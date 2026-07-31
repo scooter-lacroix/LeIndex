@@ -3,9 +3,9 @@
 //! Provides persistent storage for discovered projects with automatic reconnection.
 
 use crate::global::DEFAULT_DB_PATH;
-use crate::storage::schema::{GLOBAL_REGISTRY_CACHE_SIZE_KIB, GLOBAL_REGISTRY_MMAP_SIZE};
 use crate::storage::UniqueProjectId;
-use rusqlite::{params, Connection};
+use crate::storage::schema::{GLOBAL_REGISTRY_CACHE_SIZE_KIB, GLOBAL_REGISTRY_MMAP_SIZE};
+use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -254,7 +254,13 @@ impl GlobalRegistry {
             base_name: row.get(1)?,
             path: PathBuf::from(row.get::<_, String>(2)?),
             language: row.get(3)?,
-            file_count: row.get::<_, i64>(4)? as usize,
+            file_count: row.get::<_, i64>(4)?.try_into().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?,
             content_fingerprint: row.get(5)?,
             is_clone: row.get(6)?,
             cloned_from: row.get(7)?,
@@ -489,9 +495,11 @@ mod tests {
         let projects = registry.list_projects().unwrap();
 
         assert_eq!(projects.len(), 3);
-        assert!(projects
-            .iter()
-            .all(|p| p.language == Some("rust".to_string())));
+        assert!(
+            projects
+                .iter()
+                .all(|p| p.language == Some("rust".to_string()))
+        );
     }
 
     #[test]
@@ -566,6 +574,31 @@ mod tests {
 
         let err = registry.load_existing_ids("broken").unwrap_err();
         assert!(matches!(err, GlobalRegistryError::Database(_)));
+    }
+
+    #[test]
+    fn test_list_projects_rejects_negative_file_count() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let mut registry = GlobalRegistry::init(&db_path).unwrap();
+        let project_path = temp_dir.path().join("negative-count");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        let id = registry
+            .register_project(&project_path, None, 1, "negative-count-fp")
+            .unwrap();
+
+        registry
+            .conn
+            .execute(
+                "UPDATE global_projects SET file_count = -1 WHERE unique_project_id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            registry.list_projects(),
+            Err(GlobalRegistryError::Database(_))
+        ));
     }
 
     #[test]

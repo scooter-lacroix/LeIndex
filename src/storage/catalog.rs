@@ -38,8 +38,6 @@ pub struct CatalogSymbol {
 /// catalog and rebuilding its page cache for every symbol/file request.
 #[derive(Debug, Clone)]
 pub struct CatalogReader {
-    #[allow(dead_code)]
-    db_path: PathBuf,
     project_ids: [String; 2],
     connection: Arc<Mutex<Connection>>,
 }
@@ -66,7 +64,6 @@ impl CatalogReader {
                 .optional()?;
             drop(conn);
             Ok(project_ids.map(|project_ids| Self {
-                db_path,
                 project_ids,
                 connection,
             }))

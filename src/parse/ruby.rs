@@ -4,7 +4,7 @@ use crate::cfg_builder;
 use crate::cfg_loop_handler;
 use crate::parse::traits::calculate_complexity;
 use crate::parse::traits::clean_call_text;
-use crate::parse::traits::{find_node_by_id, Block, Edge, EdgeType, Parameter, Visibility};
+use crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility, find_node_by_id};
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
 };
@@ -316,7 +316,19 @@ fn extract_ruby_parameters(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<P
 }
 
 const DECISION_KINDS: &[&str] = &[
-    "if", "unless", "when", "while", "until", "for", "elsif", "rescue",
+    "if",
+    "unless",
+    "when",
+    "while",
+    "until",
+    "for",
+    "elsif",
+    "rescue",
+    "if_modifier",
+    "unless_modifier",
+    "while_modifier",
+    "until_modifier",
+    "ternary",
 ];
 cfg_builder!();
 cfg_loop_handler!();
@@ -413,5 +425,24 @@ end";
 
         assert!(metrics.cyclomatic > 1);
         assert!(metrics.nesting_depth > 0);
+    }
+
+    #[test]
+    fn test_ruby_modifier_and_ternary_complexity() {
+        let source = b"def choose(value)
+  result = value if value > 0
+  result = value unless value.nil?
+  result = value ? :positive : :negative
+  result
+end";
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ruby::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let metrics = RubyParser::new().extract_complexity(&tree.root_node());
+
+        assert_eq!(metrics.cyclomatic, 5);
     }
 }

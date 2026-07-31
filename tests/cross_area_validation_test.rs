@@ -190,7 +190,10 @@ mod ort_discovery_priority {
         assert!(
             env < cfg && cfg < ul && ul < sib,
             "discovery chain MUST be ordered: ORT_DYLIB_PATH -> config -> user_lib -> sibling (got env={}, cfg={}, user_lib={}, sib={})",
-            env, cfg, ul, sib
+            env,
+            cfg,
+            ul,
+            sib
         );
     }
 

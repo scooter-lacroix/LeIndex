@@ -286,17 +286,11 @@ fn test_dynamic_model_assets_require_complete_single_file_download() {
 
 #[test]
 fn test_model_checksum_status_missing_for_clean_dir() {
-    // VAL-SETUP-017: no model + no manifest -> Missing. We exercise this by
-    // pointing LEINDEX_HOME at a fresh tempfile::TempDir (auto-cleanup on drop).
-    // Resource-duplication fix: use tempfile::TempDir instead of manual
-    // std::env::temp_dir() to guarantee cleanup even on panic.
-    let _g = PIPE_ENV_LOCK.lock().unwrap();
+    let _g = PIPE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var("LEINDEX_HOME", tmp.path());
-    let status = model_checksum_status();
-    std::env::remove_var("LEINDEX_HOME");
+    let _env = EnvVarGuard::set("LEINDEX_HOME", &tmp.path().display().to_string());
+    let status = model_checksum_status_for_name("qwen3-embed-0.6b");
     assert_eq!(status, ModelChecksumStatus::Missing);
-    // tmp is auto-cleaned when dropped
 }
 
 // ── VAL-SETUP-020/021/022: New error and version-compatibility tests ──
@@ -643,11 +637,13 @@ fn test_gpu_smoke_result_fails_provider_mismatch() {
     );
 
     assert!(!result.passed);
-    assert!(result
-        .error
-        .as_deref()
-        .unwrap_or_default()
-        .contains("configured execution provider migraphx"));
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("configured execution provider migraphx")
+    );
 }
 
 #[test]
@@ -667,16 +663,60 @@ fn test_build_config_without_version() {
 use std::sync::Mutex;
 static PIPE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// RAII guard that restores an environment variable to its original value on drop.
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let original = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.original {
+            Some(val) => unsafe {
+                std::env::set_var(self.key, val);
+            },
+            None => unsafe {
+                std::env::remove_var(self.key);
+            },
+        }
+    }
+}
+
+#[test]
+fn env_var_guard_restores_original_value_on_panic() {
+    use std::panic;
+    let _g = PIPE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let key = "LEINDEX_TEST_PANIC_RESTORE";
+    unsafe { std::env::set_var(key, "original") };
+    let result = panic::catch_unwind(|| {
+        let _guard = EnvVarGuard::set(key, "temporary");
+        assert_eq!(std::env::var(key).unwrap(), "temporary");
+        panic!("simulated failure inside guarded scope");
+    });
+    assert!(result.is_err(), "expected the guarded closure to panic");
+    assert_eq!(
+        std::env::var(key).unwrap(),
+        "original",
+        "EnvVarGuard must restore the original value even on panic"
+    );
+    unsafe { std::env::remove_var(key) };
+}
+
 #[test]
 fn test_find_pip_honors_pip_bin_with_split() {
-    // VAL-SETUP-021: PIP_BIN can point at "python3 -m pip" style.
-    let _g = PIPE_ENV_LOCK.lock().unwrap();
-    // /bin/true is a guaranteed-present binary that succeeds with whatever args,
-    // so use it as a "pip" stand-in. We only check the parse logic.
-    std::env::set_var("PIP_BIN", "/bin/true -m pip");
-    // find_pip runs --version; /bin/true returns 0, so it should "succeed".
+    let _g = PIPE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::set("PIP_BIN", "/bin/true -m pip");
     let result = find_pip();
-    std::env::remove_var("PIP_BIN");
     let (program, prefix) = result.expect("PIP_BIN should be honored");
     assert_eq!(program, "/bin/true");
     assert_eq!(prefix, vec!["-m".to_string(), "pip".to_string()]);
@@ -690,10 +730,9 @@ fn test_parse_pip_bin_rejects_arbitrary_multi_arg_command() {
 
 #[test]
 fn test_find_pip_honors_pip_bin_single_token() {
-    let _g = PIPE_ENV_LOCK.lock().unwrap();
-    std::env::set_var("PIP_BIN", "/bin/true");
+    let _g = PIPE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::set("PIP_BIN", "/bin/true");
     let result = find_pip();
-    std::env::remove_var("PIP_BIN");
     let (program, prefix) = result.expect("PIP_BIN single token should be honored");
     assert_eq!(program, "/bin/true");
     assert!(prefix.is_empty());
@@ -701,12 +740,9 @@ fn test_find_pip_honors_pip_bin_single_token() {
 
 #[test]
 fn test_find_pip_empty_pip_bin_falls_through() {
-    let _g = PIPE_ENV_LOCK.lock().unwrap();
-    std::env::set_var("PIP_BIN", "   ");
-    // We can't assert what the fallback finds (system-dependent), but it
-    // must not crash and must follow PIP_BIN's absence.
+    let _g = PIPE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::set("PIP_BIN", "   ");
     let _ = find_pip();
-    std::env::remove_var("PIP_BIN");
 }
 
 // ── VAL-SETUP-025/026: Smoke test result and status line ──
@@ -797,17 +833,6 @@ fn test_permission_denied_error_names_path_and_leindex_home() {
     assert!(msg.contains("LEINDEX_HOME"), "{}", msg);
 }
 
-#[test]
-fn test_smoke_test_catastrophic_error_is_actionable() {
-    let err = SetupError::SmokeTestCatastrophic {
-        message: "worker binary not found".to_string(),
-    };
-    let msg = err.to_string();
-    assert!(msg.contains("smoke test"), "{}", msg);
-    assert!(msg.contains("worker binary not found"), "{}", msg);
-    assert!(msg.contains("leindex-embed"), "{}", msg);
-}
-
 // ── VAL-SETUP-033: GPU vendor detection ──
 
 #[test]
@@ -835,54 +860,38 @@ fn test_detected_gpu_variants_are_distinct() {
 
 #[test]
 fn test_detect_amd_gpu_no_false_positive_on_clean_system() {
-    // With a bogus ROCM_PATH that does not exist, the detection should
-    // not claim an AMD GPU is present via that path alone.
-    let _g = PIPE_ENV_LOCK.lock().unwrap();
-    std::env::set_var("ROCM_PATH", "/definitely/not/a/real/path");
-    // This may still be true if /opt/rocm exists on the test host, so we
-    // only check it doesn't panic and returns a bool-like enum.
+    let _g = PIPE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::set("ROCM_PATH", "/definitely/not/a/real/path");
     let _ = detect_amd_gpu();
-    std::env::remove_var("ROCM_PATH");
 }
 
 #[test]
 fn test_detect_amd_gpu_honors_existing_rocm_path() {
-    // When ROCM_PATH points at an existing directory, AMD is detected.
-    // Resource-duplication fix: use tempfile::TempDir for auto-cleanup.
-    let _g = PIPE_ENV_LOCK.lock().unwrap();
+    let _g = PIPE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var("ROCM_PATH", tmp.path());
+    let _env = EnvVarGuard::set("ROCM_PATH", &tmp.path().display().to_string());
     assert!(detect_amd_gpu(), "existing ROCM_PATH should detect AMD");
-    std::env::remove_var("ROCM_PATH");
-    // tmp auto-cleans on drop
 }
 
 #[test]
 fn test_detect_nvidia_gpu_with_cuda_path_env() {
-    // When CUDA_PATH points at an existing directory, NVIDIA is detected.
-    // Resource-duplication fix: use tempfile::TempDir for auto-cleanup.
-    let _g = PIPE_ENV_LOCK.lock().unwrap();
+    let _g = PIPE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var("CUDA_PATH", tmp.path());
+    let _env = EnvVarGuard::set("CUDA_PATH", &tmp.path().display().to_string());
     assert!(
         detect_nvidia_gpu(),
         "existing CUDA_PATH should detect NVIDIA"
     );
-    std::env::remove_var("CUDA_PATH");
-    // tmp auto-cleans on drop
 }
 
 // ── VAL-SETUP-031 + VAL-SETUP-035: ensure_home_writable + LEINDEX_HOME ──
 
 #[test]
 fn test_ensure_home_writable_succeeds_for_writable_leindex_home() {
-    // Resource-duplication fix: use tempfile::TempDir for auto-cleanup.
-    let _g = PIPE_ENV_LOCK.lock().unwrap();
+    let _g = PIPE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var("LEINDEX_HOME", tmp.path());
+    let _env = EnvVarGuard::set("LEINDEX_HOME", &tmp.path().display().to_string());
     let result = ensure_home_writable();
-    std::env::remove_var("LEINDEX_HOME");
-    // tmp auto-cleans on drop
     assert!(
         result.is_ok(),
         "writable LEINDEX_HOME should pass: {:?}",
@@ -892,41 +901,30 @@ fn test_ensure_home_writable_succeeds_for_writable_leindex_home() {
 
 #[test]
 fn test_ensure_home_writable_uses_leindex_home_location() {
-    // VAL-SETUP-032/035: LEINDEX_HOME drives where config goes.
-    // Resource-duplication fix: use tempfile::TempDir for auto-cleanup.
-    let _g = PIPE_ENV_LOCK.lock().unwrap();
+    let _g = PIPE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var("LEINDEX_HOME", tmp.path());
+    let _env = EnvVarGuard::set("LEINDEX_HOME", &tmp.path().display().to_string());
     let result = ensure_home_writable();
     assert!(result.is_ok());
-    // After the probe, the config directory should exist under $LEINDEX_HOME.
     assert!(
         tmp.path().join("config").is_dir(),
         "config dir should be under LEINDEX_HOME"
     );
-    std::env::remove_var("LEINDEX_HOME");
-    // tmp auto-cleans on drop
 }
 
 #[test]
 fn test_ensure_home_writable_fails_for_read_only_dir() {
-    // VAL-SETUP-031: a read-only directory surfaces a PermissionDenied error.
-    // We create a tempfile::TempDir, chmod it 555 (read+execute only), and
-    // verify the probe fails. Then restore perms and let TempDir clean up.
-    // Resource-duplication fix: use tempfile::TempDir for auto-cleanup.
-    let _g = PIPE_ENV_LOCK.lock().unwrap();
+    let _g = PIPE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().to_path_buf();
 
-    // Make the base directory read-only (no write permission).
-    // 0o555 = r-xr-xr-x
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o555)).unwrap();
     }
 
-    std::env::set_var("LEINDEX_HOME", &base);
+    let _env = EnvVarGuard::set("LEINDEX_HOME", &base.display().to_string());
     let result = ensure_home_writable();
 
     // Restore permissions before assertions so cleanup always works.
@@ -935,8 +933,7 @@ fn test_ensure_home_writable_fails_for_read_only_dir() {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755));
     }
-    std::env::remove_var("LEINDEX_HOME");
-    // tmp auto-cleans on drop (we restored perms above)
+    // tmp auto-cleans on drop; _env guard restores LEINDEX_HOME on drop
 
     // On Unix with a read-only base, we expect a PermissionDenied error.
     // On non-Unix or when running as root, the probe may succeed; skip
@@ -1029,7 +1026,7 @@ fn test_copy_bundled_models_creates_symlinks_not_copies() {
     // Resource-duplication fix: copy_bundled_models must create symlinks
     // (not copies) when source and dest are on the same filesystem.
     // We simulate a bundled models dir with a small placeholder file.
-    let _g = PIPE_ENV_LOCK.lock().unwrap();
+    let _g = PIPE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     let bundled = tempfile::tempdir().unwrap();
     let dest = tempfile::tempdir().unwrap();
@@ -1082,4 +1079,22 @@ fn test_try_link_model_file_overwrites_existing() {
         "copy strategy should overwrite: {:?}",
         result
     );
+}
+
+#[test]
+fn test_install_downloaded_model_file_preserves_destination_when_staging_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing_source = tmp.path().join("missing-model.onnx");
+    let destination = tmp.path().join("model.onnx");
+    std::fs::write(&destination, b"existing model").unwrap();
+
+    let result = install_downloaded_model_file(&missing_source, &destination);
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&destination).unwrap(), b"existing model");
+}
+
+#[test]
+fn test_ensure_models_rejects_unknown_name_before_model_directory_resolution() {
+    let result = ensure_models_present(None, "unsupported-model-name");
+    assert!(matches!(result, Err(SetupError::InvalidModelName { .. })));
 }

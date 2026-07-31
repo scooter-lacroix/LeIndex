@@ -19,14 +19,14 @@ pub use types::{
 };
 // Re-export crate-internal types for sibling modules (index_builder, index_cache, etc.)
 pub(crate) use types::{
-    ProjectFileScan, DEPENDENCY_MANIFEST_NAMES, SKIP_DIRS, SOURCE_FILE_EXTENSIONS,
+    DEPENDENCY_MANIFEST_NAMES, ProjectFileScan, SKIP_DIRS, SOURCE_FILE_EXTENSIONS,
 };
 
 use crate::cli::index_builder;
 use crate::cli::memory::WarmStrategy;
 use crate::graph::pdg::ProgramDependenceGraph;
 use crate::search::search::SearchEngine;
-use crate::storage::{schema::Storage, UniqueProjectId};
+use crate::storage::{UniqueProjectId, schema::Storage};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -684,17 +684,6 @@ impl LeIndex {
     fn check_manifest_stale(&self) -> bool {
         let ctx = self.freshness_context();
         crate::cli::index_freshness::check_manifest_stale(&ctx, || self.scan_project_files())
-    }
-
-    /// Given changed manifests, find source files importing from those packages.
-    #[allow(dead_code)]
-    fn files_importing_from_manifests(
-        &self,
-        changed_manifests: &[PathBuf],
-        all_source_paths: &[PathBuf],
-        pdg: &ProgramDependenceGraph,
-    ) -> Vec<PathBuf> {
-        index_builder::files_importing_from_manifests(changed_manifests, all_source_paths, pdg)
     }
 
     /// Fast-path freshness check: O(1) for indexed files, O(D) for source

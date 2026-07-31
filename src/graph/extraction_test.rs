@@ -291,6 +291,78 @@ fn cross_file_flow_argument_is_resolved_after_merge() {
 }
 
 #[test]
+fn cross_file_flow_uses_exact_qualified_target_without_bare_name_fallback() {
+    let mut caller = sig("dispatch", "dispatch", false);
+    caller.flow_facts.push(crate::parse::traits::FlowFact {
+        channel: FlowChannel::Argument,
+        source: "value".to_string(),
+        target: "module.target".to_string(),
+        position: Some(0),
+        byte_range: (0, 5),
+    });
+    let qualified = sig("target", "module.target", false);
+    let unrelated = sig("target", "target", false);
+    let mut merged = ProgramDependenceGraph::new();
+    for (signatures, file) in [
+        (vec![caller.clone()], "caller.rs"),
+        (vec![qualified.clone()], "qualified.rs"),
+        (vec![unrelated.clone()], "unrelated.rs"),
+    ] {
+        crate::cli::index_builder::merge_pdgs(
+            &mut merged,
+            extract_pdg_from_signatures(signatures, b"", file, "rust"),
+        );
+    }
+
+    resolve_cross_file_flow_edges_for_files(
+        &mut merged,
+        &[
+            ("caller.rs".to_string(), caller),
+            ("qualified.rs".to_string(), qualified),
+            ("unrelated.rs".to_string(), unrelated),
+        ],
+    );
+
+    let caller_id = merged
+        .node_indices()
+        .find(|&id| {
+            merged
+                .get_node(id)
+                .is_some_and(|node| node.id == "caller.rs:dispatch")
+        })
+        .unwrap();
+    let qualified_id = merged
+        .node_indices()
+        .find(|&id| {
+            merged
+                .get_node(id)
+                .is_some_and(|node| node.id == "qualified.rs:module.target")
+        })
+        .unwrap();
+    let unrelated_id = merged
+        .node_indices()
+        .find(|&id| {
+            merged
+                .get_node(id)
+                .is_some_and(|node| node.id == "unrelated.rs:target")
+        })
+        .unwrap();
+
+    assert!(merged.edge_indices().any(|edge_id| {
+        merged.edge_endpoints(edge_id) == Some((caller_id, qualified_id))
+            && merged
+                .get_edge(edge_id)
+                .is_some_and(|edge| edge.edge_type == EdgeType::DataDependency)
+    }));
+    assert!(!merged.edge_indices().any(|edge_id| {
+        merged.edge_endpoints(edge_id) == Some((caller_id, unrelated_id))
+            && merged
+                .get_edge(edge_id)
+                .is_some_and(|edge| edge.edge_type == EdgeType::DataDependency)
+    }));
+}
+
+#[test]
 fn python_multiline_import_parsed() {
     let source = b"from os.path import (\n    join,\n    exists,\n    dirname\n)\n";
     let imports = extract_import_paths_from_source(source, "python");

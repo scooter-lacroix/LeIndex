@@ -15,8 +15,8 @@ use anyhow::{Context, Result};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Canonical phase names in execution order (VAL-MEASURE-002, VAL-CPHASE-036).
@@ -399,7 +399,10 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
     if config.verbose {
         eprintln!(
             "memcheck: phase 'embed_active' complete — main_rss_max: {} KiB, worker_rss_max: {} KiB, combined_rss_max: {} KiB, samples: {}",
-            report.rss_max_kib, report.worker_rss_max_kib, report.combined_rss_max_kib, report.sample_count
+            report.rss_max_kib,
+            report.worker_rss_max_kib,
+            report.combined_rss_max_kib,
+            report.sample_count
         );
     }
 

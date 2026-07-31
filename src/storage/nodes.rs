@@ -1,7 +1,7 @@
 // Node persistence operations
 
 use crate::storage::schema::Storage;
-use rusqlite::{params, OptionalExtension, Result as SqliteResult};
+use rusqlite::{OptionalExtension, Result as SqliteResult, params};
 use serde::{Deserialize, Serialize};
 
 /// Node record for database storage

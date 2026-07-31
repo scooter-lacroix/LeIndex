@@ -8,7 +8,7 @@ use super::request_meta::WorkBudget;
 use crate::cli::live_project::LiveProject;
 use crate::cli::registry::ProjectRegistry;
 use crate::graph::pdg::{NodeId, ProgramDependenceGraph};
-use crate::search::query_route::{classify, QueryRoute, RequestedMode};
+use crate::search::query_route::{QueryRoute, RequestedMode, classify};
 use crate::search::ranking::Score;
 use crate::storage::{CatalogReader, CatalogSymbol};
 use regex::Regex;
@@ -172,7 +172,7 @@ fn catalog_symbol_matches(
     type_filter: &str,
     regex: Option<&Regex>,
 ) -> bool {
-    let in_scope = scope.map_or(true, |scope| {
+    let in_scope = scope.is_none_or(|scope| {
         symbol.file_path.starts_with(scope)
             || symbol.file_path
                 == std::path::Path::new(scope.trim_end_matches(std::path::MAIN_SEPARATOR))
@@ -221,17 +221,37 @@ async fn fresh_catalog_symbols(
     let pattern_lower = pattern.to_lowercase();
     let mut fresh = Vec::new();
     let mut stale_paths = HashSet::new();
+    let mut live_bytes_cache: std::collections::HashMap<PathBuf, Vec<u8>> =
+        std::collections::HashMap::new();
+    let mut freshness_cache: std::collections::HashMap<PathBuf, bool> =
+        std::collections::HashMap::new();
     for mut symbol in symbols {
-        symbol.file_path = live
-            .file(&symbol.file_path.to_string_lossy())
-            .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
+        symbol.file_path = match live.file(&symbol.file_path.to_string_lossy()) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
         if !catalog_symbol_matches(&symbol, scope, &pattern_lower, type_filter, regex.as_ref()) {
             continue;
         }
-        let bytes = read_live_bytes(symbol.file_path.clone()).await?;
-        let is_fresh = match catalog {
-            Some(catalog) => catalog_is_fresh(catalog, &symbol.file_path, &bytes).await,
-            None => false,
+        let bytes = if let Some(cached) = live_bytes_cache.get(&symbol.file_path) {
+            cached.clone()
+        } else {
+            let bytes = match read_live_bytes(symbol.file_path.clone()).await {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            live_bytes_cache.insert(symbol.file_path.clone(), bytes.clone());
+            bytes
+        };
+        let is_fresh = if let Some(cached) = freshness_cache.get(&symbol.file_path) {
+            *cached
+        } else {
+            let is_fresh = match catalog {
+                Some(catalog) => catalog_is_fresh(catalog, &symbol.file_path, &bytes).await,
+                None => false,
+            };
+            freshness_cache.insert(symbol.file_path.clone(), is_fresh);
+            is_fresh
         };
         if is_fresh {
             fresh.push((symbol, bytes));
@@ -250,7 +270,9 @@ async fn catalog_fallback_paths(
     stale_paths: HashSet<PathBuf>,
 ) -> Result<(Vec<PathBuf>, bool), JsonRpcError> {
     if !stale_paths.is_empty() {
-        return Ok((stale_paths.into_iter().collect(), true));
+        let mut paths: Vec<_> = stale_paths.into_iter().collect();
+        paths.sort();
+        return Ok((paths, true));
     }
     if has_fresh_symbols {
         return Ok((Vec::new(), false));
@@ -287,10 +309,15 @@ async fn append_live_catalog_matches(
     let regex = compiled_symbol_regex(pattern);
     for path in paths {
         // Avoid invoking Tree-sitter for every source file when a catalog is
-        // missing. A cheap byte-level prefilter keeps the live fallback
+        // missing. A cheap byte-level prefilter keeps literal live fallback
         // bounded by files that can actually contain the requested anchor.
-        let bytes = read_live_bytes(path.clone()).await?;
-        if !live_text_might_match(&bytes, pattern) {
+        // Regex-shaped queries must bypass this heuristic: the regex matcher
+        // is authoritative and a literal byte search can produce false negatives.
+        let bytes = match read_live_bytes(path.clone()).await {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        if regex.is_none() && !live_text_might_match(&bytes, pattern) {
             continue;
         }
         let parsed = match parse_live_file(path).await {
@@ -302,7 +329,7 @@ async fn append_live_catalog_matches(
             Err(_) => continue,
         };
         for symbol in parsed.symbols {
-            let in_scope = scope.map_or(true, |scope| symbol.file_path.starts_with(scope));
+            let in_scope = scope.is_none_or(|scope| symbol.file_path.starts_with(scope));
             let type_matches = type_filter == "all" || symbol.node_type == type_filter;
             let name_matches = symbol.symbol_name.to_lowercase().contains(&pattern_lower)
                 || symbol

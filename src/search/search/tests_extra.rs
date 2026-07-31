@@ -51,11 +51,13 @@ fn test_incremental_reindex_content_cleared() {
     }
 
     // But func3 tokens should still be searchable
-    assert!(engine
-        .node_tokens
-        .get("func3")
-        .unwrap()
-        .contains("important"));
+    assert!(
+        engine
+            .node_tokens
+            .get("func3")
+            .unwrap()
+            .contains("important")
+    );
 }
 
 // ----------------------------------------------------------------
@@ -1392,9 +1394,9 @@ fn test_search_mode_exact_vs_semantic_different_rankings() {
         .map(|r| r.score.overall)
         .unwrap_or(0.0);
     assert!(
-            exact_match_exact_score > exact_match_semantic_score,
-            "exact mode ({:.4}) should give higher score to exact name match than semantic mode ({:.4})",
-            exact_match_exact_score,
-            exact_match_semantic_score
-        );
+        exact_match_exact_score > exact_match_semantic_score,
+        "exact mode ({:.4}) should give higher score to exact name match than semantic mode ({:.4})",
+        exact_match_exact_score,
+        exact_match_semantic_score
+    );
 }

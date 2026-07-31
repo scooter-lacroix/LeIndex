@@ -146,7 +146,7 @@ impl HybridEmbedder {
         }
     }
 
-    /// Get the TF-IDF dimension (always 768)
+    /// Get the configured TF-IDF embedding dimension.
     pub fn tfidf_dimension(&self) -> usize {
         self.tfidf().dimension()
     }
@@ -266,12 +266,19 @@ impl HybridEmbedder {
                 .ok()?;
                 match result {
                     EmbedResult::Success(response) => {
-                        match response.into_vectors().into_iter().next() {
-                            // VAL-CPHASE-016: write from flat buffer directly. Presence of the
-                            // vector (not response.count) is the real non-empty contract.
-                            Some(v) => Some(Ok(v)),
-                            None => Some(Err("worker returned empty response".to_string())),
+                        let vectors = response.into_vectors();
+                        if vectors.len() != 1 {
+                            return Some(Err(format!(
+                                "worker returned {} vectors for one input",
+                                vectors.len()
+                            )));
                         }
+                        // VAL-CPHASE-016: write from flat buffer directly. The decoded
+                        // vector count, not response.count, is the storage contract.
+                        Some(Ok(vectors
+                            .into_iter()
+                            .next()
+                            .expect("validated vector count")))
                     }
                     EmbedResult::Fallback { batch_id, error } => {
                         // VAL-CPHASE-018/019: Fallback already logged actionable warning.
@@ -356,12 +363,19 @@ impl HybridEmbedder {
                 let result = neural.embed_with_fallback(&texts, NEURAL_EMBEDDING_DIMENSION);
                 match result {
                     EmbedResult::Success(response) => {
-                        match response.into_vectors().into_iter().next() {
-                            // VAL-CPHASE-016: write from flat buffer directly. Presence of the
-                            // vector (not response.count) is the real non-empty contract.
-                            Some(v) => Some(Ok(v)),
-                            None => Some(Err("worker returned empty response".to_string())),
+                        let vectors = response.into_vectors();
+                        if vectors.len() != 1 {
+                            return Some(Err(format!(
+                                "worker returned {} vectors for one input",
+                                vectors.len()
+                            )));
                         }
+                        // VAL-CPHASE-016: write from flat buffer directly. The decoded
+                        // vector count, not response.count, is the storage contract.
+                        Some(Ok(vectors
+                            .into_iter()
+                            .next()
+                            .expect("validated vector count")))
                     }
                     EmbedResult::Fallback { batch_id, error } => {
                         // VAL-CPHASE-018/019: Fallback already logged actionable warning.
@@ -404,13 +418,14 @@ impl HybridEmbedder {
                 let result = neural.embed_with_fallback(texts, NEURAL_EMBEDDING_DIMENSION);
                 match result {
                     EmbedResult::Success(response) => {
-                        if response.count == texts.len() {
-                            response.into_vectors().into_iter().map(Some).collect()
+                        let vectors = response.into_vectors();
+                        if vectors.len() == texts.len() {
+                            vectors.into_iter().map(Some).collect()
                         } else {
                             tracing::warn!(
                                 expected = texts.len(),
-                                got = response.count,
-                                "Neural batch returned wrong count, falling back to None for all"
+                                got = vectors.len(),
+                                "Neural batch returned wrong vector count, falling back to None for all"
                             );
                             vec![None; texts.len()]
                         }
@@ -469,12 +484,7 @@ impl HybridEmbedder {
         match self {
             Self::TfIdfOnly(_) => false,
             #[cfg(feature = "onnx")]
-            Self::HybridLocal { .. } => {
-                // With the worker architecture, "loaded" means the worker process
-                // is running. This will be properly tracked in the runtime lifecycle
-                // feature. For now, return false as the worker is spawned on demand.
-                false
-            }
+            Self::HybridLocal { neural, .. } => neural.is_ready(),
             #[cfg(feature = "remote-embeddings")]
             Self::HybridRemote { .. } => false,
         }

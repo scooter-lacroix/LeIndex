@@ -3,12 +3,12 @@ use super::helpers::{
     wrap_live_with_meta_dirty,
 };
 use super::protocol::JsonRpcError;
-use super::request_meta::{record_git_ms, record_pdg_ms, WorkBudget};
+use super::request_meta::{WorkBudget, record_git_ms, record_pdg_ms};
 use crate::cli::git::{self, GitStatus};
 use crate::cli::live_project::LiveProject;
 use crate::cli::registry::ProjectRegistry;
 use crate::graph::pdg::{NodeId, ProgramDependenceGraph, TraversalConfig};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -89,7 +89,7 @@ impl GitStatusHandler {
             Err(error) => {
                 return Err(JsonRpcError::internal_error(format!(
                     "git status failed: {error}"
-                )))
+                )));
             }
         };
 
@@ -381,7 +381,7 @@ fn safe_stage_candidate(
             .any(|submodule| submodule.path == path)
         && !path.starts_with(".leindex")
         && is_source_file(path)
-        && scope.map_or(true, |scope| absolute.starts_with(scope))
+        && scope.is_none_or(|scope| absolute.starts_with(scope))
 }
 
 fn is_source_file(path: &Path) -> bool {

@@ -1,7 +1,7 @@
 use crate::graph::{extract_pdg_from_signatures, pdg::ProgramDependenceGraph};
 use crate::parse::{parallel::ParsingResult, prelude::ParallelParser, traits::SignatureInfo};
-use crate::phase::docs::{analyze_docs, DocsSummary};
-use crate::phase::freshness::{compute_freshness, FreshnessState};
+use crate::phase::docs::{DocsSummary, analyze_docs};
+use crate::phase::freshness::{FreshnessState, compute_freshness};
 use crate::phase::options::PhaseOptions;
 use crate::phase::pdg_utils::merge_pdgs;
 use crate::phase::utils::{collect_files, hash_inventory};
@@ -11,7 +11,7 @@ use crate::storage::{
     },
     schema::Storage,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::warn;

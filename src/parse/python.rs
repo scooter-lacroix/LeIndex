@@ -2,7 +2,7 @@
 
 use crate::cfg_builder;
 use crate::parse::traits::calculate_complexity;
-use crate::parse::traits::{find_node_by_id, Block, Edge, EdgeType, Parameter, Visibility};
+use crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility, find_node_by_id};
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
 };
@@ -265,30 +265,6 @@ fn extract_python_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Imp
 
     visit(&root, source, &mut imports);
     imports
-}
-
-/// Extract function signature from a function_definition node
-///
-/// This is the legacy version for backward compatibility.
-/// New code should use `extract_function_signature_with_path`.
-#[allow(dead_code)]
-fn extract_function_signature(
-    node: &tree_sitter::Node<'_>,
-    source: &[u8],
-    class_name: Option<&str>,
-) -> Option<SignatureInfo> {
-    // Extract function name
-    let name_node = node.child_by_field_name("name")?;
-    let name = name_node.utf8_text(source).ok()?.to_string();
-
-    // Build qualified name from class_name if present
-    let qualified_name = if let Some(class) = class_name {
-        format!("{}.{}", class, name)
-    } else {
-        name.clone()
-    };
-
-    extract_function_signature_with_path(node, source, &qualified_name)
 }
 
 /// Extract function signature from a function_definition node with a pre-computed qualified name

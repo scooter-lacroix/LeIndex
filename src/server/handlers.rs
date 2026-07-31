@@ -2,10 +2,10 @@
 
 use crate::storage::Storage;
 use axum::{
-    extract::{ws::WebSocketUpgrade, Path, Query, State},
+    Json, Router,
+    extract::{Path, Query, State, ws::WebSocketUpgrade},
     http::StatusCode,
     response::IntoResponse,
-    Json, Router,
 };
 use futures::stream::StreamExt;
 use serde::Deserialize;

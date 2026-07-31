@@ -39,19 +39,19 @@ pub use protocol::{
     HealthResponse, Request, RerankRequest, RerankResponse, Response, WorkerState,
 };
 
-pub use batch::{split_request, stitch_responses, truncate_text, BatchConfig};
+pub use batch::{BatchConfig, split_request, stitch_responses, truncate_text};
 pub use config::{
     ConfigError, IndexingConfig, LeIndexConfig, NeuralConfig, RecoveryAction, SearchConfig,
 };
 pub use model_path::ModelResolver;
 pub use ort_discovery::{
-    discover_and_init, last_outcome as last_ort_outcome, DiscoveryOutcome, DiscoverySource,
-    InitResult,
+    DiscoveryOutcome, DiscoverySource, InitResult, discover_and_init,
+    last_outcome as last_ort_outcome,
 };
-pub use provider::{is_cuda_compiled_in, is_migraphx_compiled_in, ExecutionProviderSelector};
+pub use provider::{ExecutionProviderSelector, is_cuda_compiled_in, is_migraphx_compiled_in};
 pub use runtime::{
-    RuntimeConfig, WorkerRuntime, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_FRAME_SIZE,
-    DEFAULT_MAX_TEXT_SIZE, READ_BUF_CAPACITY,
+    DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_TEXT_SIZE, READ_BUF_CAPACITY,
+    RuntimeConfig, WorkerRuntime,
 };
 pub use startup::{StartupReport, StartupReporter};
 

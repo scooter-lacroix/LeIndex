@@ -138,7 +138,12 @@ pub fn get_prompt(
                 .as_ref()
                 .and_then(|a| a.get("query"))
                 .and_then(|q| q.as_str())
-                .unwrap_or("your code investigation");
+                .filter(|query| !query.trim().is_empty())
+                .ok_or_else(|| {
+                    JsonRpcError::invalid_params(
+                        "investigation_workflow requires a non-empty string 'query' argument",
+                    )
+                })?;
 
             Ok(vec![
                 PromptMessage {
@@ -169,6 +174,7 @@ pub struct Resource {
     pub name: String,
     /// MIME type of the resource
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "mimeType")]
     pub mime_type: Option<String>,
     /// Resource description
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -182,6 +188,7 @@ pub struct ResourceContent {
     pub uri: String,
     /// MIME type
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "mimeType")]
     pub mime_type: Option<String>,
     /// Text content (if text resource)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -303,7 +310,7 @@ Or use the MCP tool:
 ## Environment Variables
 
 - `LEINDEX_HOME` - Storage directory (default: ~/.leindex)
-- `LEINDEX_PORT` - Server port (default: 47268)
+- `LEINDEX_PORT` - Server port (default: 47500)
 "#;
 
 /// Server configuration guide content
@@ -322,7 +329,7 @@ The LeIndex server can be configured via:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `LEINDEX_HOME` | Storage/index directory | `~/.leindex` |
-| `LEINDEX_PORT` | HTTP server port | `47268` |
+| `LEINDEX_PORT` | HTTP server port | `47500` |
 | `LEINDEX_HOST` | HTTP server host | `127.0.0.1` |
 
 ## MCP Server Mode
@@ -358,3 +365,41 @@ leindex serve --max-projects 10
 
 Default maximum: 5 projects.
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_investigation_workflow_requires_non_empty_query() {
+        assert!(get_prompt("investigation_workflow", None).is_err());
+        assert!(
+            get_prompt(
+                "investigation_workflow",
+                Some(serde_json::json!({"query": "   "}))
+            )
+            .is_err()
+        );
+        assert!(
+            get_prompt(
+                "investigation_workflow",
+                Some(serde_json::json!({"query": 42}))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_investigation_workflow_generates_for_non_empty_query() {
+        let messages = get_prompt(
+            "investigation_workflow",
+            Some(serde_json::json!({"query": "find authentication"})),
+        )
+        .unwrap();
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0].content {
+            PromptContent::Text { text } => assert!(text.contains("find authentication")),
+        }
+    }
+}

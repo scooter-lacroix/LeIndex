@@ -3,7 +3,7 @@
 use crate::cfg_builder;
 use crate::parse::traits::calculate_complexity;
 use crate::parse::traits::clean_call_text;
-use crate::parse::traits::{find_node_by_id, Block, Edge, EdgeType, Parameter, Visibility};
+use crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility, find_node_by_id};
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
 };

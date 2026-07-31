@@ -413,10 +413,8 @@ fn extract_csharp_parameters(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec
     // Try "parameters" field first, then look for parameter_list child
     let params_node = node.child_by_field_name("parameters").or_else(|| {
         let mut cursor = node.walk();
-        let result = node
-            .children(&mut cursor)
-            .find(|child| child.kind() == "parameter_list");
-        result
+        node.children(&mut cursor)
+            .find(|child| child.kind() == "parameter_list")
     });
 
     if let Some(params) = params_node {
@@ -468,72 +466,6 @@ fn extract_visibility(node: &tree_sitter::Node<'_>, source: &[u8]) -> Visibility
     Visibility::Private
 }
 
-#[allow(dead_code)]
-fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
-    // C# uses XML documentation comments: /// <summary>...</summary>
-    // Look for the previous sibling that might be a comment
-
-    // We need to search backwards from the current node
-    // This is tricky in tree-sitter, so we'll search the tree for comments
-    // that appear before this node's byte range
-    let node_start = node.byte_range().start;
-
-    // Walk up to find the root, then search for comments
-    let mut current = *node;
-    let root = loop {
-        let parent = current.parent();
-        match parent {
-            Some(p) => current = p,
-            None => break current,
-        }
-    };
-
-    // Collect all comments in the tree that appear before our node
-    let mut comments_before = Vec::new();
-    let mut cursor = root.walk();
-    collect_comments_recursive(&root, &mut cursor, source, node_start, &mut comments_before);
-
-    // Get the closest comment before this node
-    comments_before
-        .into_iter()
-        .rev()
-        .find(|comment_start| {
-            // Check if the comment is "close" to the node (within ~500 bytes)
-            node_start.saturating_sub(*comment_start) <= 500
-        })
-        .map(|_| {
-            // For now, return a placeholder since XML doc comment parsing is complex
-            // A full implementation would parse the <summary>, <param>, <returns> tags
-            "C# XML documentation comment".to_string()
-        })
-}
-
-#[allow(dead_code)]
-#[allow(clippy::only_used_in_recursion)]
-fn collect_comments_recursive(
-    node: &tree_sitter::Node<'_>,
-    cursor: &mut tree_sitter::TreeCursor<'_>,
-    source: &[u8],
-    target_byte: usize,
-    comments_before: &mut Vec<usize>,
-) {
-    // Check if this node is a comment before our target
-    if node.kind() == "comment" {
-        let byte_range = node.byte_range();
-        if byte_range.end <= target_byte {
-            if let Ok(_comment) = node.utf8_text(source) {
-                comments_before.push(byte_range.start);
-            }
-        }
-    }
-
-    // Recurse into children
-    let mut c = node.walk();
-    for child in node.children(&mut c) {
-        collect_comments_recursive(&child, cursor, source, target_byte, comments_before);
-    }
-}
-
 const DECISION_KINDS: &[&str] = &[
     "if_statement",
     "for_statement",
@@ -560,7 +492,7 @@ impl<'a> CfgBuilder<'a> {
             "if_statement" => {
                 self.handle_if_statement(node, current_block)?;
             }
-            "for_statement" | "foreach_statement" | "while_statement" => {
+            "for_statement" | "foreach_statement" | "while_statement" | "do_statement" => {
                 self.handle_loop_statement(node, current_block)?;
             }
             _ => {

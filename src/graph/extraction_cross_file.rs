@@ -289,6 +289,16 @@ const COMMON_CALL_NAMES: &[&str] = &[
     "render",
 ];
 
+/// Resolve call targets across all files.
+///
+/// This function intentionally fans out to ALL matching candidates rather than
+/// selecting a unique callee. Connecting to every possible target ensures no
+/// real call edge is missed — false-positive connectivity is preferable to
+/// false-negative missed edges for a code-intelligence tool. Callers can filter
+/// edges by confidence or traversal depth downstream.
+///
+/// Targets are deduplicated before return to prevent the same NodeId from
+/// appearing multiple times through different candidate-resolution paths.
 fn resolve_cross_file_call_targets(
     candidates: &[String],
     indexes: &CrossFileCallIndexes,
@@ -329,6 +339,8 @@ fn resolve_cross_file_call_targets(
             }
         }
     }
+    targets.sort_unstable();
+    targets.dedup();
     targets
 }
 
@@ -461,8 +473,11 @@ fn existing_typed_edges(
 /// Resolve source-level value/state channels after all per-file PDGs merge.
 ///
 /// Per-file extraction already emits local flow edges. This pass connects the
-/// same facts to definitions in other files, using the existing call-resolution
-/// name maps rather than attempting type inference or alias analysis.
+/// same facts to definitions in other files, using exact normalized qualified
+/// names rather than a bare-name fallback. The exact-key contract prevents a
+/// fact targeting `module.target` from attaching to an unrelated `target` in
+/// another file; callers that need broader alias/type inference must add that
+/// evidence explicitly rather than widening this bounded resolver.
 // ponytail: syntax/name matching keeps indexing bounded; add type/alias analysis
 // only when measured flow misses justify its cost.
 pub fn resolve_cross_file_flow_edges_for_files(
@@ -473,7 +488,6 @@ pub fn resolve_cross_file_flow_edges_for_files(
 
     let mut by_qname: HashMap<String, Vec<NodeId>> = HashMap::new();
     let mut by_file_qname: HashMap<(String, String), Vec<NodeId>> = HashMap::new();
-    let mut by_last: HashMap<String, Vec<NodeId>> = HashMap::new();
 
     for nid in pdg.node_indices() {
         let Some(node) = pdg.get_node(nid) else {
@@ -491,9 +505,6 @@ pub fn resolve_cross_file_flow_edges_for_files(
             .entry((normalized.clone(), node.file_path.to_string()))
             .or_default()
             .push(nid);
-        if let Some(last) = normalized.rsplit('.').next() {
-            by_last.entry(last.to_string()).or_default().push(nid);
-        }
     }
 
     let mut existing = existing_typed_edges(pdg);
@@ -521,7 +532,7 @@ pub fn resolve_cross_file_flow_edges_for_files(
                 }
                 _ => continue,
             };
-            let targets = resolve_cross_file_flow_targets(target_label, &by_qname, &by_last);
+            let targets = resolve_cross_file_flow_targets(target_label, &by_qname);
             for caller_id in &caller_ids {
                 for target_id in &targets {
                     if caller_id == target_id
@@ -554,27 +565,7 @@ pub fn resolve_cross_file_flow_edges_for_files(
 fn resolve_cross_file_flow_targets(
     target: &str,
     by_qname: &HashMap<String, Vec<crate::graph::pdg::NodeId>>,
-    by_last: &HashMap<String, Vec<crate::graph::pdg::NodeId>>,
 ) -> Vec<crate::graph::pdg::NodeId> {
     let normalized = normalize_symbol(target);
-    let mut targets = by_qname.get(&normalized).cloned().unwrap_or_default();
-    if targets.is_empty() {
-        let segments: Vec<&str> = normalized.split('.').filter(|s| !s.is_empty()).collect();
-        for len in 2..=3_usize.min(segments.len()) {
-            let suffix = segments[segments.len() - len..].join(".");
-            if let Some(ids) = by_qname.get(&suffix) {
-                targets.extend(ids);
-            }
-        }
-    }
-    if targets.is_empty() {
-        if let Some(last) = normalized.rsplit('.').next() {
-            if let Some(ids) = by_last.get(last) {
-                targets.extend(ids);
-            }
-        }
-    }
-    targets.sort_unstable();
-    targets.dedup();
-    targets
+    by_qname.get(&normalized).cloned().unwrap_or_default()
 }

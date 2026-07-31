@@ -242,7 +242,7 @@ fn test_trim_read_symbol_caps_callers() {
     assert!(
         src.ends_with("..."),
         "missing ellipsis: {:?}",
-        &src[src.len() - 10..]
+        src.chars().rev().take(10).collect::<String>()
     );
     assert_eq!(t["source_truncated"], true);
     // Callers capped at 5
@@ -277,7 +277,7 @@ fn test_trim_grep_symbols_drops_byte_range() {
     assert!(r.get("language").is_none());
     assert_eq!(r["callers"].as_array().unwrap().len(), 5);
     assert_eq!(r["callee_count"], Value::Null); // not present in input
-                                                // caller_count (kept) reflects blast radius even when callers list is capped
+    // caller_count (kept) reflects blast radius even when callers list is capped
     assert_eq!(r["caller_count"], 10);
 }
 

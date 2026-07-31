@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::command::{EditCommand, EditResult};
-use super::engine::{replace_near_definitions, EditEngine, EditError, Result};
+use super::engine::{EditEngine, EditError, Result, replace_near_definitions};
 use crate::graph::pdg::ProgramDependenceGraph as PDG;
 use crate::storage::UniqueProjectId;
 
@@ -95,7 +95,7 @@ impl Refactor {
 
         // Record in edit history for undo support.
         if result.success {
-            if let (Some(ref originals), Some(ref modifieds)) =
+            if let (Some(originals), Some(modifieds)) =
                 (&result.original_contents, &result.modified_contents)
             {
                 let mut history = engine.history.lock().await;

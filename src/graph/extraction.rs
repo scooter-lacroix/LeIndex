@@ -55,7 +55,10 @@ pub fn extract_pdg_from_signatures(
             .entry(sig.qualified_name.clone())
             .or_default()
             .push(nid);
-        node_ids.insert(sig.qualified_name.clone(), nid);
+        // Use or_insert to retain the FIRST insertion (more intuitive than
+        // last-wins). Operations using node_ids (inheritance, source-level
+        // flow, import/class inference) see the first-inserted duplicate.
+        node_ids.entry(sig.qualified_name.clone()).or_insert(nid);
     }
 
     // Phase 1b: Infer Class nodes from method qualified names.
@@ -1033,6 +1036,8 @@ fn local_call_targets(
         }
     }
 
+    targets.sort_unstable();
+    targets.dedup();
     targets
 }
 
@@ -1460,7 +1465,7 @@ fn strip_block_comments(lang: &str, source: &str) -> String {
             while let Some(c) = chars.next() {
                 if c == '/' && chars.peek() == Some(&'*') {
                     chars.next(); // consume '*'
-                                  // Skip until */
+                    // Skip until */
                     loop {
                         match chars.next() {
                             Some('*') if chars.peek() == Some(&'/') => {

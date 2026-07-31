@@ -6,7 +6,7 @@ use super::helpers::{
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
-use crate::edit::{atomic_write_with_expected_async, ResolvedEditChange};
+use crate::edit::{ResolvedEditChange, atomic_write_with_expected_async};
 use crate::validation::validation_to_json;
 use serde_json::Value;
 use std::sync::Arc;
@@ -377,18 +377,14 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                 .or_else(|| args.get("new_str"))
                 .and_then(|v| v.as_str());
             match (old_text, new_text) {
-                (Some(old), Some(new)) => {
-                    Ok(serde_json::json!([{
-                        "type": "replace_text",
-                        "old_text": old,
-                        "new_text": new
-                    }]))
-                }
-                _ => {
-                    Err(JsonRpcError::invalid_params(
-                        "Provide either 'changes' array or 'old_text'+'new_text' for simple replacement"
-                    ))
-                }
+                (Some(old), Some(new)) => Ok(serde_json::json!([{
+                    "type": "replace_text",
+                    "old_text": old,
+                    "new_text": new
+                }])),
+                _ => Err(JsonRpcError::invalid_params(
+                    "Provide either 'changes' array or 'old_text'+'new_text' for simple replacement",
+                )),
             }
         }
     }

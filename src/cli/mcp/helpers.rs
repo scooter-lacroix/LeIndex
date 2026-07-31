@@ -1,7 +1,7 @@
 use super::protocol::JsonRpcError;
 use crate::cli::leindex::{ComponentStatus, IndexHealth, SOURCE_FILE_EXTENSIONS};
 use crate::cli::skip_dirs::SKIP_DIRS;
-use crate::edit::{replace_whole_word, EditChange};
+use crate::edit::{EditChange, replace_whole_word};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -223,12 +223,10 @@ pub(crate) fn is_index_genuinely_stale(health: &Option<IndexHealth>, project_roo
 
     // Check untracked files: only stale if they have source extensions and
     // are not in skip directories.
-    let has_new_source_files = git_status
+    git_status
         .untracked
         .iter()
-        .any(|path| is_source_file(path) && !is_in_skip_dir(path));
-
-    has_new_source_files
+        .any(|path| is_source_file(path) && !is_in_skip_dir(path))
 }
 
 /// Check if a path has a source file extension.

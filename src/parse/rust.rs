@@ -3,7 +3,7 @@
 use crate::cfg_builder;
 use crate::cfg_loop_handler;
 use crate::parse::traits::{
-    find_node_by_id, Block, Edge, EdgeType, FlowChannel, FlowFact, Parameter, Visibility,
+    Block, Edge, EdgeType, FlowChannel, FlowFact, Parameter, Visibility, find_node_by_id,
 };
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
@@ -1329,15 +1329,21 @@ impl Client for Server {
         // Should find methods from impl blocks
         let methods: Vec<_> = signatures.iter().filter(|s| s.is_method).collect();
         assert!(!methods.is_empty());
-        assert!(methods
-            .iter()
-            .any(|sig| sig.qualified_name == "Server::new"));
-        assert!(methods
-            .iter()
-            .any(|sig| sig.qualified_name == "Server::start"));
-        assert!(methods
-            .iter()
-            .any(|sig| sig.qualified_name == "Server::connect"));
+        assert!(
+            methods
+                .iter()
+                .any(|sig| sig.qualified_name == "Server::new")
+        );
+        assert!(
+            methods
+                .iter()
+                .any(|sig| sig.qualified_name == "Server::start")
+        );
+        assert!(
+            methods
+                .iter()
+                .any(|sig| sig.qualified_name == "Server::connect")
+        );
     }
 
     #[test]
@@ -1386,12 +1392,16 @@ pub enum Result<T, E> {
 
         let result = signatures.iter().find(|s| s.name == "Result");
         assert!(result.is_some());
-        assert!(signatures
-            .iter()
-            .any(|s| s.qualified_name == "Option::Some"));
-        assert!(signatures
-            .iter()
-            .any(|s| s.qualified_name == "Option::None"));
+        assert!(
+            signatures
+                .iter()
+                .any(|s| s.qualified_name == "Option::Some")
+        );
+        assert!(
+            signatures
+                .iter()
+                .any(|s| s.qualified_name == "Option::None")
+        );
     }
 
     #[test]
@@ -1802,17 +1812,19 @@ fn execute_native_command(password: &str, askpass: &str) {
             .find(|sig| sig.name == "execute_native_command")
             .unwrap();
 
-        assert!(sig
-            .flow_facts
-            .iter()
-            .any(|fact| { fact.channel == FlowChannel::CommandArgument && fact.target == "argv" }));
+        assert!(
+            sig.flow_facts.iter().any(|fact| {
+                fact.channel == FlowChannel::CommandArgument && fact.target == "argv"
+            })
+        );
         assert!(sig.flow_facts.iter().any(|fact| {
             fact.channel == FlowChannel::Environment && fact.target == "SUDO_ASKPASS"
         }));
-        assert!(sig
-            .flow_facts
-            .iter()
-            .any(|fact| { fact.channel == FlowChannel::Stdin && fact.target == "password" }));
+        assert!(
+            sig.flow_facts
+                .iter()
+                .any(|fact| { fact.channel == FlowChannel::Stdin && fact.target == "password" })
+        );
         assert!(sig.flow_facts.iter().any(|fact| {
             fact.channel == FlowChannel::StateWrite && fact.target == "registry_record"
         }));

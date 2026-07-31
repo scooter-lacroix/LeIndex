@@ -223,7 +223,7 @@ impl Int8QuantizedVector {
         let mut padded_data = data;
         let remainder = padded_data.len() % SIMD_LANES;
         if remainder != 0 {
-            padded_data.extend(std::iter::repeat(0i8).take(SIMD_LANES - remainder));
+            padded_data.extend(std::iter::repeat_n(0i8, SIMD_LANES - remainder));
         }
 
         // Convert to blocks

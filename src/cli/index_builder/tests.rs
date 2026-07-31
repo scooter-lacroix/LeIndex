@@ -833,9 +833,11 @@ fn test_tfidf_embedder_persist_roundtrip() {
 #[test]
 fn test_tfidf_embedder_missing_file_returns_none() {
     let temp = tempfile::tempdir().unwrap();
-    assert!(TfIdfEmbedder::load_from_storage(temp.path())
-        .unwrap()
-        .is_none());
+    assert!(
+        TfIdfEmbedder::load_from_storage(temp.path())
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -843,9 +845,11 @@ fn test_tfidf_embedder_freshness_checks_pdg_counts() {
     let mut embedder = TfIdfEmbedder::build_from_tokens(&[]);
     embedder.pdg_nodes = 3;
     embedder.pdg_edges = 7;
-    assert!(embedder.is_fresh(3, 7));
-    assert!(!embedder.is_fresh(4, 7));
-    assert!(!embedder.is_fresh(3, 8));
+    embedder.pdg_fingerprint = "test-fingerprint".to_string();
+    let fp = "test-fingerprint";
+    assert!(embedder.is_fresh(3, 7, fp));
+    assert!(!embedder.is_fresh(4, 7, fp));
+    assert!(!embedder.is_fresh(3, 8, fp));
 }
 
 #[test]
@@ -1180,4 +1184,59 @@ fn test_hybrid_embedder_compare_backends() {
             assert!(hybrid_local.neural_dimension().is_some());
         }
     }
+}
+
+#[test]
+fn file_summary_context_collects_same_file_symbols_excluding_summary_nodes() {
+    use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};
+    use std::sync::Arc;
+
+    let mut pdg = ProgramDependenceGraph::new();
+    let lib: Arc<str> = Arc::from("src/lib.rs");
+    // A FileSummary node must NOT appear in the collected symbol names.
+    pdg.add_node(Node {
+        id: "src/lib.rs".to_string(),
+        node_type: NodeType::FileSummary,
+        name: "src/lib.rs".to_string(),
+        file_path: lib.clone(),
+        byte_range: (0, 0),
+        complexity: 0,
+        language: "rust".to_string(),
+    });
+    for name in ["alpha", "beta", "gamma"] {
+        pdg.add_node(Node {
+            id: format!("src/lib.rs:{name}"),
+            node_type: NodeType::Function,
+            name: name.to_string(),
+            file_path: lib.clone(),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "rust".to_string(),
+        });
+    }
+    pdg.add_node(Node {
+        id: "src/other.rs:delta".to_string(),
+        node_type: NodeType::Function,
+        name: "delta".to_string(),
+        file_path: Arc::from("src/other.rs"),
+        byte_range: (0, 10),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+
+    let ctx = FileSummaryContext::from_pdg(&pdg);
+    // Same-file symbols, FileSummary excluded, insertion order preserved.
+    assert_eq!(
+        ctx.file_symbols.get("src/lib.rs"),
+        Some(&vec![
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string()
+        ])
+    );
+    // Different file is bucketed separately.
+    assert_eq!(
+        ctx.file_symbols.get("src/other.rs"),
+        Some(&vec!["delta".to_string()])
+    );
 }

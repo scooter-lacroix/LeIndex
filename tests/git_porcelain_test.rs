@@ -88,15 +88,21 @@ fn test_inventory_uses_git_ignore_and_nested_repo_boundaries() {
     let paths = source_inventory(root).unwrap();
     assert!(paths.contains(&root.join("src/lib.rs")));
     assert!(paths.contains(&root.join("src/new.rs")));
-    assert!(!paths
-        .iter()
-        .any(|path| path.starts_with(root.join("target"))));
-    assert!(!paths
-        .iter()
-        .any(|path| path.starts_with(root.join(".leindex"))));
-    assert!(!paths
-        .iter()
-        .any(|path| path.starts_with(root.join("scratch/nested-repo"))));
+    assert!(
+        !paths
+            .iter()
+            .any(|path| path.starts_with(root.join("target")))
+    );
+    assert!(
+        !paths
+            .iter()
+            .any(|path| path.starts_with(root.join(".leindex")))
+    );
+    assert!(
+        !paths
+            .iter()
+            .any(|path| path.starts_with(root.join("scratch/nested-repo")))
+    );
 }
 
 #[test]
@@ -158,9 +164,11 @@ fn test_source_candidates_prefilters_fixed_string_without_full_inventory() {
 
     let hits = source_candidates(root, "target_symbol").unwrap();
     assert_eq!(hits, vec![root.join("hit.rs")]);
-    assert!(source_candidates(root, "does_not_exist")
-        .unwrap()
-        .is_empty());
+    assert!(
+        source_candidates(root, "does_not_exist")
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

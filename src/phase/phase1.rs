@@ -1,4 +1,5 @@
-use crate::parse::prelude::{score_languages, LanguageCompleteness};
+use crate::graph::pdg::{NodeType, ProgramDependenceGraph};
+use crate::parse::prelude::{LanguageCompleteness, score_languages};
 use crate::phase::context::PhaseExecutionContext;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -60,21 +61,45 @@ pub fn run(context: &PhaseExecutionContext) -> Phase1Summary {
 
     Phase1Summary {
         total_files: context.file_inventory.len(),
-        parsed_files: context.parse_results.len(),
+        // Derive project-wide metrics from the PDG so incremental runs report
+        // the full project state, not just the changed batch.
+        parsed_files: pdg_unique_file_count(&context.pdg),
         parse_failures: context
             .parse_results
             .iter()
             .filter(|r| r.is_failure())
             .count(),
-        signatures: context
-            .parse_results
-            .iter()
-            .map(|r| r.signatures.len())
-            .sum(),
+        signatures: pdg_signature_node_count(&context.pdg),
         language_distribution,
         parser_completeness,
         cache_hit,
     }
+}
+
+/// Count unique files from PDG nodes (project-wide, not just the current batch).
+fn pdg_unique_file_count(pdg: &ProgramDependenceGraph) -> usize {
+    use std::collections::HashSet;
+    pdg.node_indices()
+        .filter_map(|n| pdg.get_node(n))
+        .map(|n| n.file_path.to_string())
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// Count parser-signature node types from the project-wide PDG.
+///
+/// Only function, method, and variable nodes represent parser signatures;
+/// classes, modules, and synthetic file summaries are structural metadata.
+fn pdg_signature_node_count(pdg: &ProgramDependenceGraph) -> usize {
+    pdg.node_indices()
+        .filter_map(|n| pdg.get_node(n))
+        .filter(|n| {
+            matches!(
+                n.node_type,
+                NodeType::Function | NodeType::Method | NodeType::Variable
+            )
+        })
+        .count()
 }
 
 /// Build a best-effort LanguageCompleteness list from PDG language distribution.
@@ -142,6 +167,36 @@ fn merge_completeness_with_pdg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdg_signature_count_excludes_structural_and_summary_nodes() {
+        use crate::graph::pdg::Node;
+
+        let mut pdg = ProgramDependenceGraph::new();
+        for (index, node_type) in [
+            NodeType::Function,
+            NodeType::Method,
+            NodeType::Variable,
+            NodeType::Class,
+            NodeType::Module,
+            NodeType::FileSummary,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            pdg.add_node(Node {
+                id: format!("node-{index}"),
+                node_type,
+                name: format!("symbol-{index}"),
+                file_path: format!("/tmp/file-{index}.rs").into(),
+                byte_range: (0, 1),
+                complexity: 0,
+                language: "rust".to_string(),
+            });
+        }
+
+        assert_eq!(pdg_signature_node_count(&pdg), 3);
+    }
 
     #[test]
     fn merge_completeness_adds_missing_languages() {

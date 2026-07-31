@@ -10,7 +10,7 @@ use crate::graph::trigram::TrigramIndex;
 use crate::storage::edges::{EdgeMetadata as StorageEdgeMetadata, EdgeType as StorageEdgeType};
 use crate::storage::nodes::{NodeRecord, NodeType as StorageNodeType};
 use crate::storage::schema::Storage;
-use rusqlite::{params, Result as SqliteResult};
+use rusqlite::{Result as SqliteResult, params};
 use std::collections::HashMap;
 use std::sync::Arc;
 

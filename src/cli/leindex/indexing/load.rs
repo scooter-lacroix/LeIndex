@@ -110,7 +110,7 @@ impl LeIndex {
         if !(snapshot.pdg_nodes == pdg_node_count
             && snapshot.pdg_edges == pdg_edge_count
             && snapshot.pdg_fingerprint == current_pdg_fingerprint
-            && tfidf_embedder.is_fresh(pdg_node_count, pdg_edge_count))
+            && tfidf_embedder.is_fresh(pdg_node_count, pdg_edge_count, current_pdg_fingerprint))
         {
             info!("Search snapshot/embedder stale for current PDG; rebuilding search index");
             return false;
@@ -184,7 +184,8 @@ impl LeIndex {
     ) -> Result<index_builder::HybridEmbedder> {
         let batch_size = self.indexing_batch_size();
         Ok(if let Some(embedder) = persisted_embedder {
-            if embedder.is_fresh(pdg_node_count, pdg_edge_count) {
+            let fp = crate::cli::index_builder::pdg_search_fingerprint(pdg);
+            if embedder.is_fresh(pdg_node_count, pdg_edge_count, &fp) {
                 info!("Loaded persisted embedder from storage");
                 // Use tfidf_only during load_from_storage to avoid expensive
                 // batch neural embedding; neural embeddings are restored below.
@@ -199,13 +200,12 @@ impl LeIndex {
                 )?
             } else {
                 info!("Persisted embedder is stale; rebuilding TF-IDF index");
-                let stale_tfidf = index_builder::HybridEmbedder::tfidf_only(embedder);
                 index_builder::index_nodes_tfidf_only(
                     pdg,
                     &mut self.search_engine,
                     &mut self.cache.file_stats_cache,
                     batch_size,
-                    Some(stale_tfidf),
+                    None,
                     None,
                 )?
             }

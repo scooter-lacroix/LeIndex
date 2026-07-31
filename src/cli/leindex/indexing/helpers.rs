@@ -9,7 +9,7 @@ use crate::cli::index_job::{
     ScanCheckpoint,
 };
 use crate::cli::memory_cap::MemoryCapGuard;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::warn;
@@ -41,6 +41,15 @@ pub(super) fn read_verified_artifact<T>(
             (blake3::hash(&bytes).to_hex().as_str() == expected_hash).then_some(())?;
             read(store).ok().flatten()
         })
+}
+
+fn path_contains_component_boundary(value: &str, component: &str) -> bool {
+    let value = value.replace('\\', "/");
+    let component = component.trim_matches('/');
+    value == component
+        || value.strip_prefix(&format!("{component}/")).is_some()
+        || value.strip_suffix(&format!("/{component}")).is_some()
+        || value.contains(&format!("/{component}/"))
 }
 
 pub(super) fn add_submodule_summary_nodes(
@@ -86,7 +95,8 @@ pub(super) fn add_submodule_summary_nodes(
             .filter_map(|index| pdg.get_node(index).map(|node| (index, node)))
             .filter(|(_, node)| {
                 node.node_type == crate::graph::pdg::NodeType::External
-                    && (node.name.contains(&relative) || node.id.contains(&relative))
+                    && (path_contains_component_boundary(&node.name, &relative)
+                        || path_contains_component_boundary(&node.id, &relative))
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
@@ -290,11 +300,29 @@ pub(super) fn reuse_parse_results(
         let Some(expected_hash) = parse_checkpoint.artifact_hashes.get(source_hash) else {
             continue;
         };
-        let Some(parsed) = store.read_parsed_for_path_verified(source_hash, expected_hash, path)?
-        else {
-            continue;
+        let parsed = match store.read_parsed_for_path_verified(source_hash, expected_hash, path) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => continue,
+            Err(error) => {
+                warn!(
+                    "Unable to reuse parsed checkpoint for '{}': {}; reparsing",
+                    path.display(),
+                    error
+                );
+                continue;
+            }
         };
-        let source_bytes = cache.get_or_read(path)?.as_ref().clone();
+        let source_bytes = match cache.get_or_read(path) {
+            Ok(bytes) => bytes.as_ref().clone(),
+            Err(error) => {
+                warn!(
+                    "Unable to reuse source bytes for '{}': {}; reparsing",
+                    path.display(),
+                    error
+                );
+                continue;
+            }
+        };
         results.push(crate::parse::parallel::ParsingResult {
             file_path: parsed.file_path,
             language: Some(parsed.language),
@@ -370,4 +398,29 @@ pub(super) fn git_tree_oid(project_path: &std::path::Path) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_path_contains_component_boundary_normalizes_separators() {
+        assert!(path_contains_component_boundary(
+            "src\\submodule\\lib.rs",
+            "src/submodule"
+        ));
+        assert!(path_contains_component_boundary(
+            "src/submodule/lib.rs",
+            "src/submodule"
+        ));
+        assert!(!path_contains_component_boundary(
+            "src/submodule-extra/lib.rs",
+            "src/submodule"
+        ));
+        assert!(!path_contains_component_boundary(
+            "src/not-submodule/lib.rs",
+            "src/submodule"
+        ));
+    }
 }

@@ -1,8 +1,8 @@
-use super::{get_project_path, ToolCommands};
+use super::{ToolCommands, get_project_path};
 use crate::cli::leindex::LeIndex;
-use crate::cli::mcp::handlers::{all_tool_handlers, ToolHandler};
+use crate::cli::mcp::handlers::{ToolHandler, all_tool_handlers};
 use crate::cli::mcp::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
-use crate::cli::registry::{ProjectRegistry, DEFAULT_MAX_PROJECTS};
+use crate::cli::registry::{DEFAULT_MAX_PROJECTS, ProjectRegistry};
 use anyhow::{Context, Result as AnyhowResult};
 use serde_json::{Map, Value};
 use std::io::{self, BufRead, Read, Write};
@@ -120,8 +120,9 @@ fn spawn_stdio_cleanup(server: crate::cli::mcp::server::McpServer) {
         }
     });
     tokio::spawn(async move {
-        if let Err(error) = cleanup_handle.await {
-            tracing::error!("MCP stdio cleanup task died: {error}");
+        match cleanup_handle.await {
+            Ok(_) => {}
+            Err(error) => tracing::error!("MCP stdio cleanup task died: {error}"),
         }
     });
 }
@@ -542,7 +543,7 @@ async fn handle_mcp_request(
     _project_path: PathBuf,
 ) -> anyhow::Result<Option<JsonRpcResponse>> {
     use crate::cli::mcp::server::{
-        handle_tool_call, list_tools_json, HANDLERS, SERVER_INSTANCE, SERVER_STATE,
+        HANDLERS, SERVER_INSTANCE, SERVER_STATE, handle_tool_call, list_tools_json,
     };
 
     let method_name = request.method.clone();

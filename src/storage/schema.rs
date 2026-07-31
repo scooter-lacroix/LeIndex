@@ -58,7 +58,7 @@ impl Default for StorageConfig {
 /// Main storage interface
 pub struct Storage {
     conn: Connection,
-    #[allow(dead_code)]
+
     config: StorageConfig,
 }
 
@@ -85,8 +85,22 @@ impl Storage {
         conn.pragma_update(None, "busy_timeout", 1000)?;
 
         // Read-only config: no WAL, a thin read cache, shared mmap at OS level.
-        // No migrations, no DDL, no `schema_version` writes — the published
+        // No migrations, no DDL, and no `schema_version` writes — the published
         // generation is treated as an immutable, already-initialized snapshot.
+        // Validate the marker before accepting the handle so an incompatible
+        // generation cannot be hydrated as if it were current.
+        let current: u32 = conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version WHERE key = 'schema'",
+            [],
+            |row| row.get(0),
+        )?;
+        if current != Self::SCHEMA_VERSION {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "Database schema v{} does not match this version (v{}).",
+                current,
+                Self::SCHEMA_VERSION
+            )));
+        }
         let config = StorageConfig {
             db_path: path.to_string_lossy().to_string(),
             wal_enabled: false,

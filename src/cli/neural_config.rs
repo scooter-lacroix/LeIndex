@@ -352,7 +352,10 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConfigError::NoHomeDir => {
-                write!(f, "Cannot resolve LeIndex home directory. Set LEINDEX_HOME or ensure HOME is set.")
+                write!(
+                    f,
+                    "Cannot resolve LeIndex home directory. Set LEINDEX_HOME or ensure HOME is set."
+                )
             }
             ConfigError::Io(path, msg) => {
                 write!(f, "I/O error on {}: {}", path.display(), msg)

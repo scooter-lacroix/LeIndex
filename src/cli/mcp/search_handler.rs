@@ -52,17 +52,36 @@ fn classify_search(
     (route, route_name, query_type)
 }
 
-fn path_in_scope(file_path: &str, scope: Option<&str>) -> bool {
+fn path_in_scope(file_path: &str, scope: Option<&str>, project_root: &std::path::Path) -> bool {
     let Some(scope) = scope else {
         return true;
     };
-    let scope = scope.trim_end_matches(std::path::MAIN_SEPARATOR);
-    if std::path::Path::new(scope).extension().is_some() {
-        file_path == scope
+    let normalize = |path: &str| path.replace('\\', "/").trim_end_matches('/').to_string();
+    let project_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let scope = normalize(scope);
+    let scope_path = std::path::Path::new(&scope);
+    let scope_is_directory = scope.ends_with('/')
+        || scope.ends_with('\\')
+        || if scope_path.is_absolute() {
+            scope_path.is_dir()
+        } else {
+            project_root.join(scope_path).is_dir()
+        };
+    let absolute_scope = if scope_path.is_absolute() {
+        scope
     } else {
-        file_path == scope
-            || file_path.starts_with(&format!("{}{}", scope, std::path::MAIN_SEPARATOR))
-    }
+        normalize(&project_root.join(scope_path).to_string_lossy())
+    };
+    let file_path = normalize(file_path);
+    let absolute_file_path = if std::path::Path::new(&file_path).is_absolute() {
+        file_path
+    } else {
+        normalize(&project_root.join(&file_path).to_string_lossy())
+    };
+    absolute_file_path == absolute_scope
+        || (scope_is_directory && absolute_file_path.starts_with(&format!("{absolute_scope}/")))
 }
 
 fn scoped_search(
@@ -73,8 +92,9 @@ fn scoped_search(
     query_type: Option<crate::search::ranking::QueryType>,
     ephemeral: bool,
     scope: Option<&str>,
+    project_root: &std::path::Path,
 ) -> Result<Vec<crate::search::search::SearchResult>, JsonRpcError> {
-    const MAX_FETCH_K: usize = 1000;
+    const MAX_FETCH_K: usize = 10_000;
     let search = |index: &mut crate::cli::leindex::LeIndex, fetch_k| {
         if ephemeral {
             index.search_ephemeral(query, fetch_k, query_type)
@@ -82,26 +102,29 @@ fn scoped_search(
             index.search(query, fetch_k, query_type)
         }
     };
-    let mut fetch_k = (top_k + offset).min(MAX_FETCH_K);
+    let required = offset.saturating_add(top_k);
+    let mut fetch_k = required.clamp(1, MAX_FETCH_K);
     let mut all_results = search(index, fetch_k)
         .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
     let mut filtered: Vec<_> = all_results
         .iter()
-        .filter(|result| path_in_scope(&result.file_path, scope))
+        .filter(|result| path_in_scope(&result.file_path, scope, project_root))
         .cloned()
         .collect();
 
-    if filtered.is_empty() && scope.is_some() && !all_results.is_empty() {
-        fetch_k = (fetch_k * 10).min(MAX_FETCH_K * 10);
-        if fetch_k > top_k + offset {
-            all_results = search(index, fetch_k)
-                .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
-            filtered = all_results
-                .iter()
-                .filter(|result| path_in_scope(&result.file_path, scope))
-                .cloned()
-                .collect();
+    while filtered.len() < required && all_results.len() >= fetch_k && fetch_k < MAX_FETCH_K {
+        let next_fetch_k = fetch_k.saturating_mul(2).min(MAX_FETCH_K);
+        if next_fetch_k == fetch_k {
+            break;
         }
+        fetch_k = next_fetch_k;
+        all_results = search(index, fetch_k)
+            .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
+        filtered = all_results
+            .iter()
+            .filter(|result| path_in_scope(&result.file_path, scope, project_root))
+            .cloned()
+            .collect();
     }
     Ok(filtered)
 }
@@ -257,6 +280,7 @@ to auto-switch/auto-index projects."
             ));
         }
 
+        let project_root = guard.project_path().to_path_buf();
         let filtered = scoped_search(
             &mut guard,
             &effective_query,
@@ -265,6 +289,7 @@ to auto-switch/auto-index projects."
             query_type,
             task_context.is_some(),
             scope.as_deref(),
+            &project_root,
         )?;
 
         let total_filtered = filtered.len();
@@ -334,16 +359,50 @@ mod tests {
         }
     }
 
+    fn directory_root() -> &'static std::path::Path {
+        std::path::Path::new(".")
+    }
+
     #[test]
     fn test_path_in_scope_handles_files_and_directories() {
         let separator = std::path::MAIN_SEPARATOR;
         let nested = format!("src{separator}cli{separator}main.rs");
         let sibling = format!("src{separator}lib.rs");
 
-        assert!(path_in_scope(&nested, Some("src")));
-        assert!(!path_in_scope(&sibling, Some(&nested)));
-        assert!(path_in_scope(&nested, Some(&nested)));
-        assert!(path_in_scope(&nested, None));
+        assert!(path_in_scope(&nested, Some("src"), directory_root()));
+        assert!(path_in_scope(
+            "src\\cli\\main.rs",
+            Some("src"),
+            directory_root()
+        ));
+        assert!(!path_in_scope(&sibling, Some(&nested), directory_root()));
+        assert!(path_in_scope(&nested, Some(&nested), directory_root()));
+        assert!(path_in_scope(&nested, None, directory_root()));
+    }
+
+    #[test]
+    fn test_path_in_scope_preserves_file_and_dotted_directory_boundaries() {
+        let directory = tempdir().unwrap();
+        let dotted_dir = directory.path().join("docs.v1");
+        std::fs::create_dir(&dotted_dir).unwrap();
+        let extensionless_file = directory.path().join("Makefile");
+        std::fs::write(&extensionless_file, b"all:\n").unwrap();
+
+        let dotted_dir = dotted_dir.to_string_lossy().replace('\\', "/");
+        let extensionless_file = extensionless_file.to_string_lossy().replace('\\', "/");
+        let dotted_child = format!("{dotted_dir}/guide.md");
+        let false_file_child = format!("{extensionless_file}/nested.rs");
+
+        assert!(path_in_scope(
+            &dotted_child,
+            Some(&dotted_dir),
+            directory.path()
+        ));
+        assert!(!path_in_scope(
+            &false_file_child,
+            Some(&extensionless_file),
+            directory.path()
+        ));
     }
 
     #[test]

@@ -404,7 +404,7 @@ async fn resident_relations(
                         callees: Vec::new(),
                         dependencies: Vec::new(),
                         pdg_status: "partial",
-                    }
+                    };
                 }
             }
         }
@@ -414,7 +414,7 @@ async fn resident_relations(
                 callees: Vec::new(),
                 dependencies: Vec::new(),
                 pdg_status: "not_loaded",
-            }
+            };
         }
     };
 

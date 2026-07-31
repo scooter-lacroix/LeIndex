@@ -1,10 +1,5 @@
 use super::*;
 
-/// Check if onnxruntime is installed (any variant).
-pub(super) fn check_ort_installed() -> bool {
-    get_ort_version().is_some()
-}
-
 /// Get the installed onnxruntime version by importing it via Python.
 ///
 /// Returns `Some(version_string)` (e.g., "1.25.0") when onnxruntime can be
@@ -422,11 +417,7 @@ fn split_pip_bin_override(value: &str) -> Option<Vec<String>> {
     if !current.is_empty() {
         parts.push(current);
     }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts)
-    }
+    if parts.is_empty() { None } else { Some(parts) }
 }
 
 /// Discover the ORT dylib path from pip installation.
@@ -467,7 +458,11 @@ fn discover_ort_path_fallback() -> Option<PathBuf> {
 
     let leindex_home = std::env::var("LEINDEX_HOME")
         .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|home| PathBuf::from(home).join(".leindex")))
+        .or_else(|_| {
+            std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .map(|home| PathBuf::from(home).join(".leindex"))
+        })
         .ok();
     if let Some(home) = leindex_home {
         let dir = home.join("lib");
@@ -535,14 +530,26 @@ pub(super) fn find_ort_lib_in_dir(dir: &Path) -> Option<PathBuf> {
         .or_else(|| scan_dir_for_ort_lib(dir))
 }
 
+/// Extract a numeric version key from an ORT library filename for sorting.
+/// e.g., "libonnxruntime.so.1.20.0" → [1, 20, 0]. Unparseable suffixes yield
+/// an empty key (sorts before real versions, never selected as newest).
+fn ort_lib_version_key(path: &Path) -> Vec<u64> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let parts: Vec<&str> = name.rsplitn(4, '.').collect();
+    parts
+        .iter()
+        .rev()
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect()
+}
+
 /// Scan a directory for any loadable ORT runtime library, including versioned
 /// pip-wheel sonames. Returns the highest-sorted match (newest version) so
 /// setup records the same library the worker would load.
 fn scan_dir_for_ort_lib(dir: &Path) -> Option<PathBuf> {
-    let mut matches = std::fs::read_dir(dir)
-        .ok()
-        .into_iter()
-        .flat_map(|entries| entries.filter_map(Result::ok))
+    let mut matches: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
             path.file_name()
@@ -550,8 +557,13 @@ fn scan_dir_for_ort_lib(dir: &Path) -> Option<PathBuf> {
                 .map(is_ort_runtime_lib_name_for_setup)
                 .unwrap_or(false)
         })
-        .collect::<Vec<_>>();
-    matches.sort();
+        .collect();
+    // Sort by numeric version key, then by path for deterministic tie-breaking.
+    matches.sort_by(|a, b| {
+        ort_lib_version_key(a)
+            .cmp(&ort_lib_version_key(b))
+            .then_with(|| a.cmp(b))
+    });
     matches.pop()
 }
 

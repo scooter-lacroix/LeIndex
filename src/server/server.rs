@@ -9,7 +9,7 @@ use tracing::{error, info};
 
 use crate::server::config::ServerConfig;
 use crate::server::error::ApiError;
-use crate::server::handlers::{create_router, AppState};
+use crate::server::handlers::{AppState, create_router};
 use crate::storage::Storage;
 use walkdir::WalkDir;
 

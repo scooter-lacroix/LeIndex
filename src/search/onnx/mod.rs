@@ -34,8 +34,8 @@ pub use chunking::{ChunkConfig, CrossLanguageChunker, SemanticChunk};
 
 #[cfg(feature = "onnx")]
 pub use client::{
-    migraphx_cache_path, prune_stale_migraphx_profiles, ClientError, EmbedResult, EmbeddingClient,
-    WorkerAvailability,
+    ClientError, EmbedResult, EmbeddingClient, WorkerAvailability, migraphx_cache_path,
+    prune_stale_migraphx_profiles,
 };
 
 #[cfg(feature = "remote-embeddings")]

@@ -1,4 +1,11 @@
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static MODEL_INSTALL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn next_model_install_id() -> u64 {
+    MODEL_INSTALL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
 
 pub(super) const QWEN3_ONNX_REPOSITORY: &str = "zhiqing/Qwen3-Embedding-0.6B-ONNX";
 pub(super) const QWEN3_ONNX_REVISION: &str = "c96cc9c82d08ee7869600e2191078fc939957026";
@@ -35,16 +42,6 @@ pub(super) fn model_name_for_provider(provider: Option<ExecutionProvider>) -> &'
 }
 
 /// Check if model files are present in the model directory.
-///
-/// VAL-SETUP-014: used by `--check` mode to flag model presence. We count a
-/// file as "present" if it exists on disk; the checksum-aware variant is
-/// `model_checksum_status()` which returns one of Ok/Mismatch/Unknown so the
-/// caller can warn about a corrupted file without failing the existence check.
-#[allow(dead_code)]
-pub(super) fn check_model_present() -> bool {
-    check_model_present_for_name("qwen3-embed-0.6b")
-}
-
 pub(super) fn check_model_present_for_name(model_name: &str) -> bool {
     let model_filename = format!("{}.onnx", model_name);
 
@@ -118,20 +115,9 @@ pub enum ModelChecksumStatus {
     Mismatch { expected: String, actual: String },
 }
 
-/// Check the model file's checksum status against the bundled manifest.
-///
-/// Walks the same model_dir / bundled / binary-side lookup as
-/// `check_model_present()`. When a `checksums.sha256` sibling file exists,
-/// its entry for `qwen3-embed-0.6b.onnx` is compared against the file's
-/// computed SHA256.
-#[allow(dead_code)]
-pub fn model_checksum_status() -> ModelChecksumStatus {
-    model_checksum_status_for_name("qwen3-embed-0.6b")
-}
-
 pub(super) fn model_checksum_status_for_name(model_name: &str) -> ModelChecksumStatus {
     use crate::cli::leindex::model_download::{
-        check_file_against_manifest, parse_checksums, CheckResult, DYNAMIC_MODEL_ONNX_FILENAME,
+        CheckResult, DYNAMIC_MODEL_ONNX_FILENAME, check_file_against_manifest, parse_checksums,
     };
 
     let model_dir = match crate::cli::neural_config::model_dir_path() {
@@ -245,7 +231,7 @@ pub(super) fn ensure_hugging_face_cli() -> Result<String, SetupError> {
 
 pub(super) fn profile_assets_verified(model_dir: &Path, profile: ModelDownloadProfile) -> bool {
     use crate::cli::leindex::model_download::{
-        check_file_against_manifest, parse_checksums, CheckResult,
+        CheckResult, check_file_against_manifest, parse_checksums,
     };
 
     if !dynamic_model_assets_present(model_dir) {
@@ -279,22 +265,78 @@ pub(super) fn install_downloaded_model_file(src: &Path, dst: &Path) -> Result<()
             src.display()
         )));
     }
+    let file_name = dst
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| SetupError::Io(format!("Invalid model destination {}", dst.display())))?;
+    let install_id = next_model_install_id();
+    let staged = dst.with_file_name(format!(
+        ".{file_name}.leindex-install-{}-{install_id}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&staged);
 
-    if dst.exists() {
-        std::fs::remove_file(dst)
-            .map_err(|e| SetupError::Io(format!("Cannot replace {}: {}", dst.display(), e)))?;
-    }
+    // Stage beside the destination so the final rename stays on one
+    // filesystem. The existing destination is untouched until staging succeeds.
+    std::fs::copy(src, &staged).map_err(|e| {
+        SetupError::Io(format!(
+            "Cannot stage downloaded model file {}: {}",
+            dst.display(),
+            e
+        ))
+    })?;
 
-    if std::fs::rename(src, dst).is_err() {
-        std::fs::copy(src, dst).map_err(|e| {
-            SetupError::Io(format!(
-                "Cannot install downloaded model file {}: {}",
-                dst.display(),
-                e
-            ))
-        })?;
+    let install = match std::fs::rename(&staged, dst) {
+        Ok(()) => Ok(()),
+        Err(rename_error) if dst.exists() => {
+            // Windows cannot rename over an existing file. Move the old
+            // destination to a sibling backup, install the staged file, and
+            // restore the backup if the replacement fails.
+            let backup = dst.with_file_name(format!(
+                ".{file_name}.leindex-backup-{}-{install_id}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&backup);
+            if let Err(error) = std::fs::rename(dst, &backup) {
+                let _ = std::fs::remove_file(&staged);
+                return Err(SetupError::Io(format!(
+                    "Cannot prepare replacement for {}: {}",
+                    dst.display(),
+                    error
+                )));
+            }
+            match std::fs::rename(&staged, dst) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&backup);
+                    Ok(())
+                }
+                Err(error) => match std::fs::rename(&backup, dst) {
+                    Ok(()) => Err(SetupError::Io(format!(
+                        "Cannot install downloaded model file {} after staging: {} (initial rename: {})",
+                        dst.display(),
+                        error,
+                        rename_error
+                    ))),
+                    Err(restore_error) => Err(SetupError::Io(format!(
+                        "Cannot install downloaded model file {} after staging: {}; restoring the previous file also failed: {} (initial rename: {})",
+                        dst.display(),
+                        error,
+                        restore_error,
+                        rename_error
+                    ))),
+                },
+            }
+        }
+        Err(error) => Err(SetupError::Io(format!(
+            "Cannot install downloaded model file {} after staging: {}",
+            dst.display(),
+            error
+        ))),
+    };
+    if install.is_err() {
+        let _ = std::fs::remove_file(&staged);
     }
-    Ok(())
+    install
 }
 
 pub(super) fn generate_profile_checksum_manifest(
@@ -327,7 +369,11 @@ pub(super) fn ensure_hugging_face_model_present(
     }
 
     let hf = ensure_hugging_face_cli()?;
-    let staging = model_dir.join(format!(".hf-download-{}", std::process::id()));
+    let staging = model_dir.join(format!(
+        ".hf-download-{}-{}",
+        std::process::id(),
+        next_model_install_id()
+    ));
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|e| {
         SetupError::Io(format!(
@@ -404,8 +450,8 @@ pub(super) fn ensure_model_file_present(
     model_onnx_name: &str,
 ) -> Result<(bool, bool), SetupError> {
     use crate::cli::leindex::model_download::{
-        check_file_against_manifest, download_file_with_retry, parse_checksums, CheckResult,
-        DownloadOutcome, DEFAULT_DOWNLOAD_RETRIES,
+        CheckResult, DEFAULT_DOWNLOAD_RETRIES, DownloadOutcome, check_file_against_manifest,
+        download_file_with_retry, parse_checksums,
     };
 
     let dest = model_dir.join(file.local);
@@ -508,8 +554,21 @@ pub(super) fn ensure_models_present(
     model_name: &str,
 ) -> Result<bool, SetupError> {
     use crate::cli::leindex::model_download::{
-        self, iter_model_files, parse_checksums, DYNAMIC_MODEL_ONNX_FILENAME,
+        self, DYNAMIC_MODEL_ONNX_FILENAME, iter_model_files, parse_checksums,
     };
+
+    let legacy_model_name = model_download::MODEL_ONNX_FILENAME
+        .strip_suffix(".onnx")
+        .unwrap_or(model_download::MODEL_ONNX_FILENAME);
+    let dynamic_model_name = DYNAMIC_MODEL_ONNX_FILENAME
+        .strip_suffix(".onnx")
+        .unwrap_or(DYNAMIC_MODEL_ONNX_FILENAME);
+    if model_name != legacy_model_name && model_name != dynamic_model_name {
+        return Err(SetupError::InvalidModelName {
+            model_name: model_name.to_string(),
+            accepted_names: format!("'{}' or '{}'", legacy_model_name, dynamic_model_name),
+        });
+    }
 
     let model_dir = crate::cli::neural_config::model_dir_path()
         .ok_or_else(|| SetupError::Io("Cannot resolve model directory".to_string()))?;

@@ -1,11 +1,11 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use leindex::cli::ProjectRegistry;
 use leindex::cli::mcp::handlers::all_tool_handlers;
 use leindex::cli::mcp::protocol::JsonRpcRequest;
 use leindex::cli::mcp::server::{handle_tool_call, index_with_progress};
-use leindex::cli::memory_report::{current_rss_bytes, MemoryReportTracker};
-use leindex::cli::ProjectRegistry;
+use leindex::cli::memory_report::{MemoryReportTracker, current_rss_bytes};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;

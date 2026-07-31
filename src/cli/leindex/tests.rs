@@ -53,18 +53,21 @@ fn test_project_scan_excludes_lockfiles_from_source_but_keeps_manifests() {
     let mut index = LeIndex::new(dir.path()).unwrap();
     let scan = index.get_project_scan(true).unwrap();
 
-    assert!(scan
-        .source_paths
-        .iter()
-        .any(|path| path.file_name().and_then(|name| name.to_str()) == Some("main.rs")));
-    assert!(scan
-        .source_paths
-        .iter()
-        .all(|path| path.file_name().and_then(|name| name.to_str()) != Some("package-lock.json")));
-    assert!(scan
-        .manifest_paths
-        .iter()
-        .any(|path| path.file_name().and_then(|name| name.to_str()) == Some("package.json")));
+    assert!(
+        scan.source_paths
+            .iter()
+            .any(|path| path.file_name().and_then(|name| name.to_str()) == Some("main.rs"))
+    );
+    assert!(
+        scan.source_paths.iter().all(
+            |path| path.file_name().and_then(|name| name.to_str()) != Some("package-lock.json")
+        )
+    );
+    assert!(
+        scan.manifest_paths
+            .iter()
+            .any(|path| path.file_name().and_then(|name| name.to_str()) == Some("package.json"))
+    );
     assert!(scan.manifest_paths.iter().any(|path| {
         path.file_name().and_then(|name| name.to_str()) == Some("package-lock.json")
     }));

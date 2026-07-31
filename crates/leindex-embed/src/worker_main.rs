@@ -203,6 +203,7 @@ fn run_socket_worker(config: RuntimeConfig, socket_path: PathBuf) -> anyhow::Res
 
     let status_path = socket_path.with_extension("status");
     let pid_path = socket_path.with_extension("pid");
+    let start_time_path = socket_path.with_extension("start");
     let initial_health = HealthResponse {
         state: WorkerState::Initializing,
         phase: "initializing".to_string(),
@@ -212,6 +213,8 @@ fn run_socket_worker(config: RuntimeConfig, socket_path: PathBuf) -> anyhow::Res
         error: None,
     };
     write_worker_pid(&pid_path, process::id())?;
+    #[cfg(target_os = "linux")]
+    write_worker_start_time(&start_time_path, process::id())?;
     write_worker_status(&status_path, "initializing")?;
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)?;
@@ -226,6 +229,7 @@ fn run_socket_worker(config: RuntimeConfig, socket_path: PathBuf) -> anyhow::Res
             let _ = write_worker_status(&status_path, "failed");
             let _ = std::fs::remove_file(&status_path);
             let _ = std::fs::remove_file(&pid_path);
+            let _ = std::fs::remove_file(&start_time_path);
             return Err(error.into());
         }
     };
@@ -239,6 +243,17 @@ fn run_socket_worker(config: RuntimeConfig, socket_path: PathBuf) -> anyhow::Res
         socket_path.display()
     );
 
+    run_socket_accept_loop(listener, lifecycle, socket_path, status_path, pid_path)
+}
+
+#[cfg(unix)]
+fn run_socket_accept_loop(
+    listener: std::os::unix::net::UnixListener,
+    lifecycle: Arc<SocketLifecycle>,
+    socket_path: PathBuf,
+    status_path: PathBuf,
+    pid_path: PathBuf,
+) -> anyhow::Result<()> {
     loop {
         if lifecycle.is_failed() {
             tracing::error!("socket worker initialization failed; shutting down");
@@ -326,6 +341,7 @@ fn shutdown_worker(
     let _ = std::fs::remove_file(socket_path);
     let _ = std::fs::remove_file(status_path);
     let _ = std::fs::remove_file(pid_path);
+    let _ = std::fs::remove_file(socket_path.with_extension("start"));
 }
 
 /// Log a transient accept error (unless it is a quiet busy-loop) and back off.
@@ -462,6 +478,18 @@ fn write_worker_status(path: &std::path::Path, status: &str) -> io::Result<()> {
 fn write_worker_pid(path: &std::path::Path, pid: u32) -> io::Result<()> {
     let next = path.with_extension("pid.next");
     std::fs::write(&next, format!("{}\n", pid))?;
+    std::fs::rename(next, path)
+}
+
+#[cfg(target_os = "linux")]
+fn write_worker_start_time(path: &std::path::Path, pid: u32) -> io::Result<()> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let start_time = stat
+        .rsplit_once(") ")
+        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+        .ok_or_else(|| io::Error::other("missing process start time"))?;
+    let next = path.with_extension("start.next");
+    std::fs::write(&next, format!("{start_time}\n"))?;
     std::fs::rename(next, path)
 }
 

@@ -39,8 +39,8 @@ use leindex_embed::protocol::{
 mod client_config;
 use client_config::*;
 pub use client_config::{
-    migraphx_cache_path, prune_stale_migraphx_profiles, ClientError, EmbedResult, EmbeddingClient,
-    WorkerAvailability,
+    ClientError, EmbedResult, EmbeddingClient, WorkerAvailability, migraphx_cache_path,
+    prune_stale_migraphx_profiles,
 };
 
 /// Classify a `std::io::Error` as one that indicates the worker process has
@@ -1751,9 +1751,9 @@ mod tests {
     fn test_read_ort_dylib_path_from_config_returns_value() {
         let _g = TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("LEINDEX_HOME", tmp.path());
-        std::env::remove_var("LEINDEX_ONNX_INFERENCE_BATCH_SIZE");
-        std::env::remove_var("LEINDEX_ONNX_SEQUENCE_LEN");
+        unsafe { std::env::set_var("LEINDEX_HOME", tmp.path()) };
+        unsafe { std::env::remove_var("LEINDEX_ONNX_INFERENCE_BATCH_SIZE") };
+        unsafe { std::env::remove_var("LEINDEX_ONNX_SEQUENCE_LEN") };
 
         let cfg_dir = tmp.path().join("config");
         std::fs::create_dir_all(&cfg_dir).unwrap();
@@ -1773,14 +1773,14 @@ mod tests {
             Some("cpu")
         );
 
-        std::env::remove_var("LEINDEX_HOME");
+        unsafe { std::env::remove_var("LEINDEX_HOME") };
     }
 
     #[test]
     fn test_read_execution_provider_from_config_skips_auto() {
         let _g = TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("LEINDEX_HOME", tmp.path());
+        unsafe { std::env::set_var("LEINDEX_HOME", tmp.path()) };
 
         let cfg_dir = tmp.path().join("config");
         std::fs::create_dir_all(&cfg_dir).unwrap();
@@ -1801,14 +1801,14 @@ mod tests {
             Some("migraphx")
         );
 
-        std::env::remove_var("LEINDEX_HOME");
+        unsafe { std::env::remove_var("LEINDEX_HOME") };
     }
 
     #[test]
     fn test_read_worker_model_name_from_config_returns_value() {
         let _g = TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("LEINDEX_HOME", tmp.path());
+        unsafe { std::env::set_var("LEINDEX_HOME", tmp.path()) };
 
         let cfg_dir = tmp.path().join("config");
         std::fs::create_dir_all(&cfg_dir).unwrap();
@@ -1823,16 +1823,16 @@ mod tests {
             Some("qwen3-embed-0.6b-dynamic")
         );
 
-        std::env::remove_var("LEINDEX_HOME");
+        unsafe { std::env::remove_var("LEINDEX_HOME") };
     }
 
     #[test]
     fn test_migraphx_model_cache_path_uses_leindex_home() {
         let _g = TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("LEINDEX_HOME", tmp.path());
-        std::env::remove_var("LEINDEX_ONNX_INFERENCE_BATCH_SIZE");
-        std::env::remove_var("LEINDEX_ONNX_SEQUENCE_LEN");
+        unsafe { std::env::set_var("LEINDEX_HOME", tmp.path()) };
+        unsafe { std::env::remove_var("LEINDEX_ONNX_INFERENCE_BATCH_SIZE") };
+        unsafe { std::env::remove_var("LEINDEX_ONNX_SEQUENCE_LEN") };
         let expected = tmp
             .path()
             .join("cache")
@@ -1845,7 +1845,7 @@ mod tests {
             Some(expected.as_path())
         );
 
-        std::env::remove_var("LEINDEX_HOME");
+        unsafe { std::env::remove_var("LEINDEX_HOME") };
     }
 
     #[test]
@@ -1853,9 +1853,9 @@ mod tests {
     fn test_daemon_socket_path_includes_inference_shape() {
         let _g = TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("LEINDEX_HOME", tmp.path());
-        std::env::remove_var("LEINDEX_ONNX_INFERENCE_BATCH_SIZE");
-        std::env::remove_var("LEINDEX_ONNX_SEQUENCE_LEN");
+        unsafe { std::env::set_var("LEINDEX_HOME", tmp.path()) };
+        unsafe { std::env::remove_var("LEINDEX_ONNX_INFERENCE_BATCH_SIZE") };
+        unsafe { std::env::remove_var("LEINDEX_ONNX_SEQUENCE_LEN") };
 
         let socket =
             daemon_socket_path(Some("migraphx"), Some("qwen3-embed-0.6b-dynamic")).unwrap();
@@ -1864,14 +1864,14 @@ mod tests {
         assert!(filename.ends_with(".sock"));
         assert!(socket.to_string_lossy().len() <= 100);
 
-        std::env::remove_var("LEINDEX_HOME");
+        unsafe { std::env::remove_var("LEINDEX_HOME") };
     }
 
     #[test]
     fn test_read_ort_dylib_path_from_config_returns_none_when_absent() {
         let _g = TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("LEINDEX_HOME", tmp.path());
+        unsafe { std::env::set_var("LEINDEX_HOME", tmp.path()) };
 
         // No config file at all.
         assert_eq!(read_ort_dylib_path_from_config(), None);
@@ -1886,14 +1886,14 @@ mod tests {
         .unwrap();
         assert_eq!(read_ort_dylib_path_from_config(), None);
 
-        std::env::remove_var("LEINDEX_HOME");
+        unsafe { std::env::remove_var("LEINDEX_HOME") };
     }
 
     #[test]
     fn test_read_ort_dylib_path_from_config_handles_single_quotes() {
         let _g = TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("LEINDEX_HOME", tmp.path());
+        unsafe { std::env::set_var("LEINDEX_HOME", tmp.path()) };
 
         let cfg_dir = tmp.path().join("config");
         std::fs::create_dir_all(&cfg_dir).unwrap();
@@ -1908,45 +1908,45 @@ mod tests {
             Some("/quote/ort.so")
         );
 
-        std::env::remove_var("LEINDEX_HOME");
+        unsafe { std::env::remove_var("LEINDEX_HOME") };
     }
 
     #[test]
     fn test_leindex_home_dir_prefers_env_override() {
         let _g = TEST_ENV_LOCK.lock().unwrap();
-        std::env::set_var("LEINDEX_HOME", "/custom/leindex/home");
+        unsafe { std::env::set_var("LEINDEX_HOME", "/custom/leindex/home") };
         assert_eq!(
             leindex_home_dir(),
             Some(std::path::PathBuf::from("/custom/leindex/home"))
         );
-        std::env::remove_var("LEINDEX_HOME");
+        unsafe { std::env::remove_var("LEINDEX_HOME") };
     }
 
     #[test]
     fn test_leindex_home_dir_falls_back_to_home() {
         let _g = TEST_ENV_LOCK.lock().unwrap();
-        std::env::remove_var("LEINDEX_HOME");
-        std::env::set_var("HOME", "/home/testuser");
+        unsafe { std::env::remove_var("LEINDEX_HOME") };
+        unsafe { std::env::set_var("HOME", "/home/testuser") };
         let home = leindex_home_dir();
         assert_eq!(
             home,
             Some(std::path::PathBuf::from("/home/testuser/.leindex"))
         );
-        std::env::remove_var("HOME");
+        unsafe { std::env::remove_var("HOME") };
     }
 
     #[test]
     fn test_leindex_home_dir_relative_env_ignored() {
         let _g = TEST_ENV_LOCK.lock().unwrap();
-        std::env::set_var("LEINDEX_HOME", "relative/path");
-        std::env::set_var("HOME", "/home/fallback");
+        unsafe { std::env::set_var("LEINDEX_HOME", "relative/path") };
+        unsafe { std::env::set_var("HOME", "/home/fallback") };
         // Should fall back to HOME-based path, not use relative.
         let home = leindex_home_dir();
         assert_eq!(
             home,
             Some(std::path::PathBuf::from("/home/fallback/.leindex"))
         );
-        std::env::remove_var("LEINDEX_HOME");
-        std::env::remove_var("HOME");
+        unsafe { std::env::remove_var("LEINDEX_HOME") };
+        unsafe { std::env::remove_var("HOME") };
     }
 }

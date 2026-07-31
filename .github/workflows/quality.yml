@@ -13,7 +13,7 @@ env:
 jobs:
   # ── Duplicate code detection via jscpd ──────────────────────────────
   # Uses jscpd to detect copy-paste code blocks across the Rust source.
-  # Threshold: fail if duplication exceeds 5% of total code.
+  # Threshold: fail if duplication exceeds the staged 8% baseline; reduce toward 5%.
   duplicate-code:
     name: Duplicate Code Detection
     runs-on: ubuntu-latest
@@ -30,15 +30,16 @@ jobs:
         # intentionally preserved for parser accuracy. Non-parser clusters (hnsw,
         # config, test fixtures) are the next reduction target. Staged plan:
         # 8% (current) -> 6% (non-parser dedup) -> 5% (long-term).
-        npx --yes jscpd@3.5.10 \
-          src/ \
-          crates/ \
-          --format "rust" \
-          --min-lines 6 \
-          --min-tokens 50 \
-          --threshold 8 \
-          --reporters "console,html" \
-          --output ./jscpd-report
+        run: |
+          npx --yes jscpd@3.5.10 \
+            src/ \
+            crates/ \
+            --format "rust" \
+            --min-lines 6 \
+            --min-tokens 50 \
+            --threshold 8 \
+            --reporters "console,html" \
+            --output ./jscpd-report
       - name: Upload jscpd report
         if: always()
         uses: actions/upload-artifact@v4

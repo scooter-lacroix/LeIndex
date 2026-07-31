@@ -3,11 +3,12 @@
 use super::{LeIndex, ProjectFileScan};
 use crate::cli::index_builder;
 use crate::cli::index_job::{
-    latest_incomplete_job, CheckpointStore, JobPaths, LexicalCheckpoint, NeuralCheckpoint,
-    ParseCheckpoint, ParsedFileCheckpoint, PdgCheckpoint, PublishedGeneration, ScanCheckpoint,
+    CheckpointStore, JobPaths, LexicalCheckpoint, NeuralCheckpoint, ParseCheckpoint,
+    ParsedFileCheckpoint, PdgCheckpoint, PublishedGeneration, ScanCheckpoint,
+    latest_incomplete_job,
 };
 use crate::cli::memory_cap::MemoryCapGuard;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -63,7 +64,20 @@ pub(crate) struct IndexPipelineState {
     pub(crate) neural_checkpoint: Option<NeuralCheckpoint>,
     pub(crate) neural_rows: usize,
     pub(crate) neural_resume_loaded: bool,
+    pub(crate) admitted_node_ids: HashSet<String>,
     pub(crate) skip: bool,
+}
+
+fn sorted_admitted_node_ids(admitted_node_ids: &HashSet<String>) -> Vec<String> {
+    let mut ids: Vec<String> = admitted_node_ids.iter().cloned().collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn restored_admitted_node_ids(checkpoint: Option<&LexicalCheckpoint>) -> HashSet<String> {
+    checkpoint
+        .map(|checkpoint| checkpoint.admitted_node_ids.iter().cloned().collect())
+        .unwrap_or_default()
 }
 
 impl IndexPipelineState {
@@ -108,6 +122,7 @@ impl IndexPipelineState {
             neural_checkpoint: None,
             neural_rows: 0,
             neural_resume_loaded: false,
+            admitted_node_ids: HashSet::new(),
             skip: false,
         }
     }
@@ -581,6 +596,7 @@ impl LeIndex {
         };
         let pruner = crate::search::search::ContentPruner::new();
         let mut updated_nodes: Vec<crate::search::search::NodeInfo> = Vec::new();
+        let file_summary_ctx = &index_builder::FileSummaryContext::from_pdg(pdg);
 
         for node_idx in pdg.node_indices() {
             let Some(node) = pdg.get_node(node_idx) else {
@@ -599,6 +615,7 @@ impl LeIndex {
                 node,
                 file_bytes.as_ref(),
                 &connectivity_config,
+                file_summary_ctx,
             );
             let pruning_decision = pruner.evaluate(&node.file_path, &node_content, &node.name);
             if pruning_decision != crate::search::search::PruningDecision::Keep {
@@ -870,6 +887,7 @@ impl LeIndex {
             .map(|(checkpoint, _)| checkpoint.clone());
         state.pdg = resumed_pdg.map(|(_, pdg)| pdg);
         state.resumed_lexical = resumed_lexical;
+        state.admitted_node_ids = restored_admitted_node_ids(state.resumed_lexical.as_ref());
         state.resumed_neural = resumed_neural;
         state.checkpoint_store = Some(checkpoint_store);
         injected_phase_failure("scan")?;
@@ -1117,8 +1135,7 @@ impl LeIndex {
         } else if stats.total_external > 0 {
             info!(
                 "External dependency resolution: no lockfile registry found, {} builtins recognized, {} unresolved external imports",
-                stats.builtin,
-                stats.unresolved
+                stats.builtin, stats.unresolved
             );
         }
         state.ext_in_lockfile = registry.len();
@@ -1249,7 +1266,13 @@ impl LeIndex {
             };
         }
         let persisted = match persisted {
-            Some(embedder) if embedder.is_fresh(pdg.node_count(), pdg.edge_count()) => {
+            Some(embedder)
+                if embedder.is_fresh(
+                    pdg.node_count(),
+                    pdg.edge_count(),
+                    &crate::cli::index_builder::pdg_search_fingerprint(pdg),
+                ) =>
+            {
                 info!("Loaded persisted embedder from storage");
                 Some(embedder)
             }
@@ -1300,6 +1323,7 @@ impl LeIndex {
             embedder.persist_to_storage(&self.project_path, &pdg)?;
         }
         let indexed_count = self.search_engine.node_count();
+        state.admitted_node_ids = self.search_engine.live_node_ids().into_iter().collect();
         self.mark_index_phase(
             super::IndexPhase::Lexical,
             super::ComponentStatus::Initializing,
@@ -1353,10 +1377,12 @@ impl LeIndex {
                 .map(index_builder::pdg_search_fingerprint)
                 .unwrap_or_default(),
         )?;
+        let admitted_node_ids = sorted_admitted_node_ids(&state.admitted_node_ids);
         let lexical_checkpoint = LexicalCheckpoint {
             pdg_hash: pdg_checkpoint.artifact_hash.clone(),
             snapshot_path: self.project_path.join(".leindex/search_snapshot.bin"),
             tfidf_path: self.project_path.join(".leindex/tfidf_embedder.bin"),
+            admitted_node_ids,
         };
         let lexical_hash = checkpoint_store.write_lexical(&lexical_checkpoint)?;
         self.checkpoint_state(checkpoint_store, "lexical", lexical_hash.clone());
@@ -1470,10 +1496,9 @@ impl LeIndex {
     /// Persist the neural mmap only when embeddings were freshly produced
     /// (not resumed) AND there are rows to write — never persist an empty mmap.
     /// Extracted from run_neural to keep that function's branch count bounded.
-    #[allow(unused_variables)] // params used only under onnx/remote-embeddings
-    fn persist_neural_mmap(&self, neural_resume_loaded: bool, neural_rows: usize) -> Result<()> {
+    fn persist_neural_mmap(&self, _neural_resume_loaded: bool, _neural_rows: usize) -> Result<()> {
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-        if !neural_resume_loaded && neural_rows > 0 {
+        if !_neural_resume_loaded && _neural_rows > 0 {
             index_builder::persist_neural_embeddings_to_mmap(
                 &self.search_engine,
                 &self.project_path,
@@ -1510,12 +1535,15 @@ impl LeIndex {
         );
         if neural_rows == 0 && !neural_resume_loaded {
             if let Some(neural_embedder) = neural_embedder.as_ref() {
+                let pdg = self
+                    .pdg
+                    .as_ref()
+                    .context("PDG is resident before neural enrichment")?;
                 let rows = index_builder::enrich_neural_embeddings(
-                    self.pdg
-                        .as_ref()
-                        .context("PDG is resident before neural enrichment")?,
+                    pdg,
                     neural_embedder,
                     &mut index_builder::FileReadCache::new(200),
+                    &state.admitted_node_ids,
                 );
                 neural_rows = self.search_engine.update_neural_embeddings(rows);
             }

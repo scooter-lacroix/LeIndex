@@ -4,7 +4,7 @@
 // symbols across multiple projects, enabling cross-project symbol resolution.
 
 use crate::storage::schema::Storage;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 

@@ -3,8 +3,8 @@
 // This module provides the command-line interface for LeIndex.
 
 use crate::cli::leindex::LeIndex;
-use crate::cli::mcp::output::render_tool_output;
 use crate::cli::mcp::McpServer;
+use crate::cli::mcp::output::render_tool_output;
 #[cfg(test)]
 use mcp_commands::find_tool_handler;
 use mcp_commands::{
@@ -13,10 +13,10 @@ use mcp_commands::{
 
 #[path = "mcp_commands.rs"]
 mod mcp_commands;
-use crate::phase::{run_phase_analysis, DocsMode, FormatMode, PhaseOptions, PhaseSelection};
+use crate::phase::{DocsMode, FormatMode, PhaseOptions, PhaseSelection, run_phase_analysis};
 use anyhow::Context;
 use anyhow::Result as AnyhowResult;
-use clap::{error::ErrorKind, Parser, Subcommand};
+use clap::{Parser, Subcommand, error::ErrorKind};
 use serde_json::Value;
 use std::fs;
 use std::net::SocketAddr;
@@ -603,7 +603,10 @@ fn warn_if_path_is_shadowed(command: &Commands) {
             resolved.display(),
             current_exe.display(),
             cargo_bin_dir()
-                .unwrap_or_else(|| current_exe.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf())
+                .unwrap_or_else(|| current_exe
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf())
                 .display()
         ),
     );

@@ -1,6 +1,7 @@
 //! TF-IDF embedder: persisted state, vocabulary building, and embedding.
-
 use super::*;
+
+const TFIDF_SCHEMA_VERSION: u32 = 1;
 
 /// TF-IDF based embedding system for code content.
 ///
@@ -11,11 +12,15 @@ use super::*;
 /// the previous hash-based approach which produced random vectors.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TfIdfPersistedState {
+    #[serde(default)]
+    schema_version: u32,
     vocab: Vec<String>,
     idf: Vec<f32>,
     dimension: usize,
     pdg_nodes: usize,
     pdg_edges: usize,
+    #[serde(default)]
+    pdg_fingerprint: String,
 }
 
 /// TF-IDF embedding provider for code search
@@ -35,6 +40,8 @@ pub struct TfIdfEmbedder {
     pub(crate) pdg_nodes: usize,
     /// PDG edge count captured when persisted for staleness checks
     pub(crate) pdg_edges: usize,
+    /// PDG fingerprint captured when persisted for staleness checks
+    pub(crate) pdg_fingerprint: String,
 }
 
 impl TfIdfEmbedder {
@@ -66,6 +73,7 @@ impl TfIdfEmbedder {
                 dimension: TARGET_DIM,
                 pdg_nodes: 0,
                 pdg_edges: 0,
+                pdg_fingerprint: String::new(),
             };
         }
 
@@ -139,6 +147,7 @@ impl TfIdfEmbedder {
             dimension: TARGET_DIM,
             pdg_nodes: 0,
             pdg_edges: 0,
+            pdg_fingerprint: String::new(),
         }
     }
 
@@ -215,33 +224,67 @@ impl TfIdfEmbedder {
         vec
     }
 
-    #[allow(dead_code)]
-    fn from_persisted_state(state: TfIdfPersistedState) -> Self {
-        Self {
+    fn from_persisted_state(state: TfIdfPersistedState) -> Option<Self> {
+        if state.schema_version != TFIDF_SCHEMA_VERSION {
+            tracing::warn!(
+                "Persisted TF-IDF schema version {} != current {}; discarding",
+                state.schema_version,
+                TFIDF_SCHEMA_VERSION
+            );
+            return None;
+        }
+        if state.dimension != crate::search::search::DEFAULT_EMBEDDING_DIMENSION {
+            tracing::warn!(
+                "Persisted TF-IDF dimension {} != expected {}; discarding",
+                state.dimension,
+                crate::search::search::DEFAULT_EMBEDDING_DIMENSION
+            );
+            return None;
+        }
+        if state.vocab.len() != state.idf.len() {
+            tracing::warn!(
+                "Persisted TF-IDF vocab/idf length mismatch ({} != {}); discarding",
+                state.vocab.len(),
+                state.idf.len()
+            );
+            return None;
+        }
+        Some(Self {
             vocab: state.vocab,
             idf: state.idf,
             dimension: state.dimension,
             pdg_nodes: state.pdg_nodes,
             pdg_edges: state.pdg_edges,
-        }
+            pdg_fingerprint: state.pdg_fingerprint,
+        })
     }
 
     fn persisted_state(&self, pdg: &ProgramDependenceGraph) -> TfIdfPersistedState {
         TfIdfPersistedState {
+            schema_version: TFIDF_SCHEMA_VERSION,
             vocab: self.vocab.clone(),
             idf: self.idf.clone(),
             dimension: self.dimension,
             pdg_nodes: pdg.node_count(),
             pdg_edges: pdg.edge_count(),
+            pdg_fingerprint: pdg_search_fingerprint(pdg),
         }
     }
 
     /// Check if the embedder is fresh relative to the current PDG state
     ///
     /// Returns true if the embedder was built from the same PDG state
-    /// (same node and edge counts), indicating no reindex is needed.
-    pub fn is_fresh(&self, pdg_node_count: usize, pdg_edge_count: usize) -> bool {
-        self.pdg_nodes == pdg_node_count && self.pdg_edges == pdg_edge_count
+    /// (same node count, edge count, and fingerprint), indicating no reindex is needed.
+    pub fn is_fresh(
+        &self,
+        pdg_node_count: usize,
+        pdg_edge_count: usize,
+        pdg_fingerprint: &str,
+    ) -> bool {
+        self.pdg_nodes == pdg_node_count
+            && self.pdg_edges == pdg_edge_count
+            && !pdg_fingerprint.is_empty()
+            && self.pdg_fingerprint == pdg_fingerprint
     }
 
     /// Get the embedding dimension
@@ -257,7 +300,6 @@ impl TfIdfEmbedder {
     ///
     /// Attempts to load a previously persisted embedder from the project's
     /// `.leindex/tfidf_embedder.bin` file. Returns None if the file doesn't exist.
-    #[allow(dead_code)]
     pub fn load_from_storage(project_path: &Path) -> Result<Option<Self>> {
         Self::load_from_artifact_path(&project_path.join(".leindex"))
     }
@@ -279,7 +321,7 @@ impl TfIdfEmbedder {
                 path.display()
             )
         })?;
-        Ok(Some(Self::from_persisted_state(state)))
+        Ok(Self::from_persisted_state(state))
     }
 
     /// Persist the TF-IDF embedder to storage
@@ -301,5 +343,54 @@ impl TfIdfEmbedder {
             .context("Failed to serialize embedder")?;
         std::fs::write(&path, payload)
             .with_context(|| format!("Failed to persist embedder: {}", path.display()))
+    }
+}
+
+#[cfg(test)]
+mod tfidf_persistence_tests {
+    use super::*;
+
+    fn valid_state() -> TfIdfPersistedState {
+        TfIdfPersistedState {
+            schema_version: TFIDF_SCHEMA_VERSION,
+            vocab: vec!["alpha".to_string()],
+            idf: vec![1.0],
+            dimension: crate::search::search::DEFAULT_EMBEDDING_DIMENSION,
+            pdg_nodes: 1,
+            pdg_edges: 0,
+            pdg_fingerprint: "fp".to_string(),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_schema_version() {
+        let mut state = valid_state();
+        state.schema_version = 0;
+        assert!(TfIdfEmbedder::from_persisted_state(state).is_none());
+    }
+
+    #[test]
+    fn rejects_dimension_mismatch() {
+        let mut state = valid_state();
+        state.dimension = 512;
+        assert!(TfIdfEmbedder::from_persisted_state(state).is_none());
+    }
+
+    #[test]
+    fn rejects_vocab_idf_length_mismatch() {
+        let mut state = valid_state();
+        state.vocab.push("beta".to_string());
+        assert!(TfIdfEmbedder::from_persisted_state(state).is_none());
+    }
+
+    #[test]
+    fn accepts_valid_state_and_preserves_fingerprint() {
+        let state = valid_state();
+        let loaded = TfIdfEmbedder::from_persisted_state(state).expect("valid state loads");
+        assert_eq!(
+            loaded.dimension,
+            crate::search::search::DEFAULT_EMBEDDING_DIMENSION
+        );
+        assert_eq!(loaded.pdg_fingerprint, "fp");
     }
 }

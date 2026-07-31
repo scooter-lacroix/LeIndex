@@ -36,7 +36,7 @@ fn unix_now_ms() -> u64 {
 #[cfg(feature = "onnx")]
 use ort::logging::LogLevel;
 #[cfg(feature = "onnx")]
-use ort::session::{builder::GraphOptimizationLevel, builder::SessionBuilder, Session};
+use ort::session::{Session, builder::GraphOptimizationLevel, builder::SessionBuilder};
 
 /// Default idle timeout in seconds before the worker tears itself down.
 ///

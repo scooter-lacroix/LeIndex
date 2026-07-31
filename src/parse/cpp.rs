@@ -444,6 +444,9 @@ const DECISION_KINDS: &[&str] = &[
     "while_statement",
     "do_statement",
     "case_statement",
+    "for_range_loop",
+    "catch_clause",
+    "conditional_expression",
 ];
 cfg_builder!();
 cfg_loop_handler!();
@@ -463,7 +466,7 @@ impl<'a> CfgBuilder<'a> {
             "if_statement" => {
                 self.handle_if_statement(node, current_block)?;
             }
-            "for_statement" | "while_statement" | "do_statement" => {
+            "for_statement" | "for_range_loop" | "while_statement" | "do_statement" => {
                 self.handle_loop_statement(node, current_block)?;
             }
             "switch_statement" => {
@@ -600,5 +603,43 @@ private:
 
         assert!(metrics.cyclomatic > 1);
         assert!(metrics.nesting_depth > 0);
+    }
+
+    #[test]
+    fn test_cpp_range_loop_cfg_has_loop_back_edge() {
+        let source = b"void iterate(std::vector<int> values) {
+    for (int value : values) {
+        consume(value);
+    }
+}";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let range_loop = {
+            let mut stack = vec![root];
+            let mut found = None;
+            while let Some(node) = stack.pop() {
+                if node.kind() == "for_range_loop" {
+                    found = Some(node);
+                    break;
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.children(&mut cursor));
+            }
+            found.expect("tree-sitter-cpp should expose a for_range_loop node")
+        };
+        let mut cfg_builder = CfgBuilder::new(source);
+        cfg_builder.build_from_node(&range_loop).unwrap();
+        let cfg = cfg_builder.finish();
+
+        assert!(
+            cfg.edges
+                .iter()
+                .any(|edge| matches!(edge.edge_type, EdgeType::Loop)),
+            "range-loop CFG must contain a loop back-edge"
+        );
     }
 }

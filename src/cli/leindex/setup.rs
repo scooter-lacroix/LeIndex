@@ -604,14 +604,15 @@ fn prepare_neural_runtime(
     choices: &SetupChoices,
     model_name: &str,
 ) -> Result<NeuralRuntimeState, SetupError> {
-    let initial_ort_installed = check_ort_installed();
+    let pre_existing_version = get_ort_version();
+    let initial_ort_installed = pre_existing_version.is_some();
     let model_present = check_model_present_for_name(model_name);
 
     if !choices.neural_enabled {
         return Ok(NeuralRuntimeState {
             ort_dylib_path: None,
             ort_version: None,
-            ort_installed: check_ort_installed(),
+            ort_installed: initial_ort_installed,
             model_present,
         });
     }
@@ -645,8 +646,8 @@ fn prepare_neural_runtime(
     // before deciding whether to (re)install. An incompatible version
     // triggers either an upgrade (when too old) or a clear warning (when
     // too new). This must run before install so we don't silently proceed
-    // with a known-bad version.
-    let pre_existing_version = get_ort_version();
+    // with a known-bad version. `pre_existing_version` was already computed
+    // above via `get_ort_version()`.
     let mut upgrade_unsupported_ort = false;
     if let Some(ref detected) = pre_existing_version {
         match check_ort_version_compatibility(detected) {
@@ -670,7 +671,10 @@ fn prepare_neural_runtime(
                     detected, supported_max
                 );
                 println!("     Reason: {}.", reason);
-                println!("     Setup will continue, but if you hit ABI errors, pin onnxruntime to <= {}.", supported_max);
+                println!(
+                    "     Setup will continue, but if you hit ABI errors, pin onnxruntime to <= {}.",
+                    supported_max
+                );
                 // We continue: too-new may still work, just warn.
             }
             VersionCompatibility::Supported => {
@@ -700,21 +704,13 @@ fn prepare_neural_runtime(
                 provider.config_value()
             );
         }
-    } else if pre_existing_version.is_none() {
-        // CPU was selected but the installed ORT couldn't report a version
-        // (or was too old to import). Trigger an upgrade.
-        println!("  -> onnxruntime installed but unimportable; upgrading...");
-        install_ort(provider)?;
     }
 
     // Discover ORT dylib path and version after (potential) install.
     let ort_dylib_path = discover_ort_path();
-    let ort_version = get_ort_version().or(pre_existing_version);
-
-    // Recompute ORT installed flag after the install/maintain step so the
-    // smoke-test branch and the SetupResult reflect the actual end state
-    // (VAL-SETUP-027: install_ort may have just brought ORT online).
-    let ort_installed = check_ort_installed();
+    let post_install_version = get_ort_version();
+    let ort_installed = post_install_version.is_some();
+    let ort_version = post_install_version.or(pre_existing_version);
 
     // Validate models whenever neural is enabled. We deliberately do NOT
     // short-circuit on `check_model_present()` returning true because:
@@ -1104,8 +1100,8 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
     let (config, action) = crate::cli::neural_config::LeIndexConfig::load_or_recover()
         .map_err(|e| SetupError::ConfigRead(e.to_string()))?;
 
-    let ort_installed = check_ort_installed();
     let live_version = get_ort_version();
+    let ort_installed = live_version.is_some();
     let model_present = check_model_present_for_name(&config.neural.model_name);
     // VAL-SETUP-014/018: checksum status is surfaced so a corrupted file
     // is visible from `--check` without needing to re-run setup.
@@ -1207,33 +1203,13 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
         println!("Config file: {}", path.display());
     }
 
-    Ok(CheckResult {
-        neural_enabled: config.neural.enabled,
-        provider: config.neural.execution_provider.clone(),
-        ort_installed,
-        ort_version,
-        ort_path,
-        model_present,
-        fully_configured,
-    })
+    Ok(CheckResult { fully_configured })
 }
 
 /// Result of --check mode.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+
 pub struct CheckResult {
-    /// Whether neural is enabled in config.
-    pub neural_enabled: bool,
-    /// Configured execution provider string.
-    pub provider: String,
-    /// Whether ORT is installed.
-    pub ort_installed: bool,
-    /// Detected or recorded ORT version, if any (VAL-SETUP-020).
-    pub ort_version: Option<String>,
-    /// Discovered ORT dylib path.
-    pub ort_path: Option<PathBuf>,
-    /// Whether model files are present.
-    pub model_present: bool,
     /// Whether all components are ready for neural search.
     pub fully_configured: bool,
 }
@@ -1508,6 +1484,11 @@ pub enum SetupError {
         model_name: String,
         model_dir: PathBuf,
     },
+    /// The configured model name is not one of the supported profiles.
+    InvalidModelName {
+        model_name: String,
+        accepted_names: String,
+    },
     /// Hugging Face CLI is required for model installation.
     HuggingFaceCliNotFound,
     /// Hugging Face CLI failed to download the selected model repository.
@@ -1529,17 +1510,6 @@ pub enum SetupError {
         /// The underlying OS error message.
         reason: String,
     },
-    /// Post-setup embedding smoke test failed.
-    ///
-    /// VAL-SETUP-026: Setup reports FAIL with the worker error text and
-    /// actionable guidance, exits non-zero, but still persists whatever
-    /// config it could write. The caller (`cmd_setup_impl`) does NOT bail
-    /// on this error; instead, `execute_setup` returns a `SetupResult`
-    /// with `smoke_test: Some(failed)` so the summary can print it.
-    /// This variant is reserved for catastrophic worker-startup failures
-    /// where we cannot even produce a result struct.
-    #[allow(dead_code)]
-    SmokeTestCatastrophic { message: String },
 }
 
 impl std::fmt::Display for SetupError {
@@ -1547,10 +1517,17 @@ impl std::fmt::Display for SetupError {
         match self {
             SetupError::Conflict { message } => write!(f, "{}", message),
             SetupError::NoFlags => {
-                write!(f, "No setup options specified. Use --neural, --no-neural, --cpu, --gpu, or --check. Run 'leindex setup --help' for details.")
+                write!(
+                    f,
+                    "No setup options specified. Use --neural, --no-neural, --cpu, --gpu, or --check. Run 'leindex setup --help' for details."
+                )
             }
             SetupError::Interactive(msg) => {
-                write!(f, "Interactive prompt failed: {}. If running in a non-interactive context, use flags like --neural --cpu.", msg)
+                write!(
+                    f,
+                    "Interactive prompt failed: {}. If running in a non-interactive context, use flags like --neural --cpu.",
+                    msg
+                )
             }
             SetupError::ConfigWrite(msg) => {
                 write!(f, "Failed to write config: {}", msg)
@@ -1666,6 +1643,14 @@ impl std::fmt::Display for SetupError {
                     model_name
                 )
             }
+            SetupError::InvalidModelName {
+                model_name,
+                accepted_names,
+            } => write!(
+                f,
+                "Unsupported model name '{}'. Accepted model names are {}.",
+                model_name, accepted_names
+            ),
             SetupError::HuggingFaceCliNotFound => {
                 write!(
                     f,
@@ -1699,15 +1684,6 @@ impl std::fmt::Display for SetupError {
                      (e.g., export LEINDEX_HOME=/tmp/leindex).",
                     path.display(),
                     reason
-                )
-            }
-            SetupError::SmokeTestCatastrophic { message } => {
-                write!(
-                    f,
-                    "Embedding smoke test could not run: {}. \
-                     Check that the leindex-embed worker binary is installed and that \
-                     ORT + model files are present. Run `leindex setup --check` for diagnostics.",
-                    message
                 )
             }
         }

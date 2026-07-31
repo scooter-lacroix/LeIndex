@@ -23,6 +23,7 @@ fn strip_line_ending(line: &str) -> &str {
 
 type PdgSpans = HashMap<String, Vec<((usize, usize), String, String)>>;
 
+#[derive(Clone)]
 struct TextSearchParams {
     query: String,
     is_regex: bool,
@@ -33,7 +34,7 @@ struct TextSearchParams {
     budget: WorkBudget,
     include_globs: Vec<String>,
     exclude_globs: Vec<String>,
-    regex: Option<Regex>,
+    regex: Option<std::sync::Arc<Regex>>,
     search_query: String,
 }
 
@@ -62,14 +63,14 @@ fn parse_text_search_params(args: &Value) -> Result<TextSearchParams, JsonRpcErr
     let is_regex = extract_bool(args, "is_regex", false);
     let case_sensitive = extract_bool(args, "case_sensitive", false);
     let regex = if is_regex {
-        Some(
+        Some(std::sync::Arc::new(
             RegexBuilder::new(&query)
                 .case_insensitive(!case_sensitive)
                 .build()
                 .map_err(|error| {
                     JsonRpcError::invalid_params(format!("Invalid regex '{}': {}", query, error))
                 })?,
-        )
+        ))
     } else {
         None
     };
@@ -458,13 +459,23 @@ to understand match context. Supports regex, globs, scope, and context_lines."
         let params = parse_text_search_params(&args)?;
         let started = Instant::now();
         let context = resolve_live_search_context(registry, &args).await?;
-        let (results, partial) = scan_source_paths(
-            &context.source_paths,
-            context.scope.as_deref(),
-            &params,
-            &context.pdg_spans,
-            started,
-        );
+        let source_paths = context.source_paths.clone();
+        let scope = context.scope.clone();
+        let scan_params = params.clone();
+        let pdg_spans = context.pdg_spans.clone();
+        let (results, partial) = tokio::task::spawn_blocking(move || {
+            scan_source_paths(
+                &source_paths,
+                scope.as_deref(),
+                &scan_params,
+                &pdg_spans,
+                started,
+            )
+        })
+        .await
+        .map_err(|error| {
+            JsonRpcError::internal_error(format!("text search task failed: {error}"))
+        })?;
         let total = results.len();
         let paginated: Vec<Value> = results
             .into_iter()

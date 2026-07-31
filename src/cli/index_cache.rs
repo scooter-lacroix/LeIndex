@@ -1,8 +1,8 @@
 // Index Cache — cache subsystem extracted from LeIndex
 
 use crate::cli::memory::{
-    pdg_cache_key, project_scan_cache_key, search_cache_key, CacheEntry, CacheSpiller,
-    MemoryConfig, WarmStrategy,
+    CacheEntry, CacheSpiller, MemoryConfig, WarmStrategy, pdg_cache_key, project_scan_cache_key,
+    search_cache_key,
 };
 use crate::graph::pdg::{NodeId, ProgramDependenceGraph};
 use anyhow::{Context, Result};

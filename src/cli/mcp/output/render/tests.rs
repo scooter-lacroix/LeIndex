@@ -276,9 +276,9 @@ fn test_render_diagnostics_plain_output() {
                 "issues": [{"severity": "warning", "message": "slow"}]
             }"#);
     assert_eq!(
-            render_diagnostics(&payload, false),
-            "── Diagnostics ──\n  Project: /repo\n  Indexed files: 2\n\n  System Health:\n    Index health: healthy\n    PDG loaded: true\n    PDG nodes: 3\n    Embedding model: model\n\n  Issues:\n    warning slow\n"
-        );
+        render_diagnostics(&payload, false),
+        "── Diagnostics ──\n  Project: /repo\n  Indexed files: 2\n\n  System Health:\n    Index health: healthy\n    PDG loaded: true\n    PDG nodes: 3\n    Embedding model: model\n\n  Issues:\n    warning slow\n"
+    );
 }
 
 #[test]
@@ -295,9 +295,9 @@ fn test_render_impact_plain_output() {
                 "transitive_callers": 1
             }"#);
     assert_eq!(
-            render_impact(&payload, false),
-            "── Impact Analysis ──\n  Symbol: alpha\n  File: src/lib.rs\n  Change type: modify\n  Risk: ● high\n\n  Direct callers (1):\n    ← caller\n\n  Transitive affected symbols (1):\n    → affected\n\n  Summary: one caller\n\n  Affected files: 2\n  Transitive callers: 1\n"
-        );
+        render_impact(&payload, false),
+        "── Impact Analysis ──\n  Symbol: alpha\n  File: src/lib.rs\n  Change type: modify\n  Risk: ● high\n\n  Direct callers (1):\n    ← caller\n\n  Transitive affected symbols (1):\n    → affected\n\n  Summary: one caller\n\n  Affected files: 2\n  Transitive callers: 1\n"
+    );
 }
 
 #[test]
@@ -310,9 +310,9 @@ fn test_render_edit_metadata_plain_output() {
                 "breaking_changes": ["none"]
             }"#);
     assert_eq!(
-            render_edit_preview(&preview, false),
-            "  Affected symbols: alpha\n  Affected files: src/lib.rs\n  Risk level: low\n  Change count: 1\n  Breaking: none\n"
-        );
+        render_edit_preview(&preview, false),
+        "  Affected symbols: alpha\n  Affected files: src/lib.rs\n  Risk level: low\n  Change count: 1\n  Breaking: none\n"
+    );
 
     let rename = v(r#"{
                 "old_name": "alpha",
@@ -322,9 +322,9 @@ fn test_render_edit_metadata_plain_output() {
                 "preview_only": true
             }"#);
     assert_eq!(
-            render_rename_symbol(&rename, false),
-            "  Rename: alpha → beta\n  Files affected: 2\n  Additional diffs: 1 more (not shown)\n  Preview only: changes not applied\n"
-        );
+        render_rename_symbol(&rename, false),
+        "  Rename: alpha → beta\n  Files affected: 2\n  Additional diffs: 1 more (not shown)\n  Preview only: changes not applied\n"
+    );
 }
 
 #[test]
@@ -344,9 +344,9 @@ fn test_render_file_summary_plain_output() {
     let output = render_tool_output_plain("leindex_file_summary", &payload, &v("{}"));
 
     assert_eq!(
-            output,
-            "── File Summary ──\n  File: src/lib.rs\n  Language: rust\n  Lines: 10\n  Symbols: 2\n  Role: library\n\n  Symbols:\n    • alpha\n    • Beta\n"
-        );
+        output,
+        "── File Summary ──\n  File: src/lib.rs\n  Language: rust\n  Lines: 10\n  Symbols: 2\n  Role: library\n\n  Symbols:\n    • alpha\n    • Beta\n"
+    );
 }
 
 #[test]

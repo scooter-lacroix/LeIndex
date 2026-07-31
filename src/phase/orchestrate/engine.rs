@@ -139,14 +139,14 @@ impl<R: PhaseRunner> OrchestrationEngine<R> {
 
 #[cfg(test)]
 mod tests {
-    use anyhow::{anyhow, Result};
+    use anyhow::{Result, anyhow};
 
     use crate::phase::{
+        PhaseAnalysisReport, PhaseSelection,
         format::FormatMode,
         options::PhaseOptions,
         orchestrate::{model::OrchestrationRequest, state::RunStatus},
         phase1::Phase1Summary,
-        PhaseAnalysisReport, PhaseSelection,
     };
 
     use super::*;
@@ -390,12 +390,14 @@ mod tests {
         );
 
         assert_eq!(report.state.status, RunStatus::Failed);
-        assert!(report
-            .state
-            .last_error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("timeout budget exceeded"));
+        assert!(
+            report
+                .state
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("timeout budget exceeded")
+        );
     }
 
     #[test]

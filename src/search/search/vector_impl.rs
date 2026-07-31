@@ -114,8 +114,9 @@ impl MmapVectorIndex {
 
     fn remove(&mut self, node_id: &str) -> bool {
         let removed_delta = self.delta.remove(node_id).is_some();
-        let removed_base =
-            self.rows.contains_key(node_id) && self.tombstones.insert(node_id.into());
+        let removed_base = !self.cleared
+            && self.rows.contains_key(node_id)
+            && self.tombstones.insert(node_id.into());
         removed_delta || removed_base
     }
 
@@ -128,6 +129,21 @@ impl MmapVectorIndex {
                 .sum::<usize>()
             + self.tombstones.iter().map(String::len).sum::<usize>()
             + std::mem::size_of::<Self>()
+    }
+
+    fn similarity(&self, node_id: &str, query: &[f32]) -> Option<f32> {
+        if let Some(vector) = self.delta.get(node_id) {
+            return (vector.len() == query.len())
+                .then(|| crate::search::vector::cosine_similarity(query, vector));
+        }
+        if self.cleared || self.tombstones.contains(node_id) {
+            return None;
+        }
+        let row = self.rows.get(node_id).copied()?;
+        self.base
+            .embedding_slice_by_index(row)
+            .filter(|embedding| embedding.len() == query.len())
+            .map(|embedding| crate::search::vector::cosine_similarity(query, embedding))
     }
 
     fn embedding(&self, node_id: &str) -> Option<Vec<f32>> {
@@ -239,6 +255,21 @@ impl VectorIndexImpl {
             Self::Mmap(idx) => idx.remove(node_id),
             Self::HNSW(idx) => idx.remove(node_id),
             Self::HNSWQuantized(idx) => idx.remove(node_id),
+        }
+    }
+
+    /// Return a cosine score without materializing mmap-backed rows.
+    pub(super) fn similarity(&self, node_id: &str, query: &[f32]) -> Option<f32> {
+        match self {
+            Self::Mmap(index) => index.similarity(node_id, query),
+            Self::BruteForce(index) => index
+                .get(node_id)
+                .filter(|embedding| embedding.len() == query.len())
+                .map(|embedding| crate::search::vector::cosine_similarity(query, embedding)),
+            Self::HNSW(_) | Self::HNSWQuantized(_) => self
+                .embedding(node_id)
+                .filter(|embedding| embedding.len() == query.len())
+                .map(|embedding| crate::search::vector::cosine_similarity(query, &embedding)),
         }
     }
 

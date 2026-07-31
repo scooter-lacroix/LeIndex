@@ -125,11 +125,7 @@ impl Int8QualityGate {
             idcg += 1.0 / (rank + 1.0).log2();
         }
 
-        if idcg == 0.0 {
-            0.0
-        } else {
-            dcg / idcg
-        }
+        if idcg == 0.0 { 0.0 } else { dcg / idcg }
     }
 
     /// Compute a latency percentile from a sorted list of nanosecond samples.

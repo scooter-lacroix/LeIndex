@@ -1,7 +1,7 @@
 use super::helpers::{extract_bool, extract_string, make_diff, wrap_with_meta};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
-use crate::edit::{atomic_write, replace_whole_word, ResolvedEditChange};
+use crate::edit::{ResolvedEditChange, atomic_write, replace_whole_word};
 use crate::validation::validation_to_json;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -75,7 +75,7 @@ fn reference_files(
     }
     Ok(files
         .into_iter()
-        .filter(|file| scope.map_or(true, |scope| file.starts_with(scope)))
+        .filter(|file| scope.is_none_or(|scope| file.starts_with(scope)))
         .collect())
 }
 

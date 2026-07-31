@@ -128,7 +128,7 @@ pub use memory::{MemoryConfig as MemoryManagementConfig, MemoryManager};
 
 #[cfg(feature = "mcp-server")]
 pub use mcp::{
-    error_codes, JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpServer, McpServerConfig,
+    JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpServer, McpServerConfig, error_codes,
 };
 #[cfg(feature = "mcp-server")]
 pub use registry::ProjectRegistry;

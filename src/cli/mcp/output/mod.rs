@@ -168,13 +168,13 @@ pub fn lookup_args<'a>(_name: &str, args: Option<&'a Value>) -> &'a Value {
 // =============================================================================
 
 pub use diff::{
-    compute_diff, render_split_diff, render_unified_diff, DiffFormatter, DiffHunk, DiffLine,
-    DiffOp, DiffResult,
+    DiffFormatter, DiffHunk, DiffLine, DiffOp, DiffResult, compute_diff, render_split_diff,
+    render_unified_diff,
 };
 pub use render::{
-    render_tool_output, render_tool_output_plain, render_tree, DiagnosticsFormatter,
-    FileSummaryFormatter, GitStatusFormatter, ImpactFormatter, PhaseFormatter, ProjectMapFormatter,
-    SearchFormatter, SymbolLookupFormatter,
+    DiagnosticsFormatter, FileSummaryFormatter, GitStatusFormatter, ImpactFormatter,
+    PhaseFormatter, ProjectMapFormatter, SearchFormatter, SymbolLookupFormatter,
+    render_tool_output, render_tool_output_plain, render_tree,
 };
 pub use trim::trim_llm_payload;
 

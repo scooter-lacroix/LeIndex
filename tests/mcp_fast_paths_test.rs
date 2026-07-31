@@ -4,20 +4,20 @@
 // the process-wide instrumentation snapshot.
 #![allow(clippy::await_holding_lock)]
 
+use leindex::cli::ProjectRegistry;
 use leindex::cli::mcp::handlers::all_tool_handlers;
 use leindex::cli::mcp::handlers::{FileSummaryHandler, GrepSymbolsHandler, ReadSymbolHandler};
 use leindex::cli::mcp::protocol::JsonRpcRequest;
 use leindex::cli::mcp::request_meta::{
+    NEURAL_REQUESTS, PDG_LOADS, PROJECT_HYDRATIONS, PhaseTimings, WorkBudget,
     collect_request_timings, current_request_timing_sink, record_hydrate_ms, record_neural_ms,
-    record_neural_ms_to, record_pdg_ms, reset_path_counters, PhaseTimings, WorkBudget,
-    NEURAL_REQUESTS, PDG_LOADS, PROJECT_HYDRATIONS,
+    record_neural_ms_to, record_pdg_ms, reset_path_counters,
 };
 use leindex::cli::mcp::server::handle_tool_call;
-use leindex::cli::ProjectRegistry;
-use leindex::search::query_route::{classify, QueryRoute, RequestedMode};
+use leindex::search::query_route::{QueryRoute, RequestedMode, classify};
 use leindex::storage::nodes::NodeType;
 use leindex::storage::{NodeRecord, NodeStore, Storage, UniqueProjectId};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 use std::process::Command;
 use std::sync::atomic::Ordering;
@@ -163,21 +163,27 @@ fn test_path_metadata_primitives_are_deterministic() {
     assert_eq!(PDG_LOADS.load(Ordering::Relaxed), 0);
     assert_eq!(NEURAL_REQUESTS.load(Ordering::Relaxed), 0);
 
-    assert!(WorkBudget {
-        max_latency_ms: 0,
-        allow_partial: true,
-    }
-    .elapsed(Instant::now()));
-    assert!(!WorkBudget {
-        max_latency_ms: u64::MAX,
-        allow_partial: true,
-    }
-    .elapsed(Instant::now()));
-    assert!(!WorkBudget {
-        max_latency_ms: 0,
-        allow_partial: false,
-    }
-    .elapsed(Instant::now()));
+    assert!(
+        WorkBudget {
+            max_latency_ms: 0,
+            allow_partial: true,
+        }
+        .elapsed(Instant::now())
+    );
+    assert!(
+        !WorkBudget {
+            max_latency_ms: u64::MAX,
+            allow_partial: true,
+        }
+        .elapsed(Instant::now())
+    );
+    assert!(
+        !WorkBudget {
+            max_latency_ms: 0,
+            allow_partial: false,
+        }
+        .elapsed(Instant::now())
+    );
 
     let metadata = serde_json::to_value(PhaseTimings {
         handler_ms: 4,
@@ -599,11 +605,13 @@ async fn test_stale_catalog_file_summary_does_not_attach_stale_pdg_relations() {
         .expect("stale file summary response");
     assert_eq!(response["pdg_status"], "stale");
     assert_eq!(response["retrieval"]["partial"], true);
-    assert!(response["symbols"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|symbol| { symbol["name"] == "live_marker" }));
+    assert!(
+        response["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| { symbol["name"] == "live_marker" })
+    );
 }
 
 #[tokio::test]

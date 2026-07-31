@@ -1,7 +1,7 @@
 use super::helpers::{extract_bool, extract_usize, phase_analysis_schema, wrap_with_meta};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
-use crate::phase::{run_phase_analysis, DocsMode, FormatMode, PhaseOptions, PhaseSelection};
+use crate::phase::{DocsMode, FormatMode, PhaseOptions, PhaseSelection, run_phase_analysis};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -258,66 +258,76 @@ fn enrich_report(mut report: Value, symbols: Option<Vec<Value>>) -> Value {
     report
 }
 
+struct PhaseRequest {
+    selection: PhaseSelection,
+    options: PhaseOptions,
+    single_file_target: Option<PathBuf>,
+}
+
+fn phase_request(args: &Value, project_root: &Path) -> Result<PhaseRequest, JsonRpcError> {
+    let selection = parse_phase_selection(args.get("phase"))?;
+    let (mode, docs_mode, include_docs) = phase_modes(args)?;
+    let (root, focus_files, single_file_target) =
+        phase_target(project_root, args.get("path").and_then(Value::as_str))?;
+    let max_files = phase_max_files(args, !focus_files.is_empty())?;
+    let options = PhaseOptions {
+        root,
+        focus_files,
+        mode,
+        max_files,
+        max_focus_files: extract_usize(args, "max_focus_files", 20)?,
+        top_n: extract_usize(args, "top_n", 10)?,
+        max_output_chars: extract_usize(args, "max_chars", 12000)?,
+        use_incremental_refresh: true,
+        include_docs,
+        docs_mode,
+        hotspot_keywords: PhaseOptions::default().hotspot_keywords,
+    };
+    Ok(PhaseRequest {
+        selection,
+        options,
+        single_file_target,
+    })
+}
+
 async fn execute_phase_analysis(
     registry: &Arc<ProjectRegistry>,
     args: Value,
 ) -> Result<Value, JsonRpcError> {
-    let project_path = args.get("project_path").and_then(|v| v.as_str());
+    let project_path = args.get("project_path").and_then(Value::as_str);
     let handle = registry.get_or_create(project_path).await?;
+    let base_project_root = handle.read().await.project_path().to_path_buf();
+    let request = phase_request(&args, &base_project_root)?;
 
-    let selection = parse_phase_selection(args.get("phase"))?;
-
-    let (parsed_mode, parsed_docs_mode, include_docs) = phase_modes(&args)?;
-
-    let base_project_root = {
-        let reader = handle.read().await;
-        reader.project_path().to_path_buf()
-    };
-
-    let (root, focus_files, single_file_target) =
-        phase_target(&base_project_root, args.get("path").and_then(Value::as_str))?;
-
-    let max_files = phase_max_files(&args, !focus_files.is_empty())?;
-
-    let max_focus_files = extract_usize(&args, "max_focus_files", 20)?;
-    let top_n = extract_usize(&args, "top_n", 10)?;
-    let max_output_chars = extract_usize(&args, "max_chars", 12000)?;
-
-    let file_symbols_json = if let Some(file_path) = single_file_target.as_deref() {
-        let content = std::fs::read_to_string(file_path).unwrap_or_default();
-        let reader = handle.read().await;
-        reader
-            .pdg()
-            .map(|pdg| file_symbols(pdg, file_path, &content))
+    let file_symbols_json = if let Some(file_path) = request.single_file_target.as_deref() {
+        let file_path = file_path.to_path_buf();
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let content = std::fs::read_to_string(&file_path).unwrap_or_default();
+            let reader = handle.blocking_read();
+            reader
+                .pdg()
+                .map(|pdg| file_symbols(pdg, &file_path, &content))
+        })
+        .await
+        .map_err(|error| {
+            JsonRpcError::internal_error(format!("single-file phase enrichment failed: {error}"))
+        })?
     } else {
         None
     };
 
-    let options = PhaseOptions {
-        root,
-        focus_files,
-        mode: parsed_mode,
-        max_files,
-        max_focus_files,
-        top_n,
-        max_output_chars,
-        use_incremental_refresh: true,
-        include_docs,
-        docs_mode: parsed_docs_mode,
-        hotspot_keywords: PhaseOptions::default().hotspot_keywords,
-    };
-
-    let report = tokio::task::spawn_blocking(move || run_phase_analysis(options, selection))
-        .await
-        .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))?
-        .map_err(|e| JsonRpcError::internal_error(format!("Phase analysis failed: {}", e)))?;
+    let report =
+        tokio::task::spawn_blocking(move || run_phase_analysis(request.options, request.selection))
+            .await
+            .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))?
+            .map_err(|e| JsonRpcError::internal_error(format!("Phase analysis failed: {}", e)))?;
 
     let report_value = enrich_report(
         serde_json::to_value(report)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?,
         file_symbols_json,
     );
-
     let index_for_meta = handle.read().await;
     Ok(wrap_with_meta(report_value, &index_for_meta))
 }

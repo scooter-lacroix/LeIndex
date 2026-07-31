@@ -32,4 +32,4 @@ enum-variant-size-threshold = 200
 single-char-binding-names-threshold = 4
 
 # MSRV for lint compatibility.
-msrv = "1.75"
+msrv = "1.85"

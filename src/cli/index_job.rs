@@ -192,6 +192,11 @@ pub struct LexicalCheckpoint {
     pub pdg_hash: String,
     pub snapshot_path: PathBuf,
     pub tfidf_path: PathBuf,
+    /// Node IDs admitted by the authoritative lexical index. Older
+    /// checkpoints omit this field and are treated as requiring lexical
+    /// hydration before neural enrichment.
+    #[serde(default)]
+    pub admitted_node_ids: Vec<String>,
 }
 
 /// Metadata for neural publication.
@@ -376,7 +381,10 @@ impl CheckpointStore {
     }
 
     pub fn write_lexical(&self, checkpoint: &LexicalCheckpoint) -> Result<String> {
-        let bytes = serde_json::to_vec(checkpoint).context("serialize lexical checkpoint")?;
+        let mut canonical = checkpoint.clone();
+        canonical.admitted_node_ids.sort_unstable();
+        canonical.admitted_node_ids.dedup();
+        let bytes = serde_json::to_vec(&canonical).context("serialize lexical checkpoint")?;
         atomic_write(&self.paths.lexical(), &bytes)
     }
 
@@ -717,6 +725,65 @@ mod tests {
                 .expect("decode durable job status");
         assert_eq!(saved.job_id, "job-1");
         assert_eq!(saved.phase, "pdg");
+    }
+
+    #[test]
+    fn lexical_checkpoint_admitted_ids_are_backward_compatible() {
+        let legacy = r#"{
+            "pdg_hash": "pdg",
+            "snapshot_path": ".leindex/search_snapshot.bin",
+            "tfidf_path": ".leindex/tfidf_embedder.bin"
+        }"#;
+        let checkpoint: LexicalCheckpoint =
+            serde_json::from_str(legacy).expect("decode legacy lexical checkpoint");
+        assert!(checkpoint.admitted_node_ids.is_empty());
+    }
+
+    #[test]
+    fn lexical_checkpoint_writer_canonicalizes_admitted_ids() {
+        let temp = tempfile::tempdir().expect("temp checkpoint root");
+        let store = CheckpointStore::new(temp.path(), 1);
+        let mut first = LexicalCheckpoint {
+            pdg_hash: "pdg".to_string(),
+            snapshot_path: PathBuf::from("snapshot.bin"),
+            tfidf_path: PathBuf::from("tfidf.bin"),
+            admitted_node_ids: vec!["node-z".to_string(), "node-a".to_string()],
+        };
+        let mut second = first.clone();
+        second.admitted_node_ids = vec!["node-a".to_string(), "node-z".to_string()];
+
+        let first_hash = store
+            .write_lexical(&first)
+            .expect("write first lexical checkpoint");
+        let second_hash = store
+            .write_lexical(&second)
+            .expect("write second lexical checkpoint");
+        let restored = store
+            .read_lexical()
+            .expect("read lexical checkpoint")
+            .expect("checkpoint exists");
+
+        assert_eq!(first_hash, second_hash);
+        assert_eq!(restored.admitted_node_ids, ["node-a", "node-z"]);
+        first.admitted_node_ids.push("node-a".to_string());
+        let duplicate_hash = store
+            .write_lexical(&first)
+            .expect("write duplicate lexical checkpoint");
+        assert_eq!(duplicate_hash, second_hash);
+    }
+
+    #[test]
+    fn lexical_checkpoint_payload_is_deterministic_when_ids_are_sorted() {
+        let checkpoint = LexicalCheckpoint {
+            pdg_hash: "pdg".to_string(),
+            snapshot_path: PathBuf::from("snapshot.bin"),
+            tfidf_path: PathBuf::from("tfidf.bin"),
+            admitted_node_ids: vec!["node-a".to_string(), "node-b".to_string()],
+        };
+        let encoded_once = serde_json::to_vec(&checkpoint).expect("encode checkpoint");
+        let encoded_twice = serde_json::to_vec(&checkpoint).expect("encode checkpoint again");
+        assert_eq!(encoded_once, encoded_twice);
+        assert_eq!(checkpoint.admitted_node_ids, ["node-a", "node-b"]);
     }
 
     #[test]

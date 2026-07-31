@@ -1,7 +1,7 @@
 // Index Freshness — staleness detection logic extracted from LeIndex
 
 use super::leindex::IndexHealth;
-use super::leindex::{ProjectFileScan, DEPENDENCY_MANIFEST_NAMES};
+use super::leindex::{DEPENDENCY_MANIFEST_NAMES, ProjectFileScan};
 use crate::cli::memory::CacheEntry;
 use crate::cli::skip_dirs::SKIP_DIRS;
 use crate::storage::schema::Storage;
@@ -287,15 +287,25 @@ fn indexed_files_are_stale(
     indexed_files: &HashMap<String, String>,
     db_time: std::time::SystemTime,
 ) -> bool {
-    should_skip_fast_file_stat_scan(indexed_files.len())
-        || indexed_files.keys().any(|indexed_path| {
-            match std::fs::metadata(ctx.project_path.join(indexed_path)) {
-                Ok(metadata) => metadata
-                    .modified()
-                    .map_or(true, |modified| modified >= db_time),
-                Err(_) => true,
-            }
-        })
+    // Skip the expensive per-file stat scan for large projects (10,000+ files).
+    // Return false (inconclusive) to defer to the authoritative hash-based
+    // freshness check rather than falsely declaring staleness. The caller
+    // (`is_stale_fast`) ORs this with other fast checks; when all return false,
+    // the caller proceeds to the authoritative path. When any fast check returns
+    // true, the caller initiates a reindex (which also runs the authoritative
+    // check). So returning false here means "this fast check found nothing
+    // stale" and the other checks + authoritative path still run.
+    if should_skip_fast_file_stat_scan(indexed_files.len()) {
+        return false;
+    }
+    indexed_files.keys().any(|indexed_path| {
+        match std::fs::metadata(ctx.project_path.join(indexed_path)) {
+            Ok(metadata) => metadata
+                .modified()
+                .map_or(true, |modified| modified >= db_time),
+            Err(_) => true,
+        }
+    })
 }
 
 fn manifests_are_stale(

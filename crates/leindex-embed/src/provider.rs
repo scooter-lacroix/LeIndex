@@ -559,14 +559,17 @@ mod tests {
         std::fs::write(rocm_lib.join("libmigraphx_c.so"), b"fake").unwrap();
 
         let old_rocm = std::env::var("ROCM_PATH").ok();
-        std::env::set_var("ROCM_PATH", temp.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("ROCM_PATH", temp.path()) };
 
         assert!(ExecutionProviderSelector::rocm_path_has_migraphx());
 
         if let Some(value) = old_rocm {
-            std::env::set_var("ROCM_PATH", value);
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("ROCM_PATH", value) };
         } else {
-            std::env::remove_var("ROCM_PATH");
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("ROCM_PATH") };
         }
     }
 

@@ -486,6 +486,9 @@ fn extract_js_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportI
     }
 
     fn add_named_import(imports: &mut Vec<ImportInfo>, module: &str, part: &str) {
+        if module.is_empty() {
+            return;
+        }
         if let Some((name, alias)) = part.split_once(" as ") {
             let path = format!("{}.{}", module, name.trim());
             add_import(imports, &path, Some(alias.trim().to_string()));
@@ -745,12 +748,11 @@ fn extract_ts_parameters(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<Par
                     // If no name field found, look for identifier child
                     let param_name = if param_name.is_none() {
                         let mut ccursor = child.walk();
-                        let result = child
+                        child
                             .children(&mut ccursor)
                             .find(|c| c.kind() == "identifier")
                             .and_then(|c| c.utf8_text(source).ok())
-                            .map(|s| s.to_string());
-                        result
+                            .map(|s| s.to_string())
                     } else {
                         param_name
                     };
@@ -777,12 +779,11 @@ fn extract_ts_parameters(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<Par
                     // If no name field found, look for identifier child
                     let param_name = if param_name.is_none() {
                         let mut ccursor = child.walk();
-                        let result = child
+                        child
                             .children(&mut ccursor)
                             .find(|c| c.kind() == "identifier")
                             .and_then(|c| c.utf8_text(source).ok())
-                            .map(|s| s.to_string());
-                        result
+                            .map(|s| s.to_string())
                     } else {
                         param_name
                     };
@@ -858,12 +859,8 @@ const DECISION_KINDS: &[&str] = &[
     "for_statement",
     "for_in_statement",
     "for_of_statement",
-    "try_statement",
-    "switch_statement",
     "catch_clause",
-    "else_clause",
     "switch_case",
-    "switch_default",
 ];
 cfg_builder!();
 cfg_loop_handler!();
@@ -1098,5 +1095,42 @@ type JsonObject = Record<string, unknown>;";
 
         assert!(metrics.cyclomatic > 1);
         assert!(metrics.nesting_depth > 0);
+    }
+
+    #[test]
+    fn test_javascript_empty_named_import_is_ignored() {
+        let source = b"import { helper } from \"\";\nfunction run() { return 1; }";
+
+        let signatures = JavaScriptParser::new().get_signatures(source).unwrap();
+
+        assert_eq!(signatures.len(), 1);
+        assert!(signatures[0].imports.is_empty());
+    }
+
+    #[test]
+    fn test_javascript_complexity_counts_catch_and_switch_cases() {
+        let source = b"function decide(value) {
+    try {
+        if (value > 0) {
+            return value;
+        }
+    } catch (error) {
+        switch (value) {
+            case 0:
+                return 0;
+            default:
+                return -1;
+        }
+    }
+}";
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&crate::parse::traits::languages::javascript::language())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let metrics = JavaScriptParser::new().extract_complexity(&tree.root_node());
+
+        assert_eq!(metrics.cyclomatic, 4);
     }
 }

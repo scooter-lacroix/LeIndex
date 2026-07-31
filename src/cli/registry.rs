@@ -30,7 +30,7 @@
 //!     stats when possible.
 
 use crate::cli::errors::detect_corruption;
-use crate::cli::index_job::{new_job_id, IndexJobSnapshot, IndexJobState, JobPaths, JobStatus};
+use crate::cli::index_job::{IndexJobSnapshot, IndexJobState, JobPaths, JobStatus, new_job_id};
 use crate::cli::leindex::{IndexStats, LeIndex};
 use crate::cli::mcp::protocol::JsonRpcError;
 use crate::cli::watcher::IndexWatcher;
@@ -115,6 +115,13 @@ impl ProjectRwLock {
     pub async fn read(&self) -> ProjectReadGuard<'_> {
         ProjectReadGuard {
             inner: self.inner.lock().await,
+        }
+    }
+
+    /// Acquire a synchronous read guard from a `spawn_blocking` context.
+    pub fn blocking_read(&self) -> ProjectReadGuard<'_> {
+        ProjectReadGuard {
+            inner: self.inner.blocking_lock(),
         }
     }
 
@@ -539,6 +546,20 @@ impl ProjectRegistry {
         } else {
             Ok(state.snapshot().await)
         }
+    }
+
+    /// Read the current owned indexing-job snapshot without starting or
+    /// coalescing a job. Used by polling clients and lifecycle tests.
+    pub async fn get_index_job_snapshot(
+        &self,
+        project_path: Option<&str>,
+    ) -> Result<Option<IndexJobSnapshot>, JsonRpcError> {
+        let canonical = self.resolve_path(project_path).await?;
+        let state = self.index_jobs.lock().await.get(&canonical).cloned();
+        Ok(match state {
+            Some(state) => Some(state.snapshot().await),
+            None => None,
+        })
     }
 
     /// Select the existing owned job or replace a completed one for an explicit reindex.

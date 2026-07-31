@@ -12,7 +12,6 @@
 //! directory. They MUST run serially: `cargo test -- --test-threads=1`.
 //! Running them in parallel causes concurrent worker spawns against the same
 //! daemon socket, producing false failures.
-
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -36,7 +35,6 @@ fn small_repo_fixture() -> PathBuf {
 }
 
 /// Helper: get the release leindex binary path.
-#[allow(dead_code)]
 fn leindex_binary() -> PathBuf {
     workspace_root().join("target/release/leindex")
 }
@@ -437,7 +435,9 @@ fn test_val_measure_006_mapped_file_and_anon_captured() {
             assert!(
                 mapped > 0 || anon > 0,
                 "phase '{}' should have at least one of mapped_file or anon > 0 (got mapped={}, anon={})",
-                phase_name, mapped, anon
+                phase_name,
+                mapped,
+                anon
             );
         }
     }

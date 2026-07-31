@@ -5,6 +5,43 @@ use std::sync::Mutex as StdMutex;
 
 static ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
+/// RAII guard that restores an environment variable to its original value on drop.
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let original = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, original }
+    }
+
+    fn remove(key: &'static str) -> Self {
+        let original = std::env::var(key).ok();
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.original {
+            Some(val) => unsafe {
+                std::env::set_var(self.key, val);
+            },
+            None => unsafe {
+                std::env::remove_var(self.key);
+            },
+        }
+    }
+}
+
 /// Config whose model name resolves to no on-disk file, so
 /// `WorkerRuntime::new` skips the ~300s MIGraphX JIT compile. The worker
 /// tests below exercise pooling / idle-timer logic, never real inference, so
@@ -32,8 +69,8 @@ fn test_runtime_config_default() {
 
 #[test]
 fn onnx_inference_batch_size_defaults_to_fixed_batch_safe_value() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::remove_var(ONNX_INFERENCE_BATCH_SIZE_ENV);
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
 
     assert_eq!(
         configured_onnx_inference_batch_size("qwen3-embed-0.6b", "cpu"),
@@ -47,34 +84,32 @@ fn onnx_inference_batch_size_defaults_to_fixed_batch_safe_value() {
 
 #[test]
 fn onnx_inference_batch_size_uses_positive_env_override() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::set_var(ONNX_INFERENCE_BATCH_SIZE_ENV, "32");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::set(ONNX_INFERENCE_BATCH_SIZE_ENV, "32");
 
     assert_eq!(
         configured_onnx_inference_batch_size("qwen3-embed-0.6b", "migraphx"),
         32
     );
-
-    std::env::remove_var(ONNX_INFERENCE_BATCH_SIZE_ENV);
 }
 
 #[test]
 fn onnx_inference_batch_size_rejects_zero_and_bad_values() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-    std::env::set_var(ONNX_INFERENCE_BATCH_SIZE_ENV, "0");
+    // Use a single guard capturing the original; intermediate mutations are fine.
+    let _env = EnvVarGuard::set(ONNX_INFERENCE_BATCH_SIZE_ENV, "0");
     assert_eq!(
         configured_onnx_inference_batch_size("qwen3-embed-0.6b", "cpu"),
         DEFAULT_ONNX_INFERENCE_BATCH_SIZE
     );
 
-    std::env::set_var(ONNX_INFERENCE_BATCH_SIZE_ENV, "nope");
+    drop(_env);
+    let _env = EnvVarGuard::set(ONNX_INFERENCE_BATCH_SIZE_ENV, "nope");
     assert_eq!(
         configured_onnx_inference_batch_size("qwen3-embed-0.6b", "cpu"),
         DEFAULT_ONNX_INFERENCE_BATCH_SIZE
     );
-
-    std::env::remove_var(ONNX_INFERENCE_BATCH_SIZE_ENV);
 }
 
 #[cfg(feature = "onnx")]
@@ -117,25 +152,27 @@ fn position_ids_repeat_sequence_for_each_batch_row() {
 
 #[test]
 fn onnx_sequence_len_defaults_and_clamps_env_override() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::remove_var(ONNX_SEQUENCE_LEN_ENV);
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_SEQUENCE_LEN_ENV);
     assert_eq!(configured_onnx_sequence_len(), DEFAULT_MAX_SEQ_LEN);
+    drop(_env);
 
-    std::env::set_var(ONNX_SEQUENCE_LEN_ENV, "4");
+    let _env = EnvVarGuard::set(ONNX_SEQUENCE_LEN_ENV, "4");
     assert_eq!(configured_onnx_sequence_len(), DEFAULT_MAX_SEQ_LEN);
+    drop(_env);
 
-    std::env::set_var(ONNX_SEQUENCE_LEN_ENV, "256");
+    let _env = EnvVarGuard::set(ONNX_SEQUENCE_LEN_ENV, "256");
     assert_eq!(configured_onnx_sequence_len(), 256);
+    drop(_env);
 
-    std::env::set_var(ONNX_SEQUENCE_LEN_ENV, "4096");
+    let _env = EnvVarGuard::set(ONNX_SEQUENCE_LEN_ENV, "4096");
     assert_eq!(configured_onnx_sequence_len(), MAX_ONNX_SEQUENCE_LEN);
-    std::env::remove_var(ONNX_SEQUENCE_LEN_ENV);
 }
 
 #[test]
 fn dynamic_qwen_uses_batched_inference_by_default() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::remove_var(ONNX_INFERENCE_BATCH_SIZE_ENV);
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
 
     assert_eq!(
         configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic", "cpu"),
@@ -146,8 +183,8 @@ fn dynamic_qwen_uses_batched_inference_by_default() {
 
 #[test]
 fn migraphx_uses_one_stable_batch_shape_by_default() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::remove_var(ONNX_INFERENCE_BATCH_SIZE_ENV);
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
 
     assert_eq!(
         configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic", "migraphx"),

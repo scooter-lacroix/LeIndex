@@ -8,7 +8,6 @@
 //! per-phase main RSS, worker RSS, and combined RSS rather than a single
 //! undifferentiated number.
 
-use crate::workload::CANONICAL_PHASES;
 use serde::{Deserialize, Serialize};
 
 /// Per-phase memory report (VAL-MEASURE-003, VAL-CPHASE-035).
@@ -51,38 +50,37 @@ pub struct MemcheckReport {
     pub timestamp: String,
 }
 
-impl MemcheckReport {
-    /// Get a phase report by name.
-    #[allow(dead_code)]
-    pub fn get_phase(&self, name: &str) -> Option<&PhaseReport> {
-        self.phases.iter().find(|p| p.phase == name)
-    }
-
-    /// Validate that the report contains all canonical phases in order.
-    #[allow(dead_code)]
-    pub fn validate_canonical_phases(&self) -> Result<(), String> {
-        if self.phases.len() != CANONICAL_PHASES.len() {
-            return Err(format!(
-                "expected {} phases, got {}",
-                CANONICAL_PHASES.len(),
-                self.phases.len()
-            ));
-        }
-        for (i, expected) in CANONICAL_PHASES.iter().enumerate() {
-            if self.phases[i].phase != *expected {
-                return Err(format!(
-                    "phase {}: expected '{}', got '{}'",
-                    i, expected, self.phases[i].phase
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workload::CANONICAL_PHASES;
+    impl MemcheckReport {
+        /// Get a phase report by name.
+        pub fn get_phase(&self, name: &str) -> Option<&PhaseReport> {
+            self.phases.iter().find(|p| p.phase == name)
+        }
+
+        /// Validate that the report contains all canonical phases in order.
+        pub fn validate_canonical_phases(&self) -> Result<(), String> {
+            use crate::workload::CANONICAL_PHASES;
+            if self.phases.len() != CANONICAL_PHASES.len() {
+                return Err(format!(
+                    "expected {} phases, got {}",
+                    CANONICAL_PHASES.len(),
+                    self.phases.len()
+                ));
+            }
+            for (i, expected) in CANONICAL_PHASES.iter().enumerate() {
+                if self.phases[i].phase != *expected {
+                    return Err(format!(
+                        "phase {}: expected '{}', got '{}'",
+                        i, expected, self.phases[i].phase
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
 
     fn make_phase(name: &str) -> PhaseReport {
         PhaseReport {

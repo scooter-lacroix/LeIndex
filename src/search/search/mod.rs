@@ -204,7 +204,12 @@ impl SearchEngine {
     /// layer (which can read config; this `search` crate cannot, to keep the
     /// dependency direction cli -> search). Clamped to [0, 1].
     pub fn set_neural_weight(&mut self, weight: f32) {
-        self.neural_weight = weight.clamp(0.0, 1.0);
+        let clamped = weight.clamp(0.0, 1.0);
+        if (clamped - self.neural_weight).abs() > f32::EPSILON {
+            self.search_cache.clear();
+            self.search_cache_bytes = 0;
+        }
+        self.neural_weight = clamped;
     }
 
     /// Index nodes for searching
@@ -667,10 +672,21 @@ impl SearchEngine {
         self.nodes
             .iter()
             .filter_map(|n| {
-                n.neural_embedding
+                // Prefer the in-memory per-node embedding; after snapshot
+                // hydration the neural vectors live in the mmap-backed index
+                // (no heap mirror), so fall back to it to avoid underreporting
+                // — collect is also used to persist neural embeddings.
+                let embedding = n
+                    .neural_embedding
                     .as_ref()
                     .filter(|e| !e.is_empty())
-                    .map(|e| (n.node_id.clone(), e.clone()))
+                    .cloned()
+                    .or_else(|| {
+                        self.neural_vector_index
+                            .as_ref()
+                            .and_then(|idx| idx.embedding(&n.node_id))
+                    });
+                embedding.map(|e| (n.node_id.clone(), e))
             })
             .collect()
     }
@@ -809,7 +825,6 @@ impl SearchEngine {
                 .map_err(|error| format!("failed to build mmap vector index: {error}"))?,
         );
         if let Some(mmap) = neural_mmap.as_ref() {
-            staged.restore_neural_embeddings(mmap);
             // Build the lazy-paged neural ANN — reuses MmapVectorIndex, the
             // SAME pattern as the tfidf index above. This is the semantic
             // RETRIEVAL signal: its top-K hits are unioned into the candidate
@@ -1094,7 +1109,7 @@ impl SearchEngine {
         let neural_candidates: HashSet<String> =
             match (&query.query_neural_embedding, &self.neural_vector_index) {
                 (Some(q_emb), Some(idx)) => idx
-                    .search(q_emb, (query.top_k * 10).max(100))
+                    .search(q_emb, query.top_k.saturating_mul(10).max(100))
                     .into_iter()
                     .map(|(id, _)| id)
                     .collect(),
@@ -1118,39 +1133,24 @@ impl SearchEngine {
         let final_results = self.finalize_results(results, query.top_k, cache_key);
         Ok(final_results)
     }
-    /// Pre-compute TF-IDF vector search results for semantic queries. Uses the
-    /// provided query embedding, falling back to the first non-empty node
-    /// embedding (legacy). Returns empty for non-semantic queries.
+    /// Pre-compute TF-IDF vector search results for semantic queries using the
+    /// caller-provided query embedding. Returns empty when semantic retrieval
+    /// has no query vector or the query is non-semantic.
     fn compute_vector_results(&self, query: &SearchQuery) -> HashMap<String, f32> {
         if !query.semantic {
             return HashMap::new();
         }
-        let embedding = if let Some(emb) = &query.query_embedding {
-            Some(emb.clone())
-        } else {
-            // Legacy fallback: reuse the first non-empty TF-IDF embedding.
-            self.nodes
-                .iter()
-                .find_map(|n| {
-                    if n.tfidf_embedding.is_empty() {
-                        None
-                    } else {
-                        Some(&n.tfidf_embedding)
-                    }
-                })
-                .cloned()
+        let Some(embedding) = query.query_embedding.as_ref() else {
+            // Semantic retrieval without a query vector has no valid vector
+            // space to search. Do not substitute an arbitrary node vector.
+            return HashMap::new();
         };
-        match embedding {
-            Some(emb) => {
-                // Over-fetch beyond top_k for good coverage of relevant nodes.
-                let vector_search_k = (query.top_k * 10).max(100);
-                self.vector_index
-                    .search(&emb, vector_search_k)
-                    .into_iter()
-                    .collect()
-            }
-            None => HashMap::new(),
-        }
+        // Over-fetch beyond top_k for good coverage of relevant nodes.
+        let vector_search_k = query.top_k.saturating_mul(10).max(100);
+        self.vector_index
+            .search(embedding, vector_search_k)
+            .into_iter()
+            .collect()
     }
 
     /// Build the candidate node pool: all nodes when the query has no tokens,
@@ -1444,12 +1444,13 @@ impl SearchEngine {
         // Guard: skip insertion if a single entry exceeds the cache budget.
         if results_bytes < SEARCH_CACHE_MAX_BYTES {
             // If replacing an existing entry, subtract its bytes first.
-            if let Some(existing) = self.search_cache.get(&cache_key) {
+            // Remove an existing value before accounting for the replacement.
+            if let Some(existing) = self.search_cache.pop(&cache_key) {
                 self.search_cache_bytes = self
                     .search_cache_bytes
-                    .saturating_sub(Self::estimate_search_results_bytes(existing));
+                    .saturating_sub(Self::estimate_search_results_bytes(&existing));
             }
-            // Evict until there is room.
+            // Evict until there is room for the new value.
             while self.search_cache_bytes + results_bytes > SEARCH_CACHE_MAX_BYTES
                 && !self.search_cache.is_empty()
             {
@@ -1460,7 +1461,11 @@ impl SearchEngine {
                 }
             }
             self.search_cache_bytes += results_bytes;
-            self.search_cache.put(cache_key, final_results.clone());
+            if let Some((_, evicted)) = self.search_cache.push(cache_key, final_results.clone()) {
+                self.search_cache_bytes = self
+                    .search_cache_bytes
+                    .saturating_sub(Self::estimate_search_results_bytes(&evicted));
+            }
         }
 
         final_results
@@ -1498,7 +1503,7 @@ impl SearchEngine {
         tfidf_score: f32,
     ) -> Score {
         let structural_score = (node.complexity as f32 / 100.0).min(1.0);
-        let neural_score = Self::neural_score(query, node);
+        let neural_score = self.neural_score(query, node);
         let neural_available = query.query_neural_embedding.is_some();
         let is_exact_mode = matches!(
             query.query_type,
@@ -1515,13 +1520,22 @@ impl SearchEngine {
         score
     }
 
-    fn neural_score(query: &SearchQuery, node: &NodeInfo) -> f32 {
-        match (&query.query_neural_embedding, &node.neural_embedding) {
-            (Some(query_embedding), Some(node_embedding)) => {
-                crate::search::vector::cosine_similarity(query_embedding, node_embedding)
-            }
-            _ => 0.0,
-        }
+    fn neural_score(&self, query: &SearchQuery, node: &NodeInfo) -> f32 {
+        let Some(query_embedding) = query.query_neural_embedding.as_ref() else {
+            return 0.0;
+        };
+        self.neural_vector_index
+            .as_ref()
+            .and_then(|index| index.similarity(&node.node_id, query_embedding))
+            .or_else(|| {
+                node.neural_embedding
+                    .as_ref()
+                    .filter(|embedding| embedding.len() == query_embedding.len())
+                    .map(|embedding| {
+                        crate::search::vector::cosine_similarity(query_embedding, embedding)
+                    })
+            })
+            .unwrap_or(0.0)
     }
 
     fn scoring_weights(&self, query: &SearchQuery, neural_available: bool) -> (f32, f32, f32, f32) {

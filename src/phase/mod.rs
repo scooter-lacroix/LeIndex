@@ -283,18 +283,22 @@ fn run_phase5(
         return Ok((cached.payload, true));
     }
 
-    let phase1_summary = phase1_summary
-        .cloned()
-        .unwrap_or_else(|| phase1::run(context));
-    let phase2_summary = phase2_summary
-        .cloned()
-        .unwrap_or_else(|| phase2::run(context));
-    let phase3_summary = phase3_summary
-        .cloned()
-        .unwrap_or_else(|| phase3::run(context, options));
-    let phase4_summary = phase4_summary
-        .cloned()
-        .unwrap_or_else(|| phase4::run(context, options));
+    let phase1_summary = match phase1_summary {
+        Some(summary) => summary.clone(),
+        None => compute_and_cache_phase1(cache, context)?,
+    };
+    let phase2_summary = match phase2_summary {
+        Some(summary) => summary.clone(),
+        None => compute_and_cache_phase2(cache, context)?,
+    };
+    let phase3_summary = match phase3_summary {
+        Some(summary) => summary.clone(),
+        None => compute_and_cache_phase3(cache, context, options)?,
+    };
+    let phase4_summary = match phase4_summary {
+        Some(summary) => summary.clone(),
+        None => compute_and_cache_phase4(cache, context, options)?,
+    };
 
     let summary = phase5::run(
         context,
@@ -318,6 +322,89 @@ fn should_run(phase: u8, selection: PhaseSelection) -> bool {
         PhaseSelection::Single(p) => p == phase,
         PhaseSelection::All => true,
     }
+}
+
+/// Compute a phase 1 summary and persist it to the cache.
+///
+/// Used as the fallback path in `run_phase5` when a caller-supplied summary
+/// is not available. Without this persistence, a later request recomputes
+/// the same summary unnecessarily.
+fn compute_and_cache_phase1(
+    cache: &PhaseCache,
+    context: &PhaseExecutionContext,
+) -> Result<Phase1Summary> {
+    if let Some(cached) =
+        cache.load::<Phase1Summary>(&context.project_id, &context.generation_hash, 1)?
+    {
+        return Ok(cached.payload);
+    }
+    let summary = phase1::run(context);
+    cache.save(&context.project_id, &context.generation_hash, 1, &summary)?;
+    Ok(summary)
+}
+
+fn compute_and_cache_phase2(
+    cache: &PhaseCache,
+    context: &PhaseExecutionContext,
+) -> Result<Phase2Summary> {
+    if let Some(cached) =
+        cache.load::<Phase2Summary>(&context.project_id, &context.generation_hash, 2)?
+    {
+        return Ok(cached.payload);
+    }
+    let summary = phase2::run(context);
+    cache.save(&context.project_id, &context.generation_hash, 2, &summary)?;
+    Ok(summary)
+}
+
+fn compute_and_cache_phase3(
+    cache: &PhaseCache,
+    context: &PhaseExecutionContext,
+    options: &PhaseOptions,
+) -> Result<Phase3Summary> {
+    let key = options_hash_for_phase(3, options);
+    if let Some(cached) = cache.load_with_options::<Phase3Summary>(
+        &context.project_id,
+        &context.generation_hash,
+        3,
+        key.as_deref(),
+    )? {
+        return Ok(cached.payload);
+    }
+    let summary = phase3::run(context, options);
+    cache.save_with_options(
+        &context.project_id,
+        &context.generation_hash,
+        3,
+        key.as_deref(),
+        &summary,
+    )?;
+    Ok(summary)
+}
+
+fn compute_and_cache_phase4(
+    cache: &PhaseCache,
+    context: &PhaseExecutionContext,
+    options: &PhaseOptions,
+) -> Result<Phase4Summary> {
+    let key = options_hash_for_phase(4, options);
+    if let Some(cached) = cache.load_with_options::<Phase4Summary>(
+        &context.project_id,
+        &context.generation_hash,
+        4,
+        key.as_deref(),
+    )? {
+        return Ok(cached.payload);
+    }
+    let summary = phase4::run(context, options);
+    cache.save_with_options(
+        &context.project_id,
+        &context.generation_hash,
+        4,
+        key.as_deref(),
+        &summary,
+    )?;
+    Ok(summary)
 }
 
 fn options_hash_for_phase(phase: u8, options: &PhaseOptions) -> Option<String> {

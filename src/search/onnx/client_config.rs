@@ -16,10 +16,10 @@ pub(super) fn embed_daemon_enabled() -> bool {
 
 /// Maximum response frame size in bytes.
 ///
-/// This mirrors the worker-side guard (`max_frame_size * 2` = 32 MiB) to
-/// prevent a compromised or buggy worker from causing excessive allocations.
-/// A response larger than this is rejected with a clear protocol error.
-pub(super) const MAX_RESPONSE_FRAME_SIZE: u32 = 64 * 1024 * 1024; // 64 MiB
+/// Mirrors the worker-side incoming-frame guard (`max_frame_size * 2` = 32 MiB
+/// with the default 16 MiB max_frame_size). A response larger than this is
+/// rejected with a clear protocol error.
+pub(super) const MAX_RESPONSE_FRAME_SIZE: u32 = 32 * 1024 * 1024; // 32 MiB
 
 /// Read buffer capacity for BufReader wrapping the inference data path.
 ///
@@ -296,6 +296,56 @@ pub(super) fn cleanup_daemon_paths(socket_path: &Path) {
     let _ = std::fs::remove_file(socket_path);
     let _ = std::fs::remove_file(socket_path.with_extension("status"));
     let _ = std::fs::remove_file(socket_path.with_extension("pid"));
+    let _ = std::fs::remove_file(socket_path.with_extension("start"));
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_pid_is_owned(pid: libc::pid_t, socket_path: &Path) -> bool {
+    let expected_start = std::fs::read_to_string(socket_path.with_extension("start"))
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let Some(expected_start) = expected_start else {
+        return false;
+    };
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+    let actual_start = stat
+        .as_deref()
+        .and_then(|stat| stat.rsplit_once(") "))
+        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+        .and_then(|value| value.parse::<u64>().ok());
+    if actual_start != Some(expected_start) {
+        return false;
+    }
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok();
+    let Some(cmdline) = cmdline else {
+        return false;
+    };
+    let command = String::from_utf8_lossy(&cmdline);
+    if !command.split('\0').any(|arg| arg.contains("leindex-embed")) {
+        return false;
+    }
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok();
+    let Some(uid_line) = status
+        .as_deref()
+        .and_then(|status| status.lines().find(|line| line.starts_with("Uid:")))
+    else {
+        return false;
+    };
+    let Some(uid) = uid_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    uid == unsafe { libc::geteuid() }
+}
+
+#[cfg(not(target_os = "linux"))]
+/// Fail closed on Unix platforms without a process-identity API wired here;
+/// stale cleanup must never signal an unverified PID.
+fn daemon_pid_is_owned(_pid: libc::pid_t, _socket_path: &Path) -> bool {
+    false
 }
 
 /// Kill a stale daemon process by reading its PID from the `.pid` sidecar
@@ -315,23 +365,34 @@ pub(super) fn kill_stale_daemon_by_pid(socket_path: &Path) {
     else {
         return;
     };
-    if pid <= 0 {
+    if pid <= 0 || !daemon_pid_is_owned(pid, socket_path) {
         return;
     }
 
-    // SIGTERM first to allow graceful cleanup.
+    // Validate immediately before signaling. The sidecar/start-time checks
+    // narrow the PID-reuse window; fail closed if ownership changed.
+    if !daemon_pid_is_owned(pid, socket_path) {
+        return;
+    }
     let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
 
     // Bounded grace window for graceful exit, then SIGKILL.
     let deadline = Instant::now() + STALE_DAEMON_KILL_GRACE;
     loop {
+        // Re-check ownership before escalation so PID reuse cannot turn the
+        // cleanup path into a signal against an unrelated process.
+        if !daemon_pid_is_owned(pid, socket_path) {
+            break;
+        }
         // Check liveness: kill(pid, 0) returns 0 if the process exists.
         let alive = unsafe { libc::kill(pid, 0) } == 0;
         if !alive {
             break;
         }
         if Instant::now() >= deadline {
-            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            if daemon_pid_is_owned(pid, socket_path) {
+                let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
             break;
         }
         thread::sleep(Duration::from_millis(25));

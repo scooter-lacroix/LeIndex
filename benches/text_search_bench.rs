@@ -17,7 +17,7 @@
 //! cargo bench --bench text_search_bench -- --baseline before
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 // Mock dependencies from helpers.rs to keep benchmark self-contained while mirroring production
 fn normalise_ws(s: &str) -> String {

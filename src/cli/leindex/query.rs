@@ -132,9 +132,9 @@ impl LeIndex {
                             let path = self.resolve_indexed_file_path(&node.file_path);
                             let bytes = file_cache
                                 .entry(node.file_path.to_string())
-                                .or_insert_with(|| std::fs::read(&path).ok())
-                                .clone();
+                                .or_insert_with(|| std::fs::read(&path).ok());
                             bytes
+                                .as_ref()
                                 .filter(|bytes| {
                                     node.byte_range.0 < node.byte_range.1
                                         && node.byte_range.1 <= bytes.len()
@@ -948,7 +948,7 @@ fn fuzzy_find_node(
         };
         if best_match
             .as_ref()
-            .map_or(true, |(_, best_score)| score > *best_score)
+            .is_none_or(|(_, best_score)| score > *best_score)
         {
             best_match = Some((node_id, score));
         }
@@ -991,6 +991,8 @@ fn event_loop_candidate_nodes(
         return bounded_node_indices(pdg);
     }
 
+    let mut candidates: Vec<_> = candidates.into_iter().collect();
+    candidates.sort_unstable();
     candidates
         .into_iter()
         .map(|index| crate::graph::pdg::NodeId::new(index as usize))
@@ -1249,7 +1251,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{simple_stem, LeIndex};
+    use super::{LeIndex, simple_stem};
     use crate::cli::memory::CacheEntry;
     use crate::search::{ranking::Score, search::SearchResult};
 

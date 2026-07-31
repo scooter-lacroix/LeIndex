@@ -14,8 +14,8 @@ use serde_json::Value;
 
 use super::diff::{render_default, render_diff_value};
 use super::{
-    normalize_tool_name, truncate_chars, BOLD, DIM, LIGHT_BLUE, LIGHT_CYAN, LIGHT_GREEN,
-    LIGHT_GREY, LIGHT_MAGENTA, LIGHT_RED, LIGHT_YELLOW, RESET, WHITE,
+    BOLD, DIM, LIGHT_BLUE, LIGHT_CYAN, LIGHT_GREEN, LIGHT_GREY, LIGHT_MAGENTA, LIGHT_RED,
+    LIGHT_YELLOW, RESET, WHITE, normalize_tool_name, truncate_chars,
 };
 mod git_status;
 use git_status::render_git_status;
@@ -182,10 +182,7 @@ fn render_tree_node(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     let dep_suffix = if incoming > 0 || outgoing > 0 {
-        format!(
-            "  {}[{}→{}←{}]{}",
-            count_color, outgoing, incoming, reset, reset,
-        )
+        format!("  {}[{}→{}]{}", count_color, outgoing, incoming, reset,)
     } else {
         String::new()
     };
@@ -1222,8 +1219,8 @@ fn render_phase(data: &Value, color: bool) -> String {
     }
 
     // Show generation
-    if let Some(gen) = data.get("generation").and_then(|v| v.as_str()) {
-        out.push_str(&field("Generation", gen, color));
+    if let Some(r#gen) = data.get("generation").and_then(|v| v.as_str()) {
+        out.push_str(&field("Generation", r#gen, color));
     }
 
     out.push_str(&render_phase_section(data, 1, color));

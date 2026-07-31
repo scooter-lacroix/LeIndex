@@ -23,7 +23,7 @@ use crate::search::onnx::remote::RemoteEmbeddingProvider;
 use crate::search::onnx::{GenericRemoteProvider, RemoteEmbeddingConfig, RemoteEmbeddingError};
 
 use super::leindex::{
-    FileStats, IndexStats, ProjectFileScan, DEPENDENCY_MANIFEST_NAMES, SKIP_DIRS,
+    DEPENDENCY_MANIFEST_NAMES, FileStats, IndexStats, ProjectFileScan, SKIP_DIRS,
     SOURCE_FILE_EXTENSIONS,
 };
 mod hybrid;
@@ -222,6 +222,33 @@ fn is_external_node_excluded(node: &crate::graph::pdg::Node) -> bool {
     node.node_type == NodeType::External
 }
 
+/// Precomputed context for FileSummary node enrichment.
+///
+/// Built once per indexing pass to avoid scanning all PDG nodes for every
+/// FileSummary node (O(N×M) → O(1) per lookup).
+pub(crate) struct FileSummaryContext {
+    /// file_path → names of non-FileSummary symbols in PDG iteration order
+    file_symbols: HashMap<String, Vec<String>>,
+}
+
+impl FileSummaryContext {
+    /// Build the context from a PDG with a single O(N) pass.
+    pub(crate) fn from_pdg(pdg: &ProgramDependenceGraph) -> Self {
+        let mut file_symbols: HashMap<String, Vec<String>> = HashMap::new();
+        for ni in pdg.node_indices() {
+            if let Some(n) = pdg.get_node(ni) {
+                if !matches!(n.node_type, NodeType::FileSummary) {
+                    file_symbols
+                        .entry(n.file_path.to_string())
+                        .or_default()
+                        .push(n.name.clone());
+                }
+            }
+        }
+        Self { file_symbols }
+    }
+}
+
 /// Build the bounded semantic text used by both the mandatory lexical index
 /// and the deferred neural enrichment pass. Keeping this in one place makes
 /// the two result layers rank the same node content.
@@ -231,6 +258,7 @@ pub(crate) fn enriched_node_content(
     node: &crate::graph::pdg::Node,
     file_bytes: &[u8],
     connectivity_config: &crate::graph::pdg::TraversalConfig,
+    file_summary_ctx: &FileSummaryContext,
 ) -> String {
     let content = String::from_utf8_lossy(file_bytes);
     let mut enrichment = format!(
@@ -261,20 +289,18 @@ pub(crate) fn enriched_node_content(
     // individual function does. (conceptual-recall fix)
     if matches!(node.node_type, NodeType::FileSummary) {
         let doc = leading_file_doc(file_bytes);
-        let mut items: Vec<String> = Vec::new();
-        for ni in pdg.node_indices() {
-            if let Some(n) = pdg.get_node(ni) {
-                if !matches!(n.node_type, NodeType::FileSummary)
-                    && n.file_path == node.file_path
-                    && n.name != node.name
-                {
-                    items.push(n.name.clone());
-                    if items.len() >= 40 {
-                        break;
-                    }
-                }
-            }
-        }
+        let items: Vec<String> = file_summary_ctx
+            .file_symbols
+            .get(&*node.file_path)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter(|n| *n != &node.name)
+                    .take(40)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         let doc_block = if doc.is_empty() {
             String::new()
         } else {
@@ -718,6 +744,18 @@ fn finalize_project_scan(
 /// If a `FileReadCache` is provided, it will be populated with file contents
 /// so that subsequent calls to `index_nodes` can reuse the same cache and
 /// avoid reading files twice.
+///
+/// # Fail-fast on I/O errors
+///
+/// An unreadable source file aborts the entire collection via `?` propagation.
+/// This is intentional: the hash map is the authoritative change-detection
+/// mechanism. A missing entry is indistinguishable from "file was deleted" —
+/// but the file still exists on disk, creating a false signal. The
+/// parse-plan logic compares current hashes to `indexed_files`; a missing
+/// entry forces a parse only if the file appears in the current scan. If a
+/// file was skipped from the scan entirely due to an I/O error, it is never
+/// scheduled. Fail-fast makes incomplete generations visible rather than
+/// silently producing partial indexes with undetectable gaps.
 pub(crate) fn collect_source_files_with_hashes(
     scan: &ProjectFileScan,
     mut file_cache: Option<&mut FileReadCache>,
@@ -883,8 +921,14 @@ fn index_nodes_with_embedder_inner(
     };
 
     let node_indices: Vec<petgraph::graph::NodeIndex> = pdg.node_indices().collect();
-    let (df, total_docs) =
-        build_document_frequencies(pdg, &node_indices, &mut file_cache, &connectivity_config);
+    let file_summary_ctx = FileSummaryContext::from_pdg(pdg);
+    let (df, total_docs) = build_document_frequencies(
+        pdg,
+        &node_indices,
+        &mut file_cache,
+        &connectivity_config,
+        &file_summary_ctx,
+    );
     let embedder = build_embedder_from_corpus(embedder, total_docs, df, pdg, _allow_neural);
 
     // A+ bound-gated admission, selective pruning, and work hoisting.
@@ -901,6 +945,7 @@ fn index_nodes_with_embedder_inner(
     search_engine.clear_index();
 
     let mut nodes: Vec<NodeInfo> = Vec::with_capacity(batch_size);
+    let mut total_admitted: usize = 0;
 
     for batch in node_indices.chunks(batch_size) {
         nodes.clear();
@@ -921,6 +966,7 @@ fn index_nodes_with_embedder_inner(
                 &mut admission_gate,
                 &mut work_hoister,
                 &embedder,
+                &file_summary_ctx,
                 _allow_neural,
             ) {
                 NodeBuildOutcome::SkippedExternal => external_skipped_count += 1,
@@ -951,16 +997,17 @@ fn index_nodes_with_embedder_inner(
             &mut nodes,
             Vec::with_capacity(batch_size),
         ));
+        total_admitted += admission_gate.nodes_admitted();
     }
 
-    // A+ logging: per-batch stats at info! level (invisible under default WARN).
+    // A+ logging: run-total stats at info! level (invisible under default WARN).
     if pruned_count > 0 || shed_count > 0 || hoisted_count > 0 || external_skipped_count > 0 {
         info!(
             pruned = pruned_count,
             shed = shed_count,
             hoisted = hoisted_count,
             external_skipped = external_skipped_count,
-            admitted = admission_gate.nodes_admitted(),
+            admitted = total_admitted,
             "A+ bound-gated indexing stats"
         );
     }
@@ -971,6 +1018,7 @@ fn index_nodes_with_embedder_inner(
             total_pruned = pruned_count,
             total_shed = shed_count,
             total_hoisted = hoisted_count,
+            total_admitted = total_admitted,
             "indexing completed with pruning/shedding — some nodes were filtered"
         );
     }
@@ -980,12 +1028,11 @@ fn index_nodes_with_embedder_inner(
 /// Run deferred neural embedding for the pending batch indices, caching each
 /// result in the work hoister and storing it on the node. Sub-chunked to cap
 /// IPC payload and worker memory. No-op for an empty pending list.
-#[allow(unused_variables)] // embedder/work_hoister used only under onnx/remote-embeddings
 fn embed_pending_neural_batch(
-    embedder: &HybridEmbedder,
+    _embedder: &HybridEmbedder,
     nodes: &mut [NodeInfo],
     neural_pending: &[usize],
-    work_hoister: &mut crate::search::search::WorkHoister,
+    _work_hoister: &mut crate::search::search::WorkHoister,
 ) {
     const NEURAL_IPC_BATCH: usize = 256;
     for ipc_chunk in neural_pending.chunks(NEURAL_IPC_BATCH) {
@@ -995,10 +1042,10 @@ fn embed_pending_neural_batch(
                 .iter()
                 .map(|&idx| nodes[idx].content.clone())
                 .collect();
-            let batch_results = embedder.embed_neural_batch_blocking(&texts);
+            let batch_results = _embedder.embed_neural_batch_blocking(&texts);
             for (i, &node_vec_idx) in ipc_chunk.iter().enumerate() {
                 let neural = batch_results.get(i).and_then(|r| r.clone());
-                work_hoister.store(
+                _work_hoister.store(
                     &nodes[node_vec_idx].content,
                     nodes[node_vec_idx].tfidf_embedding.clone(),
                     neural.clone(),
@@ -1044,6 +1091,7 @@ fn build_indexed_node(
     admission_gate: &mut crate::search::search::IndexingAdmissionGate,
     work_hoister: &mut crate::search::search::WorkHoister,
     embedder: &HybridEmbedder,
+    file_summary_ctx: &FileSummaryContext,
     allow_neural: bool,
 ) -> NodeBuildOutcome {
     if is_external_node_excluded(node) {
@@ -1053,7 +1101,14 @@ fn build_indexed_node(
     let file_bytes = file_cache
         .get_or_read(Path::new(&*node.file_path))
         .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
-    let node_content = enriched_node_content(pdg, node_idx, node, &file_bytes, connectivity_config);
+    let node_content = enriched_node_content(
+        pdg,
+        node_idx,
+        node,
+        &file_bytes,
+        connectivity_config,
+        file_summary_ctx,
+    );
 
     let pruning_decision = pruner.evaluate(&node.file_path, &node_content, &node.name);
     if pruning_decision != crate::search::search::PruningDecision::Keep {
@@ -1117,6 +1172,7 @@ fn build_document_frequencies(
     node_indices: &[petgraph::graph::NodeIndex],
     file_cache: &mut FileReadCache,
     connectivity_config: &crate::graph::pdg::TraversalConfig,
+    file_summary_ctx: &FileSummaryContext,
 ) -> (std::collections::HashMap<String, usize>, usize) {
     let mut df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut seen_tokens: HashSet<String> = HashSet::new();
@@ -1131,8 +1187,14 @@ fn build_document_frequencies(
         let file_bytes = file_cache
             .get_or_read(Path::new(&*node.file_path))
             .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
-        let node_content =
-            enriched_node_content(pdg, node_idx, node, &file_bytes, connectivity_config);
+        let node_content = enriched_node_content(
+            pdg,
+            node_idx,
+            node,
+            &file_bytes,
+            connectivity_config,
+            file_summary_ctx,
+        );
         let tokens = tokenize_code(&node_content);
         seen_tokens.clear();
         for tok in &tokens {
@@ -1200,6 +1262,7 @@ fn build_embedder_from_corpus(
         dimension: crate::search::search::DEFAULT_EMBEDDING_DIMENSION,
         pdg_nodes: pdg.node_count(),
         pdg_edges: pdg.edge_count(),
+        pdg_fingerprint: pdg_search_fingerprint(pdg),
     };
 
     build_neural_embedder(tfidf_embedder, allow_neural)
@@ -1226,11 +1289,10 @@ fn stratify_vocab(idf_scores: Vec<(String, f32)>) -> Vec<(String, f32)> {
 /// Wrap a TF-IDF embedder as hybrid_local (neural query embedding) when the
 /// ONNX feature is enabled and neural indexing is allowed, falling back to
 /// tfidf_only on initialization failure or when neural is disabled.
-#[allow(unused_variables)] // allow_neural used only under the onnx feature
-fn build_neural_embedder(tfidf_embedder: TfIdfEmbedder, allow_neural: bool) -> HybridEmbedder {
+fn build_neural_embedder(tfidf_embedder: TfIdfEmbedder, _allow_neural: bool) -> HybridEmbedder {
     #[cfg(feature = "onnx")]
     {
-        if allow_neural {
+        if _allow_neural {
             match HybridEmbedder::hybrid_local(tfidf_embedder.clone(), None) {
                 Ok(hybrid) => hybrid,
                 Err(e) => {
@@ -1264,6 +1326,7 @@ pub(crate) fn enrich_neural_embeddings(
     pdg: &ProgramDependenceGraph,
     embedder: &HybridEmbedder,
     file_cache: &mut FileReadCache,
+    admitted_node_ids: &HashSet<String>,
 ) -> Vec<(String, Vec<f32>)> {
     if !embedder.has_neural() {
         return Vec::new();
@@ -1287,6 +1350,7 @@ pub(crate) fn enrich_neural_embeddings(
         };
         let mut pending = Vec::with_capacity(NEURAL_IPC_BATCH);
         let mut rows = Vec::new();
+        let file_summary_ctx = FileSummaryContext::from_pdg(pdg);
         for node_idx in pdg.node_indices() {
             let Some(node) = pdg.get_node(node_idx) else {
                 continue;
@@ -1296,11 +1360,22 @@ pub(crate) fn enrich_neural_embeddings(
             if is_external_node_excluded(node) {
                 continue;
             }
+            // A1: Neural/lexical consistency — only embed nodes that survived
+            // the lexical admission gate (ContentPruner + IndexingAdmissionGate).
+            if !admitted_node_ids.contains(&node.id) {
+                continue;
+            }
             let file_bytes = file_cache
                 .get_or_read(Path::new(&*node.file_path))
                 .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
-            let text =
-                enriched_node_content(pdg, node_idx, node, &file_bytes, &connectivity_config);
+            let text = enriched_node_content(
+                pdg,
+                node_idx,
+                node,
+                &file_bytes,
+                &connectivity_config,
+                &file_summary_ctx,
+            );
             pending.push((node.id.clone(), text));
             if pending.len() == NEURAL_IPC_BATCH {
                 append_neural_batch(embedder, &pending, &mut rows);
@@ -1390,58 +1465,6 @@ pub(crate) fn detect_changed_manifests(
         }
     }
     changed
-}
-
-/// Given a set of changed manifests, find which source files import
-/// from packages defined in those manifests.
-#[allow(dead_code)]
-pub(crate) fn files_importing_from_manifests(
-    changed_manifests: &[PathBuf],
-    all_source_paths: &[PathBuf],
-    pdg: &ProgramDependenceGraph,
-) -> Vec<PathBuf> {
-    if changed_manifests.is_empty() {
-        return Vec::new();
-    }
-
-    let changed_dirs: HashSet<PathBuf> = changed_manifests
-        .iter()
-        .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
-        .collect();
-
-    let mut affected: Vec<PathBuf> = Vec::new();
-    for sp in all_source_paths {
-        if let Some(parent) = sp.parent() {
-            for dir in &changed_dirs {
-                if sp.starts_with(dir) || parent.starts_with(dir) {
-                    affected.push(sp.clone());
-                    break;
-                }
-            }
-        }
-    }
-
-    let affected_set: HashSet<String> = affected.iter().map(|p| p.display().to_string()).collect();
-
-    let source_set: HashSet<String> = all_source_paths
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect();
-
-    let mut affected_set = affected_set;
-    for nid in pdg.node_indices() {
-        if let Some(node) = pdg.get_node(nid) {
-            if node.node_type == NodeType::External {
-                let fp = node.file_path.as_ref();
-                if !affected_set.contains(fp) && source_set.contains(fp) {
-                    affected_set.insert(node.file_path.to_string());
-                    affected.push(PathBuf::from(&*node.file_path));
-                }
-            }
-        }
-    }
-
-    affected
 }
 
 // ============================================================================
@@ -1591,14 +1614,6 @@ pub(crate) fn persist_search_snapshot(
         "Persisted search snapshot"
     );
     Ok(())
-}
-
-/// Try to load previously persisted search metadata.
-#[allow(dead_code)]
-pub(crate) fn try_load_search_snapshot(
-    project_path: &Path,
-) -> Option<crate::search::search::SearchSnapshot> {
-    try_load_search_snapshot_from_storage(&project_path.join(".leindex"))
 }
 
 /// Try to load search metadata from an explicit storage directory.
@@ -1846,16 +1861,6 @@ fn sanitize_for_prefix(s: &str) -> String {
             }
         })
         .collect()
-}
-
-/// Try to load a previously persisted mmap embedding index.
-///
-/// Returns `None` if the file does not exist or is corrupt.
-#[allow(dead_code)]
-pub(crate) fn try_load_mmap_embeddings(
-    project_path: &Path,
-) -> Option<crate::search::vector::MmapEmbeddingIndex> {
-    try_load_mmap_embeddings_from_storage(&project_path.join(".leindex"))
 }
 
 /// Try to load TF-IDF embeddings from an explicit storage directory.
