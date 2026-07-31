@@ -354,12 +354,11 @@ impl EmbeddingClient {
         let configured_provider = std::env::var("LEINDEX_WORKER_EXECUTION_PROVIDER")
             .ok()
             .or_else(|| config_env.execution_provider.clone());
-        let configured_model = std::env::var("LEINDEX_WORKER_MODEL")
-            .ok()
-            .or_else(|| config_env.model_name.clone());
-
         #[cfg(unix)]
         if self.use_daemon {
+            let configured_model = std::env::var("LEINDEX_WORKER_MODEL")
+                .ok()
+                .or_else(|| config_env.model_name.clone());
             if let Some(handle) = self.spawn_or_connect_daemon(
                 &worker_path,
                 config_env,
@@ -1068,8 +1067,8 @@ impl EmbeddingClient {
         let should_kill_child = !handle.persistent || (kill_persistent && owns_child);
         if should_kill_child {
             if handle.persistent && owns_child {
+                #[cfg(unix)]
                 if let Some(socket_path) = handle.socket_path.take() {
-                    #[cfg(unix)]
                     cleanup_daemon_paths(&socket_path);
                 }
             }

@@ -243,7 +243,7 @@ mod windows_lock {
     const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
     const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
 
-    extern "system" {
+    unsafe extern "system" {
         fn LockFileEx(
             handle: usize,
             flags: u32,

@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -462,7 +462,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<String> {
     }
     fs::rename(&next, path)?;
     #[cfg(unix)]
-    File::open(parent)?.sync_all()?;
+    fs::File::open(parent)?.sync_all()?;
     Ok(blake3::hash(bytes).to_hex().to_string())
 }
 

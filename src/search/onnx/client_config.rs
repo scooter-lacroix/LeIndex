@@ -344,7 +344,7 @@ fn daemon_pid_is_owned(pid: libc::pid_t, socket_path: &Path) -> bool {
 #[cfg(not(target_os = "linux"))]
 /// Fail closed on Unix platforms without a process-identity API wired here;
 /// stale cleanup must never signal an unverified PID.
-fn daemon_pid_is_owned(_pid: libc::pid_t, _socket_path: &Path) -> bool {
+fn daemon_pid_is_owned(_pid: i32, _socket_path: &Path) -> bool {
     false
 }
 
