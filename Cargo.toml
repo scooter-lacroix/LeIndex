@@ -284,7 +284,7 @@ rayon = { version = "1.10", optional = true }
 once_cell = { version = "1.19", optional = true }
 
 # Graph feature dependencies
-petgraph = { version = "0.7", features = ["serde"], optional = true }
+petgraph = { version = "0.8", features = ["serde"], optional = true }
 
 # Storage feature dependencies
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
