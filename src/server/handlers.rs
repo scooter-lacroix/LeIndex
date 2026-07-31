@@ -859,7 +859,7 @@ pub async fn websocket_handler(
                         Ok(event) => {
                             let json = event.to_json();
                             use axum::extract::ws::Message;
-                            if socket.send(Message::Text(json)).await.is_err() {
+                            if socket.send(Message::Text(json.into())).await.is_err() {
                                 break;
                             }
                         }

@@ -54,7 +54,7 @@
     "LICENSE"
   ],
   "dependencies": {
-    "https-proxy-agent": "^7.0.0",
+    "https-proxy-agent": "^9.1.0",
     "progress": "^2.0.3"
   },
   "devDependencies": {}
