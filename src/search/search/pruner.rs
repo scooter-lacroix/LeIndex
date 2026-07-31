@@ -287,7 +287,10 @@ impl WorkHoister {
             byte_size,
         };
 
-        if let Some(existing) = self.cache.put(hash, entry) {
+        // `push` (not `put`) so the entry removed for a count-capacity eviction
+        // is returned and its bytes subtracted. `put` silently drops that entry,
+        // inflating tracked_bytes and causing over-eviction.
+        if let Some((_, existing)) = self.cache.push(hash, entry) {
             self.tracked_bytes = self.tracked_bytes.saturating_sub(existing.byte_size);
         }
 
