@@ -271,6 +271,18 @@ fn run_phase5(
     phase3_summary: Option<&Phase3Summary>,
     phase4_summary: Option<&Phase4Summary>,
 ) -> Result<(Phase5Summary, bool)> {
+    let key = options_hash_for_phase(5, options);
+
+    // Check the cache FIRST: a hit means phase1-4 never need to run.
+    if let Some(cached) = cache.load_with_options::<Phase5Summary>(
+        &context.project_id,
+        &context.generation_hash,
+        5,
+        key.as_deref(),
+    )? {
+        return Ok((cached.payload, true));
+    }
+
     let phase1_summary = phase1_summary
         .cloned()
         .unwrap_or_else(|| phase1::run(context));
@@ -283,16 +295,6 @@ fn run_phase5(
     let phase4_summary = phase4_summary
         .cloned()
         .unwrap_or_else(|| phase4::run(context, options));
-    let key = options_hash_for_phase(5, options);
-
-    if let Some(cached) = cache.load_with_options::<Phase5Summary>(
-        &context.project_id,
-        &context.generation_hash,
-        5,
-        key.as_deref(),
-    )? {
-        return Ok((cached.payload, true));
-    }
 
     let summary = phase5::run(
         context,
