@@ -315,12 +315,19 @@ fn manifests_are_stale(
 
     find_new_root_manifest(ctx.project_path, &already_listed)
         || find_new_nested_manifest(ctx.project_path, &already_listed)
-        || manifest_paths
-            .iter()
-            .any(|manifest_path| match std::fs::metadata(manifest_path) {
+        || manifest_paths.iter().any(|manifest_path| {
+            // Resolve relative manifest paths against the project root so
+            // the mtime check is correct regardless of the process CWD.
+            let resolved = if std::path::Path::new(manifest_path).is_absolute() {
+                std::path::PathBuf::from(manifest_path)
+            } else {
+                ctx.project_path.join(manifest_path)
+            };
+            match std::fs::metadata(&resolved) {
                 Ok(metadata) => metadata.modified().is_ok_and(|modified| modified > db_time),
                 Err(_) => true,
-            })
+            }
+        })
 }
 
 /// Check whether the project root contains a manifest that is

@@ -369,14 +369,20 @@ pub(super) fn ensure_hugging_face_model_present(
         });
     }
 
-    install_downloaded_model_file(
-        &staging.join(profile.remote_model),
-        &model_dir.join(profile.local_model),
-    )?;
-    for file in ["tokenizer.json", "config.json"] {
-        install_downloaded_model_file(&staging.join(file), &model_dir.join(file))?;
-    }
+    // Install within a closure so the staging dir is cleaned on every path
+    // (success or install failure) before the error, if any, propagates.
+    let install_result = (|| -> Result<(), SetupError> {
+        install_downloaded_model_file(
+            &staging.join(profile.remote_model),
+            &model_dir.join(profile.local_model),
+        )?;
+        for file in ["tokenizer.json", "config.json"] {
+            install_downloaded_model_file(&staging.join(file), &model_dir.join(file))?;
+        }
+        Ok(())
+    })();
     let _ = std::fs::remove_dir_all(&staging);
+    install_result?;
 
     if !dynamic_model_assets_present(model_dir) {
         return Err(SetupError::ModelUnavailable {
