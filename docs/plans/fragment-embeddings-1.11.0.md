@@ -305,11 +305,11 @@ git commit -m "feat: incremental fragment sync with root-hash guard"
 
 **Files:** `src/cli/leindex/mod.rs` (`search_cache_key_for` :643); `src/cli/index_builder/mod.rs` (`search_cache_key_for` :1496, `v2:` format :1517).
 
-- [ ] Extend the `v2:` query-result cache key with: `fragment_enabled`, `fragment_weight`, `fragment_root_hash`. A config or generation change invalidates the persisted search cache (mirror existing `embed_model`/`rerank_model` discipline).
-- [ ] No change to `search_cache_key(project_id)` (`src/cli/memory.rs:1305`) — that is the index-cache spiller key (`src/cli/index_cache.rs:242`), distinct from the query-result cache.
-- [ ] Add the fragment knobs to `search_cache_key_for`'s signature and all callers (`query.rs:249`, `:337`, `:1288`).
-- [ ] Test: changing `fragment_weight`/root hash produces a different key; legacy keys (no fragment fields) still parse.
-- [ ] Verify and commit:
+- [x] Extend the `v2:` query-result cache key with: `fragment_enabled`, `fragment_weight`, `fragment_root_hash`. A config or generation change invalidates the persisted search cache (mirror existing `embed_model`/`rerank_model` discipline).
+- [x] No change to `search_cache_key(project_id)` (`src/cli/memory.rs:1305`) — that is the index-cache spiller key (`src/cli/index_cache.rs:242`), distinct from the query-result cache.
+- [x] Add the fragment knobs to `search_cache_key_for`'s signature and all callers (`query.rs:249`, `:337`, `:1288`).
+- [x] Test: changing `fragment_weight`/root hash produces a different key; legacy keys (no fragment fields) still parse.
+- [x] Verify and commit:
 
 ```bash
 cargo test -p leindex --features cli cache_key

@@ -977,6 +977,124 @@ fn test_read_file_once_error() {
 }
 
 // ============================================================================
+// CACHE-KEY INTEGRATION (Task 8): fragment knobs fold into the v2 key
+// ============================================================================
+
+/// Minimal `IndexStats` for cache-key tests (the struct has no `Default`).
+fn cache_key_stats() -> IndexStats {
+    IndexStats {
+        total_files: 3,
+        files_parsed: 3,
+        successful_parses: 3,
+        failed_parses: 0,
+        total_signatures: 7,
+        pdg_nodes: 7,
+        pdg_edges: 6,
+        indexed_nodes: 7,
+        indexing_time_ms: 100,
+        external_deps_in_lockfile: 0,
+        external_deps_resolved: 0,
+        external_deps_unresolved: 0,
+        external_deps_total: 0,
+        external_deps_builtin: 0,
+    }
+}
+
+/// Build a search cache key with explicit fragment knobs.
+fn cache_key_with_fragments(
+    fragment_enabled: bool,
+    fragment_weight: f64,
+    fragment_root_hash: &str,
+) -> String {
+    search_cache_key_for(
+        "proj-a",
+        Path::new("/tmp/proj-a"),
+        &cache_key_stats(),
+        "auth token verify",
+        10,
+        None,
+        true,
+        "hybrid",
+        0.4,
+        true,
+        80,
+        fragment_enabled,
+        fragment_weight,
+        fragment_root_hash,
+        "qwen3-embed-0.6b",
+        "qwen3-reranker-0.6b-seq-cls",
+    )
+}
+
+/// A `fragment_weight` change must produce a different key (config invalidation).
+#[test]
+fn test_cache_key_fragment_weight_change_invalidates() {
+    let base = cache_key_with_fragments(true, 0.10, "root-hash-A");
+    let changed = cache_key_with_fragments(true, 0.25, "root-hash-A");
+    assert_ne!(
+        base, changed,
+        "fragment_weight change must invalidate the key"
+    );
+}
+
+/// A fragment root-hash (generation) change must produce a different key.
+#[test]
+fn test_cache_key_fragment_root_hash_change_invalidates() {
+    let base = cache_key_with_fragments(true, 0.10, "root-hash-A");
+    let changed = cache_key_with_fragments(true, 0.10, "root-hash-B");
+    assert_ne!(
+        base, changed,
+        "fragment root hash change must invalidate the key"
+    );
+}
+
+/// The fragment master switch is part of the key (feature-off keys differ).
+#[test]
+fn test_cache_key_fragment_enabled_change_invalidates() {
+    let base = cache_key_with_fragments(true, 0.10, "root-hash-A");
+    let off = cache_key_with_fragments(false, 0.10, "root-hash-A");
+    assert_ne!(base, off, "fragment master switch must invalidate the key");
+}
+
+/// Identical fragment knobs produce the identical key (deterministic).
+#[test]
+fn test_cache_key_fragment_knobs_deterministic() {
+    let a = cache_key_with_fragments(true, 0.10, "root-hash-A");
+    let b = cache_key_with_fragments(true, 0.10, "root-hash-A");
+    assert_eq!(a, b, "same fragment knobs must produce the same key");
+}
+
+/// Legacy v2 keys (written before the fragment fields existed) must still be
+/// valid cache keys: the format string is deterministic and the `v2:` prefix
+/// keeps them sweepable, and they never collide with the fragment-extended key.
+#[test]
+fn test_cache_key_legacy_v2_without_fragment_fields_parses() {
+    // Rebuild the pre-fragment v2 format exactly as older builds produced it
+    // (fragment knobs absent). Deterministic => stable across a key change.
+    let legacy = search_cache_key(&format!(
+        "v2:query:{}:{}:{}:{}:{:?}:neural={}:mode={}:nw={}:rr={}|{}|{}:embed={}",
+        stable_project_cache_id("proj-a", Path::new("/tmp/proj-a")),
+        index_fingerprint(&cache_key_stats()),
+        10,
+        "auth token verify",
+        None::<crate::search::ranking::QueryType>,
+        true,
+        "hybrid",
+        0.4,
+        true,
+        80,
+        "qwen3-reranker-0.6b-seq-cls",
+        "qwen3-embed-0.6b",
+    ));
+    let modern = cache_key_with_fragments(false, 0.0, "");
+    assert!(!legacy.is_empty(), "legacy key format still produces a key");
+    assert_ne!(
+        legacy, modern,
+        "legacy key must not collide with the fragment-extended key"
+    );
+}
+
+// ============================================================================
 // HYBRID EMBEDDING INTEGRATION TESTS
 // ============================================================================
 

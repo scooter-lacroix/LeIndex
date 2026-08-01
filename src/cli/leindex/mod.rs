@@ -640,6 +640,16 @@ impl LeIndex {
         let cfg = crate::config::LeIndexConfig::load_cached();
         let rerank_model = std::env::var("LEINDEX_WORKER_RERANK_MODEL")
             .unwrap_or_else(|_| "qwen3-reranker-0.6b-seq-cls".to_string());
+        // Task 8: the persisted fragment-layer content root hash also lands in
+        // the key — a fragment re-embed (generation change) must invalidate the
+        // query-result cache, mirroring the embed/rerank model discipline. The
+        // manifest + root live under `.leindex/` (see persist_search_snapshot).
+        let fragment_root_hash =
+            index_builder::fragment::sync::load_fragment_root(&self.project_path.join(".leindex"))
+                .ok()
+                .flatten()
+                .map(|root| root.root_hash)
+                .unwrap_or_default();
         index_builder::search_cache_key_for(
             &self.project_id,
             &self.project_path,
@@ -654,6 +664,7 @@ impl LeIndex {
             cfg.search.rerank_top_n,
             cfg.search.fragment_index_enabled,
             cfg.search.fragment_weight,
+            &fragment_root_hash,
             &cfg.neural.model_name,
             &rerank_model,
         )
