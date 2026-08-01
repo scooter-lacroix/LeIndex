@@ -41,8 +41,8 @@ model_name = "qwen3-embed-0.6b-dynamic"
 [search]
 # "hybrid" (lexical + neural), "text" (lexical only), or "neural" (neural only).
 search_mode = "hybrid"
-# Neural score weight in hybrid mode (0.0-1.0).
-neural_weight = 0.6
+# Neural score weight in hybrid mode (0.0-1.0). Default 0.4 (matches scorer).
+neural_weight = 0.4
 
 # ── Indexing pipeline ───────────────────────────────────────────────────────
 [indexing]

@@ -421,6 +421,16 @@ use leindex::lerecherche::SearchEngine;
 
 ## [Unreleased] - INT8 Quantization Optimization
 
+### Changed
+
+- Aligned the `[search] neural_weight` config default to **0.4** (was 0.3) so
+  stock installs match the scorer-side defaults (`HybridScorer::for_code()` /
+  `HybridScoringWeights::default()`, both 0.40). The hybrid blend now shifts
+  toward neural as documented. Users with an explicit `neural_weight` in their
+  config are unaffected.
+- Removed the dead `EmbeddingConfig.neural_weight` project-config knob
+  (never read by scoring); `leindex.toml.example` now ships `neural_weight = 0.4`.
+
 ### ✨ **Performance: INT8 Quantized Vector Search**
 
 Major performance optimization for vector search with ~74% memory reduction.

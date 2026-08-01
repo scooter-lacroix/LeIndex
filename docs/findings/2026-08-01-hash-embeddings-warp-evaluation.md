@@ -200,7 +200,7 @@ Web research (Warp docs, engineering blog, RuVector ADR-210 cross-reference) con
 Beyond the hash-embedding evaluation, the following were observed. Each is small-to-medium; none require the Warp integration.
 
 ### 9.1 Correctness / hygiene
-1. **Config default drift:** `src/config.rs` `default_neural_weight()` returns `0.3`, while `HybridScorer::for_code()` and `HybridScoringWeights::default()` use `0.4`. The CLI passes config's 0.3 via `set_neural_weight`, so the effective default differs from the documented scorer defaults. Pick one source of truth (prefer config; document the scorer default as "legacy"). *(Touched by in-flight plan — reconcile after merge.)*
+1. **Config default drift:** `src/config.rs` `default_neural_weight()` returns `0.3`, while `HybridScorer::for_code()` and `HybridScoringWeights::default()` use `0.4`. The CLI passes config's 0.3 via `set_neural_weight`, so the effective default differs from the documented scorer defaults. **RESOLVED 2026-08-01:** config default is now 0.4 (single source of truth); dead `EmbeddingConfig.neural_weight` removed. See `docs/findings/2026-08-01-neural-weight-default-drift.md`.
 2. **`src/graph/embedding.rs` is dead weight / stale:** `NodeEmbedding` claims "CodeRankEmbed" 768-dim while the real neural model is `qwen3-embed-0.6b` (1024-dim); `EmbeddingCache` uses FIFO eviction with a TODO saying "would use LRU in production" and is not on the search hot path. Either wire it into the fragment store (Phase 1) or delete it.
 3. **`Score::new`/`HybridScorer::with_weights` legacy APIs** are deprecated but still referenced in tests; after 1.10.0, consider removing the deprecated shims to shrink surface (AGENTS.md zero-warning policy already keeps them compiling).
 

@@ -163,7 +163,7 @@ ort_version = "1.25.0"
 
 [search]
 search_mode = "hybrid"
-neural_weight = 0.3
+neural_weight = 0.4
 
 [indexing]
 batch_size = 500

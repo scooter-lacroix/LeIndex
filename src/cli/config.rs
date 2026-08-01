@@ -498,16 +498,17 @@ pub struct MemoryConfig {
     pub max_memory_mb: usize,
 }
 
-/// Embedding configuration for hybrid embedding system
+/// Embedding configuration for hybrid embedding system.
+///
+/// The `neural_weight` field was removed on 2026-08-01 (dead: never read by
+/// scoring — the canonical knob is `[search] neural_weight` in `src/config.rs`).
+/// Existing project configs that set it under `[indexing.embeddings]` still
+/// parse fine: serde ignores unknown fields (no `deny_unknown_fields`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
     /// Enable hybrid embeddings (TF-IDF + neural/remote)
     #[serde(default = "default_enable_hybrid")]
     pub enable_hybrid: bool,
-
-    /// Neural embedding weight in hybrid scoring (0.0-1.0)
-    #[serde(default = "default_neural_weight")]
-    pub neural_weight: f32,
 
     /// Remote embedding API endpoint (if using remote embeddings)
     #[serde(default)]
@@ -526,15 +527,10 @@ const fn default_enable_hybrid() -> bool {
     false // Default to TF-IDF only for compatibility
 }
 
-const fn default_neural_weight() -> f32 {
-    0.4 // Default neural weight from HybridScoringWeights
-}
-
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
             enable_hybrid: default_enable_hybrid(),
-            neural_weight: default_neural_weight(),
             remote_endpoint: None,
             remote_api_key: None,
             onnx_model_path: None,

@@ -124,7 +124,8 @@ pub struct SearchEngine {
     search_cache_bytes: usize,
     /// Configured neural-score weight for the hybrid (None query_type) scoring
     /// arm. Set from `[search] neural_weight` in leindex.toml via
-    /// `set_neural_weight`. Default 0.4 preserves prior behavior when unset.
+    /// `set_neural_weight` (config is the single source of truth; `src/config.rs`
+    /// `default_neural_weight()` = 0.4, matching `HybridScorer::for_code()`).
     neural_weight: f32,
 }
 
