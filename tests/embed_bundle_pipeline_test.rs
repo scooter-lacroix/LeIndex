@@ -1,3 +1,4 @@
+#![cfg(feature = "onnx")]
 // Model resolution contract tests.
 //
 // Published bundles never contain model assets. Setup-managed models resolve

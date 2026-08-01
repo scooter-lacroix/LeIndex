@@ -1049,7 +1049,7 @@ mod tests {
 
     #[test]
     fn test_discover_path_only_checks_pip_before_system() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/ort_discovery.rs");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/embed/ort_discovery.rs");
         let src = std::fs::read_to_string(path).unwrap();
         let helper = src
             .split("pub fn discover_path_only()")
@@ -1072,7 +1072,7 @@ mod tests {
 
     #[test]
     fn test_bare_loader_fallback_does_not_require_path_exists() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/ort_discovery.rs");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/embed/ort_discovery.rs");
         let src = std::fs::read_to_string(path).unwrap();
         let helper = src
             .split("pub fn discover_and_init()")

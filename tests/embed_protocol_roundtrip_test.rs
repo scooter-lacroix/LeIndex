@@ -1,3 +1,4 @@
+#![cfg(feature = "onnx")]
 // Protocol round-trip integration test
 //
 // VAL-CPHASE-003: Worker request/response frames serialize and deserialize

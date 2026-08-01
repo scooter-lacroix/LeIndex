@@ -1,3 +1,4 @@
+#![cfg(feature = "onnx")]
 // Worker runtime lifecycle integration tests
 //
 // Tests the full worker lifecycle behavior:

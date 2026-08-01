@@ -1,3 +1,4 @@
+#![cfg(feature = "onnx")]
 // ONNX worker delegation and fallback integration tests
 //
 // Tests the main-daemon side of the worker architecture:
