@@ -29,6 +29,13 @@ use super::leindex::{
 mod hybrid;
 mod tfidf;
 
+// Fragment chunking (Tier-2 sub-symbol + Tier-3 orphan) — fragment-embeddings
+// 1.11.0 Task 2 deliverable. `dead_code` is allowed while the module API is
+// exercised only by its own tests; production consumers (fragment store, mmap
+// persistence, query fusion) land in Tasks 3-7. Not a suppressed defect.
+#[allow(dead_code)]
+mod fragment;
+
 pub use hybrid::*;
 pub use tfidf::*;
 
@@ -139,7 +146,7 @@ pub(crate) fn tokenize_code(text: &str) -> Vec<String> {
 /// Return a small, non-redundant slice of doc/comment lines immediately
 /// preceding a symbol. This keeps semantic chunks useful for review language
 /// without creating a second full-file embedding document.
-fn preceding_doc_context(bytes: &[u8], start: usize) -> String {
+pub(crate) fn preceding_doc_context(bytes: &[u8], start: usize) -> String {
     let prefix = String::from_utf8_lossy(&bytes[..start.min(bytes.len())]);
     let mut lines = Vec::new();
     for line in prefix.lines().rev() {

@@ -162,15 +162,17 @@ git commit -m "feat: add fragment index configuration knobs"
 
 **Files:** NEW `src/cli/index_builder/fragment/{mod,chunker,orphan,enrich,tests}.rs`; language lookup via `LanguageConfig::from_extension` (`src/parse/traits.rs:396`).
 
-- [ ] `chunker.rs` — port Warp's semantic split (`crates/ai/src/index/full_source_code_embedding/chunker/semantic.rs`):
+> **Progress:** Task 2 implemented 2026-08-01 (`src/cli/index_builder/fragment/{mod,chunker,orphan,enrich,tests}.rs` + wiring in `index_builder/mod.rs`: `#[allow(dead_code)] mod fragment;` + `preceding_doc_context` → `pub(crate)`). Warp `semantic_tests.rs`/`naive_tests.rs` ported verbatim (adapted: `usize` offsets, in-tree `line_spans`, `LanguageId` lookup); orphan/enrich tests added. `cargo test --lib --features cli fragment` 21/21, `cargo clippy -p leindex --features cli --lib -- -D warnings` 0, `cargo fmt --all --check` clean.
+
+- [x] `chunker.rs` — port Warp's semantic split (`crates/ai/src/index/full_source_code_embedding/chunker/semantic.rs`):
   - `split_node` recursion over the node's AST subtree, `MAX_TRAVERSAL_DEPTH = 200`.
   - `MAX_BYTES_PER_CHUNK = fragment_max_bytes` (default 12,000).
   - Reverse-coalesce (Warp `coalesce_fragments`) **within the node byte range only** — invariant 5.
   - Naive fallback (Warp `naive.rs`: 200-line chunks, byte-safe splits) for missing grammar/parse failure.
-- [ ] **Language lookup:** use the verified entry point `LanguageConfig::from_extension` (`src/parse/traits.rs:396`), which delegates to `LanguageId::from_extension` in `src/parse/grammar.rs` — same tree-sitter grammar registry, no new dependency.
-- [ ] `orphan.rs` — Tier-3: union of Tier-1 node byte ranges per file; complement = orphan regions; **exclude the leading file-doc region** (invariant: FileSummary already covers it); chunk with same rules; light header `// type:module lang:<lang> file:<path>`.
-- [ ] `enrich.rs` — fragment enrichment: owner header line (`// type:function lang:rust callers:N callees:N complexity:N` + `// <symbol> in <path>`) prefixed to Tier-2 slices; reuse `preceding_doc_context` (already comment-marker-stripped, 24-line cap).
-- [ ] Port Warp `semantic_tests.rs` expectations verbatim (coalescing keeps `#[derive]`+`struct`, `impl`+method, `fn main` split at byte-safe boundaries; no fragment exceeds max bytes; no fragment crosses a node range). Add orphan tests (module-level statement retrievable; file-doc region excluded; empty complement → zero rows).
+- [x] **Language lookup:** use the verified entry point `LanguageConfig::from_extension` (`src/parse/traits.rs:396`), which delegates to `LanguageId::from_extension` in `src/parse/grammar.rs` — same tree-sitter grammar registry, no new dependency.
+- [x] `orphan.rs` — Tier-3: union of Tier-1 node byte ranges per file; complement = orphan regions; **exclude the leading file-doc region** (invariant: FileSummary already covers it); chunk with same rules; light header `// type:module lang:<lang> file:<path>`.
+- [x] `enrich.rs` — fragment enrichment: owner header line (`// type:function lang:rust callers:N callees:N complexity:N` + `// <symbol> in <path>`) prefixed to Tier-2 slices; reuse `preceding_doc_context` (already comment-marker-stripped, 24-line cap).
+- [x] Port Warp `semantic_tests.rs` expectations verbatim (coalescing keeps `#[derive]`+`struct`, `impl`+method, `fn main` split at byte-safe boundaries; no fragment exceeds max bytes; no fragment crosses a node range). Add orphan tests (module-level statement retrievable; file-doc region excluded; empty complement → zero rows).
 - [ ] Verify and commit:
 
 ```bash
