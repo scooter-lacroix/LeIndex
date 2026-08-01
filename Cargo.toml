@@ -25,6 +25,8 @@ categories = [
 ]
 include = [
     "/src/lib.rs",
+    "/src/feature_flags.rs",
+    "/src/observability.rs",
     "/src/bin/**",
     "/src/cli/**",
     "/src/edit/**",
@@ -38,6 +40,7 @@ include = [
     "/src/validation/**",
     "/tests/**",
     "/benches/**",
+    "/build.rs",
     "/Cargo.toml",
     "/Cargo.lock",
     "/README.md",
