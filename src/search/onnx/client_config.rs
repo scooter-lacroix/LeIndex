@@ -114,11 +114,18 @@ pub(super) struct WorkerConfigEnv {
 ///
 /// VAL-SETUP-020/VAL-ORT-006: when the worker is spawned from the daemon we
 /// surface the dylib path chosen during `leindex setup` so the worker's ORT
-/// discovery chain picks the same build. Reads the process-cached config so
-/// the documented `[neural]` knobs are resolved without re-parsing the file.
-///
+/// discovery chain picks the same build. Reads the TOML directly (the
+/// production caller memoizes via its own OnceLock — see
+/// `WorkerHandle::cached_config`).
 pub(super) fn read_worker_config_env_from_config() -> WorkerConfigEnv {
-    let config = crate::config::LeIndexConfig::load_cached();
+    // Read the TOML directly (not load_cached()): the sole production caller
+    // (WorkerHandle::cached_config) wraps this in its own OnceLock, so the
+    // process-wide cache here would be redundant. Using the non-cached load
+    // keeps the config-reading test helpers honest — they write a fresh
+    // leindex.toml into a temp LEINDEX_HOME and expect to read it back
+    // regardless of which test initialized the global cache first.
+    let config = crate::config::LeIndexConfig::load()
+        .unwrap_or_else(|_| crate::config::LeIndexConfig::default());
     let provider = config.neural.execution_provider.trim().to_ascii_lowercase();
     WorkerConfigEnv {
         ort_dylib_path: config.neural.ort_dylib_path.clone(),
@@ -895,5 +902,22 @@ impl EmbeddingClient {
     pub(super) fn cached_config(&self) -> &WorkerConfigEnv {
         self.cached_config
             .get_or_init(read_worker_config_env_from_config)
+    }
+}
+
+#[cfg(test)]
+mod frame_size_tests {
+    use super::*;
+
+    /// CR-F10 (pr32 plan): the client response-frame guard must match the
+    /// worker-side incoming-frame guard (`max_frame_size * 2` = 32 MiB with the
+    /// default 16 MiB max_frame_size).
+    #[test]
+    fn test_max_response_frame_size_matches_worker_guard() {
+        assert_eq!(MAX_RESPONSE_FRAME_SIZE, 32 * 1024 * 1024);
+        assert_eq!(
+            MAX_RESPONSE_FRAME_SIZE as usize,
+            crate::embed::runtime::DEFAULT_MAX_FRAME_SIZE * 2
+        );
     }
 }

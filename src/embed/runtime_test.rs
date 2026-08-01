@@ -42,15 +42,21 @@ impl Drop for EnvVarGuard {
     }
 }
 
-/// Config whose model name resolves to no on-disk file, so
-/// `WorkerRuntime::new` skips the ~300s MIGraphX JIT compile. The worker
-/// tests below exercise pooling / idle-timer logic, never real inference, so
-/// no model is needed. Without this, a real `qwen3-embed-0.6b.onnx` under
+/// Config whose model names resolve to no on-disk file, so
+/// `WorkerRuntime::new` skips the ~300s MIGraphX JIT compile AND the lazy
+/// reranker cannot load. The worker tests below exercise pooling / idle-timer /
+/// dispatch-without-a-session logic, never real inference, so no model is
+/// needed. Without this, a real `qwen3-embed-0.6b.onnx` under
 /// `~/.leindex/models` makes every `WorkerRuntime::new` compile the model and
 /// OOM the test binary (regression introduced when the static model shipped).
+/// The rerank model name is likewise poisoned so `ensure_rerank_session` fails
+/// at model resolution and dispatch returns an Error frame deterministically —
+/// otherwise a host with the rerank model installed would build a real session
+/// and the dispatch-error assertions below would be environment-dependent.
 fn no_compile_config() -> RuntimeConfig {
     RuntimeConfig {
         model_name: "__leindex_test_no_model__".to_string(),
+        rerank_model_name: "__leindex_test_no_rerank_model__".to_string(),
         ..RuntimeConfig::default()
     }
 }
@@ -485,6 +491,112 @@ fn test_run_loop_single_request() {
 
     let result = rt.run_loop(reader, writer);
     assert!(result.is_ok());
+}
+
+// ── Task 7: provider selection precedence & truthfulness ──────────────
+
+#[test]
+fn runtime_config_provider_env_overrides_toml_and_default() {
+    // Direct-worker precedence: env > TOML > "auto". When the env var is set,
+    // it wins regardless of what the TOML contains (the TOML is read via the
+    // process-global OnceLock and may hold any value on the test host).
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::set("LEINDEX_WORKER_EXECUTION_PROVIDER", "cuda");
+
+    let config = RuntimeConfig::from_env();
+    assert_eq!(
+        config.execution_provider, "cuda",
+        "env var must take precedence over TOML and the 'auto' default"
+    );
+
+    drop(_env);
+    // With the env var unset, from_env falls back to TOML or "auto". Either
+    // way it must be a non-empty lowercase value (normalized).
+    let _env_removed = EnvVarGuard::remove("LEINDEX_WORKER_EXECUTION_PROVIDER");
+    let config = RuntimeConfig::from_env();
+    assert!(
+        !config.execution_provider.trim().is_empty(),
+        "provider must always resolve to a non-empty value"
+    );
+    // The value handed to the selector is already normalized lowercased.
+    assert_eq!(
+        config.execution_provider,
+        config.execution_provider.to_ascii_lowercase(),
+    );
+}
+
+#[test]
+fn runtime_config_provider_blanks_env_falls_through() {
+    // A blank/whitespace env value is treated as unset → falls through to TOML
+    // or "auto". This prevents a stray `LEINDEX_WORKER_EXECUTION_PROVIDER=""`
+    // from producing an empty provider string that bypasses normalization.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::set("LEINDEX_WORKER_EXECUTION_PROVIDER", "   ");
+    let config = RuntimeConfig::from_env();
+    assert!(
+        !config.execution_provider.trim().is_empty(),
+        "blank env value must fall through to a non-empty default"
+    );
+}
+
+#[test]
+fn explicit_gpu_provider_select_returns_cpu_fallback_not_hard_error() {
+    // Explicit-GPU→CPU is the documented neural-fallback path: select()
+    // returns Err(ProviderSelection) whose provider is CPU, so the runtime
+    // can log a warning and continue. This is the contract that
+    // try_provider_or_cpu preserves when error_on_failure() turns a failed
+    // registration into an Err — the fallback rebuild must NOT be a hard error.
+    use crate::embed::provider::ExecutionProviderSelector;
+    let result = ExecutionProviderSelector::select("cuda");
+    match result {
+        Ok(selection) => {
+            // CUDA is available on this host — still a concrete provider, never
+            // "auto", and registration will be attempted with error_on_failure.
+            let name = selection.name();
+            assert!(
+                name == "cuda" || name == "cpu",
+                "unexpected cuda-resolution: {name}"
+            );
+        }
+        Err(fallback) => {
+            assert_eq!(fallback.fallback_name(), "cpu");
+            assert!(!fallback.is_requested_provider());
+            assert!(
+                fallback.reason().contains("CUDA"),
+                "fallback reason should name the missing provider: {}",
+                fallback.reason()
+            );
+        }
+    }
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn runtime_resolved_provider_is_never_auto_for_embed_or_rerank() {
+    // End-to-end invariant: after WorkerRuntime construction, the provider
+    // recorded on provider_runtime_status (used by both the embedder session
+    // and the lazy reranker via ensure_rerank_session) is never the unresolved
+    // "auto" token. It is always one of cpu/cuda/migraphx/coreml.
+    //
+    // no_compile_config() points at a non-existent model so build_session
+    // fails at commit_from_file; the provider_runtime_status then retains the
+    // pre-build "cpu" fallback value, which is itself a valid concrete token.
+    // The invariant under test is that NO path surfaces "auto" to a session
+    // builder or the health response.
+    let rt = WorkerRuntime::new(RuntimeConfig {
+        execution_provider: "auto".to_string(),
+        ..no_compile_config()
+    });
+    let health = rt.health_response(crate::embed::protocol::WorkerState::Initializing, None);
+    let provider = health.provider.expect("health response carries a provider");
+    assert_ne!(
+        provider, "auto",
+        "the provider handed to embedder/reranker session builders must be concrete"
+    );
+    assert!(
+        matches!(provider.as_str(), "cpu" | "cuda" | "migraphx" | "coreml"),
+        "resolved provider must be one of the concrete tokens, got {provider}"
+    );
 }
 
 #[test]

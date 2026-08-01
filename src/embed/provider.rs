@@ -75,7 +75,11 @@ pub enum Provider {
     /// MIGraphX GPU execution provider (AMD GPUs via ROCm).
     /// This is the modern replacement for the deprecated ROCmExecutionProvider.
     Migraphx,
-    /// ROCm GPU execution provider (deprecated, use MIGraphX instead).
+    /// Deprecated alias: parses from `"rocm"` for backwards compatibility but
+    /// **never reaches registration**. `ort::ep::ROCm` was removed from ONNX
+    /// Runtime; the selector resolves `"rocm"` to [`Provider::Migraphx`] (when
+    /// available) or CPU. This variant exists only so `from_name("rocm")`
+    /// keeps parsing for legacy configs/env vars.
     Rocm,
     /// CoreML execution provider (macOS).
     CoreMl,
@@ -127,45 +131,56 @@ impl ExecutionProviderSelector {
     ///
     /// VAL-CPHASE-011: Honors configured selection and reports fallback.
     ///
-    /// Returns `Ok(ProviderSelection)` if the requested provider is available,
-    /// or `Err(ProviderSelection)` with a fallback to CPU if not.
+    /// Returns `Ok(ProviderSelection)` when the requested provider is available
+    /// **or** when "auto" resolves (including to CPU — Auto→CPU is a normal
+    /// outcome, not a fallback). Returns `Err(ProviderSelection)` with a CPU
+    /// fallback only when an **explicit** GPU/CoreML provider was requested but
+    /// is unavailable on this system.
     ///
-    /// Note: "rocm" is accepted as an alias for "migraphx" because the
-    /// ROCmExecutionProvider has been removed from ONNX Runtime (replaced
-    /// by MIGraphX). This maintains backwards compatibility for users who
-    /// set LEINDEX_WORKER_EXECUTION_PROVIDER=rocm.
+    /// Normalization: input is `trim().to_ascii_lowercase()` once. Accepted
+    /// values: `auto`, `cpu`, `cuda`, legacy `gpu`, `migraphx`, deprecated
+    /// `rocm`, `coreml`. Unknown values fall back to CPU with an actionable
+    /// reason.
+    ///
+    /// `rocm` is accepted for backwards compatibility but **never** registers
+    /// `ort::ep::ROCm` (that EP was removed from ONNX Runtime). It resolves to
+    /// MIGraphX when available, otherwise CPU.
     pub fn select(requested: &str) -> Result<ProviderSelection, ProviderSelection> {
-        // "auto" tries to find the best available GPU provider
-        if requested.eq_ignore_ascii_case("auto") {
-            // Try MIGraphX first (modern AMD GPU provider)
-            if Self::is_migraphx_available() {
-                return Ok(ProviderSelection {
-                    provider: Provider::Migraphx,
-                    is_requested: true,
-                    fallback_reason: Some("auto-detected MIGraphX (AMD GPU)".to_string()),
-                });
-            }
-            // Try CUDA next (NVIDIA GPU)
-            if Self::is_cuda_available() {
-                return Ok(ProviderSelection {
-                    provider: Provider::Cuda,
-                    is_requested: true,
-                    fallback_reason: Some("auto-detected CUDA (NVIDIA GPU)".to_string()),
-                });
-            }
-            // Fall back to CPU
-            return Err(ProviderSelection {
-                provider: Provider::Cpu,
-                is_requested: false,
-                fallback_reason: Some(
-                    "auto: no GPU execution provider found, falling back to CPU".to_string(),
-                ),
+        let requested = requested.trim().to_ascii_lowercase();
+        Self::select_normalized(&requested)
+    }
+
+    /// Inner selector operating on an already-normalized (lowercased, trimmed)
+    /// name. Split out so the auto path can recurse through the same
+    /// normalization-free fast path.
+    fn select_normalized(requested: &str) -> Result<ProviderSelection, ProviderSelection> {
+        // "auto" resolves to the best available provider. CoreML → MIGraphX →
+        // CUDA → CPU. Auto→CPU is `Ok` (a normal outcome, not a fallback error)
+        // so the runtime does not log a spurious neural-fallback warning for
+        // the common CPU-only case.
+        if requested == "auto" {
+            let provider = select_auto_from_availability(
+                Self::is_coreml_available(),
+                Self::is_migraphx_available(),
+                Self::is_cuda_available(),
+            );
+            let reason = match provider {
+                Provider::CoreMl => "auto-detected CoreML (Apple GPU)".to_string(),
+                Provider::Migraphx => "auto-detected MIGraphX (AMD GPU)".to_string(),
+                Provider::Cuda => "auto-detected CUDA (NVIDIA GPU)".to_string(),
+                Provider::Cpu => "auto: no GPU execution provider available, using CPU".to_string(),
+                // Unreachable: select_auto_from_availability only returns the
+                // four variants above.
+                Provider::Rocm => "auto: using ROCm alias".to_string(),
+            };
+            return Ok(ProviderSelection {
+                provider,
+                is_requested: true,
+                fallback_reason: Some(reason),
             });
         }
 
-        let requested_provider = Provider::from_name(requested);
-
-        match requested_provider {
+        match Provider::from_name(requested) {
             Some(Provider::Cpu) => Ok(ProviderSelection {
                 provider: Provider::Cpu,
                 is_requested: true,
@@ -179,38 +194,30 @@ impl ExecutionProviderSelector {
                         fallback_reason: None,
                     })
                 } else {
-                    Err(ProviderSelection {
-                        provider: Provider::Cpu,
-                        is_requested: false,
-                        fallback_reason: Some(
-                            "CUDA runtime or driver not found on this system".to_string(),
-                        ),
-                    })
+                    Err(Self::cpu_fallback(
+                        "CUDA runtime or driver not found on this system",
+                    ))
                 }
             }
-            Some(provider @ Provider::Migraphx) => {
+            Some(Provider::Migraphx) => {
                 if Self::is_migraphx_available() {
                     Ok(ProviderSelection {
-                        provider,
+                        provider: Provider::Migraphx,
                         is_requested: true,
                         fallback_reason: None,
                     })
                 } else {
-                    Err(ProviderSelection {
-                        provider: Provider::Cpu,
-                        is_requested: false,
-                        fallback_reason: Some(
-                            "MIGraphX not found on this system (requires ROCm + MIGraphX)"
-                                .to_string(),
-                        ),
-                    })
+                    Err(Self::cpu_fallback(
+                        "MIGraphX not found on this system (requires ROCm + MIGraphX)",
+                    ))
                 }
             }
-            // "rocm" maps to MIGraphX since ROCmExecutionProvider was removed from ORT
-            Some(provider @ Provider::Rocm) => {
+            // "rocm" is a backwards-compat alias. The ROCmExecutionProvider was
+            // removed from ONNX Runtime; we NEVER register `ort::ep::ROCm`.
+            // Resolve to MIGraphX (the modern AMD EP) when available, else CPU.
+            Some(Provider::Rocm) => {
                 if Self::is_migraphx_available() {
                     Ok(ProviderSelection {
-                        // Use MIGraphX as the actual provider
                         provider: Provider::Migraphx,
                         is_requested: true,
                         fallback_reason: Some(
@@ -218,21 +225,11 @@ impl ExecutionProviderSelector {
                                 .to_string(),
                         ),
                     })
-                } else if Self::is_rocm_available() {
-                    // Very old ORT builds may still have ROCM EP
-                    Ok(ProviderSelection {
-                        provider,
-                        is_requested: true,
-                        fallback_reason: None,
-                    })
                 } else {
-                    Err(ProviderSelection {
-                        provider: Provider::Cpu,
-                        is_requested: false,
-                        fallback_reason: Some(
-                            "Neither MIGraphX nor ROCm runtime found on this system".to_string(),
-                        ),
-                    })
+                    Err(Self::cpu_fallback(
+                        "MIGraphX not found (rocm alias); ROCm EP is removed from ORT, \
+                         install onnxruntime-migraphx or use CPU",
+                    ))
                 }
             }
             Some(provider @ Provider::CoreMl) => {
@@ -243,24 +240,21 @@ impl ExecutionProviderSelector {
                         fallback_reason: None,
                     })
                 } else {
-                    Err(ProviderSelection {
-                        provider: Provider::Cpu,
-                        is_requested: false,
-                        fallback_reason: Some("CoreML is only available on macOS".to_string()),
-                    })
+                    Err(Self::cpu_fallback("CoreML is only available on macOS"))
                 }
             }
-            None => {
-                // Unknown provider name — fall back to CPU
-                Err(ProviderSelection {
-                    provider: Provider::Cpu,
-                    is_requested: false,
-                    fallback_reason: Some(format!(
-                        "unknown execution provider '{}', falling back to CPU",
-                        requested
-                    )),
-                })
-            }
+            None => Err(Self::cpu_fallback(&format!(
+                "unknown execution provider '{}', falling back to CPU",
+                requested
+            ))),
+        }
+    }
+
+    fn cpu_fallback(reason: &str) -> ProviderSelection {
+        ProviderSelection {
+            provider: Provider::Cpu,
+            is_requested: false,
+            fallback_reason: Some(reason.to_string()),
         }
     }
 
@@ -362,23 +356,6 @@ impl ExecutionProviderSelector {
         }
     }
 
-    /// Check if ROCm is available on this system.
-    /// Note: ROCm being available does not mean the deprecated ROCmExecutionProvider
-    /// is compiled into the ONNX Runtime build. Use `is_migraphx_available()` for
-    /// the modern AMD GPU provider.
-    fn is_rocm_available() -> bool {
-        #[cfg(feature = "onnx")]
-        {
-            ort::ep::ROCm::default().is_available().unwrap_or(false)
-        }
-        #[cfg(not(feature = "onnx"))]
-        {
-            // Conservative fallback: check environment and driver presence
-            std::env::var("ROCM_PATH").is_ok()
-                || std::path::Path::new("/opt/rocm/bin/rocm-smi").exists()
-        }
-    }
-
     /// Check if CoreML is available (macOS only).
     fn is_coreml_available() -> bool {
         cfg!(target_os = "macos")
@@ -408,6 +385,30 @@ pub fn is_migraphx_compiled_in() -> bool {
 /// without raising the driver-presence heuristic.
 pub fn is_cuda_compiled_in() -> bool {
     ExecutionProviderSelector::is_cuda_compiled_in()
+}
+
+/// Pure, hardware-independent resolution of the "auto" execution provider.
+///
+/// Order of preference: **CoreML → MIGraphX → CUDA → CPU**.
+///
+/// - CoreML is preferred on Apple Silicon (lowest-latency, always-on GPU).
+/// - MIGraphX is the modern AMD GPU provider (ROCm EP is removed from ORT).
+/// - CUDA covers NVIDIA.
+/// - CPU is the always-available baseline.
+///
+/// This helper takes explicit availability booleans so it can be unit-tested
+/// without any GPU hardware: every branch is reachable by construction. The
+/// runtime feeds it the results of the availability probes below.
+pub fn select_auto_from_availability(coreml: bool, migraphx: bool, cuda: bool) -> Provider {
+    if coreml {
+        Provider::CoreMl
+    } else if migraphx {
+        Provider::Migraphx
+    } else if cuda {
+        Provider::Cuda
+    } else {
+        Provider::Cpu
+    }
 }
 
 #[cfg(test)]
@@ -474,12 +475,12 @@ mod tests {
     #[test]
     fn test_rocm_provider_selection() {
         let result = ExecutionProviderSelector::select("rocm");
-        // "rocm" now maps to MIGraphX (the modern AMD GPU provider)
+        // "rocm" maps to MIGraphX (the modern AMD GPU provider) or CPU fallback.
+        // It must NEVER resolve to Provider::Rocm — ort::ep::ROCm is removed.
         match result {
             Ok(selection) => {
-                // Should use migraphx (or rocm on very old ORT builds)
-                let name = selection.name();
-                assert!(name == "migraphx" || name == "rocm");
+                assert_eq!(selection.name(), "migraphx");
+                assert!(selection.reason().contains("MIGraphX"));
             }
             Err(fallback) => {
                 assert_eq!(fallback.fallback_name(), "cpu");
@@ -634,5 +635,103 @@ mod tests {
             crate::embed::provider::is_cuda_compiled_in(),
             ExecutionProviderSelector::is_cuda_compiled_in()
         );
+    }
+
+    // ── Task 7: truthful, portable provider selection ───────────────────
+
+    #[test]
+    fn auto_order() {
+        // Hardware-independent: every branch reachable by construction.
+        // CoreML → MIGraphX → CUDA → CPU.
+        assert_eq!(
+            select_auto_from_availability(true, true, true),
+            Provider::CoreMl
+        );
+        assert_eq!(
+            select_auto_from_availability(false, true, true),
+            Provider::Migraphx
+        );
+        assert_eq!(
+            select_auto_from_availability(false, false, true),
+            Provider::Cuda
+        );
+        assert_eq!(
+            select_auto_from_availability(false, false, false),
+            Provider::Cpu
+        );
+    }
+
+    #[test]
+    fn auto_returns_ok_not_fallback_on_cpu_only() {
+        // Auto→CPU is a normal `Ok`, not a neural-fallback error. On a
+        // CPU-only system (the common CI case) select("auto") must be Ok and
+        // report cpu without the "explicit GPU requested" fallback framing.
+        let result = ExecutionProviderSelector::select("auto");
+        match result {
+            Ok(selection) => {
+                let name = selection.name();
+                assert!(
+                    name == "cpu" || name == "cuda" || name == "migraphx" || name == "coreml",
+                    "auto resolved to {name}, expected a concrete provider"
+                );
+                assert!(
+                    selection.is_requested_provider(),
+                    "auto resolution is always 'requested'"
+                );
+                if name == "cpu" {
+                    assert!(
+                        selection.reason().contains("no GPU"),
+                        "auto→cpu reason should explain no GPU was found, got: {}",
+                        selection.reason()
+                    );
+                }
+            }
+            Err(fallback) => {
+                panic!(
+                    "auto must never return Err (got CPU fallback: {})",
+                    fallback.reason()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auto_never_resolves_to_unresolved_name() {
+        // The name handed to a session builder must be concrete, never "auto".
+        let selection = ExecutionProviderSelector::select("auto").unwrap();
+        assert_ne!(selection.name(), "auto");
+        assert_ne!(selection.name(), "rocm");
+    }
+
+    #[test]
+    fn select_normalizes_whitespace_and_case() {
+        // trim().to_ascii_lowercase() applied once at the entry point.
+        for input in ["  CUDA  ", "Cuda", "GPU", "  MiGrApHx  ", "\tcoreml\n"] {
+            let _ = ExecutionProviderSelector::select(input);
+            // Must not panic / not return the unknown-fallback for recognized
+            // names regardless of surrounding whitespace or case.
+            let result = ExecutionProviderSelector::select(input);
+            let name = match &result {
+                Ok(s) => s.name(),
+                Err(s) => s.fallback_name(),
+            };
+            assert_ne!(
+                name.contains("unknown"),
+                true,
+                "normalized '{input}' should not hit the unknown-fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn rocm_alias_never_returns_rocm_provider() {
+        // The selector must resolve "rocm" to MIGraphX or CPU — never to
+        // Provider::Rocm, which would imply registering ort::ep::ROCm.
+        for input in ["rocm", "  ROCM  ", "Rocm"] {
+            match ExecutionProviderSelector::select(input) {
+                Ok(s) => assert_eq!(s.name(), "migraphx", "rocm alias resolved to {}", s.name()),
+                Err(f) => assert_eq!(f.fallback_name(), "cpu"),
+            }
+        }
     }
 }

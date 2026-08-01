@@ -275,7 +275,19 @@ impl RuntimeConfig {
             .unwrap_or(1024);
 
         let execution_provider = std::env::var("LEINDEX_WORKER_EXECUTION_PROVIDER")
-            .unwrap_or_else(|_| "auto".to_string());
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                // VAL-DAEMON-002: Use load_cached() so config TOML is parsed
+                // at most once per process via OnceLock.
+                let value = crate::config::LeIndexConfig::load_cached()
+                    .neural
+                    .execution_provider
+                    .trim()
+                    .to_ascii_lowercase();
+                (!value.is_empty()).then_some(value)
+            })
+            .unwrap_or_else(|| "auto".to_string());
 
         let rerank_model_name = std::env::var("LEINDEX_WORKER_RERANK_MODEL")
             .ok()
@@ -478,31 +490,55 @@ fn maybe_missing_ep_fallback(
 
 /// Attach the selected execution provider to `builder`, falling back to CPU on
 /// registration failure. `provider_name` is recorded verbatim on the status.
+///
+/// Invariants (enforced in debug builds):
+/// - `provider_name` is a **concrete** provider (`cpu`/`cuda`/`migraphx`/
+///   `rocm`/`coreml`), never the unresolved `"auto"` token. Auto must be
+///   resolved by [`ExecutionProviderSelector::select`] before reaching here so
+///   that the reranker and embedder sessions always see a concrete provider.
+///
+/// Registration uses `.error_on_failure()` so a failed GPU/CoreML EP load is
+/// surfaced as a `Result::Err` rather than silently ignored. The explicit
+/// GPU→CPU fallback is preserved by [`try_provider_or_cpu`], which catches
+/// that `Err` and rebuilds a CPU session — so explicit-GPU-on-a-CPU-box still
+/// works (with a neural-fallback warning), it is never a hard error.
 #[cfg(feature = "onnx")]
 fn attach_execution_provider(
     builder: SessionBuilder,
     provider_name: &str,
 ) -> Result<(SessionBuilder, ProviderRuntimeStatus), ort::Error> {
+    debug_assert!(
+        provider_name != "auto",
+        "attach_execution_provider received unresolved 'auto'; select() must run first"
+    );
     match provider_name {
         "cuda" => try_provider_or_cpu(
             builder,
-            ort::ep::CUDA::default().build(),
+            ort::ep::CUDA::default().build().error_on_failure(),
             provider_name,
             "CUDA",
         ),
-        // "auto" already resolved to MIGraphX by the selector; explicit "migraphx"
-        // uses it directly. The pre-flight check above guarantees MIGraphX is
-        // compiled in for "migraphx"; "auto" still lets try_provider_or_cpu fall
-        // back if registration fails.
-        "migraphx" | "auto" => {
-            try_provider_or_cpu(builder, build_migraphx_ep(), provider_name, "MIGraphX")
-        }
-        // ROCm EP is deprecated in favor of MIGraphX; "rocm" uses MIGraphX and
-        // falls back to CPU if registration fails.
-        "rocm" => try_provider_or_cpu(builder, build_migraphx_ep(), provider_name, "MIGraphX"),
+        // Explicit "migraphx". The "auto" token is resolved upstream by the
+        // selector (CoreML → MIGraphX → CUDA → CPU) and must never reach here
+        // — see the debug_assert above.
+        "migraphx" => try_provider_or_cpu(
+            builder,
+            build_migraphx_ep().error_on_failure(),
+            provider_name,
+            "MIGraphX",
+        ),
+        // ROCm EP is deprecated in favor of MIGraphX and removed from ORT;
+        // "rocm" is a backwards-compat alias that registers MIGraphX and falls
+        // back to CPU if registration fails. ort::ep::ROCm is never registered.
+        "rocm" => try_provider_or_cpu(
+            builder,
+            build_migraphx_ep().error_on_failure(),
+            "migraphx",
+            "MIGraphX (rocm alias)",
+        ),
         "coreml" => try_provider_or_cpu(
             builder,
-            ort::ep::CoreML::default().build(),
+            ort::ep::CoreML::default().build().error_on_failure(),
             provider_name,
             "CoreML",
         ),
@@ -739,13 +775,20 @@ impl WorkerRuntime {
         model_path: &std::path::Path,
         provider_name: &str,
     ) -> Result<SessionBuildOutcome, ort::Error> {
+        // Auto must be resolved before reaching a session builder — see
+        // attach_execution_provider's debug_assert. The optimization-level
+        // match below therefore only lists concrete GPU providers.
+        debug_assert!(
+            provider_name != "auto",
+            "build_session received unresolved 'auto'; select() must run first"
+        );
         // For GPU execution providers (MIGraphX/ROCm), use Level3 optimization
         // so the ONNX graph undergoes maximum operator fusion before the EP sees
         // it; at Level1 the graph is too granular and MIGraphX falls back to CPU
         // for most operators, leaving VRAM unused. Level3 enables the transformer
         // fusion passes that move computation to the GPU.
         let optimization_level = match provider_name {
-            "migraphx" | "rocm" | "auto" => GraphOptimizationLevel::Level3,
+            "migraphx" | "rocm" => GraphOptimizationLevel::Level3,
             _ => GraphOptimizationLevel::Level1,
         };
 
@@ -1518,17 +1561,15 @@ impl WorkerRuntime {
                 message: format!("rerank tokenizer load failed ({}): {}", tokenizer_path, e),
             },
         )?);
-        // Use the configured execution provider (typically MIGraphX/GPU) so the
+        // Use the same concrete provider the embedder session resolved to
+        // (self.provider_runtime_status.execution_provider), so the
         // cross-encoder is fast (~1-3s after a one-time compile cached as a
-        // .mxr). The native ORT_MIGraphX_MODEL_CACHE_PATH cache persists across
-        // idle evictions, so on-demand reloads stay warm. CPU is ~70s/query for
+        // .mxr) and the reranker never receives the unresolved "auto" token.
+        // The native ORT_MIGraphX_MODEL_CACHE_PATH cache persists across idle
+        // evictions, so on-demand reloads stay warm. CPU is ~70s/query for
         // top-20 × 512 — unusable interactively. If the provider is unavailable
         // for this model, build_session falls back to CPU automatically.
-        let provider = if self.config.execution_provider.trim().is_empty() {
-            "auto"
-        } else {
-            self.config.execution_provider.as_str()
-        };
+        let provider = self.provider_runtime_status.execution_provider.as_str();
         let outcome = Self::build_session(&model_path, provider).map_err(|e| WorkerError {
             kind: ErrorKind::Inference,
             message: format!("rerank session build failed: {}", e),
