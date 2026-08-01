@@ -225,7 +225,7 @@ Add to Claude Desktop config:
 To pin a specific binary release instead of `latest`:
 
 ```bash
-LEINDEX_BINARY_VERSION=1.9.0 npm install @leindex/mcp
+LEINDEX_BINARY_VERSION=1.9.5 npm install @leindex/mcp
 ```
 
 ---

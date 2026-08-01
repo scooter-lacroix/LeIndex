@@ -1,7 +1,7 @@
 {
   "name": "leindex-dashboard",
   "private": true,
-  "version": "1.9.0",
+  "version": "1.9.5",
   "description": "LeIndex Dashboard - Visual interface for code indexing and analysis",
   "type": "module",
   "scripts": {

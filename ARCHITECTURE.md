@@ -1,4 +1,4 @@
-# LeIndex Architecture (v1.9.0)
+# LeIndex Architecture (v1.9.5)
 
 ## Overview
 

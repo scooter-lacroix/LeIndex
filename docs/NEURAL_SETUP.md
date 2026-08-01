@@ -1,6 +1,6 @@
 # Neural Search Setup
 
-LeIndex 1.9.0 combines TF-IDF, PDG, and neural signals over the same nodes when
+LeIndex 1.9.5 combines TF-IDF, PDG, and neural signals over the same nodes when
 the ONNX feature is enabled:
 
 - TF-IDF for exact vocabulary and identifier matches
@@ -30,12 +30,18 @@ Setup writes `$LEINDEX_HOME/config/leindex.toml`, normally
 setup is successful only when the requested provider is active; silent CPU
 fallback is reported as a failure.
 
+The persisted provider is one of `auto`, `cpu`, `cuda`, `migraphx`, or
+`coreml`. `auto` resolves by availability (CoreML -> MIGraphX -> CUDA -> CPU)
+and is the default; `leindex setup` with no provider flag selects Auto, and
+`--neural --coreml` is offered on Apple Silicon. `rocm` is accepted as a
+deprecated alias that routes to MIGraphX and never registers `ort::ep::ROCm`.
+
 ## Model Provisioning
 
 Models are never included in GitHub Release archives, crates.io, npm, or PyPI
 artifacts. `leindex setup` owns model provisioning.
 
-The 1.9.0 profile downloads
+The 1.9.5 profile downloads
 [Qwen3 Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) from
 Hugging Face via Hugging Face CLI:
 

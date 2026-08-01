@@ -1,6 +1,6 @@
 # LeIndex Performance Benchmarks
 
-## 1.9.0 fast-path contract
+## 1.9.5 fast-path contract
 
 The release benchmark is the Rust Criterion harness in
 [`benches/mcp_tool_latency.rs`](../benches/mcp_tool_latency.rs). It measures
@@ -66,7 +66,7 @@ artifacts. This is a throughput optimization, not a request timeout.
 ## Executive Summary
 
 The sections below are historical scanner-only measurements retained for
-comparison. They are not the 1.9.0 MCP latency gate and should not be read as
+comparison. They are not the 1.9.5 MCP latency gate and should not be read as
 current end-to-end indexing numbers.
 
 A comprehensive performance benchmark suite has been successfully implemented to validate LeIndex optimization targets. The benchmarks demonstrate that the system **far exceeds** all performance requirements.

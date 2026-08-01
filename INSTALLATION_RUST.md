@@ -1,6 +1,6 @@
 # LeIndex Rust Installation Guide
 
-This guide covers crates.io and source builds for LeIndex 1.9.0. For release
+This guide covers crates.io and source builds for LeIndex 1.9.5. For release
 bundles, npm, and PyPI, see [INSTALLATION.md](INSTALLATION.md).
 
 ## Requirements

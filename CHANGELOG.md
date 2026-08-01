@@ -2,6 +2,59 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [1.9.5] - 2026-08-01 - Embed-Merge Release
+
+The 1.9.1 through 1.9.5 sub-releases below ship together as 1.9.5. They merge
+the embedding worker into the root crate, pin the ONNX runtime fix, make every
+execution provider runtime-selectable, and rework the release pipeline.
+
+### [1.9.1] - 2026-08-01 - Feature boundaries + unified config
+
+- Repaired the strict feature DAG: `skip_dirs` is shared across features, graph
+  dependencies are gated correctly, and MCP-metric code is gated under `cli`.
+- Consolidated neural configuration into `src/config.rs` so the CLI and the
+  ONNX worker share one schema and one process cache instead of duplicate
+  definitions.
+
+### [1.9.2] - 2026-08-01 - ort rc.13 + all execution providers
+
+- Pinned `ort = 2.0.0-rc.13` from crates.io, which contains the load-dynamic
+  deadlock fix (upstream commit `17ed727`).
+- Removed the non-propagating `[patch.crates-io]` git patch.
+- The `onnx` feature now compiles every runtime-selectable execution-provider
+  API (CUDA, MIGraphX, ROCm, CoreML). These are marker/API features only; no
+  SDK is linked at build time.
+
+### [1.9.3] - 2026-08-01 - One crate, two binaries
+
+- Merged the `leindex-embed` worker source into `src/embed/`; the root
+  `leindex-embed` bin wraps `leindex::embed::worker_main::run`.
+- Migrated all integration suites and worker tests to the root crate; retired
+  the `crates/leindex-embed` subcrate entirely.
+- `cargo install leindex --features onnx` now installs both the `leindex` and
+  `leindex-embed` binaries from a single crate.
+
+### [1.9.4] - 2026-08-01 - Truthful provider selection + setup
+
+- Pure `select_auto_from_availability` selection: CoreML -> MIGraphX -> CUDA ->
+  CPU, evaluated before session attach so `auto` is never passed to ORT.
+- `.error_on_failure()` on EP registration with preserved GPU-to-CPU fallback.
+- `rocm` is a deprecated alias that routes to MIGraphX and never registers
+  `ort::ep::ROCm`.
+- Setup gains Auto and CoreML options with host-aware install candidates and
+  persists `auto`; stale PATH workers are rejected via a `--version` check.
+
+### [1.9.5] - 2026-08-01 - Release pipeline + docs
+
+- CI/release reworked for one crate: a Linux compile matrix plus a macOS CoreML
+  check, and an encoded `create-release -> publish-crates ->
+  crates-index-ready -> undraft-release -> publish-npm/pypi -> summary` job
+  graph.
+- npm `cargo install leindex-embed` fallback removed; a retired-subcrate guard
+  rejects the old package form.
+- Version bumped to 1.9.5 and docs synchronized to the one-crate, two-binary
+  reality.
+
 ## [1.9.0] - 2026-07-21 - Fast Core Retrieval and Owned Index Jobs
 
 ### Added
