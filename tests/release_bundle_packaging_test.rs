@@ -109,7 +109,7 @@ mod build_time_invariants {
     /// or `println!` issuing such a directive remains.
     #[test]
     fn build_scripts_have_no_origin_rpath() {
-        for rel in ["build.rs", "crates/leindex-embed/build.rs"] {
+        for rel in ["build.rs"] {
             let script = build_script(rel);
             // Drop comment lines so doc comments mentioning the absence of
             // rpath do not trip the literal-substring check.

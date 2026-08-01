@@ -137,9 +137,8 @@ mod build_line_invariants {
                 "cargo build line must reference the 'onnx' feature (load-dynamic): {line}"
             );
             // Must NOT enable onnx-migraphx as a build feature.
-            // The feature is passed as leindex-embed/onnx-migraphx or
-            // onnx-migraphx; either form indicates building the provider
-            // bindings which is not needed under load-dynamic.
+            // Its presence (in any form) indicates building the provider
+            // bindings, which is not needed under load-dynamic.
             assert!(
                 !line.contains("onnx-migraphx"),
                 "cargo build line must NOT contain onnx-migraphx (runtime-only under load-dynamic): {line}"

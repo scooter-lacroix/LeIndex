@@ -175,7 +175,10 @@ fn default_search_mode() -> String {
 }
 
 fn default_neural_weight() -> f64 {
-    0.3
+    // Single source of truth for the hybrid neural blend. Must match the
+    // scorer-side defaults (HybridScorer::for_code / HybridScoringWeights
+    // both use 0.40) so a stock install behaves as documented.
+    0.4
 }
 
 fn default_rerank_top_n() -> u32 {
@@ -427,12 +430,20 @@ mod tests {
     }
 
     #[test]
+    fn test_default_neural_weight_is_0_4() {
+        // VAL-CONFIG: config default must match the scorer-side defaults
+        // (HybridScorer::for_code / HybridScoringWeights both use 0.40).
+        assert_eq!(LeIndexConfig::default().search.neural_weight, 0.4);
+    }
+
+    #[test]
     fn test_config_missing_keys_uses_defaults() {
         // VAL-SETUP-030: stale config from older version gets defaults for new keys
         let toml_str = "[neural]\nenabled = true\n";
         let config: LeIndexConfig = toml::from_str(toml_str).unwrap();
         assert!(config.neural.enabled);
         assert_eq!(config.search.search_mode, "hybrid");
+        assert_eq!(config.search.neural_weight, 0.4);
         assert_eq!(config.indexing.batch_size, 500);
         assert_eq!(config.neural.model_name, "qwen3-embed-0.6b");
     }
@@ -442,6 +453,7 @@ mod tests {
         let config: LeIndexConfig = toml::from_str("").unwrap();
         assert!(!config.neural.enabled);
         assert_eq!(config.search.search_mode, "hybrid");
+        assert_eq!(config.search.neural_weight, 0.4);
     }
 
     #[test]
@@ -483,5 +495,45 @@ mod tests {
         };
         let toml_str = toml::to_string(&config).unwrap();
         assert!(!toml_str.contains("ort_dylib_path"));
+    }
+
+    /// Serialize env-var-mutating tests within the lib test binary.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_load_or_recover_corrupt_file() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config").join("leindex.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "[neural\nbroken toml").unwrap();
+        // SAFETY: env mutation serialized by ENV_LOCK; single-threaded under the lock.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
+        let (config, action) = LeIndexConfig::load_or_recover().unwrap();
+        assert!(matches!(action, RecoveryAction::RecoveredFromCorrupt(_)));
+        assert!(!config.neural.enabled);
+        assert!(config_path.with_extension("toml.bak").exists());
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
+    }
+
+    #[test]
+    fn test_config_load_returns_default_when_missing() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, "/nonexistent/path/for/testing") };
+        let (config, action) = LeIndexConfig::load_or_recover().unwrap();
+        assert!(matches!(action, RecoveryAction::CreatedDefault));
+        assert!(!config.neural.enabled);
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
+    }
+
+    #[test]
+    fn test_resolve_leindex_home_env_override() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, "/custom/leindex") };
+        assert_eq!(
+            resolve_leindex_home(),
+            Some(PathBuf::from("/custom/leindex"))
+        );
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 }

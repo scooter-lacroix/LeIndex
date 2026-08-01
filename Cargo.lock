@@ -1903,7 +1903,6 @@ dependencies = [
  "futures-util",
  "half",
  "hnsw_rs",
- "leindex-embed",
  "libc",
  "libsql",
  "lru",
@@ -1958,27 +1957,6 @@ dependencies = [
  "walkdir",
  "which 8.0.5",
  "wide",
-]
-
-[[package]]
-name = "leindex-embed"
-version = "1.9.0"
-dependencies = [
- "anyhow",
- "bincode",
- "dirs",
- "half",
- "libc",
- "ndarray",
- "ort",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tokenizers",
- "toml",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

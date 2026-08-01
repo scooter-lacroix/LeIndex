@@ -29,13 +29,16 @@ include = [
     "/src/observability.rs",
     "/src/bin/**",
     "/src/cli/**",
+    "/src/config.rs",
     "/src/edit/**",
+    "/src/embed/**",
     "/src/global/**",
     "/src/graph/**",
     "/src/parse/**",
     "/src/phase/**",
     "/src/search/**",
     "/src/server/**",
+    "/src/skip_dirs.rs",
     "/src/storage/**",
     "/src/validation/**",
     "/tests/**",
@@ -220,8 +223,7 @@ turso = ["dep:libsql", "dep:rusqlite_migration"]
 #
 # VAL-CARGO-002/005: `cargo install leindex --features onnx` installs both the
 # main binary and the worker binary with real ONNX inference support.
-# Transitional: leindex-embed/onnx stays until Task 6 moves worker source in.
-onnx = ["search", "dep:ort", "ort/half", "ort/cuda", "ort/migraphx", "ort/rocm", "ort/coreml", "dep:tokenizers", "dep:ndarray", "dep:half", "dep:which", "dep:toml", "dep:dirs", "leindex-embed/onnx"]
+onnx = ["search", "dep:ort", "ort/half", "ort/cuda", "ort/migraphx", "ort/rocm", "ort/coreml", "dep:tokenizers", "dep:ndarray", "dep:half", "dep:which", "dep:toml", "dep:dirs"]
 
 # Legacy build-command alias; onnx now compiles every runtime-selectable EP.
 onnx-migraphx = ["onnx"]
@@ -307,8 +309,6 @@ ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, fea
 tokenizers = { version = "0.20", optional = true }
 ndarray = { version = "0.17", optional = true }
 half = { version = "2.1", optional = true, default-features = false }
-# Transitional: remove in Task 6 after worker source moves to src/embed.
-leindex-embed = { version = "1.9.0", path = "crates/leindex-embed", optional = true, default-features = false }
 
 # Remote embedding API dependencies (for cloud-based embeddings)
 reqwest = { version = "0.12", features = ["json", "rustls-tls-webpki-roots", "gzip", "deflate"], optional = true, default-features = false }
@@ -359,7 +359,6 @@ tokio-test = "0.4"
 tempfile = "3.13"
 rstest = "0.23"
 proptest = "1.6"
-leindex-embed = { path = "crates/leindex-embed" }
 rand = "0.8"
 
 # Binary targets
@@ -371,11 +370,10 @@ doc = false
 
 # VAL-CARGO-005: Worker binary co-installed via `cargo install leindex --features onnx`.
 # `cargo install <pkg>` only installs `[[bin]]` targets from `<pkg>`'s own
-# Cargo.toml, so the root crate mirrors the leindex-embed worker binary as a
-# thin wrapper (`src/bin/leindex-embed.rs`) around `leindex_embed::worker_main::run()`.
+# Cargo.toml, so the worker lives as a root bin wrapper
+# (`src/bin/leindex-embed.rs`) around `leindex::embed::worker_main::run()`.
 # Gated by `required-features = ["onnx"]` so default installs without neural
-# support are unaffected. The subcrate at `crates/leindex-embed` retains its
-# own `[[bin]]` target for standalone workspace builds and tests.
+# support are unaffected.
 [[bin]]
 name = "leindex-embed"
 path = "src/bin/leindex-embed.rs"
@@ -434,8 +432,7 @@ strip = false
 [workspace]
 members = [
     ".",
-    "crates/leindex-embed",
-    "tools/memcheck",
+    "tools/memcheck", 
     "tools/xtask",
 ]
 
