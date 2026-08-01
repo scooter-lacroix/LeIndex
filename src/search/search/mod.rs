@@ -121,10 +121,10 @@ pub struct SearchEngine {
     /// `fragment_weight > 0` — keeps the default path byte-identical
     /// (fragment-embeddings 1.11.0 Task 6, invariant 7).
     fragment_index_enabled: bool,
-    /// Fragment fusion weight from `[search] fragment_weight` (default 0.30,
-    /// empirically tuned: smallest weight that surfaces fragments over strong
-    /// tfidf matches without regressing node rank). Only applied when
-    /// `fragment_index_enabled` (renormalized into the five
+    /// Fragment fusion weight from `[search] fragment_weight` (default 0.35,
+    /// empirically tuned: smallest weight with real margin that surfaces
+    /// fragments over strong tfidf matches without regressing node rank).
+    /// Only applied when `fragment_index_enabled` (renormalized into the five
     /// weights).
     fragment_weight: f32,
     /// content_hash → (owner node id, best byte range) for mapping fragment
@@ -183,7 +183,7 @@ impl SearchEngine {
             neural_vector_index: None,
             fragment_vector_index: None,
             fragment_index_enabled: false,
-            fragment_weight: 0.30,
+            fragment_weight: 0.35,
             fragment_refs: HashMap::new(),
         }
     }
@@ -229,7 +229,7 @@ impl SearchEngine {
             neural_vector_index: None,
             fragment_vector_index: None,
             fragment_index_enabled: false,
-            fragment_weight: 0.30,
+            fragment_weight: 0.35,
             fragment_refs: HashMap::new(),
         }
     }
@@ -1735,7 +1735,7 @@ impl SearchEngine {
         let (tfidf_weight, neural_weight, structural_weight, text_weight) =
             self.scoring_weights(query, neural_available);
         // Fragment fusion (Task 6): gate renormalization on the master switch
-        // (NOT `fragment_weight > 0` — the default 0.30 would renormalize with
+        // (NOT `fragment_weight > 0` — the default 0.35 would renormalize with
         // the feature off, breaking invariant 7's byte-identical default). The
         // five weights are renormalized to sum to 1.0; when disabled the
         // fragment weight is 0.0 and the base four are untouched.

@@ -1348,11 +1348,12 @@ fn test_fragment_layer_off_by_default_contributes_nothing() {
 ///   embedding (cosine 1.0) and fill ranks 1-5, cutting the owners OUT of the
 ///   result set at baseline — so the fragment tier is genuinely the only path
 ///   that can surface them (not merely re-rank nodes that are already present).
-/// - `fragment_weight` sweep (0.12 / 0.20 / 0.30 / 0.40) vs baseline (0.0):
-///   the shipped default was empirically tuned to 0.30 (see
-///   `src/config.rs::default_fragment_weight`) — 0.30 is the smallest weight
-///   that surfaces fragments over strong tfidf matches (fragment share
-///   w/(1+w) vs decoy tfidf share 0.3/(1+w) flips at w > 0.3) while
+/// - `fragment_weight` sweep (0.12 / 0.20 / 0.30 / 0.35 / 0.40) vs baseline
+///   (0.0): the shipped default was empirically tuned to 0.35 (see
+///   `src/config.rs::default_fragment_weight`) — 0.35 is the smallest weight
+///   with real margin that surfaces fragments over strong tfidf matches
+///   (fragment share w/(1+w) vs decoy tfidf share 0.3/(1+w); 0.30 sits at
+///   share-equality and is fragile, 0.35 clears it by ~3.7pp) while
 ///   preserving node-rank exactly. The assertion stays on 0.40 so the
 ///   surfacing MECHANISM is verified in isolation regardless of the shipped
 ///   default.
@@ -1519,16 +1520,22 @@ fn test_fragment_tier_improves_conceptual_mrr() {
     let conceptual_w012 = mrr(&conceptual, true, 0.12);
     let conceptual_w020 = mrr(&conceptual, true, 0.20);
     let conceptual_w030 = mrr(&conceptual, true, 0.30);
+    let conceptual_w035 = mrr(&conceptual, true, 0.35);
     let conceptual_w040 = mrr(&conceptual, true, 0.40);
     let node_w040 = mrr(&node_level, true, 0.40);
 
     eprintln!(
-        "fragment_recall_mrr: baseline(off)={conceptual_off:.4} w=0.12:{conceptual_w012:.4} w=0.20:{conceptual_w020:.4} w=0.30:{conceptual_w030:.4} w=0.40:{conceptual_w040:.4} | node-rank off={node_off:.4} w=0.40:{node_w040:.4}"
+        "fragment_recall_mrr: baseline(off)={conceptual_off:.4} w=0.12:{conceptual_w012:.4} w=0.20:{conceptual_w020:.4} w=0.30:{conceptual_w030:.4} w=0.35:{conceptual_w035:.4} w=0.40:{conceptual_w040:.4} | node-rank off={node_off:.4} w=0.40:{node_w040:.4}"
     );
 
+    // The shipped default (0.35) must deliver the recall gain — that is the
+    // product claim being tuned. Assert on the DEFAULT rather than the 0.40
+    // demonstration weight so a future regression that breaks the shipped
+    // default specifically fails here; 0.40 is still printed above as margin
+    // evidence.
     assert!(
-        conceptual_w040 > conceptual_off,
-        "fragment tier must improve conceptual-query MRR: baseline {conceptual_off:.4} -> with fragments {conceptual_w040:.4}"
+        conceptual_w035 > conceptual_off,
+        "fragment tier must improve conceptual-query MRR at the shipped default 0.35: baseline {conceptual_off:.4} -> with fragments {conceptual_w035:.4}"
     );
     assert!(
         node_w040 >= node_off,
