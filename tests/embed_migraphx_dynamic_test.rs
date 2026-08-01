@@ -25,8 +25,8 @@
 
 use std::sync::Mutex;
 
-use leindex_embed::ort_discovery::InitResult;
-use leindex_embed::provider::ExecutionProviderSelector;
+use leindex::embed::ort_discovery::InitResult;
+use leindex::embed::provider::ExecutionProviderSelector;
 use ort::ep::MIGraphX;
 use ort::session::builder::GraphOptimizationLevel;
 
@@ -49,7 +49,7 @@ fn val_ort_015_runtime_discovers_and_loads_ort_dylib() {
     let saved = std::env::var("ORT_DYLIB_PATH").ok();
     unsafe { std::env::remove_var("ORT_DYLIB_PATH") };
 
-    let init = leindex_embed::discover_and_init();
+    let init = leindex::embed::discover_and_init();
     match &init {
         InitResult::Initialized(outcome) => {
             // The dylib must have been loaded from a real path that exists
@@ -62,7 +62,7 @@ fn val_ort_015_runtime_discovers_and_loads_ort_dylib() {
 
             // The cached outcome must be reachable via last_outcome() so that
             // the startup report and diagnostics can surface it (VAL-ORT-022).
-            let cached = leindex_embed::last_ort_outcome();
+            let cached = leindex::embed::last_ort_outcome();
             assert!(
                 cached.is_some(),
                 "last_outcome() should return Some after successful discovery"
@@ -97,7 +97,7 @@ fn val_ort_015_migraphx_compiled_in_when_using_full_ort_binary() {
 
     // Ensure the ORT library is loaded so the GetAvailableProviders() probe
     // below reflects a real binary (not a not-yet-loaded state).
-    let _ = leindex_embed::discover_and_init();
+    let _ = leindex::embed::discover_and_init();
 
     // Determine whether the dynamically loaded ORT lists MIGraphX. This is
     // the pure probe used by the runtime to decide between VAL-ORT-015 and
@@ -105,7 +105,7 @@ fn val_ort_015_migraphx_compiled_in_when_using_full_ort_binary() {
     // under test might be a CPU-only libonnxruntime (e.g., the default
     // `onnxruntime` pip package). Instead we record what we see and assert
     // the requested-provider path matches reality.
-    let migraphx_compiled_in = leindex_embed::is_migraphx_compiled_in();
+    let migraphx_compiled_in = leindex::embed::is_migraphx_compiled_in();
     eprintln!(
         "VAL-ORT-015: is_migraphx_compiled_in() = {}",
         migraphx_compiled_in
@@ -159,7 +159,7 @@ fn val_ort_015_migraphx_ep_registers_in_session() {
     // Load ORT (if available); on machines without ORT, this test asserts the
     // no-op path only.
     let initialized = matches!(
-        leindex_embed::discover_and_init(),
+        leindex::embed::discover_and_init(),
         InitResult::Initialized(_)
     );
     if !initialized {
@@ -170,7 +170,7 @@ fn val_ort_015_migraphx_ep_registers_in_session() {
         return;
     }
 
-    if !leindex_embed::is_migraphx_compiled_in() {
+    if !leindex::embed::is_migraphx_compiled_in() {
         eprintln!(
             "VAL-ORT-015: loaded ORT binary does not include MIGraphX; \
              skipping session-build MIGraphX registration check"
@@ -271,9 +271,9 @@ fn val_ort_016_explicit_migraphx_request_when_not_compiled_in_surfaces_fallback(
     let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     // Load ORT first so the pure probe reflects the loaded binary.
-    let _ = leindex_embed::discover_and_init();
+    let _ = leindex::embed::discover_and_init();
 
-    if leindex_embed::is_migraphx_compiled_in() {
+    if leindex::embed::is_migraphx_compiled_in() {
         // On an AMD-GPU system with onnxruntime-migraphx installed, we can't
         // exercise the "EP not compiled in" branch here — the binary does
         // report it as available. The fallback behavior in that case is still
@@ -330,17 +330,17 @@ fn val_ort_016_explicit_migraphx_request_when_not_compiled_in_surfaces_fallback(
 fn val_ort_016_pre_flight_check_returns_false_when_migraphx_missing() {
     let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let _ = leindex_embed::discover_and_init();
+    let _ = leindex::embed::discover_and_init();
 
     // The pure binary probe is the heart of the dynamic-load fallback.
     // When MIGraphX truly is not compiled in, is_migraphx_compiled_in()
     // returns false and the runtime.rs build_session() pre-flight check
     // bypasses the MIGraphX registration entirely.
-    let probe = leindex_embed::is_migraphx_compiled_in();
+    let probe = leindex::embed::is_migraphx_compiled_in();
 
     // We don't force `probe` to either value here — instead we verify the
     // invariant that the probe and ORT's GetAvailableProviders() agree.
-    let cuda_probe = leindex_embed::is_cuda_compiled_in();
+    let cuda_probe = leindex::embed::is_cuda_compiled_in();
     eprintln!("VAL-ORT-016: probe migraphx={} cuda={}", probe, cuda_probe);
 
     // No ORT installed OR CPU-only ORT -> both probes must be false.
@@ -357,7 +357,7 @@ fn val_ort_016_pre_flight_check_returns_false_when_migraphx_missing() {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn searcher_paths(searched: &[(leindex_embed::DiscoverySource, String)]) -> Vec<&str> {
+fn searcher_paths(searched: &[(leindex::embed::DiscoverySource, String)]) -> Vec<&str> {
     searched.iter().map(|(_, p)| p.as_str()).collect()
 }
 
@@ -367,7 +367,7 @@ fn locate_test_model() -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
 
     // Reuse the worker's ModelResolver for path resolution precedence.
-    match leindex_embed::ModelResolver::resolve("qwen3-embed-0.6b-dynamic") {
+    match leindex::embed::ModelResolver::resolve("qwen3-embed-0.6b-dynamic") {
         Ok(path) => Some(path),
         Err(_) => {
             // Fallback: look in common source-tree locations for development.

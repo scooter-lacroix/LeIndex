@@ -695,3 +695,60 @@ mod tests {
         worker.join().unwrap();
     }
 }
+
+/// Worker-entry tests migrated from the retired subcrate binary. Pure
+/// protocol/runtime exercise — no socket, no platform gating.
+#[cfg(test)]
+mod worker_entry_tests {
+    use crate::embed::protocol::{self, BatchId, EmbedRequest, Frame, MsgType};
+    use crate::embed::runtime::{DEFAULT_IDLE_TIMEOUT_SECS, RuntimeConfig, WorkerRuntime};
+    use std::io::Cursor;
+    use std::time::Duration;
+
+    #[test]
+    fn test_binary_embed_roundtrip_via_runtime() {
+        let request = EmbedRequest {
+            texts: vec!["hello".to_string(), "world".to_string()],
+            expected_dim: 4,
+        };
+        let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
+        let wire = frame.encode_wire().unwrap();
+        let decoded = Frame::from_wire_bytes(&wire[4..]).unwrap();
+        assert_eq!(decoded.header.batch_id, BatchId::new(1));
+        assert_eq!(decoded.header.msg_type, MsgType::EmbedRequest);
+    }
+
+    #[test]
+    fn test_runtime_handles_embed_request() {
+        let config = RuntimeConfig::default();
+        let rt = WorkerRuntime::new(config);
+        let request = EmbedRequest {
+            texts: vec!["test".to_string()],
+            expected_dim: 8,
+        };
+        let frame = protocol::embed_request_frame(BatchId::new(42), request).unwrap();
+        let response_frame = rt.dispatch(&frame);
+        assert_eq!(response_frame.header.batch_id, BatchId::new(42));
+        // Without a real ONNX session, dispatch returns an error frame.
+        assert_eq!(response_frame.header.msg_type, MsgType::Error);
+    }
+
+    #[test]
+    fn test_run_loop_single_request() {
+        let config = RuntimeConfig {
+            idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+            ..RuntimeConfig::default()
+        };
+        let rt = WorkerRuntime::new(config);
+        let request = EmbedRequest {
+            texts: vec!["hello".to_string()],
+            expected_dim: 4,
+        };
+        let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
+        let wire = frame.encode_wire().unwrap();
+        let reader = Cursor::new(wire);
+        let writer = Cursor::new(Vec::<u8>::new());
+        let result = rt.run_loop(reader, writer);
+        assert!(result.is_ok());
+    }
+}

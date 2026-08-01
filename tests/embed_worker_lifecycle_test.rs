@@ -17,17 +17,17 @@
 use std::io::Cursor;
 use std::time::Duration;
 
-use leindex_embed::batch::{self, BatchConfig, SplitResult};
-use leindex_embed::model_path::ModelResolver;
+use leindex::embed::batch::{self, BatchConfig, SplitResult};
+use leindex::embed::model_path::ModelResolver;
 #[cfg(not(feature = "onnx"))]
-use leindex_embed::protocol::Response;
+use leindex::embed::protocol::Response;
 
 /// Serialize env-var-mutating model path tests to avoid race conditions.
 static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-use leindex_embed::protocol::{self, BatchId, EmbedRequest, EmbedResponse, MsgType, Request};
-use leindex_embed::provider::ExecutionProviderSelector;
-use leindex_embed::runtime::{RuntimeConfig, WorkerRuntime};
-use leindex_embed::startup::{StartupReport, StartupReporter};
+use leindex::embed::protocol::{self, BatchId, EmbedRequest, EmbedResponse, MsgType, Request};
+use leindex::embed::provider::ExecutionProviderSelector;
+use leindex::embed::runtime::{RuntimeConfig, WorkerRuntime};
+use leindex::embed::startup::{StartupReport, StartupReporter};
 
 /// Config whose model name resolves to no on-disk file, so `WorkerRuntime::new`
 /// leaves the ONNX session unset and skips the ~300s MIGraphX JIT compile. The
@@ -37,7 +37,7 @@ use leindex_embed::startup::{StartupReport, StartupReporter};
 /// so the global `no_compile_config()` -> `no_compile_config()` swap below
 /// cannot recurse.
 fn no_compile_config() -> RuntimeConfig {
-    use leindex_embed::runtime::{
+    use leindex::embed::runtime::{
         DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_TEXT_SIZE,
     };
     RuntimeConfig {
@@ -429,7 +429,8 @@ fn test_startup_report_marks_actual_cpu_fallback() {
 
 #[test]
 fn test_runtime_startup_report_uses_session_provider_status() {
-    let runtime_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime.rs");
+    let runtime_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/embed/runtime.rs");
     let runtime = std::fs::read_to_string(&runtime_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", runtime_path.display()));
 
@@ -914,7 +915,7 @@ fn test_default_idle_timeout_is_60_seconds() {
     // orphaned worker would again linger for 5 minutes holding ~1.5 GB
     // of ROCm/MIGraphX runtime, and test sweeps would OOM the machine.
     assert_eq!(
-        leindex_embed::runtime::DEFAULT_IDLE_TIMEOUT_SECS,
+        leindex::embed::runtime::DEFAULT_IDLE_TIMEOUT_SECS,
         60,
         "DEFAULT_IDLE_TIMEOUT_SECS must remain 60 to bound orphaned-worker lifetime"
     );
@@ -928,7 +929,7 @@ fn test_default_config_uses_reduced_idle_timeout() {
     let config = no_compile_config();
     assert_eq!(
         config.idle_timeout,
-        Duration::from_secs(leindex_embed::runtime::DEFAULT_IDLE_TIMEOUT_SECS)
+        Duration::from_secs(leindex::embed::runtime::DEFAULT_IDLE_TIMEOUT_SECS)
     );
     assert_eq!(config.idle_timeout, Duration::from_secs(60));
 }

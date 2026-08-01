@@ -7,7 +7,7 @@
 use std::fs;
 use std::sync::Mutex;
 
-use leindex_embed::ModelResolver;
+use leindex::embed::ModelResolver;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 

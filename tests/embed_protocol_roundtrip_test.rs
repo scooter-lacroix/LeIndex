@@ -3,7 +3,7 @@
 // VAL-CPHASE-003: Worker request/response frames serialize and deserialize
 // without losing batch identity, payload ordering, dimensions, or error identity.
 
-use leindex_embed::protocol::{
+use leindex::embed::protocol::{
     BatchId, EmbedRequest, EmbedResponse, ErrorKind, Frame, MsgType, Request, RerankDocument,
     RerankRequest, RerankResponse, Response, WorkerError, embed_request_frame,
     embed_response_frame, error_frame, rerank_request_frame, rerank_response_frame,
@@ -193,13 +193,13 @@ fn test_rerank_response_roundtrip() {
     let batch_id = BatchId::new(500);
     let response = RerankResponse {
         results: vec![
-            leindex_embed::protocol::RerankResult {
+            leindex::embed::protocol::RerankResult {
                 id: "node1".to_string(),
                 original_score: 0.95,
                 rerank_score: 0.98,
                 combined_score: 0.97,
             },
-            leindex_embed::protocol::RerankResult {
+            leindex::embed::protocol::RerankResult {
                 id: "node2".to_string(),
                 original_score: 0.80,
                 rerank_score: 0.75,
