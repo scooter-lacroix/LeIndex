@@ -338,9 +338,9 @@ git commit -m "docs: fragment embeddings guidance and changelog"
 
 **Files:** `Cargo.toml:3`, `package.json`, `dashboard/package.json`, `pi/package.json`, `packages/npm-leindex-mcp/{package.json,README.md,test.js}`, `packages/pypi-leindex/{pyproject.toml,__init__.py}`, `install.sh`, `install_macos.sh`, `install.ps1`; regenerate `Cargo.lock`.
 
-- [ ] Bump all surfaces to 1.11.0 in the same change (AGENTS.md version parity; mirror 1.10.0 Task 11 list).
-- [ ] Confirm `cargo package -p leindex --allow-dirty --list` includes `src/cli/index_builder/fragment/**` and the new artifact paths are NOT in package (they are runtime `.leindex/` files, not crate files).
-- [ ] Verify and commit:
+- [x] Bump all surfaces to 1.11.0 in the same change (AGENTS.md version parity; mirror 1.10.0 Task 11 list).
+- [x] Confirm `cargo package -p leindex --allow-dirty --list` includes `src/cli/index_builder/fragment/**` and the new artifact paths are NOT in package (they are runtime `.leindex/` files, not crate files).
+- [x] Verify and commit:
 
 ```bash
 git add Cargo.toml Cargo.lock package.json dashboard/package.json pi/package.json \

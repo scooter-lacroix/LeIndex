@@ -102,10 +102,10 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
   assert(installer.isOrtBundleLibraryName(expected), `${expected} should be accepted as a bundle library`);
   assert(installer.isOrtBundleLibraryName(providerHelper), 'provider helper libraries should be accepted as bundle libraries');
   assert(!installer.isOrtBundleLibraryName('README.txt'), 'non-library files should not be accepted as bundle libraries');
-  assert.strictEqual(installer.assertSafeArchiveFileName('leindex-1.9.0-linux-x86_64.tar.gz'), 'leindex-1.9.0-linux-x86_64.tar.gz');
+  assert.strictEqual(installer.assertSafeArchiveFileName('leindex-1.11.0-linux-x86_64.tar.gz'), 'leindex-1.11.0-linux-x86_64.tar.gz');
   assert.throws(() => installer.assertSafeArchiveFileName('../leindex.tar.gz'), /Unsafe release asset name/);
   assert.throws(() => installer.assertSafeArchiveFileName('..\\leindex.zip'), /Unsafe release asset name/);
-  assert(installer.isSafeArchiveMemberName('leindex-1.9.0-linux-x86_64/bin/leindex'));
+  assert(installer.isSafeArchiveMemberName('leindex-1.11.0-linux-x86_64/bin/leindex'));
   assert(!installer.isSafeArchiveMemberName('../../etc/passwd'));
   assert(!installer.isSafeArchiveMemberName('/tmp/pwned'));
   assert(!installer.isSafeArchiveMemberName('C:\\temp\\pwned'));

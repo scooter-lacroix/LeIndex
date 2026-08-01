@@ -6,4 +6,4 @@ The package exposes two console scripts (see ``pyproject.toml``):
 * ``leindex-setup`` -> :func:`leindex.bootstrap.setup_main`
 """
 
-__version__ = "1.9.0"
+__version__ = "1.11.0"
