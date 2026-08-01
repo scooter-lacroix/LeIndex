@@ -1,9 +1,22 @@
 //! Search snapshot and staged-retrieval configuration/metrics.
 
+// Snapshot structs below consume `super::*` items and are storage-only; the
+// staged-retrieval config/metrics that remain are self-contained, so the
+// import is gated to avoid unused-import under `--features onnx` without
+// storage (cli implies storage, so this keeps cli symbols out of `search`).
+#[cfg(feature = "storage")]
 use super::*;
 
 /// Persisted metadata needed to hydrate SearchEngine without re-running the
 /// source-content indexing pipeline.
+///
+/// Storage-gated: the snapshot persistence + hydration APIs are consumed by
+/// `src/cli/` (`persist_search_snapshot` / `try_hydrate_from_snapshot`) and the
+/// structs are gated behind the `storage` feature (cli implies storage, so the
+/// strict feature-DAG rule — no `cli` symbols in `search` — is preserved).
+/// Under `--features onnx` without `storage` they would otherwise be dead code
+/// (clippy -D warnings).
+#[cfg(feature = "storage")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SearchSnapshot {
     pub(crate) version: u32,
@@ -23,6 +36,7 @@ pub(crate) struct SearchSnapshot {
 }
 
 /// Per-node metadata for fast search-index hydration.
+#[cfg(feature = "storage")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SearchSnapshotNode {
     pub(crate) node_id: String,

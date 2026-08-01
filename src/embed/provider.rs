@@ -715,9 +715,8 @@ mod tests {
                 Ok(s) => s.name(),
                 Err(s) => s.fallback_name(),
             };
-            assert_ne!(
-                name.contains("unknown"),
-                true,
+            assert!(
+                !name.contains("unknown"),
                 "normalized '{input}' should not hit the unknown-fallback"
             );
         }

@@ -7,6 +7,11 @@
 // - VAL-CPHASE-019: Fallback emits an actionable warning
 // - VAL-CPHASE-020: Worker failure does not crash the main daemon
 // - VAL-CPHASE-021: A fresh worker can be spawned after a fallback episode
+//
+// Requires the `onnx` feature: these tests exercise `leindex::embed`, which is
+// cfg-gated behind `feature = "onnx"` in `src/lib.rs` (mirrors
+// `embed_migraphx_dynamic_test.rs`).
+#![cfg(feature = "onnx")]
 
 use std::sync::{Arc, Mutex};
 

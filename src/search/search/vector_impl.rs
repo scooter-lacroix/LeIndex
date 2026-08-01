@@ -21,6 +21,12 @@ pub struct MmapVectorIndex {
 }
 
 impl MmapVectorIndex {
+    /// Rebuild an mmap-backed index from persisted embeddings + node ids.
+    ///
+    /// Cli-only: consumed by the snapshot hydration path in `src/cli/`, so
+    /// gated behind the `cli` feature (dead code under `--features onnx`
+    /// without `cli`).
+    #[cfg(feature = "storage")]
     pub(super) fn from_snapshot(
         base: Arc<MmapEmbeddingIndex>,
         node_ids: &[String],
@@ -340,11 +346,14 @@ pub enum VectorIndexError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "storage")]
     use super::*;
+    #[cfg(feature = "storage")]
     use crate::search::vector::write_mmap_embeddings;
 
     /// CR-F8 (pr32 plan): after `clear()`, removing a pre-clear ID must not
     /// insert a tombstone and must return `false`.
+    #[cfg(feature = "storage")]
     #[test]
     fn test_remove_after_clear_returns_false() {
         let dir = tempfile::tempdir().unwrap();
@@ -367,6 +376,7 @@ mod tests {
     }
 
     /// CR-F8: tombstone set stays empty after clearing + removing pre-clear IDs.
+    #[cfg(feature = "storage")]
     #[test]
     fn test_remove_after_clear_no_tombstone_growth() {
         let dir = tempfile::tempdir().unwrap();

@@ -51,6 +51,10 @@ pub const WORK_HOISTER_MAX_ENTRIES: usize = 4_096;
 pub const WORK_HOISTER_MAX_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 
 /// Output dimension of the bundled Qwen3 embedding model.
+///
+/// Cli-only (snapshot hydration validates neural/fragment mmap dimensions);
+/// gated so `--features onnx` without `cli` has no dead const.
+#[cfg(feature = "storage")]
 const NEURAL_EMBEDDING_DIMENSION: usize = 1024;
 mod int8_quality;
 mod node_info;
@@ -147,6 +151,8 @@ pub struct SearchEngine {
     neural_weight: f32,
 }
 
+/// Cli-only snapshot format version (persistence lives in `src/cli/`).
+#[cfg(feature = "storage")]
 const SEARCH_SNAPSHOT_VERSION: u32 = 1;
 
 impl SearchEngine {
@@ -782,6 +788,11 @@ impl SearchEngine {
     }
 
     /// Create a compact persisted metadata snapshot for fast cold-start load.
+    ///
+    /// Storage-gated: consumed by `index_builder::persist_search_snapshot`
+    /// (cli implies storage; gating on `storage` keeps cli symbols out of
+    /// `search` per the strict feature-DAG rule).
+    #[cfg(feature = "storage")]
     pub(crate) fn search_snapshot(
         &self,
         pdg_nodes: usize,
@@ -836,6 +847,10 @@ impl SearchEngine {
     ///
     /// This preserves the same resident structures built by `append_nodes`
     /// without rereading source files or recomputing TF-IDF/neural embeddings.
+    ///
+    /// Storage-gated: consumed by `LeIndex::try_hydrate_from_snapshot` (cli
+    /// implies storage; gating on `storage` keeps cli symbols out of `search`).
+    #[cfg(feature = "storage")]
     pub(crate) fn restore_from_search_snapshot(
         &mut self,
         snapshot: SearchSnapshot,

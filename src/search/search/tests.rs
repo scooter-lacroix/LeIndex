@@ -64,6 +64,7 @@ fn test_index_nodes() {
     assert!(!engine.is_empty());
 }
 
+#[cfg(feature = "storage")]
 #[test]
 fn test_search_snapshot_restore_round_trip() {
     let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
@@ -124,6 +125,7 @@ fn test_search_snapshot_restore_round_trip() {
 }
 
 #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+#[cfg(feature = "storage")]
 #[test]
 fn search_snapshot_restores_neural_rows_without_heap_tfidf_copy() {
     let mut engine = SearchEngine::new();
@@ -171,6 +173,7 @@ fn search_snapshot_restores_neural_rows_without_heap_tfidf_copy() {
     assert!(restored.nodes[0].tfidf_embedding.is_empty());
 }
 
+#[cfg(feature = "storage")]
 #[test]
 fn test_search_snapshot_restore_rejects_wrong_tfidf_dimension() {
     let mut engine = SearchEngine::new();
@@ -1002,6 +1005,7 @@ fn test_incremental_reindex_node_id_to_idx_consistency() {
     }
 }
 
+#[cfg(feature = "storage")]
 #[test]
 fn test_search_snapshot_fragment_roundtrip() {
     let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
@@ -1068,6 +1072,7 @@ fn test_search_snapshot_fragment_roundtrip() {
     assert_eq!(collected[1].0, "hash_def");
 }
 
+#[cfg(feature = "storage")]
 #[test]
 fn test_search_snapshot_restore_disables_fragment_on_row_mismatch() {
     let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
@@ -1130,6 +1135,7 @@ fn test_search_snapshot_restore_disables_fragment_on_row_mismatch() {
     );
 }
 
+#[cfg(feature = "storage")]
 #[test]
 fn test_fragment_owner_union_and_byte_range_surfacing() {
     let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
@@ -1229,6 +1235,7 @@ fn test_fragment_owner_union_and_byte_range_surfacing() {
     );
 }
 
+#[cfg(feature = "storage")]
 #[test]
 fn test_fragment_layer_off_by_default_contributes_nothing() {
     let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];

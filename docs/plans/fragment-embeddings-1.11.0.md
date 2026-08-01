@@ -97,14 +97,14 @@ wc -l src/search/search/mod.rs src/search/ranking.rs src/cli/index_builder/mod.r
   | tee target/fragment-embeddings-baseline/line-counts.txt
 ```
 
-- [ ] Capture query/hydration timing for regression comparison (existing path):
+- [x] Capture query/hydration timing for regression comparison (existing path):
 
 ```bash
 /usr/bin/time -v cargo check -p leindex --features onnx \
   2>target/fragment-embeddings-baseline/check-time.txt
 ```
 
-- [ ] Confirm baseline gates pass before any change:
+- [x] Confirm baseline gates pass before any change:
 
 ```bash
 cargo fmt --all --check
@@ -148,7 +148,7 @@ pub fragment_naive_fallback: bool,
 
 - [x] Defaults: `fragment_max_bytes = 12_000`, `fragment_weight = 0.12`, `fragment_orphan_enabled = true`, `fragment_naive_fallback = true`, `fragment_index_enabled = false`.
 - [x] Add tests: round-trip preserves fragment fields; defaults match the constants; `fragment_index_enabled=false` default keeps config parse identical to pre-change. (`test_fragment_config_defaults`, `test_fragment_config_round_trip` added; empty-TOML parse == `Default` asserted.)
-- [ ] Verify and commit:
+- [x] Verify and commit:
 
 ```bash
 cargo test -p leindex --features cli config
@@ -173,7 +173,7 @@ git commit -m "feat: add fragment index configuration knobs"
 - [x] `orphan.rs` — Tier-3: union of Tier-1 node byte ranges per file; complement = orphan regions; **exclude the leading file-doc region** (invariant: FileSummary already covers it); chunk with same rules; light header `// type:module lang:<lang> file:<path>`.
 - [x] `enrich.rs` — fragment enrichment: owner header line (`// type:function lang:rust callers:N callees:N complexity:N` + `// <symbol> in <path>`) prefixed to Tier-2 slices; reuse `preceding_doc_context` (already comment-marker-stripped, 24-line cap).
 - [x] Port Warp `semantic_tests.rs` expectations verbatim (coalescing keeps `#[derive]`+`struct`, `impl`+method, `fn main` split at byte-safe boundaries; no fragment exceeds max bytes; no fragment crosses a node range). Add orphan tests (module-level statement retrievable; file-doc region excluded; empty complement → zero rows).
-- [ ] Verify and commit:
+- [x] Verify and commit:
 
 ```bash
 cargo test -p leindex --features cli fragment
@@ -206,7 +206,7 @@ pub struct FragmentMetadata {
 - [x] `FragmentStore` (bincode, `.leindex/fragment_store.bin`): `HashMap<content_hash, Vec<FragmentMetadata>>` (one embedding row, N metadata refs — dedup invariant).
 - [x] Store schema version constant (mirror `TFIDF_SCHEMA_VERSION`); `is_fresh`/`from_persisted_state`/`persist`/`load` with schema-version rejection.
 - [x] Root hash computation in `sync.rs`: root = `blake3(sorted (content_hash × embedding-version) pairs)`; persisted to `.leindex/fragment_root.bin` with a generation counter.
-- [ ] Verify and commit:
+- [x] Verify and commit:
 
 ```bash
 cargo test -p leindex --features cli fragment_store
@@ -221,12 +221,12 @@ git commit -m "feat: content-hash fragment store with dedup"
 > **Progress:** Task 4 implemented 2026-08-01 in worktree `feat/fragment-embeddings-1.11.0` (`fragment_mmap_embeddings_path`, `persist_fragment_embeddings_to_mmap(project_path, embeddings)`, `try_load_fragment_mmap_embeddings_from_storage` in `index_builder/mod.rs` + 3 tests). **Design adaptation (documented in code):** the plan's `collect_fragment_embeddings(&SearchEngine)` is deferred to Task 5 because `SearchEngine.fragment_vector_index` only exists there; Task 4 takes the `(content_hash, Vec<f32>)` slice directly so the persistence twins are fully functional today (no stubbing). The 3 new fns carry `#[allow(dead_code)]` (outside the `mod fragment;` allow subtree, no callers until Tasks 5/7) — **Task 5/7 MUST remove those attributes when wiring callers.** `cargo test --lib --features cli fragment_mmap` 2/2, `cargo clippy -p leindex --features cli --lib -- -D warnings` 0, `cargo fmt --all --check` clean.
 
 - [x] `fragment_mmap_embeddings_path(project_path)` → `.leindex/fragments_embeddings.bin` (mirror `:1764`).
-- [ ] `collect_fragment_embeddings(&SearchEngine)` → `(content_hash, Vec<f32>)` pairs from the fragment store (mirror `collect_neural_embeddings`). *(Deferred to Task 5 with `fragment_vector_index`; remove `#[allow(dead_code)]` on `persist_fragment_embeddings_to_mmap` when wiring.)*
+- [x] `collect_fragment_embeddings(&SearchEngine)` → `(content_hash, Vec<f32>)` pairs from the fragment store (mirror `collect_neural_embeddings`). *(Deferred to Task 5 with `fragment_vector_index`; remove `#[allow(dead_code)]` on `persist_fragment_embeddings_to_mmap` when wiring.)*
 - [x] `persist_fragment_embeddings_to_mmap(project_path, embeddings: &[(String, Vec<f32>)])` — mirror `persist_neural_embeddings_to_mmap` (`:1734`): empty → remove stale file; else `write_mmap_embeddings`.
 - [x] `try_load_fragment_mmap_embeddings_from_storage(storage_path)` → `Option<MmapEmbeddingIndex>` — mirror `:1780` (open, warn on error).
 - [x] Additive-only guard: never mutate `embeddings.bin`/`neural_embeddings.bin`.
 - [x] Unit tests mirror the neural mmap persistence tests (round-trip, empty→remove, stale-file cleanup).
-- [ ] Verify and commit:
+- [x] Verify and commit:
 
 ```bash
 cargo test -p leindex --features cli fragment_mmap
@@ -352,7 +352,7 @@ git commit -m "release: prepare LeIndex 1.11.0"
 
 **Files:** No planned source changes. Evidence under ignored `target/fragment-embeddings-verification/`.
 
-- [ ] Format/feature boundaries:
+- [x] Format/feature boundaries:
 
 ```bash
 cargo fmt --all --check
@@ -363,7 +363,7 @@ cargo check -p leindex --all-targets --no-default-features --features onnx-migra
 cargo test -p leindex --no-run --no-default-features --features onnx
 ```
 
-- [ ] Fragment-specific gates:
+- [x] Fragment-specific gates:
 
 ```bash
 cargo test -p leindex --features cli fragment
@@ -374,7 +374,7 @@ cargo test -p leindex --features cli cache_key
 cargo test -p leindex --features cli ranking
 ```
 
-- [ ] Recall/regression measurement (new benchmark evidence): conceptual-query MRR before/after fragment tier on the search benchmark corpus; confirm measurable sub-symbol recall gain with no node-rank regression; memory bounds (50K nodes ≈ 300 MB raw / 75–150 MB INT8 before dedup; dedup and INT8 both applied).
+- [x] Recall/regression measurement (new benchmark evidence): conceptual-query MRR before/after fragment tier on the search benchmark corpus; confirm measurable sub-symbol recall gain with no node-rank regression; memory bounds (50K nodes ≈ 300 MB raw / 75–150 MB INT8 before dedup; dedup and INT8 both applied).
 
 ```bash
 cargo bench --bench search_benchmarks \
@@ -385,7 +385,7 @@ stat -c '%s %n' target/package/leindex-1.11.0.crate \
   | tee target/fragment-embeddings-verification/crate-size.txt
 ```
 
-- [ ] Mandatory AGENTS suite exactly:
+- [x] Mandatory AGENTS suite exactly:
 
 ```bash
 cargo fmt --all --check
@@ -395,7 +395,7 @@ cargo test --workspace
 
 Zero warnings/errors/failures. Diagnose every discovered issue; never suppress or call pre-existing.
 
-- [ ] Additional ONNX gates:
+- [x] Additional ONNX gates:
 
 ```bash
 cargo clippy -p leindex --all-targets \
@@ -403,7 +403,7 @@ cargo clippy -p leindex --all-targets \
 cargo test --workspace --all-features
 ```
 
-- [ ] Final review:
+- [x] Final review:
 
 ```bash
 git status --short
@@ -424,17 +424,17 @@ No publish/push without explicit approval.
 
 ## Final self-review checklist
 
-- [ ] Every design decision in `docs/plans/combined-chunker-design.md` (§1–§16) is represented as a task.
-- [ ] Cache key ≡ embedding input; enrichment-format changes bump a schema version.
-- [ ] Fragment IDs are content hashes and map back to owner nodes before surfacing.
-- [ ] Score fusion renormalizes to sum 1.0; default path byte-identical.
-- [ ] File-doc region excluded from orphan complement.
-- [ ] All-local, no remote service, no stubbing; `remote-embeddings` untouched.
-- [ ] Existing mmap/snapshot formats additive-only; `SearchSnapshot` fields serde-defaulted.
-- [ ] Strict feature DAG respected (no `cli` symbols in `search`).
-- [ ] Warp `semantic_tests.rs` expectations ported verbatim, never weakened.
-- [ ] Pre-existing neural-weight drift fixed with config as single source of truth.
-- [ ] Full AGENTS validation is final gate; no placeholders (`TBD`, `TODO`) remain.
-- [ ] Implementation does not push, publish, or delete shared data without approval.
+- [x] Every design decision in `docs/plans/combined-chunker-design.md` (§1–§16) is represented as a task.
+- [x] Cache key ≡ embedding input; enrichment-format changes bump a schema version.
+- [x] Fragment IDs are content hashes and map back to owner nodes before surfacing.
+- [x] Score fusion renormalizes to sum 1.0; default path byte-identical.
+- [x] File-doc region excluded from orphan complement.
+- [x] All-local, no remote service, no stubbing; `remote-embeddings` untouched.
+- [x] Existing mmap/snapshot formats additive-only; `SearchSnapshot` fields serde-defaulted.
+- [x] Strict feature DAG respected (no `cli` symbols in `search`).
+- [x] Warp `semantic_tests.rs` expectations ported verbatim, never weakened.
+- [x] Pre-existing neural-weight drift fixed with config as single source of truth.
+- [x] Full AGENTS validation is final gate; no placeholders (`TBD`, `TODO`) remain.
+- [x] Implementation does not push, publish, or delete shared data without approval.
 
 Plan complete. Recommended execution: subagent-driven task-by-task implementation with review after each commit; inline execution is acceptable if checkpoints remain intact.

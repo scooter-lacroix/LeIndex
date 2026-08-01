@@ -13,6 +13,11 @@
 // - VAL-CPHASE-013: Batch ordering is preserved through IPC
 // - VAL-CPHASE-014: Oversized batch is split before transport and re-stitched
 // - VAL-CPHASE-015: Single oversized text is reduced before IPC framing
+//
+// Requires the `onnx` feature: these tests exercise `leindex::embed`, which is
+// cfg-gated behind `feature = "onnx"` in `src/lib.rs` (mirrors
+// `embed_migraphx_dynamic_test.rs`).
+#![cfg(feature = "onnx")]
 
 use std::io::Cursor;
 use std::time::Duration;
