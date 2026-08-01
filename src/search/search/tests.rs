@@ -1129,3 +1129,180 @@ fn test_search_snapshot_restore_disables_fragment_on_row_mismatch() {
         "row-count mismatch must disable the fragment layer"
     );
 }
+
+#[test]
+fn test_fragment_owner_union_and_byte_range_surfacing() {
+    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf_embedding[0] = 1.0;
+
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding,
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+
+    // Hydrate a 2-row fragment index owned by the single node.
+    let mut snapshot = engine.search_snapshot(1, 0, "frag-fingerprint".to_string());
+    snapshot.fragment_rows = 2;
+    let dir = tempfile::tempdir().unwrap();
+    let tfidf_path = dir.path().join("tfidf.bin");
+    let frag_path = dir.path().join("frag.bin");
+    crate::search::vector::write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings())
+        .unwrap();
+    let mut hash_abc = vec![0.0f32; NEURAL_EMBEDDING_DIMENSION];
+    hash_abc[0] = 1.0;
+    let mut hash_def = vec![0.0f32; NEURAL_EMBEDDING_DIMENSION];
+    hash_def[1] = 1.0;
+    let fragment_embeddings = vec![
+        ("hash_abc".to_string(), hash_abc),
+        ("hash_def".to_string(), hash_def),
+    ];
+    crate::search::vector::write_mmap_embeddings(&frag_path, &fragment_embeddings).unwrap();
+    let tfidf_mmap = crate::search::vector::MmapEmbeddingIndex::open(&tfidf_path).unwrap();
+    let frag_mmap = crate::search::vector::MmapEmbeddingIndex::open(&frag_path).unwrap();
+    let frag_ids = vec!["hash_abc".to_string(), "hash_def".to_string()];
+
+    let mut restored = SearchEngine::new();
+    restored
+        .restore_from_search_snapshot(
+            snapshot,
+            Arc::new(tfidf_mmap),
+            None,
+            Some(Arc::new(frag_mmap)),
+            Some(&frag_ids),
+        )
+        .unwrap();
+    // Turn the fragment layer ON: master switch + fusion weight + refs map.
+    let mut refs = std::collections::HashMap::new();
+    refs.insert(
+        "hash_abc".to_string(),
+        ("auth.rs:authenticate_user".to_string(), (10, 25)),
+    );
+    refs.insert(
+        "hash_def".to_string(),
+        ("auth.rs:authenticate_user".to_string(), (30, 45)),
+    );
+    restored.set_fragment_index_enabled(true);
+    restored.set_fragment_weight(0.12);
+    restored.set_fragment_refs(refs);
+
+    // A neural query embedding close to hash_abc must surface the owner with
+    // the fragment byte range and a nonzero fragment score component.
+    let mut query_neural = vec![0.0f32; NEURAL_EMBEDDING_DIMENSION];
+    query_neural[0] = 1.0;
+    let results = restored
+        .search(SearchQuery {
+            query: "authenticate".to_string(),
+            top_k: 5,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: Some(engine.collect_embeddings()[0].1.clone()),
+            query_neural_embedding: Some(query_neural),
+            threshold: None,
+            query_type: None,
+        })
+        .unwrap();
+    let owner = results
+        .iter()
+        .find(|r| r.node_id == "auth.rs:authenticate_user");
+    assert!(
+        owner.is_some(),
+        "fragment owner must enter the candidate pool"
+    );
+    let result = owner.unwrap();
+    assert_eq!(result.fragment_byte_range, Some((10, 25)));
+    assert!(result.score.fragment > 0.0);
+    assert_eq!(
+        result.byte_range,
+        (0, 29),
+        "node byte range stays unchanged"
+    );
+}
+
+#[test]
+fn test_fragment_layer_off_by_default_contributes_nothing() {
+    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf_embedding[0] = 1.0;
+
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding,
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+
+    let mut snapshot = engine.search_snapshot(1, 0, "frag-fingerprint".to_string());
+    snapshot.fragment_rows = 2;
+    let dir = tempfile::tempdir().unwrap();
+    let tfidf_path = dir.path().join("tfidf.bin");
+    let frag_path = dir.path().join("frag.bin");
+    crate::search::vector::write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings())
+        .unwrap();
+    let mut hash_abc = vec![0.0f32; NEURAL_EMBEDDING_DIMENSION];
+    hash_abc[0] = 1.0;
+    let fragment_embeddings = vec![
+        ("hash_abc".to_string(), hash_abc),
+        (
+            "hash_def".to_string(),
+            vec![0.0f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+    ];
+    crate::search::vector::write_mmap_embeddings(&frag_path, &fragment_embeddings).unwrap();
+    let tfidf_mmap = crate::search::vector::MmapEmbeddingIndex::open(&tfidf_path).unwrap();
+    let frag_mmap = crate::search::vector::MmapEmbeddingIndex::open(&frag_path).unwrap();
+    let frag_ids = vec!["hash_abc".to_string(), "hash_def".to_string()];
+
+    let mut restored = SearchEngine::new();
+    restored
+        .restore_from_search_snapshot(
+            snapshot,
+            Arc::new(tfidf_mmap),
+            None,
+            Some(Arc::new(frag_mmap)),
+            Some(&frag_ids),
+        )
+        .unwrap();
+    // fragment_index_enabled stays false (default): the fragment layer must
+    // contribute nothing, even with a fragment index hydrated.
+
+    let mut query_neural = vec![0.0f32; NEURAL_EMBEDDING_DIMENSION];
+    query_neural[0] = 1.0;
+    let results = restored
+        .search(SearchQuery {
+            query: "authenticate".to_string(),
+            top_k: 5,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: Some(engine.collect_embeddings()[0].1.clone()),
+            query_neural_embedding: Some(query_neural),
+            threshold: None,
+            query_type: None,
+        })
+        .unwrap();
+    let owner = results
+        .iter()
+        .find(|r| r.node_id == "auth.rs:authenticate_user");
+    assert!(owner.is_some(), "lexical match keeps the owner in results");
+    let result = owner.unwrap();
+    assert_eq!(result.fragment_byte_range, None);
+    assert_eq!(result.score.fragment, 0.0);
+}

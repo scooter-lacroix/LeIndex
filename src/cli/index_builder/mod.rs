@@ -1514,17 +1514,20 @@ pub(crate) fn search_cache_key_for(
     neural_weight: f64,
     rerank_enabled: bool,
     rerank_top_n: u32,
+    fragment_index_enabled: bool,
+    fragment_weight: f64,
     embed_model: &str,
     rerank_model: &str,
 ) -> String {
     // v2: widens the key to include every result-affecting config knob + model
-    // identity (search_mode, neural_weight, rerank_enabled/top_n, embedder +
-    // reranker model). v1 keys omitted these, so a config or model change
-    // silently served stale cached results until a re-index changed the node
-    // count. The `v2:` namespace prefix lands in the (sanitized) cache filename
-    // so legacy v1 entries are identifiably stale and sweepable, not silent.
+    // identity (search_mode, neural_weight, rerank_enabled/top_n, fragment
+    // knobs, embedder + reranker model). v1 keys omitted these, so a config or
+    // model change silently served stale cached results until a re-index
+    // changed the node count. The `v2:` namespace prefix lands in the
+    // (sanitized) cache filename so legacy v1 entries are identifiably stale
+    // and sweepable, not silent.
     search_cache_key(&format!(
-        "v2:query:{}:{}:{}:{}:{:?}:neural={}:mode={}:nw={}:rr={}|{}|{}:embed={}",
+        "v2:query:{}:{}:{}:{}:{:?}:neural={}:mode={}:nw={}:rr={}|{}|{}:frag={}|{}:embed={}",
         stable_project_cache_id(project_id, project_path),
         index_fingerprint(stats),
         top_k,
@@ -1536,6 +1539,8 @@ pub(crate) fn search_cache_key_for(
         rerank_enabled,
         rerank_top_n,
         rerank_model,
+        fragment_index_enabled,
+        fragment_weight,
         embed_model,
     ))
 }

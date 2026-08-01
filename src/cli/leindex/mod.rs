@@ -517,11 +517,14 @@ impl LeIndex {
             project_path
         );
 
-        // Initialize search engine, configured with the documented `[search]
-        // neural_weight` knob (previously dead config). VAL-CONFIG.
+        // Initialize search engine, configured with the documented `[search]`
+        // knobs: `neural_weight` (previously dead config) plus the fragment
+        // layer master switch + fusion weight. VAL-CONFIG.
         let mut search_engine = SearchEngine::new();
-        search_engine
-            .set_neural_weight(crate::config::LeIndexConfig::load_cached().neural_weight_f32());
+        let cfg = crate::config::LeIndexConfig::load_cached();
+        search_engine.set_neural_weight(cfg.neural_weight_f32());
+        search_engine.set_fragment_index_enabled(cfg.search.fragment_index_enabled);
+        search_engine.set_fragment_weight(cfg.search.fragment_weight as f32);
 
         // Initialize cache subsystem
         let cache_dir = storage_path.join("cache");
@@ -649,6 +652,8 @@ impl LeIndex {
             cfg.search.neural_weight,
             cfg.search.rerank_enabled,
             cfg.search.rerank_top_n,
+            cfg.search.fragment_index_enabled,
+            cfg.search.fragment_weight,
             &cfg.neural.model_name,
             &rerank_model,
         )

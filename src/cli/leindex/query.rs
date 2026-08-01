@@ -595,6 +595,7 @@ impl LeIndex {
             score: crate::search::ranking::Score::default(),
             context: None,
             byte_range,
+            fragment_byte_range: None,
             line_number,
         }];
 
@@ -1270,6 +1271,7 @@ mod tests {
             score: Score::default(),
             context: Some(String::new()),
             byte_range: (0, 0),
+            fragment_byte_range: None,
             line_number: Some(1),
         }
     }

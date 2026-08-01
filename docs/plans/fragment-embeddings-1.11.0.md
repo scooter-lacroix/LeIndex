@@ -265,15 +265,15 @@ git commit -m "feat: hydrate fragment vector index from snapshot"
 
 **Files:** `src/search/search/mod.rs` (neural candidates :1109, `collect_search_candidates` :1164/:1179/:1192); `src/search/ranking.rs` (`Score`, `HybridScorer`); `src/cli/leindex/query.rs` (search path :249, rerank pool).
 
-- [ ] In `search()`: alongside `neural_candidates`, compute `fragment_candidates` from `fragment_vector_index` (top_k×10, ≥100) when a query neural embedding exists.
-- [ ] **Renormalization gate:** key score renormalization on `fragment_index_enabled` (the master switch), NOT `fragment_weight > 0` — the default `fragment_weight` is already `0.12` (> 0), so gating on the weight alone would renormalize with the feature off and break invariant 7 (byte-identical default).
-- [ ] Map fragment hits → owner nodes: `HashMap<owner_node_id, Vec<content_hash>>` from the fragment store; add owners to the candidate pool (invariant 6); retain the best fragment byte range per owner for result surfacing.
-- [ ] **Result surfacing:** add `fragment_byte_range: Option<(usize, usize)>` to `SearchResult` (serde default → `None` for old cached results) rather than repurposing the node-level `byte_range` — keeps node ranges and fragment ranges distinguishable. Populate from the retained best fragment range; leave `byte_range` (node-level) unchanged.
-- [ ] `Score` gains `fragment: f32` (serde default 0.0); `HybridScorer::score_hybrid` gains a `fragment` weight; **when `fragment_index_enabled`, renormalize the five weights to sum 1.0** (mirror `HybridScoringWeights::normalize`); gated so default path is byte-identical.
-- [ ] Query path (`query.rs`): read `cfg.search.fragment_index_enabled`; when enabled, include fragment candidates in the reranker pool (single union pool, existing top-80); truncate back to `top_k` after rerank.
-- [ ] Exact/identifier routes (`query_route.rs`) unchanged; fragment layer participates only when a query neural embedding exists.
-- [ ] Tests: fragment candidate union; owner mapping; renormalization math (all five weights sum 1.0); default (feature-off) scores byte-identical to pre-change; exact-route non-regression.
-- [ ] Verify and commit:
+- [x] In `search()`: alongside `neural_candidates`, compute `fragment_candidates` from `fragment_vector_index` (top_k×10, ≥100) when a query neural embedding exists.
+- [x] **Renormalization gate:** key score renormalization on `fragment_index_enabled` (the master switch), NOT `fragment_weight > 0` — the default `fragment_weight` is already `0.12` (> 0), so gating on the weight alone would renormalize with the feature off and break invariant 7 (byte-identical default).
+- [x] Map fragment hits → owner nodes: `HashMap<owner_node_id, Vec<content_hash>>` from the fragment store; add owners to the candidate pool (invariant 6); retain the best fragment byte range per owner for result surfacing.
+- [x] **Result surfacing:** add `fragment_byte_range: Option<(usize, usize)>` to `SearchResult` (serde default → `None` for old cached results) rather than repurposing the node-level `byte_range` — keeps node ranges and fragment ranges distinguishable. Populate from the retained best fragment range; leave `byte_range` (node-level) unchanged.
+- [x] `Score` gains `fragment: f32` (serde default 0.0); `HybridScorer::score_hybrid` gains a `fragment` weight; **when `fragment_index_enabled`, renormalize the five weights to sum 1.0** (mirror `HybridScoringWeights::normalize`); gated so default path is byte-identical.
+- [x] Query path (`query.rs`): read `cfg.search.fragment_index_enabled`; when enabled, include fragment candidates in the reranker pool (single union pool, existing top-80); truncate back to `top_k` after rerank.
+- [x] Exact/identifier routes (`query_route.rs`) unchanged; fragment layer participates only when a query neural embedding exists.
+- [x] Tests: fragment candidate union; owner mapping; renormalization math (all five weights sum 1.0); default (feature-off) scores byte-identical to pre-change; exact-route non-regression.
+- [x] Verify and commit:
 
 ```bash
 cargo test -p leindex --features cli ranking

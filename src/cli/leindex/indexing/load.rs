@@ -131,18 +131,19 @@ impl LeIndex {
         // mismatched artifact can never poison the node-level path.
         let fragment_mmap_raw =
             index_builder::try_load_fragment_mmap_embeddings_from_storage(artifact_path);
-        let fragment_ids: Option<Vec<String>> =
-            match index_builder::fragment::FragmentStore::load_from_artifact_path(artifact_path) {
-                Ok(Some(store)) => Some(store.content_hashes().map(str::to_string).collect()),
-                Ok(None) => None,
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "Failed to load fragment store; fragment layer disabled"
-                    );
-                    None
-                }
-            };
+        let fragment_store =
+            index_builder::fragment::FragmentStore::load_from_artifact_path(artifact_path);
+        let fragment_ids: Option<Vec<String>> = match &fragment_store {
+            Ok(Some(store)) => Some(store.content_hashes().map(str::to_string).collect()),
+            Ok(None) => None,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to load fragment store; fragment layer disabled"
+                );
+                None
+            }
+        };
         let fragment_layer_ok = fragment_ids.is_some()
             && index_builder::fragment_layer_is_valid(
                 snapshot.fragment_root_hash.as_deref(),
@@ -188,6 +189,25 @@ impl LeIndex {
                 #[cfg(not(feature = "onnx"))]
                 {
                     self.embedder = Some(index_builder::HybridEmbedder::tfidf_only(tfidf_embedder));
+                }
+
+                // Fragment owner mapping (Task 6, invariant 6): content hash →
+                // (owner node id, best byte range) from the store, used at
+                // query time to map fragment hits back to their Tier-1 owners.
+                if let Ok(Some(store)) = &fragment_store {
+                    let refs: std::collections::HashMap<String, (String, (usize, usize))> = store
+                        .content_hashes()
+                        .filter_map(|hash| {
+                            store.get(hash).and_then(|metas| {
+                                metas.iter().find_map(|meta| {
+                                    meta.owner.as_ref().map(|owner| {
+                                        (hash.to_string(), (owner.clone(), meta.byte_range))
+                                    })
+                                })
+                            })
+                        })
+                        .collect();
+                    self.search_engine.set_fragment_refs(refs);
                 }
 
                 if let Err(err) = self.load_stats_from_path(artifact_path) {
