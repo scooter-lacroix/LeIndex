@@ -774,6 +774,54 @@ fn test_empty_neural_persist_removes_stale_mmap() {
     );
 }
 
+// Fragment mmap twins (Task 4) — mirror the neural mmap persistence tests.
+
+/// Empty fragment persistence removes a stale mmap file (feature-off leaves no
+/// orphan artifact).
+#[test]
+fn test_empty_fragment_persist_removes_stale_mmap() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let stale_path = fragment_mmap_embeddings_path(temp.path());
+    std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+    std::fs::write(&stale_path, b"stale fragment data").unwrap();
+
+    persist_fragment_embeddings_to_mmap(temp.path(), &[]).unwrap();
+
+    assert!(
+        !stale_path.exists(),
+        "empty fragment persistence should remove stale fragment mmap file"
+    );
+}
+
+/// Fragment embeddings round-trip through `fragments_embeddings.bin`: write
+/// content-hash-addressed rows, then load them back with matching dimension.
+#[test]
+fn test_fragment_mmap_roundtrip() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let embeddings = vec![
+        ("hash_abc".to_string(), vec![0.1, 0.2, 0.3]),
+        ("hash_def".to_string(), vec![0.4, 0.5, 0.6]),
+    ];
+
+    persist_fragment_embeddings_to_mmap(temp.path(), &embeddings).unwrap();
+
+    let index = try_load_fragment_mmap_embeddings_from_storage(&temp.path().join(".leindex"))
+        .expect("fragment mmap loads");
+    assert_eq!(index.len(), 2);
+    assert_eq!(index.dimension(), 3);
+    assert!(index.get_embedding("hash_abc").is_some());
+    assert!(index.get_embedding("hash_def").is_some());
+}
+
+/// Missing fragment mmap artifact → `None` (not an error).
+#[test]
+fn test_fragment_mmap_missing_is_none() {
+    let temp = tempfile::TempDir::new().unwrap();
+    assert!(
+        try_load_fragment_mmap_embeddings_from_storage(&temp.path().join(".leindex")).is_none()
+    );
+}
+
 #[test]
 fn test_index_nodes_accumulates_df_across_passes() {
     use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};

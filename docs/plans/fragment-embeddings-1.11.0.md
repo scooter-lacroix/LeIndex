@@ -218,12 +218,14 @@ git commit -m "feat: content-hash fragment store with dedup"
 
 **Files:** `src/cli/index_builder/mod.rs` (near `persist_neural_embeddings_to_mmap` :1734, `neural_mmap_embeddings_path` :1764, `try_load_neural_mmap_embeddings_from_storage` :1780); `src/search/vector.rs` (:837 `write_mmap_embeddings`).
 
-- [ ] `fragment_mmap_embeddings_path(project_path)` → `.leindex/fragments_embeddings.bin` (mirror `:1764`).
-- [ ] `collect_fragment_embeddings(&SearchEngine)` → `(content_hash, Vec<f32>)` pairs from the fragment store (mirror `collect_neural_embeddings`).
-- [ ] `persist_fragment_embeddings_to_mmap(&SearchEngine, project_path)` — mirror `persist_neural_embeddings_to_mmap` (`:1734`): empty → remove stale file; else `write_mmap_embeddings`.
-- [ ] `try_load_fragment_mmap_embeddings_from_storage(storage_path)` → `Option<MmapEmbeddingIndex>` — mirror `:1780` (open, warn on error).
-- [ ] Additive-only guard: never mutate `embeddings.bin`/`neural_embeddings.bin`.
-- [ ] Unit tests mirror the neural mmap persistence tests (round-trip, empty→remove, stale-file cleanup).
+> **Progress:** Task 4 implemented 2026-08-01 in worktree `feat/fragment-embeddings-1.11.0` (`fragment_mmap_embeddings_path`, `persist_fragment_embeddings_to_mmap(project_path, embeddings)`, `try_load_fragment_mmap_embeddings_from_storage` in `index_builder/mod.rs` + 3 tests). **Design adaptation (documented in code):** the plan's `collect_fragment_embeddings(&SearchEngine)` is deferred to Task 5 because `SearchEngine.fragment_vector_index` only exists there; Task 4 takes the `(content_hash, Vec<f32>)` slice directly so the persistence twins are fully functional today (no stubbing). The 3 new fns carry `#[allow(dead_code)]` (outside the `mod fragment;` allow subtree, no callers until Tasks 5/7) — **Task 5/7 MUST remove those attributes when wiring callers.** `cargo test --lib --features cli fragment_mmap` 2/2, `cargo clippy -p leindex --features cli --lib -- -D warnings` 0, `cargo fmt --all --check` clean.
+
+- [x] `fragment_mmap_embeddings_path(project_path)` → `.leindex/fragments_embeddings.bin` (mirror `:1764`).
+- [ ] `collect_fragment_embeddings(&SearchEngine)` → `(content_hash, Vec<f32>)` pairs from the fragment store (mirror `collect_neural_embeddings`). *(Deferred to Task 5 with `fragment_vector_index`; remove `#[allow(dead_code)]` on `persist_fragment_embeddings_to_mmap` when wiring.)*
+- [x] `persist_fragment_embeddings_to_mmap(project_path, embeddings: &[(String, Vec<f32>)])` — mirror `persist_neural_embeddings_to_mmap` (`:1734`): empty → remove stale file; else `write_mmap_embeddings`.
+- [x] `try_load_fragment_mmap_embeddings_from_storage(storage_path)` → `Option<MmapEmbeddingIndex>` — mirror `:1780` (open, warn on error).
+- [x] Additive-only guard: never mutate `embeddings.bin`/`neural_embeddings.bin`.
+- [x] Unit tests mirror the neural mmap persistence tests (round-trip, empty→remove, stale-file cleanup).
 - [ ] Verify and commit:
 
 ```bash
@@ -236,7 +238,7 @@ git commit -m "feat: fragment embeddings mmap persistence"
 
 **Files:** `src/search/search/mod.rs` (field :109, `new()` :142, `with_dimension()` :178, `clear_index()` :252, `restore_from_search_snapshot` :739); `src/search/search/staged_retrieval.rs` (`SearchSnapshot` :8).
 
-- [ ] Add `fragment_vector_index: Option<VectorIndexImpl>` next to `neural_vector_index` (:109); init `None` in `new()`/`with_dimension()`; clear in `clear_index()`.
+- [ ] Add `fragment_vector_index: Option<VectorIndexImpl>` next to `neural_vector_index` (:109); init `None` in `new()`/`with_dimension()`; clear in `clear_index()`. **Also: add `SearchEngine::collect_fragment_embeddings` (Task 4's deferred item) and remove `#[allow(dead_code)]` from the 3 Task 4 fns in `index_builder/mod.rs`.**
 - [ ] Extend `SearchSnapshot` (`staged_retrieval.rs:8`): `fragment_root_hash: Option<String>` (serde default), `fragment_rows: u32` (default 0).
 - [ ] `restore_from_search_snapshot` (:739): accept `fragment_mmap: Option<Arc<MmapEmbeddingIndex>>` + `fragment_ids: Option<&[String]>` (content-hash keys) — **both optional** so the existing `load.rs:126` call site still compiles unchanged (transitional buildability, per embed-merge discipline); validate `fragment_mmap.len() == snapshot.fragment_rows` and root-hash match (invariant 8); build `fragment_vector_index = Some(VectorIndexImpl::Mmap(MmapVectorIndex::from_snapshot(mmap, fragment_ids)))` — non-fatal on failure (mirror neural block).
 - [ ] **Update the caller in the same task:** thread the new optional params through `load.rs` `try_hydrate_from_snapshot` (`:91-129`) so the tree compiles at the end of Task 5, not Task 7. Task 7 then only wires the *fragment store load* (persisted artifacts), not the signature.

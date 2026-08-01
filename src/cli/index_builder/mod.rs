@@ -1812,6 +1812,101 @@ pub(crate) fn try_load_neural_mmap_embeddings_from_storage(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fragment embeddings mmap twins (fragment-embeddings 1.11.0 Task 4)
+// ---------------------------------------------------------------------------
+//
+// Structural twins of the neural mmap path (`neural_embeddings.bin` →
+// `MmapEmbeddingIndex`). Fragment embeddings are content-hash-addressed: the
+// IDs written are blake3 content hashes of the enriched fragment text, so a
+// row in `fragments_embeddings.bin` maps 1:1 to a `FragmentStore` row key.
+// Additive-only (invariant 4): never mutates `embeddings.bin`/
+// `neural_embeddings.bin`.
+//
+// `#[allow(dead_code)]` below: Task 4 delivers the persistence twins ahead of
+// their production callers — `SearchEngine::collect_fragment_embeddings`
+// (Task 5) and the post-index persist sites (Task 7). Remove the attribute
+// once those land; it documents the rollout, not a suppressed defect.
+
+/// Path for the fragment embeddings mmap file.
+#[allow(dead_code)]
+fn fragment_mmap_embeddings_path(project_path: &Path) -> PathBuf {
+    project_path
+        .join(".leindex")
+        .join("fragments_embeddings.bin")
+}
+
+/// Persist fragment embeddings to a separate mmap file for fast hydration.
+///
+/// Mirrors `persist_neural_embeddings_to_mmap`: an empty input removes a stale
+/// file (feature-off leaves no orphan artifact); otherwise writes the matrix
+/// via `write_mmap_embeddings`. The `embeddings` slice is `(content_hash,
+/// Vec<f32>)` pairs collected by Task 5's `SearchEngine::collect_fragment_embeddings`
+/// (or its fragment-store fallback); passing them in keeps this task free of a
+/// `SearchEngine` dependency that does not exist until Task 5 adds
+/// `fragment_vector_index`.
+#[allow(dead_code)]
+pub(crate) fn persist_fragment_embeddings_to_mmap(
+    project_path: &Path,
+    embeddings: &[(String, Vec<f32>)],
+) -> Result<()> {
+    let path = fragment_mmap_embeddings_path(project_path);
+    if embeddings.is_empty() {
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| {
+                anyhow::anyhow!("Failed to remove stale fragment mmap embeddings: {e}")
+            })?;
+            info!(
+                path = %path.display(),
+                "Removed stale fragment embeddings mmap file"
+            );
+        }
+        return Ok(());
+    }
+    crate::search::vector::write_mmap_embeddings(&path, embeddings)
+        .map_err(|e| anyhow::anyhow!("Failed to write fragment mmap embeddings: {e}"))?;
+    info!(
+        count = embeddings.len(),
+        path = %path.display(),
+        "Persisted fragment embeddings to mmap file"
+    );
+    Ok(())
+}
+
+/// Try to load previously persisted fragment embeddings from an explicit
+/// storage directory (`.leindex/fragments_embeddings.bin`).
+///
+/// Returns `None` when the file does not exist or is corrupt (mirrors the
+/// neural loader's warn-and-continue behavior).
+#[allow(dead_code)]
+pub(crate) fn try_load_fragment_mmap_embeddings_from_storage(
+    storage_path: &Path,
+) -> Option<crate::search::vector::MmapEmbeddingIndex> {
+    let path = storage_path.join("fragments_embeddings.bin");
+    if !path.exists() {
+        return None;
+    }
+    match crate::search::vector::MmapEmbeddingIndex::open(&path) {
+        Ok(index) => {
+            info!(
+                nodes = index.len(),
+                dim = index.dimension(),
+                path = %path.display(),
+                "Loaded fragment mmap embedding index"
+            );
+            Some(index)
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to load fragment mmap embedding index"
+            );
+            None
+        }
+    }
+}
+
 /// Clear persisted search query and analysis cache entries for a project.
 ///
 /// After indexing (full or incremental), previously cached search results
