@@ -145,11 +145,11 @@ pub(super) fn read_worker_model_name_from_config() -> Option<String> {
 
 pub(super) fn migraphx_model_cache_path(model_name: Option<&str>) -> Option<std::path::PathBuf> {
     let model = sanitize_cache_component(model_name.unwrap_or("qwen3-embed-0.6b-dynamic"));
-    let batch = leindex_embed::runtime::configured_onnx_inference_batch_size(
+    let batch = crate::embed::runtime::configured_onnx_inference_batch_size(
         model_name.unwrap_or("qwen3-embed-0.6b-dynamic"),
         "migraphx",
     );
-    let sequence = leindex_embed::runtime::configured_onnx_sequence_len();
+    let sequence = crate::embed::runtime::configured_onnx_sequence_len();
     // Key on batch + sequence only. A compiled MIGraphX program depends on the
     // model graph + input shape, never on LeIndex's software version (the model
     // name is already a parent dir segment). Including the package version here
@@ -245,8 +245,8 @@ pub(super) fn daemon_socket_path(
     let provider_name = provider.unwrap_or("auto");
     let model_name = model_name.unwrap_or("qwen3-embed-0.6b");
     let batch =
-        leindex_embed::runtime::configured_onnx_inference_batch_size(model_name, provider_name);
-    let sequence = leindex_embed::runtime::configured_onnx_sequence_len();
+        crate::embed::runtime::configured_onnx_inference_batch_size(model_name, provider_name);
+    let sequence = crate::embed::runtime::configured_onnx_sequence_len();
     let descriptor = format!(
         "{}:{provider_name}:{model_name}:b{batch}:s{sequence}",
         env!("CARGO_PKG_VERSION")

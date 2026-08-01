@@ -30,7 +30,7 @@ use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-use leindex_embed::protocol::{
+use crate::embed::protocol::{
     self, BatchId, EmbedRequest, EmbedResponse, ErrorKind, Frame, HealthResponse, MsgType,
     RerankDocument, RerankRequest, RerankResponse, Response, WorkerError, WorkerState,
 };
@@ -1539,7 +1539,7 @@ impl Drop for EmbeddingClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leindex_embed::protocol::ErrorKind;
+    use crate::embed::protocol::ErrorKind;
 
     /// TEMP verification: spawn the REAL leindex-embed worker (pipe mode) and run
     /// one embed through the production EmbeddingClient. On a cold MIGraphX cache

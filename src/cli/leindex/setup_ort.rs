@@ -425,11 +425,11 @@ fn split_pip_bin_override(value: &str) -> Option<Vec<String>> {
 /// VAL-CROSS-015: this is exposed `pub(crate)` so the `diagnostics` command
 /// can surface the same ORT path that `setup --check` reports, keeping the
 /// two surfaces consistent. The chain mirrors
-/// `leindex_embed::ort_discovery::discover_path_only()` but uses the main
+/// `crate::embed::ort_discovery::discover_path_only()` but uses the main
 /// binary's process context (its own current_exe sibling, its own pip).
 pub(crate) fn discover_ort_path() -> Option<PathBuf> {
     #[cfg(feature = "onnx")]
-    if let Some(outcome) = leindex_embed::ort_discovery::discover_path_only() {
+    if let Some(outcome) = crate::embed::ort_discovery::discover_path_only() {
         return Some(outcome.path);
     }
 

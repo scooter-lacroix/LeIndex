@@ -73,6 +73,13 @@ pub mod skip_dirs;
 #[cfg(any(feature = "cli", feature = "onnx"))]
 pub mod config;
 
+/// ONNX worker protocol and implementation.
+///
+/// Public for package worker binary and integration tests; not stable user API.
+#[cfg(feature = "onnx")]
+#[doc(hidden)]
+pub mod embed;
+
 // Feature flag infrastructure (always available)
 pub mod feature_flags;
 

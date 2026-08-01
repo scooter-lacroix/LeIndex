@@ -1155,7 +1155,7 @@ pub(crate) fn collect_ort_diagnostics() -> (Option<String>, Option<String>, Stri
 
     // ort_path: prefer the live discovery chain, fall back to configured path.
     #[cfg(feature = "onnx")]
-    let live_path = leindex_embed::ort_discovery::discover_path_only()
+    let live_path = crate::embed::ort_discovery::discover_path_only()
         .map(|outcome| outcome.path.display().to_string());
     #[cfg(not(feature = "onnx"))]
     let live_path: Option<String> = None;
