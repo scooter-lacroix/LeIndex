@@ -243,6 +243,25 @@ mod feature_propagation {
         );
     }
 
+    /// VAL-ORT-EP: root onnx enables every runtime-selectable execution-provider
+    /// API (cuda, migraphx, rocm, coreml) so the worker can register any of them.
+    #[test]
+    fn onnx_feature_enables_all_execution_providers() {
+        let toml = root_cargo_toml();
+        let onnx_line = toml
+            .lines()
+            .find(|l| l.trim_start().starts_with("onnx = ["))
+            .expect("root Cargo.toml must define an 'onnx' feature");
+        for ep in ["ort/cuda", "ort/migraphx", "ort/rocm", "ort/coreml"] {
+            assert!(
+                onnx_line.contains(ep),
+                "root 'onnx' feature MUST include '{}'. Got: {}",
+                ep,
+                onnx_line
+            );
+        }
+    }
+
     /// VAL-CARGO-003: onnx-migraphx builds on onnx and adds migraphx.
     #[test]
     fn onnx_migraphx_feature_includes_migraphx() {
@@ -252,7 +271,12 @@ mod feature_propagation {
             .find(|l| l.trim_start().starts_with("onnx-migraphx = ["))
             .expect("root Cargo.toml must define 'onnx-migraphx' feature");
 
-        assert!(migraphx_line.contains("leindex-embed/onnx-migraphx"));
+        assert!(
+            migraphx_line.contains("\"onnx\""),
+            "onnx-migraphx is now a legacy alias for the onnx feature (which includes \
+             ort/migraphx). Got: {}",
+            migraphx_line
+        );
     }
 
     /// VAL-ORT-001/002: The ort crate uses load-dynamic (not download-binaries).

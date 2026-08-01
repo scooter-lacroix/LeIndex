@@ -1901,14 +1901,17 @@ dependencies = [
  "dirs",
  "futures",
  "futures-util",
+ "half",
  "hnsw_rs",
  "leindex-embed",
  "libc",
  "libsql",
  "lru",
  "memmap2",
+ "ndarray",
  "notify",
  "once_cell",
+ "ort",
  "petgraph",
  "proptest",
  "rand 0.8.7",
@@ -1925,6 +1928,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tikv-jemallocator",
+ "tokenizers",
  "tokio",
  "tokio-stream",
  "tokio-test",
@@ -2558,8 +2562,9 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "ort"
-version = "2.0.0-rc.12"
-source = "git+https://github.com/pykeio/ort?rev=17ed727770746447620d0d76e9893ed1a3d7c221#17ed727770746447620d0d76e9893ed1a3d7c221"
+version = "2.0.0-rc.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4336a1e2b38848325241c72889086886004e589b7c74f335e60a8e8db5138a0b"
 dependencies = [
  "half",
  "libloading 0.9.0",
@@ -2571,8 +2576,9 @@ dependencies = [
 
 [[package]]
 name = "ort-sys"
-version = "2.0.0-rc.12"
-source = "git+https://github.com/pykeio/ort?rev=17ed727770746447620d0d76e9893ed1a3d7c221#17ed727770746447620d0d76e9893ed1a3d7c221"
+version = "2.0.0-rc.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf211e3776eea6aec988552fa118dd746d70e1b1e5e244058d1c98015f3e5872"
 
 [[package]]
 name = "parking_lot"

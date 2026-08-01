@@ -209,25 +209,22 @@ validation = [
 # Use with: cargo build --features "full turso"
 turso = ["dep:libsql", "dep:rusqlite_migration"]
 
-# Neural embeddings with ONNX Runtime and tokenizers
-# Opt-in feature: R15 - True neural embeddings with cross-language support
-# Use with: cargo build --features onnx
-# Default model: Qwen3-Embedding-0.6B (~300MB) - user-specified
-# Reranker: Qwen3-Reranker-0.6B (~300MB) - optional quality improvement
+# Neural embeddings with ONNX Runtime and tokenizers.
+# Opt-in feature: cargo build --features onnx (also installs the worker binary).
+# Default model: Qwen3-Embedding-0.6B (~300MB); Reranker: Qwen3-Reranker-0.6B.
 #
-# VAL-CPHASE-002: The main crate no longer owns ONNX runtime deps directly.
-# ONNX inference is delegated to the leindex-embed worker process.
+# The onnx feature compiles every runtime-selectable execution-provider API
+# (CUDA, MIGraphX, ROCm-aliased-to-MIGraphX, CoreML). With `load-dynamic` these
+# are ort-sys marker/API features — they do NOT link vendor SDKs at build time;
+# the worker dlopens libonnxruntime and selects an EP at runtime.
 #
-# VAL-CARGO-002/005: `cargo install leindex --features onnx` must install a
-# working worker binary alongside the main binary. We propagate the `onnx`
-# feature to the leindex-embed subcrate so the installed worker binary
-# contains real ONNX inference support (not a dummy-embedding fallback).
-onnx = ["search", "dep:leindex-embed", "leindex-embed/onnx", "dep:which", "dep:toml", "dep:dirs"]
+# VAL-CARGO-002/005: `cargo install leindex --features onnx` installs both the
+# main binary and the worker binary with real ONNX inference support.
+# Transitional: leindex-embed/onnx stays until Task 6 moves worker source in.
+onnx = ["search", "dep:ort", "ort/half", "ort/cuda", "ort/migraphx", "ort/rocm", "ort/coreml", "dep:tokenizers", "dep:ndarray", "dep:half", "dep:which", "dep:toml", "dep:dirs", "leindex-embed/onnx"]
 
-# AMD GPU acceleration via MIGraphX (requires ROCm installed).
-# MIGraphX is the modern replacement for the deprecated ROCmExecutionProvider.
-# Use with: cargo build --features onnx-migraphx
-onnx-migraphx = ["onnx", "leindex-embed/onnx-migraphx"]
+# Legacy build-command alias; onnx now compiles every runtime-selectable EP.
+onnx-migraphx = ["onnx"]
 
 # Remote embedding API support (OpenAI, etc.)
 # Opt-in feature: Use cloud-based embedding services instead of local models
@@ -303,9 +300,14 @@ bytemuck = { version = "1.15", optional = true }
 wide = { version = "0.7", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
 
-# ONNX Runtime dependencies — delegated to the worker crate (VAL-CPHASE-002)
-# The main crate depends only on the protocol types (no ONNX runtime deps).
-# The worker binary enables the `onnx` feature separately.
+# ONNX Runtime dependencies. `load-dynamic` disables build-time ORT/SDK
+# linking; the worker dlopens libonnxruntime at runtime. EP features
+# (cuda/migraphx/rocm/coreml) are ort-sys marker/API features, not SDK links.
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["ndarray", "std", "tracing", "load-dynamic", "api-23"] }
+tokenizers = { version = "0.20", optional = true }
+ndarray = { version = "0.17", optional = true }
+half = { version = "2.1", optional = true, default-features = false }
+# Transitional: remove in Task 6 after worker source moves to src/embed.
 leindex-embed = { version = "1.9.0", path = "crates/leindex-embed", optional = true, default-features = false }
 
 # Remote embedding API dependencies (for cloud-based embeddings)
@@ -504,17 +506,6 @@ suspicious_else_formatting = "deny"
 [lints]
 workspace = true
 
-# ort rc.12 deadlocks while reporting dynamic-loader errors because its error
-# constructor recursively initializes ORT under the dylib OnceLock. Pin the
-# focused upstream fix until a crates.io release containing it is available.
-#
-# CAVEAT (crates.io consumers): a workspace `[patch.crates-io]` does NOT
-# propagate to downstream crates that depend on the separately published
-# `leindex-embed`. Repository builds use this fixed revision, but standalone
-# crates.io consumers of leindex-embed resolve the unpatched ort rc.12 until
-# upstream publishes a release containing 17ed727. Track upstream ort releases
-# and bump leindex-embed's `ort` version requirement (removing this patch) as
-# soon as a fixed release is ≥3 days old (per the dep-release-age policy).
-[patch.crates-io]
-ort = { git = "https://github.com/pykeio/ort", rev = "17ed727770746447620d0d76e9893ed1a3d7c221" }
-ort-sys = { git = "https://github.com/pykeio/ort", rev = "17ed727770746447620d0d76e9893ed1a3d7c221" }
+# ort 2.0.0-rc.13 (crates.io) contains the load-dynamic deadlock fix (commit
+# 17ed727). No [patch.crates-io] is used: workspace patches do not propagate
+# to crates.io consumers of the published crate anyway.

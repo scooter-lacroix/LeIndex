@@ -22,8 +22,8 @@ default = []
 # The worker discovers and dlopens libonnxruntime at runtime via the
 # ort_discovery module (env var, config, ~/.leindex/lib, sibling dir,
 # pip site-packages, system paths). See `ort_discovery.rs`.
-onnx = ["dep:ort", "ort/half", "dep:tokenizers", "dep:ndarray", "dep:half"]
-onnx-migraphx = ["onnx", "ort/migraphx"]
+onnx = ["dep:ort", "ort/half", "ort/cuda", "ort/migraphx", "ort/rocm", "ort/coreml", "dep:tokenizers", "dep:ndarray", "dep:half"]
+onnx-migraphx = ["onnx"]
 
 [dependencies]
 # Protocol serialization
@@ -43,7 +43,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `load-dynamic` replaces `download-binaries` + `copy-dylibs` + `tls-native`:
 # the ort crate no longer downloads, links, or vendor-copies any ORT library at
 # build time. The worker dlopens libonnxruntime at runtime via ort::init_from().
-ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["ndarray", "std", "tracing", "load-dynamic", "api-23"] }
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["ndarray", "std", "tracing", "load-dynamic", "api-23"] }
 tokenizers = { version = "0.20", optional = true }
 ndarray = { version = "0.17", optional = true }
 half = { version = "2.1", optional = true, default-features = false }
