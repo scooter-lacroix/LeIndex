@@ -93,11 +93,17 @@ jobs:
           git fetch --tags
 
           # ── Check crates.io ──
-          if cargo search leindex-embed 2>/dev/null | grep -q "^leindex-embed = \"${VERSION}\""; then
-            echo "crates.io: v${VERSION} already published"
+          # The workspace publishes both leindex and leindex-embed in one job;
+          # treat crates.io as published only when BOTH are visible. Otherwise a
+          # partial publish (leindex-embed succeeds, leindex fails) would satisfy
+          # the canary and the missing crate would never ship.
+          EMBED_OK=$(cargo search leindex-embed 2>/dev/null | grep -q "^leindex-embed = \"${VERSION}\"" && echo true || echo false)
+          MAIN_OK=$(cargo search leindex 2>/dev/null | grep -q "^leindex = \"${VERSION}\"" && echo true || echo false)
+          if [ "$EMBED_OK" = "true" ] && [ "$MAIN_OK" = "true" ]; then
+            echo "crates.io: v${VERSION} already published (leindex + leindex-embed)"
             echo "needs_crates=false" >> "$GITHUB_OUTPUT"
           else
-            echo "crates.io: v${VERSION} not yet published"
+            echo "crates.io: v${VERSION} not yet fully published (leindex=$MAIN_OK, leindex-embed=$EMBED_OK)"
             echo "needs_crates=true" >> "$GITHUB_OUTPUT"
           fi
 
