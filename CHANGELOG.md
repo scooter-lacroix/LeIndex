@@ -2,6 +2,40 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [1.11.0] - 2026-08-01 - Fragment Embeddings and Content-Hash Store
+
+### Added
+
+- **Fragment embedding layer (opt-in)** — sub-symbol semantic chunks via a
+  tree-sitter chunker (ported from Warp's `full_source_code_embedding`) plus
+  module-level orphan coverage, so conceptual queries can match the exact
+  region that answers them instead of only the whole symbol.
+- **Localized content-hash store** — every fragment is addressed by a blake3
+  hash of its exact embedded text; incremental indexing is idempotent and
+  deduplicated, and the whole layer is fully local (no remote service).
+- **Incremental fragment sync engine** — per-file blake3 manifest, skip
+  unchanged files, embed-missing-only diffing, generation bump, and
+  store → root → manifest persistence ordering with crash self-healing.
+- **Fragment search integration** — fragment candidates union into the search
+  pool, map back to owner nodes via content hash, fuse as a renormalized
+  `fragment` score component, and feed the existing local reranker.
+- **Cache-key v2 extension** — `search_cache_key_for` now folds
+  `fragment_index_enabled`, `fragment_weight`, and the persisted fragment root
+  hash into the key so a config/model change invalidates the result cache.
+- **`leindex setup --check` surfaces fragment knobs** — fragment index
+  on/off, weight, max bytes, orphan and naive-fallback toggles.
+
+### Changed
+
+- **Neural-weight default drift fixed** — the `[search] neural_weight` config
+  default now matches the scorer-side default (0.4, was 0.3); the dead
+  `EmbeddingConfig.neural_weight` knob was removed.
+
+### Docs
+
+- README (root, npm, PyPI) and `leindex.toml.example` document the fragment
+  index opt-in, config knobs, and the all-local privacy note.
+
 ## [1.9.0] - 2026-07-21 - Fast Core Retrieval and Owned Index Jobs
 
 ### Added

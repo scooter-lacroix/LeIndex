@@ -321,11 +321,11 @@ git commit -m "feat: fold fragment knobs into search cache key"
 
 **Files:** `src/cli/cli.rs` (`Commands::Search` :349, `cmd_search_impl` :737); three public READMEs; `docs/NEURAL_SETUP.md`, `docs/PERFORMANCE_BENCHMARKS.md`, `CHANGELOG.md`, `RELEASE_NOTES.md`.
 
-- [ ] `leindex setup --check` and `leindex config` surfaces report fragment knobs; no new CLI flag required (config-driven, consistent with `rerank_enabled`).
+- [x] `leindex setup --check` and `leindex config` surfaces report fragment knobs; no new CLI flag required (config-driven, consistent with `rerank_enabled`).
 - [x] Neural-weight default drift (config 0.3 vs scorer 0.4) — **fixed on 2026-08-01** (config default now 0.4; dead constant removed; docs aligned). No further action in this task; see `docs/findings/2026-08-01-neural-weight-default-drift.md`.
-- [ ] Update README surfaces: fragment index opt-in, config knobs, privacy note (all-local).
-- [ ] Changelog `[1.11.0]` entry: fragment embeddings, content-hash store, orphan coverage, cache-key v2 extension, weight-drift fix.
-- [ ] Verify and commit:
+- [x] Update README surfaces: fragment index opt-in, config knobs, privacy note (all-local).
+- [x] Changelog `[1.11.0]` entry: fragment embeddings, content-hash store, orphan coverage, cache-key v2 extension, weight-drift fix.
+- [x] Verify and commit:
 
 ```bash
 rg -n 'fragment' README.md packages/pypi-leindex/README.md packages/npm-leindex-mcp/README.md \
