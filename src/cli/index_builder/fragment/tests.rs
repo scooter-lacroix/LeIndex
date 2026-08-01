@@ -668,3 +668,190 @@ fn test_enrich_orphan_module_header() {
         "// type:module lang:rust file:orphan_test.rs\nconst MIN: u32 = 1;"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fragment store (Task 3) tests
+// ---------------------------------------------------------------------------
+
+fn sample_metadata(content_hash: &str, owner: Option<&str>, offset: u64) -> FragmentMetadata {
+    FragmentMetadata {
+        content_hash: content_hash.to_string(),
+        owner: owner.map(str::to_string),
+        file_path: "rect.rs".to_string(),
+        byte_range: (0, 10),
+        line_range: (0, 2),
+        embedding_offset: offset,
+    }
+}
+
+/// Identical enriched text (same content hash) is stored once and referenced
+/// twice — the dedup invariant (one embedding row, N metadata refs).
+#[test]
+fn test_store_dedup_one_row_many_refs() {
+    let mut store = FragmentStore::new();
+    store.insert(sample_metadata("abc123", Some("node1"), 0));
+    store.insert(sample_metadata("abc123", Some("node2"), 0));
+    store.insert(sample_metadata("def456", None, 1));
+
+    assert_eq!(
+        store.len(),
+        2,
+        "two unique content hashes → two embedding rows"
+    );
+    assert_eq!(
+        store.fragment_count(),
+        3,
+        "three metadata refs total across the two rows"
+    );
+    assert_eq!(store.get("abc123").unwrap().len(), 2);
+    assert!(store.get("missing").is_none());
+}
+
+/// Owner-node mapping powers invariant 6 (fragment hits map back to owners).
+#[test]
+fn test_store_owner_mapping() {
+    let mut store = FragmentStore::new();
+    store.insert(sample_metadata("abc123", Some("node1"), 0));
+    store.insert(sample_metadata("def456", Some("node1"), 1));
+    store.insert(sample_metadata("ghi789", Some("node2"), 2));
+    store.insert(sample_metadata("orphan1", None, 3));
+
+    let map = store.owner_to_hashes();
+    let node1 = map.get("node1").unwrap();
+    assert!(node1.contains(&"abc123".to_string()));
+    assert!(node1.contains(&"def456".to_string()));
+    assert_eq!(map.get("node2").unwrap(), &vec!["ghi789".to_string()]);
+    // Orphans (owner = None) never appear in the owner map.
+    assert!(!map.values().flatten().any(|h| h == "orphan1"));
+}
+
+/// Persist → load round-trip preserves metadata exactly (bincode, schema-versioned).
+#[test]
+fn test_store_persist_load_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = FragmentStore::new();
+    store.insert(sample_metadata("abc123", Some("node1"), 0));
+    store.insert(sample_metadata("abc123", Some("node2"), 0));
+    store.insert(sample_metadata("def456", None, 1));
+    store.persist_to_storage(dir.path()).unwrap();
+
+    let loaded = FragmentStore::load_from_storage(dir.path())
+        .unwrap()
+        .expect("store loads");
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded.fragment_count(), 3);
+    assert_eq!(loaded.get("abc123").unwrap().len(), 2);
+    assert_eq!(
+        loaded.get("abc123").unwrap()[0].owner.as_deref(),
+        Some("node1")
+    );
+    assert_eq!(loaded.get("def456").unwrap()[0].owner, None);
+}
+
+/// Missing artifact → `None` (not an error); fresh store is empty.
+#[test]
+fn test_store_load_missing_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(FragmentStore::new().is_empty());
+    assert!(
+        FragmentStore::load_from_storage(dir.path())
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Schema-version mismatch rejects the store (never silently reused).
+#[test]
+fn test_store_schema_mismatch_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = FragmentStore::new();
+    store.insert(sample_metadata("abc123", None, 0));
+    store.persist_to_storage(dir.path()).unwrap();
+
+    // Corrupt the persisted schema version in place.
+    let path = dir.path().join(".leindex").join("fragment_store.bin");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[0] = 0xff; // schema_version (u32 LE, first byte) no longer 1
+    std::fs::write(&path, &bytes).unwrap();
+
+    assert!(
+        FragmentStore::load_from_storage(dir.path())
+            .unwrap()
+            .is_none(),
+        "schema-mismatched store must be discarded"
+    );
+}
+
+/// Root hash is deterministic for identical stores and content-sensitive.
+#[test]
+fn test_root_hash_deterministic_and_content_sensitive() {
+    let mut a = FragmentStore::new();
+    a.insert(sample_metadata("abc123", Some("node1"), 0));
+    a.insert(sample_metadata("def456", None, 1));
+
+    let mut b = FragmentStore::new();
+    b.insert(sample_metadata("def456", None, 0));
+    b.insert(sample_metadata("abc123", Some("node1"), 1));
+
+    let root_a = compute_fragment_root_hash(&a);
+    let root_b = compute_fragment_root_hash(&b);
+    assert_eq!(root_a, root_b, "root is order-independent (sorted pairs)");
+
+    let mut c = FragmentStore::new();
+    c.insert(sample_metadata("abc123", Some("node1"), 0));
+    c.insert(sample_metadata("changed", None, 1));
+    assert_ne!(
+        root_a,
+        compute_fragment_root_hash(&c),
+        "content change must change the root"
+    );
+}
+
+/// Root persist → load round-trip preserves hash, generation, and row count.
+#[test]
+fn test_root_persist_load_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = FragmentStore::new();
+    store.insert(sample_metadata("abc123", None, 0));
+    persist_fragment_root(dir.path(), &store, 7).unwrap();
+
+    let state = load_fragment_root(&dir.path().join(".leindex"))
+        .unwrap()
+        .expect("root loads");
+    assert_eq!(state.root_hash, compute_fragment_root_hash(&store));
+    assert_eq!(state.generation, 7);
+    assert_eq!(state.fragment_rows, 1);
+}
+
+/// Missing root artifact → `None` (not an error).
+#[test]
+fn test_root_load_missing_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        load_fragment_root(&dir.path().join(".leindex"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Root schema-version mismatch rejects the artifact (never silently reused).
+#[test]
+fn test_root_schema_mismatch_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = FragmentStore::new();
+    store.insert(sample_metadata("abc123", None, 0));
+    persist_fragment_root(dir.path(), &store, 1).unwrap();
+
+    // Corrupt the persisted schema version in place (u32 LE first byte).
+    let path = dir.path().join(".leindex").join("fragment_root.bin");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[0] = 0xff;
+    std::fs::write(&path, &bytes).unwrap();
+
+    assert!(
+        load_fragment_root(&dir.path().join(".leindex"))
+            .unwrap()
+            .is_none(),
+        "schema-mismatched root must be discarded"
+    );
+}

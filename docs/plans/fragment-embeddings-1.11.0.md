@@ -187,7 +187,9 @@ git commit -m "feat: semantic fragment chunker with orphan coverage"
 
 **Files:** NEW `src/cli/index_builder/fragment/mod.rs`, `sync.rs`; `src/cli/index_builder/mod.rs`.
 
-- [ ] `FragmentMetadata`:
+> **Progress:** Task 3 implemented 2026-08-01 in worktree `feat/fragment-embeddings-1.11.0` (`FragmentStore` + `FragmentMetadata` in `fragment/mod.rs`; `sync.rs` root-hash/generation). `cargo test --lib --features cli fragment` 30/30, `cargo clippy -p leindex --features cli --lib -- -D warnings` 0, `cargo fmt --all --check` clean.
+
+- [x] `FragmentMetadata`:
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,9 +203,9 @@ pub struct FragmentMetadata {
 }
 ```
 
-- [ ] `FragmentStore` (bincode, `.leindex/fragment_store.bin`): `HashMap<content_hash, Vec<FragmentMetadata>>` (one embedding row, N metadata refs — dedup invariant).
-- [ ] Store schema version constant (mirror `TFIDF_SCHEMA_VERSION`); `is_fresh`/`from_persisted_state`/`persist`/`load` with schema-version rejection.
-- [ ] Root hash computation in `sync.rs`: root = `blake3(sorted (content_hash × embedding-version) pairs)`; persisted to `.leindex/fragment_root.bin` with a generation counter.
+- [x] `FragmentStore` (bincode, `.leindex/fragment_store.bin`): `HashMap<content_hash, Vec<FragmentMetadata>>` (one embedding row, N metadata refs — dedup invariant).
+- [x] Store schema version constant (mirror `TFIDF_SCHEMA_VERSION`); `is_fresh`/`from_persisted_state`/`persist`/`load` with schema-version rejection.
+- [x] Root hash computation in `sync.rs`: root = `blake3(sorted (content_hash × embedding-version) pairs)`; persisted to `.leindex/fragment_root.bin` with a generation counter.
 - [ ] Verify and commit:
 
 ```bash

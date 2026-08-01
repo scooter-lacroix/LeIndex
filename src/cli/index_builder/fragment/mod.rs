@@ -20,11 +20,16 @@
 // `mod fragment;` declaration in `index_builder/mod.rs` documents that planned
 // rollout — not a suppressed defect.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 mod chunker;
 mod enrich;
 mod orphan;
+mod sync;
 
 // Re-exports so the task-local test module (tests.rs, included via
 // `#[path]`) can exercise the chunker/enrich/orphan APIs through
@@ -36,6 +41,10 @@ pub(crate) use chunker::{chunk_naive, chunk_semantic};
 pub(crate) use enrich::{enrich_fragment, enrich_orphan, orphan_header, owner_header};
 #[cfg(test)]
 pub(crate) use orphan::{OrphanInput, orphan_fragments};
+#[cfg(test)]
+pub(crate) use sync::{
+    FragmentRootState, compute_fragment_root_hash, load_fragment_root, persist_fragment_root,
+};
 
 /// Number of lines per chunk when chunking naively (≈ Warp's `LINES_PER_CHUNK`).
 const LINES_PER_CHUNK: usize = 200;
@@ -142,6 +151,160 @@ fn try_chunk_code_semantically<'a>(code: &'a str, path: &'a Path) -> Option<Vec<
     let language_id = crate::parse::grammar::LanguageId::from_extension(ext)?;
     let language = language_id.from_cache().ok()?;
     chunker::chunk_semantic(code, path, MAX_BYTES_PER_CHUNK, &language).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Content-hash fragment store (Task 3)
+// ---------------------------------------------------------------------------
+
+/// Schema version for the fragment store bincode artifact (mirrors the
+/// `TFIDF_SCHEMA_VERSION` discipline). Bump when the persisted layout changes;
+/// stale stores are rejected on load, never silently reused.
+const FRAGMENT_STORE_SCHEMA_VERSION: u32 = 1;
+
+/// Metadata for one fragment row.
+///
+/// `content_hash` is the blake3 hex of the exact enriched text that was
+/// embedded (invariant 3: cache key ≡ embedding input). Multiple metadata refs
+/// may share one content hash — the dedup invariant: identical text is
+/// embedded once and referenced N times.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct FragmentMetadata {
+    /// blake3(enriched text that was embedded).
+    pub(crate) content_hash: String,
+    /// Tier-1 node id when the fragment lives inside a symbol; `None` for
+    /// Tier-3 orphan (module-level) fragments.
+    pub(crate) owner: Option<String>,
+    /// File path of the fragment's source file.
+    pub(crate) file_path: String,
+    /// Exact source byte range (file-absolute).
+    pub(crate) byte_range: (usize, usize),
+    /// Source line range (inclusive, 0-based like tree-sitter rows).
+    pub(crate) line_range: (usize, usize),
+    /// Row offset into the fragment embeddings mmap (filled at persist time).
+    pub(crate) embedding_offset: u64,
+}
+
+/// Persisted fragment store state (bincode at `.leindex/fragment_store.bin`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FragmentStoreState {
+    #[serde(default)]
+    schema_version: u32,
+    /// content_hash → metadata refs (one embedding row, N refs).
+    #[serde(default)]
+    rows: HashMap<String, Vec<FragmentMetadata>>,
+}
+
+/// Content-hash-addressed fragment store with dedup.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FragmentStore {
+    rows: HashMap<String, Vec<FragmentMetadata>>,
+}
+
+impl FragmentStore {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of unique embedding rows (distinct content hashes).
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Insert a fragment row, deduplicating by content hash.
+    pub(crate) fn insert(&mut self, meta: FragmentMetadata) {
+        self.rows
+            .entry(meta.content_hash.clone())
+            .or_default()
+            .push(meta);
+    }
+
+    /// Metadata refs for a content hash (`None` when unknown).
+    pub(crate) fn get(&self, content_hash: &str) -> Option<&[FragmentMetadata]> {
+        self.rows.get(content_hash).map(Vec::as_slice)
+    }
+
+    /// All content hashes (embedding row keys).
+    pub(crate) fn content_hashes(&self) -> impl Iterator<Item = &str> {
+        self.rows.keys().map(String::as_str)
+    }
+
+    /// Owner-node mapping: owner node id → content hashes of its fragments
+    /// (invariant 6: fragment hits map back to owner nodes before surfacing).
+    pub(crate) fn owner_to_hashes(&self) -> HashMap<String, Vec<String>> {
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for (hash, metas) in &self.rows {
+            for meta in metas {
+                if let Some(owner) = &meta.owner {
+                    out.entry(owner.clone()).or_default().push(hash.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Total fragment count (metadata refs, not unique embedding rows).
+    pub(crate) fn fragment_count(&self) -> usize {
+        self.rows.values().map(Vec::len).sum()
+    }
+
+    fn storage_path(project_path: &Path) -> PathBuf {
+        project_path.join(".leindex").join("fragment_store.bin")
+    }
+
+    /// Load the fragment store from storage (None when absent or schema-mismatched).
+    pub(crate) fn load_from_storage(project_path: &Path) -> Result<Option<Self>> {
+        Self::load_from_artifact_path(&project_path.join(".leindex"))
+    }
+
+    /// Load from an explicit storage directory (generation hydration path).
+    pub(crate) fn load_from_artifact_path(storage_path: &Path) -> Result<Option<Self>> {
+        let path = storage_path.join("fragment_store.bin");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("Failed to read fragment store: {}", path.display()))?;
+        let state: FragmentStoreState = bincode::deserialize(&bytes)
+            .with_context(|| format!("Failed to deserialize fragment store: {}", path.display()))?;
+        Ok(Self::from_persisted_state(state))
+    }
+
+    /// Persist the store to `.leindex/fragment_store.bin`.
+    pub(crate) fn persist_to_storage(&self, project_path: &Path) -> Result<()> {
+        let path = Self::storage_path(project_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create fragment store directory: {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let payload = bincode::serialize(&FragmentStoreState {
+            schema_version: FRAGMENT_STORE_SCHEMA_VERSION,
+            rows: self.rows.clone(),
+        })
+        .context("Failed to serialize fragment store")?;
+        std::fs::write(&path, payload)
+            .with_context(|| format!("Failed to persist fragment store: {}", path.display()))
+    }
+
+    fn from_persisted_state(state: FragmentStoreState) -> Option<Self> {
+        if state.schema_version != FRAGMENT_STORE_SCHEMA_VERSION {
+            tracing::warn!(
+                "Persisted fragment store schema version {} != current {}; discarding",
+                state.schema_version,
+                FRAGMENT_STORE_SCHEMA_VERSION
+            );
+            return None;
+        }
+        Some(Self { rows: state.rows })
+    }
 }
 
 #[cfg(test)]
