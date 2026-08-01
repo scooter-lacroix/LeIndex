@@ -156,6 +156,31 @@ impl MmapVectorIndex {
         let row = self.rows.get(node_id).copied()?;
         self.base.get_embedding_by_row(row)
     }
+
+    /// Enumerate all `(id, embedding)` rows in base-row order for persistence.
+    ///
+    /// Used by `SearchEngine::collect_fragment_embeddings` (Task 5): the
+    /// fragment index is read-only mmap-backed at hydration, so every live row
+    /// maps 1:1 to a base row. If Task 7 wires fragment mutations (delta /
+    /// tombstones), this must mirror them the way `search` does.
+    pub(crate) fn entries(&self) -> Vec<(String, Vec<f32>)> {
+        if self.cleared {
+            return self
+                .delta
+                .iter()
+                .map(|(id, vector)| (id.clone(), vector.clone()))
+                .collect();
+        }
+        self.rows
+            .iter()
+            .filter(|(id, _)| !self.tombstones.contains(*id))
+            .filter_map(|(id, row)| {
+                self.base
+                    .get_embedding_by_row(*row)
+                    .map(|embedding| (id.clone(), embedding))
+            })
+            .collect()
+    }
 }
 
 /// Vector index implementation

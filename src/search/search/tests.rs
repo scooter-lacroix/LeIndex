@@ -97,7 +97,7 @@ fn test_search_snapshot_restore_round_trip() {
 
     let mut restored = SearchEngine::new();
     let restored_count = restored
-        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None)
+        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None, None, None)
         .unwrap();
 
     assert_eq!(restored_count, 1);
@@ -159,7 +159,13 @@ fn search_snapshot_restores_neural_rows_without_heap_tfidf_copy() {
 
     let mut restored = SearchEngine::new();
     restored
-        .restore_from_search_snapshot(snapshot, Arc::new(tfidf_mmap), Some(Arc::new(neural_mmap)))
+        .restore_from_search_snapshot(
+            snapshot,
+            Arc::new(tfidf_mmap),
+            Some(Arc::new(neural_mmap)),
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(restored.collect_neural_embeddings().len(), 1);
     assert!(restored.nodes[0].tfidf_embedding.is_empty());
@@ -194,7 +200,7 @@ fn test_search_snapshot_restore_rejects_wrong_tfidf_dimension() {
 
     let mut restored = SearchEngine::new();
     let err = restored
-        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None)
+        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None, None, None)
         .unwrap_err();
     assert!(err.contains("TF-IDF mmap dimension"));
     assert!(restored.is_empty());
@@ -994,4 +1000,132 @@ fn test_incremental_reindex_node_id_to_idx_consistency() {
             node.node_id
         );
     }
+}
+
+#[test]
+fn test_search_snapshot_fragment_roundtrip() {
+    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf_embedding[0] = 1.0;
+
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding,
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+
+    // Simulate a fragment-enabled persisted snapshot: the cli-side persist path
+    // fills `fragment_rows` from the hydrated index before writing.
+    let mut snapshot = engine.search_snapshot(1, 0, "frag-fingerprint".to_string());
+    snapshot.fragment_rows = 2;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tfidf_path = dir.path().join("tfidf.bin");
+    let frag_path = dir.path().join("frag.bin");
+    crate::search::vector::write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings())
+        .unwrap();
+    let fragment_embeddings = vec![
+        (
+            "hash_abc".to_string(),
+            vec![0.1f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+        (
+            "hash_def".to_string(),
+            vec![0.2f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+    ];
+    crate::search::vector::write_mmap_embeddings(&frag_path, &fragment_embeddings).unwrap();
+    let tfidf_mmap = crate::search::vector::MmapEmbeddingIndex::open(&tfidf_path).unwrap();
+    let frag_mmap = crate::search::vector::MmapEmbeddingIndex::open(&frag_path).unwrap();
+    let frag_ids = vec!["hash_abc".to_string(), "hash_def".to_string()];
+
+    let mut restored = SearchEngine::new();
+    restored
+        .restore_from_search_snapshot(
+            snapshot,
+            Arc::new(tfidf_mmap),
+            None,
+            Some(Arc::new(frag_mmap)),
+            Some(&frag_ids),
+        )
+        .unwrap();
+
+    // Fragment fields survive the round-trip.
+    let resnap = restored.search_snapshot(1, 0, "frag-fingerprint".to_string());
+    assert_eq!(resnap.fragment_rows, 2);
+    let mut collected = restored.collect_fragment_embeddings();
+    assert_eq!(collected.len(), 2);
+    collected.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(collected[0].0, "hash_abc");
+    assert_eq!(collected[1].0, "hash_def");
+}
+
+#[test]
+fn test_search_snapshot_restore_disables_fragment_on_row_mismatch() {
+    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf_embedding[0] = 1.0;
+
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding,
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+
+    // Snapshot claims 5 fragment rows but the mmap only has 2: the fragment
+    // layer must be disabled, while the node-level restore still succeeds.
+    let mut snapshot = engine.search_snapshot(1, 0, "frag-fingerprint".to_string());
+    snapshot.fragment_rows = 5;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tfidf_path = dir.path().join("tfidf.bin");
+    let frag_path = dir.path().join("frag.bin");
+    crate::search::vector::write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings())
+        .unwrap();
+    let fragment_embeddings = vec![
+        (
+            "hash_abc".to_string(),
+            vec![0.1f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+        (
+            "hash_def".to_string(),
+            vec![0.2f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+    ];
+    crate::search::vector::write_mmap_embeddings(&frag_path, &fragment_embeddings).unwrap();
+    let tfidf_mmap = crate::search::vector::MmapEmbeddingIndex::open(&tfidf_path).unwrap();
+    let frag_mmap = crate::search::vector::MmapEmbeddingIndex::open(&frag_path).unwrap();
+    let frag_ids = vec!["hash_abc".to_string(), "hash_def".to_string()];
+
+    let mut restored = SearchEngine::new();
+    restored
+        .restore_from_search_snapshot(
+            snapshot,
+            Arc::new(tfidf_mmap),
+            None,
+            Some(Arc::new(frag_mmap)),
+            Some(&frag_ids),
+        )
+        .unwrap();
+    assert_eq!(restored.node_count(), 1);
+    assert!(
+        restored.collect_fragment_embeddings().is_empty(),
+        "row-count mismatch must disable the fragment layer"
+    );
 }

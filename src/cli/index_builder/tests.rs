@@ -1288,3 +1288,122 @@ fn file_summary_context_collects_same_file_symbols_excluding_summary_nodes() {
         Some(&vec!["delta".to_string()])
     );
 }
+
+#[test]
+fn test_persist_search_snapshot_writes_fragment_artifacts() {
+    use crate::search::search::{DEFAULT_EMBEDDING_DIMENSION, NodeInfo, SearchEngine};
+    use crate::search::vector::MmapEmbeddingIndex;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let project_path = temp.path();
+    let storage = project_path.join(".leindex");
+    std::fs::create_dir_all(&storage).unwrap();
+
+    // Build a fragment-enabled engine by hydrating a 2-row fragment index from
+    // persisted-style mmap files (the same path `indexing/load.rs` uses).
+    let mut engine = SearchEngine::new();
+    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf_embedding[0] = 1.0;
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding,
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+    let mut snapshot = engine.search_snapshot(1, 0, "frag".to_string());
+    snapshot.fragment_rows = 2;
+    let tfidf_path = storage.join("tfidf.bin");
+    let frag_path = storage.join("frag.bin");
+    crate::search::vector::write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings())
+        .unwrap();
+    let fragment_embeddings = vec![
+        ("hash_abc".to_string(), vec![0.1f32; 1024]),
+        ("hash_def".to_string(), vec![0.2f32; 1024]),
+    ];
+    crate::search::vector::write_mmap_embeddings(&frag_path, &fragment_embeddings).unwrap();
+    let tfidf_mmap = MmapEmbeddingIndex::open(&tfidf_path).unwrap();
+    let frag_mmap = MmapEmbeddingIndex::open(&frag_path).unwrap();
+    let frag_ids = vec!["hash_abc".to_string(), "hash_def".to_string()];
+    let mut hydrated = SearchEngine::new();
+    hydrated
+        .restore_from_search_snapshot(
+            snapshot,
+            std::sync::Arc::new(tfidf_mmap),
+            None,
+            Some(std::sync::Arc::new(frag_mmap)),
+            Some(&frag_ids),
+        )
+        .unwrap();
+
+    // Persist: must write the fragment mmap + root and stamp the snapshot root.
+    persist_search_snapshot(&hydrated, project_path, 1, 0, "frag".to_string()).unwrap();
+    assert!(storage.join("fragments_embeddings.bin").exists());
+    assert!(storage.join("fragment_root.bin").exists());
+
+    // Reload: the snapshot carries the root hash and passes invariant-8
+    // validation against the persisted artifacts.
+    let reloaded = try_load_search_snapshot_from_storage(&storage).unwrap();
+    assert!(reloaded.fragment_root_hash.is_some());
+    assert_eq!(reloaded.fragment_rows, 2);
+    let mmap = try_load_fragment_mmap_embeddings_from_storage(&storage).unwrap();
+    assert!(fragment_layer_is_valid(
+        reloaded.fragment_root_hash.as_deref(),
+        Some(&mmap),
+        &storage
+    ));
+}
+
+#[test]
+fn test_fragment_layer_is_valid_rejects_stale_root() {
+    use crate::search::vector::MmapEmbeddingIndex;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let project_path = temp.path();
+    let storage = project_path.join(".leindex");
+
+    let ids = vec!["hash_abc".to_string(), "hash_def".to_string()];
+    fragment::sync::persist_fragment_root_from_ids(project_path, &ids, 0).unwrap();
+
+    let frag_path = storage.join("frag.bin");
+    let embeddings = vec![
+        ("hash_abc".to_string(), vec![0.1f32; 1024]),
+        ("hash_def".to_string(), vec![0.2f32; 1024]),
+    ];
+    crate::search::vector::write_mmap_embeddings(&frag_path, &embeddings).unwrap();
+    let mmap = MmapEmbeddingIndex::open(&frag_path).unwrap();
+
+    // Matching root + row count -> valid.
+    let good_root = fragment::sync::load_fragment_root(&storage)
+        .unwrap()
+        .unwrap()
+        .root_hash;
+    assert!(fragment_layer_is_valid(
+        Some(&good_root),
+        Some(&mmap),
+        &storage
+    ));
+    // Stale root -> invalid.
+    assert!(!fragment_layer_is_valid(
+        Some("stale-hash"),
+        Some(&mmap),
+        &storage
+    ));
+    // Snapshot without a root -> invalid (feature-off semantics).
+    assert!(!fragment_layer_is_valid(None, Some(&mmap), &storage));
+    // Missing mmap -> invalid.
+    assert!(!fragment_layer_is_valid(Some(&good_root), None, &storage));
+    // Missing fragment_root.bin artifact -> invalid.
+    std::fs::remove_file(storage.join("fragment_root.bin")).unwrap();
+    assert!(!fragment_layer_is_valid(
+        Some(&good_root),
+        Some(&mmap),
+        &storage
+    ));
+}

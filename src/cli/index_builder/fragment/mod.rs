@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 mod chunker;
 mod enrich;
 mod orphan;
-mod sync;
+pub(crate) mod sync;
 
 // Re-exports so the task-local test module (tests.rs, included via
 // `#[path]`) can exercise the chunker/enrich/orphan APIs through

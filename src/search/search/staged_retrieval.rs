@@ -12,6 +12,14 @@ pub(crate) struct SearchSnapshot {
     pub(crate) pdg_fingerprint: String,
     pub(crate) indexed_nodes: usize,
     pub(crate) nodes: Vec<SearchSnapshotNode>,
+    /// Fragment layer root hash (filled by the cli-side persist path;
+    /// `None` for legacy/feature-off snapshots).
+    #[serde(default)]
+    pub(crate) fragment_root_hash: Option<String>,
+    /// Unique fragment embedding rows recorded at persist time. Serde-defaults
+    /// to 0 for legacy snapshots (fragment layer off).
+    #[serde(default)]
+    pub(crate) fragment_rows: u32,
 }
 
 /// Per-node metadata for fast search-index hydration.

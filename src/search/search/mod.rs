@@ -107,6 +107,11 @@ pub struct SearchEngine {
     /// `vector_index` — so no hand-rolled scan. None when no neural mmap is
     /// loaded (tests, tfidf-only indexes).
     neural_vector_index: Option<VectorIndexImpl>,
+    /// Fragment embeddings (sub-symbol semantic chunks), hydrated from
+    /// `.leindex/fragments_embeddings.bin` at search-load. Same lazy-paged
+    /// MmapVectorIndex pattern as the neural index; None when the fragment
+    /// layer is off or no fragment mmap is present.
+    fragment_vector_index: Option<VectorIndexImpl>,
     /// Complexity cache for O(1) lookups (fixes O(n²) bug)
     complexity_cache: HashMap<String, u32>,
     /// Inverted index for O(1) text lookups: token -> set of node IDs
@@ -155,6 +160,7 @@ impl SearchEngine {
             search_cache_bytes: 0,
             neural_weight: 0.4,
             neural_vector_index: None,
+            fragment_vector_index: None,
         }
     }
 
@@ -197,6 +203,7 @@ impl SearchEngine {
             search_cache_bytes: 0,
             neural_weight: 0.4,
             neural_vector_index: None,
+            fragment_vector_index: None,
         }
     }
 
@@ -262,6 +269,7 @@ impl SearchEngine {
         // Also drop the lazy-paged neural ANN so a stale mmap isn't reused
         // after a full reindex rebuilds the lexical index from scratch.
         self.neural_vector_index = None;
+        self.fragment_vector_index = None;
     }
 
     /// Append nodes to the existing index without clearing.
@@ -692,6 +700,18 @@ impl SearchEngine {
             .collect()
     }
 
+    /// Collect fragment embeddings for persistence.
+    ///
+    /// Returns `(content_hash, embedding)` pairs for every row in the
+    /// mmap-backed fragment index. Empty when the fragment layer is off or no
+    /// fragment index is hydrated.
+    pub fn collect_fragment_embeddings(&self) -> Vec<(String, Vec<f32>)> {
+        match &self.fragment_vector_index {
+            Some(VectorIndexImpl::Mmap(idx)) => idx.entries(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Create a compact persisted metadata snapshot for fast cold-start load.
     pub(crate) fn search_snapshot(
         &self,
@@ -730,6 +750,16 @@ impl SearchEngine {
             pdg_fingerprint,
             indexed_nodes: self.nodes.len(),
             nodes,
+            // Fragment layer (Task 5): rows come from the hydrated fragment
+            // index; the root hash is filled by the cli-side
+            // `persist_search_snapshot` (the search crate cannot read the
+            // fragment_root.bin artifact — dependency direction is cli -> search).
+            fragment_root_hash: None,
+            fragment_rows: self
+                .fragment_vector_index
+                .as_ref()
+                .map(|idx| idx.len() as u32)
+                .unwrap_or(0),
         }
     }
 
@@ -742,6 +772,8 @@ impl SearchEngine {
         snapshot: SearchSnapshot,
         tfidf_mmap: Arc<MmapEmbeddingIndex>,
         neural_mmap: Option<Arc<MmapEmbeddingIndex>>,
+        fragment_mmap: Option<Arc<MmapEmbeddingIndex>>,
+        fragment_ids: Option<&[String]>,
     ) -> Result<usize, String> {
         if snapshot.version != SEARCH_SNAPSHOT_VERSION {
             return Err(format!(
@@ -838,6 +870,35 @@ impl SearchEngine {
                     error = %error,
                     "failed to build neural mmap vector index; semantic retrieval disabled"
                 ),
+            }
+        }
+
+        // Fragment layer (Task 5, invariant 8): row count must match the
+        // snapshot's recorded fragment_rows. Failure is NON-fatal — the
+        // fragment layer must never block the node-level path (invariant 3);
+        // a mismatch simply disables fragment retrieval, leaving the node
+        // index fully hydrated.
+        if let (Some(mmap), Some(ids)) = (fragment_mmap.as_ref(), fragment_ids) {
+            if mmap.len() as u32 != snapshot.fragment_rows {
+                tracing::warn!(
+                    rows = mmap.len(),
+                    snapshot_rows = snapshot.fragment_rows,
+                    "fragment mmap row count != snapshot; fragment retrieval disabled"
+                );
+            } else if mmap.dimension() as usize != NEURAL_EMBEDDING_DIMENSION {
+                tracing::warn!(
+                    dim = mmap.dimension(),
+                    expected = NEURAL_EMBEDDING_DIMENSION,
+                    "fragment mmap dimension mismatch; fragment retrieval disabled"
+                );
+            } else {
+                match MmapVectorIndex::from_snapshot(std::sync::Arc::clone(mmap), ids) {
+                    Ok(idx) => staged.fragment_vector_index = Some(VectorIndexImpl::Mmap(idx)),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "failed to build fragment mmap vector index; fragment retrieval disabled"
+                    ),
+                }
             }
         }
 

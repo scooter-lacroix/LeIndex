@@ -41,8 +41,24 @@ pub(crate) struct FragmentRootState {
 /// embedding-schema-version` entries. Sorting makes the digest independent of
 /// insertion order (a Merkle-root property over the row set).
 pub(crate) fn compute_fragment_root_hash(store: &FragmentStore) -> String {
-    let mut entries: Vec<String> = store
-        .content_hashes()
+    root_hash_from_entries(store.content_hashes())
+}
+
+/// Compute the fragment root hash directly from content-hash ids.
+///
+/// Used by the snapshot-persist path (`persist_search_snapshot`, Task 5),
+/// which holds the collected id → embedding pairs but not a `FragmentStore`.
+/// Identical to `compute_fragment_root_hash` — same entries, same digest, so
+/// hydration validation (invariant 8) holds regardless of which path wrote it.
+pub(crate) fn compute_fragment_root_hash_from_ids(ids: &[String]) -> String {
+    root_hash_from_entries(ids.iter().map(String::as_str))
+}
+
+/// Shared core: blake3 over sorted `content_hash:embedding-schema-version`
+/// entries. Sorting makes the digest independent of insertion order (a
+/// Merkle-root property over the row set).
+fn root_hash_from_entries<'a>(hashes: impl Iterator<Item = &'a str>) -> String {
+    let mut entries: Vec<String> = hashes
         .map(|hash| format!("{hash}:{FRAGMENT_EMBEDDING_SCHEMA_VERSION}"))
         .collect();
     entries.sort();
@@ -71,6 +87,41 @@ pub(crate) fn persist_fragment_root(
         fragment_rows: store.len() as u64,
     };
     let path = fragment_root_path(project_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create fragment root directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+    let payload = bincode::serialize(&state).context("Failed to serialize fragment root")?;
+    std::fs::write(&path, payload)
+        .with_context(|| format!("Failed to persist fragment root: {}", path.display()))
+}
+
+/// Persist the fragment root for a content-hash id list (snapshot-persist
+/// path, Task 5). Empty ids remove a stale root file so feature-off leaves no
+/// orphan artifact (mirrors the fragment mmap persist behavior).
+pub(crate) fn persist_fragment_root_from_ids(
+    project_path: &Path,
+    ids: &[String],
+    generation: u64,
+) -> Result<()> {
+    let path = fragment_root_path(project_path);
+    if ids.is_empty() {
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|e| anyhow::anyhow!("Failed to remove stale fragment root: {e}"))?;
+        }
+        return Ok(());
+    }
+    let state = FragmentRootState {
+        schema_version: FRAGMENT_ROOT_SCHEMA_VERSION,
+        root_hash: compute_fragment_root_hash_from_ids(ids),
+        generation,
+        fragment_rows: ids.len() as u64,
+    };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!(

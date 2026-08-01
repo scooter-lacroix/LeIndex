@@ -30,11 +30,13 @@ mod hybrid;
 mod tfidf;
 
 // Fragment chunking (Tier-2 sub-symbol + Tier-3 orphan) — fragment-embeddings
-// 1.11.0 Task 2 deliverable. `dead_code` is allowed while the module API is
-// exercised only by its own tests; production consumers (fragment store, mmap
-// persistence, query fusion) land in Tasks 3-7. Not a suppressed defect.
+// 1.11.0 Task 2 deliverable. The store (Task 3), mmap persistence (Task 4) and
+// snapshot hydration (Task 5) consume the module API; the remaining `dead_code`
+// covers the chunker/enrich/orphan surface that query fusion (Task 6) wires.
+// `pub(crate)` so `indexing/load.rs` can hydrate the fragment layer from the
+// persisted artifacts. Not a suppressed defect.
 #[allow(dead_code)]
-mod fragment;
+pub(crate) mod fragment;
 
 pub use hybrid::*;
 pub use tfidf::*;
@@ -1597,10 +1599,29 @@ pub(crate) fn persist_search_snapshot(
     pdg_edges: usize,
     pdg_fingerprint: String,
 ) -> Result<()> {
-    let snapshot = search_engine.search_snapshot(pdg_nodes, pdg_edges, pdg_fingerprint);
+    let mut snapshot = search_engine.search_snapshot(pdg_nodes, pdg_edges, pdg_fingerprint);
     if snapshot.indexed_nodes == 0 {
         return Ok(());
     }
+
+    // Fragment layer (Task 5): persist the fragment embedding matrix + root
+    // hash alongside the snapshot so cold-start hydration can rebuild the
+    // fragment vector index and validate invariant 8 (root-hash + row count).
+    // The rich fragment store (owner/file/byte metadata, generations) is wired
+    // in Task 7; until fragment_store.bin exists, hydration keeps the fragment
+    // layer off at runtime (feature-off compatible).
+    let fragment_embeddings = search_engine.collect_fragment_embeddings();
+    if !fragment_embeddings.is_empty() {
+        let fragment_ids: Vec<String> = fragment_embeddings
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        snapshot.fragment_root_hash = Some(fragment::sync::compute_fragment_root_hash_from_ids(
+            &fragment_ids,
+        ));
+        fragment::sync::persist_fragment_root_from_ids(project_path, &fragment_ids, 0)?;
+    }
+    persist_fragment_embeddings_to_mmap(project_path, &fragment_embeddings)?;
 
     let path = search_snapshot_path(project_path);
     if let Some(parent) = path.parent() {
@@ -1823,13 +1844,11 @@ pub(crate) fn try_load_neural_mmap_embeddings_from_storage(
 // Additive-only (invariant 4): never mutates `embeddings.bin`/
 // `neural_embeddings.bin`.
 //
-// `#[allow(dead_code)]` below: Task 4 delivers the persistence twins ahead of
-// their production callers — `SearchEngine::collect_fragment_embeddings`
-// (Task 5) and the post-index persist sites (Task 7). Remove the attribute
-// once those land; it documents the rollout, not a suppressed defect.
+// Fragment persistence twins (Task 4) — now live: `persist_search_snapshot`
+// persists the fragment mmap + root (Task 5) and `indexing/load.rs` loads the
+// mmap for hydration.
 
 /// Path for the fragment embeddings mmap file.
-#[allow(dead_code)]
 fn fragment_mmap_embeddings_path(project_path: &Path) -> PathBuf {
     project_path
         .join(".leindex")
@@ -1845,7 +1864,6 @@ fn fragment_mmap_embeddings_path(project_path: &Path) -> PathBuf {
 /// (or its fragment-store fallback); passing them in keeps this task free of a
 /// `SearchEngine` dependency that does not exist until Task 5 adds
 /// `fragment_vector_index`.
-#[allow(dead_code)]
 pub(crate) fn persist_fragment_embeddings_to_mmap(
     project_path: &Path,
     embeddings: &[(String, Vec<f32>)],
@@ -1878,7 +1896,6 @@ pub(crate) fn persist_fragment_embeddings_to_mmap(
 ///
 /// Returns `None` when the file does not exist or is corrupt (mirrors the
 /// neural loader's warn-and-continue behavior).
-#[allow(dead_code)]
 pub(crate) fn try_load_fragment_mmap_embeddings_from_storage(
     storage_path: &Path,
 ) -> Option<crate::search::vector::MmapEmbeddingIndex> {
@@ -1903,6 +1920,34 @@ pub(crate) fn try_load_fragment_mmap_embeddings_from_storage(
                 "Failed to load fragment mmap embedding index"
             );
             None
+        }
+    }
+}
+
+/// Validate the persisted fragment layer against the snapshot (invariant 8).
+///
+/// The snapshot records the fragment root hash (filled at persist time by
+/// `persist_search_snapshot`); `fragment_root.bin` must carry the SAME hash
+/// and a row count matching the fragment mmap. Any mismatch means the fragment
+/// artifacts are stale relative to the snapshot — callers must disable the
+/// fragment layer (never block the node-level path, invariant 3).
+pub(crate) fn fragment_layer_is_valid(
+    snapshot_root: Option<&str>,
+    fragment_mmap: Option<&crate::search::vector::MmapEmbeddingIndex>,
+    storage_path: &Path,
+) -> bool {
+    let (Some(root), Some(mmap)) = (snapshot_root, fragment_mmap) else {
+        return false;
+    };
+    match fragment::sync::load_fragment_root(storage_path) {
+        Ok(Some(state)) => state.root_hash == root && state.fragment_rows == mmap.len() as u64,
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to load fragment root for validation; fragment layer disabled"
+            );
+            false
         }
     }
 }

@@ -238,22 +238,28 @@ git commit -m "feat: fragment embeddings mmap persistence"
 
 **Files:** `src/search/search/mod.rs` (field :109, `new()` :142, `with_dimension()` :178, `clear_index()` :252, `restore_from_search_snapshot` :739); `src/search/search/staged_retrieval.rs` (`SearchSnapshot` :8).
 
-- [ ] Add `fragment_vector_index: Option<VectorIndexImpl>` next to `neural_vector_index` (:109); init `None` in `new()`/`with_dimension()`; clear in `clear_index()`. **Also: add `SearchEngine::collect_fragment_embeddings` (Task 4's deferred item) and remove `#[allow(dead_code)]` from the 3 Task 4 fns in `index_builder/mod.rs`.**
-- [ ] Extend `SearchSnapshot` (`staged_retrieval.rs:8`): `fragment_root_hash: Option<String>` (serde default), `fragment_rows: u32` (default 0).
-- [ ] `restore_from_search_snapshot` (:739): accept `fragment_mmap: Option<Arc<MmapEmbeddingIndex>>` + `fragment_ids: Option<&[String]>` (content-hash keys) — **both optional** so the existing `load.rs:126` call site still compiles unchanged (transitional buildability, per embed-merge discipline); validate `fragment_mmap.len() == snapshot.fragment_rows` and root-hash match (invariant 8); build `fragment_vector_index = Some(VectorIndexImpl::Mmap(MmapVectorIndex::from_snapshot(mmap, fragment_ids)))` — non-fatal on failure (mirror neural block).
-- [ ] **Update the caller in the same task:** thread the new optional params through `load.rs` `try_hydrate_from_snapshot` (`:91-129`) so the tree compiles at the end of Task 5, not Task 7. Task 7 then only wires the *fragment store load* (persisted artifacts), not the signature.
-- [ ] `collect_fragment_embeddings` reads from `fragment_vector_index` (fallback to store) for persistence.
-- [ ] Tests: snapshot round-trip with fragment fields; stale root → rejection; missing fragment rows → rejection; feature-off → `None` behaves identically to today.
-- [ ] Verify and commit:
+- [x] Add `fragment_vector_index: Option<VectorIndexImpl>` next to `neural_vector_index` (:109); init `None` in `new()`/`with_dimension()`; clear in `clear_index()`. **Also: add `SearchEngine::collect_fragment_embeddings` (Task 4's deferred item) and remove `#[allow(dead_code)]` from the 3 Task 4 fns in `index_builder/mod.rs`.**
+- [x] Extend `SearchSnapshot` (`staged_retrieval.rs:8`): `fragment_root_hash: Option<String>` (serde default), `fragment_rows: u32` (default 0).
+- [x] `restore_from_search_snapshot` (:739): accept `fragment_mmap: Option<Arc<MmapEmbeddingIndex>>` + `fragment_ids: Option<&[String]>` (content-hash keys) — **both optional** so the existing `load.rs:126` call site still compiles unchanged (transitional buildability, per embed-merge discipline); validate `fragment_mmap.len() == snapshot.fragment_rows` and root-hash match (invariant 8); build `fragment_vector_index = Some(VectorIndexImpl::Mmap(MmapVectorIndex::from_snapshot(mmap, fragment_ids)))` — non-fatal on failure (mirror neural block).
+- [x] **Update the caller in the same task:** thread the new optional params through `load.rs` `try_hydrate_from_snapshot` (`:91-129`) so the tree compiles at the end of Task 5, not Task 7. Task 7 then only wires the *fragment store load* (persisted artifacts), not the signature.
+- [x] `collect_fragment_embeddings` reads from `fragment_vector_index` (fallback to store) for persistence.
+- [x] Tests: snapshot round-trip with fragment fields; stale root → rejection; missing fragment rows → rejection; feature-off → `None` behaves identically to today.
+- [x] Verify and commit:
 
 ```bash
-cargo test -p leindex --features cli search_snapshot
+cargo test --lib -p leindex --features cli search_snapshot
 cargo check -p leindex --no-default-features --features search
 cargo check -p leindex --no-default-features --features cli
 git add src/search/search/mod.rs src/search/search/staged_retrieval.rs \
   src/cli/leindex/indexing/load.rs
 git commit -m "feat: hydrate fragment vector index from snapshot"
 ```
+
+**Progress note (Task 5 landed):** `fragment_vector_index` hydration is fully wired end-to-end (persist → hydrate → validate). Root-hash + row-count validation splits across `fragment_layer_is_valid` (cli, invariant 8) and the non-fatal restore block (invariant 3). Runtime activation awaits Task 7 (the rich `fragment_store.bin`), at which point hydration also gains fragment ids — today the layer stays off when the store is absent.
+
+> **Forward notes for Task 5 successors:**
+> - The plan's verify command `cargo test -p leindex --features cli search_snapshot` fails on the pre-1.10.0 tree (onnx-gated `pub mod embed` breaks the `onnx_worker_fallback`/`embed_bundle_pipeline_test` integration targets). Use `cargo test --lib -p leindex --features cli search_snapshot` until embed-merge lands.
+> - The fragment mmap row order is HashMap-iteration order (non-deterministic) in both `entries()` (persist) and `store.content_hashes()` (hydrate ids). `from_snapshot` resolves rows by id lookup, so this is safe today — but Task 7 must resolve `embedding_offset` via `find_node_row`, never positional store-iteration index.
 
 ### Task 6: Query-time retrieval + ranking fusion
 

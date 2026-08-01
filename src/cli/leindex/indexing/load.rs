@@ -123,10 +123,48 @@ impl LeIndex {
         #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
         let neural_mmap: Option<std::sync::Arc<crate::search::vector::MmapEmbeddingIndex>> = None;
 
+        // Fragment layer (Task 5, invariant 8): thread the fragment mmap + id
+        // list into the restore call. The rich fragment store (owner/file/byte
+        // metadata) is wired in Task 7; until fragment_store.bin exists the id
+        // list is empty and the fragment layer stays off (feature-off
+        // compatible). `fragment_layer_is_valid` rejects stale roots, so a
+        // mismatched artifact can never poison the node-level path.
+        let fragment_mmap_raw =
+            index_builder::try_load_fragment_mmap_embeddings_from_storage(artifact_path);
+        let fragment_ids: Option<Vec<String>> =
+            match index_builder::fragment::FragmentStore::load_from_artifact_path(artifact_path) {
+                Ok(Some(store)) => Some(store.content_hashes().map(str::to_string).collect()),
+                Ok(None) => None,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Failed to load fragment store; fragment layer disabled"
+                    );
+                    None
+                }
+            };
+        let fragment_layer_ok = fragment_ids.is_some()
+            && index_builder::fragment_layer_is_valid(
+                snapshot.fragment_root_hash.as_deref(),
+                fragment_mmap_raw.as_ref(),
+                artifact_path,
+            );
+        let fragment_mmap = match (fragment_layer_ok, fragment_mmap_raw) {
+            (true, Some(mmap)) => Some(std::sync::Arc::new(mmap)),
+            _ => None,
+        };
+        let fragment_ids = if fragment_layer_ok {
+            fragment_ids
+        } else {
+            None
+        };
+
         match self.search_engine.restore_from_search_snapshot(
             snapshot,
             std::sync::Arc::new(tfidf_mmap),
             neural_mmap,
+            fragment_mmap,
+            fragment_ids.as_deref(),
         ) {
             Ok(indexed_count) => {
                 #[cfg(feature = "onnx")]
