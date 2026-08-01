@@ -734,9 +734,11 @@ This finding requires a **product decision**: is fan-out to all matching candida
 
 ### D2. Admission-count accumulation across batches
 
-**Status:** VALID
+**Status:** RESOLVED (implemented 2026-08-01)
 
 **Problem:** `admission_gate.reset()` is called at the start of each batch (`:907`), and `nodes_admitted()` is logged after the loop (`:963`). The logged `admitted` value reflects only the last batch, while `pruned`/`shed`/`hoisted`/`external_skipped` accumulate across all batches.
+
+**Resolution (in-tree, confirmed 2026-08-01):** `total_admitted` accumulates `admission_gate.nodes_admitted()` before each reset (`src/cli/index_builder/mod.rs:948,1000`), and the A+ logging/warn emit `admitted = total_admitted` (`:1010,1021`).
 
 **Current location:**
 - `src/cli/index_builder/mod.rs:907` — `admission_gate.reset()`
@@ -798,9 +800,11 @@ This finding requires a **product decision**: is fan-out to all matching candida
 
 ### D3. memcheck xtask entrypoint test robustness
 
-**Status:** VALID
+**Status:** RESOLVED (implemented 2026-08-01)
 
 **Problem:** `test_val_measure_012_xtask_memcheck_entrypoint` hardcodes `target/debug/xtask`, ignores `CARGO_TARGET_DIR`, may use a stale binary, doesn't assert process success, and only checks `--help` output.
+
+**Resolution (in-tree, confirmed 2026-08-01):** the test now uses `cargo run --quiet -p xtask -- memcheck --help` with `workspace_root()` and asserts `output.status.success()` + stdout mentions memcheck (`tools/memcheck/tests/diff_logic.rs:344-364`).
 
 **Current location:** `tools/memcheck/tests/diff_logic.rs:343-370`, `workspace_root()` at `:14-23`.
 
@@ -1084,9 +1088,17 @@ This finding requires a **product decision**: is fan-out to all matching candida
 
 ### CR-F8. VectorImpl clear/remove tombstone bug
 
-**Status:** VALID
+**Status:** RESOLVED (implemented + verified 2026-08-01)
 
 **Problem:** After `MmapVectorIndex::clear()`, `rows` still contains pre-clear IDs. Calling `remove(pre_clear_id)` finds the ID in `rows` and inserts an unnecessary tombstone, returning `true` misleadingly. Tombstone growth causes memory bloat.
+
+**Resolution (in-tree, confirmed 2026-08-01):** `remove` now guards base-row tombstoning with `!self.cleared` (`src/search/search/vector_impl.rs:113-119`):
+```rust
+let removed_base = !self.cleared
+    && self.rows.contains_key(node_id)
+    && self.tombstones.insert(node_id.into());
+```
+Verification tests added 2026-08-01: `test_remove_after_clear_returns_false` + `test_remove_after_clear_no_tombstone_growth` (`src/search/search/vector_impl.rs`).
 
 **Current location:** `src/search/search/vector_impl.rs:109-120`.
 
@@ -1120,11 +1132,16 @@ This finding requires a **product decision**: is fan-out to all matching candida
 
 ### CR-F9. set_neural_weight cache invalidation
 
-**Status:** VALID
+**Status:** RESOLVED (implemented + verified 2026-08-01)
 
 **Problem:** `Searcher::set_neural_weight` sets `neural_weight` without clearing `search_cache`. Cached results scored with the old weight are returned for queries after the weight changes. The cache key doesn't include `neural_weight`.
 
-**Current location:** `src/search/search/mod.rs:206-208`.
+**Resolution (in-tree since the search-cache v2 work, confirmed 2026-08-01):**
+- `set_neural_weight` (`src/search/search/mod.rs:207-213`) clears `search_cache` and `search_cache_bytes` when the clamped value changes — exactly the design below.
+- The v2 query-result cache key **does** include `neural_weight` (`nw={}` at `src/cli/index_builder/mod.rs:1517`, threaded from `LeIndex::search_cache_key_for` at `src/cli/leindex/mod.rs:643-652`) — the fix went *beyond* the "out of scope" note below.
+- Verification tests added 2026-08-01: `test_set_neural_weight_clears_cache_on_change` + `test_set_neural_weight_preserves_cache_when_unchanged` (`src/search/search/tests_extra.rs`).
+
+**Current location:** `src/search/search/mod.rs:207-213`.
 
 **Design:**
 
@@ -1142,7 +1159,7 @@ This finding requires a **product decision**: is fan-out to all matching candida
 
    This matches CodeRabbit's suggested patch. Only clears when the value actually changes (after clamping).
 
-**Affected callsites:** `src/search/search/mod.rs:206-208`.
+**Affected callsites:** `src/search/search/mod.rs:207-213` (the in-tree `set_neural_weight` body).
 
 **CCN impact:** +2 branches (CCN ~4, well within ≤15).
 
@@ -1156,9 +1173,11 @@ This finding requires a **product decision**: is fan-out to all matching candida
 
 ### CR-F10. MAX_RESPONSE_FRAME_SIZE alignment
 
-**Status:** VALID
+**Status:** RESOLVED (implemented + verified 2026-08-01)
 
 **Problem:** The constant is 64 MiB but the comment says it mirrors the worker-side guard of `max_frame_size * 2 = 32 MiB`. The worker default is `DEFAULT_MAX_FRAME_SIZE = 16 MiB`, so `2× = 32 MiB`. The client should be 32 MiB, not 64 MiB.
+
+**Resolution (in-tree, confirmed 2026-08-01):** `MAX_RESPONSE_FRAME_SIZE` is now `32 * 1024 * 1024` with an accurate mirror comment (`src/search/onnx/client_config.rs:22`), matching `crate::embed::runtime::DEFAULT_MAX_FRAME_SIZE * 2`. Verification test added 2026-08-01: `test_max_response_frame_size_matches_worker_guard`.
 
 **Current location:**
 - `src/search/onnx/client_config.rs:17-22` — constant (64 MiB)
@@ -1351,8 +1370,8 @@ This finding requires a **product decision**: is fan-out to all matching candida
 | C1 | C1 | VALID (conservative by design) | `test_cross_file_call_fans_out_to_all_matches` |
 | C2 | C2 | PARTIAL | `test_duplicate_qname_inheritance_assigns_to_first` |
 | D1 | D1 | VALID | `test_env_var_guard_restores_on_panic` |
-| D2 | D2 | VALID | Multi-batch indexing log check |
-| D3 | D3 | VALID | `cargo test -p memcheck --test diff_logic test_val_measure_012` |
+| D2 | D2 | **RESOLVED** | `total_admitted` accumulation in-tree at `index_builder/mod.rs:948,1000,1010,1021` |
+| D3 | D3 | **RESOLVED** | `cargo test -p memcheck --test diff_logic test_val_measure_012` (in-tree) |
 | D4 | D4 | VALID | Run 27 runtime tests twice |
 | D5 | D5 | VALID | `test_ort_lib_sort_prefers_10_over_9` |
 | **Fresh review findings** | | | |
@@ -1363,9 +1382,9 @@ This finding requires a **product decision**: is fan-out to all matching candida
 | CR-F5 | CR-F5 | VALID | Verify with `cargo test --workspace` |
 | CR-F6 | CR-F6 | VALID | `test_indexed_files_stale_skips_large_project` |
 | CR-F7 | CR-F7 | VALID | `test_large_top_k_does_not_overflow` |
-| CR-F8 | CR-F8 | VALID | `test_remove_after_clear_returns_false` |
-| CR-F9 | CR-F9 | VALID | `test_set_neural_weight_clears_cache_on_change` |
-| CR-F10 | CR-F10 | VALID | `test_max_response_frame_size_matches_worker_guard` |
+| CR-F8 | CR-F8 | **RESOLVED** | `test_remove_after_clear_returns_false` + `test_remove_after_clear_no_tombstone_growth` (added 2026-08-01); fix in-tree at `vector_impl.rs:113-119` |
+| CR-F9 | CR-F9 | **RESOLVED** | `test_set_neural_weight_clears_cache_on_change` + `test_set_neural_weight_preserves_cache_when_unchanged` (added 2026-08-01); fix in-tree at `search/mod.rs:207-213` + `nw={}` in v2 key |
+| CR-F10 | CR-F10 | **RESOLVED** | `test_max_response_frame_size_matches_worker_guard` (added 2026-08-01); fix in-tree at `client_config.rs:22` (32 MiB) |
 | CR-F11 | CR-F11 | VALID | `test_cpp_range_for_complexity` |
 | CR-F12 | CR-F12 | VALID | `test_discover_ort_path_userprofile_fallback` |
 | CR-F13 | CR-F13 | VALID | Existing 78 setup tests |
@@ -1389,7 +1408,7 @@ All functions touched must end at CCN ≤ 15. No `// lizard: off` suppressions. 
 
 ## Execution Priority
 
-1. **Low-risk, high-confidence fixes first:** CR-F7 (saturating mul), CR-F8 (clear/remove), CR-F10 (frame size), CR-F11 (DECISION_KINDS), CR-F13 (run_check dedup), D2 (admission count), CR-F9 (cache invalidation).
+1. **Low-risk, high-confidence fixes first:** ~~CR-F7 (saturating mul)~~, ~~CR-F8 (clear/remove)~~ — **done 2026-08-01**, ~~CR-F10 (frame size)~~ — **done 2026-08-01**, CR-F11 (DECISION_KINDS), CR-F13 (run_check dedup), ~~D2 (admission count)~~ — **done 2026-08-01**. ~~CR-F9 (cache invalidation)~~ — **done 2026-08-01**; remove from queue.
 2. **Test infrastructure:** D1, D4 (EnvVarGuard) — enables safe testing of other changes.
 3. **Medium-risk refactors:** A3 (TF-IDF persistence), A6 (phase5 cache), CR-F6 (freshness skip), CR-F14 (prepare_neural_runtime), CR-F12 (USERPROFILE), D5 (ORT sorting), D3 (memcheck test).
 4. **Higher-risk refactors:** A1 (neural admission), A2 (FileSummary precompute), A5 (spawn_blocking), B1 (parse_results metric fix — **drop the rename, see B1 alternatives**), C2 (node_ids fix).

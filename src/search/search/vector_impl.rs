@@ -312,3 +312,62 @@ pub enum VectorIndexError {
     #[error("Index operation failed: {0}")]
     IndexOperationFailed(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::search::vector::write_mmap_embeddings;
+
+    /// CR-F8 (pr32 plan): after `clear()`, removing a pre-clear ID must not
+    /// insert a tombstone and must return `false`.
+    #[test]
+    fn test_remove_after_clear_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embeddings.bin");
+        write_mmap_embeddings(
+            &path,
+            &[
+                ("a".to_string(), vec![1.0, 0.0]),
+                ("b".to_string(), vec![0.0, 1.0]),
+            ],
+        )
+        .unwrap();
+        let base = Arc::new(MmapEmbeddingIndex::open(&path).unwrap());
+        let mut idx =
+            MmapVectorIndex::from_snapshot(base, &["a".to_string(), "b".to_string()]).unwrap();
+
+        idx.clear();
+        assert!(!idx.remove("a"), "remove after clear must return false");
+        assert!(!idx.remove("b"), "remove after clear must return false");
+    }
+
+    /// CR-F8: tombstone set stays empty after clearing + removing pre-clear IDs.
+    #[test]
+    fn test_remove_after_clear_no_tombstone_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embeddings.bin");
+        write_mmap_embeddings(
+            &path,
+            &[
+                ("a".to_string(), vec![1.0, 0.0]),
+                ("b".to_string(), vec![0.0, 1.0]),
+                ("c".to_string(), vec![0.5, 0.5]),
+            ],
+        )
+        .unwrap();
+        let base = Arc::new(MmapEmbeddingIndex::open(&path).unwrap());
+        let mut idx = MmapVectorIndex::from_snapshot(
+            base,
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+        )
+        .unwrap();
+
+        idx.clear();
+        let _ = idx.remove("a");
+        let _ = idx.remove("b");
+        assert!(
+            idx.tombstones.is_empty(),
+            "no tombstones may be created for pre-clear IDs after clear"
+        );
+    }
+}
