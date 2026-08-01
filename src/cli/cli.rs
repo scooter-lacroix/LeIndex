@@ -1468,18 +1468,24 @@ fn handle_smoke_and_warmup(
 
 /// Determine whether auto-warmup should run on a cold MIGraphX cache.
 ///
-/// Auto-warmup triggers when neural is enabled, a GPU (MIGraphX) provider was
-/// selected, and the MIGraphX cache directory does not yet exist (cold cache).
+/// Auto-warmup triggers when the smoke test reported MIGraphX as the **active**
+/// provider (the actual runtime selection, not the requested enum — Auto may
+/// resolve to MIGraphX on an AMD host) and the MIGraphX cache is cold.
 #[cfg(feature = "onnx")]
 fn should_auto_warmup(
-    choices: &crate::cli::leindex::setup::SetupChoices,
+    _choices: &crate::cli::leindex::setup::SetupChoices,
     result: &crate::cli::leindex::setup::SetupResult,
 ) -> bool {
-    use crate::cli::leindex::setup::ExecutionProvider;
-
-    // Only warm up for MIGraphX provider.
-    let is_migraphx = choices.provider == Some(ExecutionProvider::Migraphx);
-    if !is_migraphx {
+    // Warm only active MIGraphX: the smoke test is the authority on which EP
+    // the worker actually used. An explicit `--gpu amd` that fell back to CPU
+    // must not trigger warmup; an Auto selection that resolved to MIGraphX
+    // must trigger it.
+    let active_is_migraphx = result
+        .smoke_test
+        .as_ref()
+        .and_then(|s| s.execution_provider.as_deref())
+        == Some("migraphx");
+    if !active_is_migraphx {
         return false;
     }
 

@@ -31,21 +31,42 @@ pub use setup_ort::get_ort_version;
 use setup_ort::*;
 
 /// Execution provider selected during setup.
+///
+/// `Auto` is the policy that defers concrete-provider choice to the runtime
+/// selector (CoreML → MIGraphX → CUDA → CPU). It is the default for bare
+/// `--neural`. The configured value persisted to `leindex.toml` is `"auto"`
+/// even when setup installed a concrete package candidate (e.g., onnxruntime-gpu)
+/// derived from host detection — the runtime re-resolves on each launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionProvider {
+    /// Automatic selection: runtime probes CoreML/MIGraphX/CUDA and falls back to CPU.
+    ///
+    /// `Auto` has no fixed pip package; callers must resolve a concrete
+    /// **install candidate** via [`install_candidate`] before invoking
+    /// `pip_package()` / `install_ort()`.
+    Auto,
     /// CPU inference (works everywhere).
     Cpu,
     /// NVIDIA CUDA GPU.
     Cuda,
     /// AMD MIGraphX GPU (ROCm).
     Migraphx,
+    /// Apple CoreML GPU (macOS only).
+    CoreMl,
 }
 
 impl ExecutionProvider {
     /// The ORT pip package name for this provider.
+    ///
+    /// `Auto` maps to the plain `onnxruntime` package, but this value must not
+    /// be used to drive an install decision before resolving the install
+    /// candidate via [`install_candidate`] — `Auto` may need a GPU package on
+    /// an NVIDIA host. Callers that install ORT pass a concrete candidate.
     pub fn pip_package(&self) -> &'static str {
         match self {
-            ExecutionProvider::Cpu => "onnxruntime",
+            ExecutionProvider::Auto | ExecutionProvider::Cpu | ExecutionProvider::CoreMl => {
+                "onnxruntime"
+            }
             ExecutionProvider::Cuda => "onnxruntime-gpu",
             ExecutionProvider::Migraphx => "onnxruntime-migraphx",
         }
@@ -54,9 +75,58 @@ impl ExecutionProvider {
     /// The config string value for this provider.
     pub fn config_value(&self) -> &'static str {
         match self {
+            ExecutionProvider::Auto => "auto",
             ExecutionProvider::Cpu => "cpu",
             ExecutionProvider::Cuda => "cuda",
             ExecutionProvider::Migraphx => "migraphx",
+            ExecutionProvider::CoreMl => "coreml",
+        }
+    }
+
+    /// Whether this provider is a concrete (non-`Auto`) value.
+    ///
+    /// Install/availability paths require a concrete provider; `Auto` must be
+    /// resolved through [`install_candidate`] first. Exercised by the
+    /// `install_candidate` unit tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_concrete(self) -> bool {
+        !matches!(self, ExecutionProvider::Auto)
+    }
+}
+
+/// Resolve the concrete install candidate for a setup provider.
+///
+/// Explicit providers (`Cpu`/`Cuda`/`Migraphx`/`CoreMl`) resolve to themselves.
+/// `Auto` resolves via host/vendor detection:
+///
+/// - Auto + Apple (macOS) → `CoreMl`
+/// - Auto + AMD on supported Linux x86_64 → `Migraphx`
+/// - Auto + NVIDIA → `Cuda`
+/// - Auto + no usable accelerator → `Cpu`
+///
+/// The configured policy persisted to `leindex.toml` remains `"auto"`; this
+/// helper only decides which pip package / availability probe applies during
+/// the install phase. Probe order: host/vendor → install distribution →
+/// discover/init dylib → provider availability → real session/inference smoke
+/// test. The runtime selector remains the pre-install authority is NOT granted
+/// here — this is the install-candidate resolver, not the runtime selector.
+pub fn install_candidate(provider: ExecutionProvider) -> ExecutionProvider {
+    match provider {
+        concrete @ (ExecutionProvider::Cpu
+        | ExecutionProvider::Cuda
+        | ExecutionProvider::Migraphx
+        | ExecutionProvider::CoreMl) => concrete,
+        ExecutionProvider::Auto => {
+            // Apple → CoreML (lowest-latency, always-on GPU on Apple Silicon).
+            if cfg!(target_os = "macos") {
+                ExecutionProvider::CoreMl
+            } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) && detect_amd_gpu() {
+                ExecutionProvider::Migraphx
+            } else if detect_nvidia_gpu() {
+                ExecutionProvider::Cuda
+            } else {
+                ExecutionProvider::Cpu
+            }
         }
     }
 }
@@ -157,13 +227,25 @@ impl SmokeTestResult {
         if error.is_none() {
             if let Some(configured) = configured_provider_label.as_deref() {
                 let active = execution_provider.as_deref();
+                // VAL-SETUP smoke match: the configured label must agree with
+                // the provider the worker actually loaded.
+                //   cpu→cpu, cuda→cuda, migraphx→migraphx, legacy rocm→migraphx,
+                //   coreml→coreml, auto→any concrete provider (incl. CPU).
                 let provider_matches = matches!(
                     (configured, active),
-                    ("cuda", Some("cuda"))
+                    ("cpu", Some("cpu"))
+                        | ("cuda", Some("cuda"))
                         | ("migraphx", Some("migraphx"))
                         | ("rocm", Some("migraphx" | "rocm"))
+                        | ("coreml", Some("coreml"))
+                        | ("auto", Some("cpu" | "cuda" | "migraphx" | "coreml"))
                 );
-                if matches!(configured, "migraphx" | "rocm" | "cuda") && !provider_matches {
+                // Only flag a mismatch for labels that assert a concrete shape.
+                // `cpu` is permissive (CPU is always a valid outcome), so it is
+                // excluded from the needs-match set just like the original.
+                let needs_match =
+                    matches!(configured, "migraphx" | "rocm" | "cuda" | "coreml" | "auto");
+                if needs_match && !provider_matches {
                     error = Some(format!(
                         "configured execution provider {} but worker reported {}",
                         configured,
@@ -251,9 +333,11 @@ pub fn resolve_from_flags(
             GpuVendor::Nvidia => ExecutionProvider::Cuda,
         })
     } else {
-        // --neural without provider: default to CPU
-        // VAL-SETUP-009: --neural with no GPU flags defaults to CPU
-        Some(ExecutionProvider::Cpu)
+        // VAL-SETUP-009: --neural with no provider flags becomes Auto. The
+        // concrete install candidate is resolved from host detection during
+        // execute_setup; the persisted config value stays "auto" so the runtime
+        // re-resolves on each launch and survives hardware changes.
+        Some(ExecutionProvider::Auto)
     };
 
     Ok(SetupChoices {
@@ -287,68 +371,64 @@ pub fn run_interactive_flow() -> Result<SetupChoices, SetupError> {
         });
     }
 
-    // VAL-SETUP-004/005: CPU or GPU?
-    let provider_items = vec![
-        "CPU (works everywhere)",
-        "GPU (faster, requires AMD/NVIDIA GPU)",
-    ];
-
-    let gpu_choice = Select::new()
-        .with_prompt("CPU or GPU-based neural embeddings?")
-        .items(&provider_items)
-        .default(0)
-        .interact()
-        .map_err(|e| SetupError::Interactive(e.to_string()))?;
-
-    if gpu_choice == 0 {
-        // VAL-SETUP-004: CPU selected
-        return Ok(SetupChoices {
-            neural_enabled: true,
-            provider: Some(ExecutionProvider::Cpu),
-        });
-    }
-
-    // VAL-SETUP-005: GPU -> AMD/NVIDIA/N/A
-    let vendor_items = vec![
-        "AMD (ROCm/MIGraphX)",
-        "NVIDIA (CUDA)",
-        "N/A (no usable GPU detected)",
-    ];
-
-    // VAL-SETUP-033: Before presenting the vendor menu, run a best-effort
-    // detection so we can print actionable guidance when neither AMD nor
-    // NVIDIA tooling is visible. The user can still pick any option; we do
-    // not prevent them, but the guidance for an unknown-vendor system helps
-    // them avoid dead-ending on a GPU choice they cannot satisfy.
+    // VAL-SETUP-004/005: provider menu. Auto is always offered and is the
+    // default (mirrors bare `--neural`). The remaining options are gated by
+    // host so we never offer an impossible combination:
+    //   * Apple (macOS) → Auto / CoreML / CPU
+    //   * Linux x86_64  → Auto / CPU / CUDA / MIGraphX
+    //   * other hosts   → Auto / CPU / CUDA
     let detected_vendor = detect_gpu_vendor();
+
+    // Build the menu. Each entry pairs a display label with the provider it
+    // resolves to so the routing table below stays a single source of truth.
+    let menu: Vec<(&'static str, ExecutionProvider)> = if cfg!(target_os = "macos") {
+        vec![
+            (
+                "Auto (recommended; uses CoreML on Apple Silicon)",
+                ExecutionProvider::Auto,
+            ),
+            ("CoreML (Apple GPU)", ExecutionProvider::CoreMl),
+            ("CPU (works everywhere)", ExecutionProvider::Cpu),
+        ]
+    } else {
+        let mut entries: Vec<(&'static str, ExecutionProvider)> = vec![
+            (
+                "Auto (recommended; detects CUDA/MIGraphX at runtime)",
+                ExecutionProvider::Auto,
+            ),
+            ("CPU (works everywhere)", ExecutionProvider::Cpu),
+            ("NVIDIA CUDA", ExecutionProvider::Cuda),
+        ];
+        // MIGraphX is only offered on supported platforms (Linux x86_64).
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            entries.push(("AMD MIGraphX (ROCm)", ExecutionProvider::Migraphx));
+        }
+        entries
+    };
+
+    // VAL-SETUP-033: print best-effort detection guidance before the prompt.
     match detected_vendor {
-        DetectedGpu::Amd => {
-            println!("  (Detected AMD GPU / ROCm tooling.)");
-        }
-        DetectedGpu::Nvidia => {
-            println!("  (Detected NVIDIA GPU / CUDA tooling.)");
-        }
+        DetectedGpu::Amd => println!("  (Detected AMD GPU / ROCm tooling.)"),
+        DetectedGpu::Nvidia => println!("  (Detected NVIDIA GPU / CUDA tooling.)"),
         DetectedGpu::Unknown => {
-            println!("  (No AMD ROCm or NVIDIA CUDA tooling detected.)");
-            println!("   Recommendation: choose 'N/A' to use CPU, which works everywhere.");
-            println!("   If you have a GPU, install ROCm (AMD) or the CUDA toolkit (NVIDIA)");
-            println!("   and re-run `leindex setup`.");
+            if !cfg!(target_os = "macos") {
+                println!("  (No AMD ROCm or NVIDIA CUDA tooling detected.)");
+                println!("   Recommendation: choose 'Auto' or 'CPU'.");
+            }
         }
     }
 
-    let vendor_choice = Select::new()
-        .with_prompt("Which GPU vendor?")
-        .items(&vendor_items)
-        .default(default_gpu_vendor_index(detected_vendor))
+    let labels: Vec<&'static str> = menu.iter().map(|(label, _)| *label).collect();
+    let default_idx = 0; // Auto is the default.
+
+    let choice = Select::new()
+        .with_prompt("Which execution provider?")
+        .items(&labels)
+        .default(default_idx)
         .interact()
         .map_err(|e| SetupError::Interactive(e.to_string()))?;
 
-    // VAL-SETUP-006/007/008: vendor routing
-    let provider = match vendor_choice {
-        0 => ExecutionProvider::Migraphx, // VAL-SETUP-006: AMD -> MIGraphX
-        1 => ExecutionProvider::Cuda,     // VAL-SETUP-007: NVIDIA -> CUDA
-        _ => ExecutionProvider::Cpu,      // VAL-SETUP-008: N/A -> CPU fallback
-    };
+    let provider = menu[choice].1;
 
     Ok(SetupChoices {
         neural_enabled: true,
@@ -391,6 +471,9 @@ pub fn detect_gpu_vendor() -> DetectedGpu {
     }
 }
 
+/// Index into the (removed) vendor menu for a detected GPU. Retained for the
+/// detection-mapping test; the interactive flow now builds a host-gated menu.
+#[cfg(test)]
 fn default_gpu_vendor_index(detected: DetectedGpu) -> usize {
     match detected {
         DetectedGpu::Amd => 0,
@@ -640,7 +723,13 @@ fn prepare_neural_runtime(
         }
     }
 
-    let provider = choices.provider.unwrap_or(ExecutionProvider::Cpu);
+    // Resolve the concrete install candidate. Auto must NOT reach install_ort /
+    // pip_package directly: it has no fixed package. The candidate is derived
+    // from host detection (Auto+Apple→CoreML, Auto+AMD→MIGraphX, Auto+NVIDIA→
+    // CUDA, Auto+none→CPU). The persisted config_value remains "auto" via
+    // build_config which reads choices.provider (the policy), not this candidate.
+    let configured = choices.provider.unwrap_or(ExecutionProvider::Cpu);
+    let provider = install_candidate(configured);
 
     // VAL-SETUP-022: Check version compatibility of any existing install
     // before deciding whether to (re)install. An incompatible version

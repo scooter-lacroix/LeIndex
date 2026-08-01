@@ -123,11 +123,18 @@ pub(super) fn check_ort_version_compatibility(detected: &str) -> VersionCompatib
 }
 
 /// Check if a specific execution provider is available in the installed ORT.
+///
+/// Mapping: CoreMl→"CoreMLExecutionProvider", Cuda→"CUDAExecutionProvider",
+/// Migraphx→"MIGraphXExecutionProvider", Cpu→always true, Auto→always false
+/// (the caller must resolve Auto to a concrete candidate before probing).
 pub(super) fn check_provider_available(provider: ExecutionProvider) -> bool {
     let provider_name = match provider {
         ExecutionProvider::Migraphx => "MIGraphXExecutionProvider",
         ExecutionProvider::Cuda => "CUDAExecutionProvider",
+        ExecutionProvider::CoreMl => "CoreMLExecutionProvider",
         ExecutionProvider::Cpu => return true, // CPU is always available
+        // Auto has no fixed provider to probe; callers resolve a candidate first.
+        ExecutionProvider::Auto => return false,
     };
 
     let check_script = format!(

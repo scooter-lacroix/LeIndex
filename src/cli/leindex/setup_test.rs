@@ -74,11 +74,13 @@ fn test_resolve_no_neural() {
 }
 
 #[test]
-fn test_resolve_neural_default_cpu() {
-    // VAL-SETUP-009: --neural alone defaults to CPU
+fn test_resolve_neural_default_auto() {
+    // VAL-SETUP-009: --neural alone becomes Auto (not CPU). The concrete
+    // install candidate is resolved from host detection during execute_setup;
+    // the persisted config value stays "auto".
     let choices = resolve_from_flags(true, false, false, None).unwrap();
     assert!(choices.neural_enabled);
-    assert_eq!(choices.provider, Some(ExecutionProvider::Cpu));
+    assert_eq!(choices.provider, Some(ExecutionProvider::Auto));
 }
 
 #[test]
@@ -135,7 +137,12 @@ fn test_parse_gpu_vendor_invalid() {
 
 #[test]
 fn test_execution_provider_pip_package() {
+    // Auto|Cpu|CoreMl => "onnxruntime"; Cuda => "onnxruntime-gpu";
+    // Migraphx => "onnxruntime-migraphx". Auto.pip_package() must not be
+    // called to drive an install decision before resolving the candidate.
+    assert_eq!(ExecutionProvider::Auto.pip_package(), "onnxruntime");
     assert_eq!(ExecutionProvider::Cpu.pip_package(), "onnxruntime");
+    assert_eq!(ExecutionProvider::CoreMl.pip_package(), "onnxruntime");
     assert_eq!(ExecutionProvider::Cuda.pip_package(), "onnxruntime-gpu");
     assert_eq!(
         ExecutionProvider::Migraphx.pip_package(),
@@ -156,10 +163,12 @@ fn test_pip_ort_package_spec_is_bounded_to_supported_major() {
 }
 
 #[test]
-fn test_execution_provider_config_value() {
+fn test_execution_provider_config_values() {
+    assert_eq!(ExecutionProvider::Auto.config_value(), "auto");
     assert_eq!(ExecutionProvider::Cpu.config_value(), "cpu");
     assert_eq!(ExecutionProvider::Cuda.config_value(), "cuda");
     assert_eq!(ExecutionProvider::Migraphx.config_value(), "migraphx");
+    assert_eq!(ExecutionProvider::CoreMl.config_value(), "coreml");
 }
 
 #[test]
@@ -554,9 +563,11 @@ fn test_build_config_records_ort_version() {
 #[test]
 fn test_build_config_selects_dynamic_qwen_model_for_all_local_providers() {
     for provider in [
+        ExecutionProvider::Auto,
         ExecutionProvider::Cpu,
         ExecutionProvider::Cuda,
         ExecutionProvider::Migraphx,
+        ExecutionProvider::CoreMl,
     ] {
         let choices = SetupChoices {
             neural_enabled: true,
@@ -572,9 +583,11 @@ fn test_build_config_selects_dynamic_qwen_model_for_all_local_providers() {
 #[test]
 fn test_model_download_profile_uses_hugging_face_cli_assets() {
     for provider in [
+        ExecutionProvider::Auto,
         ExecutionProvider::Cpu,
         ExecutionProvider::Cuda,
         ExecutionProvider::Migraphx,
+        ExecutionProvider::CoreMl,
     ] {
         let profile = model_download_profile(Some(provider));
         assert_eq!(profile.repository, "zhiqing/Qwen3-Embedding-0.6B-ONNX");
@@ -1097,4 +1110,156 @@ fn test_install_downloaded_model_file_preserves_destination_when_staging_fails()
 fn test_ensure_models_rejects_unknown_name_before_model_directory_resolution() {
     let result = ensure_models_present(None, "unsupported-model-name");
     assert!(matches!(result, Err(SetupError::InvalidModelName { .. })));
+}
+
+// ── Task 8: Auto/CoreML provider setup ──────────────────────────────────
+
+#[test]
+fn test_install_candidate_resolves_explicit_to_self() {
+    // Explicit providers are their own install candidate.
+    assert_eq!(
+        install_candidate(ExecutionProvider::Cpu),
+        ExecutionProvider::Cpu
+    );
+    assert_eq!(
+        install_candidate(ExecutionProvider::Cuda),
+        ExecutionProvider::Cuda
+    );
+    assert_eq!(
+        install_candidate(ExecutionProvider::Migraphx),
+        ExecutionProvider::Migraphx
+    );
+    assert_eq!(
+        install_candidate(ExecutionProvider::CoreMl),
+        ExecutionProvider::CoreMl
+    );
+}
+
+#[test]
+fn test_install_candidate_auto_resolves_to_concrete() {
+    // Auto must resolve to a concrete provider (never Auto itself) regardless
+    // of the host. The concrete value depends on host detection, but it must
+    // always be one of the four concrete variants.
+    let candidate = install_candidate(ExecutionProvider::Auto);
+    assert!(
+        candidate.is_concrete(),
+        "Auto install candidate must be concrete, got {:?}",
+        candidate
+    );
+    assert_ne!(candidate, ExecutionProvider::Auto);
+}
+
+#[test]
+fn test_is_concrete_distinguishes_auto() {
+    assert!(!ExecutionProvider::Auto.is_concrete());
+    assert!(ExecutionProvider::Cpu.is_concrete());
+    assert!(ExecutionProvider::Cuda.is_concrete());
+    assert!(ExecutionProvider::Migraphx.is_concrete());
+    assert!(ExecutionProvider::CoreMl.is_concrete());
+}
+
+#[test]
+fn test_check_provider_available_auto_returns_false() {
+    // Auto has no fixed provider to probe; callers must resolve a candidate.
+    assert!(!check_provider_available(ExecutionProvider::Auto));
+}
+
+#[test]
+fn test_coreml_smoke_result_accepts_coreml_runtime() {
+    // coreml→coreml is a passing match.
+    let result = SmokeTestResult::from_embedding_outcome(
+        QWEN3_EMBEDDING_DIMENSION,
+        Some("coreml".to_string()),
+        Some("coreml".to_string()),
+    );
+    assert!(result.passed);
+    assert!(result.error.is_none());
+}
+
+#[test]
+fn test_coreml_smoke_result_fails_on_cpu_runtime() {
+    // coreml configured but cpu active → mismatch failure.
+    let result = SmokeTestResult::from_embedding_outcome(
+        QWEN3_EMBEDDING_DIMENSION,
+        Some("cpu".to_string()),
+        Some("coreml".to_string()),
+    );
+    assert!(!result.passed);
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("configured execution provider coreml")
+    );
+}
+
+#[test]
+fn test_auto_smoke_result_accepts_any_concrete_including_cpu() {
+    // auto→any concrete provider (incl. CPU) is a passing match.
+    for active in ["cpu", "cuda", "migraphx", "coreml"] {
+        let result = SmokeTestResult::from_embedding_outcome(
+            QWEN3_EMBEDDING_DIMENSION,
+            Some(active.to_string()),
+            Some("auto".to_string()),
+        );
+        assert!(result.passed, "auto should accept active='{}'", active);
+        assert!(
+            result.error.is_none(),
+            "auto+{} got error: {:?}",
+            active,
+            result.error
+        );
+    }
+}
+
+#[test]
+fn test_auto_smoke_result_fails_when_worker_reports_none() {
+    // auto with no reported provider cannot be confirmed → mismatch.
+    let result = SmokeTestResult::from_embedding_outcome(
+        QWEN3_EMBEDDING_DIMENSION,
+        None,
+        Some("auto".to_string()),
+    );
+    assert!(!result.passed);
+}
+
+/// VAL-SETUP-023 / Task 8: bare `--neural` persists `execution_provider = "auto"`
+/// even though setup may install a concrete package candidate (e.g., onnxruntime-gpu).
+///
+/// This test exercises ONLY the config-writer seam (`build_config` + `save`)
+/// against a temp `LEINDEX_HOME`. It must NOT invoke pip, model downloads, or
+/// any live setup step. It is serialized under `PIPE_ENV_LOCK` because it
+/// mutates the process-wide `LEINDEX_HOME`.
+#[test]
+fn test_setup_persists_auto_provider() {
+    let _g = PIPE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = EnvVarGuard::set("LEINDEX_HOME", &tmp.path().display().to_string());
+
+    // Mirror what execute_setup writes for a bare `--neural` (Auto) run:
+    // the configured policy is Auto; build_config emits "auto".
+    let choices = SetupChoices {
+        neural_enabled: true,
+        provider: Some(ExecutionProvider::Auto),
+    };
+    let config = build_config(&choices, None, None);
+
+    // The persisted value is "auto" — NOT the install candidate.
+    assert_eq!(config.neural.execution_provider, "auto");
+    assert!(config.neural.enabled);
+
+    // Write to disk and reload to confirm the TOML round-trips "auto".
+    let written_path = config.save().expect("config save should succeed");
+    assert!(written_path.exists());
+
+    let reloaded = crate::config::LeIndexConfig::load().expect("config load should succeed");
+    assert_eq!(reloaded.neural.execution_provider, "auto");
+    assert!(reloaded.neural.enabled);
+
+    // No pip / model artifacts should have been created under LEINDEX_HOME.
+    assert!(
+        !tmp.path().join("models").exists(),
+        "test must not download models"
+    );
 }
