@@ -131,7 +131,10 @@ impl LeIndex {
             Ok(indexed_count) => {
                 #[cfg(feature = "onnx")]
                 {
-                    match index_builder::HybridEmbedder::hybrid_local(tfidf_embedder, None) {
+                    match index_builder::HybridEmbedder::hybrid_local(
+                        tfidf_embedder,
+                        Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
+                    ) {
                         Ok(hybrid) => self.embedder = Some(hybrid),
                         Err(e) => {
                             warn!(
@@ -267,7 +270,10 @@ impl LeIndex {
                     .ok()
                     .flatten()
             {
-                match index_builder::HybridEmbedder::hybrid_local(tfidf, None) {
+                match index_builder::HybridEmbedder::hybrid_local(
+                    tfidf,
+                    Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
+                ) {
                     Ok(hybrid) => self.embedder = Some(hybrid),
                     Err(e) => {
                         warn!(

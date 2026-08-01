@@ -1402,7 +1402,7 @@ impl LeIndex {
                 .context("core embedder is set before neural enrichment")?
                 .tfidf()
                 .clone(),
-            None,
+            Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
         )
         .ok();
         if let Some(reason) = embedder

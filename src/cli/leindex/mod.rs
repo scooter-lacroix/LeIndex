@@ -520,11 +520,8 @@ impl LeIndex {
         // Initialize search engine, configured with the documented `[search]
         // neural_weight` knob (previously dead config). VAL-CONFIG.
         let mut search_engine = SearchEngine::new();
-        search_engine.set_neural_weight(
-            crate::config::LeIndexConfig::load_cached()
-                .search
-                .neural_weight as f32,
-        );
+        search_engine
+            .set_neural_weight(crate::config::LeIndexConfig::load_cached().neural_weight_f32());
 
         // Initialize cache subsystem
         let cache_dir = storage_path.join("cache");

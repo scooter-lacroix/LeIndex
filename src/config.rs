@@ -251,6 +251,13 @@ impl LeIndexConfig {
         Self::load_from_path(&config_file_path().ok_or(ConfigError::NoHomeDir)?)
     }
 
+    /// The hybrid neural-score weight as `f32` — the type scoring and embedder
+    /// consumers need. Config stores it as `f64`; centralize the cast so all
+    /// call sites agree (single source of truth, VAL-CONFIG).
+    pub fn neural_weight_f32(&self) -> f32 {
+        self.search.neural_weight as f32
+    }
+
     /// Process-wide cached config read. Reads leindex.toml once on first access,
     /// then serves the cached value; falls back to `Default` on error. Use this
     /// on hot paths (query/index) so the documented `[search]` knobs are read
