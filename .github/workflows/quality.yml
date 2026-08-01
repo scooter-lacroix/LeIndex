@@ -11,6 +11,64 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # ── Compile-oriented feature matrix (Linux) ─────────────────────────
+  # One published crate, two binaries. Statically verify each feature
+  # combination still compiles and links its test targets without running
+  # runtime ONNX tests (no ORT shared libs / models in CI). The onnx row
+  # also checks the legacy onnx-migraphx alias so a stale feature gate is
+  # caught here, not at release time.
+  compile-matrix:
+    name: Compile (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: default, args: "" }
+          - { name: minimal, args: "--no-default-features --features minimal" }
+          - { name: onnx-install-path, args: "--no-default-features --features onnx" }
+          - { name: all-features, args: "--all-features" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: compile-${{ matrix.name }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            compile-${{ matrix.name }}-cargo-
+      - name: cargo check
+        run: cargo check -p leindex --all-targets ${{ matrix.args }}
+      - name: cargo test --no-run (compile tests, do not execute runtime ONNX)
+        run: cargo test -p leindex --no-run ${{ matrix.args }}
+      - name: Also check legacy onnx-migraphx alias (onnx row only)
+        if: matrix.name == 'onnx-install-path'
+        run: cargo check -p leindex --no-default-features --features onnx-migraphx
+
+  # ── CoreML compile check (macOS, no GPU runner) ─────────────────────
+  # macOS has no self-hosted GPU runner in this repo; we only verify the
+  # strict onnx feature set (which carries ort/coreml) compiles on Darwin.
+  compile-macos-coreml:
+    name: Compile (macOS CoreML)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: compile-macos-coreml-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            compile-macos-coreml-cargo-
+      - name: cargo check (strict onnx, includes ort/coreml)
+        run: cargo check -p leindex --no-default-features --features onnx --all-targets
+
   # ── Duplicate code detection via jscpd ──────────────────────────────
   # Uses jscpd to detect copy-paste code blocks across the Rust source.
   # Threshold: fail if duplication exceeds the staged 8% baseline; reduce toward 5%.
@@ -63,9 +121,10 @@ jobs:
       - name: Run complexity analysis
         run: |
           # Generate the browsable HTML report (lizard -o always exits 0).
+          # The worker source lives at src/embed/ (the leindex-embed subcrate
+          # was retired into the root crate), so src/ covers the full tree.
           lizard \
             src/ \
-            crates/leindex-embed/src/ \
             -C 15 \
             -x"*/tests/*" \
             -x"*/target/*" \
@@ -75,7 +134,6 @@ jobs:
           # (lizard's -o report mode always exits 0, so the gate is a separate run).
           lizard \
             src/ \
-            crates/leindex-embed/src/ \
             -C 15 \
             -x"*/tests/*" \
             -x"*/target/*" \

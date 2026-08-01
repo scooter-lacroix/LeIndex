@@ -423,8 +423,13 @@ mod distribution_coverage {
     #[test]
     fn release_workflow_triggers_on_distribution_files() {
         let workflow = release_yml();
+        // One published crate: the worker source lives under `src/**`
+        // (merged from the retired crates/leindex-embed subcrate). The
+        // trigger must cover the merged source tree, the installers, the
+        // workflow itself, and the docs — but NOT `crates/**` (the
+        // directory no longer exists).
         for path in [
-            "crates/**",
+            "src/**",
             "install.sh",
             ".github/workflows/release.yml",
             "docs/**",
@@ -435,5 +440,9 @@ mod distribution_coverage {
                 path
             );
         }
+        assert!(
+            !workflow.contains("crates/**"),
+            "release workflow must not trigger on `crates/**` (the leindex-embed subcrate was retired; src/** covers the merged worker source)"
+        );
     }
 }

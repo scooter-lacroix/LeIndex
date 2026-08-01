@@ -11,7 +11,7 @@ on:
       - "src/search/**"
       - "src/graph/**"
       - "src/storage/**"
-      - "crates/leindex-embed/**"
+      - "src/embed/**"
       - "benches/mcp_tool_latency.rs"
       - "scripts/check-performance.sh"
 

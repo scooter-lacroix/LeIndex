@@ -31,20 +31,6 @@ updates:
           - "tower"
           - "tower-http"
 
-  # Subcrate: leindex-embed
-  - package-ecosystem: "cargo"
-    directory: "/crates/leindex-embed"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-    open-pull-requests-limit: 5
-    labels:
-      - "dependencies"
-      - "rust"
-    commit-message:
-      prefix: "deps"
-      include: "scope"
-
   # GitHub Actions
   - package-ecosystem: "github-actions"
     directory: "/"

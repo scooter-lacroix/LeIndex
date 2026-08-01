@@ -1,13 +1,12 @@
-// Worker entry point shared by the leindex-embed subcrate binary and the
-// root crate's cargo-install-friendly wrapper binary.
+// Worker entry point for the leindex-embed binary.
 //
 // VAL-CARGO-005: `cargo install leindex --features onnx` must install BOTH
-// the `leindex` and `leindex-embed` binaries. Because `cargo install <pkg>`
-// only installs `[[bin]]` targets declared in `<pkg>`'s own `Cargo.toml`,
-// the root leindex crate mirrors the worker binary via a thin wrapper at
-// `src/bin/leindex-embed.rs`. Both binaries call this function so the
-// worker logic lives in a single place and is feature-unified through the
-// library crate.
+// the `leindex` and `leindex-embed` binaries from the single root crate.
+// The worker logic lives here (in `src/embed/`) and the root crate's
+// `src/bin/leindex-embed.rs` wrapper is a thin shim around this function,
+// so the worker logic has one source of truth and is feature-unified
+// through the library crate. (The retired crates/leindex-embed subcrate's
+// own binary no longer exists.)
 //
 // VAL-CPHASE-001: The worker is a separate executable built alongside leindex.
 // VAL-CPHASE-004: Worker transport uses local IPC only.
@@ -35,8 +34,8 @@ use crate::embed::runtime::{RuntimeConfig, WorkerRuntime};
 ///
 /// This function is the single source of truth for the worker entry point.
 /// It is called by:
-///   - `crates/leindex-embed/src/bin/leindex-embed.rs` (subcrate binary)
-///   - `src/bin/leindex-embed.rs` (root crate cargo-install wrapper)
+///   - `src/bin/leindex-embed.rs` (root crate cargo-install wrapper, the
+///     only leindex-embed binary now that the subcrate is retired)
 ///
 /// VAL-CARGO-005/VAL-RELEASE-002: `leindex-embed --version` prints the
 /// release version (matching `leindex --version`) and exits 0 so install

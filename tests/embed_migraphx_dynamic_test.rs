@@ -75,7 +75,7 @@ fn val_ort_015_runtime_discovers_and_loads_ort_dylib() {
             // This branch is acceptable on a machine without any ORT
             // installation. The test suite under --features onnx-migraphx on
             // an AMD-GPU CI runner must reach Initialized, but a developer
-            // running `cargo test -p leindex-embed --features onnx` on a
+            // running `cargo test -p leindex --features onnx` on a
             // laptop without ORT will hit NotFound. We log the searched
             // paths so a failure is not silent.
             eprintln!(

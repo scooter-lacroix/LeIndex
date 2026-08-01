@@ -307,7 +307,9 @@ install_leindex() {
 
     # Build from source
     log_info "Building LeIndex..."
-    if cargo build --release -p leindex -p leindex-embed --features leindex/onnx,leindex-embed/onnx 2>&1 | tee -a "$INSTALL_LOG"; then
+    # One published crate (leindex) builds BOTH binaries (leindex and
+    # leindex-embed). The retired leindex-embed subcrate is gone.
+    if cargo build --release -p leindex --features leindex/onnx 2>&1 | tee -a "$INSTALL_LOG"; then
         log_success "Build completed successfully"
     else
         log_error "Build failed"
@@ -345,7 +347,7 @@ install_leindex() {
             log_warn "Failed to install worker binary to $worker_install_path"
         fi
     else
-        log_warn "Worker binary not found (leindex-embed); ONNX inference will use in-process fallback"
+        log_warn "Worker binary (leindex-embed) not found; neural search unavailable. Rebuild with: cargo build --release -p leindex --features leindex/onnx"
     fi
 
     # Clean up temporary clone if we created it

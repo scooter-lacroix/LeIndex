@@ -622,8 +622,7 @@ pub(super) fn parse_startup_report_provider(line: &str) -> Option<String> {
 /// Uses environment variables directly (rather than the `dirs` crate) so we
 /// don't couple the `onnx` feature to the `cli` feature's optional `dirs`
 /// dependency. `$LEINDEX_HOME` wins over `$HOME/.leindex` to stay consistent
-/// with the rest of the codebase (see `config.rs` and
-/// `crates/leindex-embed`).
+/// with the rest of the codebase (see `config.rs` and `src/embed`).
 pub(super) fn leindex_home_dir() -> Option<std::path::PathBuf> {
     if let Ok(custom) = std::env::var("LEINDEX_HOME") {
         let p = std::path::PathBuf::from(&custom);

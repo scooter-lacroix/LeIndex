@@ -903,10 +903,10 @@ fn test_runtime_config_from_env() {
 //      minute of going idle.
 //
 // Building the worker binary itself exercises the `prctl` call, so a
-// successful `cargo build -p leindex-embed` is a smoke test that the code
-// compiles on the current platform. The tests below assert the policy
-// constants and exercise the reaping logic via the memcheck-style helper
-// functions.
+// successful `cargo build -p leindex --features onnx --bin leindex-embed`
+// is a smoke test that the code compiles on the current platform. The tests
+// below assert the policy constants and exercise the reaping logic via the
+// memcheck-style helper functions.
 
 #[test]
 fn test_default_idle_timeout_is_60_seconds() {
