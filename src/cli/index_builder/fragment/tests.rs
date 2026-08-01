@@ -855,3 +855,281 @@ fn test_root_schema_mismatch_rejected() {
         "schema-mismatched root must be discarded"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Incremental sync engine (Task 7)
+// ---------------------------------------------------------------------------
+
+/// Deterministic chunk_fn: every file becomes exactly one fragment whose
+/// content hash is derived from the file bytes, so an edit changes the hash
+/// (must be re-embedded) and an unchanged file keeps its hash (0 re-embeds).
+fn one_fragment_per_file(
+    path: &std::path::Path,
+    bytes: &[u8],
+    owner: Option<&str>,
+) -> Vec<FragmentCandidate> {
+    let text = String::from_utf8_lossy(bytes);
+    let enriched = format!("// sync-test\n{}", text);
+    let content_hash = blake3::hash(enriched.as_bytes()).to_hex().to_string();
+    vec![FragmentCandidate {
+        content_hash: content_hash.clone(),
+        enriched_text: enriched,
+        meta: FragmentMetadata {
+            content_hash,
+            owner: owner.map(str::to_string),
+            file_path: path.display().to_string(),
+            byte_range: (0, bytes.len()),
+            line_range: (0, bytes.len().max(1) - 1),
+            embedding_offset: 0,
+        },
+    }]
+}
+
+/// Unchanged file → skipped entirely: 0 re-embeds, generation stays put.
+#[test]
+fn test_sync_unchanged_file_zero_reembeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("main.rs");
+    std::fs::write(&file, b"fn main() { println!(\"hi\"); }\n").unwrap();
+    let file_hash = blake3::hash(b"fn main() { println!(\"hi\"); }\n")
+        .to_hex()
+        .to_string();
+    let files = vec![(file.clone(), file_hash)];
+    let mut store = FragmentStore::new();
+
+    let mut embed_calls: usize = 0;
+    let (summary, _rows) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files,
+        &mut |path: &std::path::Path, bytes: &[u8]| {
+            one_fragment_per_file(path, bytes, Some("main"))
+        },
+        &mut |texts: &[String]| {
+            embed_calls += texts.len();
+            texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect()
+        },
+    )
+    .unwrap();
+    assert_eq!(summary.files_changed, 1, "first sync sees the new file");
+    assert_eq!(summary.embedded, 1);
+    assert_eq!(summary.generation, 1);
+
+    // Second pass with the IDENTICAL file → 0 re-embeds.
+    embed_calls = 0;
+    let (summary2, _rows2) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files,
+        &mut |path: &std::path::Path, bytes: &[u8]| {
+            one_fragment_per_file(path, bytes, Some("main"))
+        },
+        &mut |texts: &[String]| {
+            embed_calls += texts.len();
+            texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect()
+        },
+    )
+    .unwrap();
+    assert_eq!(summary2.files_changed, 0, "unchanged file is skipped");
+    assert_eq!(embed_calls, 0, "no re-embeds for an unchanged file");
+    assert_eq!(summary2.embedded, 0);
+    assert_eq!(summary2.generation, 1, "generation does not bump on no-op");
+}
+
+/// Single-edit file → ONLY the affected file's fragments are re-embedded;
+/// the untouched file's rows survive and are not re-embedded.
+#[test]
+fn test_sync_single_edit_only_affected_reembedded() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.rs");
+    let b = dir.path().join("b.rs");
+    std::fs::write(&a, b"pub fn alpha() -> i32 { 1 }\n").unwrap();
+    std::fs::write(&b, b"pub fn beta() -> i32 { 2 }\n").unwrap();
+    let files_a = vec![
+        (
+            a.clone(),
+            blake3::hash(b"pub fn alpha() -> i32 { 1 }\n")
+                .to_hex()
+                .to_string(),
+        ),
+        (
+            b.clone(),
+            blake3::hash(b"pub fn beta() -> i32 { 2 }\n")
+                .to_hex()
+                .to_string(),
+        ),
+    ];
+    let mut store = FragmentStore::new();
+
+    let (summary, _) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files_a,
+        &mut |path: &std::path::Path, bytes: &[u8]| one_fragment_per_file(path, bytes, Some("x")),
+        &mut |texts: &[String]| texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect(),
+    )
+    .unwrap();
+    assert_eq!(summary.embedded, 2, "both files embedded on first pass");
+    assert_eq!(store.len(), 2);
+    let gen_after_first = summary.generation;
+
+    // Edit ONLY b.
+    std::fs::write(&b, b"pub fn beta() -> i32 { 42 }\n").unwrap();
+    let files_b = vec![
+        (
+            a.clone(),
+            blake3::hash(b"pub fn alpha() -> i32 { 1 }\n")
+                .to_hex()
+                .to_string(),
+        ),
+        (
+            b.clone(),
+            blake3::hash(b"pub fn beta() -> i32 { 42 }\n")
+                .to_hex()
+                .to_string(),
+        ),
+    ];
+    let mut embed_calls: usize = 0;
+    let (summary2, _) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files_b,
+        &mut |path: &std::path::Path, bytes: &[u8]| one_fragment_per_file(path, bytes, Some("x")),
+        &mut |texts: &[String]| {
+            embed_calls += texts.len();
+            texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect()
+        },
+    )
+    .unwrap();
+    assert_eq!(summary2.files_changed, 1, "only b changed");
+    assert_eq!(embed_calls, 1, "only the affected fragment is re-embedded");
+    assert_eq!(summary2.embedded, 1);
+    assert_eq!(store.len(), 2, "a's row survives; b's row replaced");
+    assert!(
+        summary2.generation > gen_after_first,
+        "generation bumps on edit"
+    );
+}
+
+/// Manifest persist → load round-trip preserves file hashes + generation.
+#[test]
+fn test_sync_manifest_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join(".leindex");
+    let mut manifest = FragmentFileManifest::new();
+    manifest.generation = 3;
+    manifest
+        .file_hashes
+        .insert("a.rs".to_string(), "abc".to_string());
+    manifest
+        .file_content_hashes
+        .insert("a.rs".to_string(), vec!["h1".to_string()]);
+    persist_fragment_sync_manifest(&storage, &manifest).unwrap();
+
+    let loaded = load_fragment_sync_manifest(&storage)
+        .unwrap()
+        .expect("manifest loads");
+    assert_eq!(loaded.generation, 3);
+    assert_eq!(
+        loaded.file_hashes.get("a.rs").map(String::as_str),
+        Some("abc")
+    );
+    assert_eq!(
+        loaded.file_content_hashes.get("a.rs").map(Vec::as_slice),
+        Some(&["h1".to_string()][..])
+    );
+}
+
+/// Mid-build generation guard: a manifest generation AHEAD of the persisted
+/// root means the tree is half-synced → the fragment layer must not serve
+/// (hydration falls back to the last complete root, i.e. layer off). Matching
+/// generations → consistent.
+#[test]
+fn test_sync_mid_build_generation_serves_last_complete_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join(".leindex");
+    let mut store = FragmentStore::new();
+    store.insert(sample_metadata("abc123", None, 0));
+
+    // Complete state: root + manifest BOTH at generation 1.
+    persist_fragment_root(dir.path(), &store, 1).unwrap();
+    let mut manifest = FragmentFileManifest::new();
+    manifest.generation = 1;
+    persist_fragment_sync_manifest(&storage, &manifest).unwrap();
+    let root = load_fragment_root(&storage).unwrap().unwrap();
+    assert!(
+        fragment_layer_generation_is_consistent(&storage, &root),
+        "matching generations are consistent"
+    );
+
+    // Mid-build: manifest bumped to generation 2 but the root was NOT yet
+    // rewritten (crash between store/manifest and root persist).
+    let mut mid_build = FragmentFileManifest::new();
+    mid_build.generation = 2;
+    persist_fragment_sync_manifest(&storage, &mid_build).unwrap();
+    let root_after = load_fragment_root(&storage).unwrap().unwrap();
+    assert!(
+        !fragment_layer_generation_is_consistent(&storage, &root_after),
+        "manifest ahead of root ⇒ half-synced tree must not serve"
+    );
+}
+
+/// Root mismatch → rebuild: after a content edit the next engine pass detects
+/// the changed file hash, re-embeds the edited content, and re-persists a NEW
+/// root under a bumped generation — the stale pre-edit root is superseded,
+/// never served (hydration rejects a mismatch; the engine repairs it).
+#[test]
+fn test_sync_root_mismatch_forces_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("main.rs");
+    let v1 = b"fn main() { println!(\"v1\"); }\n";
+    let v2 = b"fn main() { println!(\"v2\"); }\n";
+    std::fs::write(&file, v1).unwrap();
+
+    let mut store = FragmentStore::new();
+    let files = |bytes: &[u8]| vec![(file.clone(), blake3::hash(bytes).to_hex().to_string())];
+    let (summary, _) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files(v1),
+        &mut |path: &std::path::Path, bytes: &[u8]| {
+            one_fragment_per_file(path, bytes, Some("main"))
+        },
+        &mut |texts: &[String]| texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect(),
+    )
+    .unwrap();
+    assert_eq!(summary.generation, 1);
+    let root_v1 = load_fragment_root(&dir.path().join(".leindex"))
+        .unwrap()
+        .expect("root after first sync");
+
+    // Edit the file → the pass must re-embed the new content and re-persist a
+    // DIFFERENT root under a bumped generation (the stale one is superseded).
+    std::fs::write(&file, v2).unwrap();
+    let (summary2, _) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files(v2),
+        &mut |path: &std::path::Path, bytes: &[u8]| {
+            one_fragment_per_file(path, bytes, Some("main"))
+        },
+        &mut |texts: &[String]| texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect(),
+    )
+    .unwrap();
+    assert_eq!(summary2.embedded, 1, "edited content is re-embedded");
+    assert_eq!(summary2.generation, 2, "generation bumps on the edit");
+
+    let root_v2 = load_fragment_root(&dir.path().join(".leindex"))
+        .unwrap()
+        .expect("root after second sync");
+    assert_ne!(
+        root_v2.root_hash, root_v1.root_hash,
+        "content edit must change the persisted root"
+    );
+    assert_eq!(
+        root_v2.root_hash,
+        compute_fragment_root_hash(&store),
+        "persisted root always matches the live store"
+    );
+    assert_eq!(root_v2.generation, 2);
+}

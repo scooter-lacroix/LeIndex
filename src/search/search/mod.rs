@@ -747,14 +747,36 @@ impl SearchEngine {
             .collect()
     }
 
+    /// Populate the fragment vector index from freshly embedded rows at
+    /// INDEX time (fragment-embeddings 1.11.0 Task 7).
+    ///
+    /// The sync engine embeds only content hashes missing from the store and
+    /// hands the `(content_hash, embedding)` pairs here; they are inserted
+    /// into a BruteForce index so `collect_fragment_embeddings` + the query
+    /// path work immediately (hydration later swaps in the Mmap-backed twin).
+    /// Empty input clears the layer. Dimension is taken from the first row.
+    pub fn set_fragment_embeddings(&mut self, rows: Vec<(String, Vec<f32>)>) {
+        let dimension = rows.first().map(|(_, emb)| emb.len()).unwrap_or(0);
+        if dimension == 0 || rows.is_empty() {
+            self.fragment_vector_index = None;
+        } else {
+            let mut index = VectorIndex::new(dimension);
+            index.insert_batch(rows);
+            self.fragment_vector_index = Some(VectorIndexImpl::BruteForce(index));
+        }
+        self.search_cache.clear();
+        self.search_cache_bytes = 0;
+    }
+
     /// Collect fragment embeddings for persistence.
     ///
-    /// Returns `(content_hash, embedding)` pairs for every row in the
-    /// mmap-backed fragment index. Empty when the fragment layer is off or no
-    /// fragment index is hydrated.
+    /// Returns `(content_hash, embedding)` pairs for every row in the fragment
+    /// index — mmap-backed (hydration) OR BruteForce-backed (index time, Task
+    /// 7). Empty when the fragment layer is off or no fragment index exists.
     pub fn collect_fragment_embeddings(&self) -> Vec<(String, Vec<f32>)> {
         match &self.fragment_vector_index {
             Some(VectorIndexImpl::Mmap(idx)) => idx.entries(),
+            Some(VectorIndexImpl::BruteForce(idx)) => idx.entries(),
             _ => Vec::new(),
         }
     }

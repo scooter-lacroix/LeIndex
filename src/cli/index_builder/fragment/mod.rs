@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 mod chunker;
 mod enrich;
+pub(crate) mod extract;
 mod orphan;
 pub(crate) mod sync;
 
@@ -43,7 +44,9 @@ pub(crate) use enrich::{enrich_fragment, enrich_orphan, orphan_header, owner_hea
 pub(crate) use orphan::{OrphanInput, orphan_fragments};
 #[cfg(test)]
 pub(crate) use sync::{
-    FragmentRootState, compute_fragment_root_hash, load_fragment_root, persist_fragment_root,
+    FragmentCandidate, FragmentFileManifest, compute_fragment_root_hash,
+    fragment_layer_generation_is_consistent, incremental_sync_fragments, load_fragment_root,
+    load_fragment_sync_manifest, persist_fragment_root, persist_fragment_sync_manifest,
 };
 
 /// Number of lines per chunk when chunking naively (≈ Warp's `LINES_PER_CHUNK`).
@@ -226,6 +229,14 @@ impl FragmentStore {
     /// Metadata refs for a content hash (`None` when unknown).
     pub(crate) fn get(&self, content_hash: &str) -> Option<&[FragmentMetadata]> {
         self.rows.get(content_hash).map(Vec::as_slice)
+    }
+
+    /// Remove a content-hash row and ALL of its metadata refs.
+    ///
+    /// Used by incremental sync (Task 7) when a file is removed or re-chunked:
+    /// the embedding row is dropped when no refs remain.
+    pub(crate) fn remove_hash(&mut self, content_hash: &str) {
+        self.rows.remove(content_hash);
     }
 
     /// All content hashes (embedding row keys).

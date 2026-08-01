@@ -287,13 +287,13 @@ git commit -m "feat: fragment retrieval fusion with renormalized scoring"
 
 **Files:** `src/cli/index_builder/fragment/sync.rs`; `src/cli/leindex/indexing/load.rs` (hydration :11/:91/:121, finalize :313-324); `src/cli/leindex/indexing/mod.rs` (persist sites :440-456, :1369-1370, :1482, :1497).
 
-- [ ] Incremental index: file BLAKE3 unchanged → skip file; changed → re-chunk, diff content hashes against store, embed **only missing hashes** via existing worker (batch 256 IPC).
-- [ ] Update fragment store rows + recompute root hash per generation; persist `fragment_root.bin`.
-- [ ] Hydration (`load.rs`): **wire the actual fragment store + root-hash load into the Task 5 plumbing** — load fragment mmap + fragment store alongside neural (`:121`), pass `fragment_ids` + root hash through `try_hydrate_from_snapshot` (`:91`); `finalize_hydration` (`:313-324`) persists fragment artifacts when `persist_artifacts`. (Task 5 already established the signature + call-site plumbing; this task connects the persisted artifacts.)
-- [ ] Post-index persist twins at `indexing/mod.rs` sites (:440-456, :1369-1370, :1482, :1497).
-- [ ] Query-time guard: if a generation is mid-build, serve from last complete root or flag staleness (Warp `out_of_sync_delay` analog); never read a half-synced fragment tree.
-- [ ] Tests: unchanged file → 0 re-embeds; single-edit file → only affected fragments re-embedded; mid-build generation → last-complete-root served; root mismatch → rebuild.
-- [ ] Verify and commit:
+- [x] Incremental index: file BLAKE3 unchanged → skip file; changed → re-chunk, diff content hashes against store, embed **only missing hashes** via existing worker (batch 256 IPC).
+- [x] Update fragment store rows + recompute root hash per generation; persist `fragment_root.bin`.
+- [x] Hydration (`load.rs`): **wire the actual fragment store + root-hash load into the Task 5 plumbing** — load fragment mmap + fragment store alongside neural (`:121`), pass `fragment_ids` + root hash through `try_hydrate_from_snapshot` (`:91`); `finalize_hydration` (`:313-324`) persists fragment artifacts when `persist_artifacts`. (Task 5 already established the signature + call-site plumbing; this task connects the persisted artifacts.)
+- [x] Post-index persist twins at `indexing/mod.rs` sites (:440-456, :1369-1370, :1482, :1497).
+- [x] Query-time guard: if a generation is mid-build, serve from last complete root or flag staleness (Warp `out_of_sync_delay` analog); never read a half-synced fragment tree.
+- [x] Tests: unchanged file → 0 re-embeds; single-edit file → only affected fragments re-embedded; mid-build generation → last-complete-root served; root mismatch → rebuild.
+- [x] Verify and commit:
 
 ```bash
 cargo test -p leindex --features cli fragment_sync

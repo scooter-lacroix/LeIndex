@@ -1612,10 +1612,14 @@ pub(crate) fn persist_search_snapshot(
     // Fragment layer (Task 5): persist the fragment embedding matrix + root
     // hash alongside the snapshot so cold-start hydration can rebuild the
     // fragment vector index and validate invariant 8 (root-hash + row count).
-    // The rich fragment store (owner/file/byte metadata, generations) is wired
-    // in Task 7; until fragment_store.bin exists, hydration keeps the fragment
-    // layer off at runtime (feature-off compatible).
+    // Task 7: the mmap is written FIRST and the root LAST (the root is the
+    // commit marker — a crash mid-persist leaves a mismatched/older root that
+    // hydration rejects via `fragment_layer_generation_is_consistent`, so a
+    // half-synced fragment tree never serves). The root generation is taken
+    // from the sync manifest so `fragment_root.bin` and
+    // `fragment_sync_manifest.bin` stay generation-aligned.
     let fragment_embeddings = search_engine.collect_fragment_embeddings();
+    persist_fragment_embeddings_to_mmap(project_path, &fragment_embeddings)?;
     if !fragment_embeddings.is_empty() {
         let fragment_ids: Vec<String> = fragment_embeddings
             .iter()
@@ -1624,9 +1628,18 @@ pub(crate) fn persist_search_snapshot(
         snapshot.fragment_root_hash = Some(fragment::sync::compute_fragment_root_hash_from_ids(
             &fragment_ids,
         ));
-        fragment::sync::persist_fragment_root_from_ids(project_path, &fragment_ids, 0)?;
+        // CRITICAL: the manifest lives in `.leindex/`, so the lookup must use
+        // the storage dir (like `load_fragment_root`) — using `project_path`
+        // directly reads the wrong path, falls back to generation 0, and would
+        // clobber the engine's gen-N root, permanently disabling the layer.
+        let generation =
+            fragment::sync::load_fragment_sync_manifest(&project_path.join(".leindex"))
+                .ok()
+                .flatten()
+                .map(|manifest| manifest.generation)
+                .unwrap_or(0);
+        fragment::sync::persist_fragment_root_from_ids(project_path, &fragment_ids, generation)?;
     }
-    persist_fragment_embeddings_to_mmap(project_path, &fragment_embeddings)?;
 
     let path = search_snapshot_path(project_path);
     if let Some(parent) = path.parent() {
@@ -1945,7 +1958,17 @@ pub(crate) fn fragment_layer_is_valid(
         return false;
     };
     match fragment::sync::load_fragment_root(storage_path) {
-        Ok(Some(state)) => state.root_hash == root && state.fragment_rows == mmap.len() as u64,
+        Ok(Some(state)) => {
+            // Task 7: refuse a HALF-SYNCED fragment tree. The manifest + store +
+            // root are written together under one bumped generation; a
+            // mid-build crash leaves an older root (generation mismatch) which
+            // must not serve — the caller falls back to the last complete root
+            // (i.e. the fragment layer stays off). Legacy Task 5/6 artifacts
+            // with no manifest are accepted.
+            state.root_hash == root
+                && state.fragment_rows == mmap.len() as u64
+                && fragment::sync::fragment_layer_generation_is_consistent(storage_path, &state)
+        }
         Ok(None) => false,
         Err(e) => {
             tracing::warn!(

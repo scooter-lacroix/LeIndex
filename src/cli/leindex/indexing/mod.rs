@@ -438,6 +438,14 @@ impl LeIndex {
 
         // R10: Persist embeddings to mmap file after watcher incremental reindex
         index_builder::persist_embeddings_to_mmap(&self.search_engine, &self.project_path)?;
+        // Fragment layer (Task 7): incremental sync before the snapshot persist
+        // so the fragment mmap + root twins are written with real rows. Never
+        // fatal — a sync failure disables only the fragment layer.
+        if let Err(e) = self.sync_fragment_layer() {
+            warn!(
+                "Fragment layer sync failed (fragment layer disabled for this generation): {e:#}"
+            );
+        }
         let (pdg_node_count, pdg_edge_count) = self
             .pdg
             .as_ref()
@@ -1367,6 +1375,12 @@ impl LeIndex {
         self.search_engine.clear_neural_embeddings();
         self.build_file_stats_cache();
         index_builder::persist_embeddings_to_mmap(&self.search_engine, &self.project_path)?;
+        // Fragment layer (Task 7): incremental sync before the snapshot persist.
+        if let Err(e) = self.sync_fragment_layer() {
+            warn!(
+                "Fragment layer sync failed (fragment layer disabled for this generation): {e:#}"
+            );
+        }
         index_builder::persist_search_snapshot(
             &self.search_engine,
             &self.project_path,
@@ -1479,6 +1493,13 @@ impl LeIndex {
         if embedder.is_some() {
             self.embedder = embedder;
         }
+        // Fragment layer (Task 7): incremental sync before the snapshot persist
+        // so the fragment mmap + root twins carry this generation's rows.
+        if let Err(e) = self.sync_fragment_layer() {
+            warn!(
+                "Fragment layer sync failed (fragment layer disabled for this generation): {e:#}"
+            );
+        }
         index_builder::persist_search_snapshot(
             &self.search_engine,
             &self.project_path,
@@ -1502,6 +1523,124 @@ impl LeIndex {
                 &self.project_path,
             )?;
         }
+        Ok(())
+    }
+
+    /// Incremental fragment sync (Task 7): diff the current source files
+    /// against the persisted manifest, re-chunk ONLY changed files via the
+    /// PDG (Tier-2 sub-symbol + Tier-3 orphans), embed ONLY content hashes
+    /// missing from the store (batch-256 IPC), then update the store + root
+    /// under a bumped generation and populate the engine's fragment vector
+    /// index so `persist_search_snapshot` writes real fragment twins.
+    ///
+    /// Feature-off compatible: a no-op when `[search] fragment_index_enabled`
+    /// is false, no PDG is resident, or no neural embedder is configured. A
+    /// mid-build crash is handled by the generation guard in
+    /// `fragment_layer_is_valid` — hydration serves the last complete root
+    /// (i.e. keeps the fragment layer off) rather than a half-synced tree.
+    fn sync_fragment_layer(&mut self) -> Result<()> {
+        let cfg = crate::config::LeIndexConfig::load_cached();
+        if !cfg.search.fragment_index_enabled || self.pdg.is_none() {
+            return Ok(());
+        }
+        // The fragment layer only produces rows when a neural embedder is
+        // configured; without one (e.g. text-only builds) it is a no-op.
+        let embedder = self.configured_neural_embedder()?;
+        if embedder.is_none() {
+            return Ok(());
+        }
+        let files = self.collect_source_files_with_hashes(false, None)?;
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        let mut store =
+            index_builder::fragment::FragmentStore::load_from_storage(&self.project_path)?
+                .unwrap_or_default();
+        let max_bytes = cfg.search.fragment_max_bytes as usize;
+        let orphan_enabled = cfg.search.fragment_orphan_enabled;
+
+        // Scoped so the chunk closure (which borrows `self.pdg`) is dropped
+        // before we mutate `self.search_engine` below.
+        let (summary, new_embeddings) = {
+            let pdg = self.pdg.as_ref().expect("checked above");
+            let mut chunk_fn = |path: &std::path::Path, bytes: &[u8]| {
+                index_builder::fragment::extract::extract_file_fragments(
+                    pdg,
+                    path,
+                    bytes,
+                    max_bytes,
+                    orphan_enabled,
+                )
+            };
+            let mut embed_fn = |texts: &[String]| -> Vec<Option<Vec<f32>>> {
+                #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+                {
+                    match &embedder {
+                        Some(embedder) => embedder.embed_neural_batch_blocking(texts),
+                        None => vec![None; texts.len()],
+                    }
+                }
+                #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
+                {
+                    let _ = (&embedder, texts);
+                    vec![None; texts.len()]
+                }
+            };
+            index_builder::fragment::sync::incremental_sync_fragments(
+                &self.project_path,
+                &mut store,
+                &files,
+                &mut chunk_fn,
+                &mut embed_fn,
+            )?
+        };
+
+        info!(
+            files_scanned = summary.files_scanned,
+            files_changed = summary.files_changed,
+            fragments_total = summary.fragments_total,
+            embedded = summary.embedded,
+            reused = summary.reused,
+            generation = summary.generation,
+            "Fragment incremental sync complete"
+        ); // Merge freshly embedded rows with reused rows, then populate the
+        // engine's fragment index so the snapshot persist twins write the
+        // complete matrix. EVERY content hash in the store needs an embedding:
+        // prefer this pass's fresh rows, fall back to the previous fragment
+        // mmap (reused hashes are not re-embedded). A hash with neither is
+        // skipped — mirroring the engine's skip-on-None discipline so store
+        // row-count ≡ engine row-count (invariant 8) is preserved.
+        let fresh_rows: std::collections::HashMap<String, Vec<f32>> =
+            new_embeddings.into_iter().collect();
+        let old_rows: std::collections::HashMap<String, Vec<f32>> =
+            index_builder::try_load_fragment_mmap_embeddings_from_storage(
+                &self.project_path.join(".leindex"),
+            )
+            .map(|mmap| mmap.entries().unwrap_or_default().into_iter().collect())
+            .unwrap_or_default();
+        let mut rows: Vec<(String, Vec<f32>)> = Vec::with_capacity(store.len());
+        for hash in store.content_hashes() {
+            if let Some(embedding) = fresh_rows.get(hash).or_else(|| old_rows.get(hash)) {
+                rows.push((hash.to_string(), embedding.clone()));
+            }
+        }
+        self.search_engine.set_fragment_embeddings(rows);
+
+        // Owner refs (invariant 6): content hash → (owner node id, best range).
+        let refs: std::collections::HashMap<String, (String, (usize, usize))> = store
+            .content_hashes()
+            .filter_map(|hash| {
+                store.get(hash).and_then(|metas| {
+                    metas.iter().find_map(|meta| {
+                        meta.owner
+                            .as_ref()
+                            .map(|owner| (hash.to_string(), (owner.clone(), meta.byte_range)))
+                    })
+                })
+            })
+            .collect();
+        self.search_engine.set_fragment_refs(refs);
         Ok(())
     }
 
