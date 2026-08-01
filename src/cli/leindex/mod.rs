@@ -521,7 +521,7 @@ impl LeIndex {
         // neural_weight` knob (previously dead config). VAL-CONFIG.
         let mut search_engine = SearchEngine::new();
         search_engine.set_neural_weight(
-            crate::cli::neural_config::LeIndexConfig::load_cached()
+            crate::config::LeIndexConfig::load_cached()
                 .search
                 .neural_weight as f32,
         );
@@ -637,7 +637,7 @@ impl LeIndex {
     ) -> String {
         // Fold every result-affecting config knob + model identity into the key
         // so a config/model change invalidates the cache (not just a re-index).
-        let cfg = crate::cli::neural_config::LeIndexConfig::load_cached();
+        let cfg = crate::config::LeIndexConfig::load_cached();
         let rerank_model = std::env::var("LEINDEX_WORKER_RERANK_MODEL")
             .unwrap_or_else(|_| "qwen3-reranker-0.6b-seq-cls".to_string());
         index_builder::search_cache_key_for(

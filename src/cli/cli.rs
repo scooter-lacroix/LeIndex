@@ -1160,7 +1160,7 @@ pub(crate) fn collect_ort_diagnostics() -> (Option<String>, Option<String>, Stri
     #[cfg(not(feature = "onnx"))]
     let live_path: Option<String> = None;
 
-    let config_path = crate::cli::neural_config::LeIndexConfig::load()
+    let config_path = crate::config::LeIndexConfig::load()
         .ok()
         .and_then(|c| c.neural.ort_dylib_path);
 
@@ -1168,13 +1168,13 @@ pub(crate) fn collect_ort_diagnostics() -> (Option<String>, Option<String>, Stri
 
     // ort_version: prefer the live-detected version, fall back to the recorded one.
     let live_version = setup::get_ort_version();
-    let recorded_version = crate::cli::neural_config::LeIndexConfig::load()
+    let recorded_version = crate::config::LeIndexConfig::load()
         .ok()
         .and_then(|c| c.neural.ort_version);
     let ort_version = live_version.or(recorded_version);
 
     // execution_provider: from config, default to "auto" when unset.
-    let execution_provider = crate::cli::neural_config::LeIndexConfig::load()
+    let execution_provider = crate::config::LeIndexConfig::load()
         .ok()
         .map(|c| c.neural.execution_provider)
         .filter(|s| !s.is_empty())

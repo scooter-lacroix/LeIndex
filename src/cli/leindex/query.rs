@@ -119,7 +119,7 @@ impl LeIndex {
         file_cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
         exact_route: bool,
     ) {
-        let rerank_cfg = &crate::cli::neural_config::LeIndexConfig::load_cached().search;
+        let rerank_cfg = &crate::config::LeIndexConfig::load_cached().search;
         if rerank_cfg.rerank_enabled && !exact_route && !results.is_empty() {
             if let Some(embedder) = self.embedder.as_ref() {
                 let n = (rerank_cfg.rerank_top_n as usize).min(results.len());
@@ -228,10 +228,10 @@ impl LeIndex {
         // wins; otherwise fall back to the configured [search] search_mode so
         // the documented config knob actually controls retrieval. This is the
         // fix for search_mode being a dead string (VAL-CONFIG).
-        let search_config = &crate::cli::neural_config::LeIndexConfig::load_cached().search;
+        let search_config = &crate::config::LeIndexConfig::load_cached().search;
         let effective_query_type = match query_type {
             Some(explicit) => Some(explicit),
-            None => crate::cli::neural_config::query_type_for_mode(&search_config.search_mode),
+            None => crate::config::query_type_for_mode(&search_config.search_mode),
         };
         let exact_route = matches!(
             effective_query_type,

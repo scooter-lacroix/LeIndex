@@ -1,8 +1,7 @@
-// Neural search configuration schema for ~/.leindex/config/leindex.toml
+// User-level neural search configuration schema for ~/.leindex/config/leindex.toml
 //
-// This module defines the TOML schema for the user-level neural search
-// configuration written by the `leindex setup` command. It mirrors the
-// schema in `crates/leindex-embed/src/config.rs` for cross-crate consistency.
+// Canonical TOML schema for the user-level neural search configuration written
+// by the `leindex setup` command. Shared by the CLI and the ONNX worker.
 //
 // VAL-SETUP-023: Config written with correct schema
 // VAL-SETUP-024: Idempotent re-runs
@@ -410,5 +409,79 @@ mod tests {
         let bad_toml = "[neural\nenabled = true\n";
         let result = LeIndexConfig::parse_toml(bad_toml);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_config_roundtrip_preserves_rerank_fields() {
+        let mut config = LeIndexConfig::default();
+        config.search.rerank_enabled = true;
+        config.search.rerank_top_n = 80;
+        let decoded: LeIndexConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(decoded.search.rerank_enabled);
+        assert_eq!(decoded.search.rerank_top_n, 80);
+    }
+
+    #[test]
+    fn test_default_execution_provider_is_auto() {
+        assert_eq!(LeIndexConfig::default().neural.execution_provider, "auto");
+    }
+
+    #[test]
+    fn test_config_missing_keys_uses_defaults() {
+        // VAL-SETUP-030: stale config from older version gets defaults for new keys
+        let toml_str = "[neural]\nenabled = true\n";
+        let config: LeIndexConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.neural.enabled);
+        assert_eq!(config.search.search_mode, "hybrid");
+        assert_eq!(config.indexing.batch_size, 500);
+        assert_eq!(config.neural.model_name, "qwen3-embed-0.6b");
+    }
+
+    #[test]
+    fn test_config_empty_uses_defaults() {
+        let config: LeIndexConfig = toml::from_str("").unwrap();
+        assert!(!config.neural.enabled);
+        assert_eq!(config.search.search_mode, "hybrid");
+    }
+
+    #[test]
+    fn test_full_config_round_trip() {
+        let config = LeIndexConfig {
+            neural: NeuralConfig {
+                enabled: true,
+                execution_provider: "migraphx".to_string(),
+                ort_dylib_path: Some("/usr/local/lib/libonnxruntime.so.1.25.0".to_string()),
+                ort_version: Some("1.25.0".to_string()),
+                model_dir: "/home/user/.leindex/models".to_string(),
+                model_name: "qwen3-embed-0.6b".to_string(),
+            },
+            search: SearchConfig {
+                search_mode: "hybrid".to_string(),
+                neural_weight: 0.35,
+                rerank_enabled: true,
+                rerank_top_n: 80,
+            },
+            indexing: IndexingConfig {
+                batch_size: 1000,
+                max_files: 100_000,
+            },
+        };
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: LeIndexConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config, parsed);
+    }
+
+    #[test]
+    fn test_ort_dylib_path_skip_serializing_if_none() {
+        let config = NeuralConfig {
+            enabled: true,
+            execution_provider: "cpu".to_string(),
+            ort_dylib_path: None,
+            ort_version: None,
+            model_dir: "/models".to_string(),
+            model_name: "qwen3-embed-0.6b".to_string(),
+        };
+        let toml_str = toml::to_string(&config).unwrap();
+        assert!(!toml_str.contains("ort_dylib_path"));
     }
 }

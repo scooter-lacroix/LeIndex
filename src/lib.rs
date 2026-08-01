@@ -69,6 +69,10 @@ pub mod validation;
 #[cfg(any(feature = "graph", feature = "cli"))]
 pub mod skip_dirs;
 
+/// User configuration shared by CLI and ONNX worker code.
+#[cfg(any(feature = "cli", feature = "onnx"))]
+pub mod config;
+
 // Feature flag infrastructure (always available)
 pub mod feature_flags;
 

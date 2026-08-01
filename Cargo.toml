@@ -145,6 +145,7 @@ cli = [
     "storage",
     "phase",
     "edit",
+    "validation",
     "mcp-server",
     "dep:clap",
     "dep:toml",
@@ -221,7 +222,7 @@ turso = ["dep:libsql", "dep:rusqlite_migration"]
 # working worker binary alongside the main binary. We propagate the `onnx`
 # feature to the leindex-embed subcrate so the installed worker binary
 # contains real ONNX inference support (not a dummy-embedding fallback).
-onnx = ["search", "dep:leindex-embed", "leindex-embed/onnx", "dep:which"]
+onnx = ["search", "dep:leindex-embed", "leindex-embed/onnx", "dep:which", "dep:toml", "dep:dirs"]
 
 # AMD GPU acceleration via MIGraphX (requires ROCm installed).
 # MIGraphX is the modern replacement for the deprecated ROCmExecutionProvider.

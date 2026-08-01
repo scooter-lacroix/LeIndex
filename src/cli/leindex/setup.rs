@@ -775,7 +775,7 @@ fn truncate_for_display(s: &str, max_chars: usize) -> String {
 /// with a sentinel file. Returns a clear `PermissionDenied` error naming the
 /// offending path when the home cannot be written.
 fn ensure_home_writable() -> Result<(), SetupError> {
-    let home = crate::cli::neural_config::resolve_leindex_home()
+    let home = crate::config::resolve_leindex_home()
         .ok_or_else(|| SetupError::Io("Cannot resolve LeIndex home directory.".to_string()))?;
 
     let config_dir = home.join("config");
@@ -930,19 +930,16 @@ fn run_embedding_smoke_test_inner(
 /// VAL-SETUP-029: Corrupted config recovered gracefully
 /// VAL-SETUP-030: Stale config migrated
 fn merge_with_existing(
-    mut new_config: crate::cli::neural_config::LeIndexConfig,
-) -> (
-    crate::cli::neural_config::LeIndexConfig,
-    Option<RecoveryNotice>,
-) {
+    mut new_config: crate::config::LeIndexConfig,
+) -> (crate::config::LeIndexConfig, Option<RecoveryNotice>) {
     // Try to load existing config with recovery
-    match crate::cli::neural_config::LeIndexConfig::load_or_recover() {
+    match crate::config::LeIndexConfig::load_or_recover() {
         Ok((existing, action)) => {
             let notice = match action {
-                crate::cli::neural_config::RecoveryAction::RecoveredFromCorrupt(backup) => {
+                crate::config::RecoveryAction::RecoveredFromCorrupt(backup) => {
                     Some(RecoveryNotice::RecoveredFromCorrupt(backup))
                 }
-                crate::cli::neural_config::RecoveryAction::Loaded => {
+                crate::config::RecoveryAction::Loaded => {
                     // VAL-SETUP-030: Preserve search/indexing settings from existing config
                     // unless the new config explicitly overrides them. Setup always
                     // writes neural settings; search/indexing are borrowed from existing.
@@ -972,7 +969,7 @@ fn merge_with_existing(
                         None
                     }
                 }
-                crate::cli::neural_config::RecoveryAction::CreatedDefault => None,
+                crate::config::RecoveryAction::CreatedDefault => None,
             };
             (new_config, notice)
         }
@@ -994,18 +991,18 @@ fn build_config(
     choices: &SetupChoices,
     ort_dylib_path: Option<&std::path::Path>,
     ort_version: Option<&str>,
-) -> crate::cli::neural_config::LeIndexConfig {
-    use crate::cli::neural_config::{IndexingConfig, NeuralConfig, SearchConfig};
+) -> crate::config::LeIndexConfig {
+    use crate::config::{IndexingConfig, NeuralConfig, SearchConfig};
 
     let provider_str = choices.provider.map(|p| p.config_value()).unwrap_or("auto");
 
-    crate::cli::neural_config::LeIndexConfig {
+    crate::config::LeIndexConfig {
         neural: NeuralConfig {
             enabled: choices.neural_enabled,
             execution_provider: provider_str.to_string(),
             ort_dylib_path: ort_dylib_path.map(|p| p.display().to_string()),
             ort_version: ort_version.map(|s| s.to_string()),
-            model_dir: crate::cli::neural_config::model_dir_path()
+            model_dir: crate::config::model_dir_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "~/.leindex/models".to_string()),
             model_name: model_name_for_provider(choices.provider).to_string(),
@@ -1097,7 +1094,7 @@ fn print_check_overall_status(
 /// VAL-SETUP-020: Reports the ORT version (from config + live detection)
 /// VAL-SETUP-034: Surfaces full configuration
 pub fn run_check() -> Result<CheckResult, SetupError> {
-    let (config, action) = crate::cli::neural_config::LeIndexConfig::load_or_recover()
+    let (config, action) = crate::config::LeIndexConfig::load_or_recover()
         .map_err(|e| SetupError::ConfigRead(e.to_string()))?;
 
     let live_version = get_ort_version();
@@ -1179,7 +1176,7 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
     println!("Neural weight:      {}", config.search.neural_weight);
 
     // Recovery notice
-    if let crate::cli::neural_config::RecoveryAction::RecoveredFromCorrupt(ref backup) = action {
+    if let crate::config::RecoveryAction::RecoveredFromCorrupt(ref backup) = action {
         println!();
         println!(
             "WARNING: Previous config was corrupted. Backed up to: {}",
@@ -1198,7 +1195,7 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
     );
 
     // Config file path
-    if let Some(path) = crate::cli::neural_config::config_file_path() {
+    if let Some(path) = crate::config::config_file_path() {
         println!();
         println!("Config file: {}", path.display());
     }

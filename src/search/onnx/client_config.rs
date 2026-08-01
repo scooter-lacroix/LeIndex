@@ -109,41 +109,23 @@ pub(super) struct WorkerConfigEnv {
     pub(super) model_name: Option<String>,
 }
 
-/// Read worker-relevant values from the user-level
-/// `~/.leindex/config/leindex.toml` (honoring `$LEINDEX_HOME`).
+/// Read worker-relevant values from the shared user-level config
+/// (`crate::config::LeIndexConfig`, honoring `$LEINDEX_HOME`).
 ///
 /// VAL-SETUP-020/VAL-ORT-006: when the worker is spawned from the daemon we
 /// surface the dylib path chosen during `leindex setup` so the worker's ORT
-/// discovery chain picks the same build. The lookup is intentionally minimal
-/// (text scan, mirroring `leindex-embed::ort_discovery::read_config_ort_path`)
-/// because the file is tiny and pulling a full TOML parser into the search
-/// crate is not worth it.
+/// discovery chain picks the same build. Reads the process-cached config so
+/// the documented `[neural]` knobs are resolved without re-parsing the file.
 ///
 pub(super) fn read_worker_config_env_from_config() -> WorkerConfigEnv {
-    let Some(home) = leindex_home_dir() else {
-        return WorkerConfigEnv::default();
-    };
-    let cfg = home.join("config").join("leindex.toml");
-    let Ok(contents) = std::fs::read_to_string(&cfg) else {
-        return WorkerConfigEnv::default();
-    };
-    let mut parsed = WorkerConfigEnv::default();
-    for raw in contents.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(value) = parse_config_assignment(line, "ort_dylib_path") {
-            parsed.ort_dylib_path = Some(value);
-        } else if let Some(value) = parse_config_assignment(line, "execution_provider") {
-            if !value.eq_ignore_ascii_case("auto") {
-                parsed.execution_provider = Some(value);
-            }
-        } else if let Some(value) = parse_config_assignment(line, "model_name") {
-            parsed.model_name = Some(value);
-        }
+    let config = crate::config::LeIndexConfig::load_cached();
+    let provider = config.neural.execution_provider.trim().to_ascii_lowercase();
+    WorkerConfigEnv {
+        ort_dylib_path: config.neural.ort_dylib_path.clone(),
+        execution_provider: (provider != "auto" && !provider.is_empty()).then_some(provider),
+        model_name: (!config.neural.model_name.trim().is_empty())
+            .then(|| config.neural.model_name.clone()),
     }
-    parsed
 }
 
 #[cfg(test)]
@@ -519,17 +501,6 @@ pub(super) fn probe_daemon_health_with_timeout(
     }
 }
 
-pub(super) fn parse_config_assignment(line: &str, key: &str) -> Option<String> {
-    let rest = line.strip_prefix(key)?.trim_start();
-    let value_part = rest.strip_prefix('=')?.trim();
-    let trimmed = value_part.trim_matches(|c| c == '"' || c == '\'').trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
 pub(super) fn parse_startup_report_provider(line: &str) -> Option<String> {
     let (_, report) = line.split_once("startup_report")?;
     report
@@ -544,7 +515,7 @@ pub(super) fn parse_startup_report_provider(line: &str) -> Option<String> {
 /// Uses environment variables directly (rather than the `dirs` crate) so we
 /// don't couple the `onnx` feature to the `cli` feature's optional `dirs`
 /// dependency. `$LEINDEX_HOME` wins over `$HOME/.leindex` to stay consistent
-/// with the rest of the codebase (see `cli/neural_config.rs` and
+/// with the rest of the codebase (see `config.rs` and
 /// `crates/leindex-embed`).
 pub(super) fn leindex_home_dir() -> Option<std::path::PathBuf> {
     if let Ok(custom) = std::env::var("LEINDEX_HOME") {

@@ -1412,7 +1412,7 @@ impl LeIndex {
             tracing::warn!("{}", reason);
             embedder = None;
         }
-        if crate::cli::neural_config::LeIndexConfig::load_cached()
+        if crate::config::LeIndexConfig::load_cached()
             .search
             .search_mode
             == "text"
@@ -1424,9 +1424,7 @@ impl LeIndex {
         // `is_neural_enabled` ANDs the runtime flag (default-on for this GA
         // feature) with the config knob, so a disabled config stays disabled.
         if !crate::feature_flags::is_neural_enabled(
-            crate::cli::neural_config::LeIndexConfig::load_cached()
-                .neural
-                .enabled,
+            crate::config::LeIndexConfig::load_cached().neural.enabled,
         ) {
             embedder = None;
         }
@@ -1524,7 +1522,7 @@ impl LeIndex {
         // Cache-key fix: a model swap must NOT silently resume the previous
         // model's embeddings. The checkpoint stores the embedder model_name that
         // produced its rows; a mismatch forces a full re-embed.
-        let current_embed_model = crate::cli::neural_config::LeIndexConfig::load_cached()
+        let current_embed_model = crate::config::LeIndexConfig::load_cached()
             .neural
             .model_name
             .clone();
@@ -1559,7 +1557,7 @@ impl LeIndex {
             } else {
                 std::env::var("LEINDEX_NEURAL_PROVIDER").unwrap_or_else(|_| "onnx".to_string())
             },
-            model: crate::cli::neural_config::LeIndexConfig::load_cached()
+            model: crate::config::LeIndexConfig::load_cached()
                 .neural
                 .model_name
                 .clone(),

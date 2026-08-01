@@ -295,7 +295,7 @@ mod setup_idempotency_and_preservation {
     /// the file; there is no append path that could duplicate fields.
     #[test]
     fn config_save_overwrites_in_place_without_duplicating() {
-        let src = read_file("src/cli/neural_config.rs");
+        let src = read_file("src/config.rs");
         let save_fn = src
             .split("pub fn save(&self) -> Result<PathBuf, ConfigError>")
             .nth(1)

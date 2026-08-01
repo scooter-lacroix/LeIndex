@@ -447,7 +447,7 @@ fn discover_ort_path_fallback() -> Option<PathBuf> {
         }
     }
 
-    if let Ok(config) = crate::cli::neural_config::LeIndexConfig::load() {
+    if let Ok(config) = crate::config::LeIndexConfig::load() {
         if let Some(path) = config.neural.ort_dylib_path {
             let path = PathBuf::from(path);
             if path.exists() {
