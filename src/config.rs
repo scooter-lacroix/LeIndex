@@ -87,6 +87,30 @@ pub struct SearchConfig {
     /// top but costs more latency (one cross-encoder pass per candidate).
     #[serde(default = "default_rerank_top_n")]
     pub rerank_top_n: u32,
+
+    /// Enable fragment-level (sub-symbol) embeddings. Off by default; the node
+    /// index remains authoritative. When enabled, Tier-2/3 fragments participate
+    /// in Semantic/hybrid retrieval.
+    #[serde(default)]
+    pub fragment_index_enabled: bool,
+
+    /// Max bytes per fragment (≈ Warp 200 lines × 60 chars).
+    #[serde(default = "default_fragment_max_bytes")]
+    pub fragment_max_bytes: u64,
+
+    /// Fusion weight for the fragment score component (0.0-1.0). Renormalization
+    /// is gated on `fragment_index_enabled` (the master switch); this weight only
+    /// scales the fragment component once enabled.
+    #[serde(default = "default_fragment_weight")]
+    pub fragment_weight: f64,
+
+    /// Include Tier-3 module-level orphan regions.
+    #[serde(default = "default_true")]
+    pub fragment_orphan_enabled: bool,
+
+    /// Naive 200-line chunking when a tree-sitter grammar is unavailable.
+    #[serde(default = "default_true")]
+    pub fragment_naive_fallback: bool,
 }
 
 /// Map a configured `search_mode` string to the default `QueryType` used when a
@@ -143,6 +167,11 @@ impl Default for SearchConfig {
             neural_weight: default_neural_weight(),
             rerank_enabled: false,
             rerank_top_n: default_rerank_top_n(),
+            fragment_index_enabled: false,
+            fragment_max_bytes: default_fragment_max_bytes(),
+            fragment_weight: default_fragment_weight(),
+            fragment_orphan_enabled: default_true(),
+            fragment_naive_fallback: default_true(),
         }
     }
 }
@@ -179,6 +208,19 @@ fn default_neural_weight() -> f64 {
     // scorer-side defaults (HybridScorer::for_code / HybridScoringWeights
     // both use 0.40) so a stock install behaves as documented.
     0.4
+}
+
+fn default_fragment_max_bytes() -> u64 {
+    // ≈ Warp's 200 lines × 60 chars default chunk budget.
+    12_000
+}
+
+fn default_fragment_weight() -> f64 {
+    0.12
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_rerank_top_n() -> u32 {
@@ -464,6 +506,32 @@ mod tests {
     }
 
     #[test]
+    fn test_fragment_config_defaults() {
+        let config = LeIndexConfig::default();
+        assert!(!config.search.fragment_index_enabled);
+        assert_eq!(config.search.fragment_max_bytes, 12_000);
+        assert_eq!(config.search.fragment_weight, 0.12);
+        assert!(config.search.fragment_orphan_enabled);
+        assert!(config.search.fragment_naive_fallback);
+
+        // Parse from empty TOML -> same defaults (backward compatible).
+        let parsed: LeIndexConfig = toml::from_str("").unwrap();
+        assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn test_fragment_config_round_trip() {
+        let mut config = LeIndexConfig::default();
+        config.search.fragment_index_enabled = true;
+        config.search.fragment_max_bytes = 24_000;
+        config.search.fragment_weight = 0.20;
+        config.search.fragment_orphan_enabled = false;
+        config.search.fragment_naive_fallback = false;
+        let decoded: LeIndexConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(config, decoded);
+    }
+
+    #[test]
     fn test_full_config_round_trip() {
         let config = LeIndexConfig {
             neural: NeuralConfig {
@@ -479,6 +547,11 @@ mod tests {
                 neural_weight: 0.35,
                 rerank_enabled: true,
                 rerank_top_n: 80,
+                fragment_index_enabled: false,
+                fragment_max_bytes: 12_000,
+                fragment_weight: 0.12,
+                fragment_orphan_enabled: true,
+                fragment_naive_fallback: true,
             },
             indexing: IndexingConfig {
                 batch_size: 1000,
