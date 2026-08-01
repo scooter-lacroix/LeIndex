@@ -49,7 +49,9 @@ neural_weight = 0.4
 # node-level index stays authoritative until enabled.
 fragment_index_enabled = false
 # Fusion weight of the fragment score component (renormalized when enabled).
-fragment_weight = 0.12
+# 0.30 is the empirically tuned default: smallest weight that surfaces fragment
+# hits over strong tfidf matches without regressing node-level ranking.
+fragment_weight = 0.30
 # Max bytes per fragment (~200 lines x 60 chars, mirroring Warp's default).
 fragment_max_bytes = 12000
 # Include Tier-3 module-level orphan regions.

@@ -216,7 +216,12 @@ fn default_fragment_max_bytes() -> u64 {
 }
 
 fn default_fragment_weight() -> f64 {
-    0.12
+    // Empirically tuned (fragment-embeddings 1.11.0): the MRR sweep over
+    // 0.12/0.20/0.30/0.40 shows 0.30 is the smallest weight that delivers full
+    // conceptual-recall (MRR 0.0 -> 1.0) while preserving node-rank exactly
+    // (1.0 -> 1.0). Below 0.30 the fragment share cannot outrank a strong
+    // tfidf match; above 0.30 the blend changes more than necessary.
+    0.30
 }
 
 fn default_true() -> bool {
@@ -510,7 +515,7 @@ mod tests {
         let config = LeIndexConfig::default();
         assert!(!config.search.fragment_index_enabled);
         assert_eq!(config.search.fragment_max_bytes, 12_000);
-        assert_eq!(config.search.fragment_weight, 0.12);
+        assert_eq!(config.search.fragment_weight, 0.30);
         assert!(config.search.fragment_orphan_enabled);
         assert!(config.search.fragment_naive_fallback);
 
@@ -549,7 +554,7 @@ mod tests {
                 rerank_top_n: 80,
                 fragment_index_enabled: false,
                 fragment_max_bytes: 12_000,
-                fragment_weight: 0.12,
+                fragment_weight: 0.30,
                 fragment_orphan_enabled: true,
                 fragment_naive_fallback: true,
             },

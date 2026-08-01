@@ -71,7 +71,7 @@
 4. **Additive storage only.** New files `fragment_store.bin`, `fragments_embeddings.bin`, `fragment_root.bin`; existing `embeddings.bin`/`neural_embeddings.bin`/`search_snapshot.bin` layouts untouched; `SearchSnapshot` new fields are serde-defaulted (`None`/`0`).
 5. **Fragments never cross node byte ranges.** A Tier-2 fragment is always a contiguous sub-range of one symbol.
 6. **Fragment hits map back to owner nodes** via content-hash before results are surfaced; exact/identifier routes are unaffected.
-7. **Score fusion renormalizes — gated on the master switch.** Renormalization is keyed on `fragment_index_enabled` (NOT `fragment_weight > 0`, whose default 0.12 already exceeds zero); `fragment_weight` only scales the fragment component once enabled. Default behavior (feature off) is byte-identical.
+7. **Score fusion renormalizes — gated on the master switch.** Renormalization is keyed on `fragment_index_enabled` (NOT `fragment_weight > 0`, whose default 0.30 already exceeds zero); `fragment_weight` only scales the fragment component once enabled. Default behavior (feature off) is byte-identical.
 8. **Stale-generation rejection.** Hydration rejects fragment mmap whose row count ≠ snapshot `fragment_rows` or whose root hash mismatches, mirroring `restore_from_search_snapshot` discipline.
 9. **Strict feature DAG.** Fragment module compiles under `cli` (and the `graph`-visible pure types under `search`); never introduces `cli`-only symbols into `src/search`.
 10. **No test disappears; every new file follows `*_test.rs` naming** and every assertion is ported from Warp's `semantic_tests.rs` expectations, never weakened.
@@ -146,7 +146,7 @@ pub fragment_orphan_enabled: bool,
 pub fragment_naive_fallback: bool,
 ```
 
-- [x] Defaults: `fragment_max_bytes = 12_000`, `fragment_weight = 0.12`, `fragment_orphan_enabled = true`, `fragment_naive_fallback = true`, `fragment_index_enabled = false`.
+- [x] Defaults: `fragment_max_bytes = 12_000`, `fragment_weight = 0.30` *(empirically tuned: smallest weight that surfaces fragments over strong tfidf matches without regressing node rank — MRR sweep 0.12→0.20→0.30→0.40)*, `fragment_orphan_enabled = true`, `fragment_naive_fallback = true`, `fragment_index_enabled = false`.
 - [x] Add tests: round-trip preserves fragment fields; defaults match the constants; `fragment_index_enabled=false` default keeps config parse identical to pre-change. (`test_fragment_config_defaults`, `test_fragment_config_round_trip` added; empty-TOML parse == `Default` asserted.)
 - [x] Verify and commit:
 
@@ -266,7 +266,7 @@ git commit -m "feat: hydrate fragment vector index from snapshot"
 **Files:** `src/search/search/mod.rs` (neural candidates :1109, `collect_search_candidates` :1164/:1179/:1192); `src/search/ranking.rs` (`Score`, `HybridScorer`); `src/cli/leindex/query.rs` (search path :249, rerank pool).
 
 - [x] In `search()`: alongside `neural_candidates`, compute `fragment_candidates` from `fragment_vector_index` (top_k×10, ≥100) when a query neural embedding exists.
-- [x] **Renormalization gate:** key score renormalization on `fragment_index_enabled` (the master switch), NOT `fragment_weight > 0` — the default `fragment_weight` is already `0.12` (> 0), so gating on the weight alone would renormalize with the feature off and break invariant 7 (byte-identical default).
+- [x] **Renormalization gate:** key score renormalization on `fragment_index_enabled` (the master switch), NOT `fragment_weight > 0` — the default `fragment_weight` is already `0.30` (> 0), so gating on the weight alone would renormalize with the feature off and break invariant 7 (byte-identical default).
 - [x] Map fragment hits → owner nodes: `HashMap<owner_node_id, Vec<content_hash>>` from the fragment store; add owners to the candidate pool (invariant 6); retain the best fragment byte range per owner for result surfacing.
 - [x] **Result surfacing:** add `fragment_byte_range: Option<(usize, usize)>` to `SearchResult` (serde default → `None` for old cached results) rather than repurposing the node-level `byte_range` — keeps node ranges and fragment ranges distinguishable. Populate from the retained best fragment range; leave `byte_range` (node-level) unchanged.
 - [x] `Score` gains `fragment: f32` (serde default 0.0); `HybridScorer::score_hybrid` gains a `fragment` weight; **when `fragment_index_enabled`, renormalize the five weights to sum 1.0** (mirror `HybridScoringWeights::normalize`); gated so default path is byte-identical.

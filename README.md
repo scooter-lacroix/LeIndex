@@ -666,7 +666,7 @@ Enable it in `~/.leindex/config/leindex.toml`:
 # Master switch. Off by default; the node-level index stays authoritative.
 fragment_index_enabled = true
 # Fusion weight of the fragment score component (renormalized when enabled).
-fragment_weight = 0.12
+fragment_weight = 0.30
 # Max bytes per fragment (~200 lines x 60 chars, mirroring Warp's default).
 fragment_max_bytes = 12000
 # Include Tier-3 module-level orphan regions.
