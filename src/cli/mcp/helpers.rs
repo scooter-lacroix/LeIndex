@@ -1,7 +1,7 @@
 use super::protocol::JsonRpcError;
 use crate::cli::leindex::{ComponentStatus, IndexHealth, SOURCE_FILE_EXTENSIONS};
-use crate::cli::skip_dirs::SKIP_DIRS;
 use crate::edit::{EditChange, replace_whole_word};
+use crate::skip_dirs::SKIP_DIRS;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 

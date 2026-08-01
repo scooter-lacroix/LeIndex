@@ -65,6 +65,10 @@ pub mod edit;
 #[cfg(feature = "validation")]
 pub mod validation;
 
+/// Shared directory exclusions used by graph and CLI traversals.
+#[cfg(any(feature = "graph", feature = "cli"))]
+pub mod skip_dirs;
+
 // Feature flag infrastructure (always available)
 pub mod feature_flags;
 

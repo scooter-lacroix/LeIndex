@@ -104,7 +104,7 @@ parse = [
 ]
 
 # Graph depends on parse
-graph = ["parse", "dep:petgraph"]
+graph = ["parse", "dep:petgraph", "dep:walkdir", "dep:regex"]
 
 # Storage depends on parse and graph
 storage = [

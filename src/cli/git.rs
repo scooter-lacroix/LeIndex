@@ -291,7 +291,7 @@ fn is_skipped_source_path(path: &Path, root: &Path) -> bool {
             component
                 .as_os_str()
                 .to_str()
-                .is_some_and(|name| crate::cli::skip_dirs::SKIP_DIRS.contains(&name))
+                .is_some_and(|name| crate::skip_dirs::SKIP_DIRS.contains(&name))
         })
     })
 }

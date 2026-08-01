@@ -1239,6 +1239,7 @@ impl EmbeddingClient {
         texts: &[String],
         expected_dim: usize,
     ) -> Result<EmbedResponse, ClientError> {
+        #[cfg(feature = "cli")]
         crate::cli::mcp::request_meta::NEURAL_REQUESTS
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let neural_started = Instant::now();
@@ -1286,6 +1287,7 @@ impl EmbeddingClient {
             neural_ms,
             "ONNX embedding attempt complete"
         );
+        #[cfg(feature = "cli")]
         crate::cli::mcp::request_meta::record_neural_ms(neural_ms);
         result
     }

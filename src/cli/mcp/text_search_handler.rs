@@ -110,9 +110,7 @@ async fn live_source_inventory(project_root: &Path) -> Result<Vec<PathBuf>, Json
                     .into_iter()
                     .filter_entry(|entry| {
                         let name = entry.file_name().to_string_lossy();
-                        !crate::cli::skip_dirs::SKIP_DIRS
-                            .iter()
-                            .any(|skip| name == *skip)
+                        !crate::skip_dirs::SKIP_DIRS.iter().any(|skip| name == *skip)
                     })
                 {
                     let entry = match entry {

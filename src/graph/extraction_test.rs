@@ -240,6 +240,7 @@ fn inheritance_super_call_signal() {
     );
 }
 
+#[cfg(feature = "cli")]
 #[test]
 fn cross_file_flow_argument_is_resolved_after_merge() {
     let mut caller = sig("dispatch", "dispatch", false);
@@ -290,6 +291,7 @@ fn cross_file_flow_argument_is_resolved_after_merge() {
     }));
 }
 
+#[cfg(feature = "cli")]
 #[test]
 fn cross_file_flow_uses_exact_qualified_target_without_bare_name_fallback() {
     let mut caller = sig("dispatch", "dispatch", false);

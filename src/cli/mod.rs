@@ -110,8 +110,6 @@ pub mod neural_config;
 /// Multi-project registry with per-project concurrency.
 #[cfg(feature = "mcp-server")]
 pub mod registry;
-/// Shared directory exclusion constants.
-pub mod skip_dirs;
 /// File watcher for auto-reindex.
 #[cfg(feature = "mcp-server")]
 pub mod watcher;

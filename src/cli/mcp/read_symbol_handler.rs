@@ -185,9 +185,7 @@ async fn find_live_symbol_in_inventory(
                 .into_iter()
                 .filter_entry(|entry| {
                     let name = entry.file_name().to_string_lossy();
-                    !crate::cli::skip_dirs::SKIP_DIRS
-                        .iter()
-                        .any(|skip| name == *skip)
+                    !crate::skip_dirs::SKIP_DIRS.iter().any(|skip| name == *skip)
                 })
                 .filter_map(Result::ok)
                 .filter(|entry| entry.file_type().is_file())

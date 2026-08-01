@@ -3,6 +3,7 @@
 //
 // Validates: VAL-BPHASE-026, VAL-BPHASE-027, VAL-BPHASE-028, VAL-BPHASE-029
 
+#![cfg(feature = "storage")]
 use leindex::storage::schema::{
     DEFAULT_READER_POOL_SIZE, PROJECT_READER_CACHE_SIZE_KIB, PROJECT_STORE_MMAP_SIZE,
     PROJECT_WRITER_CACHE_SIZE_KIB, StorageConfig, StoragePool,
