@@ -132,16 +132,25 @@ fn coalesce_fragments<'a>(
 /// Chunks code into an ordered list of fragments.
 ///
 /// The code is chunked "semantically" using tree-sitter when a grammar is
-/// available for the file's extension; otherwise fragments are naively chunked
-/// by lines (byte-safe splits, 200 lines per chunk by default). Note that the
-/// grammar registry is extension-keyed, so extensionless files (`Makefile`,
-/// `Dockerfile`, `.gitignore`) intentionally fall back to naive chunking.
+/// available for the file's extension; otherwise — when `naive_fallback` is
+/// enabled — fragments are naively chunked by lines (byte-safe splits). Note
+/// that the grammar registry is extension-keyed, so extensionless files
+/// (`Makefile`, `Dockerfile`, `.gitignore`) intentionally fall back to naive
+/// chunking when the fallback is enabled.
 ///
-/// NOTE for Tasks 3-7: consume `chunker::chunk_naive` / `chunker::chunk_semantic`
-/// / `orphan_fragments` via full paths or this entry point — the mod.rs
-/// re-exports are `#[cfg(test)]`-gated and do not exist in non-test builds.
-pub(crate) fn chunk_code<'a>(code: &'a str, path: &'a Path) -> Vec<Fragment<'a>> {
-    if let Some(mut fragments) = try_chunk_code_semantically(code, path) {
+/// `max_bytes` bounds every Tier-2 sub-symbol fragment (mirrors the
+/// `[search] fragment_max_bytes` config knob), and `naive_fallback` gates the
+/// naive 200-line path (the `[search] fragment_naive_fallback` knob). With the
+/// fallback disabled, files without a grammar produce no fragments rather than
+/// silently switching to line-chunking — the configured knobs control every
+/// tier.
+pub(crate) fn chunk_code<'a>(
+    code: &'a str,
+    path: &'a Path,
+    max_bytes: usize,
+    naive_fallback: bool,
+) -> Vec<Fragment<'a>> {
+    if let Some(mut fragments) = try_chunk_code_semantically(code, path, max_bytes) {
         // ponytail: empty-file edge case can yield one spurious empty fragment
         // via the semantic path (naive path already returns []). Drop it so the
         // store never embeds/hashes an empty string. O(n) retain, n = fragments
@@ -149,16 +158,25 @@ pub(crate) fn chunk_code<'a>(code: &'a str, path: &'a Path) -> Vec<Fragment<'a>>
         fragments.retain(|f| !f.content.is_empty());
         return fragments;
     }
-    chunker::chunk_naive(code, path, MAX_BYTES_PER_CHUNK, LINES_PER_CHUNK)
+    if naive_fallback {
+        chunker::chunk_naive(code, path, max_bytes, LINES_PER_CHUNK)
+    } else {
+        Vec::new()
+    }
 }
 
 /// Attempts to chunk code semantically, returning `None` when no grammar exists
-/// for the file extension or the parse/split fails (caller falls back to naive).
-fn try_chunk_code_semantically<'a>(code: &'a str, path: &'a Path) -> Option<Vec<Fragment<'a>>> {
+/// for the file extension or the parse/split fails (caller falls back to naive
+/// when the fallback knob is enabled).
+fn try_chunk_code_semantically<'a>(
+    code: &'a str,
+    path: &'a Path,
+    max_bytes: usize,
+) -> Option<Vec<Fragment<'a>>> {
     let ext = path.extension()?.to_str()?;
     let language_id = crate::parse::grammar::LanguageId::from_extension(ext)?;
     let language = language_id.from_cache().ok()?;
-    chunker::chunk_semantic(code, path, MAX_BYTES_PER_CHUNK, &language).ok()
+    chunker::chunk_semantic(code, path, max_bytes, &language).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -324,5 +342,5 @@ impl FragmentStore {
 }
 
 #[cfg(test)]
-#[path = "tests.rs"]
-mod tests;
+#[path = "fragment_test.rs"]
+mod test;

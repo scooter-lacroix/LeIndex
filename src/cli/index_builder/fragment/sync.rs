@@ -295,6 +295,50 @@ pub(crate) struct FragmentSyncSummary {
     pub(crate) generation: u64,
 }
 
+/// Embed a batch of missing candidates in batch-256 chunks, inserting rows for
+/// successful embeddings only (store row-count ≡ mmap row-count, invariant 8).
+/// Returns whether every candidate was embedded; a partial failure leaves the
+/// file unmarked in the manifest so a later run retries it.
+fn embed_missing_batches(
+    missing: &mut [(String, FragmentMetadata)],
+    store: &mut FragmentStore,
+    embed_fn: &mut dyn FnMut(&[String]) -> Vec<Option<Vec<f32>>>,
+    new_embeddings: &mut Vec<(String, Vec<f32>)>,
+    summary: &mut FragmentSyncSummary,
+    produced: &mut HashSet<String>,
+) -> (bool, usize) {
+    const EMBED_BATCH: usize = 256;
+    let mut all_embedded = true;
+    let mut inserted = 0;
+    for chunk in missing.chunks(EMBED_BATCH) {
+        let texts: Vec<String> = chunk.iter().map(|(t, _)| t.clone()).collect();
+        let results = embed_fn(&texts);
+        for (i, (_, meta)) in chunk.iter().enumerate() {
+            match results.get(i) {
+                Some(Some(embedding)) if !embedding.is_empty() => {
+                    store.insert(meta.clone());
+                    summary.embedded += 1;
+                    inserted += 1;
+                    new_embeddings.push((meta.content_hash.clone(), embedding.clone()));
+                }
+                _ => {
+                    // Embedding unavailable: do NOT insert the row, keeping
+                    // store row-count ≡ mmap row-count (invariant 8). Mark the
+                    // file incomplete so a later run retries.
+                    tracing::warn!(
+                        hash = %meta.content_hash,
+                        file = %meta.file_path,
+                        "Fragment embedding unavailable; row skipped"
+                    );
+                    produced.remove(&meta.content_hash);
+                    all_embedded = false;
+                }
+            }
+        }
+    }
+    (all_embedded, inserted)
+}
+
 /// Drop every store row owned by `file_path`, and drop hash entries that end
 /// up with no refs (their embedding row is no longer referenced).
 fn remove_file_rows(store: &mut FragmentStore, file_path: &str) {
@@ -347,6 +391,14 @@ fn remove_file_rows(store: &mut FragmentStore, file_path: &str) {
 /// mmap row-count, invariant 8). A file whose embedding partially fails is NOT
 /// marked synced in the manifest, so a later run retries it.
 ///
+/// `force_reembed` recovers from a missing/corrupt fragment embeddings mmap:
+/// when the caller detects the store has rows but no recoverable mmap (P2-4,
+/// Codex review), it passes `true` so the manifest file-hash skip is bypassed
+/// and every content hash is (re)embedded even if it is already in the store —
+/// otherwise unchanged files would be skipped, `new_embeddings` would stay
+/// empty, an empty fragment index would be installed, and the snapshot path
+/// would remove the mmap again, permanently disabling fragment retrieval.
+///
 /// **Persist ordering is deliberate — store → root → manifest, with the
 /// manifest written LAST as the commit marker.** A crash between store and
 /// root leaves a complete older root + manifest in place (guard consistent,
@@ -357,15 +409,108 @@ fn remove_file_rows(store: &mut FragmentStore, file_path: &str) {
 /// `fragment_layer_generation_is_consistent` rejects — the layer stays off
 /// until the next sync repairs it. Either way the fragment layer degrades
 /// conservatively; the node-level index is never affected.
+/// Outcome of processing one changed file: whether store rows changed.
+struct FileSyncOutcome {
+    store_modified: bool,
+}
+
+/// Process one changed file: drop its stale rows, re-chunk via `chunk_fn`,
+/// embed store-missing content hashes via `embed_fn` (batch-256 chunks), and
+/// update the manifest. The file hash is committed to the manifest ONLY when
+/// every candidate embedded successfully (a partial failure leaves the file
+/// unmarked so a later run retries it). Returns whether store rows changed
+/// (stale rows dropped or rows added), which drives generation bump + persist.
+fn process_changed_file(
+    store: &mut FragmentStore,
+    manifest: &mut FragmentFileManifest,
+    path: &Path,
+    file_hash: &str,
+    force_reembed: bool,
+    chunk_fn: &mut dyn FnMut(&Path, &[u8]) -> Vec<FragmentCandidate>,
+    embed_fn: &mut dyn FnMut(&[String]) -> Vec<Option<Vec<f32>>>,
+    new_embeddings: &mut Vec<(String, Vec<f32>)>,
+    summary: &mut FragmentSyncSummary,
+) -> FileSyncOutcome {
+    let path_str = path.display().to_string();
+    let mut store_modified = false;
+
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "Failed to read source file during fragment sync; skipping"
+            );
+            return FileSyncOutcome { store_modified };
+        }
+    };
+
+    // Drop this file's stale rows before inserting the fresh candidates.
+    if manifest.file_content_hashes.remove(&path_str).is_some() {
+        remove_file_rows(store, &path_str);
+        store_modified = true;
+    }
+
+    let candidates = chunk_fn(path, &bytes);
+    summary.fragments_total += candidates.len();
+    let mut missing: Vec<(String, FragmentMetadata)> = Vec::new(); // (enriched_text, meta)
+    let mut produced: HashSet<String> = HashSet::new();
+
+    for cand in candidates {
+        // A store cache hit is dedup'd (no re-embed) UNLESS forcing a
+        // re-embed — a recovered mmap needs every row, not just new ones.
+        if !force_reembed && store.get(&cand.content_hash).is_some() {
+            // Content-hash cache hit: dedup'd, no re-embed. Add the ref.
+            summary.reused += 1;
+            store.insert(cand.meta.clone());
+            store_modified = true;
+            produced.insert(cand.content_hash);
+        } else {
+            // Recovery-only note: when `force_reembed` is set (lost fragment
+            // mmap), every candidate lands here even if its hash is already in
+            // the store — identical cross-file fragments are re-embedded once
+            // per file and accrue duplicate store refs. Harmless (root,
+            // fragment_refs, and the mmap all key by unique hash and
+            // collapse) and bounded to the one-time recovery pass; do not
+            // "optimize" this back into the cache-hit path.
+            missing.push((cand.enriched_text, cand.meta));
+            produced.insert(cand.content_hash);
+        }
+    }
+
+    // Embed the missing hashes, in batch-256 chunks (existing IPC batch).
+    let (all_embedded, inserted) = embed_missing_batches(
+        &mut missing,
+        store,
+        embed_fn,
+        new_embeddings,
+        summary,
+        &mut produced,
+    );
+    // Rows inserted by the embed path change the store too — without this the
+    // FIRST sync (all-new fragments) would never persist store/root or bump
+    // the generation (latent pre-refactor bug: `store_dirty` was only set on
+    // the cache-hit and stale-row-removal paths).
+    store_modified |= inserted > 0;
+
+    manifest
+        .file_content_hashes
+        .insert(path_str.clone(), produced.into_iter().collect());
+    if all_embedded {
+        manifest.file_hashes.insert(path_str, file_hash.to_string());
+    }
+    FileSyncOutcome { store_modified }
+}
+
 pub(crate) fn incremental_sync_fragments(
     project_path: &Path,
     store: &mut FragmentStore,
     files: &[(PathBuf, String)],
     chunk_fn: &mut dyn FnMut(&Path, &[u8]) -> Vec<FragmentCandidate>,
     embed_fn: &mut dyn FnMut(&[String]) -> Vec<Option<Vec<f32>>>,
+    force_reembed: bool,
 ) -> Result<(FragmentSyncSummary, Vec<(String, Vec<f32>)>)> {
-    const EMBED_BATCH: usize = 256;
-
     let storage_path = project_path.join(".leindex");
     let mut manifest = load_fragment_sync_manifest(&storage_path)?.unwrap_or_default();
     let mut summary = FragmentSyncSummary {
@@ -396,83 +541,25 @@ pub(crate) fn incremental_sync_fragments(
 
     for (path, file_hash) in files {
         let path_str = path.display().to_string();
-        if manifest.file_hashes.get(&path_str) == Some(file_hash) {
-            continue; // unchanged → skip file entirely (0 re-embeds)
+        // Unchanged files are skipped entirely (0 re-embeds) UNLESS the caller
+        // forces a re-embed to recover from a lost fragment mmap (P2-4).
+        if !force_reembed && manifest.file_hashes.get(&path_str) == Some(file_hash) {
+            continue;
         }
         summary.files_changed += 1;
         manifest_dirty = true;
-
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    path = %path.display(),
-                    "Failed to read source file during fragment sync; skipping"
-                );
-                continue;
-            }
-        };
-
-        // Drop this file's stale rows before inserting the fresh candidates.
-        if manifest.file_content_hashes.remove(&path_str).is_some() {
-            remove_file_rows(store, &path_str);
-            store_dirty = true;
-        }
-
-        let candidates = chunk_fn(path, &bytes);
-        summary.fragments_total += candidates.len();
-        let mut missing: Vec<(String, FragmentMetadata)> = Vec::new(); // (enriched_text, meta)
-        let mut produced: Vec<String> = Vec::new();
-        let mut all_embedded = true;
-
-        for cand in candidates {
-            if store.get(&cand.content_hash).is_some() {
-                // Content-hash cache hit: dedup'd, no re-embed. Add the ref.
-                summary.reused += 1;
-                store.insert(cand.meta.clone());
-                store_dirty = true;
-                produced.push(cand.content_hash);
-            } else {
-                missing.push((cand.enriched_text, cand.meta));
-                produced.push(cand.content_hash);
-            }
-        }
-
-        // Embed ONLY missing hashes, in batch-256 chunks (existing IPC batch).
-        for chunk in missing.chunks(EMBED_BATCH) {
-            let texts: Vec<String> = chunk.iter().map(|(t, _)| t.clone()).collect();
-            let results = embed_fn(&texts);
-            for (i, (_, meta)) in chunk.iter().enumerate() {
-                match results.get(i) {
-                    Some(Some(embedding)) if !embedding.is_empty() => {
-                        store.insert(meta.clone());
-                        store_dirty = true;
-                        summary.embedded += 1;
-                        new_embeddings.push((meta.content_hash.clone(), embedding.clone()));
-                    }
-                    _ => {
-                        // Embedding unavailable: do NOT insert the row, keeping
-                        // store row-count ≡ mmap row-count (invariant 8). Mark
-                        // the file incomplete so a later run retries.
-                        tracing::warn!(
-                            hash = %meta.content_hash,
-                            file = %meta.file_path,
-                            "Fragment embedding unavailable; row skipped"
-                        );
-                        produced.retain(|h| h != &meta.content_hash);
-                        all_embedded = false;
-                    }
-                }
-            }
-        }
-
-        manifest
-            .file_content_hashes
-            .insert(path_str.clone(), produced);
-        if all_embedded {
-            manifest.file_hashes.insert(path_str, file_hash.clone());
-        }
+        let outcome = process_changed_file(
+            store,
+            &mut manifest,
+            path,
+            file_hash,
+            force_reembed,
+            chunk_fn,
+            embed_fn,
+            &mut new_embeddings,
+            &mut summary,
+        );
+        store_dirty |= outcome.store_modified;
     }
 
     if store_dirty {

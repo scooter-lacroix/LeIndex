@@ -10,7 +10,10 @@
 //     doc context, and owned by the node.
 //   - Tier-3: module-level orphan regions (complement of the node ranges,
 //     excluding the leading file-doc block) are naively chunked and enriched
-//     with the module header; owner is `None`.
+//     with the module header. Orphans are attributed to the file's FileSummary
+//     node when one exists (invariant 6: fragment hits always map to an owner
+//     node before surfacing); owner is `None` only for files without a
+//     FileSummary node.
 //
 // Both tiers are fed to the same store, so dedup, root-hash, and hydration
 // treat them identically.
@@ -83,8 +86,10 @@ fn node_type_to_str(node_type: &NodeType) -> &'static str {
 /// Extract Tier-2 (sub-symbol) + Tier-3 (orphan) fragment candidates for one
 /// file, ready for the incremental sync engine.
 ///
-/// `max_bytes` bounds orphan chunk size (mirrors `[search] fragment_max_bytes`);
-/// Tier-2 chunks use the module default. Returns an empty vec when the file is
+/// `max_bytes` bounds both Tier-2 sub-symbol and Tier-3 orphan chunk size
+/// (mirrors `[search] fragment_max_bytes`), and `naive_fallback` gates the
+/// naive 200-line chunker when a tree-sitter grammar is unavailable (mirrors
+/// `[search] fragment_naive_fallback`). Returns an empty vec when the file is
 /// not valid UTF-8 or produces no fragments (fully node-covered file).
 pub(crate) fn extract_file_fragments(
     pdg: &ProgramDependenceGraph,
@@ -92,6 +97,7 @@ pub(crate) fn extract_file_fragments(
     file_bytes: &[u8],
     max_bytes: usize,
     orphan_enabled: bool,
+    naive_fallback: bool,
 ) -> Vec<FragmentCandidate> {
     let Ok(code) = std::str::from_utf8(file_bytes) else {
         return Vec::new();
@@ -121,6 +127,9 @@ pub(crate) fn extract_file_fragments(
     }
 
     let file_path_str = path.display().to_string();
+    // FileSummary owner id for Tier-3 orphan attribution, captured during the
+    // single O(N) node pass (nit-4: no second per-file O(N) scan).
+    let mut file_summary_id: Option<String> = None;
     let mut nodes: Vec<NodeInfo> = Vec::new();
     let mut node_ranges: Vec<(usize, usize)> = Vec::new();
     for node_idx in pdg.node_indices() {
@@ -130,7 +139,11 @@ pub(crate) fn extract_file_fragments(
         if node.file_path.as_ref() != file_path_str {
             continue;
         }
-        if matches!(node.node_type, NodeType::External | NodeType::FileSummary) {
+        if matches!(node.node_type, NodeType::FileSummary) {
+            file_summary_id = Some(node.id.clone());
+            continue;
+        }
+        if matches!(node.node_type, NodeType::External) {
             continue;
         }
         if node.byte_range.1 <= node.byte_range.0 {
@@ -160,7 +173,7 @@ pub(crate) fn extract_file_fragments(
             continue;
         }
         let node_code = &code[start..end];
-        let mut fragments = chunk_code(node_code, path);
+        let mut fragments = chunk_code(node_code, path, max_bytes, naive_fallback);
         // Re-base byte offsets to file coordinates (chunk_code offsets are
         // relative to the slice it was given).
         for frag in &mut fragments {
@@ -193,7 +206,11 @@ pub(crate) fn extract_file_fragments(
         }
     }
 
-    // Tier-3: module-level orphan regions (naive chunks, owner = None).
+    // Tier-3: module-level orphan regions (naive chunks). Orphans are
+    // attributed to the file's FileSummary node when one exists so their hits
+    // map back to a searchable file-level result (invariant 6: fragment hits
+    // always map to an owner node before surfacing). Without a FileSummary the
+    // orphan keeps owner: None and is stored but not independently searchable.
     if orphan_enabled && !node_ranges.is_empty() {
         let file_doc_end = leading_file_doc_end(file_bytes);
         for frag in orphan_fragments(OrphanInput {
@@ -216,7 +233,7 @@ pub(crate) fn extract_file_fragments(
                 enriched_text: enriched,
                 meta: FragmentMetadata {
                     content_hash,
-                    owner: None,
+                    owner: file_summary_id.clone(),
                     file_path: file_path_str.clone(),
                     byte_range: (frag.start_byte_index, frag.end_byte_index),
                     line_range: (

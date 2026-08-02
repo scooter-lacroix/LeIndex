@@ -1,6 +1,9 @@
 //! Vector index implementations (mmap-backed and in-memory).
 
+use std::sync::Arc;
+
 use super::*;
+use crate::search::vector::MmapEmbeddingIndex;
 
 // ============================================================================
 // VECTOR INDEX IMPLEMENTATION
