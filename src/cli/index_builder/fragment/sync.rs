@@ -470,6 +470,59 @@ struct FileSyncOutcome {
     store_modified: bool,
 }
 
+/// Identity-mismatch flags for the incremental sync engine (Codex P1).
+///
+/// Decoded once per sync pass so the decision points live in a single small
+/// helper (keeps `incremental_sync_fragments` under the CCN gate).
+struct IdentityMismatch {
+    /// Persisted identity differs from the current one (model OR any knob,
+    /// or never recorded) — bypasses the source-hash skip.
+    identity_changed: bool,
+    /// The model changed — every persisted embedding is suspect, so a full
+    /// re-embed is forced even for matching content hashes.
+    model_changed: bool,
+    /// Effective force flag: caller-forced (mmap recovery) OR model change.
+    effective_force_reembed: bool,
+}
+
+/// Compare the persisted extraction identity against the current one and
+/// derive the invalidation flags (Codex P1).
+///
+/// An EMPTY stored model is deliberately NOT a model change: a fresh
+/// manifest's store is empty anyway (forcing would be a no-op), and a
+/// manifest-lost but store-survives recovery (P2-4-adjacent) must be able to
+/// reuse the rows written under the current model instead of wasting a full
+/// re-embed.
+fn detect_identity_mismatch(
+    persisted: &FragmentExtractionIdentity,
+    current: &FragmentExtractionIdentity,
+    force_reembed: bool,
+) -> IdentityMismatch {
+    let identity_changed = persisted != current;
+    let model_changed = identity_changed
+        && !persisted.model_name.is_empty()
+        && persisted.model_name != current.model_name;
+    IdentityMismatch {
+        identity_changed,
+        model_changed,
+        effective_force_reembed: force_reembed || model_changed,
+    }
+}
+
+/// Whether an unchanged file can be skipped entirely (0 re-chunk, 0 re-embed).
+///
+/// The skip is bypassed when the caller forces a re-embed (lost-mmap recovery,
+/// P2-4) or the extraction identity changed (Codex P1: a model/knob change
+/// must re-sync even when sources are byte-identical).
+fn should_skip_unchanged_file(
+    force_reembed: bool,
+    identity_changed: bool,
+    persisted_hash: Option<&String>,
+    current_hash: &String,
+) -> bool {
+    !force_reembed && !identity_changed && persisted_hash == Some(current_hash)
+}
+
 /// Process one changed file: drop its stale rows, re-chunk via `chunk_fn`,
 /// embed store-missing content hashes via `embed_fn` (batch-256 chunks), and
 /// update the manifest. The file hash is committed to the manifest ONLY when
@@ -579,23 +632,12 @@ pub(crate) fn incremental_sync_fragments(
     // re-embedded under the new model (stale even for identical content
     // hashes). Knob-only changes re-chunk files but still reuse identical
     // content hashes (same text, same model → same embedding).
-    let identity_changed = manifest.extraction_identity != *identity;
-    // A model swap makes every persisted embedding suspect — stale even when
-    // content hashes match — so it forces a full re-embed. An EMPTY stored
-    // model is deliberately NOT treated as a model change: a fresh manifest's
-    // store is empty anyway (forcing would be a no-op), and a manifest-lost
-    // but store-survives recovery (P2-4-adjacent) must be able to reuse the
-    // rows written under the current model instead of wasting a full re-embed.
-    let model_changed = identity_changed
-        && !manifest.extraction_identity.model_name.is_empty()
-        && manifest.extraction_identity.model_name != identity.model_name;
-    // Effective force: caller-forced (mmap recovery) OR model change.
-    let effective_force_reembed = force_reembed || model_changed;
-    if identity_changed {
+    let mismatch = detect_identity_mismatch(&manifest.extraction_identity, identity, force_reembed);
+    if mismatch.identity_changed {
         tracing::info!(
             old_model = %manifest.extraction_identity.model_name,
             new_model = %identity.model_name,
-            model_changed,
+            model_changed = mismatch.model_changed,
             "Fragment extraction identity changed; forcing fragment re-sync"
         );
     }
@@ -631,10 +673,12 @@ pub(crate) fn incremental_sync_fragments(
         // forces a re-embed to recover from a lost fragment mmap (P2-4) or the
         // extraction identity changed (Codex P1: model/knob change must
         // re-sync even when sources are byte-identical).
-        if !force_reembed
-            && !identity_changed
-            && manifest.file_hashes.get(&path_str) == Some(file_hash)
-        {
+        if should_skip_unchanged_file(
+            force_reembed,
+            mismatch.identity_changed,
+            manifest.file_hashes.get(&path_str),
+            file_hash,
+        ) {
             continue;
         }
         summary.files_changed += 1;
@@ -644,7 +688,7 @@ pub(crate) fn incremental_sync_fragments(
             &mut manifest,
             path,
             file_hash,
-            effective_force_reembed,
+            mismatch.effective_force_reembed,
             chunk_fn,
             embed_fn,
             &mut new_embeddings,
@@ -657,7 +701,7 @@ pub(crate) fn incremental_sync_fragments(
     // compares against it. Updated even when no store rows changed (a
     // knob-only re-chunk to identical content) so the mismatch resolves and
     // future runs are incremental again.
-    if identity_changed {
+    if mismatch.identity_changed {
         manifest.extraction_identity = identity.clone();
         manifest_dirty = true;
     }
