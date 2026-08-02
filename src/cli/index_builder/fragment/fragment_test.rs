@@ -1541,12 +1541,14 @@ fn test_chunk_semantic_oversized_leaf_bytes_not_dropped() {
     // Every leaf byte must be covered by some fragment (no dropped content).
     let mut covered = vec![false; source.len()];
     for chunk in &chunks {
-        for b in chunk.start_byte_index..chunk.end_byte_index {
-            covered[b] = true;
-        }
+        covered[chunk.start_byte_index..chunk.end_byte_index].fill(true);
     }
-    for b in comment_start..comment_end {
-        assert!(covered[b], "leaf byte {b} dropped by the semantic chunker");
+    for (offset, &covered_byte) in covered[comment_start..comment_end].iter().enumerate() {
+        assert!(
+            covered_byte,
+            "leaf byte {} dropped by the semantic chunker",
+            comment_start + offset
+        );
     }
 }
 
