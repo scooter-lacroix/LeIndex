@@ -155,9 +155,11 @@ This is the biggest "search more freely" win — **code and docs between/outside
 
 1. Run existing node-level search (Tier 1) **and** fragment-level search (Tier 2+3) against the same query embedding(s).
 2. Map fragment hits to owner node for display/dedup, but surface the fragment's `byte_range` + `line_range` in results.
-3. `Score` gains optional `fragment: f32` component; default weight **0.10–0.15** (conservative — node ranking stays authoritative). Configurable via `[search] fragment_weight`.
+3. `Score` gains optional `fragment: f32` component; default weight **0.35** (empirically tuned via the MRR sweep — smallest weight with real margin that surfaces fragments over strong tfidf matches without regressing node rank; 0.30 sits at share-equality and is fragile, 0.35 clears it by ~3.7pp). Configurable via `[search] fragment_weight`.
 
-> **Weight renormalization required:** `HybridScorer::score_hybrid` is a plain weighted sum clamped to [0,1] — weights are **not** normalized. Adding a 5th `fragment` component on top of existing weights (which sum to 1.0) would silently depress every overall score and shift global ranking. When `fragment_weight > 0`, renormalize the five weights to sum to 1.0 (mirror `HybridScoringWeights::normalize` in `src/cli/index_builder/hybrid.rs`), and gate the renormalized scorer behind the fragment feature so default behavior stays byte-identical when the feature is off.
+> **Weight renormalization required:** `HybridScorer::score_hybrid` is a plain weighted sum clamped to [0,1] — weights are **not** normalized. Adding a 5th `fragment` component on top of existing weights (which sum to 1.0) would silently depress every overall score and shift global ranking. When the fragment feature is enabled, renormalize the five weights to sum to 1.0 (mirror `HybridScoringWeights::normalize` in `src/cli/index_builder/hybrid.rs`).
+>
+> **Resolution (1.11.0): gate renormalization on the master switch `fragment_index_enabled`, NOT on `fragment_weight > 0`** — the shipped default `fragment_weight = 0.35` already exceeds zero, so weight-gating would renormalize with the feature off and break invariant 7 (byte-identical default).
 4. Reranker pool = union of node + fragment candidates, top-N local cross-encoder rerank (existing `rerank_top_n=80`), preserving the current pipeline.
 5. Exact/identifier routes unaffected (fragment layer participates only in `Semantic`/hybrid routes; `query_route.rs` unchanged).
 
@@ -169,7 +171,7 @@ This is the biggest "search more freely" win — **code and docs between/outside
 [search]
 fragment_index_enabled = false   # opt-in for 1.10.x; flip default on in 1.11 after validation
 fragment_max_bytes = 12000       # ≈ Warp 200 lines × 60 chars
-fragment_weight = 0.12           # fusion weight for fragment score component
+fragment_weight = 0.35           # fusion weight for fragment score component (tuned: real margin over the 0.30 share-equality boundary)
 fragment_orphan_enabled = true   # Tier 3 module-level coverage
 fragment_naive_fallback = true   # naive chunking when tree-sitter unavailable
 ```
@@ -227,7 +229,7 @@ Integration seams (all post-`embed-merge-1.10.0` names):
 | Risk | Mitigation |
 |---|---|
 | Index growth (more embeddings) | Content-hash dedup; INT8 quantization (existing); opt-in flag |
-| Fragment fusion drowns node ranking | Conservative `fragment_weight` (0.10–0.15); validate with benchmarks |
+| Fragment fusion drowns node ranking | Empirically tuned `fragment_weight = 0.35` (real margin, no node-rank regression — verified 1.0 → 1.0); validate with benchmarks |
 | Double tree-sitter parse (parse phase + chunker) | Reuse the parsed tree / grammar cache (`GrammarCache`); chunk from node's AST subtree, not a fresh file parse |
 | Storage format drift | Additive files only; versioned headers; stale-generation rejection |
 | Scope collision with 1.10.0 | Land strictly after embed-merge Tasks 1–7 (config + worker paths) |
