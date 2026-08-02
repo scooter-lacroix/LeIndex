@@ -1177,6 +1177,64 @@ fn print_check_overall_status(
     }
 }
 
+fn print_check_model_checksum(status: &ModelChecksumStatus) {
+    match status {
+        ModelChecksumStatus::Ok => {
+            println!("Model checksum:     verified (matches checksums.sha256)");
+        }
+        ModelChecksumStatus::Unknown => {
+            println!("Model checksum:     no manifest entry (cannot verify)");
+        }
+        ModelChecksumStatus::Mismatch { expected, actual } => {
+            println!(
+                "Model checksum:     MISMATCH (expected {}..., got {}...).",
+                &expected[..expected.len().min(12)],
+                &actual[..actual.len().min(12)],
+            );
+            println!("     Re-run `leindex setup --neural --cpu` to re-download.");
+        }
+        ModelChecksumStatus::Missing => {
+            // Already reported via Model files: absent.
+        }
+    }
+}
+
+fn print_check_search_settings(search: &crate::config::SearchConfig) {
+    println!();
+    println!("Search mode:        {}", search.search_mode);
+    println!("Neural weight:      {}", search.neural_weight);
+    println!(
+        "Rerank enabled:     {}",
+        if search.rerank_enabled { "ON" } else { "OFF" }
+    );
+    println!(
+        "Fragment index:     {}",
+        if search.fragment_index_enabled {
+            "ON (sub-symbol semantic chunks)"
+        } else {
+            "OFF (node-level index authoritative)"
+        }
+    );
+    println!("Fragment weight:    {}", search.fragment_weight);
+    println!("Fragment max bytes: {}", search.fragment_max_bytes);
+    println!(
+        "Fragment orphan:    {}",
+        if search.fragment_orphan_enabled {
+            "ON"
+        } else {
+            "OFF"
+        }
+    );
+    println!(
+        "Fragment naive fallback: {}",
+        if search.fragment_naive_fallback {
+            "ON"
+        } else {
+            "OFF"
+        }
+    );
+}
+
 /// Print a status report without modifying anything.
 ///
 /// VAL-SETUP-014: --check mode reads config and reports status
@@ -1239,64 +1297,10 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
 
     // VAL-SETUP-017/018: report the checksum verdict so users can tell whether
     // `~/.leindex/models/qwen3-embed-0.6b.onnx` is intact or needs re-download.
-    match &checksum_status {
-        ModelChecksumStatus::Ok => {
-            println!("Model checksum:     verified (matches checksums.sha256)");
-        }
-        ModelChecksumStatus::Unknown => {
-            println!("Model checksum:     no manifest entry (cannot verify)");
-        }
-        ModelChecksumStatus::Mismatch { expected, actual } => {
-            println!(
-                "Model checksum:     MISMATCH (expected {}..., got {}...).",
-                &expected[..expected.len().min(12)],
-                &actual[..actual.len().min(12)],
-            );
-            println!("     Re-run `leindex setup --neural --cpu` to re-download.");
-        }
-        ModelChecksumStatus::Missing => {
-            // Already reported via Model files: absent.
-        }
-    }
+    print_check_model_checksum(&checksum_status);
 
     // Search settings
-    println!();
-    println!("Search mode:        {}", config.search.search_mode);
-    println!("Neural weight:      {}", config.search.neural_weight);
-    println!(
-        "Rerank enabled:     {}",
-        if config.search.rerank_enabled {
-            "ON"
-        } else {
-            "OFF"
-        }
-    );
-    println!(
-        "Fragment index:     {}",
-        if config.search.fragment_index_enabled {
-            "ON (sub-symbol semantic chunks)"
-        } else {
-            "OFF (node-level index authoritative)"
-        }
-    );
-    println!("Fragment weight:    {}", config.search.fragment_weight);
-    println!("Fragment max bytes: {}", config.search.fragment_max_bytes);
-    println!(
-        "Fragment orphan:    {}",
-        if config.search.fragment_orphan_enabled {
-            "ON"
-        } else {
-            "OFF"
-        }
-    );
-    println!(
-        "Fragment naive fallback: {}",
-        if config.search.fragment_naive_fallback {
-            "ON"
-        } else {
-            "OFF"
-        }
-    );
+    print_check_search_settings(&config.search);
 
     // Recovery notice
     if let crate::config::RecoveryAction::RecoveredFromCorrupt(ref backup) = action {

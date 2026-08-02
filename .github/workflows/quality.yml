@@ -91,7 +91,6 @@ jobs:
         run: |
           npx --yes jscpd@3.5.10 \
             src/ \
-            crates/ \
             --format "rust" \
             --min-lines 6 \
             --min-tokens 50 \
@@ -168,7 +167,7 @@ jobs:
               echo "::warning file=$file::Large file: ${lines} lines (max ${MAX_LINES})"
               FOUND_ISSUE=1
             fi
-          done < <(find src crates -name '*.rs' -not -path '*/target/*' 2>/dev/null)
+          done < <(find src -name '*.rs' -not -path '*/target/*' 2>/dev/null)
 
           # Check all source files for size violations (excluding target, node_modules, .git, models)
           while IFS= read -r file; do
@@ -223,12 +222,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check workspace dependency version consistency
         run: |
-          # NOTE: intentionally no `set -e` — this script manages its own exit
-          # code via ERRORS. With `set -e`, a `grep -oP` no-match (returns 1)
-          # or an empty dep_name hitting the assoc-array subscript ("bad array
-          # subscript") aborted the job with exit 1 before any real drift was
-          # computed. Guard both, and exit 1 only on genuine mismatches.
-          MEMBER_FILES=$(find crates tools -name Cargo.toml 2>/dev/null)
+          # NOTE: the default `run` shell applies `set -e`, so EVERY command
+          # below is explicitly guarded (`|| true`, `&&`, or an `if`/`[ ]` test)
+          # so the script always reaches its own ERRORS-based exit. The
+          # workspace is now one root crate + `tools/*` (the `crates/leindex-
+          # embed` subcrate was retired); the `|| true` also keeps this robust
+          # if a member dir is ever absent. Exit 1 only on genuine drift.
+          MEMBER_FILES=$(find tools -name Cargo.toml 2>/dev/null || true)
           ERRORS=0
 
           # Collect all external dependency versions across workspace members
@@ -376,10 +376,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Count tech debt markers
         run: |
-          TODO=$(grep -rIn --include='*.rs' 'TODO' src/ crates/ 2>/dev/null | wc -l)
-          FIXME=$(grep -rIn --include='*.rs' 'FIXME' src/ crates/ 2>/dev/null | wc -l)
-          HACK=$(grep -rIn --include='*.rs' 'HACK' src/ crates/ 2>/dev/null | wc -l)
-          XXX=$(grep -rIn --include='*.rs' 'XXX' src/ crates/ 2>/dev/null | wc -l)
+          TODO=$(grep -rIn --include='*.rs' 'TODO' src/ 2>/dev/null | wc -l)
+          FIXME=$(grep -rIn --include='*.rs' 'FIXME' src/ 2>/dev/null | wc -l)
+          HACK=$(grep -rIn --include='*.rs' 'HACK' src/ 2>/dev/null | wc -l)
+          XXX=$(grep -rIn --include='*.rs' 'XXX' src/ 2>/dev/null | wc -l)
           TOTAL=$((TODO + FIXME + HACK + XXX))
           echo "::notice::Tech debt markers: TODO=$TODO FIXME=$FIXME HACK=$HACK XXX=$XXX Total=$TOTAL"
           echo "Tech debt markers tracked: TODO=$TODO FIXME=$FIXME HACK=$HACK XXX=$XXX Total=$TOTAL" > tech-debt-report.txt
@@ -403,7 +403,7 @@ jobs:
           DEAD=0
           for flag in NeuralSearch RemoteEmbeddings CrossLanguageResolution ExperimentalHnsw StreamingMcp GlobalAutoSync; do
             # Count references outside the definition in feature_flags.rs
-            REFS=$(grep -rIn --include='*.rs' "FeatureFlag::$flag" src/ crates/ 2>/dev/null | grep -v 'src/feature_flags.rs' | wc -l)
+            REFS=$(grep -rIn --include='*.rs' "FeatureFlag::$flag" src/ 2>/dev/null | grep -v 'src/feature_flags.rs' | wc -l)
             if [ "$REFS" -eq 0 ]; then
               echo "::warning::FeatureFlag::$flag is defined but never used outside feature_flags.rs"
               DEAD=$((DEAD + 1))

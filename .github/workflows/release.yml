@@ -709,7 +709,7 @@ jobs:
     if: always() && needs.detect.outputs.needs_build == 'true' && !(needs.crates-io.result == 'failure')
     runs-on: ubuntu-latest
     steps:
-      - name: Wait for leindex ${{{ needs.detect.outputs.version }}} in the crates.io index
+      - name: Wait for leindex ${{ needs.detect.outputs.version }} in the crates.io index
         env:
           VERSION: ${{ needs.detect.outputs.version }}
         run: |
