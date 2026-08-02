@@ -185,6 +185,20 @@ impl LeIndex {
         if include_neural {
             artifact_paths.push(self.project_path.join(".leindex/neural_embeddings.bin"));
         }
+        // Fragment layer (Task 6, invariant 8): the four fragment artifacts
+        // must be published with each generation or a cold start resolving the
+        // immutable generation would lose the fragment store/mmap and the
+        // indexed fragment layer would silently vanish. Copied only when the
+        // files exist (feature-off leaves nothing extra); validated on load by
+        // `fragment_layer_is_valid` (root hash + mmap row count).
+        for name in [
+            "fragment_store.bin",
+            "fragment_root.bin",
+            "fragment_sync_manifest.bin",
+            "fragments_embeddings.bin",
+        ] {
+            artifact_paths.push(self.project_path.join(".leindex").join(name));
+        }
         for source in artifact_paths {
             if !source.is_file() || !copied.insert(source.clone()) {
                 continue;
@@ -1559,6 +1573,21 @@ impl LeIndex {
                 .unwrap_or_default();
         let max_bytes = cfg.search.fragment_max_bytes as usize;
         let orphan_enabled = cfg.search.fragment_orphan_enabled;
+        let naive_fallback = cfg.search.fragment_naive_fallback;
+
+        // P2-4 (Codex review): detect a missing/corrupt fragment embeddings mmap
+        // BEFORE the sync so unchanged files are NOT skipped. With the mmap gone
+        // but the store+manifest intact, a normal run would embed nothing, install
+        // an empty fragment index, and the snapshot path would remove the mmap
+        // again — permanently disabling fragment retrieval. Recover by forcing a
+        // full re-embed of every content hash.
+        let pre_sync_mmap_rows: std::collections::HashMap<String, Vec<f32>> =
+            index_builder::try_load_fragment_mmap_embeddings_from_storage(
+                &self.project_path.join(".leindex"),
+            )
+            .map(|mmap| mmap.entries().unwrap_or_default().into_iter().collect())
+            .unwrap_or_default();
+        let force_reembed = !store.is_empty() && pre_sync_mmap_rows.is_empty();
 
         // Scoped so the chunk closure (which borrows `self.pdg`) is dropped
         // before we mutate `self.search_engine` below.
@@ -1571,6 +1600,7 @@ impl LeIndex {
                     bytes,
                     max_bytes,
                     orphan_enabled,
+                    naive_fallback,
                 )
             };
             let mut embed_fn = |texts: &[String]| -> Vec<Option<Vec<f32>>> {
@@ -1593,6 +1623,7 @@ impl LeIndex {
                 &files,
                 &mut chunk_fn,
                 &mut embed_fn,
+                force_reembed,
             )?
         };
 

@@ -1,5 +1,15 @@
 use super::*;
 
+// The snapshot cluster (search_snapshot / restore_from_search_snapshot) moved
+// out of mod.rs into the sibling snapshot.rs module; tests building 1024-dim
+// snapshot vectors need these two names that were previously reachable via
+// `use super::*` glob (mod.rs no longer imports Arc or defines the const).
+// Storage-gated to match the test functions that use them.
+#[cfg(feature = "storage")]
+use super::snapshot::NEURAL_EMBEDDING_DIMENSION;
+#[cfg(feature = "storage")]
+use std::sync::Arc;
+
 pub(super) fn create_test_nodes() -> Vec<NodeInfo> {
     vec![
         NodeInfo {

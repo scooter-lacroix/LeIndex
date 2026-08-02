@@ -13,13 +13,12 @@ use crate::search::hnsw::{HNSWIndex, HNSWParams};
 use crate::search::quantization::int8_hnsw::{Int8HnswIndex, Int8HnswParams};
 use crate::search::query::{MAX_EMBEDDING_DIMENSION, MIN_EMBEDDING_DIMENSION};
 use crate::search::ranking::{HybridScorer, Score};
-use crate::search::vector::{MmapEmbeddingIndex, VectorIndex};
+use crate::search::vector::VectorIndex;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 
 // ============================================================================
 // CONSTANTS & VALIDATION
@@ -50,15 +49,11 @@ pub const WORK_HOISTER_MAX_ENTRIES: usize = 4_096;
 /// Maximum byte budget for the work-hoister cache.
 pub const WORK_HOISTER_MAX_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 
-/// Output dimension of the bundled Qwen3 embedding model.
-///
-/// Cli-only (snapshot hydration validates neural/fragment mmap dimensions);
-/// gated so `--features onnx` without `cli` has no dead const.
-#[cfg(feature = "storage")]
-const NEURAL_EMBEDDING_DIMENSION: usize = 1024;
 mod int8_quality;
 mod node_info;
 mod pruner;
+#[cfg(feature = "storage")]
+mod snapshot;
 mod staged_retrieval;
 mod vector_impl;
 
@@ -152,10 +147,6 @@ pub struct SearchEngine {
     /// `default_neural_weight()` = 0.4, matching `HybridScorer::for_code()`).
     neural_weight: f32,
 }
-
-/// Cli-only snapshot format version (persistence lives in `src/cli/`).
-#[cfg(feature = "storage")]
-const SEARCH_SNAPSHOT_VERSION: u32 = 1;
 
 impl SearchEngine {
     /// Create a new search engine with default 768-dim embeddings
@@ -787,231 +778,6 @@ impl SearchEngine {
             Some(VectorIndexImpl::BruteForce(idx)) => idx.entries(),
             _ => Vec::new(),
         }
-    }
-
-    /// Create a compact persisted metadata snapshot for fast cold-start load.
-    ///
-    /// Storage-gated: consumed by `index_builder::persist_search_snapshot`
-    /// (cli implies storage; gating on `storage` keeps cli symbols out of
-    /// `search` per the strict feature-DAG rule).
-    #[cfg(feature = "storage")]
-    pub(crate) fn search_snapshot(
-        &self,
-        pdg_nodes: usize,
-        pdg_edges: usize,
-        pdg_fingerprint: String,
-    ) -> SearchSnapshot {
-        let nodes = self
-            .nodes
-            .iter()
-            .map(|node| {
-                let mut tokens: Vec<String> = self
-                    .node_tokens
-                    .get(&node.node_id)
-                    .map(|set| set.iter().cloned().collect())
-                    .unwrap_or_default();
-                tokens.sort();
-
-                SearchSnapshotNode {
-                    node_id: node.node_id.clone(),
-                    file_path: node.file_path.clone(),
-                    symbol_name: node.symbol_name.clone(),
-                    language: node.language.clone(),
-                    byte_range: node.byte_range,
-                    complexity: node.complexity,
-                    signature: node.signature.clone(),
-                    tokens,
-                }
-            })
-            .collect();
-
-        SearchSnapshot {
-            version: SEARCH_SNAPSHOT_VERSION,
-            pdg_nodes,
-            pdg_edges,
-            pdg_fingerprint,
-            indexed_nodes: self.nodes.len(),
-            nodes,
-            // Fragment layer (Task 5): rows come from the hydrated fragment
-            // index; the root hash is filled by the cli-side
-            // `persist_search_snapshot` (the search crate cannot read the
-            // fragment_root.bin artifact — dependency direction is cli -> search).
-            fragment_root_hash: None,
-            fragment_rows: self
-                .fragment_vector_index
-                .as_ref()
-                .map(|idx| idx.len() as u32)
-                .unwrap_or(0),
-        }
-    }
-
-    /// Hydrate the search engine from persisted metadata plus mmap embeddings.
-    ///
-    /// This preserves the same resident structures built by `append_nodes`
-    /// without rereading source files or recomputing TF-IDF/neural embeddings.
-    ///
-    /// Storage-gated: consumed by `LeIndex::try_hydrate_from_snapshot` (cli
-    /// implies storage; gating on `storage` keeps cli symbols out of `search`).
-    #[cfg(feature = "storage")]
-    pub(crate) fn restore_from_search_snapshot(
-        &mut self,
-        snapshot: SearchSnapshot,
-        tfidf_mmap: Arc<MmapEmbeddingIndex>,
-        neural_mmap: Option<Arc<MmapEmbeddingIndex>>,
-        fragment_mmap: Option<Arc<MmapEmbeddingIndex>>,
-        fragment_ids: Option<&[String]>,
-    ) -> Result<usize, String> {
-        if snapshot.version != SEARCH_SNAPSHOT_VERSION {
-            return Err(format!(
-                "unsupported search snapshot version {}",
-                snapshot.version
-            ));
-        }
-        if snapshot.indexed_nodes != snapshot.nodes.len() {
-            return Err(format!(
-                "snapshot indexed_nodes {} != node metadata count {}",
-                snapshot.indexed_nodes,
-                snapshot.nodes.len()
-            ));
-        }
-        if tfidf_mmap.len() != snapshot.indexed_nodes {
-            return Err(format!(
-                "TF-IDF mmap row count {} != snapshot indexed_nodes {}",
-                tfidf_mmap.len(),
-                snapshot.indexed_nodes
-            ));
-        }
-        if tfidf_mmap.dimension() as usize != DEFAULT_EMBEDDING_DIMENSION {
-            return Err(format!(
-                "TF-IDF mmap dimension {} != expected {}",
-                tfidf_mmap.dimension(),
-                DEFAULT_EMBEDDING_DIMENSION
-            ));
-        }
-
-        if let Some(ref mmap) = neural_mmap {
-            if mmap.dimension() as usize != NEURAL_EMBEDDING_DIMENSION {
-                return Err(format!(
-                    "neural mmap dimension {} != expected {}",
-                    mmap.dimension(),
-                    NEURAL_EMBEDDING_DIMENSION
-                ));
-            }
-        }
-
-        let mut nodes = Vec::with_capacity(snapshot.nodes.len());
-        let mut missing_tfidf = 0usize;
-        for snap in snapshot.nodes {
-            if tfidf_mmap.find_node_row(&snap.node_id).is_none() {
-                missing_tfidf += 1;
-                continue;
-            }
-
-            nodes.push(NodeInfo {
-                node_id: snap.node_id,
-                file_path: snap.file_path,
-                symbol_name: snap.symbol_name,
-                language: snap.language,
-                content: String::new(),
-                byte_range: snap.byte_range,
-                // Base vectors remain in the mmap-backed vector index below;
-                // keeping empty per-node vectors avoids a second heap mirror.
-                tfidf_embedding: Vec::new(),
-                neural_embedding: None,
-                complexity: snap.complexity,
-                signature: snap.signature,
-                pre_tokenized: Some(snap.tokens),
-            });
-        }
-
-        if missing_tfidf > 0 {
-            return Err(format!(
-                "snapshot missing {} TF-IDF embedding record(s)",
-                missing_tfidf
-            ));
-        }
-
-        let preserved_neural_weight = self.neural_weight;
-        let preserved_fragment_enabled = self.fragment_index_enabled;
-        let preserved_fragment_weight = self.fragment_weight;
-        let preserved_fragment_refs = self.fragment_refs.clone();
-        let mut staged = SearchEngine::new();
-        staged.append_nodes(nodes);
-        let node_ids = staged
-            .nodes
-            .iter()
-            .map(|node| node.node_id.clone())
-            .collect::<Vec<_>>();
-        staged.vector_index = VectorIndexImpl::Mmap(
-            MmapVectorIndex::from_snapshot(tfidf_mmap, &node_ids)
-                .map_err(|error| format!("failed to build mmap vector index: {error}"))?,
-        );
-        if let Some(mmap) = neural_mmap.as_ref() {
-            // Build the lazy-paged neural ANN — reuses MmapVectorIndex, the
-            // SAME pattern as the tfidf index above. This is the semantic
-            // RETRIEVAL signal: its top-K hits are unioned into the candidate
-            // pool at query time (replaces the brute-force neural scan, which
-            // duplicated this .search() logic). Failure is non-fatal: semantic
-            // retrieval just won't contribute.
-            match MmapVectorIndex::from_snapshot(std::sync::Arc::clone(mmap), &node_ids) {
-                Ok(idx) => staged.neural_vector_index = Some(VectorIndexImpl::Mmap(idx)),
-                Err(error) => tracing::warn!(
-                    error = %error,
-                    "failed to build neural mmap vector index; semantic retrieval disabled"
-                ),
-            }
-        }
-
-        // Fragment layer (Task 5, invariant 8): row count must match the
-        // snapshot's recorded fragment_rows. Failure is NON-fatal — the
-        // fragment layer must never block the node-level path (invariant 3);
-        // a mismatch simply disables fragment retrieval, leaving the node
-        // index fully hydrated.
-        if let (Some(mmap), Some(ids)) = (fragment_mmap.as_ref(), fragment_ids) {
-            if mmap.len() as u32 != snapshot.fragment_rows {
-                tracing::warn!(
-                    rows = mmap.len(),
-                    snapshot_rows = snapshot.fragment_rows,
-                    "fragment mmap row count != snapshot; fragment retrieval disabled"
-                );
-            } else if mmap.dimension() as usize != NEURAL_EMBEDDING_DIMENSION {
-                tracing::warn!(
-                    dim = mmap.dimension(),
-                    expected = NEURAL_EMBEDDING_DIMENSION,
-                    "fragment mmap dimension mismatch; fragment retrieval disabled"
-                );
-            } else {
-                match MmapVectorIndex::from_snapshot(std::sync::Arc::clone(mmap), ids) {
-                    Ok(idx) => staged.fragment_vector_index = Some(VectorIndexImpl::Mmap(idx)),
-                    Err(error) => tracing::warn!(
-                        error = %error,
-                        "failed to build fragment mmap vector index; fragment retrieval disabled"
-                    ),
-                }
-            }
-        }
-
-        if staged.nodes.len() != snapshot.indexed_nodes {
-            return Err(format!(
-                "hydrated node count {} != snapshot indexed_nodes {}",
-                staged.nodes.len(),
-                snapshot.indexed_nodes
-            ));
-        }
-        if staged.vector_index.len() != snapshot.indexed_nodes {
-            return Err(format!(
-                "hydrated vector count {} != snapshot indexed_nodes {}",
-                staged.vector_index.len(),
-                snapshot.indexed_nodes
-            ));
-        }
-
-        staged.neural_weight = preserved_neural_weight;
-        staged.fragment_index_enabled = preserved_fragment_enabled;
-        staged.fragment_weight = preserved_fragment_weight;
-        staged.fragment_refs = preserved_fragment_refs;
-        *self = staged;
-        Ok(self.nodes.len())
     }
 
     /// Check if the index is empty

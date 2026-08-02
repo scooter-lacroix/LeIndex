@@ -909,6 +909,7 @@ fn test_sync_unchanged_file_zero_reembeds() {
             embed_calls += texts.len();
             texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect()
         },
+        false,
     )
     .unwrap();
     assert_eq!(summary.files_changed, 1, "first sync sees the new file");
@@ -928,6 +929,7 @@ fn test_sync_unchanged_file_zero_reembeds() {
             embed_calls += texts.len();
             texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect()
         },
+        false,
     )
     .unwrap();
     assert_eq!(summary2.files_changed, 0, "unchanged file is skipped");
@@ -967,6 +969,7 @@ fn test_sync_single_edit_only_affected_reembedded() {
         &files_a,
         &mut |path: &std::path::Path, bytes: &[u8]| one_fragment_per_file(path, bytes, Some("x")),
         &mut |texts: &[String]| texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect(),
+        false,
     )
     .unwrap();
     assert_eq!(summary.embedded, 2, "both files embedded on first pass");
@@ -999,6 +1002,7 @@ fn test_sync_single_edit_only_affected_reembedded() {
             embed_calls += texts.len();
             texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect()
         },
+        false,
     )
     .unwrap();
     assert_eq!(summary2.files_changed, 1, "only b changed");
@@ -1096,6 +1100,7 @@ fn test_sync_root_mismatch_forces_rebuild() {
             one_fragment_per_file(path, bytes, Some("main"))
         },
         &mut |texts: &[String]| texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect(),
+        false,
     )
     .unwrap();
     assert_eq!(summary.generation, 1);
@@ -1114,6 +1119,7 @@ fn test_sync_root_mismatch_forces_rebuild() {
             one_fragment_per_file(path, bytes, Some("main"))
         },
         &mut |texts: &[String]| texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect(),
+        false,
     )
     .unwrap();
     assert_eq!(summary2.embedded, 1, "edited content is re-embedded");
@@ -1149,7 +1155,7 @@ fn test_chunk_code_never_emits_empty_fragments() {
         Path::new("empty.py"),
         Path::new("empty.js"),
     ] {
-        let chunks = chunk_code("", path);
+        let chunks = chunk_code("", path, MAX_BYTES_PER_CHUNK, true);
         assert!(
             chunks.iter().all(|f| !f.content.is_empty()),
             "chunk_code({path:?}) emitted an empty fragment: {chunks:?}"
