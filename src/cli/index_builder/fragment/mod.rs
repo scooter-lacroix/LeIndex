@@ -21,6 +21,7 @@
 // rollout — not a suppressed defect.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -195,6 +196,40 @@ fn try_chunk_code_semantically<'a>(
 /// stale stores are rejected on load, never silently reused.
 const FRAGMENT_STORE_SCHEMA_VERSION: u32 = 1;
 
+/// Atomically write `bytes` to `path`: write a sibling temp file, fsync it,
+/// then rename it over the target (Codex wave-5 item 1). A plain
+/// `std::fs::write` is non-atomic — an interrupt/disk-full mid-write
+/// truncates the artifact, and every later load hits the bincode error until
+/// the user manually deletes it. Mirrors `cli/index_job.rs::atomic_write`
+/// (minus the blake3 return, which no caller here needs).
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("fragment artifact path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("fragment artifact has invalid file name"))?;
+    let next = parent.join(format!("{file_name}.next"));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&next)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    #[cfg(windows)]
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    std::fs::rename(&next, path)?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 /// Metadata for one fragment row.
 ///
 /// `content_hash` is the blake3 hex of the exact enriched text that was
@@ -308,7 +343,7 @@ impl FragmentStore {
             rows: self.rows.clone(),
         })
         .context("Failed to serialize fragment store")?;
-        std::fs::write(&path, payload)
+        atomic_write(&path, &payload)
             .with_context(|| format!("Failed to persist fragment store: {}", path.display()))
     }
 

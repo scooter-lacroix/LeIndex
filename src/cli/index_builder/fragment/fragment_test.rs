@@ -1481,3 +1481,179 @@ fn test_extract_orphans_for_top_level_only_file() {
     // No symbol nodes → the orphan complement covers the entire source.
     assert_eq!(covered, code.len(), "orphan coverage spans the whole file");
 }
+
+// ---------------------------------------------------------------------------
+// Codex wave-5 (review #5, commit 0cd74b1b): three P2s
+// ---------------------------------------------------------------------------
+
+/// Persist is atomic: no `.next` temp sibling survives the call, and a
+/// truncated artifact (simulating a pre-fix interrupted plain write) is fully
+/// replaced by the next persist so the store loads again. Regression for
+/// Codex wave-5 item 1: `std::fs::write` mid-write truncation permanently
+/// broke the store until manual deletion.
+#[test]
+fn test_store_persist_atomic_no_temp_leftover() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = FragmentStore::default();
+    store.insert(sample_metadata("abc123", Some("node1"), 0));
+    store.persist_to_storage(dir.path()).unwrap();
+
+    let leindex = dir.path().join(".leindex");
+    let store_path = leindex.join("fragment_store.bin");
+    assert!(store_path.exists(), "store artifact written");
+    assert!(
+        !leindex.join("fragment_store.bin.next").exists(),
+        "atomic write must leave no .next temp sibling"
+    );
+
+    // A truncated store (as left by an interrupted pre-fix write) is healed
+    // by the next persist: the artifact is replaced whole, never appended.
+    std::fs::write(&store_path, b"\x01\x02").unwrap();
+    store.persist_to_storage(dir.path()).unwrap();
+    let loaded = FragmentStore::load_from_storage(dir.path())
+        .unwrap()
+        .expect("store loads after heal");
+    assert_eq!(loaded.len(), 1);
+    assert!(
+        !leindex.join("fragment_store.bin.next").exists(),
+        "healing persist also leaves no temp sibling"
+    );
+}
+
+/// An oversized LEAF (long comment) is byte-split, never dropped. Regression
+/// for Codex wave-5 item 2: the oversized-child branch recursed into the leaf,
+/// which has no children, producing an empty placeholder that `chunk_code`
+/// dropped — the leaf's source bytes were never emitted.
+#[test]
+fn test_chunk_semantic_oversized_leaf_bytes_not_dropped() {
+    let comment = format!("// {}", "x".repeat(500));
+    let source = format!("fn main() {{\n    {comment}\n}}\n");
+    let chunks = chunk_semantic(&source, Path::new("test.rs"), 64, &ts_language("rs"))
+        .expect("semantic chunking succeeds");
+
+    assert!(!chunks.is_empty(), "chunks produced");
+    let comment_start = source.find("// x").expect("comment present");
+    let comment_end = source[comment_start..]
+        .find('\n')
+        .map(|off| comment_start + off)
+        .unwrap_or(source.len());
+
+    // Every leaf byte must be covered by some fragment (no dropped content).
+    let mut covered = vec![false; source.len()];
+    for chunk in &chunks {
+        for b in chunk.start_byte_index..chunk.end_byte_index {
+            covered[b] = true;
+        }
+    }
+    for b in comment_start..comment_end {
+        assert!(covered[b], "leaf byte {b} dropped by the semantic chunker");
+    }
+}
+
+/// A PARTIALLY-embedded file that disappears before its retry must have its
+/// store rows cleared. Regression for Codex wave-5 item 3: `removed_paths` was
+/// derived only from `file_hashes`, but a partial file is intentionally
+/// omitted from `file_hashes` (retryability, wave-2 item 2) while recorded in
+/// `file_content_hashes` + the store — its dead rows + owner refs would have
+/// persisted in every later mmap.
+#[test]
+fn test_sync_removed_partial_file_clears_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("main.rs");
+    std::fs::write(&file, b"fn main() { println!(\"hi\"); }\n").unwrap();
+    let file_hash = blake3::hash(b"fn main() { println!(\"hi\"); }\n")
+        .to_hex()
+        .to_string();
+    let files = vec![(file.clone(), file_hash)];
+    let mut store = FragmentStore::default();
+    let identity = FragmentExtractionIdentity::default();
+
+    // Two candidates per file; the embed closure embeds ONLY the first, so the
+    // file is PARTIALLY embedded: one row inserted, file hash uncommitted.
+    let mut two_fragments = |path: &std::path::Path, bytes: &[u8]| {
+        let text = String::from_utf8_lossy(bytes);
+        (0..2)
+            .map(|i| {
+                let enriched = format!("// part{i}\n{text}");
+                let content_hash = blake3::hash(enriched.as_bytes()).to_hex().to_string();
+                FragmentCandidate {
+                    content_hash: content_hash.clone(),
+                    enriched_text: enriched,
+                    meta: FragmentMetadata {
+                        content_hash,
+                        owner: Some("main".to_string()),
+                        file_path: path.display().to_string(),
+                        byte_range: (0, bytes.len()),
+                        line_range: (0, bytes.len().max(1) - 1),
+                        embedding_offset: 0,
+                    },
+                }
+            })
+            .collect()
+    };
+
+    let (summary, _) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files,
+        &mut two_fragments,
+        &mut |texts: &[String]| {
+            texts
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    if i == 0 {
+                        Some(vec![1.0, 0.0, 0.0])
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        },
+        false,
+        &identity,
+    )
+    .unwrap();
+    assert_eq!(summary.embedded, 1, "one of two fragments embedded");
+    assert_eq!(store.len(), 1, "one row inserted");
+
+    let storage = dir.path().join(".leindex");
+    let m1 = load_fragment_sync_manifest(&storage)
+        .unwrap()
+        .expect("manifest persisted");
+    assert!(
+        m1.file_content_hashes
+            .contains_key(&file.display().to_string()),
+        "partial file recorded in file_content_hashes"
+    );
+    assert!(
+        !m1.file_hashes.contains_key(&file.display().to_string()),
+        "partial file NOT committed to file_hashes"
+    );
+
+    // Second pass: the file is GONE before its retry. Its rows must be
+    // cleared even though it never reached `file_hashes`.
+    let (_, _) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &[],
+        &mut two_fragments,
+        &mut |_texts: &[String]| vec![None],
+        false,
+        &identity,
+    )
+    .unwrap();
+    assert_eq!(
+        store.len(),
+        0,
+        "deleted partial file's rows must be cleared (wave-5 item 3)"
+    );
+    let m2 = load_fragment_sync_manifest(&storage)
+        .unwrap()
+        .expect("manifest persisted");
+    assert!(
+        !m2.file_content_hashes
+            .contains_key(&file.display().to_string()),
+        "stale file_content_hashes entry removed"
+    );
+}

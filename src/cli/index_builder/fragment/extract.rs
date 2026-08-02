@@ -60,7 +60,9 @@ fn leading_file_doc_end(bytes: &[u8]) -> usize {
 }
 
 /// 0-based line number containing `offset` (count of `\n` before it).
-fn line_of(bytes: &[u8], offset: usize) -> usize {
+/// `pub(super)`: shared with the chunker for leaf-byte-split line mapping
+/// (Codex wave-5 item 2).
+pub(super) fn line_of(bytes: &[u8], offset: usize) -> usize {
     bytes[..offset.min(bytes.len())]
         .iter()
         .filter(|&&b| b == b'\n')

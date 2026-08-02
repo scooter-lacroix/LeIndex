@@ -10,6 +10,7 @@ use std::path::Path;
 
 use super::Fragment;
 use super::coalesce_fragments;
+use super::extract::line_of;
 
 /// Maximum depth for recursive tree traversal to prevent infinite recursion
 /// or excessive depth in malformed/deeply nested code.
@@ -109,14 +110,29 @@ fn split_node<'a, 'b>(
             std::mem::swap(&mut current_fragment, &mut new_fragment);
             fragments.push(new_fragment);
 
-            fragments.append(&mut split_node(
-                child,
-                code,
-                max_bytes_per_chunk,
-                path,
-                cursor,
-                depth + 1,
-            )?);
+            // Codex wave-5 item 2: an oversized LEAF (no named children — a
+            // long string literal, comment, or token) has nothing to recurse
+            // into, so `split_node` returns an empty placeholder that
+            // `chunk_code` drops — the leaf's bytes would never be emitted.
+            // Byte-split the leaf's range directly instead.
+            if child.named_child_count() == 0 {
+                fragments.extend(split_leaf_by_bytes(
+                    code,
+                    path,
+                    max_bytes_per_chunk,
+                    child.start_byte(),
+                    child.end_byte(),
+                ));
+            } else {
+                fragments.append(&mut split_node(
+                    child,
+                    code,
+                    max_bytes_per_chunk,
+                    path,
+                    cursor,
+                    depth + 1,
+                )?);
+            }
         } else if child_size + current_fragment.size() > max_bytes_per_chunk {
             // The child would make the current fragment too large, so we finalize the current
             // fragment and create a new one.
@@ -134,6 +150,60 @@ fn split_node<'a, 'b>(
     fragments.push(current_fragment);
 
     Ok(fragments)
+}
+
+/// Byte-splits an oversized LEAF node's byte range into fragments of at most
+/// `max_bytes_per_chunk` bytes (Codex wave-5 item 2).
+///
+/// Leaf nodes (long string literals, comments, tokens) have no children to
+/// recurse into, so `split_node` cannot split them — it would return an empty
+/// placeholder that `chunk_code` drops, losing the leaf's source bytes. This
+/// mirrors `chunk_line_by_bytes`' UTF-8-safe boundary logic but over an
+/// arbitrary byte range, so multi-line leaves are split correctly too.
+fn split_leaf_by_bytes<'a>(
+    code: &'a str,
+    path: &'a Path,
+    max_bytes_per_chunk: usize,
+    start_byte: usize,
+    end_byte: usize,
+) -> Vec<Fragment<'a>> {
+    let mut fragments = Vec::new();
+    let mut current_start = start_byte;
+
+    while current_start < end_byte {
+        let remaining_bytes = end_byte - current_start;
+        let chunk_size = std::cmp::min(remaining_bytes, max_bytes_per_chunk);
+        let mut chunk_end = current_start + chunk_size;
+
+        // Ensure chunk_end is on a UTF-8 character boundary.
+        while chunk_end > current_start && !code.is_char_boundary(chunk_end) {
+            chunk_end -= 1;
+        }
+
+        // If we couldn't find a valid boundary within reasonable distance,
+        // move forward to the next character boundary instead.
+        if chunk_end <= current_start {
+            chunk_end = current_start + chunk_size;
+            while chunk_end < end_byte && !code.is_char_boundary(chunk_end) {
+                chunk_end += 1;
+            }
+        }
+
+        let start_line = line_of(code.as_bytes(), current_start);
+        let end_line = line_of(code.as_bytes(), chunk_end.saturating_sub(1));
+        fragments.push(Fragment {
+            content: &code[current_start..chunk_end],
+            start_line,
+            end_line,
+            start_byte_index: current_start,
+            end_byte_index: chunk_end,
+            file_path: path,
+        });
+
+        current_start = chunk_end;
+    }
+
+    fragments
 }
 
 impl<'a> Fragment<'a> {

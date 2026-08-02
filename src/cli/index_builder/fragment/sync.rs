@@ -106,7 +106,7 @@ pub(crate) fn persist_fragment_root(
         })?;
     }
     let payload = bincode::serialize(&state).context("Failed to serialize fragment root")?;
-    std::fs::write(&path, payload)
+    super::atomic_write(&path, &payload)
         .with_context(|| format!("Failed to persist fragment root: {}", path.display()))
 }
 
@@ -141,7 +141,7 @@ pub(crate) fn persist_fragment_root_from_ids(
         })?;
     }
     let payload = bincode::serialize(&state).context("Failed to serialize fragment root")?;
-    std::fs::write(&path, payload)
+    super::atomic_write(&path, &payload)
         .with_context(|| format!("Failed to persist fragment root: {}", path.display()))
 }
 
@@ -311,7 +311,7 @@ pub(crate) fn persist_fragment_sync_manifest(
     }
     let payload =
         bincode::serialize(manifest).context("Failed to serialize fragment sync manifest")?;
-    std::fs::write(&path, payload).with_context(|| {
+    super::atomic_write(&path, &payload).with_context(|| {
         format!(
             "Failed to persist fragment sync manifest: {}",
             path.display()
@@ -677,11 +677,24 @@ pub(crate) fn incremental_sync_fragments(
     let mut all_files_complete = true;
 
     // Removed files (in manifest, not in the current set): drop their rows.
+    //
+    // Codex wave-5 item 3: a PARTIALLY-embedded file is intentionally omitted
+    // from `file_hashes` (wave-2 item-2 retryability: the hash is committed
+    // only when every fragment embedded) while recorded in
+    // `file_content_hashes` + the store. If that incomplete file is deleted
+    // before the retry, deriving `removed_paths` from `file_hashes` alone
+    // would miss it and its rows + dead owner refs would persist in every
+    // later mmap, crowding valid fragments out of the bounded ANN candidate
+    // set. The union of both hash maps covers that case; `HashSet` dedups
+    // paths present in both.
     let removed_paths: Vec<String> = manifest
         .file_hashes
         .keys()
+        .chain(manifest.file_content_hashes.keys())
         .filter(|p| !current_paths.contains(*p))
         .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
         .collect();
     for path in &removed_paths {
         if manifest.file_content_hashes.remove(path).is_some() {
