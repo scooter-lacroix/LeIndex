@@ -210,6 +210,13 @@ pub enum Commands {
         /// removed when the server shuts down. Only available on Unix.
         #[arg(long = "socket")]
         socket: Option<PathBuf>,
+
+        /// Exit the MCP server after this many seconds with no requests.
+        /// Overrides `[mcp] idle_timeout_secs` from leindex.toml. `0` disables
+        /// idle exit (server lives until stdin EOF). MCP clients respawn the
+        /// server on the next tool call. Memory-pressure remediation 1.11.0.
+        #[arg(long = "mcp-idle-timeout-secs")]
+        idle_timeout_secs: Option<u64>,
     },
 
     /// Start the frontend dashboard
@@ -329,11 +336,13 @@ impl Cli {
             Commands::Mcp {
                 stdio: true,
                 socket: None,
+                idle_timeout_secs: None,
             }
         } else {
             self.command.unwrap_or(Commands::Mcp {
                 stdio: false,
                 socket: None,
+                idle_timeout_secs: None,
             })
         };
 
@@ -389,7 +398,15 @@ impl Cli {
             Commands::Diagnostics => cmd_diagnostics_impl(global_project).await,
             Commands::Tools { command } => cmd_tools_impl(command, global_project).await,
             Commands::Serve { host, port } => cmd_serve_impl(host, port).await,
-            Commands::Mcp { socket, .. } => {
+            Commands::Mcp {
+                socket,
+                idle_timeout_secs: _idle_timeout_secs,
+                ..
+            } => {
+                // T2 (memory-pressure remediation) wires `_idle_timeout_secs`
+                // (CLI override of `[mcp] idle_timeout_secs`) into the stdio
+                // and socket server loops; parsed here so the flag surface is
+                // complete in T1.
                 if let Some(ref socket_path) = socket {
                     cmd_mcp_socket_impl(socket_path, global_project).await
                 } else {

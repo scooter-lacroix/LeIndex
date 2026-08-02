@@ -67,3 +67,14 @@ fragment_naive_fallback = true
 batch_size = 500
 # Cap on source files indexed per run.
 max_files = 50000
+
+# ── MCP server lifecycle (1.11.0 memory-pressure remediation) ───────────────
+[mcp]
+# Exit the MCP server process after this many seconds with no requests.
+# 0 disables idle exit (server lives until stdin EOF). MCP clients respawn the
+# server on the next tool call, so idle swapped-out servers release their
+# memory instead of accumulating (8+ instances / 2.4 GiB RSS each was observed).
+idle_timeout_secs = 1800
+# Unload a loaded project engine from the ProjectRegistry after this many
+# seconds idle (0 = keep loaded once touched). Reloaded on the next tool call.
+engine_max_idle_secs = 600

@@ -33,6 +33,10 @@ pub struct LeIndexConfig {
     /// Indexing pipeline configuration.
     #[serde(default)]
     pub indexing: IndexingConfig,
+
+    /// MCP server lifecycle configuration.
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 /// Neural embeddings configuration ([neural] section).
@@ -147,6 +151,30 @@ pub struct IndexingConfig {
     pub max_files: u64,
 }
 
+/// MCP server lifecycle configuration ([mcp] section).
+///
+/// Memory-pressure remediation (1.11.0): MCP servers spawned by AI agents were
+/// accumulating (8+ instances, 2.4 GiB RSS each) because the process had no
+/// idle exit and loaded project engines were never unloaded. These knobs let
+/// an operator (or agent config) bound a server's lifetime and footprint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpConfig {
+    /// Exit the MCP server process after this many seconds with no requests.
+    /// `0` disables idle exit (the server lives until stdin EOF, today's
+    /// behavior). MCP clients respawn the server on the next tool call, so
+    /// this releases a swapped-out idle server's memory without losing
+    /// functionality. Default 1800 (30 min).
+    #[serde(default = "default_mcp_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+
+    /// Unload a loaded project engine from the ProjectRegistry after this many
+    /// seconds idle (0 = keep loaded once touched). Reloaded on the next tool
+    /// call. Caps per-process RSS while the spawning agent stays alive.
+    /// Default 600 (10 min).
+    #[serde(default = "default_mcp_engine_max_idle_secs")]
+    pub engine_max_idle_secs: u64,
+}
+
 // ── Defaults ─────────────────────────────────────────────────────────────
 
 impl Default for NeuralConfig {
@@ -183,6 +211,15 @@ impl Default for IndexingConfig {
         Self {
             batch_size: default_batch_size(),
             max_files: default_max_files(),
+        }
+    }
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: default_mcp_idle_timeout_secs(),
+            engine_max_idle_secs: default_mcp_engine_max_idle_secs(),
         }
     }
 }
@@ -248,6 +285,19 @@ fn default_batch_size() -> u64 {
 
 fn default_max_files() -> u64 {
     50_000
+}
+
+fn default_mcp_idle_timeout_secs() -> u64 {
+    // 30 min: long enough that active agent sessions never hit a cold reload,
+    // short enough that an idle swapped-out server self-terminates instead of
+    // holding multi-GB of swap for hours (memory-pressure remediation 1.11.0).
+    1800
+}
+
+fn default_mcp_engine_max_idle_secs() -> u64 {
+    // 10 min: release a loaded project engine (and its mmaps) after this much
+    // quiet, reloading on the next tool call.
+    600
 }
 
 // ── Path resolution ──────────────────────────────────────────────────────
@@ -581,10 +631,39 @@ mod tests {
                 batch_size: 1000,
                 max_files: 100_000,
             },
+            mcp: McpConfig {
+                idle_timeout_secs: 3600,
+                engine_max_idle_secs: 1200,
+            },
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: LeIndexConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(config, parsed);
+    }
+
+    #[test]
+    fn test_mcp_config_defaults() {
+        // Memory-pressure remediation 1.11.0 (D-1/D-2).
+        let config = LeIndexConfig::default();
+        assert_eq!(config.mcp.idle_timeout_secs, 1800);
+        assert_eq!(config.mcp.engine_max_idle_secs, 600);
+
+        // Parse from empty TOML -> same defaults (backward compatible: existing
+        // configs without an [mcp] section keep working).
+        let parsed: LeIndexConfig = toml::from_str("").unwrap();
+        assert_eq!(parsed.mcp, McpConfig::default());
+        let legacy = "[neural]\nenabled = true\n";
+        let parsed_legacy: LeIndexConfig = toml::from_str(legacy).unwrap();
+        assert_eq!(parsed_legacy.mcp, McpConfig::default());
+    }
+
+    #[test]
+    fn test_mcp_config_round_trip() {
+        let mut config = LeIndexConfig::default();
+        config.mcp.idle_timeout_secs = 60;
+        config.mcp.engine_max_idle_secs = 0;
+        let decoded: LeIndexConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(config.mcp, decoded.mcp);
     }
 
     #[test]

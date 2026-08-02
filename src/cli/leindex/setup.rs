@@ -1107,6 +1107,7 @@ fn build_config(
         },
         search: SearchConfig::default(),
         indexing: IndexingConfig::default(),
+        mcp: crate::config::McpConfig::default(),
     }
 }
 
