@@ -1201,11 +1201,11 @@ fn test_fragment_owner_union_and_byte_range_surfacing() {
     let mut refs = std::collections::HashMap::new();
     refs.insert(
         "hash_abc".to_string(),
-        ("auth.rs:authenticate_user".to_string(), (10, 25)),
+        vec![("auth.rs:authenticate_user".to_string(), (10, 25))],
     );
     refs.insert(
         "hash_def".to_string(),
-        ("auth.rs:authenticate_user".to_string(), (30, 45)),
+        vec![("auth.rs:authenticate_user".to_string(), (30, 45))],
     );
     restored.set_fragment_index_enabled(true);
     restored.set_fragment_weight(0.12);
@@ -1426,7 +1426,7 @@ fn test_fragment_tier_improves_conceptual_mrr() {
         fragment_rows.push((frag_id.clone(), emb));
         refs.insert(
             frag_id,
-            (format!("mod.rs:owner_{i}"), (8 + i * 2, 12 + i * 2)),
+            vec![(format!("mod.rs:owner_{i}"), (8 + i * 2, 12 + i * 2))],
         );
     }
 
@@ -1550,5 +1550,160 @@ fn test_fragment_tier_improves_conceptual_mrr() {
     assert!(
         node_w040 >= node_off,
         "fragment tier must not regress node-level ranking MRR: baseline {node_off:.4} -> with fragments {node_w040:.4}"
+    );
+}
+
+/// Codex wave-2 item 5 regression: identical fragment content embedded once
+/// but referenced by MULTIPLE owners must surface EVERY owner at query time.
+/// The old refs build collapsed to the first owner (`find_map`), so a hash
+/// shared by N owners only ever lifted one of them into the candidate pool.
+#[test]
+fn test_fragment_multi_owner_refs_all_surface() {
+    // Two nodes in different files, both owning byte ranges of the SAME
+    // fragment content (identical enriched text → one content hash).
+    let mut engine = SearchEngine::with_dimension(8);
+    let owner_ids = ["a.rs:fn_a", "b.rs:fn_b"];
+    let nodes: Vec<NodeInfo> = owner_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| NodeInfo {
+            node_id: id.to_string(),
+            file_path: format!("{}.rs", if i == 0 { "a" } else { "b" }),
+            symbol_name: format!("fn_{}", if i == 0 { "a" } else { "b" }),
+            language: "rust".to_string(),
+            content: format!(
+                "pub fn fn_{}() {{ /* shared */ }}",
+                if i == 0 { "a" } else { "b" }
+            ),
+            byte_range: (0, 40),
+            // One-hot at dim 1: the fragment query (dim 0) must NOT match
+            // either node lexically/vectorially at the node level.
+            tfidf_embedding: (0..8).map(|d| if d == 1 { 1.0 } else { 0.0 }).collect(),
+            neural_embedding: None,
+            complexity: 2,
+            signature: None,
+            pre_tokenized: Some(vec![]),
+        })
+        .collect();
+    engine.index_nodes(nodes);
+
+    // One fragment row (dim 0 hot), referenced by BOTH owners.
+    let shared_hash = "shared_content_hash".to_string();
+    engine.set_fragment_embeddings(vec![(
+        shared_hash.clone(),
+        (0..8).map(|d| if d == 0 { 1.0 } else { 0.0 }).collect(),
+    )]);
+    let mut refs = std::collections::HashMap::new();
+    refs.insert(
+        shared_hash,
+        vec![
+            ("a.rs:fn_a".to_string(), (2, 10)),
+            ("b.rs:fn_b".to_string(), (2, 10)),
+        ],
+    );
+    engine.set_fragment_refs(refs);
+    engine.set_fragment_index_enabled(true);
+    engine.set_fragment_weight(0.35);
+
+    // Neural query embedding matches the fragment (dim 0 hot).
+    let results = engine
+        .search(SearchQuery {
+            query: "shared intent".to_string(),
+            top_k: 5,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: None,
+            query_neural_embedding: Some((0..8).map(|d| if d == 0 { 1.0 } else { 0.0 }).collect()),
+            threshold: None,
+            query_type: None,
+        })
+        .unwrap();
+
+    for owner in owner_ids {
+        let hit = results.iter().find(|r| r.node_id == owner);
+        assert!(
+            hit.is_some(),
+            "multi-owner fragment must surface owner {owner:?} (got {:?})",
+            results.iter().map(|r| &r.node_id).collect::<Vec<_>>()
+        );
+        assert!(
+            hit.unwrap().score.fragment > 0.0,
+            "owner {owner:?} must carry a nonzero fragment score"
+        );
+        assert_eq!(
+            hit.unwrap().fragment_byte_range,
+            Some((2, 10)),
+            "owner {owner:?} must surface the fragment byte range"
+        );
+    }
+}
+
+/// Codex wave-2 item 9 regression: a fragment id list whose length disagrees
+/// with the snapshot's recorded row count must disable the fragment layer
+/// (non-fatal), just like a mmap row-count or dimension mismatch — so a
+/// truncated/incomplete id list can never yield a half-mapped fragment index.
+#[cfg(feature = "storage")]
+#[test]
+fn test_search_snapshot_disables_fragment_on_id_count_mismatch() {
+    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf_embedding[0] = 1.0;
+
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding,
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+
+    // Snapshot records 2 fragment rows; mmap has 2 rows (both checks pass),
+    // but the id list carries only 1 — the id-count guard must disable the
+    // layer while the node-level restore still succeeds.
+    let mut snapshot = engine.search_snapshot(1, 0, "frag-fingerprint".to_string());
+    snapshot.fragment_rows = 2;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tfidf_path = dir.path().join("tfidf.bin");
+    let frag_path = dir.path().join("frag.bin");
+    crate::search::vector::write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings())
+        .unwrap();
+    let fragment_embeddings = vec![
+        (
+            "hash_abc".to_string(),
+            vec![0.1f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+        (
+            "hash_def".to_string(),
+            vec![0.2f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+    ];
+    crate::search::vector::write_mmap_embeddings(&frag_path, &fragment_embeddings).unwrap();
+    let tfidf_mmap = crate::search::vector::MmapEmbeddingIndex::open(&tfidf_path).unwrap();
+    let frag_mmap = crate::search::vector::MmapEmbeddingIndex::open(&frag_path).unwrap();
+    // TRUNCATED id list: mmap rows 2, ids 1.
+    let frag_ids = vec!["hash_abc".to_string()];
+
+    let mut restored = SearchEngine::new();
+    restored
+        .restore_from_search_snapshot(
+            snapshot,
+            Arc::new(tfidf_mmap),
+            None,
+            Some(Arc::new(frag_mmap)),
+            Some(&frag_ids),
+        )
+        .unwrap();
+    assert_eq!(restored.node_count(), 1);
+    assert!(
+        restored.collect_fragment_embeddings().is_empty(),
+        "id-count mismatch must disable the fragment layer"
     );
 }

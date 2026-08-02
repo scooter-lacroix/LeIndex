@@ -184,7 +184,12 @@ const FRAGMENT_SYNC_MANIFEST_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub(crate) struct FragmentExtractionIdentity {
     /// Neural model name whose embeddings produced the rows ("" = never
-    /// recorded — treated as a mismatch so an upgrade forces a re-sync).
+    /// recorded). An unrecorded model is an IDENTITY mismatch (forces a
+    /// re-sync, so an upgrade is never hidden by the source-hash skip) but
+    /// deliberately NOT a MODEL change: it cannot force the full re-embed,
+    /// because a fresh manifest's store is empty (forcing would be a no-op)
+    /// and a manifest-lost but store-survives recovery must be able to reuse
+    /// rows written under the current model. See `detect_identity_mismatch`.
     pub(crate) model_name: String,
     /// blake3 over the fragment knobs (`fragment_max_bytes`,
     /// `fragment_orphan_enabled`, `fragment_naive_fallback`) + the embedding
@@ -453,7 +458,9 @@ fn remove_file_rows(store: &mut FragmentStore, file_path: &str) {
 /// sources; a model swap additionally forces a full re-embed (effective
 /// `force_reembed`) because old-model embeddings are stale even for matching
 /// content hashes. The identity is re-persisted after the pass so the next
-/// identical run is incremental again.
+/// identical run is incremental again — but ONLY when every affected file
+/// fully embedded: a partial resync keeps the old identity so the next run
+/// retries the incomplete file (Codex wave-2 item 2).
 ///
 /// **Persist ordering is deliberate — store → root → manifest, with the
 /// manifest written LAST as the commit marker.** A crash between store and
@@ -465,9 +472,14 @@ fn remove_file_rows(store: &mut FragmentStore, file_path: &str) {
 /// `fragment_layer_generation_is_consistent` rejects — the layer stays off
 /// until the next sync repairs it. Either way the fragment layer degrades
 /// conservatively; the node-level index is never affected.
-/// Outcome of processing one changed file: whether store rows changed.
+/// Outcome of processing one changed file: whether store rows changed, and
+/// whether the file was fully embedded (every candidate row inserted). A file
+/// that is NOT complete must not count toward an identity commit — otherwise a
+/// failed identity resync would persist the new identity and the incomplete
+/// file's stale hash would skip it forever (Codex wave-2 item 2).
 struct FileSyncOutcome {
     store_modified: bool,
+    complete: bool,
 }
 
 /// Identity-mismatch flags for the incremental sync engine (Codex P1).
@@ -551,7 +563,10 @@ fn process_changed_file(
                 path = %path.display(),
                 "Failed to read source file during fragment sync; skipping"
             );
-            return FileSyncOutcome { store_modified };
+            return FileSyncOutcome {
+                store_modified,
+                complete: false,
+            };
         }
     };
 
@@ -609,7 +624,10 @@ fn process_changed_file(
     if all_embedded {
         manifest.file_hashes.insert(path_str, file_hash.to_string());
     }
-    FileSyncOutcome { store_modified }
+    FileSyncOutcome {
+        store_modified,
+        complete: all_embedded,
+    }
 }
 
 pub(crate) fn incremental_sync_fragments(
@@ -650,6 +668,13 @@ pub(crate) fn incremental_sync_fragments(
     let mut new_embeddings: Vec<(String, Vec<f32>)> = Vec::new();
     let mut store_dirty = false;
     let mut manifest_dirty = false;
+    // Every changed file must fully embed before the new identity is committed
+    // (Codex wave-2 item 2): if any file fails mid-resync, its manifest hash
+    // stays stale AND the identity stays old, so the NEXT run still sees the
+    // identity mismatch and retries the incomplete file. Committing the
+    // identity despite a failure would skip it forever (hash matches, identity
+    // matches).
+    let mut all_files_complete = true;
 
     // Removed files (in manifest, not in the current set): drop their rows.
     let removed_paths: Vec<String> = manifest
@@ -695,13 +720,16 @@ pub(crate) fn incremental_sync_fragments(
             &mut summary,
         );
         store_dirty |= outcome.store_modified;
+        all_files_complete &= outcome.complete;
     }
 
     // Persist the identity that produced these rows (Codex P1) so the next run
     // compares against it. Updated even when no store rows changed (a
     // knob-only re-chunk to identical content) so the mismatch resolves and
-    // future runs are incremental again.
-    if mismatch.identity_changed {
+    // future runs are incremental again. Gated on every affected file having
+    // fully embedded — a partial resync must not claim the new identity (the
+    // stale identity keeps the retry firing).
+    if mismatch.identity_changed && all_files_complete {
         manifest.extraction_identity = identity.clone();
         manifest_dirty = true;
     }

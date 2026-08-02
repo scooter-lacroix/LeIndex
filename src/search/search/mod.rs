@@ -122,10 +122,13 @@ pub struct SearchEngine {
     /// Only applied when `fragment_index_enabled` (renormalized into the five
     /// weights).
     fragment_weight: f32,
-    /// content_hash → (owner node id, best byte range) for mapping fragment
-    /// hits back to their Tier-1 owner (invariant 6). Populated by the cli
-    /// hydration path from the fragment store.
-    fragment_refs: HashMap<String, (String, (usize, usize))>,
+    /// content_hash → ALL (owner node id, byte range) refs for mapping
+    /// fragment hits back to their Tier-1 owners (invariant 6). A Vec (not a
+    /// single ref) because identical content can legitimately live under N
+    /// owners — dedup must not collapse multi-owner fragments to the first
+    /// (Codex wave-2 item 5). Populated by the cli hydration path from the
+    /// fragment store.
+    fragment_refs: HashMap<String, Vec<(String, (usize, usize))>>,
     /// Complexity cache for O(1) lookups (fixes O(n²) bug)
     complexity_cache: HashMap<String, u32>,
     /// Inverted index for O(1) text lookups: token -> set of node IDs
@@ -259,10 +262,10 @@ impl SearchEngine {
         self.fragment_weight = clamped;
     }
 
-    /// Populate the fragment reference map (content hash → owner node id +
-    /// byte range) from the cli-side fragment store (invariant 6 owner
+    /// Populate the fragment reference map (content hash → ALL (owner node id,
+    /// byte range) refs) from the cli-side fragment store (invariant 6 owner
     /// mapping, fragment-embeddings 1.11.0 Task 6).
-    pub fn set_fragment_refs(&mut self, refs: HashMap<String, (String, (usize, usize))>) {
+    pub fn set_fragment_refs(&mut self, refs: HashMap<String, Vec<(String, (usize, usize))>>) {
         self.fragment_refs = refs;
     }
 
@@ -316,6 +319,10 @@ impl SearchEngine {
         // after a full reindex rebuilds the lexical index from scratch.
         self.neural_vector_index = None;
         self.fragment_vector_index = None;
+        // And drop the fragment owner refs — a full reindex rebuilds the
+        // fragment layer too, so stale hash → owner mappings must not survive
+        // (phantom fragment hits after reindex; Kilo wave-2 item 6).
+        self.fragment_refs.clear();
     }
 
     /// Append nodes to the existing index without clearing.
@@ -763,6 +770,11 @@ impl SearchEngine {
             index.insert_batch(rows);
             self.fragment_vector_index = Some(VectorIndexImpl::BruteForce(index));
         }
+        // Clear the owner refs whenever the index is replaced or cleared —
+        // stale hash → owner mappings for rows no longer in the index would
+        // surface phantom fragment hits (Kilo wave-2 item 7). The cli caller
+        // re-populates refs from the fresh store right after.
+        self.fragment_refs.clear();
         self.search_cache.clear();
         self.search_cache_bytes = 0;
     }
@@ -1040,35 +1052,28 @@ impl SearchEngine {
         // neural query embedding and map content-hash hits back to their Tier-1
         // owner nodes. Owners enter the candidate pool and carry the best
         // fragment byte range for result surfacing. Participates only when the
-        // master switch is on AND a neural query embedding exists.
-        let fragment_candidates: HashMap<String, f32> =
-            match (&query.query_neural_embedding, &self.fragment_vector_index) {
-                (Some(q_emb), Some(idx))
-                    if self.fragment_index_enabled && !self.fragment_refs.is_empty() =>
-                {
-                    idx.search(q_emb, query.top_k.saturating_mul(10).max(100))
-                        .into_iter()
-                        .collect()
-                }
-                _ => HashMap::new(),
-            };
-        let mut fragment_owner_scores: HashMap<String, f32> = HashMap::new();
-        let mut fragment_owner_ranges: HashMap<String, (usize, usize)> = HashMap::new();
-        if !fragment_candidates.is_empty() && !self.fragment_refs.is_empty() {
-            for (hash, score) in &fragment_candidates {
-                if let Some((owner, range)) = self.fragment_refs.get(hash) {
-                    // Keep the BEST-scoring fragment per owner (invariant 6):
-                    // the surfaced byte range must correspond to the fragment
-                    // that actually drives the score, independent of HashMap
-                    // iteration order.
-                    let entry = fragment_owner_scores.entry(owner.clone()).or_insert(0.0);
-                    if *score > *entry {
-                        *entry = *score;
-                        fragment_owner_ranges.insert(owner.clone(), *range);
-                    }
-                }
-            }
-        }
+        // master switch is on AND a neural query embedding exists AND the query
+        // is not Exact-route (exact identifier lookups stay purely lexical —
+        // the CLI zeroes the neural embedding for them; this guard is
+        // defense-in-depth for direct `search()` callers, Codex wave-2 item 4).
+        // (CCN extraction — the whole fragment-owner mapping lives in
+        // `collect_fragment_owners` to keep `search` under the lizard gate.)
+        let (fragment_owner_scores, fragment_owner_ranges) = self.collect_fragment_owners(
+            &query.query_neural_embedding,
+            query.query_type,
+            query.top_k,
+        );
+
+        // Fragment fusion RENORMALIZATION gate (Codex wave-2 item 4): renorm
+        // must be gated on the fragment layer ACTUALLY participating in this
+        // query — master switch ON AND at least one fragment candidate mapped
+        // to an owner. Gating on the config switch alone would downscale the
+        // four base weights by 1/(1+fragment_weight) even when every fragment
+        // score is necessarily 0 (exact/neural=None queries; or a hydrated
+        // layer whose mmap/refs are unavailable), silently distorting the
+        // default path. `fragment_owner_scores` being non-empty is exactly the
+        // participation signal (it is populated only when candidates mapped).
+        let fragment_active = self.fragment_index_enabled && !fragment_owner_scores.is_empty();
 
         let candidates = self.collect_search_candidates(
             &text_query,
@@ -1086,6 +1091,7 @@ impl SearchEngine {
                 &vector_results,
                 &fragment_owner_scores,
                 &fragment_owner_ranges,
+                fragment_active,
             ) {
                 results.push(result);
             }
@@ -1094,6 +1100,60 @@ impl SearchEngine {
         let final_results = self.finalize_results(results, query.top_k, cache_key);
         Ok(final_results)
     }
+    /// Query the fragment ANN with the neural query embedding and map
+    /// content-hash hits back to their Tier-1 owner nodes (Task 6, invariant
+    /// 6). Returns `(owner → best fragment score, owner → byte range of that
+    /// best fragment)`.
+    ///
+    /// Participates only when the master switch is on AND a neural query
+    /// embedding AND the owner refs exist AND the query is not Exact-route
+    /// (exact identifier lookups stay purely lexical — the CLI zeroes the
+    /// neural embedding for them; this guard is defense-in-depth for direct
+    /// `search()` callers, Codex wave-2 item 4); otherwise both maps are
+    /// empty. ALL owners of a content hash are preserved (identical fragment
+    /// text is embedded once but can be referenced by N owners — Codex wave-2
+    /// item 5), and the BEST-scoring fragment per owner is kept so the
+    /// surfaced byte range corresponds to the fragment that actually drives
+    /// the score, independent of HashMap iteration order (invariant 6).
+    /// Extracted as a helper to keep `search` under the lizard CCN gate.
+    fn collect_fragment_owners(
+        &self,
+        query_neural_embedding: &Option<Vec<f32>>,
+        query_type: Option<crate::search::ranking::QueryType>,
+        top_k: usize,
+    ) -> (HashMap<String, f32>, HashMap<String, (usize, usize)>) {
+        let mut fragment_owner_scores: HashMap<String, f32> = HashMap::new();
+        let mut fragment_owner_ranges: HashMap<String, (usize, usize)> = HashMap::new();
+        let exact_route = matches!(query_type, Some(crate::search::ranking::QueryType::Exact));
+        let fragment_candidates: HashMap<String, f32> =
+            match (query_neural_embedding, &self.fragment_vector_index) {
+                (Some(q_emb), Some(idx))
+                    if !exact_route
+                        && self.fragment_index_enabled
+                        && !self.fragment_refs.is_empty() =>
+                {
+                    idx.search(q_emb, top_k.saturating_mul(10).max(100))
+                        .into_iter()
+                        .collect()
+                }
+                _ => HashMap::new(),
+            };
+        if !fragment_candidates.is_empty() && !self.fragment_refs.is_empty() {
+            for (hash, score) in &fragment_candidates {
+                if let Some(refs) = self.fragment_refs.get(hash) {
+                    for (owner, range) in refs {
+                        let entry = fragment_owner_scores.entry(owner.clone()).or_insert(0.0);
+                        if *score > *entry {
+                            *entry = *score;
+                            fragment_owner_ranges.insert(owner.clone(), *range);
+                        }
+                    }
+                }
+            }
+        }
+        (fragment_owner_scores, fragment_owner_ranges)
+    }
+
     /// Pre-compute TF-IDF vector search results for semantic queries using the
     /// caller-provided query embedding. Returns empty when semantic retrieval
     /// has no query vector or the query is non-semantic.
@@ -1309,7 +1369,8 @@ impl SearchEngine {
             }
             // The staged (coarse-then-exact) path does not fuse fragment
             // candidates (Task 6 wires the authoritative `search` path); empty
-            // fragment maps keep its behavior byte-identical to before.
+            // fragment maps + fragment_active=false keep its behavior
+            // byte-identical to before (no fragment renorm either).
             if let Some(result) = self.score_and_collect(
                 node,
                 &query,
@@ -1317,6 +1378,7 @@ impl SearchEngine {
                 &vector_results,
                 &HashMap::new(),
                 &HashMap::new(),
+                false,
             ) {
                 results.push(result);
             }
@@ -1341,6 +1403,7 @@ impl SearchEngine {
         vector_results: &HashMap<String, f32>,
         fragment_scores: &HashMap<String, f32>,
         fragment_ranges: &HashMap<String, (usize, usize)>,
+        fragment_active: bool,
     ) -> Option<SearchResult> {
         let text_score = self.calculate_text_score_optimized(
             text_query,
@@ -1373,6 +1436,7 @@ impl SearchEngine {
             text_score,
             tfidf_score,
             fragment_score,
+            fragment_active,
         );
         if score.overall <= 0.0 {
             return None;
@@ -1490,6 +1554,7 @@ impl SearchEngine {
         text_score: f32,
         tfidf_score: f32,
         fragment_score: f32,
+        fragment_active: bool,
     ) -> Score {
         let structural_score = (node.complexity as f32 / 100.0).min(1.0);
         let neural_score = self.neural_score(query, node);
@@ -1500,13 +1565,16 @@ impl SearchEngine {
         );
         let (tfidf_weight, neural_weight, structural_weight, text_weight) =
             self.scoring_weights(query, neural_available);
-        // Fragment fusion (Task 6): gate renormalization on the master switch
-        // (NOT `fragment_weight > 0` — the default 0.35 would renormalize with
-        // the feature off, breaking invariant 7's byte-identical default). The
-        // five weights are renormalized to sum to 1.0; when disabled the
-        // fragment weight is 0.0 and the base four are untouched.
+        // Fragment fusion (Task 6): renormalize ONLY when the fragment layer
+        // actually participates in this query (`fragment_active` — master
+        // switch AND owner-score participation; Codex wave-2 item 4). NOT
+        // `fragment_weight > 0` (the default 0.35 would renormalize with the
+        // feature off) and NOT the bare config switch (a layer with no mmap /
+        // refs / neural query embedding yields fragment score 0 for every
+        // node, so renorm would distort the base weights for nothing). When
+        // inactive the fragment weight is 0.0 and the base four are untouched.
         let (tfidf_weight, neural_weight, structural_weight, text_weight, fragment_weight) =
-            if self.fragment_index_enabled {
+            if fragment_active {
                 crate::search::ranking::HybridScorer::renormalize_weights(
                     tfidf_weight,
                     neural_weight,

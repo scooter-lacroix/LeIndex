@@ -189,6 +189,14 @@ impl SearchEngine {
             );
             return;
         }
+        if ids.len() as u32 != snapshot_rows {
+            tracing::warn!(
+                ids = ids.len(),
+                snapshot_rows,
+                "fragment id list count != snapshot; fragment retrieval disabled"
+            );
+            return;
+        }
         if mmap.dimension() as usize != NEURAL_EMBEDDING_DIMENSION {
             tracing::warn!(
                 dim = mmap.dimension(),

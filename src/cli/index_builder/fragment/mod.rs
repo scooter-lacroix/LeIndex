@@ -53,13 +53,6 @@ pub(crate) use sync::{
 /// Number of lines per chunk when chunking naively (≈ Warp's `LINES_PER_CHUNK`).
 const LINES_PER_CHUNK: usize = 200;
 
-/// Average number of characters per line (≈ Warp's `AVG_CHAR_PER_LINE`).
-const AVG_CHAR_PER_LINE: usize = 60;
-
-/// Default max bytes per fragment — 200 lines × 60 chars ≈ Warp's default and
-/// the `[search] fragment_max_bytes` config default (12_000).
-pub(crate) const MAX_BYTES_PER_CHUNK: usize = LINES_PER_CHUNK * AVG_CHAR_PER_LINE;
-
 /// A code fragment with line + byte range information.
 ///
 /// Byte offsets are into the file/region `&str` the fragment borrows from
@@ -229,10 +222,6 @@ pub(crate) struct FragmentStore {
 }
 
 impl FragmentStore {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     /// Number of unique embedding rows (distinct content hashes).
     pub(crate) fn len(&self) -> usize {
         self.rows.len()
@@ -266,25 +255,6 @@ impl FragmentStore {
     /// All content hashes (embedding row keys).
     pub(crate) fn content_hashes(&self) -> impl Iterator<Item = &str> {
         self.rows.keys().map(String::as_str)
-    }
-
-    /// Owner-node mapping: owner node id → content hashes of its fragments
-    /// (invariant 6: fragment hits map back to owner nodes before surfacing).
-    pub(crate) fn owner_to_hashes(&self) -> HashMap<String, Vec<String>> {
-        let mut out: HashMap<String, Vec<String>> = HashMap::new();
-        for (hash, metas) in &self.rows {
-            for meta in metas {
-                if let Some(owner) = &meta.owner {
-                    out.entry(owner.clone()).or_default().push(hash.clone());
-                }
-            }
-        }
-        out
-    }
-
-    /// Total fragment count (metadata refs, not unique embedding rows).
-    pub(crate) fn fragment_count(&self) -> usize {
-        self.rows.values().map(Vec::len).sum()
     }
 
     fn storage_path(project_path: &Path) -> PathBuf {

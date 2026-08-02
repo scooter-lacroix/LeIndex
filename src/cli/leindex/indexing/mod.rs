@@ -1669,17 +1669,24 @@ impl LeIndex {
         }
         self.search_engine.set_fragment_embeddings(rows);
 
-        // Owner refs (invariant 6): content hash → (owner node id, best range).
-        let refs: std::collections::HashMap<String, (String, (usize, usize))> = store
+        // Owner refs (invariant 6): content hash → ALL (owner node id, byte
+        // range) refs. A Vec per hash because identical content can live under
+        // N owners — dedup must not collapse multi-owner fragments to the
+        // first (Codex wave-2 item 5).
+        let refs: std::collections::HashMap<String, Vec<(String, (usize, usize))>> = store
             .content_hashes()
             .filter_map(|hash| {
-                store.get(hash).and_then(|metas| {
-                    metas.iter().find_map(|meta| {
+                let owners: Vec<(String, (usize, usize))> = store
+                    .get(hash)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|meta| {
                         meta.owner
                             .as_ref()
-                            .map(|owner| (hash.to_string(), (owner.clone(), meta.byte_range)))
+                            .map(|owner| (owner.clone(), meta.byte_range))
                     })
-                })
+                    .collect();
+                (!owners.is_empty()).then(|| (hash.to_string(), owners))
             })
             .collect();
         self.search_engine.set_fragment_refs(refs);

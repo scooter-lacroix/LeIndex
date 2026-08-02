@@ -688,7 +688,7 @@ fn sample_metadata(content_hash: &str, owner: Option<&str>, offset: u64) -> Frag
 /// twice — the dedup invariant (one embedding row, N metadata refs).
 #[test]
 fn test_store_dedup_one_row_many_refs() {
-    let mut store = FragmentStore::new();
+    let mut store = FragmentStore::default();
     store.insert(sample_metadata("abc123", Some("node1"), 0));
     store.insert(sample_metadata("abc123", Some("node2"), 0));
     store.insert(sample_metadata("def456", None, 1));
@@ -698,38 +698,53 @@ fn test_store_dedup_one_row_many_refs() {
         2,
         "two unique content hashes → two embedding rows"
     );
+    // Total metadata refs across rows (dedup: N refs, 1 embedding row).
+    let total_refs: usize = store
+        .content_hashes()
+        .map(|h| store.get(h).map(|metas| metas.len()).unwrap_or(0))
+        .sum();
     assert_eq!(
-        store.fragment_count(),
-        3,
+        total_refs, 3,
         "three metadata refs total across the two rows"
     );
     assert_eq!(store.get("abc123").unwrap().len(), 2);
     assert!(store.get("missing").is_none());
 }
 
-/// Owner-node mapping powers invariant 6 (fragment hits map back to owners).
+/// Owner-node mapping powers invariant 6 (fragment hits map back to owners):
+/// every metadata ref carries its owner, and orphan refs (owner = None) never
+/// map to an owner. Verified through the refs the sync path consumes
+/// (`content_hashes` + `get`), the same accessors `incremental_sync_fragments`
+/// and the cli hydration path use.
 #[test]
 fn test_store_owner_mapping() {
-    let mut store = FragmentStore::new();
+    let mut store = FragmentStore::default();
     store.insert(sample_metadata("abc123", Some("node1"), 0));
     store.insert(sample_metadata("def456", Some("node1"), 1));
     store.insert(sample_metadata("ghi789", Some("node2"), 2));
     store.insert(sample_metadata("orphan1", None, 3));
 
-    let map = store.owner_to_hashes();
-    let node1 = map.get("node1").unwrap();
-    assert!(node1.contains(&"abc123".to_string()));
-    assert!(node1.contains(&"def456".to_string()));
-    assert_eq!(map.get("node2").unwrap(), &vec!["ghi789".to_string()]);
-    // Orphans (owner = None) never appear in the owner map.
-    assert!(!map.values().flatten().any(|h| h == "orphan1"));
+    let owners_of = |hash: &str| -> Vec<Option<String>> {
+        store
+            .get(hash)
+            .map(|metas| metas.iter().map(|m| m.owner.clone()).collect())
+            .unwrap_or_default()
+    };
+    let node1 = owners_of("abc123");
+    assert!(node1.iter().any(|o| o.as_deref() == Some("node1")));
+    let node1_b = owners_of("def456");
+    assert!(node1_b.iter().any(|o| o.as_deref() == Some("node1")));
+    let node2 = owners_of("ghi789");
+    assert!(node2.iter().any(|o| o.as_deref() == Some("node2")));
+    // Orphans (owner = None) never map to an owner.
+    assert!(owners_of("orphan1").iter().all(|o| o.is_none()));
 }
 
 /// Persist → load round-trip preserves metadata exactly (bincode, schema-versioned).
 #[test]
 fn test_store_persist_load_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = FragmentStore::new();
+    let mut store = FragmentStore::default();
     store.insert(sample_metadata("abc123", Some("node1"), 0));
     store.insert(sample_metadata("abc123", Some("node2"), 0));
     store.insert(sample_metadata("def456", None, 1));
@@ -739,7 +754,11 @@ fn test_store_persist_load_roundtrip() {
         .unwrap()
         .expect("store loads");
     assert_eq!(loaded.len(), 2);
-    assert_eq!(loaded.fragment_count(), 3);
+    let loaded_refs: usize = loaded
+        .content_hashes()
+        .map(|h| loaded.get(h).map(|metas| metas.len()).unwrap_or(0))
+        .sum();
+    assert_eq!(loaded_refs, 3);
     assert_eq!(loaded.get("abc123").unwrap().len(), 2);
     assert_eq!(
         loaded.get("abc123").unwrap()[0].owner.as_deref(),
@@ -752,7 +771,7 @@ fn test_store_persist_load_roundtrip() {
 #[test]
 fn test_store_load_missing_is_none() {
     let dir = tempfile::tempdir().unwrap();
-    assert!(FragmentStore::new().is_empty());
+    assert!(FragmentStore::default().is_empty());
     assert!(
         FragmentStore::load_from_storage(dir.path())
             .unwrap()
@@ -764,7 +783,7 @@ fn test_store_load_missing_is_none() {
 #[test]
 fn test_store_schema_mismatch_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = FragmentStore::new();
+    let mut store = FragmentStore::default();
     store.insert(sample_metadata("abc123", None, 0));
     store.persist_to_storage(dir.path()).unwrap();
 
@@ -785,11 +804,11 @@ fn test_store_schema_mismatch_rejected() {
 /// Root hash is deterministic for identical stores and content-sensitive.
 #[test]
 fn test_root_hash_deterministic_and_content_sensitive() {
-    let mut a = FragmentStore::new();
+    let mut a = FragmentStore::default();
     a.insert(sample_metadata("abc123", Some("node1"), 0));
     a.insert(sample_metadata("def456", None, 1));
 
-    let mut b = FragmentStore::new();
+    let mut b = FragmentStore::default();
     b.insert(sample_metadata("def456", None, 0));
     b.insert(sample_metadata("abc123", Some("node1"), 1));
 
@@ -797,7 +816,7 @@ fn test_root_hash_deterministic_and_content_sensitive() {
     let root_b = compute_fragment_root_hash(&b);
     assert_eq!(root_a, root_b, "root is order-independent (sorted pairs)");
 
-    let mut c = FragmentStore::new();
+    let mut c = FragmentStore::default();
     c.insert(sample_metadata("abc123", Some("node1"), 0));
     c.insert(sample_metadata("changed", None, 1));
     assert_ne!(
@@ -811,7 +830,7 @@ fn test_root_hash_deterministic_and_content_sensitive() {
 #[test]
 fn test_root_persist_load_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = FragmentStore::new();
+    let mut store = FragmentStore::default();
     store.insert(sample_metadata("abc123", None, 0));
     persist_fragment_root(dir.path(), &store, 7).unwrap();
 
@@ -838,7 +857,7 @@ fn test_root_load_missing_is_none() {
 #[test]
 fn test_root_schema_mismatch_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = FragmentStore::new();
+    let mut store = FragmentStore::default();
     store.insert(sample_metadata("abc123", None, 0));
     persist_fragment_root(dir.path(), &store, 1).unwrap();
 
@@ -895,7 +914,7 @@ fn test_sync_unchanged_file_zero_reembeds() {
         .to_hex()
         .to_string();
     let files = vec![(file.clone(), file_hash)];
-    let mut store = FragmentStore::new();
+    let mut store = FragmentStore::default();
 
     let mut embed_calls: usize = 0;
     let (summary, _rows) = incremental_sync_fragments(
@@ -963,7 +982,7 @@ fn test_sync_single_edit_only_affected_reembedded() {
                 .to_string(),
         ),
     ];
-    let mut store = FragmentStore::new();
+    let mut store = FragmentStore::default();
 
     let (summary, _) = incremental_sync_fragments(
         dir.path(),
@@ -1056,7 +1075,7 @@ fn test_sync_manifest_roundtrip() {
 fn test_sync_mid_build_generation_serves_last_complete_root() {
     let dir = tempfile::tempdir().unwrap();
     let storage = dir.path().join(".leindex");
-    let mut store = FragmentStore::new();
+    let mut store = FragmentStore::default();
     store.insert(sample_metadata("abc123", None, 0));
 
     // Complete state: root + manifest BOTH at generation 1.
@@ -1094,7 +1113,7 @@ fn test_sync_root_mismatch_forces_rebuild() {
     let v2 = b"fn main() { println!(\"v2\"); }\n";
     std::fs::write(&file, v1).unwrap();
 
-    let mut store = FragmentStore::new();
+    let mut store = FragmentStore::default();
     let files = |bytes: &[u8]| vec![(file.clone(), blake3::hash(bytes).to_hex().to_string())];
     let (summary, _) = incremental_sync_fragments(
         dir.path(),
@@ -1159,7 +1178,7 @@ fn test_sync_extraction_identity_change_forces_resync() {
     std::fs::write(&file, contents).unwrap();
     let file_hash = blake3::hash(contents).to_hex().to_string();
     let files = vec![(file.clone(), file_hash)];
-    let mut store = FragmentStore::new();
+    let mut store = FragmentStore::default();
 
     let identity_a = FragmentExtractionIdentity::new("model-a", 12_000, true, true);
     let identity_b = FragmentExtractionIdentity::new("model-b", 12_000, true, true);
@@ -1263,6 +1282,102 @@ fn test_sync_extraction_identity_change_forces_resync() {
     );
 }
 
+/// Codex wave-2 item 2 regression: a PARTIAL embed failure must NOT commit the
+/// new extraction identity. If it did, the failed file's manifest hash stays
+/// stale while the identity now matches — the next run would see hash-match +
+/// identity-match and skip the incomplete file forever. The stale identity
+/// keeps the retry firing until every affected file fully embeds.
+#[test]
+fn test_sync_partial_failure_does_not_commit_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("main.rs");
+    let contents = b"fn main() { println!(\"hi\"); }\n";
+    std::fs::write(&file, contents).unwrap();
+    let file_hash = blake3::hash(contents).to_hex().to_string();
+    let files = vec![(file.clone(), file_hash)];
+    let mut store = FragmentStore::default();
+    let identity = FragmentExtractionIdentity::new("model-a", 12_000, true, true);
+
+    // First pass: embedding FAILS for every text (worker unavailable). The
+    // file is re-chunked but `complete=false`, so the identity must stay
+    // stale and the file hash must stay uncommitted.
+    let (summary_fail, _) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files,
+        &mut |path: &std::path::Path, bytes: &[u8]| {
+            one_fragment_per_file(path, bytes, Some("main"))
+        },
+        &mut |_texts: &[String]| vec![None],
+        false,
+        &identity,
+    )
+    .unwrap();
+    assert_eq!(summary_fail.files_changed, 1, "first pass sees the file");
+    assert_eq!(summary_fail.embedded, 0, "embeds failed, nothing stored");
+    assert_eq!(store.len(), 0, "failed embeds insert no rows");
+
+    // The persisted manifest must NOT claim the new identity after a failed
+    // pass (retry contract).
+    let storage = dir.path().join(".leindex");
+    let manifest_after_fail = load_fragment_sync_manifest(&storage)
+        .unwrap()
+        .expect("manifest persisted");
+    assert_ne!(
+        manifest_after_fail.extraction_identity, identity,
+        "failed pass must not commit the identity"
+    );
+    assert!(
+        manifest_after_fail.file_hashes.is_empty(),
+        "failed file's hash must stay uncommitted"
+    );
+
+    // Second pass: embedding now succeeds. The STALE identity still mismatches
+    // → the file is re-chunked and re-embedded; the identity is finally
+    // committed and the file hash recorded.
+    let (summary_ok, _) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files,
+        &mut |path: &std::path::Path, bytes: &[u8]| {
+            one_fragment_per_file(path, bytes, Some("main"))
+        },
+        &mut |texts: &[String]| texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect(),
+        false,
+        &identity,
+    )
+    .unwrap();
+    assert_eq!(summary_ok.embedded, 1, "retry embeds the recovered file");
+    assert_eq!(store.len(), 1);
+    let manifest_after_ok = load_fragment_sync_manifest(&storage)
+        .unwrap()
+        .expect("manifest persisted");
+    assert_eq!(
+        manifest_after_ok.extraction_identity, identity,
+        "fully-successful pass commits the identity"
+    );
+
+    // Third pass: identity + hash both match → incremental skip (0 re-embeds).
+    let mut embed_calls: usize = 0;
+    let (summary_inc, _) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files,
+        &mut |path: &std::path::Path, bytes: &[u8]| {
+            one_fragment_per_file(path, bytes, Some("main"))
+        },
+        &mut |texts: &[String]| {
+            embed_calls += texts.len();
+            texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect()
+        },
+        false,
+        &identity,
+    )
+    .unwrap();
+    assert_eq!(summary_inc.files_changed, 0, "committed identity ⇒ skip");
+    assert_eq!(embed_calls, 0, "no re-embeds after recovery");
+}
+
 // ---------------------------------------------------------------------------
 // chunk_code entry-point contract (Minor #1 empty-fragment guard)
 // ---------------------------------------------------------------------------
@@ -1278,7 +1393,7 @@ fn test_chunk_code_never_emits_empty_fragments() {
         Path::new("empty.py"),
         Path::new("empty.js"),
     ] {
-        let chunks = chunk_code("", path, MAX_BYTES_PER_CHUNK, true);
+        let chunks = chunk_code("", path, 12_000, true);
         assert!(
             chunks.iter().all(|f| !f.content.is_empty()),
             "chunk_code({path:?}) emitted an empty fragment: {chunks:?}"

@@ -192,21 +192,29 @@ impl LeIndex {
                 }
 
                 // Fragment owner mapping (Task 6, invariant 6): content hash →
-                // (owner node id, best byte range) from the store, used at
+                // ALL (owner node id, byte range) refs from the store, used at
                 // query time to map fragment hits back to their Tier-1 owners.
+                // A Vec per hash because identical content can legitimately
+                // live under N owners — dedup must not collapse multi-owner
+                // fragments to the first (Codex wave-2 item 5).
                 if let Ok(Some(store)) = &fragment_store {
-                    let refs: std::collections::HashMap<String, (String, (usize, usize))> = store
-                        .content_hashes()
-                        .filter_map(|hash| {
-                            store.get(hash).and_then(|metas| {
-                                metas.iter().find_map(|meta| {
-                                    meta.owner.as_ref().map(|owner| {
-                                        (hash.to_string(), (owner.clone(), meta.byte_range))
+                    let refs: std::collections::HashMap<String, Vec<(String, (usize, usize))>> =
+                        store
+                            .content_hashes()
+                            .filter_map(|hash| {
+                                let owners: Vec<(String, (usize, usize))> = store
+                                    .get(hash)
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|meta| {
+                                        meta.owner
+                                            .as_ref()
+                                            .map(|owner| (owner.clone(), meta.byte_range))
                                     })
-                                })
+                                    .collect();
+                                (!owners.is_empty()).then(|| (hash.to_string(), owners))
                             })
-                        })
-                        .collect();
+                            .collect();
                     self.search_engine.set_fragment_refs(refs);
                 }
 
