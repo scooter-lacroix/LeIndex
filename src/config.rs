@@ -94,7 +94,9 @@ pub struct SearchConfig {
     #[serde(default)]
     pub fragment_index_enabled: bool,
 
-    /// Max bytes per fragment (≈ Warp 200 lines × 60 chars).
+    /// Max bytes per fragment (≈ Warp 200 lines × 60 chars). 0 disables the
+    /// byte cap — fragments are bounded by the line chunk only (Codex wave-3
+    /// item 3: a zero limit previously looped forever in the byte splitter).
     #[serde(default = "default_fragment_max_bytes")]
     pub fragment_max_bytes: u64,
 

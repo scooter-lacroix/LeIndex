@@ -42,6 +42,15 @@ pub(crate) fn orphan_fragments<'a>(input: OrphanInput<'a>) -> Vec<Fragment<'a>> 
     let file_len = code.len();
     let doc_end = input.file_doc_end.min(file_len);
 
+    // A zero byte limit means "no byte cap" (Codex wave-3 item 3): each orphan
+    // region is chunked whole (bounded by lines only) instead of entering the
+    // naive byte-split loop, which would spin forever with a 0 chunk size.
+    let max_bytes = if input.max_bytes == 0 {
+        file_len
+    } else {
+        input.max_bytes
+    };
+
     // Merge overlapping Tier-1 node ranges into a sorted, disjoint list.
     let mut ranges: Vec<(usize, usize)> = input.node_ranges.to_vec();
     ranges.retain(|(start, end)| start < end && *start < file_len);
@@ -79,7 +88,7 @@ pub(crate) fn orphan_fragments<'a>(input: OrphanInput<'a>) -> Vec<Fragment<'a>> 
         }
         let region_code = &code[region_start..region_end];
         let line_base = code[..region_start].bytes().filter(|&b| b == b'\n').count();
-        let mut fragments = chunk_naive(region_code, input.path, input.max_bytes, LINES_PER_CHUNK);
+        let mut fragments = chunk_naive(region_code, input.path, max_bytes, LINES_PER_CHUNK);
         for fragment in &mut fragments {
             fragment.start_byte_index += region_start;
             fragment.end_byte_index += region_start;

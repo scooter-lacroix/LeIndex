@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use super::*;
+use crate::graph::pdg::{Node, ProgramDependenceGraph};
 use crate::parse::grammar::LanguageId;
 
 /// Resolve the tree-sitter Language for a file extension via the shared cache.
@@ -1403,4 +1404,80 @@ fn test_chunk_code_never_emits_empty_fragments() {
             "chunk_code({path:?}) on empty input must return [], got {chunks:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Codex wave-3 item 3: fragment_max_bytes = 0 must mean "no byte cap"
+// ---------------------------------------------------------------------------
+
+/// A zero byte limit previously sent `chunk_naive`'s byte-split loop into an
+/// infinite spin (`chunk_size = min(remaining, 0) = 0` → `chunk_end ==
+/// current_start` → empty fragments forever). 0 must instead mean "no byte
+/// cap": the whole input is one fragment.
+#[test]
+fn test_chunk_naive_zero_max_bytes_no_infinite_loop() {
+    let code = "line1\nline2\nline3\nline4abcdefghijklmnopqrstuvwxyz";
+    let path = Path::new("test_file.xyz");
+
+    let fragments = chunk_naive(code, path, 0, 1000);
+
+    assert_eq!(fragments.len(), 1, "zero byte cap → one fragment, no loop");
+    assert_eq!(fragments[0].content, code);
+    assert!(!fragments[0].content.is_empty());
+}
+
+/// `chunk_code` normalizes a zero byte cap to the whole source: the semantic
+/// path emits one fragment covering the full input (and never recurses with a
+/// 0-size split).
+#[test]
+fn test_chunk_code_zero_max_bytes_returns_whole_source() {
+    // No trailing newline: the semantic path's coverage is the root node's
+    // children (a final `\n` is not part of any fn_item, so it is excluded
+    // from the fragment range).
+    let source = "fn foo() {}\nfn bar() {}";
+    let fragments = chunk_code(source, Path::new("test.rs"), 0, true);
+
+    assert_eq!(
+        fragments.len(),
+        1,
+        "zero byte cap → whole source as one fragment"
+    );
+    assert_eq!(fragments[0].content, source);
+}
+
+// ---------------------------------------------------------------------------
+// Codex wave-3 item 2: Tier-3 orphans for files with only top-level statements
+// ---------------------------------------------------------------------------
+
+/// A file whose only PDG node is the FileSummary (no symbol nodes → empty
+/// node-range set) previously got ZERO fragments: the `!node_ranges.is_empty()`
+/// gate in `extract_file_fragments` skipped the whole orphan pass. The
+/// complement of an empty range set is the entire file minus the leading
+/// file-doc region, so these files must now get full Tier-3 coverage,
+/// attributed to the FileSummary owner (invariant 6).
+#[test]
+fn test_extract_orphans_for_top_level_only_file() {
+    let mut pdg = ProgramDependenceGraph::new();
+    let _fs = pdg.add_node(Node::new_file_summary("script.py", "python"));
+    // No trailing newline: `line_spans` excludes a final line terminator, so
+    // the orphan fragment's byte range is the full file only without one.
+    let code = b"import os\n\nprint(\"hello world\")";
+    let candidates = extract_file_fragments(&pdg, Path::new("script.py"), code, 12_000, true, true);
+
+    assert!(
+        !candidates.is_empty(),
+        "top-level-only file must produce Tier-3 orphan fragments"
+    );
+    let mut covered = 0usize;
+    for candidate in &candidates {
+        assert_eq!(
+            candidate.meta.owner.as_deref(),
+            Some("script.py::file_summary"),
+            "orphans map back to the FileSummary owner (invariant 6)"
+        );
+        assert!(!candidate.enriched_text.is_empty());
+        covered += candidate.meta.byte_range.1 - candidate.meta.byte_range.0;
+    }
+    // No symbol nodes → the orphan complement covers the entire source.
+    assert_eq!(covered, code.len(), "orphan coverage spans the whole file");
 }

@@ -54,6 +54,7 @@ fragment_index_enabled = false
 # ranking (MRR sweep: 0.12/0.20 no gain, 0.35 flips to full recall, node-rank 1.0).
 fragment_weight = 0.35
 # Max bytes per fragment (~200 lines x 60 chars, mirroring Warp's default).
+# 0 disables the byte cap (fragments bounded by lines only).
 fragment_max_bytes = 12000
 # Include Tier-3 module-level orphan regions.
 fragment_orphan_enabled = true

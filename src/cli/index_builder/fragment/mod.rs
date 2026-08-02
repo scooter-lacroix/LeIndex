@@ -41,6 +41,8 @@ pub(crate) use chunker::{chunk_naive, chunk_semantic};
 #[cfg(test)]
 pub(crate) use enrich::{enrich_fragment, enrich_orphan, orphan_header, owner_header};
 #[cfg(test)]
+pub(crate) use extract::extract_file_fragments;
+#[cfg(test)]
 pub(crate) use orphan::{OrphanInput, orphan_fragments};
 #[cfg(test)]
 pub(crate) use sync::{
@@ -144,6 +146,17 @@ pub(crate) fn chunk_code<'a>(
     max_bytes: usize,
     naive_fallback: bool,
 ) -> Vec<Fragment<'a>> {
+    // A zero `max_bytes` means "no byte cap" (Codex wave-3 item 3): the whole
+    // input is one chunking unit, and the naive path never enters its byte-
+    // split loop. Normalizing to `code.len()` (floor 1) here keeps every
+    // downstream chunker under the invariant that its byte limit is > 0;
+    // `split_node`/`chunk_line_by_bytes` additionally guard `== 0` directly
+    // for callers that bypass this wrapper (e.g. `orphan_fragments`).
+    let max_bytes = if max_bytes == 0 {
+        code.len().max(1)
+    } else {
+        max_bytes
+    };
     if let Some(mut fragments) = try_chunk_code_semantically(code, path, max_bytes) {
         // ponytail: empty-file edge case can yield one spurious empty fragment
         // via the semantic path (naive path already returns []). Drop it so the

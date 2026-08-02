@@ -76,6 +76,23 @@ fn split_node<'a, 'b>(
         ));
     }
 
+    // Guard (Codex wave-3 item 3): a zero byte limit means "no byte cap" — the
+    // whole node is one fragment. Without this, `child_size > 0` would recurse
+    // into every child (bounded only by MAX_TRAVERSAL_DEPTH) and waste a full
+    // depth-limited recursion; the naive path has the same 0-size loop hazard.
+    if max_bytes_per_chunk == 0 {
+        let node_start = node.start_byte();
+        let node_end = node.end_byte();
+        return Ok(vec![Fragment {
+            content: &code[node_start..node_end],
+            start_line: node.start_position().row,
+            end_line: node.end_position().row,
+            start_byte_index: node_start,
+            end_byte_index: node_end,
+            file_path: path,
+        }]);
+    }
+
     let mut current_fragment = Fragment::from_node_start(node, path);
     let mut fragments = vec![];
 
@@ -170,7 +187,10 @@ pub(crate) fn chunk_naive<'a>(
             let (end_line, end_range) =
                 chunk.last().expect("Chunks must have at least one element");
 
-            if (end_range.1 - start_range.0) > max_bytes_per_chunk {
+            // A zero byte limit means "no byte cap" (Codex wave-3 item 3): the
+            // line-chunk is emitted whole and the byte-split path below is
+            // never entered (chunk_line_by_bytes guards `== 0` as well).
+            if max_bytes_per_chunk != 0 && (end_range.1 - start_range.0) > max_bytes_per_chunk {
                 let chunked_fragments = chunk.iter().flat_map(|(line, line_span)| {
                     chunk_line_by_bytes(code, path, max_bytes_per_chunk, *line, *line_span)
                 });
@@ -229,6 +249,21 @@ fn chunk_line_by_bytes<'a>(
     let (line_start, line_end) = line_span;
     let line_content = &code[line_start..line_end];
     let line_length = line_end - line_start;
+
+    // Guard (Codex wave-3 item 3): a zero byte limit means "no byte cap" — the
+    // line is one fragment. Without this the split loop computes
+    // `chunk_size = min(remaining, 0) = 0`, `chunk_end == current_start`, and
+    // spins forever pushing empty fragments.
+    if max_bytes_per_chunk == 0 {
+        return vec![Fragment {
+            content: line_content,
+            start_line: line_number,
+            end_line: line_number,
+            file_path: path,
+            start_byte_index: line_start,
+            end_byte_index: line_end,
+        }];
+    }
 
     // If the line is smaller than max_bytes_per_chunk, return it as a single fragment.
     if line_length <= max_bytes_per_chunk {

@@ -87,10 +87,15 @@ fn node_type_to_str(node_type: &NodeType) -> &'static str {
 /// file, ready for the incremental sync engine.
 ///
 /// `max_bytes` bounds both Tier-2 sub-symbol and Tier-3 orphan chunk size
-/// (mirrors `[search] fragment_max_bytes`), and `naive_fallback` gates the
-/// naive 200-line chunker when a tree-sitter grammar is unavailable (mirrors
-/// `[search] fragment_naive_fallback`). Returns an empty vec when the file is
-/// not valid UTF-8 or produces no fragments (fully node-covered file).
+/// (mirrors `[search] fragment_max_bytes`; 0 = no byte cap), and
+/// `naive_fallback` gates the naive 200-line chunker when a tree-sitter grammar
+/// is unavailable (mirrors `[search] fragment_naive_fallback`). Returns an
+/// empty vec when the file is not valid UTF-8 or produces no fragments (a
+/// fully node-covered file whose complement contains nothing indexable). Files
+/// with ONLY top-level statements (a FileSummary node but no symbol nodes)
+/// still get Tier-3 orphan coverage: with an empty node-range set the
+/// complement is the whole file minus the leading file-doc region, which is
+/// exactly the glue code FileSummary does not synthesize (Codex wave-3 item 2).
 pub(crate) fn extract_file_fragments(
     pdg: &ProgramDependenceGraph,
     path: &Path,
@@ -211,7 +216,15 @@ pub(crate) fn extract_file_fragments(
     // map back to a searchable file-level result (invariant 6: fragment hits
     // always map to an owner node before surfacing). Without a FileSummary the
     // orphan keeps owner: None and is stored but not independently searchable.
-    if orphan_enabled && !node_ranges.is_empty() {
+    //
+    // The gate is bare `orphan_enabled`: with an EMPTY node-range set (files
+    // with only top-level statements — a FileSummary node but no symbol
+    // nodes) `orphan_fragments` computes the complement as the whole file
+    // minus the leading file-doc region, giving those files Tier-3 coverage
+    // instead of zero fragments (Codex wave-3 item 2). No double-index risk:
+    // FileSummary ranges are excluded from `node_ranges` and the file-doc
+    // region is excluded by `leading_file_doc_end`.
+    if orphan_enabled {
         let file_doc_end = leading_file_doc_end(file_bytes);
         for frag in orphan_fragments(OrphanInput {
             file_bytes,
