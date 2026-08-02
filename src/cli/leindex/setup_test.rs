@@ -1,5 +1,34 @@
 use super::*;
 
+#[test]
+fn preserve_existing_sections_keeps_fragment_knobs_across_rerun() {
+    // Codex P2 regression: rerunning `leindex setup` must not reset fragment_*
+    // settings to defaults when search_mode stays at "hybrid" (the default).
+    // The old conditional only preserved the search section when search_mode
+    // differed, silently clobbering fragment config on a default-mode rerun.
+    let mut existing = crate::config::LeIndexConfig::default();
+    existing.search.fragment_index_enabled = true;
+    existing.search.fragment_weight = 0.5;
+    existing.search.fragment_max_bytes = 9_999;
+    existing.search.fragment_orphan_enabled = false;
+    existing.search.fragment_naive_fallback = false;
+
+    // `new_config` mirrors `build_config`: neural from prompts, search/indexing defaults.
+    let mut new_config = crate::config::LeIndexConfig::default();
+    new_config.neural.model_name = "new-model".to_string();
+
+    let merged = preserve_existing_sections(new_config, &existing);
+
+    // Fragment settings preserved from `existing`, not reset to defaults.
+    assert!(merged.search.fragment_index_enabled);
+    assert_eq!(merged.search.fragment_weight, 0.5);
+    assert_eq!(merged.search.fragment_max_bytes, 9_999);
+    assert!(!merged.search.fragment_orphan_enabled);
+    assert!(!merged.search.fragment_naive_fallback);
+    // Neural (the one section setup owns) still comes from the new config.
+    assert_eq!(merged.neural.model_name, "new-model");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn test_setup_ort_lib_name_accepts_versioned_linux_pip_soname() {

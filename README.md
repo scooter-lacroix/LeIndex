@@ -643,7 +643,7 @@ LeIndex.
 
 ### Fragment Index (sub-symbol semantic chunks)
 
-LeIndex 1.11 adds an **opt-in fragment embedding layer** that improves both
+LeIndex 1.9.5 adds an **opt-in fragment embedding layer** that improves both
 recall and precision on top of the node-level TF-IDF/PDG/neural stack:
 
 - **Tier 2 — sub-symbol fragments**: large nodes (functions, methods, blocks)

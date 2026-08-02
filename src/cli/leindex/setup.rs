@@ -1018,6 +1018,21 @@ fn run_embedding_smoke_test_inner(
 /// VAL-SETUP-024: Idempotent - re-running produces equivalent config
 /// VAL-SETUP-029: Corrupted config recovered gracefully
 /// VAL-SETUP-030: Stale config migrated
+/// Preserve the search + indexing sections from an existing config across a
+/// setup rerun. `build_config` always emits defaults for these sections (setup
+/// only owns the neural section), so they carry no user intent — the existing
+/// values must always win. The prior search_mode/batch_size-diff condition
+/// silently reset fragment settings to defaults on a default-mode rerun
+/// (Codex P2 review). Extracted from `merge_with_existing` for unit testing.
+fn preserve_existing_sections(
+    mut new_config: crate::config::LeIndexConfig,
+    existing: &crate::config::LeIndexConfig,
+) -> crate::config::LeIndexConfig {
+    new_config.search = existing.search.clone();
+    new_config.indexing = existing.indexing.clone();
+    new_config
+}
+
 fn merge_with_existing(
     mut new_config: crate::config::LeIndexConfig,
 ) -> (crate::config::LeIndexConfig, Option<RecoveryNotice>) {
@@ -1029,16 +1044,10 @@ fn merge_with_existing(
                     Some(RecoveryNotice::RecoveredFromCorrupt(backup))
                 }
                 crate::config::RecoveryAction::Loaded => {
-                    // VAL-SETUP-030: Preserve search/indexing settings from existing config
-                    // unless the new config explicitly overrides them. Setup always
-                    // writes neural settings; search/indexing are borrowed from existing.
-                    if existing.search.search_mode != new_config.search.search_mode {
-                        // Preserve existing search settings
-                        new_config.search = existing.search;
-                    }
-                    if existing.indexing.batch_size != new_config.indexing.batch_size {
-                        new_config.indexing = existing.indexing;
-                    }
+                    // VAL-SETUP-030 / Codex P2: setup only owns neural config, so the
+                    // existing search + indexing sections (incl. fragment_* knobs and
+                    // indexing.batch_size) are preserved unconditionally across reruns.
+                    new_config = preserve_existing_sections(new_config, &existing);
 
                     // VAL-SETUP-030: Detect stale ORT dylib paths left over
                     // from older installs. The pre-1.8 bundling strategy
