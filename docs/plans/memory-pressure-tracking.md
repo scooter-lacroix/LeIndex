@@ -17,8 +17,8 @@
 
 | # | Task | Owner | Status | Empirical/validation evidence | Commit | Handoff notes |
 |---|------|-------|--------|-------------------------------|--------|---------------|
-| T0 | Baseline capture (`free -h`, per-proc RSS/swap/VSZ, index size, uptimes) | Agent B | ✅ | 62Gi/40Gi used, swap 31/31Gi; claude mcp 2.39GiB RSS/14.0GiB swap; worker 2.15GiB/8.9GiB/24.3GiB VSZ; index 51G; 8+ mcp instances | — | Evidence: findings doc §2; handoff = plan approved by GrayHill before T1 |
-| T1 | Config plumbing (mcp idle, engine max idle, ORT threads, worker RSS/available knobs) | Agent B | ⬜ | — | — | GrayHill: review config schema + dotfile parity |
+| T0 | Baseline capture (`free -h`, per-proc RSS/swap/VSZ, index size, uptimes) | Agent B | ✅ | 62Gi/40Gi used, swap 31/31Gi; claude mcp 2.39GiB RSS/14.0GiB swap; worker 2.15GiB/8.9GiB/24.3GiB VSZ; index 51G; 8+ mcp instances | — | Evidence: findings doc §2; plan + tracker approved by GrayHill (msg 72/73) + user scope (bolt onto PR #51) |
+| T1 | Config plumbing (mcp idle, engine max idle, ORT threads, worker RSS/available knobs) | Agent B | 🔁 | fmt PASS · clippy cli --all-targets -D PASS (j2-capped; box under swap pressure) · config 49/0 · setup 99/0 · mcp 203/0 | `bc6faf9d` (on 4c238135 docs) | GrayHill: review schema + dotfile parity; on sign-off → T2 |
 | T2 | MCP process-level idle exit (`--mcp-idle-timeout-secs`) | Agent B | ⬜ | — | — | Needs T1 knob; unit test with 2s window |
 | T3 | ProjectRegistry loaded-engine idle eviction | Agent B | ⬜ | — | — | Needs T1 knob; RSS-baseline measurement required (51G project) |
 | T4 | Single-instance per-project lock | Agent B | ⬜ | — | — | Stretch; confirm scope with maintainer |
@@ -49,7 +49,8 @@
 
 | Handoff | From | To | State | Notes |
 |---------|------|----|-------|-------|
-| 1 | Agent B | GrayHill | SENT | Plan + tracker + findings docs created (2026-08-02). Request: review D1–D6 + territory map before T1. Agent B holds all implementation until alignment. |
+| 1 | Agent B | GrayHill | ✅ | Plan + tracker + findings docs created (2026-08-02). GrayHill approved D-1/D-2/D-4/D-5/D-6 (msg 72); D-3 resolved advisory-only (msg 74); user decided bolt-onto-PR-#51 (msg 73). |
+| 2 | Agent B | GrayHill | SENT | T1 batch committed `4c238135` (docs) + `bc6faf9d` (config knobs), NOT pushed. Awaiting GrayHill review before T2 (idle exit). |
 
 ---
 
