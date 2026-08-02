@@ -68,6 +68,63 @@ fn generate_session_id() -> String {
     format!("leindex-{pid}-{seq}")
 }
 
+/// Process-level last-activity clock for MCP idle self-exit (D-1).
+///
+/// Tracks when the *process* last served any request across both stdio and
+/// Unix-socket transports, so a long-lived MCP server can self-terminate
+/// after an operator-configured quiet window (`[mcp] idle_timeout_secs`,
+/// `--mcp-idle-timeout-secs`). MCP clients (claude/codex/maestro) treat
+/// server exit as the normal MCP lifecycle and respawn on the next tool call.
+///
+/// Memory-pressure remediation: the 8-instance accumulation observed on the
+/// swap-saturated workstation was servers idling-forever while their agent
+/// parent held the pipe open; idle self-exit is the highest-impact lever.
+#[derive(Clone)]
+pub struct ProcessIdleClock {
+    last_request_ms: Arc<AtomicU64>,
+}
+
+impl Default for ProcessIdleClock {
+    fn default() -> Self {
+        Self {
+            last_request_ms: Arc::new(AtomicU64::new(now_unix_ms())),
+        }
+    }
+}
+
+impl ProcessIdleClock {
+    /// Create a clock initialized to "now" (zero idle at construction).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record activity — call whenever a request or connection is observed.
+    pub fn touch(&self) {
+        self.last_request_ms.store(now_unix_ms(), Ordering::Relaxed);
+    }
+
+    /// How long since the last recorded activity.
+    pub fn idle_duration(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            now_unix_ms().saturating_sub(self.last_request_ms.load(Ordering::Relaxed)),
+        )
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// True when the process has been idle for at least `timeout`.
+///
+/// `timeout == None` means idle exit is disabled (`--mcp-idle-timeout-secs 0`).
+pub fn idle_exit_due(idle: std::time::Duration, timeout: Option<std::time::Duration>) -> bool {
+    timeout.is_some_and(|t| idle >= t)
+}
+
 /// Default MCP server port.
 ///
 /// Chosen in IANA dynamic/private range (49152-65535) and well above the
@@ -1148,7 +1205,17 @@ impl McpServer {
     ///
     /// The socket file is removed when the returned future completes or is
     /// dropped (via `SocketCleanupGuard`).
-    pub async fn run_socket(&self, socket_path: &std::path::Path) -> anyhow::Result<()> {
+    /// Run the MCP server on a Unix domain socket.
+    ///
+    /// `idle_clock` tracks process-level activity for the D-1 idle self-exit;
+    /// `idle_timeout` is the quiet window after which the process exits 0
+    /// (`None` = disabled via `--mcp-idle-timeout-secs 0`).
+    pub async fn run_socket(
+        &self,
+        socket_path: &std::path::Path,
+        idle_clock: ProcessIdleClock,
+        idle_timeout: Option<std::time::Duration>,
+    ) -> anyhow::Result<()> {
         use tokio::net::UnixListener;
 
         // Remove stale socket file if present
@@ -1173,31 +1240,62 @@ impl McpServer {
             socket_path.display()
         );
 
+        // D-1/D-2 (memory-pressure remediation): a per-second tick enforces the
+        // process-level idle self-exit; a 60-second sweep evicts loaded project
+        // engines that have been idle past `[mcp] engine_max_idle_secs` so a
+        // long-lived server does not retain every project it ever touched.
+        let idle_timeout: Option<std::time::Duration> = idle_timeout;
+        let engine_max_idle = std::time::Duration::from_secs(
+            crate::config::LeIndexConfig::load_cached()
+                .mcp
+                .engine_max_idle_secs,
+        );
+        let mut idle_ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut sweep_ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+
         loop {
-            let (stream, _addr) = listener
-                .accept()
-                .await
-                .context("Failed to accept connection")?;
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _addr) = accepted.context("Failed to accept connection")?;
+                    idle_clock.touch();
 
-            let session_id = generate_session_id();
-            self.session_handshakes.insert(
-                Arc::<str>::from(session_id.as_str()),
-                (false, Instant::now()),
-            );
+                    let session_id = generate_session_id();
+                    self.session_handshakes.insert(
+                        Arc::<str>::from(session_id.as_str()),
+                        (false, Instant::now()),
+                    );
 
-            tokio::spawn(handle_socket_connection(
-                stream,
-                session_id,
-                self.session_handshakes.clone(),
-                self.handshake_complete.clone(),
-            ));
+                    tokio::spawn(handle_socket_connection(
+                        stream,
+                        session_id,
+                        self.session_handshakes.clone(),
+                        self.handshake_complete.clone(),
+                        idle_clock.clone(),
+                    ));
+                }
+                _ = sweep_ticker.tick() => {
+                    if let Some(registry) = SERVER_STATE.get() {
+                        let evicted = registry.evict_idle_engines(engine_max_idle).await;
+                        if evicted > 0 {
+                            info!(
+                                "Evicted {evicted} idle project engine(s) (D-2 engine idle eviction)"
+                            );
+                        }
+                    }
+                }
+                _ = idle_ticker.tick() => {
+                    if idle_exit_due(idle_clock.idle_duration(), idle_timeout) {
+                        info!(
+                            "MCP socket server idle for {idle_timeout:?}; exiting (D-1 memory-pressure idle exit)"
+                        );
+                        break;
+                    }
+                }
+            }
         }
 
-        #[allow(unreachable_code)]
-        {
-            // _guard is dropped here, cleaning up the socket file
-            Ok(())
-        }
+        // _guard is dropped here, cleaning up the socket file
+        Ok(())
     }
 }
 
@@ -1393,10 +1491,12 @@ async fn handle_socket_connection(
     session_id: String,
     session_handshakes: Arc<DashMap<Arc<str>, (bool, Instant)>>,
     handshake_complete: Arc<AtomicBool>,
+    idle_clock: ProcessIdleClock,
 ) {
     use tokio::io::BufReader;
 
     debug!("Accepted Unix socket connection (session: {})", session_id);
+    idle_clock.touch();
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
@@ -1422,6 +1522,7 @@ async fn handle_socket_connection(
         if json_payload.is_empty() {
             continue;
         }
+        idle_clock.touch();
         let Some(response) = handle_socket_message(
             &json_payload,
             &session_id,

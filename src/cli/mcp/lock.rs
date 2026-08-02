@@ -1,0 +1,250 @@
+//! Advisory per-project single-instance lock for `leindex mcp` (D-3).
+//!
+//! Memory-pressure remediation: the swap-saturated workstation showed **8+
+//! concurrent `leindex mcp` instances** for the same projects — every agent
+//! session spawned its own server, each holding a ~2.4 GiB loaded engine
+//! resident forever. This module writes a project-scoped lockfile
+//! (`~/.leindex/run/leindex-mcp-<project-hash>.{lock,start}`) so a second
+//! server for the same canonical project can *at least* know a live sibling
+//! exists.
+//!
+//! **Advisory only — deliberately NOT a hard exit.** GrayHill flagged the
+//! original D-3 design as a flaw: stdio MCP servers are 1:1 with the agent's
+//! pipe, so a second instance hard-exiting 0 would break that agent's client.
+//! The agreed design logs the overlap and continues; the *real* dedup lever
+//! is the D-1 idle self-exit + D-2 engine eviction, which make duplicate
+//! servers self-terminate and drop their engines.
+
+use std::hash::{Hash, Hasher};
+use std::io;
+use std::path::{Path, PathBuf};
+
+/// Outcome of [`McpProjectLock::try_acquire`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockOutcome {
+    /// This process now owns the lock (freshly written or stale-stolen).
+    Acquired,
+    /// A live sibling `leindex mcp` serves the same canonical project. The
+    /// caller should log a warning and continue (advisory semantics).
+    AlreadyOwned {
+        /// PID of the live sibling instance owning the lock.
+        pid: u32,
+    },
+    /// The lock could not be established (no home dir / write failure).
+    /// Treat as advisory-no-op: never block the server on a lock problem.
+    NotAvailable,
+}
+
+/// Held lock guard. Removing the sidecars on `Drop` keeps `~/.leindex/run/`
+/// self-healing when a server exits cleanly (the D-7 GC covers SIGKILL debris).
+#[derive(Debug)]
+pub struct McpProjectLock {
+    run_dir: PathBuf,
+    stem: String,
+}
+
+impl McpProjectLock {
+    /// Try to acquire the advisory lock for a canonical project path.
+    ///
+    /// Steals the lock when the owning PID is dead (start-time mismatch or
+    /// missing `/proc` entry), mirroring `daemon_pid_is_owned` semantics.
+    /// Never fails the server: all error paths degrade to `NotAvailable`.
+    pub fn try_acquire(canonical: &Path) -> (LockOutcome, Option<McpProjectLock>) {
+        let Some(home) = crate::config::resolve_leindex_home() else {
+            return (LockOutcome::NotAvailable, None);
+        };
+        let run_dir = home.join("run");
+        Self::try_acquire_in_dir(canonical, &run_dir)
+    }
+
+    /// Testable core: acquires the lock under an explicit run directory.
+    pub fn try_acquire_in_dir(
+        canonical: &Path,
+        run_dir: &Path,
+    ) -> (LockOutcome, Option<McpProjectLock>) {
+        let stem = lock_stem(canonical);
+        if std::fs::create_dir_all(run_dir).is_err() {
+            return (LockOutcome::NotAvailable, None);
+        }
+        let lock_path = run_dir.join(format!("{stem}.lock"));
+        let start_path = run_dir.join(format!("{stem}.start"));
+
+        if let Ok(pid_str) = std::fs::read_to_string(&lock_path) {
+            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                if pid_is_owned(pid, &start_path) {
+                    return (LockOutcome::AlreadyOwned { pid }, None);
+                }
+            }
+        }
+
+        // Fresh acquire or stale steal: write pid + start-time sidecars.
+        if write_pid(&lock_path, std::process::id()).is_err()
+            || write_start_time(&start_path, std::process::id()).is_err()
+        {
+            return (LockOutcome::NotAvailable, None);
+        }
+
+        (
+            LockOutcome::Acquired,
+            Some(McpProjectLock {
+                run_dir: run_dir.to_path_buf(),
+                stem,
+            }),
+        )
+    }
+
+    /// Explicitly release the sidecars (also called by `Drop`).
+    pub fn release(&self) {
+        let _ = std::fs::remove_file(self.run_dir.join(format!("{}.lock", self.stem)));
+        let _ = std::fs::remove_file(self.run_dir.join(format!("{}.start", self.stem)));
+    }
+}
+
+impl Drop for McpProjectLock {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Deterministic per-project lock stem: `leindex-mcp-<16-hex-hash>`.
+fn lock_stem(canonical: &Path) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.as_os_str().hash(&mut hasher);
+    format!("leindex-mcp-{:016x}", hasher.finish())
+}
+
+/// True when `pid` is alive AND matches the `start` sidecar (a reused PID for
+/// a dead process fails the start-time comparison, so stale locks are stolen).
+fn pid_is_owned(pid: u32, start_path: &Path) -> bool {
+    let expected = std::fs::read_to_string(start_path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let Some(expected) = expected else {
+        return false;
+    };
+    let actual = proc_start_time(pid);
+    if actual != Some(expected) {
+        return false;
+    }
+    // Secondary sanity: the owning process should be a leindex mcp server.
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok();
+    cmdline.is_some_and(|raw| {
+        let command = String::from_utf8_lossy(&raw);
+        command
+            .split('\0')
+            .any(|arg| arg.contains("leindex") || arg.contains("mcp"))
+    })
+}
+
+fn proc_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat.rsplit_once(") ")?.1;
+    fields.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+fn write_pid(path: &Path, pid: u32) -> io::Result<()> {
+    std::fs::write(path, format!("{pid}\n"))
+}
+
+fn write_start_time(path: &Path, pid: u32) -> io::Result<()> {
+    let start = proc_start_time(pid)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no /proc stat for pid"))?;
+    std::fs::write(path, format!("{start}\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_run_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    #[test]
+    fn test_acquire_writes_and_releases_sidecars() {
+        let dir = temp_run_dir();
+        let canonical = Path::new("/tmp/proj-a");
+        let (outcome, guard) = McpProjectLock::try_acquire_in_dir(canonical, dir.path());
+        assert_eq!(outcome, LockOutcome::Acquired);
+        let guard = guard.expect("guard");
+        let lock_path = dir.path().join(format!("{}.lock", lock_stem(canonical)));
+        assert!(lock_path.exists());
+        // Dropping the guard removes the sidecars.
+        drop(guard);
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn test_second_live_instance_reports_owned() {
+        let dir = temp_run_dir();
+        let canonical = Path::new("/tmp/proj-b");
+        let (_o1, guard1) = McpProjectLock::try_acquire_in_dir(canonical, dir.path());
+        assert!(guard1.is_some());
+
+        // Second acquire from the same live process (this test binary) must
+        // report AlreadyOwned with our own pid.
+        let (outcome, guard2) = McpProjectLock::try_acquire_in_dir(canonical, dir.path());
+        assert_eq!(
+            outcome,
+            LockOutcome::AlreadyOwned {
+                pid: std::process::id()
+            }
+        );
+        assert!(guard2.is_none());
+        // After the first guard drops, a fresh acquire succeeds again.
+        drop(guard1);
+        let (outcome, _guard3) = McpProjectLock::try_acquire_in_dir(canonical, dir.path());
+        assert_eq!(outcome, LockOutcome::Acquired);
+    }
+
+    #[test]
+    fn test_stale_lock_with_dead_pid_is_stolen() {
+        let dir = temp_run_dir();
+        let canonical = Path::new("/tmp/proj-c");
+        let stem = lock_stem(canonical);
+        // Dead PID sidecars (pid 2^22 will not exist as this process).
+        let dead_pid = 1 << 22;
+        std::fs::write(
+            dir.path().join(format!("{stem}.lock")),
+            format!("{dead_pid}\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(format!("{stem}.start")), "12345\n").unwrap();
+
+        let (outcome, guard) = McpProjectLock::try_acquire_in_dir(canonical, dir.path());
+        assert_eq!(outcome, LockOutcome::Acquired, "stale lock must be stolen");
+        assert!(guard.is_some());
+        // The stolen lock now records our own pid.
+        let lock_contents =
+            std::fs::read_to_string(dir.path().join(format!("{stem}.lock"))).unwrap();
+        assert_eq!(
+            lock_contents.trim().parse::<u32>().unwrap(),
+            std::process::id()
+        );
+    }
+
+    #[test]
+    fn test_different_projects_coexist() {
+        let dir = temp_run_dir();
+        let (o1, g1) = McpProjectLock::try_acquire_in_dir(Path::new("/tmp/proj-d1"), dir.path());
+        let (o2, g2) = McpProjectLock::try_acquire_in_dir(Path::new("/tmp/proj-d2"), dir.path());
+        assert_eq!(o1, LockOutcome::Acquired);
+        assert_eq!(o2, LockOutcome::Acquired);
+        assert!(g1.is_some());
+        assert!(g2.is_some());
+    }
+
+    #[test]
+    fn test_pid_is_owned_self() {
+        // Our own process + our own start-time must be reported as owned.
+        let dir = temp_run_dir();
+        let start_path = dir.path().join("self.start");
+        write_start_time(&start_path, std::process::id()).unwrap();
+        assert!(pid_is_owned(std::process::id(), &start_path));
+        // A wrong start-time (bogus pid) must be reported as not owned.
+        assert!(!pid_is_owned(
+            std::process::id(),
+            &dir.path().join("missing.start")
+        ));
+    }
+}

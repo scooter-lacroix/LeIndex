@@ -400,17 +400,16 @@ impl Cli {
             Commands::Serve { host, port } => cmd_serve_impl(host, port).await,
             Commands::Mcp {
                 socket,
-                idle_timeout_secs: _idle_timeout_secs,
+                idle_timeout_secs,
                 ..
             } => {
-                // T2 (memory-pressure remediation) wires `_idle_timeout_secs`
-                // (CLI override of `[mcp] idle_timeout_secs`) into the stdio
-                // and socket server loops; parsed here so the flag surface is
-                // complete in T1.
+                // T2 (memory-pressure remediation): the CLI flag overrides
+                // `[mcp] idle_timeout_secs` and drives the D-1 idle self-exit
+                // in both the stdio and socket server loops.
                 if let Some(ref socket_path) = socket {
-                    cmd_mcp_socket_impl(socket_path, global_project).await
+                    cmd_mcp_socket_impl(socket_path, global_project, idle_timeout_secs).await
                 } else {
-                    cmd_mcp_stdio_impl(global_project).await
+                    cmd_mcp_stdio_impl(global_project, idle_timeout_secs).await
                 }
             }
             Commands::Dashboard { port, prod } => cmd_dashboard_impl(port, prod).await,
