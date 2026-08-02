@@ -369,7 +369,20 @@ impl LeIndexConfig {
             Ok(config) => Ok((config, RecoveryAction::Loaded)),
             Err(parse_err) => {
                 let backup_path = config_path.with_extension("toml.bak");
-                let _ = std::fs::rename(&config_path, &backup_path);
+                // Propagate a backup-rename failure instead of discarding it: the
+                // old `let _ =` would report RecoveredFromCorrupt while the corrupt
+                // original is still in place (no backup was actually written), so a
+                // later setup could overwrite the corrupt file without preserving it.
+                // (Codex P2 review.)
+                if let Err(e) = std::fs::rename(&config_path, &backup_path) {
+                    return Err(ConfigError::Io(
+                        config_path,
+                        format!(
+                            "config corrupted ({parse_err}); backup rename to {} failed: {e}",
+                            backup_path.display()
+                        ),
+                    ));
+                }
                 tracing::warn!(
                     "Config corrupted: {}. Backed up to {}",
                     parse_err,

@@ -56,12 +56,12 @@ INSTALL_ONLY_FLAG = "--bootstrap-install-only"
 # under load-dynamic, so the install succeeds on a clean host).
 INSTALL_FEATURES = "onnx"
 
-# Main binary package name on crates.io.
+# Main binary package name on crates.io. `cargo install leindex --features onnx`
+# builds BOTH the `leindex` main binary and the `leindex-embed` worker binary
+# (the worker is a [[bin]] target of this crate), so no separate worker-package
+# install is needed — the former standalone `leindex-embed` crates.io package
+# was removed when the embed subcrate was folded into the main crate.
 MAIN_PACKAGE = "leindex"
-# Worker binary package name on crates.io (separate package that ships the
-# ``leindex-embed`` executable). ``cargo install leindex`` only installs the
-# main crate's bin targets, so the worker must be installed explicitly.
-WORKER_PACKAGE = "leindex-embed"
 
 
 class BootstrapError(RuntimeError):
@@ -202,10 +202,10 @@ def ensure_leindex_installed(*, interactive: bool) -> tuple[Path, bool]:
         return target.leindex_binary, False
 
     cargo_binary = ensure_cargo_available(target, interactive=interactive)
+    # install_leindex (cargo install leindex --features onnx) builds BOTH the
+    # main `leindex` and the `leindex-embed` worker bin (a [[bin]] target of this
+    # crate), so the worker is present without a separate install.
     install_leindex(cargo_binary, wanted_version)
-    # VAL-PYPI-008: also install the worker binary so neural search works after
-    # setup. This is a separate crates.io package with its own bin target.
-    install_embed_worker(cargo_binary, wanted_version)
 
     installed_version = read_installed_version(target.leindex_binary)
     if not installed_version:
@@ -240,7 +240,10 @@ def ensure_worker_present(target: InstallTarget, *, interactive: bool) -> None:
         return
 
     try:
-        install_embed_worker(Path(cargo), desired_version())
+        # The worker is a [[bin]] of the main crate, so reinstalling the main
+        # package with onnx (re)builds it. (Formerly a separate leindex-embed
+        # package install, which no longer exists post-embed-merge.)
+        install_leindex(Path(cargo), desired_version())
     except BootstrapError as error:
         print(
             f"Warning: could not install the leindex-embed worker: {error}",
@@ -363,17 +366,6 @@ def install_leindex(cargo_binary: Path, version: str) -> None:
     run_checked(
         build_install_command(cargo_binary, MAIN_PACKAGE, version, features=INSTALL_FEATURES),
         "LeIndex installation via cargo failed",
-    )
-
-
-def install_embed_worker(cargo_binary: Path, version: str) -> None:
-    """Install the ``leindex-embed`` worker binary (VAL-PYPI-008)."""
-    print(f"Installing leindex-embed {version} worker via cargo...", file=sys.stderr)
-    run_checked(
-        build_install_command(
-            cargo_binary, WORKER_PACKAGE, version, features=INSTALL_FEATURES
-        ),
-        "leindex-embed worker installation via cargo failed",
     )
 
 

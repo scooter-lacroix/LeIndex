@@ -114,7 +114,6 @@ class BootstrapTests(unittest.TestCase):
                     bootstrap, "ensure_cargo_available", return_value=target.cargo_binary
                 ) as ensure_cargo,
                 mock.patch.object(bootstrap, "install_leindex") as install_leindex,
-                mock.patch.object(bootstrap, "install_embed_worker") as install_worker,
             ):
                 resolved, fresh = bootstrap.ensure_leindex_installed(interactive=False)
 
@@ -124,8 +123,6 @@ class BootstrapTests(unittest.TestCase):
             self.assertTrue(fresh)
             ensure_cargo.assert_called_once()
             install_leindex.assert_called_once_with(target.cargo_binary, "1.5.2")
-            # VAL-PYPI-008: the worker is bootstrapped in the same pass.
-            install_worker.assert_called_once_with(target.cargo_binary, "1.5.2")
 
     def test_install_leindex_uses_onnx_feature(self) -> None:
         # VAL-PYPI-008: install commands must enable the `onnx` feature so the
@@ -145,21 +142,6 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn("--version", cmd)
         self.assertEqual(cmd[cmd.index("--version") + 1], "1.8.1")
         self.assertIn("leindex", cmd)
-
-    def test_install_embed_worker_uses_onnx_feature(self) -> None:
-        captured: dict[str, list[str]] = {}
-
-        def fake_run_checked(command, message):
-            captured["cmd"] = list(command)
-
-        with mock.patch.object(bootstrap, "run_checked", side_effect=fake_run_checked):
-            bootstrap.install_embed_worker(Path("/fake/cargo"), "1.8.1")
-
-        cmd = captured["cmd"]
-        self.assertIn("--features", cmd)
-        self.assertEqual(cmd[cmd.index("--features") + 1], "onnx")
-        # The worker package must be referenced explicitly.
-        self.assertIn(bootstrap.WORKER_PACKAGE, cmd)
 
     def test_ensure_cargo_available_reports_noninteractive_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

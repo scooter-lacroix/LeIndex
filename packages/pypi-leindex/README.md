@@ -247,6 +247,23 @@ Codebase → Tree-sitter Parser → PDG Builder → Semantic Index → Query Eng
 
 ---
 
+## Fragment embeddings (opt-in)
+
+LeIndex ships an opt-in fragment layer — sub-symbol semantic chunks plus
+module-level orphan coverage, content-hash-addressed and fully local (the same
+Qwen3 ONNX worker as the neural layer). Enable it in `~/.leindex/config/leindex.toml`:
+
+```toml
+[search]
+fragment_index_enabled = true   # master switch (off by default; node index stays authoritative)
+fragment_weight = 0.35          # fusion weight of the fragment component when enabled
+fragment_max_bytes = 12000      # max bytes per fragment (~200 lines x 60 chars)
+fragment_orphan_enabled = true  # include Tier-3 module-level orphan regions
+fragment_naive_fallback = true  # naive 200-line chunking when no tree-sitter grammar
+```
+
+See the root README's *Fragment Index* section for the full architecture.
+
 ## Other Install Options
 
 ### crates.io
