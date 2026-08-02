@@ -29,6 +29,32 @@ fn preserve_existing_sections_keeps_fragment_knobs_across_rerun() {
     assert_eq!(merged.neural.model_name, "new-model");
 }
 
+#[test]
+fn preserve_existing_sections_keeps_mcp_knobs_across_rerun() {
+    // Memory-pressure T1 regression: rerunning `leindex setup` must not reset
+    // [mcp] lifecycle knobs to defaults. Mirrors the fragment-knobs test — the
+    // [mcp] section (idle_timeout_secs / engine_max_idle_secs) is not owned by
+    // setup, so it must survive a rerun exactly as the user configured it.
+    // Same clobber class as wave-1; caught in GrayHill's T1 review.
+    let mut existing = crate::config::LeIndexConfig::default();
+    existing.mcp.idle_timeout_secs = 120;
+    existing.mcp.engine_max_idle_secs = 60;
+
+    // `new_config` mirrors `build_config`: neural from prompts, mcp at default
+    // (1800/600). Confirm preserve overrides the default with existing values.
+    let mut new_config = crate::config::LeIndexConfig::default();
+    new_config.neural.model_name = "new-model".to_string();
+    assert_eq!(new_config.mcp.idle_timeout_secs, 1800);
+
+    let merged = preserve_existing_sections(new_config, &existing);
+
+    // [mcp] preserved from `existing`, not reset to defaults.
+    assert_eq!(merged.mcp.idle_timeout_secs, 120);
+    assert_eq!(merged.mcp.engine_max_idle_secs, 60);
+    // Neural (the one section setup owns) still comes from the new config.
+    assert_eq!(merged.neural.model_name, "new-model");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn test_setup_ort_lib_name_accepts_versioned_linux_pip_soname() {
