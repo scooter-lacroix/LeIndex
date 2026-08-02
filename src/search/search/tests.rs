@@ -1639,6 +1639,72 @@ fn test_fragment_multi_owner_refs_all_surface() {
     }
 }
 
+/// Codex wave-2 item 4 regression (Exact-route defense-in-depth): even with
+/// the fragment master switch ON, a neural query embedding present, and owner
+/// refs populated, an Exact-route query must NOT fuse fragments — the fragment
+/// layer is inert (`fragment_byte_range` None, `score.fragment` 0.0) so an
+/// exact identifier lookup stays purely lexical. Mirrors the CLI's zeroing of
+/// `query_neural_embedding` for exact routes; pins the search-crate guard.
+#[test]
+fn test_fragment_inert_for_exact_route_query() {
+    let mut engine = SearchEngine::with_dimension(8);
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding: (0..8).map(|d| if d == 1 { 1.0 } else { 0.0 }).collect(),
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+    engine.set_fragment_embeddings(vec![(
+        "hash_abc".to_string(),
+        (0..8).map(|d| if d == 0 { 1.0 } else { 0.0 }).collect(),
+    )]);
+    let mut refs = std::collections::HashMap::new();
+    refs.insert(
+        "hash_abc".to_string(),
+        vec![("auth.rs:authenticate_user".to_string(), (2, 10))],
+    );
+    engine.set_fragment_refs(refs);
+    engine.set_fragment_index_enabled(true);
+    engine.set_fragment_weight(0.35);
+
+    // Exact route WITH a neural embedding that matches the fragment: the
+    // Exact-route guard must keep the fragment layer out.
+    let results = engine
+        .search(SearchQuery {
+            query: "authenticate_user".to_string(),
+            top_k: 5,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            query_neural_embedding: Some((0..8).map(|d| if d == 0 { 1.0 } else { 0.0 }).collect()),
+            threshold: None,
+            query_type: Some(crate::search::ranking::QueryType::Exact),
+        })
+        .unwrap();
+    let hit = results
+        .iter()
+        .find(|r| r.node_id == "auth.rs:authenticate_user");
+    assert!(hit.is_some(), "exact-name match keeps the owner in results");
+    assert_eq!(
+        hit.unwrap().fragment_byte_range,
+        None,
+        "Exact route must not surface a fragment byte range"
+    );
+    assert_eq!(
+        hit.unwrap().score.fragment,
+        0.0,
+        "Exact route must not fuse a fragment score"
+    );
+}
+
 /// Codex wave-2 item 9 regression: a fragment id list whose length disagrees
 /// with the snapshot's recorded row count must disable the fragment layer
 /// (non-fatal), just like a mmap row-count or dimension mismatch — so a

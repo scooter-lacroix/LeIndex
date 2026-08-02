@@ -1112,9 +1112,11 @@ impl SearchEngine {
     /// `search()` callers, Codex wave-2 item 4); otherwise both maps are
     /// empty. ALL owners of a content hash are preserved (identical fragment
     /// text is embedded once but can be referenced by N owners — Codex wave-2
-    /// item 5), and the BEST-scoring fragment per owner is kept so the
+    /// item 5), and the best-scoring fragment per owner is kept so the
     /// surfaced byte range corresponds to the fragment that actually drives
     /// the score, independent of HashMap iteration order (invariant 6).
+    /// Within ONE hash the score is identical for every ref, so the first
+    /// range kept is score-equivalent — no max selection is needed there.
     /// Extracted as a helper to keep `search` under the lizard CCN gate.
     fn collect_fragment_owners(
         &self,
