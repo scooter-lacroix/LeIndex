@@ -197,6 +197,9 @@ impl SearchEngine {
             );
             return;
         }
+        // Fragment embeddings are produced by the same bundled Qwen3 embedder as
+        // the neural layer (see NEURAL_EMBEDDING_DIMENSION), so the fragment mmap
+        // shares this dimension. Revisit if fragments ever gain a dedicated embedder.
         if mmap.dimension() as usize != NEURAL_EMBEDDING_DIMENSION {
             tracing::warn!(
                 dim = mmap.dimension(),
