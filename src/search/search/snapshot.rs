@@ -216,6 +216,37 @@ impl SearchEngine {
             ),
         }
     }
+
+    /// Restore the fragment vector index into an EXISTING engine without a
+    /// full snapshot rebuild (Codex wave-6 item 1).
+    ///
+    /// The slow TF-IDF-fallback hydration path rebuilds the node index from
+    /// the PDG (`index_nodes_tfidf_only`) but never restored the persisted
+    /// fragment layer — the fragment mmap/store load block lived only on the
+    /// fast snapshot-hydrate path. An otherwise-valid fragment layer was then
+    /// disabled for the process lifetime after a cold start whose TF-IDF mmap
+    /// was missing/corrupt, and the subsequent snapshot persist would remove
+    /// the valid fragment mmap (empty `collect_fragment_embeddings`). This
+    /// installs the validated fragment mmap twin on top of the rebuilt node
+    /// index; row-count/dimension validation is identical to
+    /// `install_fragment_vector_index` and failure is non-fatal (invariant 3).
+    pub(crate) fn restore_fragment_index(
+        &mut self,
+        fragment_mmap: Option<Arc<MmapEmbeddingIndex>>,
+        fragment_ids: Option<&[String]>,
+        snapshot_rows: u32,
+    ) {
+        Self::install_fragment_vector_index(
+            self,
+            fragment_mmap.as_ref(),
+            fragment_ids,
+            snapshot_rows,
+        );
+        // A fragment-layer install invalidates any cached results shaped by the
+        // pre-restore engine (the slow path may have had none, but be safe).
+        self.search_cache.clear();
+        self.search_cache_bytes = 0;
+    }
 }
 
 /// Validate snapshot version, node counts, and mmap shape before hydration.

@@ -128,37 +128,12 @@ impl LeIndex {
         // metadata) is wired in Task 7; until fragment_store.bin exists the id
         // list is empty and the fragment layer stays off (feature-off
         // compatible). `fragment_layer_is_valid` rejects stale roots, so a
-        // mismatched artifact can never poison the node-level path.
-        let fragment_mmap_raw =
-            index_builder::try_load_fragment_mmap_embeddings_from_storage(artifact_path);
-        let fragment_store =
-            index_builder::fragment::FragmentStore::load_from_artifact_path(artifact_path);
-        let fragment_ids: Option<Vec<String>> = match &fragment_store {
-            Ok(Some(store)) => Some(store.content_hashes().map(str::to_string).collect()),
-            Ok(None) => None,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "Failed to load fragment store; fragment layer disabled"
-                );
-                None
-            }
-        };
-        let fragment_layer_ok = fragment_ids.is_some()
-            && index_builder::fragment_layer_is_valid(
-                snapshot.fragment_root_hash.as_deref(),
-                fragment_mmap_raw.as_ref(),
-                artifact_path,
-            );
-        let fragment_mmap = match (fragment_layer_ok, fragment_mmap_raw) {
-            (true, Some(mmap)) => Some(std::sync::Arc::new(mmap)),
-            _ => None,
-        };
-        let fragment_ids = if fragment_layer_ok {
-            fragment_ids
-        } else {
-            None
-        };
+        // mismatched artifact can never poison the node-level path. Shared with
+        // the slow TF-IDF-fallback rebuild path (Codex wave-6 item 1).
+        let (fragment_mmap, fragment_ids, fragment_store) = Self::load_validated_fragment_layer(
+            artifact_path,
+            snapshot.fragment_root_hash.as_deref(),
+        );
 
         match self.search_engine.restore_from_search_snapshot(
             snapshot,
@@ -198,24 +173,8 @@ impl LeIndex {
                 // live under N owners — dedup must not collapse multi-owner
                 // fragments to the first (Codex wave-2 item 5).
                 if let Ok(Some(store)) = &fragment_store {
-                    let refs: std::collections::HashMap<String, Vec<(String, (usize, usize))>> =
-                        store
-                            .content_hashes()
-                            .filter_map(|hash| {
-                                let owners: Vec<(String, (usize, usize))> = store
-                                    .get(hash)
-                                    .into_iter()
-                                    .flatten()
-                                    .filter_map(|meta| {
-                                        meta.owner
-                                            .as_ref()
-                                            .map(|owner| (owner.clone(), meta.byte_range))
-                                    })
-                                    .collect();
-                                (!owners.is_empty()).then(|| (hash.to_string(), owners))
-                            })
-                            .collect();
-                    self.search_engine.set_fragment_refs(refs);
+                    self.search_engine
+                        .set_fragment_refs(fragment_owner_refs(store));
                 }
 
                 if let Err(err) = self.load_stats_from_path(artifact_path) {
@@ -328,6 +287,12 @@ impl LeIndex {
             }
         }
 
+        // Fragment layer (Codex wave-6 item 1): the slow TF-IDF-fallback
+        // rebuild path must restore + validate the persisted fragment layer
+        // too, not just the fast snapshot-hydrate path. Extracted to a method
+        // to keep this function under the CCN-15 gate.
+        self.restore_fragment_layer_from_snapshot(artifact_path);
+
         // VAL-ONNX-001: upgrade to hybrid_local for query-time neural embedding.
         #[cfg(feature = "onnx")]
         {
@@ -408,4 +373,120 @@ impl LeIndex {
 
         Ok(())
     }
+}
+
+impl LeIndex {
+    /// Load + validate the persisted fragment-layer artifacts (fragment mmap,
+    /// store, and content-hash id list) against the snapshot's recorded
+    /// fragment root (invariant 8).
+    ///
+    /// Shared by the fast snapshot-hydrate path and the slow TF-IDF-fallback
+    /// rebuild path (Codex wave-6 item 1) so BOTH restore an otherwise-valid
+    /// fragment layer after a cold start. Returns `(fragment_mmap,
+    /// fragment_ids, fragment_store)`; the two Options are `None` when the
+    /// layer is absent or fails validation (callers keep the fragment layer
+    /// off — feature-off compatible).
+    pub(super) fn load_validated_fragment_layer(
+        artifact_path: &std::path::Path,
+        snapshot_fragment_root: Option<&str>,
+    ) -> (
+        Option<std::sync::Arc<crate::search::vector::MmapEmbeddingIndex>>,
+        Option<Vec<String>>,
+        Result<Option<index_builder::fragment::FragmentStore>, anyhow::Error>,
+    ) {
+        let fragment_mmap_raw =
+            index_builder::try_load_fragment_mmap_embeddings_from_storage(artifact_path);
+        let fragment_store =
+            index_builder::fragment::FragmentStore::load_from_artifact_path(artifact_path);
+        let fragment_ids: Option<Vec<String>> = match &fragment_store {
+            Ok(Some(store)) => Some(store.content_hashes().map(str::to_string).collect()),
+            Ok(None) => None,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to load fragment store; fragment layer disabled"
+                );
+                None
+            }
+        };
+        let fragment_layer_ok = fragment_ids.is_some()
+            && index_builder::fragment_layer_is_valid(
+                snapshot_fragment_root,
+                fragment_mmap_raw.as_ref(),
+                artifact_path,
+            );
+        let fragment_mmap = match (fragment_layer_ok, fragment_mmap_raw) {
+            (true, Some(mmap)) => Some(std::sync::Arc::new(mmap)),
+            _ => None,
+        };
+        let fragment_ids = if fragment_layer_ok {
+            fragment_ids
+        } else {
+            None
+        };
+        (fragment_mmap, fragment_ids, fragment_store)
+    }
+
+    /// Restore the persisted fragment layer after a TF-IDF-fallback rebuild
+    /// (Codex wave-6 item 1).
+    ///
+    /// The slow path must restore + validate the persisted fragment layer
+    /// too, not just the fast snapshot-hydrate path. An otherwise-valid
+    /// fragment layer was silently dropped for the process lifetime after a
+    /// cold start whose TF-IDF mmap was missing/corrupt — and on the
+    /// mutable-storage path, finalization could then persist a
+    /// fragment-free engine and remove the valid fragment mmap. The persisted
+    /// snapshot (even when stale for the PDG) still records the fragment root
+    /// the artifacts were synced against, so it is the correct validation
+    /// reference here. Row-count/dimension validation is delegated to
+    /// `SearchEngine::restore_fragment_index`; failure is non-fatal and
+    /// leaves the fragment layer off (invariant 3).
+    fn restore_fragment_layer_from_snapshot(&mut self, artifact_path: &std::path::Path) {
+        let Some(snapshot) = index_builder::try_load_search_snapshot_from_storage(artifact_path)
+        else {
+            return;
+        };
+        let (fragment_mmap, fragment_ids, fragment_store) = Self::load_validated_fragment_layer(
+            artifact_path,
+            snapshot.fragment_root_hash.as_deref(),
+        );
+        let (Some(mmap), Some(ids)) = (fragment_mmap, fragment_ids) else {
+            return;
+        };
+        self.search_engine
+            .restore_fragment_index(Some(mmap), Some(&ids), snapshot.fragment_rows);
+        if let Ok(Some(store)) = &fragment_store {
+            self.search_engine
+                .set_fragment_refs(fragment_owner_refs(store));
+        }
+        info!(
+            rows = ids.len(),
+            "Restored fragment layer after TF-IDF-fallback rebuild"
+        );
+    }
+}
+
+/// Build the fragment owner-ref map (content hash → ALL (owner node id, byte
+/// range) refs) from the store (invariant 6). A Vec per hash because identical
+/// content can live under N owners — dedup must not collapse multi-owner
+/// fragments to the first (Codex wave-2 item 5).
+fn fragment_owner_refs(
+    store: &index_builder::fragment::FragmentStore,
+) -> std::collections::HashMap<String, Vec<(String, (usize, usize))>> {
+    store
+        .content_hashes()
+        .filter_map(|hash| {
+            let owners: Vec<(String, (usize, usize))> = store
+                .get(hash)
+                .into_iter()
+                .flatten()
+                .filter_map(|meta| {
+                    meta.owner
+                        .as_ref()
+                        .map(|owner| (owner.clone(), meta.byte_range))
+                })
+                .collect();
+            (!owners.is_empty()).then(|| (hash.to_string(), owners))
+        })
+        .collect()
 }

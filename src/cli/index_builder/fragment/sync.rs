@@ -561,8 +561,21 @@ fn process_changed_file(
             tracing::warn!(
                 error = %e,
                 path = %path.display(),
-                "Failed to read source file during fragment sync; skipping"
+                "Failed to read source file during fragment sync; dropping its stale rows"
             );
+            // Codex wave-6 item 2: the file changed on disk (source hash
+            // differs) but became unreadable between source-hashing and this
+            // second read. Its previously-persisted rows describe the
+            // PRE-CHANGE content; keeping them would let the caller publish
+            // the new node generation with stale fragment text/ranges. Drop
+            // this file's rows + manifest entries now so the layer never
+            // serves deleted content; the file hash stays uncommitted so the
+            // next sync re-reads and restores it.
+            if manifest.file_content_hashes.remove(&path_str).is_some() {
+                remove_file_rows(store, &path_str);
+                store_modified = true;
+            }
+            manifest.file_hashes.remove(&path_str);
             return FileSyncOutcome {
                 store_modified,
                 complete: false,

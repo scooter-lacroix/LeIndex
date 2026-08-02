@@ -126,6 +126,17 @@ impl SearchEngine {
             };
         if !fragment_candidates.is_empty() && !self.fragment_refs.is_empty() {
             for (hash, score) in &fragment_candidates {
+                // Codex wave-6 item 3: only ACCEPT a positive fragment hit.
+                // `entry(owner).or_insert(0.0)` inserts every owner BEFORE the
+                // score check, so an unrelated query whose cosine scores are
+                // all ≤ 0 still populated `fragment_owner_scores` (all 0.0) →
+                // `search()` saw a non-empty map → marked the fragment layer
+                // active → renormalized every real signal despite zero
+                // fragment contribution. Skip non-positive hits so activation
+                // is driven only by actually-accepted positive scores.
+                if *score <= 0.0 {
+                    continue;
+                }
                 if let Some(refs) = self.fragment_refs.get(hash) {
                     for (owner, range) in refs {
                         let entry = fragment_owner_scores.entry(owner.clone()).or_insert(0.0);

@@ -1773,3 +1773,139 @@ fn test_search_snapshot_disables_fragment_on_id_count_mismatch() {
         "id-count mismatch must disable the fragment layer"
     );
 }
+
+/// Codex wave-6 item 3 regression: a query whose fragment cosine hits are ALL
+/// non-positive must NOT activate the fragment fusion layer.
+///
+/// Before the fix, `entry(owner).or_insert(0.0)` inserted every owner BEFORE
+/// the score comparison, so an unrelated query whose fragment candidates all
+/// scored ≤ 0 still populated `fragment_owner_scores` (all 0.0) → `search()`
+/// saw a non-empty map → marked the layer active → renormalized the four base
+/// weights by 1/(1+fragment_weight) despite zero fragment contribution. The
+/// fix skips non-positive hits, keeping the owner-score map empty so the
+/// activation gate stays honest. Asserts the enabled-layer overall score equals
+/// the layer-disabled baseline (identical base weights ⇒ no renorm distortion).
+#[test]
+fn test_fragment_nonpositive_hits_do_not_activate_fusion() {
+    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf_embedding[0] = 1.0;
+
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding,
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+
+    // Fragment layer ON with a fusion weight, but the ONLY fragment embedding
+    // is ANTI-correlated with the query neural embedding (cosine ≤ 0).
+    engine.set_fragment_index_enabled(true);
+    engine.set_fragment_weight(0.12);
+    let frag_embedding = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    engine.set_fragment_embeddings(vec![("hash_neg".to_string(), frag_embedding)]);
+    let mut refs = std::collections::HashMap::new();
+    refs.insert(
+        "hash_neg".to_string(),
+        vec![("auth.rs:authenticate_user".to_string(), (10, 25))],
+    );
+    engine.set_fragment_refs(refs);
+
+    // Hoist the query embedding OUT of the closure so `make_query` owns its
+    // data instead of borrowing `engine` immutably (which would conflict with
+    // the later `&mut self` `engine.search` / `set_fragment_index_enabled`
+    // calls).
+    let query_embedding = engine.collect_embeddings()[0].1.clone();
+    let make_query = || SearchQuery {
+        query: "authenticate".to_string(),
+        top_k: 5,
+        token_budget: None,
+        semantic: true,
+        expand_context: false,
+        query_embedding: Some(query_embedding.clone()),
+        query_neural_embedding: Some(vec![-1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        threshold: None,
+        query_type: None,
+    };
+
+    let results = engine.search(make_query()).unwrap();
+    let owner = results
+        .iter()
+        .find(|r| r.node_id == "auth.rs:authenticate_user")
+        .expect("owner node remains in results");
+    assert_eq!(
+        owner.score.fragment, 0.0,
+        "no positive fragment hit must yield a zero fragment score"
+    );
+    assert_eq!(
+        owner.fragment_byte_range, None,
+        "non-positive fragment hit must not surface a byte range"
+    );
+
+    // The layer must NOT be marked active: renorm would downscale the four
+    // base weights by 1/(1+fragment_weight). Disabling the layer entirely must
+    // yield an IDENTICAL overall score — the proof there is no renorm.
+    engine.set_fragment_index_enabled(false);
+    let baseline = engine.search(make_query()).unwrap();
+    let baseline_owner = baseline
+        .iter()
+        .find(|r| r.node_id == "auth.rs:authenticate_user")
+        .expect("baseline owner node");
+    assert!(
+        (owner.score.overall - baseline_owner.score.overall).abs() < 1e-6,
+        "non-positive fragment hits must not renormalize base weights: enabled={} disabled={}",
+        owner.score.overall,
+        baseline_owner.score.overall
+    );
+}
+
+/// Codex wave-6 item 1 regression: `SearchEngine::restore_fragment_index`
+/// installs a validated fragment mmap twin into an EXISTING engine without a
+/// full snapshot rebuild — the slow TF-IDF-fallback hydration path restores
+/// the fragment layer on top of the freshly rebuilt node index. Row-count
+/// validation mirrors the snapshot-hydrate path; a mismatch must leave the
+/// layer off (invariant 8).
+#[cfg(feature = "storage")]
+#[test]
+fn test_restore_fragment_index_installs_validated_mmap_twin() {
+    let dir = tempfile::tempdir().unwrap();
+    let frag_path = dir.path().join("frag.bin");
+    let fragment_embeddings = vec![
+        (
+            "hash_abc".to_string(),
+            vec![0.1f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+        (
+            "hash_def".to_string(),
+            vec![0.2f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+    ];
+    crate::search::vector::write_mmap_embeddings(&frag_path, &fragment_embeddings).unwrap();
+    let frag_mmap = crate::search::vector::MmapEmbeddingIndex::open(&frag_path).unwrap();
+    let frag_ids = vec!["hash_abc".to_string(), "hash_def".to_string()];
+
+    // Valid install: row count + id list + dimension all consistent.
+    let mut engine = SearchEngine::new();
+    engine.restore_fragment_index(Some(Arc::new(frag_mmap)), Some(&frag_ids), 2);
+    assert_eq!(
+        engine.collect_fragment_embeddings().len(),
+        2,
+        "valid fragment mmap twin must be installed by restore_fragment_index"
+    );
+
+    // Row-count mismatch → install refused, fragment layer stays off.
+    let frag_mmap2 = crate::search::vector::MmapEmbeddingIndex::open(&frag_path).unwrap();
+    let mut engine2 = SearchEngine::new();
+    engine2.restore_fragment_index(Some(Arc::new(frag_mmap2)), Some(&frag_ids), 99);
+    assert!(
+        engine2.collect_fragment_embeddings().is_empty(),
+        "row-count mismatch must disable the fragment layer (invariant 8)"
+    );
+}

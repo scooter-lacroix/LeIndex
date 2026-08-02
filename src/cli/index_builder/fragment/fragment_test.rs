@@ -1659,3 +1659,92 @@ fn test_sync_removed_partial_file_clears_rows() {
         "stale file_content_hashes entry removed"
     );
 }
+
+#[test]
+fn test_sync_read_failure_drops_stale_rows() {
+    // Codex wave-6 item 2: a file whose source hash differs but which becomes
+    // UNREADABLE between source-hashing and process_changed_file's second read
+    // must have its stale rows + manifest entries dropped, not silently kept
+    // (the old code returned complete:false and "skipped" while the outer
+    // sync still Ok'd — the stale PRE-CHANGE rows were published with the new
+    // node generation).
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("main.rs");
+
+    // Pass 1: content A fully embedded and committed.
+    let content_a = b"fn main() { println!(\"hi\"); }\n";
+    std::fs::write(&file, content_a).unwrap();
+    let file_hash_a = blake3::hash(content_a).to_hex().to_string();
+    let files = vec![(file.clone(), file_hash_a.clone())];
+    let mut store = FragmentStore::default();
+    let identity = FragmentExtractionIdentity::default();
+
+    let mut one_fragment = |path: &std::path::Path, bytes: &[u8]| {
+        let text = String::from_utf8_lossy(bytes);
+        let enriched = format!("// frag\n{text}");
+        let content_hash = blake3::hash(enriched.as_bytes()).to_hex().to_string();
+        vec![FragmentCandidate {
+            content_hash: content_hash.clone(),
+            enriched_text: enriched,
+            meta: FragmentMetadata {
+                content_hash,
+                owner: Some("main".to_string()),
+                file_path: path.display().to_string(),
+                byte_range: (0, bytes.len()),
+                line_range: (0, bytes.len().max(1) - 1),
+                embedding_offset: 0,
+            },
+        }]
+    };
+
+    let (summary, _) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files,
+        &mut one_fragment,
+        &mut |texts: &[String]| texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect(),
+        false,
+        &identity,
+    )
+    .unwrap();
+    assert_eq!(summary.embedded, 1, "pass 1 embeds one fragment");
+    assert_eq!(store.len(), 1, "pass 1 commits one row");
+
+    // Pass 2: the caller hashes the NEW content (hash differs from the
+    // committed hash A), then the file disappears before the sync re-reads it.
+    // Deleting it makes std::fs::read fail deterministically (NotFound).
+    let content_b = b"fn main() { println!(\"changed\"); }\n";
+    let file_hash_b = blake3::hash(content_b).to_hex().to_string();
+    assert_ne!(file_hash_b, file_hash_a, "hash changed on disk");
+    std::fs::remove_file(&file).unwrap();
+    let files_b = vec![(file.clone(), file_hash_b)];
+
+    let (_, _) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files_b,
+        &mut one_fragment,
+        &mut |_texts: &[String]| vec![None],
+        false,
+        &identity,
+    )
+    .unwrap();
+    assert_eq!(
+        store.len(),
+        0,
+        "unreadable changed file's stale rows must be dropped (wave-6 item 2)"
+    );
+    let storage = dir.path().join(".leindex");
+    let m2 = load_fragment_sync_manifest(&storage)
+        .unwrap()
+        .expect("manifest persisted");
+    assert!(
+        !m2.file_hashes.contains_key(&file.display().to_string()),
+        "stale file_hashes entry removed on read failure"
+    );
+    assert!(
+        !m2.file_content_hashes
+            .contains_key(&file.display().to_string()),
+        "stale file_content_hashes entry removed on read failure"
+    );
+}
