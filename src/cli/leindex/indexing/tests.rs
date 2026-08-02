@@ -81,3 +81,37 @@ fn watcher_delta_publishes_current_generation() {
             .is_file()
     );
 }
+
+/// Codex wave-4 P2 regression: a fragment-sync failure must leave the engine
+/// fragment-free BEFORE the snapshot persist runs. Every snapshot persist is
+/// preceded by `sync_fragment_layer_or_clear`; on failure that error branch
+/// calls `set_fragment_embeddings(Vec::new())` — the single call that drops the
+/// fragment index, the owner refs, and the result cache. Without it, a fresh
+/// node generation would be published with STALE (pre-change) fragment text
+/// and byte ranges, letting a changed symbol rank/surface against deleted
+/// content. This pins the clearing contract the error branch depends on.
+#[test]
+fn fragment_sync_failure_clear_empties_engine_fragment_state() {
+    let mut engine = crate::search::search::SearchEngine::new();
+    engine.set_fragment_index_enabled(true);
+    // Simulate stale rows from a previous generation.
+    engine.set_fragment_embeddings(vec![("hash-old".to_string(), vec![1.0, 2.0, 3.0])]);
+    engine.set_fragment_refs(std::collections::HashMap::from([(
+        "hash-old".to_string(),
+        vec![("owner-a".to_string(), (10, 40))],
+    )]));
+    assert_eq!(
+        engine.collect_fragment_embeddings().len(),
+        1,
+        "precondition: stale rows are present"
+    );
+
+    // The exact call the sync-failure branch of
+    // `sync_fragment_layer_or_clear` makes before the snapshot persist.
+    engine.set_fragment_embeddings(Vec::new());
+
+    assert!(
+        engine.collect_fragment_embeddings().is_empty(),
+        "stale fragment rows must be gone before the snapshot persist"
+    );
+}

@@ -452,14 +452,12 @@ impl LeIndex {
 
         // R10: Persist embeddings to mmap file after watcher incremental reindex
         index_builder::persist_embeddings_to_mmap(&self.search_engine, &self.project_path)?;
-        // Fragment layer (Task 7): incremental sync before the snapshot persist
-        // so the fragment mmap + root twins are written with real rows. Never
-        // fatal — a sync failure disables only the fragment layer.
-        if let Err(e) = self.sync_fragment_layer() {
-            warn!(
-                "Fragment layer sync failed (fragment layer disabled for this generation): {e:#}"
-            );
-        }
+        // Fragment layer (Task 7): incremental sync before the snapshot
+        // persist. On failure the layer is CLEARED (not just logged) so this
+        // generation can never pair new nodes with stale pre-change fragment
+        // text/byte ranges (Codex wave-4 P2). Node-level ranking stays
+        // authoritative; the fragment layer is simply off for this generation.
+        self.sync_fragment_layer_or_clear();
         let (pdg_node_count, pdg_edge_count) = self
             .pdg
             .as_ref()
@@ -1389,12 +1387,10 @@ impl LeIndex {
         self.search_engine.clear_neural_embeddings();
         self.build_file_stats_cache();
         index_builder::persist_embeddings_to_mmap(&self.search_engine, &self.project_path)?;
-        // Fragment layer (Task 7): incremental sync before the snapshot persist.
-        if let Err(e) = self.sync_fragment_layer() {
-            warn!(
-                "Fragment layer sync failed (fragment layer disabled for this generation): {e:#}"
-            );
-        }
+        // Fragment layer (Task 7): incremental sync before the snapshot
+        // persist. On failure the layer is CLEARED (not just logged) — see
+        // `sync_fragment_layer_or_clear` (Codex wave-4 P2).
+        self.sync_fragment_layer_or_clear();
         index_builder::persist_search_snapshot(
             &self.search_engine,
             &self.project_path,
@@ -1507,13 +1503,10 @@ impl LeIndex {
         if embedder.is_some() {
             self.embedder = embedder;
         }
-        // Fragment layer (Task 7): incremental sync before the snapshot persist
-        // so the fragment mmap + root twins carry this generation's rows.
-        if let Err(e) = self.sync_fragment_layer() {
-            warn!(
-                "Fragment layer sync failed (fragment layer disabled for this generation): {e:#}"
-            );
-        }
+        // Fragment layer (Task 7): incremental sync before the snapshot
+        // persist. On failure the layer is CLEARED (not just logged) — see
+        // `sync_fragment_layer_or_clear` (Codex wave-4 P2).
+        self.sync_fragment_layer_or_clear();
         index_builder::persist_search_snapshot(
             &self.search_engine,
             &self.project_path,
@@ -1552,6 +1545,26 @@ impl LeIndex {
     /// mid-build crash is handled by the generation guard in
     /// `fragment_layer_is_valid` — hydration serves the last complete root
     /// (i.e. keeps the fragment layer off) rather than a half-synced tree.
+    /// Run the fragment-layer incremental sync, clearing the in-memory
+    /// fragment rows on failure (Codex wave-4 P2).
+    ///
+    /// Every snapshot persist is preceded by a fragment sync; on sync failure
+    /// the engine would otherwise keep the PREVIOUS generation's fragment
+    /// index + owner refs, so a fresh node snapshot could rank/surface a
+    /// changed symbol against deleted (pre-change) fragment content. Clearing
+    /// makes the pre-existing "fragment layer disabled for this generation"
+    /// warning honest and keeps the persisted snapshot fragment-free.
+    /// `set_fragment_embeddings` with empty input drops the index, the owner
+    /// refs, and the result cache in one call.
+    fn sync_fragment_layer_or_clear(&mut self) {
+        if let Err(e) = self.sync_fragment_layer() {
+            warn!(
+                "Fragment layer sync failed (fragment layer disabled for this generation): {e:#}"
+            );
+            self.search_engine.set_fragment_embeddings(Vec::new());
+        }
+    }
+
     fn sync_fragment_layer(&mut self) -> Result<()> {
         let cfg = crate::config::LeIndexConfig::load_cached();
         if !cfg.search.fragment_index_enabled || self.pdg.is_none() {
