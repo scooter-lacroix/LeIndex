@@ -4,6 +4,11 @@
 // Published bundles never contain model assets. Setup-managed models resolve
 // from LEINDEX_MODEL_PATH or the user model directory, and missing assets fail
 // with actionable errors.
+//
+// Requires the `onnx` feature: these tests exercise `leindex::embed`, which is
+// cfg-gated behind `feature = "onnx"` in `src/lib.rs` (mirrors
+// `embed_migraphx_dynamic_test.rs`).
+#![cfg(feature = "onnx")]
 
 use std::fs;
 use std::sync::Mutex;

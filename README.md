@@ -253,6 +253,7 @@ Codebase → Tree-sitter Parser → PDG Builder → Semantic Index → Query Eng
 
 - **Core hybrid retrieval** — TF-IDF lexical matching plus PDG structure on every applicable result
 - **Hybrid neural scoring** — local ONNX similarity over the same symbols, with TF-IDF/PDG fallback
+- **Fragment embeddings (opt-in)** — sub-symbol semantic chunks (tree-sitter) + module-level orphan coverage, content-hash-addressed for idempotent incremental indexing; all-local, no remote service
 - **5-phase analysis** — additive multi-pass codebase analysis pipeline
 - **Cross-project indexing** — search across multiple repos at once
 - **20 MCP tools** — read, analyze, edit preview/apply, rename, impact analysis
@@ -639,6 +640,45 @@ discovered automatically. `leindex setup --neural --gpu amd` installs MIGraphX,
 uses the same validated `qwen3-embed-0.6b-dynamic.onnx` graph provisioned by
 Hugging Face CLI under `~/.leindex/models/`; model files are not packaged with
 LeIndex.
+
+### Fragment Index (sub-symbol semantic chunks)
+
+LeIndex 1.11 adds an **opt-in fragment embedding layer** that improves both
+recall and precision on top of the node-level TF-IDF/PDG/neural stack:
+
+- **Tier 2 — sub-symbol fragments**: large nodes (functions, methods, blocks)
+  are split into semantic chunks with a tree-sitter chunker (ported from Warp's
+  `full_source_code_embedding`), so a conceptual query can hit the exact region
+  that answers it instead of only the whole symbol.
+- **Tier 3 — orphan coverage**: module-level regions no PDG node owns are
+  embedded too, so free-floating code, imports, and file docs stay discoverable.
+- **Content-hash store**: every fragment is addressed by a blake3 hash of its
+  exact embedded text. Incremental indexing re-embeds only changed content and
+  is fully idempotent — the same code always maps to the same fragments.
+- **All-local**: fragments are embedded with the same local Qwen3 ONNX worker.
+  No remote service is used unless you opt into a remote provider. Content
+  hashes, manifests, and embeddings never leave your machine.
+
+Enable it in `~/.leindex/config/leindex.toml`:
+
+```toml
+[search]
+# Master switch. Off by default; the node-level index stays authoritative.
+fragment_index_enabled = true
+# Fusion weight of the fragment score component (renormalized when enabled).
+fragment_weight = 0.35
+# Max bytes per fragment (~200 lines x 60 chars, mirroring Warp's default).
+fragment_max_bytes = 12000
+# Include Tier-3 module-level orphan regions.
+fragment_orphan_enabled = true
+# Naive 200-line chunking when a tree-sitter grammar is unavailable.
+fragment_naive_fallback = true
+```
+
+Fragment candidates fuse into hybrid retrieval as a renormalized score
+component and feed the existing local reranker. See
+[docs/plans/fragment-embeddings-1.11.0.md](docs/plans/fragment-embeddings-1.11.0.md)
+for the full architecture.
 
 ### Remote Cloud Providers
 

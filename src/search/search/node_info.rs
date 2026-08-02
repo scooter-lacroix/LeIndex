@@ -298,6 +298,17 @@ pub struct SearchResult {
     /// Byte range in source
     pub byte_range: (usize, usize),
 
+    /// Byte range of the best-matching fragment (sub-symbol) for this result.
+    ///
+    /// `None` when the fragment layer is off or no fragment matched. Distinct
+    /// from the node-level `byte_range` (invariant 7): a fragment hit surfaces
+    /// the exact sub-symbol range, never a node range (fragment-embeddings
+    /// 1.11.0 Task 6). Serde-defaults for self-describing formats; bincode
+    /// cache entries written before this field fail decode and fall back to a
+    /// cache miss (recomputed), which is the intended graceful path.
+    #[serde(default)]
+    pub fragment_byte_range: Option<(usize, usize)>,
+
     /// 1-based line number of the symbol's definition in the source file.
     ///
     /// Populated by `LeIndex::search()` from the PDG node's byte_range.

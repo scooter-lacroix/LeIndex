@@ -51,6 +51,10 @@ pub const WORK_HOISTER_MAX_ENTRIES: usize = 4_096;
 pub const WORK_HOISTER_MAX_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 
 /// Output dimension of the bundled Qwen3 embedding model.
+///
+/// Cli-only (snapshot hydration validates neural/fragment mmap dimensions);
+/// gated so `--features onnx` without `cli` has no dead const.
+#[cfg(feature = "storage")]
 const NEURAL_EMBEDDING_DIMENSION: usize = 1024;
 mod int8_quality;
 mod node_info;
@@ -107,6 +111,26 @@ pub struct SearchEngine {
     /// `vector_index` — so no hand-rolled scan. None when no neural mmap is
     /// loaded (tests, tfidf-only indexes).
     neural_vector_index: Option<VectorIndexImpl>,
+    /// Fragment embeddings (sub-symbol semantic chunks), hydrated from
+    /// `.leindex/fragments_embeddings.bin` at search-load. Same lazy-paged
+    /// MmapVectorIndex pattern as the neural index; None when the fragment
+    /// layer is off or no fragment mmap is present.
+    fragment_vector_index: Option<VectorIndexImpl>,
+    /// Master switch for the fragment layer (from `[search]
+    /// fragment_index_enabled`). Gating renormalization on this — NOT on
+    /// `fragment_weight > 0` — keeps the default path byte-identical
+    /// (fragment-embeddings 1.11.0 Task 6, invariant 7).
+    fragment_index_enabled: bool,
+    /// Fragment fusion weight from `[search] fragment_weight` (default 0.35,
+    /// empirically tuned: smallest weight with real margin that surfaces
+    /// fragments over strong tfidf matches without regressing node rank).
+    /// Only applied when `fragment_index_enabled` (renormalized into the five
+    /// weights).
+    fragment_weight: f32,
+    /// content_hash → (owner node id, best byte range) for mapping fragment
+    /// hits back to their Tier-1 owner (invariant 6). Populated by the cli
+    /// hydration path from the fragment store.
+    fragment_refs: HashMap<String, (String, (usize, usize))>,
     /// Complexity cache for O(1) lookups (fixes O(n²) bug)
     complexity_cache: HashMap<String, u32>,
     /// Inverted index for O(1) text lookups: token -> set of node IDs
@@ -129,6 +153,8 @@ pub struct SearchEngine {
     neural_weight: f32,
 }
 
+/// Cli-only snapshot format version (persistence lives in `src/cli/`).
+#[cfg(feature = "storage")]
 const SEARCH_SNAPSHOT_VERSION: u32 = 1;
 
 impl SearchEngine {
@@ -155,6 +181,10 @@ impl SearchEngine {
             search_cache_bytes: 0,
             neural_weight: 0.4,
             neural_vector_index: None,
+            fragment_vector_index: None,
+            fragment_index_enabled: false,
+            fragment_weight: 0.35,
+            fragment_refs: HashMap::new(),
         }
     }
 
@@ -197,6 +227,10 @@ impl SearchEngine {
             search_cache_bytes: 0,
             neural_weight: 0.4,
             neural_vector_index: None,
+            fragment_vector_index: None,
+            fragment_index_enabled: false,
+            fragment_weight: 0.35,
+            fragment_refs: HashMap::new(),
         }
     }
 
@@ -211,6 +245,34 @@ impl SearchEngine {
             self.search_cache_bytes = 0;
         }
         self.neural_weight = clamped;
+    }
+
+    /// Enable/disable the fragment layer (master switch, from `[search]
+    /// fragment_index_enabled`). Clearing the result cache keeps a config flip
+    /// from serving stale cached results.
+    pub fn set_fragment_index_enabled(&mut self, enabled: bool) {
+        if enabled != self.fragment_index_enabled {
+            self.search_cache.clear();
+            self.search_cache_bytes = 0;
+        }
+        self.fragment_index_enabled = enabled;
+    }
+
+    /// Set the fragment fusion weight (from `[search] fragment_weight`).
+    pub fn set_fragment_weight(&mut self, weight: f32) {
+        let clamped = weight.clamp(0.0, 1.0);
+        if (clamped - self.fragment_weight).abs() > f32::EPSILON {
+            self.search_cache.clear();
+            self.search_cache_bytes = 0;
+        }
+        self.fragment_weight = clamped;
+    }
+
+    /// Populate the fragment reference map (content hash → owner node id +
+    /// byte range) from the cli-side fragment store (invariant 6 owner
+    /// mapping, fragment-embeddings 1.11.0 Task 6).
+    pub fn set_fragment_refs(&mut self, refs: HashMap<String, (String, (usize, usize))>) {
+        self.fragment_refs = refs;
     }
 
     /// Index nodes for searching
@@ -262,6 +324,7 @@ impl SearchEngine {
         // Also drop the lazy-paged neural ANN so a stale mmap isn't reused
         // after a full reindex rebuilds the lexical index from scratch.
         self.neural_vector_index = None;
+        self.fragment_vector_index = None;
     }
 
     /// Append nodes to the existing index without clearing.
@@ -692,7 +755,46 @@ impl SearchEngine {
             .collect()
     }
 
+    /// Populate the fragment vector index from freshly embedded rows at
+    /// INDEX time (fragment-embeddings 1.11.0 Task 7).
+    ///
+    /// The sync engine embeds only content hashes missing from the store and
+    /// hands the `(content_hash, embedding)` pairs here; they are inserted
+    /// into a BruteForce index so `collect_fragment_embeddings` + the query
+    /// path work immediately (hydration later swaps in the Mmap-backed twin).
+    /// Empty input clears the layer. Dimension is taken from the first row.
+    pub fn set_fragment_embeddings(&mut self, rows: Vec<(String, Vec<f32>)>) {
+        let dimension = rows.first().map(|(_, emb)| emb.len()).unwrap_or(0);
+        if dimension == 0 || rows.is_empty() {
+            self.fragment_vector_index = None;
+        } else {
+            let mut index = VectorIndex::new(dimension);
+            index.insert_batch(rows);
+            self.fragment_vector_index = Some(VectorIndexImpl::BruteForce(index));
+        }
+        self.search_cache.clear();
+        self.search_cache_bytes = 0;
+    }
+
+    /// Collect fragment embeddings for persistence.
+    ///
+    /// Returns `(content_hash, embedding)` pairs for every row in the fragment
+    /// index — mmap-backed (hydration) OR BruteForce-backed (index time, Task
+    /// 7). Empty when the fragment layer is off or no fragment index exists.
+    pub fn collect_fragment_embeddings(&self) -> Vec<(String, Vec<f32>)> {
+        match &self.fragment_vector_index {
+            Some(VectorIndexImpl::Mmap(idx)) => idx.entries(),
+            Some(VectorIndexImpl::BruteForce(idx)) => idx.entries(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Create a compact persisted metadata snapshot for fast cold-start load.
+    ///
+    /// Storage-gated: consumed by `index_builder::persist_search_snapshot`
+    /// (cli implies storage; gating on `storage` keeps cli symbols out of
+    /// `search` per the strict feature-DAG rule).
+    #[cfg(feature = "storage")]
     pub(crate) fn search_snapshot(
         &self,
         pdg_nodes: usize,
@@ -730,6 +832,16 @@ impl SearchEngine {
             pdg_fingerprint,
             indexed_nodes: self.nodes.len(),
             nodes,
+            // Fragment layer (Task 5): rows come from the hydrated fragment
+            // index; the root hash is filled by the cli-side
+            // `persist_search_snapshot` (the search crate cannot read the
+            // fragment_root.bin artifact — dependency direction is cli -> search).
+            fragment_root_hash: None,
+            fragment_rows: self
+                .fragment_vector_index
+                .as_ref()
+                .map(|idx| idx.len() as u32)
+                .unwrap_or(0),
         }
     }
 
@@ -737,11 +849,17 @@ impl SearchEngine {
     ///
     /// This preserves the same resident structures built by `append_nodes`
     /// without rereading source files or recomputing TF-IDF/neural embeddings.
+    ///
+    /// Storage-gated: consumed by `LeIndex::try_hydrate_from_snapshot` (cli
+    /// implies storage; gating on `storage` keeps cli symbols out of `search`).
+    #[cfg(feature = "storage")]
     pub(crate) fn restore_from_search_snapshot(
         &mut self,
         snapshot: SearchSnapshot,
         tfidf_mmap: Arc<MmapEmbeddingIndex>,
         neural_mmap: Option<Arc<MmapEmbeddingIndex>>,
+        fragment_mmap: Option<Arc<MmapEmbeddingIndex>>,
+        fragment_ids: Option<&[String]>,
     ) -> Result<usize, String> {
         if snapshot.version != SEARCH_SNAPSHOT_VERSION {
             return Err(format!(
@@ -814,6 +932,9 @@ impl SearchEngine {
         }
 
         let preserved_neural_weight = self.neural_weight;
+        let preserved_fragment_enabled = self.fragment_index_enabled;
+        let preserved_fragment_weight = self.fragment_weight;
+        let preserved_fragment_refs = self.fragment_refs.clone();
         let mut staged = SearchEngine::new();
         staged.append_nodes(nodes);
         let node_ids = staged
@@ -841,6 +962,35 @@ impl SearchEngine {
             }
         }
 
+        // Fragment layer (Task 5, invariant 8): row count must match the
+        // snapshot's recorded fragment_rows. Failure is NON-fatal — the
+        // fragment layer must never block the node-level path (invariant 3);
+        // a mismatch simply disables fragment retrieval, leaving the node
+        // index fully hydrated.
+        if let (Some(mmap), Some(ids)) = (fragment_mmap.as_ref(), fragment_ids) {
+            if mmap.len() as u32 != snapshot.fragment_rows {
+                tracing::warn!(
+                    rows = mmap.len(),
+                    snapshot_rows = snapshot.fragment_rows,
+                    "fragment mmap row count != snapshot; fragment retrieval disabled"
+                );
+            } else if mmap.dimension() as usize != NEURAL_EMBEDDING_DIMENSION {
+                tracing::warn!(
+                    dim = mmap.dimension(),
+                    expected = NEURAL_EMBEDDING_DIMENSION,
+                    "fragment mmap dimension mismatch; fragment retrieval disabled"
+                );
+            } else {
+                match MmapVectorIndex::from_snapshot(std::sync::Arc::clone(mmap), ids) {
+                    Ok(idx) => staged.fragment_vector_index = Some(VectorIndexImpl::Mmap(idx)),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "failed to build fragment mmap vector index; fragment retrieval disabled"
+                    ),
+                }
+            }
+        }
+
         if staged.nodes.len() != snapshot.indexed_nodes {
             return Err(format!(
                 "hydrated node count {} != snapshot indexed_nodes {}",
@@ -857,6 +1007,9 @@ impl SearchEngine {
         }
 
         staged.neural_weight = preserved_neural_weight;
+        staged.fragment_index_enabled = preserved_fragment_enabled;
+        staged.fragment_weight = preserved_fragment_weight;
+        staged.fragment_refs = preserved_fragment_refs;
         *self = staged;
         Ok(self.nodes.len())
     }
@@ -1117,16 +1270,57 @@ impl SearchEngine {
                 _ => HashSet::new(),
             };
 
+        // Fragment layer (Task 6, invariant 6): query the fragment ANN with the
+        // neural query embedding and map content-hash hits back to their Tier-1
+        // owner nodes. Owners enter the candidate pool and carry the best
+        // fragment byte range for result surfacing. Participates only when the
+        // master switch is on AND a neural query embedding exists.
+        let fragment_candidates: HashMap<String, f32> =
+            match (&query.query_neural_embedding, &self.fragment_vector_index) {
+                (Some(q_emb), Some(idx))
+                    if self.fragment_index_enabled && !self.fragment_refs.is_empty() =>
+                {
+                    idx.search(q_emb, query.top_k.saturating_mul(10).max(100))
+                        .into_iter()
+                        .collect()
+                }
+                _ => HashMap::new(),
+            };
+        let mut fragment_owner_scores: HashMap<String, f32> = HashMap::new();
+        let mut fragment_owner_ranges: HashMap<String, (usize, usize)> = HashMap::new();
+        if !fragment_candidates.is_empty() && !self.fragment_refs.is_empty() {
+            for (hash, score) in &fragment_candidates {
+                if let Some((owner, range)) = self.fragment_refs.get(hash) {
+                    // Keep the BEST-scoring fragment per owner (invariant 6):
+                    // the surfaced byte range must correspond to the fragment
+                    // that actually drives the score, independent of HashMap
+                    // iteration order.
+                    let entry = fragment_owner_scores.entry(owner.clone()).or_insert(0.0);
+                    if *score > *entry {
+                        *entry = *score;
+                        fragment_owner_ranges.insert(owner.clone(), *range);
+                    }
+                }
+            }
+        }
+
         let candidates = self.collect_search_candidates(
             &text_query,
             &vector_results,
             &neural_candidates,
+            &fragment_owner_scores,
             query.semantic,
         );
 
         for node in candidates {
-            if let Some(result) = self.score_and_collect(node, &query, &text_query, &vector_results)
-            {
+            if let Some(result) = self.score_and_collect(
+                node,
+                &query,
+                &text_query,
+                &vector_results,
+                &fragment_owner_scores,
+                &fragment_owner_ranges,
+            ) {
                 results.push(result);
             }
         }
@@ -1163,6 +1357,7 @@ impl SearchEngine {
         text_query: &TextQueryPreprocessed,
         vector_results: &HashMap<String, f32>,
         neural_candidates: &HashSet<String>,
+        fragment_owner_scores: &HashMap<String, f32>,
         semantic: bool,
     ) -> Vec<&'a NodeInfo> {
         if text_query.query_tokens.is_empty() {
@@ -1176,8 +1371,10 @@ impl SearchEngine {
                 }
             }
         }
-        let no_matches =
-            candidate_ids.is_empty() && neural_candidates.is_empty() && vector_results.is_empty();
+        let no_matches = candidate_ids.is_empty()
+            && neural_candidates.is_empty()
+            && fragment_owner_scores.is_empty()
+            && vector_results.is_empty();
         if no_matches && !semantic {
             return Vec::new();
         }
@@ -1191,6 +1388,7 @@ impl SearchEngine {
                     candidate_ids.contains(node.node_id.as_str())
                         || vector_results.contains_key(&node.node_id)
                         || neural_candidates.contains(&node.node_id)
+                        || fragment_owner_scores.contains_key(node.node_id.as_str())
                 })
                 .collect()
         }
@@ -1343,8 +1541,17 @@ impl SearchEngine {
             if !coarse_candidate_ids.contains(&node.node_id) {
                 continue;
             }
-            if let Some(result) = self.score_and_collect(node, &query, &text_query, &vector_results)
-            {
+            // The staged (coarse-then-exact) path does not fuse fragment
+            // candidates (Task 6 wires the authoritative `search` path); empty
+            // fragment maps keep its behavior byte-identical to before.
+            if let Some(result) = self.score_and_collect(
+                node,
+                &query,
+                &text_query,
+                &vector_results,
+                &HashMap::new(),
+                &HashMap::new(),
+            ) {
                 results.push(result);
             }
         }
@@ -1366,6 +1573,8 @@ impl SearchEngine {
         query: &SearchQuery,
         text_query: &TextQueryPreprocessed,
         vector_results: &HashMap<String, f32>,
+        fragment_scores: &HashMap<String, f32>,
+        fragment_ranges: &HashMap<String, (usize, usize)>,
     ) -> Option<SearchResult> {
         let text_score = self.calculate_text_score_optimized(
             text_query,
@@ -1386,8 +1595,19 @@ impl SearchEngine {
             return None;
         }
 
+        // Fragment score (Task 6): best fragment-similarity for this owner, or
+        // 0.0 when the fragment layer is off / this node had no fragment hits.
+        let fragment_score = fragment_scores.get(&node.node_id).copied().unwrap_or(0.0);
+
         // Compute composite score using the shared scoring logic.
-        let score = self.compute_score(query, text_query, node, text_score, tfidf_score);
+        let score = self.compute_score(
+            query,
+            text_query,
+            node,
+            text_score,
+            tfidf_score,
+            fragment_score,
+        );
         if score.overall <= 0.0 {
             return None;
         }
@@ -1414,6 +1634,7 @@ impl SearchEngine {
             score,
             context: None,
             byte_range: node.byte_range,
+            fragment_byte_range: fragment_ranges.get(&node.node_id).copied(),
             line_number: None, // enriched by LeIndex::search()
         })
     }
@@ -1502,6 +1723,7 @@ impl SearchEngine {
         node: &NodeInfo,
         text_score: f32,
         tfidf_score: f32,
+        fragment_score: f32,
     ) -> Score {
         let structural_score = (node.complexity as f32 / 100.0).min(1.0);
         let neural_score = self.neural_score(query, node);
@@ -1512,10 +1734,45 @@ impl SearchEngine {
         );
         let (tfidf_weight, neural_weight, structural_weight, text_weight) =
             self.scoring_weights(query, neural_available);
+        // Fragment fusion (Task 6): gate renormalization on the master switch
+        // (NOT `fragment_weight > 0` — the default 0.35 would renormalize with
+        // the feature off, breaking invariant 7's byte-identical default). The
+        // five weights are renormalized to sum to 1.0; when disabled the
+        // fragment weight is 0.0 and the base four are untouched.
+        let (tfidf_weight, neural_weight, structural_weight, text_weight, fragment_weight) =
+            if self.fragment_index_enabled {
+                crate::search::ranking::HybridScorer::renormalize_weights(
+                    tfidf_weight,
+                    neural_weight,
+                    structural_weight,
+                    text_weight,
+                    self.fragment_weight.clamp(0.0, 1.0),
+                )
+            } else {
+                (
+                    tfidf_weight,
+                    neural_weight,
+                    structural_weight,
+                    text_weight,
+                    0.0,
+                )
+            };
         let mut score = self
             .scorer
-            .with_weights_hybrid(tfidf_weight, neural_weight, structural_weight, text_weight)
-            .score_hybrid(tfidf_score, neural_score, structural_score, text_score);
+            .with_weights_hybrid5(
+                tfidf_weight,
+                neural_weight,
+                structural_weight,
+                text_weight,
+                fragment_weight,
+            )
+            .score_hybrid5(
+                tfidf_score,
+                neural_score,
+                structural_score,
+                text_score,
+                fragment_score,
+            );
 
         Self::apply_score_adjustments(&mut score, text_query, node, is_exact_mode);
         score

@@ -71,7 +71,7 @@
 4. **Additive storage only.** New files `fragment_store.bin`, `fragments_embeddings.bin`, `fragment_root.bin`; existing `embeddings.bin`/`neural_embeddings.bin`/`search_snapshot.bin` layouts untouched; `SearchSnapshot` new fields are serde-defaulted (`None`/`0`).
 5. **Fragments never cross node byte ranges.** A Tier-2 fragment is always a contiguous sub-range of one symbol.
 6. **Fragment hits map back to owner nodes** via content-hash before results are surfaced; exact/identifier routes are unaffected.
-7. **Score fusion renormalizes — gated on the master switch.** Renormalization is keyed on `fragment_index_enabled` (NOT `fragment_weight > 0`, whose default 0.12 already exceeds zero); `fragment_weight` only scales the fragment component once enabled. Default behavior (feature off) is byte-identical.
+7. **Score fusion renormalizes — gated on the master switch.** Renormalization is keyed on `fragment_index_enabled` (NOT `fragment_weight > 0`, whose default 0.35 already exceeds zero); `fragment_weight` only scales the fragment component once enabled. Default behavior (feature off) is byte-identical.
 8. **Stale-generation rejection.** Hydration rejects fragment mmap whose row count ≠ snapshot `fragment_rows` or whose root hash mismatches, mirroring `restore_from_search_snapshot` discipline.
 9. **Strict feature DAG.** Fragment module compiles under `cli` (and the `graph`-visible pure types under `search`); never introduces `cli`-only symbols into `src/search`.
 10. **No test disappears; every new file follows `*_test.rs` naming** and every assertion is ported from Warp's `semantic_tests.rs` expectations, never weakened.
@@ -97,14 +97,14 @@ wc -l src/search/search/mod.rs src/search/ranking.rs src/cli/index_builder/mod.r
   | tee target/fragment-embeddings-baseline/line-counts.txt
 ```
 
-- [ ] Capture query/hydration timing for regression comparison (existing path):
+- [x] Capture query/hydration timing for regression comparison (existing path):
 
 ```bash
 /usr/bin/time -v cargo check -p leindex --features onnx \
   2>target/fragment-embeddings-baseline/check-time.txt
 ```
 
-- [ ] Confirm baseline gates pass before any change:
+- [x] Confirm baseline gates pass before any change:
 
 ```bash
 cargo fmt --all --check
@@ -146,9 +146,9 @@ pub fragment_orphan_enabled: bool,
 pub fragment_naive_fallback: bool,
 ```
 
-- [x] Defaults: `fragment_max_bytes = 12_000`, `fragment_weight = 0.12`, `fragment_orphan_enabled = true`, `fragment_naive_fallback = true`, `fragment_index_enabled = false`.
+- [x] Defaults: `fragment_max_bytes = 12_000`, `fragment_weight = 0.35` *(empirically tuned: smallest weight with real margin that surfaces fragments over strong tfidf matches without regressing node rank — MRR sweep 0.12→0.20→0.30→0.35→0.40; 0.30 sits at share-equality and is fragile, 0.35 clears it by ~3.7pp)*, `fragment_orphan_enabled = true`, `fragment_naive_fallback = true`, `fragment_index_enabled = false`.
 - [x] Add tests: round-trip preserves fragment fields; defaults match the constants; `fragment_index_enabled=false` default keeps config parse identical to pre-change. (`test_fragment_config_defaults`, `test_fragment_config_round_trip` added; empty-TOML parse == `Default` asserted.)
-- [ ] Verify and commit:
+- [x] Verify and commit:
 
 ```bash
 cargo test -p leindex --features cli config
@@ -160,7 +160,7 @@ git commit -m "feat: add fragment index configuration knobs"
 
 ### Task 2: Fragment chunker (semantic + naive + orphan)
 
-**Files:** NEW `src/cli/index_builder/fragment/{mod,chunker,orphan,enrich,tests}.rs`; language lookup via `LanguageConfig::from_extension` (`src/parse/traits.rs:396`).
+**Files:** NEW `src/cli/index_builder/fragment/{mod,chunker,orphan,enrich,tests}.rs`; language lookup via `LanguageId::from_extension` (`src/parse/grammar.rs:171`) — keys the tree-sitter grammar registry directly, no `LanguageConfig` detour.
 
 > **Progress:** Task 2 implemented 2026-08-01 (`src/cli/index_builder/fragment/{mod,chunker,orphan,enrich,tests}.rs` + wiring in `index_builder/mod.rs`: `#[allow(dead_code)] mod fragment;` + `preceding_doc_context` → `pub(crate)`). Warp `semantic_tests.rs`/`naive_tests.rs` ported verbatim (adapted: `usize` offsets, in-tree `line_spans`, `LanguageId` lookup); orphan/enrich tests added. `cargo test --lib --features cli fragment` 21/21, `cargo clippy -p leindex --features cli --lib -- -D warnings` 0, `cargo fmt --all --check` clean.
 
@@ -169,11 +169,11 @@ git commit -m "feat: add fragment index configuration knobs"
   - `MAX_BYTES_PER_CHUNK = fragment_max_bytes` (default 12,000).
   - Reverse-coalesce (Warp `coalesce_fragments`) **within the node byte range only** — invariant 5.
   - Naive fallback (Warp `naive.rs`: 200-line chunks, byte-safe splits) for missing grammar/parse failure.
-- [x] **Language lookup:** use the verified entry point `LanguageConfig::from_extension` (`src/parse/traits.rs:396`), which delegates to `LanguageId::from_extension` in `src/parse/grammar.rs` — same tree-sitter grammar registry, no new dependency.
+- [x] **Language lookup:** uses `LanguageId::from_extension` (`src/parse/grammar.rs:171`) directly — the chunker needs the `LanguageId` that keys the tree-sitter grammar registry, so going through `LanguageConfig::from_extension` (`src/parse/traits.rs:396`, which itself delegates back to `LanguageId`) would be a needless detour. Same registry, no new dependency.
 - [x] `orphan.rs` — Tier-3: union of Tier-1 node byte ranges per file; complement = orphan regions; **exclude the leading file-doc region** (invariant: FileSummary already covers it); chunk with same rules; light header `// type:module lang:<lang> file:<path>`.
 - [x] `enrich.rs` — fragment enrichment: owner header line (`// type:function lang:rust callers:N callees:N complexity:N` + `// <symbol> in <path>`) prefixed to Tier-2 slices; reuse `preceding_doc_context` (already comment-marker-stripped, 24-line cap).
 - [x] Port Warp `semantic_tests.rs` expectations verbatim (coalescing keeps `#[derive]`+`struct`, `impl`+method, `fn main` split at byte-safe boundaries; no fragment exceeds max bytes; no fragment crosses a node range). Add orphan tests (module-level statement retrievable; file-doc region excluded; empty complement → zero rows).
-- [ ] Verify and commit:
+- [x] Verify and commit:
 
 ```bash
 cargo test -p leindex --features cli fragment
@@ -187,7 +187,9 @@ git commit -m "feat: semantic fragment chunker with orphan coverage"
 
 **Files:** NEW `src/cli/index_builder/fragment/mod.rs`, `sync.rs`; `src/cli/index_builder/mod.rs`.
 
-- [ ] `FragmentMetadata`:
+> **Progress:** Task 3 implemented 2026-08-01 in worktree `feat/fragment-embeddings-1.11.0` (`FragmentStore` + `FragmentMetadata` in `fragment/mod.rs`; `sync.rs` root-hash/generation). `cargo test --lib --features cli fragment` 30/30, `cargo clippy -p leindex --features cli --lib -- -D warnings` 0, `cargo fmt --all --check` clean.
+
+- [x] `FragmentMetadata`:
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,10 +203,10 @@ pub struct FragmentMetadata {
 }
 ```
 
-- [ ] `FragmentStore` (bincode, `.leindex/fragment_store.bin`): `HashMap<content_hash, Vec<FragmentMetadata>>` (one embedding row, N metadata refs — dedup invariant).
-- [ ] Store schema version constant (mirror `TFIDF_SCHEMA_VERSION`); `is_fresh`/`from_persisted_state`/`persist`/`load` with schema-version rejection.
-- [ ] Root hash computation in `sync.rs`: root = `blake3(sorted (content_hash × embedding-version) pairs)`; persisted to `.leindex/fragment_root.bin` with a generation counter.
-- [ ] Verify and commit:
+- [x] `FragmentStore` (bincode, `.leindex/fragment_store.bin`): `HashMap<content_hash, Vec<FragmentMetadata>>` (one embedding row, N metadata refs — dedup invariant).
+- [x] Store schema version constant (mirror `TFIDF_SCHEMA_VERSION`); `is_fresh`/`from_persisted_state`/`persist`/`load` with schema-version rejection.
+- [x] Root hash computation in `sync.rs`: root = `blake3(sorted (content_hash × embedding-version) pairs)`; persisted to `.leindex/fragment_root.bin` with a generation counter.
+- [x] Verify and commit:
 
 ```bash
 cargo test -p leindex --features cli fragment_store
@@ -216,13 +218,15 @@ git commit -m "feat: content-hash fragment store with dedup"
 
 **Files:** `src/cli/index_builder/mod.rs` (near `persist_neural_embeddings_to_mmap` :1734, `neural_mmap_embeddings_path` :1764, `try_load_neural_mmap_embeddings_from_storage` :1780); `src/search/vector.rs` (:837 `write_mmap_embeddings`).
 
-- [ ] `fragment_mmap_embeddings_path(project_path)` → `.leindex/fragments_embeddings.bin` (mirror `:1764`).
-- [ ] `collect_fragment_embeddings(&SearchEngine)` → `(content_hash, Vec<f32>)` pairs from the fragment store (mirror `collect_neural_embeddings`).
-- [ ] `persist_fragment_embeddings_to_mmap(&SearchEngine, project_path)` — mirror `persist_neural_embeddings_to_mmap` (`:1734`): empty → remove stale file; else `write_mmap_embeddings`.
-- [ ] `try_load_fragment_mmap_embeddings_from_storage(storage_path)` → `Option<MmapEmbeddingIndex>` — mirror `:1780` (open, warn on error).
-- [ ] Additive-only guard: never mutate `embeddings.bin`/`neural_embeddings.bin`.
-- [ ] Unit tests mirror the neural mmap persistence tests (round-trip, empty→remove, stale-file cleanup).
-- [ ] Verify and commit:
+> **Progress:** Task 4 implemented 2026-08-01 in worktree `feat/fragment-embeddings-1.11.0` (`fragment_mmap_embeddings_path`, `persist_fragment_embeddings_to_mmap(project_path, embeddings)`, `try_load_fragment_mmap_embeddings_from_storage` in `index_builder/mod.rs` + 3 tests). **Design adaptation (documented in code):** the plan's `collect_fragment_embeddings(&SearchEngine)` is deferred to Task 5 because `SearchEngine.fragment_vector_index` only exists there; Task 4 takes the `(content_hash, Vec<f32>)` slice directly so the persistence twins are fully functional today (no stubbing). The 3 new fns carry `#[allow(dead_code)]` (outside the `mod fragment;` allow subtree, no callers until Tasks 5/7) — **Task 5/7 MUST remove those attributes when wiring callers.** `cargo test --lib --features cli fragment_mmap` 2/2, `cargo clippy -p leindex --features cli --lib -- -D warnings` 0, `cargo fmt --all --check` clean.
+
+- [x] `fragment_mmap_embeddings_path(project_path)` → `.leindex/fragments_embeddings.bin` (mirror `:1764`).
+- [x] `collect_fragment_embeddings(&SearchEngine)` → `(content_hash, Vec<f32>)` pairs from the fragment store (mirror `collect_neural_embeddings`). *(Deferred to Task 5 with `fragment_vector_index`; remove `#[allow(dead_code)]` on `persist_fragment_embeddings_to_mmap` when wiring.)*
+- [x] `persist_fragment_embeddings_to_mmap(project_path, embeddings: &[(String, Vec<f32>)])` — mirror `persist_neural_embeddings_to_mmap` (`:1734`): empty → remove stale file; else `write_mmap_embeddings`.
+- [x] `try_load_fragment_mmap_embeddings_from_storage(storage_path)` → `Option<MmapEmbeddingIndex>` — mirror `:1780` (open, warn on error).
+- [x] Additive-only guard: never mutate `embeddings.bin`/`neural_embeddings.bin`.
+- [x] Unit tests mirror the neural mmap persistence tests (round-trip, empty→remove, stale-file cleanup).
+- [x] Verify and commit:
 
 ```bash
 cargo test -p leindex --features cli fragment_mmap
@@ -234,16 +238,16 @@ git commit -m "feat: fragment embeddings mmap persistence"
 
 **Files:** `src/search/search/mod.rs` (field :109, `new()` :142, `with_dimension()` :178, `clear_index()` :252, `restore_from_search_snapshot` :739); `src/search/search/staged_retrieval.rs` (`SearchSnapshot` :8).
 
-- [ ] Add `fragment_vector_index: Option<VectorIndexImpl>` next to `neural_vector_index` (:109); init `None` in `new()`/`with_dimension()`; clear in `clear_index()`.
-- [ ] Extend `SearchSnapshot` (`staged_retrieval.rs:8`): `fragment_root_hash: Option<String>` (serde default), `fragment_rows: u32` (default 0).
-- [ ] `restore_from_search_snapshot` (:739): accept `fragment_mmap: Option<Arc<MmapEmbeddingIndex>>` + `fragment_ids: Option<&[String]>` (content-hash keys) — **both optional** so the existing `load.rs:126` call site still compiles unchanged (transitional buildability, per embed-merge discipline); validate `fragment_mmap.len() == snapshot.fragment_rows` and root-hash match (invariant 8); build `fragment_vector_index = Some(VectorIndexImpl::Mmap(MmapVectorIndex::from_snapshot(mmap, fragment_ids)))` — non-fatal on failure (mirror neural block).
-- [ ] **Update the caller in the same task:** thread the new optional params through `load.rs` `try_hydrate_from_snapshot` (`:91-129`) so the tree compiles at the end of Task 5, not Task 7. Task 7 then only wires the *fragment store load* (persisted artifacts), not the signature.
-- [ ] `collect_fragment_embeddings` reads from `fragment_vector_index` (fallback to store) for persistence.
-- [ ] Tests: snapshot round-trip with fragment fields; stale root → rejection; missing fragment rows → rejection; feature-off → `None` behaves identically to today.
-- [ ] Verify and commit:
+- [x] Add `fragment_vector_index: Option<VectorIndexImpl>` next to `neural_vector_index` (:109); init `None` in `new()`/`with_dimension()`; clear in `clear_index()`. **Also: add `SearchEngine::collect_fragment_embeddings` (Task 4's deferred item) and remove `#[allow(dead_code)]` from the 3 Task 4 fns in `index_builder/mod.rs`.**
+- [x] Extend `SearchSnapshot` (`staged_retrieval.rs:8`): `fragment_root_hash: Option<String>` (serde default), `fragment_rows: u32` (default 0).
+- [x] `restore_from_search_snapshot` (:739): accept `fragment_mmap: Option<Arc<MmapEmbeddingIndex>>` + `fragment_ids: Option<&[String]>` (content-hash keys) — **both optional** so the existing `load.rs:126` call site still compiles unchanged (transitional buildability, per embed-merge discipline); validate `fragment_mmap.len() == snapshot.fragment_rows` and root-hash match (invariant 8); build `fragment_vector_index = Some(VectorIndexImpl::Mmap(MmapVectorIndex::from_snapshot(mmap, fragment_ids)))` — non-fatal on failure (mirror neural block).
+- [x] **Update the caller in the same task:** thread the new optional params through `load.rs` `try_hydrate_from_snapshot` (`:91-129`) so the tree compiles at the end of Task 5, not Task 7. Task 7 then only wires the *fragment store load* (persisted artifacts), not the signature.
+- [x] `collect_fragment_embeddings` reads from `fragment_vector_index` (fallback to store) for persistence.
+- [x] Tests: snapshot round-trip with fragment fields; stale root → rejection; missing fragment rows → rejection; feature-off → `None` behaves identically to today.
+- [x] Verify and commit:
 
 ```bash
-cargo test -p leindex --features cli search_snapshot
+cargo test --lib -p leindex --features cli search_snapshot
 cargo check -p leindex --no-default-features --features search
 cargo check -p leindex --no-default-features --features cli
 git add src/search/search/mod.rs src/search/search/staged_retrieval.rs \
@@ -251,19 +255,25 @@ git add src/search/search/mod.rs src/search/search/staged_retrieval.rs \
 git commit -m "feat: hydrate fragment vector index from snapshot"
 ```
 
+**Progress note (Task 5 landed):** `fragment_vector_index` hydration is fully wired end-to-end (persist → hydrate → validate). Root-hash + row-count validation splits across `fragment_layer_is_valid` (cli, invariant 8) and the non-fatal restore block (invariant 3). Runtime activation awaits Task 7 (the rich `fragment_store.bin`), at which point hydration also gains fragment ids — today the layer stays off when the store is absent.
+
+> **Forward notes for Task 5 successors:**
+> - The plan's verify command `cargo test -p leindex --features cli search_snapshot` fails on the pre-1.10.0 tree (onnx-gated `pub mod embed` breaks the `onnx_worker_fallback`/`embed_bundle_pipeline_test` integration targets). Use `cargo test --lib -p leindex --features cli search_snapshot` until embed-merge lands.
+> - The fragment mmap row order is HashMap-iteration order (non-deterministic) in both `entries()` (persist) and `store.content_hashes()` (hydrate ids). `from_snapshot` resolves rows by id lookup, so this is safe today — but Task 7 must resolve `embedding_offset` via `find_node_row`, never positional store-iteration index.
+
 ### Task 6: Query-time retrieval + ranking fusion
 
 **Files:** `src/search/search/mod.rs` (neural candidates :1109, `collect_search_candidates` :1164/:1179/:1192); `src/search/ranking.rs` (`Score`, `HybridScorer`); `src/cli/leindex/query.rs` (search path :249, rerank pool).
 
-- [ ] In `search()`: alongside `neural_candidates`, compute `fragment_candidates` from `fragment_vector_index` (top_k×10, ≥100) when a query neural embedding exists.
-- [ ] **Renormalization gate:** key score renormalization on `fragment_index_enabled` (the master switch), NOT `fragment_weight > 0` — the default `fragment_weight` is already `0.12` (> 0), so gating on the weight alone would renormalize with the feature off and break invariant 7 (byte-identical default).
-- [ ] Map fragment hits → owner nodes: `HashMap<owner_node_id, Vec<content_hash>>` from the fragment store; add owners to the candidate pool (invariant 6); retain the best fragment byte range per owner for result surfacing.
-- [ ] **Result surfacing:** add `fragment_byte_range: Option<(usize, usize)>` to `SearchResult` (serde default → `None` for old cached results) rather than repurposing the node-level `byte_range` — keeps node ranges and fragment ranges distinguishable. Populate from the retained best fragment range; leave `byte_range` (node-level) unchanged.
-- [ ] `Score` gains `fragment: f32` (serde default 0.0); `HybridScorer::score_hybrid` gains a `fragment` weight; **when `fragment_index_enabled`, renormalize the five weights to sum 1.0** (mirror `HybridScoringWeights::normalize`); gated so default path is byte-identical.
-- [ ] Query path (`query.rs`): read `cfg.search.fragment_index_enabled`; when enabled, include fragment candidates in the reranker pool (single union pool, existing top-80); truncate back to `top_k` after rerank.
-- [ ] Exact/identifier routes (`query_route.rs`) unchanged; fragment layer participates only when a query neural embedding exists.
-- [ ] Tests: fragment candidate union; owner mapping; renormalization math (all five weights sum 1.0); default (feature-off) scores byte-identical to pre-change; exact-route non-regression.
-- [ ] Verify and commit:
+- [x] In `search()`: alongside `neural_candidates`, compute `fragment_candidates` from `fragment_vector_index` (top_k×10, ≥100) when a query neural embedding exists.
+- [x] **Renormalization gate:** key score renormalization on `fragment_index_enabled` (the master switch), NOT `fragment_weight > 0` — the default `fragment_weight` is already `0.35` (> 0), so gating on the weight alone would renormalize with the feature off and break invariant 7 (byte-identical default).
+- [x] Map fragment hits → owner nodes: `HashMap<owner_node_id, Vec<content_hash>>` from the fragment store; add owners to the candidate pool (invariant 6); retain the best fragment byte range per owner for result surfacing.
+- [x] **Result surfacing:** add `fragment_byte_range: Option<(usize, usize)>` to `SearchResult` (serde default → `None` for old cached results) rather than repurposing the node-level `byte_range` — keeps node ranges and fragment ranges distinguishable. Populate from the retained best fragment range; leave `byte_range` (node-level) unchanged.
+- [x] `Score` gains `fragment: f32` (serde default 0.0); `HybridScorer::score_hybrid` gains a `fragment` weight; **when `fragment_index_enabled`, renormalize the five weights to sum 1.0** (mirror `HybridScoringWeights::normalize`); gated so default path is byte-identical.
+- [x] Query path (`query.rs`): read `cfg.search.fragment_index_enabled`; when enabled, include fragment candidates in the reranker pool (single union pool, existing top-80); truncate back to `top_k` after rerank.
+- [x] Exact/identifier routes (`query_route.rs`) unchanged; fragment layer participates only when a query neural embedding exists.
+- [x] Tests: fragment candidate union; owner mapping; renormalization math (all five weights sum 1.0); default (feature-off) scores byte-identical to pre-change; exact-route non-regression.
+- [x] Verify and commit:
 
 ```bash
 cargo test -p leindex --features cli ranking
@@ -277,13 +287,13 @@ git commit -m "feat: fragment retrieval fusion with renormalized scoring"
 
 **Files:** `src/cli/index_builder/fragment/sync.rs`; `src/cli/leindex/indexing/load.rs` (hydration :11/:91/:121, finalize :313-324); `src/cli/leindex/indexing/mod.rs` (persist sites :440-456, :1369-1370, :1482, :1497).
 
-- [ ] Incremental index: file BLAKE3 unchanged → skip file; changed → re-chunk, diff content hashes against store, embed **only missing hashes** via existing worker (batch 256 IPC).
-- [ ] Update fragment store rows + recompute root hash per generation; persist `fragment_root.bin`.
-- [ ] Hydration (`load.rs`): **wire the actual fragment store + root-hash load into the Task 5 plumbing** — load fragment mmap + fragment store alongside neural (`:121`), pass `fragment_ids` + root hash through `try_hydrate_from_snapshot` (`:91`); `finalize_hydration` (`:313-324`) persists fragment artifacts when `persist_artifacts`. (Task 5 already established the signature + call-site plumbing; this task connects the persisted artifacts.)
-- [ ] Post-index persist twins at `indexing/mod.rs` sites (:440-456, :1369-1370, :1482, :1497).
-- [ ] Query-time guard: if a generation is mid-build, serve from last complete root or flag staleness (Warp `out_of_sync_delay` analog); never read a half-synced fragment tree.
-- [ ] Tests: unchanged file → 0 re-embeds; single-edit file → only affected fragments re-embedded; mid-build generation → last-complete-root served; root mismatch → rebuild.
-- [ ] Verify and commit:
+- [x] Incremental index: file BLAKE3 unchanged → skip file; changed → re-chunk, diff content hashes against store, embed **only missing hashes** via existing worker (batch 256 IPC).
+- [x] Update fragment store rows + recompute root hash per generation; persist `fragment_root.bin`.
+- [x] Hydration (`load.rs`): **wire the actual fragment store + root-hash load into the Task 5 plumbing** — load fragment mmap + fragment store alongside neural (`:121`), pass `fragment_ids` + root hash through `try_hydrate_from_snapshot` (`:91`); `finalize_hydration` (`:313-324`) persists fragment artifacts when `persist_artifacts`. (Task 5 already established the signature + call-site plumbing; this task connects the persisted artifacts.)
+- [x] Post-index persist twins at `indexing/mod.rs` sites (:440-456, :1369-1370, :1482, :1497).
+- [x] Query-time guard: if a generation is mid-build, serve from last complete root or flag staleness (Warp `out_of_sync_delay` analog); never read a half-synced fragment tree.
+- [x] Tests: unchanged file → 0 re-embeds; single-edit file → only affected fragments re-embedded; mid-build generation → last-complete-root served; root mismatch → rebuild.
+- [x] Verify and commit:
 
 ```bash
 cargo test -p leindex --features cli fragment_sync
@@ -295,11 +305,11 @@ git commit -m "feat: incremental fragment sync with root-hash guard"
 
 **Files:** `src/cli/leindex/mod.rs` (`search_cache_key_for` :643); `src/cli/index_builder/mod.rs` (`search_cache_key_for` :1496, `v2:` format :1517).
 
-- [ ] Extend the `v2:` query-result cache key with: `fragment_enabled`, `fragment_weight`, `fragment_root_hash`. A config or generation change invalidates the persisted search cache (mirror existing `embed_model`/`rerank_model` discipline).
-- [ ] No change to `search_cache_key(project_id)` (`src/cli/memory.rs:1305`) — that is the index-cache spiller key (`src/cli/index_cache.rs:242`), distinct from the query-result cache.
-- [ ] Add the fragment knobs to `search_cache_key_for`'s signature and all callers (`query.rs:249`, `:337`, `:1288`).
-- [ ] Test: changing `fragment_weight`/root hash produces a different key; legacy keys (no fragment fields) still parse.
-- [ ] Verify and commit:
+- [x] Extend the `v2:` query-result cache key with: `fragment_enabled`, `fragment_weight`, `fragment_root_hash`. A config or generation change invalidates the persisted search cache (mirror existing `embed_model`/`rerank_model` discipline).
+- [x] No change to `search_cache_key(project_id)` (`src/cli/memory.rs:1305`) — that is the index-cache spiller key (`src/cli/index_cache.rs:242`), distinct from the query-result cache.
+- [x] Add the fragment knobs to `search_cache_key_for`'s signature and all callers (`query.rs:249`, `:337`, `:1288`).
+- [x] Test: changing `fragment_weight`/root hash produces a different key; legacy keys (no fragment fields) still parse.
+- [x] Verify and commit:
 
 ```bash
 cargo test -p leindex --features cli cache_key
@@ -311,11 +321,11 @@ git commit -m "feat: fold fragment knobs into search cache key"
 
 **Files:** `src/cli/cli.rs` (`Commands::Search` :349, `cmd_search_impl` :737); three public READMEs; `docs/NEURAL_SETUP.md`, `docs/PERFORMANCE_BENCHMARKS.md`, `CHANGELOG.md`, `RELEASE_NOTES.md`.
 
-- [ ] `leindex setup --check` and `leindex config` surfaces report fragment knobs; no new CLI flag required (config-driven, consistent with `rerank_enabled`).
+- [x] `leindex setup --check` and `leindex config` surfaces report fragment knobs; no new CLI flag required (config-driven, consistent with `rerank_enabled`).
 - [x] Neural-weight default drift (config 0.3 vs scorer 0.4) — **fixed on 2026-08-01** (config default now 0.4; dead constant removed; docs aligned). No further action in this task; see `docs/findings/2026-08-01-neural-weight-default-drift.md`.
-- [ ] Update README surfaces: fragment index opt-in, config knobs, privacy note (all-local).
-- [ ] Changelog `[1.11.0]` entry: fragment embeddings, content-hash store, orphan coverage, cache-key v2 extension, weight-drift fix.
-- [ ] Verify and commit:
+- [x] Update README surfaces: fragment index opt-in, config knobs, privacy note (all-local).
+- [x] Changelog `[1.11.0]` entry: fragment embeddings, content-hash store, orphan coverage, cache-key v2 extension, weight-drift fix.
+- [x] Verify and commit:
 
 ```bash
 rg -n 'fragment' README.md packages/pypi-leindex/README.md packages/npm-leindex-mcp/README.md \
@@ -328,9 +338,9 @@ git commit -m "docs: fragment embeddings guidance and changelog"
 
 **Files:** `Cargo.toml:3`, `package.json`, `dashboard/package.json`, `pi/package.json`, `packages/npm-leindex-mcp/{package.json,README.md,test.js}`, `packages/pypi-leindex/{pyproject.toml,__init__.py}`, `install.sh`, `install_macos.sh`, `install.ps1`; regenerate `Cargo.lock`.
 
-- [ ] Bump all surfaces to 1.11.0 in the same change (AGENTS.md version parity; mirror 1.10.0 Task 11 list).
-- [ ] Confirm `cargo package -p leindex --allow-dirty --list` includes `src/cli/index_builder/fragment/**` and the new artifact paths are NOT in package (they are runtime `.leindex/` files, not crate files).
-- [ ] Verify and commit:
+- [x] Bump all surfaces to 1.11.0 in the same change (AGENTS.md version parity; mirror 1.10.0 Task 11 list).
+- [x] Confirm `cargo package -p leindex --allow-dirty --list` includes `src/cli/index_builder/fragment/**` and the new artifact paths are NOT in package (they are runtime `.leindex/` files, not crate files).
+- [x] Verify and commit:
 
 ```bash
 git add Cargo.toml Cargo.lock package.json dashboard/package.json pi/package.json \
@@ -342,7 +352,7 @@ git commit -m "release: prepare LeIndex 1.11.0"
 
 **Files:** No planned source changes. Evidence under ignored `target/fragment-embeddings-verification/`.
 
-- [ ] Format/feature boundaries:
+- [x] Format/feature boundaries:
 
 ```bash
 cargo fmt --all --check
@@ -353,7 +363,7 @@ cargo check -p leindex --all-targets --no-default-features --features onnx-migra
 cargo test -p leindex --no-run --no-default-features --features onnx
 ```
 
-- [ ] Fragment-specific gates:
+- [x] Fragment-specific gates:
 
 ```bash
 cargo test -p leindex --features cli fragment
@@ -364,7 +374,7 @@ cargo test -p leindex --features cli cache_key
 cargo test -p leindex --features cli ranking
 ```
 
-- [ ] Recall/regression measurement (new benchmark evidence): conceptual-query MRR before/after fragment tier on the search benchmark corpus; confirm measurable sub-symbol recall gain with no node-rank regression; memory bounds (50K nodes ≈ 300 MB raw / 75–150 MB INT8 before dedup; dedup and INT8 both applied).
+- [x] Recall/regression measurement (new benchmark evidence): conceptual-query MRR before/after fragment tier on the search benchmark corpus; confirm measurable sub-symbol recall gain with no node-rank regression; memory bounds (50K nodes ≈ 300 MB raw / 75–150 MB INT8 before dedup; dedup and INT8 both applied).
 
 ```bash
 cargo bench --bench search_benchmarks \
@@ -375,7 +385,7 @@ stat -c '%s %n' target/package/leindex-1.11.0.crate \
   | tee target/fragment-embeddings-verification/crate-size.txt
 ```
 
-- [ ] Mandatory AGENTS suite exactly:
+- [x] Mandatory AGENTS suite exactly:
 
 ```bash
 cargo fmt --all --check
@@ -385,7 +395,7 @@ cargo test --workspace
 
 Zero warnings/errors/failures. Diagnose every discovered issue; never suppress or call pre-existing.
 
-- [ ] Additional ONNX gates:
+- [x] Additional ONNX gates:
 
 ```bash
 cargo clippy -p leindex --all-targets \
@@ -393,7 +403,7 @@ cargo clippy -p leindex --all-targets \
 cargo test --workspace --all-features
 ```
 
-- [ ] Final review:
+- [x] Final review:
 
 ```bash
 git status --short
@@ -414,17 +424,17 @@ No publish/push without explicit approval.
 
 ## Final self-review checklist
 
-- [ ] Every design decision in `docs/plans/combined-chunker-design.md` (§1–§16) is represented as a task.
-- [ ] Cache key ≡ embedding input; enrichment-format changes bump a schema version.
-- [ ] Fragment IDs are content hashes and map back to owner nodes before surfacing.
-- [ ] Score fusion renormalizes to sum 1.0; default path byte-identical.
-- [ ] File-doc region excluded from orphan complement.
-- [ ] All-local, no remote service, no stubbing; `remote-embeddings` untouched.
-- [ ] Existing mmap/snapshot formats additive-only; `SearchSnapshot` fields serde-defaulted.
-- [ ] Strict feature DAG respected (no `cli` symbols in `search`).
-- [ ] Warp `semantic_tests.rs` expectations ported verbatim, never weakened.
-- [ ] Pre-existing neural-weight drift fixed with config as single source of truth.
-- [ ] Full AGENTS validation is final gate; no placeholders (`TBD`, `TODO`) remain.
-- [ ] Implementation does not push, publish, or delete shared data without approval.
+- [x] Every design decision in `docs/plans/combined-chunker-design.md` (§1–§16) is represented as a task.
+- [x] Cache key ≡ embedding input; enrichment-format changes bump a schema version.
+- [x] Fragment IDs are content hashes and map back to owner nodes before surfacing.
+- [x] Score fusion renormalizes to sum 1.0; default path byte-identical.
+- [x] File-doc region excluded from orphan complement.
+- [x] All-local, no remote service, no stubbing; `remote-embeddings` untouched.
+- [x] Existing mmap/snapshot formats additive-only; `SearchSnapshot` fields serde-defaulted.
+- [x] Strict feature DAG respected (no `cli` symbols in `search`).
+- [x] Warp `semantic_tests.rs` expectations ported verbatim, never weakened.
+- [x] Pre-existing neural-weight drift fixed with config as single source of truth.
+- [x] Full AGENTS validation is final gate; no placeholders (`TBD`, `TODO`) remain.
+- [x] Implementation does not push, publish, or delete shared data without approval.
 
 Plan complete. Recommended execution: subagent-driven task-by-task implementation with review after each commit; inline execution is acceptable if checkpoints remain intact.

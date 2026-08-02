@@ -21,6 +21,12 @@ pub struct MmapVectorIndex {
 }
 
 impl MmapVectorIndex {
+    /// Rebuild an mmap-backed index from persisted embeddings + node ids.
+    ///
+    /// Cli-only: consumed by the snapshot hydration path in `src/cli/`, so
+    /// gated behind the `cli` feature (dead code under `--features onnx`
+    /// without `cli`).
+    #[cfg(feature = "storage")]
     pub(super) fn from_snapshot(
         base: Arc<MmapEmbeddingIndex>,
         node_ids: &[String],
@@ -155,6 +161,31 @@ impl MmapVectorIndex {
         }
         let row = self.rows.get(node_id).copied()?;
         self.base.get_embedding_by_row(row)
+    }
+
+    /// Enumerate all `(id, embedding)` rows in base-row order for persistence.
+    ///
+    /// Used by `SearchEngine::collect_fragment_embeddings` (Task 5): the
+    /// fragment index is read-only mmap-backed at hydration, so every live row
+    /// maps 1:1 to a base row. If Task 7 wires fragment mutations (delta /
+    /// tombstones), this must mirror them the way `search` does.
+    pub(crate) fn entries(&self) -> Vec<(String, Vec<f32>)> {
+        if self.cleared {
+            return self
+                .delta
+                .iter()
+                .map(|(id, vector)| (id.clone(), vector.clone()))
+                .collect();
+        }
+        self.rows
+            .iter()
+            .filter(|(id, _)| !self.tombstones.contains(*id))
+            .filter_map(|(id, row)| {
+                self.base
+                    .get_embedding_by_row(*row)
+                    .map(|embedding| (id.clone(), embedding))
+            })
+            .collect()
     }
 }
 
@@ -315,11 +346,14 @@ pub enum VectorIndexError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "storage")]
     use super::*;
+    #[cfg(feature = "storage")]
     use crate::search::vector::write_mmap_embeddings;
 
     /// CR-F8 (pr32 plan): after `clear()`, removing a pre-clear ID must not
     /// insert a tombstone and must return `false`.
+    #[cfg(feature = "storage")]
     #[test]
     fn test_remove_after_clear_returns_false() {
         let dir = tempfile::tempdir().unwrap();
@@ -342,6 +376,7 @@ mod tests {
     }
 
     /// CR-F8: tombstone set stays empty after clearing + removing pre-clear IDs.
+    #[cfg(feature = "storage")]
     #[test]
     fn test_remove_after_clear_no_tombstone_growth() {
         let dir = tempfile::tempdir().unwrap();

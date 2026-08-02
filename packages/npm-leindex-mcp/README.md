@@ -85,6 +85,18 @@ profile warmed during setup and reused through its compiled cache and resident
 worker. Indexing and semantic requests start/await the configured worker when
 it is cold; terminal provider failure preserves the core TF-IDF/PDG result.
 
+### Fragment Embeddings (1.9.5+, opt-in)
+
+LeIndex 1.9.5 adds a fully-local **fragment embedding layer**: large symbols
+are split into tree-sitter semantic chunks (plus module-level orphan regions)
+and embedded with the same local Qwen3 worker. Fragments are
+content-hash-addressed (blake3), so incremental indexing is idempotent and
+deduplicated, and no remote service is involved. Enable it in
+`~/.leindex/config/leindex.toml` under `[search]` with `fragment_index_enabled
+= true` (plus `fragment_weight`, `fragment_max_bytes`,
+`fragment_orphan_enabled`, `fragment_naive_fallback`). Off by default; the
+node-level index remains authoritative.
+
 ---
 
 ## MCP Configuration Examples

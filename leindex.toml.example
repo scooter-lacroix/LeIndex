@@ -44,6 +44,22 @@ search_mode = "hybrid"
 # Neural score weight in hybrid mode (0.0-1.0). Default 0.4 (matches scorer).
 neural_weight = 0.4
 
+# ── Fragment embeddings (1.11+) ─────────────────────────────────────────────
+# Sub-symbol semantic chunks + orphan coverage, all-local. Off by default; the
+# node-level index stays authoritative until enabled.
+fragment_index_enabled = false
+# Fusion weight of the fragment score component (renormalized when enabled).
+# 0.35 is the empirically tuned default: smallest weight with real margin that
+# surfaces fragment hits over strong tfidf matches without regressing node-level
+# ranking (MRR sweep: 0.12/0.20 no gain, 0.35 flips to full recall, node-rank 1.0).
+fragment_weight = 0.35
+# Max bytes per fragment (~200 lines x 60 chars, mirroring Warp's default).
+fragment_max_bytes = 12000
+# Include Tier-3 module-level orphan regions.
+fragment_orphan_enabled = true
+# Naive 200-line chunking when a tree-sitter grammar is unavailable.
+fragment_naive_fallback = true
+
 # ── Indexing pipeline ───────────────────────────────────────────────────────
 [indexing]
 # Texts per embedding IPC batch.

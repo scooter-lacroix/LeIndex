@@ -774,6 +774,54 @@ fn test_empty_neural_persist_removes_stale_mmap() {
     );
 }
 
+// Fragment mmap twins (Task 4) — mirror the neural mmap persistence tests.
+
+/// Empty fragment persistence removes a stale mmap file (feature-off leaves no
+/// orphan artifact).
+#[test]
+fn test_empty_fragment_persist_removes_stale_mmap() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let stale_path = fragment_mmap_embeddings_path(temp.path());
+    std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+    std::fs::write(&stale_path, b"stale fragment data").unwrap();
+
+    persist_fragment_embeddings_to_mmap(temp.path(), &[]).unwrap();
+
+    assert!(
+        !stale_path.exists(),
+        "empty fragment persistence should remove stale fragment mmap file"
+    );
+}
+
+/// Fragment embeddings round-trip through `fragments_embeddings.bin`: write
+/// content-hash-addressed rows, then load them back with matching dimension.
+#[test]
+fn test_fragment_mmap_roundtrip() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let embeddings = vec![
+        ("hash_abc".to_string(), vec![0.1, 0.2, 0.3]),
+        ("hash_def".to_string(), vec![0.4, 0.5, 0.6]),
+    ];
+
+    persist_fragment_embeddings_to_mmap(temp.path(), &embeddings).unwrap();
+
+    let index = try_load_fragment_mmap_embeddings_from_storage(&temp.path().join(".leindex"))
+        .expect("fragment mmap loads");
+    assert_eq!(index.len(), 2);
+    assert_eq!(index.dimension(), 3);
+    assert!(index.get_embedding("hash_abc").is_some());
+    assert!(index.get_embedding("hash_def").is_some());
+}
+
+/// Missing fragment mmap artifact → `None` (not an error).
+#[test]
+fn test_fragment_mmap_missing_is_none() {
+    let temp = tempfile::TempDir::new().unwrap();
+    assert!(
+        try_load_fragment_mmap_embeddings_from_storage(&temp.path().join(".leindex")).is_none()
+    );
+}
+
 #[test]
 fn test_index_nodes_accumulates_df_across_passes() {
     use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};
@@ -925,6 +973,124 @@ fn test_read_file_once_error() {
     assert!(
         result.is_err(),
         "reading a nonexistent file should return an error"
+    );
+}
+
+// ============================================================================
+// CACHE-KEY INTEGRATION (Task 8): fragment knobs fold into the v2 key
+// ============================================================================
+
+/// Minimal `IndexStats` for cache-key tests (the struct has no `Default`).
+fn cache_key_stats() -> IndexStats {
+    IndexStats {
+        total_files: 3,
+        files_parsed: 3,
+        successful_parses: 3,
+        failed_parses: 0,
+        total_signatures: 7,
+        pdg_nodes: 7,
+        pdg_edges: 6,
+        indexed_nodes: 7,
+        indexing_time_ms: 100,
+        external_deps_in_lockfile: 0,
+        external_deps_resolved: 0,
+        external_deps_unresolved: 0,
+        external_deps_total: 0,
+        external_deps_builtin: 0,
+    }
+}
+
+/// Build a search cache key with explicit fragment knobs.
+fn cache_key_with_fragments(
+    fragment_enabled: bool,
+    fragment_weight: f64,
+    fragment_root_hash: &str,
+) -> String {
+    search_cache_key_for(
+        "proj-a",
+        Path::new("/tmp/proj-a"),
+        &cache_key_stats(),
+        "auth token verify",
+        10,
+        None,
+        true,
+        "hybrid",
+        0.4,
+        true,
+        80,
+        fragment_enabled,
+        fragment_weight,
+        fragment_root_hash,
+        "qwen3-embed-0.6b",
+        "qwen3-reranker-0.6b-seq-cls",
+    )
+}
+
+/// A `fragment_weight` change must produce a different key (config invalidation).
+#[test]
+fn test_cache_key_fragment_weight_change_invalidates() {
+    let base = cache_key_with_fragments(true, 0.10, "root-hash-A");
+    let changed = cache_key_with_fragments(true, 0.25, "root-hash-A");
+    assert_ne!(
+        base, changed,
+        "fragment_weight change must invalidate the key"
+    );
+}
+
+/// A fragment root-hash (generation) change must produce a different key.
+#[test]
+fn test_cache_key_fragment_root_hash_change_invalidates() {
+    let base = cache_key_with_fragments(true, 0.10, "root-hash-A");
+    let changed = cache_key_with_fragments(true, 0.10, "root-hash-B");
+    assert_ne!(
+        base, changed,
+        "fragment root hash change must invalidate the key"
+    );
+}
+
+/// The fragment master switch is part of the key (feature-off keys differ).
+#[test]
+fn test_cache_key_fragment_enabled_change_invalidates() {
+    let base = cache_key_with_fragments(true, 0.10, "root-hash-A");
+    let off = cache_key_with_fragments(false, 0.10, "root-hash-A");
+    assert_ne!(base, off, "fragment master switch must invalidate the key");
+}
+
+/// Identical fragment knobs produce the identical key (deterministic).
+#[test]
+fn test_cache_key_fragment_knobs_deterministic() {
+    let a = cache_key_with_fragments(true, 0.10, "root-hash-A");
+    let b = cache_key_with_fragments(true, 0.10, "root-hash-A");
+    assert_eq!(a, b, "same fragment knobs must produce the same key");
+}
+
+/// Legacy v2 keys (written before the fragment fields existed) must still be
+/// valid cache keys: the format string is deterministic and the `v2:` prefix
+/// keeps them sweepable, and they never collide with the fragment-extended key.
+#[test]
+fn test_cache_key_legacy_v2_without_fragment_fields_parses() {
+    // Rebuild the pre-fragment v2 format exactly as older builds produced it
+    // (fragment knobs absent). Deterministic => stable across a key change.
+    let legacy = search_cache_key(&format!(
+        "v2:query:{}:{}:{}:{}:{:?}:neural={}:mode={}:nw={}:rr={}|{}|{}:embed={}",
+        stable_project_cache_id("proj-a", Path::new("/tmp/proj-a")),
+        index_fingerprint(&cache_key_stats()),
+        10,
+        "auth token verify",
+        None::<crate::search::ranking::QueryType>,
+        true,
+        "hybrid",
+        0.4,
+        true,
+        80,
+        "qwen3-reranker-0.6b-seq-cls",
+        "qwen3-embed-0.6b",
+    ));
+    let modern = cache_key_with_fragments(false, 0.0, "");
+    assert!(!legacy.is_empty(), "legacy key format still produces a key");
+    assert_ne!(
+        legacy, modern,
+        "legacy key must not collide with the fragment-extended key"
     );
 }
 
@@ -1239,4 +1405,123 @@ fn file_summary_context_collects_same_file_symbols_excluding_summary_nodes() {
         ctx.file_symbols.get("src/other.rs"),
         Some(&vec!["delta".to_string()])
     );
+}
+
+#[test]
+fn test_persist_search_snapshot_writes_fragment_artifacts() {
+    use crate::search::search::{DEFAULT_EMBEDDING_DIMENSION, NodeInfo, SearchEngine};
+    use crate::search::vector::MmapEmbeddingIndex;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let project_path = temp.path();
+    let storage = project_path.join(".leindex");
+    std::fs::create_dir_all(&storage).unwrap();
+
+    // Build a fragment-enabled engine by hydrating a 2-row fragment index from
+    // persisted-style mmap files (the same path `indexing/load.rs` uses).
+    let mut engine = SearchEngine::new();
+    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf_embedding[0] = 1.0;
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding,
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+    let mut snapshot = engine.search_snapshot(1, 0, "frag".to_string());
+    snapshot.fragment_rows = 2;
+    let tfidf_path = storage.join("tfidf.bin");
+    let frag_path = storage.join("frag.bin");
+    crate::search::vector::write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings())
+        .unwrap();
+    let fragment_embeddings = vec![
+        ("hash_abc".to_string(), vec![0.1f32; 1024]),
+        ("hash_def".to_string(), vec![0.2f32; 1024]),
+    ];
+    crate::search::vector::write_mmap_embeddings(&frag_path, &fragment_embeddings).unwrap();
+    let tfidf_mmap = MmapEmbeddingIndex::open(&tfidf_path).unwrap();
+    let frag_mmap = MmapEmbeddingIndex::open(&frag_path).unwrap();
+    let frag_ids = vec!["hash_abc".to_string(), "hash_def".to_string()];
+    let mut hydrated = SearchEngine::new();
+    hydrated
+        .restore_from_search_snapshot(
+            snapshot,
+            std::sync::Arc::new(tfidf_mmap),
+            None,
+            Some(std::sync::Arc::new(frag_mmap)),
+            Some(&frag_ids),
+        )
+        .unwrap();
+
+    // Persist: must write the fragment mmap + root and stamp the snapshot root.
+    persist_search_snapshot(&hydrated, project_path, 1, 0, "frag".to_string()).unwrap();
+    assert!(storage.join("fragments_embeddings.bin").exists());
+    assert!(storage.join("fragment_root.bin").exists());
+
+    // Reload: the snapshot carries the root hash and passes invariant-8
+    // validation against the persisted artifacts.
+    let reloaded = try_load_search_snapshot_from_storage(&storage).unwrap();
+    assert!(reloaded.fragment_root_hash.is_some());
+    assert_eq!(reloaded.fragment_rows, 2);
+    let mmap = try_load_fragment_mmap_embeddings_from_storage(&storage).unwrap();
+    assert!(fragment_layer_is_valid(
+        reloaded.fragment_root_hash.as_deref(),
+        Some(&mmap),
+        &storage
+    ));
+}
+
+#[test]
+fn test_fragment_layer_is_valid_rejects_stale_root() {
+    use crate::search::vector::MmapEmbeddingIndex;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let project_path = temp.path();
+    let storage = project_path.join(".leindex");
+
+    let ids = vec!["hash_abc".to_string(), "hash_def".to_string()];
+    fragment::sync::persist_fragment_root_from_ids(project_path, &ids, 0).unwrap();
+
+    let frag_path = storage.join("frag.bin");
+    let embeddings = vec![
+        ("hash_abc".to_string(), vec![0.1f32; 1024]),
+        ("hash_def".to_string(), vec![0.2f32; 1024]),
+    ];
+    crate::search::vector::write_mmap_embeddings(&frag_path, &embeddings).unwrap();
+    let mmap = MmapEmbeddingIndex::open(&frag_path).unwrap();
+
+    // Matching root + row count -> valid.
+    let good_root = fragment::sync::load_fragment_root(&storage)
+        .unwrap()
+        .unwrap()
+        .root_hash;
+    assert!(fragment_layer_is_valid(
+        Some(&good_root),
+        Some(&mmap),
+        &storage
+    ));
+    // Stale root -> invalid.
+    assert!(!fragment_layer_is_valid(
+        Some("stale-hash"),
+        Some(&mmap),
+        &storage
+    ));
+    // Snapshot without a root -> invalid (feature-off semantics).
+    assert!(!fragment_layer_is_valid(None, Some(&mmap), &storage));
+    // Missing mmap -> invalid.
+    assert!(!fragment_layer_is_valid(Some(&good_root), None, &storage));
+    // Missing fragment_root.bin artifact -> invalid.
+    std::fs::remove_file(storage.join("fragment_root.bin")).unwrap();
+    assert!(!fragment_layer_is_valid(
+        Some(&good_root),
+        Some(&mmap),
+        &storage
+    ));
 }

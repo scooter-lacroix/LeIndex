@@ -123,10 +123,49 @@ impl LeIndex {
         #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
         let neural_mmap: Option<std::sync::Arc<crate::search::vector::MmapEmbeddingIndex>> = None;
 
+        // Fragment layer (Task 5, invariant 8): thread the fragment mmap + id
+        // list into the restore call. The rich fragment store (owner/file/byte
+        // metadata) is wired in Task 7; until fragment_store.bin exists the id
+        // list is empty and the fragment layer stays off (feature-off
+        // compatible). `fragment_layer_is_valid` rejects stale roots, so a
+        // mismatched artifact can never poison the node-level path.
+        let fragment_mmap_raw =
+            index_builder::try_load_fragment_mmap_embeddings_from_storage(artifact_path);
+        let fragment_store =
+            index_builder::fragment::FragmentStore::load_from_artifact_path(artifact_path);
+        let fragment_ids: Option<Vec<String>> = match &fragment_store {
+            Ok(Some(store)) => Some(store.content_hashes().map(str::to_string).collect()),
+            Ok(None) => None,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to load fragment store; fragment layer disabled"
+                );
+                None
+            }
+        };
+        let fragment_layer_ok = fragment_ids.is_some()
+            && index_builder::fragment_layer_is_valid(
+                snapshot.fragment_root_hash.as_deref(),
+                fragment_mmap_raw.as_ref(),
+                artifact_path,
+            );
+        let fragment_mmap = match (fragment_layer_ok, fragment_mmap_raw) {
+            (true, Some(mmap)) => Some(std::sync::Arc::new(mmap)),
+            _ => None,
+        };
+        let fragment_ids = if fragment_layer_ok {
+            fragment_ids
+        } else {
+            None
+        };
+
         match self.search_engine.restore_from_search_snapshot(
             snapshot,
             std::sync::Arc::new(tfidf_mmap),
             neural_mmap,
+            fragment_mmap,
+            fragment_ids.as_deref(),
         ) {
             Ok(indexed_count) => {
                 #[cfg(feature = "onnx")]
@@ -150,6 +189,25 @@ impl LeIndex {
                 #[cfg(not(feature = "onnx"))]
                 {
                     self.embedder = Some(index_builder::HybridEmbedder::tfidf_only(tfidf_embedder));
+                }
+
+                // Fragment owner mapping (Task 6, invariant 6): content hash →
+                // (owner node id, best byte range) from the store, used at
+                // query time to map fragment hits back to their Tier-1 owners.
+                if let Ok(Some(store)) = &fragment_store {
+                    let refs: std::collections::HashMap<String, (String, (usize, usize))> = store
+                        .content_hashes()
+                        .filter_map(|hash| {
+                            store.get(hash).and_then(|metas| {
+                                metas.iter().find_map(|meta| {
+                                    meta.owner.as_ref().map(|owner| {
+                                        (hash.to_string(), (owner.clone(), meta.byte_range))
+                                    })
+                                })
+                            })
+                        })
+                        .collect();
+                    self.search_engine.set_fragment_refs(refs);
                 }
 
                 if let Err(err) = self.load_stats_from_path(artifact_path) {

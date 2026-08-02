@@ -109,6 +109,8 @@ mod build_time_invariants {
     /// or `println!` issuing such a directive remains.
     #[test]
     fn build_scripts_have_no_origin_rpath() {
+        // Single-element loop inlined (clippy::single-element-loop): the release
+        // packaging test currently validates only the root `build.rs`.
         let rel = "build.rs";
         let script = build_script(rel);
         // Drop comment lines so doc comments mentioning the absence of

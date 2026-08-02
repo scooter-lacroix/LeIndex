@@ -198,6 +198,20 @@ impl VectorIndex {
         self.embeddings.get(node_id)
     }
 
+    /// Return all `(node_id, embedding)` records.
+    ///
+    /// Used by the fragment layer to collect index-time rows for mmap
+    /// persistence (fragment-embeddings 1.11.0 Task 7): the engine's
+    /// in-memory fragment index is BruteForce-backed at index time and
+    /// Mmap-backed at hydration, and both must expose the same row
+    /// enumeration so persist and hydrate stay structurally identical.
+    pub fn entries(&self) -> Vec<(String, Vec<f32>)> {
+        self.embeddings
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     /// Get estimated memory usage in bytes
     #[must_use]
     pub fn estimated_memory_bytes(&self) -> usize {

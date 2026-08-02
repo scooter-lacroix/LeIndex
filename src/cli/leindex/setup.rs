@@ -1263,6 +1263,40 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
     println!();
     println!("Search mode:        {}", config.search.search_mode);
     println!("Neural weight:      {}", config.search.neural_weight);
+    println!(
+        "Rerank enabled:     {}",
+        if config.search.rerank_enabled {
+            "ON"
+        } else {
+            "OFF"
+        }
+    );
+    println!(
+        "Fragment index:     {}",
+        if config.search.fragment_index_enabled {
+            "ON (sub-symbol semantic chunks)"
+        } else {
+            "OFF (node-level index authoritative)"
+        }
+    );
+    println!("Fragment weight:    {}", config.search.fragment_weight);
+    println!("Fragment max bytes: {}", config.search.fragment_max_bytes);
+    println!(
+        "Fragment orphan:    {}",
+        if config.search.fragment_orphan_enabled {
+            "ON"
+        } else {
+            "OFF"
+        }
+    );
+    println!(
+        "Fragment naive fallback: {}",
+        if config.search.fragment_naive_fallback {
+            "ON"
+        } else {
+            "OFF"
+        }
+    );
 
     // Recovery notice
     if let crate::config::RecoveryAction::RecoveredFromCorrupt(ref backup) = action {

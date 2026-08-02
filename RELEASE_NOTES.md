@@ -4,7 +4,8 @@ Release date: 2026-08-01
 
 LeIndex 1.9.5 merges the embedding worker into the root crate, pins the ONNX
 Runtime load-dynamic fix, makes every execution provider runtime-selectable,
-and reworks the release pipeline for a single crate that ships two binaries.
+reworks the release pipeline for a single crate that ships two binaries, and
+adds an opt-in fragment embedding layer backed by a content-hash store.
 
 ## One crate, two binaries
 
@@ -49,6 +50,29 @@ and reworks the release pipeline for a single crate that ships two binaries.
 
 Cargo, worker, installer, npm, dashboard, pi, PyPI, lockfile, and runtime
 version surfaces are aligned at `1.9.5`.
+
+## Fragment embeddings (opt-in)
+
+LeIndex 1.9.5 also ships a fully-local, opt-in **fragment embedding layer** on
+top of the TF-IDF / PDG / neural stack. Large symbols are split into
+tree-sitter semantic chunks (plus module-level orphan regions) and embedded
+with the same local Qwen3 ONNX worker. Fragments are content-hash-addressed
+(blake3), so incremental indexing is idempotent and deduplicated; the search
+cache key now folds in the fragment knobs and the persisted content root.
+Enable it in `~/.leindex/config/leindex.toml`
+(`[search] fragment_index_enabled = true`, with `fragment_weight` defaulting to
+`0.35`). Everything stays on-machine — no remote service unless you opt into a
+remote embedding provider.
+
+- Sub-symbol semantic chunking (Tier 2) + orphan module coverage (Tier 3).
+- Content-hash-addressed fragment store with incremental sync and crash
+  self-healing (store → root → manifest persistence ordering).
+- Fragment candidates fuse into hybrid retrieval as a renormalized score
+  component and feed the existing local reranker.
+- Cache-key v2 folds fragment enable/weight/root-hash; `leindex setup --check`
+  reports the fragment knobs.
+- The `[search] neural_weight` config default was aligned to the scorer
+  default (0.4).
 
 ---
 

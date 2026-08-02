@@ -517,11 +517,14 @@ impl LeIndex {
             project_path
         );
 
-        // Initialize search engine, configured with the documented `[search]
-        // neural_weight` knob (previously dead config). VAL-CONFIG.
+        // Initialize search engine, configured with the documented `[search]`
+        // knobs: `neural_weight` (previously dead config) plus the fragment
+        // layer master switch + fusion weight. VAL-CONFIG.
         let mut search_engine = SearchEngine::new();
-        search_engine
-            .set_neural_weight(crate::config::LeIndexConfig::load_cached().neural_weight_f32());
+        let cfg = crate::config::LeIndexConfig::load_cached();
+        search_engine.set_neural_weight(cfg.neural_weight_f32());
+        search_engine.set_fragment_index_enabled(cfg.search.fragment_index_enabled);
+        search_engine.set_fragment_weight(cfg.search.fragment_weight as f32);
 
         // Initialize cache subsystem
         let cache_dir = storage_path.join("cache");
@@ -637,6 +640,16 @@ impl LeIndex {
         let cfg = crate::config::LeIndexConfig::load_cached();
         let rerank_model = std::env::var("LEINDEX_WORKER_RERANK_MODEL")
             .unwrap_or_else(|_| "qwen3-reranker-0.6b-seq-cls".to_string());
+        // Task 8: the persisted fragment-layer content root hash also lands in
+        // the key — a fragment re-embed (generation change) must invalidate the
+        // query-result cache, mirroring the embed/rerank model discipline. The
+        // manifest + root live under `.leindex/` (see persist_search_snapshot).
+        let fragment_root_hash =
+            index_builder::fragment::sync::load_fragment_root(&self.project_path.join(".leindex"))
+                .ok()
+                .flatten()
+                .map(|root| root.root_hash)
+                .unwrap_or_default();
         index_builder::search_cache_key_for(
             &self.project_id,
             &self.project_path,
@@ -649,6 +662,9 @@ impl LeIndex {
             cfg.search.neural_weight,
             cfg.search.rerank_enabled,
             cfg.search.rerank_top_n,
+            cfg.search.fragment_index_enabled,
+            cfg.search.fragment_weight,
+            &fragment_root_hash,
             &cfg.neural.model_name,
             &rerank_model,
         )

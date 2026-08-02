@@ -165,6 +165,8 @@ pub(crate) fn chunk_naive<'a>(
         .into_iter()
         .flat_map(|chunk| {
             let (start_line, start_range) = chunk[0];
+            // `slice::chunks()` never yields an empty slice, so `last()` is
+            // always `Some` here — the expect branch is unreachable.
             let (end_line, end_range) =
                 chunk.last().expect("Chunks must have at least one element");
 

@@ -235,6 +235,7 @@ Codebase → Tree-sitter Parser → PDG Builder → Semantic Index → Query Eng
 
 - **Core hybrid retrieval** — TF-IDF lexical matching plus PDG structure
 - **Hybrid neural scoring** — local ONNX similarity over the same symbols with TF-IDF/PDG fallback
+- **Fragment embeddings (opt-in)** — sub-symbol semantic chunks + orphan coverage, content-hash-addressed and fully local
 - **5-phase analysis** — additive multi-pass codebase analysis pipeline
 - **Cross-project indexing** — search across multiple repos at once
 - **20 MCP tools** — read, analyze, edit preview/apply, rename, impact analysis

@@ -3,6 +3,11 @@
 //
 // VAL-CPHASE-003: Worker request/response frames serialize and deserialize
 // without losing batch identity, payload ordering, dimensions, or error identity.
+//
+// Requires the `onnx` feature: these tests exercise `leindex::embed::protocol`,
+// which is cfg-gated behind `feature = "onnx"` in `src/lib.rs` (mirrors
+// `embed_migraphx_dynamic_test.rs`).
+#![cfg(feature = "onnx")]
 
 use leindex::embed::protocol::{
     BatchId, EmbedRequest, EmbedResponse, ErrorKind, Frame, MsgType, Request, RerankDocument,
