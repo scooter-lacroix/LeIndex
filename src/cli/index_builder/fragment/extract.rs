@@ -127,6 +127,9 @@ pub(crate) fn extract_file_fragments(
     }
 
     let file_path_str = path.display().to_string();
+    // FileSummary owner id for Tier-3 orphan attribution, captured during the
+    // single O(N) node pass (nit-4: no second per-file O(N) scan).
+    let mut file_summary_id: Option<String> = None;
     let mut nodes: Vec<NodeInfo> = Vec::new();
     let mut node_ranges: Vec<(usize, usize)> = Vec::new();
     for node_idx in pdg.node_indices() {
@@ -136,7 +139,11 @@ pub(crate) fn extract_file_fragments(
         if node.file_path.as_ref() != file_path_str {
             continue;
         }
-        if matches!(node.node_type, NodeType::External | NodeType::FileSummary) {
+        if matches!(node.node_type, NodeType::FileSummary) {
+            file_summary_id = Some(node.id.clone());
+            continue;
+        }
+        if matches!(node.node_type, NodeType::External) {
             continue;
         }
         if node.byte_range.1 <= node.byte_range.0 {
@@ -204,13 +211,6 @@ pub(crate) fn extract_file_fragments(
     // map back to a searchable file-level result (invariant 6: fragment hits
     // always map to an owner node before surfacing). Without a FileSummary the
     // orphan keeps owner: None and is stored but not independently searchable.
-    let file_summary_id: Option<String> = pdg
-        .node_indices()
-        .filter_map(|idx| pdg.get_node(idx))
-        .find(|n| {
-            n.file_path.as_ref() == file_path_str && matches!(n.node_type, NodeType::FileSummary)
-        })
-        .map(|n| n.id.clone());
     if orphan_enabled && !node_ranges.is_empty() {
         let file_doc_end = leading_file_doc_end(file_bytes);
         for frag in orphan_fragments(OrphanInput {

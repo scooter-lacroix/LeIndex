@@ -305,7 +305,7 @@ fn embed_missing_batches(
     embed_fn: &mut dyn FnMut(&[String]) -> Vec<Option<Vec<f32>>>,
     new_embeddings: &mut Vec<(String, Vec<f32>)>,
     summary: &mut FragmentSyncSummary,
-    produced: &mut Vec<String>,
+    produced: &mut HashSet<String>,
 ) -> (bool, usize) {
     const EMBED_BATCH: usize = 256;
     let mut all_embedded = true;
@@ -330,7 +330,7 @@ fn embed_missing_batches(
                         file = %meta.file_path,
                         "Fragment embedding unavailable; row skipped"
                     );
-                    produced.retain(|h| h != &meta.content_hash);
+                    produced.remove(&meta.content_hash);
                     all_embedded = false;
                 }
             }
@@ -455,7 +455,7 @@ fn process_changed_file(
     let candidates = chunk_fn(path, &bytes);
     summary.fragments_total += candidates.len();
     let mut missing: Vec<(String, FragmentMetadata)> = Vec::new(); // (enriched_text, meta)
-    let mut produced: Vec<String> = Vec::new();
+    let mut produced: HashSet<String> = HashSet::new();
 
     for cand in candidates {
         // A store cache hit is dedup'd (no re-embed) UNLESS forcing a
@@ -465,7 +465,7 @@ fn process_changed_file(
             summary.reused += 1;
             store.insert(cand.meta.clone());
             store_modified = true;
-            produced.push(cand.content_hash);
+            produced.insert(cand.content_hash);
         } else {
             // Recovery-only note: when `force_reembed` is set (lost fragment
             // mmap), every candidate lands here even if its hash is already in
@@ -475,7 +475,7 @@ fn process_changed_file(
             // collapse) and bounded to the one-time recovery pass; do not
             // "optimize" this back into the cache-hit path.
             missing.push((cand.enriched_text, cand.meta));
-            produced.push(cand.content_hash);
+            produced.insert(cand.content_hash);
         }
     }
 
@@ -496,7 +496,7 @@ fn process_changed_file(
 
     manifest
         .file_content_hashes
-        .insert(path_str.clone(), produced);
+        .insert(path_str.clone(), produced.into_iter().collect());
     if all_embedded {
         manifest.file_hashes.insert(path_str, file_hash.to_string());
     }
