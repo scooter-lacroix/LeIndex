@@ -44,7 +44,7 @@ search_mode = "hybrid"
 # Neural score weight in hybrid mode (0.0-1.0). Default 0.4 (matches scorer).
 neural_weight = 0.4
 
-# ── Fragment embeddings (1.11+) ─────────────────────────────────────────────
+# ── Fragment embeddings (1.9.5+) ────────────────────────────────────────────
 # Sub-symbol semantic chunks + orphan coverage, all-local. Off by default; the
 # node-level index stays authoritative until enabled.
 fragment_index_enabled = false
