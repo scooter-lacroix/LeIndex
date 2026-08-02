@@ -762,7 +762,9 @@ jobs:
           VERSION="${{ needs.detect.outputs.version }}"
           RELEASE_SHA=$(gh release view "v${VERSION}" --json targetCommitish --jq '.targetCommitish' 2>/dev/null || echo "")
           BRANCH_HEAD_SHA=$(git ls-remote origin "refs/heads/${GITHUB_REF_NAME}" | awk '{print $1}')
-          if [ -n "$RELEASE_SHA" ] && [ "$RELEASE_SHA" != "$BRANCH_HEAD_SHA" ]; then
+          if [ -z "$RELEASE_SHA" ]; then
+            echo "::warning::Release v${VERSION} has no targetCommitish (or did not resolve); skipping SHA verification."
+          elif [ "$RELEASE_SHA" != "$BRANCH_HEAD_SHA" ]; then
             echo "::warning::Release SHA ($RELEASE_SHA) != ${GITHUB_REF_NAME} HEAD ($BRANCH_HEAD_SHA)"
             echo "New commits landed during release — proceeding with undraft anyway."
           else
@@ -773,7 +775,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
-          IS_DRAFT=$(gh release view "v${VERSION}" --json isDraft --jq '.isDraft' 2>/dev/null || echo "true")
+          # Fail clearly if the release was never created (e.g. github-release
+          # failed or skipped) instead of masking a missing release as a draft
+          # and then confusingly failing on `gh release edit`. (Kilo release.yml
+          # CRITICAL + WARNING.) Note: we intentionally do NOT gate this job's
+          # `if:` on github-release.result == 'success' — github-release is
+          # itself gated on need_build == 'true', so it skips in the legitimate
+          # "already-published-but-still-draft" recovery case, where this job
+          # MUST still run to undraft the existing release.
+          if ! gh release view "v${VERSION}" --json isDraft >/dev/null 2>&1; then
+            echo "::error::Release v${VERSION} does not exist (github-release did not create it); cannot undraft."
+            exit 1
+          fi
+          IS_DRAFT=$(gh release view "v${VERSION}" --json isDraft --jq '.isDraft')
           if [ "$IS_DRAFT" = "true" ]; then
             echo "Undrafting release v${VERSION}..."
             gh release edit "v${VERSION}" --draft=false

@@ -29,13 +29,9 @@ use super::leindex::{
 mod hybrid;
 mod tfidf;
 
-// Fragment chunking (Tier-2 sub-symbol + Tier-3 orphan) — fragment-embeddings
-// 1.11.0 Task 2 deliverable. The store (Task 3), mmap persistence (Task 4) and
-// snapshot hydration (Task 5) consume the module API; the remaining `dead_code`
-// covers the chunker/enrich/orphan surface that query fusion (Task 6) wires.
-// `pub(crate)` so `indexing/load.rs` can hydrate the fragment layer from the
-// persisted artifacts. Not a suppressed defect.
-#[allow(dead_code)]
+// Fragment chunking (Tier-2 sub-symbol + Tier-3 orphan). `pub(crate)` so
+// `indexing/load.rs` hydrates the fragment layer from the persisted artifacts;
+// the sync engine + search fusion consume the module API directly.
 pub(crate) mod fragment;
 pub(crate) mod persistence;
 
@@ -45,8 +41,8 @@ pub use tfidf::*;
 
 #[cfg(test)]
 #[allow(clippy::infallible_destructuring_match)]
-#[path = "tests.rs"]
-mod tests;
+#[path = "index_builder_test.rs"]
+mod test;
 
 // ============================================================================
 // TF-IDF EMBEDDING SYSTEM
