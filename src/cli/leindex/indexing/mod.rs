@@ -1574,6 +1574,16 @@ impl LeIndex {
         let max_bytes = cfg.search.fragment_max_bytes as usize;
         let orphan_enabled = cfg.search.fragment_orphan_enabled;
         let naive_fallback = cfg.search.fragment_naive_fallback;
+        // Codex P1: persist the model + fragment-knob identity so a model or
+        // knob change while sources are byte-identical forces a fragment
+        // re-sync (mirrors the node-level `NeuralCheckpoint.model` discipline;
+        // without it the source-hash skip would silently serve stale rows).
+        let extraction_identity = index_builder::fragment::sync::FragmentExtractionIdentity::new(
+            &cfg.neural.model_name,
+            max_bytes,
+            orphan_enabled,
+            naive_fallback,
+        );
 
         // P2-4 (Codex review): detect a missing/corrupt fragment embeddings mmap
         // BEFORE the sync so unchanged files are NOT skipped. With the mmap gone
@@ -1624,6 +1634,7 @@ impl LeIndex {
                 &mut chunk_fn,
                 &mut embed_fn,
                 force_reembed,
+                &extraction_identity,
             )?
         };
 

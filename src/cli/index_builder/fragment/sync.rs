@@ -173,8 +173,49 @@ pub(crate) fn load_fragment_root(storage_path: &Path) -> Result<Option<FragmentR
 /// Schema version for the incremental-sync manifest artifact.
 const FRAGMENT_SYNC_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
+/// Identity of the extraction+embedding configuration that produced the
+/// persisted fragment rows.
+///
+/// Persisted in `FragmentFileManifest` so a neural-model or fragment-knob
+/// change while source files are unchanged does NOT silently serve stale rows
+/// (Codex P1): the source-hash skip is bypassed, and when the model changed
+/// every store row is re-embedded — mirroring the node-level
+/// `NeuralCheckpoint.model` invalidation discipline.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub(crate) struct FragmentExtractionIdentity {
+    /// Neural model name whose embeddings produced the rows ("" = never
+    /// recorded — treated as a mismatch so an upgrade forces a re-sync).
+    pub(crate) model_name: String,
+    /// blake3 over the fragment knobs (`fragment_max_bytes`,
+    /// `fragment_orphan_enabled`, `fragment_naive_fallback`) + the embedding
+    /// schema version.
+    pub(crate) knobs_hash: String,
+}
+
+impl FragmentExtractionIdentity {
+    /// Compute the identity from the current config knobs. The embedding
+    /// schema version is folded in so a format change also invalidates.
+    pub(crate) fn new(
+        model_name: &str,
+        max_bytes: usize,
+        orphan_enabled: bool,
+        naive_fallback: bool,
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&(max_bytes as u64).to_le_bytes());
+        hasher.update(&[orphan_enabled as u8]);
+        hasher.update(&[naive_fallback as u8]);
+        hasher.update(&FRAGMENT_EMBEDDING_SCHEMA_VERSION.to_le_bytes());
+        Self {
+            model_name: model_name.to_string(),
+            knobs_hash: hasher.finalize().to_hex().to_string(),
+        }
+    }
+}
+
 /// Persisted incremental-sync state: per-file blake3 hashes, the content
-/// hashes each file produced, and the monotonic build generation.
+/// hashes each file produced, the extraction identity, and the monotonic
+/// build generation.
 ///
 /// `file_hashes` is what makes re-indexing incremental: a file whose blake3
 /// matches the manifest is skipped entirely (0 re-embeds). `file_content_hashes`
@@ -192,6 +233,12 @@ pub(crate) struct FragmentFileManifest {
     /// file path → content hashes it produced (stale-row removal on re-chunk).
     #[serde(default)]
     pub(crate) file_content_hashes: HashMap<String, Vec<String>>,
+    /// Identity of the model + fragment knobs that produced the persisted rows
+    /// (Codex P1). `#[serde(default)]` keeps old manifests loadable — an
+    /// unrecorded identity is treated as a mismatch so the first post-upgrade
+    /// sync re-syncs conservatively.
+    #[serde(default)]
+    pub(crate) extraction_identity: FragmentExtractionIdentity,
 }
 
 impl FragmentFileManifest {
@@ -201,6 +248,7 @@ impl FragmentFileManifest {
             generation: 0,
             file_hashes: HashMap::new(),
             file_content_hashes: HashMap::new(),
+            extraction_identity: FragmentExtractionIdentity::default(),
         }
     }
 }
@@ -399,6 +447,14 @@ fn remove_file_rows(store: &mut FragmentStore, file_path: &str) {
 /// empty, an empty fragment index would be installed, and the snapshot path
 /// would remove the mmap again, permanently disabling fragment retrieval.
 ///
+/// `identity` is the current model + fragment-knob identity (Codex P1). When
+/// it differs from the identity persisted in the manifest, the source-hash
+/// skip is bypassed so a model/knob change is NOT hidden by byte-identical
+/// sources; a model swap additionally forces a full re-embed (effective
+/// `force_reembed`) because old-model embeddings are stale even for matching
+/// content hashes. The identity is re-persisted after the pass so the next
+/// identical run is incremental again.
+///
 /// **Persist ordering is deliberate — store → root → manifest, with the
 /// manifest written LAST as the commit marker.** A crash between store and
 /// root leaves a complete older root + manifest in place (guard consistent,
@@ -510,9 +566,39 @@ pub(crate) fn incremental_sync_fragments(
     chunk_fn: &mut dyn FnMut(&Path, &[u8]) -> Vec<FragmentCandidate>,
     embed_fn: &mut dyn FnMut(&[String]) -> Vec<Option<Vec<f32>>>,
     force_reembed: bool,
+    identity: &FragmentExtractionIdentity,
 ) -> Result<(FragmentSyncSummary, Vec<(String, Vec<f32>)>)> {
     let storage_path = project_path.join(".leindex");
     let mut manifest = load_fragment_sync_manifest(&storage_path)?.unwrap_or_default();
+    // Codex P1: model/knob-change invalidation. A source-hash-only skip would
+    // silently serve old-model embeddings after a neural-model or fragment-knob
+    // change while source files are unchanged. Mirror the node-level
+    // `NeuralCheckpoint.model` discipline: the manifest persists the identity
+    // that produced its rows; on mismatch the file-hash skip is bypassed AND —
+    // when the MODEL changed — the store cache-hit skip too, so every row is
+    // re-embedded under the new model (stale even for identical content
+    // hashes). Knob-only changes re-chunk files but still reuse identical
+    // content hashes (same text, same model → same embedding).
+    let identity_changed = manifest.extraction_identity != *identity;
+    // A model swap makes every persisted embedding suspect — stale even when
+    // content hashes match — so it forces a full re-embed. An EMPTY stored
+    // model is deliberately NOT treated as a model change: a fresh manifest's
+    // store is empty anyway (forcing would be a no-op), and a manifest-lost
+    // but store-survives recovery (P2-4-adjacent) must be able to reuse the
+    // rows written under the current model instead of wasting a full re-embed.
+    let model_changed = identity_changed
+        && !manifest.extraction_identity.model_name.is_empty()
+        && manifest.extraction_identity.model_name != identity.model_name;
+    // Effective force: caller-forced (mmap recovery) OR model change.
+    let effective_force_reembed = force_reembed || model_changed;
+    if identity_changed {
+        tracing::info!(
+            old_model = %manifest.extraction_identity.model_name,
+            new_model = %identity.model_name,
+            model_changed,
+            "Fragment extraction identity changed; forcing fragment re-sync"
+        );
+    }
     let mut summary = FragmentSyncSummary {
         files_scanned: files.len(),
         ..Default::default()
@@ -542,8 +628,13 @@ pub(crate) fn incremental_sync_fragments(
     for (path, file_hash) in files {
         let path_str = path.display().to_string();
         // Unchanged files are skipped entirely (0 re-embeds) UNLESS the caller
-        // forces a re-embed to recover from a lost fragment mmap (P2-4).
-        if !force_reembed && manifest.file_hashes.get(&path_str) == Some(file_hash) {
+        // forces a re-embed to recover from a lost fragment mmap (P2-4) or the
+        // extraction identity changed (Codex P1: model/knob change must
+        // re-sync even when sources are byte-identical).
+        if !force_reembed
+            && !identity_changed
+            && manifest.file_hashes.get(&path_str) == Some(file_hash)
+        {
             continue;
         }
         summary.files_changed += 1;
@@ -553,13 +644,22 @@ pub(crate) fn incremental_sync_fragments(
             &mut manifest,
             path,
             file_hash,
-            force_reembed,
+            effective_force_reembed,
             chunk_fn,
             embed_fn,
             &mut new_embeddings,
             &mut summary,
         );
         store_dirty |= outcome.store_modified;
+    }
+
+    // Persist the identity that produced these rows (Codex P1) so the next run
+    // compares against it. Updated even when no store rows changed (a
+    // knob-only re-chunk to identical content) so the mismatch resolves and
+    // future runs are incremental again.
+    if identity_changed {
+        manifest.extraction_identity = identity.clone();
+        manifest_dirty = true;
     }
 
     if store_dirty {

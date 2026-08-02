@@ -44,9 +44,10 @@ pub(crate) use enrich::{enrich_fragment, enrich_orphan, orphan_header, owner_hea
 pub(crate) use orphan::{OrphanInput, orphan_fragments};
 #[cfg(test)]
 pub(crate) use sync::{
-    FragmentCandidate, FragmentFileManifest, compute_fragment_root_hash,
-    fragment_layer_generation_is_consistent, incremental_sync_fragments, load_fragment_root,
-    load_fragment_sync_manifest, persist_fragment_root, persist_fragment_sync_manifest,
+    FragmentCandidate, FragmentExtractionIdentity, FragmentFileManifest,
+    compute_fragment_root_hash, fragment_layer_generation_is_consistent,
+    incremental_sync_fragments, load_fragment_root, load_fragment_sync_manifest,
+    persist_fragment_root, persist_fragment_sync_manifest,
 };
 
 /// Number of lines per chunk when chunking naively (≈ Warp's `LINES_PER_CHUNK`).

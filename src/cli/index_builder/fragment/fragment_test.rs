@@ -910,6 +910,7 @@ fn test_sync_unchanged_file_zero_reembeds() {
             texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect()
         },
         false,
+        &FragmentExtractionIdentity::default(),
     )
     .unwrap();
     assert_eq!(summary.files_changed, 1, "first sync sees the new file");
@@ -930,6 +931,7 @@ fn test_sync_unchanged_file_zero_reembeds() {
             texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect()
         },
         false,
+        &FragmentExtractionIdentity::default(),
     )
     .unwrap();
     assert_eq!(summary2.files_changed, 0, "unchanged file is skipped");
@@ -970,6 +972,7 @@ fn test_sync_single_edit_only_affected_reembedded() {
         &mut |path: &std::path::Path, bytes: &[u8]| one_fragment_per_file(path, bytes, Some("x")),
         &mut |texts: &[String]| texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect(),
         false,
+        &FragmentExtractionIdentity::default(),
     )
     .unwrap();
     assert_eq!(summary.embedded, 2, "both files embedded on first pass");
@@ -1003,6 +1006,7 @@ fn test_sync_single_edit_only_affected_reembedded() {
             texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect()
         },
         false,
+        &FragmentExtractionIdentity::default(),
     )
     .unwrap();
     assert_eq!(summary2.files_changed, 1, "only b changed");
@@ -1101,6 +1105,7 @@ fn test_sync_root_mismatch_forces_rebuild() {
         },
         &mut |texts: &[String]| texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect(),
         false,
+        &FragmentExtractionIdentity::default(),
     )
     .unwrap();
     assert_eq!(summary.generation, 1);
@@ -1120,6 +1125,7 @@ fn test_sync_root_mismatch_forces_rebuild() {
         },
         &mut |texts: &[String]| texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect(),
         false,
+        &FragmentExtractionIdentity::default(),
     )
     .unwrap();
     assert_eq!(summary2.embedded, 1, "edited content is re-embedded");
@@ -1138,6 +1144,123 @@ fn test_sync_root_mismatch_forces_rebuild() {
         "persisted root always matches the live store"
     );
     assert_eq!(root_v2.generation, 2);
+}
+
+/// Codex P1: a model/knob identity change must NOT be hidden by the
+/// source-hash skip. A byte-identical file whose embedding model changed is
+/// re-chunked AND re-embedded (effective force) — the persisted identity
+/// mismatch invalidates the incremental skip, mirroring the node-level
+/// `NeuralCheckpoint.model` discipline.
+#[test]
+fn test_sync_extraction_identity_change_forces_resync() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("main.rs");
+    let contents = b"fn main() { println!(\"hi\"); }\n";
+    std::fs::write(&file, contents).unwrap();
+    let file_hash = blake3::hash(contents).to_hex().to_string();
+    let files = vec![(file.clone(), file_hash)];
+    let mut store = FragmentStore::new();
+
+    let identity_a = FragmentExtractionIdentity::new("model-a", 12_000, true, true);
+    let identity_b = FragmentExtractionIdentity::new("model-b", 12_000, true, true);
+
+    let (summary, _) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files,
+        &mut |path: &std::path::Path, bytes: &[u8]| {
+            one_fragment_per_file(path, bytes, Some("main"))
+        },
+        &mut |texts: &[String]| texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect(),
+        false,
+        &identity_a,
+    )
+    .unwrap();
+    assert_eq!(summary.files_changed, 1, "first sync sees the new file");
+    assert_eq!(summary.embedded, 1);
+    assert_eq!(summary.generation, 1);
+
+    // Identical file + identical identity → incremental (0 re-embeds).
+    let mut embed_calls: usize = 0;
+    let (summary_same, _) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files,
+        &mut |path: &std::path::Path, bytes: &[u8]| {
+            one_fragment_per_file(path, bytes, Some("main"))
+        },
+        &mut |texts: &[String]| {
+            embed_calls += texts.len();
+            texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect()
+        },
+        false,
+        &identity_a,
+    )
+    .unwrap();
+    assert_eq!(summary_same.files_changed, 0, "unchanged file is skipped");
+    assert_eq!(embed_calls, 0, "no re-embeds for unchanged file + identity");
+
+    // Same file, CHANGED model identity → the skip is invalidated: the file
+    // is re-chunked and the row re-embedded under the new model.
+    let (summary_b, _) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files,
+        &mut |path: &std::path::Path, bytes: &[u8]| {
+            one_fragment_per_file(path, bytes, Some("main"))
+        },
+        &mut |texts: &[String]| texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect(),
+        false,
+        &identity_b,
+    )
+    .unwrap();
+    assert_eq!(
+        summary_b.files_changed, 1,
+        "identity change re-chunks a byte-identical file"
+    );
+    assert_eq!(
+        summary_b.embedded, 1,
+        "model change re-embeds the stale row under the new model"
+    );
+    assert_eq!(summary_b.generation, 2, "generation bumps on the re-sync");
+
+    // The new identity is persisted: a third identical pass is incremental.
+    let (summary_b2, _) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files,
+        &mut |path: &std::path::Path, bytes: &[u8]| {
+            one_fragment_per_file(path, bytes, Some("main"))
+        },
+        &mut |texts: &[String]| texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect(),
+        false,
+        &identity_b,
+    )
+    .unwrap();
+    assert_eq!(
+        summary_b2.files_changed, 0,
+        "persisted identity makes the next run incremental again"
+    );
+    assert_eq!(summary_b2.embedded, 0);
+
+    // Knob-only change (same model, different knobs) also invalidates.
+    let identity_c = FragmentExtractionIdentity::new("model-b", 24_000, true, true);
+    let (summary_c, _) = incremental_sync_fragments(
+        dir.path(),
+        &mut store,
+        &files,
+        &mut |path: &std::path::Path, bytes: &[u8]| {
+            one_fragment_per_file(path, bytes, Some("main"))
+        },
+        &mut |texts: &[String]| texts.iter().map(|_| Some(vec![1.0, 0.0, 0.0])).collect(),
+        false,
+        &identity_c,
+    )
+    .unwrap();
+    assert_eq!(
+        summary_c.files_changed, 1,
+        "knob change invalidates the source-hash skip too"
+    );
 }
 
 // ---------------------------------------------------------------------------
