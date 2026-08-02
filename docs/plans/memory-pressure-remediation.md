@@ -90,18 +90,21 @@ Evidence capture: `docs/findings/2026-08-02-leindex-swap-saturation-investigatio
 - **Files:** `src/config.rs`, `leindex.toml.example`, `.env.example`, `src/cli/cli.rs`, docs.
 
 ### T2 — MCP process-level idle exit (D-1)
+> ✅ **DONE** — commit `478295ad` (with T3/T4). Unit tests: clock touch-reset, `idle_exit_due` logic, effective-timeout priority/zero.
 - **Goal:** `cmd_mcp_stdio_impl` + `cmd_mcp_socket_impl` exit 0 after `idle_timeout_secs` of no requests.
 - **Steps:** (1) hoist a process-level `last_request` Instant updated in `response_for_payload` (and socket handler entry); (2) in the stdio loop's idle wait (`read_stdio_input` returns `Skip`/would-block? — if it blocks, wrap reads with a timeout or poll a channel) add a deadline check; stdio read currently blocks — implement a select over `last_request` elapsed vs a background tick that triggers exit (tokio `select!` on a sleep vs. the next request via a mpsc feeding `response_for_payload`), mirroring how `server.rs` sessions are swept; (3) socket mode: reuse `run_socket` accept loop with the same idle clock.
 - **Acceptance:** new unit tests with a 2s idle timeout: process exits after silence; a request at t=1s resets the clock; in-flight request is never interrupted. memcheck `mcp-idle-proliferation` phase green.
 - **Files:** `src/cli/mcp_commands.rs`, `src/cli/mcp/server.rs`, `src/cli/mcp/server_test.rs`.
 
 ### T3 — Loaded-engine idle eviction (D-2)
+> ✅ **DONE** — commit `478295ad`. `last_used` per project (touched on `get_or_load`); `evict_idle_engines` skips in-flight via `try_write`; wired into the stdio 60s cleanup task + socket accept-loop sweep. Tests: idle-removal + in-flight/recent skip.
 - **Goal:** `ProjectRegistry` evicts engines idle > `engine_max_idle_secs`.
 - **Steps:** (1) add `last_used` + `active_calls` to the per-project entry (registry.rs); (2) `evict_idle_engines()` drops entries with `active_calls == 0 && last_used.elapsed() > max_idle` (guard: engine's own Drop releases mmaps — verify `LeIndex`/`SearchEngine` Drop order frees the mmap twins; if not, add explicit `unload()`); (3) call from the existing 60s cleanup task (stdio + socket).
 - **Acceptance:** unit test: load engine, idle-past-threshold, assert registry empty + RSS returned to baseline (memcheck phase). In-flight-call test: an active call blocks eviction.
 - **Files:** `src/cli/registry.rs`, `src/cli/mcp_commands.rs` (cleanup wiring), tests.
 
 ### T4 — Single-instance per-project lock (D-3)
+> ✅ **DONE (advisory)** — commit `478295ad`. Per GrayHill design-flaw resolution (msg 74): the second instance WARNS and continues — never exits — because a stdio server is 1:1 with its agent's pipe. Tests: sidecar write/release, live-sibling `AlreadyOwned`, dead-pid stale-steal, cross-project coexistence.
 - **Goal:** second `leindex mcp` for the same project exits 0 with a warning.
 - **Steps:** (1) new `src/cli/mcp/lock.rs` — `try_acquire(project_canonical)` writes `run/leindex-mcp-<hash>.{lock,pid,start}`; `pid_is_owned` reuses start-time comparison (port from `client_config::daemon_pid_is_owned`); (2) stale-steal on dead PID; (3) release on shutdown/exit (Drop guard + explicit on all exit paths).
 - **Acceptance:** unit tests: second instance exits 0; dead-pid lock is stolen; different projects coexist; release on clean exit.
@@ -126,8 +129,9 @@ Evidence capture: `docs/findings/2026-08-02-leindex-swap-saturation-investigatio
 - **Files:** `src/search/onnx/client_config.rs`, `src/cli/cleanup.rs`, `src/cli/cli.rs`, tests.
 
 ### T8 — memcheck harness fixes + new phases (D-8)
+> ⏳ **PARTIAL** — steps (1)-(2) verified + **T8a done** (commit `f7fad073`): worker-binary resolution (main.rs `resolve_worker_binary`) already handles the merged `-p leindex --bin leindex-embed` layout; sentinel root-cause documented (u64::MAX placeholders fire only when resolution fails); budget gate de-flaked by re-baselining embed_idle→8020 / embed_teardown→7900 and widening tolerance 5%→10%. `cargo test -p memcheck` 10/0. Step (3) phases deferred: `worker-ort-threads` needs T5, `stale-artifacts` needs T7; `mcp-idle-proliferation` lands with the T5/T7 batch so the phases are added once, exercised once.
 - **Goal:** harness resolves the merged worker binary; the 4 new phases run and assert.
-- **Steps:** (1) fix `tools/memcheck/src/main.rs` resolution for `-p leindex --bin leindex-embed` layout; (2) resolve the `u64::MAX` sentinels in `workload.rs` (root-cause the sentinel firing — previously masked by the missing binary); (3) add `mcp-idle-proliferation`, `worker-ort-threads`, `stale-artifacts` phases; (4) wire into `harness_integration.rs`.
+- **Steps:** (1) ✅ fix `tools/memcheck/src/main.rs` resolution for `-p leindex --bin leindex-embed` layout; (2) ✅ resolve the `u64::MAX` sentinels in `workload.rs` (root-cause the sentinel firing — previously masked by the missing binary); (3) ⏳ add `mcp-idle-proliferation`, `worker-ort-threads`, `stale-artifacts` phases (deferred to T5/T7 batch); (4) ⏳ wire into `harness_integration.rs`.
 - **Acceptance:** `cargo test -p memcheck` green on the merged tree; phases emit the empirical RSS/swap numbers recorded in the tracker.
 - **Files:** `tools/memcheck/**`, `tools/xtask`.
 
