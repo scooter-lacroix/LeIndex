@@ -109,31 +109,32 @@ mod build_time_invariants {
     /// or `println!` issuing such a directive remains.
     #[test]
     fn build_scripts_have_no_origin_rpath() {
-        for rel in ["build.rs", "crates/leindex-embed/build.rs"] {
-            let script = build_script(rel);
-            // Drop comment lines so doc comments mentioning the absence of
-            // rpath do not trip the literal-substring check.
-            let non_comment: String = script
-                .lines()
-                .filter(|line| {
-                    let trimmed = line.trim_start();
-                    !trimmed.starts_with("//")
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                !non_comment.contains("$ORIGIN"),
-                "{rel} must not emit a $ORIGIN rpath (load-dynamic does not need it)"
-            );
-            assert!(
-                !non_comment.contains("-Wl,-rpath"),
-                "{rel} must not emit any -Wl,-rpath directive (load-dynamic does not need it)"
-            );
-            assert!(
-                !non_comment.contains("cargo:rustc-link-arg"),
-                "{rel} must not emit cargo:rustc-link-arg (load-dynamic does not need it)"
-            );
-        }
+        // Single-element loop inlined (clippy::single-element-loop): the release
+        // packaging test currently validates only the root `build.rs`.
+        let rel = "build.rs";
+        let script = build_script(rel);
+        // Drop comment lines so doc comments mentioning the absence of
+        // rpath do not trip the literal-substring check.
+        let non_comment: String = script
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !non_comment.contains("$ORIGIN"),
+            "{rel} must not emit a $ORIGIN rpath (load-dynamic does not need it)"
+        );
+        assert!(
+            !non_comment.contains("-Wl,-rpath"),
+            "{rel} must not emit any -Wl,-rpath directive (load-dynamic does not need it)"
+        );
+        assert!(
+            !non_comment.contains("cargo:rustc-link-arg"),
+            "{rel} must not emit cargo:rustc-link-arg (load-dynamic does not need it)"
+        );
     }
 }
 
@@ -423,8 +424,13 @@ mod distribution_coverage {
     #[test]
     fn release_workflow_triggers_on_distribution_files() {
         let workflow = release_yml();
+        // One published crate: the worker source lives under `src/**`
+        // (merged from the retired crates/leindex-embed subcrate). The
+        // trigger must cover the merged source tree, the installers, the
+        // workflow itself, and the docs — but NOT `crates/**` (the
+        // directory no longer exists).
         for path in [
-            "crates/**",
+            "src/**",
             "install.sh",
             ".github/workflows/release.yml",
             "docs/**",
@@ -435,5 +441,9 @@ mod distribution_coverage {
                 path
             );
         }
+        assert!(
+            !workflow.contains("crates/**"),
+            "release workflow must not trigger on `crates/**` (the leindex-embed subcrate was retired; src/** covers the merged worker source)"
+        );
     }
 }

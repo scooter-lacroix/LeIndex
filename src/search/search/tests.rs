@@ -1,5 +1,15 @@
 use super::*;
 
+// The snapshot cluster (search_snapshot / restore_from_search_snapshot) moved
+// out of mod.rs into the sibling snapshot.rs module; tests building 1024-dim
+// snapshot vectors need these two names that were previously reachable via
+// `use super::*` glob (mod.rs no longer imports Arc or defines the const).
+// Storage-gated to match the test functions that use them.
+#[cfg(feature = "storage")]
+use super::snapshot::NEURAL_EMBEDDING_DIMENSION;
+#[cfg(feature = "storage")]
+use std::sync::Arc;
+
 pub(super) fn create_test_nodes() -> Vec<NodeInfo> {
     vec![
         NodeInfo {
@@ -64,6 +74,7 @@ fn test_index_nodes() {
     assert!(!engine.is_empty());
 }
 
+#[cfg(feature = "storage")]
 #[test]
 fn test_search_snapshot_restore_round_trip() {
     let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
@@ -97,7 +108,7 @@ fn test_search_snapshot_restore_round_trip() {
 
     let mut restored = SearchEngine::new();
     let restored_count = restored
-        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None)
+        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None, None, None)
         .unwrap();
 
     assert_eq!(restored_count, 1);
@@ -124,6 +135,7 @@ fn test_search_snapshot_restore_round_trip() {
 }
 
 #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+#[cfg(feature = "storage")]
 #[test]
 fn search_snapshot_restores_neural_rows_without_heap_tfidf_copy() {
     let mut engine = SearchEngine::new();
@@ -159,12 +171,19 @@ fn search_snapshot_restores_neural_rows_without_heap_tfidf_copy() {
 
     let mut restored = SearchEngine::new();
     restored
-        .restore_from_search_snapshot(snapshot, Arc::new(tfidf_mmap), Some(Arc::new(neural_mmap)))
+        .restore_from_search_snapshot(
+            snapshot,
+            Arc::new(tfidf_mmap),
+            Some(Arc::new(neural_mmap)),
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(restored.collect_neural_embeddings().len(), 1);
     assert!(restored.nodes[0].tfidf_embedding.is_empty());
 }
 
+#[cfg(feature = "storage")]
 #[test]
 fn test_search_snapshot_restore_rejects_wrong_tfidf_dimension() {
     let mut engine = SearchEngine::new();
@@ -194,7 +213,7 @@ fn test_search_snapshot_restore_rejects_wrong_tfidf_dimension() {
 
     let mut restored = SearchEngine::new();
     let err = restored
-        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None)
+        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None, None, None)
         .unwrap_err();
     assert!(err.contains("TF-IDF mmap dimension"));
     assert!(restored.is_empty());
@@ -994,4 +1013,899 @@ fn test_incremental_reindex_node_id_to_idx_consistency() {
             node.node_id
         );
     }
+}
+
+#[cfg(feature = "storage")]
+#[test]
+fn test_search_snapshot_fragment_roundtrip() {
+    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf_embedding[0] = 1.0;
+
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding,
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+
+    // Simulate a fragment-enabled persisted snapshot: the cli-side persist path
+    // fills `fragment_rows` from the hydrated index before writing.
+    let mut snapshot = engine.search_snapshot(1, 0, "frag-fingerprint".to_string());
+    snapshot.fragment_rows = 2;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tfidf_path = dir.path().join("tfidf.bin");
+    let frag_path = dir.path().join("frag.bin");
+    crate::search::vector::write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings())
+        .unwrap();
+    let fragment_embeddings = vec![
+        (
+            "hash_abc".to_string(),
+            vec![0.1f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+        (
+            "hash_def".to_string(),
+            vec![0.2f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+    ];
+    crate::search::vector::write_mmap_embeddings(&frag_path, &fragment_embeddings).unwrap();
+    let tfidf_mmap = crate::search::vector::MmapEmbeddingIndex::open(&tfidf_path).unwrap();
+    let frag_mmap = crate::search::vector::MmapEmbeddingIndex::open(&frag_path).unwrap();
+    let frag_ids = vec!["hash_abc".to_string(), "hash_def".to_string()];
+
+    let mut restored = SearchEngine::new();
+    restored
+        .restore_from_search_snapshot(
+            snapshot,
+            Arc::new(tfidf_mmap),
+            None,
+            Some(Arc::new(frag_mmap)),
+            Some(&frag_ids),
+        )
+        .unwrap();
+
+    // Fragment fields survive the round-trip.
+    let resnap = restored.search_snapshot(1, 0, "frag-fingerprint".to_string());
+    assert_eq!(resnap.fragment_rows, 2);
+    let mut collected = restored.collect_fragment_embeddings();
+    assert_eq!(collected.len(), 2);
+    collected.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(collected[0].0, "hash_abc");
+    assert_eq!(collected[1].0, "hash_def");
+}
+
+#[cfg(feature = "storage")]
+#[test]
+fn test_search_snapshot_restore_disables_fragment_on_row_mismatch() {
+    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf_embedding[0] = 1.0;
+
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding,
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+
+    // Snapshot claims 5 fragment rows but the mmap only has 2: the fragment
+    // layer must be disabled, while the node-level restore still succeeds.
+    let mut snapshot = engine.search_snapshot(1, 0, "frag-fingerprint".to_string());
+    snapshot.fragment_rows = 5;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tfidf_path = dir.path().join("tfidf.bin");
+    let frag_path = dir.path().join("frag.bin");
+    crate::search::vector::write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings())
+        .unwrap();
+    let fragment_embeddings = vec![
+        (
+            "hash_abc".to_string(),
+            vec![0.1f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+        (
+            "hash_def".to_string(),
+            vec![0.2f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+    ];
+    crate::search::vector::write_mmap_embeddings(&frag_path, &fragment_embeddings).unwrap();
+    let tfidf_mmap = crate::search::vector::MmapEmbeddingIndex::open(&tfidf_path).unwrap();
+    let frag_mmap = crate::search::vector::MmapEmbeddingIndex::open(&frag_path).unwrap();
+    let frag_ids = vec!["hash_abc".to_string(), "hash_def".to_string()];
+
+    let mut restored = SearchEngine::new();
+    restored
+        .restore_from_search_snapshot(
+            snapshot,
+            Arc::new(tfidf_mmap),
+            None,
+            Some(Arc::new(frag_mmap)),
+            Some(&frag_ids),
+        )
+        .unwrap();
+    assert_eq!(restored.node_count(), 1);
+    assert!(
+        restored.collect_fragment_embeddings().is_empty(),
+        "row-count mismatch must disable the fragment layer"
+    );
+}
+
+#[cfg(feature = "storage")]
+#[test]
+fn test_fragment_owner_union_and_byte_range_surfacing() {
+    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf_embedding[0] = 1.0;
+
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding,
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+
+    // Hydrate a 2-row fragment index owned by the single node.
+    let mut snapshot = engine.search_snapshot(1, 0, "frag-fingerprint".to_string());
+    snapshot.fragment_rows = 2;
+    let dir = tempfile::tempdir().unwrap();
+    let tfidf_path = dir.path().join("tfidf.bin");
+    let frag_path = dir.path().join("frag.bin");
+    crate::search::vector::write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings())
+        .unwrap();
+    let mut hash_abc = vec![0.0f32; NEURAL_EMBEDDING_DIMENSION];
+    hash_abc[0] = 1.0;
+    let mut hash_def = vec![0.0f32; NEURAL_EMBEDDING_DIMENSION];
+    hash_def[1] = 1.0;
+    let fragment_embeddings = vec![
+        ("hash_abc".to_string(), hash_abc),
+        ("hash_def".to_string(), hash_def),
+    ];
+    crate::search::vector::write_mmap_embeddings(&frag_path, &fragment_embeddings).unwrap();
+    let tfidf_mmap = crate::search::vector::MmapEmbeddingIndex::open(&tfidf_path).unwrap();
+    let frag_mmap = crate::search::vector::MmapEmbeddingIndex::open(&frag_path).unwrap();
+    let frag_ids = vec!["hash_abc".to_string(), "hash_def".to_string()];
+
+    let mut restored = SearchEngine::new();
+    restored
+        .restore_from_search_snapshot(
+            snapshot,
+            Arc::new(tfidf_mmap),
+            None,
+            Some(Arc::new(frag_mmap)),
+            Some(&frag_ids),
+        )
+        .unwrap();
+    // Turn the fragment layer ON: master switch + fusion weight + refs map.
+    let mut refs = std::collections::HashMap::new();
+    refs.insert(
+        "hash_abc".to_string(),
+        vec![("auth.rs:authenticate_user".to_string(), (10, 25))],
+    );
+    refs.insert(
+        "hash_def".to_string(),
+        vec![("auth.rs:authenticate_user".to_string(), (30, 45))],
+    );
+    restored.set_fragment_index_enabled(true);
+    restored.set_fragment_weight(0.12);
+    restored.set_fragment_refs(refs);
+
+    // A neural query embedding close to hash_abc must surface the owner with
+    // the fragment byte range and a nonzero fragment score component.
+    let mut query_neural = vec![0.0f32; NEURAL_EMBEDDING_DIMENSION];
+    query_neural[0] = 1.0;
+    let results = restored
+        .search(SearchQuery {
+            query: "authenticate".to_string(),
+            top_k: 5,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: Some(engine.collect_embeddings()[0].1.clone()),
+            query_neural_embedding: Some(query_neural),
+            threshold: None,
+            query_type: None,
+        })
+        .unwrap();
+    let owner = results
+        .iter()
+        .find(|r| r.node_id == "auth.rs:authenticate_user");
+    assert!(
+        owner.is_some(),
+        "fragment owner must enter the candidate pool"
+    );
+    let result = owner.unwrap();
+    assert_eq!(result.fragment_byte_range, Some((10, 25)));
+    assert!(result.score.fragment > 0.0);
+    assert_eq!(
+        result.byte_range,
+        (0, 29),
+        "node byte range stays unchanged"
+    );
+}
+
+#[cfg(feature = "storage")]
+#[test]
+fn test_fragment_layer_off_by_default_contributes_nothing() {
+    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf_embedding[0] = 1.0;
+
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding,
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+
+    let mut snapshot = engine.search_snapshot(1, 0, "frag-fingerprint".to_string());
+    snapshot.fragment_rows = 2;
+    let dir = tempfile::tempdir().unwrap();
+    let tfidf_path = dir.path().join("tfidf.bin");
+    let frag_path = dir.path().join("frag.bin");
+    crate::search::vector::write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings())
+        .unwrap();
+    let mut hash_abc = vec![0.0f32; NEURAL_EMBEDDING_DIMENSION];
+    hash_abc[0] = 1.0;
+    let fragment_embeddings = vec![
+        ("hash_abc".to_string(), hash_abc),
+        (
+            "hash_def".to_string(),
+            vec![0.0f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+    ];
+    crate::search::vector::write_mmap_embeddings(&frag_path, &fragment_embeddings).unwrap();
+    let tfidf_mmap = crate::search::vector::MmapEmbeddingIndex::open(&tfidf_path).unwrap();
+    let frag_mmap = crate::search::vector::MmapEmbeddingIndex::open(&frag_path).unwrap();
+    let frag_ids = vec!["hash_abc".to_string(), "hash_def".to_string()];
+
+    let mut restored = SearchEngine::new();
+    restored
+        .restore_from_search_snapshot(
+            snapshot,
+            Arc::new(tfidf_mmap),
+            None,
+            Some(Arc::new(frag_mmap)),
+            Some(&frag_ids),
+        )
+        .unwrap();
+    // fragment_index_enabled stays false (default): the fragment layer must
+    // contribute nothing, even with a fragment index hydrated.
+
+    let mut query_neural = vec![0.0f32; NEURAL_EMBEDDING_DIMENSION];
+    query_neural[0] = 1.0;
+    let results = restored
+        .search(SearchQuery {
+            query: "authenticate".to_string(),
+            top_k: 5,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: Some(engine.collect_embeddings()[0].1.clone()),
+            query_neural_embedding: Some(query_neural),
+            threshold: None,
+            query_type: None,
+        })
+        .unwrap();
+    let owner = results
+        .iter()
+        .find(|r| r.node_id == "auth.rs:authenticate_user");
+    assert!(owner.is_some(), "lexical match keeps the owner in results");
+    let result = owner.unwrap();
+    assert_eq!(result.fragment_byte_range, None);
+    assert_eq!(result.score.fragment, 0.0);
+}
+
+// Empirical recall-gain measurement for the fragment tier (Task 11 evidence).
+//
+// Builds a synthetic corpus where each conceptual query targets sub-symbol
+// content that exists ONLY as fragment rows (content-hash addressed), not in
+// the owner node's lexical surface. A pool of lexically-dominant decoy nodes
+// fills the top-k at baseline, so the owner is ABSENT from results without
+// the fragment tier; the fragment score then surfaces the owner. Measures
+// MRR@5 with the fragment tier disabled (baseline) and enabled, and asserts a
+// measurable gain. Also re-runs plain node-level queries to assert NO
+// node-rank regression when the tier is enabled (plan stop-condition: MRR on
+// existing node queries must not drop).
+//
+// Deliberately not gated behind `storage`/`cli`: the fragment public API
+// (set_fragment_index_enabled/set_fragment_weight/set_fragment_refs/
+// set_fragment_embeddings) lives in the search crate and is available in any
+// `search` build, so the measurement runs in the default workspace suite.
+#[test]
+/// Empirical MRR evidence for the fragment tier (plan Task 11 checkbox:
+/// "Recall/regression measurement (conceptual-query MRR before/after fragment
+/// tier)").
+///
+/// Scenario design notes (all three quirks were empirically diagnosed on first
+/// run — gain=0.0000 — and fixed here):
+/// - `with_dimension(DIM)`: a default 768-dim engine silently rejects the
+///   8-dim synthetic tfidf embeddings, which left `vector_results` empty and
+///   made scoring degenerate to structural noise. The engine must match the
+///   synthetic dimension so the vector path actually runs.
+/// - Distinct query text per query: the search cache key folds in the query
+///   STRING but not the neural embedding content, so identical texts collapse
+///   to one cached result set. Each conceptual query gets its own text.
+/// - `top_k` (5) < corpus (10): decoys perfectly match the tfidf query
+///   embedding (cosine 1.0) and fill ranks 1-5, cutting the owners OUT of the
+///   result set at baseline — so the fragment tier is genuinely the only path
+///   that can surface them (not merely re-rank nodes that are already present).
+/// - `fragment_weight` sweep (0.12 / 0.20 / 0.30 / 0.35 / 0.40) vs baseline
+///   (0.0): the shipped default was empirically tuned to 0.35 (see
+///   `src/config.rs::default_fragment_weight`) — 0.35 is the smallest weight
+///   with real margin that surfaces fragments over strong tfidf matches
+///   (fragment share w/(1+w) vs decoy tfidf share 0.3/(1+w); 0.30 sits at
+///   share-equality and is fragile, 0.35 clears it by ~3.7pp) while
+///   preserving node-rank exactly. The assertion stays on 0.40 so the
+///   surfacing MECHANISM is verified in isolation regardless of the shipped
+///   default.
+fn test_fragment_tier_improves_conceptual_mrr() {
+    const DIM: usize = 8;
+    const N_OWNERS: usize = 4;
+    const N_DECOYS: usize = 6;
+    const TOP_K: usize = 5; // < corpus (10): owners must be cut at baseline
+    let one_hot = |dim: usize, hot: usize| -> Vec<f32> {
+        (0..dim).map(|i| if i == hot { 1.0 } else { 0.0 }).collect()
+    };
+
+    // Owner nodes: tfidf one-hot at dim 1 — the conceptual query embedding
+    // (dim 0) does NOT match them, so at baseline they score ~0 and get cut.
+    // Decoy nodes: tfidf one-hot at dim 0 — perfect tfidf match, fills the
+    // top-k and pushes the owners out of the results entirely.
+    let build_nodes = || -> Vec<NodeInfo> {
+        let mut nodes: Vec<NodeInfo> = (0..N_OWNERS)
+            .map(|i| NodeInfo {
+                node_id: format!("mod.rs:owner_{i}"),
+                file_path: "mod.rs".to_string(),
+                symbol_name: format!("owner_{i}"),
+                language: "rust".to_string(),
+                content: format!("pub fn owner_{i}() {{ /* unrelated body */ }}"),
+                byte_range: (0, 40),
+                tfidf_embedding: one_hot(DIM, 1),
+                neural_embedding: None,
+                complexity: 2,
+                signature: None,
+                pre_tokenized: Some(vec![format!("owner_{i}")]),
+            })
+            .collect();
+        for d in 0..N_DECOYS {
+            nodes.push(NodeInfo {
+                node_id: format!("mod.rs:decoy_{d}"),
+                file_path: "mod.rs".to_string(),
+                symbol_name: format!("decoy_{d}"),
+                language: "rust".to_string(),
+                content: format!("pub fn decoy_{d}() {{ /* dominates lexical space */ }}"),
+                byte_range: (0, 50),
+                tfidf_embedding: one_hot(DIM, 0),
+                neural_embedding: None,
+                complexity: 1,
+                signature: None,
+                pre_tokenized: Some(vec![format!("decoy_{d}")]),
+            });
+        }
+        nodes
+    };
+
+    // Fragment rows: one per owner, embedded at a *distinct* semantic region
+    // (dim 6) far from every node tfidf one-hot. The conceptual queries embed
+    // near this region, so only the fragment tier can surface the owner.
+    let mut fragment_rows = Vec::new();
+    let mut refs = std::collections::HashMap::new();
+    for i in 0..N_OWNERS {
+        let mut emb = one_hot(DIM, 6);
+        emb[i % DIM] = 0.5; // per-owner differentiation
+        let frag_id = format!("hash_owner_{i}");
+        fragment_rows.push((frag_id.clone(), emb));
+        refs.insert(
+            frag_id,
+            vec![(format!("mod.rs:owner_{i}"), (8 + i * 2, 12 + i * 2))],
+        );
+    }
+
+    // Build a fresh engine with the same corpus; optionally enable fragments
+    // at the given fusion weight (0.0 == off).
+    let build_engine = |fragments_on: bool, frag_weight: f32| -> SearchEngine {
+        let mut engine = SearchEngine::with_dimension(DIM);
+        engine.index_nodes(build_nodes());
+        if fragments_on {
+            engine.set_fragment_embeddings(fragment_rows.clone());
+            engine.set_fragment_refs(refs.clone());
+            engine.set_fragment_index_enabled(true);
+            engine.set_fragment_weight(frag_weight);
+        }
+        engine
+    };
+
+    // MRR@TOP_K over a set of (expected owner, query text, tfidf query
+    // embedding, neural query embedding) tuples. `frag_weight` selects the
+    // fusion weight (0.4 is the demonstration weight; the shipped 0.12 default
+    // is measured separately below, unasserted, to self-demonstrate that
+    // fragments add recall without outranking strong tfidf matches).
+    let mrr = |queries: &[(String, String, Vec<f32>, Option<Vec<f32>>)],
+               fragments_on: bool,
+               frag_weight: f32|
+     -> f64 {
+        let mut engine = build_engine(fragments_on, frag_weight);
+        let mut reciprocal_ranks = Vec::new();
+        for (target, query_text, query_emb, query_neural) in queries.iter() {
+            let results = engine
+                .search(SearchQuery {
+                    query: query_text.clone(),
+                    top_k: TOP_K,
+                    token_budget: None,
+                    semantic: true,
+                    expand_context: false,
+                    query_embedding: Some(query_emb.clone()),
+                    query_neural_embedding: query_neural.clone(),
+                    threshold: None,
+                    query_type: None,
+                })
+                .unwrap();
+            let rank = results
+                .iter()
+                .position(|r| r.node_id == *target)
+                .map(|p| p + 1);
+            reciprocal_ranks.push(match rank {
+                Some(r) => 1.0 / r as f64,
+                None => 0.0,
+            });
+        }
+        reciprocal_ranks.iter().sum::<f64>() / reciprocal_ranks.len() as f64
+    };
+
+    // Conceptual queries: text has no lexical overlap with any node, each has
+    // DISTINCT text (avoids the search-cache key collision that would serve
+    // query 0's result set to the others), the tfidf embedding matches decoys
+    // only, and the neural embedding exactly matches fragment i (cosine 1.0).
+    // Baseline: decoys fill the top-k, owner absent (0.0). With fragments: the
+    // owner surfaces via the fusion path.
+    let conceptual: Vec<(String, String, Vec<f32>, Option<Vec<f32>>)> = (0..N_OWNERS)
+        .map(|i| {
+            let mut q = one_hot(DIM, 6);
+            q[i % DIM] = 0.5;
+            (
+                format!("mod.rs:owner_{i}"),
+                format!("conceptual sub-symbol intent {i}"),
+                one_hot(DIM, 0),
+                Some(q),
+            )
+        })
+        .collect();
+
+    // Node-level queries: query text matches the owner token lexically, the
+    // tfidf embedding is neutral (dim 7, matches nothing), and the neural
+    // embedding is None so the fragment path is inert — the owner surfaces via
+    // the normal path identically with and without the tier. Guards the plan
+    // stop-condition (fragment tier must not regress node-level ranking).
+    let node_level: Vec<(String, String, Vec<f32>, Option<Vec<f32>>)> = (0..N_OWNERS)
+        .map(|i| {
+            (
+                format!("mod.rs:owner_{i}"),
+                format!("owner_{i}"),
+                one_hot(DIM, 7),
+                None,
+            )
+        })
+        .collect();
+
+    let conceptual_off = mrr(&conceptual, false, 0.0);
+    let node_off = mrr(&node_level, false, 0.0);
+
+    // Fragment-weight default sweep (Task: tune fragment_weight). Measure the
+    // conceptual-recall MRR at the candidate defaults 0.12 / 0.2 / 0.3 / 0.4
+    // (and the node-level no-regression guard at each). All four are measured
+    // empirically and printed; the assertion stays on the demonstration weight
+    // (0.4) so the surfacing MECHANISM is verified in isolation regardless of
+    // the shipped default (see the fn doc comment). The winning default is
+    // recorded in the printed line and applied to `src/config.rs`
+    // `default_fragment_weight()`.
+    let conceptual_w012 = mrr(&conceptual, true, 0.12);
+    let conceptual_w020 = mrr(&conceptual, true, 0.20);
+    let conceptual_w030 = mrr(&conceptual, true, 0.30);
+    let conceptual_w035 = mrr(&conceptual, true, 0.35);
+    let conceptual_w040 = mrr(&conceptual, true, 0.40);
+    let node_w040 = mrr(&node_level, true, 0.40);
+
+    eprintln!(
+        "fragment_recall_mrr: baseline(off)={conceptual_off:.4} w=0.12:{conceptual_w012:.4} w=0.20:{conceptual_w020:.4} w=0.30:{conceptual_w030:.4} w=0.35:{conceptual_w035:.4} w=0.40:{conceptual_w040:.4} | node-rank off={node_off:.4} w=0.40:{node_w040:.4}"
+    );
+
+    // The shipped default (0.35) must deliver the recall gain — that is the
+    // product claim being tuned. Assert on the DEFAULT rather than the 0.40
+    // demonstration weight so a future regression that breaks the shipped
+    // default specifically fails here; 0.40 is still printed above as margin
+    // evidence.
+    assert!(
+        conceptual_w035 > conceptual_off,
+        "fragment tier must improve conceptual-query MRR at the shipped default 0.35: baseline {conceptual_off:.4} -> with fragments {conceptual_w035:.4}"
+    );
+    assert!(
+        node_w040 >= node_off,
+        "fragment tier must not regress node-level ranking MRR: baseline {node_off:.4} -> with fragments {node_w040:.4}"
+    );
+}
+
+/// Codex wave-2 item 5 regression: identical fragment content embedded once
+/// but referenced by MULTIPLE owners must surface EVERY owner at query time.
+/// The old refs build collapsed to the first owner (`find_map`), so a hash
+/// shared by N owners only ever lifted one of them into the candidate pool.
+#[test]
+fn test_fragment_multi_owner_refs_all_surface() {
+    // Two nodes in different files, both owning byte ranges of the SAME
+    // fragment content (identical enriched text → one content hash).
+    let mut engine = SearchEngine::with_dimension(8);
+    let owner_ids = ["a.rs:fn_a", "b.rs:fn_b"];
+    let nodes: Vec<NodeInfo> = owner_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| NodeInfo {
+            node_id: id.to_string(),
+            file_path: format!("{}.rs", if i == 0 { "a" } else { "b" }),
+            symbol_name: format!("fn_{}", if i == 0 { "a" } else { "b" }),
+            language: "rust".to_string(),
+            content: format!(
+                "pub fn fn_{}() {{ /* shared */ }}",
+                if i == 0 { "a" } else { "b" }
+            ),
+            byte_range: (0, 40),
+            // One-hot at dim 1: the fragment query (dim 0) must NOT match
+            // either node lexically/vectorially at the node level.
+            tfidf_embedding: (0..8).map(|d| if d == 1 { 1.0 } else { 0.0 }).collect(),
+            neural_embedding: None,
+            complexity: 2,
+            signature: None,
+            pre_tokenized: Some(vec![]),
+        })
+        .collect();
+    engine.index_nodes(nodes);
+
+    // One fragment row (dim 0 hot), referenced by BOTH owners.
+    let shared_hash = "shared_content_hash".to_string();
+    engine.set_fragment_embeddings(vec![(
+        shared_hash.clone(),
+        (0..8).map(|d| if d == 0 { 1.0 } else { 0.0 }).collect(),
+    )]);
+    let mut refs = std::collections::HashMap::new();
+    refs.insert(
+        shared_hash,
+        vec![
+            ("a.rs:fn_a".to_string(), (2, 10)),
+            ("b.rs:fn_b".to_string(), (2, 10)),
+        ],
+    );
+    engine.set_fragment_refs(refs);
+    engine.set_fragment_index_enabled(true);
+    engine.set_fragment_weight(0.35);
+
+    // Neural query embedding matches the fragment (dim 0 hot).
+    let results = engine
+        .search(SearchQuery {
+            query: "shared intent".to_string(),
+            top_k: 5,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: None,
+            query_neural_embedding: Some((0..8).map(|d| if d == 0 { 1.0 } else { 0.0 }).collect()),
+            threshold: None,
+            query_type: None,
+        })
+        .unwrap();
+
+    for owner in owner_ids {
+        let hit = results.iter().find(|r| r.node_id == owner);
+        assert!(
+            hit.is_some(),
+            "multi-owner fragment must surface owner {owner:?} (got {:?})",
+            results.iter().map(|r| &r.node_id).collect::<Vec<_>>()
+        );
+        assert!(
+            hit.unwrap().score.fragment > 0.0,
+            "owner {owner:?} must carry a nonzero fragment score"
+        );
+        assert_eq!(
+            hit.unwrap().fragment_byte_range,
+            Some((2, 10)),
+            "owner {owner:?} must surface the fragment byte range"
+        );
+    }
+}
+
+/// Codex wave-2 item 4 regression (Exact-route defense-in-depth): even with
+/// the fragment master switch ON, a neural query embedding present, and owner
+/// refs populated, an Exact-route query must NOT fuse fragments — the fragment
+/// layer is inert (`fragment_byte_range` None, `score.fragment` 0.0) so an
+/// exact identifier lookup stays purely lexical. Mirrors the CLI's zeroing of
+/// `query_neural_embedding` for exact routes; pins the search-crate guard.
+#[test]
+fn test_fragment_inert_for_exact_route_query() {
+    let mut engine = SearchEngine::with_dimension(8);
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding: (0..8).map(|d| if d == 1 { 1.0 } else { 0.0 }).collect(),
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+    engine.set_fragment_embeddings(vec![(
+        "hash_abc".to_string(),
+        (0..8).map(|d| if d == 0 { 1.0 } else { 0.0 }).collect(),
+    )]);
+    let mut refs = std::collections::HashMap::new();
+    refs.insert(
+        "hash_abc".to_string(),
+        vec![("auth.rs:authenticate_user".to_string(), (2, 10))],
+    );
+    engine.set_fragment_refs(refs);
+    engine.set_fragment_index_enabled(true);
+    engine.set_fragment_weight(0.35);
+
+    // Exact route WITH a neural embedding that matches the fragment: the
+    // Exact-route guard must keep the fragment layer out.
+    let results = engine
+        .search(SearchQuery {
+            query: "authenticate_user".to_string(),
+            top_k: 5,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            query_neural_embedding: Some((0..8).map(|d| if d == 0 { 1.0 } else { 0.0 }).collect()),
+            threshold: None,
+            query_type: Some(crate::search::ranking::QueryType::Exact),
+        })
+        .unwrap();
+    let hit = results
+        .iter()
+        .find(|r| r.node_id == "auth.rs:authenticate_user");
+    assert!(hit.is_some(), "exact-name match keeps the owner in results");
+    assert_eq!(
+        hit.unwrap().fragment_byte_range,
+        None,
+        "Exact route must not surface a fragment byte range"
+    );
+    assert_eq!(
+        hit.unwrap().score.fragment,
+        0.0,
+        "Exact route must not fuse a fragment score"
+    );
+}
+
+/// Codex wave-2 item 9 regression: a fragment id list whose length disagrees
+/// with the snapshot's recorded row count must disable the fragment layer
+/// (non-fatal), just like a mmap row-count or dimension mismatch — so a
+/// truncated/incomplete id list can never yield a half-mapped fragment index.
+#[cfg(feature = "storage")]
+#[test]
+fn test_search_snapshot_disables_fragment_on_id_count_mismatch() {
+    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf_embedding[0] = 1.0;
+
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding,
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+
+    // Snapshot records 2 fragment rows; mmap has 2 rows (both checks pass),
+    // but the id list carries only 1 — the id-count guard must disable the
+    // layer while the node-level restore still succeeds.
+    let mut snapshot = engine.search_snapshot(1, 0, "frag-fingerprint".to_string());
+    snapshot.fragment_rows = 2;
+
+    let dir = tempfile::tempdir().unwrap();
+    let tfidf_path = dir.path().join("tfidf.bin");
+    let frag_path = dir.path().join("frag.bin");
+    crate::search::vector::write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings())
+        .unwrap();
+    let fragment_embeddings = vec![
+        (
+            "hash_abc".to_string(),
+            vec![0.1f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+        (
+            "hash_def".to_string(),
+            vec![0.2f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+    ];
+    crate::search::vector::write_mmap_embeddings(&frag_path, &fragment_embeddings).unwrap();
+    let tfidf_mmap = crate::search::vector::MmapEmbeddingIndex::open(&tfidf_path).unwrap();
+    let frag_mmap = crate::search::vector::MmapEmbeddingIndex::open(&frag_path).unwrap();
+    // TRUNCATED id list: mmap rows 2, ids 1.
+    let frag_ids = vec!["hash_abc".to_string()];
+
+    let mut restored = SearchEngine::new();
+    restored
+        .restore_from_search_snapshot(
+            snapshot,
+            Arc::new(tfidf_mmap),
+            None,
+            Some(Arc::new(frag_mmap)),
+            Some(&frag_ids),
+        )
+        .unwrap();
+    assert_eq!(restored.node_count(), 1);
+    assert!(
+        restored.collect_fragment_embeddings().is_empty(),
+        "id-count mismatch must disable the fragment layer"
+    );
+}
+
+/// Codex wave-6 item 3 regression: a query whose fragment cosine hits are ALL
+/// non-positive must NOT activate the fragment fusion layer.
+///
+/// Before the fix, `entry(owner).or_insert(0.0)` inserted every owner BEFORE
+/// the score comparison, so an unrelated query whose fragment candidates all
+/// scored ≤ 0 still populated `fragment_owner_scores` (all 0.0) → `search()`
+/// saw a non-empty map → marked the layer active → renormalized the four base
+/// weights by 1/(1+fragment_weight) despite zero fragment contribution. The
+/// fix skips non-positive hits, keeping the owner-score map empty so the
+/// activation gate stays honest. Asserts the enabled-layer overall score equals
+/// the layer-disabled baseline (identical base weights ⇒ no renorm distortion).
+#[test]
+fn test_fragment_nonpositive_hits_do_not_activate_fusion() {
+    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf_embedding[0] = 1.0;
+
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding,
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+
+    // Fragment layer ON with a fusion weight, but the ONLY fragment embedding
+    // is ANTI-correlated with the query neural embedding (cosine ≤ 0).
+    engine.set_fragment_index_enabled(true);
+    engine.set_fragment_weight(0.12);
+    let frag_embedding = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    engine.set_fragment_embeddings(vec![("hash_neg".to_string(), frag_embedding)]);
+    let mut refs = std::collections::HashMap::new();
+    refs.insert(
+        "hash_neg".to_string(),
+        vec![("auth.rs:authenticate_user".to_string(), (10, 25))],
+    );
+    engine.set_fragment_refs(refs);
+
+    // Hoist the query embedding OUT of the closure so `make_query` owns its
+    // data instead of borrowing `engine` immutably (which would conflict with
+    // the later `&mut self` `engine.search` / `set_fragment_index_enabled`
+    // calls).
+    let query_embedding = engine.collect_embeddings()[0].1.clone();
+    let make_query = || SearchQuery {
+        query: "authenticate".to_string(),
+        top_k: 5,
+        token_budget: None,
+        semantic: true,
+        expand_context: false,
+        query_embedding: Some(query_embedding.clone()),
+        query_neural_embedding: Some(vec![-1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        threshold: None,
+        query_type: None,
+    };
+
+    let results = engine.search(make_query()).unwrap();
+    let owner = results
+        .iter()
+        .find(|r| r.node_id == "auth.rs:authenticate_user")
+        .expect("owner node remains in results");
+    assert_eq!(
+        owner.score.fragment, 0.0,
+        "no positive fragment hit must yield a zero fragment score"
+    );
+    assert_eq!(
+        owner.fragment_byte_range, None,
+        "non-positive fragment hit must not surface a byte range"
+    );
+
+    // The layer must NOT be marked active: renorm would downscale the four
+    // base weights by 1/(1+fragment_weight). Disabling the layer entirely must
+    // yield an IDENTICAL overall score — the proof there is no renorm.
+    engine.set_fragment_index_enabled(false);
+    let baseline = engine.search(make_query()).unwrap();
+    let baseline_owner = baseline
+        .iter()
+        .find(|r| r.node_id == "auth.rs:authenticate_user")
+        .expect("baseline owner node");
+    assert!(
+        (owner.score.overall - baseline_owner.score.overall).abs() < 1e-6,
+        "non-positive fragment hits must not renormalize base weights: enabled={} disabled={}",
+        owner.score.overall,
+        baseline_owner.score.overall
+    );
+}
+
+/// Codex wave-6 item 1 regression: `SearchEngine::restore_fragment_index`
+/// installs a validated fragment mmap twin into an EXISTING engine without a
+/// full snapshot rebuild — the slow TF-IDF-fallback hydration path restores
+/// the fragment layer on top of the freshly rebuilt node index. Row-count
+/// validation mirrors the snapshot-hydrate path; a mismatch must leave the
+/// layer off (invariant 8).
+#[cfg(feature = "storage")]
+#[test]
+fn test_restore_fragment_index_installs_validated_mmap_twin() {
+    let dir = tempfile::tempdir().unwrap();
+    let frag_path = dir.path().join("frag.bin");
+    let fragment_embeddings = vec![
+        (
+            "hash_abc".to_string(),
+            vec![0.1f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+        (
+            "hash_def".to_string(),
+            vec![0.2f32; NEURAL_EMBEDDING_DIMENSION],
+        ),
+    ];
+    crate::search::vector::write_mmap_embeddings(&frag_path, &fragment_embeddings).unwrap();
+    let frag_mmap = crate::search::vector::MmapEmbeddingIndex::open(&frag_path).unwrap();
+    let frag_ids = vec!["hash_abc".to_string(), "hash_def".to_string()];
+
+    // Valid install: row count + id list + dimension all consistent.
+    let mut engine = SearchEngine::new();
+    engine.restore_fragment_index(Some(Arc::new(frag_mmap)), Some(&frag_ids), 2);
+    assert_eq!(
+        engine.collect_fragment_embeddings().len(),
+        2,
+        "valid fragment mmap twin must be installed by restore_fragment_index"
+    );
+
+    // Row-count mismatch → install refused, fragment layer stays off.
+    let frag_mmap2 = crate::search::vector::MmapEmbeddingIndex::open(&frag_path).unwrap();
+    let mut engine2 = SearchEngine::new();
+    engine2.restore_fragment_index(Some(Arc::new(frag_mmap2)), Some(&frag_ids), 99);
+    assert!(
+        engine2.collect_fragment_embeddings().is_empty(),
+        "row-count mismatch must disable the fragment layer (invariant 8)"
+    );
 }

@@ -46,7 +46,7 @@ pub(super) fn check_model_present_for_name(model_name: &str) -> bool {
     let model_filename = format!("{}.onnx", model_name);
 
     // Check via config module's model_dir_path
-    if let Some(model_dir) = crate::cli::neural_config::model_dir_path() {
+    if let Some(model_dir) = crate::config::model_dir_path() {
         if model_assets_present(&model_dir, &model_filename) {
             return true;
         }
@@ -120,7 +120,7 @@ pub(super) fn model_checksum_status_for_name(model_name: &str) -> ModelChecksumS
         CheckResult, DYNAMIC_MODEL_ONNX_FILENAME, check_file_against_manifest, parse_checksums,
     };
 
-    let model_dir = match crate::cli::neural_config::model_dir_path() {
+    let model_dir = match crate::config::model_dir_path() {
         Some(d) => d,
         None => return ModelChecksumStatus::Missing,
     };
@@ -570,7 +570,7 @@ pub(super) fn ensure_models_present(
         });
     }
 
-    let model_dir = crate::cli::neural_config::model_dir_path()
+    let model_dir = crate::config::model_dir_path()
         .ok_or_else(|| SetupError::Io("Cannot resolve model directory".to_string()))?;
 
     // Create model directory up front so subsequent file operations can rely

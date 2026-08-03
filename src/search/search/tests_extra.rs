@@ -1400,3 +1400,89 @@ fn test_search_mode_exact_vs_semantic_different_rankings() {
         exact_match_semantic_score
     );
 }
+
+// CR-F9 (pr32-coderabbit-deferred-remediation-plan.md): changing the effective
+// neural weight must invalidate cached results scored with the old weight.
+#[test]
+fn test_set_neural_weight_clears_cache_on_change() {
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(create_test_nodes());
+
+    let query = SearchQuery {
+        query: "hello".to_string(),
+        top_k: 10,
+        token_budget: None,
+        semantic: false,
+        expand_context: false,
+        query_embedding: None,
+        query_neural_embedding: None,
+        threshold: None,
+        query_type: None,
+    };
+
+    // Populate the cache.
+    let first = engine.search(query.clone()).unwrap();
+    assert!(
+        engine.search_cache_len() > 0,
+        "search should populate the cache"
+    );
+
+    // Change the effective weight (default is 0.4 -> 0.7): cache must clear.
+    engine.set_neural_weight(0.7);
+    assert_eq!(
+        engine.search_cache_len(),
+        0,
+        "cache must be cleared when the neural weight changes"
+    );
+
+    // Recompute: cache repopulates with the new weight and results match.
+    let second = engine.search(query).unwrap();
+    assert!(
+        engine.search_cache_len() > 0,
+        "cache repopulates after change"
+    );
+    assert_eq!(first.len(), second.len());
+}
+
+// CR-F9: setting the same effective weight (after clamping) must NOT clear the
+// cache — cached results remain valid.
+#[test]
+fn test_set_neural_weight_preserves_cache_when_unchanged() {
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(create_test_nodes());
+
+    let query = SearchQuery {
+        query: "world".to_string(),
+        top_k: 10,
+        token_budget: None,
+        semantic: false,
+        expand_context: false,
+        query_embedding: None,
+        query_neural_embedding: None,
+        threshold: None,
+        query_type: None,
+    };
+
+    // Populate the cache.
+    let _ = engine.search(query.clone()).unwrap();
+    assert!(engine.search_cache_len() > 0);
+
+    // Setting the same weight the engine already has (0.4) is a no-op.
+    let len_before = engine.search_cache_len();
+    engine.set_neural_weight(0.4);
+    assert_eq!(
+        engine.search_cache_len(),
+        len_before,
+        "cache must survive an unchanged weight"
+    );
+
+    // Same query still hits the cache (identical key, no re-insertion, so the
+    // cache length is unchanged after the second search).
+    let cached = engine.search(query).unwrap();
+    assert!(!cached.is_empty());
+    assert_eq!(
+        engine.search_cache_len(),
+        len_before,
+        "unchanged weight + identical query must be a cache hit"
+    );
+}

@@ -105,13 +105,12 @@ pub mod memory;
 pub mod memory_cap;
 /// Lightweight memory report for graceful shutdown.
 pub mod memory_report;
-/// Neural search configuration schema for ~/.leindex/config/leindex.toml.
-pub mod neural_config;
 /// Multi-project registry with per-project concurrency.
 #[cfg(feature = "mcp-server")]
 pub mod registry;
-/// Shared directory exclusion constants.
-pub mod skip_dirs;
+/// D-2 idle-engine eviction (sibling of `registry` so the Large-File gate
+/// keeps breathing room — see `registry.rs` head count).
+mod registry_evict;
 /// File watcher for auto-reindex.
 #[cfg(feature = "mcp-server")]
 pub mod watcher;

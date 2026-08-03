@@ -51,7 +51,7 @@ mod no_ort_fallback_notice {
     /// gracefully.
     #[test]
     fn worker_runtime_emits_actionable_notice_when_ort_missing() {
-        let src = read_file("crates/leindex-embed/src/runtime.rs");
+        let src = read_file("src/embed/runtime.rs");
 
         // Locate the InitResult::NotFound branch (where the worker emits the
         // notice). The surrounding code MUST log an error naming the searched
@@ -148,7 +148,7 @@ mod ort_discovery_priority {
     /// advanced user can override the resolved ORT without running setup.
     #[test]
     fn env_var_is_highest_priority_in_rust_discovery() {
-        let src = read_file("crates/leindex-embed/src/ort_discovery.rs");
+        let src = read_file("src/embed/ort_discovery.rs");
 
         // `discover_candidates()` builds the ordered chain. Confirm the env
         // var is consulted first by checking the function's documented order.
@@ -201,7 +201,7 @@ mod ort_discovery_priority {
     /// `leindex setup`-installed runtime wins over a stale `/usr/lib` library.
     #[test]
     fn pip_discovery_precedes_system_discovery() {
-        let src = read_file("crates/leindex-embed/src/ort_discovery.rs");
+        let src = read_file("src/embed/ort_discovery.rs");
 
         let discover_fn = src
             .split("pub fn discover_and_init()")
@@ -245,7 +245,7 @@ mod ort_discovery_priority {
     /// Release extract as well as after install.sh copies libs into place.
     #[test]
     fn bundle_ort_discoverable_via_sibling_and_user_lib() {
-        let src = read_file("crates/leindex-embed/src/ort_discovery.rs");
+        let src = read_file("src/embed/ort_discovery.rs");
         // Sibling dir is searched (next to the running binary = the
         // leindex-embed worker shipped in bin/ alongside the bundle's lib/).
         // install.sh also copies bundled libs to $LEINDEX_HOME/lib, which is
@@ -295,7 +295,7 @@ mod setup_idempotency_and_preservation {
     /// the file; there is no append path that could duplicate fields.
     #[test]
     fn config_save_overwrites_in_place_without_duplicating() {
-        let src = read_file("src/cli/neural_config.rs");
+        let src = read_file("src/config.rs");
         let save_fn = src
             .split("pub fn save(&self) -> Result<PathBuf, ConfigError>")
             .nth(1)
@@ -470,15 +470,18 @@ mod version_parity {
         );
     }
 
-    /// VAL-CROSS-014: the leindex-embed subcrate must match the root crate's
-    /// version (worker and main binary share a version).
+    /// VAL-CROSS-014: One-crate layout — worker and main binary share a single
+    /// crate, so there is no subcrate version to drift.
     #[test]
-    fn leindex_embed_matches_root_version() {
-        let cargo = read_file("Cargo.toml");
-        let embed = read_file("crates/leindex-embed/Cargo.toml");
-        let cargo_v = extract_version(&cargo).expect("Cargo.toml version");
-        let embed_v = extract_version(&embed).expect("leindex-embed Cargo.toml version");
-        assert_eq!(cargo_v, embed_v, "embed subcrate version drift");
+    fn one_crate_two_bin_layout() {
+        read_file("src/embed/mod.rs");
+        read_file("src/embed/worker_main.rs");
+        read_file("src/bin/leindex-embed.rs");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            !root.join("crates/leindex-embed").exists(),
+            "crates/leindex-embed must not exist (subcrate retired into src/embed)"
+        );
     }
 }
 
@@ -574,7 +577,7 @@ mod diagnostics_ort_info {
     /// report the resolved ORT path it actually loaded (after init_from).
     #[test]
     fn ort_discovery_exposes_last_outcome_for_diagnostics() {
-        let src = read_file("crates/leindex-embed/src/ort_discovery.rs");
+        let src = read_file("src/embed/ort_discovery.rs");
         assert!(
             src.contains("pub fn last_outcome()"),
             "ort_discovery must expose last_outcome() so the worker reports the resolved ORT path"
@@ -608,7 +611,7 @@ mod diagnostics_ort_info {
             .expect("setup discover_ort_path helper must exist");
 
         assert!(
-            helper.contains("leindex_embed::ort_discovery::discover_path_only"),
+            helper.contains("crate::embed::ort_discovery::discover_path_only"),
             "setup --check must use worker discover_path_only so ORT priority remains env/config/user_lib/sibling/pip/system"
         );
         assert!(
@@ -723,15 +726,23 @@ mod per_surface_journeys {
     /// via the feature chain; the smoke test on an AMD GPU is performed in
     /// the user-testing validator.
     #[test]
-    fn onnx_migraphx_feature_propagates_to_embed_subcrate() {
+    fn onnx_migraphx_feature_is_alias_of_onnx() {
         let cargo = read_file("Cargo.toml");
         let migraphx_line = cargo
             .lines()
             .find(|l| l.trim_start().starts_with("onnx-migraphx = ["))
             .expect("Cargo.toml must define onnx-migraphx feature");
         assert!(
-            migraphx_line.contains("leindex-embed/onnx-migraphx"),
-            "VAL-CROSS-005: onnx-migraphx feature must propagate to leindex-embed/onnx-migraphx"
+            migraphx_line.contains("\"onnx\""),
+            "VAL-CROSS-005: onnx-migraphx must alias the onnx feature (which compiles ort/migraphx)"
+        );
+        let onnx_line = cargo
+            .lines()
+            .find(|l| l.trim_start().starts_with("onnx = ["))
+            .expect("Cargo.toml must define onnx feature");
+        assert!(
+            onnx_line.contains("ort/migraphx"),
+            "VAL-CROSS-005: onnx feature must compile ort/migraphx"
         );
     }
 
@@ -811,7 +822,7 @@ mod cross_surface_fallback_consistency {
     #[test]
     fn bundle_lib_layout_matches_discovery_chain_search_path() {
         let sh = read_file("install.sh");
-        let cmd = read_file("crates/leindex-embed/src/ort_discovery.rs");
+        let cmd = read_file("src/embed/ort_discovery.rs");
 
         // install.sh writes bundled libs to $LEINDEX_HOME/lib; discovery
         // searches ~/.leindex/lib via the user_lib candidate. The two paths

@@ -3,7 +3,7 @@
 use super::leindex::IndexHealth;
 use super::leindex::{DEPENDENCY_MANIFEST_NAMES, ProjectFileScan};
 use crate::cli::memory::CacheEntry;
-use crate::cli::skip_dirs::SKIP_DIRS;
+use crate::skip_dirs::SKIP_DIRS;
 use crate::storage::schema::Storage;
 use anyhow::Result;
 use std::collections::HashMap;

@@ -184,7 +184,7 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
         };
         let err = report.validate_canonical_phases().unwrap_err();
-        assert!(err.contains("expected 9 phases"));
+        assert!(err.contains("expected 12 phases"));
     }
 
     #[test]

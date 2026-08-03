@@ -185,6 +185,20 @@ impl LeIndex {
         if include_neural {
             artifact_paths.push(self.project_path.join(".leindex/neural_embeddings.bin"));
         }
+        // Fragment layer (Task 6, invariant 8): the four fragment artifacts
+        // must be published with each generation or a cold start resolving the
+        // immutable generation would lose the fragment store/mmap and the
+        // indexed fragment layer would silently vanish. Copied only when the
+        // files exist (feature-off leaves nothing extra); validated on load by
+        // `fragment_layer_is_valid` (root hash + mmap row count).
+        for name in [
+            "fragment_store.bin",
+            "fragment_root.bin",
+            "fragment_sync_manifest.bin",
+            "fragments_embeddings.bin",
+        ] {
+            artifact_paths.push(self.project_path.join(".leindex").join(name));
+        }
         for source in artifact_paths {
             if !source.is_file() || !copied.insert(source.clone()) {
                 continue;
@@ -438,6 +452,12 @@ impl LeIndex {
 
         // R10: Persist embeddings to mmap file after watcher incremental reindex
         index_builder::persist_embeddings_to_mmap(&self.search_engine, &self.project_path)?;
+        // Fragment layer (Task 7): incremental sync before the snapshot
+        // persist. On failure the layer is CLEARED (not just logged) so this
+        // generation can never pair new nodes with stale pre-change fragment
+        // text/byte ranges (Codex wave-4 P2). Node-level ranking stays
+        // authoritative; the fragment layer is simply off for this generation.
+        self.sync_fragment_layer_or_clear();
         let (pdg_node_count, pdg_edge_count) = self
             .pdg
             .as_ref()
@@ -1367,6 +1387,10 @@ impl LeIndex {
         self.search_engine.clear_neural_embeddings();
         self.build_file_stats_cache();
         index_builder::persist_embeddings_to_mmap(&self.search_engine, &self.project_path)?;
+        // Fragment layer (Task 7): incremental sync before the snapshot
+        // persist. On failure the layer is CLEARED (not just logged) — see
+        // `sync_fragment_layer_or_clear` (Codex wave-4 P2).
+        self.sync_fragment_layer_or_clear();
         index_builder::persist_search_snapshot(
             &self.search_engine,
             &self.project_path,
@@ -1402,7 +1426,7 @@ impl LeIndex {
                 .context("core embedder is set before neural enrichment")?
                 .tfidf()
                 .clone(),
-            None,
+            Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
         )
         .ok();
         if let Some(reason) = embedder
@@ -1412,7 +1436,7 @@ impl LeIndex {
             tracing::warn!("{}", reason);
             embedder = None;
         }
-        if crate::cli::neural_config::LeIndexConfig::load_cached()
+        if crate::config::LeIndexConfig::load_cached()
             .search
             .search_mode
             == "text"
@@ -1424,9 +1448,7 @@ impl LeIndex {
         // `is_neural_enabled` ANDs the runtime flag (default-on for this GA
         // feature) with the config knob, so a disabled config stays disabled.
         if !crate::feature_flags::is_neural_enabled(
-            crate::cli::neural_config::LeIndexConfig::load_cached()
-                .neural
-                .enabled,
+            crate::config::LeIndexConfig::load_cached().neural.enabled,
         ) {
             embedder = None;
         }
@@ -1481,6 +1503,10 @@ impl LeIndex {
         if embedder.is_some() {
             self.embedder = embedder;
         }
+        // Fragment layer (Task 7): incremental sync before the snapshot
+        // persist. On failure the layer is CLEARED (not just logged) — see
+        // `sync_fragment_layer_or_clear` (Codex wave-4 P2).
+        self.sync_fragment_layer_or_clear();
         index_builder::persist_search_snapshot(
             &self.search_engine,
             &self.project_path,
@@ -1507,6 +1533,179 @@ impl LeIndex {
         Ok(())
     }
 
+    /// Incremental fragment sync (Task 7): diff the current source files
+    /// against the persisted manifest, re-chunk ONLY changed files via the
+    /// PDG (Tier-2 sub-symbol + Tier-3 orphans), embed ONLY content hashes
+    /// missing from the store (batch-256 IPC), then update the store + root
+    /// under a bumped generation and populate the engine's fragment vector
+    /// index so `persist_search_snapshot` writes real fragment twins.
+    ///
+    /// Feature-off compatible: a no-op when `[search] fragment_index_enabled`
+    /// is false, no PDG is resident, or no neural embedder is configured. A
+    /// mid-build crash is handled by the generation guard in
+    /// `fragment_layer_is_valid` — hydration serves the last complete root
+    /// (i.e. keeps the fragment layer off) rather than a half-synced tree.
+    /// Run the fragment-layer incremental sync, clearing the in-memory
+    /// fragment rows on failure (Codex wave-4 P2).
+    ///
+    /// Every snapshot persist is preceded by a fragment sync; on sync failure
+    /// the engine would otherwise keep the PREVIOUS generation's fragment
+    /// index + owner refs, so a fresh node snapshot could rank/surface a
+    /// changed symbol against deleted (pre-change) fragment content. Clearing
+    /// makes the pre-existing "fragment layer disabled for this generation"
+    /// warning honest and keeps the persisted snapshot fragment-free.
+    /// `set_fragment_embeddings` with empty input drops the index, the owner
+    /// refs, and the result cache in one call.
+    fn sync_fragment_layer_or_clear(&mut self) {
+        if let Err(e) = self.sync_fragment_layer() {
+            warn!(
+                "Fragment layer sync failed (fragment layer disabled for this generation): {e:#}"
+            );
+            self.search_engine.set_fragment_embeddings(Vec::new());
+        }
+    }
+
+    fn sync_fragment_layer(&mut self) -> Result<()> {
+        let cfg = crate::config::LeIndexConfig::load_cached();
+        if !cfg.search.fragment_index_enabled || self.pdg.is_none() {
+            return Ok(());
+        }
+        // The fragment layer only produces rows when a neural embedder is
+        // configured; without one (e.g. text-only builds) it is a no-op.
+        let embedder = self.configured_neural_embedder()?;
+        if embedder.is_none() {
+            return Ok(());
+        }
+        let files = self.collect_source_files_with_hashes(false, None)?;
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        let mut store =
+            index_builder::fragment::FragmentStore::load_from_storage(&self.project_path)?
+                .unwrap_or_default();
+        let max_bytes = cfg.search.fragment_max_bytes as usize;
+        let orphan_enabled = cfg.search.fragment_orphan_enabled;
+        let naive_fallback = cfg.search.fragment_naive_fallback;
+        // Codex P1: persist the model + fragment-knob identity so a model or
+        // knob change while sources are byte-identical forces a fragment
+        // re-sync (mirrors the node-level `NeuralCheckpoint.model` discipline;
+        // without it the source-hash skip would silently serve stale rows).
+        let extraction_identity = index_builder::fragment::sync::FragmentExtractionIdentity::new(
+            &cfg.neural.model_name,
+            max_bytes,
+            orphan_enabled,
+            naive_fallback,
+        );
+
+        // P2-4 (Codex review): detect a missing/corrupt fragment embeddings mmap
+        // BEFORE the sync so unchanged files are NOT skipped. With the mmap gone
+        // but the store+manifest intact, a normal run would embed nothing, install
+        // an empty fragment index, and the snapshot path would remove the mmap
+        // again — permanently disabling fragment retrieval. Recover by forcing a
+        // full re-embed of every content hash.
+        let pre_sync_mmap_rows: std::collections::HashMap<String, Vec<f32>> =
+            index_builder::try_load_fragment_mmap_embeddings_from_storage(
+                &self.project_path.join(".leindex"),
+            )
+            .map(|mmap| mmap.entries().unwrap_or_default().into_iter().collect())
+            .unwrap_or_default();
+        let force_reembed = !store.is_empty() && pre_sync_mmap_rows.is_empty();
+
+        // Scoped so the chunk closure (which borrows `self.pdg`) is dropped
+        // before we mutate `self.search_engine` below.
+        let (summary, new_embeddings) = {
+            let pdg = self.pdg.as_ref().expect("checked above");
+            let mut chunk_fn = |path: &std::path::Path, bytes: &[u8]| {
+                index_builder::fragment::extract::extract_file_fragments(
+                    pdg,
+                    path,
+                    bytes,
+                    max_bytes,
+                    orphan_enabled,
+                    naive_fallback,
+                )
+            };
+            let mut embed_fn = |texts: &[String]| -> Vec<Option<Vec<f32>>> {
+                #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+                {
+                    match &embedder {
+                        Some(embedder) => embedder.embed_neural_batch_blocking(texts),
+                        None => vec![None; texts.len()],
+                    }
+                }
+                #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
+                {
+                    let _ = (&embedder, texts);
+                    vec![None; texts.len()]
+                }
+            };
+            index_builder::fragment::sync::incremental_sync_fragments(
+                &self.project_path,
+                &mut store,
+                &files,
+                &mut chunk_fn,
+                &mut embed_fn,
+                force_reembed,
+                &extraction_identity,
+            )?
+        };
+
+        info!(
+            files_scanned = summary.files_scanned,
+            files_changed = summary.files_changed,
+            fragments_total = summary.fragments_total,
+            embedded = summary.embedded,
+            reused = summary.reused,
+            generation = summary.generation,
+            "Fragment incremental sync complete"
+        ); // Merge freshly embedded rows with reused rows, then populate the
+        // engine's fragment index so the snapshot persist twins write the
+        // complete matrix. EVERY content hash in the store needs an embedding:
+        // prefer this pass's fresh rows, fall back to the previous fragment
+        // mmap (reused hashes are not re-embedded). A hash with neither is
+        // skipped — mirroring the engine's skip-on-None discipline so store
+        // row-count ≡ engine row-count (invariant 8) is preserved.
+        let fresh_rows: std::collections::HashMap<String, Vec<f32>> =
+            new_embeddings.into_iter().collect();
+        let old_rows: std::collections::HashMap<String, Vec<f32>> =
+            index_builder::try_load_fragment_mmap_embeddings_from_storage(
+                &self.project_path.join(".leindex"),
+            )
+            .map(|mmap| mmap.entries().unwrap_or_default().into_iter().collect())
+            .unwrap_or_default();
+        let mut rows: Vec<(String, Vec<f32>)> = Vec::with_capacity(store.len());
+        for hash in store.content_hashes() {
+            if let Some(embedding) = fresh_rows.get(hash).or_else(|| old_rows.get(hash)) {
+                rows.push((hash.to_string(), embedding.clone()));
+            }
+        }
+        self.search_engine.set_fragment_embeddings(rows);
+
+        // Owner refs (invariant 6): content hash → ALL (owner node id, byte
+        // range) refs. A Vec per hash because identical content can live under
+        // N owners — dedup must not collapse multi-owner fragments to the
+        // first (Codex wave-2 item 5).
+        let refs: std::collections::HashMap<String, Vec<(String, (usize, usize))>> = store
+            .content_hashes()
+            .filter_map(|hash| {
+                let owners: Vec<(String, (usize, usize))> = store
+                    .get(hash)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|meta| {
+                        meta.owner
+                            .as_ref()
+                            .map(|owner| (owner.clone(), meta.byte_range))
+                    })
+                    .collect();
+                (!owners.is_empty()).then(|| (hash.to_string(), owners))
+            })
+            .collect();
+        self.search_engine.set_fragment_refs(refs);
+        Ok(())
+    }
+
     pub(crate) fn run_neural(
         &mut self,
         _job: &JobPaths,
@@ -1524,7 +1723,7 @@ impl LeIndex {
         // Cache-key fix: a model swap must NOT silently resume the previous
         // model's embeddings. The checkpoint stores the embedder model_name that
         // produced its rows; a mismatch forces a full re-embed.
-        let current_embed_model = crate::cli::neural_config::LeIndexConfig::load_cached()
+        let current_embed_model = crate::config::LeIndexConfig::load_cached()
             .neural
             .model_name
             .clone();
@@ -1559,7 +1758,7 @@ impl LeIndex {
             } else {
                 std::env::var("LEINDEX_NEURAL_PROVIDER").unwrap_or_else(|_| "onnx".to_string())
             },
-            model: crate::cli::neural_config::LeIndexConfig::load_cached()
+            model: crate::config::LeIndexConfig::load_cached()
                 .neural
                 .model_name
                 .clone(),

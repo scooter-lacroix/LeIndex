@@ -92,7 +92,30 @@ jobs:
             echo "::error::package.json version mismatch after sed: got '${ACTUAL}', expected '${NEW_VERSION}'"
             exit 1
           fi
-          echo "package.json → ${NEW_VERSION}"
+          echo "packages/npm-leindex-mcp/package.json → ${NEW_VERSION}"
+
+      - name: Bump version in root/dashboard/pi package.json
+        env:
+          NEW_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          # Root, dashboard, and pi package.json carry the same version surface.
+          # Only the first "version" field in each file is a release marker;
+          # leave any nested dependency versions untouched by matching the
+          # indented top-level key only.
+          for pf in package.json dashboard/package.json pi/package.json; do
+            if [ ! -f "$pf" ]; then
+              echo "::warning::$pf not found; skipping"
+              continue
+            fi
+            # Match the top-level "version" key (2-space indent) only.
+            sed -i "0,/^  \"version\": \".*\"/s/^  \"version\": \".*\"/  \"version\": \"${NEW_VERSION}\"/" "$pf"
+            ACTUAL=$(grep -m1 '"version"' "$pf" | sed 's/.*"\(.*\)".*/\1/')
+            if [ "$ACTUAL" != "$NEW_VERSION" ]; then
+              echo "::error::$pf version mismatch after sed: got '${ACTUAL}', expected '${NEW_VERSION}'"
+              exit 1
+            fi
+            echo "$pf → ${NEW_VERSION}"
+          done
 
       - name: Bump version in PyPI pyproject.toml
         env:
@@ -158,14 +181,29 @@ jobs:
         env:
           NEW_VERSION: ${{ github.event.inputs.version }}
         run: |
+          # Parity gate covers every release surface so a stale current
+          # marker anywhere fails the bump. The retired leindex-embed
+          # subcrate had its own manifest; that surface is gone, so it is
+          # intentionally not checked here.
           CARGO=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          ROOT_NPM=$(grep -m1 '"version"' package.json | sed 's/.*"\(.*\)".*/\1/')
+          DASHBOARD=$(grep -m1 '"version"' dashboard/package.json | sed 's/.*"\(.*\)".*/\1/')
+          PI=$(grep -m1 '"version"' pi/package.json | sed 's/.*"\(.*\)".*/\1/')
           NPM=$(grep '"version"' packages/npm-leindex-mcp/package.json | head -1 | sed 's/.*"\(.*\)".*/\1/')
           PYPI=$(grep '^version =' packages/pypi-leindex/pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          if [ "$CARGO" != "$NEW_VERSION" ] || [ "$NPM" != "$NEW_VERSION" ] || [ "$PYPI" != "$NEW_VERSION" ]; then
-            echo "::error::Version parity check failed: Cargo=${CARGO} npm=${NPM} PyPI=${PYPI} expected=${NEW_VERSION}"
-            exit 1
-          fi
-          echo "All versions match: ${NEW_VERSION}"
+          PYPI_RUNTIME=$(grep -m1 '__version__' packages/pypi-leindex/src/leindex/__init__.py | sed 's/.*"\(.*\)".*/\1/')
+          INSTALL_SH=$(grep -m1 'SCRIPT_VERSION=' install.sh | sed 's/.*"\(.*\)".*/\1/')
+          INSTALL_MACOS=$(grep -m1 'SCRIPT_VERSION=' install_macos.sh | sed 's/.*"\(.*\)".*/\1/')
+          INSTALL_PS=$(grep -m1 '\$ScriptVersion' install.ps1 | sed 's/.*"\(.*\)".*/\1/')
+          INSTALL_PS_EXP=$(grep -m1 '\$ExpectedVersion' install.ps1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "Surfaces: Cargo=$CARGO root=$ROOT_NPM dashboard=$DASHBOARD pi=$PI npm=$NPM PyPI=$PYPI runtime=$PYPI_RUNTIME installers=$INSTALL_SH/$INSTALL_MACOS/$INSTALL_PS/$INSTALL_PS_EXP"
+          for surface in "$CARGO" "$ROOT_NPM" "$DASHBOARD" "$PI" "$NPM" "$PYPI" "$PYPI_RUNTIME" "$INSTALL_SH" "$INSTALL_MACOS" "$INSTALL_PS" "$INSTALL_PS_EXP"; do
+            if [ "$surface" != "$NEW_VERSION" ]; then
+              echo "::error::Version parity check failed: found '${surface}', expected '${NEW_VERSION}'"
+              exit 1
+            fi
+          done
+          echo "All release surfaces match: ${NEW_VERSION}"
 
       - name: Commit and push
         env:
@@ -173,7 +211,12 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock packages/npm-leindex-mcp/package.json packages/pypi-leindex/pyproject.toml
+          git add Cargo.toml Cargo.lock
+          [ -f package.json ] && git add package.json
+          [ -f dashboard/package.json ] && git add dashboard/package.json
+          [ -f pi/package.json ] && git add pi/package.json
+          [ -f packages/npm-leindex-mcp/package.json ] && git add packages/npm-leindex-mcp/package.json
+          [ -f packages/pypi-leindex/pyproject.toml ] && git add packages/pypi-leindex/pyproject.toml
           [ -f install.sh ] && git add install.sh
           [ -f install_macos.sh ] && git add install_macos.sh
           [ -f install.ps1 ] && git add install.ps1
@@ -189,13 +232,13 @@ jobs:
           echo "## Version Bump: ${OLD_VERSION} → ${NEW_VERSION}" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Files changed:**" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`Cargo.toml\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`Cargo.lock\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`Cargo.toml\` / \`Cargo.lock\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`package.json\` (root)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`dashboard/package.json\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`pi/package.json\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- \`packages/npm-leindex-mcp/package.json\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- \`packages/pypi-leindex/pyproject.toml\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`install.sh\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`install_macos.sh\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`install.ps1\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`packages/pypi-leindex/src/leindex/__init__.py\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`packages/pypi-leindex/src/leindex/__init__.py\` (runtime)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`install.sh\` / \`install_macos.sh\` / \`install.ps1\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "The \`release.yml\` workflow will now detect this version change and handle building, publishing, and GitHub release creation." >> "$GITHUB_STEP_SUMMARY"

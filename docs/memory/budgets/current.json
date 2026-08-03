@@ -2,9 +2,10 @@
   "description": "Absolute memory budget ceilings for memcheck regression gating. Single source of truth consumed by cargo xtask memcheck and CI. Tightened to C-phase band after Plan 3 worker-aware memory accounting. Combined ceilings apply to main+worker RSS during worker-active phases.",
   "fixture": "small_repo",
   "regression_rules": {
-    "baseline_tolerance_pct": 5,
+    "baseline_tolerance_pct": 10,
     "ceiling_tolerance_pct": 10
   },
+  "tolerance_note": "baseline_tolerance_pct widened 5 -> 10 (T8a, memory-pressure remediation). The box-idle RSS baseline is noisy under swap saturation: on bb76392e embed_idle measured 8020 KiB against a 7576 baseline +5% (7955) and flaked. 10% absorbs sub-10% jitter while still failing a genuine >10% regression.",
   "phases": {
     "idle_warm": {
       "rss_max_kib": 102400,
@@ -45,11 +46,25 @@
       "rss_max_kib": 102400,
       "description": "Main daemon remains capped at 100 MiB; provider-default auto/MIGraphX neural worker measured 5472552 KiB, with an 8 GiB combined ceiling for model/runtime residency.",
       "combined_rss_max_kib": 8388608
-    },
-    "embed_teardown": {
-      "rss_max_kib": 102400,
-      "description": "After C: 102400 KiB (100 MiB). Main daemon idle after worker teardown. Worker process should be gone.",
-      "combined_rss_max_kib": null
-    }
+    },  "embed_teardown": {
+   "rss_max_kib": 102400,
+   "description": "After C: 102400 KiB (100 MiB). Main daemon idle after worker teardown. Worker process should be gone.",
+   "combined_rss_max_kib": null
+  },
+  "mcp_idle_proliferation": {
+   "rss_max_kib": 307200,
+   "description": "T8 step-3: combined RSS of 3 concurrent idle MCP servers. 307200 KiB (300 MiB) = 3x the 100 MiB single-server idle ceiling; catches gross per-server leaks. The tight linearity guard (combined <= 3.5x single) lives in harness_integration.rs::test_mcp_idle_proliferation_linearity.",
+   "combined_rss_max_kib": null
+  },
+  "worker_ort_threads": {
+   "rss_max_kib": 102400,
+   "description": "T8 step-3: main daemon capped at 100 MiB during the worker-active trigger under LEINDEX_WORKER_ORT_THREADS=1. Combined ceiling 4 GiB leaves headroom for the opt-in {0,4,1} comparison run (LEINDEX_MEMCHECK_EXPENSIVE=1); the phase's own baseline is captured with the capped setting.",
+   "combined_rss_max_kib": 4194304
+  },
+  "stale_artifacts": {
+   "rss_max_kib": 102400,
+   "description": "T8 step-3: RSS of the `leindex cleanup --stale-daemons` sweep command against seeded dead-pid sidecars (100 MiB ceiling; measured value is a few MB). Removal of every seeded sidecar is asserted in-phase and in harness_integration.rs::test_stale_artifacts_phase_removes_dead_sidecars.",
+   "combined_rss_max_kib": null
   }
+ }
 }

@@ -9,7 +9,6 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'src/**'
-      - 'crates/**'
       - 'packages/**'
       - 'install.sh'
       - 'docs/**'
@@ -47,7 +46,6 @@ jobs:
         run: |
           set -e
           CARGO_VER=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-          WORKER_VER=$(grep -m1 '^version' crates/leindex-embed/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           ROOT_NPM_VER=$(node -p "require('./package.json').version")
           DASHBOARD_VER=$(node -p "require('./dashboard/package.json').version")
           PI_VER=$(node -p "require('./pi/package.json').version")
@@ -58,8 +56,11 @@ jobs:
           INSTALL_MACOS_VER=$(grep -m1 'SCRIPT_VERSION=' install_macos.sh | sed 's/.*"\(.*\)".*/\1/')
           INSTALL_PS_VER=$(grep -m1 '\$ScriptVersion' install.ps1 | sed 's/.*"\(.*\)".*/\1/')
           INSTALL_PS_EXPECTED=$(grep -m1 '\$ExpectedVersion' install.ps1 | sed 's/.*"\(.*\)".*/\1/')
-          echo "Cargo=$CARGO_VER worker=$WORKER_VER root=$ROOT_NPM_VER dashboard=$DASHBOARD_VER pi=$PI_VER npm=$NPM_VER PyPI=$PYPI_VER runtime=$PYPI_RUNTIME_VER installers=$INSTALL_SH_VER/$INSTALL_MACOS_VER/$INSTALL_PS_VER/$INSTALL_PS_EXPECTED"
-          for surface in "$WORKER_VER" "$ROOT_NPM_VER" "$DASHBOARD_VER" "$PI_VER" "$NPM_VER" "$PYPI_VER" "$PYPI_RUNTIME_VER" "$INSTALL_SH_VER" "$INSTALL_MACOS_VER" "$INSTALL_PS_VER" "$INSTALL_PS_EXPECTED"; do
+          echo "Cargo=$CARGO_VER root=$ROOT_NPM_VER dashboard=$DASHBOARD_VER pi=$PI_VER npm=$NPM_VER PyPI=$PYPI_VER runtime=$PYPI_RUNTIME_VER installers=$INSTALL_SH_VER/$INSTALL_MACOS_VER/$INSTALL_PS_VER/$INSTALL_PS_EXPECTED"
+          # One published crate (leindex) carries both binaries; the retired
+          # leindex-embed subcrate is gone, so there is no separate worker
+          # version surface to match against.
+          for surface in "$ROOT_NPM_VER" "$DASHBOARD_VER" "$PI_VER" "$NPM_VER" "$PYPI_VER" "$PYPI_RUNTIME_VER" "$INSTALL_SH_VER" "$INSTALL_MACOS_VER" "$INSTALL_PS_VER" "$INSTALL_PS_EXPECTED"; do
             if [ "$CARGO_VER" != "$surface" ]; then
               echo "ERROR: published version surface mismatch (Cargo=$CARGO_VER, found=$surface)"
               exit 1
@@ -93,17 +94,14 @@ jobs:
           git fetch --tags
 
           # ── Check crates.io ──
-          # The workspace publishes both leindex and leindex-embed in one job;
-          # treat crates.io as published only when BOTH are visible. Otherwise a
-          # partial publish (leindex-embed succeeds, leindex fails) would satisfy
-          # the canary and the missing crate would never ship.
-          EMBED_OK=$(cargo search leindex-embed 2>/dev/null | grep -q "^leindex-embed = \"${VERSION}\"" && echo true || echo false)
-          MAIN_OK=$(cargo search leindex 2>/dev/null | grep -q "^leindex = \"${VERSION}\"" && echo true || echo false)
-          if [ "$EMBED_OK" = "true" ] && [ "$MAIN_OK" = "true" ]; then
-            echo "crates.io: v${VERSION} already published (leindex + leindex-embed)"
+          # One published crate (leindex) ships both binaries; the retired
+          # leindex-embed subcrate is gone. A single canary against leindex
+          # is sufficient — there is no second crate to fall out of sync.
+          if cargo search leindex 2>/dev/null | grep -q "^leindex = \"${VERSION}\""; then
+            echo "crates.io: v${VERSION} already published (leindex)"
             echo "needs_crates=false" >> "$GITHUB_OUTPUT"
           else
-            echo "crates.io: v${VERSION} not yet fully published (leindex=$MAIN_OK, leindex-embed=$EMBED_OK)"
+            echo "crates.io: v${VERSION} not yet published"
             echo "needs_crates=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -676,44 +674,7 @@ jobs:
             ~/.cargo/git
           key: publish-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Publish leindex-embed to crates.io
-        run: |
-          VERSION=$(grep '^version =' crates/leindex-embed/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          if cargo search leindex-embed 2>/dev/null | grep -q "^leindex-embed = \"${VERSION}\""; then
-            echo "Version ${VERSION} of leindex-embed already published to crates.io — skipping"
-          else
-            OUTPUT=$(cargo publish --allow-dirty -p leindex-embed 2>&1) || {
-              if echo "$OUTPUT" | grep -q "already exists"; then
-                echo "Version ${VERSION} already published to crates.io (index lag) — skipping"
-              else
-                echo "$OUTPUT"
-                exit 1
-              fi
-            }
-          fi
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Wait for leindex-embed registry visibility
-        run: |
-          VERSION=$(grep '^version =' crates/leindex-embed/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          INDEX_URL="https://index.crates.io/le/in/leindex-embed"
-          for attempt in $(seq 1 30); do
-            if INDEX_ENTRY=$(curl -fsS "$INDEX_URL"); then
-              if grep -q "\"vers\":\"${VERSION}\"" <<< "$INDEX_ENTRY"; then
-                echo "leindex-embed ${VERSION} is visible in the crates.io index"
-                exit 0
-              fi
-            else
-              echo "::warning::Failed to query the crates.io sparse index (${attempt}/30)"
-            fi
-            echo "Waiting for crates.io index propagation (${attempt}/30)..."
-            sleep 10
-          done
-          echo "::error::leindex-embed ${VERSION} was not visible after 5 minutes"
-          exit 1
-
-      - name: Publish leindex to crates.io
+      - name: Publish leindex to crates.io (one crate, two binaries)
         run: |
           VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           if cargo search leindex 2>/dev/null | grep -q "^leindex = \"${VERSION}\""; then
@@ -731,11 +692,118 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
+  # ── Gate: wait for crates.io index visibility ───────────────────────
+  # Encoded job-graph node: publish-crates → crates-index-ready →
+  # undraft-release → publish-npm/publish-pypi.
+  #
+  # This gate MUST succeed both when this run just published the crate
+  # (index propagation lag) AND when the version already existed (in which
+  # case `crates-io` was skipped). It never publishes; it only blocks
+  # downstream jobs until `leindex == VERSION` is resolvable from the
+  # crates.io sparse index, so `npm`/`pypi` (and the undraft) cannot race
+  # ahead of registry propagation. Runs with `if: always()` so a skipped
+  # `crates-io` (already published) still reaches the wait loop below.
+  crates-index-ready:
+    name: crates.io index ready
+    needs: [detect, crates-io]
+    if: always() && needs.detect.outputs.needs_build == 'true' && !(needs.crates-io.result == 'failure')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for leindex ${{ needs.detect.outputs.version }} in the crates.io index
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -e
+          INDEX_URL="https://index.crates.io/le/in/leindex"
+          echo "Waiting for leindex ${VERSION} to be visible in the crates.io sparse index..."
+          for attempt in $(seq 1 30); do
+            if INDEX_ENTRY=$(curl -fsS "$INDEX_URL" 2>/dev/null); then
+              if grep -q "\"vers\":\"${VERSION}\"" <<< "$INDEX_ENTRY"; then
+                echo "leindex ${VERSION} is visible in the crates.io index (attempt ${attempt}/30)"
+                # Cross-check via cargo search (the one-crate canary).
+                if cargo search leindex 2>/dev/null | grep -q "^leindex = \"${VERSION}\""; then
+                  echo "One-crate canary OK: leindex ${VERSION} resolvable via cargo search"
+                  exit 0
+                fi
+                echo "::warning::index entry present but cargo search not yet resolved; retrying"
+              fi
+            else
+              echo "::warning::Failed to query the crates.io sparse index (${attempt}/30)"
+            fi
+            echo "Waiting for crates.io index propagation (${attempt}/30)..."
+            sleep 10
+          done
+          echo "::error::leindex ${VERSION} was not visible after 5 minutes"
+          exit 1
+
+  # ── Undraft the GitHub Release ──────────────────────────────────────
+  # Encoded job-graph node: crates-index-ready → undraft-release →
+  # publish-npm/publish-pypi. npm/PyPI download from the public release
+  # assets, so the release MUST be undrafted (public) before they run —
+  # otherwise npm points at private draft assets that vanish on rerun.
+  #
+  # This job MUST NOT be skipped in the already-published case: a prior run
+  # may have published the crate but left the release in draft (e.g. npm
+  # failed, or the run was cancelled after crates-io). It runs whenever a
+  # draft release exists for this version, regardless of needs_crates.
+  undraft-release:
+    name: Undraft GitHub Release
+    needs: [detect, github-release, crates-index-ready]
+    if: always() && needs.crates-index-ready.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify HEAD matches release commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.detect.outputs.version }}"
+          RELEASE_SHA=$(gh release view "v${VERSION}" --json targetCommitish --jq '.targetCommitish' 2>/dev/null || echo "")
+          BRANCH_HEAD_SHA=$(git ls-remote origin "refs/heads/${GITHUB_REF_NAME}" | awk '{print $1}')
+          if [ -z "$RELEASE_SHA" ]; then
+            echo "::warning::Release v${VERSION} has no targetCommitish (or did not resolve); skipping SHA verification."
+          elif [ "$RELEASE_SHA" != "$BRANCH_HEAD_SHA" ]; then
+            echo "::warning::Release SHA ($RELEASE_SHA) != ${GITHUB_REF_NAME} HEAD ($BRANCH_HEAD_SHA)"
+            echo "New commits landed during release — proceeding with undraft anyway."
+          else
+            echo "SHA verified: $BRANCH_HEAD_SHA"
+          fi
+      - name: Publish draft release (undraft)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.detect.outputs.version }}"
+          # Fail clearly if the release was never created (e.g. github-release
+          # failed or skipped) instead of masking a missing release as a draft
+          # and then confusingly failing on `gh release edit`. (Kilo release.yml
+          # CRITICAL + WARNING.) Note: we intentionally do NOT gate this job's
+          # `if:` on github-release.result == 'success' — github-release is
+          # itself gated on need_build == 'true', so it skips in the legitimate
+          # "already-published-but-still-draft" recovery case, where this job
+          # MUST still run to undraft the existing release.
+          if ! gh release view "v${VERSION}" --json isDraft >/dev/null 2>&1; then
+            echo "::error::Release v${VERSION} does not exist (github-release did not create it); cannot undraft."
+            exit 1
+          fi
+          IS_DRAFT=$(gh release view "v${VERSION}" --json isDraft --jq '.isDraft')
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo "Undrafting release v${VERSION}..."
+            gh release edit "v${VERSION}" --draft=false
+            echo "Release v${VERSION} is now public."
+          else
+            echo "Release v${VERSION} is already non-draft; nothing to undraft."
+          fi
+
   # ── Publish npm package (optional — skips if NPM_TOKEN not set) ─────
+  # Encoded job-graph node: undraft-release → publish-npm. Runs AFTER the
+  # release is undrafted (public) so the published package's install.js
+  # never resolves to private draft assets on a rerun.
   npm:
     name: Publish npm
-    needs: [detect, github-release]
-    if: needs.detect.outputs.needs_npm == 'true'
+    needs: [detect, undraft-release]
+    if: always() && needs.undraft-release.result == 'success' && needs.detect.outputs.needs_npm == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -787,10 +855,11 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # ── Publish PyPI package (thin wrapper — installs binary via cargo) ──
+  # Encoded job-graph node: undraft-release → publish-pypi (parallel with npm).
   pypi:
     name: Publish PyPI
-    needs: [detect, github-release]
-    if: needs.detect.outputs.needs_pypi == 'true'
+    needs: [detect, undraft-release]
+    if: always() && needs.undraft-release.result == 'success' && needs.detect.outputs.needs_pypi == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -849,10 +918,15 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
 
-  # ── Final summary ────────────────────────────────────────────────────
+  # ── Final summary + cross-surface canary ─────────────────────────────
+  # Encoded job-graph terminal node: ... → parallel publish-npm/publish-pypi
+  # → final canaries/summary. Runs unconditionally so a failure in any
+  # upstream publish job is still surfaced here. Undrafting is handled by
+  # the dedicated `undraft-release` job; this job only reports and re-runs
+  # the one-crate canary.
   summary:
     name: Release Summary
-    needs: [detect, github-release, crates-io, npm, pypi]
+    needs: [detect, github-release, undraft-release, crates-io, npm, pypi]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -878,28 +952,15 @@ jobs:
             echo "all_published=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Verify HEAD matches release commit
-        if: needs.github-release.result == 'success' && steps.check_all.outputs.all_published != 'true'
+      - name: One-crate canary (cargo search)
+        if: steps.check_all.outputs.all_published != 'true'
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
-          RELEASE_SHA=$(gh release view "v${VERSION}" --json targetCommitish --jq '.targetCommitish')
-          BRANCH_HEAD_SHA=$(git ls-remote origin "refs/heads/${GITHUB_REF_NAME}" | awk '{print $1}')
-          if [ "$RELEASE_SHA" != "$BRANCH_HEAD_SHA" ]; then
-            echo "::warning::Release SHA ($RELEASE_SHA) != ${GITHUB_REF_NAME} HEAD ($BRANCH_HEAD_SHA)"
-            echo "New commits landed during release — proceeding with undraft anyway."
-          else
-            echo "SHA verified: $BRANCH_HEAD_SHA"
+          if ! cargo search leindex 2>/dev/null | grep -q "^leindex = \"${VERSION}\""; then
+            echo "::error::one-crate canary failed: leindex ${VERSION} not resolvable via cargo search"
+            exit 1
           fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Publish draft release
-        if: needs.github-release.result == 'success' && steps.check_all.outputs.all_published != 'true'
-        run: |
-          VERSION="${{ needs.detect.outputs.version }}"
-          gh release edit "v${VERSION}" --draft=false
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "One-crate canary OK: leindex ${VERSION} resolvable"
 
       - name: Print summary
         if: steps.check_all.outputs.all_published != 'true'
@@ -909,13 +970,15 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Step | Status |" >> "$GITHUB_STEP_SUMMARY"
           echo "|------|--------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| GitHub Release | ${{ needs.github-release.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| GitHub Release (draft) | ${{ needs.github-release.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| crates.io | ${{ needs.crates-io.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| crates-index-ready | ${{ needs.crates-index-ready.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| undraft-release | ${{ needs.undraft-release.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| npm | ${{ needs.npm.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| PyPI | ${{ needs.pypi.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "### Registry notes" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **crates.io**: Publishes the Rust crate (required)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **crates.io**: One published crate (leindex) ships both binaries (required)" >> "$GITHUB_STEP_SUMMARY"
           echo "- **PyPI**: Thin Python wrapper that bootstraps cargo install (optional — needs PYPI_TOKEN)" >> "$GITHUB_STEP_SUMMARY"
           echo "- **npm**: Binary wrapper with GH Release download (optional — needs NPM_TOKEN)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"

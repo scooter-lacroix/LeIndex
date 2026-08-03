@@ -6,6 +6,7 @@
 //            VAL-BPHASE-021, VAL-BPHASE-022, VAL-BPHASE-023, VAL-BPHASE-024,
 //            VAL-BPHASE-025, VAL-BPHASE-041, VAL-BPHASE-042, VAL-BPHASE-043
 
+#![cfg(feature = "cli")]
 use leindex::cli::mcp::edit_cache::{
     EDIT_CACHE_MAX_ENTRY_BYTES, EDIT_CACHE_TOTAL_CAP_BYTES, EditCache, EditCacheEntry,
 };

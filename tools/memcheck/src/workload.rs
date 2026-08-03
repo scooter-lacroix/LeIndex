@@ -8,6 +8,16 @@
 //! Worker-aware extensions (VAL-CPHASE-036): the canonical workload includes
 //! an idle pre-embed phase, a worker-active embed phase, and a phase that
 //! exercises teardown/restart behavior.
+//!
+//! Memory-pressure remediation extensions (T8 step-3): three further phases
+//! guard the 2026-08 memory work:
+//! - `mcp_idle_proliferation`: PROLIFERATION_COUNT concurrent idle MCP servers,
+//!   reporting their COMBINED RSS (superlinear per-server growth guard).
+//! - `worker_ort_threads`: the worker-active trigger under the capped
+//!   `LEINDEX_WORKER_ORT_THREADS=1` setting (deterministic cross-host baseline).
+//! - `stale_artifacts`: seeds dead-pid run-dir sidecars, runs
+//!   `leindex cleanup --stale-daemons`, samples the sweep, and fails loudly if
+//!   any seeded sidecar survives.
 
 use crate::report::PhaseReport;
 use crate::sampler;
@@ -19,13 +29,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Canonical phase names in execution order (VAL-MEASURE-002, VAL-CPHASE-036).
+/// Canonical phase names in execution order (VAL-MEASURE-002, VAL-CPHASE-036,
+/// T8 step-3).
 ///
 /// The original 6 phases are preserved. Three worker-active phases are added
 /// after the original phases to exercise the worker lifecycle:
 /// - `embed_idle`: idle MCP process before any embed demand
 /// - `embed_active`: MCP process with worker-active embedding (triggers worker spawn)
 /// - `embed_teardown`: idle after worker teardown, verifying worker process cleanup
+///
+/// Memory-pressure remediation (T8 step-3) adds three more:
+/// - `mcp_idle_proliferation`: combined RSS of PROLIFERATION_COUNT concurrent
+///   idle MCP servers (superlinear growth guard)
+/// - `worker_ort_threads`: worker RSS under the capped ORT-thread setting
+/// - `stale_artifacts`: `leindex cleanup --stale-daemons` RSS + seeded-sidecar
+///   removal assertion
 pub const CANONICAL_PHASES: &[&str] = &[
     "idle_warm",
     "index",
@@ -36,10 +54,22 @@ pub const CANONICAL_PHASES: &[&str] = &[
     "embed_idle",
     "embed_active",
     "embed_teardown",
+    "mcp_idle_proliferation",
+    "worker_ort_threads",
+    "stale_artifacts",
 ];
 
 /// The worker binary name used for child-process detection.
 const WORKER_BINARY_NAME: &str = "leindex-embed";
+
+/// Concurrent idle MCP servers launched by the `mcp_idle_proliferation` phase.
+const PROLIFERATION_COUNT: usize = 3;
+
+/// Dwell time for the `mcp_idle_proliferation` phase.
+const PROLIFERATION_DWELL: Duration = Duration::from_secs(4);
+
+/// Dwell time for the `worker_ort_threads` phase.
+const WORKER_ORT_THREADS_DWELL: Duration = Duration::from_secs(4);
 
 /// Idle phase dwell time (seconds).
 const IDLE_DWELL: Duration = Duration::from_secs(3);
@@ -202,7 +232,11 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
         // Still add placeholder phases so the report has the right phase count.
         // Use u64::MAX sentinel values so the budget gate fails these phases
         // (they were not actually measured). A zero-valued report would pass
-        // trivially since 0 < any threshold.
+        // trivially since 0 < any threshold. Only the three `embed_*` phases
+        // are inserted here: `worker_ort_threads` gets its placeholder at the
+        // same canonical position as the real run (after mcp_idle_proliferation,
+        // before stale_artifacts) so report order matches CANONICAL_PHASES on
+        // both paths (VAL-MEASURE-002).
         eprintln!(
             "memcheck: WARNING: worker-active phases skipped ({} not found) — \
              placeholder reports will fail the budget gate",
@@ -213,22 +247,57 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
                 .unwrap_or_else(|| "worker binary path not set".to_string())
         );
         for phase_name in &["embed_idle", "embed_active", "embed_teardown"] {
-            reports.push(PhaseReport {
-                phase: phase_name.to_string(),
-                rss_min_kib: 0,
-                rss_max_kib: u64::MAX,
-                rss_p95_kib: 0,
-                mapped_file_kib: 0,
-                anon_kib: 0,
-                sample_count: 0,
-                duration_ms: 0,
-                worker_rss_max_kib: 0,
-                combined_rss_max_kib: u64::MAX,
-            });
+            reports.push(placeholder_report(phase_name));
         }
     }
 
+    // ── Phase 10: mcp_idle_proliferation ────────────────────────────────
+    // Spawn PROLIFERATION_COUNT concurrent idle MCP servers and measure their
+    // combined RSS. The single-server reference is the `idle_warm` phase of the
+    // same run; the harness test `test_mcp_idle_proliferation_linearity`
+    // asserts combined ≤ 3.5 × single (memory-pressure T2/T8). Always runs.
+    let report = run_idle_proliferation_phase(config)?;
+    reports.push(report);
+
+    // ── Phase 11: worker_ort_threads ────────────────────────────────────
+    // Worker-gated: real run or placeholder at the SAME canonical position on
+    // both paths (after mcp_idle_proliferation, before stale_artifacts), so
+    // report order always matches CANONICAL_PHASES (VAL-MEASURE-002).
+    if worker_available {
+        let (child, report) = run_worker_ort_threads_phase(config)?;
+        reports.push(report);
+        kill_child(child);
+    } else {
+        reports.push(placeholder_report("worker_ort_threads"));
+    }
+
+    // ── Phase 12: stale_artifacts ───────────────────────────────────────
+    // Seed dead-pid run-dir sidecars, run `leindex cleanup --stale-daemons`,
+    // sample the sweep, assert every seeded sidecar was removed (T7/T8).
+    // Always runs.
+    let report = run_stale_artifacts_phase(config)?;
+    reports.push(report);
+
     Ok(reports)
+}
+
+/// Placeholder report for a worker-gated phase that could not run because the
+/// worker binary is missing. `u64::MAX` sentinels make the budget gate fail
+/// these phases loudly (they were not actually measured); a zero-valued report
+/// would pass trivially since 0 < any threshold.
+fn placeholder_report(phase_name: &str) -> PhaseReport {
+    PhaseReport {
+        phase: phase_name.to_string(),
+        rss_min_kib: 0,
+        rss_max_kib: u64::MAX,
+        rss_p95_kib: 0,
+        mapped_file_kib: 0,
+        anon_kib: 0,
+        sample_count: 0,
+        duration_ms: 0,
+        worker_rss_max_kib: 0,
+        combined_rss_max_kib: u64::MAX,
+    }
 }
 
 // ─── Phase implementations ──────────────────────────────────────────────
@@ -271,10 +340,10 @@ fn run_idle_phase(
     Ok((child, report))
 }
 
-/// Run the embed_active phase: launch MCP process, trigger a search that
+/// Run a worker-active phase: launch an MCP process, trigger a search that
 /// activates the ONNX worker, and sample both main + worker RSS.
 ///
-/// VAL-CPHASE-036: The canonical workload includes a worker-active embed phase.
+/// VAL-CPHASE-036: The canonical workload includes worker-active phases.
 /// VAL-CPHASE-034: The memcheck harness detects the worker process once
 /// embedding begins and records it separately from the main daemon.
 ///
@@ -282,12 +351,21 @@ fn run_idle_phase(
 /// to the MCP process's stdin, rather than launching a separate CLI command.
 /// This ensures the MCP process (which we are sampling) actually receives the
 /// search request and spawns the embedding worker as a child process.
-fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport)> {
+///
+/// `extra_env` is applied to the launched MCP process (and inherited by the
+/// worker it spawns), so phases can pin settings such as
+/// `LEINDEX_WORKER_ORT_THREADS` deterministically.
+fn run_worker_active_phase(
+    config: &WorkloadConfig,
+    phase_name: &str,
+    dwell: Duration,
+    extra_env: &[(&str, &str)],
+) -> Result<(Child, PhaseReport)> {
     if config.verbose {
-        eprintln!("memcheck: phase 'embed_active' starting (worker-active)");
+        eprintln!("memcheck: phase '{}' starting (worker-active)", phase_name);
     }
 
-    let mut child = launch_mcp_process(config)?;
+    let mut child = launch_mcp_process_with_env(config, extra_env)?;
     let pid = child.id();
 
     // Take stdin/stdout pipes for MCP JSON-RPC communication.
@@ -361,10 +439,9 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
 
     // Sample the MCP process (and its worker child) for the dwell period.
     // stdin_pipe is still in scope so the child process stays alive.
-    let dwell = Duration::from_secs(5);
     let report = sample_pid_for_duration(
         pid,
-        "embed_active",
+        phase_name,
         dwell,
         config.sample_interval,
         Some(WORKER_BINARY_NAME),
@@ -398,7 +475,8 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
 
     if config.verbose {
         eprintln!(
-            "memcheck: phase 'embed_active' complete — main_rss_max: {} KiB, worker_rss_max: {} KiB, combined_rss_max: {} KiB, samples: {}",
+            "memcheck: phase '{}' complete — main_rss_max: {} KiB, worker_rss_max: {} KiB, combined_rss_max: {} KiB, samples: {}",
+            phase_name,
             report.rss_max_kib,
             report.worker_rss_max_kib,
             report.combined_rss_max_kib,
@@ -407,6 +485,221 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
     }
 
     Ok((child, report))
+}
+
+/// Run the canonical `embed_active` phase (5s dwell, default env).
+fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport)> {
+    run_worker_active_phase(config, "embed_active", Duration::from_secs(5), &[])
+}
+
+/// Run the `worker_ort_threads` phase: the worker-active trigger under the
+/// T5/D3 capped ORT-thread setting. Pinning `LEINDEX_WORKER_ORT_THREADS=1`
+/// explicitly makes the baseline deterministic across hosts (the default is
+/// host-parallelism-derived). The {0,4,1} empirical record and the
+/// cap ≤ no-cap assertion live in the opt-in harness test
+/// `test_worker_ort_threads_cap_leq_nocap` (LEINDEX_MEMCHECK_EXPENSIVE=1).
+fn run_worker_ort_threads_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport)> {
+    run_worker_active_phase(
+        config,
+        "worker_ort_threads",
+        WORKER_ORT_THREADS_DWELL,
+        &[("LEINDEX_WORKER_ORT_THREADS", "1")],
+    )
+}
+
+/// Run the `mcp_idle_proliferation` phase: launch PROLIFERATION_COUNT
+/// concurrent idle MCP servers and report their COMBINED RSS. Each server gets
+/// its own throwaway `LEINDEX_HOME` so concurrent starts never contend on the
+/// advisory run-dir lock (memory-pressure T2/T8).
+fn run_idle_proliferation_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
+    if config.verbose {
+        eprintln!(
+            "memcheck: phase 'mcp_idle_proliferation' starting ({} concurrent idle MCP servers)",
+            PROLIFERATION_COUNT
+        );
+    }
+
+    let root = tempfile::tempdir().context("mcp_idle_proliferation: create temp home root")?;
+    let root_path = root.path().to_path_buf();
+    let mut homes = Vec::with_capacity(PROLIFERATION_COUNT);
+    for i in 0..PROLIFERATION_COUNT {
+        let home = root_path.join(format!("home-{i}"));
+        std::fs::create_dir_all(&home)
+            .with_context(|| format!("mcp_idle_proliferation: create {}", home.display()))?;
+        homes.push(home);
+    }
+
+    let mut children = Vec::with_capacity(PROLIFERATION_COUNT);
+    for home in &homes {
+        let home_str = home
+            .to_str()
+            .context("mcp_idle_proliferation: non-UTF8 temp home path")?;
+        let env = [("LEINDEX_HOME", home_str)];
+        match launch_mcp_process_with_env(config, &env) {
+            Ok(child) => children.push(child),
+            Err(e) => {
+                // Kilo WARNING: partial-failure process leak. If a launch fails
+                // after earlier children were already spawned, the `?` would
+                // return early and drop the temp `root` while live servers
+                // still run inside it (and never kill them). Kill everything
+                // launched so far before propagating.
+                for child in children {
+                    kill_child(child);
+                }
+                return Err(e);
+            }
+        }
+    }
+    std::thread::sleep(STARTUP_GRACE);
+
+    let pids: Vec<u32> = children.iter().map(|c| c.id()).collect();
+    let report = match sample_pids_for_duration(
+        &pids,
+        "mcp_idle_proliferation",
+        PROLIFERATION_DWELL,
+        config.sample_interval,
+    ) {
+        Ok(report) => report,
+        Err(e) => {
+            // Same leak class as the launch loop: never drop the temp root
+            // while sampled servers still run.
+            for child in children {
+                kill_child(child);
+            }
+            return Err(e);
+        }
+    };
+
+    for child in children {
+        kill_child(child);
+    }
+
+    if config.verbose {
+        eprintln!(
+            "memcheck: phase 'mcp_idle_proliferation' complete — combined rss_max: {} KiB ({} servers), samples: {}",
+            report.rss_max_kib, PROLIFERATION_COUNT, report.sample_count
+        );
+    }
+
+    Ok(report)
+}
+
+/// Sample the SUM of RSS across multiple PIDs on every tick, producing a
+/// single aggregate [`PhaseReport`] for the group.
+fn sample_pids_for_duration(
+    pids: &[u32],
+    phase_name: &str,
+    dwell: Duration,
+    sample_interval: Duration,
+) -> Result<PhaseReport> {
+    let start = Instant::now();
+    let mut samples = Vec::new();
+
+    while start.elapsed() < dwell {
+        let mut combined = 0u64;
+        let mut mapped = 0u64;
+        let mut anon = 0u64;
+        let mut all_ok = true;
+        for &pid in pids {
+            match sampler::sample(pid, None) {
+                Ok(s) => {
+                    combined += s.rss_kib;
+                    mapped += s.mapped_file_kib;
+                    anon += s.anon_kib;
+                }
+                Err(_) => {
+                    all_ok = false;
+                    break;
+                }
+            }
+        }
+        if all_ok {
+            samples.push(sampler::MemorySample {
+                rss_kib: combined,
+                mapped_file_kib: mapped,
+                anon_kib: anon,
+                pss_kib: 0,
+                worker_rss_kib: 0,
+            });
+        }
+        std::thread::sleep(sample_interval);
+    }
+
+    let duration = start.elapsed();
+    Ok(build_phase_report(phase_name, &mut samples, duration))
+}
+
+/// Run the `stale_artifacts` phase: seed dead-pid run-dir sidecars, run
+/// `leindex cleanup --stale-daemons`, sample the sweep command's RSS, then
+/// assert every seeded sidecar was removed. A surviving sidecar fails the
+/// phase loudly (memory-pressure T7/T8).
+///
+/// The seeded home is either a pre-provisioned one pointed at by
+/// `LEINDEX_MEMCHECK_STALE_HOME` (used by the harness integration test) or a
+/// throwaway temp dir created here.
+fn run_stale_artifacts_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
+    if config.verbose {
+        eprintln!("memcheck: phase 'stale_artifacts' starting (seed dead sidecars + cleanup)");
+    }
+
+    let (home_path, created) = match std::env::var_os("LEINDEX_MEMCHECK_STALE_HOME") {
+        Some(h) => (PathBuf::from(h), false),
+        None => {
+            let home = tempfile::tempdir().context("stale_artifacts: create temp LEINDEX_HOME")?;
+            (home.keep(), true)
+        }
+    };
+    let run_dir = home_path.join("run");
+    std::fs::create_dir_all(&run_dir)
+        .with_context(|| format!("stale_artifacts: create {}", run_dir.display()))?;
+
+    // Sidecar naming matches the T7 sweeper (cleanup.rs `sweep_run_dir`):
+    // `leindex-embed-<stem>.<ext>` where ext ∈ {lock, pid, sock, status, ...}.
+    // A pid file naming a provably-dead pid (max i32 pid, never allocated on
+    // Linux) makes every sidecar in the stem stale regardless of age.
+    let stem = "leindex-embed-memcheck";
+    const DEAD_PID: &str = "2147483647";
+    let seeded = ["pid", "lock", "sock"];
+    for ext in seeded {
+        let contents = if ext == "pid" { DEAD_PID } else { "" };
+        std::fs::write(
+            run_dir.join(format!("{stem}.{ext}")),
+            format!("{contents}\n"),
+        )
+        .with_context(|| format!("stale_artifacts: seed {stem}.{ext}"))?;
+    }
+
+    let home_for_cmd = home_path.clone();
+    let report = run_command_phase(config, "stale_artifacts", move |bin, _fixture| {
+        let mut cmd = Command::new(bin);
+        cmd.arg("cleanup").arg("--stale-daemons");
+        cmd.env("LEINDEX_HOME", &home_for_cmd);
+        cmd
+    })?;
+
+    for ext in seeded {
+        let path = run_dir.join(format!("{stem}.{ext}"));
+        if path.exists() {
+            anyhow::bail!(
+                "stale_artifacts: sidecar {} survived `cleanup --stale-daemons` — T7 sweeper regression",
+                path.display()
+            );
+        }
+    }
+
+    if created {
+        let _ = std::fs::remove_dir_all(&home_path);
+    }
+
+    if config.verbose {
+        eprintln!(
+            "memcheck: phase 'stale_artifacts' complete — cleanup rss_max: {} KiB, all {} seeded sidecars removed",
+            report.rss_max_kib,
+            seeded.len()
+        );
+    }
+
+    Ok(report)
 }
 
 /// Run a one-shot command phase (index / query / reindex).
@@ -539,6 +832,15 @@ fn run_command_phase(
 
 /// Launch a leindex process that stays alive (MCP stdio mode).
 fn launch_mcp_process(config: &WorkloadConfig) -> Result<Child> {
+    launch_mcp_process_with_env(config, &[])
+}
+
+/// Launch a leindex MCP process with extra environment overrides applied on
+/// top of the standard harness environment (inherited by any worker it spawns).
+fn launch_mcp_process_with_env(
+    config: &WorkloadConfig,
+    extra_env: &[(&str, &str)],
+) -> Result<Child> {
     let mut cmd = Command::new(&config.binary);
     cmd.arg("mcp")
         .arg("--stdio")
@@ -547,6 +849,9 @@ fn launch_mcp_process(config: &WorkloadConfig) -> Result<Child> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("LEINDEX_EMBED_DAEMON", "0");
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
 
     if config.verbose {
         eprintln!("  launching MCP: {:?}", cmd);
@@ -852,13 +1157,16 @@ mod tests {
                 "embed_idle",
                 "embed_active",
                 "embed_teardown",
+                "mcp_idle_proliferation",
+                "worker_ort_threads",
+                "stale_artifacts",
             ]
         );
     }
 
     #[test]
     fn test_canonical_phases_count() {
-        assert_eq!(CANONICAL_PHASES.len(), 9);
+        assert_eq!(CANONICAL_PHASES.len(), 12);
     }
 
     #[test]

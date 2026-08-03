@@ -13,10 +13,12 @@ use mcp_commands::{
 
 #[path = "mcp_commands.rs"]
 mod mcp_commands;
-use crate::phase::{DocsMode, FormatMode, PhaseOptions, PhaseSelection, run_phase_analysis};
+#[path = "phase_commands.rs"]
+mod phase_commands;
 use anyhow::Context;
 use anyhow::Result as AnyhowResult;
 use clap::{Parser, Subcommand, error::ErrorKind};
+use phase_commands::cmd_phase_impl;
 use serde_json::Value;
 use std::fs;
 use std::net::SocketAddr;
@@ -210,6 +212,13 @@ pub enum Commands {
         /// removed when the server shuts down. Only available on Unix.
         #[arg(long = "socket")]
         socket: Option<PathBuf>,
+
+        /// Exit the MCP server after this many seconds with no requests.
+        /// Overrides `[mcp] idle_timeout_secs` from leindex.toml. `0` disables
+        /// idle exit (server lives until stdin EOF). MCP clients respawn the
+        /// server on the next tool call. Memory-pressure remediation 1.11.0.
+        #[arg(long = "mcp-idle-timeout-secs")]
+        idle_timeout_secs: Option<u64>,
     },
 
     /// Start the frontend dashboard
@@ -232,6 +241,11 @@ pub enum Commands {
         /// Show what would be removed without actually removing
         #[arg(long = "dry-run")]
         dry_run: bool,
+
+        /// Sweep stale daemon sidecars in ~/.leindex/run/ (dead-pid or
+        /// too-old worker/MCP lock, pid, sock, status, start files)
+        #[arg(long = "stale-daemons")]
+        stale_daemons: bool,
     },
 
     /// Configure neural search: install ORT, set up models, and write config
@@ -308,6 +322,11 @@ impl Cli {
         // Initialize logging
         init_logging_impl(self.verbose);
 
+        // Codex P2 (cleanup.rs:554): `startup_gc` had no production caller;
+        // run it early so stale temp-fallback storage is GC'd on every CLI
+        // run. Safe because `is_locked` probes the cross-process write lock.
+        crate::cli::cleanup::startup_gc();
+
         // Set up optional memory report tracker.
         // The tracker observes RSS during execution and writes a compact JSON
         // summary on drop (graceful shutdown). Also enabled via
@@ -329,11 +348,13 @@ impl Cli {
             Commands::Mcp {
                 stdio: true,
                 socket: None,
+                idle_timeout_secs: None,
             }
         } else {
             self.command.unwrap_or(Commands::Mcp {
                 stdio: false,
                 socket: None,
+                idle_timeout_secs: None,
             })
         };
 
@@ -389,18 +410,26 @@ impl Cli {
             Commands::Diagnostics => cmd_diagnostics_impl(global_project).await,
             Commands::Tools { command } => cmd_tools_impl(command, global_project).await,
             Commands::Serve { host, port } => cmd_serve_impl(host, port).await,
-            Commands::Mcp { socket, .. } => {
+            Commands::Mcp {
+                socket,
+                idle_timeout_secs,
+                ..
+            } => {
+                // T2 (memory-pressure remediation): the CLI flag overrides
+                // `[mcp] idle_timeout_secs` and drives the D-1 idle self-exit
+                // in both the stdio and socket server loops.
                 if let Some(ref socket_path) = socket {
-                    cmd_mcp_socket_impl(socket_path, global_project).await
+                    cmd_mcp_socket_impl(socket_path, global_project, idle_timeout_secs).await
                 } else {
-                    cmd_mcp_stdio_impl(global_project).await
+                    cmd_mcp_stdio_impl(global_project, idle_timeout_secs).await
                 }
             }
             Commands::Dashboard { port, prod } => cmd_dashboard_impl(port, prod).await,
             Commands::Cleanup {
                 max_age_days,
                 dry_run,
-            } => cmd_cleanup_impl(max_age_days, dry_run).await,
+                stale_daemons,
+            } => cmd_cleanup_impl(max_age_days, dry_run, stale_daemons).await,
             Commands::Setup {
                 neural,
                 no_neural,
@@ -414,6 +443,10 @@ impl Cli {
         // Write the memory report (if tracking was enabled) before returning.
         // Rust does not run Drop for statics, so this must be explicit.
         crate::cli::memory_report::shutdown();
+
+        // Codex P2 (cleanup.rs:554): flush registered temp-fallback storage on
+        // clean exit (lock-aware via `is_locked`).
+        crate::cli::cleanup::flush_registered_temp_cleanups();
 
         result
     }
@@ -902,87 +935,6 @@ async fn cmd_context_impl(
     Ok(())
 }
 
-/// Phase command implementation
-#[allow(clippy::too_many_arguments)]
-async fn cmd_phase_impl(
-    phase: Option<u8>,
-    all: bool,
-    mode: String,
-    path: Option<PathBuf>,
-    project: Option<PathBuf>,
-    max_files: usize,
-    max_focus_files: usize,
-    top_n: usize,
-    max_output_chars: usize,
-    include_docs: bool,
-    docs_mode: String,
-    no_incremental_refresh: bool,
-) -> AnyhowResult<()> {
-    if !all && phase.is_none() {
-        anyhow::bail!("Specify either --phase <1..5> or --all");
-    }
-
-    if all && phase.is_some() {
-        anyhow::bail!("Use either --phase or --all, not both");
-    }
-
-    let target_path = path
-        .or(project)
-        .unwrap_or_else(|| std::env::current_dir().unwrap());
-    let canonical_path = target_path
-        .canonicalize()
-        .context("Failed to canonicalize phase analysis path")?;
-
-    let (root, focus_files) = if canonical_path.is_file() {
-        let parent = canonical_path
-            .parent()
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("phase analysis file path has no parent directory"))?;
-        (parent, vec![canonical_path.clone()])
-    } else {
-        (canonical_path, Vec::new())
-    };
-
-    let parsed_mode = FormatMode::parse(&mode)
-        .ok_or_else(|| anyhow::anyhow!("Invalid mode '{}'. Use ultra|balanced|verbose", mode))?;
-
-    let parsed_docs_mode = DocsMode::parse(&docs_mode).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Invalid docs mode '{}'. Use off|markdown|text|all",
-            docs_mode
-        )
-    })?;
-
-    let selection = if all {
-        PhaseSelection::All
-    } else {
-        let p = phase.unwrap();
-        PhaseSelection::from_number(p)
-            .ok_or_else(|| anyhow::anyhow!("Invalid phase '{}'. Use 1..5", p))?
-    };
-
-    let options = PhaseOptions {
-        root,
-        focus_files,
-        mode: parsed_mode,
-        max_files,
-        max_focus_files,
-        top_n,
-        max_output_chars,
-        use_incremental_refresh: !no_incremental_refresh,
-        include_docs,
-        docs_mode: parsed_docs_mode,
-        hotspot_keywords: PhaseOptions::default().hotspot_keywords,
-    };
-
-    let report = tokio::task::spawn_blocking(move || run_phase_analysis(options, selection))
-        .await
-        .context("Phase task failed")??;
-
-    println!("{}", report.formatted_output);
-    Ok(())
-}
-
 /// Diagnostics command implementation
 async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     let project_path = get_project_path(project);
@@ -1155,12 +1107,12 @@ pub(crate) fn collect_ort_diagnostics() -> (Option<String>, Option<String>, Stri
 
     // ort_path: prefer the live discovery chain, fall back to configured path.
     #[cfg(feature = "onnx")]
-    let live_path = leindex_embed::ort_discovery::discover_path_only()
+    let live_path = crate::embed::ort_discovery::discover_path_only()
         .map(|outcome| outcome.path.display().to_string());
     #[cfg(not(feature = "onnx"))]
     let live_path: Option<String> = None;
 
-    let config_path = crate::cli::neural_config::LeIndexConfig::load()
+    let config_path = crate::config::LeIndexConfig::load()
         .ok()
         .and_then(|c| c.neural.ort_dylib_path);
 
@@ -1168,13 +1120,13 @@ pub(crate) fn collect_ort_diagnostics() -> (Option<String>, Option<String>, Stri
 
     // ort_version: prefer the live-detected version, fall back to the recorded one.
     let live_version = setup::get_ort_version();
-    let recorded_version = crate::cli::neural_config::LeIndexConfig::load()
+    let recorded_version = crate::config::LeIndexConfig::load()
         .ok()
         .and_then(|c| c.neural.ort_version);
     let ort_version = live_version.or(recorded_version);
 
     // execution_provider: from config, default to "auto" when unset.
-    let execution_provider = crate::cli::neural_config::LeIndexConfig::load()
+    let execution_provider = crate::config::LeIndexConfig::load()
         .ok()
         .map(|c| c.neural.execution_provider)
         .filter(|s| !s.is_empty())
@@ -1468,18 +1420,24 @@ fn handle_smoke_and_warmup(
 
 /// Determine whether auto-warmup should run on a cold MIGraphX cache.
 ///
-/// Auto-warmup triggers when neural is enabled, a GPU (MIGraphX) provider was
-/// selected, and the MIGraphX cache directory does not yet exist (cold cache).
+/// Auto-warmup triggers when the smoke test reported MIGraphX as the **active**
+/// provider (the actual runtime selection, not the requested enum — Auto may
+/// resolve to MIGraphX on an AMD host) and the MIGraphX cache is cold.
 #[cfg(feature = "onnx")]
 fn should_auto_warmup(
-    choices: &crate::cli::leindex::setup::SetupChoices,
+    _choices: &crate::cli::leindex::setup::SetupChoices,
     result: &crate::cli::leindex::setup::SetupResult,
 ) -> bool {
-    use crate::cli::leindex::setup::ExecutionProvider;
-
-    // Only warm up for MIGraphX provider.
-    let is_migraphx = choices.provider == Some(ExecutionProvider::Migraphx);
-    if !is_migraphx {
+    // Warm only active MIGraphX: the smoke test is the authority on which EP
+    // the worker actually used. An explicit `--gpu amd` that fell back to CPU
+    // must not trigger warmup; an Auto selection that resolved to MIGraphX
+    // must trigger it.
+    let active_is_migraphx = result
+        .smoke_test
+        .as_ref()
+        .and_then(|s| s.execution_provider.as_deref())
+        == Some("migraphx");
+    if !active_is_migraphx {
         return false;
     }
 
@@ -1514,12 +1472,29 @@ fn check_neutral_conflicts(
     Ok(())
 }
 
-/// Cleanup command implementation — remove stale LeIndex temp artifacts.
-async fn cmd_cleanup_impl(max_age_days: u64, dry_run: bool) -> AnyhowResult<()> {
-    use crate::cli::cleanup::run_gc;
+/// Cleanup command implementation — remove stale LeIndex temp artifacts
+/// and/or sweep stale daemon sidecars (memory-pressure T7).
+async fn cmd_cleanup_impl(
+    max_age_days: u64,
+    dry_run: bool,
+    stale_daemons: bool,
+) -> AnyhowResult<()> {
+    use crate::cli::cleanup::{run_gc, sweep_stale_daemon_artifacts};
     use std::time::Duration;
 
     let max_age = Duration::from_secs(max_age_days * 24 * 3600);
+
+    if stale_daemons {
+        let label = if dry_run { " (dry run)\n" } else { "\n" };
+        println!("LeIndex Cleanup — stale daemon sidecars{}", label);
+        println!(
+            "Sweeping ~/.leindex/run/ for dead-pid or >{} day(s) old worker/MCP sidecars...\n",
+            max_age_days
+        );
+        let report = sweep_stale_daemon_artifacts(max_age, dry_run);
+        println!("{}", report);
+        return Ok(());
+    }
 
     if dry_run {
         // In dry-run mode we scan but do not remove
@@ -1778,9 +1753,11 @@ mod tests {
             Some(Commands::Cleanup {
                 max_age_days,
                 dry_run,
+                stale_daemons,
             }) => {
                 assert_eq!(max_age_days, 7);
                 assert!(!dry_run);
+                assert!(!stale_daemons);
             }
             _ => panic!("Expected Cleanup command"),
         }
@@ -1788,15 +1765,24 @@ mod tests {
 
     #[test]
     fn test_cleanup_command_with_flags() {
-        let cli = Cli::try_parse_from(["leindex", "cleanup", "--max-age-days", "14", "--dry-run"])
-            .unwrap();
+        let cli = Cli::try_parse_from([
+            "leindex",
+            "cleanup",
+            "--max-age-days",
+            "14",
+            "--dry-run",
+            "--stale-daemons",
+        ])
+        .unwrap();
         match cli.command {
             Some(Commands::Cleanup {
                 max_age_days,
                 dry_run,
+                stale_daemons,
             }) => {
                 assert_eq!(max_age_days, 14);
                 assert!(dry_run);
+                assert!(stale_daemons);
             }
             _ => panic!("Expected Cleanup command"),
         }

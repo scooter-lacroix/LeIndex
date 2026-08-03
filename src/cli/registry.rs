@@ -228,8 +228,9 @@ impl Drop for RefreshGuard {
 
 /// Multi-project registry.
 pub struct ProjectRegistry {
-    /// Canonical path -> project handle.
-    projects: RwLock<HashMap<PathBuf, ProjectHandle>>,
+    /// Canonical path -> project handle. `pub(crate)` for the D-2 eviction
+    /// impl in `registry_evict.rs`.
+    pub(crate) projects: RwLock<HashMap<PathBuf, ProjectHandle>>,
 
     /// LRU order tracker. Most-recently-used at the back.
     lru_order: Mutex<VecDeque<PathBuf>>,
@@ -261,6 +262,15 @@ pub struct ProjectRegistry {
     /// refresh is in progress for that project and new requests skip the
     /// refresh to avoid duplicate work.
     incremental_refresh_guard: Mutex<HashMap<PathBuf, bool>>,
+
+    /// Per-project last-access timestamps for idle-engine eviction (D-2).
+    ///
+    /// Touched on every `get_or_load`; `evict_idle_engines` (defined in
+    /// `registry_evict.rs`) drops projects that have been unused for
+    /// `[mcp] engine_max_idle_secs` so a long-lived MCP process releases
+    /// loaded-project mmaps instead of retaining every project it ever
+    /// touched (memory-pressure remediation).
+    pub(crate) last_used: RwLock<HashMap<PathBuf, std::time::Instant>>,
 }
 
 impl ProjectRegistry {
@@ -276,6 +286,7 @@ impl ProjectRegistry {
             watchers: Mutex::new(HashMap::new()),
             stale_cache: RwLock::new(HashMap::new()),
             incremental_refresh_guard: Mutex::new(HashMap::new()),
+            last_used: RwLock::new(HashMap::new()),
         }
     }
 
@@ -302,6 +313,9 @@ impl ProjectRegistry {
             }
         }
 
+        let mut last_used = HashMap::new();
+        last_used.insert(path.clone(), std::time::Instant::now());
+
         Self {
             projects: RwLock::new(map),
             lru_order: Mutex::new(lru),
@@ -312,6 +326,7 @@ impl ProjectRegistry {
             watchers: Mutex::new(watchers),
             stale_cache: RwLock::new(HashMap::new()),
             incremental_refresh_guard: Mutex::new(HashMap::new()),
+            last_used: RwLock::new(last_used),
         }
     }
 
@@ -345,6 +360,7 @@ impl ProjectRegistry {
             let projects = self.projects.read().await;
             if let Some(handle) = projects.get(&canonical) {
                 self.touch_lru(&canonical).await;
+                self.touch_last_used(&canonical).await;
                 self.set_default(&canonical).await;
                 return Ok(handle.clone());
             }
@@ -837,39 +853,71 @@ impl ProjectRegistry {
     /// Cleans up all associated bookkeeping: LRU order, index slots,
     /// watchers, and stale-cache entries (VAL-APLUS-027).
     pub async fn evict(&self, path: &Path) {
+        // Codex P2: the map removal and the storage close run under ONE
+        // `projects` write-lock hold, so a concurrent `get_or_load` cannot
+        // clone the Arc in between and later resume on a closed index.
+        // `try_write()` still skips a caller that is *currently* inside the
+        // inner lock.
         let removed = {
             let mut projects = self.projects.write().await;
-            projects.remove(path)
-        };
-
-        if let Some(handle) = removed {
-            if let Ok(mut idx) = handle.try_write() {
-                if let Err(e) = idx.close() {
-                    warn!(
-                        "Failed to close storage for evicted project {}: {}",
-                        path.display(),
-                        e
-                    );
+            match projects.remove(path) {
+                Some(handle) => {
+                    if let Ok(mut idx) = handle.try_write() {
+                        if let Err(e) = idx.close() {
+                            warn!(
+                                "Failed to close storage for evicted project {}: {}",
+                                path.display(),
+                                e
+                            );
+                        }
+                    }
+                    info!("Evicted project: {}", path.display());
+                    true
                 }
+                None => false,
             }
-            info!("Evicted project: {}", path.display());
+        };
+        if removed {
+            self.cleanup_evicted(path).await;
         }
+    }
 
+    /// Shared bookkeeping cleanup after a project has been removed from the
+    /// map (LRU order, index slots, watchers, stale cache, index jobs,
+    /// incremental-refresh guard, and the D-2 idle-eviction timestamp). Used by
+    /// [`Self::evict`], [`Self::evict_lru_if_needed`], and the D-2 idle sweep
+    /// so every eviction path leaves identical state behind.
+    pub(crate) async fn cleanup_evicted(&self, path: &Path) {
         let mut lru = self.lru_order.lock().await;
         lru.retain(|p| p != path);
+        drop(lru);
 
         let mut slots = self.index_slots.lock().await;
         slots.remove(path);
+        drop(slots);
 
+        // Remove watcher so the evicted LeIndex is not kept alive by the
+        // watcher's captured ProjectHandle.
         let mut watchers = self.watchers.lock().await;
         watchers.remove(path);
+        drop(watchers);
 
         // A+ hotspot cleanup: evict stale-cache entry so residency does not
         // grow monotonically across long-lived sessions (VAL-APLUS-027).
         self.stale_cache.write().await.remove(path);
 
+        // Drop per-project bookkeeping so a reloaded project starts clean.
+        // Without this, `index_jobs` leaks one entry per distinct project
+        // visited (memory growth over a long-lived session), and a stale
+        // `true` in `incremental_refresh_guard` would block future background
+        // refreshes for this path when it is reloaded.
+        self.index_jobs.lock().await.remove(path);
+
         // Clean up incremental refresh guard.
         self.incremental_refresh_guard.lock().await.remove(path);
+
+        // Clean up the D-2 idle-eviction timestamp.
+        self.last_used.write().await.remove(path);
     }
 
     /// Resolve an optional `project_path` string to a canonical `PathBuf`.
@@ -998,6 +1046,7 @@ impl ProjectRegistry {
             let mut projects = self.projects.write().await;
             projects.insert(canonical.clone(), handle.clone());
         }
+        self.touch_last_used(&canonical).await;
 
         // Start file watcher for auto-reindex — opt-in only.
         //
@@ -1291,49 +1340,36 @@ impl ProjectRegistry {
         };
 
         if let Some(path) = evict_path {
+            // Codex P2: remove + close under ONE projects write-lock hold — no
+            // gap in which a concurrent `get_or_load` could clone the Arc and
+            // later resume on a closed index. `try_write()` still skips a
+            // caller that is currently inside the inner lock.
             let removed = {
                 let mut projects = self.projects.write().await;
-                projects.remove(&path)
-            };
-
-            if let Some(handle) = removed {
-                if let Ok(mut idx) = handle.try_write() {
-                    if let Err(e) = idx.close() {
-                        warn!(
-                            "Failed to close storage for LRU-evicted project {}: {}",
-                            path.display(),
-                            e
-                        );
+                match projects.remove(&path) {
+                    Some(handle) => {
+                        if let Ok(mut idx) = handle.try_write() {
+                            if let Err(e) = idx.close() {
+                                warn!(
+                                    "Failed to close storage for LRU-evicted project {}: {}",
+                                    path.display(),
+                                    e
+                                );
+                            }
+                        }
+                        true
                     }
+                    None => false,
                 }
+            };
+            if removed {
+                self.cleanup_evicted(&path).await;
+                info!(
+                    "Evicted LRU project: {} (capacity: {})",
+                    path.display(),
+                    self.max_projects
+                );
             }
-
-            let mut slots = self.index_slots.lock().await;
-            slots.remove(&path);
-
-            // Remove watcher so the evicted LeIndex is not kept alive by
-            // the watcher's captured ProjectHandle.
-            let mut watchers = self.watchers.lock().await;
-            watchers.remove(&path);
-
-            // A+ hotspot cleanup: also evict stale-cache entry
-            self.stale_cache.write().await.remove(&path);
-
-            // Drop per-project bookkeeping so a reloaded project starts clean.
-            // Without this, `index_jobs` leaks one entry per distinct project
-            // visited (memory growth over a long-lived session), and a stale
-            // `true` in `incremental_refresh_guard` would block future
-            // background refreshes for this path when it is reloaded.
-            self.index_jobs.lock().await.remove(&path);
-            if let Ok(mut guard) = self.incremental_refresh_guard.try_lock() {
-                guard.remove(&path);
-            }
-
-            info!(
-                "Evicted LRU project: {} (capacity: {})",
-                path.display(),
-                self.max_projects
-            );
         }
     }
 }

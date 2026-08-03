@@ -1,6 +1,6 @@
 # LeIndex Installation Guide
 
-Last updated: 2026-07-21 for LeIndex 1.9.0.
+Last updated: 2026-08-01 for LeIndex 1.9.5.
 
 LeIndex is distributed through GitHub release bundles, crates.io, npm, and
 PyPI. Core TF-IDF retrieval and PDG relationships are published first after

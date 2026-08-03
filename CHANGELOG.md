@@ -2,6 +2,99 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [1.9.5] - 2026-08-01 - Embed-Merge + Fragment Embeddings
+
+The 1.9.1 through 1.9.5 sub-releases below ship together as 1.9.5. They merge
+the embedding worker into the root crate, pin the ONNX runtime fix, make every
+execution provider runtime-selectable, rework the release pipeline, and add an
+opt-in fragment embedding layer backed by a content-hash store.
+
+### [1.9.1] - 2026-08-01 - Feature boundaries + unified config
+
+- Repaired the strict feature DAG: `skip_dirs` is shared across features, graph
+  dependencies are gated correctly, and MCP-metric code is gated under `cli`.
+- Consolidated neural configuration into `src/config.rs` so the CLI and the
+  ONNX worker share one schema and one process cache instead of duplicate
+  definitions.
+
+### [1.9.2] - 2026-08-01 - ort rc.13 + all execution providers
+
+- Pinned `ort = 2.0.0-rc.13` from crates.io, which contains the load-dynamic
+  deadlock fix (upstream commit `17ed727`).
+- Removed the non-propagating `[patch.crates-io]` git patch.
+- The `onnx` feature now compiles every runtime-selectable execution-provider
+  API (CUDA, MIGraphX, ROCm, CoreML). These are marker/API features only; no
+  SDK is linked at build time.
+
+### [1.9.3] - 2026-08-01 - One crate, two binaries
+
+- Merged the `leindex-embed` worker source into `src/embed/`; the root
+  `leindex-embed` bin wraps `leindex::embed::worker_main::run`.
+- Migrated all integration suites and worker tests to the root crate; retired
+  the `crates/leindex-embed` subcrate entirely.
+- `cargo install leindex --features onnx` now installs both the `leindex` and
+  `leindex-embed` binaries from a single crate.
+
+### [1.9.4] - 2026-08-01 - Truthful provider selection + setup
+
+- Pure `select_auto_from_availability` selection: CoreML -> MIGraphX -> CUDA ->
+  CPU, evaluated before session attach so `auto` is never passed to ORT.
+- `.error_on_failure()` on EP registration with preserved GPU-to-CPU fallback.
+- `rocm` is a deprecated alias that routes to MIGraphX and never registers
+  `ort::ep::ROCm`.
+- Setup gains Auto and CoreML options with host-aware install candidates and
+  persists `auto`; stale PATH workers are rejected via a `--version` check.
+
+### [1.9.5] - 2026-08-01 - Release pipeline + docs
+
+- CI/release reworked for one crate: a Linux compile matrix plus a macOS CoreML
+  check, and an encoded `create-release -> publish-crates ->
+  crates-index-ready -> undraft-release -> publish-npm/pypi -> summary` job
+  graph.
+- npm `cargo install leindex-embed` fallback removed; a retired-subcrate guard
+  rejects the old package form.
+- Version bumped to 1.9.5 and docs synchronized to the one-crate, two-binary
+  reality.
+
+### Fragment embeddings (opt-in) + content-hash store
+
+Ships in 1.9.5 alongside the embed-merge (no separate sub-release).
+
+#### Added
+
+- **Fragment embedding layer (opt-in)** — sub-symbol semantic chunks via a
+  tree-sitter chunker (ported from Warp's `full_source_code_embedding`) plus
+  module-level orphan coverage, so conceptual queries can match the exact
+  region that answers them instead of only the whole symbol.
+- **Localized content-hash store** — every fragment is addressed by a blake3
+  hash of its exact embedded text; incremental indexing is idempotent and
+  deduplicated, and the whole layer is fully local (no remote service).
+- **Incremental fragment sync engine** — per-file blake3 manifest, skip
+  unchanged files, embed-missing-only diffing, generation bump, and
+  store → root → manifest persistence ordering with crash self-healing.
+- **Fragment search integration** — fragment candidates union into the search
+  pool, map back to owner nodes via content hash, fuse as a renormalized
+  `fragment` score component, and feed the existing local reranker.
+- **Cache-key v2 extension** — `search_cache_key_for` now folds
+  `fragment_index_enabled`, `fragment_weight`, and the persisted fragment root
+  hash into the key so a config/model change invalidates the result cache.
+- **`leindex setup --check` surfaces fragment knobs** — fragment index
+  on/off, weight, max bytes, orphan and naive-fallback toggles.
+
+#### Changed
+
+- **Neural-weight default drift fixed** — the `[search] neural_weight` config
+  default now matches the scorer-side default (0.4, was 0.3); the dead
+  `EmbeddingConfig.neural_weight` knob was removed.
+- **`fragment_weight` default tuned to 0.35** — the initial 0.12 produced zero
+  conceptual-recall gain in the MRR sweep; 0.35 is the smallest weight with
+  real margin over the share-equality boundary.
+
+#### Docs
+
+- README (root, npm, PyPI) and `leindex.toml.example` document the fragment
+  index opt-in, config knobs, and the all-local privacy note.
+
 ## [1.9.0] - 2026-07-21 - Fast Core Retrieval and Owned Index Jobs
 
 ### Added
@@ -420,6 +513,16 @@ use leindex::lerecherche::SearchEngine;
 - Boolean parameter handling and tool argument coercion consistency improvements (accepting both boolean and string forms where required).
 
 ## [Unreleased] - INT8 Quantization Optimization
+
+### Changed
+
+- Aligned the `[search] neural_weight` config default to **0.4** (was 0.3) so
+  stock installs match the scorer-side defaults (`HybridScorer::for_code()` /
+  `HybridScoringWeights::default()`, both 0.40). The hybrid blend now shifts
+  toward neural as documented. Users with an explicit `neural_weight` in their
+  config are unaffected.
+- Removed the dead `EmbeddingConfig.neural_weight` project-config knob
+  (never read by scoring); `leindex.toml.example` now ships `neural_weight = 0.4`.
 
 ### ✨ **Performance: INT8 Quantized Vector Search**
 

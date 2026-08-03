@@ -1,28 +1,28 @@
 //! Cargo install layout tests (VAL-CARGO-001..013).
 //!
-//! These tests statically verify that the root `Cargo.toml` is configured so
-//! `cargo install leindex` (and the `--features onnx` / `--features
-//! onnx-migraphx` variants) produces correct results without requiring ORT
-//! at build time.
+//! One published crate, two installed processes. These tests statically verify
+//! that the root `Cargo.toml` is configured so `cargo install leindex` (and the
+//! `--features onnx` / `--features onnx-migraphx` variants) produces correct
+//! results without requiring ORT at build time.
 //!
 //! Key invariants:
 //!   * `cargo install leindex --features onnx` installs BOTH `leindex` and
-//!     `leindex-embed` binaries (VAL-CARGO-002/005).
+//!     `leindex-embed` binaries from the single root crate (VAL-CARGO-002/005).
 //!   * `cargo install leindex` (default features) installs `leindex`
 //!     (VAL-CARGO-001/004).
 //!   * The worker binary is gated by `required-features = ["onnx"]` so the
 //!     default install is unaffected.
-//!   * The `onnx` feature propagates to `leindex-embed/onnx` so the installed
-//!     worker has real ONNX inference support (not a dummy fallback).
+//!   * The worker source lives at `src/embed/` (no separate subcrate); the
+//!     `onnx` feature compiles every runtime-selectable EP API.
 //!   * No `ORT_LIB_PATH` / `ORT_PREFER_DYNAMIC_LINK` entries remain in
 //!     `.cargo/config.toml` (VAL-ORT-003 / VAL-DOCS-008/011).
-//!   * No `$ORIGIN` rpath in build scripts (VAL-RELEASE-012).
+//!   * No `$ORIGIN` rpath in the build script (VAL-RELEASE-012).
 //!   * No `ort-lib/` directory exists (VAL-ORT-004 / VAL-DOCS-009/010).
 //!   * The worker binary exposes `--version` (VAL-CARGO-005 evidence).
 //!
 //! Because `cargo install` cannot run inside `cargo test`, we verify the
-//! Cargo.toml metadata that drives the install layout. The end-to-end
-//! install was validated manually during feature development.
+//! Cargo.toml metadata that drives the install layout. The end-to-end install
+//! was validated manually during feature development.
 
 #![cfg(test)]
 
@@ -37,16 +37,6 @@ fn repo_root() -> PathBuf {
 /// Read the root Cargo.toml as a string.
 fn root_cargo_toml() -> String {
     let path = repo_root().join("Cargo.toml");
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
-}
-
-/// Read the leindex-embed subcrate Cargo.toml as a string.
-fn embed_cargo_toml() -> String {
-    let path = repo_root()
-        .join("crates")
-        .join("leindex-embed")
-        .join("Cargo.toml");
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
@@ -98,8 +88,7 @@ mod binary_targets {
 
     /// VAL-CARGO-002/005: The root package declares a `leindex-embed`
     /// `[[bin]]` target so `cargo install leindex --features onnx` installs
-    /// both binaries. Without this, `cargo install` only installs binaries
-    /// from the root crate's own `[[bin]]` targets (not from subcrates).
+    /// both binaries from the single root crate.
     #[test]
     fn root_declares_leindex_embed_bin_target() {
         let toml = root_cargo_toml();
@@ -116,13 +105,11 @@ mod binary_targets {
         );
 
         let embed = embed_bin.unwrap();
-        // The path should point to the root src/bin/ wrapper
         assert!(
             embed.contains("path = \"src/bin/leindex-embed.rs\""),
             "leindex-embed bin target should point to src/bin/leindex-embed.rs, got: {}",
             embed
         );
-        // Must be gated by required-features = ["onnx"]
         assert!(
             embed.contains("required-features = [\"onnx\"]"),
             "leindex-embed bin target must have required-features = [\"onnx\"], got: {}",
@@ -130,8 +117,7 @@ mod binary_targets {
         );
     }
 
-    /// VAL-CARGO-001/004: The root package also declares the `leindex`
-    /// main binary.
+    /// VAL-CARGO-001/004: The root package also declares the `leindex` main binary.
     #[test]
     fn root_declares_leindex_bin_target() {
         let toml = root_cargo_toml();
@@ -163,7 +149,7 @@ mod binary_targets {
         );
     }
 
-    /// VAL-CARGO-002: The root wrapper source exists and calls the shared run fn.
+    /// VAL-CARGO-002: The root wrapper source exists and calls the worker run fn.
     #[test]
     fn root_embed_wrapper_source_exists() {
         let path = repo_root().join("src").join("bin").join("leindex-embed.rs");
@@ -171,22 +157,18 @@ mod binary_targets {
         let src = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
         assert!(
-            src.contains("leindex_embed::worker_main::run"),
-            "Wrapper must call leindex_embed::worker_main::run()"
+            src.contains("leindex::embed::worker_main::run"),
+            "Wrapper must call leindex::embed::worker_main::run()"
         );
     }
 
-    /// VAL-CARGO-005: The shared worker_main module exists in leindex-embed.
+    /// VAL-CARGO-005: The shared worker_main module exists in src/embed.
     #[test]
     fn worker_main_module_exists() {
-        let path = repo_root()
-            .join("crates")
-            .join("leindex-embed")
-            .join("src")
-            .join("worker_main.rs");
+        let path = repo_root().join("src").join("embed").join("worker_main.rs");
         assert!(
             path.exists(),
-            "crates/leindex-embed/src/worker_main.rs must exist"
+            "src/embed/worker_main.rs must exist (worker source merged into root)"
         );
         let src = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
@@ -197,48 +179,57 @@ mod binary_targets {
         );
     }
 
-    /// VAL-CARGO-005: The lib.rs exports worker_main.
+    /// VAL-CARGO-005: The embed module exports worker_main.
     #[test]
     fn lib_exports_worker_main() {
-        let path = repo_root()
-            .join("crates")
-            .join("leindex-embed")
-            .join("src")
-            .join("lib.rs");
+        let path = repo_root().join("src").join("embed").join("mod.rs");
         let src = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
         assert!(
             src.contains("pub mod worker_main"),
-            "lib.rs must export worker_main module"
+            "src/embed/mod.rs must export worker_main module"
         );
     }
 }
 
 // ============================================================================
-// VAL-CARGO-002: The onnx feature propagates to leindex-embed/onnx
+// VAL-CARGO-002: The onnx feature compiles every runtime-selectable EP
 // ============================================================================
 
 mod feature_propagation {
     use super::*;
 
-    /// VAL-CARGO-002: The root `onnx` feature MUST enable `leindex-embed/onnx`
-    /// so the installed worker binary has real ONNX inference support.
-    /// Without this propagation, the worker would compile without onnx and
-    /// produce dummy zeros instead of real embeddings.
+    /// VAL-ORT-EP: root onnx enables every runtime-selectable execution-provider
+    /// API (cuda, migraphx, rocm, coreml) so the worker can register any of them.
     #[test]
-    fn onnx_feature_propagates_to_leindex_embed() {
+    fn onnx_feature_enables_all_execution_providers() {
         let toml = root_cargo_toml();
-
-        // Find the onnx feature line
         let onnx_line = toml
             .lines()
             .find(|l| l.trim_start().starts_with("onnx = ["))
             .expect("root Cargo.toml must define an 'onnx' feature");
+        for ep in ["ort/cuda", "ort/migraphx", "ort/rocm", "ort/coreml"] {
+            assert!(
+                onnx_line.contains(ep),
+                "root 'onnx' feature MUST include '{}'. Got: {}",
+                ep,
+                onnx_line
+            );
+        }
+    }
 
+    /// One-crate invariant: the retired worker subcrate no longer exists,
+    /// so the onnx feature must NOT reference it.
+    #[test]
+    fn onnx_feature_has_no_leindex_embed_propagation() {
+        let toml = root_cargo_toml();
+        let onnx_line = toml
+            .lines()
+            .find(|l| l.trim_start().starts_with("onnx = ["))
+            .expect("root Cargo.toml must define an 'onnx' feature");
         assert!(
-            onnx_line.contains("leindex-embed/onnx"),
-            "The root 'onnx' feature MUST include 'leindex-embed/onnx' so the worker \
-             binary gets ONNX support. Got: {}",
+            !onnx_line.contains("leindex-embed"),
+            "one-crate layout: onnx feature must not reference the retired subcrate. Got: {}",
             onnx_line
         );
     }
@@ -252,37 +243,41 @@ mod feature_propagation {
             .find(|l| l.trim_start().starts_with("onnx-migraphx = ["))
             .expect("root Cargo.toml must define 'onnx-migraphx' feature");
 
-        assert!(migraphx_line.contains("leindex-embed/onnx-migraphx"));
+        assert!(
+            migraphx_line.contains("\"onnx\""),
+            "onnx-migraphx is now a legacy alias for the onnx feature (which includes \
+             ort/migraphx). Got: {}",
+            migraphx_line
+        );
     }
 
     /// VAL-ORT-001/002: The ort crate uses load-dynamic (not download-binaries).
-    /// We check only the active `ort = ...` dependency line, ignoring comments.
+    /// We check only the active `ort = ...` dependency line in the root manifest.
     #[test]
     fn ort_uses_load_dynamic() {
-        let toml = embed_cargo_toml();
+        let toml = root_cargo_toml();
 
-        // Find the ort dependency line (not a comment)
         let ort_line = toml
             .lines()
             .find(|l| {
                 let t = l.trim();
                 t.starts_with("ort = ") || t.starts_with("ort = {")
             })
-            .expect("leindex-embed must declare an ort dependency");
+            .expect("root Cargo.toml must declare an ort dependency");
 
         assert!(
             ort_line.contains("load-dynamic"),
-            "leindex-embed ort dependency must use load-dynamic feature. Got: {}",
+            "root ort dependency must use load-dynamic feature. Got: {}",
             ort_line
         );
         assert!(
             !ort_line.contains("download-binaries"),
-            "leindex-embed ort dependency must NOT use download-binaries. Got: {}",
+            "root ort dependency must NOT use download-binaries. Got: {}",
             ort_line
         );
         assert!(
             !ort_line.contains("copy-dylibs"),
-            "leindex-embed ort dependency must NOT use copy-dylibs. Got: {}",
+            "root ort dependency must NOT use copy-dylibs. Got: {}",
             ort_line
         );
     }
@@ -323,7 +318,6 @@ mod setup_command {
 
 // ============================================================================
 // VAL-CARGO-011: No ORT vendored into ~/.cargo/bin/
-// (Static check: no build mechanism copies .so files into install root)
 // ============================================================================
 
 mod no_ort_vendoring {
@@ -354,85 +348,73 @@ mod no_ort_vendoring {
         );
     }
 
-    /// VAL-DOCS-010: No source references to ort-lib/ remain.
+    /// VAL-DOCS-010: No source references to ort-lib/ remain in the root build script.
     #[test]
     fn no_source_references_to_ort_lib() {
-        // Check build scripts
-        for rel in ["build.rs", "crates/leindex-embed/build.rs"] {
-            let path = repo_root().join(rel);
-            if let Ok(src) = std::fs::read_to_string(&path) {
-                // Allow references in comments explaining what was removed
-                for line in src.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.starts_with("//") || trimmed.starts_with("#") {
-                        continue;
-                    }
-                    assert!(
-                        !trimmed.contains("ort-lib"),
-                        "Build script {} references ort-lib/ in code: {}",
-                        rel,
-                        trimmed
-                    );
+        let path = repo_root().join("build.rs");
+        if let Ok(src) = std::fs::read_to_string(&path) {
+            for line in src.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") || trimmed.starts_with("#") {
+                    continue;
                 }
+                assert!(
+                    !trimmed.contains("ort-lib"),
+                    "Build script references ort-lib/ in code: {}",
+                    trimmed
+                );
             }
         }
     }
 
-    /// VAL-RELEASE-012: No $ORIGIN rpath in build scripts.
+    /// VAL-RELEASE-012: No $ORIGIN rpath in the root build script.
     #[test]
     fn build_scripts_have_no_origin_rpath() {
-        for rel in ["build.rs", "crates/leindex-embed/build.rs"] {
-            let path = repo_root().join(rel);
-            if let Ok(src) = std::fs::read_to_string(&path) {
-                for line in src.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.starts_with("//") {
-                        continue;
-                    }
-                    assert!(
-                        !trimmed.contains("$ORIGIN"),
-                        "Build script {} still uses $ORIGIN rpath: {}",
-                        rel,
-                        trimmed
-                    );
+        let path = repo_root().join("build.rs");
+        if let Ok(src) = std::fs::read_to_string(&path) {
+            for line in src.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") {
+                    continue;
                 }
+                assert!(
+                    !trimmed.contains("$ORIGIN"),
+                    "Build script still uses $ORIGIN rpath: {}",
+                    trimmed
+                );
             }
         }
     }
 }
 
 // ============================================================================
-// VAL-CARGO-012/013: Version parity
+// VAL-CARGO-012/013: One-crate / two-bin layout
 // ============================================================================
 
-mod version_parity {
+mod one_crate_layout {
     use super::*;
 
-    /// Extract the version = "..." line from a TOML string.
-    fn extract_version(toml: &str) -> Option<String> {
-        for line in toml.lines() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("version = ") {
-                let v = rest.trim().trim_matches('"');
-                if !v.is_empty() {
-                    return Some(v.to_string());
-                }
-            }
-        }
-        None
-    }
-
-    /// VAL-DOCS-005 / VAL-CARGO-012: Root and subcrate versions must match.
+    /// VAL-CARGO-012: The retired leindex-embed subcrate is gone; worker source
+    /// lives at src/embed/ and the wrapper at src/bin/leindex-embed.rs.
     #[test]
-    fn versions_match_across_crates() {
-        let root = root_cargo_toml();
-        let embed = embed_cargo_toml();
-        let root_v = extract_version(&root).expect("root Cargo.toml missing version");
-        let embed_v = extract_version(&embed).expect("embed Cargo.toml missing version");
-        assert_eq!(
-            root_v, embed_v,
-            "Version mismatch: root={} embed={}",
-            root_v, embed_v
+    fn one_crate_two_bin_layout() {
+        let root = repo_root();
+        assert!(
+            !root.join("crates").join("leindex-embed").exists(),
+            "crates/leindex-embed must not exist (subcrate retired into src/embed)"
+        );
+        assert!(root.join("src").join("embed").join("mod.rs").is_file());
+        assert!(
+            root.join("src")
+                .join("embed")
+                .join("worker_main.rs")
+                .is_file()
+        );
+        assert!(
+            root.join("src")
+                .join("bin")
+                .join("leindex-embed.rs")
+                .is_file()
         );
     }
 }
@@ -451,5 +433,18 @@ mod docs_packaging {
             cargo.contains("/docs/NEURAL_SETUP.md"),
             "crate package include list must contain docs/NEURAL_SETUP.md because README points to it"
         );
+    }
+
+    /// Package includes must ship the merged worker source + shared config/skip_dirs.
+    #[test]
+    fn crate_package_includes_embed_source() {
+        let cargo = root_cargo_toml();
+        for inc in ["/src/embed/**", "/src/config.rs", "/src/skip_dirs.rs"] {
+            assert!(
+                cargo.contains(inc),
+                "crate package include list must contain '{}' (merged worker source)",
+                inc
+            );
+        }
     }
 }

@@ -26,6 +26,38 @@ fn test_server_config_default() {
     assert!(config.bind_address.port() >= 10000);
 }
 
+#[test]
+fn test_process_idle_clock_touch_resets_idle() {
+    let clock = ProcessIdleClock::new();
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    assert!(
+        clock.idle_duration() >= std::time::Duration::from_millis(20),
+        "idle grows while untouched"
+    );
+    clock.touch();
+    assert!(
+        clock.idle_duration() < std::time::Duration::from_millis(10),
+        "touch resets the idle clock"
+    );
+}
+
+#[test]
+fn test_idle_exit_due_logic() {
+    let five_sec = std::time::Duration::from_secs(5);
+    // Idle past the window fires the exit.
+    assert!(idle_exit_due(
+        std::time::Duration::from_secs(6),
+        Some(five_sec)
+    ));
+    // A fresh request (idle < window) does not.
+    assert!(!idle_exit_due(
+        std::time::Duration::from_secs(4),
+        Some(five_sec)
+    ));
+    // Disabled (`0` = None) never fires, even after an hour of silence.
+    assert!(!idle_exit_due(std::time::Duration::from_secs(3600), None));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_read_bounded_line_rejects_oversized_input_and_handles_eof() {
@@ -64,6 +96,7 @@ async fn test_socket_connection_preserves_newline_and_content_length_framing() {
         "framing-test".to_string(),
         session_handshakes.clone(),
         handshake_complete,
+        ProcessIdleClock::new(),
     ));
 
     // An invalid newline-delimited message exercises the newline response
@@ -115,6 +148,7 @@ async fn test_socket_connection_closes_on_malformed_or_incomplete_headers() {
         "malformed-header-test".to_string(),
         Arc::new(DashMap::new()),
         Arc::new(AtomicBool::new(false)),
+        ProcessIdleClock::new(),
     ));
     client.write_all(b"Content-Length: nope\r\n").await.unwrap();
     let mut response = Vec::new();
@@ -128,6 +162,7 @@ async fn test_socket_connection_closes_on_malformed_or_incomplete_headers() {
         "incomplete-header-test".to_string(),
         Arc::new(DashMap::new()),
         Arc::new(AtomicBool::new(false)),
+        ProcessIdleClock::new(),
     ));
     client
         .write_all(b"Content-Length: 8\r\n\r\nshort")

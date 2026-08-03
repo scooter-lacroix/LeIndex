@@ -75,31 +75,131 @@ pub(super) fn platform_binary_name(binary_name: &str) -> String {
     }
 }
 
+/// Env var override for the worker binary path. When set, the value must point
+/// to a worker that exists; a broken explicit path is an actionable error, not
+/// a silent fallthrough to sibling/PATH resolution.
+pub(super) const WORKER_PATH_ENV: &str = "LEINDEX_WORKER_PATH";
+
+/// The version a PATH-discovered worker must report on `--version`.
+///
+/// There is no separate worker protocol version: the worker and main crate are
+/// kept version-aligned by the AGENTS.md version-parity rule, so
+/// `env!("CARGO_PKG_VERSION")` is the compatibility check. See
+/// `src/embed/worker_main.rs` (`run`): `leindex-embed --version` prints exactly
+/// `leindex-embed <CARGO_PKG_VERSION>`.
+const EXPECTED_WORKER_VERSION_LINE: &str = concat!("leindex-embed ", env!("CARGO_PKG_VERSION"));
+
 /// Resolve the path to the worker binary.
 ///
-/// First tries the running binary's directory and its Cargo `deps` parent, so
-/// tests/invocations from `target/{debug,release}/deps` use the worker built
-/// from this checkout instead of an older globally installed binary. Falls
-/// back to PATH lookup for packaged installations.
+/// Precedence (Task 9, embed-merge-1.10.0):
+/// 1. `LEINDEX_WORKER_PATH` if set and present — a set-but-missing path returns
+///    an actionable `NotFound` error and does **not** silently fall through.
+/// 2. Sibling binary in the running exe's directory and its Cargo `deps`
+///    parent (so `target/{debug,release}/deps` tests use this checkout's build).
+///    Trusted by location — no `--version` spawn.
+/// 3. PATH lookup, validated by running `<candidate> --version` and requiring
+///    the output `leindex-embed <CARGO_PKG_VERSION>`. Stale/incompatible PATH
+///    workers are rejected with `NotFound`.
 pub(super) fn resolve_worker_binary() -> Result<PathBuf, std::io::Error> {
     let binary_name = platform_binary_name("leindex-embed");
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            for candidate_dir in [Some(exe_dir), exe_dir.parent()].into_iter().flatten() {
-                let sibling = candidate_dir.join(&binary_name);
-                if sibling.is_file() {
-                    return Ok(sibling);
-                }
-            }
+    let exe_dirs: Vec<PathBuf> = std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            let dir = exe.parent()?.to_path_buf();
+            let grandparent = exe
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf());
+            Some(vec![Some(dir), grandparent])
+        })
+        .map(|v| v.into_iter().flatten().collect())
+        .unwrap_or_default();
+
+    let path_lookup = |name: &str| which::which(name);
+    resolve_worker_binary_with(
+        std::env::var_os(WORKER_PATH_ENV),
+        &exe_dirs,
+        &binary_name,
+        &path_lookup,
+    )
+}
+
+/// Pure resolution core, factored out for testing without touching the real
+/// environment or `current_exe`.
+///
+/// `explicit` is the raw `LEINDEX_WORKER_PATH` value (if set). `exe_dirs` are
+/// the trusted sibling search dirs (exe dir then its parent). `path_lookup`
+/// is the `which`-style PATH resolver, injectable so tests never touch the
+/// user's real PATH.
+fn resolve_worker_binary_with(
+    explicit: Option<std::ffi::OsString>,
+    exe_dirs: &[PathBuf],
+    binary_name: &str,
+    path_lookup: &dyn Fn(&str) -> Result<PathBuf, which::Error>,
+) -> Result<PathBuf, std::io::Error> {
+    // 1. Explicit override: set means it must work, never silently fall through.
+    if let Some(raw) = explicit {
+        let candidate = PathBuf::from(raw);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "{} is set to '{}' but no worker binary exists there \
+                 (remove the override or point it at a valid leindex-embed)",
+                WORKER_PATH_ENV,
+                candidate.display()
+            ),
+        ));
+    }
+
+    // 2. Sibling binary — trusted by location, no version spawn.
+    for dir in exe_dirs {
+        let sibling = dir.join(binary_name);
+        if sibling.is_file() {
+            return Ok(sibling);
         }
     }
-    // Fall back to PATH lookup
-    which::which(&binary_name).map_err(|e| {
+
+    // 3. PATH fallback — must be version-compatible.
+    let candidate = path_lookup(binary_name).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("worker binary '{}' not found in PATH: {}", binary_name, e),
         )
-    })
+    })?;
+    if path_candidate_version_matches(&candidate) {
+        Ok(candidate)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "PATH worker '{}' did not report the expected version \
+                 (want '{}'); remove or update it",
+                candidate.display(),
+                EXPECTED_WORKER_VERSION_LINE
+            ),
+        ))
+    }
+}
+
+/// Run `<candidate> --version` and accept only an exact match against the
+/// current crate version. Used solely for the PATH fallback; sibling and
+/// explicit-override candidates are trusted by location and skip this spawn.
+fn path_candidate_version_matches(candidate: &std::path::Path) -> bool {
+    let output = match std::process::Command::new(candidate)
+        .arg("--version")
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.trim_end() == EXPECTED_WORKER_VERSION_LINE
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -109,41 +209,30 @@ pub(super) struct WorkerConfigEnv {
     pub(super) model_name: Option<String>,
 }
 
-/// Read worker-relevant values from the user-level
-/// `~/.leindex/config/leindex.toml` (honoring `$LEINDEX_HOME`).
+/// Read worker-relevant values from the shared user-level config
+/// (`crate::config::LeIndexConfig`, honoring `$LEINDEX_HOME`).
 ///
 /// VAL-SETUP-020/VAL-ORT-006: when the worker is spawned from the daemon we
 /// surface the dylib path chosen during `leindex setup` so the worker's ORT
-/// discovery chain picks the same build. The lookup is intentionally minimal
-/// (text scan, mirroring `leindex-embed::ort_discovery::read_config_ort_path`)
-/// because the file is tiny and pulling a full TOML parser into the search
-/// crate is not worth it.
-///
+/// discovery chain picks the same build. Reads the TOML directly (the
+/// production caller memoizes via its own OnceLock — see
+/// `WorkerHandle::cached_config`).
 pub(super) fn read_worker_config_env_from_config() -> WorkerConfigEnv {
-    let Some(home) = leindex_home_dir() else {
-        return WorkerConfigEnv::default();
-    };
-    let cfg = home.join("config").join("leindex.toml");
-    let Ok(contents) = std::fs::read_to_string(&cfg) else {
-        return WorkerConfigEnv::default();
-    };
-    let mut parsed = WorkerConfigEnv::default();
-    for raw in contents.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(value) = parse_config_assignment(line, "ort_dylib_path") {
-            parsed.ort_dylib_path = Some(value);
-        } else if let Some(value) = parse_config_assignment(line, "execution_provider") {
-            if !value.eq_ignore_ascii_case("auto") {
-                parsed.execution_provider = Some(value);
-            }
-        } else if let Some(value) = parse_config_assignment(line, "model_name") {
-            parsed.model_name = Some(value);
-        }
+    // Read the TOML directly (not load_cached()): the sole production caller
+    // (WorkerHandle::cached_config) wraps this in its own OnceLock, so the
+    // process-wide cache here would be redundant. Using the non-cached load
+    // keeps the config-reading test helpers honest — they write a fresh
+    // leindex.toml into a temp LEINDEX_HOME and expect to read it back
+    // regardless of which test initialized the global cache first.
+    let config = crate::config::LeIndexConfig::load()
+        .unwrap_or_else(|_| crate::config::LeIndexConfig::default());
+    let provider = config.neural.execution_provider.trim().to_ascii_lowercase();
+    WorkerConfigEnv {
+        ort_dylib_path: config.neural.ort_dylib_path.clone(),
+        execution_provider: (provider != "auto" && !provider.is_empty()).then_some(provider),
+        model_name: (!config.neural.model_name.trim().is_empty())
+            .then(|| config.neural.model_name.clone()),
     }
-    parsed
 }
 
 #[cfg(test)]
@@ -163,11 +252,11 @@ pub(super) fn read_worker_model_name_from_config() -> Option<String> {
 
 pub(super) fn migraphx_model_cache_path(model_name: Option<&str>) -> Option<std::path::PathBuf> {
     let model = sanitize_cache_component(model_name.unwrap_or("qwen3-embed-0.6b-dynamic"));
-    let batch = leindex_embed::runtime::configured_onnx_inference_batch_size(
+    let batch = crate::embed::runtime::configured_onnx_inference_batch_size(
         model_name.unwrap_or("qwen3-embed-0.6b-dynamic"),
         "migraphx",
     );
-    let sequence = leindex_embed::runtime::configured_onnx_sequence_len();
+    let sequence = crate::embed::runtime::configured_onnx_sequence_len();
     // Key on batch + sequence only. A compiled MIGraphX program depends on the
     // model graph + input shape, never on LeIndex's software version (the model
     // name is already a parent dir segment). Including the package version here
@@ -263,8 +352,8 @@ pub(super) fn daemon_socket_path(
     let provider_name = provider.unwrap_or("auto");
     let model_name = model_name.unwrap_or("qwen3-embed-0.6b");
     let batch =
-        leindex_embed::runtime::configured_onnx_inference_batch_size(model_name, provider_name);
-    let sequence = leindex_embed::runtime::configured_onnx_sequence_len();
+        crate::embed::runtime::configured_onnx_inference_batch_size(model_name, provider_name);
+    let sequence = crate::embed::runtime::configured_onnx_sequence_len();
     let descriptor = format!(
         "{}:{provider_name}:{model_name}:b{batch}:s{sequence}",
         env!("CARGO_PKG_VERSION")
@@ -519,17 +608,6 @@ pub(super) fn probe_daemon_health_with_timeout(
     }
 }
 
-pub(super) fn parse_config_assignment(line: &str, key: &str) -> Option<String> {
-    let rest = line.strip_prefix(key)?.trim_start();
-    let value_part = rest.strip_prefix('=')?.trim();
-    let trimmed = value_part.trim_matches(|c| c == '"' || c == '\'').trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
 pub(super) fn parse_startup_report_provider(line: &str) -> Option<String> {
     let (_, report) = line.split_once("startup_report")?;
     report
@@ -544,8 +622,7 @@ pub(super) fn parse_startup_report_provider(line: &str) -> Option<String> {
 /// Uses environment variables directly (rather than the `dirs` crate) so we
 /// don't couple the `onnx` feature to the `cli` feature's optional `dirs`
 /// dependency. `$LEINDEX_HOME` wins over `$HOME/.leindex` to stay consistent
-/// with the rest of the codebase (see `cli/neural_config.rs` and
-/// `crates/leindex-embed`).
+/// with the rest of the codebase (see `config.rs` and `src/embed`).
 pub(super) fn leindex_home_dir() -> Option<std::path::PathBuf> {
     if let Ok(custom) = std::env::var("LEINDEX_HOME") {
         let p = std::path::PathBuf::from(&custom);
@@ -924,5 +1001,219 @@ impl EmbeddingClient {
     pub(super) fn cached_config(&self) -> &WorkerConfigEnv {
         self.cached_config
             .get_or_init(read_worker_config_env_from_config)
+    }
+}
+
+#[cfg(test)]
+mod frame_size_tests {
+    use super::*;
+
+    /// CR-F10 (pr32 plan): the client response-frame guard must match the
+    /// worker-side incoming-frame guard (`max_frame_size * 2` = 32 MiB with the
+    /// default 16 MiB max_frame_size).
+    #[test]
+    fn test_max_response_frame_size_matches_worker_guard() {
+        assert_eq!(MAX_RESPONSE_FRAME_SIZE, 32 * 1024 * 1024);
+        assert_eq!(
+            MAX_RESPONSE_FRAME_SIZE as usize,
+            crate::embed::runtime::DEFAULT_MAX_FRAME_SIZE * 2
+        );
+    }
+}
+
+#[cfg(test)]
+mod worker_binary_resolution_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Build a detached temp fake worker that prints `line` on `--version`
+    /// and exits 0. The file is kept (not auto-removed) so the test can spawn
+    /// it; tests rely on the OS temp cleanup rather than a guard.
+    fn fake_worker(line: &str) -> std::path::PathBuf {
+        // NamedTempFile + keep(): a single temp file we chmod and spawn.
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let script = format!("#!/bin/sh\necho '{line}'\n");
+        f.write_all(script.as_bytes()).unwrap();
+        f.flush().unwrap();
+        // `keep()` detaches the temp file, returning (File, PathBuf). The
+        // returned PathBuf is what we chmod, spawn, and assert against.
+        let (_file, path) = f.keep().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    /// Precedence rule 1: a valid explicit `LEINDEX_WORKER_PATH` wins, even
+    /// when a sibling and a PATH candidate are present.
+    #[test]
+    fn worker_binary_explicit_override_wins() {
+        let explicit_path = fake_worker("leindex-embed 0.0.0-dummy");
+        let binary_name = platform_binary_name("leindex-embed");
+        let lookup = |_: &str| Err(which::Error::CannotFindBinaryPath);
+        let got = resolve_worker_binary_with(
+            Some(explicit_path.clone().into_os_string()),
+            &[],
+            &binary_name,
+            &lookup,
+        )
+        .unwrap();
+        assert_eq!(got, explicit_path);
+    }
+
+    /// Precedence rule 1 (negative): a set-but-missing explicit path returns
+    /// an actionable NotFound error and does NOT silently fall through to the
+    /// sibling or PATH sources.
+    #[test]
+    fn worker_binary_explicit_bad_path_is_actionable_error() {
+        let binary_name = platform_binary_name("leindex-embed");
+        // A sibling exists and a PATH candidate would match — both must be
+        // ignored because the explicit override is set but broken.
+        let tmp = tempfile::tempdir().unwrap();
+        let sibling = tmp.path().join(&binary_name);
+        std::fs::write(&sibling, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let lookup = |_: &str| Ok(sibling.clone());
+        let bad = tmp.path().join("does-not-exist");
+        let err = resolve_worker_binary_with(
+            Some(bad.clone().into_os_string()),
+            &[tmp.path().to_path_buf()],
+            &binary_name,
+            &lookup,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        let msg = err.to_string();
+        assert!(msg.contains(WORKER_PATH_ENV), "msg={msg}");
+        assert!(msg.contains("does-not-exist"), "msg={msg}");
+    }
+
+    /// Precedence rule 2: sibling binary is trusted by location — no
+    /// `--version` spawn, so even a sibling that prints the wrong version is
+    /// accepted.
+    #[test]
+    fn worker_binary_sibling_trusted_no_version_spawn() {
+        let binary_name = platform_binary_name("leindex-embed");
+        let tmp = tempfile::tempdir().unwrap();
+        let sibling = tmp.path().join(&binary_name);
+        // Deliberately wrong version; sibling trust must ignore it.
+        std::fs::write(&sibling, b"#!/bin/sh\necho 'leindex-embed 0.0.0-stale'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // A lookup that would panic if reached, proving the sibling short-circuits.
+        let lookup = |_: &str| -> Result<PathBuf, which::Error> {
+            panic!("PATH lookup must not run when a sibling exists")
+        };
+        let got =
+            resolve_worker_binary_with(None, &[tmp.path().to_path_buf()], &binary_name, &lookup)
+                .unwrap();
+        assert_eq!(got, sibling);
+    }
+
+    /// Precedence rule 3 (positive): PATH candidate whose `--version` exactly
+    /// matches `leindex-embed <CARGO_PKG_VERSION>` is accepted.
+    #[test]
+    fn worker_binary_path_version_match_accepted() {
+        let expected = format!("leindex-embed {}", env!("CARGO_PKG_VERSION"));
+        let cand = fake_worker(&expected);
+        let binary_name = platform_binary_name("leindex-embed");
+        let target = cand.clone();
+        let lookup = move |_: &str| Ok(target.clone());
+        let got = resolve_worker_binary_with(None, &[], &binary_name, &lookup).unwrap();
+        assert_eq!(got, cand);
+    }
+
+    /// Precedence rule 3 (negative): a stale PATH worker that prints a
+    /// non-matching version is rejected with NotFound. This is the core
+    /// regression guard for stale globally-installed workers.
+    #[test]
+    fn worker_binary_stale_path_version_rejected() {
+        let cand = fake_worker("leindex-embed 0.0.0-stale");
+        let binary_name = platform_binary_name("leindex-embed");
+        let target = cand.clone();
+        let lookup = move |_: &str| Ok(target.clone());
+        let err = resolve_worker_binary_with(None, &[], &binary_name, &lookup).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did not report the expected version"),
+            "msg={msg}"
+        );
+    }
+
+    /// Precedence rule 3 (negative): a PATH worker that prints the right
+    /// version line plus trailing junk (e.g. a debug banner) is still
+    /// rejected — the match is exact after trimming only trailing whitespace.
+    #[test]
+    fn worker_binary_path_version_must_be_exact_line() {
+        let expected = format!("leindex-embed {}", env!("CARGO_PKG_VERSION"));
+        // Extra line after the version → stdout is not a single matching line.
+        let cand = fake_worker(&format!("{expected}\nDEBUG banner"));
+        let binary_name = platform_binary_name("leindex-embed");
+        let target = cand.clone();
+        let lookup = move |_: &str| Ok(target.clone());
+        let err = resolve_worker_binary_with(None, &[], &binary_name, &lookup).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// Precedence rule 3: PATH lookup failure propagates as NotFound.
+    #[test]
+    fn worker_binary_path_not_found_propagates() {
+        let binary_name = platform_binary_name("leindex-embed");
+        let lookup = |_: &str| Err(which::Error::CannotFindBinaryPath);
+        let err = resolve_worker_binary_with(None, &[], &binary_name, &lookup).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// `EXPECTED_WORKER_VERSION_LINE` is `leindex-embed <CARGO_PKG_VERSION>` —
+    /// pins the compatibility contract to the crate version (no separate
+    /// protocol version exists).
+    #[test]
+    fn worker_binary_expected_version_line_is_crate_version() {
+        assert_eq!(
+            EXPECTED_WORKER_VERSION_LINE,
+            format!("leindex-embed {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// `platform_binary_name` reflects the host's extension rule; on Windows
+    /// the resolver searches for `leindex-embed.exe`. Kept as a documented
+    /// expectation rather than a cross-compile assertion.
+    #[test]
+    fn worker_binary_platform_name_has_exe_suffix_on_windows() {
+        let name = platform_binary_name("leindex-embed");
+        if cfg!(windows) {
+            assert_eq!(name, "leindex-embed.exe");
+        } else {
+            assert_eq!(name, "leindex-embed");
+        }
+    }
+
+    /// Windows helper parity: under `#[cfg(windows)]` a `.exe` fake worker
+    /// built by `fake_worker` would be exercised here. On non-Windows hosts
+    /// this is a no-op so the suite stays green, but the test documents the
+    /// `.exe`-suffix contract for the stale-rejection path.
+    #[cfg(windows)]
+    #[test]
+    fn worker_binary_stale_exe_rejected_windows() {
+        // Reuse the version-mismatch logic with a `.exe`-named temp file.
+        // NamedTempFile has no extension; build one in a tempdir instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let cand = tmp.path().join("leindex-embed.exe");
+        std::fs::write(&cand, b"this is not a runnable exe\n").unwrap();
+        let binary_name = platform_binary_name("leindex-embed");
+        let target = cand.clone();
+        let lookup = move |_: &str| Ok(target.clone());
+        let err = resolve_worker_binary_with(None, &[], &binary_name, &lookup).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }

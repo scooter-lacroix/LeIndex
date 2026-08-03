@@ -49,6 +49,28 @@ leindex mcp --stdio
 
 This reads JSON-RPC from stdin and writes responses to stdout, with logs to stderr.
 
+### Server Lifecycle (idle exit & engine eviction)
+
+Long-lived MCP servers can accumulate resident memory — each loaded project engine
+holds its index in RSS. LeIndex self-manages this so idle servers release memory
+instead of being swapped out. Configure in `leindex.toml`:
+
+```toml
+[mcp]
+# Exit the server process after this many seconds with no requests.
+# 0 = never (server lives until stdin EOF / socket close). Default: 1800.
+idle_timeout_secs = 1800
+# Unload a loaded project engine after this many seconds idle. It is reloaded
+# transparently on the next tool call. 0 = keep loaded once touched. Default: 600.
+engine_max_idle_secs = 600
+```
+
+The `--mcp-idle-timeout-secs <N>` flag overrides `idle_timeout_secs` for a single
+`leindex mcp` invocation (highest priority; `0` disables). MCP clients respawn the
+server on the next tool call, so a self-exited server is not lost — it just stops
+holding memory while idle. In-flight requests are never interrupted; idle checks
+run only between requests.
+
 ---
 
 ## Tool Comparison vs Standard Tools
@@ -1717,5 +1739,5 @@ Or via the health endpoint:
 
 ```bash
 curl http://localhost:3000/health
-# {"status":"ok","service":"leindex","version":"1.9.0"}
+# {"status":"ok","service":"leindex","version":"1.9.5"}
 ```

@@ -22,6 +22,8 @@
 // }
 // ```
 
+/// Advisory per-project single-instance lock (D-3 memory-pressure).
+pub mod lock;
 /// Dispatch macro for `ToolHandler` enum and match-arm generation.
 #[macro_use]
 pub mod macros;

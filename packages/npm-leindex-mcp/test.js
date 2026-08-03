@@ -102,10 +102,10 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
   assert(installer.isOrtBundleLibraryName(expected), `${expected} should be accepted as a bundle library`);
   assert(installer.isOrtBundleLibraryName(providerHelper), 'provider helper libraries should be accepted as bundle libraries');
   assert(!installer.isOrtBundleLibraryName('README.txt'), 'non-library files should not be accepted as bundle libraries');
-  assert.strictEqual(installer.assertSafeArchiveFileName('leindex-1.9.0-linux-x86_64.tar.gz'), 'leindex-1.9.0-linux-x86_64.tar.gz');
+  assert.strictEqual(installer.assertSafeArchiveFileName('leindex-1.9.5-linux-x86_64.tar.gz'), 'leindex-1.9.5-linux-x86_64.tar.gz');
   assert.throws(() => installer.assertSafeArchiveFileName('../leindex.tar.gz'), /Unsafe release asset name/);
   assert.throws(() => installer.assertSafeArchiveFileName('..\\leindex.zip'), /Unsafe release asset name/);
-  assert(installer.isSafeArchiveMemberName('leindex-1.9.0-linux-x86_64/bin/leindex'));
+  assert(installer.isSafeArchiveMemberName('leindex-1.9.5-linux-x86_64/bin/leindex'));
   assert(!installer.isSafeArchiveMemberName('../../etc/passwd'));
   assert(!installer.isSafeArchiveMemberName('/tmp/pwned'));
   assert(!installer.isSafeArchiveMemberName('C:\\temp\\pwned'));
@@ -352,5 +352,64 @@ if (fs.existsSync(binaryPath)) {
 } else {
   console.log('  ⚠ Binary not installed (run: npm install)');
 }
+
+// Test 7: One-crate install-layout guard
+// Statically rejects resurrected active forms of the retired leindex-embed
+// subcrate (cargo install leindex-embed, -p leindex-embed, leindex-embed/onnx)
+// while ALLOWING executable-name references (--bin leindex-embed, prose).
+console.log('Test 7: Retired-subcrate install guard');
+const installJsPath = path.join(__dirname, 'install.js');
+const installJsSource = fs.readFileSync(installJsPath, 'utf8');
+
+// (a) The installer itself must be clean.
+assert.strictEqual(
+  installer.findRetiredSubcrateInstallCommands(installJsSource).length,
+  0,
+  'install.js must not contain active retired leindex-embed install/publish forms'
+);
+
+// (b) The guard detects each forbidden active form ...
+assert.strictEqual(
+  installer.findRetiredSubcrateInstallCommands('cargo install leindex-embed --features onnx').length,
+  1,
+  'guard must flag `cargo install leindex-embed`'
+);
+assert.strictEqual(
+  installer.findRetiredSubcrateInstallCommands('cargo build -p leindex-embed --features onnx').length,
+  1,
+  'guard must flag `-p leindex-embed`'
+);
+assert.strictEqual(
+  installer.findRetiredSubcrateInstallCommands('cargo build --features leindex-embed/onnx').length,
+  1,
+  'guard must flag `leindex-embed/onnx`'
+);
+
+// (c) ... while ALLOWING executable-name references and prose.
+assert.strictEqual(
+  installer.findRetiredSubcrateInstallCommands('cargo install --bin leindex-embed leindex').length,
+  0,
+  'guard must allow `--bin leindex-embed` (executable name)'
+);
+assert.strictEqual(
+  installer.findRetiredSubcrateInstallCommands('   ✓ Installed leindex-embed worker via cargo').length,
+  0,
+  'guard must allow prose mentioning the leindex-embed binary/worker'
+);
+assert.strictEqual(
+  installer.findRetiredSubcrateInstallCommands('const workerName = "leindex-embed";').length,
+  0,
+  'guard must allow the executable name as a string literal'
+);
+
+// (d) The --self-check CLI mode exits 0 against the current file.
+const { spawnSync } = require('child_process');
+const selfCheck = spawnSync(process.execPath, [installJsPath, '--self-check'], { encoding: 'utf8' });
+assert.strictEqual(
+  selfCheck.status,
+  0,
+  `install.js --self-check must exit 0 on a clean installer (got ${selfCheck.status}): ${selfCheck.stderr}`
+);
+console.log('  ✓ No retired leindex-embed install/publish forms; executable-name refs allowed\n');
 
 console.log('\n✅ All tests passed!');

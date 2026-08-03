@@ -13,13 +13,12 @@ use crate::search::hnsw::{HNSWIndex, HNSWParams};
 use crate::search::quantization::int8_hnsw::{Int8HnswIndex, Int8HnswParams};
 use crate::search::query::{MAX_EMBEDDING_DIMENSION, MIN_EMBEDDING_DIMENSION};
 use crate::search::ranking::{HybridScorer, Score};
-use crate::search::vector::{MmapEmbeddingIndex, VectorIndex};
+use crate::search::vector::VectorIndex;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 
 // ============================================================================
 // CONSTANTS & VALIDATION
@@ -50,11 +49,12 @@ pub const WORK_HOISTER_MAX_ENTRIES: usize = 4_096;
 /// Maximum byte budget for the work-hoister cache.
 pub const WORK_HOISTER_MAX_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 
-/// Output dimension of the bundled Qwen3 embedding model.
-const NEURAL_EMBEDDING_DIMENSION: usize = 1024;
+mod fragment;
 mod int8_quality;
 mod node_info;
 mod pruner;
+#[cfg(feature = "storage")]
+mod snapshot;
 mod staged_retrieval;
 mod vector_impl;
 
@@ -107,6 +107,29 @@ pub struct SearchEngine {
     /// `vector_index` — so no hand-rolled scan. None when no neural mmap is
     /// loaded (tests, tfidf-only indexes).
     neural_vector_index: Option<VectorIndexImpl>,
+    /// Fragment embeddings (sub-symbol semantic chunks), hydrated from
+    /// `.leindex/fragments_embeddings.bin` at search-load. Same lazy-paged
+    /// MmapVectorIndex pattern as the neural index; None when the fragment
+    /// layer is off or no fragment mmap is present.
+    fragment_vector_index: Option<VectorIndexImpl>,
+    /// Master switch for the fragment layer (from `[search]
+    /// fragment_index_enabled`). Gating renormalization on this — NOT on
+    /// `fragment_weight > 0` — keeps the default path byte-identical
+    /// (fragment-embeddings 1.11.0 Task 6, invariant 7).
+    fragment_index_enabled: bool,
+    /// Fragment fusion weight from `[search] fragment_weight` (default 0.35,
+    /// empirically tuned: smallest weight with real margin that surfaces
+    /// fragments over strong tfidf matches without regressing node rank).
+    /// Only applied when `fragment_index_enabled` (renormalized into the five
+    /// weights).
+    fragment_weight: f32,
+    /// content_hash → ALL (owner node id, byte range) refs for mapping
+    /// fragment hits back to their Tier-1 owners (invariant 6). A Vec (not a
+    /// single ref) because identical content can legitimately live under N
+    /// owners — dedup must not collapse multi-owner fragments to the first
+    /// (Codex wave-2 item 5). Populated by the cli hydration path from the
+    /// fragment store.
+    fragment_refs: HashMap<String, Vec<(String, (usize, usize))>>,
     /// Complexity cache for O(1) lookups (fixes O(n²) bug)
     complexity_cache: HashMap<String, u32>,
     /// Inverted index for O(1) text lookups: token -> set of node IDs
@@ -124,11 +147,10 @@ pub struct SearchEngine {
     search_cache_bytes: usize,
     /// Configured neural-score weight for the hybrid (None query_type) scoring
     /// arm. Set from `[search] neural_weight` in leindex.toml via
-    /// `set_neural_weight`. Default 0.4 preserves prior behavior when unset.
+    /// `set_neural_weight` (config is the single source of truth; `src/config.rs`
+    /// `default_neural_weight()` = 0.4, matching `HybridScorer::for_code()`).
     neural_weight: f32,
 }
-
-const SEARCH_SNAPSHOT_VERSION: u32 = 1;
 
 impl SearchEngine {
     /// Create a new search engine with default 768-dim embeddings
@@ -154,6 +176,10 @@ impl SearchEngine {
             search_cache_bytes: 0,
             neural_weight: 0.4,
             neural_vector_index: None,
+            fragment_vector_index: None,
+            fragment_index_enabled: false,
+            fragment_weight: 0.35,
+            fragment_refs: HashMap::new(),
         }
     }
 
@@ -196,6 +222,10 @@ impl SearchEngine {
             search_cache_bytes: 0,
             neural_weight: 0.4,
             neural_vector_index: None,
+            fragment_vector_index: None,
+            fragment_index_enabled: false,
+            fragment_weight: 0.35,
+            fragment_refs: HashMap::new(),
         }
     }
 
@@ -261,6 +291,11 @@ impl SearchEngine {
         // Also drop the lazy-paged neural ANN so a stale mmap isn't reused
         // after a full reindex rebuilds the lexical index from scratch.
         self.neural_vector_index = None;
+        self.fragment_vector_index = None;
+        // And drop the fragment owner refs — a full reindex rebuilds the
+        // fragment layer too, so stale hash → owner mappings must not survive
+        // (phantom fragment hits after reindex; Kilo wave-2 item 6).
+        self.fragment_refs.clear();
     }
 
     /// Append nodes to the existing index without clearing.
@@ -691,175 +726,6 @@ impl SearchEngine {
             .collect()
     }
 
-    /// Create a compact persisted metadata snapshot for fast cold-start load.
-    pub(crate) fn search_snapshot(
-        &self,
-        pdg_nodes: usize,
-        pdg_edges: usize,
-        pdg_fingerprint: String,
-    ) -> SearchSnapshot {
-        let nodes = self
-            .nodes
-            .iter()
-            .map(|node| {
-                let mut tokens: Vec<String> = self
-                    .node_tokens
-                    .get(&node.node_id)
-                    .map(|set| set.iter().cloned().collect())
-                    .unwrap_or_default();
-                tokens.sort();
-
-                SearchSnapshotNode {
-                    node_id: node.node_id.clone(),
-                    file_path: node.file_path.clone(),
-                    symbol_name: node.symbol_name.clone(),
-                    language: node.language.clone(),
-                    byte_range: node.byte_range,
-                    complexity: node.complexity,
-                    signature: node.signature.clone(),
-                    tokens,
-                }
-            })
-            .collect();
-
-        SearchSnapshot {
-            version: SEARCH_SNAPSHOT_VERSION,
-            pdg_nodes,
-            pdg_edges,
-            pdg_fingerprint,
-            indexed_nodes: self.nodes.len(),
-            nodes,
-        }
-    }
-
-    /// Hydrate the search engine from persisted metadata plus mmap embeddings.
-    ///
-    /// This preserves the same resident structures built by `append_nodes`
-    /// without rereading source files or recomputing TF-IDF/neural embeddings.
-    pub(crate) fn restore_from_search_snapshot(
-        &mut self,
-        snapshot: SearchSnapshot,
-        tfidf_mmap: Arc<MmapEmbeddingIndex>,
-        neural_mmap: Option<Arc<MmapEmbeddingIndex>>,
-    ) -> Result<usize, String> {
-        if snapshot.version != SEARCH_SNAPSHOT_VERSION {
-            return Err(format!(
-                "unsupported search snapshot version {}",
-                snapshot.version
-            ));
-        }
-        if snapshot.indexed_nodes != snapshot.nodes.len() {
-            return Err(format!(
-                "snapshot indexed_nodes {} != node metadata count {}",
-                snapshot.indexed_nodes,
-                snapshot.nodes.len()
-            ));
-        }
-        if tfidf_mmap.len() != snapshot.indexed_nodes {
-            return Err(format!(
-                "TF-IDF mmap row count {} != snapshot indexed_nodes {}",
-                tfidf_mmap.len(),
-                snapshot.indexed_nodes
-            ));
-        }
-        if tfidf_mmap.dimension() as usize != DEFAULT_EMBEDDING_DIMENSION {
-            return Err(format!(
-                "TF-IDF mmap dimension {} != expected {}",
-                tfidf_mmap.dimension(),
-                DEFAULT_EMBEDDING_DIMENSION
-            ));
-        }
-
-        if let Some(ref mmap) = neural_mmap {
-            if mmap.dimension() as usize != NEURAL_EMBEDDING_DIMENSION {
-                return Err(format!(
-                    "neural mmap dimension {} != expected {}",
-                    mmap.dimension(),
-                    NEURAL_EMBEDDING_DIMENSION
-                ));
-            }
-        }
-
-        let mut nodes = Vec::with_capacity(snapshot.nodes.len());
-        let mut missing_tfidf = 0usize;
-        for snap in snapshot.nodes {
-            if tfidf_mmap.find_node_row(&snap.node_id).is_none() {
-                missing_tfidf += 1;
-                continue;
-            }
-
-            nodes.push(NodeInfo {
-                node_id: snap.node_id,
-                file_path: snap.file_path,
-                symbol_name: snap.symbol_name,
-                language: snap.language,
-                content: String::new(),
-                byte_range: snap.byte_range,
-                // Base vectors remain in the mmap-backed vector index below;
-                // keeping empty per-node vectors avoids a second heap mirror.
-                tfidf_embedding: Vec::new(),
-                neural_embedding: None,
-                complexity: snap.complexity,
-                signature: snap.signature,
-                pre_tokenized: Some(snap.tokens),
-            });
-        }
-
-        if missing_tfidf > 0 {
-            return Err(format!(
-                "snapshot missing {} TF-IDF embedding record(s)",
-                missing_tfidf
-            ));
-        }
-
-        let preserved_neural_weight = self.neural_weight;
-        let mut staged = SearchEngine::new();
-        staged.append_nodes(nodes);
-        let node_ids = staged
-            .nodes
-            .iter()
-            .map(|node| node.node_id.clone())
-            .collect::<Vec<_>>();
-        staged.vector_index = VectorIndexImpl::Mmap(
-            MmapVectorIndex::from_snapshot(tfidf_mmap, &node_ids)
-                .map_err(|error| format!("failed to build mmap vector index: {error}"))?,
-        );
-        if let Some(mmap) = neural_mmap.as_ref() {
-            // Build the lazy-paged neural ANN — reuses MmapVectorIndex, the
-            // SAME pattern as the tfidf index above. This is the semantic
-            // RETRIEVAL signal: its top-K hits are unioned into the candidate
-            // pool at query time (replaces the brute-force neural scan, which
-            // duplicated this .search() logic). Failure is non-fatal: semantic
-            // retrieval just won't contribute.
-            match MmapVectorIndex::from_snapshot(std::sync::Arc::clone(mmap), &node_ids) {
-                Ok(idx) => staged.neural_vector_index = Some(VectorIndexImpl::Mmap(idx)),
-                Err(error) => tracing::warn!(
-                    error = %error,
-                    "failed to build neural mmap vector index; semantic retrieval disabled"
-                ),
-            }
-        }
-
-        if staged.nodes.len() != snapshot.indexed_nodes {
-            return Err(format!(
-                "hydrated node count {} != snapshot indexed_nodes {}",
-                staged.nodes.len(),
-                snapshot.indexed_nodes
-            ));
-        }
-        if staged.vector_index.len() != snapshot.indexed_nodes {
-            return Err(format!(
-                "hydrated vector count {} != snapshot indexed_nodes {}",
-                staged.vector_index.len(),
-                snapshot.indexed_nodes
-            ));
-        }
-
-        staged.neural_weight = preserved_neural_weight;
-        *self = staged;
-        Ok(self.nodes.len())
-    }
-
     /// Check if the index is empty
     ///
     /// # Returns
@@ -1116,16 +982,51 @@ impl SearchEngine {
                 _ => HashSet::new(),
             };
 
+        // Fragment layer (Task 6, invariant 6): query the fragment ANN with the
+        // neural query embedding and map content-hash hits back to their Tier-1
+        // owner nodes. Owners enter the candidate pool and carry the best
+        // fragment byte range for result surfacing. Participates only when the
+        // master switch is on AND a neural query embedding exists AND the query
+        // is not Exact-route (exact identifier lookups stay purely lexical —
+        // the CLI zeroes the neural embedding for them; this guard is
+        // defense-in-depth for direct `search()` callers, Codex wave-2 item 4).
+        // (CCN extraction — the whole fragment-owner mapping lives in
+        // `collect_fragment_owners` to keep `search` under the lizard gate.)
+        let (fragment_owner_scores, fragment_owner_ranges) = self.collect_fragment_owners(
+            &query.query_neural_embedding,
+            query.query_type,
+            query.top_k,
+        );
+
+        // Fragment fusion RENORMALIZATION gate (Codex wave-2 item 4): renorm
+        // must be gated on the fragment layer ACTUALLY participating in this
+        // query — master switch ON AND at least one fragment candidate mapped
+        // to an owner. Gating on the config switch alone would downscale the
+        // four base weights by 1/(1+fragment_weight) even when every fragment
+        // score is necessarily 0 (exact/neural=None queries; or a hydrated
+        // layer whose mmap/refs are unavailable), silently distorting the
+        // default path. `fragment_owner_scores` being non-empty is exactly the
+        // participation signal (it is populated only when candidates mapped).
+        let fragment_active = self.fragment_index_enabled && !fragment_owner_scores.is_empty();
+
         let candidates = self.collect_search_candidates(
             &text_query,
             &vector_results,
             &neural_candidates,
+            &fragment_owner_scores,
             query.semantic,
         );
 
         for node in candidates {
-            if let Some(result) = self.score_and_collect(node, &query, &text_query, &vector_results)
-            {
+            if let Some(result) = self.score_and_collect(
+                node,
+                &query,
+                &text_query,
+                &vector_results,
+                &fragment_owner_scores,
+                &fragment_owner_ranges,
+                fragment_active,
+            ) {
                 results.push(result);
             }
         }
@@ -1133,6 +1034,7 @@ impl SearchEngine {
         let final_results = self.finalize_results(results, query.top_k, cache_key);
         Ok(final_results)
     }
+
     /// Pre-compute TF-IDF vector search results for semantic queries using the
     /// caller-provided query embedding. Returns empty when semantic retrieval
     /// has no query vector or the query is non-semantic.
@@ -1162,6 +1064,7 @@ impl SearchEngine {
         text_query: &TextQueryPreprocessed,
         vector_results: &HashMap<String, f32>,
         neural_candidates: &HashSet<String>,
+        fragment_owner_scores: &HashMap<String, f32>,
         semantic: bool,
     ) -> Vec<&'a NodeInfo> {
         if text_query.query_tokens.is_empty() {
@@ -1175,8 +1078,10 @@ impl SearchEngine {
                 }
             }
         }
-        let no_matches =
-            candidate_ids.is_empty() && neural_candidates.is_empty() && vector_results.is_empty();
+        let no_matches = candidate_ids.is_empty()
+            && neural_candidates.is_empty()
+            && fragment_owner_scores.is_empty()
+            && vector_results.is_empty();
         if no_matches && !semantic {
             return Vec::new();
         }
@@ -1190,6 +1095,7 @@ impl SearchEngine {
                     candidate_ids.contains(node.node_id.as_str())
                         || vector_results.contains_key(&node.node_id)
                         || neural_candidates.contains(&node.node_id)
+                        || fragment_owner_scores.contains_key(node.node_id.as_str())
                 })
                 .collect()
         }
@@ -1342,8 +1248,19 @@ impl SearchEngine {
             if !coarse_candidate_ids.contains(&node.node_id) {
                 continue;
             }
-            if let Some(result) = self.score_and_collect(node, &query, &text_query, &vector_results)
-            {
+            // The staged (coarse-then-exact) path does not fuse fragment
+            // candidates (Task 6 wires the authoritative `search` path); empty
+            // fragment maps + fragment_active=false keep its behavior
+            // byte-identical to before (no fragment renorm either).
+            if let Some(result) = self.score_and_collect(
+                node,
+                &query,
+                &text_query,
+                &vector_results,
+                &HashMap::new(),
+                &HashMap::new(),
+                false,
+            ) {
                 results.push(result);
             }
         }
@@ -1365,6 +1282,9 @@ impl SearchEngine {
         query: &SearchQuery,
         text_query: &TextQueryPreprocessed,
         vector_results: &HashMap<String, f32>,
+        fragment_scores: &HashMap<String, f32>,
+        fragment_ranges: &HashMap<String, (usize, usize)>,
+        fragment_active: bool,
     ) -> Option<SearchResult> {
         let text_score = self.calculate_text_score_optimized(
             text_query,
@@ -1385,8 +1305,20 @@ impl SearchEngine {
             return None;
         }
 
+        // Fragment score (Task 6): best fragment-similarity for this owner, or
+        // 0.0 when the fragment layer is off / this node had no fragment hits.
+        let fragment_score = fragment_scores.get(&node.node_id).copied().unwrap_or(0.0);
+
         // Compute composite score using the shared scoring logic.
-        let score = self.compute_score(query, text_query, node, text_score, tfidf_score);
+        let score = self.compute_score(
+            query,
+            text_query,
+            node,
+            text_score,
+            tfidf_score,
+            fragment_score,
+            fragment_active,
+        );
         if score.overall <= 0.0 {
             return None;
         }
@@ -1413,6 +1345,7 @@ impl SearchEngine {
             score,
             context: None,
             byte_range: node.byte_range,
+            fragment_byte_range: fragment_ranges.get(&node.node_id).copied(),
             line_number: None, // enriched by LeIndex::search()
         })
     }
@@ -1501,6 +1434,8 @@ impl SearchEngine {
         node: &NodeInfo,
         text_score: f32,
         tfidf_score: f32,
+        fragment_score: f32,
+        fragment_active: bool,
     ) -> Score {
         let structural_score = (node.complexity as f32 / 100.0).min(1.0);
         let neural_score = self.neural_score(query, node);
@@ -1511,10 +1446,48 @@ impl SearchEngine {
         );
         let (tfidf_weight, neural_weight, structural_weight, text_weight) =
             self.scoring_weights(query, neural_available);
+        // Fragment fusion (Task 6): renormalize ONLY when the fragment layer
+        // actually participates in this query (`fragment_active` — master
+        // switch AND owner-score participation; Codex wave-2 item 4). NOT
+        // `fragment_weight > 0` (the default 0.35 would renormalize with the
+        // feature off) and NOT the bare config switch (a layer with no mmap /
+        // refs / neural query embedding yields fragment score 0 for every
+        // node, so renorm would distort the base weights for nothing). When
+        // inactive the fragment weight is 0.0 and the base four are untouched.
+        let (tfidf_weight, neural_weight, structural_weight, text_weight, fragment_weight) =
+            if fragment_active {
+                crate::search::ranking::HybridScorer::renormalize_weights(
+                    tfidf_weight,
+                    neural_weight,
+                    structural_weight,
+                    text_weight,
+                    self.fragment_weight.clamp(0.0, 1.0),
+                )
+            } else {
+                (
+                    tfidf_weight,
+                    neural_weight,
+                    structural_weight,
+                    text_weight,
+                    0.0,
+                )
+            };
         let mut score = self
             .scorer
-            .with_weights_hybrid(tfidf_weight, neural_weight, structural_weight, text_weight)
-            .score_hybrid(tfidf_score, neural_score, structural_score, text_score);
+            .with_weights_hybrid5(
+                tfidf_weight,
+                neural_weight,
+                structural_weight,
+                text_weight,
+                fragment_weight,
+            )
+            .score_hybrid5(
+                tfidf_score,
+                neural_score,
+                structural_score,
+                text_score,
+                fragment_score,
+            );
 
         Self::apply_score_adjustments(&mut score, text_query, node, is_exact_mode);
         score

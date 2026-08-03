@@ -1,3 +1,81 @@
+# LeIndex 1.9.5 Release Notes
+
+Release date: 2026-08-01
+
+LeIndex 1.9.5 merges the embedding worker into the root crate, pins the ONNX
+Runtime load-dynamic fix, makes every execution provider runtime-selectable,
+reworks the release pipeline for a single crate that ships two binaries, and
+adds an opt-in fragment embedding layer backed by a content-hash store.
+
+## One crate, two binaries
+
+- The `leindex-embed` worker source now lives in `src/embed/`; the root
+  `leindex-embed` binary is a thin wrapper around
+  `leindex::embed::worker_main::run`.
+- The `crates/leindex-embed` subcrate is retired. `cargo install leindex
+  --features onnx` installs both the `leindex` and `leindex-embed` binaries
+  from the single root crate.
+- All integration suites and worker tests run against the root crate; the
+  release pipeline carries a retired-subcrate guard.
+
+## ort 2.0.0-rc.13 and runtime-selectable providers
+
+- `ort` is pinned to `2.0.0-rc.13` from crates.io, which contains the
+  load-dynamic deadlock fix (upstream commit `17ed727`). The previous
+  non-propagating `[patch.crates-io]` git patch is removed.
+- The `onnx` feature compiles every execution-provider API (CUDA, MIGraphX,
+  ROCm, CoreML) as marker/API features. No provider SDK is linked at build
+  time; the worker discovers and registers providers at runtime via
+  `load-dynamic`.
+
+## Provider selection and setup
+
+- `auto` resolves via `select_auto_from_availability` (CoreML -> MIGraphX ->
+  CUDA -> CPU) before session attach, so `auto` is never passed to ORT.
+- EP registration uses `.error_on_failure()` with a preserved GPU-to-CPU
+  fallback on terminal provider failure.
+- `rocm` is a deprecated alias that routes to MIGraphX and never registers
+  `ort::ep::ROCm`.
+- Setup gains Auto and CoreML options with host-aware install candidates,
+  persists `auto`, and rejects stale PATH workers via a `--version` check.
+
+## Runtime requirements (unchanged)
+
+- ONNX Runtime is still resolved at runtime; the build does not require any
+  provider SDK to be installed.
+- Core TF-IDF retrieval and PDG relationships are published first and remain
+  queryable if a provider is unavailable.
+- Neural vectors are part of the default semantic path when the worker is
+  healthy.
+
+Cargo, worker, installer, npm, dashboard, pi, PyPI, lockfile, and runtime
+version surfaces are aligned at `1.9.5`.
+
+## Fragment embeddings (opt-in)
+
+LeIndex 1.9.5 also ships a fully-local, opt-in **fragment embedding layer** on
+top of the TF-IDF / PDG / neural stack. Large symbols are split into
+tree-sitter semantic chunks (plus module-level orphan regions) and embedded
+with the same local Qwen3 ONNX worker. Fragments are content-hash-addressed
+(blake3), so incremental indexing is idempotent and deduplicated; the search
+cache key now folds in the fragment knobs and the persisted content root.
+Enable it in `~/.leindex/config/leindex.toml`
+(`[search] fragment_index_enabled = true`, with `fragment_weight` defaulting to
+`0.35`). Everything stays on-machine — no remote service unless you opt into a
+remote embedding provider.
+
+- Sub-symbol semantic chunking (Tier 2) + orphan module coverage (Tier 3).
+- Content-hash-addressed fragment store with incremental sync and crash
+  self-healing (store → root → manifest persistence ordering).
+- Fragment candidates fuse into hybrid retrieval as a renormalized score
+  component and feed the existing local reranker.
+- Cache-key v2 folds fragment enable/weight/root-hash; `leindex setup --check`
+  reports the fragment knobs.
+- The `[search] neural_weight` config default was aligned to the scorer
+  default (0.4).
+
+---
+
 # LeIndex 1.9.0 Release Notes
 
 Release date: 2026-07-21

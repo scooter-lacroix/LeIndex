@@ -19,6 +19,12 @@ pub struct Score {
 
     /// Text match component
     pub text_match: f32,
+
+    /// Fragment (sub-symbol) similarity component. Always 0.0 unless the
+    /// fragment layer is enabled (fragment-embeddings 1.11.0 Task 6).
+    /// Serde-defaults so legacy persisted scores decode as 0.0.
+    #[serde(default)]
+    pub fragment: f32,
 }
 
 impl Score {
@@ -42,6 +48,7 @@ impl Score {
             neural,
             structural,
             text_match,
+            fragment: 0.0,
         }
     }
 
@@ -65,6 +72,10 @@ pub struct HybridScorer {
 
     /// Weight for text match component
     text_weight: f32,
+
+    /// Weight for the fragment (sub-symbol) component. 0.0 unless the
+    /// fragment layer is enabled (fragment-embeddings 1.11.0 Task 6).
+    fragment_weight: f32,
 }
 
 impl HybridScorer {
@@ -89,6 +100,7 @@ impl HybridScorer {
             neural_weight: 0.40,
             structural_weight: 0.15,
             text_weight: 0.15,
+            fragment_weight: 0.0,
         }
     }
 
@@ -101,6 +113,7 @@ impl HybridScorer {
             neural_weight: 0.00,
             structural_weight: 0.20,
             text_weight: 0.20,
+            fragment_weight: 0.0,
         }
     }
 
@@ -114,6 +127,7 @@ impl HybridScorer {
             neural_weight: 0.55,
             structural_weight: 0.10,
             text_weight: 0.10,
+            fragment_weight: 0.0,
         }
     }
 
@@ -140,6 +154,26 @@ impl HybridScorer {
         self.neural_weight = neural;
         self.structural_weight = structural;
         self.text_weight = text;
+        self.fragment_weight = 0.0;
+        self
+    }
+
+    /// Set custom hybrid weights including the fragment (sub-symbol) component
+    /// (fragment-embeddings 1.11.0 Task 6). Callers are expected to renormalize
+    /// the five weights to sum to 1.0 (see [`HybridScorer::renormalize_weights`]).
+    pub fn with_weights_hybrid5(
+        mut self,
+        tfidf: f32,
+        neural: f32,
+        structural: f32,
+        text: f32,
+        fragment: f32,
+    ) -> Self {
+        self.tfidf_weight = tfidf;
+        self.neural_weight = neural;
+        self.structural_weight = structural;
+        self.text_weight = text;
+        self.fragment_weight = fragment;
         self
     }
 
@@ -154,10 +188,26 @@ impl HybridScorer {
 
     /// Calculate combined hybrid score with TF-IDF and neural components
     pub fn score_hybrid(&self, tfidf: f32, neural: f32, structural: f32, text_match: f32) -> Score {
+        self.score_hybrid5(tfidf, neural, structural, text_match, 0.0)
+    }
+
+    /// Calculate the combined hybrid score with a fragment (sub-symbol)
+    /// component (fragment-embeddings 1.11.0 Task 6). With a 0.0 fragment
+    /// weight the result is byte-identical to [`Self::score_hybrid`], keeping
+    /// the default (feature-off) path unchanged.
+    pub fn score_hybrid5(
+        &self,
+        tfidf: f32,
+        neural: f32,
+        structural: f32,
+        text_match: f32,
+        fragment: f32,
+    ) -> Score {
         let overall = tfidf * self.tfidf_weight
             + neural * self.neural_weight
             + structural * self.structural_weight
-            + text_match * self.text_weight;
+            + text_match * self.text_weight
+            + fragment * self.fragment_weight;
 
         Score {
             overall: overall.clamp(0.0, 1.0),
@@ -165,6 +215,7 @@ impl HybridScorer {
             neural,
             structural,
             text_match,
+            fragment,
         }
     }
 
@@ -172,8 +223,36 @@ impl HybridScorer {
         score.overall = (score.tfidf * self.tfidf_weight
             + score.neural * self.neural_weight
             + score.structural * self.structural_weight
-            + score.text_match * self.text_weight)
+            + score.text_match * self.text_weight
+            + score.fragment * self.fragment_weight)
             .clamp(0.0, 1.0);
+    }
+
+    /// Renormalize the five hybrid weights to sum to 1.0 (fragment fusion,
+    /// fragment-embeddings 1.11.0 Task 6).
+    ///
+    /// The base four weights already sum to 1.0; the fragment weight is added
+    /// and every component divided by the new total, so enabling the fragment
+    /// layer keeps the composite in [0, 1] without exceeding it. With a 0.0
+    /// fragment weight the tuple is unchanged (byte-identical default).
+    pub fn renormalize_weights(
+        tfidf: f32,
+        neural: f32,
+        structural: f32,
+        text: f32,
+        fragment: f32,
+    ) -> (f32, f32, f32, f32, f32) {
+        let sum = tfidf + neural + structural + text + fragment;
+        if sum <= f32::EPSILON {
+            return (0.0, 0.0, 0.0, 0.0, 0.0);
+        }
+        (
+            tfidf / sum,
+            neural / sum,
+            structural / sum,
+            text / sum,
+            fragment / sum,
+        )
     }
 
     /// Re-rank results based on query type (legacy method for compatibility)
@@ -367,6 +446,7 @@ mod tests {
                         neural: 0.3,
                         structural: 0.4,
                         text_match: 0.5,
+                        fragment: 0.0,
                     },
                     query_type,
                 }],
@@ -380,5 +460,31 @@ mod tests {
             assert!((score.text_match - expected.3).abs() < f32::EPSILON);
             assert!((score.overall - expected.4).abs() < f32::EPSILON);
         }
+    }
+
+    #[test]
+    fn test_renormalize_weights_sums_to_one() {
+        let (t, n, s, tx, f) = HybridScorer::renormalize_weights(0.3, 0.3, 0.1, 0.3, 0.12);
+        let sum = t + n + s + tx + f;
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "renormalized weights must sum to 1.0"
+        );
+        // Base proportions are preserved: tfidf / neural stays 1.0 (0.3/0.3).
+        assert!((t / n - 1.0).abs() < 1e-6);
+        // Degenerate input yields all zeros rather than NaN.
+        let (t2, n2, s2, tx2, f2) = HybridScorer::renormalize_weights(0.0, 0.0, 0.0, 0.0, 0.0);
+        assert_eq!((t2, n2, s2, tx2, f2), (0.0, 0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn test_score_hybrid5_fragment_component() {
+        let scorer = HybridScorer::new().with_weights_hybrid5(0.3, 0.3, 0.1, 0.3, 0.12);
+        let score = scorer.score_hybrid5(0.8, 0.9, 0.6, 0.4, 0.5);
+        assert_eq!(score.fragment, 0.5);
+        assert!(score.overall <= 1.0);
+        // The 4-arg score_hybrid stays fragment-free (byte-identical default).
+        let base = scorer.score_hybrid(0.8, 0.9, 0.6, 0.4);
+        assert_eq!(base.fragment, 0.0);
     }
 }

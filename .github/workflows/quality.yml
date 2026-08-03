@@ -11,6 +11,64 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # ── Compile-oriented feature matrix (Linux) ─────────────────────────
+  # One published crate, two binaries. Statically verify each feature
+  # combination still compiles and links its test targets without running
+  # runtime ONNX tests (no ORT shared libs / models in CI). The onnx row
+  # also checks the legacy onnx-migraphx alias so a stale feature gate is
+  # caught here, not at release time.
+  compile-matrix:
+    name: Compile (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: default, args: "" }
+          - { name: minimal, args: "--no-default-features --features minimal" }
+          - { name: onnx-install-path, args: "--no-default-features --features onnx" }
+          - { name: all-features, args: "--all-features" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: compile-${{ matrix.name }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            compile-${{ matrix.name }}-cargo-
+      - name: cargo check
+        run: cargo check -p leindex --all-targets ${{ matrix.args }}
+      - name: cargo test --no-run (compile tests, do not execute runtime ONNX)
+        run: cargo test -p leindex --no-run ${{ matrix.args }}
+      - name: Also check legacy onnx-migraphx alias (onnx row only)
+        if: matrix.name == 'onnx-install-path'
+        run: cargo check -p leindex --no-default-features --features onnx-migraphx
+
+  # ── CoreML compile check (macOS, no GPU runner) ─────────────────────
+  # macOS has no self-hosted GPU runner in this repo; we only verify the
+  # strict onnx feature set (which carries ort/coreml) compiles on Darwin.
+  compile-macos-coreml:
+    name: Compile (macOS CoreML)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: compile-macos-coreml-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            compile-macos-coreml-cargo-
+      - name: cargo check (strict onnx, includes ort/coreml)
+        run: cargo check -p leindex --no-default-features --features onnx --all-targets
+
   # ── Duplicate code detection via jscpd ──────────────────────────────
   # Uses jscpd to detect copy-paste code blocks across the Rust source.
   # Threshold: fail if duplication exceeds the staged 8% baseline; reduce toward 5%.
@@ -33,7 +91,6 @@ jobs:
         run: |
           npx --yes jscpd@3.5.10 \
             src/ \
-            crates/ \
             --format "rust" \
             --min-lines 6 \
             --min-tokens 50 \
@@ -63,9 +120,10 @@ jobs:
       - name: Run complexity analysis
         run: |
           # Generate the browsable HTML report (lizard -o always exits 0).
+          # The worker source lives at src/embed/ (the leindex-embed subcrate
+          # was retired into the root crate), so src/ covers the full tree.
           lizard \
             src/ \
-            crates/leindex-embed/src/ \
             -C 15 \
             -x"*/tests/*" \
             -x"*/target/*" \
@@ -75,7 +133,6 @@ jobs:
           # (lizard's -o report mode always exits 0, so the gate is a separate run).
           lizard \
             src/ \
-            crates/leindex-embed/src/ \
             -C 15 \
             -x"*/tests/*" \
             -x"*/target/*" \
@@ -110,7 +167,7 @@ jobs:
               echo "::warning file=$file::Large file: ${lines} lines (max ${MAX_LINES})"
               FOUND_ISSUE=1
             fi
-          done < <(find src crates -name '*.rs' -not -path '*/target/*' 2>/dev/null)
+          done < <(find src -name '*.rs' -not -path '*/target/*' 2>/dev/null)
 
           # Check all source files for size violations (excluding target, node_modules, .git, models)
           while IFS= read -r file; do
@@ -165,12 +222,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check workspace dependency version consistency
         run: |
-          # NOTE: intentionally no `set -e` — this script manages its own exit
-          # code via ERRORS. With `set -e`, a `grep -oP` no-match (returns 1)
-          # or an empty dep_name hitting the assoc-array subscript ("bad array
-          # subscript") aborted the job with exit 1 before any real drift was
-          # computed. Guard both, and exit 1 only on genuine mismatches.
-          MEMBER_FILES=$(find crates tools -name Cargo.toml 2>/dev/null)
+          # NOTE: the default `run` shell applies `set -e`, so EVERY command
+          # below is explicitly guarded (`|| true`, `&&`, or an `if`/`[ ]` test)
+          # so the script always reaches its own ERRORS-based exit. The
+          # workspace is now one root crate + `tools/*` (the `crates/leindex-
+          # embed` subcrate was retired); the `|| true` also keeps this robust
+          # if a member dir is ever absent. Exit 1 only on genuine drift.
+          MEMBER_FILES=$(find tools -name Cargo.toml 2>/dev/null || true)
           ERRORS=0
 
           # Collect all external dependency versions across workspace members
@@ -318,10 +376,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Count tech debt markers
         run: |
-          TODO=$(grep -rIn --include='*.rs' 'TODO' src/ crates/ 2>/dev/null | wc -l)
-          FIXME=$(grep -rIn --include='*.rs' 'FIXME' src/ crates/ 2>/dev/null | wc -l)
-          HACK=$(grep -rIn --include='*.rs' 'HACK' src/ crates/ 2>/dev/null | wc -l)
-          XXX=$(grep -rIn --include='*.rs' 'XXX' src/ crates/ 2>/dev/null | wc -l)
+          TODO=$(grep -rIn --include='*.rs' 'TODO' src/ 2>/dev/null | wc -l)
+          FIXME=$(grep -rIn --include='*.rs' 'FIXME' src/ 2>/dev/null | wc -l)
+          HACK=$(grep -rIn --include='*.rs' 'HACK' src/ 2>/dev/null | wc -l)
+          XXX=$(grep -rIn --include='*.rs' 'XXX' src/ 2>/dev/null | wc -l)
           TOTAL=$((TODO + FIXME + HACK + XXX))
           echo "::notice::Tech debt markers: TODO=$TODO FIXME=$FIXME HACK=$HACK XXX=$XXX Total=$TOTAL"
           echo "Tech debt markers tracked: TODO=$TODO FIXME=$FIXME HACK=$HACK XXX=$XXX Total=$TOTAL" > tech-debt-report.txt
@@ -345,7 +403,7 @@ jobs:
           DEAD=0
           for flag in NeuralSearch RemoteEmbeddings CrossLanguageResolution ExperimentalHnsw StreamingMcp GlobalAutoSync; do
             # Count references outside the definition in feature_flags.rs
-            REFS=$(grep -rIn --include='*.rs' "FeatureFlag::$flag" src/ crates/ 2>/dev/null | grep -v 'src/feature_flags.rs' | wc -l)
+            REFS=$(grep -rIn --include='*.rs' "FeatureFlag::$flag" src/ 2>/dev/null | grep -v 'src/feature_flags.rs' | wc -l)
             if [ "$REFS" -eq 0 ]; then
               echo "::warning::FeatureFlag::$flag is defined but never used outside feature_flags.rs"
               DEAD=$((DEAD + 1))

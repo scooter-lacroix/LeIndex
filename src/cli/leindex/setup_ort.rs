@@ -123,11 +123,18 @@ pub(super) fn check_ort_version_compatibility(detected: &str) -> VersionCompatib
 }
 
 /// Check if a specific execution provider is available in the installed ORT.
+///
+/// Mapping: CoreMl→"CoreMLExecutionProvider", Cuda→"CUDAExecutionProvider",
+/// Migraphx→"MIGraphXExecutionProvider", Cpu→always true, Auto→always false
+/// (the caller must resolve Auto to a concrete candidate before probing).
 pub(super) fn check_provider_available(provider: ExecutionProvider) -> bool {
     let provider_name = match provider {
         ExecutionProvider::Migraphx => "MIGraphXExecutionProvider",
         ExecutionProvider::Cuda => "CUDAExecutionProvider",
+        ExecutionProvider::CoreMl => "CoreMLExecutionProvider",
         ExecutionProvider::Cpu => return true, // CPU is always available
+        // Auto has no fixed provider to probe; callers resolve a candidate first.
+        ExecutionProvider::Auto => return false,
     };
 
     let check_script = format!(
@@ -425,11 +432,11 @@ fn split_pip_bin_override(value: &str) -> Option<Vec<String>> {
 /// VAL-CROSS-015: this is exposed `pub(crate)` so the `diagnostics` command
 /// can surface the same ORT path that `setup --check` reports, keeping the
 /// two surfaces consistent. The chain mirrors
-/// `leindex_embed::ort_discovery::discover_path_only()` but uses the main
+/// `crate::embed::ort_discovery::discover_path_only()` but uses the main
 /// binary's process context (its own current_exe sibling, its own pip).
 pub(crate) fn discover_ort_path() -> Option<PathBuf> {
     #[cfg(feature = "onnx")]
-    if let Some(outcome) = leindex_embed::ort_discovery::discover_path_only() {
+    if let Some(outcome) = crate::embed::ort_discovery::discover_path_only() {
         return Some(outcome.path);
     }
 
@@ -447,7 +454,7 @@ fn discover_ort_path_fallback() -> Option<PathBuf> {
         }
     }
 
-    if let Ok(config) = crate::cli::neural_config::LeIndexConfig::load() {
+    if let Ok(config) = crate::config::LeIndexConfig::load() {
         if let Some(path) = config.neural.ort_dylib_path {
             let path = PathBuf::from(path);
             if path.exists() {

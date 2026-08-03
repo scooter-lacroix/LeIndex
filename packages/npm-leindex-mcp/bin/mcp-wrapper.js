@@ -26,7 +26,9 @@ const binaryName = process.platform === 'win32' ? 'leindex.exe' : 'leindex';
 
 /**
  * The unversioned ONNX Runtime shared library name on the current platform.
- * Mirrors `ort_lib_names()` in `crates/leindex-embed/src/ort_discovery.rs`.
+ * Mirrors `ort_lib_names()` in `src/embed/ort_discovery.rs` (the worker
+ * source was merged into the root crate from the retired crates/leindex-embed
+ * subcrate).
  */
 function getOrtLibNames() {
   if (process.platform === 'win32') {

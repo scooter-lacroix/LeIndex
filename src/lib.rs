@@ -65,6 +65,21 @@ pub mod edit;
 #[cfg(feature = "validation")]
 pub mod validation;
 
+/// Shared directory exclusions used by graph and CLI traversals.
+#[cfg(any(feature = "graph", feature = "cli"))]
+pub mod skip_dirs;
+
+/// User configuration shared by CLI and ONNX worker code.
+#[cfg(any(feature = "cli", feature = "onnx"))]
+pub mod config;
+
+/// ONNX worker protocol and implementation.
+///
+/// Public for package worker binary and integration tests; not stable user API.
+#[cfg(feature = "onnx")]
+#[doc(hidden)]
+pub mod embed;
+
 // Feature flag infrastructure (always available)
 pub mod feature_flags;
 

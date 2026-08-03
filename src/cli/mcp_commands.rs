@@ -1,7 +1,9 @@
 use super::{ToolCommands, get_project_path};
 use crate::cli::leindex::LeIndex;
 use crate::cli::mcp::handlers::{ToolHandler, all_tool_handlers};
+use crate::cli::mcp::lock::{LockOutcome, McpProjectLock};
 use crate::cli::mcp::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
+use crate::cli::mcp::server::{ProcessIdleClock, idle_exit_due};
 use crate::cli::registry::{DEFAULT_MAX_PROJECTS, ProjectRegistry};
 use anyhow::{Context, Result as AnyhowResult};
 use serde_json::{Map, Value};
@@ -63,9 +65,32 @@ pub(super) async fn cmd_tools_impl(
 /// Initialization is deferred: the server enters the stdin read loop immediately
 /// (no SQLite open, no PDG load, no TF-IDF rebuild, no file watcher at startup).
 /// Projects are loaded lazily on first tool call via `ProjectRegistry::get_or_load()`.
-pub(super) async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
+pub(super) async fn cmd_mcp_stdio_impl(
+    project: Option<PathBuf>,
+    idle_timeout_secs: Option<u64>,
+) -> AnyhowResult<()> {
     info!("Starting LeIndex MCP stdio server (lazy project loading)");
     crate::cli::memory_report::observe_rss("mcp_stdio_startup");
+
+    // D-3 advisory single-instance lock: warn when a live sibling already
+    // serves the same canonical project, but NEVER hard-exit — a stdio server
+    // is 1:1 with its agent's pipe, and exiting would break that agent's
+    // client (GrayHill design-flaw resolution, msg 74).
+    let lock_target = project
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .and_then(|path| path.canonicalize().ok());
+    if let Some(canonical) = lock_target {
+        let (outcome, guard) = McpProjectLock::try_acquire(&canonical);
+        if let LockOutcome::AlreadyOwned { pid } = outcome {
+            tracing::warn!(
+                "Another leindex mcp already serves this project (pid {pid}); \
+                 this instance continues in advisory mode (D-3)"
+            );
+        }
+        // Held for the process lifetime; Drop releases the sidecars on exit.
+        let _lock_guard = guard;
+    }
 
     let server = crate::cli::mcp::server::McpServer::new(
         crate::cli::mcp::server::McpServerConfig::default(),
@@ -74,36 +99,106 @@ pub(super) async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult
     spawn_stdio_cleanup(server.clone());
     set_default_project(project).await?;
 
-    let stdin = io::stdin();
-    let mut reader = io::BufReader::new(stdin.lock());
-    let mut stdout = io::stdout().lock();
-    let mut framed_responses = false;
+    let idle_timeout = effective_mcp_idle_timeout(idle_timeout_secs);
+    if let Some(timeout) = idle_timeout {
+        info!(
+            "MCP stdio idle self-exit enabled: exiting after {}s with no requests (D-1)",
+            timeout.as_secs()
+        );
+    }
+    let idle_clock = ProcessIdleClock::new();
 
-    loop {
-        let input = match read_stdio_input(&mut reader) {
-            Ok(StdioInput::Payload { json, framed }) => {
-                framed_responses |= framed;
-                json
-            }
-            Ok(StdioInput::Skip) => continue,
-            Ok(StdioInput::End) => break,
-            Err(error) => {
-                tracing::debug!("MCP stdio: fatal read error, breaking loop: {}", error);
+    // D-1 idle exit: the blocking stdin read cannot be interrupted by tokio,
+    // so a dedicated reader thread feeds the async loop over a channel. The
+    // thread exits naturally with the process.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<io::Result<StdioInput>>(8);
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = io::BufReader::new(stdin.lock());
+        loop {
+            let input = read_stdio_input(&mut reader);
+            let terminal = matches!(input, Ok(StdioInput::End)) | input.is_err();
+            if tx.blocking_send(input).is_err() {
                 break;
             }
-        };
-        let Some((response, parse_error)) = response_for_payload(&input).await else {
-            continue;
-        };
-        if write_stdio_response(&mut stdout, &response, framed_responses).is_err() {
-            if framed_responses && parse_error {
-                continue;
+            if terminal {
+                break;
             }
-            tracing::debug!("MCP stdio: failed to write to stdout");
-            break;
+        }
+    });
+
+    let mut stdout = io::stdout().lock();
+    let mut framed_responses = false;
+    let mut idle_ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            maybe_input = rx.recv() => {
+                let input = match maybe_input {
+                    Some(Ok(input)) => input,
+                    Some(Err(error)) => {
+                        tracing::debug!("MCP stdio: fatal read error, breaking loop: {}", error);
+                        break;
+                    }
+                    None => break,
+                };
+                // Any payload (including ping/notifications) resets the clock.
+                idle_clock.touch();
+                if !process_stdio_payload(input, &mut framed_responses, &mut stdout).await {
+                    break;
+                }
+            }
+            _ = idle_ticker.tick() => {
+                if idle_exit_due(idle_clock.idle_duration(), idle_timeout) {
+                    info!(
+                        "MCP stdio server idle for {:?}; exiting (D-1 memory-pressure idle exit)",
+                        idle_timeout
+                    );
+                    break;
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Process one stdio payload and write its response. Returns `false` when the
+/// server loop should exit (stdin `End`, fatal write failure). Extracted from
+/// `cmd_mcp_stdio_impl` so the entry function stays under the CCN-15 gate.
+async fn process_stdio_payload(
+    input: StdioInput,
+    framed_responses: &mut bool,
+    stdout: &mut impl Write,
+) -> bool {
+    let json = match input {
+        StdioInput::Payload { json, framed } => {
+            *framed_responses |= framed;
+            json
+        }
+        StdioInput::Skip => return true,
+        StdioInput::End => return false,
+    };
+    let Some((response, parse_error)) = response_for_payload(&json).await else {
+        return true;
+    };
+    if write_stdio_response(stdout, &response, *framed_responses).is_err() {
+        if *framed_responses && parse_error {
+            return true;
+        }
+        tracing::debug!("MCP stdio: failed to write to stdout");
+        return false;
+    }
+    true
+}
+
+/// Resolve the effective MCP idle self-exit window (D-1): the CLI flag wins
+/// over `[mcp] idle_timeout_secs`; `0` disables the feature (`None`).
+fn effective_mcp_idle_timeout(cli_flag: Option<u64>) -> Option<std::time::Duration> {
+    let secs = cli_flag.unwrap_or_else(|| {
+        crate::config::LeIndexConfig::load_cached()
+            .mcp
+            .idle_timeout_secs
+    });
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
 fn spawn_stdio_cleanup(server: crate::cli::mcp::server::McpServer) {
@@ -116,6 +211,20 @@ fn spawn_stdio_cleanup(server: crate::cli::mcp::server::McpServer) {
             let removed = server.cleanup_stale_sessions(SESSION_MAX_IDLE);
             if removed > 0 {
                 tracing::debug!("Cleaned up {} stale session(s)", removed);
+            }
+            // D-2 (memory-pressure): evict loaded project engines idle past
+            // `[mcp] engine_max_idle_secs` so a long-lived MCP process does
+            // not retain every project it ever touched (mmaps + heap freed).
+            if let Some(registry) = crate::cli::mcp::server::SERVER_STATE.get() {
+                let engine_max_idle = std::time::Duration::from_secs(
+                    crate::config::LeIndexConfig::load_cached()
+                        .mcp
+                        .engine_max_idle_secs,
+                );
+                let evicted = registry.evict_idle_engines(engine_max_idle).await;
+                if evicted > 0 {
+                    tracing::info!("Evicted {evicted} idle project engine(s) (D-2)");
+                }
             }
         }
     });
@@ -247,11 +356,22 @@ fn write_stdio_response(writer: &mut impl Write, response: &str, framed: bool) -
 pub(super) async fn cmd_mcp_socket_impl(
     socket_path: &std::path::Path,
     project: Option<PathBuf>,
+    idle_timeout_secs: Option<u64>,
 ) -> AnyhowResult<()> {
     let project_path = get_project_path(project);
     let canonical_path = project_path
         .canonicalize()
         .context("Failed to canonicalize project path")?;
+
+    // D-3 advisory single-instance lock (warn + continue, never hard-exit).
+    let (lock_outcome, guard) = McpProjectLock::try_acquire(&canonical_path);
+    if let LockOutcome::AlreadyOwned { pid } = lock_outcome {
+        tracing::warn!(
+            "Another leindex mcp already serves this project (pid {pid}); \
+             this instance continues in advisory mode (D-3)"
+        );
+    }
+    let _lock_guard = guard;
 
     info!(
         "Starting LeIndex MCP Unix socket server at {} for project: {}",
@@ -284,7 +404,10 @@ pub(super) async fn cmd_mcp_socket_impl(
     println!("Project: {}", canonical_path.display());
     println!("\nPress Ctrl+C to stop the server\n");
 
-    server.run_socket(socket_path).await
+    let idle_timeout = effective_mcp_idle_timeout(idle_timeout_secs);
+    server
+        .run_socket(socket_path, ProcessIdleClock::new(), idle_timeout)
+        .await
 }
 
 /// MCP Unix socket command implementation — stub for non-Unix platforms.
@@ -292,6 +415,7 @@ pub(super) async fn cmd_mcp_socket_impl(
 pub(super) async fn cmd_mcp_socket_impl(
     _socket_path: &std::path::Path,
     _project: Option<PathBuf>,
+    _idle_timeout_secs: Option<u64>,
 ) -> AnyhowResult<()> {
     anyhow::bail!("Unix sockets are not supported on this platform");
 }
@@ -770,6 +894,22 @@ mod tests {
         let mut output = Vec::new();
         write_stdio_response(&mut output, "{}", false).unwrap();
         assert_eq!(output, b"{}\n");
+    }
+
+    #[test]
+    fn test_effective_mcp_idle_timeout_priority_and_zero() {
+        // CLI flag wins over `[mcp] idle_timeout_secs`.
+        assert_eq!(
+            effective_mcp_idle_timeout(Some(5)),
+            Some(std::time::Duration::from_secs(5))
+        );
+        // `0` disables the feature (None).
+        assert_eq!(effective_mcp_idle_timeout(Some(0)), None);
+        // No flag: falls back to the config default (1800).
+        assert_eq!(
+            effective_mcp_idle_timeout(None),
+            Some(std::time::Duration::from_secs(1800))
+        );
     }
 
     #[test]

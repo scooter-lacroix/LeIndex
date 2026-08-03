@@ -96,7 +96,7 @@ This file is the authoritative ledger for the remediation work. Every implementa
 ### 2.2 D4 — Embed-runtime environment-variable isolation
 
 - **Status:** ✅ Complete
-- **File/range:** `crates/leindex-embed/src/runtime_test.rs:9-32` plus guarded tests around `73-187`.
+- **File/range:** `crates/leindex-embed/src/runtime_test.rs:9-32` plus guarded tests around `73-187` (subcrate since merged into root `src/embed/`).
 - **Edit:** Added and applied `EnvVarGuard` to runtime configuration tests.
 - **Logic:** Runtime tests must be order-independent despite process-global environment variables.
 - **Verification:** Workspace tests and ONNX clippy passed in the prior validation cycle; final cycle pending.
@@ -250,8 +250,8 @@ The following inventory is the final `git status --short` accounting. It include
 
 1. `.github/workflows/quality.yml` — jscpd/Lizard workflow syntax and command gate.
 2. `TASKLIST.md` — current gate/reindex/task-status reconciliation.
-3. `crates/leindex-embed/src/runtime_test.rs` — D4 environment guards.
-4. `crates/leindex-embed/src/worker_main.rs` — socket-worker complexity split.
+3. `src/embed/runtime_test.rs` (was `crates/leindex-embed/src/runtime_test.rs`) — D4 environment guards.
+4. `src/embed/worker_main.rs` (was `crates/leindex-embed/src/worker_main.rs`) — socket-worker complexity split.
 5. `src/cli/index_builder/hybrid.rs` — embedding cardinality/readiness validation and TF-IDF documentation.
 6. `src/cli/index_builder/mod.rs` — admission metrics, neural admission plumbing, summary precompute, source-collection rationale.
 7. `src/cli/index_builder/tests.rs` — indexing regressions.
@@ -383,7 +383,7 @@ This batch is recorded before any source edit. Each item will be marked complete
 | MCP framing regression | `src/cli/mcp/server.rs` | socket loop `1224-1393`, tests `1570+` | Exercise actual Unix-socket Content-Length framing, newline framing, malformed headers, incomplete headers, and timeout/close behavior. | 🔄 In progress |
 | Lizard split: MCP socket | `src/cli/mcp/server.rs` | `handle_socket_connection` around `1224-1393` | Extract framing/header/payload/response helpers without changing protocol behavior; reduce CCN below 16. | 🔄 In progress |
 | Lizard split: phase analysis | `src/cli/mcp/phase_handler.rs` | `execute_phase_analysis` around `261-331` | Extract target/configuration and phase execution/report assembly helpers while preserving phase selection and output schema. | 🔄 In progress |
-| Lizard split: embed socket worker | `crates/leindex-embed/src/worker_main.rs` | `run_socket_worker` around `201-283` | Extract initialization/accept/retry lifecycle helpers without changing cleanup, readiness, or idle-shutdown semantics. | 🔄 In progress |
+| Lizard split: embed socket worker | `src/embed/worker_main.rs` (was `crates/leindex-embed/src/worker_main.rs`) | `run_socket_worker` around `201-283` | Extract initialization/accept/retry lifecycle helpers without changing cleanup, readiness, or idle-shutdown semantics. | 🔄 In progress |
 | Daemon PID safety documentation/test | `src/search/onnx/client_config.rs`, `Tracker.md` | PID ownership/kill path around `300-390` | Preserve immediate ownership recheck and document platform limitations; stale cleanup remains fail-closed when identity cannot be proven. | 🔄 In progress |
 | Reconcile final ledger | `Tracker.md`, `TASKLIST.md` | final sections | Update all statuses, edited-file inventory, line ranges, and command outputs from the final post-edit state only. | ⏳ Planned |
 
@@ -506,7 +506,7 @@ These commands are being rerun after the last checkpoint-writer/test hardening e
 
 | ONNX + remote clippy | `cargo clippy -p leindex --features onnx,remote-embeddings -- -D warnings` | ✅ Final corrected run passed |
 
-| Lizard | `lizard src/ crates/leindex-embed/src/ -C 15 -x '*/tests/*'` | ✅ Passed; zero violations |
+| Lizard | `lizard src/ -C 15 -x '*/tests/*'` (subcrate merged into `src/embed/`) | ✅ Passed; zero violations |
 
 | Oversized files | `find src crates -name '*.rs' -print0 | xargs -0 wc -l | awk '$1>2000'` | ✅ Passed; zero files over 2,000 lines |
 
@@ -543,7 +543,7 @@ The final reviewer found three hardening items after the otherwise green validat
 - `cargo clippy -p leindex --features onnx,remote-embeddings -- -D warnings` — passed.
 - `cargo test --workspace` — passed; 1,760 passed, 0 failed, 35 ignored.
 - Focused search, registry, C++, and exact-flow regressions — passed.
-- `lizard src/ crates/leindex-embed/src/ -C 15 -x '*/tests/*'` — passed; zero violations.
+- `lizard src/ -C 15 -x '*/tests/*'` — passed; zero violations (`src/embed/` now covers the former `crates/leindex-embed/src/` tree).
 - Oversized Rust-file check — passed; zero files over 2,000 lines.
 - Workflow YAML parse and `git diff --check` — passed.
 - `code-reviewer-luna` — final review completed; reported hardening items were implemented and revalidated.
@@ -557,8 +557,8 @@ The following current-source ranges come from the final `git diff --unified=0` a
 
 - `.github/workflows/quality.yml`: 16, 33-42
 - `TASKLIST.md`: 10, 12, 15-16, 49, 59, 71, 110-111
-- `crates/leindex-embed/src/runtime_test.rs`: 8-44, 72-73, 87-88, 93, 98, 100-101, 107-108, 112, 155-156, 158, 160, 162, 164, 166, 168-169, 174-175, 186-187
-- `crates/leindex-embed/src/worker_main.rs`: 206, 216-217, 232, 246-256, 344, 484-495
+- `crates/leindex-embed/src/runtime_test.rs` (now `src/embed/runtime_test.rs`): 8-44, 72-73, 87-88, 93, 98, 100-101, 107-108, 112, 155-156, 158, 160, 162, 164, 166, 168-169, 174-175, 186-187
+- `crates/leindex-embed/src/worker_main.rs` (now `src/embed/worker_main.rs`): 206, 216-217, 232, 246-256, 344, 484-495
 - `src/cli/index_builder/hybrid.rs`: 149, 269-274, 276-281, 366-371, 373-378, 421-423, 427-428, 487
 - `src/cli/index_builder/mod.rs`: 225-251, 261, 292-303, 747-758, 924-931, 948, 969, 1000, 1003, 1010, 1021, 1095, 1105-1112, 1176, 1191-1198, 1266, 1331, 1355, 1365-1369, 1373-1380
 - `src/cli/index_builder/tests.rs`: 846-850

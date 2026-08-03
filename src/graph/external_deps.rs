@@ -1487,7 +1487,7 @@ pub fn discover_dependency_manifests(
         "requirements.txt",
         "yarn.lock",
     ];
-    use crate::cli::skip_dirs::SKIP_DIRS;
+    use crate::skip_dirs::SKIP_DIRS;
 
     let mut discovered = Vec::new();
 

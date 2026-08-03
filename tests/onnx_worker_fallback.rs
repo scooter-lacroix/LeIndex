@@ -1,3 +1,4 @@
+#![cfg(feature = "onnx")]
 // ONNX worker delegation and fallback integration tests
 //
 // Tests the main-daemon side of the worker architecture:
@@ -7,10 +8,15 @@
 // - VAL-CPHASE-019: Fallback emits an actionable warning
 // - VAL-CPHASE-020: Worker failure does not crash the main daemon
 // - VAL-CPHASE-021: A fresh worker can be spawned after a fallback episode
+//
+// Requires the `onnx` feature: these tests exercise `leindex::embed`, which is
+// cfg-gated behind `feature = "onnx"` in `src/lib.rs` (mirrors
+// `embed_migraphx_dynamic_test.rs`).
+#![cfg(feature = "onnx")]
 
 use std::sync::{Arc, Mutex};
 
-use leindex_embed::protocol::{
+use leindex::embed::protocol::{
     BatchId, EmbedRequest, EmbedResponse, ErrorKind, Frame, MsgType, Request, Response, WorkerError,
 };
 
@@ -43,7 +49,7 @@ impl MockWorker {
                 kind: ErrorKind::Inference,
                 message: format!("simulated worker failure ({} remaining)", *failures),
             };
-            leindex_embed::protocol::error_frame(batch_id, err)
+            leindex::embed::protocol::error_frame(batch_id, err)
                 .expect("error frame construction should not fail")
         } else {
             // Success: return flat row-major zeros
@@ -55,7 +61,7 @@ impl MockWorker {
             let count = texts.len();
             let dim = self.dimension;
             let response = EmbedResponse::new(vec![0.0f32; count * dim], count, dim);
-            leindex_embed::protocol::embed_response_frame(batch_id, response)
+            leindex::embed::protocol::embed_response_frame(batch_id, response)
                 .expect("response frame construction should not fail")
         }
     }
@@ -131,7 +137,7 @@ fn test_worker_failure_triggers_retry() {
         texts: vec!["test".to_string()],
         expected_dim: 4,
     };
-    let frame = leindex_embed::protocol::embed_request_frame(BatchId::new(1), request)
+    let frame = leindex::embed::protocol::embed_request_frame(BatchId::new(1), request)
         .expect("frame construction");
 
     let response1 = mock.process(frame);
@@ -142,7 +148,7 @@ fn test_worker_failure_triggers_retry() {
         texts: vec!["test".to_string()],
         expected_dim: 4,
     };
-    let frame2 = leindex_embed::protocol::embed_request_frame(BatchId::new(2), request2)
+    let frame2 = leindex::embed::protocol::embed_request_frame(BatchId::new(2), request2)
         .expect("frame construction");
 
     let response2 = mock.process(frame2);
@@ -183,13 +189,13 @@ fn test_second_failure_triggers_tfidf_fallback() {
         texts: vec!["test text".to_string()],
         expected_dim: 4,
     };
-    let frame1 = leindex_embed::protocol::embed_request_frame(BatchId::new(1), request.clone())
+    let frame1 = leindex::embed::protocol::embed_request_frame(BatchId::new(1), request.clone())
         .expect("frame construction");
     let response1 = mock.process(frame1);
     assert_eq!(response1.header.msg_type, MsgType::Error);
 
     // Retry (second attempt): also fails
-    let frame2 = leindex_embed::protocol::embed_request_frame(BatchId::new(2), request.clone())
+    let frame2 = leindex::embed::protocol::embed_request_frame(BatchId::new(2), request.clone())
         .expect("frame construction");
     let response2 = mock.process(frame2);
     assert_eq!(response2.header.msg_type, MsgType::Error);
@@ -201,7 +207,7 @@ fn test_second_failure_triggers_tfidf_fallback() {
 
     // The mock has now exhausted its failures, so a third attempt would succeed
     // (simulating a fresh worker spawn), but the batch already fell back.
-    let frame3 = leindex_embed::protocol::embed_request_frame(BatchId::new(3), request)
+    let frame3 = leindex::embed::protocol::embed_request_frame(BatchId::new(3), request)
         .expect("frame construction");
     let response3 = mock.process(frame3);
     assert_eq!(response3.header.msg_type, MsgType::EmbedResponse);
@@ -219,12 +225,12 @@ fn test_fallback_only_affects_failed_batch() {
         texts: vec!["batch 1 text".to_string()],
         expected_dim: dim,
     };
-    let _frame1 = leindex_embed::protocol::embed_request_frame(BatchId::new(1), request1)
+    let _frame1 = leindex::embed::protocol::embed_request_frame(BatchId::new(1), request1)
         .expect("frame construction");
     // Simulate success
     let response1 = EmbedResponse::new(vec![1.0f32; dim], 1, dim);
     let resp_frame1 =
-        leindex_embed::protocol::embed_response_frame(BatchId::new(1), response1).unwrap();
+        leindex::embed::protocol::embed_response_frame(BatchId::new(1), response1).unwrap();
     assert_eq!(resp_frame1.header.msg_type, MsgType::EmbedResponse);
 
     // Batch 2: fails twice → TF-IDF fallback (degraded but complete)
@@ -237,11 +243,11 @@ fn test_fallback_only_affects_failed_batch() {
         texts: vec!["batch 3 text".to_string()],
         expected_dim: dim,
     };
-    let _frame3 = leindex_embed::protocol::embed_request_frame(BatchId::new(3), request3)
+    let _frame3 = leindex::embed::protocol::embed_request_frame(BatchId::new(3), request3)
         .expect("frame construction");
     let response3 = EmbedResponse::new(vec![3.0f32; dim], 1, dim);
     let resp_frame3 =
-        leindex_embed::protocol::embed_response_frame(BatchId::new(3), response3).unwrap();
+        leindex::embed::protocol::embed_response_frame(BatchId::new(3), response3).unwrap();
     assert_eq!(resp_frame3.header.msg_type, MsgType::EmbedResponse);
 }
 
@@ -325,7 +331,7 @@ fn test_client_handles_worker_error_gracefully() {
     // When the worker returns an error, the client should return a
     // ClientError::Worker rather than panicking.
 
-    use leindex_embed::protocol::{ErrorKind, WorkerError};
+    use leindex::embed::protocol::{ErrorKind, WorkerError};
 
     let err = WorkerError {
         kind: ErrorKind::Inference,
@@ -378,7 +384,7 @@ fn test_fresh_worker_after_fallback_episode() {
         texts: vec!["first request".to_string()],
         expected_dim: 4,
     };
-    let frame1 = leindex_embed::protocol::embed_request_frame(BatchId::new(1), request1)
+    let frame1 = leindex::embed::protocol::embed_request_frame(BatchId::new(1), request1)
         .expect("frame construction");
 
     // Initial attempt fails
@@ -390,7 +396,7 @@ fn test_fresh_worker_after_fallback_episode() {
         texts: vec!["first request".to_string()],
         expected_dim: 4,
     };
-    let frame1b = leindex_embed::protocol::embed_request_frame(BatchId::new(2), request1b)
+    let frame1b = leindex::embed::protocol::embed_request_frame(BatchId::new(2), request1b)
         .expect("frame construction");
     let resp1b = mock1.process(frame1b);
     assert_eq!(resp1b.header.msg_type, MsgType::Error);
@@ -404,7 +410,7 @@ fn test_fresh_worker_after_fallback_episode() {
         texts: vec!["second request after recovery".to_string()],
         expected_dim: 4,
     };
-    let frame2 = leindex_embed::protocol::embed_request_frame(BatchId::new(3), request2)
+    let frame2 = leindex::embed::protocol::embed_request_frame(BatchId::new(3), request2)
         .expect("frame construction");
 
     let resp2 = mock2.process(frame2);
@@ -437,7 +443,7 @@ fn test_multiple_fallback_recovery_cycles() {
             expected_dim: 4,
         };
         let frame =
-            leindex_embed::protocol::embed_request_frame(BatchId::new(cycle as u64 * 10), request)
+            leindex::embed::protocol::embed_request_frame(BatchId::new(cycle as u64 * 10), request)
                 .expect("frame construction");
 
         let resp = mock_fail.process(frame);
@@ -449,7 +455,7 @@ fn test_multiple_fallback_recovery_cycles() {
             texts: vec![format!("cycle {} recovery", cycle)],
             expected_dim: 4,
         };
-        let frame2 = leindex_embed::protocol::embed_request_frame(
+        let frame2 = leindex::embed::protocol::embed_request_frame(
             BatchId::new(cycle as u64 * 10 + 1),
             request2,
         )
@@ -466,7 +472,7 @@ fn test_multiple_fallback_recovery_cycles() {
 fn pip_discovery_checks_filesystem_before_python() {
     // With ORT_DYLIB_PATH set, discover_candidates() returns a path
     // containing libonnxruntime without spawning Python.
-    use leindex_embed::ort_discovery::discover_candidates;
+    use leindex::embed::ort_discovery::discover_candidates;
 
     // We can't easily set env vars in a test without a lock, but we verify
     // the discover_candidates function is callable and returns a Vec.
@@ -493,7 +499,7 @@ fn pip_discovery_checks_filesystem_before_python() {
 #[test]
 fn ort_discovery_caches_config_load() {
     // LeIndexConfig::load_cached() should return the same &'static reference.
-    use leindex_embed::config::LeIndexConfig;
+    use leindex::config::LeIndexConfig;
 
     let cfg1 = LeIndexConfig::load_cached();
     let cfg2 = LeIndexConfig::load_cached();
@@ -509,7 +515,7 @@ fn ort_discovery_caches_config_load() {
 fn read_buf_capacity_constant_is_at_least_128kb() {
     // The READ_BUF_CAPACITY constant should be >= 128 * 1024 to support
     // large embedding responses in a single read.
-    use leindex_embed::runtime::READ_BUF_CAPACITY;
+    use leindex::embed::runtime::READ_BUF_CAPACITY;
     // Use a runtime comparison to avoid clippy::assertions_on_constants.
     let min_capacity: usize = 128 * 1024;
     assert!(
@@ -525,7 +531,7 @@ fn read_buf_capacity_constant_is_at_least_128kb() {
 /// This tests the actual client code path with a mockable worker.
 #[cfg(feature = "onnx")]
 mod client_fallback_tests {
-    use leindex_embed::protocol::EmbedResponse;
+    use leindex::embed::protocol::EmbedResponse;
 
     /// Test that the FallbackResult type correctly represents the three
     /// possible outcomes: success, retry-then-success, and TF-IDF fallback.
@@ -572,8 +578,8 @@ mod dead_worker_tests {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
+    use leindex::embed::protocol::{BatchId, EmbedRequest, Frame};
     use leindex::search::{ClientError, EmbeddingClient};
-    use leindex_embed::protocol::{BatchId, EmbedRequest, Frame};
 
     /// VAL-DEADWORKER-002: `ClientError` has a `WorkerDied` variant.
     #[test]
@@ -621,7 +627,8 @@ mod dead_worker_tests {
             texts: vec!["test".to_string()],
             expected_dim: 4,
         };
-        let frame = leindex_embed::protocol::embed_request_frame(BatchId::new(1), request).unwrap();
+        let frame =
+            leindex::embed::protocol::embed_request_frame(BatchId::new(1), request).unwrap();
 
         // send_and_receive must detect the dead worker and return WorkerDied.
         let result = client.test_send_and_receive(frame);
@@ -653,7 +660,8 @@ mod dead_worker_tests {
             texts: vec!["partial".to_string()],
             expected_dim: 4,
         };
-        let frame = leindex_embed::protocol::embed_request_frame(BatchId::new(2), request).unwrap();
+        let frame =
+            leindex::embed::protocol::embed_request_frame(BatchId::new(2), request).unwrap();
         let result = client.test_send_and_receive(frame);
 
         assert!(
@@ -679,7 +687,8 @@ mod dead_worker_tests {
             texts: vec!["clear test".to_string()],
             expected_dim: 4,
         };
-        let frame = leindex_embed::protocol::embed_request_frame(BatchId::new(3), request).unwrap();
+        let frame =
+            leindex::embed::protocol::embed_request_frame(BatchId::new(3), request).unwrap();
 
         let result = client.test_send_and_receive(frame);
         assert!(matches!(result, Err(ClientError::WorkerDied { .. })));
@@ -726,7 +735,8 @@ mod dead_worker_tests {
             texts: vec!["cleanup test".to_string()],
             expected_dim: 4,
         };
-        let frame = leindex_embed::protocol::embed_request_frame(BatchId::new(4), request).unwrap();
+        let frame =
+            leindex::embed::protocol::embed_request_frame(BatchId::new(4), request).unwrap();
 
         let result = client.test_send_and_receive(frame);
         assert!(matches!(result, Err(ClientError::WorkerDied { .. })));
@@ -776,8 +786,9 @@ mod dead_worker_tests {
                 let batch_id = req_frame.header.batch_id;
 
                 // Send back a valid embed response (1 text, dim=4)
-                let response = leindex_embed::protocol::EmbedResponse::new(vec![0.0f32; 4], 1, 4);
-                let resp_frame = leindex_embed::protocol::embed_response_frame(batch_id, response)?;
+                let response = leindex::embed::protocol::EmbedResponse::new(vec![0.0f32; 4], 1, 4);
+                let resp_frame =
+                    leindex::embed::protocol::embed_response_frame(batch_id, response)?;
                 let wire = resp_frame.encode_wire()?;
                 mock_stream.write_all(&wire)?;
                 mock_stream.flush()?;
@@ -789,7 +800,8 @@ mod dead_worker_tests {
             texts: vec!["normal request".to_string()],
             expected_dim: 4,
         };
-        let frame = leindex_embed::protocol::embed_request_frame(BatchId::new(5), request).unwrap();
+        let frame =
+            leindex::embed::protocol::embed_request_frame(BatchId::new(5), request).unwrap();
         let result = client.test_send_and_receive(frame);
 
         // Normal request should succeed (not WorkerDied).

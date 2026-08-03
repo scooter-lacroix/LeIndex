@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #############################################
 # LeIndex Universal Installer
-# Version: 1.9.0 - Rust Edition + Dashboard Assets
+# Version: 1.9.5 - Rust Edition + Dashboard Assets
 # Platform: Linux/Unix
 #
 # Installer:
@@ -25,7 +25,7 @@ set -euo pipefail
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-readonly SCRIPT_VERSION="1.9.0"
+readonly SCRIPT_VERSION="1.9.5"
 readonly PROJECT_NAME="LeIndex"
 readonly PROJECT_SLUG="leindex"
 readonly MIN_RUST_MAJOR=1
@@ -674,7 +674,11 @@ install_leindex() {
     # (load-dynamic) produces a binary that can use CPU, CUDA, or MIGraphX
     # ORT at runtime depending on which library is discovered.
     log_info "Building LeIndex..."
-    if cargo build --release -p leindex -p leindex-embed --features leindex/onnx,leindex-embed/onnx 2>&1 | tee -a "$INSTALL_LOG"; then
+    # One published crate (leindex) builds BOTH binaries (leindex and
+    # leindex-embed). The retired leindex-embed subcrate is gone, so we do
+    # NOT pass -p leindex-embed or leindex-embed/onnx — building -p leindex
+    # with the onnx feature compiles the worker [[bin]] target too.
+    if cargo build --release -p leindex --features leindex/onnx 2>&1 | tee -a "$INSTALL_LOG"; then
         log_success "Build completed successfully"
     else
         log_error "Build failed"
@@ -719,7 +723,7 @@ install_leindex() {
             log_warn "Failed to install worker binary to $worker_install_path"
         fi
     else
-        log_warn "Worker binary not found (leindex-embed); ONNX inference will use in-process fallback"
+        log_warn "Worker binary (leindex-embed) not found; neural search unavailable. Rebuild with: cargo build --release -p leindex --features leindex/onnx"
     fi
 
     # Install bundled ORT runtime libraries (from release bundle lib/
@@ -746,10 +750,10 @@ install_ort_libraries() {
     # `pip install onnxruntime` or `leindex setup` run.
     #
     # With the load-dynamic ort feature, NO ORT is linked at build time.
-    # The runtime discovery chain (in crates/leindex-embed/src/ort_discovery.rs)
-    # searches ORT_DYLIB_PATH env, config, ~/.leindex/lib/, sibling dir to
-    # the binary, pip site-packages, and system paths. Installing bundled
-    # libs to ~/.leindex/lib/ makes the GitHub Release bundle path zero-setup.
+    # The runtime discovery chain (in src/embed/ort_discovery.rs) searches
+    # ORT_DYLIB_PATH env, config, ~/.leindex/lib/, sibling dir to the
+    # binary, pip site-packages, and system paths. Installing bundled libs
+    # to ~/.leindex/lib/ makes the GitHub Release bundle path zero-setup.
     #
     # When building from source via `cargo build` (no ORT at build time),
     # there is no lib/ directory to copy; this function logs that and is

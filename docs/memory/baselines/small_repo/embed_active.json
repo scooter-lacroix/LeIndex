@@ -1,12 +1,13 @@
 {
-  "phase": "embed_active",
-  "rss_min_kib": 8168,
-  "rss_max_kib": 20864,
-  "rss_p95_kib": 20864,
-  "mapped_file_kib": 11456,
-  "anon_kib": 9408,
-  "sample_count": 20,
-  "duration_ms": 5146,
-  "worker_rss_max_kib": 4928636,
-  "combined_rss_max_kib": 4949500
+ "phase": "embed_active",
+ "rss_min_kib": 9520,
+ "rss_max_kib": 20044,
+ "rss_p95_kib": 20044,
+ "mapped_file_kib": 12440,
+ "anon_kib": 7604,
+ "sample_count": 20,
+ "duration_ms": 5129,
+ "worker_rss_max_kib": 2604964,
+ "combined_rss_max_kib": 2625008,
+ "rebaselined_note": "T8 step-3 re-baseline (2026-08-03, default provider): main 20044 / worker 2604964 / combined 2625008 KiB (committed 966417da: 20240 / 2594916 / 2615156). Worker residency is provider/cache-state dependent; combined ceiling 8 GiB holds. {0,4,1} ORT-thread record (CPU provider) in the worker_ort_threads phase note."
 }

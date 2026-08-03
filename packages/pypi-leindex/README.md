@@ -194,6 +194,8 @@ is enabled; the neural vectors attach to those same nodes:
 
 LeIndex runs as an **MCP server**, allowing tools like **Claude Code**, **Cursor**, and other MCP-compatible agents to explore your codebase with semantic understanding.
 
+**Server lifecycle:** long-running MCP servers self-exit after `[mcp] idle_timeout_secs` (default `1800`; `0`=off) and evict idle loaded engines after `[mcp] engine_max_idle_secs` (default `600`) to avoid swap accumulation; override per-invocation with `--mcp-idle-timeout-secs`. See [docs/MCP.md](../../docs/MCP.md).
+
 ```bash
 # Start MCP stdio mode (for Claude Code / Cursor)
 leindex mcp
@@ -235,6 +237,7 @@ Codebase → Tree-sitter Parser → PDG Builder → Semantic Index → Query Eng
 
 - **Core hybrid retrieval** — TF-IDF lexical matching plus PDG structure
 - **Hybrid neural scoring** — local ONNX similarity over the same symbols with TF-IDF/PDG fallback
+- **Fragment embeddings (opt-in)** — sub-symbol semantic chunks + orphan coverage, content-hash-addressed and fully local
 - **5-phase analysis** — additive multi-pass codebase analysis pipeline
 - **Cross-project indexing** — search across multiple repos at once
 - **20 MCP tools** — read, analyze, edit preview/apply, rename, impact analysis
@@ -245,6 +248,23 @@ Codebase → Tree-sitter Parser → PDG Builder → Semantic Index → Query Eng
 - **Flexible embedding backends** — choose between TF-IDF, local ONNX models, or remote cloud providers (OpenAI, Cohere)
 
 ---
+
+## Fragment embeddings (opt-in)
+
+LeIndex ships an opt-in fragment layer — sub-symbol semantic chunks plus
+module-level orphan coverage, content-hash-addressed and fully local (the same
+Qwen3 ONNX worker as the neural layer). Enable it in `~/.leindex/config/leindex.toml`:
+
+```toml
+[search]
+fragment_index_enabled = true   # master switch (off by default; node index stays authoritative)
+fragment_weight = 0.35          # fusion weight of the fragment component when enabled
+fragment_max_bytes = 12000      # max bytes per fragment (~200 lines x 60 chars)
+fragment_orphan_enabled = true  # include Tier-3 module-level orphan regions
+fragment_naive_fallback = true  # naive 200-line chunking when no tree-sitter grammar
+```
+
+See the root README's *Fragment Index* section for the full architecture.
 
 ## Other Install Options
 

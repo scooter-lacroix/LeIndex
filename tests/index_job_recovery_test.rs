@@ -1,5 +1,6 @@
 //! Durable checkpoint/recovery contract tests.
 
+#![cfg(feature = "cli")]
 use leindex::cli::index_job::{
     CheckpointStore, FileFingerprint, JobCheckpointState, JobStatus, LexicalCheckpoint,
     NeuralCheckpoint, ParseCheckpoint, ParsedFileCheckpoint, ScanCheckpoint,

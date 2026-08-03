@@ -100,7 +100,7 @@ pub(crate) const SOURCE_FILE_EXTENSIONS: &[&str] = &[
 ];
 
 // Directories to always skip during source collection
-pub(crate) use crate::cli::skip_dirs::SKIP_DIRS;
+pub(crate) use crate::skip_dirs::SKIP_DIRS;
 
 pub(crate) const DEPENDENCY_MANIFEST_NAMES: &[&str] = &[
     "Cargo.lock",

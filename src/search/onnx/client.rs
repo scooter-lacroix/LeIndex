@@ -30,7 +30,7 @@ use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-use leindex_embed::protocol::{
+use crate::embed::protocol::{
     self, BatchId, EmbedRequest, EmbedResponse, ErrorKind, Frame, HealthResponse, MsgType,
     RerankDocument, RerankRequest, RerankResponse, Response, WorkerError, WorkerState,
 };
@@ -1239,6 +1239,7 @@ impl EmbeddingClient {
         texts: &[String],
         expected_dim: usize,
     ) -> Result<EmbedResponse, ClientError> {
+        #[cfg(feature = "cli")]
         crate::cli::mcp::request_meta::NEURAL_REQUESTS
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let neural_started = Instant::now();
@@ -1286,6 +1287,7 @@ impl EmbeddingClient {
             neural_ms,
             "ONNX embedding attempt complete"
         );
+        #[cfg(feature = "cli")]
         crate::cli::mcp::request_meta::record_neural_ms(neural_ms);
         result
     }
@@ -1537,7 +1539,7 @@ impl Drop for EmbeddingClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leindex_embed::protocol::ErrorKind;
+    use crate::embed::protocol::ErrorKind;
 
     /// TEMP verification: spawn the REAL leindex-embed worker (pipe mode) and run
     /// one embed through the production EmbeddingClient. On a cold MIGraphX cache

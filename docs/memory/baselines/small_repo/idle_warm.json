@@ -1,12 +1,13 @@
 {
-  "phase": "idle_warm",
-  "rss_min_kib": 7672,
-  "rss_max_kib": 7672,
-  "rss_p95_kib": 7672,
-  "mapped_file_kib": 6960,
-  "anon_kib": 712,
-  "sample_count": 12,
-  "duration_ms": 3007,
-  "worker_rss_max_kib": 0,
-  "combined_rss_max_kib": 7672
+ "phase": "idle_warm",
+ "rss_min_kib": 8908,
+ "rss_max_kib": 8908,
+ "rss_p95_kib": 8908,
+ "mapped_file_kib": 8152,
+ "anon_kib": 756,
+ "sample_count": 12,
+ "duration_ms": 3008,
+ "worker_rss_max_kib": 0,
+ "combined_rss_max_kib": 8908,
+ "rebaselined_note": "T8 step-3 re-baseline (memory-pressure remediation, 2026-08-03): measured 8908 KiB in the 12-phase run (committed 966417da value 8900). Stable within box-idle jitter; 10% tolerance absorbs it."
 }

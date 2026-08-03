@@ -315,7 +315,7 @@ impl HybridEmbedder {
         #[allow(clippy::needless_return)]
         // return is required so the cfg(not(onnx)) fallthrough block can follow
         {
-            use leindex_embed::protocol::RerankDocument;
+            use crate::embed::protocol::RerankDocument;
             return match self {
                 Self::TfIdfOnly(_) => None,
                 Self::HybridLocal { neural, .. } => {

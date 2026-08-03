@@ -80,11 +80,18 @@ fn run_memcheck(update_baseline: bool) -> Result<()> {
     // Ensure the worker binary exists (for worker-active phases)
     if !leindex_embed_bin.exists() {
         eprintln!("xtask: building leindex-embed worker binary...");
+        // The `leindex-embed` crate was retired in the 1.10.0 embed-merge;
+        // the worker is now a `[[bin]]` of the `leindex` package
+        // (`src/bin/leindex-embed.rs`), so build it with `-p leindex
+        // --bin leindex-embed`. The `onnx` feature keeps the worker able to
+        // load real ORT (matching the embedded worker binary).
         let status = Command::new("cargo")
             .args([
                 "build",
                 "--release",
                 "-p",
+                "leindex",
+                "--bin",
                 "leindex-embed",
                 "--features",
                 "onnx",

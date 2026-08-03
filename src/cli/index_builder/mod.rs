@@ -29,13 +29,20 @@ use super::leindex::{
 mod hybrid;
 mod tfidf;
 
+// Fragment chunking (Tier-2 sub-symbol + Tier-3 orphan). `pub(crate)` so
+// `indexing/load.rs` hydrates the fragment layer from the persisted artifacts;
+// the sync engine + search fusion consume the module API directly.
+pub(crate) mod fragment;
+pub(crate) mod persistence;
+
 pub use hybrid::*;
+pub(crate) use persistence::*;
 pub use tfidf::*;
 
 #[cfg(test)]
 #[allow(clippy::infallible_destructuring_match)]
-#[path = "tests.rs"]
-mod tests;
+#[path = "index_builder_test.rs"]
+mod test;
 
 // ============================================================================
 // TF-IDF EMBEDDING SYSTEM
@@ -139,7 +146,7 @@ pub(crate) fn tokenize_code(text: &str) -> Vec<String> {
 /// Return a small, non-redundant slice of doc/comment lines immediately
 /// preceding a symbol. This keeps semantic chunks useful for review language
 /// without creating a second full-file embedding document.
-fn preceding_doc_context(bytes: &[u8], start: usize) -> String {
+pub(crate) fn preceding_doc_context(bytes: &[u8], start: usize) -> String {
     let prefix = String::from_utf8_lossy(&bytes[..start.min(bytes.len())]);
     let mut lines = Vec::new();
     for line in prefix.lines().rev() {
@@ -1505,17 +1512,21 @@ pub(crate) fn search_cache_key_for(
     neural_weight: f64,
     rerank_enabled: bool,
     rerank_top_n: u32,
+    fragment_index_enabled: bool,
+    fragment_weight: f64,
+    fragment_root_hash: &str,
     embed_model: &str,
     rerank_model: &str,
 ) -> String {
     // v2: widens the key to include every result-affecting config knob + model
-    // identity (search_mode, neural_weight, rerank_enabled/top_n, embedder +
-    // reranker model). v1 keys omitted these, so a config or model change
-    // silently served stale cached results until a re-index changed the node
-    // count. The `v2:` namespace prefix lands in the (sanitized) cache filename
-    // so legacy v1 entries are identifiably stale and sweepable, not silent.
+    // identity (search_mode, neural_weight, rerank_enabled/top_n, fragment
+    // knobs incl. the persisted content root hash, embedder + reranker model).
+    // v1 keys omitted these, so a config or model change silently served stale
+    // cached results until a re-index changed the node count. The `v2:`
+    // namespace prefix lands in the (sanitized) cache filename so legacy v1
+    // entries are identifiably stale and sweepable, not silent.
     search_cache_key(&format!(
-        "v2:query:{}:{}:{}:{}:{:?}:neural={}:mode={}:nw={}:rr={}|{}|{}:embed={}",
+        "v2:query:{}:{}:{}:{}:{:?}:neural={}:mode={}:nw={}:rr={}|{}|{}:frag={}|{}|{}:embed={}",
         stable_project_cache_id(project_id, project_path),
         index_fingerprint(stats),
         top_k,
@@ -1527,6 +1538,9 @@ pub(crate) fn search_cache_key_for(
         rerank_enabled,
         rerank_top_n,
         rerank_model,
+        fragment_index_enabled,
+        fragment_weight,
+        fragment_root_hash,
         embed_model,
     ))
 }
@@ -1545,264 +1559,6 @@ pub(crate) fn analysis_cache_key_for(
         token_budget,
         query.trim().to_lowercase()
     ))
-}
-
-// ============================================================================
-// MMAP EMBEDDING PERSISTENCE (R10)
-// ============================================================================
-
-/// Persist all embeddings from the search engine to an mmap-backed binary file.
-///
-/// After indexing completes, call this to write a `.leindex/embeddings.bin`
-/// file that can be memory-mapped for fast read-only access without loading
-/// the full embedding matrix into heap memory.
-pub(crate) fn persist_embeddings_to_mmap(
-    search_engine: &SearchEngine,
-    project_path: &Path,
-) -> Result<()> {
-    let path = crate::search::vector::mmap_embeddings_path(project_path);
-    if search_engine.is_mmap_backed() && path.is_file() {
-        return Ok(());
-    }
-    let embeddings = search_engine.collect_embeddings();
-    if embeddings.is_empty() {
-        return Ok(());
-    }
-    crate::search::vector::write_mmap_embeddings(&path, &embeddings)
-        .map_err(|e| anyhow::anyhow!("Failed to write mmap embeddings: {e}"))?;
-    info!(
-        count = embeddings.len(),
-        path = %path.display(),
-        "Persisted embeddings to mmap file"
-    );
-    Ok(())
-}
-
-fn search_snapshot_path(project_path: &Path) -> PathBuf {
-    project_path.join(".leindex").join("search_snapshot.bin")
-}
-
-/// Persist search metadata required for fast load_from_storage hydration.
-pub(crate) fn persist_search_snapshot(
-    search_engine: &SearchEngine,
-    project_path: &Path,
-    pdg_nodes: usize,
-    pdg_edges: usize,
-    pdg_fingerprint: String,
-) -> Result<()> {
-    let snapshot = search_engine.search_snapshot(pdg_nodes, pdg_edges, pdg_fingerprint);
-    if snapshot.indexed_nodes == 0 {
-        return Ok(());
-    }
-
-    let path = search_snapshot_path(project_path);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "Failed to create search snapshot directory: {}",
-                parent.display()
-            )
-        })?;
-    }
-
-    let bytes = bincode::serialize(&snapshot).context("Failed to serialize search snapshot")?;
-    std::fs::write(&path, bytes)
-        .with_context(|| format!("Failed to write search snapshot: {}", path.display()))?;
-    info!(
-        count = snapshot.indexed_nodes,
-        path = %path.display(),
-        "Persisted search snapshot"
-    );
-    Ok(())
-}
-
-/// Try to load search metadata from an explicit storage directory.
-pub(crate) fn try_load_search_snapshot_from_storage(
-    storage_path: &Path,
-) -> Option<crate::search::search::SearchSnapshot> {
-    let path = storage_path.join("search_snapshot.bin");
-    if !path.exists() {
-        return None;
-    }
-
-    match std::fs::read(&path)
-        .with_context(|| format!("Failed to read search snapshot: {}", path.display()))
-        .and_then(|bytes| {
-            bincode::deserialize::<crate::search::search::SearchSnapshot>(&bytes)
-                .context("Failed to deserialize search snapshot")
-        }) {
-        Ok(snapshot) => {
-            info!(
-                count = snapshot.indexed_nodes,
-                path = %path.display(),
-                "Loaded search snapshot"
-            );
-            Some(snapshot)
-        }
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "Failed to load search snapshot"
-            );
-            None
-        }
-    }
-}
-
-struct Blake3FormatWriter<'a>(&'a mut blake3::Hasher);
-
-impl std::fmt::Write for Blake3FormatWriter<'_> {
-    fn write_str(&mut self, value: &str) -> std::fmt::Result {
-        self.0.update(value.as_bytes());
-        Ok(())
-    }
-}
-
-/// Stable fingerprint of the PDG state that materially affects search
-/// hydration. This prevents a snapshot produced for one PDG from being reused
-/// after storage changes that happen to preserve node/edge counts.
-pub(crate) fn pdg_search_fingerprint(pdg: &ProgramDependenceGraph) -> String {
-    use std::fmt::Write as _;
-
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"leindex-pdg-search-v2");
-
-    let mut nodes: Vec<[u8; 32]> = pdg
-        .node_indices()
-        .filter_map(|node_idx| {
-            pdg.get_node(node_idx).map(|node| {
-                let mut record = blake3::Hasher::new();
-                write!(
-                    Blake3FormatWriter(&mut record),
-                    "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}",
-                    node.id,
-                    node.node_type,
-                    node.name,
-                    node.file_path,
-                    node.byte_range.0,
-                    node.byte_range.1,
-                    node.complexity,
-                    node.language
-                )
-                .expect("hash writer is infallible");
-                *record.finalize().as_bytes()
-            })
-        })
-        .collect();
-    nodes.sort_unstable();
-    for node in nodes {
-        hasher.update(&node);
-    }
-
-    let mut edges: Vec<[u8; 32]> = pdg
-        .edge_indices()
-        .filter_map(|edge_idx| {
-            let edge = pdg.get_edge(edge_idx)?;
-            let (from, to) = pdg.edge_endpoints(edge_idx)?;
-            let from = pdg.get_node(from)?;
-            let to = pdg.get_node(to)?;
-            let mut record = blake3::Hasher::new();
-            write!(
-                Blake3FormatWriter(&mut record),
-                "{}\0{}\0{:?}\0{:?}\0{:?}\0{:?}",
-                from.id,
-                to.id,
-                edge.edge_type,
-                edge.metadata.call_count,
-                edge.metadata.variable_name,
-                edge.metadata.confidence.map(f32::to_bits)
-            )
-            .expect("hash writer is infallible");
-            Some(*record.finalize().as_bytes())
-        })
-        .collect();
-    edges.sort_unstable();
-    for edge in edges {
-        hasher.update(&edge);
-    }
-
-    hasher.finalize().to_hex().to_string()
-}
-
-/// Persist neural embeddings to a separate mmap file for fast load_from_storage.
-///
-/// This stores the ONNX neural embeddings (1024-dim) separately from the
-/// TF-IDF embeddings (768-dim) so they can be restored without re-computing
-/// ONNX inference for all nodes.
-#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-pub(crate) fn persist_neural_embeddings_to_mmap(
-    search_engine: &SearchEngine,
-    project_path: &Path,
-) -> Result<()> {
-    let embeddings = search_engine.collect_neural_embeddings();
-    let path = neural_mmap_embeddings_path(project_path);
-    if embeddings.is_empty() {
-        if path.exists() {
-            std::fs::remove_file(&path).map_err(|e| {
-                anyhow::anyhow!("Failed to remove stale neural mmap embeddings: {e}")
-            })?;
-            info!(
-                path = %path.display(),
-                "Removed stale neural embeddings mmap file"
-            );
-        }
-        return Ok(());
-    }
-    crate::search::vector::write_mmap_embeddings(&path, &embeddings)
-        .map_err(|e| anyhow::anyhow!("Failed to write neural mmap embeddings: {e}"))?;
-    info!(
-        count = embeddings.len(),
-        path = %path.display(),
-        "Persisted neural embeddings to mmap file"
-    );
-    Ok(())
-}
-
-/// Path for the neural embeddings mmap file.
-#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-fn neural_mmap_embeddings_path(project_path: &Path) -> PathBuf {
-    project_path.join(".leindex").join("neural_embeddings.bin")
-}
-
-/// Try to load previously persisted neural embeddings from mmap file.
-///
-/// Returns `None` if the file does not exist or is corrupt.
-#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-pub(crate) fn try_load_neural_mmap_embeddings(
-    project_path: &Path,
-) -> Option<crate::search::vector::MmapEmbeddingIndex> {
-    try_load_neural_mmap_embeddings_from_storage(&project_path.join(".leindex"))
-}
-
-/// Try to load neural embeddings from an explicit storage directory.
-#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-pub(crate) fn try_load_neural_mmap_embeddings_from_storage(
-    storage_path: &Path,
-) -> Option<crate::search::vector::MmapEmbeddingIndex> {
-    let path = storage_path.join("neural_embeddings.bin");
-    if !path.exists() {
-        return None;
-    }
-    match crate::search::vector::MmapEmbeddingIndex::open(&path) {
-        Ok(index) => {
-            info!(
-                nodes = index.len(),
-                dim = index.dimension(),
-                path = %path.display(),
-                "Loaded neural mmap embedding index"
-            );
-            Some(index)
-        }
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "Failed to load neural mmap embedding index"
-            );
-            None
-        }
-    }
 }
 
 /// Clear persisted search query and analysis cache entries for a project.

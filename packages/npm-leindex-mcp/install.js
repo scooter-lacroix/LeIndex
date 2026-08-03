@@ -27,8 +27,9 @@ const MAX_REDIRECTS = 5;
 
 /**
  * The unversioned ONNX Runtime shared library name on the current platform.
- * The discovery chain in `crates/leindex-embed/src/ort_discovery.rs` looks for
- * exactly these filenames at each candidate directory.
+ * The discovery chain in `src/embed/ort_discovery.rs` looks for exactly these
+ * filenames at each candidate directory. (The worker source was merged into
+ * the root crate from the retired crates/leindex-embed subcrate.)
  */
 function getOrtLibNames() {
   if (process.platform === 'win32') {
@@ -651,7 +652,18 @@ async function installFromBundle(release) {
       }
       console.log('   ✓ Worker binary installed');
     } else {
-      console.log('   ⚠ Worker binary not found in bundle; ONNX will use in-process fallback');
+      // The leindex-embed worker binary is part of the bundle; if it is
+      // missing, neural (ONNX) search is unavailable — there is NO
+      // in-process ONNX fallback (the client delegates all inference to
+      // the worker process). TF-IDF search still works. Recover with:
+      //   npm install (re-fetch the bundle)  |  cargo install leindex --features onnx
+      //   |  leindex setup --neural after obtaining the worker.
+      throw new Error(
+        `Worker binary (leindex-embed) not found in bundle at bin/${workerName}. ` +
+          'Neural search is unavailable until it is installed. ' +
+          'Re-run `npm install`, or run `cargo install leindex --features onnx` ' +
+          'to build both binaries from source, then `leindex setup --neural`.'
+      );
     }
 
     // VAL-NPM-002: Install bundled ORT shared libraries under `lib/`.
@@ -858,33 +870,33 @@ async function install() {
     console.error('\n   Attempting fallback to cargo install...');
     
     try {
-      // Use --force to overwrite any old workspace crate installations
+      // One published crate (leindex) ships BOTH binaries: `cargo install
+      // leindex --features onnx` installs `leindex` and `leindex-embed`
+      // (VAL-CARGO-005). The retired leindex-embed subcrate is gone, so
+      // there is no separate worker crate to install — a second
+      // `cargo install leindex-embed` would now fail.
       execSync('cargo install leindex --force --features onnx', { stdio: 'inherit' });
-      console.log('\n   ✓ Installed leindex via cargo');
-      
-      // Also install the ONNX worker binary
-      try {
-        execSync('cargo install leindex-embed --features onnx --force', { stdio: 'inherit' });
-        console.log('   ✓ Installed leindex-embed worker via cargo');
-      } catch (embedErr) {
-        console.log('   ⚠ leindex-embed install failed; ONNX will use in-process fallback');
-      }
-      
-      // Link cargo-installed binary to our bin directory
+      console.log('\n   ✓ Installed leindex + leindex-embed via cargo (one crate, two binaries)');
+
+      // Link cargo-installed binaries to our bin directory.
       try {
         const cargoHome = process.env.CARGO_HOME || `${require('os').homedir()}/.cargo`;
         const cargoBin = path.join(cargoHome, 'bin', binaryName);
         if (fs.existsSync(cargoBin)) {
           fs.copyFileSync(cargoBin, binaryPath);
           fs.chmodSync(binaryPath, 0o755);
-          console.log('   ✓ Binary linked to package directory');
+          console.log('   ✓ Main binary linked to package directory');
         }
-        // Also link worker binary if available
+        // The worker binary is co-installed by the same cargo install.
         const cargoWorker = path.join(cargoHome, 'bin', workerName);
         if (fs.existsSync(cargoWorker)) {
           fs.copyFileSync(cargoWorker, workerPath);
           fs.chmodSync(workerPath, 0o755);
           console.log('   ✓ Worker binary linked to package directory');
+        } else {
+          // No in-process ONNX fallback exists: if the worker is absent,
+          // neural search is unavailable until it is obtained.
+          console.log('   ⚠ Worker binary (leindex-embed) missing from cargo install; neural search unavailable. Re-run `cargo install leindex --features onnx`.');
         }
       } catch (linkErr) {
         console.log('   ⚠ Could not link binary, but cargo install succeeded');
@@ -892,11 +904,66 @@ async function install() {
     } catch (cargoError) {
       console.error('\n❌ Installation failed');
       console.error('\n   Please install manually:');
-      console.error('   1. cargo install leindex --force');
+      console.error('   1. cargo install leindex --force --features onnx');
       console.error('   2. Or build from source: git clone + cargo build --release');
       console.error('   3. Or wait for GitHub release and reinstall this package');
       process.exit(1);
     }
+  }
+}
+
+/**
+ * Static guard against resurrecting the retired leindex-embed subcrate.
+ *
+ * One published crate (leindex) ships BOTH binaries; the separate
+ * `leindex-embed` crate was deleted. These active command/package forms
+ * would now fail or pull a non-existent crate, so any of them appearing
+ * in THIS installer is a regression:
+ *
+ *   - `cargo install leindex-embed`        (subcrate crate name; gone)
+ *   - `-p leindex-embed`                    (package selector; gone)
+ *   - `leindex-embed/onnx`                  (package/feature ref; gone)
+ *
+ * Executable-NAME references are still valid and intentionally allowed:
+ *   - `--bin leindex-embed`                 (cargo binary selector)
+ *   - prose like "leindex-embed binary" or "the leindex-embed worker"
+ *
+ * Returns an array of offending line descriptors (empty when clean).
+ * `runRetiredSubcrateGuard(file)` throws on the first offender.
+ */
+function findRetiredSubcrateInstallCommands(sourceText) {
+  const offenders = [];
+  const lines = String(sourceText).split(/\r?\n/);
+  lines.forEach((line, idx) => {
+    const trimmed = line.trim();
+    // Skip comments and the guard's own documentation/regex.
+    if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) {
+      return;
+    }
+    // Active command/package forms (whole-word-ish matches). `-p` and `-` are
+    // non-word characters, so use (?:^|\s) rather than \b before them.
+    const isActiveForm =
+      /(?:^|\s)cargo\s+install\s+leindex-embed\b/.test(line) ||
+      /(?:^|\s)-p\s+leindex-embed\b/.test(line) ||
+      /\bleindex-embed\/onnx\b/.test(line);
+    if (isActiveForm) {
+      offenders.push({ line: idx + 1, text: line });
+    }
+  });
+  return offenders;
+}
+
+function runRetiredSubcrateGuard(filePath) {
+  const src = fs.readFileSync(filePath, 'utf8');
+  const offenders = findRetiredSubcrateInstallCommands(src);
+  if (offenders.length > 0) {
+    const details = offenders
+      .map((o) => `  ${filePath}:${o.line}: ${o.text.trim()}`)
+      .join('\n');
+    throw new Error(
+      `install.js resurrected a retired leindex-embed subcrate install/publish form ` +
+        `(one crate ships both binaries now). Offending lines:\n${details}`
+    );
   }
 }
 
@@ -907,6 +974,8 @@ module.exports = {
   copyBundledEntry,
   copyRegularBundledFile,
   copyRegularFileNoFollow,
+  findRetiredSubcrateInstallCommands,
+  runRetiredSubcrateGuard,
   getAssetName,
   getBundleAssetName,
   getOrtLibNames,
@@ -926,6 +995,19 @@ module.exports = {
 };
 
 if (require.main === module) {
+  // `node install.js --self-check` runs the static retired-subcrate guard
+  // against this file and exits non-zero on a regression. Used by CI / the
+  // npm test suite to keep the one-crate install layout intact.
+  if (process.argv.includes('--self-check')) {
+    try {
+      runRetiredSubcrateGuard(__filename);
+      console.log('✓ install.js self-check: no retired leindex-embed install forms');
+      process.exit(0);
+    } catch (err) {
+      console.error('❌ ' + err.message);
+      process.exit(1);
+    }
+  }
   install().catch((err) => {
     console.error('❌ Installation error:', err);
     process.exit(1);
