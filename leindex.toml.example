@@ -68,7 +68,7 @@ batch_size = 500
 # Cap on source files indexed per run.
 max_files = 50000
 
-# ── MCP server lifecycle (1.11.0 memory-pressure remediation) ───────────────
+# ── MCP server lifecycle (1.9.5 memory-pressure remediation) ───────────────
 [mcp]
 # Exit the MCP server process after this many seconds with no requests.
 # 0 disables idle exit (server lives until stdin EOF). MCP clients respawn the

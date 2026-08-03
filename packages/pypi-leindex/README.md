@@ -194,6 +194,8 @@ is enabled; the neural vectors attach to those same nodes:
 
 LeIndex runs as an **MCP server**, allowing tools like **Claude Code**, **Cursor**, and other MCP-compatible agents to explore your codebase with semantic understanding.
 
+**Server lifecycle:** long-running MCP servers self-exit after `[mcp] idle_timeout_secs` (default `1800`; `0`=off) and evict idle loaded engines after `[mcp] engine_max_idle_secs` (default `600`) to avoid swap accumulation; override per-invocation with `--mcp-idle-timeout-secs`. See [docs/MCP.md](../../docs/MCP.md).
+
 ```bash
 # Start MCP stdio mode (for Claude Code / Cursor)
 leindex mcp

@@ -101,6 +101,8 @@ node-level index remains authoritative.
 
 ## MCP Configuration Examples
 
+**Server lifecycle:** long-running MCP servers self-exit after `[mcp] idle_timeout_secs` (default `1800`; `0`=off) and evict idle loaded engines after `[mcp] engine_max_idle_secs` (default `600`) to avoid swap accumulation; override per-invocation with `--mcp-idle-timeout-secs`. Configure in `leindex.toml`; see [docs/MCP.md](../../docs/MCP.md).
+
 ### Cursor IDE
 
 Add to Cursor settings (`~/.cursor/mcp.json` or Settings → MCP):

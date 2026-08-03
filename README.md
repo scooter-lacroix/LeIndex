@@ -323,6 +323,8 @@ If you intentionally installed the full Rust binary via `cargo install leindex`,
 `install.sh`, or the PyPI bootstrapper, you can replace `npx -y @leindex/mcp`
 with `leindex mcp`.
 
+**Server lifecycle:** long-running MCP servers self-exit after `[mcp] idle_timeout_secs` (default `1800`; `0`=off) and evict idle loaded engines after `[mcp] engine_max_idle_secs` (default `600`) to avoid swap accumulation; override per-invocation with `--mcp-idle-timeout-secs`. See [docs/MCP.md](docs/MCP.md).
+
 Every MCP tool is also available from the CLI bridge:
 
 ```bash

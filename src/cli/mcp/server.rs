@@ -1244,7 +1244,6 @@ impl McpServer {
         // process-level idle self-exit; a 60-second sweep evicts loaded project
         // engines that have been idle past `[mcp] engine_max_idle_secs` so a
         // long-lived server does not retain every project it ever touched.
-        let idle_timeout: Option<std::time::Duration> = idle_timeout;
         let engine_max_idle = std::time::Duration::from_secs(
             crate::config::LeIndexConfig::load_cached()
                 .mcp
