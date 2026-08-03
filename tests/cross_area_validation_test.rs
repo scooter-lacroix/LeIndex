@@ -706,12 +706,29 @@ mod per_surface_journeys {
             toml.contains("leindex-setup = \"leindex.bootstrap:setup_main\""),
             "VAL-PYPI-005: pyproject.toml must declare the leindex-setup console script"
         );
-        // The bootstrap must install the leindex-embed worker too so neural
-        // search functions after setup.
+        // VAL-PYPI-008: the bootstrap must ensure the leindex-embed worker
+        // binary is present so neural search functions after setup. Post
+        // embed-merge the worker is a `[[bin]]` of the root crate, so a single
+        // `cargo install leindex --features onnx` co-installs it; the former
+        // standalone `install_embed_worker` helper no longer exists. The
+        // bootstrap tracks the worker via `embed_binary` and repairs a
+        // partial install (main-only) through `ensure_worker_present`.
         let bootstrap = read_file("packages/pypi-leindex/src/leindex/bootstrap.py");
         assert!(
-            bootstrap.contains("install_embed_worker"),
-            "VAL-PYPI-008: bootstrap must also install the leindex-embed worker binary"
+            bootstrap.contains("embed_binary"),
+            "VAL-PYPI-008: bootstrap must track the leindex-embed worker binary"
+        );
+        assert!(
+            bootstrap.contains("ensure_worker_present"),
+            "VAL-PYPI-008: bootstrap must ensure the leindex-embed worker binary is present"
+        );
+        // The worker must be a [[bin]] of the root crate, onnx-gated, so the
+        // single cargo install co-installs it (VAL-CARGO-005 invariant).
+        let cargo = read_file("Cargo.toml");
+        assert!(
+            cargo.contains("name = \"leindex-embed\"")
+                && cargo.contains("required-features = [\"onnx\"]"),
+            "VAL-PYPI-008: root crate must declare the onnx-gated leindex-embed worker bin"
         );
         // The bootstrap installs with the `onnx` feature so the `setup`
         // subcommand is present in the freshly installed binary.
