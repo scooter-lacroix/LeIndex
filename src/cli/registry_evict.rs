@@ -28,15 +28,19 @@ impl ProjectRegistry {
     /// tool call transparently reloads via `get_or_load`.
     ///
     /// **Atomicity (Codex P2):** every candidate is checked and evicted under
-    /// ONE `last_used` read + `projects` write hold. `get_or_load` clones the
-    /// project `Arc` *and* refreshes `last_used` together under its own read
-    /// lock, so a fresh timestamp observed under our held locks provably means
-    /// an `Arc` is outstanding for this project — we skip it rather than close
-    /// storage out from under the pending request. `try_write()` additionally
-    /// skips a caller that is currently inside the inner lock. Together these
-    /// close the window in which an eviction could hand a later-locking caller
-    /// a closed index (previously the freshness check, the removal, and the
-    /// close each ran under separate lock acquisitions).
+    /// ONE `projects` write + `last_used` read hold (acquired in that order,
+    /// matching `get_or_load`'s `projects` read -> `last_used` write order, so
+    /// the two paths can never deadlock). `get_or_load` refreshes `last_used`
+    /// *and* clones the project `Arc` while its `projects` read guard is still
+    /// live (the `Arc::clone` happens in the `return` inside that guard's
+    /// block), so a fresh timestamp observed under our held write lock
+    /// provably means an `Arc` is outstanding for this project — we skip it
+    /// rather than close storage out from under the pending request.
+    /// `try_write()` additionally skips a caller that is currently inside the
+    /// inner lock. Together these close the window in which an eviction could
+    /// hand a later-locking caller a closed index (previously the freshness
+    /// check, the removal, and the close each ran under separate lock
+    /// acquisitions).
     pub async fn evict_idle_engines(&self, max_idle: std::time::Duration) -> usize {
         let candidates: Vec<std::path::PathBuf> = {
             let last_used = self.last_used.read().await;
