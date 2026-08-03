@@ -1,13 +1,13 @@
 {
-  "phase": "embed_teardown",
-  "rss_min_kib": 9104,
-  "rss_max_kib": 9104,
-  "rss_p95_kib": 9104,
-  "mapped_file_kib": 8344,
-  "anon_kib": 760,
-  "sample_count": 12,
-  "duration_ms": 3077,
-  "worker_rss_max_kib": 0,
-  "combined_rss_max_kib": 9104,
-  "rebaselined_note": "T8 step-3 (memory-pressure remediation): empirical re-baseline measured on the merged tree post-T5/T6/T7 via `cargo xtask memcheck --update-baseline` (2026-08-03). 7900 -> 9104 KiB (+1204 KiB) = box-idle jitter on the swap-saturated workstation; within the 10% tolerance ceiling (10014)."
+ "phase": "embed_teardown",
+ "rss_min_kib": 9048,
+ "rss_max_kib": 9048,
+ "rss_p95_kib": 9048,
+ "mapped_file_kib": 8288,
+ "anon_kib": 760,
+ "sample_count": 12,
+ "duration_ms": 3069,
+ "worker_rss_max_kib": 0,
+ "combined_rss_max_kib": 9048,
+ "rebaselined_note": "T8 step-3 re-baseline (2026-08-03): measured 9048 KiB in the 12-phase capture and 8880 KiB in the re-gate run (committed 9104). The pre-966417da ceiling (8690) would fail these measurements - the re-baseline is required, not cosmetic (evidence sent to GrayHill, msg 100)."
 }

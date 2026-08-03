@@ -1,0 +1,13 @@
+{
+ "phase": "stale_artifacts",
+ "rss_min_kib": 404,
+ "rss_max_kib": 404,
+ "rss_p95_kib": 404,
+ "mapped_file_kib": 488,
+ "anon_kib": 36,
+ "sample_count": 1,
+ "duration_ms": 13,
+ "worker_rss_max_kib": 0,
+ "combined_rss_max_kib": 404,
+ "rebaselined_note": "T8 step-3: NEW phase. `leindex cleanup --stale-daemons` sweep RSS measured 360-444 KiB (2026-08-03); all 3 seeded dead-pid sidecars removed in-phase (loud failure if any survives) and in harness_integration.rs::test_stale_artifacts_phase_removes_dead_sidecars."
+}

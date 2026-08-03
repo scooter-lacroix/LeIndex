@@ -1,0 +1,13 @@
+{
+ "phase": "worker_ort_threads",
+ "rss_min_kib": 9668,
+ "rss_max_kib": 20192,
+ "rss_p95_kib": 20192,
+ "mapped_file_kib": 12588,
+ "anon_kib": 7604,
+ "sample_count": 16,
+ "duration_ms": 4105,
+ "worker_rss_max_kib": 2540352,
+ "combined_rss_max_kib": 2560544,
+ "rebaselined_note": "T8 step-3: NEW phase. Worker RSS under LEINDEX_WORKER_ORT_THREADS=1 (T5/D3 capped setting, default provider): worker 2540352 / combined 2560544 KiB (measured 2026-08-03). {0,4,1} empirical record (CPU provider, opt-in test LEINDEX_MEMCHECK_EXPENSIVE=1): t0 1497384, t4 1474980, t1 1492168 KiB \u2014 cap<=no-cap verified (t4 saves ~22 MiB, t1 ~5 MiB; model weights dominate the ~1.5-2.6 GiB residency). Budget combined ceiling 4 GiB leaves headroom for the opt-in comparison runs."
+}

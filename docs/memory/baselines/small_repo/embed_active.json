@@ -1,13 +1,13 @@
 {
-  "phase": "embed_active",
-  "rss_min_kib": 9440,
-  "rss_max_kib": 20240,
-  "rss_p95_kib": 20240,
-  "mapped_file_kib": 12636,
-  "anon_kib": 7604,
-  "sample_count": 20,
-  "duration_ms": 5147,
-  "worker_rss_max_kib": 2594916,
-  "combined_rss_max_kib": 2615156,
-  "rebaselined_note": "T8 step-3 (memory-pressure remediation): empirical re-baseline measured on the merged tree post-T5/T6/T7 via `cargo xtask memcheck --update-baseline` (2026-08-03). Worker RSS 4928636 -> 2594916 KiB, combined 4949500 -> 2615156 KiB. Measured on the post-embed-merge worker (`-p leindex --bin leindex-embed`, onnx); the prior baseline predates the 1.10.0 merge, so the drop reflects the merged worker path + provider/cache state, not a single-lever claim."
+ "phase": "embed_active",
+ "rss_min_kib": 9520,
+ "rss_max_kib": 20044,
+ "rss_p95_kib": 20044,
+ "mapped_file_kib": 12440,
+ "anon_kib": 7604,
+ "sample_count": 20,
+ "duration_ms": 5129,
+ "worker_rss_max_kib": 2604964,
+ "combined_rss_max_kib": 2625008,
+ "rebaselined_note": "T8 step-3 re-baseline (2026-08-03, default provider): main 20044 / worker 2604964 / combined 2625008 KiB (committed 966417da: 20240 / 2594916 / 2615156). Worker residency is provider/cache-state dependent; combined ceiling 8 GiB holds. {0,4,1} ORT-thread record (CPU provider) in the worker_ort_threads phase note."
 }

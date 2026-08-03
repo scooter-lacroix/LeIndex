@@ -158,8 +158,9 @@ fn test_val_measure_001_canonical_multi_phase_report() {
         .expect("report should have 'phases' field");
     let phases_arr = phases.as_array().expect("'phases' should be an array");
 
-    // Should have exactly 9 canonical phases (6 original + 3 worker-active)
-    assert_eq!(phases_arr.len(), 9, "should have 9 canonical phases");
+    // Should have exactly 12 canonical phases (6 original + 3 worker-active
+    // + 3 memory-pressure phases)
+    assert_eq!(phases_arr.len(), 12, "should have 12 canonical phases");
 
     // Phase names should match canonical order
     let expected = [
@@ -172,6 +173,9 @@ fn test_val_measure_001_canonical_multi_phase_report() {
         "embed_idle",
         "embed_active",
         "embed_teardown",
+        "mcp_idle_proliferation",
+        "worker_ort_threads",
+        "stale_artifacts",
     ];
     for (i, expected_name) in expected.iter().enumerate() {
         let phase_name = phases_arr[i]
@@ -218,6 +222,9 @@ fn test_val_measure_002_phase_order_is_canonical() {
         "embed_idle",
         "embed_active",
         "embed_teardown",
+        "mcp_idle_proliferation",
+        "worker_ort_threads",
+        "stale_artifacts",
     ];
 
     // No missing phases
@@ -295,12 +302,12 @@ fn test_val_measure_003_per_phase_schema_has_required_metrics() {
             );
         }
 
-        // sample_count should be positive for the first 6 phases (original canonical).
-        // Worker-active phases (embed_*) may have 0 samples if the worker binary
-        // is not available.
+        // sample_count should be positive for the non-worker-gated phases.
+        // Worker-gated phases (embed_*, worker_ort_threads) may have 0 samples
+        // if the worker binary is not available (placeholder reports).
         let phase_name = phase.get("phase").unwrap().as_str().unwrap_or("");
         let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
-        if !phase_name.starts_with("embed_") {
+        if !phase_name.starts_with("embed_") && phase_name != "worker_ort_threads" {
             assert!(
                 sample_count > 0,
                 "phase {} ('{}') should have at least 1 sample",
@@ -309,9 +316,9 @@ fn test_val_measure_003_per_phase_schema_has_required_metrics() {
             );
         }
 
-        // duration_ms should be positive for the first 6 phases
+        // duration_ms should be positive for the non-worker-gated phases
         let duration = phase.get("duration_ms").unwrap().as_u64().unwrap();
-        if !phase_name.starts_with("embed_") {
+        if !phase_name.starts_with("embed_") && phase_name != "worker_ort_threads" {
             assert!(
                 duration > 0,
                 "phase {} ('{}') should have positive duration",
@@ -379,8 +386,11 @@ fn test_val_measure_005_linux_rss_is_primary_metric() {
         let rss_max = phase.get("rss_max_kib").unwrap().as_u64().unwrap();
         let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
 
-        // Skip worker-active phases that had no samples (worker binary not available)
-        if phase_name.starts_with("embed_") && sample_count == 0 {
+        // Skip worker-gated phases that had no samples (worker binary not
+        // available → placeholder reports carry u64::MAX sentinels).
+        if (phase_name.starts_with("embed_") || phase_name == "worker_ort_threads")
+            && sample_count == 0
+        {
             continue;
         }
 
@@ -536,7 +546,10 @@ fn test_idle_phases_have_reasonable_duration() {
     for phase in phases {
         let name = phase.get("phase").unwrap().as_str().unwrap();
         let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
-        if name.starts_with("idle_") || (name.starts_with("embed_") && name != "embed_active") {
+        if name.starts_with("idle_")
+            || name == "mcp_idle_proliferation"
+            || (name.starts_with("embed_") && name != "embed_active")
+        {
             // Skip phases with no samples (worker binary not available)
             if name.starts_with("embed_") && sample_count == 0 {
                 continue;
@@ -550,4 +563,186 @@ fn test_idle_phases_have_reasonable_duration() {
             );
         }
     }
+}
+
+// ─── T8 step-3: mcp_idle_proliferation linearity guard ──────────────────
+
+#[test]
+fn test_mcp_idle_proliferation_linearity() {
+    let fixture = small_repo_fixture();
+    if !fixture.exists() {
+        eprintln!("SKIP: fixture not found at {:?}", fixture);
+        return;
+    }
+
+    require_release_binary!();
+
+    let (success, report) = run_memcheck_to_json(fixture.to_str().unwrap());
+    assert!(success, "memcheck should exit 0");
+
+    let phases = report.get("phases").unwrap().as_array().unwrap();
+    let get_rss = |name: &str| -> u64 {
+        phases
+            .iter()
+            .find(|p| p.get("phase").and_then(|n| n.as_str()) == Some(name))
+            .unwrap_or_else(|| panic!("phase '{name}' missing from report"))
+            .get("rss_max_kib")
+            .unwrap()
+            .as_u64()
+            .unwrap()
+    };
+
+    let single = get_rss("idle_warm");
+    let combined = get_rss("mcp_idle_proliferation");
+    let ceiling = (single as f64 * 3.5) as u64;
+
+    // 3 concurrent idle servers must scale roughly linearly: combined ≤ 3.5 ×
+    // single-server. A per-server leak (memory-pressure T2) breaks this.
+    assert!(
+        combined <= ceiling,
+        "3 idle MCP servers combined {combined} KiB should be ≤ 3.5× single-server {single} KiB ({ceiling} KiB) — superlinear per-server growth"
+    );
+    // Sanity: all 3 servers really ran (combined ≥ 2 × single).
+    assert!(
+        combined >= single * 2,
+        "combined {combined} KiB should be at least 2× single {single} KiB (3 servers were expected)"
+    );
+}
+
+// ─── T8 step-3: stale-artifacts sweep removes dead sidecars ─────────────
+
+#[test]
+fn test_stale_artifacts_phase_removes_dead_sidecars() {
+    let fixture = small_repo_fixture();
+    if !fixture.exists() {
+        eprintln!("SKIP: fixture not found at {:?}", fixture);
+        return;
+    }
+
+    require_release_binary!();
+
+    let _lock = memcheck_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let run_dir = dir.path().join("leindex-home").join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+
+    // Seed dead-pid sidecars matching the T7 sweeper naming scheme.
+    let stem = "leindex-embed-memcheck";
+    let seeded = ["pid", "lock", "sock"];
+    for ext in seeded {
+        let contents = if ext == "pid" {
+            "2147483647\n"
+        } else {
+            "stale\n"
+        };
+        std::fs::write(run_dir.join(format!("{stem}.{ext}")), contents).unwrap();
+    }
+
+    let memcheck_bin = std::env::var("CARGO_BIN_EXE_memcheck")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root().join("target/debug/memcheck"));
+    let output = Command::new(&memcheck_bin)
+        .arg(fixture.to_str().unwrap())
+        .arg("--baselines-dir")
+        .arg(dir.path().join("baselines"))
+        .env("LEINDEX_HOME", dir.path().join("leindex-home"))
+        .env(
+            "LEINDEX_MEMCHECK_STALE_HOME",
+            dir.path().join("leindex-home"),
+        )
+        .env("LEINDEX_WORKER_EXECUTION_PROVIDER", "cpu")
+        .output()
+        .expect("failed to run memcheck");
+    assert!(
+        output.status.success(),
+        "memcheck failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for ext in seeded {
+        let path = run_dir.join(format!("{stem}.{ext}"));
+        assert!(
+            !path.exists(),
+            "sidecar {} should have been removed by the stale_artifacts phase",
+            path.display()
+        );
+    }
+}
+
+// ─── T8 step-3: worker ORT-threads cap ≤ no-cap (opt-in, expensive) ─────
+
+#[test]
+fn test_worker_ort_threads_cap_leq_nocap() {
+    // Opt-in: a full memcheck run (incl. the ONNX worker-active phases) takes
+    // ~1 min; this test runs it twice and loads the real model each time.
+    // Enable with LEINDEX_MEMCHECK_EXPENSIVE=1.
+    if std::env::var("LEINDEX_MEMCHECK_EXPENSIVE").is_err() {
+        eprintln!(
+            "SKIP: set LEINDEX_MEMCHECK_EXPENSIVE=1 to run the {{0,4,1}} ORT-thread RSS comparison"
+        );
+        return;
+    }
+    let fixture = small_repo_fixture();
+    if !fixture.exists() {
+        eprintln!("SKIP: fixture not found at {:?}", fixture);
+        return;
+    }
+
+    require_release_binary!();
+
+    let measure = |threads: &str| -> u64 {
+        let _lock = memcheck_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("report.json");
+        let memcheck_bin = std::env::var("CARGO_BIN_EXE_memcheck")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| workspace_root().join("target/debug/memcheck"));
+        let output = Command::new(&memcheck_bin)
+            .arg(fixture.to_str().unwrap())
+            .arg("--output")
+            .arg(&output_path)
+            .arg("--baselines-dir")
+            .arg(dir.path().join("baselines"))
+            .env("LEINDEX_HOME", dir.path().join("leindex-home"))
+            .env("LEINDEX_WORKER_EXECUTION_PROVIDER", "cpu")
+            .env("LEINDEX_WORKER_ORT_THREADS", threads)
+            .output()
+            .expect("failed to run memcheck");
+        if !output.status.success() {
+            eprintln!(
+                "memcheck (threads={threads}) failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return u64::MAX;
+        }
+        let content = std::fs::read_to_string(&output_path).unwrap_or_default();
+        let json: serde_json::Value =
+            serde_json::from_str(&content).unwrap_or(serde_json::Value::Null);
+        json.get("phases")
+            .and_then(|p| p.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|p| p.get("phase").and_then(|n| n.as_str()) == Some("worker_ort_threads"))
+            })
+            .and_then(|p| p.get("worker_rss_max_kib"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::MAX)
+    };
+
+    // Plan {0,4,1}: measure all three settings and log the deltas as the
+    // empirical record. The assertion is cap ≤ no-cap for both capped values.
+    let t0 = measure("0");
+    let t4 = measure("4");
+    let t1 = measure("1");
+    eprintln!(
+        "worker_ort_threads empirical record: threads=0 (uncapped) -> {t0} KiB, threads=4 -> {t4} KiB, threads=1 -> {t1} KiB"
+    );
+    assert!(
+        t1 <= t0,
+        "capped ORT threads (1) worker RSS {t1} KiB must be ≤ uncapped (0) {t0} KiB (T5/D3)"
+    );
+    assert!(
+        t4 <= t0,
+        "capped ORT threads (4) worker RSS {t4} KiB must be ≤ uncapped (0) {t0} KiB (T5/D3)"
+    );
 }

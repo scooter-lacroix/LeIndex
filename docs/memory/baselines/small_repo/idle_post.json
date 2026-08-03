@@ -1,13 +1,13 @@
 {
-  "phase": "idle_post",
-  "rss_min_kib": 8912,
-  "rss_max_kib": 8912,
-  "rss_p95_kib": 8912,
-  "mapped_file_kib": 8148,
-  "anon_kib": 764,
-  "sample_count": 12,
-  "duration_ms": 3008,
-  "worker_rss_max_kib": 0,
-  "combined_rss_max_kib": 8912,
-  "rebaselined_note": "T8 step-3 (memory-pressure remediation): empirical re-baseline measured on the merged tree post-T5/T6/T7 via `cargo xtask memcheck --update-baseline` (2026-08-03). 8596 -> 8912 KiB (+316 KiB) = box-idle jitter on the swap-saturated workstation; within the 10% tolerance ceiling (9803)."
+ "phase": "idle_post",
+ "rss_min_kib": 8884,
+ "rss_max_kib": 8884,
+ "rss_p95_kib": 8884,
+ "mapped_file_kib": 8124,
+ "anon_kib": 760,
+ "sample_count": 12,
+ "duration_ms": 3008,
+ "worker_rss_max_kib": 0,
+ "combined_rss_max_kib": 8884,
+ "rebaselined_note": "T8 step-3 re-baseline (2026-08-03): measured 8884 KiB (committed 8912). Sub-10% box jitter; tolerance holds."
 }
