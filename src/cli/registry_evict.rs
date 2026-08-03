@@ -27,13 +27,16 @@ impl ProjectRegistry {
     /// retain that engine's mmaps/heap for the process lifetime. The next
     /// tool call transparently reloads via `get_or_load`.
     ///
-    /// **Known benign race (Kilo review item, documented-and-leave):** the
-    /// candidate set is snapshotted under the `last_used` read lock, then each
-    /// project is checked + evicted afterward. A `get_or_load` that lands
-    /// between the snapshot and the `try_write` guard re-touches `last_used`,
-    /// but the in-flight `try_write()` guard below still prevents the
-    /// destructive case (tearing down a mid-call engine). The residual is a
-    /// benign evict-and-reload-on-next-call, which the D-2 design tolerates.
+    /// **Atomicity (Codex P2):** every candidate is checked and evicted under
+    /// ONE `last_used` read + `projects` write hold. `get_or_load` clones the
+    /// project `Arc` *and* refreshes `last_used` together under its own read
+    /// lock, so a fresh timestamp observed under our held locks provably means
+    /// an `Arc` is outstanding for this project — we skip it rather than close
+    /// storage out from under the pending request. `try_write()` additionally
+    /// skips a caller that is currently inside the inner lock. Together these
+    /// close the window in which an eviction could hand a later-locking caller
+    /// a closed index (previously the freshness check, the removal, and the
+    /// close each ran under separate lock acquisitions).
     pub async fn evict_idle_engines(&self, max_idle: std::time::Duration) -> usize {
         let candidates: Vec<std::path::PathBuf> = {
             let last_used = self.last_used.read().await;
@@ -52,19 +55,65 @@ impl ProjectRegistry {
 
         let mut evicted = 0;
         for path in candidates {
-            // Skip projects with an in-flight call: the mutex is held by an
-            // active tool handler, so eviction must not tear it down mid-use.
-            let in_flight = {
-                let projects = self.projects.read().await;
-                match projects.get(&path) {
-                    Some(handle) => handle.try_write().is_err(),
-                    None => false,
-                }
-            };
+            // One atomic sequence per candidate (Codex P2). Lock order is
+            // `projects` write FIRST, then `last_used` read — matching
+            // `get_or_load` (projects.read -> last_used.write via
+            // `touch_last_used`), so the sweep can never deadlock against an
+            // in-flight tool call. Holding the projects write lock through the
+            // checks + remove + close means no `get_or_load` read section can
+            // be in flight: the freshness value we read is authoritative, and
+            // no new Arc can be cloned between the removal and the close.
+            let mut projects = self.projects.write().await;
+            let last_used = self.last_used.read().await;
+
+            if !projects.contains_key(&path) {
+                continue;
+            }
+            // A `get_or_load` landed since the snapshot: it refreshed
+            // `last_used`, so an Arc is outstanding — never close storage out
+            // from under that pending request.
+            let touched_recently = last_used
+                .get(&path)
+                .map(|last| last.elapsed() <= max_idle)
+                .unwrap_or(true);
+            if touched_recently {
+                continue;
+            }
+            // A caller is currently inside the inner lock: in-flight request.
+            let in_flight = projects
+                .get(&path)
+                .is_some_and(|handle| handle.try_write().is_err());
             if in_flight {
                 continue;
             }
-            self.evict(&path).await;
+            // Under the held write lock the key cannot vanish between the
+            // checks and the removal; still, degrade gracefully rather than
+            // panicking the sweep task if the invariant ever breaks.
+            let Some(handle) = projects.remove(&path) else {
+                continue;
+            };
+            match handle.try_write() {
+                Ok(mut idx) => {
+                    if let Err(e) = idx.close() {
+                        tracing::warn!(
+                            "Failed to close storage for evicted project {}: {}",
+                            path.display(),
+                            e
+                        );
+                    }
+                }
+                // A caller acquired the inner lock between our checks (a
+                // pre-existing Arc holder, e.g. a long-parked handler): leave
+                // the index alive; storage closes when its last Arc drops.
+                Err(()) => tracing::debug!(
+                    "Skipped close for in-flight evicted project {}",
+                    path.display()
+                ),
+            }
+            tracing::info!("Evicted project: {}", path.display());
+            drop(projects);
+            drop(last_used);
+            self.cleanup_evicted(&path).await;
             evicted += 1;
         }
         evicted

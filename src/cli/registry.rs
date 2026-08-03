@@ -853,36 +853,65 @@ impl ProjectRegistry {
     /// Cleans up all associated bookkeeping: LRU order, index slots,
     /// watchers, and stale-cache entries (VAL-APLUS-027).
     pub async fn evict(&self, path: &Path) {
+        // Codex P2: the map removal and the storage close run under ONE
+        // `projects` write-lock hold, so a concurrent `get_or_load` cannot
+        // clone the Arc in between and later resume on a closed index.
+        // `try_write()` still skips a caller that is *currently* inside the
+        // inner lock.
         let removed = {
             let mut projects = self.projects.write().await;
-            projects.remove(path)
-        };
-
-        if let Some(handle) = removed {
-            if let Ok(mut idx) = handle.try_write() {
-                if let Err(e) = idx.close() {
-                    warn!(
-                        "Failed to close storage for evicted project {}: {}",
-                        path.display(),
-                        e
-                    );
+            match projects.remove(path) {
+                Some(handle) => {
+                    if let Ok(mut idx) = handle.try_write() {
+                        if let Err(e) = idx.close() {
+                            warn!(
+                                "Failed to close storage for evicted project {}: {}",
+                                path.display(),
+                                e
+                            );
+                        }
+                    }
+                    info!("Evicted project: {}", path.display());
+                    true
                 }
+                None => false,
             }
-            info!("Evicted project: {}", path.display());
+        };
+        if removed {
+            self.cleanup_evicted(path).await;
         }
+    }
 
+    /// Shared bookkeeping cleanup after a project has been removed from the
+    /// map (LRU order, index slots, watchers, stale cache, index jobs,
+    /// incremental-refresh guard, and the D-2 idle-eviction timestamp). Used by
+    /// [`Self::evict`], [`Self::evict_lru_if_needed`], and the D-2 idle sweep
+    /// so every eviction path leaves identical state behind.
+    pub(crate) async fn cleanup_evicted(&self, path: &Path) {
         let mut lru = self.lru_order.lock().await;
         lru.retain(|p| p != path);
+        drop(lru);
 
         let mut slots = self.index_slots.lock().await;
         slots.remove(path);
+        drop(slots);
 
+        // Remove watcher so the evicted LeIndex is not kept alive by the
+        // watcher's captured ProjectHandle.
         let mut watchers = self.watchers.lock().await;
         watchers.remove(path);
+        drop(watchers);
 
         // A+ hotspot cleanup: evict stale-cache entry so residency does not
         // grow monotonically across long-lived sessions (VAL-APLUS-027).
         self.stale_cache.write().await.remove(path);
+
+        // Drop per-project bookkeeping so a reloaded project starts clean.
+        // Without this, `index_jobs` leaks one entry per distinct project
+        // visited (memory growth over a long-lived session), and a stale
+        // `true` in `incremental_refresh_guard` would block future background
+        // refreshes for this path when it is reloaded.
+        self.index_jobs.lock().await.remove(path);
 
         // Clean up incremental refresh guard.
         self.incremental_refresh_guard.lock().await.remove(path);
@@ -1311,49 +1340,36 @@ impl ProjectRegistry {
         };
 
         if let Some(path) = evict_path {
+            // Codex P2: remove + close under ONE projects write-lock hold — no
+            // gap in which a concurrent `get_or_load` could clone the Arc and
+            // later resume on a closed index. `try_write()` still skips a
+            // caller that is currently inside the inner lock.
             let removed = {
                 let mut projects = self.projects.write().await;
-                projects.remove(&path)
-            };
-
-            if let Some(handle) = removed {
-                if let Ok(mut idx) = handle.try_write() {
-                    if let Err(e) = idx.close() {
-                        warn!(
-                            "Failed to close storage for LRU-evicted project {}: {}",
-                            path.display(),
-                            e
-                        );
+                match projects.remove(&path) {
+                    Some(handle) => {
+                        if let Ok(mut idx) = handle.try_write() {
+                            if let Err(e) = idx.close() {
+                                warn!(
+                                    "Failed to close storage for LRU-evicted project {}: {}",
+                                    path.display(),
+                                    e
+                                );
+                            }
+                        }
+                        true
                     }
+                    None => false,
                 }
+            };
+            if removed {
+                self.cleanup_evicted(&path).await;
+                info!(
+                    "Evicted LRU project: {} (capacity: {})",
+                    path.display(),
+                    self.max_projects
+                );
             }
-
-            let mut slots = self.index_slots.lock().await;
-            slots.remove(&path);
-
-            // Remove watcher so the evicted LeIndex is not kept alive by
-            // the watcher's captured ProjectHandle.
-            let mut watchers = self.watchers.lock().await;
-            watchers.remove(&path);
-
-            // A+ hotspot cleanup: also evict stale-cache entry
-            self.stale_cache.write().await.remove(&path);
-
-            // Drop per-project bookkeeping so a reloaded project starts clean.
-            // Without this, `index_jobs` leaks one entry per distinct project
-            // visited (memory growth over a long-lived session), and a stale
-            // `true` in `incremental_refresh_guard` would block future
-            // background refreshes for this path when it is reloaded.
-            self.index_jobs.lock().await.remove(&path);
-            if let Ok(mut guard) = self.incremental_refresh_guard.try_lock() {
-                guard.remove(&path);
-            }
-
-            info!(
-                "Evicted LRU project: {} (capacity: {})",
-                path.display(),
-                self.max_projects
-            );
         }
     }
 }
