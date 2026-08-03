@@ -535,17 +535,40 @@ fn run_idle_proliferation_phase(config: &WorkloadConfig) -> Result<PhaseReport> 
             .to_str()
             .context("mcp_idle_proliferation: non-UTF8 temp home path")?;
         let env = [("LEINDEX_HOME", home_str)];
-        children.push(launch_mcp_process_with_env(config, &env)?);
+        match launch_mcp_process_with_env(config, &env) {
+            Ok(child) => children.push(child),
+            Err(e) => {
+                // Kilo WARNING: partial-failure process leak. If a launch fails
+                // after earlier children were already spawned, the `?` would
+                // return early and drop the temp `root` while live servers
+                // still run inside it (and never kill them). Kill everything
+                // launched so far before propagating.
+                for child in children {
+                    kill_child(child);
+                }
+                return Err(e);
+            }
+        }
     }
     std::thread::sleep(STARTUP_GRACE);
 
     let pids: Vec<u32> = children.iter().map(|c| c.id()).collect();
-    let report = sample_pids_for_duration(
+    let report = match sample_pids_for_duration(
         &pids,
         "mcp_idle_proliferation",
         PROLIFERATION_DWELL,
         config.sample_interval,
-    )?;
+    ) {
+        Ok(report) => report,
+        Err(e) => {
+            // Same leak class as the launch loop: never drop the temp root
+            // while sampled servers still run.
+            for child in children {
+                kill_child(child);
+            }
+            return Err(e);
+        }
+    };
 
     for child in children {
         kill_child(child);

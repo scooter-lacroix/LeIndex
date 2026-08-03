@@ -734,6 +734,20 @@ fn test_worker_ort_threads_cap_leq_nocap() {
     let t0 = measure("0");
     let t4 = measure("4");
     let t1 = measure("1");
+    // Kilo WARNING: u64::MAX is the failure sentinel returned by `measure` on
+    // any run error. If every run failed, `MAX <= MAX` would make the cap
+    // assertions below pass vacuously (false green). Fail loudly instead.
+    for (label, kib) in [
+        ("threads=0 (uncapped)", t0),
+        ("threads=4", t4),
+        ("threads=1", t1),
+    ] {
+        assert_ne!(
+            kib,
+            u64::MAX,
+            "measurement for {label} failed (memcheck run error) — cannot validate the ORT-thread cap (T5/D3)"
+        );
+    }
     eprintln!(
         "worker_ort_threads empirical record: threads=0 (uncapped) -> {t0} KiB, threads=4 -> {t4} KiB, threads=1 -> {t1} KiB"
     );
