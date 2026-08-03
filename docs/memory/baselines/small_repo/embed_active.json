@@ -1,12 +1,13 @@
 {
   "phase": "embed_active",
-  "rss_min_kib": 8168,
-  "rss_max_kib": 20864,
-  "rss_p95_kib": 20864,
-  "mapped_file_kib": 11456,
-  "anon_kib": 9408,
+  "rss_min_kib": 9440,
+  "rss_max_kib": 20240,
+  "rss_p95_kib": 20240,
+  "mapped_file_kib": 12636,
+  "anon_kib": 7604,
   "sample_count": 20,
-  "duration_ms": 5146,
-  "worker_rss_max_kib": 4928636,
-  "combined_rss_max_kib": 4949500
+  "duration_ms": 5147,
+  "worker_rss_max_kib": 2594916,
+  "combined_rss_max_kib": 2615156,
+  "rebaselined_note": "T8 step-3 (memory-pressure remediation): empirical re-baseline measured on the merged tree post-T5/T6/T7 via `cargo xtask memcheck --update-baseline` (2026-08-03). Worker RSS 4928636 -> 2594916 KiB, combined 4949500 -> 2615156 KiB. Measured on the post-embed-merge worker (`-p leindex --bin leindex-embed`, onnx); the prior baseline predates the 1.10.0 merge, so the drop reflects the merged worker path + provider/cache state, not a single-lever claim."
 }

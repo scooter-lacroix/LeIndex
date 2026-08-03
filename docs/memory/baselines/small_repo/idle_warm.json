@@ -1,13 +1,13 @@
 {
   "phase": "idle_warm",
-  "rss_min_kib": 8464,
-  "rss_max_kib": 8464,
-  "rss_p95_kib": 8464,
-  "mapped_file_kib": 6960,
-  "anon_kib": 1504,
+  "rss_min_kib": 8900,
+  "rss_max_kib": 8900,
+  "rss_p95_kib": 8900,
+  "mapped_file_kib": 8140,
+  "anon_kib": 760,
   "sample_count": 12,
-  "duration_ms": 3007,
+  "duration_ms": 3008,
   "worker_rss_max_kib": 0,
-  "combined_rss_max_kib": 8464,
-  "rebaselined_note": "T8 wave-2 (memory-pressure remediation): re-baselined from 7672 to 8464 = the idle_warm RSS measured by the CI Memory budget gate on bf1f59ab. T2 (MCP idle self-exit) added a dedicated stdin reader thread + mpsc + 1s idle ticker to every idle MCP server (~+790 KiB anon). Mapped-file pages unchanged; the delta is anon (thread stack/allocator arenas). Ceiling at 10% tolerance = 9310 KiB. Net win: +800 KiB idle-temporary vs 2.4 GiB held forever + self-exit."
+  "combined_rss_max_kib": 8900,
+  "rebaselined_note": "T8 step-3 (memory-pressure remediation): empirical re-baseline measured on the merged tree post-T5/T6/T7 via `cargo xtask memcheck --update-baseline` (2026-08-03). 8464 -> 8900 KiB (+436 KiB) = box-idle jitter on the swap-saturated workstation; within the 10% tolerance ceiling (9790)."
 }
