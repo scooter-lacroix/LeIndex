@@ -232,9 +232,11 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
         // Still add placeholder phases so the report has the right phase count.
         // Use u64::MAX sentinel values so the budget gate fails these phases
         // (they were not actually measured). A zero-valued report would pass
-        // trivially since 0 < any threshold. `worker_ort_threads` is inserted
-        // here so the canonical order (…embed_teardown, mcp_idle_proliferation,
-        // worker_ort_threads, stale_artifacts) holds on both paths.
+        // trivially since 0 < any threshold. Only the three `embed_*` phases
+        // are inserted here: `worker_ort_threads` gets its placeholder at the
+        // same canonical position as the real run (after mcp_idle_proliferation,
+        // before stale_artifacts) so report order matches CANONICAL_PHASES on
+        // both paths (VAL-MEASURE-002).
         eprintln!(
             "memcheck: WARNING: worker-active phases skipped ({} not found) — \
              placeholder reports will fail the budget gate",
@@ -244,12 +246,7 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "worker binary path not set".to_string())
         );
-        for phase_name in &[
-            "embed_idle",
-            "embed_active",
-            "embed_teardown",
-            "worker_ort_threads",
-        ] {
+        for phase_name in &["embed_idle", "embed_active", "embed_teardown"] {
             reports.push(placeholder_report(phase_name));
         }
     }
@@ -263,13 +260,15 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
     reports.push(report);
 
     // ── Phase 11: worker_ort_threads ────────────────────────────────────
-    // Worker-gated: real measurement above the worker-gated block would break
-    // canonical order, so the real run happens here and the placeholder was
-    // pushed inside the else-branch. Only one of the two paths fires.
+    // Worker-gated: real run or placeholder at the SAME canonical position on
+    // both paths (after mcp_idle_proliferation, before stale_artifacts), so
+    // report order always matches CANONICAL_PHASES (VAL-MEASURE-002).
     if worker_available {
         let (child, report) = run_worker_ort_threads_phase(config)?;
         reports.push(report);
         kill_child(child);
+    } else {
+        reports.push(placeholder_report("worker_ort_threads"));
     }
 
     // ── Phase 12: stale_artifacts ───────────────────────────────────────
