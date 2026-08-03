@@ -360,9 +360,15 @@ fn is_daemon_sidecar(name: &str) -> bool {
 ///   that stem (a running daemon owns them).
 /// - A stem with a `.pid` file whose pid is **dead** → all its sidecars are
 ///   stale, regardless of age (the daemon that owned them is gone).
-/// - A stem with **no pid file** (e.g. a 0-byte flock target or a crashed MCP
-///   guard) → stale when older than `max_age` (mtime).
+/// - A stem with **no readable pid file** (e.g. a 0-byte flock target, a
+///   crashed MCP guard, or a malformed pid file) → stale when older than
+///   `max_age` (mtime).
 /// - On non-Linux (pid liveness unknowable) every stem falls back to mtime.
+///
+/// Note: a *live* MCP server that runs longer than `max_age` may have its own
+/// advisory `.lock`/`.start` sidecars swept by the mtime path (MCP stems carry
+/// no pid file). Impact is advisory-only (a lost dup-instance warning, never
+/// data loss); do not tighten the mtime threshold without re-examining this.
 ///
 /// Never touches anything not in the run dir, and never removes a live daemon's
 /// files. Honours `dry_run`.
@@ -433,8 +439,13 @@ fn sweep_run_dir(run_dir: &Path, max_age: Duration, dry_run: bool) -> DaemonSwee
 /// Live-pid protection + pid-presence for one sidecar stem. Returns
 /// `(live, has_pid)`: `live` when any `.pid` file names a running process
 /// (that stem is protected from sweeping); `has_pid` when any `.pid` file
-/// exists (a dead/absent pid makes every sidecar stale regardless of age;
-/// non-Linux platforms where liveness is unknowable fall back to mtime).
+/// holds a *readable, parseable* pid (a dead/absent pid makes every sidecar
+/// stale regardless of age; non-Linux platforms where liveness is unknowable
+/// fall back to mtime).
+///
+/// A malformed/unreadable pid file deliberately does NOT set `has_pid`: if it
+/// did, the whole stem would be "dead regardless of age" and a live daemon
+/// whose pid file is transiently unreadable could have its sidecars swept.
 fn stem_liveness(files: &[PathBuf]) -> (bool, bool) {
     let mut live = false;
     let mut has_pid = false;
@@ -442,13 +453,13 @@ fn stem_liveness(files: &[PathBuf]) -> (bool, bool) {
         if path.extension().is_none_or(|ext| ext != "pid") {
             continue;
         }
-        has_pid = true;
         let Ok(pid_str) = fs::read_to_string(path) else {
             continue;
         };
         let Ok(pid) = pid_str.trim().parse::<u32>() else {
             continue;
         };
+        has_pid = true;
         if pid_is_alive(pid) == Some(true) {
             live = true;
         }
@@ -766,6 +777,26 @@ mod tests {
             dir.path().join(format!("{stem}.lock")).exists(),
             "dry run removes nothing"
         );
+    }
+
+    #[test]
+    fn test_sweep_keeps_malformed_pid_stem_recent_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        // A malformed (unparseable) pid file must NOT mark the stem "dead
+        // regardless of age": that would let a live daemon with a transiently
+        // unreadable pid file have its sidecars swept. With a generous max_age,
+        // recent sidecars survive via the mtime fallback path.
+        let stem = "leindex-embed-eeeeeeeeeeeeeeee";
+        fs::write(dir.path().join(format!("{stem}.pid")), b"not-a-pid").unwrap();
+        fs::write(dir.path().join(format!("{stem}.status")), "ready\n").unwrap();
+
+        let report = sweep_run_dir(dir.path(), Duration::from_secs(7 * 24 * 3600), false);
+        assert_eq!(
+            report.removed, 0,
+            "malformed pid must fall back to mtime, not sweep recent sidecars"
+        );
+        assert!(dir.path().join(format!("{stem}.pid")).exists());
+        assert!(dir.path().join(format!("{stem}.status")).exists());
     }
 
     #[test]

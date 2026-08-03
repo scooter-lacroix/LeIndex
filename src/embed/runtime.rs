@@ -766,10 +766,11 @@ impl WorkerRuntime {
     }
 
     /// T6: whether the worker's resident set exceeds `LEINDEX_WORKER_MAX_RSS_MB`.
-    /// When it does, the run loop self-exits so the parent can respawn a lean
-    /// worker instead of holding a multi-GiB swapped-out model forever (the
-    /// swap-saturation root cause this batch targets). Logs the trigger.
-    fn rss_over_cap(&self) -> bool {
+    /// When it does, the run loop (and the socket accept loop) self-exit so the
+    /// parent can respawn a lean worker instead of holding a multi-GiB
+    /// swapped-out model forever (the swap-saturation root cause this batch
+    /// targets). Logs the trigger.
+    pub(crate) fn rss_over_cap(&self) -> bool {
         let Some(max_mb) = self.config.max_rss_mb else {
             return false;
         };

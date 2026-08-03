@@ -84,12 +84,15 @@ pub(crate) fn env_flag(name: &str) -> bool {
 }
 
 /// Default ONNX intra-op thread count: 75% of available parallelism, floored
-/// at 2 (T5). Kept out of `RuntimeConfig::default`'s literal so tests and
-/// callers share one source of truth, and low-parallelism environments still
-/// get at least 2 threads.
+/// at 2 and capped at the actual parallelism (T5) — a 1-core box gets 1 thread,
+/// never more than the hardware provides. Kept out of `RuntimeConfig::default`'s
+/// literal so tests and callers share one source of truth.
 pub(crate) fn default_ort_threads() -> usize {
     std::thread::available_parallelism()
-        .map(|n| (n.get().saturating_mul(3) / 4).max(2))
+        .map(|n| {
+            let n = n.get();
+            ((n.saturating_mul(3) / 4).max(2)).min(n)
+        })
         .unwrap_or(2)
 }
 

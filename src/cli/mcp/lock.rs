@@ -148,7 +148,9 @@ impl Drop for McpProjectLock {
 /// every project's lock stem, leaving stale locks behind (Kilo #3) and letting
 /// duplicate instances stop colliding. blake3 output is stable forever.
 fn lock_stem(canonical: &Path) -> String {
-    let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
+    // Byte-exact (OsStr::as_encoded_bytes, 1.74+): `to_string_lossy` could let
+    // two distinct non-UTF8 paths collide onto the same stem.
+    let hash = blake3::hash(canonical.as_os_str().as_encoded_bytes());
     // First 8 bytes → u64 little-endian → 16 hex chars, matching the prior
     // `{:016x}` formatting of the lockfile name shape.
     let mut bytes = [0u8; 8];

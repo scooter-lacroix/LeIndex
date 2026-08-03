@@ -312,6 +312,13 @@ fn run_socket_accept_loop(
                 shutdown_worker(&lifecycle, &socket_path, &status_path, &pid_path);
                 return Ok(());
             }
+            // T6: RSS self-exit must also fire while IDLE (no client connection
+            // holds a run_loop). An over-cap idle worker would otherwise hold
+            // its multi-GiB swapped-out model until the socket idle timeout.
+            if runtime.rss_over_cap() {
+                shutdown_worker(&lifecycle, &socket_path, &status_path, &pid_path);
+                return Ok(());
+            }
         }
 
         match listener.accept() {
@@ -338,11 +345,22 @@ fn run_socket_accept_loop(
                     continue;
                 }
                 let connection_lifecycle = Arc::clone(&lifecycle);
-                let active = Arc::clone(&active_clients);
-                std::thread::spawn(move || {
+                let slot_guard = SocketClientSlotGuard {
+                    active: Arc::clone(&active_clients),
+                };
+                // On spawn failure (e.g. FD exhaustion — the exact failure
+                // class this cap guards against) the closure is dropped, so
+                // `slot_guard`'s Drop releases the slot automatically — the
+                // counter can never leak and lock out all new connections.
+                if let Err(error) = std::thread::Builder::new().spawn(move || {
                     handle_socket_client(connection_lifecycle, stream);
-                    drop(SocketClientSlotGuard { active });
-                });
+                    drop(slot_guard);
+                }) {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to spawn socket client thread; connection dropped and slot released"
+                    );
+                }
             }
             Err(e) => {
                 let Some(delay) = accept_retry_delay(&e) else {
