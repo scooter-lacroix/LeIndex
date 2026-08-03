@@ -129,16 +129,24 @@ fn walkdir_size(path: &Path) -> u64 {
     total
 }
 
-/// Check whether a directory is likely in active use by trying to create and
-/// delete a test file inside it.  If we cannot, we skip removal.
+/// Check whether a directory is likely in active use by probing the project's
+/// cross-process write lock (`index.lock`, flock(2)) with the same
+/// non-blocking primitive used by `ProjectWriteLock` (Codex P2).
+///
+/// A directory-writability probe is unsound for temp-backed indexes: an
+/// unrelated probe file can be created even while another process holds
+/// SQLite / `index.lock` open, so `leindex cleanup` would remove an active
+/// database directory. `try_acquire` returns `Some(guard)` only when no live
+/// writer holds the lock; `None` (held elsewhere) or an error (unreadable
+/// directory) both mean "locked" — skip removal.
 fn is_locked(dir: &Path) -> bool {
-    let test_file = dir.join(".leindex-gc-lock-test");
-    match fs::write(&test_file, b"test") {
-        Ok(_) => {
-            // Clean up the test file
-            let _ = fs::remove_file(&test_file);
-            false
-        }
+    match crate::cli::leindex::ProjectWriteLock::try_acquire(dir) {
+        // No live writer holds the lock; the guard drops here (flock
+        // released) before the caller removes the directory.
+        Ok(Some(_)) => false,
+        // Another process holds the write lock => in use.
+        Ok(None) => true,
+        // Cannot probe (permission / IO) => conservatively treat as locked.
         Err(_) => true,
     }
 }
@@ -287,7 +295,12 @@ pub fn artifact_age(dir: &Path) -> SystemTime {
 }
 
 /// Run startup garbage collection — removes artifacts older than the default
-/// threshold.  This is meant to be called early in the CLI startup path.
+/// threshold. This is meant to be called early in the CLI startup path
+/// (`Cli::run`). Safe because [`is_locked`] probes the project's cross-process
+/// write lock (Codex P2): a directory a live writer is using is never removed.
+/// Readers do not take the write lock, so a reader-only sibling using a stale
+/// (>7-day) temp index is not protected — an inherent limitation of the
+/// advisory write lock, unchanged from the previous probe-file check.
 pub fn startup_gc() {
     let max_age = Duration::from_secs(DEFAULT_MAX_AGE_DAYS * 24 * 3600);
     let report = run_gc(max_age);
@@ -518,12 +531,21 @@ fn remove_sidecar(path: &Path, dry_run: bool, report: &mut DaemonSweepReport) {
     }
 }
 
-/// Register an at-exit cleanup hook that removes the given temp storage
-/// directory when the process exits cleanly.
+/// Registered temp-storage paths to remove on clean exit.
 ///
-/// This uses panic hooks for cleanup.  The cleanup is best-effort — if the
-/// process is killed with SIGKILL, artifacts will remain until the next
-/// startup GC pass.
+/// Codex P2 (cleanup.rs:554): the previous implementation registered an empty
+/// `call_once` — no hook, no retained path — so clean process exits left the
+/// entire temp-fallback database + index behind. Paths are now retained here
+/// and flushed by [`flush_registered_temp_cleanups`] from the CLI exit path.
+static AT_EXIT_PATHS: std::sync::OnceLock<std::sync::Mutex<Vec<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+/// Register a temp storage directory for best-effort removal on clean exit.
+///
+/// The cleanup is lock-aware (see [`is_locked`]) so an active temp-backed
+/// index used by another process is never removed. If the process is killed
+/// with SIGKILL, artifacts remain until the next startup GC pass
+/// ([`startup_gc`]).
 pub fn register_at_exit_cleanup(storage_path: PathBuf) {
     // Only register cleanup for paths that are NOT in-project .leindex
     if storage_path
@@ -548,21 +570,56 @@ pub fn register_at_exit_cleanup(storage_path: PathBuf) {
         return;
     }
 
-    // Register a shared cleanup function using at_exit
-    // We use std::sync::Once to ensure single registration
-    static CLEANUP_REGISTERED: std::sync::Once = std::sync::Once::new();
-    CLEANUP_REGISTERED.call_once(|| {
-        // Note: We cannot move storage_path into the panic hook since
-        // set_hook requires Fn and not FnOnce. Instead, we use a global
-        // option for the cleanup path.
-        // For now, the startup GC is the primary cleanup mechanism.
-        // At-exit cleanup is best-effort via the startup GC on next run.
-    });
+    let registry = AT_EXIT_PATHS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    // Poison-tolerant like `flush_registered_temp_cleanups`: a poisoned mutex
+    // (some other thread panicked while holding it) must not silently drop the
+    // registration — degrade to the locked data instead.
+    let mut paths = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !paths.contains(&storage_path) {
+        paths.push(storage_path.clone());
+        debug!(
+            "Registered at-exit cleanup for temp storage: {}",
+            storage_path.display()
+        );
+    }
+}
+
+/// Remove every registered temp storage directory (best-effort).
+///
+/// Called from the CLI exit path (`Cli::run`, next to the memory-report
+/// flush) so clean process exits do not leave temp-fallback databases behind.
+/// Each path is guarded by [`is_locked`] (Codex P2): a directory whose
+/// `index.lock` is held by a live **writer** is skipped (readers do not take
+/// the write lock, so a reader-only sibling using a stale temp index is not
+/// protected — an inherent limitation of the advisory write lock, unchanged
+/// from the previous probe-file check and strictly better than it).
+///
+/// The registry is cleared after flushing: this runs once per process at
+/// exit, and a second flush must be a no-op rather than re-probing paths that
+/// were already removed.
+pub fn flush_registered_temp_cleanups() {
+    let Some(registry) = AT_EXIT_PATHS.get() else {
+        return;
+    };
+    let paths = {
+        let mut guard = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *guard)
+    };
+    for path in paths {
+        best_effort_cleanup(&path);
+    }
 }
 
 /// Best-effort cleanup of a single storage directory.
+///
+/// Lock-aware (Codex P2): a directory whose `index.lock` is held by another
+/// process is never removed.
 pub fn best_effort_cleanup(path: &Path) {
-    if path.exists() && path.starts_with(std::env::temp_dir()) {
+    if path.exists() && path.starts_with(std::env::temp_dir()) && !is_locked(path) {
         match fs::remove_dir_all(path) {
             Ok(()) => {
                 eprintln!("[leindex] Cleaned up temp storage: {}", path.display());
@@ -630,6 +687,39 @@ mod tests {
     fn test_is_locked_on_writable_dir() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!is_locked(dir.path()));
+    }
+
+    #[test]
+    fn test_is_locked_detects_held_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = crate::cli::leindex::ProjectWriteLock::acquire(dir.path()).unwrap();
+        assert!(is_locked(dir.path()));
+        drop(guard);
+        assert!(!is_locked(dir.path()));
+    }
+
+    #[test]
+    fn test_register_and_flush_temp_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("leindex.db"), b"x").unwrap();
+        register_at_exit_cleanup(path.clone());
+        flush_registered_temp_cleanups();
+        assert!(
+            !path.exists(),
+            "flush should remove registered temp storage"
+        );
+    }
+
+    #[test]
+    fn test_register_skips_in_project_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let in_project = dir.path().join(".leindex");
+        fs::create_dir_all(&in_project).unwrap();
+        register_at_exit_cleanup(in_project.clone());
+        flush_registered_temp_cleanups();
+        assert!(in_project.exists(), "in-project .leindex is never cleaned");
     }
 
     #[test]

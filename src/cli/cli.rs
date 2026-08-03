@@ -320,6 +320,16 @@ impl Cli {
         // Initialize logging
         init_logging_impl(self.verbose);
 
+        // Codex P2 (cleanup.rs:554): `startup_gc` previously had no production
+        // caller, so temp-fallback storage accumulated until a manual
+        // `leindex cleanup`. Invoke it early in the CLI startup path — the
+        // documented intent of the function — so stale temp artifacts are
+        // removed on every CLI run. Safe because `is_locked` now probes the
+        // project's cross-process write lock (flock on `index.lock`) instead
+        // of directory writability, so an ACTIVE temp-backed index is never
+        // removed (Codex P2, cleanup.rs:136).
+        crate::cli::cleanup::startup_gc();
+
         // Set up optional memory report tracker.
         // The tracker observes RSS during execution and writes a compact JSON
         // summary on drop (graceful shutdown). Also enabled via
@@ -436,6 +446,13 @@ impl Cli {
         // Write the memory report (if tracking was enabled) before returning.
         // Rust does not run Drop for statics, so this must be explicit.
         crate::cli::memory_report::shutdown();
+
+        // Codex P2 (cleanup.rs:554): flush temp-fallback storage registered by
+        // `LeIndex::new` (`register_at_exit_cleanup` previously installed no
+        // hook and retained no path). Clean process exits now remove the
+        // temp-backed database + index; lock-aware via `is_locked`, so an
+        // index another process is actively writing is skipped.
+        crate::cli::cleanup::flush_registered_temp_cleanups();
 
         result
     }
