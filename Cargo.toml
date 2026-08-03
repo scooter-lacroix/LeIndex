@@ -432,7 +432,7 @@ strip = false
 [workspace]
 members = [
     ".",
-    "tools/memcheck", 
+    "tools/memcheck",
     "tools/xtask",
 ]
 
