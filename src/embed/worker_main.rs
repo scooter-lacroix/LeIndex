@@ -342,6 +342,15 @@ fn run_socket_accept_loop(
                         max_clients,
                         "worker socket client concurrency cap reached; dropping connection"
                     );
+                    // Harden against a hammer-retrying client: a connection
+                    // dropped at the cap could otherwise tight-loop
+                    // accept->drop with no backoff. A brief pause gives the
+                    // listener backpressure and keeps the log from flooding;
+                    // well-behaved clients (the embed daemon) are sequential
+                    // and never hit this path, but a misbehaving peer must not
+                    // be able to spin the accept loop. Clients are still
+                    // expected to back off on EOF.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
                 let connection_lifecycle = Arc::clone(&lifecycle);
