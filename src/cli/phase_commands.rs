@@ -87,9 +87,10 @@ fn resolve_phase_flags(all: bool, phase: Option<u8>) -> AnyhowResult<()> {
 /// Resolves the analysis target (explicit path > project > cwd) and
 /// canonicalizes it.
 fn resolve_phase_target(path: Option<PathBuf>, project: Option<PathBuf>) -> AnyhowResult<PathBuf> {
-    let target_path = path
-        .or(project)
-        .unwrap_or_else(|| std::env::current_dir().unwrap());
+    let target_path = match path.or(project) {
+        Some(p) => p,
+        None => std::env::current_dir().context("Failed to determine current directory")?,
+    };
     target_path
         .canonicalize()
         .context("Failed to canonicalize phase analysis path")

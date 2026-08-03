@@ -569,6 +569,17 @@ fn runtime_config_min_available_mb_defaults_to_documented_floor() {
     let _env3 = EnvVarGuard::set("LEINDEX_WORKER_MIN_AVAILABLE_MB", "0");
     let config = RuntimeConfig::from_env();
     assert_eq!(config.min_available_mb, None, "0 = disabled");
+
+    // Codex P2: a malformed override must NOT silently bypass the guard —
+    // fall back to the documented floor rather than resolving to None like
+    // an explicit 0.
+    let _env4 = EnvVarGuard::set("LEINDEX_WORKER_MIN_AVAILABLE_MB", "not-a-number");
+    let config = RuntimeConfig::from_env();
+    assert_eq!(
+        config.min_available_mb,
+        Some(DEFAULT_MIN_AVAILABLE_MB),
+        "malformed MIN_AVAILABLE_MB must keep the documented 2048 MiB default"
+    );
 }
 
 #[test]

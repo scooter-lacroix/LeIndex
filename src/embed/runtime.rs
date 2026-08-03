@@ -222,7 +222,22 @@ impl RuntimeConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&v| v > 0);
         let min_available_mb = match std::env::var("LEINDEX_WORKER_MIN_AVAILABLE_MB") {
-            Ok(v) => v.parse::<u64>().ok().filter(|&v| v > 0),
+            Ok(v) => match v.trim().parse::<u64>() {
+                Ok(0) => None,
+                Ok(n) => Some(n),
+                Err(_) => {
+                    // A malformed override must not silently bypass the
+                    // guard (Codex P2): keep the documented default floor
+                    // instead of resolving to `None` like an explicit `0`.
+                    tracing::warn!(
+                        value = %v,
+                        "malformed LEINDEX_WORKER_MIN_AVAILABLE_MB; falling back to \
+                         {} MiB (memory-pressure T6)",
+                        DEFAULT_MIN_AVAILABLE_MB
+                    );
+                    Some(DEFAULT_MIN_AVAILABLE_MB)
+                }
+            },
             Err(_) => Some(DEFAULT_MIN_AVAILABLE_MB),
         };
 
