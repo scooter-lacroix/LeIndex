@@ -13,10 +13,12 @@ use mcp_commands::{
 
 #[path = "mcp_commands.rs"]
 mod mcp_commands;
-use crate::phase::{DocsMode, FormatMode, PhaseOptions, PhaseSelection, run_phase_analysis};
+#[path = "phase_commands.rs"]
+mod phase_commands;
 use anyhow::Context;
 use anyhow::Result as AnyhowResult;
 use clap::{Parser, Subcommand, error::ErrorKind};
+use phase_commands::cmd_phase_impl;
 use serde_json::Value;
 use std::fs;
 use std::net::SocketAddr;
@@ -320,14 +322,9 @@ impl Cli {
         // Initialize logging
         init_logging_impl(self.verbose);
 
-        // Codex P2 (cleanup.rs:554): `startup_gc` previously had no production
-        // caller, so temp-fallback storage accumulated until a manual
-        // `leindex cleanup`. Invoke it early in the CLI startup path — the
-        // documented intent of the function — so stale temp artifacts are
-        // removed on every CLI run. Safe because `is_locked` now probes the
-        // project's cross-process write lock (flock on `index.lock`) instead
-        // of directory writability, so an ACTIVE temp-backed index is never
-        // removed (Codex P2, cleanup.rs:136).
+        // Codex P2 (cleanup.rs:554): `startup_gc` had no production caller;
+        // run it early so stale temp-fallback storage is GC'd on every CLI
+        // run. Safe because `is_locked` probes the cross-process write lock.
         crate::cli::cleanup::startup_gc();
 
         // Set up optional memory report tracker.
@@ -447,11 +444,8 @@ impl Cli {
         // Rust does not run Drop for statics, so this must be explicit.
         crate::cli::memory_report::shutdown();
 
-        // Codex P2 (cleanup.rs:554): flush temp-fallback storage registered by
-        // `LeIndex::new` (`register_at_exit_cleanup` previously installed no
-        // hook and retained no path). Clean process exits now remove the
-        // temp-backed database + index; lock-aware via `is_locked`, so an
-        // index another process is actively writing is skipped.
+        // Codex P2 (cleanup.rs:554): flush registered temp-fallback storage on
+        // clean exit (lock-aware via `is_locked`).
         crate::cli::cleanup::flush_registered_temp_cleanups();
 
         result
@@ -938,87 +932,6 @@ async fn cmd_context_impl(
         )
     );
 
-    Ok(())
-}
-
-/// Phase command implementation
-#[allow(clippy::too_many_arguments)]
-async fn cmd_phase_impl(
-    phase: Option<u8>,
-    all: bool,
-    mode: String,
-    path: Option<PathBuf>,
-    project: Option<PathBuf>,
-    max_files: usize,
-    max_focus_files: usize,
-    top_n: usize,
-    max_output_chars: usize,
-    include_docs: bool,
-    docs_mode: String,
-    no_incremental_refresh: bool,
-) -> AnyhowResult<()> {
-    if !all && phase.is_none() {
-        anyhow::bail!("Specify either --phase <1..5> or --all");
-    }
-
-    if all && phase.is_some() {
-        anyhow::bail!("Use either --phase or --all, not both");
-    }
-
-    let target_path = path
-        .or(project)
-        .unwrap_or_else(|| std::env::current_dir().unwrap());
-    let canonical_path = target_path
-        .canonicalize()
-        .context("Failed to canonicalize phase analysis path")?;
-
-    let (root, focus_files) = if canonical_path.is_file() {
-        let parent = canonical_path
-            .parent()
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("phase analysis file path has no parent directory"))?;
-        (parent, vec![canonical_path.clone()])
-    } else {
-        (canonical_path, Vec::new())
-    };
-
-    let parsed_mode = FormatMode::parse(&mode)
-        .ok_or_else(|| anyhow::anyhow!("Invalid mode '{}'. Use ultra|balanced|verbose", mode))?;
-
-    let parsed_docs_mode = DocsMode::parse(&docs_mode).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Invalid docs mode '{}'. Use off|markdown|text|all",
-            docs_mode
-        )
-    })?;
-
-    let selection = if all {
-        PhaseSelection::All
-    } else {
-        let p = phase.unwrap();
-        PhaseSelection::from_number(p)
-            .ok_or_else(|| anyhow::anyhow!("Invalid phase '{}'. Use 1..5", p))?
-    };
-
-    let options = PhaseOptions {
-        root,
-        focus_files,
-        mode: parsed_mode,
-        max_files,
-        max_focus_files,
-        top_n,
-        max_output_chars,
-        use_incremental_refresh: !no_incremental_refresh,
-        include_docs,
-        docs_mode: parsed_docs_mode,
-        hotspot_keywords: PhaseOptions::default().hotspot_keywords,
-    };
-
-    let report = tokio::task::spawn_blocking(move || run_phase_analysis(options, selection))
-        .await
-        .context("Phase task failed")??;
-
-    println!("{}", report.formatted_output);
     Ok(())
 }
 
