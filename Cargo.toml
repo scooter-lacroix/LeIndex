@@ -331,7 +331,7 @@ dialoguer = { version = "0.11", optional = true }
 
 # SHA256 verification for downloaded model files during `leindex setup`.
 # VAL-SETUP-017/018: checksum verification of ~/.leindex/models/* artifacts.
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 
 # Server feature dependencies (axum 0.7)
 axum = { version = "0.8", features = ["ws"], optional = true }
