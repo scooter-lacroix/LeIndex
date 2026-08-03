@@ -239,6 +239,11 @@ pub enum Commands {
         /// Show what would be removed without actually removing
         #[arg(long = "dry-run")]
         dry_run: bool,
+
+        /// Sweep stale daemon sidecars in ~/.leindex/run/ (dead-pid or
+        /// too-old worker/MCP lock, pid, sock, status, start files)
+        #[arg(long = "stale-daemons")]
+        stale_daemons: bool,
     },
 
     /// Configure neural search: install ORT, set up models, and write config
@@ -416,7 +421,8 @@ impl Cli {
             Commands::Cleanup {
                 max_age_days,
                 dry_run,
-            } => cmd_cleanup_impl(max_age_days, dry_run).await,
+                stale_daemons,
+            } => cmd_cleanup_impl(max_age_days, dry_run, stale_daemons).await,
             Commands::Setup {
                 neural,
                 no_neural,
@@ -1536,12 +1542,29 @@ fn check_neutral_conflicts(
     Ok(())
 }
 
-/// Cleanup command implementation — remove stale LeIndex temp artifacts.
-async fn cmd_cleanup_impl(max_age_days: u64, dry_run: bool) -> AnyhowResult<()> {
-    use crate::cli::cleanup::run_gc;
+/// Cleanup command implementation — remove stale LeIndex temp artifacts
+/// and/or sweep stale daemon sidecars (memory-pressure T7).
+async fn cmd_cleanup_impl(
+    max_age_days: u64,
+    dry_run: bool,
+    stale_daemons: bool,
+) -> AnyhowResult<()> {
+    use crate::cli::cleanup::{run_gc, sweep_stale_daemon_artifacts};
     use std::time::Duration;
 
     let max_age = Duration::from_secs(max_age_days * 24 * 3600);
+
+    if stale_daemons {
+        let label = if dry_run { " (dry run)\n" } else { "\n" };
+        println!("LeIndex Cleanup — stale daemon sidecars{}", label);
+        println!(
+            "Sweeping ~/.leindex/run/ for dead-pid or >{} day(s) old worker/MCP sidecars...\n",
+            max_age_days
+        );
+        let report = sweep_stale_daemon_artifacts(max_age, dry_run);
+        println!("{}", report);
+        return Ok(());
+    }
 
     if dry_run {
         // In dry-run mode we scan but do not remove
@@ -1800,9 +1823,11 @@ mod tests {
             Some(Commands::Cleanup {
                 max_age_days,
                 dry_run,
+                stale_daemons,
             }) => {
                 assert_eq!(max_age_days, 7);
                 assert!(!dry_run);
+                assert!(!stale_daemons);
             }
             _ => panic!("Expected Cleanup command"),
         }
@@ -1810,15 +1835,24 @@ mod tests {
 
     #[test]
     fn test_cleanup_command_with_flags() {
-        let cli = Cli::try_parse_from(["leindex", "cleanup", "--max-age-days", "14", "--dry-run"])
-            .unwrap();
+        let cli = Cli::try_parse_from([
+            "leindex",
+            "cleanup",
+            "--max-age-days",
+            "14",
+            "--dry-run",
+            "--stale-daemons",
+        ])
+        .unwrap();
         match cli.command {
             Some(Commands::Cleanup {
                 max_age_days,
                 dry_run,
+                stale_daemons,
             }) => {
                 assert_eq!(max_age_days, 14);
                 assert!(dry_run);
+                assert!(stale_daemons);
             }
             _ => panic!("Expected Cleanup command"),
         }

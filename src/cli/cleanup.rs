@@ -300,6 +300,194 @@ pub fn startup_gc() {
     }
 }
 
+/// Summary of a stale-daemon sidecar sweep (T7).
+#[derive(Debug, Default)]
+pub struct DaemonSweepReport {
+    /// Sidecar stems scanned (`leindex-embed-*` / `leindex-mcp-*`).
+    pub scanned: usize,
+    /// Sidecar files removed.
+    pub removed: usize,
+    /// Paths that could not be removed.
+    pub failed: Vec<(PathBuf, String)>,
+}
+
+impl std::fmt::Display for DaemonSweepReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Daemon sweep report:")?;
+        writeln!(f, "  Stems scanned: {}", self.scanned)?;
+        writeln!(f, "  Files removed: {}", self.removed)?;
+        if !self.failed.is_empty() {
+            writeln!(f, "  Failed:        {} file(s)", self.failed.len())?;
+            for (path, reason) in &self.failed {
+                writeln!(f, "    {} - {}", path.display(), reason)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Best-effort pid liveness check (T7). Linux uses `/proc/<pid>` existence;
+/// on other platforms we cannot verify, so `None` signals "unknown" and the
+/// caller falls back to the mtime threshold.
+fn pid_is_alive(pid: u32) -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(std::path::Path::new(&format!("/proc/{pid}")).exists())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// True when `name` is one of the sidecar files the daemon worker or the MCP
+/// advisory lock writes under `~/.leindex/run/`.
+fn is_daemon_sidecar(name: &str) -> bool {
+    matches!(
+        name,
+        "lock" | "pid" | "sock" | "status" | "start" | "start.next" | "pid.next" | "status.next"
+    )
+}
+
+/// Sweep stale daemon sidecars out of `~/.leindex/run/` (T7).
+///
+/// Memory-pressure remediation: crashed/SIGKILLed workers and MCP servers leave
+/// `.lock`/`.pid`/`.sock`/`.status`/`.start` sidecars behind (verified live:
+/// `leindex-embed-*` debris dating back weeks in `~/.leindex/run/`). Liveness
+/// rules:
+/// - A stem with a `.pid` file whose pid is **alive** → keep every sidecar for
+///   that stem (a running daemon owns them).
+/// - A stem with a `.pid` file whose pid is **dead** → all its sidecars are
+///   stale, regardless of age (the daemon that owned them is gone).
+/// - A stem with **no pid file** (e.g. a 0-byte flock target or a crashed MCP
+///   guard) → stale when older than `max_age` (mtime).
+/// - On non-Linux (pid liveness unknowable) every stem falls back to mtime.
+///
+/// Never touches anything not in the run dir, and never removes a live daemon's
+/// files. Honours `dry_run`.
+pub fn sweep_stale_daemon_artifacts(max_age: Duration, dry_run: bool) -> DaemonSweepReport {
+    let Some(home) = crate::config::resolve_leindex_home() else {
+        return DaemonSweepReport::default();
+    };
+    sweep_run_dir(&home.join("run"), max_age, dry_run)
+}
+
+/// Testable core of [`sweep_stale_daemon_artifacts`] over an explicit run dir.
+fn sweep_run_dir(run_dir: &Path, max_age: Duration, dry_run: bool) -> DaemonSweepReport {
+    let mut report = DaemonSweepReport::default();
+    let entries = match fs::read_dir(run_dir) {
+        Ok(entries) => entries,
+        Err(_) => return report, // no run dir yet → nothing to sweep
+    };
+    let cutoff = SystemTime::now() - max_age;
+
+    // Group sidecar files by their stem (e.g. `leindex-embed-<hash>`).
+    let mut stems: std::collections::BTreeMap<String, Vec<PathBuf>> =
+        std::collections::BTreeMap::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name() else {
+            continue;
+        };
+        let file_name = file_name.to_string_lossy();
+        let Some((stem, ext)) = file_name.rsplit_once('.') else {
+            continue;
+        };
+        if !is_daemon_sidecar(ext) {
+            continue;
+        }
+        if !(stem.starts_with("leindex-embed-") || stem.starts_with("leindex-mcp-")) {
+            continue;
+        }
+        stems.entry(stem.to_string()).or_default().push(path);
+    }
+
+    for (stem, mut files) in stems {
+        files.sort();
+        report.scanned += 1;
+        let (live, has_pid) = stem_liveness(&files);
+        // Live-pid protection: any `.pid` file naming a running process keeps
+        // the whole stem (a live daemon owns its sidecars).
+        if live {
+            debug!("Keeping live daemon sidecars for {}", stem);
+            continue;
+        }
+
+        for path in files {
+            // pid-file stems: dead pid means stale regardless of age.
+            // Non-pid stems (or unknowable liveness): age threshold applies.
+            if !sidecar_is_stale(&path, has_pid, &cutoff) {
+                continue;
+            }
+            remove_sidecar(&path, dry_run, &mut report);
+        }
+    }
+
+    report
+}
+
+/// Live-pid protection + pid-presence for one sidecar stem. Returns
+/// `(live, has_pid)`: `live` when any `.pid` file names a running process
+/// (that stem is protected from sweeping); `has_pid` when any `.pid` file
+/// exists (a dead/absent pid makes every sidecar stale regardless of age;
+/// non-Linux platforms where liveness is unknowable fall back to mtime).
+fn stem_liveness(files: &[PathBuf]) -> (bool, bool) {
+    let mut live = false;
+    let mut has_pid = false;
+    for path in files {
+        if path.extension().is_none_or(|ext| ext != "pid") {
+            continue;
+        }
+        has_pid = true;
+        let Ok(pid_str) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(pid) = pid_str.trim().parse::<u32>() else {
+            continue;
+        };
+        if pid_is_alive(pid) == Some(true) {
+            live = true;
+        }
+    }
+    (live, has_pid)
+}
+
+/// Staleness decision for a single sidecar (T7). `has_pid` stems were already
+/// determined to have a dead/absent pid, so they are stale regardless of age;
+/// non-pid stems fall back to the mtime threshold.
+fn sidecar_is_stale(path: &Path, has_pid: bool, cutoff: &SystemTime) -> bool {
+    if has_pid {
+        return true;
+    }
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|mtime| mtime < *cutoff)
+        .unwrap_or(false)
+}
+
+/// Remove (or count, in dry-run) one stale sidecar (T7).
+fn remove_sidecar(path: &Path, dry_run: bool, report: &mut DaemonSweepReport) {
+    if dry_run {
+        debug!("Would remove stale daemon sidecar {}", path.display());
+        report.removed += 1;
+        return;
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {
+            info!("Removed stale daemon sidecar {}", path.display());
+            report.removed += 1;
+        }
+        Err(e) => {
+            warn!("Failed to remove daemon sidecar {}: {}", path.display(), e);
+            report.failed.push((path.to_path_buf(), e.to_string()));
+        }
+    }
+}
+
 /// Register an at-exit cleanup hook that removes the given temp storage
 /// directory when the process exits cleanly.
 ///
@@ -511,5 +699,87 @@ mod tests {
         // Don't actually create it — just verify the function handles it
         // The key check is that it doesn't match the temp dir prefix
         assert!(!non_temp.starts_with(std::env::temp_dir()));
+    }
+
+    #[test]
+    fn test_sweep_ignores_unrelated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("not-a-sidecar.txt"), b"x").unwrap();
+        fs::write(dir.path().join("other-app.pid"), b"12345").unwrap();
+
+        let report = sweep_run_dir(dir.path(), Duration::from_secs(0), false);
+        assert_eq!(report.scanned, 0);
+        assert_eq!(report.removed, 0);
+        assert!(dir.path().join("not-a-sidecar.txt").exists());
+        assert!(dir.path().join("other-app.pid").exists());
+    }
+
+    #[test]
+    fn test_sweep_keeps_live_pid_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        // A stem owned by THIS process must be kept entirely.
+        let stem = "leindex-embed-aaaaaaaaaaaaaaaa";
+        fs::write(
+            dir.path().join(format!("{stem}.pid")),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        fs::write(dir.path().join(format!("{stem}.status")), "ready\n").unwrap();
+
+        let report = sweep_run_dir(dir.path(), Duration::from_secs(0), false);
+        assert_eq!(report.removed, 0, "live-pid stem must not be swept");
+        assert!(dir.path().join(format!("{stem}.pid")).exists());
+        assert!(dir.path().join(format!("{stem}.status")).exists());
+    }
+
+    #[test]
+    fn test_sweep_removes_dead_pid_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        // A dead pid owns this stem → every sidecar is stale regardless of age.
+        let dead_pid = 1 << 22; // will not exist as this process
+        let stem = "leindex-embed-bbbbbbbbbbbbbbbb";
+        fs::write(
+            dir.path().join(format!("{stem}.pid")),
+            format!("{dead_pid}\n"),
+        )
+        .unwrap();
+        fs::write(dir.path().join(format!("{stem}.sock")), b"").unwrap();
+        fs::write(dir.path().join(format!("{stem}.status")), "ready\n").unwrap();
+
+        let report = sweep_run_dir(dir.path(), Duration::from_secs(0), false);
+        assert_eq!(report.removed, 3);
+        assert!(!dir.path().join(format!("{stem}.pid")).exists());
+        assert!(!dir.path().join(format!("{stem}.sock")).exists());
+        assert!(!dir.path().join(format!("{stem}.status")).exists());
+    }
+
+    #[test]
+    fn test_sweep_dry_run_counts_without_removing() {
+        let dir = tempfile::tempdir().unwrap();
+        // A non-pid stem with zero max_age is stale by mtime (mtime < now).
+        let stem = "leindex-mcp-cccccccccccccccc";
+        fs::write(dir.path().join(format!("{stem}.lock")), b"").unwrap();
+
+        let report = sweep_run_dir(dir.path(), Duration::from_secs(0), true);
+        assert_eq!(report.removed, 1, "dry run must still count");
+        assert!(
+            dir.path().join(format!("{stem}.lock")).exists(),
+            "dry run removes nothing"
+        );
+    }
+
+    #[test]
+    fn test_sweep_removes_old_nonpid_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        // A non-pid stem (e.g. a crashed MCP guard's lock) with zero max_age is
+        // stale by mtime (mtime < cutoff when cutoff ≈ now).
+        let stem = "leindex-mcp-dddddddddddddddd";
+        fs::write(dir.path().join(format!("{stem}.lock")), b"").unwrap();
+        fs::write(dir.path().join(format!("{stem}.start")), "12345\n").unwrap();
+
+        let report = sweep_run_dir(dir.path(), Duration::from_secs(0), false);
+        assert_eq!(report.removed, 2);
+        assert!(!dir.path().join(format!("{stem}.lock")).exists());
+        assert!(!dir.path().join(format!("{stem}.start")).exists());
     }
 }
