@@ -329,7 +329,12 @@ impl std::fmt::Display for DaemonSweepReport {
 /// Best-effort pid liveness check (T7). Linux uses `/proc/<pid>` existence;
 /// on other platforms we cannot verify, so `None` signals "unknown" and the
 /// caller falls back to the mtime threshold.
-fn pid_is_alive(pid: u32) -> Option<bool> {
+///
+/// `pub(crate)`: also used by [`crate::cli::mcp::lock`] as the ownership
+/// liveness gate that prevents the publication-TOCTOU stale-steal (a live
+/// owner whose `.start` sidecar is mid-write must never have its lock
+/// unlinked).
+pub(crate) fn pid_is_alive(pid: u32) -> Option<bool> {
     #[cfg(target_os = "linux")]
     {
         let proc_dir = std::path::PathBuf::from(format!("/proc/{pid}"));

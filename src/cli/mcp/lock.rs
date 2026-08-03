@@ -124,14 +124,30 @@ impl McpProjectLock {
                     Some(pid) if pid_is_owned(pid, &start_path) => {
                         return (LockOutcome::AlreadyOwned { pid }, None);
                     }
-                    // The recorded owner is dead → the lock is stale. Remove it
-                    // and retry the exclusive create exactly once.
-                    Some(_) => {
-                        let _ = std::fs::remove_file(&lock_path);
-                        if create_lock_exclusive(&lock_path).is_err() {
-                            return (LockOutcome::NotAvailable, None);
+                    // The recorded owner may be dead (stale, safe to steal) OR
+                    // alive-but-mid-initialization (lock PID written, `.start`
+                    // not yet). Codex P2 (publication TOCTOU): a loser must
+                    // NEVER unlink a live owner's lock — that would let two
+                    // servers both return `Acquired` and defeat the duplicate
+                    // instance warning. Only a provably-dead owner (or a
+                    // recycled PID that is not a leindex process) may be stolen.
+                    Some(pid) => match crate::cli::cleanup::pid_is_alive(pid) {
+                        // Live leindex/MCP sibling — possibly between `write_pid`
+                        // and `write_start_time`. Do not touch its sidecars;
+                        // degrade to advisory no-op (the real dedup levers are
+                        // D-1 idle self-exit + D-2 engine eviction).
+                        Some(true) => return (LockOutcome::NotAvailable, None),
+                        // Provably dead, recycled PID, or unknown → stale. Remove
+                        // it and retry the exclusive create exactly once. (`None`
+                        // is unreachable here — `pid_is_alive` always returns
+                        // `Some` on Linux and this branch is Linux-gated.)
+                        _ => {
+                            let _ = std::fs::remove_file(&lock_path);
+                            if create_lock_exclusive(&lock_path).is_err() {
+                                return (LockOutcome::NotAvailable, None);
+                            }
                         }
-                    }
+                    },
                     // Unparseable/empty file: a concurrent acquirer is mid-write.
                     // Never remove or steal it — treat as a temporary no-op.
                     None => return (LockOutcome::NotAvailable, None),
@@ -385,6 +401,46 @@ mod tests {
             lock_contents.trim().parse::<u32>().unwrap(),
             std::process::id()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_live_owner_without_start_sidecar_is_not_stolen() {
+        // Codex P2 (publication TOCTOU, lock.rs:130): a loser must never unlink
+        // a lock whose owner is a LIVE leindex process even when the `.start`
+        // sidecar is missing or mismatched (the winner is between `write_pid`
+        // and `write_start_time`). Unlinking would let both processes return
+        // `Acquired` and defeat the duplicate-instance warning.
+        let dir = temp_run_dir();
+        let canonical = Path::new("/tmp/proj-toctou");
+        let stem = lock_stem(canonical);
+        // Precondition: this test process must be classified as a live owner
+        // (its cmdline path contains "leindex"). If the liveness gate ever
+        // misclassifies us, the test must fail loudly, not silently.
+        assert_eq!(
+            crate::cli::cleanup::pid_is_alive(std::process::id()),
+            Some(true),
+            "test precondition: this process must be detected as a live leindex/mcp process"
+        );
+        // Simulate the winner mid-initialization: the lock file records a live
+        // PID but no `.start` sidecar exists yet.
+        std::fs::write(
+            dir.path().join(format!("{stem}.lock")),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+
+        let (outcome, guard) = McpProjectLock::try_acquire_in_dir(canonical, dir.path());
+        assert_eq!(
+            outcome,
+            LockOutcome::NotAvailable,
+            "live owner without .start must degrade to NotAvailable, never steal"
+        );
+        assert!(guard.is_none());
+        // The lock file must be left intact with the original owner recorded.
+        let lock_path = dir.path().join(format!("{stem}.lock"));
+        assert!(lock_path.exists(), "live owner's lock must not be unlinked");
+        assert_eq!(read_lock_owner(&lock_path), Some(std::process::id()));
     }
 
     #[cfg(target_os = "linux")]
