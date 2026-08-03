@@ -103,18 +103,50 @@ impl McpProjectLock {
         let lock_path = run_dir.join(format!("{stem}.lock"));
         let start_path = run_dir.join(format!("{stem}.start"));
 
-        if let Ok(pid_str) = std::fs::read_to_string(&lock_path) {
-            if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                if pid_is_owned(pid, &start_path) {
-                    return (LockOutcome::AlreadyOwned { pid }, None);
-                }
+        // Fast path: a live sibling already owns the lock.
+        if let Some(pid) = read_lock_owner(&lock_path) {
+            if pid_is_owned(pid, &start_path) {
+                return (LockOutcome::AlreadyOwned { pid }, None);
             }
         }
 
-        // Fresh acquire or stale steal: write pid + start-time sidecars.
-        if write_pid(&lock_path, std::process::id()).is_err()
-            || write_start_time(&start_path, std::process::id()).is_err()
+        // Atomic arbitration (Codex P2): exclusive-create the lock file so two
+        // concurrent starters cannot both pass the ownership check and then
+        // truncate each other's sidecars. Only one process can win `create_new`;
+        // the loser re-reads ownership and reports AlreadyOwned (or steals a
+        // provably-stale lock, see below).
+        match create_lock_exclusive(&lock_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let owner = read_lock_owner(&lock_path);
+                match owner {
+                    // A sibling won the race and is live.
+                    Some(pid) if pid_is_owned(pid, &start_path) => {
+                        return (LockOutcome::AlreadyOwned { pid }, None);
+                    }
+                    // The recorded owner is dead → the lock is stale. Remove it
+                    // and retry the exclusive create exactly once.
+                    Some(_) => {
+                        let _ = std::fs::remove_file(&lock_path);
+                        if create_lock_exclusive(&lock_path).is_err() {
+                            return (LockOutcome::NotAvailable, None);
+                        }
+                    }
+                    // Unparseable/empty file: a concurrent acquirer is mid-write.
+                    // Never remove or steal it — treat as a temporary no-op.
+                    None => return (LockOutcome::NotAvailable, None),
+                }
+            }
+            Err(_) => return (LockOutcome::NotAvailable, None),
+        }
+
+        // We hold the lock file exclusively. Write pid + start-time sidecars;
+        // on failure remove our own artifacts so no partial lock is left behind.
+        let my_pid = std::process::id();
+        if write_pid(&lock_path, my_pid).is_err() || write_start_time(&start_path, my_pid).is_err()
         {
+            let _ = std::fs::remove_file(&lock_path);
+            let _ = std::fs::remove_file(&start_path);
             return (LockOutcome::NotAvailable, None);
         }
 
@@ -129,8 +161,15 @@ impl McpProjectLock {
 
     /// Explicitly release the sidecars (also called by `Drop`).
     pub fn release(&self) {
-        let _ = std::fs::remove_file(self.run_dir.join(format!("{}.lock", self.stem)));
-        let _ = std::fs::remove_file(self.run_dir.join(format!("{}.start", self.stem)));
+        let lock_path = self.run_dir.join(format!("{}.lock", self.stem));
+        // Only remove sidecars this guard still owns: if a new process stole
+        // the lock (our pid dead) between our exit and this drop, deleting the
+        // files would silence its dup-instance warning and leave it without a
+        // lock record. Compare the recorded owner before removing (Codex P2).
+        if read_lock_owner(&lock_path) == Some(std::process::id()) {
+            let _ = std::fs::remove_file(&lock_path);
+            let _ = std::fs::remove_file(self.run_dir.join(format!("{}.start", self.stem)));
+        }
     }
 }
 
@@ -190,6 +229,24 @@ fn proc_start_time(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let fields = stat.rsplit_once(") ")?.1;
     fields.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+/// Create the lock file exclusively (`create_new`): fails with
+/// `AlreadyExists` when another process already holds it. This is the atomic
+/// arbitration primitive that makes concurrent acquisition race-free.
+fn create_lock_exclusive(path: &Path) -> io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map(|_| ())
+}
+
+/// Read the PID recorded in a lock file, if parseable.
+fn read_lock_owner(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
 }
 
 fn write_pid(path: &Path, pid: u32) -> io::Result<()> {
@@ -260,6 +317,47 @@ mod tests {
         drop(guard1);
         let (outcome, _guard3) = McpProjectLock::try_acquire_in_dir(canonical, dir.path());
         assert_eq!(outcome, LockOutcome::Acquired);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_unparseable_lock_file_is_not_stolen() {
+        // Codex P2: an empty/mid-write lock file must never be removed+stolen —
+        // that would let a concurrent acquirer lose its lock mid-write. The
+        // acquirer must degrade to NotAvailable and leave the file intact.
+        let dir = temp_run_dir();
+        let canonical = Path::new("/tmp/proj-empty-lock");
+        let stem = lock_stem(canonical);
+        std::fs::write(dir.path().join(format!("{stem}.lock")), b"").unwrap();
+
+        let (outcome, guard) = McpProjectLock::try_acquire_in_dir(canonical, dir.path());
+        assert_eq!(outcome, LockOutcome::NotAvailable);
+        assert!(guard.is_none());
+        assert!(
+            dir.path().join(format!("{stem}.lock")).exists(),
+            "unparseable lock file must be left intact"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_release_only_removes_owned_sidecars() {
+        // Codex P2: a guard must not delete sidecars it no longer owns (a newer
+        // process may have stolen the lock after this one exited).
+        let dir = temp_run_dir();
+        let canonical = Path::new("/tmp/proj-stolen-lock");
+        let (_outcome, guard) = McpProjectLock::try_acquire_in_dir(canonical, dir.path());
+        let guard = guard.expect("guard");
+        let stem = lock_stem(canonical);
+        // Simulate a stale-steal: overwrite the lock with a different owner
+        // before dropping the guard.
+        std::fs::write(dir.path().join(format!("{stem}.lock")), "12345\n").unwrap();
+        drop(guard);
+        // release() saw a foreign owner → left the sidecars alone.
+        assert!(
+            dir.path().join(format!("{stem}.lock")).exists(),
+            "foreign-owned sidecars must survive a guard drop"
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -58,9 +58,9 @@ pub use crate::embed::runtime_env::{
     configured_onnx_inference_batch_size, configured_onnx_sequence_len,
 };
 use crate::embed::runtime_env::{
-    MIGRAPHX_EXHAUSTIVE_TUNE_ENV, MIGRAPHX_FP16_ENV, MIGRAPHX_MODEL_CACHE_PATH_ENV,
-    ONNX_LOG_SHAPES_ENV, build_position_ids, default_ort_threads, env_flag, mem_available_kib,
-    process_rss_kib, prune_migraphx_cache, unix_now_ms,
+    DEFAULT_MIN_AVAILABLE_MB, MIGRAPHX_EXHAUSTIVE_TUNE_ENV, MIGRAPHX_FP16_ENV,
+    MIGRAPHX_MODEL_CACHE_PATH_ENV, ONNX_LOG_SHAPES_ENV, build_position_ids, default_ort_threads,
+    env_flag, mem_available_kib, process_rss_kib, prune_migraphx_cache, unix_now_ms,
 };
 
 #[cfg(feature = "onnx")]
@@ -212,15 +212,19 @@ impl RuntimeConfig {
             .filter(|&v| v > 0)
             .unwrap_or_else(default_ort_threads);
 
-        // T6: RSS self-exit cap + MemAvailable refusal floor.
+        // T6: RSS self-exit cap + MemAvailable refusal floor. The RSS cap
+        // defaults to disabled (0 = off per .env.example); the MemAvailable
+        // floor defaults to the documented 2048 MiB so the guard is active even
+        // when the env var is unset — an unset variable must not silently
+        // bypass the refusal (Codex P1).
         let max_rss_mb = std::env::var("LEINDEX_WORKER_MAX_RSS_MB")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&v| v > 0);
-        let min_available_mb = std::env::var("LEINDEX_WORKER_MIN_AVAILABLE_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&v| v > 0);
+        let min_available_mb = match std::env::var("LEINDEX_WORKER_MIN_AVAILABLE_MB") {
+            Ok(v) => v.parse::<u64>().ok().filter(|&v| v > 0),
+            Err(_) => Some(DEFAULT_MIN_AVAILABLE_MB),
+        };
 
         Self {
             idle_timeout,

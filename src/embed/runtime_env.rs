@@ -7,7 +7,9 @@
 //! - The T6 RSS / `MemAvailable` guards (`process_rss_kib`, `mem_available_kib`,
 //!   `low_memory_refusal`).
 
-/// Default maximum single-text size in bytes (1 MiB).
+/// Default fixed ONNX sequence length (tokens) for the embed model. This is a
+/// token-length constant — the "1 MiB" single-text byte cap lives in
+/// `runtime.rs` as [`DEFAULT_MAX_TEXT_SIZE`](crate::embed::runtime::DEFAULT_MAX_TEXT_SIZE).
 pub const DEFAULT_MAX_SEQ_LEN: usize = 128;
 
 /// Default maximum texts per ONNX inference call for legacy fixed-batch models.
@@ -41,6 +43,13 @@ pub(crate) const MIGRAPHX_EXHAUSTIVE_TUNE_ENV: &str = "LEINDEX_MIGRAPHX_EXHAUSTI
 /// package version) so a release bump does not invalidate the cache.
 #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
 pub(crate) const MIGRAPHX_MODEL_CACHE_PATH_ENV: &str = "ORT_MIGRAPHX_MODEL_CACHE_PATH";
+
+/// Documented default for `LEINDEX_WORKER_MIN_AVAILABLE_MB` (`.env.example`):
+/// the worker refuses to load its multi-GiB ONNX model when system
+/// `MemAvailable` is below this floor, degrading to TF-IDF/PDG instead of
+/// thrashing the box (T6). Applied when the env var is unset so the guard is
+/// active in the default configuration (Codex P1).
+pub const DEFAULT_MIN_AVAILABLE_MB: u64 = 2048;
 
 #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
 pub fn configured_onnx_inference_batch_size(model_name: &str, provider: &str) -> usize {

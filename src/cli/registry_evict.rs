@@ -27,9 +27,9 @@ impl ProjectRegistry {
     /// retain that engine's mmaps/heap for the process lifetime. The next
     /// tool call transparently reloads via `get_or_load`.
     ///
-    /// **Known benign race (Kilo `registry.rs:908`, documented-and-leave):**
-    /// the candidate set is snapshotted under the `last_used` read lock, then
-    /// each project is checked + evicted afterward. A `get_or_load` that lands
+    /// **Known benign race (Kilo review item, documented-and-leave):** the
+    /// candidate set is snapshotted under the `last_used` read lock, then each
+    /// project is checked + evicted afterward. A `get_or_load` that lands
     /// between the snapshot and the `try_write` guard re-touches `last_used`,
     /// but the in-flight `try_write()` guard below still prevents the
     /// destructive case (tearing down a mid-call engine). The residual is a

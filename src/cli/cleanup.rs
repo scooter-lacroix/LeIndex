@@ -332,7 +332,21 @@ impl std::fmt::Display for DaemonSweepReport {
 fn pid_is_alive(pid: u32) -> Option<bool> {
     #[cfg(target_os = "linux")]
     {
-        Some(std::path::Path::new(&format!("/proc/{pid}")).exists())
+        let proc_dir = std::path::PathBuf::from(format!("/proc/{pid}"));
+        if !proc_dir.exists() {
+            return Some(false);
+        }
+        // PID-recycling guard (Kilo): the process must actually be a leindex
+        // daemon (worker or MCP server) — an unrelated process that reused a
+        // dead daemon's PID must not keep that daemon's stale sidecars
+        // protected forever. Mirrors `lock.rs::pid_is_owned`'s cmdline check.
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok();
+        Some(cmdline.is_some_and(|raw| {
+            let command = String::from_utf8_lossy(&raw);
+            command
+                .split('\0')
+                .any(|arg| arg.contains("leindex") || arg.contains("mcp"))
+        }))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -741,6 +755,26 @@ mod tests {
         assert_eq!(report.removed, 0, "live-pid stem must not be swept");
         assert!(dir.path().join(format!("{stem}.pid")).exists());
         assert!(dir.path().join(format!("{stem}.status")).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_sweep_sweeps_recycled_unrelated_pid_stem() {
+        // Kilo: pid_is_alive must not treat an unrelated process that reused a
+        // dead daemon's PID as a live leindex daemon. PID 1 (init/systemd) is
+        // alive but is not a leindex process, so a sidecar naming it must be
+        // swept rather than protected forever.
+        let dir = tempfile::tempdir().unwrap();
+        let stem = "leindex-embed-eeeeeeeeeeeeeeee";
+        std::fs::write(dir.path().join(format!("{stem}.pid")), "1\n").unwrap();
+        std::fs::write(dir.path().join(format!("{stem}.status")), "ready\n").unwrap();
+
+        let report = sweep_run_dir(dir.path(), Duration::from_secs(0), false);
+        assert_eq!(
+            report.removed, 2,
+            "recycled unrelated pid must not protect the stem"
+        );
+        assert!(!dir.path().join(format!("{stem}.pid")).exists());
     }
 
     #[test]

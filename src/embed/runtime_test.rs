@@ -3,8 +3,9 @@ use super::*;
 // for the Large-File gate); import them explicitly here.
 use crate::embed::protocol::EmbedRequest;
 use crate::embed::runtime_env::{
-    DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE, DEFAULT_ONNX_INFERENCE_BATCH_SIZE,
-    MAX_ONNX_SEQUENCE_LEN, ONNX_INFERENCE_BATCH_SIZE_ENV, ONNX_SEQUENCE_LEN_ENV,
+    DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE, DEFAULT_MIN_AVAILABLE_MB,
+    DEFAULT_ONNX_INFERENCE_BATCH_SIZE, MAX_ONNX_SEQUENCE_LEN, ONNX_INFERENCE_BATCH_SIZE_ENV,
+    ONNX_SEQUENCE_LEN_ENV,
 };
 use std::io::Cursor;
 use std::sync::Mutex as StdMutex;
@@ -543,6 +544,31 @@ fn runtime_config_provider_blanks_env_falls_through() {
         !config.execution_provider.trim().is_empty(),
         "blank env value must fall through to a non-empty default"
     );
+}
+
+#[test]
+fn runtime_config_min_available_mb_defaults_to_documented_floor() {
+    // Codex P1: with LEINDEX_WORKER_MIN_AVAILABLE_MB unset, from_env applies
+    // the documented 2048 MiB default so the refusal guard is active in the
+    // default configuration — an unset variable must not silently bypass it.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove("LEINDEX_WORKER_MIN_AVAILABLE_MB");
+    let config = RuntimeConfig::from_env();
+    assert_eq!(
+        config.min_available_mb,
+        Some(DEFAULT_MIN_AVAILABLE_MB),
+        "unset MIN_AVAILABLE_MB must apply the documented 2048 MiB default"
+    );
+
+    // An explicit positive value wins.
+    let _env2 = EnvVarGuard::set("LEINDEX_WORKER_MIN_AVAILABLE_MB", "4096");
+    let config = RuntimeConfig::from_env();
+    assert_eq!(config.min_available_mb, Some(4096));
+
+    // An explicit 0 is treated as disabled (None) per the env contract.
+    let _env3 = EnvVarGuard::set("LEINDEX_WORKER_MIN_AVAILABLE_MB", "0");
+    let config = RuntimeConfig::from_env();
+    assert_eq!(config.min_available_mb, None, "0 = disabled");
 }
 
 #[test]
