@@ -108,6 +108,9 @@ pub mod memory_report;
 /// Multi-project registry with per-project concurrency.
 #[cfg(feature = "mcp-server")]
 pub mod registry;
+/// D-2 idle-engine eviction (sibling of `registry` so the Large-File gate
+/// keeps breathing room — see `registry.rs` head count).
+mod registry_evict;
 /// File watcher for auto-reindex.
 #[cfg(feature = "mcp-server")]
 pub mod watcher;

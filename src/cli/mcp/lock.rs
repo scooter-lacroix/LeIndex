@@ -14,8 +14,16 @@
 //! The agreed design logs the overlap and continues; the *real* dedup lever
 //! is the D-1 idle self-exit + D-2 engine eviction, which make duplicate
 //! servers self-terminate and drop their engines.
+//!
+//! **Platform scope:** the ownership liveness check is Linux-only (it reads
+//! `/proc/<pid>/stat` for process start time). On macOS/Windows the lock is a
+//! documented **advisory no-op** — [`McpProjectLock::try_acquire`] returns
+//! `NotAvailable` *before any file is written*, so the half-written sidecar
+//! that a failed start-time write would otherwise leave can never be produced.
+//! The dup-instance advisory warning therefore only fires on Linux; the real
+//! dedup levers (D-1 idle self-exit, D-2 engine eviction) are platform-
+//! independent.
 
-use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -58,7 +66,33 @@ impl McpProjectLock {
     }
 
     /// Testable core: acquires the lock under an explicit run directory.
+    ///
+    /// On non-Linux platforms this is a **documented advisory no-op**: returns
+    /// `NotAvailable` without touching the filesystem, so no partial sidecar is
+    /// ever written. See the module doc for the rationale.
     pub fn try_acquire_in_dir(
+        canonical: &Path,
+        run_dir: &Path,
+    ) -> (LockOutcome, Option<McpProjectLock>) {
+        #[cfg(target_os = "linux")]
+        {
+            Self::try_acquire_in_dir_linux(canonical, run_dir)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Advisory no-op: the liveness check that makes stale-steal safe is
+            // Linux-only (/proc), so on other platforms the lock must not write
+            // a sidecar it cannot later validate (a half-written sidecar would
+            // silently bypass the dup-instance warning AND leave debris).
+            let _ = (canonical, run_dir);
+            (LockOutcome::NotAvailable, None)
+        }
+    }
+
+    /// Linux implementation of [`McpProjectLock::try_acquire_in_dir`]. Kept
+    /// as a separate helper so the non-Linux no-op stays a one-liner above.
+    #[cfg(target_os = "linux")]
+    fn try_acquire_in_dir_linux(
         canonical: &Path,
         run_dir: &Path,
     ) -> (LockOutcome, Option<McpProjectLock>) {
@@ -107,14 +141,27 @@ impl Drop for McpProjectLock {
 }
 
 /// Deterministic per-project lock stem: `leindex-mcp-<16-hex-hash>`.
+///
+/// Uses blake3 (an existing workspace dependency) instead of
+/// `DefaultHasher`, whose SipHash algorithm is documented as **not stable
+/// across Rust compiler versions** — a toolchain bump would silently change
+/// every project's lock stem, leaving stale locks behind (Kilo #3) and letting
+/// duplicate instances stop colliding. blake3 output is stable forever.
 fn lock_stem(canonical: &Path) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    canonical.as_os_str().hash(&mut hasher);
-    format!("leindex-mcp-{:016x}", hasher.finish())
+    let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
+    // First 8 bytes → u64 little-endian → 16 hex chars, matching the prior
+    // `{:016x}` formatting of the lockfile name shape.
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&hash.as_bytes()[..8]);
+    format!("leindex-mcp-{:016x}", u64::from_le_bytes(bytes))
 }
 
 /// True when `pid` is alive AND matches the `start` sidecar (a reused PID for
 /// a dead process fails the start-time comparison, so stale locks are stolen).
+/// Linux-only: the `/proc` start-time + cmdline reads do not exist on
+/// macOS/Windows, and this function is only reachable from the Linux
+/// implementation above.
+#[cfg(target_os = "linux")]
 fn pid_is_owned(pid: u32, start_path: &Path) -> bool {
     let expected = std::fs::read_to_string(start_path)
         .ok()
@@ -136,6 +183,7 @@ fn pid_is_owned(pid: u32, start_path: &Path) -> bool {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn proc_start_time(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let fields = stat.rsplit_once(") ")?.1;
@@ -146,6 +194,7 @@ fn write_pid(path: &Path, pid: u32) -> io::Result<()> {
     std::fs::write(path, format!("{pid}\n"))
 }
 
+#[cfg(target_os = "linux")]
 fn write_start_time(path: &Path, pid: u32) -> io::Result<()> {
     let start = proc_start_time(pid)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no /proc stat for pid"))?;
@@ -161,6 +210,19 @@ mod tests {
     }
 
     #[test]
+    fn test_lock_stem_is_deterministic_and_stable() {
+        // Same canonical path → same stem every call (blake3, not DefaultHasher).
+        let a = lock_stem(Path::new("/tmp/leindex/proj-alpha"));
+        let b = lock_stem(Path::new("/tmp/leindex/proj-alpha"));
+        assert_eq!(a, b);
+        assert!(a.starts_with("leindex-mcp-"));
+        // Different projects → different stems.
+        let other = lock_stem(Path::new("/tmp/leindex/proj-beta"));
+        assert_ne!(a, other);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn test_acquire_writes_and_releases_sidecars() {
         let dir = temp_run_dir();
         let canonical = Path::new("/tmp/proj-a");
@@ -174,6 +236,7 @@ mod tests {
         assert!(!lock_path.exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_second_live_instance_reports_owned() {
         let dir = temp_run_dir();
@@ -197,6 +260,7 @@ mod tests {
         assert_eq!(outcome, LockOutcome::Acquired);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_stale_lock_with_dead_pid_is_stolen() {
         let dir = temp_run_dir();
@@ -223,6 +287,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_different_projects_coexist() {
         let dir = temp_run_dir();
@@ -234,6 +299,7 @@ mod tests {
         assert!(g2.is_some());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_pid_is_owned_self() {
         // Our own process + our own start-time must be reported as owned.
@@ -246,5 +312,20 @@ mod tests {
             std::process::id(),
             &dir.path().join("missing.start")
         ));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_non_linux_acquire_is_documented_noop() {
+        // Non-Linux: advisory no-op. Must return NotAvailable and write NO
+        // sidecars (no half-written lock file), per the module doc contract.
+        let dir = temp_run_dir();
+        let canonical = Path::new("/tmp/proj-nonlinux");
+        let (outcome, guard) = McpProjectLock::try_acquire_in_dir(canonical, dir.path());
+        assert_eq!(outcome, LockOutcome::NotAvailable);
+        assert!(guard.is_none());
+        let stem = lock_stem(canonical);
+        assert!(!dir.path().join(format!("{stem}.lock")).exists());
+        assert!(!dir.path().join(format!("{stem}.start")).exists());
     }
 }
