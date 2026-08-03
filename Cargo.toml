@@ -351,7 +351,7 @@ tempfile = { version = "3.13", optional = true }
 memmap2 = { version = "0.9", optional = true }
 
 # Heap profiling allocator (opt-in memprof feature)
-tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"], optional = true }
+tikv-jemallocator = { version = "0.7", features = ["profiling", "unprefixed_malloc_on_supported_platforms"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
