@@ -1,12 +1,13 @@
 {
   "phase": "idle_warm",
-  "rss_min_kib": 7672,
-  "rss_max_kib": 7672,
-  "rss_p95_kib": 7672,
+  "rss_min_kib": 8464,
+  "rss_max_kib": 8464,
+  "rss_p95_kib": 8464,
   "mapped_file_kib": 6960,
-  "anon_kib": 712,
+  "anon_kib": 1504,
   "sample_count": 12,
   "duration_ms": 3007,
   "worker_rss_max_kib": 0,
-  "combined_rss_max_kib": 7672
+  "combined_rss_max_kib": 8464,
+  "rebaselined_note": "T8 wave-2 (memory-pressure remediation): re-baselined from 7672 to 8464 = the idle_warm RSS measured by the CI Memory budget gate on bf1f59ab. T2 (MCP idle self-exit) added a dedicated stdin reader thread + mpsc + 1s idle ticker to every idle MCP server (~+790 KiB anon). Mapped-file pages unchanged; the delta is anon (thread stack/allocator arenas). Ceiling at 10% tolerance = 9310 KiB. Net win: +800 KiB idle-temporary vs 2.4 GiB held forever + self-exit."
 }
