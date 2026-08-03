@@ -25,13 +25,6 @@ use crate::embed::protocol::{
 use crate::embed::provider::ExecutionProviderSelector;
 use crate::embed::startup::{StartupReport, StartupReporter};
 
-fn unix_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
-        .unwrap_or(0)
-}
-
 // ONNX Runtime imports - only available with "onnx" feature
 #[cfg(feature = "onnx")]
 use ort::logging::LogLevel;
@@ -47,13 +40,6 @@ use ort::session::{Session, builder::GraphOptimizationLevel, builder::SessionBui
 /// after the parent leindex process exits.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 60; // 1 minute
 
-/// Default fixed ONNX sequence length.
-///
-/// MIGraphX compiles one GPU program per input shape. Padding every request to
-/// one bounded shape lets setup warm the same shape used by indexing/search,
-/// instead of paying a multi-minute compile on the first real repo.
-pub const DEFAULT_MAX_SEQ_LEN: usize = 128;
-
 /// Default maximum outgoing frame size in bytes (16 MiB).
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
@@ -67,98 +53,15 @@ pub const DEFAULT_MAX_TEXT_SIZE: usize = 1024 * 1024;
 /// 128KB fits in a single read instead of many small reads).
 pub const READ_BUF_CAPACITY: usize = 128 * 1024;
 
-/// Default maximum texts per ONNX inference call for legacy fixed-batch models.
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-const DEFAULT_ONNX_INFERENCE_BATCH_SIZE: usize = 1;
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-const DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE: usize = 32;
-/// MIGraphX compiles the first input shape into a fixed program. Every request
-/// in a session must therefore use one stable batch dimension.
-pub const DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE: usize = 8;
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-const MAX_ONNX_INFERENCE_BATCH_SIZE: usize = 256;
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-const ONNX_INFERENCE_BATCH_SIZE_ENV: &str = "LEINDEX_ONNX_INFERENCE_BATCH_SIZE";
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-const MIN_ONNX_SEQUENCE_LEN: usize = 8;
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-const MAX_ONNX_SEQUENCE_LEN: usize = 512;
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-const ONNX_SEQUENCE_LEN_ENV: &str = "LEINDEX_ONNX_SEQUENCE_LEN";
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-const ONNX_LOG_SHAPES_ENV: &str = "LEINDEX_ONNX_LOG_SHAPES";
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-const MIGRAPHX_FP16_ENV: &str = "LEINDEX_MIGRAPHX_FP16";
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-const MIGRAPHX_EXHAUSTIVE_TUNE_ENV: &str = "LEINDEX_MIGRAPHX_EXHAUSTIVE_TUNE";
-
-/// Profile directory holding compiled MIGraphX `.mxr` programs. Set on the
-/// worker process by the embedding client; keyed on model + batch + seq (NOT
-/// package version) so a release bump does not invalidate the cache.
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-const MIGRAPHX_MODEL_CACHE_PATH_ENV: &str = "ORT_MIGRAPHX_MODEL_CACHE_PATH";
-
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-pub fn configured_onnx_inference_batch_size(model_name: &str, provider: &str) -> usize {
-    std::env::var(ONNX_INFERENCE_BATCH_SIZE_ENV)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .map(|v| v.min(MAX_ONNX_INFERENCE_BATCH_SIZE))
-        .unwrap_or_else(|| {
-            if provider.eq_ignore_ascii_case("migraphx") || provider.eq_ignore_ascii_case("rocm") {
-                DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE
-            } else if model_name.ends_with("-dynamic") {
-                DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE
-            } else {
-                DEFAULT_ONNX_INFERENCE_BATCH_SIZE
-            }
-        })
-}
-
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-fn build_position_ids(batch_size: usize, sequence_len: usize) -> Vec<i64> {
-    (0..batch_size)
-        .flat_map(|_| (0..sequence_len).map(|position| position as i64))
-        .collect()
-}
-
-/// Remove all but the `keep` newest `.mxr` files from a cache dir.
-///
-/// Without this, every model/shape/version change leaves a ~1.2 GB orphan
-/// (MIGraphX JIT artifacts are large), so the cache grows without bound across
-/// releases. Keeping one is sufficient because the active profile recompiles
-/// into the same deterministic `compiled.mxr` path.
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-fn prune_migraphx_cache(dir: &std::path::Path, keep: usize) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut mxr: Vec<(std::path::PathBuf, std::time::SystemTime)> = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "mxr"))
-        .filter_map(|path| {
-            std::fs::metadata(&path)
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .map(|mtime| (path, mtime))
-        })
-        .collect();
-    mxr.sort_by_key(|item| std::cmp::Reverse(item.1)); // newest first
-    for (path, _) in mxr.into_iter().skip(keep) {
-        match std::fs::remove_file(&path) {
-            Ok(()) => tracing::debug!("pruned stale MIGraphX cache file: {}", path.display()),
-            Err(error) => {
-                tracing::warn!(
-                    "failed to prune stale MIGraphX cache file {}: {}",
-                    path.display(),
-                    error
-                )
-            }
-        }
-    }
-}
+pub use crate::embed::runtime_env::{
+    DEFAULT_MAX_SEQ_LEN, DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE,
+    configured_onnx_inference_batch_size, configured_onnx_sequence_len,
+};
+use crate::embed::runtime_env::{
+    MIGRAPHX_EXHAUSTIVE_TUNE_ENV, MIGRAPHX_FP16_ENV, MIGRAPHX_MODEL_CACHE_PATH_ENV,
+    ONNX_LOG_SHAPES_ENV, build_position_ids, default_ort_threads, env_flag, mem_available_kib,
+    process_rss_kib, prune_migraphx_cache, unix_now_ms,
+};
 
 #[cfg(feature = "onnx")]
 fn extract_output_tensor_f32(value: &ort::value::DynValue) -> Result<Vec<f32>, String> {
@@ -175,28 +78,20 @@ fn extract_output_tensor_f32(value: &ort::value::DynValue) -> Result<Vec<f32>, S
             }),
     }
 }
-
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-pub fn configured_onnx_sequence_len() -> usize {
-    std::env::var(ONNX_SEQUENCE_LEN_ENV)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v >= MIN_ONNX_SEQUENCE_LEN)
-        .map(|v| v.min(MAX_ONNX_SEQUENCE_LEN))
-        .unwrap_or(DEFAULT_MAX_SEQ_LEN)
-}
-
-#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+/// T6 low-memory refusal: when `min_available_mb` is configured and the system
+/// has less `MemAvailable` than that, return the refusal reason so the caller
+/// can abort BEFORE loading the (multi-GiB) ONNX model. `None` when unset or
+/// when `MemAvailable` cannot be determined (no-op, documented).
+pub(crate) fn low_memory_refusal(config: &RuntimeConfig) -> Option<String> {
+    let min_mb = config.min_available_mb?;
+    let available_kib = mem_available_kib()?;
+    (available_kib < min_mb.saturating_mul(1024)).then(|| {
+        format!(
+            "system MemAvailable is {} KiB, below LEINDEX_WORKER_MIN_AVAILABLE_MB={} MB; \
+             refusing to load the ONNX model (memory-pressure T6)",
+            available_kib, min_mb
+        )
+    })
 }
 
 /// Configuration for the worker runtime.
@@ -217,6 +112,20 @@ pub struct RuntimeConfig {
     /// Reranker cross-encoder model name (loaded on demand). Empty disables
     /// reranking (handle_rerank returns passthrough scores).
     pub rerank_model_name: String,
+    /// ONNX intra-op thread count (T5). Bounding ORT's thread pool is a
+    /// memory-pressure lever: each ORT thread carries a stack + per-thread
+    /// arena, and the worker already holds a multi-GiB model. Honored via
+    /// `LEINDEX_WORKER_ORT_THREADS`; defaults to 75% of available parallelism
+    /// (floored at 2).
+    pub ort_threads: usize,
+    /// Optional RSS cap in MiB (T6). When the worker's resident set exceeds
+    /// this, it self-exits so the parent respawns a lean worker instead of
+    /// compounding swap pressure. Honored via `LEINDEX_WORKER_MAX_RSS_MB`.
+    pub max_rss_mb: Option<u64>,
+    /// Optional system `MemAvailable` floor in MiB (T6). The worker refuses to
+    /// load its ONNX model when less is available. Honored via
+    /// `LEINDEX_WORKER_MIN_AVAILABLE_MB`.
+    pub min_available_mb: Option<u64>,
 }
 
 impl Default for RuntimeConfig {
@@ -231,6 +140,9 @@ impl Default for RuntimeConfig {
             // The worker will try MIGraphX (AMD GPU), then CUDA, then CPU.
             execution_provider: "auto".to_string(),
             rerank_model_name: "qwen3-reranker-0.6b-seq-cls".to_string(),
+            ort_threads: default_ort_threads(),
+            max_rss_mb: None,
+            min_available_mb: None,
         }
     }
 }
@@ -293,6 +205,23 @@ impl RuntimeConfig {
             .ok()
             .unwrap_or_else(|| "qwen3-reranker-0.6b-seq-cls".to_string());
 
+        // T5: bounded intra-op thread pool (memory-pressure lever).
+        let ort_threads = std::env::var("LEINDEX_WORKER_ORT_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or_else(default_ort_threads);
+
+        // T6: RSS self-exit cap + MemAvailable refusal floor.
+        let max_rss_mb = std::env::var("LEINDEX_WORKER_MAX_RSS_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0);
+        let min_available_mb = std::env::var("LEINDEX_WORKER_MIN_AVAILABLE_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0);
+
         Self {
             idle_timeout,
             max_frame_size,
@@ -301,6 +230,9 @@ impl RuntimeConfig {
             embedding_dim,
             execution_provider,
             rerank_model_name,
+            ort_threads,
+            max_rss_mb,
+            min_available_mb,
         }
     }
 }
@@ -438,13 +370,18 @@ fn try_provider_or_cpu(
     provider: ort::ep::ExecutionProviderDispatch,
     status_name: &str,
     ep_label: &str,
+    ort_threads: usize,
 ) -> Result<(SessionBuilder, ProviderRuntimeStatus), ort::Error> {
     match builder.with_execution_providers([provider]) {
         Ok(sb) => Ok((sb, ProviderRuntimeStatus::available(status_name))),
         Err(e) => {
             let reason = format!("{} EP not available: {}; falling back to CPU", ep_label, e);
             tracing::warn!("{}", reason);
+            // T5: the CPU fallback must honor the intra-op thread cap too — an
+            // unbound CPU session can spawn one thread per core on top of the
+            // GPU session's pool.
             let cpu_builder = Session::builder()?
+                .with_intra_threads(ort_threads)?
                 .with_memory_pattern(false)?
                 .with_log_level(LogLevel::Warning)?
                 .with_optimization_level(GraphOptimizationLevel::Level1)?
@@ -461,6 +398,7 @@ fn try_provider_or_cpu(
 fn maybe_missing_ep_fallback(
     model_path: &std::path::Path,
     provider_name: &str,
+    ort_threads: usize,
 ) -> Result<Option<SessionBuildOutcome>, ort::Error> {
     if !matches!(provider_name, "migraphx" | "rocm")
         || crate::embed::provider::is_migraphx_compiled_in()
@@ -475,6 +413,7 @@ fn maybe_missing_ep_fallback(
         provider_name
     );
     let session = Session::builder()?
+        .with_intra_threads(ort_threads)?
         .with_memory_pattern(false)?
         .with_log_level(LogLevel::Warning)?
         .with_optimization_level(GraphOptimizationLevel::Level1)?
@@ -506,6 +445,7 @@ fn maybe_missing_ep_fallback(
 fn attach_execution_provider(
     builder: SessionBuilder,
     provider_name: &str,
+    ort_threads: usize,
 ) -> Result<(SessionBuilder, ProviderRuntimeStatus), ort::Error> {
     debug_assert!(
         provider_name != "auto",
@@ -517,6 +457,7 @@ fn attach_execution_provider(
             ort::ep::CUDA::default().build().error_on_failure(),
             provider_name,
             "CUDA",
+            ort_threads,
         ),
         // Explicit "migraphx". The "auto" token is resolved upstream by the
         // selector (CoreML → MIGraphX → CUDA → CPU) and must never reach here
@@ -526,6 +467,7 @@ fn attach_execution_provider(
             build_migraphx_ep().error_on_failure(),
             provider_name,
             "MIGraphX",
+            ort_threads,
         ),
         // ROCm EP is deprecated in favor of MIGraphX and removed from ORT;
         // "rocm" is a backwards-compat alias that registers MIGraphX and falls
@@ -535,12 +477,14 @@ fn attach_execution_provider(
             build_migraphx_ep().error_on_failure(),
             "migraphx",
             "MIGraphX (rocm alias)",
+            ort_threads,
         ),
         "coreml" => try_provider_or_cpu(
             builder,
             ort::ep::CoreML::default().build().error_on_failure(),
             provider_name,
             "CoreML",
+            ort_threads,
         ),
         _ => Ok((
             builder.with_execution_providers([ort::ep::CPU::default().build()])?,
@@ -727,7 +671,7 @@ impl WorkerRuntime {
         let session_result = match provider_selection {
             Ok(selection) => {
                 tracing::info!("using {} execution provider", selection.name());
-                Self::build_session(&model_path, &selection.name())
+                Self::build_session(&model_path, &selection.name(), config.ort_threads)
             }
             Err(fallback) => {
                 tracing::warn!(
@@ -735,7 +679,7 @@ impl WorkerRuntime {
                     fallback.fallback_name(),
                     fallback.reason()
                 );
-                Self::build_session(&model_path, &fallback.fallback_name())
+                Self::build_session(&model_path, &fallback.fallback_name(), config.ort_threads)
             }
         };
 
@@ -774,6 +718,7 @@ impl WorkerRuntime {
     fn build_session(
         model_path: &std::path::Path,
         provider_name: &str,
+        ort_threads: usize,
     ) -> Result<SessionBuildOutcome, ort::Error> {
         // Auto must be resolved before reaching a session builder — see
         // attach_execution_provider's debug_assert. The optimization-level
@@ -795,7 +740,9 @@ impl WorkerRuntime {
         // Disable memory pattern reuse: tokenized sequence lengths vary between
         // calls, and without this ORT may reuse a buffer shaped for the previous
         // sequence and report a shape mismatch.
+        // T5: bound the intra-op thread pool at every session-builder site.
         let session_builder = Session::builder()?
+            .with_intra_threads(ort_threads)?
             .with_memory_pattern(false)?
             .with_log_level(LogLevel::Warning)?
             .with_optimization_level(optimization_level)?;
@@ -803,19 +750,41 @@ impl WorkerRuntime {
         // VAL-ORT-015/016: short-circuit to a CPU session if a GPU provider was
         // selected but MIGraphX is not compiled into the dynamically-loaded ORT
         // binary. See `maybe_missing_ep_fallback`.
-        if let Some(outcome) = maybe_missing_ep_fallback(model_path, provider_name)? {
+        if let Some(outcome) = maybe_missing_ep_fallback(model_path, provider_name, ort_threads)? {
             return Ok(outcome);
         }
 
         // Attach the selected execution provider, falling back to CPU on failure.
         let (mut session_builder, provider_status) =
-            attach_execution_provider(session_builder, provider_name)?;
+            attach_execution_provider(session_builder, provider_name, ort_threads)?;
 
         let session = session_builder.commit_from_file(model_path)?;
         Ok(SessionBuildOutcome {
             session,
             provider_status,
         })
+    }
+
+    /// T6: whether the worker's resident set exceeds `LEINDEX_WORKER_MAX_RSS_MB`.
+    /// When it does, the run loop self-exits so the parent can respawn a lean
+    /// worker instead of holding a multi-GiB swapped-out model forever (the
+    /// swap-saturation root cause this batch targets). Logs the trigger.
+    fn rss_over_cap(&self) -> bool {
+        let Some(max_mb) = self.config.max_rss_mb else {
+            return false;
+        };
+        let Some(rss_kib) = process_rss_kib() else {
+            return false;
+        };
+        if rss_kib <= max_mb.saturating_mul(1024) {
+            return false;
+        }
+        tracing::warn!(
+            rss_kib,
+            max_rss_mb = max_mb,
+            "worker RSS exceeds LEINDEX_WORKER_MAX_RSS_MB; self-exiting (memory-pressure T6)"
+        );
+        true
     }
 
     /// Get a handle to the shutdown flag for external signaling.
@@ -1024,6 +993,12 @@ impl WorkerRuntime {
                     "idle timeout ({:?}) expired, worker shutting down",
                     self.config.idle_timeout
                 );
+                return Ok(());
+            }
+
+            // T6: sustained-RSS self-exit guard (extracted so the loop body's
+            // cyclomatic complexity stays bounded).
+            if self.rss_over_cap() {
                 return Ok(());
             }
 
@@ -1570,10 +1545,13 @@ impl WorkerRuntime {
         // top-20 × 512 — unusable interactively. If the provider is unavailable
         // for this model, build_session falls back to CPU automatically.
         let provider = self.provider_runtime_status.execution_provider.as_str();
-        let outcome = Self::build_session(&model_path, provider).map_err(|e| WorkerError {
-            kind: ErrorKind::Inference,
-            message: format!("rerank session build failed: {}", e),
-        })?;
+        let outcome =
+            Self::build_session(&model_path, provider, self.config.ort_threads).map_err(|e| {
+                WorkerError {
+                    kind: ErrorKind::Inference,
+                    message: format!("rerank session build failed: {}", e),
+                }
+            })?;
         let session = Arc::new(Mutex::new(outcome.session));
         tracing::info!(model = %model_name, provider, "reranker loaded on demand");
         *self.rerank_session.lock().unwrap() = Some(session.clone());

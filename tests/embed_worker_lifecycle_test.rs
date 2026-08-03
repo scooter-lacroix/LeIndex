@@ -54,6 +54,9 @@ fn no_compile_config() -> RuntimeConfig {
         embedding_dim: 1024,
         execution_provider: "auto".to_string(),
         rerank_model_name: "__leindex_test_no_model__".to_string(),
+        ort_threads: 2,
+        max_rss_mb: None,
+        min_available_mb: None,
     }
 }
 

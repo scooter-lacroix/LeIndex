@@ -11,6 +11,9 @@ pub mod ort_discovery;
 pub mod protocol;
 pub mod provider;
 pub mod runtime;
+/// Env-config helpers + T5/T6 memory guards (kept out of `runtime.rs` so it
+/// stays under the 2000-line Large-File gate).
+mod runtime_env;
 pub mod startup;
 pub mod worker_main;
 

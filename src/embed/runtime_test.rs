@@ -1,5 +1,11 @@
 use super::*;
+// Batch/sequence tuning consts live in `runtime_env` (kept out of `runtime.rs`
+// for the Large-File gate); import them explicitly here.
 use crate::embed::protocol::EmbedRequest;
+use crate::embed::runtime_env::{
+    DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE, DEFAULT_ONNX_INFERENCE_BATCH_SIZE,
+    MAX_ONNX_SEQUENCE_LEN, ONNX_INFERENCE_BATCH_SIZE_ENV, ONNX_SEQUENCE_LEN_ENV,
+};
 use std::io::Cursor;
 use std::sync::Mutex as StdMutex;
 

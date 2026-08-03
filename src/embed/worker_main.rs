@@ -18,13 +18,44 @@
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::embed::protocol::{
     self, ErrorKind, Frame, HealthResponse, MsgType, WorkerError, WorkerState,
 };
-use crate::embed::runtime::{RuntimeConfig, WorkerRuntime};
+use crate::embed::runtime::{RuntimeConfig, WorkerRuntime, low_memory_refusal};
+
+/// Bound on concurrent per-socket client-handler threads (T5 / Kilo #1). Each
+/// spawned client thread carries a stack, so an unbounded accept→spawn loop is
+/// a thread/FD-exhaustion vector. When the cap is reached the excess connection
+/// is dropped (the client observes EOF and the daemon re-requests); local IPC
+/// is effectively serialized by the daemon, so the cap is a defensive bound
+/// against pathological bursts, not a throughput limiter.
+const MAX_SOCKET_CLIENT_THREADS: usize = 16;
+
+/// Configured socket-client concurrency cap, from
+/// `LEINDEX_WORKER_MAX_SOCKET_CLIENTS` (default [`MAX_SOCKET_CLIENT_THREADS`]).
+fn max_socket_clients() -> usize {
+    std::env::var("LEINDEX_WORKER_MAX_SOCKET_CLIENTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(MAX_SOCKET_CLIENT_THREADS)
+}
+
+/// Releases a slot in the active-client counter when the handler thread exits.
+/// Moved into each spawned client thread so the cap is exact even on panic.
+struct SocketClientSlotGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for SocketClientSlotGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Run the leindex-embed worker.
 ///
@@ -149,6 +180,14 @@ pub fn run() -> ! {
         config.idle_timeout = Duration::from_secs(600);
     }
 
+    // T6: refuse to load the (multi-GiB) ONNX model when the system is below
+    // the configured MemAvailable floor. Checked here, before any heavy work in
+    // either transport, so a swap-saturated box does not spawn another model.
+    if let Some(reason) = low_memory_refusal(&config) {
+        eprintln!("leindex-embed: {reason}");
+        process::exit(1);
+    }
+
     if let Some(path) = socket_path {
         // Bind the readiness endpoint before loading ORT/model state. A
         // spawning client can now distinguish "process exists but is
@@ -237,7 +276,7 @@ fn run_socket_worker(config: RuntimeConfig, socket_path: PathBuf) -> anyhow::Res
     listener.set_nonblocking(true)?;
     // Socket is visible now. Model/ORT initialization runs in exactly one
     // thread so health requests and fast fallback remain responsive.
-    let lifecycle = Arc::new(SocketLifecycle::new(initial_health));
+    let lifecycle = Arc::new(SocketLifecycle::new(initial_health, config.max_frame_size));
     spawn_runtime_init(config, Arc::clone(&lifecycle), status_path.clone());
     tracing::info!(
         "leindex-embed socket worker listening at {}",
@@ -255,6 +294,12 @@ fn run_socket_accept_loop(
     status_path: PathBuf,
     pid_path: PathBuf,
 ) -> anyhow::Result<()> {
+    // T5/Kilo #1: bound concurrent client-handler threads so a pathological
+    // burst cannot exhaust threads/FDs on a swap-saturated box. An atomic
+    // counter (rather than std::sync::Semaphore, which is not stable on this
+    // toolchain) gives exact try-acquire semantics with zero deps.
+    let max_clients = max_socket_clients();
+    let active_clients = Arc::new(AtomicUsize::new(0));
     loop {
         if lifecycle.is_failed() {
             tracing::error!("socket worker initialization failed; shutting down");
@@ -278,8 +323,26 @@ fn run_socket_accept_loop(
                     tracing::warn!(error = %error, "failed to make worker client socket blocking");
                     continue;
                 }
+                // Bound concurrency: when every slot is in use, drop the excess
+                // connection — the daemon's client observes EOF and re-requests.
+                if active_clients
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                        (n < max_clients).then_some(n + 1)
+                    })
+                    .is_err()
+                {
+                    tracing::warn!(
+                        max_clients,
+                        "worker socket client concurrency cap reached; dropping connection"
+                    );
+                    continue;
+                }
                 let connection_lifecycle = Arc::clone(&lifecycle);
-                std::thread::spawn(move || handle_socket_client(connection_lifecycle, stream));
+                let active = Arc::clone(&active_clients);
+                std::thread::spawn(move || {
+                    handle_socket_client(connection_lifecycle, stream);
+                    drop(SocketClientSlotGuard { active });
+                });
             }
             Err(e) => {
                 let Some(delay) = accept_retry_delay(&e) else {
@@ -369,14 +432,22 @@ enum SocketLifecycleState {
 #[cfg(unix)]
 struct SocketLifecycle {
     state: Mutex<SocketLifecycleState>,
+    /// Configured max incoming frame size (used by the not-ready fast path
+    /// instead of `RuntimeConfig::default()` — Kilo #2).
+    max_frame_size: usize,
 }
 
 #[cfg(unix)]
 impl SocketLifecycle {
-    fn new(health: HealthResponse) -> Self {
+    fn new(health: HealthResponse, max_frame_size: usize) -> Self {
         Self {
             state: Mutex::new(SocketLifecycleState::Initializing(health)),
+            max_frame_size,
         }
+    }
+
+    fn max_frame(&self) -> usize {
+        self.max_frame_size
     }
 
     fn runtime(&self) -> Option<WorkerRuntime> {
@@ -533,7 +604,9 @@ fn handle_not_ready_client(
         return;
     }
     let payload_len = u32::from_le_bytes(len_buf) as usize;
-    let max_frame = RuntimeConfig::default().max_frame_size.saturating_mul(2);
+    // Kilo #2: honor the configured max frame size (this fast path used to
+    // hardcode RuntimeConfig::default(), ignoring LEINDEX_WORKER_MAX_FRAME_SIZE).
+    let max_frame = lifecycle.max_frame().saturating_mul(2);
     if payload_len > max_frame {
         return;
     }
@@ -599,6 +672,7 @@ fn run_socket_worker(_config: RuntimeConfig, _socket_path: PathBuf) -> anyhow::R
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::embed::runtime::DEFAULT_MAX_FRAME_SIZE;
 
     #[test]
     fn socket_argument_requires_a_path() {
@@ -634,14 +708,17 @@ mod tests {
     fn initializing_socket_answers_health_and_rejects_inference() {
         use std::os::unix::net::UnixStream;
 
-        let lifecycle = Arc::new(SocketLifecycle::new(HealthResponse {
-            state: WorkerState::Initializing,
-            phase: "initializing".to_string(),
-            started_unix_ms: 1,
-            provider: Some("cpu".to_string()),
-            model: "test-model".to_string(),
-            error: None,
-        }));
+        let lifecycle = Arc::new(SocketLifecycle::new(
+            HealthResponse {
+                state: WorkerState::Initializing,
+                phase: "initializing".to_string(),
+                started_unix_ms: 1,
+                provider: Some("cpu".to_string()),
+                model: "test-model".to_string(),
+                error: None,
+            },
+            DEFAULT_MAX_FRAME_SIZE,
+        ));
 
         let (mut client, server) = UnixStream::pair().unwrap();
         let server_lifecycle = Arc::clone(&lifecycle);
