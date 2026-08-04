@@ -97,13 +97,29 @@ jobs:
           # One published crate (leindex) ships both binaries; the retired
           # leindex-embed subcrate is gone. A single canary against leindex
           # is sufficient — there is no second crate to fall out of sync.
-          if cargo search leindex 2>/dev/null | grep -q "^leindex = \"${VERSION}\""; then
+          # Query the exact crates.io version endpoint. The registry's search
+          # service is separate and eventually consistent; it can lag after
+          # the registry index/API already expose a published version.
+          CRATES_API_URL="https://crates.io/api/v1/crates/leindex/${VERSION}"
+          CRATE_RESPONSE=$(mktemp)
+          HTTP_STATUS=$(curl --silent --show-error --location \
+            --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 \
+            --write-out '%{http_code}' --output "$CRATE_RESPONSE" \
+            -H "User-Agent: LeIndex release workflow" "$CRATES_API_URL" 2>/dev/null) || HTTP_STATUS="000"
+          if [ "$HTTP_STATUS" = "200" ] \
+            && VERSION="$VERSION" python3 -c 'import json, os, sys; v=json.load(sys.stdin).get("version", {}); sys.exit(0 if v.get("num") == os.environ["VERSION"] and not v.get("yanked", False) else 1)' < "$CRATE_RESPONSE"; then
             echo "crates.io: v${VERSION} already published (leindex)"
             echo "needs_crates=false" >> "$GITHUB_OUTPUT"
-          else
+          elif [ "$HTTP_STATUS" = "404" ]; then
             echo "crates.io: v${VERSION} not yet published"
             echo "needs_crates=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Unable to determine crates.io status for leindex ${VERSION} (HTTP ${HTTP_STATUS})"
+            cat "$CRATE_RESPONSE"
+            rm -f "$CRATE_RESPONSE"
+            exit 1
           fi
+          rm -f "$CRATE_RESPONSE"
 
           # ── Check npm ──
           if npm view "@leindex/mcp@${VERSION}" version 2>/dev/null; then
@@ -677,18 +693,37 @@ jobs:
       - name: Publish leindex to crates.io (one crate, two binaries)
         run: |
           VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          if cargo search leindex 2>/dev/null | grep -q "^leindex = \"${VERSION}\""; then
-            echo "Version ${VERSION} already published to crates.io — skipping"
-          else
-            OUTPUT=$(cargo publish --allow-dirty 2>&1) || {
-              if echo "$OUTPUT" | grep -q "already exists"; then
-                echo "Version ${VERSION} already published to crates.io (index lag) — skipping"
-              else
-                echo "$OUTPUT"
-                exit 1
-              fi
-            }
+          CRATES_API_URL="https://crates.io/api/v1/crates/leindex/${VERSION}"
+          CRATE_RESPONSE=$(mktemp)
+          HTTP_STATUS=$(curl --silent --show-error --location \
+            --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 \
+            --write-out '%{http_code}' --output "$CRATE_RESPONSE" \
+            -H "User-Agent: LeIndex release workflow" "$CRATES_API_URL" 2>/dev/null) || HTTP_STATUS="000"
+          if [ "$HTTP_STATUS" = "200" ]; then
+            if VERSION="$VERSION" python3 -c 'import json, os, sys; v=json.load(sys.stdin).get("version", {}); sys.exit(0 if v.get("num") == os.environ["VERSION"] and not v.get("yanked", False) else 1)' < "$CRATE_RESPONSE"; then
+              echo "Version ${VERSION} already published to crates.io — skipping"
+              rm -f "$CRATE_RESPONSE"
+              exit 0
+            fi
+            echo "::error::crates.io returned an unexpected or yanked leindex ${VERSION} version"
+            cat "$CRATE_RESPONSE"
+            rm -f "$CRATE_RESPONSE"
+            exit 1
+          elif [ "$HTTP_STATUS" != "404" ]; then
+            echo "::error::Unable to determine crates.io status for leindex ${VERSION} (HTTP ${HTTP_STATUS})"
+            cat "$CRATE_RESPONSE"
+            rm -f "$CRATE_RESPONSE"
+            exit 1
           fi
+          rm -f "$CRATE_RESPONSE"
+          OUTPUT=$(cargo publish --allow-dirty 2>&1) || {
+            if echo "$OUTPUT" | grep -q "already exists"; then
+              echo "Version ${VERSION} already published to crates.io (registry race) — skipping"
+            else
+              echo "$OUTPUT"
+              exit 1
+            fi
+          }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -706,7 +741,7 @@ jobs:
   crates-index-ready:
     name: crates.io index ready
     needs: [detect, crates-io]
-    if: always() && needs.detect.outputs.needs_build == 'true' && !(needs.crates-io.result == 'failure')
+    if: always() && needs.detect.outputs.needs_build == 'true' && !(needs['crates-io'].result == 'failure')
     runs-on: ubuntu-latest
     steps:
       - name: Wait for leindex ${{ needs.detect.outputs.version }} in the crates.io index
@@ -717,16 +752,18 @@ jobs:
           INDEX_URL="https://index.crates.io/le/in/leindex"
           echo "Waiting for leindex ${VERSION} to be visible in the crates.io sparse index..."
           for attempt in $(seq 1 30); do
-            if INDEX_ENTRY=$(curl -fsS "$INDEX_URL" 2>/dev/null); then
-              if grep -q "\"vers\":\"${VERSION}\"" <<< "$INDEX_ENTRY"; then
+            if INDEX_ENTRY=$(curl --fail --silent --show-error --location \
+                --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 \
+                -H "User-Agent: LeIndex release workflow" "$INDEX_URL" 2>/dev/null); then
+              # The sparse index is the registry source Cargo resolves
+              # against. Require the exact, non-yanked JSON-lines entry;
+              # do not wait on the separate cargo-search service.
+              if VERSION="$VERSION" python3 -c 'import json, os, sys; wanted=os.environ["VERSION"]; sys.exit(0 if any((entry := json.loads(line)).get("vers") == wanted and not entry.get("yanked", False) for line in sys.stdin if line.strip()) else 1)' <<< "$INDEX_ENTRY"; then
                 echo "leindex ${VERSION} is visible in the crates.io index (attempt ${attempt}/30)"
-                # Cross-check via cargo search (the one-crate canary).
-                if cargo search leindex 2>/dev/null | grep -q "^leindex = \"${VERSION}\""; then
-                  echo "One-crate canary OK: leindex ${VERSION} resolvable via cargo search"
-                  exit 0
-                fi
-                echo "::warning::index entry present but cargo search not yet resolved; retrying"
+                echo "Exact non-yanked sparse-index entry verified; crates.io is ready"
+                exit 0
               fi
+              echo "::warning::sparse index response did not contain an exact non-yanked version; retrying"
             else
               echo "::warning::Failed to query the crates.io sparse index (${attempt}/30)"
             fi
@@ -749,7 +786,7 @@ jobs:
   undraft-release:
     name: Undraft GitHub Release
     needs: [detect, github-release, crates-index-ready]
-    if: always() && needs.crates-index-ready.result == 'success'
+    if: always() && needs['crates-index-ready'].result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -803,7 +840,7 @@ jobs:
   npm:
     name: Publish npm
     needs: [detect, undraft-release]
-    if: always() && needs.undraft-release.result == 'success' && needs.detect.outputs.needs_npm == 'true'
+    if: always() && needs['undraft-release'].result == 'success' && needs.detect.outputs.needs_npm == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -859,7 +896,7 @@ jobs:
   pypi:
     name: Publish PyPI
     needs: [detect, undraft-release]
-    if: always() && needs.undraft-release.result == 'success' && needs.detect.outputs.needs_pypi == 'true'
+    if: always() && needs['undraft-release'].result == 'success' && needs.detect.outputs.needs_pypi == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -922,11 +959,11 @@ jobs:
   # Encoded job-graph terminal node: ... → parallel publish-npm/publish-pypi
   # → final canaries/summary. Runs unconditionally so a failure in any
   # upstream publish job is still surfaced here. Undrafting is handled by
-  # the dedicated `undraft-release` job; this job only reports and re-runs
-  # the one-crate canary.
+  # the dedicated `undraft-release` job; this job reports the exact
+  # crates.io readiness gate rather than relying on the registry search service.
   summary:
     name: Release Summary
-    needs: [detect, github-release, undraft-release, crates-io, npm, pypi]
+    needs: [detect, github-release, crates-io, crates-index-ready, undraft-release, npm, pypi]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -952,15 +989,16 @@ jobs:
             echo "all_published=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: One-crate canary (cargo search)
+      - name: Verify crates.io readiness gate
         if: steps.check_all.outputs.all_published != 'true'
+        env:
+          CRATES_READY_RESULT: ${{ needs['crates-index-ready'].result }}
         run: |
-          VERSION="${{ needs.detect.outputs.version }}"
-          if ! cargo search leindex 2>/dev/null | grep -q "^leindex = \"${VERSION}\""; then
-            echo "::error::one-crate canary failed: leindex ${VERSION} not resolvable via cargo search"
+          if [ "$CRATES_READY_RESULT" != "success" ]; then
+            echo "::error::crates.io readiness gate did not succeed (result=$CRATES_READY_RESULT)"
             exit 1
           fi
-          echo "One-crate canary OK: leindex ${VERSION} resolvable"
+          echo "Exact crates.io sparse-index readiness gate succeeded"
 
       - name: Print summary
         if: steps.check_all.outputs.all_published != 'true'
@@ -970,10 +1008,10 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Step | Status |" >> "$GITHUB_STEP_SUMMARY"
           echo "|------|--------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| GitHub Release (draft) | ${{ needs.github-release.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| crates.io | ${{ needs.crates-io.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| crates-index-ready | ${{ needs.crates-index-ready.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| undraft-release | ${{ needs.undraft-release.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| GitHub Release (draft) | ${{ needs['github-release'].result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| crates.io | ${{ needs['crates-io'].result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| crates-index-ready | ${{ needs['crates-index-ready'].result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| undraft-release | ${{ needs['undraft-release'].result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| npm | ${{ needs.npm.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| PyPI | ${{ needs.pypi.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
