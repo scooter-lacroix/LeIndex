@@ -314,4 +314,56 @@ mod test {
         let deserialized: EnvironmentCapture = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, cap);
     }
+
+    /// VAL-BASE-009: When MALLOC_ARENA_MAX is set in the environment, the
+    /// allocator_env capture includes it with the correct value.
+    /// VAL-CONT-001: The allocator_env capture records the setting.
+    #[test]
+    fn test_allocator_env_captures_malloc_arena_max() {
+        // SAFETY: env mutation is process-global, but the normal test runner
+        // does not set MALLOC_ARENA_MAX for these unit tests. We save and
+        // restore to avoid side-effects.
+        let saved = std::env::var("MALLOC_ARENA_MAX").ok();
+        // SAFETY: no other thread is reading MALLOC_ARENA_MAX in this test.
+        unsafe {
+            std::env::set_var("MALLOC_ARENA_MAX", "2");
+        }
+        let env_map = read_allocator_env();
+        assert_eq!(
+            env_map.get("MALLOC_ARENA_MAX"),
+            Some(&"2".to_string()),
+            "allocator_env should contain MALLOC_ARENA_MAX=2"
+        );
+        // Restore original state.
+        // SAFETY: same justification.
+        unsafe {
+            match &saved {
+                Some(v) => std::env::set_var("MALLOC_ARENA_MAX", v),
+                None => std::env::remove_var("MALLOC_ARENA_MAX"),
+            }
+        }
+    }
+
+    /// VAL-BASE-009: When MALLOC_ARENA_MAX is unset, allocator_env does not
+    /// contain the key (no phantom entries).
+    #[test]
+    fn test_allocator_env_omits_unset_malloc_arena_max() {
+        let saved = std::env::var("MALLOC_ARENA_MAX").ok();
+        // SAFETY: no other thread reads this var in this test.
+        unsafe {
+            std::env::remove_var("MALLOC_ARENA_MAX");
+        }
+        let env_map = read_allocator_env();
+        assert!(
+            !env_map.contains_key("MALLOC_ARENA_MAX"),
+            "allocator_env should not contain MALLOC_ARENA_MAX when unset"
+        );
+        // Restore.
+        // SAFETY: same justification.
+        unsafe {
+            if let Some(v) = &saved {
+                std::env::set_var("MALLOC_ARENA_MAX", v);
+            }
+        }
+    }
 }

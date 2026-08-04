@@ -53,6 +53,12 @@ struct Args {
     /// Print verbose output.
     #[arg(short, long)]
     verbose: bool,
+
+    /// glibc malloc arena cap applied to all child processes (spec §8.2).
+    /// Set to 0 to leave MALLOC_ARENA_MAX unset (useful for comparison runs).
+    /// Default: 2 (containment default for default/glibc builds).
+    #[arg(long, default_value = "2")]
+    malloc_arena_max: u32,
 }
 
 fn main() -> Result<()> {
@@ -102,6 +108,32 @@ fn main() -> Result<()> {
         }
         if let Some(ref output) = args.output {
             eprintln!("  output:  {}", output.display());
+        }
+    }
+
+    // ── Containment default: MALLOC_ARENA_MAX ────────────────────────
+    //
+    // Spec §8.2: default (non-memprof) builds use glibc malloc, which
+    // allocates arenas per-thread. Capping at 2 (the containment default)
+    // prevents arena blowup on multi-core hosts. We set it in the harness
+    // process environment so every spawned child inherits it, and so the
+    // env_capture module records it in allocator_env.
+    //
+    // VAL-BASE-009: when memcheck runs the child with MALLOC_ARENA_MAX=2,
+    // the baseline JSON's environment.allocator_env includes the setting.
+    // VAL-CONT-001: leindex launches with MALLOC_ARENA_MAX without error.
+    //
+    // Use --malloc-arena-max 0 to skip setting the env (for comparison
+    // against the uncapped baseline).
+    if args.malloc_arena_max > 0 {
+        let val = args.malloc_arena_max.to_string();
+        // SAFETY: single-threaded CLI startup before any child is spawned
+        // or any env_capture read occurs.
+        unsafe {
+            std::env::set_var("MALLOC_ARENA_MAX", &val);
+        }
+        if args.verbose {
+            eprintln!("  MALLOC_ARENA_MAX={}", val);
         }
     }
 
