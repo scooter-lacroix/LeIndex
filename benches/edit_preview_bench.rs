@@ -10,8 +10,9 @@
 //! cargo bench --bench edit_preview_bench
 //! ```
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use leindex::edit::ResolvedEditChange;
+use std::hint::black_box;
 use std::path::{Path, PathBuf};
 
 /// Simulate the OLD (redundant) approach: create N identical ResolvedEditChange objects.

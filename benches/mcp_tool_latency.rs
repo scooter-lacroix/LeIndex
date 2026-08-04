@@ -1,4 +1,4 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use leindex::cli::ProjectRegistry;
 use leindex::cli::mcp::handlers::all_tool_handlers;
 use leindex::cli::mcp::protocol::JsonRpcRequest;
@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
+use std::hint::black_box;
 use std::io::Write;
 use std::process::Command;
 use std::sync::Arc;

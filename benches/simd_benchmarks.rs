@@ -16,9 +16,10 @@
 //! cargo bench --bench simd_benchmarks -- --save-baseline avx2
 //! ```
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use leindex::search::quantization::simd::{dot_product_adc, fallback};
 use leindex::search::quantization::{Int8QuantizedVector, Quantize};
+use std::hint::black_box;
 
 /// Generate test data for benchmarks
 fn generate_test_data(dim: usize) -> (Vec<f32>, Vec<f32>, Int8QuantizedVector) {

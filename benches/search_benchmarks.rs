@@ -13,17 +13,18 @@
 //! cargo bench --bench search_benchmarks search_latency
 //! ```
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use leindex::search::quantization::{Int8HnswIndex, Int8HnswParams};
+use std::hint::black_box;
 
 /// Generate random test vectors
 fn generate_vectors(count: usize, dim: usize) -> Vec<(String, Vec<f32>)> {
     use rand::Rng;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     (0..count)
         .map(|i| {
-            let vector: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let vector: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0f32..1.0)).collect();
             (format!("vec_{}", i), vector)
         })
         .collect()
