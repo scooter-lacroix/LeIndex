@@ -42,25 +42,61 @@ main() {
 
     if [ -n "$DRY_RUN" ]; then
         echo -e "${YELLOW}Would run: cargo publish --allow-dirty $DRY_RUN${NC}"
-        cargo publish --allow-dirty $DRY_RUN 2>&1 || true
+        # No `|| true` here: a validation failure must propagate as a
+        # non-zero status instead of reporting completion. `set -e` turns
+        # the cargo failure into the script's exit status.
+        cargo publish --allow-dirty $DRY_RUN 2>&1
     else
         # If the exact, non-yanked version is already on crates.io, skip.
         # The registry search service can lag after the API and sparse index
         # are already current, so use the exact version endpoint instead.
         CRATES_API_URL="https://crates.io/api/v1/crates/leindex/${VERSION}"
-        if CRATE_JSON=$(curl -fsS -H "User-Agent: LeIndex publish helper" "$CRATES_API_URL" 2>/dev/null) \
-            && VERSION="$VERSION" python3 -c 'import json, os, sys; v=json.load(sys.stdin).get("version", {}); sys.exit(0 if v.get("num") == os.environ["VERSION"] and not v.get("yanked", False) else 1)' <<< "$CRATE_JSON"; then
-            echo -e "${GREEN}✓ leindex ${VERSION} already published — skipping${NC}"
-        else
-            echo -e "${YELLOW}Publishing leindex ${VERSION}...${NC}"
-            cargo publish --allow-dirty 2>&1 || {
-                echo -e "${RED}Failed to publish leindex${NC}"
+        CHECK_BODY="$(mktemp)"
+        trap 'rm -f "$CHECK_BODY"' EXIT
+        HTTP_STATUS=""
+        # Query the exact-version endpoint with bounded connect/request
+        # timeouts, retrying transient failures. Only an explicit HTTP 404
+        # means "not published yet" and licenses us to publish; timeouts,
+        # network/TLS failures, other HTTP statuses, and invalid JSON abort
+        # with an error rather than publishing into an unknown state.
+        for attempt in 1 2 3; do
+            if HTTP_STATUS="$(curl -sS -o "$CHECK_BODY" -w '%{http_code}' \
+                --connect-timeout 10 --max-time 30 \
+                -H "User-Agent: LeIndex publish helper" "$CRATES_API_URL" 2>/dev/null)"; then
+                if [ "$HTTP_STATUS" = "404" ] || [ "$HTTP_STATUS" = "200" ]; then
+                    break
+                fi
+                echo -e "${YELLOW}Warning: crates.io API returned HTTP ${HTTP_STATUS} (attempt ${attempt}/3); retrying...${NC}"
+            else
+                echo -e "${YELLOW}Warning: crates.io API unreachable (attempt ${attempt}/3); retrying...${NC}"
+                HTTP_STATUS=""
+            fi
+            [ "$attempt" -lt 3 ] && sleep 3
+        done
+        case "$HTTP_STATUS" in
+            404)
+                echo -e "${YELLOW}Publishing leindex ${VERSION}...${NC}"
+                cargo publish --allow-dirty 2>&1 || {
+                    echo -e "${RED}Failed to publish leindex${NC}"
+                    exit 1
+                }
+                echo -e "${GREEN}✓ leindex ${VERSION} published${NC}"
+                echo "Waiting for crates.io index to update..."
+                sleep 30
+                ;;
+            200)
+                if VERSION="$VERSION" python3 -c 'import json, os, sys; v=json.load(sys.stdin).get("version", {}); sys.exit(0 if v.get("num") == os.environ["VERSION"] and not v.get("yanked", False) else 1)' < "$CHECK_BODY"; then
+                    echo -e "${GREEN}✓ leindex ${VERSION} already published — skipping${NC}"
+                else
+                    echo -e "${RED}Error: leindex ${VERSION} exists on crates.io but is yanked or the version does not match${NC}"
+                    exit 1
+                fi
+                ;;
+            *)
+                echo -e "${RED}Error: could not verify publication status of leindex ${VERSION} (final HTTP status: ${HTTP_STATUS:-unreachable})${NC}"
                 exit 1
-            }
-            echo -e "${GREEN}✓ leindex ${VERSION} published${NC}"
-            echo "Waiting for crates.io index to update..."
-            sleep 30
-        fi
+                ;;
+        esac
     fi
 
     echo ""

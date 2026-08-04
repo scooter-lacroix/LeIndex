@@ -715,20 +715,25 @@ mod per_surface_journeys {
         // partial install (main-only) through `ensure_worker_present`.
         let bootstrap = read_file("packages/pypi-leindex/src/leindex/bootstrap.py");
         assert!(
-            bootstrap.contains("embed_binary"),
-            "VAL-PYPI-008: bootstrap must track the leindex-embed worker binary"
+            bootstrap.contains("embed_binary: Path"),
+            "VAL-PYPI-008: bootstrap must track the leindex-embed worker binary (embed_binary: Path)"
         );
         assert!(
-            bootstrap.contains("ensure_worker_present"),
-            "VAL-PYPI-008: bootstrap must ensure the leindex-embed worker binary is present"
+            bootstrap.contains("def ensure_worker_present("),
+            "VAL-PYPI-008: bootstrap must define ensure_worker_present()"
         );
         // The worker must be a [[bin]] of the root crate, onnx-gated, so the
-        // single cargo install co-installs it (VAL-CARGO-005 invariant).
+        // single cargo install co-installs it (VAL-CARGO-005 invariant). The
+        // `required-features` must sit in the SAME [[bin]] section that
+        // declares the worker, not merely somewhere else in Cargo.toml.
         let cargo = read_file("Cargo.toml");
+        let embed_bin_section = cargo
+            .split("[[bin]]")
+            .find(|section| section.contains("name = \"leindex-embed\""))
+            .expect("Cargo.toml must declare a [[bin]] section for leindex-embed");
         assert!(
-            cargo.contains("name = \"leindex-embed\"")
-                && cargo.contains("required-features = [\"onnx\"]"),
-            "VAL-PYPI-008: root crate must declare the onnx-gated leindex-embed worker bin"
+            embed_bin_section.contains("required-features = [\"onnx\"]"),
+            "VAL-PYPI-008: the leindex-embed [[bin]] section must declare required-features = [\"onnx\"]"
         );
         // The bootstrap installs with the `onnx` feature so the `setup`
         // subcommand is present in the freshly installed binary.
