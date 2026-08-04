@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Canonical phase names in execution order (VAL-MEASURE-002, VAL-CPHASE-036,
-/// T8 step-3).
+/// T8 step-3, §14 Baseline Protocol extensions).
 ///
 /// The original 6 phases are preserved. Three worker-active phases are added
 /// after the original phases to exercise the worker lifecycle:
@@ -44,6 +44,17 @@ use std::time::{Duration, Instant};
 /// - `worker_ort_threads`: worker RSS under the capped ORT-thread setting
 /// - `stale_artifacts`: `leindex cleanup --stale-daemons` RSS + seeded-sidecar
 ///   removal assertion
+///
+/// §14 Baseline Protocol extensions (WS1 Tasks 5-6):
+/// - `contention_3c_2p`: 3-client/2-project active contention phase
+/// - `incremental_noop`: re-index with no file changes
+/// - `incremental_one_file`: add 1 source file then re-index
+/// - `incremental_burst`: add 10 files at once then re-index
+/// - `incremental_delete`: remove a file then re-index
+/// - `query_suite_cold`: fixed query suite, cache cold
+/// - `query_suite_warm`: fixed query suite, cache warm
+/// - `full_index_run2`: second full index run (for 3x RSS stability check)
+/// - `full_index_run3`: third full index run
 pub const CANONICAL_PHASES: &[&str] = &[
     "idle_warm",
     "index",
@@ -57,6 +68,15 @@ pub const CANONICAL_PHASES: &[&str] = &[
     "mcp_idle_proliferation",
     "worker_ort_threads",
     "stale_artifacts",
+    "contention_3c_2p",
+    "incremental_noop",
+    "incremental_one_file",
+    "incremental_burst",
+    "incremental_delete",
+    "query_suite_cold",
+    "query_suite_warm",
+    "full_index_run2",
+    "full_index_run3",
 ];
 
 /// The worker binary name used for child-process detection.
@@ -86,6 +106,9 @@ pub struct WorkloadConfig {
     /// Path to the leindex-embed worker binary (for worker-active phases).
     /// If None, worker-active phases are skipped.
     pub worker_binary: Option<PathBuf>,
+    /// Directory for heap-profile snapshots (smaps). If None, profiles are
+    /// stored in a temp dir that is cleaned up after the run.
+    pub heap_profile_dir: Option<PathBuf>,
 }
 
 /// Copy fixture source files into a disposable directory, excluding its index.
@@ -278,6 +301,54 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
     let report = run_stale_artifacts_phase(config)?;
     reports.push(report);
 
+    // ── §14 Baseline Protocol Extension Phases (WS1 Tasks 5-6) ──────────
+
+    // ── Phase 13: contention_3c_2p ──────────────────────────────────────
+    // Spawn 3 leindex mcp --stdio children on 2 fixture copies, drive
+    // interleaved leindex_search calls, capture combined RSS.
+    let report = run_contention_phase(config)?;
+    reports.push(report);
+
+    // ── Phase 14: incremental_noop ──────────────────────────────────────
+    let report = run_incremental_noop_phase(config)?;
+    reports.push(report);
+
+    // ── Phase 15: incremental_one_file ──────────────────────────────────
+    let report = run_incremental_one_file_phase(config)?;
+    reports.push(report);
+
+    // ── Phase 16: incremental_burst ─────────────────────────────────────
+    let report = run_incremental_burst_phase(config)?;
+    reports.push(report);
+
+    // ── Phase 17: incremental_delete ────────────────────────────────────
+    let report = run_incremental_delete_phase(config)?;
+    reports.push(report);
+
+    // ── Phase 18: query_suite_cold ──────────────────────────────────────
+    let report = run_query_suite_cold_phase(config)?;
+    reports.push(report);
+
+    // ── Phase 19: query_suite_warm ──────────────────────────────────────
+    let report = run_query_suite_warm_phase(config)?;
+    reports.push(report);
+
+    // ── Phase 20: full_index_run2 ───────────────────────────────────────
+    let report = run_command_phase(config, "full_index_run2", |bin, fixture| {
+        let mut cmd = Command::new(bin);
+        cmd.arg("index").arg(fixture).arg("--force");
+        cmd
+    })?;
+    reports.push(report);
+
+    // ── Phase 21: full_index_run3 ───────────────────────────────────────
+    let report = run_command_phase(config, "full_index_run3", |bin, fixture| {
+        let mut cmd = Command::new(bin);
+        cmd.arg("index").arg(fixture).arg("--force");
+        cmd
+    })?;
+    reports.push(report);
+
     Ok(reports)
 }
 
@@ -297,6 +368,8 @@ fn placeholder_report(phase_name: &str) -> PhaseReport {
         duration_ms: 0,
         worker_rss_max_kib: 0,
         combined_rss_max_kib: u64::MAX,
+        gpu_vram_mib: None,
+        descendants: crate::sampler::DescendantTree::default(),
     }
 }
 
@@ -620,6 +693,7 @@ fn sample_pids_for_duration(
                 anon_kib: anon,
                 pss_kib: 0,
                 worker_rss_kib: 0,
+                gpu: sampler::GpuSample::default(),
             });
         }
         std::thread::sleep(sample_interval);
@@ -706,6 +780,10 @@ fn run_stale_artifacts_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
 ///
 /// Spawns the command, samples its PID in a background thread until it
 /// exits, then returns the phase report.
+///
+/// §14 item 9 (heap profiles): captures smaps snapshots before and after
+/// each phase boundary. §14 item (descendant counting): counts the
+/// descendant process tree at peak RSS.
 fn run_command_phase(
     config: &WorkloadConfig,
     phase_name: &str,
@@ -758,6 +836,11 @@ fn run_command_phase(
 
     let start = Instant::now();
     let _sample_interval = config.sample_interval;
+
+    // §14 item 9: Capture heap-profile snapshot (smaps) before the phase.
+    if let Some(ref profile_dir) = config.heap_profile_dir {
+        let _ = sampler::capture_heap_profile(pid, phase_name, "before", profile_dir);
+    }
 
     // Sampler thread — collects samples until the command exits.
     let done = Arc::new(AtomicBool::new(false));
@@ -816,12 +899,22 @@ fn run_command_phase(
         );
     }
 
-    let report = build_phase_report(phase_name, &mut samples, duration);
+    // §14 item 9: Capture heap-profile snapshot (smaps) after the phase.
+    // The "before" snapshot is taken right after spawn; "after" is here.
+    if let Some(ref profile_dir) = config.heap_profile_dir {
+        let _ = sampler::capture_heap_profile(pid, phase_name, "after", profile_dir);
+    }
+
+    // §14 item: Count descendant process tree at phase completion.
+    let descendants = sampler::count_descendants(pid).unwrap_or_default();
+
+    let mut report = build_phase_report(phase_name, &mut samples, duration);
+    report.descendants = descendants;
 
     if config.verbose {
         eprintln!(
-            "memcheck: phase '{}' complete — rss_max: {} KiB, samples: {}",
-            phase_name, report.rss_max_kib, report.sample_count
+            "memcheck: phase '{}' complete — rss_max: {} KiB, samples: {}, descendants: {}",
+            phase_name, report.rss_max_kib, report.sample_count, report.descendants.total
         );
     }
 
@@ -1087,6 +1180,8 @@ fn build_phase_report(
             duration_ms: duration.as_millis() as u64,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 0,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
     }
 
@@ -1115,6 +1210,9 @@ fn build_phase_report(
         .max()
         .unwrap_or(rss_max);
 
+    // GPU VRAM (peak across samples; §14 item 8)
+    let gpu_vram_mib = samples.iter().filter_map(|s| s.gpu.vram_used_mib).max();
+
     PhaseReport {
         phase: phase_name.to_string(),
         rss_min_kib: rss_min,
@@ -1126,6 +1224,8 @@ fn build_phase_report(
         duration_ms: duration.as_millis() as u64,
         worker_rss_max_kib: worker_rss_max,
         combined_rss_max_kib: combined_rss_max,
+        gpu_vram_mib,
+        descendants: sampler::DescendantTree::default(),
     }
 }
 
@@ -1135,6 +1235,390 @@ fn clean_index_state(fixture: &Path) {
     if leindex_dir.exists() {
         let _ = std::fs::remove_dir_all(&leindex_dir);
     }
+}
+
+// ─── §14 Baseline Protocol Extension Phases (WS1 Tasks 5-6) ─────────────
+
+/// Number of concurrent clients in the contention phase (§14 item 6).
+const CONTENTION_CLIENTS: usize = 3;
+
+/// Dwell time for the contention phase.
+const CONTENTION_DWELL: Duration = Duration::from_secs(4);
+
+/// Fixed query suite used for query_suite_cold/warm phases.
+const QUERY_SUITE: &[&str] = &[
+    "function", "struct", "impl", "trait", "enum", "use", "mod", "pub", "async", "match",
+];
+
+/// Run the `contention_3c_2p` phase: spawn 3 MCP clients on 2 fixture copies,
+/// drive interleaved search queries, and capture combined RSS.
+///
+/// §14 item 6 + §13 scenario 1 require an active 3-client/2-project workload.
+/// Clients 0-1 point at the primary fixture copy, client 2 points at a second
+/// fixture copy (both derived from the canonical fixture).
+fn run_contention_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
+    if config.verbose {
+        eprintln!(
+            "memcheck: phase 'contention_3c_2p' starting ({} clients, 2 projects)",
+            CONTENTION_CLIENTS
+        );
+    }
+
+    // Create a second fixture copy for project B.
+    let fixture_b = copy_fixture_source(&config.fixture)?;
+    let fixture_b_path = fixture_b.path().to_path_buf();
+
+    // Each client gets its own LEINDEX_HOME to avoid lock contention.
+    let root = tempfile::tempdir().context("contention_3c_2p: create temp home root")?;
+    let root_path = root.path().to_path_buf();
+
+    let mut children: Vec<Child> = Vec::with_capacity(CONTENTION_CLIENTS);
+    let mut homes: Vec<PathBuf> = Vec::with_capacity(CONTENTION_CLIENTS);
+    let fixtures = [
+        config.fixture.clone(),
+        config.fixture.clone(),
+        fixture_b_path.clone(),
+    ];
+
+    for i in 0..CONTENTION_CLIENTS {
+        let home = root_path.join(format!("home-{i}"));
+        std::fs::create_dir_all(&home)
+            .with_context(|| format!("contention_3c_2p: create {}", home.display()))?;
+        homes.push(home);
+    }
+
+    // Index both fixtures first (so search queries have results).
+    for fixture in &[&config.fixture, &fixture_b_path] {
+        let status = Command::new(&config.binary)
+            .arg("index")
+            .arg(fixture)
+            .current_dir(fixture)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| {
+                format!(
+                    "contention_3c_2p: failed to index fixture {}",
+                    fixture.display()
+                )
+            })?;
+        if !status.success() {
+            anyhow::bail!(
+                "contention_3c_2p: index command failed for {}",
+                fixtures[0].display()
+            );
+        }
+    }
+
+    // Spawn 3 long-running MCP processes.
+    for (i, home) in homes.iter().enumerate() {
+        let home_str = home
+            .to_str()
+            .context("contention_3c_2p: non-UTF8 temp home path")?;
+        let mut cmd = Command::new(&config.binary);
+        cmd.arg("mcp")
+            .arg("--stdio")
+            .current_dir(std::env::temp_dir())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("LEINDEX_HOME", home_str)
+            .env("LEINDEX_EMBED_DAEMON", "0");
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("contention_3c_2p: failed to spawn client {i}"))?;
+        children.push(child);
+    }
+    std::thread::sleep(STARTUP_GRACE);
+
+    // Verify all 3 clients are alive.
+    let pids: Vec<u32> = children.iter().map(|c| c.id()).collect();
+    for (i, pid) in pids.iter().enumerate() {
+        if std::fs::read_to_string(format!("/proc/{}/stat", pid)).is_err() {
+            for child in children.drain(..) {
+                kill_child(child);
+            }
+            anyhow::bail!(
+                "contention_3c_2p: client {} (pid {}) died during startup",
+                i,
+                pid
+            );
+        }
+    }
+
+    // Drive interleaved search calls on each client via a background thread
+    // that writes JSON-RPC requests to stdin and reads from stdout.
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_threads = stop.clone();
+    let fixtures_threads = fixtures
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    let mut drives: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(CONTENTION_CLIENTS);
+    for (i, child) in children.iter_mut().enumerate() {
+        let fixture_path = fixtures_threads[i].clone();
+        let mut stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stop_arc = stop_for_threads.clone();
+        drives.push(std::thread::spawn(move || {
+            let mut reader = stdout.map(std::io::BufReader::new);
+            // MCP handshake
+            if let Some(ref mut w) = stdin {
+                let init = concat!(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
+                    r#""params":{"capabilities":{}}}}"#,
+                    "\n"
+                );
+                let _ = w.write_all(init.as_bytes());
+                let _ = w.flush();
+            }
+            if let Some(ref mut r) = reader {
+                use std::io::BufRead;
+                let mut response = String::new();
+                let _ = r.read_line(&mut response);
+            }
+            if let Some(ref mut w) = stdin {
+                let notif = concat!(
+                    r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                    "\n"
+                );
+                let _ = w.write_all(notif.as_bytes());
+                let _ = w.flush();
+            }
+
+            let mut qid = 2u64;
+            while !stop_arc.load(Ordering::Relaxed) {
+                if let Some(ref mut w) = stdin {
+                    let query = format!(
+                        concat!(
+                            r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","#,
+                            r#""params":{{"name":"leindex_search","#,
+                            r#""arguments":{{"query":"how does this project work","#,
+                            r#""project_path":"{}"}}}}}}"#,
+                            "\n"
+                        ),
+                        qid,
+                        fixture_path.replace('\\', "\\\\").replace('"', "\\\"")
+                    );
+                    let _ = w.write_all(query.as_bytes());
+                    let _ = w.flush();
+                }
+                if let Some(ref mut r) = reader {
+                    use std::io::BufRead;
+                    let mut response = String::new();
+                    let _ = r.read_line(&mut response);
+                }
+                qid += 1;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            drop(stdin);
+            drop(reader);
+        }));
+    }
+
+    // Sample the COMBINED RSS across all 3 client PIDs for the dwell period.
+    let report = match sample_pids_for_duration(
+        &pids,
+        "contention_3c_2p",
+        CONTENTION_DWELL,
+        config.sample_interval,
+    ) {
+        Ok(report) => report,
+        Err(e) => {
+            stop.store(true, Ordering::Relaxed);
+            for handle in drives {
+                let _ = handle.join();
+            }
+            for child in children {
+                kill_child(child);
+            }
+            return Err(e);
+        }
+    };
+
+    // Stop drive threads and clean up children.
+    stop.store(true, Ordering::Relaxed);
+    for handle in drives {
+        let _ = handle.join();
+    }
+    for child in children {
+        kill_child(child);
+    }
+
+    // Reap orphaned workers.
+    for &pid in &pids {
+        let workers = find_worker_pids(pid, WORKER_BINARY_NAME);
+        cleanup_command_phase_workers(&workers);
+    }
+
+    if config.verbose {
+        eprintln!(
+            "memcheck: phase 'contention_3c_2p' complete — combined rss_max: {} KiB ({} clients), samples: {}",
+            report.rss_max_kib, CONTENTION_CLIENTS, report.sample_count
+        );
+    }
+
+    Ok(report)
+}
+
+/// Run `incremental_noop`: re-index with no file changes since the initial index.
+fn run_incremental_noop_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
+    if config.verbose {
+        eprintln!("memcheck: phase 'incremental_noop' starting");
+    }
+    // The fixture was already indexed by the initial "index" phase. A re-index
+    // with no changes should be a no-op (or near-instant detection of no changes).
+    run_command_phase(config, "incremental_noop", |bin, fixture| {
+        let mut cmd = Command::new(bin);
+        cmd.arg("index").arg(fixture);
+        cmd
+    })
+}
+
+/// Run `incremental_one_file`: add one new source file to the fixture, then re-index.
+fn run_incremental_one_file_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
+    if config.verbose {
+        eprintln!("memcheck: phase 'incremental_one_file' starting");
+    }
+    // Add one new source file before re-indexing.
+    let new_file = config.fixture.join("src").join("incremental_one_file.rs");
+    if let Some(parent) = new_file.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(
+        &new_file,
+        "pub fn incremental_one_file_added() -> u32 { 42 }\n",
+    )
+    .ok();
+
+    run_command_phase(config, "incremental_one_file", |bin, fixture| {
+        let mut cmd = Command::new(bin);
+        cmd.arg("index").arg(fixture);
+        cmd
+    })
+}
+
+/// Run `incremental_burst`: add 10+ source files at once, then re-index.
+fn run_incremental_burst_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
+    if config.verbose {
+        eprintln!("memcheck: phase 'incremental_burst' starting");
+    }
+    // Add 10 new source files before re-indexing.
+    for i in 0..10u32 {
+        let new_file = config
+            .fixture
+            .join("src")
+            .join(format!("incremental_burst_{i}.rs"));
+        if let Some(parent) = new_file.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(
+            &new_file,
+            format!("pub fn burst_fn_{i}() -> u32 {{ {i} }}\n"),
+        )
+        .ok();
+    }
+
+    run_command_phase(config, "incremental_burst", |bin, fixture| {
+        let mut cmd = Command::new(bin);
+        cmd.arg("index").arg(fixture);
+        cmd
+    })
+}
+
+/// Run `incremental_delete`: remove a file from the fixture, then re-index.
+fn run_incremental_delete_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
+    if config.verbose {
+        eprintln!("memcheck: phase 'incremental_delete' starting");
+    }
+    // Remove the file added by incremental_one_file.
+    let target = config.fixture.join("src").join("incremental_one_file.rs");
+    std::fs::remove_file(&target).ok();
+
+    run_command_phase(config, "incremental_delete", |bin, fixture| {
+        let mut cmd = Command::new(bin);
+        cmd.arg("index").arg(fixture);
+        cmd
+    })
+}
+
+/// Run `query_suite_cold`: run a fixed query suite against a freshly-opened project.
+/// Measures cold query latency (first access to the project, no warm cache).
+///
+/// Each query runs as a separate `leindex search` command, which opens the
+/// project fresh each time (cold cache). RSS is sampled during the first query.
+fn run_query_suite_cold_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
+    if config.verbose {
+        eprintln!(
+            "memcheck: phase 'query_suite_cold' starting ({} queries)",
+            QUERY_SUITE.len()
+        );
+    }
+
+    // For RSS measurement, run the first query as a full command-phase sample.
+    // The rest contribute to latency but not RSS (they're too quick individually).
+    let report = run_command_phase(config, "query_suite_cold", |bin, fixture| {
+        let mut cmd = Command::new(bin);
+        cmd.arg("search")
+            .arg(QUERY_SUITE[0])
+            .arg("--project")
+            .arg(fixture);
+        cmd
+    })?;
+
+    // Run remaining queries (no RSS sampling, just exercise the cold path).
+    for &query in &QUERY_SUITE[1..] {
+        let _ = Command::new(&config.binary)
+            .arg("search")
+            .arg(query)
+            .arg("--project")
+            .arg(&config.fixture)
+            .current_dir(&config.fixture)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    Ok(report)
+}
+
+/// Run `query_suite_warm`: run the same fixed query suite after warm-up.
+/// Measures warm query latency. The first `query_suite_cold` phase warms the
+/// OS page cache; this phase re-runs against the now-warm project.
+fn run_query_suite_warm_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
+    if config.verbose {
+        eprintln!(
+            "memcheck: phase 'query_suite_warm' starting ({} queries)",
+            QUERY_SUITE.len()
+        );
+    }
+
+    // The page cache is already warm from query_suite_cold. Run the first
+    // query with RSS sampling.
+    let report = run_command_phase(config, "query_suite_warm", |bin, fixture| {
+        let mut cmd = Command::new(bin);
+        cmd.arg("search")
+            .arg(QUERY_SUITE[0])
+            .arg("--project")
+            .arg(fixture);
+        cmd
+    })?;
+
+    // Run remaining queries.
+    for &query in &QUERY_SUITE[1..] {
+        let _ = Command::new(&config.binary)
+            .arg("search")
+            .arg(query)
+            .arg("--project")
+            .arg(&config.fixture)
+            .current_dir(&config.fixture)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    Ok(report)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────
@@ -1160,13 +1644,22 @@ mod tests {
                 "mcp_idle_proliferation",
                 "worker_ort_threads",
                 "stale_artifacts",
+                "contention_3c_2p",
+                "incremental_noop",
+                "incremental_one_file",
+                "incremental_burst",
+                "incremental_delete",
+                "query_suite_cold",
+                "query_suite_warm",
+                "full_index_run2",
+                "full_index_run3",
             ]
         );
     }
 
     #[test]
     fn test_canonical_phases_count() {
-        assert_eq!(CANONICAL_PHASES.len(), 12);
+        assert_eq!(CANONICAL_PHASES.len(), 21);
     }
 
     #[test]
@@ -1214,6 +1707,7 @@ mod tests {
                 anon_kib: 90,
                 pss_kib: 100,
                 worker_rss_kib: 0,
+                gpu: sampler::GpuSample::default(),
             },
             sampler::MemorySample {
                 rss_kib: 200,
@@ -1221,6 +1715,7 @@ mod tests {
                 anon_kib: 180,
                 pss_kib: 200,
                 worker_rss_kib: 50,
+                gpu: sampler::GpuSample::default(),
             },
             sampler::MemorySample {
                 rss_kib: 150,
@@ -1228,6 +1723,7 @@ mod tests {
                 anon_kib: 135,
                 pss_kib: 150,
                 worker_rss_kib: 30,
+                gpu: sampler::GpuSample::default(),
             },
         ];
         let report = build_phase_report("test", &mut samples, Duration::from_millis(500));
@@ -1256,6 +1752,7 @@ mod tests {
                 anon_kib: 0,
                 pss_kib: i * 10,
                 worker_rss_kib: 0,
+                gpu: sampler::GpuSample::default(),
             })
             .collect();
         let report = build_phase_report("test", &mut samples, Duration::from_secs(1));
@@ -1272,6 +1769,7 @@ mod tests {
                 anon_kib: 50,
                 pss_kib: 100,
                 worker_rss_kib: 0,
+                gpu: sampler::GpuSample::default(),
             },
             sampler::MemorySample {
                 rss_kib: 120,
@@ -1279,6 +1777,7 @@ mod tests {
                 anon_kib: 40,
                 pss_kib: 120,
                 worker_rss_kib: 0,
+                gpu: sampler::GpuSample::default(),
             },
             sampler::MemorySample {
                 rss_kib: 110,
@@ -1286,6 +1785,7 @@ mod tests {
                 anon_kib: 80,
                 pss_kib: 110,
                 worker_rss_kib: 0,
+                gpu: sampler::GpuSample::default(),
             },
         ];
         let report = build_phase_report("test", &mut samples, Duration::from_secs(1));
@@ -1303,6 +1803,7 @@ mod tests {
                 anon_kib: 0,
                 pss_kib: 0,
                 worker_rss_kib: 0,
+                gpu: sampler::GpuSample::default(),
             },
             sampler::MemorySample {
                 rss_kib: 60000,
@@ -1310,6 +1811,7 @@ mod tests {
                 anon_kib: 0,
                 pss_kib: 0,
                 worker_rss_kib: 80000,
+                gpu: sampler::GpuSample::default(),
             },
             sampler::MemorySample {
                 rss_kib: 55000,
@@ -1317,6 +1819,7 @@ mod tests {
                 anon_kib: 0,
                 pss_kib: 0,
                 worker_rss_kib: 90000,
+                gpu: sampler::GpuSample::default(),
             },
         ];
         let report = build_phase_report("embed_active", &mut samples, Duration::from_secs(1));

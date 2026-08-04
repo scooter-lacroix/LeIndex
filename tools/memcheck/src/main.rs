@@ -6,6 +6,7 @@
 //! Canonical phases: idle_warm → index → idle_post → query → reindex → idle_final
 
 mod diff;
+mod env_capture;
 mod report;
 mod sampler;
 mod workload;
@@ -111,9 +112,13 @@ fn main() -> Result<()> {
         sample_interval: std::time::Duration::from_millis(args.sample_interval_ms),
         verbose: args.verbose,
         worker_binary: resolve_worker_binary(args.binary.as_deref(), &workspace_root),
+        heap_profile_dir: None,
     };
 
     let phases = workload::run_workload(&config)?;
+
+    let environment = env_capture::EnvironmentCapture::capture(&workspace_root, &fixture)
+        .with_context(|| "failed to capture environment metadata")?;
 
     let full_report = report::MemcheckReport {
         // Report the CANONICAL fixture path (the user-supplied small_repo,
@@ -126,6 +131,7 @@ fn main() -> Result<()> {
         fixture: fixture.display().to_string(),
         phases,
         timestamp: chrono_now(),
+        environment,
     };
 
     // Write report to file or stdout

@@ -9,7 +9,7 @@
 //! matching that name, returning combined RSS in the sample.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A single memory sample, optionally including a worker process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +25,108 @@ pub struct MemorySample {
     /// Worker process RSS in KiB, if a worker was detected (VAL-CPHASE-034).
     /// 0 when no worker is running or worker tracking is not enabled.
     pub worker_rss_kib: u64,
+    /// GPU sample (VRAM utilization), if a GPU was detected (§14 item 8).
+    #[serde(default)]
+    pub gpu: GpuSample,
+}
+
+/// GPU VRAM/utilization sample (§14 item 8, §2.1 GPU memory reporting).
+///
+/// On a machine with ROCm (`rocm-smi`) or CUDA (`nvidia-smi`), fields are
+/// `Some`. On headless boxes (no GPU tools), all fields are `None`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct GpuSample {
+    /// VRAM used in MiB.
+    pub vram_used_mib: Option<u64>,
+    /// GPU utilization percentage.
+    pub gpu_utilization_pct: Option<u8>,
+    /// Provider: "rocm" | "cuda" | "migraphx".
+    pub provider: Option<String>,
+}
+
+/// Sample GPU VRAM and utilization via rocm-smi or nvidia-smi (first device only).
+///
+/// Returns `GpuSample::default()` (all None) on headless boxes where neither
+/// tool exists. Never panics.
+pub fn sample_gpu() -> GpuSample {
+    // Try ROCm first (AMD/ROCm/MIGraphX).
+    if let Some(sample) = sample_gpu_rocm() {
+        return sample;
+    }
+    // Try CUDA (NVIDIA).
+    if let Some(sample) = sample_gpu_cuda() {
+        return sample;
+    }
+    // Headless: nothing found.
+    GpuSample::default()
+}
+
+/// Parse VRAM from `rocm-smi --showmeminfo vram --json`.
+fn sample_gpu_rocm() -> Option<GpuSample> {
+    let output = std::process::Command::new("rocm-smi")
+        .args(["--showmeminfo", "vram", "--json"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+
+    // rocm-smi --json returns a map keyed by device, e.g. {"card0": {"VRAM Total Used (B)": "1234567"}}
+    // We take the first device.
+    let obj = parsed.as_object()?;
+    let (_dev_name, dev_data) = obj.iter().next()?;
+    let dev = dev_data.as_object()?;
+
+    let vram_used_mib = dev
+        .iter()
+        .find(|(k, _)| k.contains("VRAM") && k.contains("Used"))
+        .and_then(|(_, v)| v.as_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|bytes| bytes / (1024 * 1024));
+
+    // GPU utilization is not directly available from --showmeminfo vram,
+    // but we can try to get it from the general JSON.
+    let gpu_utilization_pct = dev
+        .iter()
+        .find(|(k, _)| k.contains("GPU") && k.contains("Use"))
+        .and_then(|(_, v)| v.as_str())
+        .and_then(|s| s.trim_matches('%').parse::<u8>().ok());
+
+    Some(GpuSample {
+        vram_used_mib,
+        gpu_utilization_pct,
+        provider: Some("rocm".to_string()),
+    })
+}
+
+/// Parse VRAM and utilization from `nvidia-smi` CSV format.
+fn sample_gpu_cuda() -> Option<GpuSample> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.used,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let csv = String::from_utf8_lossy(&output.stdout);
+    let line = csv.lines().next()?;
+    let parts: Vec<&str> = line.trim().split(',').map(|s| s.trim()).collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let vram_used_mib = parts[0].parse::<u64>().ok();
+    let gpu_utilization_pct = parts[1].parse::<u8>().ok();
+
+    Some(GpuSample {
+        vram_used_mib,
+        gpu_utilization_pct,
+        provider: Some("cuda".to_string()),
+    })
 }
 
 /// Read a single memory sample for the given PID.
@@ -45,12 +147,16 @@ pub fn sample(pid: u32, worker_name: Option<&str>) -> anyhow::Result<MemorySampl
         None => 0,
     };
 
+    // GPU sampling is global (not per-pid), but cheap enough to inline.
+    let gpu = sample_gpu();
+
     Ok(MemorySample {
         rss_kib: rss,
         mapped_file_kib: mapped,
         anon_kib: anon,
         pss_kib: pss,
         worker_rss_kib: worker_rss,
+        gpu,
     })
 }
 
@@ -68,6 +174,7 @@ fn sample_fast(pid: u32, worker_name: Option<&str>) -> anyhow::Result<MemorySamp
         anon_kib: 0,
         pss_kib: 0,
         worker_rss_kib: worker_rss,
+        gpu: GpuSample::default(),
     })
 }
 
@@ -299,6 +406,118 @@ fn is_vma_header(line: &str) -> bool {
     false
 }
 
+/// Capture a heap-profile snapshot for the given PID at a phase boundary.
+///
+/// On default (glibc) builds, captures `/proc/<pid>/smaps` as a phase-boundary
+/// snapshot — works on all Linux without requiring the memprof build.
+/// The output file is named `<phase>_<boundary>.smaps` and written to `out_dir`.
+///
+/// When `cargo build --features memprof` is used, engineers can set
+/// `MALLOC_CONF=prof:true` and use jemalloc epoch-based dumping for deeper
+/// analysis (see `src/bin/leindex.rs` doc comment).
+///
+/// Returns the path to the written snapshot file.
+pub fn capture_heap_profile(
+    pid: u32,
+    phase: &str,
+    boundary: &str,
+    out_dir: &Path,
+) -> std::io::Result<PathBuf> {
+    let smaps_path = PathBuf::from(format!("/proc/{}/smaps", pid));
+    let content = std::fs::read_to_string(&smaps_path)?;
+
+    let file_name = format!("{}_{}.smaps", phase, boundary);
+    let out_path = out_dir.join(file_name);
+    std::fs::write(&out_path, &content)?;
+
+    Ok(out_path)
+}
+
+/// Descendant process-tree summary (§14 item: "count descendant processes").
+///
+/// Walks `/proc/*/stat` PPID fields in BFS from `root_pid` to discover all
+/// living descendants. Reports total count, per-name counts, and combined RSS.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct DescendantTree {
+    /// Total number of descendant processes (not counting root).
+    pub total: usize,
+    /// Process name → count.
+    pub by_name: HashMap<String, usize>,
+    /// Sum of RSS across all descendants, in KiB.
+    pub combined_rss_kib: u64,
+}
+
+use std::collections::HashMap;
+
+/// Count all descendant processes of `root_pid` via BFS over `/proc/*/stat`.
+///
+/// Walks the process tree starting from `root_pid`, visiting every process
+/// whose PPID matches a discovered ancestor. Returns a [`DescendantTree`]
+/// summarizing total count, per-name counts, and combined RSS.
+///
+/// `root_pid` itself is NOT counted (only its descendants).
+pub fn count_descendants(root_pid: u32) -> std::io::Result<DescendantTree> {
+    // Build a map of pid → (ppid, name, rss_kib) for all live processes.
+    let mut all_procs: Vec<(u32, u32, String, u64)> = Vec::new();
+    let proc_dir = std::fs::read_dir("/proc")?;
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let pid: u32 = match name_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Read ppid and name from /proc/<pid>/stat
+        let stat_path = format!("/proc/{}/stat", pid);
+        let Ok(content) = std::fs::read_to_string(&stat_path) else {
+            continue;
+        };
+        let Some(close_paren) = content.rfind(')') else {
+            continue;
+        };
+        let comm_raw = &content[..close_paren];
+        // Extract comm between first '(' and last ')'
+        let comm = comm_raw
+            .split_once('(')
+            .map(|(_, name)| name.to_string())
+            .unwrap_or_default();
+        let rest = &content[close_paren + 1..];
+        let mut fields = rest.split_whitespace();
+        fields.next(); // state
+        let ppid: u32 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        // RSS is field 24 in /proc/<pid>/stat
+        let rss_kib: u64 = fields
+            .nth(21) // field 24 (0-indexed: state=1, ppid=2, ..., rss=24 -> skip 4-23 = 20 fields, then next is 24)
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+        all_procs.push((pid, ppid, comm, rss_kib));
+    }
+
+    // BFS from root_pid
+    let mut tree = DescendantTree::default();
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(root_pid);
+    let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+    while let Some(current_pid) = queue.pop_front() {
+        for &(pid, ppid, ref name, rss) in &all_procs {
+            if ppid == current_pid && !visited.contains(&pid) && pid != root_pid {
+                visited.insert(pid);
+                tree.total += 1;
+                *tree.by_name.entry(name.clone()).or_insert(0) += 1;
+                tree.combined_rss_kib += rss;
+                queue.push_back(pid);
+            }
+        }
+    }
+
+    Ok(tree)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +612,116 @@ mod tests {
         );
         // The process name should be non-empty
         assert!(!comm.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_gpu_sample_returns_some_on_amdgpu_or_none_elsewhere() {
+        let s = sample_gpu();
+        // On a box with ROCm: vram_used_mib is Some. On headless CI: all None.
+        // Either is valid; we just assert it doesn't panic and the struct is usable.
+        let _ = s.vram_used_mib;
+        let _ = s.gpu_utilization_pct;
+        let _ = s.provider;
+    }
+
+    #[test]
+    fn test_gpu_sample_is_consistent() {
+        // Two calls should return consistent types (both Some or both None for provider).
+        let s1 = sample_gpu();
+        let s2 = sample_gpu();
+        assert_eq!(s1.provider.is_some(), s2.provider.is_some());
+    }
+
+    #[test]
+    fn test_gpu_sample_default_is_all_none() {
+        let s = GpuSample::default();
+        assert!(s.vram_used_mib.is_none());
+        assert!(s.gpu_utilization_pct.is_none());
+        assert!(s.provider.is_none());
+    }
+
+    #[test]
+    fn test_heap_profile_writes_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = capture_heap_profile(std::process::id(), "test", "before", tmp.path()).unwrap();
+        assert!(p.exists(), "heap profile file should exist");
+        assert!(
+            p.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("test_before")
+        );
+        let metadata = std::fs::metadata(&p).unwrap();
+        assert!(metadata.len() > 0, "heap profile file should be non-empty");
+    }
+
+    #[test]
+    fn test_heap_profile_missing_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = capture_heap_profile(u32::MAX, "test", "before", tmp.path());
+        assert!(result.is_err(), "missing pid should produce an error");
+    }
+
+    #[test]
+    fn test_count_descendants_includes_spawned_child() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        // Brief wait for /proc to reflect the child
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let tree = count_descendants(std::process::id()).unwrap();
+        assert!(
+            tree.total >= 1,
+            "should find at least 1 descendant (the sleep child), got {}",
+            tree.total
+        );
+        // The child should appear in by_name
+        assert!(
+            tree.by_name.contains_key("sleep") || tree.by_name.values().sum::<usize>() >= 1,
+            "by_name should contain the child process"
+        );
+        child.kill().ok();
+        child.wait().ok();
+
+        // After killing, a re-scan should return total == 0 (or the child
+        // has been reaped by the OS).
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let tree_after = count_descendants(std::process::id()).unwrap();
+        assert_eq!(
+            tree_after.total, 0,
+            "after killing the child, total should be 0, got {}",
+            tree_after.total
+        );
+    }
+
+    #[test]
+    fn test_count_descendants_no_children() {
+        // The test process might have residual children from other tests
+        // running concurrently (e.g. test_count_descendants_includes_spawned_child
+        // spawns a "sleep"). We only check that total is small (no big tree).
+        let tree = count_descendants(std::process::id()).unwrap();
+        assert!(
+            tree.total < 5,
+            "test process should have very few descendants: {} found: {:?}",
+            tree.total,
+            tree.by_name
+        );
+    }
+
+    #[test]
+    fn test_descendant_tree_serde_roundtrip() {
+        let mut by_name = HashMap::new();
+        by_name.insert("leindex-embed".to_string(), 1);
+        let tree = DescendantTree {
+            total: 1,
+            by_name,
+            combined_rss_kib: 50000,
+        };
+        let json = serde_json::to_string(&tree).unwrap();
+        let deserialized: DescendantTree = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, tree);
     }
 }

@@ -158,9 +158,9 @@ fn test_val_measure_001_canonical_multi_phase_report() {
         .expect("report should have 'phases' field");
     let phases_arr = phases.as_array().expect("'phases' should be an array");
 
-    // Should have exactly 12 canonical phases (6 original + 3 worker-active
-    // + 3 memory-pressure phases)
-    assert_eq!(phases_arr.len(), 12, "should have 12 canonical phases");
+    // Should have exactly 21 canonical phases (6 original + 3 worker-active
+    // + 3 memory-pressure phases + 9 §14 baseline protocol extensions)
+    assert_eq!(phases_arr.len(), 21, "should have 21 canonical phases");
 
     // Phase names should match canonical order
     let expected = [
@@ -176,6 +176,15 @@ fn test_val_measure_001_canonical_multi_phase_report() {
         "mcp_idle_proliferation",
         "worker_ort_threads",
         "stale_artifacts",
+        "contention_3c_2p",
+        "incremental_noop",
+        "incremental_one_file",
+        "incremental_burst",
+        "incremental_delete",
+        "query_suite_cold",
+        "query_suite_warm",
+        "full_index_run2",
+        "full_index_run3",
     ];
     for (i, expected_name) in expected.iter().enumerate() {
         let phase_name = phases_arr[i]
@@ -225,6 +234,15 @@ fn test_val_measure_002_phase_order_is_canonical() {
         "mcp_idle_proliferation",
         "worker_ort_threads",
         "stale_artifacts",
+        "contention_3c_2p",
+        "incremental_noop",
+        "incremental_one_file",
+        "incremental_burst",
+        "incremental_delete",
+        "query_suite_cold",
+        "query_suite_warm",
+        "full_index_run2",
+        "full_index_run3",
     ];
 
     // No missing phases

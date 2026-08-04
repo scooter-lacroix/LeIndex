@@ -439,9 +439,12 @@ mod tests {
                     duration_ms: 3000,
                     worker_rss_max_kib: 0,
                     combined_rss_max_kib: *rss,
+                    gpu_vram_mib: None,
+                    descendants: crate::sampler::DescendantTree::default(),
                 })
                 .collect(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            environment: crate::env_capture::EnvironmentCapture::default(),
         }
     }
 
@@ -478,6 +481,8 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         std::fs::write(small_repo_dir.join("idle_warm.json"), json).unwrap();
@@ -494,6 +499,8 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 700000,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
         let json2 = serde_json::to_string_pretty(&baseline2).unwrap();
         std::fs::write(small_repo_dir.join("index.json"), json2).unwrap();
@@ -537,6 +544,8 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         std::fs::write(small_repo_dir.join("idle_warm.json"), json).unwrap();
@@ -617,6 +626,8 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         std::fs::write(small_repo_dir.join("idle_warm.json"), json).unwrap();
@@ -649,6 +660,8 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
 
         write_baseline(&baselines_dir, "small_repo", &phase).unwrap();
@@ -679,6 +692,8 @@ mod tests {
                 duration_ms: 3000,
                 worker_rss_max_kib: 0,
                 combined_rss_max_kib: 200000 + i as u64 * 10000,
+                gpu_vram_mib: None,
+                descendants: crate::sampler::DescendantTree::default(),
             })
             .collect::<Vec<_>>();
 
@@ -714,6 +729,8 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         std::fs::write(small_repo_dir.join("idle_warm.json"), json).unwrap();
@@ -747,6 +764,8 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         std::fs::write(small_repo_dir.join("idle_warm.json"), json).unwrap();
