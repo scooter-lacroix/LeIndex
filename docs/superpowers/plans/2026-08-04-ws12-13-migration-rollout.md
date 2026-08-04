@@ -166,7 +166,7 @@ git commit -m "refactor(rollout): phase 10 legacy path removal after fallback wi
 
 ---
 
-## Task 10: Final validation + master-plan closure
+## Task 10: Final validation + post-baseline capture (the "after")
 
 - [ ] **Step 1: Validation suite**
 
@@ -176,14 +176,83 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-- [ ] **Step 2:** Re-run WS1 memcheck on the full default-on build; confirm ≤1 GiB aggregate (3 clients / 2 projects) and footprint targets.
-- [ ] **Step 3:** Confirm every §16 gate has evidence files in `docs/baselines/`.
-- [ ] **Step 4:** Update the master plan: mark SP7 complete; close Decision/Issues/Deviations logs.
+- [ ] **Step 2: Post-baseline capture** on the full default-on v2.0.0 build, same corpora + methodology as SP1 Task 10 Step 3 (the pre-anchor). Record to `docs/baselines/2026-08-04-post-v200.json`. Diff against `2026-08-04-pre-v190-anchor.json`.
+- [ ] **Step 3:** Re-run WS1 memcheck on the default-on build; confirm ≤1 GiB aggregate (3 clients / 2 projects) and footprint targets.
+- [ ] **Step 4:** Confirm every §16 gate has evidence files in `docs/baselines/`.
 - [ ] **Step 5: Commit**
 
 ```bash
-git commit -m "docs(rollout): master-plan closure — all §16 gates evidenced"
+git commit -m "docs(rollout): post-v2.0.0 baseline + §16 gate evidence"
 ```
+
+---
+
+## Task 11: Generate shipped `BENCHMARKS.md`
+
+**Files:** Create `BENCHMARKS.md` (repo root, shipped, referenced from README).
+
+- [ ] **Step 1:** Digest `docs/baselines/2026-08-04-pre-v190-anchor.json` + `2026-08-04-post-v200.json` (+ per-workstream baselines) into a curated, human-readable `BENCHMARKS.md`. Required sections:
+  - Index database size: v1.9.x vs v2.0.0 (this repo + large fixture)
+  - Generation files: v1.9.x full-copy × N vs v2.0.0 CAS dedup (+ dedup ratio)
+  - Total `.leindex/` storage: avg + peak, before/after
+  - RAM: steady-state aggregate (daemon+worker+shims) + index-peak, before/after
+  - Headline reductions (this repo: 2.5 GiB → ≤60 MiB; large project: 150 GiB+ → proportional)
+  - §16 acceptance-gate summary (resource/perf/quality/reliability)
+- [ ] **Step 2:** Every claim links to its evidence file (kept in `docs/baselines/` until Task 13 removes the raw files; `BENCHMARKS.md` itself is the shipped digest).
+- [ ] **Step 3: Commit**
+
+```bash
+git add BENCHMARKS.md
+git commit -m "docs(v2.0.0): ship curated BENCHMARKS.md (before/after storage + RAM)"
+```
+
+---
+
+## Task 12: README + CHANGELOG radical marketing rewrite (FINAL tasks before completion marker)
+
+**Files:** `README.md` (root), `packages/pypi-leindex/README.md`, `packages/npm-leindex-mcp/README.md`, `CHANGELOG.md`.
+
+**Per AGENTS.md repo-hygiene:** keep the three README surfaces aligned; update all public MCP config examples together.
+
+- [ ] **Step 1: CHANGELOG.md** — author the `## [2.0.0]` entry: the single-daemon architecture, sub-1 GiB target, CAS generations, the footprint reduction (cite `BENCHMARKS.md`), streaming pipeline, shared worker + global cache, model bake-off outcome, rollout. Hype-toned but evidence-backed.
+- [ ] **Step 2: Root README.md** — radical marketing retune: hero headline, the resource story (17× → target overhead removal; 150 GiB+ → manageable), image/badge refresh, "why v2.0.0" section linking `BENCHMARKS.md`, updated install + MCP config examples, version-bumped feature list.
+- [ ] **Step 3: Package READMEs** (PyPI + npm) — mirror the root README's resource/marketing story; align MCP config examples across all three (AGENTS.md).
+- [ ] **Step 4: Version parity** — bump `Cargo.toml`, installer scripts, npm + PyPI metadata, in-repo version constants to `2.0.0` together (AGENTS.md repo hygiene).
+- [ ] **Step 5: Commit**
+
+```bash
+git add README.md CHANGELOG.md packages/*/README.md Cargo.toml packages/*/package.json packages/*/pyproject.toml
+git commit -m "docs(v2.0.0): radical README + CHANGELOG marketing rewrite + version bump to 2.0.0"
+```
+
+---
+
+## Task 13: Remove tracking scaffolding (before final push)
+
+**Per user mandate:** v2.0.0 ships as code + README + CHANGELOG + BENCHMARKS.md only.
+
+- [ ] **Step 1:** Remove all planning/tracking scaffolding:
+  - `docs/superpowers/plans/2026-08-04-*.md` (this effort's plans)
+  - `docs/superpowers/specs/2026-08-04-*.md` (this effort's specs)
+  - `docs/baselines/*` (raw measurement files — already digested into `BENCHMARKS.md` in Task 11)
+  - Any handoff/progress tracking docs generated during execution
+- [ ] **Step 2: Verify** `BENCHMARKS.md` references are self-contained (no dead links to removed `docs/baselines/` files — the digest must stand alone).
+- [ ] **Step 3: Verify** no other tracked file references the removed scaffolding.
+- [ ] **Step 4: Commit**
+
+```bash
+git rm -r docs/superpowers/plans/2026-08-04-*.md docs/superpowers/specs/2026-08-04-*.md docs/baselines/
+git commit -m "chore(v2.0.0): remove planning + baseline scaffolding (shipped via BENCHMARKS.md)"
+```
+
+---
+
+## Task 14: Master-plan completion marker + final push
+
+- [ ] **Step 1:** Final validation sweep on the clean tree: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`.
+- [ ] **Step 2:** Confirm ship set = code + `README.md` + `CHANGELOG.md` + `BENCHMARKS.md` (+ package READMEs/metadata). No `docs/superpowers/` or `docs/baselines/` remains.
+- [ ] **Step 3:** Final commit / push / tag `v2.0.0` via the release workflow (`.github/workflows/release.yml`).
+- [ ] **Step 4:** Master plan marked COMPLETE.
 
 ---
 

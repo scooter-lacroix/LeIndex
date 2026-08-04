@@ -10,6 +10,30 @@
 
 ---
 
+## Shipped Artifacts & Baseline Handling Policy
+
+**v2.0.0 ships as:** code + `README.md` + `CHANGELOG.md` + `BENCHMARKS.md` only.
+
+**Removed before final push (tracking scaffolding):**
+- All `docs/superpowers/plans/*.md` and `docs/superpowers/specs/*.md` (this effort)
+- All raw `docs/baselines/*.{json,md}` measurement files
+- Any handoff/progress tracking docs generated during execution
+
+**Pre/post data gathering (mandatory):**
+1. **PRE (SP1, first action):** capture a pristine v1.9.x baseline *before any v2.0.0 code change* — the immutable "before" anchor. Measures: `.leindex/` total + per-component (DB, generations, jobs, .bin), steady-state RAM, index-peak RAM, on this repo + at least one large-project fixture. Stored as the comparison reference.
+2. **DURING:** each workstream writes raw measurements to `docs/baselines/` (tracking).
+3. **POST (SP7, final):** re-measure on the full default-on v2.0.0 build; diff against the PRE anchor; digest into `BENCHMARKS.md`.
+
+**`BENCHMARKS.md` content (shipped, referenced from hyped README):**
+- Index database size: v1.9.x vs v2.0.0
+- Generation file sizes: v1.9.x (full-copy × N) vs v2.0.0 (CAS dedup) — incl. dedup ratio
+- Total `.leindex/` storage: avg + peak, before/after (this repo + large fixture)
+- RAM: steady-state aggregate (daemon+worker+shims) + index-peak, before/after
+- The headline reduction (this repo: 2.5 GiB → target ≤60 MiB; large project: 150 GiB+ → target proportional)
+- §16 acceptance-gate evidence summary (resource/perf/quality/reliability)
+
+---
+
 ## Sub-Plan Execution Order
 
 | # | Plan File | Workstreams | Status | Depends On |
@@ -40,6 +64,9 @@
 | 2026-08-04 | SP3a | LeIndex stays !Sync; readers lease mmap generation (no connection pool) | Goal is no-stall, not cross-core parallelism; readers never touch writer Mutex | ✅ User |
 | 2026-08-04 | SP3a | Retention: current+1 previous; jobs 128MiB/project + delete-on-publish | Spec §10.2 literal; footprint mandate; completed jobs have zero resume value | ✅ User (delegated) |
 | 2026-08-04 | SP3a | All TBD items MUST be resolved (measured decision) for plan completion | User mandate — no dangling TBDs | ✅ User |
+| 2026-08-04 | ALL | Baseline handling: raw `docs/baselines/` is tracking-only; at sign-off the raw files are removed BUT digested into a shipped `BENCHMARKS.md` (referenced from README) | v2.0.0 ships clean (code + README + CHANGELOG + BENCHMARKS.md); marketing claims must be backed by shipped evidence, but raw measurement JSON is internal | ✅ User |
+| 2026-08-04 | SP1/SP7 | Pre/post data gathering required: SP1 captures pristine v1.9.x "before" anchor before any code change; SP7 captures "after" and diffs into BENCHMARKS.md | Before/after comparison is the core marketing claim; needs an immutable pre anchor | ✅ User |
+| 2026-08-04 | SP7 | README + CHANGELOG radical marketing rewrite + BENCHMARKS.md generation are the FINAL tasks before the master-plan completion marker; raw baselines + all `docs/superpowers/` scaffolding removed before final push | User: v2.0.0 ships as code + README + CHANGELOG + BENCHMARKS.md only | ✅ User |
 
 ## Issues Encountered
 

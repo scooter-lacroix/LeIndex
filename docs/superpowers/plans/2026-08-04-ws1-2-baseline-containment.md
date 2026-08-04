@@ -392,7 +392,9 @@ git commit -m "docs(ws2): record Tokio/ORT thread-sweep measurements"
 
 ---
 
-## Task 10: Full validation + baseline recording
+## Task 10: Full validation + pristine v1.9.x pre-baseline (the "before" anchor)
+
+**Critical:** This task captures the IMMUTABLE pre-v2.0.0 baseline *before any architectural change lands*. It is the comparison anchor for the shipped `BENCHMARKS.md` and all marketing claims. Run it FIRST in SP1, before any code change from Tasks 1-9 ships to default builds (Tasks 1-9 are additive memcheck extensions + flag-gated containment; capture the anchor against the unmodified release binary).
 
 - [ ] **Step 1: Validation suite**
 
@@ -403,23 +405,35 @@ cargo test --workspace
 ```
 Expected: PASS (zero warnings per AGENTS.md zero-tolerance policy)
 
-- [ ] **Step 2: Run memcheck 3× on representative corpus**
+- [ ] **Step 2: Build the unmodified v1.9.x release binary** (the "before" subject)
 
 ```bash
-cargo build --release
-cargo run --release -p memcheck -- ./src --output docs/baselines/2026-08-04-ws1-baseline.json --update-baseline
+cargo build --release --bin leindex
 ```
-Run 3 times; verify no monotonic RSS growth (spec §13 scenario 13).
 
-- [ ] **Step 3: Confirm §3 hypotheses or reject them**
+- [ ] **Step 3: Capture the pristine pre-baseline** against this repo + ≥1 large-project fixture
 
-Using the heap profiles from Task 3 + descendant counts from Task 4 + the environment capture from Task 1, fill in the §3 hypothesis table (retained-byte split among enriched content, tokens, parse sigs, PDG/checkpoint, vector staging, fragment rows, fragmentation). Write to `docs/baselines/2026-08-04-ws1-hypothesis-confirmation.md`.
+For each corpus, measure and record to `docs/baselines/2026-08-04-pre-v190-anchor.json`:
+- `.leindex/` total bytes + breakdown (`du` of db/generations/jobs/*.bin)
+- Generation count + per-generation size + dedup ratio (sha256-identical detection)
+- Steady-state RSS (daemon/MCP idle warm) via memcheck `idle_warm`
+- Index-peak RSS via memcheck `index` phase (main + worker + combined)
+- p50/p95/p99 of a fixed query suite, cold + warm
+- Full-index wall time (3 runs)
 
-- [ ] **Step 4: Commit**
+This file is the **immutable before-anchor** — do not overwrite it in later workstreams.
+
+- [ ] **Step 4: Run memcheck 3× on representative corpus**; verify no monotonic RSS growth (spec §13 scenario 13).
+
+- [ ] **Step 5: Confirm §3 hypotheses or reject them**
+
+Using heap profiles (Task 3) + descendant counts (Task 4) + environment capture (Task 1), fill the §3 hypothesis table (retained-byte split among enriched content, tokens, parse sigs, PDG/checkpoint, vector staging, fragment rows, fragmentation). Write to `docs/baselines/2026-08-04-ws1-hypothesis-confirmation.md`.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add docs/baselines/
-git commit -m "docs(ws1): record baseline measurements and §3 hypothesis confirmation"
+git commit -m "docs(ws1): pristine v1.9.x pre-baseline anchor + §3 hypothesis confirmation"
 ```
 
 ---
