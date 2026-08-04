@@ -44,8 +44,12 @@ main() {
         echo -e "${YELLOW}Would run: cargo publish --allow-dirty $DRY_RUN${NC}"
         cargo publish --allow-dirty $DRY_RUN 2>&1 || true
     else
-        # If the version is already on crates.io, skip (mirrors release.yml).
-        if cargo search leindex 2>/dev/null | grep -q "^leindex = \"${VERSION}\""; then
+        # If the exact, non-yanked version is already on crates.io, skip.
+        # The registry search service can lag after the API and sparse index
+        # are already current, so use the exact version endpoint instead.
+        CRATES_API_URL="https://crates.io/api/v1/crates/leindex/${VERSION}"
+        if CRATE_JSON=$(curl -fsS -H "User-Agent: LeIndex publish helper" "$CRATES_API_URL" 2>/dev/null) \
+            && VERSION="$VERSION" python3 -c 'import json, os, sys; v=json.load(sys.stdin).get("version", {}); sys.exit(0 if v.get("num") == os.environ["VERSION"] and not v.get("yanked", False) else 1)' <<< "$CRATE_JSON"; then
             echo -e "${GREEN}✓ leindex ${VERSION} already published — skipping${NC}"
         else
             echo -e "${YELLOW}Publishing leindex ${VERSION}...${NC}"
