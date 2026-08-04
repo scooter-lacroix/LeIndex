@@ -41,8 +41,8 @@ main() {
     fi
 
     if [ -n "$DRY_RUN" ]; then
-        echo -e "${YELLOW}Would run: cargo publish $DRY_RUN${NC}"
-        cargo publish $DRY_RUN 2>&1 || true
+        echo -e "${YELLOW}Would run: cargo publish --allow-dirty $DRY_RUN${NC}"
+        cargo publish --allow-dirty $DRY_RUN 2>&1 || true
     else
         # If the version is already on crates.io, skip (mirrors release.yml).
         if cargo search leindex 2>/dev/null | grep -q "^leindex = \"${VERSION}\""; then
@@ -60,7 +60,7 @@ main() {
     fi
 
     echo ""
-    echo -e "${GREEN}All crates published successfully!${NC}"
+    echo -e "${GREEN}leindex ${VERSION} publish complete!${NC}"
     echo ""
     echo "Users can now run: cargo install leindex --features onnx"
 }

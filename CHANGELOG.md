@@ -2,6 +2,31 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [Unreleased] - Release-pipeline fix + consolidated dependency updates
+
+- **Release pipeline fix**: repaired the `VAL-PYPI-008` validation test, which
+  asserted the pre-merge `install_embed_worker` bootstrap helper. The test now
+  asserts the post-merge worker invariants (`embed_binary` tracking,
+  `ensure_worker_present`, and the onnx-gated `leindex-embed` `[[bin]]` in the
+  root crate). This unblocked `lint-and-test`, the root cause of the cascading
+  release failure (build / GitHub Release / crates.io / index-ready / summary
+  all skipped after it).
+- **Consolidated dependency updates** from the 20 dependabot PRs #52–#71
+  (all closed; bumps land here so the release-fix PR carries everything):
+  tokio-tungstenite 0.24→0.29, tower-http 0.6→0.7, lru 0.16→0.18, toml 0.8→0.9,
+  sha2 0.10→0.11, rstest 0.23→0.26, serde 1.0.228→1.0.229, chrono 0.4.43→0.4.45,
+  libc 0.2.180→0.2.189, once_cell 1.21.3→1.21.4, serde_json 1.0.149→1.0.151,
+  blake3 1.8.3→1.8.5, tracing-subscriber 0.3.22→0.3.23, rayon 1.11.0→1.12.0,
+  clap 4.5→4.6.5, rand 0.8→0.9, criterion 0.5→0.7, tikv-jemallocator 0.6→0.7.
+- **rand 0.9 migration**: `rand::thread_rng()` → `rand::rng()` and
+  `Rng::gen_range()` → `Rng::random_range()` in `benches/search_benchmarks.rs`.
+- **criterion 0.7 migration**: the deprecated `criterion::black_box` is replaced
+  by `std::hint::black_box` across all five benchmark suites.
+- **`publish_crates.sh` rewritten**: the old script referenced a multi-crate
+  workspace (`crates/`) that no longer exists and hardcoded version 1.5.0. It
+  is now a single-crate helper that reads the version from `Cargo.toml` and
+  skips already-published versions, mirroring `release.yml`.
+
 ## [1.9.5] - 2026-08-01 - Embed-Merge + Fragment Embeddings
 
 The 1.9.1 through 1.9.5 sub-releases below ship together as 1.9.5. They merge
