@@ -380,6 +380,16 @@ path = "src/bin/leindex-embed.rs"
 required-features = ["onnx"]
 doc = false
 
+# VAL-DAEMON-003/004/005/009: leindexd user-scoped daemon binary.
+# Wraps McpServer::run_socket with a hard startup lock, post-bind
+# endpoint sidecar, and configurable idle exit. Gated by `cli` so
+# it shares the same feature set as the main leindex binary (spec §4.2).
+[[bin]]
+name = "leindexd"
+path = "src/bin/leindexd.rs"
+required-features = ["cli"]
+doc = false
+
 [[bench]]
 name = "simd_benchmarks"
 path = "benches/simd_benchmarks.rs"

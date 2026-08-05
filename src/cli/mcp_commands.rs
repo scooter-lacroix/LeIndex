@@ -406,7 +406,7 @@ pub(super) async fn cmd_mcp_socket_impl(
 
     let idle_timeout = effective_mcp_idle_timeout(idle_timeout_secs);
     server
-        .run_socket(socket_path, ProcessIdleClock::new(), idle_timeout)
+        .run_socket(socket_path, ProcessIdleClock::new(), idle_timeout, None)
         .await
 }
 

@@ -133,15 +133,16 @@ mod binary_targets {
         );
     }
 
-    /// VAL-CARGO-005: There should be exactly two bin targets in the root.
+    /// VAL-CARGO-005: There should be exactly three bin targets in the root
+    /// (leindex, leindex-embed, leindexd).
     #[test]
     fn root_has_exactly_two_bin_targets() {
         let toml = root_cargo_toml();
         let bins = bin_blocks(&toml);
         assert_eq!(
             bins.len(),
-            2,
-            "Expected exactly 2 [[bin]] targets (leindex, leindex-embed), got {}: {:?}",
+            3,
+            "Expected exactly 3 [[bin]] targets (leindex, leindex-embed, leindexd), got {}: {:?}",
             bins.len(),
             bins.iter()
                 .map(|b| b.lines().next().unwrap_or(""))

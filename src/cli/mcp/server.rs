@@ -1210,11 +1210,18 @@ impl McpServer {
     /// `idle_clock` tracks process-level activity for the D-1 idle self-exit;
     /// `idle_timeout` is the quiet window after which the process exits 0
     /// (`None` = disabled via `--mcp-idle-timeout-secs 0`).
+    ///
+    /// `post_bind` is invoked after the socket is successfully bound but
+    /// before the accept loop begins. The daemon binary (`leindexd`) uses
+    /// this to publish the endpoint sidecar so clients discover the daemon
+    /// only after the socket is actually listening (spec §4.2 post-bind
+    /// callback pattern).
     pub async fn run_socket(
         &self,
         socket_path: &std::path::Path,
         idle_clock: ProcessIdleClock,
         idle_timeout: Option<std::time::Duration>,
+        post_bind: Option<&(dyn Fn(&std::path::Path) + Send + Sync)>,
     ) -> anyhow::Result<()> {
         use tokio::net::UnixListener;
 
@@ -1239,6 +1246,12 @@ impl McpServer {
             "MCP server listening on Unix socket: {}",
             socket_path.display()
         );
+
+        // Post-bind callback: the daemon writes its endpoint sidecar here so
+        // clients discover it only after the socket is actually live.
+        if let Some(cb) = post_bind {
+            cb(socket_path);
+        }
 
         // D-1/D-2 (memory-pressure remediation): a per-second tick enforces the
         // process-level idle self-exit; a 60-second sweep evicts loaded project

@@ -140,6 +140,38 @@ impl DaemonEndpoint {
     }
 }
 
+/// Write the endpoint sidecar atomically (spec §4.2 post-bind callback pattern).
+///
+/// The daemon calls this after successfully binding the Unix socket so that
+/// clients discover it only after the socket is actually live. The write is
+/// staged to a `.partial` file, fsync'd, then renamed to avoid a partially
+/// written sidecar being observed by a racer.
+pub fn write_endpoint_sidecar(run_dir: &Path, endpoint: &DaemonEndpoint) -> io::Result<()> {
+    let sidecar = run_dir.join(ENDPOINT_SIDECAR);
+    let partial = run_dir.join(format!("{ENDPOINT_SIDECAR}.partial"));
+
+    // Ensure run_dir exists.
+    std::fs::create_dir_all(run_dir)?;
+
+    // Stage + rename for atomicity.
+    let bytes = serde_json::to_vec(endpoint)?;
+    std::fs::write(&partial, &bytes)?;
+
+    // fsync the staged file before rename so the data is durable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::File::open(&partial)?;
+        // SAFETY: fsync on a valid fd is safe.
+        unsafe {
+            libc::fsync(f.as_raw_fd());
+        }
+    }
+
+    std::fs::rename(&partial, &sidecar)?;
+    Ok(())
+}
+
 /// Read and parse the sidecar file. Returns `Ok(None)` if the file does not
 /// exist. Malformed JSON is treated as "no endpoint" so the caller wins by
 /// default (idempotent recovery from a half-written sidecar left by a crash).
@@ -249,7 +281,7 @@ mod test {
             _ => panic!("expected Won on first call"),
         };
         // Simulate the daemon writing its sidecar (normally done at bind time).
-        write_endpoint_sidecar(dir.path(), &ep1).unwrap();
+        write_sidecar_raw(dir.path(), &ep1).unwrap();
         // Second resolution connects: the sidecar records our own live PID with
         // matching protocol version.
         let r2 = resolve_endpoint(dir.path(), 1).unwrap();
@@ -272,7 +304,7 @@ mod test {
             protocol_version: 1,
             leindex_version: "test".into(),
         };
-        write_endpoint_sidecar(dir.path(), &ep).unwrap();
+        write_sidecar_raw(dir.path(), &ep).unwrap();
         let r = resolve_endpoint(dir.path(), 1).unwrap();
         assert!(
             matches!(r, StartupOutcome::Won(_)),
@@ -292,7 +324,7 @@ mod test {
             protocol_version: 1,
             leindex_version: "test".into(),
         };
-        write_endpoint_sidecar(dir.path(), &ep).unwrap();
+        write_sidecar_raw(dir.path(), &ep).unwrap();
         // Caller expects protocol_version=2, sidecar has 1 → stolen.
         let r = resolve_endpoint(dir.path(), 2).unwrap();
         assert!(matches!(r, StartupOutcome::Won(_)));
@@ -306,7 +338,7 @@ mod test {
     fn test_live_current_pid_is_connected() {
         let dir = tempfile::tempdir().unwrap();
         let ep = DaemonEndpoint::current_process(dir.path().join("d.sock"), 1);
-        write_endpoint_sidecar(dir.path(), &ep).unwrap();
+        write_sidecar_raw(dir.path(), &ep).unwrap();
         let r = resolve_endpoint(dir.path(), 1).unwrap();
         match r {
             StartupOutcome::Connect(..) => {}
@@ -336,7 +368,28 @@ mod test {
         assert!(matches!(r, StartupOutcome::Won(_)));
     }
 
-    fn write_endpoint_sidecar(dir: &Path, ep: &DaemonEndpoint) -> io::Result<()> {
+    fn write_sidecar_raw(dir: &Path, ep: &DaemonEndpoint) -> io::Result<()> {
         fs::write(dir.join(ENDPOINT_SIDECAR), serde_json::to_vec(ep)?)
+    }
+
+    /// `write_endpoint_sidecar` atomically writes a sidecar that
+    /// `resolve_endpoint` subsequently reads as a live endpoint.
+    #[test]
+    fn test_write_endpoint_sidecar_atomic_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = DaemonEndpoint::current_process(dir.path().join("d.sock"), 1);
+        write_endpoint_sidecar(dir.path(), &ep).unwrap();
+
+        // Sidecar file exists and no .partial lingering.
+        assert!(dir.path().join(ENDPOINT_SIDECAR).exists());
+        assert!(
+            !dir.path()
+                .join(format!("{ENDPOINT_SIDECAR}.partial"))
+                .exists()
+        );
+
+        // resolve_endpoint reads it and connects (live PID, matching protocol).
+        let r = resolve_endpoint(dir.path(), 1).unwrap();
+        assert!(matches!(r, StartupOutcome::Connect(_)));
     }
 }
