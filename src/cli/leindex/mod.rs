@@ -12,6 +12,10 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+#[path = "generation_read_test.rs"]
+mod generation_read_tests;
+
 // Re-export public types for external callers
 pub use types::{
     AnalysisResult, ComponentStatus, CoverageReport, Diagnostics, FileStats, IndexHealth,
@@ -80,6 +84,15 @@ pub struct LeIndex {
 
     /// Ephemeral state shared by the explicit indexing phases.
     pub(crate) pipeline: Option<indexing::IndexPipelineState>,
+
+    /// Live generation read path (WS4 Task 14): when
+    /// `LEINDEX_FEATURE_GENERATION_READERS` is enabled and the project has a
+    /// current generation, this holds the leased snapshot that the
+    /// search/symbol/deep-analyze read path reads from. Holding the snapshot
+    /// keeps the generation's CAS blobs pinned (via `GenerationLease`) for the
+    /// lifetime of this process, so reads never touch the writer Mutex and
+    /// never race a concurrent publish.
+    pub(crate) generation_snapshot: Option<crate::storage::generation::GenerationSnapshot>,
 }
 
 /// Cross-process exclusive lock guarding writes to a project's storage.
@@ -600,6 +613,7 @@ impl LeIndex {
             },
             embedder: None,
             pipeline: None,
+            generation_snapshot: None,
         };
 
         // Restore persisted index stats (if any) so diagnostics can report
@@ -866,6 +880,18 @@ impl LeIndex {
     /// Ensure the PDG is loaded from storage (deferred load on first use).
     pub fn ensure_pdg_loaded(&mut self) -> Result<()> {
         if self.pdg.is_none() {
+            // WS4 Task 14: when the generation-read path is enabled, load the
+            // PDG (and search engine) from the leased mmap generation instead.
+            match self.try_hydrate_from_generation() {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        "Generation read path unavailable ({}); falling back to legacy load",
+                        e
+                    );
+                }
+            }
             let has_content = self.active_has_indexed_files();
             if has_content {
                 crate::cli::mcp::request_meta::PDG_LOADS
@@ -890,6 +916,17 @@ impl LeIndex {
     /// This loads the PDG if needed and performs a focused refresh when the
     /// in-memory search index is empty but indexed files already exist.
     pub fn ensure_analysis_context_loaded(&mut self) -> Result<()> {
+        // WS4 Task 14: prefer the generation read path when enabled. It
+        // hydrates both the PDG and the search engine in one shot, so the
+        // legacy load only runs when the flag is off or no generation exists.
+        match self.try_hydrate_from_generation() {
+            Ok(true) if self.pdg.is_some() && !self.search_engine.is_empty() => return Ok(()),
+            Ok(true) | Ok(false) => {}
+            Err(e) => warn!(
+                "Generation read path unavailable ({}); falling back to legacy load",
+                e
+            ),
+        }
         self.ensure_pdg_loaded()?;
         if self.search_engine.is_empty() && self.active_has_indexed_files() {
             self.load_from_storage()?;

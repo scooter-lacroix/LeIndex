@@ -411,7 +411,7 @@ fn copy_and_checkpoint(src: &Path) -> Result<NormalizedDb, MigrationError> {
 
 /// Produce the canonical VACUUM-normalized byte form of a catalog. This is the
 /// byte-deterministic DB payload staged into CAS (same engine as `db_layer`).
-fn vacuum_bytes(db_path: &Path) -> Result<Vec<u8>, MigrationError> {
+pub(crate) fn vacuum_bytes(db_path: &Path) -> Result<Vec<u8>, MigrationError> {
     let tmp = tempfile::tempdir()?;
     let out = tmp.path().join("normalized.db");
     let conn = Connection::open(db_path)?;
@@ -425,7 +425,7 @@ fn vacuum_bytes(db_path: &Path) -> Result<Vec<u8>, MigrationError> {
 
 /// Convert a legacy `LIEE` mmap embedding file into a [`LIDX-NRL1`] payload
 /// preserving the full f32 matrix.
-fn encode_neural_layer(embeddings_path: &Path) -> Result<Vec<u8>, MigrationError> {
+pub(crate) fn encode_neural_layer(embeddings_path: &Path) -> Result<Vec<u8>, MigrationError> {
     let bytes = fs::read(embeddings_path).map_err(|_| {
         MigrationError::Legacy(format!(
             "missing embeddings file at {}",
@@ -491,7 +491,7 @@ fn encode_neural_layer(embeddings_path: &Path) -> Result<Vec<u8>, MigrationError
 /// does not persist a sparse document×term matrix (only vocabulary + IDF),
 /// so the migration stages an empty sparse layer and preserves the dense
 /// vectors in the Neural layer. See module docs.
-fn encode_empty_tfidf() -> Vec<u8> {
+pub(crate) fn encode_empty_tfidf() -> Vec<u8> {
     let mut payload = Vec::with_capacity(TFIDF_HEADER_LEN);
     payload.extend_from_slice(TFIDF_MAGIC);
     payload.push(1); // version
@@ -504,9 +504,29 @@ fn encode_empty_tfidf() -> Vec<u8> {
     payload
 }
 
+/// Build a structurally valid, empty [`LIDX-NRL1`] payload (0 vectors). The
+/// legacy store's neural layer is preserved only when dense vectors exist;
+/// fixtures and the empty store use this canonical empty form.
+#[cfg(test)]
+pub(crate) fn encode_empty_neural() -> Vec<u8> {
+    let mut payload = Vec::with_capacity(NEURAL_HEADER_LEN);
+    payload.extend_from_slice(NEURAL_MAGIC);
+    payload.push(1); // version
+    payload.extend_from_slice(&[0, 0, 0]); // pad
+    payload.extend_from_slice(&0u32.to_le_bytes()); // node_count
+    payload.extend_from_slice(&0u32.to_le_bytes()); // dimension
+    payload.extend_from_slice(&0u32.to_le_bytes()); // dtype = F32
+    payload.extend_from_slice(&1.0f32.to_le_bytes()); // scale
+    payload.extend_from_slice(&0.0f32.to_le_bytes()); // zero_point
+    let content_hash = crate::storage::cas::blob::blob_hash(&[]);
+    payload.extend_from_slice(&content_hash);
+    payload.push(0); // alignment pad
+    payload
+}
+
 /// Reconstruct a [`LIDX-PDG1`] layer from the legacy catalog's `intel_nodes`
 /// and `intel_edges` tables.
-fn encode_pdg_layer(conn: &Connection) -> Result<Vec<u8>, MigrationError> {
+pub(crate) fn encode_pdg_layer(conn: &Connection) -> Result<Vec<u8>, MigrationError> {
     let mut interner = StringInterner::new();
 
     let mut nodes: Vec<u8> = Vec::new();
@@ -589,7 +609,7 @@ fn encode_pdg_layer(conn: &Connection) -> Result<Vec<u8>, MigrationError> {
 }
 
 /// Reconstruct a [`LIDX-SYM1`] layer from the legacy catalog's `intel_nodes`.
-fn encode_symbols_layer(conn: &Connection) -> Result<Vec<u8>, MigrationError> {
+pub(crate) fn encode_symbols_layer(conn: &Connection) -> Result<Vec<u8>, MigrationError> {
     let mut interner = StringInterner::new();
 
     let mut symbols: Vec<u8> = Vec::new();

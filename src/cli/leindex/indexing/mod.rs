@@ -1913,6 +1913,14 @@ impl LeIndex {
     /// Indexing still writes the mutable root, but normal registry hydration
     /// must never read that in-progress state after a crash or concurrent job.
     pub(crate) fn load_from_active_storage(&mut self) -> Result<()> {
+        // WS4 Task 14: when the `generation-readers` flag is enabled and the
+        // project has a current generation, hydrate the read path from the
+        // leased mmap generation instead of the legacy heap-mirror store. The
+        // lease never touches the writer Mutex, so reads keep working while a
+        // concurrent index/publish is in progress (VAL-EQUIV-002/003).
+        if self.try_hydrate_from_generation()? {
+            return Ok(());
+        }
         let active = self.active_storage_path();
         if active == self.storage_path || !active.join("leindex.db").is_file() {
             return self.load_from_mutable_storage();
@@ -1928,6 +1936,57 @@ impl LeIndex {
                     format!("Failed to open active generation at {}", active.display())
                 })?;
         self.load_from_storage_inner_at(false, Some(&active_storage), active)
+    }
+
+    /// WS4 Task 14: wire the read path (PDG + search engine) onto the leased
+    /// mmap generation when `LEINDEX_FEATURE_GENERATION_READERS` is enabled
+    /// and the project has a current generation.
+    ///
+    /// Returns `Ok(true)` when the read path is served from the generation
+    /// (or was already wired on a previous call), `Ok(false)` when the flag is
+    /// off or no generation exists (the caller falls back to the legacy
+    /// heap-mirror path). The returned snapshot is retained on `self` so its
+    /// [`GenerationLease`] keeps the generation's CAS blobs pinned for the
+    /// lifetime of this process.
+    pub(crate) fn try_hydrate_from_generation(&mut self) -> Result<bool> {
+        if !crate::feature_flags::FeatureFlag::GenerationReaders.is_enabled() {
+            return Ok(false);
+        }
+        if self.generation_snapshot.is_some() {
+            return Ok(true);
+        }
+        let Some(storage_path) =
+            crate::cli::leindex::resolve_existing_storage_path(&self.project_path)
+        else {
+            return Ok(false);
+        };
+        if crate::storage::generation::lease::read_current_generation(&storage_path).is_none() {
+            return Ok(false);
+        }
+        let snapshot = crate::storage::generation::GenerationSnapshot::open(&storage_path)
+            .with_context(|| {
+                format!(
+                    "Failed to open generation snapshot at {}",
+                    storage_path.display()
+                )
+            })?;
+        let generation_db = crate::storage::schema::Storage::open_readonly(snapshot.db_path())?;
+        // Artifact path points at the snapshot's temp dir, which holds no
+        // search-snapshot/embedder artifacts, so hydration uses the rebuild
+        // path and `persist_artifacts` stays false — the generation read path
+        // never writes legacy artifacts back into the store.
+        let artifact_path = snapshot
+            .db_path()
+            .parent()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| storage_path.clone());
+        self.load_from_storage_inner_at(false, Some(&generation_db), artifact_path)?;
+        self.generation_snapshot = Some(snapshot);
+        info!(
+            project = %self.project_path.display(),
+            "Hydrated read path from leased mmap generation"
+        );
+        Ok(true)
     }
 
     /// Load PDG from storage without populating the search engine.

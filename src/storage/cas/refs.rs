@@ -34,6 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::blob::{fsync_file, hash_to_hex, hex_to_hash};
 
@@ -41,6 +42,11 @@ use super::blob::{fsync_file, hash_to_hex, hex_to_hash};
 pub const REFS_SIDECAR: &str = "refs.json";
 /// On-disk auxiliary files the CAS blob-count / stored-hash walkers skip.
 pub const REFS_AUX_FILES: &[&str] = &[REFS_SIDECAR];
+
+/// Monotonic sequence that guarantees a unique temp-sidecar path per
+/// `persist` call in this process, so concurrent readers can each atomically
+/// swap the refcount sidecar without racing on a shared temp filename.
+static PERSIST_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Interchangeable refcount persistence backend.
 pub trait RefcountStore: Send {
@@ -155,7 +161,10 @@ impl RefcountStore for JsonSidecarStore {
 
     /// Persist the current refcounts to disk atomically.
     ///
-    /// Writes `<sidecar>.tmp`, fsyncs, then renames to `<sidecar>`.
+    /// Writes a uniquely-named temp sidecar, fsyncs, then renames to the
+    /// sidecar. The unique name makes concurrent `persist` calls (e.g. two
+    /// readers acquiring generation leases at once) safe: each renames its own
+    /// fully-written file, so no caller observes a torn temp path.
     fn persist(&self) -> Result<()> {
         // Serialize hex → count directly to avoid any lifetime pitfalls.
         let owned: HashMap<String, u64> = self
@@ -168,7 +177,10 @@ impl RefcountStore for JsonSidecarStore {
         if let Some(parent) = self.sidecar_path.parent() {
             fs::create_dir_all(parent).map_err(CasError::Io)?;
         }
-        let tmp_path = self.sidecar_path.with_extension("json.tmp");
+        let seq = PERSIST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path =
+            self.sidecar_path
+                .with_extension(format!("json.tmp.{}.{}", std::process::id(), seq));
         {
             let file = fs::File::create(&tmp_path).map_err(CasError::Io)?;
             let mut writer = std::io::BufWriter::new(file);

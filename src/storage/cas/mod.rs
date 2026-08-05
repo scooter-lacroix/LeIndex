@@ -66,7 +66,11 @@ impl CasStore {
     }
 
     /// Final blob path for `hash`: `<root>/<hh>/<hash>`.
-    fn blob_path(&self, hash: &[u8; 32]) -> PathBuf {
+    ///
+    /// The file at this path is the full CAS frame (`LIDX-BLB1` header +
+    /// payload). Generation mmap readers open it directly so reads never copy
+    /// the payload into heap.
+    pub fn blob_path(&self, hash: &[u8; 32]) -> PathBuf {
         let hex = hash_to_hex(hash);
         self.prefix_dir(hash).join(&hex)
     }

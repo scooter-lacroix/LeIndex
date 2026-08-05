@@ -16,6 +16,7 @@ pub mod manifest;
 pub mod migrate;
 pub mod reader;
 pub mod retention;
+pub mod snapshot;
 pub mod writer;
 
 pub use db_layer::{DbToCasError, db_to_cas, db_to_cas_conn};
@@ -39,4 +40,5 @@ pub use retention::{
     DEFAULT_JOB_BYTES_MAX, DEFAULT_MAX_GENERATIONS, GenerationRetentionReport, RetentionConfig,
     RetentionError, retain_after_publish, retention_report,
 };
+pub use snapshot::{GenerationSnapshot, SnapshotError};
 pub use writer::{GenerationWriter, WriterError};

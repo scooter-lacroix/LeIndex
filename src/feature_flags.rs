@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// All supported feature flags.
 ///
@@ -44,6 +44,16 @@ pub enum FeatureFlag {
     /// full-copy artifacts are removed), so it ships behind this flag and a
     /// backup warning rather than running unconditionally.
     GenerationMigration,
+    /// Wire the search/symbol/deep-analyze read path onto leased mmap
+    /// generations (WS4 Task 14) instead of the legacy heap-mirror store.
+    ///
+    /// When enabled and the project has a current generation, MCP read-path
+    /// handlers acquire a [`GenerationLease`](crate::storage::generation::lease::GenerationLease),
+    /// drop the legacy heap-mirror structures, and read from the generation's
+    /// content-addressed mmap layers. When disabled (the default), handlers
+    /// keep reading from the legacy heap-mirror path so the two can be
+    /// compared bit-for-bit (VAL-EQUIV-001/002/003).
+    GenerationReaders,
 }
 
 impl FeatureFlag {
@@ -57,6 +67,7 @@ impl FeatureFlag {
             Self::StreamingMcp => "LEINDEX_FEATURE_STREAMING_MCP",
             Self::GlobalAutoSync => "LEINDEX_FEATURE_GLOBAL_AUTO_SYNC",
             Self::GenerationMigration => "LEINDEX_FEATURE_GENERATION_MIGRATION",
+            Self::GenerationReaders => "LEINDEX_FEATURE_GENERATION_READERS",
         }
     }
 
@@ -77,7 +88,17 @@ impl FeatureFlag {
     ///
     /// Reads the corresponding env var. Values "1", "true", "yes" enable.
     /// Values "0", "false", "no" disable. If unset, uses `default_value()`.
+    ///
+    /// A test-only override (set via [`set_flag_override_for_test`]) takes
+    /// precedence so a single process can exercise both sides of a feature.
     pub fn is_enabled(&self) -> bool {
+        if let Ok(guard) = TEST_OVERRIDES.lock() {
+            if let Some(map) = guard.as_ref() {
+                if let Some(v) = map.get(self) {
+                    return *v;
+                }
+            }
+        }
         flag_store().get(self)
     }
 
@@ -91,6 +112,9 @@ impl FeatureFlag {
             Self::StreamingMcp => "Enable streaming MCP notifications",
             Self::GlobalAutoSync => "Enable global index auto-sync",
             Self::GenerationMigration => "Enable the one-time legacy→CAS store migration sweep",
+            Self::GenerationReaders => {
+                "Read-path handlers use leased mmap generations instead of heap mirrors"
+            }
         }
     }
 }
@@ -120,6 +144,7 @@ impl FlagStore {
             FeatureFlag::StreamingMcp,
             FeatureFlag::GlobalAutoSync,
             FeatureFlag::GenerationMigration,
+            FeatureFlag::GenerationReaders,
         ] {
             let enabled = match env::var(flag.env_var()) {
                 Ok(v) => matches!(
@@ -140,6 +165,48 @@ impl FlagStore {
 
 static FLAG_STORE: OnceLock<FlagStore> = OnceLock::new();
 
+/// Test-only overrides. When `Some`, values in the map shadow the env-derived
+/// store for the flagged features. Serialized by a `Mutex` so `is_enabled`
+/// callers never observe a torn map.
+static TEST_OVERRIDES: Mutex<Option<HashMap<FeatureFlag, bool>>> = Mutex::new(None);
+
+/// Test-only: force a flag's effective value regardless of the environment.
+///
+/// Overrides take precedence over the (OnceLock-cached) env-derived store, so
+/// tests can exercise both sides of a flag in one process without env
+/// mutation races. Production callers must not use this.
+#[doc(hidden)]
+pub fn set_flag_override_for_test(flag: FeatureFlag, value: bool) {
+    let mut guard = TEST_OVERRIDES.lock().expect("flag override mutex poisoned");
+    guard.get_or_insert_with(HashMap::new).insert(flag, value);
+}
+
+/// Test-only: clear all overrides, restoring env-derived flag behavior.
+#[doc(hidden)]
+pub fn clear_flag_overrides_for_test() {
+    let mut guard = TEST_OVERRIDES.lock().expect("flag override mutex poisoned");
+    *guard = None;
+}
+
+/// Serializes flag-override toggling across tests in one process.
+///
+/// `set_flag_override_for_test`/`clear_flag_overrides_for_test` mutate a
+/// process-global store, so tests that exercise a flag on both sides must hold
+/// this lock for their whole duration to avoid racing sibling tests.
+#[doc(hidden)]
+pub static FLAG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Run `f` with `flag` overridden to `value`, restoring the env-derived state
+/// afterwards. Serialized by [`FLAG_TEST_LOCK`] so tests never race the shared
+/// override store.
+#[doc(hidden)]
+pub fn with_flag_override(flag: FeatureFlag, value: bool, f: impl FnOnce()) {
+    let _g = FLAG_TEST_LOCK.lock().expect("flag test lock poisoned");
+    set_flag_override_for_test(flag, value);
+    f();
+    clear_flag_overrides_for_test();
+}
+
 fn flag_store() -> &'static FlagStore {
     FLAG_STORE.get_or_init(FlagStore::new)
 }
@@ -148,7 +215,6 @@ fn flag_store() -> &'static FlagStore {
 ///
 /// Useful for CLI output (`leindex feature-flags`) and debugging.
 pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
-    let store = flag_store();
     [
         FeatureFlag::NeuralSearch,
         FeatureFlag::RemoteEmbeddings,
@@ -157,9 +223,10 @@ pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
         FeatureFlag::StreamingMcp,
         FeatureFlag::GlobalAutoSync,
         FeatureFlag::GenerationMigration,
+        FeatureFlag::GenerationReaders,
     ]
     .into_iter()
-    .map(|f| (f, store.get(&f)))
+    .map(|f| (f, f.is_enabled()))
     .collect()
 }
 
@@ -186,5 +253,28 @@ mod test {
         // normal config) rather than gating a not-yet-released capability.
         assert!(FeatureFlag::NeuralSearch.default_value());
         assert!(FeatureFlag::StreamingMcp.default_value());
+    }
+
+    #[test]
+    fn test_generation_readers_is_new_and_off_by_default() {
+        // A genuinely new/experimental feature must ship default OFF so the
+        // legacy heap-mirror read path stays the default until proven.
+        assert_eq!(
+            FeatureFlag::GenerationReaders.env_var(),
+            "LEINDEX_FEATURE_GENERATION_READERS"
+        );
+        assert!(!FeatureFlag::GenerationReaders.default_value());
+        assert!(!FeatureFlag::GenerationReaders.is_enabled());
+    }
+
+    #[test]
+    fn test_override_toggles_flag() {
+        // Serialize the shared override store across this test only.
+        let _g = FLAG_TEST_LOCK.lock().unwrap();
+        assert!(!FeatureFlag::GenerationReaders.is_enabled());
+        set_flag_override_for_test(FeatureFlag::GenerationReaders, true);
+        assert!(FeatureFlag::GenerationReaders.is_enabled());
+        clear_flag_overrides_for_test();
+        assert!(!FeatureFlag::GenerationReaders.is_enabled());
     }
 }
