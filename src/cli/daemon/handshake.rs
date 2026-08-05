@@ -70,6 +70,32 @@ pub enum HandshakeError {
     },
 }
 
+impl HandshakeError {
+    /// Format an actionable error message for the shim to print to stderr
+    /// (spec §4.1: "reject incompatible versions with actionable
+    /// instructions"; WS3 Task 6).
+    ///
+    /// The message includes both version numbers and explicit instructions to
+    /// restart the daemon so the user can resolve the mismatch without
+    /// consulting documentation.
+    pub fn actionable_message(&self) -> String {
+        match self {
+            HandshakeError::ProtocolMismatch { client, daemon } => {
+                format!(
+                    "Client daemon protocol v{client} cannot talk to daemon v{daemon}. \
+                     Restart leindexd: leindex cleanup --stale-daemons && leindexd"
+                )
+            }
+            HandshakeError::ArtifactMismatch { client, daemon } => {
+                format!(
+                    "Client artifact format v{client} cannot read artifacts from daemon v{daemon}. \
+                     Re-index the project: leindex index --force"
+                )
+            }
+        }
+    }
+}
+
 impl Handshake {
     /// Build a `Handshake` for the current process. Reads `CARGO_PKG_VERSION`
     /// at compile time and the two numeric constants defined in this module.
@@ -199,6 +225,56 @@ mod test {
                 client: 2,
                 daemon: 1,
             }),
+        );
+    }
+
+    /// WS3 Task 6: ProtocolMismatch produces actionable error instructions
+    /// containing both version numbers and a restart command.
+    #[test]
+    fn test_protocol_mismatch_actionable_message() {
+        let err = HandshakeError::ProtocolMismatch {
+            client: 1,
+            daemon: 2,
+        };
+        let msg = err.actionable_message();
+        assert!(
+            msg.contains("v1"),
+            "actionable message must contain client version: {msg}"
+        );
+        assert!(
+            msg.contains("v2"),
+            "actionable message must contain daemon version: {msg}"
+        );
+        assert!(
+            msg.contains("leindex cleanup --stale-daemons"),
+            "actionable message must contain restart instructions: {msg}"
+        );
+        assert!(
+            msg.contains("leindexd"),
+            "actionable message must mention restarting leindexd: {msg}"
+        );
+    }
+
+    /// ArtifactMismatch actionable message contains both versions and
+    /// re-index instructions.
+    #[test]
+    fn test_artifact_mismatch_actionable_message() {
+        let err = HandshakeError::ArtifactMismatch {
+            client: 1,
+            daemon: 2,
+        };
+        let msg = err.actionable_message();
+        assert!(
+            msg.contains("v1"),
+            "message must contain client version: {msg}"
+        );
+        assert!(
+            msg.contains("v2"),
+            "message must contain daemon version: {msg}"
+        );
+        assert!(
+            msg.contains("leindex index --force"),
+            "message must contain re-index instructions: {msg}"
         );
     }
 }

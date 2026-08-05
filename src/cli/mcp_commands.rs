@@ -810,7 +810,7 @@ async fn handle_mcp_request(
 #[cfg(feature = "daemon-client")]
 async fn try_daemon_client(run_dir: &std::path::Path) -> AnyhowResult<()> {
     use crate::cli::daemon::endpoint::{StartupOutcome, resolve_endpoint};
-    use crate::cli::daemon::handshake::DAEMON_PROTOCOL_VERSION;
+    use crate::cli::daemon::handshake::{DAEMON_PROTOCOL_VERSION, HandshakeError};
     use crate::cli::daemon::shim;
     use crate::cli::daemon::spawn;
 
@@ -835,6 +835,20 @@ async fn try_daemon_client(run_dir: &std::path::Path) -> AnyhowResult<()> {
                 .context("failed to spawn leindexd")?
         }
     };
+
+    // WS3 Task 6: Validate the daemon's protocol version before forwarding.
+    // If the endpoint reports an incompatible version (race: daemon was
+    // upgraded between sidecar write and our connection), emit the actionable
+    // error message and refuse to forward (spec §4.1, §12.1).
+    if endpoint.protocol_version != DAEMON_PROTOCOL_VERSION {
+        let err = HandshakeError::ProtocolMismatch {
+            client: DAEMON_PROTOCOL_VERSION,
+            daemon: endpoint.protocol_version,
+        };
+        // Print to stderr so the user can see the diagnostic (VAL-DAEMON-008).
+        eprintln!("{}", err.actionable_message());
+        anyhow::bail!("{}", err.actionable_message());
+    }
 
     // Forward MCP frames between stdin/stdout and the daemon socket.
     shim::forward_stdio_to_daemon(&endpoint)

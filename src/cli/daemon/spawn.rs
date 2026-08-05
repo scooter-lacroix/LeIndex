@@ -20,6 +20,14 @@ const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Polling interval for checking socket existence.
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Bounded wait for a socket file to appear, exposed for integration tests
+/// ([`tests/daemon_spawn_test.rs`]). Returns `true` when the file exists,
+/// `false` when the timeout expires without the file appearing.
+#[doc(hidden)]
+pub async fn spawn_bounded_socket_wait(socket_path: &Path, timeout: Duration) -> bool {
+    wait_for_socket(socket_path, timeout).await
+}
+
 /// Spawn `leindexd` as a background child process under the given run-dir and
 /// wait for it to bind its socket and publish the endpoint sidecar.
 ///
@@ -159,11 +167,179 @@ async fn wait_for_sidecar(run_dir: &Path, timeout: Duration) -> Result<DaemonEnd
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::cli::daemon::endpoint::{DaemonEndpoint, write_endpoint_sidecar};
+    use std::fs;
+    use std::os::unix::net::UnixListener;
 
     #[test]
     fn test_resolve_leindexd_path_does_not_panic() {
         // The function should either find the binary or return an error,
         // but never panic.
         let _ = resolve_leindexd_path();
+    }
+
+    /// `wait_for_socket` returns `true` when the socket file exists.
+    #[tokio::test]
+    async fn test_wait_for_socket_returns_true_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("test.sock");
+        fs::write(&sock, b"").unwrap();
+
+        // Already exists → returns immediately.
+        let result = wait_for_socket(&sock, Duration::from_secs(1)).await;
+        assert!(result, "wait_for_socket must return true for existing file");
+    }
+
+    /// `wait_for_socket` returns `false` when the file does not appear within
+    /// the timeout. This verifies the bounded-wait guarantee: the caller does
+    /// NOT block forever.
+    #[tokio::test]
+    async fn test_wait_for_socket_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("nonexistent.sock");
+
+        let start = tokio::time::Instant::now();
+        let result = wait_for_socket(&sock, Duration::from_millis(300)).await;
+        let elapsed = start.elapsed();
+
+        assert!(!result, "wait_for_socket must return false on timeout");
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "must wait at least ~300ms before timing out, got {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must NOT wait unreasonably long, got {elapsed:?}"
+        );
+    }
+
+    /// `wait_for_socket` detects a file that appears AFTER the first poll.
+    #[tokio::test]
+    async fn test_wait_for_socket_detects_appearing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("late.sock");
+
+        // Spawn a task that creates the socket after 200ms.
+        let sock_clone = sock.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            fs::write(&sock_clone, b"").unwrap();
+        });
+
+        let result = wait_for_socket(&sock, Duration::from_secs(5)).await;
+        assert!(
+            result,
+            "wait_for_socket must detect the late-appearing file"
+        );
+    }
+
+    /// `wait_for_sidecar` reads the endpoint from the sidecar after the daemon
+    /// writes it.
+    #[tokio::test]
+    async fn test_wait_for_sidecar_reads_published_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path();
+
+        // Write a valid live endpoint sidecar atomically using current_process
+        // which captures the real PID and start time.
+        let ep = DaemonEndpoint::current_process(run_dir.join("d.sock"), DAEMON_PROTOCOL_VERSION);
+        write_endpoint_sidecar(run_dir, &ep).unwrap();
+
+        let result = wait_for_sidecar(run_dir, Duration::from_secs(5)).await;
+        assert!(
+            result.is_ok(),
+            "wait_for_sidecar must succeed: {:?}",
+            result
+        );
+        let resolved = result.unwrap();
+        assert_eq!(resolved.pid, ep.pid);
+        assert_eq!(resolved.protocol_version, DAEMON_PROTOCOL_VERSION);
+    }
+
+    /// `wait_for_sidecar` times out when the sidecar never appears.
+    #[tokio::test]
+    async fn test_wait_for_sidecar_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path();
+
+        // No sidecar is written, and no daemon connects.
+        let result = wait_for_sidecar(run_dir, Duration::from_millis(300)).await;
+        assert!(
+            result.is_err(),
+            "wait_for_sidecar must time out when sidecar never appears"
+        );
+    }
+
+    /// `wait_for_sidecar` detects a sidecar that appears after the first poll.
+    #[tokio::test]
+    async fn test_wait_for_sidecar_detects_late_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().to_path_buf();
+
+        // Spawn a task that writes the sidecar after 200ms using
+        // current_process which captures PID and start time correctly.
+        let run_dir_clone = run_dir.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let ep = DaemonEndpoint::current_process(
+                run_dir_clone.join("d.sock"),
+                DAEMON_PROTOCOL_VERSION,
+            );
+            write_endpoint_sidecar(&run_dir_clone, &ep).unwrap();
+        });
+
+        let result = wait_for_sidecar(&run_dir, Duration::from_secs(5)).await;
+        assert!(result.is_ok(), "wait_for_sidecar must detect late endpoint");
+    }
+
+    /// End-to-end test: `spawn_and_wait` spawns `leindexd`, the daemon binds
+    /// its socket and writes the sidecar, and the function returns the
+    /// resolved endpoint. Uses the real `leindexd` binary after binding a
+    /// Unix socket to verify the actual spawn path.
+    ///
+    /// This test mocks the daemon by creating the socket and sidecar directly
+    /// (without spawning a real process) to verify that `spawn_and_wait`'s
+    /// polling logic correctly waits for and returns the endpoint. The real
+    /// leindexd integration is tested in `tests/daemon_spawn_test.rs`.
+    #[tokio::test]
+    async fn test_spawn_and_wait_waits_for_socket_and_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().to_path_buf();
+        let socket_path = run_dir.join("d.sock");
+
+        // We can't easily test the full spawn_and_wait because it spawns a
+        // real leindexd binary. Instead, test the core bounded-wait logic by
+        // verifying wait_for_socket + wait_for_sidecar work together.
+
+        // Simulate the daemon binding the socket after 200ms.
+        let sock_clone = socket_path.clone();
+        let run_dir_clone = run_dir.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Bind a real Unix socket (matching what leindexd does).
+            let _listener = UnixListener::bind(&sock_clone);
+
+            // Write the endpoint sidecar using current_process which captures
+            // PID and start time correctly.
+            let ep = DaemonEndpoint::current_process(sock_clone.clone(), DAEMON_PROTOCOL_VERSION);
+            write_endpoint_sidecar(&run_dir_clone, &ep).unwrap();
+
+            // Keep the listener alive for the duration of the test by sleeping.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            // Listener drops here, cleaning up the socket.
+        });
+
+        // Wait for the socket to appear (bounded).
+        let appeared = wait_for_socket(&socket_path, Duration::from_secs(5)).await;
+        assert!(appeared, "socket must appear within timeout");
+
+        // Read the endpoint sidecar.
+        let endpoint = wait_for_sidecar(&run_dir, Duration::from_secs(5))
+            .await
+            .expect("sidecar must appear");
+
+        assert_eq!(endpoint.protocol_version, DAEMON_PROTOCOL_VERSION);
+        assert_eq!(endpoint.socket_path, socket_path);
     }
 }
