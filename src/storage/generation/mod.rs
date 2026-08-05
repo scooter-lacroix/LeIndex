@@ -11,16 +11,18 @@
 pub mod lease;
 pub mod manifest;
 pub mod reader;
+pub mod writer;
 
 pub use lease::{
     CURRENT_FILE, GENERATIONS_DIR, GenerationLease, LeaseError, MANIFEST_FILE,
     read_current_generation, read_generation_manifest,
 };
 pub use manifest::{
-    LayerKind, MANIFEST_MAGIC, MANIFEST_VERSION, Manifest, ManifestBody, ManifestError,
-    ModelIdentity,
+    ALL_LAYER_KINDS, LayerKind, MANIFEST_MAGIC, MANIFEST_VERSION, Manifest, ManifestBody,
+    ManifestError, ModelIdentity,
 };
 pub use reader::{
     NeuralDtype, NeuralReader, PdgEdge, PdgNode, PdgReader, ReaderError, SymbolEntry, SymbolReader,
     TfidfEntry, TfidfReader, VectorView,
 };
+pub use writer::{GenerationWriter, WriterError};
