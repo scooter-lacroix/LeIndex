@@ -54,6 +54,12 @@ pub enum FeatureFlag {
     /// keep reading from the legacy heap-mirror path so the two can be
     /// compared bit-for-bit (VAL-EQUIV-001/002/003).
     GenerationReaders,
+    /// Route indexing through the fair bounded scheduler (WS5): heavy work is
+    /// executed as stepped [`BoundedJob`](crate::scheduler::budget::BoundedJob)s
+    /// behind the DRR queues and admission gate instead of one unstepped
+    /// `spawn_blocking` call. Default OFF = legacy spawn_blocking + error-at-cap
+    /// indexing path.
+    BoundedScheduler,
 }
 
 impl FeatureFlag {
@@ -68,6 +74,7 @@ impl FeatureFlag {
             Self::GlobalAutoSync => "LEINDEX_FEATURE_GLOBAL_AUTO_SYNC",
             Self::GenerationMigration => "LEINDEX_FEATURE_GENERATION_MIGRATION",
             Self::GenerationReaders => "LEINDEX_FEATURE_GENERATION_READERS",
+            Self::BoundedScheduler => "LEINDEX_FEATURE_BOUNDED_SCHEDULER",
         }
     }
 
@@ -115,6 +122,9 @@ impl FeatureFlag {
             Self::GenerationReaders => {
                 "Read-path handlers use leased mmap generations instead of heap mirrors"
             }
+            Self::BoundedScheduler => {
+                "Route heavy work through the fair bounded scheduler (DRR + admission)"
+            }
         }
     }
 }
@@ -145,6 +155,7 @@ impl FlagStore {
             FeatureFlag::GlobalAutoSync,
             FeatureFlag::GenerationMigration,
             FeatureFlag::GenerationReaders,
+            FeatureFlag::BoundedScheduler,
         ] {
             let enabled = match env::var(flag.env_var()) {
                 Ok(v) => matches!(
@@ -224,6 +235,7 @@ pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
         FeatureFlag::GlobalAutoSync,
         FeatureFlag::GenerationMigration,
         FeatureFlag::GenerationReaders,
+        FeatureFlag::BoundedScheduler,
     ]
     .into_iter()
     .map(|f| (f, f.is_enabled()))

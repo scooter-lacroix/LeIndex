@@ -83,6 +83,10 @@ pub mod embed;
 // Feature flag infrastructure (always available)
 pub mod feature_flags;
 
+// Fair bounded scheduler (always available; gated at runtime by
+// LEINDEX_FEATURE_BOUNDED_SCHEDULER)
+pub mod scheduler;
+
 // Observability infrastructure (always available)
 pub mod observability;
 
