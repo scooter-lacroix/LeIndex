@@ -96,7 +96,10 @@ fn bench_persist(c: &mut Criterion, hashes: &[[u8; 32]]) {
     let mut group = c.benchmark_group("persist_10k");
     group.bench_function("json_sidecar", |b| {
         let (_dir, store) = fuel(hashes);
-        b.iter(|| std::hint::black_box(store.persist().expect("persist")));
+        b.iter(|| {
+            let _: () = store.persist().expect("persist");
+            std::hint::black_box(())
+        });
     });
     group.finish();
 }

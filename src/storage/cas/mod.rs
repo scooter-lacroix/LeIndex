@@ -217,7 +217,7 @@ impl CasStore {
 
     /// Persist the refcount sidecar to disk.
     pub fn persist(&self) -> Result<()> {
-        Ok(self.refs.persist()?)
+        self.refs.persist()
     }
 
     /// Garbage-collect blobs with refcount 0 that are not in `pinned_hashes`.
