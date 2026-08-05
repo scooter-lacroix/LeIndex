@@ -50,7 +50,7 @@ pub async fn forward_stdio_to_daemon_with_reconnect(
     endpoint: &DaemonEndpoint,
     allow_reconnect: bool,
 ) -> Result<()> {
-    let mut stream = tokio::net::UnixStream::connect(&endpoint.socket_path)
+    let stream = tokio::net::UnixStream::connect(&endpoint.socket_path)
         .await
         .with_context(|| {
             format!(
@@ -65,47 +65,77 @@ pub async fn forward_stdio_to_daemon_with_reconnect(
         endpoint.pid
     );
 
+    forward_stream_with_reconnect(
+        stream,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        &endpoint.socket_path,
+        allow_reconnect,
+    )
+    .await
+}
+
+/// Generic stream forwarder: copies bytes bidirectionally between a client-side
+/// reader/writer pair and a daemon Unix socket stream. Extracted from
+/// [`forward_stdio_to_daemon`] so integration tests can exercise the forwarding
+/// logic with in-memory pipes instead of real stdin/stdout.
+///
+/// Two tasks run concurrently:
+/// - **Client→Daemon**: reads from `client_read` and writes to the socket's
+///   write half.
+/// - **Daemon→Client**: reads from the socket's read half and writes to
+///   `client_write`.
+///
+/// If the daemon socket closes and `allow_reconnect` is true, the forwarder
+/// attempts one reconnect (spec §4.1) before giving up.
+pub async fn forward_stream_with_reconnect<R, W>(
+    mut stream: tokio::net::UnixStream,
+    mut client_read: R,
+    mut client_write: W,
+    socket_path: &std::path::Path,
+    allow_reconnect: bool,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     loop {
-        // Split the stream for bidirectional forwarding.
         let (mut socket_read, mut socket_write) = stream.split();
 
-        let stdin_to_socket = async {
-            let mut stdin = tokio::io::stdin();
-            let result = tokio::io::copy(&mut stdin, &mut socket_write).await;
+        let client_to_socket = async {
+            let result = tokio::io::copy(&mut client_read, &mut socket_write).await;
             // Shut down the write half so the daemon sees EOF on this direction.
             let _ = socket_write.shutdown().await;
             result
         };
 
-        let socket_to_stdout = async {
-            let mut stdout = tokio::io::stdout();
-            let result = tokio::io::copy(&mut socket_read, &mut stdout).await;
+        let socket_to_client = async {
+            let result = tokio::io::copy(&mut socket_read, &mut client_write).await;
             // Flush any remaining buffered output.
-            let _ = stdout.flush().await;
+            let _ = client_write.flush().await;
             result
         };
 
         // Run both directions concurrently. The pair completes when either
-        // direction closes (EOF on stdin or socket close from the daemon).
-        let (stdin_result, socket_result) = tokio::join!(stdin_to_socket, socket_to_stdout);
+        // direction closes (EOF on client read or socket close from the daemon).
+        let (client_result, socket_result) = tokio::join!(client_to_socket, socket_to_client);
 
         // Determine whether we should exit or reconnect.
-        // stdin_result is Ok(0) when stdin closes (normal shutdown from client).
-        let stdin_closed = matches!(&stdin_result, Ok(0));
+        // client_result is Ok(0) when the client read closes (normal shutdown).
+        let client_closed = matches!(&client_result, Ok(0));
         // socket_result is Ok(0) when the daemon closed the connection.
         let socket_closed = matches!(&socket_result, Ok(0));
 
-        if stdin_closed {
-            // Client closed stdin: this is the normal shutdown path.
-            debug!("shim: stdin closed, shutting down");
+        if client_closed {
+            debug!("shim: client stream closed, shutting down");
             return Ok(());
         }
 
-        // If the socket closed but stdin is still open, the daemon may have
-        // restarted. Attempt a single reconnect (spec §4.1).
+        // If the socket closed but the client is still sending, the daemon may
+        // have restarted. Attempt a single reconnect (spec §4.1).
         if socket_closed && allow_reconnect {
             debug!("shim: daemon socket closed, attempting reconnect");
-            stream = match try_reconnect(&endpoint.socket_path).await {
+            stream = match try_reconnect(socket_path).await {
                 Some(s) => s,
                 None => {
                     warn!(
@@ -120,8 +150,8 @@ pub async fn forward_stdio_to_daemon_with_reconnect(
         }
 
         // Any IO error at this point is unrecoverable.
-        if let Err(e) = stdin_result {
-            return Err(anyhow::anyhow!("shim stdin read error: {e}"));
+        if let Err(e) = client_result {
+            return Err(anyhow::anyhow!("shim client read error: {e}"));
         }
         if let Err(e) = socket_result {
             return Err(anyhow::anyhow!("shim socket read error: {e}"));
@@ -173,53 +203,67 @@ mod test {
         );
     }
 
-    /// End-to-end test: spawn a Unix listener, run the shim forwarder against
-    /// it, and verify byte-faithful passthrough in both directions.
+    /// Byte-faithful passthrough test using the generic forwarder and an
+    /// in-memory echo server. Verifies that data flows client→daemon and
+    /// daemon→client without modification.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_shim_byte_faithful_passthrough() {
-        use std::os::unix::net::UnixListener as StdUnixListener;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("passthrough.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
 
-        // Spawn a mock "daemon" that echoes received bytes back.
-        let listener = StdUnixListener::bind(&socket).unwrap();
-        let socket_clone = socket.clone();
-        let server_task = tokio::task::spawn_blocking(move || {
-            let (mut conn, _) = listener.accept().unwrap();
-            use std::io::{Read, Write};
+        // Spawn an echo server as a mock daemon.
+        let server_task = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 1024];
-            let n = conn.read(&mut buf).unwrap();
-            conn.write_all(&buf[..n]).unwrap();
+            let n = conn.read(&mut buf).await.unwrap();
+            conn.write_all(&buf[..n]).await.unwrap();
+            conn.flush().await.unwrap();
             // Close to signal the shim.
             drop(conn);
-            let _ = socket_clone; // keep path alive
         });
 
         // Give the listener a moment to be ready.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let endpoint = DaemonEndpoint {
-            socket_path: socket.clone(),
-            pid: std::process::id(),
-            pid_start_time_ms: 0,
-            protocol_version: 1,
-            leindex_version: "test".into(),
-        };
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
 
-        // We cannot easily pipe stdin/stdout in a unit test, so we verify the
-        // connection succeeds. The forwarder would block on stdin read; since
-        // there is no stdin in a test, the stdin read returns immediately (0
-        // bytes) and the forwarder exits cleanly.
-        let result = forward_stdio_to_daemon_with_reconnect(&endpoint, false).await;
-        // The result depends on how stdin behaves under test (EOF or error).
-        // In CI, tokio::io::stdin() in a non-interactive test returns EOF,
-        // so the forwarder should exit Ok. If it errors, that is also acceptable
-        // (the mock daemon still received and echoed data).
-        let _ = result;
+        // Create a duplex pipe: client_tx feeds client_read, client_write feeds client_rx.
+        let (mut client_tx, client_read) = tokio::io::duplex(4096);
+        let (client_write, mut client_rx) = tokio::io::duplex(4096);
 
-        // Wait for the server task to complete (it read and echoed).
+        // Spawn the forwarder.
+        let forward_task = tokio::spawn(async move {
+            forward_stream_with_reconnect(
+                stream,
+                client_read,
+                client_write,
+                PathBuf::from("/nonexistent-for-reconnect.sock").as_path(),
+                false,
+            )
+            .await
+        });
+
+        // Send test data through the client side.
+        let payload = b"{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"test\"}\n";
+        client_tx.write_all(payload).await.unwrap();
+        client_tx.flush().await.unwrap();
+
+        // Read the echoed response.
+        let mut response = vec![0u8; payload.len()];
+        client_rx.read_exact(&mut response).await.unwrap();
+
+        // Assert byte-faithful passthrough.
+        assert_eq!(&response[..], payload, "shim must forward bytes unmodified");
+
+        // Close the client write side to trigger the forwarder's clean exit.
+        drop(client_tx);
+
+        // Wait for forwarder to complete.
+        let _ = forward_task.await;
         let _ = server_task.await;
     }
 }
