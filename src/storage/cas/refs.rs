@@ -1,10 +1,34 @@
-//! CAS blob refcount store: in-memory `HashMap` + JSON sidecar for persistence.
+//! CAS blob refcount store: persistence backend behind the [`RefcountStore`]
+//! trait.
 //!
-//! Refcounts are mutated in-memory by [`incr`](RefcountStore::incr) /
-//! [`decr`](RefcountStore::decr) and flushed to disk by
-//! [`persist`](RefcountStore::persist). This mirrors the write-barrier
-//! semantics required by VAL-CAS-016 (kill-before-fsync may lose increments
-//! but never produces phantom counts).
+//! Refcounts are mutated in-memory by [`RefcountStore::incr`] /
+//! [`RefcountStore::decr`] and flushed to disk by
+//! [`RefcountStore::persist`]. This mirrors the write-barrier semantics
+//! required by VAL-CAS-016 (kill-before-fsync may lose increments but never
+//! produces phantom counts).
+//!
+//! WS4 Task 11 benchmarked two backends — JSON sidecar (`cas/refs.json`) and
+//! SQLite (`cas/refs.db`) — and recorded the measured decision in
+//! `docs/baselines/2026-08-04-ws4-refcount-store.md`:
+//!
+//! | Metric (10k-blob fixture) | JSON sidecar | SQLite | Verdict |
+//! |---|---|---|---|
+//! | incr ×10k | 177.3 µs | 176.7 µs | tie |
+//! | decr ×10k | 347.5 µs | 348.3 µs | tie |
+//! | persist (fsync) ×10k | 12.1 ms | 28.6 ms | JSON 2.36× faster |
+//! | reopen ×10k | 3.17 ms | 2.88 ms | SQLite 10% faster |
+//! | resident-memory delta | 2,664 KiB | 4,140 KiB | JSON 36% lower |
+//! | on-disk footprint | 730 KB | 1,581 KB | JSON 2.2× smaller |
+//! | crash-recovery (persist → reopen exact; no-persist → no phantom) | PASS | PASS | tie |
+//!
+//! **DECISION: JSON sidecar is the winner and the default.** It matches SQLite
+//! on in-memory incr/decr throughput, dominates the durable-write path
+//! (`persist` is the hot path — it is the write barrier for every lease
+//! acquire/release and every GC sweep), uses ~36% less resident memory, and
+//! writes ~2.2× less data to disk. SQLite's only edge is a ~10% faster cold
+//! reopen, which happens once per process start. The SQLite implementation
+//! was deleted after the decision; this module carries only the winner behind
+//! the trait.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -15,21 +39,63 @@ use super::blob::{fsync_file, hash_to_hex, hex_to_hash};
 
 /// JSON sidecar filename written into the CAS root.
 pub const REFS_SIDECAR: &str = "refs.json";
+/// On-disk auxiliary files the CAS blob-count / stored-hash walkers skip.
+pub const REFS_AUX_FILES: &[&str] = &[REFS_SIDECAR];
+
+/// Interchangeable refcount persistence backend.
+pub trait RefcountStore: Send {
+    /// Open (or create) a backend rooted at `cas_root`.
+    fn open(cas_root: &Path) -> Result<Self>
+    where
+        Self: Sized;
+
+    /// Increment the refcount for `hash` and return the new value.
+    fn incr(&mut self, hash: &[u8; 32]) -> u64;
+
+    /// Decrement the refcount for `hash` and return the new value, or
+    /// [`CasError::RefcountUnderflow`] if the count is already zero.
+    fn decr(&mut self, hash: &[u8; 32]) -> Result<u64>;
+
+    /// Current refcount for `hash` (0 if absent).
+    fn refcount(&self, hash: &[u8; 32]) -> u64;
+
+    /// Returns `true` if `hash` is tracked by this store with any refcount.
+    fn contains(&self, hash: &[u8; 32]) -> bool;
+
+    /// Remove the refcount entry for `hash` (used after GC deletes the blob).
+    fn remove(&mut self, hash: &[u8; 32]);
+
+    /// All `(hash, refcount)` pairs currently tracked.
+    fn iter(&self) -> Vec<([u8; 32], u64)>;
+
+    /// Hashes whose refcount is exactly zero.
+    fn zero_refcount_hashes(&self) -> Vec<[u8; 32]>;
+
+    /// The set of all hashes tracked by this store.
+    fn tracked_hashes(&self) -> HashSet<[u8; 32]>;
+
+    /// Durably flush the current refcounts to disk (write barrier).
+    fn persist(&self) -> Result<()>;
+}
 
 /// Refcount storage backed by an in-memory map and a JSON sidecar.
-pub struct RefcountStore {
+///
+/// Winner of the WS4 Task 11 sidecar-vs-SQLite decision; see module docs.
+pub struct JsonSidecarStore {
     counts: HashMap<[u8; 32], u64>,
     sidecar_path: PathBuf,
 }
 
-impl RefcountStore {
+impl RefcountStore for JsonSidecarStore {
     /// Open (or create) the sidecar at `<cas_root>/refs.json`.
     ///
-    /// If the file does not exist yet the store starts empty.
-    pub fn open(cas_root: &Path) -> std::io::Result<Self> {
+    /// If the file does not exist yet the store starts empty. A corrupt file
+    /// is treated as empty (start fresh), matching the crash-tolerant
+    /// VAL-CAS-016 semantics.
+    fn open(cas_root: &Path) -> Result<Self> {
         let sidecar_path = cas_root.join(REFS_SIDECAR);
         let counts = if sidecar_path.exists() {
-            let data = fs::read(&sidecar_path)?;
+            let data = fs::read(&sidecar_path).map_err(CasError::Io)?;
             // Map hex-string → count, tolerant of corruption.
             let map: HashMap<String, u64> = serde_json::from_slice(&data).unwrap_or_default();
             map.into_iter()
@@ -38,22 +104,19 @@ impl RefcountStore {
         } else {
             HashMap::new()
         };
-        Ok(RefcountStore {
+        Ok(JsonSidecarStore {
             counts,
             sidecar_path,
         })
     }
 
-    /// Increment the refcount for `hash` and return the new value.
-    pub fn incr(&mut self, hash: &[u8; 32]) -> u64 {
+    fn incr(&mut self, hash: &[u8; 32]) -> u64 {
         let entry = self.counts.entry(*hash).or_insert(0);
         *entry += 1;
         *entry
     }
 
-    /// Decrement the refcount for `hash` and return the new value, or
-    /// [`CasError::RefcountUnderflow`] if the count is already zero.
-    pub fn decr(&mut self, hash: &[u8; 32]) -> Result<u64> {
+    fn decr(&mut self, hash: &[u8; 32]) -> Result<u64> {
         let entry = self.counts.entry(*hash).or_insert(0);
         if *entry == 0 {
             return Err(CasError::RefcountUnderflow);
@@ -62,28 +125,23 @@ impl RefcountStore {
         Ok(*entry)
     }
 
-    /// Current refcount for `hash` (0 if absent).
-    pub fn refcount(&self, hash: &[u8; 32]) -> u64 {
+    fn refcount(&self, hash: &[u8; 32]) -> u64 {
         self.counts.get(hash).copied().unwrap_or(0)
     }
 
-    /// Returns `true` if `hash` is tracked by this store with any refcount.
-    pub fn contains(&self, hash: &[u8; 32]) -> bool {
+    fn contains(&self, hash: &[u8; 32]) -> bool {
         self.counts.contains_key(hash)
     }
 
-    /// Remove the refcount entry for `hash` (used after GC deletes the blob).
-    pub fn remove(&mut self, hash: &[u8; 32]) {
+    fn remove(&mut self, hash: &[u8; 32]) {
         self.counts.remove(hash);
     }
 
-    /// Iterate over all `(hash, refcount)` pairs.
-    pub fn iter(&self) -> impl Iterator<Item = (&[u8; 32], u64)> {
-        self.counts.iter().map(|(k, v)| (k, *v))
+    fn iter(&self) -> Vec<([u8; 32], u64)> {
+        self.counts.iter().map(|(k, v)| (*k, *v)).collect()
     }
 
-    /// Hashes whose refcount is exactly zero.
-    pub fn zero_refcount_hashes(&self) -> Vec<[u8; 32]> {
+    fn zero_refcount_hashes(&self) -> Vec<[u8; 32]> {
         self.counts
             .iter()
             .filter(|(_, v)| **v == 0)
@@ -91,35 +149,36 @@ impl RefcountStore {
             .collect()
     }
 
-    /// Return the set of all hashes tracked by this store.
-    pub fn tracked_hashes(&self) -> HashSet<[u8; 32]> {
+    fn tracked_hashes(&self) -> HashSet<[u8; 32]> {
         self.counts.keys().copied().collect()
     }
 
     /// Persist the current refcounts to disk atomically.
     ///
     /// Writes `<sidecar>.tmp`, fsyncs, then renames to `<sidecar>`.
-    pub fn persist(&self) -> std::io::Result<()> {
+    fn persist(&self) -> Result<()> {
         // Serialize hex → count directly to avoid any lifetime pitfalls.
         let owned: HashMap<String, u64> = self
             .counts
             .iter()
             .map(|(k, v)| (hash_to_hex(k), *v))
             .collect();
-        let data = serde_json::to_vec_pretty(&owned)?;
+        let data = serde_json::to_vec_pretty(&owned).map_err(CasError::Serde)?;
 
         if let Some(parent) = self.sidecar_path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(CasError::Io)?;
         }
         let tmp_path = self.sidecar_path.with_extension("json.tmp");
         {
-            let file = fs::File::create(&tmp_path)?;
+            let file = fs::File::create(&tmp_path).map_err(CasError::Io)?;
             let mut writer = std::io::BufWriter::new(file);
-            writer.write_all(&data)?;
-            writer.flush()?;
-            fsync_file(writer.get_ref())?;
+            writer
+                .write_all(&data)
+                .and_then(|_| writer.flush())
+                .map_err(CasError::Io)?;
+            fsync_file(writer.get_ref()).map_err(CasError::Io)?;
         }
-        fs::rename(&tmp_path, &self.sidecar_path)?;
+        fs::rename(&tmp_path, &self.sidecar_path).map_err(CasError::Io)?;
 
         // Best-effort dir fsync.
         if let Some(parent) = self.sidecar_path.parent() {

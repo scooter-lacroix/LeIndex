@@ -26,7 +26,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use blob::{encode_blob, extract_payload, fsync_file, hash_to_hex, validate_blob};
-use refs::{RefcountStore, Result};
+use refs::{JsonSidecarStore, RefcountStore, Result};
 
 pub use blob::BadBlob;
 pub use refs::{CasError, RetentionReport};
@@ -37,18 +37,20 @@ const STAGING_DIR: &str = ".staging";
 /// Content-addressed blob store with refcount and garbage collection.
 pub struct CasStore {
     root: PathBuf,
-    refs: RefcountStore,
+    refs: Box<dyn RefcountStore>,
 }
 
 impl CasStore {
     /// Open (or initialise) a CAS at `root`.
     ///
-    /// Creates the root, staging, and prefix directories on demand.
+    /// Creates the root, staging, and prefix directories on demand. Refcount
+    /// persistence uses the JSON sidecar winner of the WS4 Task 11 decision
+    /// (see `src/storage/cas/refs.rs`).
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         fs::create_dir_all(root.join(STAGING_DIR))?;
-        let refs = RefcountStore::open(&root)?;
+        let refs = Box::new(JsonSidecarStore::open(&root)?);
         Ok(CasStore { root, refs })
     }
 
@@ -156,15 +158,15 @@ impl CasStore {
         Ok(())
     }
 
-    /// Count the number of stored blobs (excluding `.staging/` and `refs.json`).
+    /// Count the number of stored blobs (excluding `.staging/` and aux files).
     pub fn blob_count(&self) -> Result<usize> {
         let mut count = 0;
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            // Skip the staging dir and sidecar files.
-            if name == STAGING_DIR || name == refs::REFS_SIDECAR {
+            // Skip the staging dir and refcount aux files.
+            if name == STAGING_DIR || refs::REFS_AUX_FILES.contains(&name.as_ref()) {
                 continue;
             }
             if entry.file_type()?.is_dir() {
@@ -179,7 +181,7 @@ impl CasStore {
             // Also count top-level files whose names look like blob hashes
             // (legacy / flat layout tolerance).
             if entry.file_type()?.is_file()
-                && name != refs::REFS_SIDECAR
+                && !refs::REFS_AUX_FILES.contains(&name.as_ref())
                 && !name.ends_with(".tmp")
                 && name.len() == 64
             {
@@ -276,7 +278,7 @@ impl CasStore {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name == STAGING_DIR || name == refs::REFS_SIDECAR {
+            if name == STAGING_DIR || refs::REFS_AUX_FILES.contains(&name.as_ref()) {
                 continue;
             }
             if entry.file_type()?.is_dir() {

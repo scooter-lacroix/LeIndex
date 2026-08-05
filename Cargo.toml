@@ -438,6 +438,12 @@ path = "benches/neural_dot.rs"
 harness = false
 required-features = ["full"]
 
+[[bench]]
+name = "refcount_store"
+path = "benches/refcount_store.rs"
+harness = false
+required-features = ["full"]
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
