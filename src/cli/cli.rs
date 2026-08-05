@@ -248,6 +248,21 @@ pub enum Commands {
         stale_daemons: bool,
     },
 
+    /// Report generation-store retention state (WS4 Task 9)
+    ///
+    /// Prints the read-only retention report for the project's generation
+    /// store: generation count, CAS bytes, job bytes, dedup ratio, and GC
+    /// candidates. Nothing is deleted. Use `--project` (or run inside the
+    /// project directory) to select the project.
+    #[command(visible_alias = "leindex_retention")]
+    Retention {
+        /// Print the retention report (generation count, CAS bytes, job
+        /// bytes, dedup ratio, GC candidates). This is the only implemented
+        /// mode; the command never deletes data.
+        #[arg(long = "report")]
+        report: bool,
+    },
+
     /// Configure neural search: install ORT, set up models, and write config
     ///
     /// Run `leindex setup` for an interactive wizard, or use flags for
@@ -430,6 +445,7 @@ impl Cli {
                 dry_run,
                 stale_daemons,
             } => cmd_cleanup_impl(max_age_days, dry_run, stale_daemons).await,
+            Commands::Retention { report } => cmd_retention_impl(report, global_project).await,
             Commands::Setup {
                 neural,
                 no_neural,
@@ -1517,6 +1533,27 @@ async fn cmd_cleanup_impl(
     Ok(())
 }
 
+/// `leindex retention` command implementation (WS4 Task 9).
+///
+/// Only the read-only `--report` mode is wired: it prints the generation
+/// store's retention report (generation count, CAS bytes, job bytes, dedup
+/// ratio, GC candidates) without modifying anything. The report logic lives
+/// in [`crate::cli::cleanup::retention_report_cli`].
+async fn cmd_retention_impl(report: bool, project: Option<PathBuf>) -> AnyhowResult<()> {
+    if !report {
+        println!(
+            "LeIndex Retention\n\n\
+             Use `leindex retention --report` to print the generation-store\n\
+             retention report (generation count, CAS bytes, job bytes, dedup\n\
+             ratio, GC candidates). The command is read-only."
+        );
+        return Ok(());
+    }
+    let report = crate::cli::cleanup::retention_report_cli(project.as_deref())?;
+    println!("{}", report);
+    Ok(())
+}
+
 /// Dry-run GC: scan and report without removing anything.
 fn run_gc_dry_run(max_age: std::time::Duration) -> crate::cli::cleanup::GcReport {
     use crate::cli::cleanup::artifact_scan_roots;
@@ -1810,6 +1847,29 @@ mod tests {
     fn test_memory_report_flag_absent_by_default() {
         let cli = Cli::try_parse_from(["leindex", "index", "/tmp/project"]).unwrap();
         assert!(cli.memory_report.is_none());
+    }
+
+    #[test]
+    fn test_retention_command_parsing() {
+        // WS4 Task 9: `leindex retention --report` is registered.
+        let cli = Cli::try_parse_from(["leindex", "retention", "--report"]).unwrap();
+        match cli.command {
+            Some(Commands::Retention { report }) => {
+                assert!(report, "--report must be parsed");
+            }
+            _ => panic!("Expected Retention command"),
+        }
+    }
+
+    #[test]
+    fn test_retention_command_without_report_flag() {
+        let cli = Cli::try_parse_from(["leindex", "retention"]).unwrap();
+        match cli.command {
+            Some(Commands::Retention { report }) => {
+                assert!(!report, "report flag defaults to false");
+            }
+            _ => panic!("Expected Retention command"),
+        }
     }
 
     #[test]

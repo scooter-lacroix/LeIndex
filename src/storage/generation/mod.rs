@@ -14,6 +14,7 @@ pub mod db_layer;
 pub mod lease;
 pub mod manifest;
 pub mod reader;
+pub mod retention;
 pub mod writer;
 
 pub use lease::{
@@ -27,6 +28,10 @@ pub use manifest::{
 pub use reader::{
     NeuralDtype, NeuralReader, PdgEdge, PdgNode, PdgReader, ReaderError, SymbolEntry, SymbolReader,
     TfidfEntry, TfidfReader, VectorView,
+};
+pub use retention::{
+    DEFAULT_JOB_BYTES_MAX, DEFAULT_MAX_GENERATIONS, GenerationRetentionReport, RetentionConfig,
+    RetentionError, retain_after_publish, retention_report,
 };
 pub use writer::{GenerationWriter, WriterError};
 

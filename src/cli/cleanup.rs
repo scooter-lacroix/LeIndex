@@ -701,6 +701,48 @@ pub fn best_effort_cleanup(path: &Path) {
     }
 }
 
+/// Produce a read-only retention report for a project's generation store.
+///
+/// This is the backing implementation for `leindex retention --report`
+/// (WS4 Task 9). It resolves the project's storage root (`.leindex/`, or the
+/// `LEINDEX_HOME`/XDG/tmp fallbacks via [`resolve_existing_storage_path`]),
+/// opens the CAS store, and scans `generations/` and `jobs/` to report the
+/// generation count, CAS bytes, job bytes, dedup ratio, and GC candidates.
+///
+/// The report is purely observational: no generations, blobs, or jobs are
+/// modified. A project that has not been indexed yet (no storage root, or no
+/// CAS store) yields an all-zero report rather than an error.
+pub fn retention_report_cli(
+    project: Option<&Path>,
+) -> anyhow::Result<crate::storage::generation::GenerationRetentionReport> {
+    use crate::storage::cas::CasStore;
+    use crate::storage::generation::GENERATIONS_DIR;
+    use crate::storage::generation::retention::retention_report;
+
+    let project_path = project
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
+    let canonical = project_path
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("failed to canonicalize project path: {e}"))?;
+
+    let storage_root = crate::cli::leindex::resolve_existing_storage_path(&canonical)
+        .unwrap_or_else(|| canonical.join(".leindex"));
+
+    let cas_dir = storage_root.join("cas");
+    if !storage_root.exists() || !cas_dir.exists() {
+        // Nothing has been written for this project yet.
+        return Ok(crate::storage::generation::GenerationRetentionReport::default());
+    }
+
+    let cas = CasStore::open(&cas_dir)
+        .map_err(|e| anyhow::anyhow!("failed to open CAS store at {}: {e}", cas_dir.display()))?;
+    let gens_dir = storage_root.join(GENERATIONS_DIR);
+    let jobs_dir = storage_root.join("jobs");
+    retention_report(&cas, &gens_dir, &jobs_dir)
+        .map_err(|e| anyhow::anyhow!("retention report failed: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
