@@ -1,0 +1,408 @@
+{
+  "fixture": "/mnt/WD-SSD/code_index_update/LeIndexer-release-1.8.4",
+  "phases": [
+    {
+      "phase": "idle_warm",
+      "rss_min_kib": 6416,
+      "rss_max_kib": 6416,
+      "rss_p95_kib": 6416,
+      "mapped_file_kib": 6036,
+      "anon_kib": 380,
+      "sample_count": 10,
+      "duration_ms": 3153,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 6416,
+      "gpu_vram_mib": 2977,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "index",
+      "rss_min_kib": 600,
+      "rss_max_kib": 402172,
+      "rss_p95_kib": 384272,
+      "mapped_file_kib": 13136,
+      "anon_kib": 389036,
+      "sample_count": 97,
+      "duration_ms": 7569,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 402172,
+      "gpu_vram_mib": 3000,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "idle_post",
+      "rss_min_kib": 6428,
+      "rss_max_kib": 6428,
+      "rss_p95_kib": 6428,
+      "mapped_file_kib": 6036,
+      "anon_kib": 392,
+      "sample_count": 10,
+      "duration_ms": 3153,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 6428,
+      "gpu_vram_mib": 2985,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "query",
+      "rss_min_kib": 24,
+      "rss_max_kib": 374232,
+      "rss_p95_kib": 341704,
+      "mapped_file_kib": 40872,
+      "anon_kib": 333360,
+      "sample_count": 24,
+      "duration_ms": 1895,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 374232,
+      "gpu_vram_mib": 2918,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "reindex",
+      "rss_min_kib": 96,
+      "rss_max_kib": 439532,
+      "rss_p95_kib": 420644,
+      "mapped_file_kib": 45528,
+      "anon_kib": 394004,
+      "sample_count": 75,
+      "duration_ms": 6003,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 439532,
+      "gpu_vram_mib": 2909,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "idle_final",
+      "rss_min_kib": 6524,
+      "rss_max_kib": 6524,
+      "rss_p95_kib": 6524,
+      "mapped_file_kib": 6148,
+      "anon_kib": 376,
+      "sample_count": 10,
+      "duration_ms": 3158,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 6524,
+      "gpu_vram_mib": 2909,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "embed_idle",
+      "rss_min_kib": 6488,
+      "rss_max_kib": 6488,
+      "rss_p95_kib": 6488,
+      "mapped_file_kib": 6096,
+      "anon_kib": 392,
+      "sample_count": 10,
+      "duration_ms": 3126,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 6488,
+      "gpu_vram_mib": 2909,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "embed_active",
+      "rss_min_kib": 6736,
+      "rss_max_kib": 374788,
+      "rss_p95_kib": 374788,
+      "mapped_file_kib": 41204,
+      "anon_kib": 333588,
+      "sample_count": 16,
+      "duration_ms": 5146,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 374788,
+      "gpu_vram_mib": 2909,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "embed_teardown",
+      "rss_min_kib": 6556,
+      "rss_max_kib": 6556,
+      "rss_p95_kib": 6556,
+      "mapped_file_kib": 6168,
+      "anon_kib": 388,
+      "sample_count": 10,
+      "duration_ms": 3187,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 6556,
+      "gpu_vram_mib": 2909,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "mcp_idle_proliferation",
+      "rss_min_kib": 19396,
+      "rss_max_kib": 19396,
+      "rss_p95_kib": 19396,
+      "mapped_file_kib": 18244,
+      "anon_kib": 1152,
+      "sample_count": 10,
+      "duration_ms": 4342,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 19396,
+      "gpu_vram_mib": null,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "worker_ort_threads",
+      "rss_min_kib": 6804,
+      "rss_max_kib": 374724,
+      "rss_p95_kib": 374724,
+      "mapped_file_kib": 41208,
+      "anon_kib": 333516,
+      "sample_count": 13,
+      "duration_ms": 4179,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 374724,
+      "gpu_vram_mib": 2909,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "stale_artifacts",
+      "rss_min_kib": 488,
+      "rss_max_kib": 488,
+      "rss_p95_kib": 488,
+      "mapped_file_kib": 660,
+      "anon_kib": 32,
+      "sample_count": 1,
+      "duration_ms": 77,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 488,
+      "gpu_vram_mib": 2909,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "contention_3c_2p",
+      "rss_min_kib": 19732,
+      "rss_max_kib": 20132,
+      "rss_p95_kib": 20132,
+      "mapped_file_kib": 18984,
+      "anon_kib": 1148,
+      "sample_count": 10,
+      "duration_ms": 4355,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 20132,
+      "gpu_vram_mib": null,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "incremental_noop",
+      "rss_min_kib": 216,
+      "rss_max_kib": 394084,
+      "rss_p95_kib": 384300,
+      "mapped_file_kib": 41756,
+      "anon_kib": 352328,
+      "sample_count": 45,
+      "duration_ms": 3416,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 394084,
+      "gpu_vram_mib": 2978,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "incremental_one_file",
+      "rss_min_kib": 240,
+      "rss_max_kib": 397108,
+      "rss_p95_kib": 387224,
+      "mapped_file_kib": 42388,
+      "anon_kib": 354720,
+      "sample_count": 45,
+      "duration_ms": 3446,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 397108,
+      "gpu_vram_mib": 2962,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "incremental_burst",
+      "rss_min_kib": 396,
+      "rss_max_kib": 398388,
+      "rss_p95_kib": 388444,
+      "mapped_file_kib": 43180,
+      "anon_kib": 355208,
+      "sample_count": 47,
+      "duration_ms": 3607,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 398388,
+      "gpu_vram_mib": 2962,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "incremental_delete",
+      "rss_min_kib": 376,
+      "rss_max_kib": 394344,
+      "rss_p95_kib": 384172,
+      "mapped_file_kib": 41536,
+      "anon_kib": 352808,
+      "sample_count": 47,
+      "duration_ms": 3559,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 394344,
+      "gpu_vram_mib": 2981,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "query_suite_cold",
+      "rss_min_kib": 604,
+      "rss_max_kib": 267568,
+      "rss_p95_kib": 267568,
+      "mapped_file_kib": 42984,
+      "anon_kib": 224584,
+      "sample_count": 9,
+      "duration_ms": 674,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 267568,
+      "gpu_vram_mib": 2966,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "query_suite_warm",
+      "rss_min_kib": 548,
+      "rss_max_kib": 260844,
+      "rss_p95_kib": 260844,
+      "mapped_file_kib": 43040,
+      "anon_kib": 224624,
+      "sample_count": 9,
+      "duration_ms": 673,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 260844,
+      "gpu_vram_mib": 2964,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "full_index_run2",
+      "rss_min_kib": 400,
+      "rss_max_kib": 434368,
+      "rss_p95_kib": 395776,
+      "mapped_file_kib": 47228,
+      "anon_kib": 387140,
+      "sample_count": 100,
+      "duration_ms": 7451,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 434368,
+      "gpu_vram_mib": 2964,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    },
+    {
+      "phase": "full_index_run3",
+      "rss_min_kib": 596,
+      "rss_max_kib": 437636,
+      "rss_p95_kib": 418688,
+      "mapped_file_kib": 46000,
+      "anon_kib": 419728,
+      "sample_count": 103,
+      "duration_ms": 7749,
+      "worker_rss_max_kib": 0,
+      "combined_rss_max_kib": 437636,
+      "gpu_vram_mib": 2964,
+      "descendants": {
+        "total": 0,
+        "by_name": {},
+        "combined_rss_kib": 0
+      }
+    }
+  ],
+  "timestamp": "2026-08-05T00:29:11Z",
+  "environment": {
+    "kernel": "7.1.5-1-cachyos",
+    "hardware": {
+      "cpu_model": "AMD Ryzen 7 7800X3D 8-Core Processor",
+      "cpu_count": 16,
+      "mem_total_kib": 65424824,
+      "arch": "x86_64"
+    },
+    "allocator_env": {
+      "LD_LIBRARY_PATH": "/home/scooter/.mlstack/libmpi-compat:/home/scooter/.mlstack/libmpi-compat-user-1000:/opt/rocm/lib:/opt/rocm/hip/lib:/opt/rocm/opencl/lib:",
+      "MALLOC_ARENA_MAX": "2"
+    },
+    "git_revision": "b6c5e05316ffd80c9e5c7c67483a1d469ea34a66",
+    "corpus_tree_oid": "f5af3ee33322f57821a42574af9d615eafce56d9",
+    "provider_config": {
+      "LEINDEX_WORKER_EXECUTION_PROVIDER": "cpu",
+      "LEINDEX_TOKIO_WORKERS": "2"
+    },
+    "model_digests": {
+      "embed_model": "",
+      "embed_onnx_sha256": null,
+      "reranker_model": null
+    }
+  }
+}
