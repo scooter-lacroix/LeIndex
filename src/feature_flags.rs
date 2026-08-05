@@ -36,6 +36,14 @@ pub enum FeatureFlag {
     StreamingMcp,
     /// Enable global index auto-sync.
     GlobalAutoSync,
+    /// Enable the one-time legacy→CAS store migration sweep (WS4 Task 10).
+    ///
+    /// When enabled, `LeIndex::new` converts a legacy full-copy `.leindex/`
+    /// store to the content-addressed generation layout on first run. The
+    /// sweep is destructive (stale generations, completed jobs, and redundant
+    /// full-copy artifacts are removed), so it ships behind this flag and a
+    /// backup warning rather than running unconditionally.
+    GenerationMigration,
 }
 
 impl FeatureFlag {
@@ -48,6 +56,7 @@ impl FeatureFlag {
             Self::ExperimentalHnsw => "LEINDEX_FEATURE_EXPERIMENTAL_HNSW",
             Self::StreamingMcp => "LEINDEX_FEATURE_STREAMING_MCP",
             Self::GlobalAutoSync => "LEINDEX_FEATURE_GLOBAL_AUTO_SYNC",
+            Self::GenerationMigration => "LEINDEX_FEATURE_GENERATION_MIGRATION",
         }
     }
 
@@ -81,6 +90,7 @@ impl FeatureFlag {
             Self::ExperimentalHnsw => "Enable experimental HNSW algorithm parameters",
             Self::StreamingMcp => "Enable streaming MCP notifications",
             Self::GlobalAutoSync => "Enable global index auto-sync",
+            Self::GenerationMigration => "Enable the one-time legacy→CAS store migration sweep",
         }
     }
 }
@@ -109,6 +119,7 @@ impl FlagStore {
             FeatureFlag::ExperimentalHnsw,
             FeatureFlag::StreamingMcp,
             FeatureFlag::GlobalAutoSync,
+            FeatureFlag::GenerationMigration,
         ] {
             let enabled = match env::var(flag.env_var()) {
                 Ok(v) => matches!(
@@ -145,6 +156,7 @@ pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
         FeatureFlag::ExperimentalHnsw,
         FeatureFlag::StreamingMcp,
         FeatureFlag::GlobalAutoSync,
+        FeatureFlag::GenerationMigration,
     ]
     .into_iter()
     .map(|f| (f, store.get(&f)))

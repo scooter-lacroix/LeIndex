@@ -263,6 +263,34 @@ pub enum Commands {
         report: bool,
     },
 
+    /// One-time legacy → CAS generation-store migration (WS4 Task 10)
+    ///
+    /// Converts a legacy full-copy `.leindex/` store to the content-addressed
+    /// generation layout: the current + previous generations become manifests
+    /// referencing deduplicated CAS blobs, `CURRENT` is swapped atomically
+    /// last, stale generations and completed jobs are removed, and the jobs
+    /// directory is byte-bounded. Idempotent and crash-safe; a second run is a
+    /// no-op. This is a destructive sweep — back up `.leindex/` first.
+    #[command(visible_alias = "leindex_storage_migrate")]
+    Storage {
+        /// Run the migration now.
+        #[arg(long = "migrate")]
+        migrate: bool,
+
+        /// Print the migration state (legacy layout detected? already
+        /// migrated?) without changing anything.
+        #[arg(long = "status")]
+        status: bool,
+
+        /// Job-byte cap for the sweep (default: 128 MiB).
+        #[arg(long = "job-bytes-max", value_name = "BYTES")]
+        job_bytes_max: Option<u64>,
+
+        /// Total `.leindex/` footprint goal in MiB (default: 200).
+        #[arg(long = "footprint-mib", value_name = "MIB")]
+        footprint_mib: Option<u64>,
+    },
+
     /// Configure neural search: install ORT, set up models, and write config
     ///
     /// Run `leindex setup` for an interactive wizard, or use flags for
@@ -446,6 +474,27 @@ impl Cli {
                 stale_daemons,
             } => cmd_cleanup_impl(max_age_days, dry_run, stale_daemons).await,
             Commands::Retention { report } => cmd_retention_impl(report, global_project).await,
+            Commands::Storage {
+                migrate,
+                status,
+                job_bytes_max,
+                footprint_mib,
+            } => {
+                if status {
+                    cmd_storage_status_impl(global_project).await?;
+                } else if migrate {
+                    cmd_storage_migrate_impl(global_project, job_bytes_max, footprint_mib).await?;
+                } else {
+                    println!(
+                        "LeIndex Storage\n\n\
+                         Use `leindex storage --status` to inspect the generation-store\n\
+                         layout (legacy vs. migrated) and `leindex storage --migrate` to\n\
+                         run the one-time legacy→CAS migration sweep. The sweep is\n\
+                         destructive: back up `.leindex/` first."
+                    );
+                }
+                Ok(())
+            }
             Commands::Setup {
                 neural,
                 no_neural,
@@ -1551,6 +1600,101 @@ async fn cmd_retention_impl(report: bool, project: Option<PathBuf>) -> AnyhowRes
     }
     let report = crate::cli::cleanup::retention_report_cli(project.as_deref())?;
     println!("{}", report);
+    Ok(())
+}
+
+/// Resolve the `.leindex/` storage directory for `storage` subcommands without
+/// creating anything.
+fn storage_dir_for(project: Option<PathBuf>) -> AnyhowResult<PathBuf> {
+    let project_path = get_project_path(project);
+    let canonical_path = project_path
+        .canonicalize()
+        .context("Failed to canonicalize project path")?;
+    crate::cli::leindex::LeIndex::resolve_existing_storage_path(&canonical_path)
+        .context("No existing LeIndex storage directory found for this project")
+}
+
+/// `leindex storage --status`: print the generation-store layout state.
+async fn cmd_storage_status_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
+    use crate::storage::generation::migrate::{is_legacy_full_copy_layout, is_migrated_store};
+
+    let storage_dir = storage_dir_for(project)?;
+    let legacy = is_legacy_full_copy_layout(&storage_dir);
+    let migrated = is_migrated_store(&storage_dir);
+    let cas_blobs = crate::storage::cas::CasStore::open(storage_dir.join("cas"))
+        .map_err(|e| anyhow::anyhow!("failed to open CAS for status: {e}"))?
+        .stored_hashes()
+        .map(|h| h.len())
+        .unwrap_or(0);
+    println!(
+        "LeIndex Storage\n\n\
+         Path:   {}\n\
+         Legacy full-copy layout: {}\n\
+         CAS generation store:    {}\n\
+         CAS blobs:               {}\n\
+         CURRENT manifest:        {}\n\n\
+         Use `leindex storage --migrate` to run the one-time migration sweep\n\
+         (destructive — back up `.leindex/` first). A no-op run is safe.",
+        storage_dir.display(),
+        if legacy { "yes" } else { "no" },
+        if migrated { "yes" } else { "no" },
+        cas_blobs,
+        match crate::storage::generation::lease::read_current_generation(&storage_dir) {
+            Some(g) => format!("generation {g}"),
+            None => "none".to_string(),
+        }
+    );
+    Ok(())
+}
+
+/// `leindex storage --migrate`: run the one-time legacy → CAS migration sweep.
+async fn cmd_storage_migrate_impl(
+    project: Option<PathBuf>,
+    job_bytes_max: Option<u64>,
+    footprint_mib: Option<u64>,
+) -> AnyhowResult<()> {
+    use crate::storage::generation::migrate::{MigrationConfig, migrate_legacy_store};
+
+    let storage_dir = storage_dir_for(project)?;
+    let cfg = MigrationConfig {
+        job_bytes_max: job_bytes_max
+            .unwrap_or(crate::storage::generation::retention::DEFAULT_JOB_BYTES_MAX),
+        total_footprint_goal_bytes: footprint_mib.map(|mib| mib.saturating_mul(1024 * 1024)).or(
+            Some(crate::storage::generation::migrate::DEFAULT_FOOTPRINT_GOAL_BYTES),
+        ),
+        emit_backup_warning: true,
+        stop_after_publish: false,
+    };
+    let report =
+        migrate_legacy_store(&storage_dir, &cfg).context("legacy store migration failed")?;
+    println!(
+        "Migration sweep complete\n\n\
+         Layout migrated:      {}\n\
+         Generations converted: {}\n\
+         Generations deleted:   {}\n\
+         Jobs completed deleted: {}\n\
+         Jobs byte-capped:     {}\n\
+         CAS blobs:            {}\n\
+         Bytes before:         {} ({:.2} MiB)\n\
+         Bytes after:          {} ({:.2} MiB)\n\
+         Footprint goal:       {} MiB",
+        report.migrated,
+        report.generations_converted,
+        report.generations_deleted,
+        report.jobs_completed_deleted,
+        report.jobs_byte_capped,
+        report.cas_blob_count,
+        report.total_bytes_before,
+        report.total_bytes_before as f64 / (1024.0 * 1024.0),
+        report.total_bytes_after,
+        report.total_bytes_after as f64 / (1024.0 * 1024.0),
+        cfg.total_footprint_goal_bytes
+            .unwrap_or(crate::storage::generation::migrate::DEFAULT_FOOTPRINT_GOAL_BYTES)
+            / (1024 * 1024),
+    );
+    if report.was_noop() {
+        println!("\nStore was already migrated; nothing to do.");
+    }
     Ok(())
 }
 

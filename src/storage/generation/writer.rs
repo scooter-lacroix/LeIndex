@@ -163,7 +163,23 @@ impl GenerationWriter {
     ///
     /// Returns `Err` if not all layers are staged.
     pub fn publish(&mut self, generation_number: u64) -> Result<(), WriterError> {
-        self.publish_internal(generation_number, CrashPoint::None)
+        self.publish_internal(generation_number, CrashPoint::None, true)
+    }
+
+    /// Write the manifest for `generation_number` WITHOUT updating `CURRENT`.
+    ///
+    /// This is the "publication without the final pointer swap" used by the
+    /// one-time legacy→CAS migration (WS4 Task 10). It performs every step of
+    /// [`publish`](Self::publish) except the `CURRENT` update: all 5 layers
+    /// must be staged, the manifest is written via `manifest.partial` →
+    /// fsync → rename, and the generation directory is fsynced. `CURRENT` is
+    /// left untouched so the store continues to serve the pre-swap generation
+    /// until the caller performs the final atomic swap.
+    ///
+    /// Returns `Err` if not all layers are staged. Staging state is cleared
+    /// for reuse.
+    pub fn publish_manifest_only(&mut self, generation_number: u64) -> Result<(), WriterError> {
+        self.publish_internal(generation_number, CrashPoint::None, false)
     }
 
     // -----------------------------------------------------------------------
@@ -240,7 +256,7 @@ impl GenerationWriter {
             6 => CrashPoint::AfterCurrentWrite,
             _ => CrashPoint::None,
         };
-        self.publish_internal(generation_number, crash)
+        self.publish_internal(generation_number, crash, true)
     }
 
     /// Sweep leftover `manifest.partial` files from interrupted publishes.
@@ -296,10 +312,15 @@ impl GenerationWriter {
     /// already been completed atomically by [`stage`](Self::stage) before this
     /// method is called, so those crash points stop before any manifest or
     /// CURRENT file is written, leaving the last-good generation intact.
+    ///
+    /// When `update_current` is `false` the `CURRENT` pointer is left
+    /// untouched (used by the legacy migration to prepare previous-generation
+    /// manifests before the final atomic swap via [`publish`](Self::publish)).
     fn publish_internal(
         &mut self,
         generation_number: u64,
         crash: CrashPoint,
+        update_current: bool,
     ) -> Result<(), WriterError> {
         // 1. Validate all layers are staged.
         let missing = ALL_LAYER_KINDS
@@ -363,14 +384,18 @@ impl GenerationWriter {
             return Ok(());
         }
 
-        // Step 7: atomically update CURRENT.
-        self.write_current_atomic(generation_number)?;
-
-        // Record the published manifest.
-        self.last_manifest = Some(manifest);
-
-        // Clear staging for reuse.
-        self.staged.clear();
+        // Step 7: atomically update CURRENT (skipped for manifest-only
+        // publication, e.g. the migration's previous generation).
+        if update_current {
+            self.write_current_atomic(generation_number)?;
+            // Record the published manifest.
+            self.last_manifest = Some(manifest);
+            // Clear staging for reuse.
+            self.staged.clear();
+        } else {
+            // Manifest-only: record the manifest but leave CURRENT untouched.
+            self.last_manifest = Some(manifest);
+        }
 
         Ok(())
     }

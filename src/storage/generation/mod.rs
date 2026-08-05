@@ -13,10 +13,12 @@
 pub mod db_layer;
 pub mod lease;
 pub mod manifest;
+pub mod migrate;
 pub mod reader;
 pub mod retention;
 pub mod writer;
 
+pub use db_layer::{DbToCasError, db_to_cas, db_to_cas_conn};
 pub use lease::{
     CURRENT_FILE, GENERATIONS_DIR, GenerationLease, LeaseError, MANIFEST_FILE,
     read_current_generation, read_generation_manifest,
@@ -24,6 +26,10 @@ pub use lease::{
 pub use manifest::{
     ALL_LAYER_KINDS, LayerKind, MANIFEST_MAGIC, MANIFEST_VERSION, Manifest, ManifestBody,
     ManifestError, ModelIdentity,
+};
+pub use migrate::{
+    DEFAULT_FOOTPRINT_GOAL_BYTES, MigrationConfig, MigrationError, MigrationReport,
+    is_legacy_full_copy_layout, is_migrated_store, migrate_legacy_store,
 };
 pub use reader::{
     NeuralDtype, NeuralReader, PdgEdge, PdgNode, PdgReader, ReaderError, SymbolEntry, SymbolReader,
@@ -34,5 +40,3 @@ pub use retention::{
     RetentionError, retain_after_publish, retention_report,
 };
 pub use writer::{GenerationWriter, WriterError};
-
-pub use db_layer::{DbToCasError, db_to_cas, db_to_cas_conn};

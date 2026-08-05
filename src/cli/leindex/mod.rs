@@ -30,7 +30,7 @@ use crate::storage::{UniqueProjectId, schema::Storage};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Find existing index storage without creating a directory or opening SQLite.
 pub(crate) fn resolve_existing_storage_path(project_path: &Path) -> Option<PathBuf> {
@@ -494,6 +494,46 @@ impl LeIndex {
 
         // Register at-exit cleanup for temp-based storage
         crate::cli::cleanup::register_at_exit_cleanup(storage_path.clone());
+
+        // WS4 Task 10: one-time legacy → CAS generation-store migration on the
+        // first-run path. Flag-gated (destructive sweep; ships behind a backup
+        // warning). Runs before `open_storage_with_retry` so a migrated store
+        // opens a fresh catalog; the search data lives in the CAS generation
+        // store. Idempotent: no-op for stores already migrated; a failed
+        // migration never blocks opening the project (the legacy layout still
+        // serves).
+        if crate::feature_flags::FeatureFlag::GenerationMigration.is_enabled() {
+            let migrate_cfg = crate::storage::generation::migrate::MigrationConfig::default();
+            match crate::storage::generation::migrate::migrate_legacy_store(
+                &storage_path,
+                &migrate_cfg,
+            ) {
+                Ok(report) if report.migrated || !report.was_noop() => {
+                    info!(
+                        storage = %storage_path.display(),
+                        before = report.total_bytes_before,
+                        after = report.total_bytes_after,
+                        generations = report.generations_converted,
+                        jobs_deleted = report.jobs_completed_deleted + report.jobs_byte_capped,
+                        cas_blobs = report.cas_blob_count,
+                        "Legacy store migration complete"
+                    );
+                }
+                Ok(_) => {
+                    debug!(
+                        storage = %storage_path.display(),
+                        "No legacy store migration needed"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        storage = %storage_path.display(),
+                        error = %e,
+                        "Legacy store migration failed; continuing with existing layout"
+                    );
+                }
+            }
+        }
 
         let db_path = storage_path.join("leindex.db");
         let storage = Self::open_storage_with_retry(&db_path, 3)?;
