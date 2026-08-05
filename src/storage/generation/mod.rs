@@ -8,6 +8,9 @@
 //! `docs/superpowers/plans/2026-08-04-ws4-generation-store.md` for the full
 //! design.
 
+/// DB layer normalisation: copy a live SQLite DB into CAS via VACUUM
+/// (WS4 Task 8). See `db_layer` module docs.
+pub mod db_layer;
 pub mod lease;
 pub mod manifest;
 pub mod reader;
@@ -26,3 +29,5 @@ pub use reader::{
     TfidfEntry, TfidfReader, VectorView,
 };
 pub use writer::{GenerationWriter, WriterError};
+
+pub use db_layer::{DbToCasError, db_to_cas, db_to_cas_conn};
