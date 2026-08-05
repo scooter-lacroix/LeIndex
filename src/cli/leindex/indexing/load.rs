@@ -224,7 +224,6 @@ impl LeIndex {
                     &mut self.cache.file_stats_cache,
                     batch_size,
                     Some(tfidf_embedder),
-                    None,
                 )?
             } else {
                 info!("Persisted embedder is stale; rebuilding TF-IDF index");
@@ -233,7 +232,6 @@ impl LeIndex {
                     &mut self.search_engine,
                     &mut self.cache.file_stats_cache,
                     batch_size,
-                    None,
                     None,
                 )?
             }
@@ -244,7 +242,6 @@ impl LeIndex {
                 &mut self.search_engine,
                 &mut self.cache.file_stats_cache,
                 batch_size,
-                None,
                 None,
             )?
         })

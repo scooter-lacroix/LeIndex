@@ -386,6 +386,23 @@ pub(crate) fn hash_file(path: &Path) -> Result<String> {
     Ok(read_file_once(path)?.0)
 }
 
+/// Per-chunk scratch buffer for source bodies.
+///
+/// **WS6-9 Task 8**: This was previously an LRU cache (capacity 100-200) that
+/// retained source file bodies across indexing phases (scan → parse → lexical →
+/// neural). That cross-phase retention is the §6.1 anti-pattern: RSS grew with
+/// corpus size because hundreds of MiB of source bodies persisted on the heap
+/// from scan through neural enrichment.
+///
+/// Now it is reduced to a per-chunk scratch buffer. A new instance is created
+/// at the start of each indexing batch and dropped when the batch completes.
+/// Within a batch, multiple PDG nodes from the same file share one read (the
+/// file body is read once and reused for sibling nodes in the same batch).
+/// Across batches, the scratch is dropped, so RSS stays bounded by chunk size,
+/// not corpus size (spec §6.1, VAL-STREAM-012).
+///
+/// Callers MUST NOT store a `FileReadCache` in pipeline state or share one
+/// across phases. Use `per_chunk_scratch()` to create a fresh scratch per batch.
 #[derive(Debug)]
 pub(crate) struct FileReadCache {
     capacity: usize,
@@ -394,6 +411,16 @@ pub(crate) struct FileReadCache {
 }
 
 impl FileReadCache {
+    /// Create a per-chunk scratch buffer with capacity 1.
+    ///
+    /// One slot is sufficient because PDG nodes from the same file are typically
+    /// contiguous within a batch. The slot avoids re-reading the same file for
+    /// adjacent sibling nodes while ensuring RSS is bounded by one file body,
+    /// not the entire corpus.
+    pub(crate) fn per_chunk_scratch() -> Self {
+        Self::new(1)
+    }
+
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
@@ -748,9 +775,12 @@ fn finalize_project_scan(
 
 /// Collect source files with their content hashes.
 ///
-/// If a `FileReadCache` is provided, it will be populated with file contents
-/// so that subsequent calls to `index_nodes` can reuse the same cache and
-/// avoid reading files twice.
+/// Each file is hashed via streaming I/O (`read_file_once`) and its source
+/// body is immediately dropped. No `FileReadCache` is populated — source
+/// bodies MUST NOT be retained across indexing phases (spec §6.1,
+/// VAL-STREAM-002). Later phases (parse, lexical, neural) re-read files
+/// per chunk via a small scratch buffer rather than relying on a cache
+/// populated during scan.
 ///
 /// # Fail-fast on I/O errors
 ///
@@ -765,21 +795,10 @@ fn finalize_project_scan(
 /// silently producing partial indexes with undetectable gaps.
 pub(crate) fn collect_source_files_with_hashes(
     scan: &ProjectFileScan,
-    mut file_cache: Option<&mut FileReadCache>,
 ) -> Result<Vec<(PathBuf, String)>> {
     scan.source_paths
         .iter()
-        .map(|path| {
-            let hash = if let Some(cache) = file_cache.as_deref_mut() {
-                // get_or_read already logs; extract just the hash
-                let bytes = cache.get_or_read(path)?;
-                // Compute hash from cached bytes (avoiding a second file read)
-                blake3::hash(bytes.as_slice()).to_hex().to_string()
-            } else {
-                read_file_once(path)?.0
-            };
-            Ok((path.clone(), hash))
-        })
+        .map(|path| Ok((path.clone(), read_file_once(path)?.0)))
         .collect()
 }
 
@@ -861,7 +880,7 @@ pub(crate) fn index_nodes(
     file_stats_cache: &mut Option<HashMap<String, FileStats>>,
     batch_size: usize,
 ) -> Result<HybridEmbedder> {
-    index_nodes_with_embedder(pdg, search_engine, file_stats_cache, batch_size, None, None)
+    index_nodes_with_embedder(pdg, search_engine, file_stats_cache, batch_size, None)
 }
 
 pub(crate) fn index_nodes_with_embedder(
@@ -870,7 +889,6 @@ pub(crate) fn index_nodes_with_embedder(
     file_stats_cache: &mut Option<HashMap<String, FileStats>>,
     batch_size: usize,
     embedder: Option<HybridEmbedder>,
-    shared_file_cache: Option<FileReadCache>,
 ) -> Result<HybridEmbedder> {
     index_nodes_with_embedder_inner(
         pdg,
@@ -878,7 +896,6 @@ pub(crate) fn index_nodes_with_embedder(
         file_stats_cache,
         batch_size,
         embedder,
-        shared_file_cache,
         true,
     )
 }
@@ -892,7 +909,6 @@ pub(crate) fn index_nodes_tfidf_only(
     file_stats_cache: &mut Option<HashMap<String, FileStats>>,
     batch_size: usize,
     embedder: Option<HybridEmbedder>,
-    shared_file_cache: Option<FileReadCache>,
 ) -> Result<HybridEmbedder> {
     index_nodes_with_embedder_inner(
         pdg,
@@ -900,7 +916,6 @@ pub(crate) fn index_nodes_tfidf_only(
         file_stats_cache,
         batch_size,
         embedder,
-        shared_file_cache,
         false,
     )
 }
@@ -911,13 +926,15 @@ fn index_nodes_with_embedder_inner(
     file_stats_cache: &mut Option<HashMap<String, FileStats>>,
     batch_size: usize,
     embedder: Option<HybridEmbedder>,
-    shared_file_cache: Option<FileReadCache>,
     _allow_neural: bool,
 ) -> Result<HybridEmbedder> {
     *file_stats_cache = None;
 
     let batch_size = batch_size.max(1);
-    let mut file_cache = shared_file_cache.unwrap_or_else(|| FileReadCache::new(100));
+
+    // Pass 1: document frequencies. A per-chunk scratch buffer is used so
+    // that only one file body is resident at a time. No cross-phase cache.
+    let mut file_cache = FileReadCache::per_chunk_scratch();
     let connectivity_config = crate::graph::pdg::TraversalConfig {
         max_depth: Some(1),
         max_nodes: Some(1000),
@@ -957,6 +974,10 @@ fn index_nodes_with_embedder_inner(
     for batch in node_indices.chunks(batch_size) {
         nodes.clear();
         admission_gate.reset();
+        // Reset the per-chunk scratch so no file body from a prior batch
+        // persists. RSS stays bounded by one file body, not corpus size
+        // (VAL-STREAM-012).
+        file_cache = FileReadCache::per_chunk_scratch();
         // Collect index-into-nodes for nodes that need a neural embedding.
         let mut neural_pending: Vec<usize> = Vec::new();
         for &node_idx in batch {
@@ -1332,7 +1353,6 @@ fn build_neural_embedder(tfidf_embedder: TfIdfEmbedder, _allow_neural: bool) -> 
 pub(crate) fn enrich_neural_embeddings(
     pdg: &ProgramDependenceGraph,
     embedder: &HybridEmbedder,
-    file_cache: &mut FileReadCache,
     admitted_node_ids: &HashSet<String>,
 ) -> Vec<(String, Vec<f32>)> {
     if !embedder.has_neural() {
@@ -1358,6 +1378,9 @@ pub(crate) fn enrich_neural_embeddings(
         let mut pending = Vec::with_capacity(NEURAL_IPC_BATCH);
         let mut rows = Vec::new();
         let file_summary_ctx = FileSummaryContext::from_pdg(pdg);
+        // Per-chunk scratch buffer: only one file body resident at a time.
+        // No cross-phase cache (VAL-STREAM-012).
+        let mut file_cache = FileReadCache::per_chunk_scratch();
         for node_idx in pdg.node_indices() {
             let Some(node) = pdg.get_node(node_idx) else {
                 continue;

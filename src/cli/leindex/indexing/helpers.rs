@@ -3,13 +3,12 @@
 //! main pipeline module to keep it under the line-count gate.
 
 use super::IndexPipelineState;
-use crate::cli::index_builder;
 use crate::cli::index_job::{
     CheckpointStore, FileFingerprint, LexicalCheckpoint, ParseCheckpoint, PdgCheckpoint,
     ScanCheckpoint,
 };
 use crate::cli::memory_cap::{CapStatus, MemoryCapGuard};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::warn;
@@ -291,7 +290,6 @@ pub(super) fn parse_plan(state: &IndexPipelineState) -> ParsePlan {
 pub(super) fn reuse_parse_results(
     resumed_scan: bool,
     resumed_parse: Option<&ParseCheckpoint>,
-    cache: Option<&mut index_builder::FileReadCache>,
     store: &CheckpointStore,
     source_file_hashes: &HashMap<String, String>,
     files_to_parse: &mut Vec<PathBuf>,
@@ -299,7 +297,6 @@ pub(super) fn reuse_parse_results(
     if !resumed_scan {
         return Ok(Vec::new());
     }
-    let cache = cache.context("parse phase missing shared file cache")?;
     let Some(parse_checkpoint) = resumed_parse else {
         return Ok(Vec::new());
     };
@@ -325,8 +322,9 @@ pub(super) fn reuse_parse_results(
                 continue;
             }
         };
-        let source_bytes = match cache.get_or_read(path) {
-            Ok(bytes) => bytes.as_ref().clone(),
+        // Re-read the file per chunk (VAL-STREAM-012: no cross-phase cache).
+        let source_bytes = match crate::cli::index_builder::read_file_once(path) {
+            Ok(bytes) => bytes.1.as_ref().clone(),
             Err(error) => {
                 warn!(
                     "Unable to reuse source bytes for '{}': {}; reparsing",

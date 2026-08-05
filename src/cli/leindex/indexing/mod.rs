@@ -45,7 +45,6 @@ pub(crate) struct IndexPipelineState {
     pub(crate) checkpoint_store: Option<CheckpointStore>,
     pub(crate) indexed_files: HashMap<String, String>,
     pub(crate) old_scan: Option<ProjectFileScan>,
-    pub(crate) shared_file_cache: Option<index_builder::FileReadCache>,
     pub(crate) source_files_with_hashes: Vec<(PathBuf, String)>,
     pub(crate) source_file_hashes: HashMap<String, String>,
     pub(crate) current_file_paths: HashSet<String>,
@@ -103,7 +102,6 @@ impl IndexPipelineState {
             checkpoint_store: None,
             indexed_files: HashMap::new(),
             old_scan: None,
-            shared_file_cache: None,
             source_files_with_hashes: Vec::new(),
             source_file_hashes: HashMap::new(),
             current_file_paths: HashSet::new(),
@@ -343,11 +341,10 @@ impl LeIndex {
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
                 .context("Failed to load indexed files from storage")?;
 
-        // Use a shared file cache so that file reads during hash collection
-        // can be reused later when building NodeInfo content.
-        let mut shared_file_cache = index_builder::FileReadCache::new(100);
-        let source_files_with_hashes =
-            self.collect_source_files_with_hashes(true, Some(&mut shared_file_cache))?;
+        // Hash source files without caching bodies (VAL-STREAM-012: no
+        // cross-phase source-body retention). Changed-file nodes re-read
+        // their file per chunk in build_changed_node_infos.
+        let source_files_with_hashes = self.collect_source_files_with_hashes(true)?;
         let source_file_hashes: std::collections::HashMap<String, String> =
             source_files_with_hashes
                 .iter()
@@ -429,12 +426,7 @@ impl LeIndex {
 
         let embedder = index_builder::HybridEmbedder::tfidf_only(tfidf_embedder);
 
-        let updated_nodes = Self::build_changed_node_infos(
-            &pdg,
-            &changed_file_set,
-            &mut shared_file_cache,
-            &embedder,
-        );
+        let updated_nodes = Self::build_changed_node_infos(&pdg, &changed_file_set, &embedder);
 
         self.search_engine
             .incremental_reindex(crate::search::search::TextIndexDelta {
@@ -614,7 +606,6 @@ impl LeIndex {
     fn build_changed_node_infos(
         pdg: &crate::graph::pdg::ProgramDependenceGraph,
         changed_file_set: &HashSet<String>,
-        file_cache: &mut index_builder::FileReadCache,
         embedder: &index_builder::HybridEmbedder,
     ) -> Vec<crate::search::search::NodeInfo> {
         let connectivity_config = crate::graph::pdg::TraversalConfig {
@@ -631,6 +622,8 @@ impl LeIndex {
         let pruner = crate::search::search::ContentPruner::new();
         let mut updated_nodes: Vec<crate::search::search::NodeInfo> = Vec::new();
         let file_summary_ctx = &index_builder::FileSummaryContext::from_pdg(pdg);
+        // Per-chunk scratch: only one file body resident at a time.
+        let mut file_cache = index_builder::FileReadCache::per_chunk_scratch();
 
         for node_idx in pdg.node_indices() {
             let Some(node) = pdg.get_node(node_idx) else {
@@ -849,9 +842,9 @@ impl LeIndex {
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
                 .context("Failed to load indexed files from storage")?;
         let old_scan = self.get_project_scan(false).ok();
-        let mut shared_file_cache = index_builder::FileReadCache::new(200);
-        let source_files_with_hashes =
-            self.collect_source_files_with_hashes(true, Some(&mut shared_file_cache))?;
+        // Hash source files without caching bodies (VAL-STREAM-012: no
+        // cross-phase source-body retention). Each phase re-reads per chunk.
+        let source_files_with_hashes = self.collect_source_files_with_hashes(true)?;
         info!("Found {} source files", source_files_with_hashes.len());
         let scan = scan_checkpoint(&source_files_with_hashes);
         let generation = state.job.generation;
@@ -915,7 +908,6 @@ impl LeIndex {
         );
         state.indexed_files = indexed_files;
         state.old_scan = old_scan;
-        state.shared_file_cache = Some(shared_file_cache);
         state.source_files_with_hashes = source_files_with_hashes;
         state.resumed_scan = resumed_scan;
         state.resumed_parse = resumed_parse;
@@ -1035,7 +1027,6 @@ impl LeIndex {
         let resumed_parse_results = reuse_parse_results(
             state.resumed_scan.is_some(),
             state.resumed_parse.as_ref(),
-            state.shared_file_cache.as_mut(),
             checkpoint_store,
             &plan.source_file_hashes,
             &mut plan.files_to_parse,
@@ -1265,7 +1256,6 @@ impl LeIndex {
         &mut self,
         pdg: &crate::graph::pdg::ProgramDependenceGraph,
         resume_valid: bool,
-        shared_file_cache: Option<index_builder::FileReadCache>,
     ) -> Result<index_builder::HybridEmbedder> {
         let batch_size = self.indexing_batch_size();
         let persisted = index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
@@ -1297,7 +1287,6 @@ impl LeIndex {
                         &mut self.cache.file_stats_cache,
                         batch_size,
                         persisted.map(index_builder::HybridEmbedder::tfidf_only),
-                        shared_file_cache,
                     )
                 }
             };
@@ -1325,7 +1314,6 @@ impl LeIndex {
             &mut self.cache.file_stats_cache,
             batch_size,
             persisted.map(index_builder::HybridEmbedder::tfidf_only),
-            shared_file_cache,
         )
     }
 
@@ -1350,11 +1338,7 @@ impl LeIndex {
             .resumed_lexical
             .as_ref()
             .is_some_and(|checkpoint| checkpoint.pdg_hash == pdg_checkpoint.artifact_hash);
-        let embedder = self.build_lexical_embedder(
-            &pdg,
-            lexical_resume_valid,
-            state.shared_file_cache.take(),
-        )?;
+        let embedder = self.build_lexical_embedder(&pdg, lexical_resume_valid)?;
         self.embedder = Some(embedder);
         if let Some(embedder) = &self.embedder {
             embedder.persist_to_storage(&self.project_path, &pdg)?;
@@ -1593,7 +1577,7 @@ impl LeIndex {
         if embedder.is_none() {
             return Ok(());
         }
-        let files = self.collect_source_files_with_hashes(false, None)?;
+        let files = self.collect_source_files_with_hashes(false)?;
         if files.is_empty() {
             return Ok(());
         }
@@ -1758,7 +1742,6 @@ impl LeIndex {
                 let rows = index_builder::enrich_neural_embeddings(
                     pdg,
                     neural_embedder,
-                    &mut index_builder::FileReadCache::new(200),
                     &state.admitted_node_ids,
                 );
                 neural_rows = self.search_engine.update_neural_embeddings(rows);

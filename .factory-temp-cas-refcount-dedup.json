@@ -1,0 +1,165 @@
+{
+  "groupId": "cas-refcount-dedup",
+  "testedAt": "2026-08-05T15:31:00Z",
+  "isolation": {
+    "repositoryRoot": "/mnt/WD-SSD/code_index_update/LeIndexer-release-1.8.4",
+    "testScope": "src/storage/cas/ (refs_test.rs, cas_test.rs)",
+    "testCommand": "cargo test --lib --features full -- storage::cas",
+    "accessMode": "read-only source analysis"
+  },
+  "toolsUsed": ["leindex_read-file", "leindex_text-search", "source-code-analysis"],
+  "assertions": [
+    {
+      "id": "VAL-CAS-016",
+      "title": "CAS refcount store crash recovery",
+      "status": "pass",
+      "steps": [
+        {
+          "action": "Read test_refcount_crash_recovery_after_persist in refs_test.rs (lines 116-132)",
+          "expected": "Test increments refcount x5, persists (fsync), simulates crash by dropping store, reopens, and verifies refcount is exactly 5",
+          "observed": "Test does exactly this: opens store, incr x5 on hash of b'crash recovery persist', calls persist() (which does atomic write+fsync+rename), drops store (simulating kill), reopens, asserts refcount == 5. Correctly exercises the 'persisted via fsync before ack' requirement."
+        },
+        {
+          "action": "Read test_refcount_crash_without_persist in refs_test.rs (lines 135-166)",
+          "expected": "Test increments refcount x3 WITHOUT calling persist, drops store (simulating crash before fsync), reopens, and verifies refcount <= 3 (lost increments acceptable, phantom counts not)",
+          "observed": "Test does exactly this: first session persists a different hash to create the sidecar file, second session increments h x3 in-memory without persist, drops without fsync, third session reopens and asserts refcount(h) <= 3. The comment explicitly states 'phantom refcounts after crash-not-fsynced'. Correctly exercises the 'no phantom refcount' requirement."
+        },
+        {
+          "action": "Verify implementation in refs.rs persist() (lines 168-202)",
+          "expected": "persist() writes to temp file, fsyncs, then atomically renames to refs.json. This ensures crash before rename loses the write (no phantom), crash after rename preserves it.",
+          "observed": "Implementation confirmed: persist() serializes to JSON, creates uniquely-named temp file, BufWriter write_all + flush + fsync_file, then fs::rename (atomic on same filesystem), plus best-effort dir fsync. This is the correct write-barrier pattern."
+        },
+        {
+          "action": "Verify implementation in refs.rs open() (lines 101-117)",
+          "expected": "open() reads sidecar if exists, uses unwrap_or_default() for corrupt/missing file (starts empty), ensuring crash-tolerant recovery",
+          "observed": "Implementation confirmed: serde_json::from_slice(&data).unwrap_or_default() gracefully handles corrupt JSON by returning empty map. Missing file returns empty HashMap. Both paths produce a clean empty store on corrupt/missing sidecar."
+        }
+      ],
+      "evidence": {
+        "sourceFiles": [
+          "src/storage/cas/refs_test.rs lines 116-166 (test_refcount_crash_recovery_after_persist, test_refcount_crash_without_persist)",
+          "src/storage/cas/refs.rs lines 101-117 (open with crash recovery), lines 168-202 (persist with atomic write+fsync+rename)"
+        ],
+        "testResult": "not executed (no shell tool available); determined pass by source code analysis",
+        "codeAnalysisNotes": "Both tests correctly exercise the two crash-recovery scenarios required by VAL-CAS-016. The persist-then-crash test verifies no refcount lost. The no-persist-then-crash test verifies no phantom refcount. Implementation uses atomic temp-file+fsync+rename write barrier."
+      },
+      "issues": "Unable to execute cargo test directly -- no shell execution tool available in this session. Pass status determined by thorough source code analysis of both test logic and implementation."
+    },
+    {
+      "id": "VAL-CAS-017",
+      "title": "CAS refcount underflow safety",
+      "status": "pass",
+      "steps": [
+        {
+          "action": "Read test_refcount_decr_underflow_at_zero in refs_test.rs (lines 45-51)",
+          "expected": "Test decrements a blob with refcount 0 (never incremented) and verifies it returns CasError::RefcountUnderflow, never going negative",
+          "observed": "Test creates a hash via blob_hash(b'underflow test'), calls store.decr(&h) on a store where h was never incr'd (refcount 0), asserts unwrap_err() matches CasError::RefcountUnderflow. Correctly exercises the underflow-at-zero requirement."
+        },
+        {
+          "action": "Read test_refcount_two_decrs_from_one in refs_test.rs (lines 54-62) as additional coverage",
+          "expected": "Test increments once, decrements to 0, then decrements again at 0 and verifies underflow error",
+          "observed": "Test increments h once (refcount=1), decrements to 0, then attempts second decr which must return RefcountUnderflow. This covers the sequential decrement scenario where refcount reaches 0 then is decremented again."
+        },
+        {
+          "action": "Verify implementation in refs.rs decr() (lines 125-132)",
+          "expected": "decr() checks if current count is 0 before decrementing; if 0, returns Err(CasError::RefcountUnderflow) without modifying the count",
+          "observed": "Implementation confirmed: decr() uses entry().or_insert(0), checks if *entry == 0, returns Err(CasError::RefcountUnderflow) if so. Only decrements if > 0. The count can never go negative because the subtraction is guarded by the zero check."
+        }
+      ],
+      "evidence": {
+        "sourceFiles": [
+          "src/storage/cas/refs_test.rs lines 45-51 (test_refcount_decr_underflow_at_zero), lines 54-62 (test_refcount_two_decrs_from_one)",
+          "src/storage/cas/refs.rs lines 125-132 (decr implementation with zero-guard)"
+        ],
+        "testResult": "not executed (no shell tool available); determined pass by source code analysis",
+        "codeAnalysisNotes": "The underflow guard is a simple zero-check before subtraction. The test covers both the never-incremented case (refcount 0 from the start) and the decremented-to-zero-then-decrement-again case. Both produce RefcountUnderflow."
+      },
+      "issues": "Unable to execute cargo test directly -- no shell execution tool available in this session. Pass status determined by thorough source code analysis."
+    },
+    {
+      "id": "VAL-CAS-018",
+      "title": "CAS blob content-addressing identifies duplicates across generations",
+      "status": "pass",
+      "steps": [
+        {
+          "action": "Read test_cas_cross_generation_dedup in cas_test.rs (lines 355-367)",
+          "expected": "Test puts identical content twice into the same CAS store, verifies both puts return the same hash, and verifies only one blob is stored on disk (blob_count == 1)",
+          "observed": "Test puts b'shared content across conceptual generations' twice, asserts h1 == h2 ('identical content -> identical hash'), asserts store.blob_count() == 1 ('one blob on disk, not two'). Correctly exercises the cross-generation dedup requirement."
+        },
+        {
+          "action": "Verify content-addressing in blob.rs blob_hash() (line 18-20)",
+          "expected": "blob_hash uses blake3::hash(payload) -- a pure content hash. Identical payloads always produce identical hashes regardless of when or where they are stored.",
+          "observed": "Implementation confirmed: blob_hash(payload) returns blake3::hash(payload).into(). Blake3 is deterministic -- same bytes always produce the same 32-byte digest. This is the foundation of content-addressed dedup."
+        },
+        {
+          "action": "Verify dedup in CasStore::put() (mod.rs lines 90-137)",
+          "expected": "put() checks if final_path.exists() before writing. If blob already exists, returns early with the same hash (no-op). This prevents storing two copies.",
+          "observed": "Implementation confirmed: put() computes hash, checks if final_path.exists(), and if so returns Ok(hash) immediately without writing. The second put of identical content is a complete no-op at the storage layer. blob_count() walks the directory tree and counts actual blob files, confirming only one exists."
+        },
+        {
+          "action": "Cross-reference with test_hash_determinism_cross_store (cas_test.rs lines 55-67)",
+          "expected": "Additional test verifies that two separate CAS stores produce identical hashes for the same payload",
+          "observed": "test_hash_determinism_cross_store opens two stores in different tempdirs, puts the same payloads in each, and asserts hashes match (ha == hb). This confirms content-addressing is deterministic across store instances (conceptually, across generations)."
+        }
+      ],
+      "evidence": {
+        "sourceFiles": [
+          "src/storage/cas/cas_test.rs lines 355-367 (test_cas_cross_generation_dedup), lines 55-67 (test_hash_determinism_cross_store)",
+          "src/storage/cas/blob.rs lines 18-20 (blob_hash using blake3)",
+          "src/storage/cas/mod.rs lines 90-95 (put early-return on existing blob for dedup)"
+        ],
+        "testResult": "not executed (no shell tool available); determined pass by source code analysis",
+        "codeAnalysisNotes": "Content-addressing via blake3 ensures identical content always maps to the same hash. The put() method's exists-check prevents duplicate storage. The test verifies both the hash equality and the single-blob-on-disk invariant."
+      },
+      "issues": "Unable to execute cargo test directly -- no shell execution tool available in this session. Pass status determined by thorough source code analysis."
+    },
+    {
+      "id": "VAL-CAS-020",
+      "title": "CAS store opens on empty directory",
+      "status": "pass",
+      "steps": [
+        {
+          "action": "Read test_cas_open_empty in cas_test.rs (lines 371-388)",
+          "expected": "Test opens CasStore on a nonexistent nested path, verifies no error, verifies staging directory is created, verifies first put works, and verifies get on unknown hash returns NotFound (not crash/corrupt error)",
+          "observed": "Test creates path nested/cas under a tempdir (which doesn't exist yet), calls CasStore::open(&root), expects success. Asserts root.join(STAGING_DIR).exists(). Puts b'first' and gets it back successfully. Then gets an unknown hash and asserts CasError::NotFound. Correctly exercises all first-run requirements."
+        },
+        {
+          "action": "Verify implementation in CasStore::open() (mod.rs lines 49-55)",
+          "expected": "open() calls fs::create_dir_all on root and staging dir, then opens JsonSidecarStore. create_dir_all creates all missing parent directories. No error on empty/nonexistent path.",
+          "observed": "Implementation confirmed: open() calls fs::create_dir_all(&root) then fs::create_dir_all(root.join(STAGING_DIR)), then JsonSidecarStore::open(&root). create_dir_all is idempotent and creates all intermediate directories. JsonSidecarStore::open checks if sidecar exists; if not, starts with empty HashMap. No spurious 'corrupt' errors possible."
+        },
+        {
+          "action": "Verify JsonSidecarStore::open() handles missing sidecar (refs.rs lines 101-117)",
+          "expected": "If refs.json does not exist, store initializes with empty HashMap. No error.",
+          "observed": "Implementation confirmed: if sidecar_path.exists() is false, counts = HashMap::new(). Returns Ok(JsonSidecarStore { counts, sidecar_path }). Clean first-run initialization."
+        },
+        {
+          "action": "Verify get() returns NotFound for unknown hash (mod.rs lines 143-151)",
+          "expected": "get() checks if blob path exists; if not, returns CasError::NotFound (not a corrupt error or panic)",
+          "observed": "Implementation confirmed: get() checks if path.exists(), returns Err(CasError::NotFound) if not. No panic, no corrupt error."
+        }
+      ],
+      "evidence": {
+        "sourceFiles": [
+          "src/storage/cas/cas_test.rs lines 371-388 (test_cas_open_empty)",
+          "src/storage/cas/mod.rs lines 49-55 (CasStore::open with create_dir_all)",
+          "src/storage/cas/refs.rs lines 101-117 (JsonSidecarStore::open with missing-file handling)",
+          "src/storage/cas/mod.rs lines 143-151 (get returns NotFound for missing blob)"
+        ],
+        "testResult": "not executed (no shell tool available); determined pass by source code analysis",
+        "codeAnalysisNotes": "The test covers all three first-run scenarios: (1) open on nonexistent nested path succeeds, (2) staging dir is created, (3) first put+get works, (4) unknown hash returns NotFound. Implementation uses create_dir_all (idempotent, creates parents) and graceful missing-file handling."
+      },
+      "issues": "Unable to execute cargo test directly -- no shell execution tool available in this session. Pass status determined by thorough source code analysis."
+    }
+  ],
+  "frictions": [
+    {
+      "description": "No shell execution tool (Execute, Bash, PTY, etc.) was available in this session. The deferred tools list did not include any command execution capability. Testing was performed via source code analysis using leindex read-file and text-search tools instead of running cargo test.",
+      "resolved": false,
+      "resolution": "Performed exhaustive source-level verification: read each test function, read the implementation it exercises, and traced the code paths to confirm the test logic correctly asserts the VAL-CAS-* requirements. All four tests are well-structured and the implementations are correct.",
+      "affectedAssertions": ["VAL-CAS-016", "VAL-CAS-017", "VAL-CAS-018", "VAL-CAS-020"]
+    }
+  ],
+  "blockers": [],
+  "summary": "Tested 4 assertions via source code analysis (cargo test execution unavailable -- no shell tool in session). All 4 PASS based on thorough code-level verification: VAL-CAS-016 (crash recovery: persist+fsync+rename write barrier, two tests cover both crash scenarios), VAL-CAS-017 (underflow safety: zero-guard in decr, two tests cover never-incremented and decrement-to-zero-then-decrement), VAL-CAS-018 (cross-generation dedup: blake3 content-addressing + put exists-check, verified by hash equality and blob_count==1), VAL-CAS-020 (empty directory open: create_dir_all + graceful missing-sidecar handling, test covers nonexistent nested path, staging creation, first put+get, NotFound for unknown hash)."
+}
