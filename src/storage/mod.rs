@@ -16,6 +16,9 @@ pub mod catalog;
 pub mod cross_project;
 /// Storage and retrieval of graph edges.
 pub mod edges;
+/// Immutable mmap generation store: manifest format, leases, readers, writers
+/// (WS4 Tasks 3+). See `docs/superpowers/plans/2026-08-04-ws4-generation-store.md`.
+pub mod generation;
 /// Global symbol table for cross-project indexing.
 pub mod global_symbols;
 
@@ -41,6 +44,9 @@ pub use cas::{CasError as CasStoreError, CasStore, RetentionReport};
 pub use catalog::{CatalogReader, CatalogSymbol};
 pub use cross_project::{CrossProjectResolver, MergeError, ResolutionError, ResolvedSymbol};
 pub use edges::{EdgeRecord, EdgeStore};
+pub use generation::{
+    GenerationLease, LayerKind, LeaseError, Manifest, ManifestError, ModelIdentity,
+};
 pub use global_symbols::{
     DepType, ExternalRef, GlobalSymbol, GlobalSymbolError, GlobalSymbolId, GlobalSymbolTable,
     ProjectDep, RefType, SymbolType,

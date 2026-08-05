@@ -1261,6 +1261,52 @@ impl ProjectRegistry {
         self.projects.read().await.get(path).cloned()
     }
 
+    /// Acquire a [`GenerationLease`] for the currently-published generation of
+    /// `project`.
+    ///
+    /// Reads the `CURRENT` file to find the current generation number, loads
+    /// the manifest from `generations/<N>/manifest`, opens the CAS store at
+    /// `<storage>/cas/`, and increments the refcount of every blob referenced
+    /// by the manifest. The returned lease decrements the refcounts on drop.
+    ///
+    /// This method does **not** acquire the per-project `LeIndex` writer
+    /// Mutex or `ProjectWriteLock` (flock). The lease guards blobs purely via
+    /// the CAS refcount mechanism, satisfying the no-stall read invariant
+    /// (architecture section 4.1).
+    pub async fn lease_generation(
+        &self,
+        project: &Path,
+    ) -> Result<crate::storage::GenerationLease, crate::storage::LeaseError> {
+        use crate::storage::GenerationLease;
+        use crate::storage::generation::{read_current_generation, read_generation_manifest};
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        // Resolve the project's storage path without creating or hydrating a
+        // project entry. The lease is a purely file-and-CAS operation.
+        let storage_path = crate::cli::leindex::resolve_existing_storage_path(project)
+            .unwrap_or_else(|| project.join(".leindex"));
+
+        let cas_dir = storage_path.join("cas");
+        let generation = read_current_generation(&storage_path).ok_or_else(|| {
+            crate::storage::LeaseError::NoCurrentGeneration(project.display().to_string())
+        })?;
+        let manifest = read_generation_manifest(&storage_path, generation)
+            .map_err(crate::storage::LeaseError::InvalidManifest)?;
+
+        // Open (or re-open) the CAS store. Each call opens a fresh handle
+        // backed by the same on-disk data. The refcount sidecar is
+        // read+merged on open so increments survive across openings.
+        let store = StdArc::new(StdMutex::new(
+            crate::storage::CasStore::open(&cas_dir).map_err(|e| {
+                crate::storage::LeaseError::Io(std::io::Error::other(format!(
+                    "cas open failed: {e}"
+                )))
+            })?,
+        ));
+
+        GenerationLease::acquire(store, &manifest)
+    }
+
     async fn refresh_resident_core_if_published(&self, path: &Path, resident_generation: &mut u64) {
         let storage_path = crate::cli::leindex::resolve_existing_storage_path(path)
             .unwrap_or_else(|| path.join(".leindex"));
