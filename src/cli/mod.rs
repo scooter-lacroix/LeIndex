@@ -83,6 +83,10 @@ pub mod cleanup;
 pub mod cli;
 /// Configuration for projects, languages, and storage.
 pub mod config;
+/// User-scoped daemon: endpoint discovery, startup lock, handshake
+/// (spec §4.1, §4.2). Not feature-gated: the types are referenced from both
+/// the inline server path and the daemon-client path.
+pub mod daemon;
 /// Error types and error handling logic.
 pub mod errors;
 /// Live Git porcelain-v2 status operations.
