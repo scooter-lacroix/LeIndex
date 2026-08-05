@@ -141,7 +141,7 @@ fn test_neural_int8_dot_correctness() {
     let dir = tempfile::tempdir().expect("tempdir");
     let blob_path = dir.path().join("neural_int8.blob");
 
-    let count: u32 = 200;
+    let count: u32 = 1000; // 1000-vector fixture per VAL-CAS-TBD-002
     let dim: u32 = 256; // smaller for speed, still validates SIMD paths
     let scale: f32 = 0.005;
     let zero_point: f32 = 0.4;

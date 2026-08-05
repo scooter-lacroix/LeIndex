@@ -32,12 +32,14 @@ The INT8 path must satisfy two gates before being declared production-ready:
   production search request).
 - **Iteration:** run-by-run, p50 from criterion's 20-sample run.
 
-## Correctness (VAL-READER-002)
+## Correctness (VAL-READER-002 / VAL-CAS-TBD-002)
 
 `test_neural_int8_dot_correctness` exercises 20 random `(i, query)` pairs
-against a 200-vector x 256-dim INT8 fixture with `scale=0.005`,
-`zero_point=0.4`. For each pair, the SIMD result is compared against the
-exhaustive dequantize-then-dot reference; relative epsilon must be < 1e-4.
+against a **1000-vector** x 256-dim INT8 fixture (fixture upgraded from 200
+vectors to meet the 1000-vector fixture gate in VAL-CAS-TBD-002) with
+`scale=0.005`, `zero_point=0.4`. For each pair, the SIMD result is compared
+against the exhaustive dequantize-then-dot reference; relative epsilon must be
+< 1e-4.
 
 ```
 $ cargo test -p leindex --features full --lib \
