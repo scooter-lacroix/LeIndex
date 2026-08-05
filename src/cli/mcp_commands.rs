@@ -72,6 +72,27 @@ pub(super) async fn cmd_mcp_stdio_impl(
     info!("Starting LeIndex MCP stdio server (lazy project loading)");
     crate::cli::memory_report::observe_rss("mcp_stdio_startup");
 
+    // ── Daemon-client shim path (spec §4.1, §12.3 phase 3) ─────────────
+    //
+    // When the `daemon-client` feature is enabled, attempt to discover or
+    // spawn `leindexd` and forward frames to it. If discovery/spawn fails,
+    // fall back to the inline server with a warning (never crash).
+    //
+    // VAL-SHIM-004: default build (daemon-client OFF) never enters this
+    // branch; it runs the legacy inline server unchanged.
+    #[cfg(feature = "daemon-client")]
+    {
+        if let Some(home) = crate::config::resolve_leindex_home() {
+            let run_dir = home.join("run");
+            match try_daemon_client(&run_dir).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!("daemon-client mode failed: {e}; falling back to inline server");
+                }
+            }
+        }
+    }
+
     // D-3 advisory single-instance lock: warn when a live sibling already
     // serves the same canonical project, but NEVER hard-exit — a stdio server
     // is 1:1 with its agent's pipe, and exiting would break that agent's
@@ -778,6 +799,50 @@ async fn handle_mcp_request(
             crate::cli::mcp::protocol::JsonRpcError::method_not_found(method_name),
         ))),
     }
+}
+
+/// Attempt to use the daemon-client path: discover or spawn `leindexd` and
+/// forward MCP frames to it (spec §4.1, §12.3 phase 3).
+///
+/// Returns `Ok(())` if the shim successfully connected and the forward loop
+/// completed. Returns `Err` if the daemon could not be discovered, spawned,
+/// or connected; the caller falls back to the inline server with a warning.
+#[cfg(feature = "daemon-client")]
+async fn try_daemon_client(run_dir: &std::path::Path) -> AnyhowResult<()> {
+    use crate::cli::daemon::endpoint::{StartupOutcome, resolve_endpoint};
+    use crate::cli::daemon::handshake::DAEMON_PROTOCOL_VERSION;
+    use crate::cli::daemon::shim;
+    use crate::cli::daemon::spawn;
+
+    // Ensure run-dir exists for the sidecar and socket.
+    let _ = std::fs::create_dir_all(run_dir);
+
+    let outcome = resolve_endpoint(run_dir, DAEMON_PROTOCOL_VERSION)
+        .context("daemon endpoint discovery failed")?;
+    let endpoint = match outcome {
+        StartupOutcome::Connect(ep) => {
+            tracing::info!(
+                "daemon-client: connecting to existing daemon at {} (pid {})",
+                ep.socket_path.display(),
+                ep.pid
+            );
+            ep
+        }
+        StartupOutcome::Won(_) => {
+            tracing::info!("daemon-client: no live daemon found; spawning leindexd");
+            spawn::spawn_and_wait(run_dir)
+                .await
+                .context("failed to spawn leindexd")?
+        }
+    };
+
+    // Forward MCP frames between stdin/stdout and the daemon socket.
+    shim::forward_stdio_to_daemon(&endpoint)
+        .await
+        .context("daemon-client forward loop failed")?;
+
+    tracing::debug!("daemon-client forward loop completed");
+    Ok(())
 }
 
 #[cfg(test)]

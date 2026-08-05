@@ -13,3 +13,11 @@
 pub mod endpoint;
 /// Protocol-version handshake (spec §12.1).
 pub mod handshake;
+/// Stdio shim forwarder: connects to `leindexd` and byte-faithfully proxies
+/// MCP/JSON-RPC frames between stdin/stdout and the daemon Unix socket
+/// (spec §4.1).
+#[cfg(feature = "daemon-client")]
+pub mod shim;
+/// Daemon spawn helper (creates `leindexd` when the shim wins the startup race).
+#[cfg(feature = "daemon-client")]
+pub mod spawn;

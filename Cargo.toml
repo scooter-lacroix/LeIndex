@@ -246,6 +246,13 @@ remote-embeddings = ["search", "onnx", "dep:reqwest", "dep:async-trait"]
 # VAL-MEASURE-027: memprof is excluded from CI gating.
 memprof = ["dep:tikv-jemallocator"]
 
+# Daemon-client: enables the stdio shim that forwards MCP frames to `leindexd`
+# instead of running the full inline server. When this feature is OFF (default),
+# `leindex mcp --stdio` runs the legacy inline server identical to v1.9.x.
+# When ON, the shim discovers or spawns the daemon and forwards byte-faithfully
+# (spec §4.1, §12.3 rollout phase 3).
+daemon-client = ["dep:which"]
+
 [dependencies]
 # Core dependencies (used by most modules)
 serde = { version = "1.0", features = ["derive", "rc"] }
@@ -254,7 +261,7 @@ thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "fs", "net", "sync", "time", "signal", "io-util"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "fs", "net", "sync", "time", "signal", "io-util", "process", "io-std"] }
 blake3 = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
