@@ -75,6 +75,7 @@ full = [
     "server",
     "edit",
     "validation",
+    "bounded-scheduler",
 ]
 
 # Minimal feature set (parsing and search only)
@@ -206,6 +207,10 @@ validation = [
     "parse",
     "storage",
     "graph",
+]
+bounded-scheduler = [
+    "cli",
+    "global",
 ]
 
 # Turso/libsql remote storage support (opt-in, off by default)

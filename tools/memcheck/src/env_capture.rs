@@ -315,16 +315,26 @@ mod test {
         assert_eq!(deserialized, cap);
     }
 
+    /// Serialization guard for tests that mutate `MALLOC_ARENA_MAX`.
+    /// Without this, parallel test execution causes a race between
+    /// `test_allocator_env_captures_malloc_arena_max` (sets the var) and
+    /// `test_allocator_env_omits_unset_malloc_arena_max` (removes the var).
+    static MALLOC_ARENA_MAX_TEST_GUARD: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
     /// VAL-BASE-009: When MALLOC_ARENA_MAX is set in the environment, the
     /// allocator_env capture includes it with the correct value.
     /// VAL-CONT-001: The allocator_env capture records the setting.
     #[test]
     fn test_allocator_env_captures_malloc_arena_max() {
-        // SAFETY: env mutation is process-global, but the normal test runner
-        // does not set MALLOC_ARENA_MAX for these unit tests. We save and
-        // restore to avoid side-effects.
+        let guard = MALLOC_ARENA_MAX_TEST_GUARD
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        // SAFETY: env mutation is process-global, but the mutex guard ensures
+        // no other test in this binary is concurrently reading or writing
+        // MALLOC_ARENA_MAX. We save and restore to avoid side-effects.
         let saved = std::env::var("MALLOC_ARENA_MAX").ok();
-        // SAFETY: no other thread is reading MALLOC_ARENA_MAX in this test.
         unsafe {
             std::env::set_var("MALLOC_ARENA_MAX", "2");
         }
@@ -335,21 +345,25 @@ mod test {
             "allocator_env should contain MALLOC_ARENA_MAX=2"
         );
         // Restore original state.
-        // SAFETY: same justification.
         unsafe {
             match &saved {
                 Some(v) => std::env::set_var("MALLOC_ARENA_MAX", v),
                 None => std::env::remove_var("MALLOC_ARENA_MAX"),
             }
         }
+        drop(guard);
     }
 
     /// VAL-BASE-009: When MALLOC_ARENA_MAX is unset, allocator_env does not
     /// contain the key (no phantom entries).
     #[test]
     fn test_allocator_env_omits_unset_malloc_arena_max() {
+        let guard = MALLOC_ARENA_MAX_TEST_GUARD
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
         let saved = std::env::var("MALLOC_ARENA_MAX").ok();
-        // SAFETY: no other thread reads this var in this test.
+        // SAFETY: mutex guard ensures no concurrent test mutates this var.
         unsafe {
             std::env::remove_var("MALLOC_ARENA_MAX");
         }
@@ -359,11 +373,11 @@ mod test {
             "allocator_env should not contain MALLOC_ARENA_MAX when unset"
         );
         // Restore.
-        // SAFETY: same justification.
         unsafe {
             if let Some(v) = &saved {
                 std::env::set_var("MALLOC_ARENA_MAX", v);
             }
         }
+        drop(guard);
     }
 }

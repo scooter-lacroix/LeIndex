@@ -21,6 +21,20 @@ mod load;
 #[path = "tests.rs"]
 mod tests;
 
+/// Streaming index pipeline modules (WS6-9 Tasks 1-7).
+///
+/// Each stage converts from "materialize the whole corpus" to "stream bounded
+/// chunks" with direct CAS staging. Feature-flagged via
+/// `LEINDEX_FEATURE_STREAMING_*`, default OFF. The legacy pipeline runs
+/// unmodified when flags are disabled.
+///
+/// `#[allow(dead_code)]` marks modules whose public API will be consumed by
+/// the streaming pipeline integration landing in SP4 Task 8-9 (the follow-up
+/// feature that wires these stages behind feature flags into the main
+/// `index_project_inner` loop). Tests exercise every public item today.
+#[allow(dead_code)]
+pub(crate) mod streaming;
+
 /// Runtime state carried between the six explicit indexing phases. It is
 /// present only while `index_project_inner` is executing and is cleared before
 /// the call returns. Durable checkpoints remain the restart contract.
@@ -702,10 +716,13 @@ impl LeIndex {
     /// memory usage throughout the indexing pipeline. When `max_memory_bytes` is
     /// `Some(bytes)`, a `MemoryCapGuard` is created that:
     /// - Logs a warning when RSS exceeds 90% of the cap
-    /// - Returns an error when RSS exceeds 100% of the cap
+    /// - Reports `OverCap` (a deferral signal) when RSS exceeds 100% of the cap
     ///
-    /// The memory check is performed at key checkpoints during indexing to avoid
-    /// excessive overhead while still catching runaway memory usage.
+    /// VAL-SCHED-015: the cap is an ADMISSION cap, not a hard error. Over-cap
+    /// pressure defers heavy work (and the global admission controller owns the
+    /// actual defer/reduce/evict decision) — indexing is never aborted at the
+    /// cap. The memory check is performed at key checkpoints during indexing to
+    /// avoid excessive overhead while still catching runaway memory usage.
     pub fn index_project_with_memory_cap(
         &mut self,
         force: bool,

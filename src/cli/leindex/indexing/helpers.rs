@@ -8,7 +8,7 @@ use crate::cli::index_job::{
     CheckpointStore, FileFingerprint, LexicalCheckpoint, ParseCheckpoint, PdgCheckpoint,
     ScanCheckpoint,
 };
-use crate::cli::memory_cap::MemoryCapGuard;
+use crate::cli::memory_cap::{CapStatus, MemoryCapGuard};
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -138,9 +138,22 @@ pub(super) fn progress_clear() {
     }
 }
 
+/// Observe RSS against the memory cap at an indexing phase boundary.
+///
+/// VAL-SCHED-015: this is NOT an error path anymore. Over-cap RSS reports
+/// `CapStatus::OverCap` (a deferral signal already logged by the guard) and
+/// indexing continues; capacity decisions belong to the global admission
+/// controller (`scheduler::admission`), which defers/reduces instead of
+/// erroring. A cap prevents overlapping peaks — never valid-work failures.
 pub(super) fn check_memory_cap(cap_guard: &mut Option<&mut MemoryCapGuard>) -> Result<()> {
     if let Some(guard) = cap_guard.as_mut() {
-        guard.check_now()?;
+        match guard.check_now() {
+            CapStatus::Ok => {}
+            CapStatus::OverCap => {
+                // Deferral signal: the guard has already logged the pressure.
+                // The phase continues; heavy work is gated by admission.
+            }
+        }
     }
     Ok(())
 }

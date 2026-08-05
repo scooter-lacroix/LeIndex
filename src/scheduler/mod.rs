@@ -13,11 +13,13 @@ pub mod classes;
 pub mod index_job;
 pub mod queue;
 
-pub use admission::{Admission, AdmissionDecider, BatchShape, always_admit};
+pub use admission::{Admission, AdmissionController, AdmissionDecider, BatchShape, always_admit};
 pub use budget::{BoundedJob, Step, WorkBudget};
 pub use classes::{ClassAging, WorkClass};
 pub use index_job::{IndexJob, IndexJobProgress, IndexPhaseId, PhaseExecutor};
 pub use queue::{DrrQueue, JobId, QueueKey, TargetRef, TickOutcome};
+
+use std::sync::Arc;
 
 /// A fair scheduler: DRR fairness + admission-gated dequeue of heavy work.
 pub struct Scheduler<P> {
@@ -42,6 +44,15 @@ impl<P: Send + Clone> Scheduler<P> {
             admission(estimate)
         });
         Self { queue }
+    }
+
+    /// Create a scheduler whose admission gate is the global
+    /// [`AdmissionController`] — the daemon's single memory-admission point
+    /// (§5.3). Before every index chunk / maintenance dequeue the controller
+    /// reads RSS + mmap resident + provider reserve and returns Admit, Defer,
+    /// or Reduce (never an error); pressure triggers idle-cache eviction first.
+    pub fn with_admission_controller(controller: Arc<AdmissionController>) -> Self {
+        Self::with_admission(controller.decider())
     }
 
     /// Enqueue a job, returning its id. Same-project duplicate requests with
@@ -289,5 +300,68 @@ mod test {
         let id: JobId = sched.enqueue(index_key("p"), None, Box::new(CountingJob::new(3)));
         sched.run_until_done(id, one_item_budget());
         assert!(sched.is_done(id));
+    }
+
+    /// Task 7: with the global AdmissionController wired as the scheduler's
+    /// admission gate, indexing OVER the cap defers (never errors) and then
+    /// completes after pressure-response eviction frees memory.
+    #[test]
+    fn test_scheduler_admission_controller_defers_then_completes() {
+        use crate::scheduler::admission::AdmissionController;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // RSS at the cap (1024/1024 MB) at start: every index step projects
+        // over the cap and must defer.
+        let rss = Arc::new(AtomicU64::new(1024));
+        let evictions = Arc::new(AtomicU64::new(0));
+        let rss_for_reader = rss.clone();
+        let rss_for_eviction = rss.clone();
+        let evictions_hook = evictions.clone();
+        let controller = Arc::new(
+            AdmissionController::new(1024, 0, move || Ok(rss_for_reader.load(Ordering::SeqCst)))
+                .with_eviction(move || {
+                    let call = evictions_hook.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        // First pressure response is insufficient: still over
+                        // the cap → this tick's decision is Defer.
+                        rss_for_eviction.store(1024, Ordering::SeqCst);
+                    } else {
+                        // Eviction frees idle caches → headroom appears.
+                        rss_for_eviction.store(300, Ordering::SeqCst);
+                    }
+                }),
+        );
+
+        let mut sched = Scheduler::<usize>::with_admission_controller(controller);
+        // A 10-step index chunk. The counting job's per-step estimate is
+        // small but non-zero (>= 1 MB), so at RSS == cap every step's
+        // projected footprint exceeds the cap until eviction frees memory.
+        let id: JobId = sched.enqueue(index_key("project-a"), None, Box::new(CountingJob::new(10)));
+
+        // Tick until completion. At least one tick must defer (no progress)
+        // before the eviction response frees memory and the job completes.
+        let mut steps = 0;
+        let mut deferred_ticks = 0;
+        while !sched.is_done(id) {
+            let progressed = sched.tick(one_item_budget()).is_some();
+            if !progressed {
+                deferred_ticks += 1;
+            }
+            steps += 1;
+            assert!(steps < 1000, "index job must complete, not spin forever");
+        }
+        assert!(
+            deferred_ticks >= 1,
+            "over-cap indexing must defer (at least one held tick) before eviction frees memory"
+        );
+        assert!(
+            evictions.load(Ordering::SeqCst) >= 1,
+            "pressure response (idle-cache eviction) must have fired"
+        );
+        assert!(
+            rss.load(Ordering::SeqCst) < 1024,
+            "eviction must have freed memory"
+        );
+        assert!(sched.is_done(id), "over-cap index completes after eviction");
     }
 }

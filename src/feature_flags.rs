@@ -60,6 +60,22 @@ pub enum FeatureFlag {
     /// `spawn_blocking` call. Default OFF = legacy spawn_blocking + error-at-cap
     /// indexing path.
     BoundedScheduler,
+    /// Enable the streaming scan stage (WS6-9 Task 1): scan walks files lazily,
+    /// hashing via a fixed 64KiB buffer, writing metadata records to CAS-staged
+    /// scan blob without retaining source bodies.
+    StreamingScan,
+    /// Enable the streaming parse stage (WS6-9 Task 2): bounded parse chunks
+    /// with per-file persist and syntax-tree drop before the next file.
+    StreamingParse,
+    /// Enable the compact PDG persistence stage (WS6-9 Task 3): per-file graph
+    /// fragments to CAS adjacency without whole-PDG clone.
+    StreamingPdg,
+    /// Enable the streaming TF-IDF stage (WS6-9 Task 4): two-pass external-
+    /// memory TF-IDF with direct CAS-staged row writes.
+    StreamingTfidf,
+    /// Enable the streaming neural enrichment stage (WS6-9 Task 6):
+    /// NeuralRowWriter replaces Vec accumulation, direct staged writes.
+    StreamingNeural,
 }
 
 impl FeatureFlag {
@@ -75,6 +91,11 @@ impl FeatureFlag {
             Self::GenerationMigration => "LEINDEX_FEATURE_GENERATION_MIGRATION",
             Self::GenerationReaders => "LEINDEX_FEATURE_GENERATION_READERS",
             Self::BoundedScheduler => "LEINDEX_FEATURE_BOUNDED_SCHEDULER",
+            Self::StreamingScan => "LEINDEX_FEATURE_STREAMING_SCAN",
+            Self::StreamingParse => "LEINDEX_FEATURE_STREAMING_PARSE",
+            Self::StreamingPdg => "LEINDEX_FEATURE_STREAMING_PDG",
+            Self::StreamingTfidf => "LEINDEX_FEATURE_STREAMING_TFIDF",
+            Self::StreamingNeural => "LEINDEX_FEATURE_STREAMING_NEURAL",
         }
     }
 
@@ -125,6 +146,19 @@ impl FeatureFlag {
             Self::BoundedScheduler => {
                 "Route heavy work through the fair bounded scheduler (DRR + admission)"
             }
+            Self::StreamingScan => {
+                "Streaming scan stage: lazy file walk, 64KiB hash buffer, no source retention"
+            }
+            Self::StreamingParse => {
+                "Streaming parse stage: bounded chunks, per-file persist, tree drop"
+            }
+            Self::StreamingPdg => {
+                "Compact PDG persistence: per-file fragments to CAS, no whole-PDG clone"
+            }
+            Self::StreamingTfidf => "Streaming two-pass TF-IDF with direct CAS-staged row writes",
+            Self::StreamingNeural => {
+                "Streaming neural enrichment via NeuralRowWriter (kills Vec accumulation)"
+            }
         }
     }
 }
@@ -156,6 +190,11 @@ impl FlagStore {
             FeatureFlag::GenerationMigration,
             FeatureFlag::GenerationReaders,
             FeatureFlag::BoundedScheduler,
+            FeatureFlag::StreamingScan,
+            FeatureFlag::StreamingParse,
+            FeatureFlag::StreamingPdg,
+            FeatureFlag::StreamingTfidf,
+            FeatureFlag::StreamingNeural,
         ] {
             let enabled = match env::var(flag.env_var()) {
                 Ok(v) => matches!(
@@ -236,6 +275,11 @@ pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
         FeatureFlag::GenerationMigration,
         FeatureFlag::GenerationReaders,
         FeatureFlag::BoundedScheduler,
+        FeatureFlag::StreamingScan,
+        FeatureFlag::StreamingParse,
+        FeatureFlag::StreamingPdg,
+        FeatureFlag::StreamingTfidf,
+        FeatureFlag::StreamingNeural,
     ]
     .into_iter()
     .map(|f| (f, f.is_enabled()))
