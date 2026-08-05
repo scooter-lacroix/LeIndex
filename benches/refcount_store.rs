@@ -11,7 +11,7 @@
 //! decision file; this benchmark tracks the shipped winner so a regression in
 //! the refcount hot path is caught by CI.
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use leindex::storage::cas::blob::blob_hash;
 use leindex::storage::cas::refs::{JsonSidecarStore, RefcountStore};
 use std::path::Path;
