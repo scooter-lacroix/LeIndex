@@ -7,6 +7,9 @@
 
 /// Storage analytics and metrics.
 pub mod analytics;
+/// Content-addressed blob store (CAS) and refcount/GC infrastructure
+/// (WS4 Tasks 1-2). See `docs/superpowers/plans/2026-08-04-ws4-generation-store.md`.
+pub mod cas;
 /// Bounded read-only catalog queries for exact MCP reads.
 pub mod catalog;
 /// Cross-project reference resolution and graph merging.
@@ -15,6 +18,7 @@ pub mod cross_project;
 pub mod edges;
 /// Global symbol table for cross-project indexing.
 pub mod global_symbols;
+
 /// Storage and retrieval of code nodes.
 pub mod nodes;
 /// Persistent storage for Program Dependence Graphs.
@@ -32,6 +36,8 @@ pub mod schema;
 pub mod turso_config;
 
 pub use analytics::Analytics;
+/// CAS (content-addressed blob store) types.
+pub use cas::{CasError as CasStoreError, CasStore, RetentionReport};
 pub use catalog::{CatalogReader, CatalogSymbol};
 pub use cross_project::{CrossProjectResolver, MergeError, ResolutionError, ResolvedSymbol};
 pub use edges::{EdgeRecord, EdgeStore};
