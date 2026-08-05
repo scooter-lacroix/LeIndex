@@ -10,6 +10,7 @@
 
 pub mod lease;
 pub mod manifest;
+pub mod reader;
 
 pub use lease::{
     CURRENT_FILE, GENERATIONS_DIR, GenerationLease, LeaseError, MANIFEST_FILE,
@@ -18,4 +19,8 @@ pub use lease::{
 pub use manifest::{
     LayerKind, MANIFEST_MAGIC, MANIFEST_VERSION, Manifest, ManifestBody, ManifestError,
     ModelIdentity,
+};
+pub use reader::{
+    NeuralDtype, NeuralReader, PdgEdge, PdgNode, PdgReader, ReaderError, SymbolEntry, SymbolReader,
+    TfidfEntry, TfidfReader, VectorView,
 };

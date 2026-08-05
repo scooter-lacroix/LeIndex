@@ -45,7 +45,9 @@ pub use catalog::{CatalogReader, CatalogSymbol};
 pub use cross_project::{CrossProjectResolver, MergeError, ResolutionError, ResolvedSymbol};
 pub use edges::{EdgeRecord, EdgeStore};
 pub use generation::{
-    GenerationLease, LayerKind, LeaseError, Manifest, ManifestError, ModelIdentity,
+    GenerationLease, LayerKind, LeaseError, Manifest, ManifestError, ModelIdentity, NeuralDtype,
+    NeuralReader, PdgEdge, PdgNode, PdgReader, ReaderError, SymbolEntry, SymbolReader, TfidfEntry,
+    TfidfReader, VectorView,
 };
 pub use global_symbols::{
     DepType, ExternalRef, GlobalSymbol, GlobalSymbolError, GlobalSymbolId, GlobalSymbolTable,
