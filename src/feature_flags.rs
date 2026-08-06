@@ -181,6 +181,13 @@ impl FeatureFlag {
                 }
             }
         }
+        // Phase-9 legacy fallback: when LEINDEX_LEGACY=1 is active, all
+        // v2.0.0 rollout flags revert to OFF (legacy behavior). This allows
+        // users to opt back to legacy code paths during the fallback window
+        // without setting each flag individually.
+        if legacy_mode_enabled() && is_legacy_revertible(self) {
+            return false;
+        }
         flag_store().get(self)
     }
 
@@ -236,6 +243,56 @@ impl FeatureFlag {
 pub fn is_neural_enabled(config_value: bool) -> bool {
     crate::feature_flags::FeatureFlag::NeuralSearch.is_enabled() && config_value
 }
+
+/// Environment variable name for the legacy fallback umbrella switch (phase 9).
+///
+/// When set to "1", "true", "yes", or "on", ALL rollout feature flags are
+/// forced to their OFF state (legacy behavior). This is the phase-9 fallback
+/// window mechanism: `LEINDEX_LEGACY=1` lets users opt back to the legacy
+/// v1.9.x code paths without downgrading.
+///
+/// VAL-ROLLOUT-013: legacy paths reachable during fallback window.
+pub const LEGACY_ENV: &str = "LEINDEX_LEGACY";
+
+/// Returns `true` when the legacy fallback umbrella is active (`LEINDEX_LEGACY=1`).
+///
+/// When active, `FeatureFlag::is_enabled()` returns `false` for every rollout
+/// flag, reverting the system to legacy v1.9.x behavior. This is a
+/// convenience switch so users don't have to set each `LEINDEX_FEATURE_*=0`
+/// individually during the phase-9 fallback window.
+pub fn legacy_mode_enabled() -> bool {
+    match env::var(LEGACY_ENV) {
+        Ok(v) => matches!(
+            v.to_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "enable" | "enabled"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// The set of rollout flags that `LEINDEX_LEGACY=1` reverts to legacy behavior.
+///
+/// GA features (`NeuralSearch`, `StreamingMcp`, `GlobalAutoSync`) are NOT
+/// included: they were production before v2.0.0 and the legacy fallback applies
+/// only to v2.0.0 resource-architecture flags.
+const LEGACY_REVERTIBLE_FLAGS: &[FeatureFlag] = &[
+    FeatureFlag::DaemonClient,
+    FeatureFlag::GenerationReaders,
+    FeatureFlag::BoundedScheduler,
+    FeatureFlag::StreamingScan,
+    FeatureFlag::StreamingParse,
+    FeatureFlag::StreamingPdg,
+    FeatureFlag::StreamingTfidf,
+    FeatureFlag::StreamingNeural,
+    FeatureFlag::GlobalEmbedCache,
+    FeatureFlag::ValidatedModel,
+];
+
+/// Check whether a given flag is one that `LEINDEX_LEGACY=1` would revert.
+pub fn is_legacy_revertible(flag: &FeatureFlag) -> bool {
+    LEGACY_REVERTIBLE_FLAGS.contains(flag)
+}
+
 /// Internal store that caches env-var lookups in a OnceLock for zero-cost reads.
 struct FlagStore {
     values: HashMap<FeatureFlag, bool>,
@@ -343,11 +400,17 @@ pub fn log_flag_state() {
         .map(|(flag, _)| flag)
         .collect();
     let inactive_count = flags.len() - active.len();
+    let legacy = legacy_mode_enabled();
     tracing::info!(
-        "Feature flags at startup: {} active, {} inactive (legacy default). \
+        "Feature flags at startup: {} active, {} inactive{}. \
          Active: [{}]",
         active.len(),
         inactive_count,
+        if legacy {
+            " (LEINDEX_LEGACY=1 — v2.0.0 rollout reverted)"
+        } else {
+            ""
+        },
         active
             .iter()
             .map(|f| format!(
@@ -533,5 +596,96 @@ mod test {
         assert!(!FeatureFlag::DaemonClient.is_enabled());
         clear_flag_overrides_for_test();
         assert!(FeatureFlag::DaemonClient.is_enabled());
+    }
+
+    // ── Phase 9 legacy fallback tests (VAL-ROLLOUT-013) ──────────────
+
+    /// `LEINDEX_LEGACY=1` reverts all rollout flags to OFF (legacy behavior).
+    #[test]
+    fn test_legacy_mode_reverts_rollout_flags() {
+        // Save and restore the env var since this is process-global.
+        let _g = FLAG_TEST_LOCK.lock().unwrap();
+        clear_flag_overrides_for_test();
+        let prev = env::var(LEGACY_ENV).ok();
+
+        // SAFETY: single-threaded test under FLAG_TEST_LOCK.
+        unsafe { env::set_var(LEGACY_ENV, "1") };
+
+        // NeuralSearch and StreamingMcp are GA features that predate v2.0.0.
+        // They should NOT be affected by LEINDEX_LEGACY.
+        assert!(
+            FeatureFlag::NeuralSearch.is_enabled(),
+            "GA features unaffected by LEINDEX_LEGACY"
+        );
+
+        // v2.0.0 rollout flags should all be OFF under LEINDEX_LEGACY=1.
+        for flag in [
+            FeatureFlag::DaemonClient,
+            FeatureFlag::GenerationReaders,
+            FeatureFlag::BoundedScheduler,
+            FeatureFlag::StreamingScan,
+            FeatureFlag::StreamingParse,
+            FeatureFlag::StreamingPdg,
+            FeatureFlag::StreamingTfidf,
+            FeatureFlag::StreamingNeural,
+            FeatureFlag::GlobalEmbedCache,
+            FeatureFlag::ValidatedModel,
+        ] {
+            assert!(
+                !flag.is_enabled(),
+                "{} should be OFF under LEINDEX_LEGACY=1",
+                flag.env_var()
+            );
+        }
+
+        // Restore.
+        // SAFETY: single-threaded test under FLAG_TEST_LOCK.
+        unsafe {
+            match &prev {
+                Some(v) => env::set_var(LEGACY_ENV, v),
+                None => env::remove_var(LEGACY_ENV),
+            }
+        }
+        clear_flag_overrides_for_test();
+    }
+
+    /// `LEINDEX_LEGACY=0` (or unset) leaves rollout flags at default-on.
+    #[test]
+    fn test_legacy_unset_keeps_default_on() {
+        let _g = FLAG_TEST_LOCK.lock().unwrap();
+        clear_flag_overrides_for_test();
+        let prev = env::var(LEGACY_ENV).ok();
+
+        // SAFETY: single-threaded test under FLAG_TEST_LOCK.
+        unsafe { env::remove_var(LEGACY_ENV) };
+
+        assert!(!legacy_mode_enabled());
+        assert!(FeatureFlag::GenerationReaders.is_enabled());
+        assert!(FeatureFlag::ValidatedModel.is_enabled());
+
+        // Setting to 0 also keeps defaults.
+        // SAFETY: single-threaded test under FLAG_TEST_LOCK.
+        unsafe { env::set_var(LEGACY_ENV, "0") };
+        assert!(!legacy_mode_enabled());
+
+        // SAFETY: single-threaded test under FLAG_TEST_LOCK.
+        unsafe {
+            match &prev {
+                Some(v) => env::set_var(LEGACY_ENV, v),
+                None => env::remove_var(LEGACY_ENV),
+            }
+        }
+        clear_flag_overrides_for_test();
+    }
+
+    /// `is_legacy_revertible` covers all v2.0.0 rollout flags.
+    #[test]
+    fn test_is_legacy_revertible() {
+        assert!(is_legacy_revertible(&FeatureFlag::DaemonClient));
+        assert!(is_legacy_revertible(&FeatureFlag::ValidatedModel));
+        // GA features are NOT legacy-revertible.
+        assert!(!is_legacy_revertible(&FeatureFlag::NeuralSearch));
+        // Debug escape hatch is not a rollout flag.
+        assert!(!is_legacy_revertible(&FeatureFlag::DebugEscapeHatch));
     }
 }

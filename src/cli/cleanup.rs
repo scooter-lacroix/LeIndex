@@ -811,6 +811,178 @@ impl std::fmt::Display for RetentionReportOutput {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Task 7: Unified project-store cleanup (VAL-ROLLOUT-010)
+// ---------------------------------------------------------------------------
+
+/// Report from a unified project-store cleanup pass (Task 7).
+///
+/// This struct consolidates the generation retention report (WS4),
+/// CAS GC, abandoned staging removal, and (optionally) embedding-cache
+/// compaction (WS10) into a single user-facing summary.
+#[derive(Debug, Default)]
+pub struct ProjectCleanupReport {
+    /// Generation-store retention results (stale gens, CAS GC, job pruning).
+    pub generations: crate::storage::generation::GenerationRetentionReport,
+    /// Number of abandoned staging files removed from `cas/.staging/`.
+    pub staging_files_removed: usize,
+    /// Embedding-cache compaction results (if cache exists). None if no
+    /// cache is initialized or the `onnx` feature is off.
+    #[cfg(feature = "onnx")]
+    pub cache: Option<crate::embed::cache::CacheCompactionReport>,
+}
+
+impl std::fmt::Display for ProjectCleanupReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.generations)?;
+        if self.staging_files_removed > 0 {
+            writeln!(f, "  Staging files removed: {}", self.staging_files_removed)?;
+        }
+        #[cfg(feature = "onnx")]
+        {
+            if let Some(ref cache) = self.cache {
+                writeln!(
+                    f,
+                    "  Embed cache: {} rows removed, {} bytes reclaimed",
+                    cache.rows_removed, cache.reclaimed_bytes
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Run unified cleanup on a project's `.leindex/` store.
+///
+/// This is the heart of `leindex cleanup --store` (Task 7). It performs:
+///
+/// 1. **Generation retention** (WS4 [`retain_after_publish`]): removes stale
+///    generations (not current/previous/leased), CAS GC of orphaned blobs
+///    (refcount 0, not pinned by any retained manifest), and job pruning.
+/// 2. **Abandoned staging removal**: deletes leftover `.partial` files in
+///    `cas/.staging/` from crashed writes.
+/// 3. **Embedding-cache compaction** (WS10): removes unreferenced rows from
+///    the user-level global embedding cache (`~/.leindex/embed-cache/`).
+///
+/// **Safety gates (VAL-ROLLOUT-010, §16 reliability gate):**
+/// - The current generation is NEVER removed.
+/// - The immediate previous generation (rollback point) is NEVER removed.
+/// - Any generation with an active lease (refcount > 0 on any layer blob)
+///   is NEVER removed.
+/// - CAS blobs referenced by retained/pinned manifests are NEVER GC'd.
+///
+/// When `dry_run` is true, nothing is deleted; the report reflects what
+/// *would* be removed.
+pub fn cleanup_project_store(
+    storage_root: &Path,
+    dry_run: bool,
+) -> anyhow::Result<ProjectCleanupReport> {
+    use crate::storage::cas::CasStore;
+    use crate::storage::generation::GENERATIONS_DIR;
+    use crate::storage::generation::retention::{RetentionConfig, retain_after_publish};
+
+    let cas_dir = storage_root.join("cas");
+
+    if !storage_root.exists() || !cas_dir.exists() {
+        // No CAS store → nothing to clean. Return empty report.
+        let report = ProjectCleanupReport {
+            generations: crate::storage::generation::GenerationRetentionReport::default(),
+            ..Default::default()
+        };
+        // Still check for embed-cache compaction.
+        #[cfg(feature = "onnx")]
+        {
+            report.cache = compact_embed_cache(dry_run);
+        }
+        return Ok(report);
+    }
+
+    let mut cas = CasStore::open(&cas_dir)
+        .map_err(|e| anyhow::anyhow!("failed to open CAS store at {}: {e}", cas_dir.display()))?;
+    let gens_dir = storage_root.join(GENERATIONS_DIR);
+    let jobs_dir = storage_root.join("jobs");
+
+    // Phase 1: Generation retention + CAS GC + job pruning (WS4).
+    let cfg = RetentionConfig::default();
+    let gen_report = if dry_run {
+        // Read-only report for dry-run mode.
+        crate::storage::generation::retention::retention_report(&cas, &gens_dir, &jobs_dir)
+            .map_err(|e| anyhow::anyhow!("retention report failed: {e}"))?
+    } else {
+        retain_after_publish(&mut cas, &gens_dir, &jobs_dir, &cfg)
+            .map_err(|e| anyhow::anyhow!("retention sweep failed: {e}"))?
+    };
+
+    let mut report = ProjectCleanupReport {
+        generations: gen_report,
+        ..Default::default()
+    };
+
+    // Phase 2: Remove abandoned staging files (crash recovery).
+    let staging_dir = cas_dir.join(".staging");
+    if staging_dir.exists() {
+        let mut removed = 0usize;
+        if let Ok(entries) = fs::read_dir(&staging_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "partial") {
+                    if !dry_run {
+                        if let Err(e) = fs::remove_file(&path) {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                warn!(
+                                    "cleanup: failed to remove staging file {}: {}",
+                                    path.display(),
+                                    e
+                                );
+                            }
+                        } else {
+                            removed += 1;
+                        }
+                    } else {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        report.staging_files_removed = removed;
+    }
+
+    // Phase 3: Embedding-cache compaction (WS10).
+    #[cfg(feature = "onnx")]
+    {
+        report.cache = compact_embed_cache(dry_run);
+    }
+
+    Ok(report)
+}
+
+/// Compact the user-level global embedding cache (WS10 Task 6).
+///
+/// Opens `~/.leindex/embed-cache/` (if it exists) and removes unreferenced
+/// rows. Returns `None` when no cache exists or the `onnx` feature is off.
+#[cfg(feature = "onnx")]
+fn compact_embed_cache(dry_run: bool) -> Option<crate::embed::cache::CacheCompactionReport> {
+    use crate::embed::cache::GlobalEmbeddingCache;
+
+    let home = crate::config::resolve_leindex_home()?;
+    let cache_root = home.join("embed-cache");
+    if !cache_root.exists() {
+        return None;
+    }
+    let mut cache = GlobalEmbeddingCache::open(&cache_root).ok()?;
+    if dry_run {
+        // Return current stats without compaction.
+        let stats = cache.cache_stats().ok()?;
+        Some(crate::embed::cache::CacheCompactionReport {
+            reclaimed_bytes: 0,
+            rows_removed: 0,
+            rows_retained: stats.row_count as u64,
+        })
+    } else {
+        cache.gc().ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1189,5 +1361,262 @@ mod tests {
             "malformed daemon.endpoint must be swept"
         );
         assert!(!dir.path().join("daemon.endpoint").exists());
+    }
+
+    // ── Task 7: cleanup_project_store safety tests (VAL-ROLLOUT-010) ────
+
+    /// Build a minimal generation store fixture under a temp dir.
+    ///
+    /// Creates:
+    /// - `cas/` with a CasStore
+    /// - `generations/<N>/manifest` for each generation
+    /// - `CURRENT` pointing at the latest generation
+    /// - `jobs/` directory
+    ///
+    /// Returns the temp dir, storage root, CasStore, and the generation
+    /// numbers for convenience.
+    fn build_generation_store_fixture(
+        generations: &[u64],
+        current: u64,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        std::sync::Arc<std::sync::Mutex<crate::storage::cas::CasStore>>,
+        Vec<([u8; 32], Vec<u8>)>,
+    ) {
+        use crate::storage::cas::CasStore;
+        use crate::storage::generation::lease::{CURRENT_FILE, GENERATIONS_DIR, MANIFEST_FILE};
+        use crate::storage::generation::manifest::{
+            LayerKind, MANIFEST_VERSION, Manifest, ModelIdentity,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let cas_dir = root.join("cas");
+        let gens_dir = root.join(GENERATIONS_DIR);
+        let jobs_dir = root.join("jobs");
+        std::fs::create_dir_all(&cas_dir).unwrap();
+        std::fs::create_dir_all(&gens_dir).unwrap();
+        std::fs::create_dir_all(&jobs_dir).unwrap();
+
+        let cas = CasStore::open(&cas_dir).unwrap();
+
+        let mut layer_data: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+
+        for &gen_num in generations {
+            // Create a synthetic blob for each layer.
+            let mut layers = std::collections::HashMap::new();
+            for kind in [
+                LayerKind::Db,
+                LayerKind::Tfidf,
+                LayerKind::Neural,
+                LayerKind::Pdg,
+                LayerKind::Symbols,
+            ] {
+                let payload = format!("layer-{kind:?}-gen-{gen_num}").into_bytes();
+                let hash = cas.put(&payload).expect("cas put must succeed");
+                layers.insert(kind, hash);
+                if gen_num == current {
+                    layer_data.push((hash, payload));
+                }
+            }
+
+            let manifest = Manifest {
+                version: MANIFEST_VERSION,
+                generation: gen_num,
+                model_identity: ModelIdentity {
+                    name: "test-model".to_string(),
+                    digest: "test-digest".to_string(),
+                    dimensions: 384,
+                },
+                graph_fingerprint: [0u8; 32],
+                search_fingerprint: [0u8; 32],
+                layers,
+            };
+            let manifest_bytes = manifest.to_bytes().unwrap();
+            let gen_dir = gens_dir.join(gen_num.to_string());
+            std::fs::create_dir_all(&gen_dir).unwrap();
+            std::fs::write(gen_dir.join(MANIFEST_FILE), &manifest_bytes).unwrap();
+        }
+
+        // Write CURRENT pointer.
+        std::fs::write(root.join(CURRENT_FILE), current.to_string()).unwrap();
+
+        cas.persist().unwrap();
+        let cas = std::sync::Arc::new(std::sync::Mutex::new(cas));
+
+        (dir, root, cas, layer_data)
+    }
+
+    /// Cleanup must NOT remove the current generation.
+    #[test]
+    fn test_cleanup_never_removes_current_generation() {
+        let (_dir, root, _cas, _layer_data) = build_generation_store_fixture(&[1, 2], 2);
+
+        let report = cleanup_project_store(&root, false).unwrap();
+
+        assert!(
+            std::fs::exists(root.join("generations/2/manifest")).unwrap(),
+            "current generation manifest must survive cleanup"
+        );
+        assert!(
+            report.generations.generations_retained >= 1,
+            "current gen must be counted as retained"
+        );
+    }
+
+    /// Cleanup must NOT remove the previous (rollback) generation.
+    #[test]
+    fn test_cleanup_never_removes_previous_generation() {
+        let (_dir, root, _cas, _layer_data) = build_generation_store_fixture(&[1, 2], 2);
+
+        let report = cleanup_project_store(&root, false).unwrap();
+
+        // Previous (gen 1) must survive because it's the rollback point.
+        assert!(
+            std::fs::exists(root.join("generations/1/manifest")).unwrap(),
+            "previous (rollback) generation must survive cleanup"
+        );
+        assert_eq!(report.generations.generations_retained, 2);
+    }
+
+    /// Cleanup must remove stale generations (not current/previous/leased).
+    #[test]
+    fn test_cleanup_removes_stale_generations() {
+        // 4 generations: 1 (stale), 2 (stale), 3 (previous=current-1), 4 (current)
+        let (_dir, root, _cas, _layer_data) = build_generation_store_fixture(&[1, 2, 3, 4], 4);
+
+        let report = cleanup_project_store(&root, false).unwrap();
+
+        // Gens 1 and 2 should be deleted as stale.
+        assert!(
+            !std::fs::exists(root.join("generations/1")).unwrap(),
+            "stale generation 1 must be removed"
+        );
+        assert!(
+            !std::fs::exists(root.join("generations/2")).unwrap(),
+            "stale generation 2 must be removed"
+        );
+        // Previous (3) and current (4) must survive.
+        assert!(std::fs::exists(root.join("generations/3")).unwrap());
+        assert!(std::fs::exists(root.join("generations/4")).unwrap());
+        assert_eq!(report.generations.generations_removed, 2);
+    }
+
+    /// Cleanup must NOT remove a leased generation.
+    ///
+    /// A lease is simulated by incrementing refcounts on the generation's blobs.
+    #[test]
+    fn test_cleanup_never_removes_leased_generation() {
+        let (_dir, root, cas, _layer_data) = build_generation_store_fixture(&[1, 2, 3, 4, 5], 5);
+
+        // Simulate a lease on generation 1 by incrementing refcounts.
+        // First, read gen 1's manifest for its hashes.
+        {
+            let manifest_bytes = std::fs::read(root.join("generations/1/manifest")).unwrap();
+            let manifest =
+                crate::storage::generation::manifest::Manifest::from_bytes(&manifest_bytes)
+                    .unwrap();
+            let mut store = cas.lock().unwrap();
+            for hash in manifest.layer_hashes() {
+                store.incr(&hash);
+            }
+            store.persist().unwrap();
+        }
+
+        let _report = cleanup_project_store(&root, false).unwrap();
+
+        // Gen 1 must survive because its blobs are leased.
+        assert!(
+            std::fs::exists(root.join("generations/1")).unwrap(),
+            "leased generation 1 must survive cleanup"
+        );
+        // Gens 2 and 3 are stale (current=5, previous=4, only gen 1 is leased).
+        assert!(!std::fs::exists(root.join("generations/2")).unwrap());
+        assert!(!std::fs::exists(root.join("generations/3")).unwrap());
+    }
+
+    /// Cleanup must remove orphaned CAS blobs (refcount 0, not pinned by any manifest).
+    #[test]
+    fn test_cleanup_removes_orphaned_cas_blobs() {
+        use crate::storage::cas::CasStore;
+
+        let (_dir, root, _cas, _layer_data) = build_generation_store_fixture(&[1], 1);
+
+        // Put an orphan blob (no refcount, not in any manifest).
+        let cas_dir = root.join("cas");
+        let cas = CasStore::open(&cas_dir).unwrap();
+        let orphan_payload = b"orphan-data-not-referenced";
+        // put returns a Result, so unwrap.
+        let orphan_hash = cas.put(orphan_payload).expect("cas put should succeed");
+        cas.persist().unwrap();
+
+        // Verify it exists.
+        assert!(cas.exists(&orphan_hash));
+
+        drop(cas);
+
+        let report = cleanup_project_store(&root, false).unwrap();
+
+        // Orphan should be gone.
+        let cas = CasStore::open(&cas_dir).unwrap();
+        assert!(
+            !cas.exists(&orphan_hash),
+            "orphaned CAS blob must be removed by cleanup"
+        );
+        assert!(report.generations.cas.blobs_removed > 0);
+    }
+
+    /// Cleanup must NOT remove CAS blobs referenced by current/previous/leased
+    /// generations.
+    #[test]
+    fn test_cleanup_preserves_pinned_cas_blobs() {
+        use crate::storage::cas::CasStore;
+
+        let (_dir, root, _cas, layer_data) = build_generation_store_fixture(&[1, 2], 2);
+
+        let report = cleanup_project_store(&root, false).unwrap();
+
+        // All layer blobs from current generation must survive.
+        let cas = CasStore::open(root.join("cas")).unwrap();
+        for (hash, _payload) in &layer_data {
+            assert!(
+                cas.exists(hash),
+                "CAS blob from current generation must survive cleanup"
+            );
+        }
+        assert_eq!(report.generations.cas.blobs_removed, 0);
+    }
+
+    /// Cleanup must remove abandoned staging files.
+    #[test]
+    fn test_cleanup_removes_abandoned_staging() {
+        let (_dir, root, _cas, _layer_data) = build_generation_store_fixture(&[1], 1);
+
+        // Create abandoned staging files.
+        let staging_dir = root.join("cas/.staging");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+        std::fs::write(staging_dir.join("abandoneddigest.partial"), b"partial data").unwrap();
+        std::fs::write(staging_dir.join("anothercrash.partial"), b"more partial").unwrap();
+
+        let report = cleanup_project_store(&root, false).unwrap();
+
+        assert_eq!(report.staging_files_removed, 2);
+        // Staging dir should be empty now.
+        let entries: Vec<_> = std::fs::read_dir(&staging_dir).unwrap().collect();
+        assert!(entries.is_empty(), "all abandoned staging files removed");
+    }
+
+    /// Cleanup must produce a truthful report.
+    #[test]
+    fn test_cleanup_report_accurate() {
+        let (_dir, root, _cas, _layer_data) =
+            build_generation_store_fixture(&[1, 2, 3, 4, 5, 6], 6);
+
+        let report = cleanup_project_store(&root, false).unwrap();
+
+        // Current=6, previous=5 → retained = 2. Removed = 4.
+        assert_eq!(report.generations.generations_retained, 2);
+        assert_eq!(report.generations.generations_removed, 4);
     }
 }

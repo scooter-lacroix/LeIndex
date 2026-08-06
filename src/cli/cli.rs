@@ -246,6 +246,14 @@ pub enum Commands {
         /// too-old worker/MCP lock, pid, sock, status, start files)
         #[arg(long = "stale-daemons")]
         stale_daemons: bool,
+
+        /// Clean the project's `.leindex/` generation store (Task 7):
+        /// removes orphaned CAS blobs (refcount 0), stale generations
+        /// (not current/previous/leased), abandoned staging, and runs
+        /// embed-cache compaction. NEVER touches leased/current/rollback
+        /// generations (VAL-ROLLOUT-010).
+        #[arg(long = "store")]
+        store: bool,
     },
 
     /// Report generation-store retention state (WS4 Task 9)
@@ -472,7 +480,10 @@ impl Cli {
                 max_age_days,
                 dry_run,
                 stale_daemons,
-            } => cmd_cleanup_impl(max_age_days, dry_run, stale_daemons).await,
+                store,
+            } => {
+                cmd_cleanup_impl(max_age_days, dry_run, stale_daemons, store, global_project).await
+            }
             Commands::Retention { report } => cmd_retention_impl(report, global_project).await,
             Commands::Storage {
                 migrate,
@@ -1543,9 +1554,28 @@ async fn cmd_cleanup_impl(
     max_age_days: u64,
     dry_run: bool,
     stale_daemons: bool,
+    store: bool,
+    project: Option<PathBuf>,
 ) -> AnyhowResult<()> {
     use crate::cli::cleanup::{run_gc, sweep_stale_daemon_artifacts};
     use std::time::Duration;
+
+    if store {
+        println!(
+            "LeIndex Cleanup — project store{}\n",
+            if dry_run { " (dry run)" } else { "" }
+        );
+        let project_path = get_project_path(project);
+        let canonical = project_path
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("failed to canonicalize project path: {e}"))?;
+        let storage_root = crate::cli::leindex::resolve_existing_storage_path(&canonical)
+            .unwrap_or_else(|| canonical.join(".leindex"));
+        println!("Cleaning: {}\n", storage_root.display());
+        let report = crate::cli::cleanup::cleanup_project_store(&storage_root, dry_run)?;
+        println!("{}", report);
+        return Ok(());
+    }
 
     let max_age = Duration::from_secs(max_age_days * 24 * 3600);
 
@@ -1935,10 +1965,12 @@ mod tests {
                 max_age_days,
                 dry_run,
                 stale_daemons,
+                store,
             }) => {
                 assert_eq!(max_age_days, 7);
                 assert!(!dry_run);
                 assert!(!stale_daemons);
+                assert!(!store);
             }
             _ => panic!("Expected Cleanup command"),
         }
@@ -1960,10 +1992,12 @@ mod tests {
                 max_age_days,
                 dry_run,
                 stale_daemons,
+                store,
             }) => {
                 assert_eq!(max_age_days, 14);
                 assert!(dry_run);
                 assert!(stale_daemons);
+                assert!(!store);
             }
             _ => panic!("Expected Cleanup command"),
         }
