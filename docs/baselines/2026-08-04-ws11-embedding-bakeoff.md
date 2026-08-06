@@ -48,11 +48,7 @@ All candidates are evaluated through the **full fused-retrieval path** (TF-IDF +
 
 ## Decision
 
-**Winner:** coderank-embed-137m (CodeRankEmbed 137M)
-
-- MRR@10: 1.0000
-- Total memory: 390 MiB
-- Fits budget: false
+**CONFLICT REPORT:** All gate-passing candidates exceed the target resource budget. No candidate can satisfy all acceptance gates within the §7 aggregate target. The conflict is reported per anti-cheat section 2.1 #4, #13 — no manufactured pass. See budget fit analysis above for details.
 
 ---
 

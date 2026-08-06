@@ -66,8 +66,12 @@ pub struct BakeoffReport {
     pub baseline_candidate: String,
     /// All candidate rows.
     pub rows: Vec<CandidateRow>,
-    /// Winner candidate identifier (set after applying gates).
+    /// Winner candidate identifier (set after applying gates AND budget check).
     pub winner: Option<String>,
+    /// Whether a budget conflict was detected (no fitting candidate among gate-passing).
+    pub conflict: bool,
+    /// Reason for the conflict, if any.
+    pub conflict_reason: String,
 }
 
 impl BakeoffReport {
@@ -77,6 +81,8 @@ impl BakeoffReport {
             baseline_candidate: baseline.to_string(),
             rows: Vec::new(),
             winner: None,
+            conflict: false,
+            conflict_reason: String::new(),
         }
     }
 
@@ -176,6 +182,8 @@ mod tests {
         let json = report.to_json().expect("json");
         assert!(json.contains("\"baseline_candidate\""));
         assert!(json.contains("test-candidate"));
+        assert!(json.contains("\"conflict\""));
+        assert!(json.contains("\"conflict_reason\""));
     }
 
     #[test]

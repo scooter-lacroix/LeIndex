@@ -448,15 +448,34 @@ pub struct BakeoffResult {
 }
 
 impl BakeoffResult {
-    /// Get the best candidate (lowest memory among gate-passing candidates).
-    /// If no candidates passed, returns None.
+    /// Get the best candidate (lowest memory among gate-passing, budget-fitting candidates).
+    /// If no candidates pass gates, returns None.
+    /// If candidates pass gates but none fit the budget, returns None (conflict).
     pub fn best_candidate(&self) -> Option<&CandidateResult> {
-        self.candidates.iter().filter(|c| c.passed).min_by(|a, b| {
-            a.memory
-                .total_memory_mib()
-                .partial_cmp(&b.memory.total_memory_mib())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        self.candidates
+            .iter()
+            .filter(|c| c.passed && c.profile.fits_budget(self.memory_budget_mib))
+            .min_by(|a, b| {
+                a.memory
+                    .total_memory_mib()
+                    .partial_cmp(&b.memory.total_memory_mib())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
+
+    /// Check whether candidates pass gates but none fit the budget.
+    ///
+    /// Returns true only when at least one candidate passed gates AND none of the
+    /// passing candidates fit the memory budget. This distinguishes the genuine
+    /// conflict scenario (VAL-EVAL-010) from cases where a passing candidate
+    /// also fits the budget.
+    pub fn has_budget_conflict(&self) -> bool {
+        let any_passed = self.candidates.iter().any(|c| c.passed);
+        let any_passing_fits_budget = self
+            .candidates
+            .iter()
+            .any(|c| c.passed && c.profile.fits_budget(self.memory_budget_mib));
+        any_passed && !any_passing_fits_budget
     }
 
     /// Convert to a BakeoffReport for JSON serialization.
@@ -478,9 +497,22 @@ impl BakeoffResult {
             });
         }
 
-        // Set winner: best candidate among passing
+        // Set winner: best candidate among passing AND fitting budget.
+        // If no budget-fitting candidate exists but some passed gates, report conflict.
+        // For empty candidates (test/setup), no conflict.
         if let Some(best) = self.best_candidate() {
             report.winner = Some(best.profile.id.clone());
+            report.conflict = false;
+        } else if self.candidates.is_empty() {
+            report.conflict = false;
+        } else if self.has_budget_conflict() {
+            report.conflict = true;
+            report.conflict_reason =
+                "All gate-passing candidates exceed the target resource budget".to_string();
+        } else {
+            // Candidates exist but none passed gates
+            report.conflict = true;
+            report.conflict_reason = "No candidate passes all acceptance gates".to_string();
         }
 
         report
@@ -802,6 +834,13 @@ pub fn generate_bakeoff_markdown(result: &BakeoffResult) -> String {
             best.memory.total_memory_mib(),
             best.profile.fits_budget(result.memory_budget_mib)
         ));
+    } else if result.has_budget_conflict() {
+        md.push_str(
+            "**CONFLICT REPORT:** All gate-passing candidates exceed the target resource \
+             budget. No candidate can satisfy all acceptance gates within the §7 aggregate \
+             target. The conflict is reported per anti-cheat section 2.1 #4, #13 — no \
+             manufactured pass. See budget fit analysis above for details.\n",
+        );
     } else {
         md.push_str(
             "**CONFLICT REPORT:** No candidate passes all gates within the target resource \
@@ -809,7 +848,6 @@ pub fn generate_bakeoff_markdown(result: &BakeoffResult) -> String {
              manufactured pass.\n",
         );
     }
-
     md.push_str("\n---\n\n");
     md.push_str(
         "## Anti-Cheat Compliance\n\n\
@@ -1045,6 +1083,80 @@ mod tests {
         };
         let report = result.to_report();
         assert_eq!(report.baseline_candidate, "qwen3-fp16");
+        assert!(!report.conflict);
+        assert!(report.conflict_reason.is_empty());
+    }
+
+    #[test]
+    fn test_bakeoff_conflict_when_no_candidate_fits_budget() {
+        // VAL-EVAL-010: If no candidate fits budget, conflict is reported.
+        // All 7 candidates exceed 100 MiB budget, but some pass gates.
+        let corpus = load_and_verify_corpus().expect("corpus");
+        let harness = EvalHarness::new(corpus);
+        let catalog = build_candidate_catalog();
+        let gates = Gates::default().with_variance_bands(VarianceBands {
+            aggregate_mrr10_stddev: 0.5, // Very generous, all pass
+            ..VarianceBands::default()
+        });
+
+        let result = run_full_bakeoff(&harness, &catalog, |p| p.quality_factor, &gates, 100.0)
+            .expect("bakeoff");
+
+        // All candidates pass gates (generous variance band)
+        let passing: Vec<_> = result.candidates.iter().filter(|c| c.passed).collect();
+        assert!(!passing.is_empty(), "All should pass with generous gates");
+
+        // But none fit the 100 MiB budget (minimum is ~240 MiB for CodeRankEmbed)
+        assert!(
+            result.best_candidate().is_none(),
+            "No candidate should fit 100 MiB budget"
+        );
+
+        // Conflict should be detected
+        assert!(result.has_budget_conflict(), "Should have budget conflict");
+
+        // Report should show conflict
+        let report = result.to_report();
+        assert!(report.conflict);
+        assert!(!report.conflict_reason.is_empty());
+    }
+
+    #[test]
+    fn test_bakeoff_no_conflict_when_candidate_fits_budget() {
+        // When at least one passing candidate fits the budget, no conflict.
+        // CodeRankEmbed (~390 MiB) fits 512 MiB while Qwen3 FP16 (~1569 MiB) exceeds.
+        // has_budget_conflict() should be FALSE because at least one passing
+        // candidate (CodeRankEmbed) fits the budget.
+        let corpus = load_and_verify_corpus().expect("corpus");
+        let harness = EvalHarness::new(corpus);
+        let catalog = build_candidate_catalog();
+        let gates = Gates::default().with_variance_bands(VarianceBands {
+            aggregate_mrr10_stddev: 0.5, // Very generous — all pass
+            ..VarianceBands::default()
+        });
+
+        // Use a budget that CodeRankEmbed (~390 MiB) fits
+        let result = run_full_bakeoff(&harness, &catalog, |p| p.quality_factor, &gates, 512.0)
+            .expect("bakeoff");
+
+        // CodeRankEmbed should fit 512 MiB budget
+        assert!(
+            result.best_candidate().is_some(),
+            "CodeRankEmbed should fit 512 MiB budget"
+        );
+        // has_budget_conflict() is FALSE because at least one passing candidate fits.
+        assert!(
+            !result.has_budget_conflict(),
+            "CodeRankEmbed passes gates and fits 512 MiB, so no budget conflict"
+        );
+
+        let report = result.to_report();
+        assert!(
+            !report.conflict,
+            "No conflict when a passing candidate fits the budget"
+        );
+        assert!(report.conflict_reason.is_empty());
+        assert!(report.winner.is_some(), "Winner should be selected");
     }
 
     #[test]
