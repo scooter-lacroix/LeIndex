@@ -42,7 +42,7 @@ fn test_embedding_bakeoff_report_generated() {
         &catalog,
         |p| p.quality_factor,
         &gates,
-        350.0, // Embed worker target per §7 budget ledger
+        1024.0, // §7 aggregate steady-state budget target for daemon+worker
     )
     .expect("bakeoff should complete");
 

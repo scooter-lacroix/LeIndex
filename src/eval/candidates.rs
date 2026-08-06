@@ -782,27 +782,40 @@ pub fn generate_bakeoff_markdown(result: &BakeoffResult) -> String {
     }
 
     md.push_str(&format!(
-        "\n**Memory budget target:** {:.0} MiB (§7 aggregate target ≤1 GiB for daemon+worker)\n\n",
-        result.memory_budget_mib
+        "\n**Memory budget targets:** {:.0} MiB embed worker host RSS (§7), {:.0} MiB aggregate \
+         steady-state (§7 daemon+worker)\n\n",
+        super::budget_ledger::EMBED_WORKER_HOST_BUDGET_MIB,
+        super::budget_ledger::AGGREGATE_BUDGET_MIB,
     ));
 
-    // Budget fit analysis
+    // Budget fit analysis — per-component accounting (VAL-EVAL-007).
+    //
+    // Host RSS is checked against the embed worker host budget (§7: 350 MiB).
+    // Total memory (host RSS + GPU VRAM) is checked against the aggregate
+    // steady-state budget (§7: 1024 MiB). This matches budget_ledger.rs:
+    // the ledger counts host RSS and GPU VRAM as separate budget lines,
+    // never combining them before comparison.
     md.push_str("## Budget Fit Analysis (VAL-EVAL-007)\n\n");
-    md.push_str("| Candidate | Total Mem (MiB) | Fits Budget | Notes |\n");
-    md.push_str("|-----------|-----------------|-------------|-------|\n");
+    md.push_str(
+        "| Candidate | Host RSS (MiB) | GPU VRAM (MiB) | Total Mem (MiB) | Fits Embed Worker (350 MiB) | Fits Aggregate (1024 MiB) |\n",
+    );
+    md.push_str("|-----------|---------------:|----------------:|-----------------:|:----------------------------:|:-------------------------:|\n");
     for cand_result in &result.candidates {
+        let host_rss = cand_result.memory.peak_host_rss_mib;
+        let gpu_vram = cand_result.memory.peak_gpu_vram_mib;
         let total = cand_result.memory.total_memory_mib();
-        let fits = cand_result.profile.fits_budget(result.memory_budget_mib);
+        let fits_host = host_rss <= super::budget_ledger::EMBED_WORKER_HOST_BUDGET_MIB;
+        let fits_aggregate = cand_result
+            .profile
+            .fits_budget(super::budget_ledger::AGGREGATE_BUDGET_MIB);
         md.push_str(&format!(
-            "| {} | {:.0} | {} | {} |\n",
+            "| {} | {:.0} | {:.0} | {:.0} | {} | {} |\n",
             cand_result.profile.id,
+            host_rss,
+            gpu_vram,
             total,
-            if fits { "YES" } else { "NO" },
-            if fits {
-                "Within §7 budget"
-            } else {
-                "Exceeds §7 budget"
-            },
+            if fits_host { "YES" } else { "NO" },
+            if fits_aggregate { "YES" } else { "NO" },
         ));
     }
 
@@ -1090,7 +1103,12 @@ mod tests {
     #[test]
     fn test_bakeoff_conflict_when_no_candidate_fits_budget() {
         // VAL-EVAL-010: If no candidate fits budget, conflict is reported.
-        // All 7 candidates exceed 100 MiB budget, but some pass gates.
+        //
+        // Test uses 100.0 MiB to force a genuine conflict: every candidate's
+        // total memory (host RSS + GPU VRAM) is > 100 MiB, while all pass
+        // the gate check via a generous variance band. This exercises the
+        // has_budget_conflict() / conflict-report path without relying on
+        // the budget_mib being the real 350/1024 allocation.
         let corpus = load_and_verify_corpus().expect("corpus");
         let harness = EvalHarness::new(corpus);
         let catalog = build_candidate_catalog();

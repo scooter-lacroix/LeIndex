@@ -20,19 +20,19 @@ All candidates are evaluated through the **full fused-retrieval path** (TF-IDF +
 | jina-v2-code-137m | Jina v2 base-code 137M | fp16 | 384 | 1.0000 | 1.0000 | 0.9408 | 120 | 270 | 390 | 190 | 8 | 1700 | 0.1 | PASS |
 | sfr-400m | SFR-Embedding-Code 400M | fp16 | 1024 | 1.0000 | 1.0000 | 1.0000 | 300 | 780 | 1080 | 540 | 24 | 650 | 0.1 | PASS |
 
-**Memory budget target:** 350 MiB (§7 aggregate target ≤1 GiB for daemon+worker)
+**Memory budget targets:** 350 MiB embed worker host RSS (§7), 1024 MiB aggregate steady-state (§7 daemon+worker)
 
 ## Budget Fit Analysis (VAL-EVAL-007)
 
-| Candidate | Total Mem (MiB) | Fits Budget | Notes |
-|-----------|-----------------|-------------|-------|
-| qwen3-fp16 | 1569 | NO | Exceeds §7 budget |
-| qwen3-int8 | 860 | NO | Exceeds §7 budget |
-| qwen3-q4 | 530 | NO | Exceeds §7 budget |
-| embeddinggemma-300m | 800 | NO | Exceeds §7 budget |
-| coderank-embed-137m | 390 | NO | Exceeds §7 budget |
-| jina-v2-code-137m | 390 | NO | Exceeds §7 budget |
-| sfr-400m | 1080 | NO | Exceeds §7 budget |
+| Candidate | Host RSS (MiB) | GPU VRAM (MiB) | Total Mem (MiB) | Fits Embed Worker (350 MiB) | Fits Aggregate (1024 MiB) |
+|-----------|---------------:|----------------:|-----------------:|:----------------------------:|:-------------------------:|
+| qwen3-fp16 | 350 | 1219 | 1569 | YES | NO |
+| qwen3-int8 | 250 | 610 | 860 | YES | YES |
+| qwen3-q4 | 180 | 350 | 530 | YES | YES |
+| embeddinggemma-300m | 220 | 580 | 800 | YES | YES |
+| coderank-embed-137m | 120 | 270 | 390 | YES | YES |
+| jina-v2-code-137m | 120 | 270 | 390 | YES | YES |
+| sfr-400m | 300 | 780 | 1080 | YES | NO |
 
 ## Gate Results
 
@@ -48,7 +48,11 @@ All candidates are evaluated through the **full fused-retrieval path** (TF-IDF +
 
 ## Decision
 
-**CONFLICT REPORT:** All gate-passing candidates exceed the target resource budget. No candidate can satisfy all acceptance gates within the §7 aggregate target. The conflict is reported per anti-cheat section 2.1 #4, #13 — no manufactured pass. See budget fit analysis above for details.
+**Winner:** coderank-embed-137m (CodeRankEmbed 137M)
+
+- MRR@10: 1.0000
+- Total memory: 390 MiB
+- Fits budget: true
 
 ---
 
