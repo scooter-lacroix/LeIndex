@@ -72,6 +72,9 @@ pub(super) async fn cmd_mcp_stdio_impl(
     info!("Starting LeIndex MCP stdio server (lazy project loading)");
     crate::cli::memory_report::observe_rss("mcp_stdio_startup");
 
+    // Log feature-flag state at startup (§12.3: flag state visible at start).
+    crate::feature_flags::log_flag_state();
+
     // ── Daemon-client shim path (spec §4.1, §12.3 phase 3) ─────────────
     //
     // When the `daemon-client` feature is enabled, attempt to discover or

@@ -36,6 +36,18 @@ pub enum FeatureFlag {
     StreamingMcp,
     /// Enable global index auto-sync.
     GlobalAutoSync,
+    /// Enable the daemon-client MIME protocol path (WS3).
+    ///
+    /// When enabled, `leindex mcp --stdio` acts as a thin shim that discovers
+    /// (or spawns) the user-scoped `leindexd` daemon and forwards MCP/JSON-RPC
+    /// frames to it over a Unix socket. When disabled (the default), the
+    /// stdio server runs the full inline engine (legacy v1.9.x behaviour).
+    ///
+    /// This runtime flag works alongside the `daemon-client` Cargo feature:
+    /// the Cargo feature compiles the shim code path; this env flag controls
+    /// whether the compiled code is used at runtime. When the Cargo feature
+    /// is disabled, this flag has no effect (there is no shim code to run).
+    DaemonClient,
     /// Enable the one-time legacy→CAS store migration sweep (WS4 Task 10).
     ///
     /// When enabled, `LeIndex::new` converts a legacy full-copy `.leindex/`
@@ -108,6 +120,7 @@ impl FeatureFlag {
             Self::ExperimentalHnsw => "LEINDEX_FEATURE_EXPERIMENTAL_HNSW",
             Self::StreamingMcp => "LEINDEX_FEATURE_STREAMING_MCP",
             Self::GlobalAutoSync => "LEINDEX_FEATURE_GLOBAL_AUTO_SYNC",
+            Self::DaemonClient => "LEINDEX_FEATURE_DAEMON_CLIENT",
             Self::GenerationMigration => "LEINDEX_FEATURE_GENERATION_MIGRATION",
             Self::GenerationReaders => "LEINDEX_FEATURE_GENERATION_READERS",
             Self::BoundedScheduler => "LEINDEX_FEATURE_BOUNDED_SCHEDULER",
@@ -162,6 +175,7 @@ impl FeatureFlag {
             Self::ExperimentalHnsw => "Enable experimental HNSW algorithm parameters",
             Self::StreamingMcp => "Enable streaming MCP notifications",
             Self::GlobalAutoSync => "Enable global index auto-sync",
+            Self::DaemonClient => "Stdio MCP shim forwards to user-scoped leindexd daemon (WS3)",
             Self::GenerationMigration => "Enable the one-time legacy→CAS store migration sweep",
             Self::GenerationReaders => {
                 "Read-path handlers use leased mmap generations instead of heap mirrors"
@@ -219,6 +233,7 @@ impl FlagStore {
             FeatureFlag::ExperimentalHnsw,
             FeatureFlag::StreamingMcp,
             FeatureFlag::GlobalAutoSync,
+            FeatureFlag::DaemonClient,
             FeatureFlag::GenerationMigration,
             FeatureFlag::GenerationReaders,
             FeatureFlag::BoundedScheduler,
@@ -296,6 +311,39 @@ fn flag_store() -> &'static FlagStore {
     FLAG_STORE.get_or_init(FlagStore::new)
 }
 
+/// Log the state of all feature flags at startup (spec §12.3).
+///
+/// Each flag is logged with its name, env-var, and effective ON/OFF state.
+/// Called from the daemon and the inline server entry points so the user can
+/// audit which workstream features are active in their deployment. The roll
+/// out plan (§12.3) requires flag state to be visible at daemon start.
+pub fn log_flag_state() {
+    let flags = all_flags();
+    let active: Vec<&FeatureFlag> = flags
+        .iter()
+        .filter(|(_, enabled)| *enabled)
+        .map(|(flag, _)| flag)
+        .collect();
+    let inactive_count = flags.len() - active.len();
+    tracing::info!(
+        "Feature flags at startup: {} active, {} inactive (legacy default). \
+         Active: [{}]",
+        active.len(),
+        inactive_count,
+        active
+            .iter()
+            .map(|f| format!(
+                "{} ({})",
+                f.env_var()
+                    .strip_prefix("LEINDEX_FEATURE_")
+                    .unwrap_or(f.env_var()),
+                f.is_enabled()
+            ))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+}
+
 /// Returns a list of all feature flags and their current state.
 ///
 /// Useful for CLI output (`leindex feature-flags`) and debugging.
@@ -307,6 +355,7 @@ pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
         FeatureFlag::ExperimentalHnsw,
         FeatureFlag::StreamingMcp,
         FeatureFlag::GlobalAutoSync,
+        FeatureFlag::DaemonClient,
         FeatureFlag::GenerationMigration,
         FeatureFlag::GenerationReaders,
         FeatureFlag::BoundedScheduler,
@@ -415,5 +464,54 @@ mod test {
         assert!(FeatureFlag::ValidatedModel.is_enabled());
         clear_flag_overrides_for_test();
         assert!(!FeatureFlag::ValidatedModel.is_enabled());
+    }
+
+    /// VAL-ROLLOUT-001: Every new WS3-WS11 feature flag defaults OFF.
+    ///
+    /// The rollout gates must not silently enable any workstream. This test
+    /// exercises the `default_value()` path (the production default), not the
+    /// `is_enabled()` path (which may see test overrides from sibling tests).
+    #[test]
+    fn test_all_rollout_flags_default_off() {
+        let _g = FLAG_TEST_LOCK.lock().unwrap();
+        clear_flag_overrides_for_test();
+        let rollout_flags = [
+            FeatureFlag::DaemonClient,
+            FeatureFlag::GenerationReaders,
+            FeatureFlag::BoundedScheduler,
+            FeatureFlag::StreamingScan,
+            FeatureFlag::StreamingParse,
+            FeatureFlag::StreamingPdg,
+            FeatureFlag::StreamingTfidf,
+            FeatureFlag::StreamingNeural,
+            FeatureFlag::GlobalEmbedCache,
+            FeatureFlag::ValidatedModel,
+        ];
+        for flag in &rollout_flags {
+            assert!(
+                !flag.default_value(),
+                "{} should default OFF (legacy behavior)",
+                flag.env_var()
+            );
+        }
+    }
+
+    #[test]
+    fn test_daemon_client_flag_added_and_off_by_default() {
+        assert_eq!(
+            FeatureFlag::DaemonClient.env_var(),
+            "LEINDEX_FEATURE_DAEMON_CLIENT"
+        );
+        assert!(!FeatureFlag::DaemonClient.default_value());
+    }
+
+    #[test]
+    fn test_daemon_client_override_toggles() {
+        let _g = FLAG_TEST_LOCK.lock().unwrap();
+        assert!(!FeatureFlag::DaemonClient.is_enabled());
+        set_flag_override_for_test(FeatureFlag::DaemonClient, true);
+        assert!(FeatureFlag::DaemonClient.is_enabled());
+        clear_flag_overrides_for_test();
+        assert!(!FeatureFlag::DaemonClient.is_enabled());
     }
 }

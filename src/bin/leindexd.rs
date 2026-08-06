@@ -138,6 +138,10 @@ mod imp {
             idle_timeout_secs
         );
 
+        // Log feature-flag state at startup (§12.3: flag state visible at
+        // daemon start).
+        leindex::feature_flags::log_flag_state();
+
         let rt = build_runtime();
         rt.block_on(async {
             // Build the MCP server (no eager project/model load — spec §4.2).
