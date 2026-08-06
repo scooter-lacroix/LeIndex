@@ -67,6 +67,9 @@ pub const ROW_HEADER_LEN: usize = 9 + 1 + ROW_PAD_LEN + 32 + 4 + 32;
 const REFS_FILENAME: &str = "refs.json";
 /// Filename for persisted telemetry counters.
 const TELEMETRY_FILENAME: &str = "telemetry.json";
+/// Filename for the persistent model-digest index (maps row fingerprints to
+/// model digests so `cache_stats()` can report a concrete model identity).
+const MODEL_INDEX_FILENAME: &str = "model_index.json";
 /// Environment variable that enables debug escape hatch (stores source text
 /// alongside vector rows). The feature-flag equivalent is
 /// `LEINDEX_FEATURE_EMBED_CACHE_DEBUG` (see `FeatureFlag::DebugEscapeHatch`).
@@ -298,6 +301,51 @@ fn ref_key(project_id: &str, generation: u64) -> String {
     format!("{project_id}:{generation}")
 }
 
+/// Persistent index mapping row fingerprint hex to model digest hex.
+///
+/// This sidecar allows `cache_stats()` to report the concrete model digest
+/// stored with each row rather than a generic opaque string. It is updated
+/// on every `put()` and pruned during `gc()`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelIndex {
+    /// fingerprint_hex -> model_digest_hex
+    #[serde(default)]
+    map: HashMap<String, String>,
+}
+
+impl ModelIndex {
+    /// Record the model digest for a given fingerprint.
+    pub fn insert(&mut self, fingerprint_hex: &str, model_digest_hex: &str) {
+        self.map
+            .insert(fingerprint_hex.to_string(), model_digest_hex.to_string());
+    }
+
+    /// Look up the model digest hex for a fingerprint.
+    pub fn get(&self, fingerprint_hex: &str) -> Option<&str> {
+        self.map.get(fingerprint_hex).map(String::as_str)
+    }
+
+    /// Remove an entry for a fingerprint.
+    pub fn remove(&mut self, fingerprint_hex: &str) {
+        self.map.remove(fingerprint_hex);
+    }
+
+    /// Retain only entries whose fingerprint hex is in the given set.
+    pub fn retain_existing(&mut self, existing: &HashSet<String>) {
+        self.map.retain(|k, _| existing.contains(k));
+    }
+
+    /// Number of tracked entries.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether the index is empty.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
 /// User-level content-addressed global embedding cache.
 ///
 /// The cache stores embedding vectors in fixed-layout mmap-friendly row files
@@ -329,6 +377,7 @@ pub struct GlobalEmbeddingCache {
     refs: ProjectRefs,
     config: CacheConfig,
     telemetry: CacheTelemetry,
+    model_index: ModelIndex,
 }
 
 impl GlobalEmbeddingCache {
@@ -355,11 +404,13 @@ impl GlobalEmbeddingCache {
         fs::create_dir_all(root.join("rows"))?;
         let refs = load_refs(&root)?;
         let telemetry = load_telemetry(&root)?;
+        let model_index = load_model_index(&root)?;
         Ok(GlobalEmbeddingCache {
             root,
             refs,
             config,
             telemetry,
+            model_index,
         })
     }
 
@@ -501,6 +552,12 @@ impl GlobalEmbeddingCache {
             }
         }
 
+        // Record model digest for model_identity reporting in cache_stats().
+        let fingerprint_hex = hex_encode(&fingerprint);
+        let model_digest_hex = hex_encode(&key.model_digest);
+        self.model_index.insert(&fingerprint_hex, &model_digest_hex);
+        let _ = self.persist_model_index();
+
         Ok(())
     }
 
@@ -619,8 +676,13 @@ impl GlobalEmbeddingCache {
             }
         }
         self.refs.refs.retain(|k, _| still_existing.contains(k));
+
+        // Prune model_index entries for deleted rows.
+        self.model_index.retain_existing(&still_existing);
+
         self.persist_refs()?;
         self.persist_telemetry()?;
+        self.persist_model_index()?;
 
         Ok(report)
     }
@@ -653,6 +715,56 @@ impl GlobalEmbeddingCache {
     /// Get the cache configuration (max_bytes, max_entry_bytes).
     pub fn config(&self) -> &CacheConfig {
         &self.config
+    }
+
+    /// Compute the model identity string for cache_stats():
+    /// - "none" if no rows exist
+    /// - The model digest hex if all rows share the same model digest
+    /// - "multiple" if rows from multiple distinct model digests exist
+    fn compute_model_identity(&self) -> Result<String, CacheError> {
+        let rows_dir = self.root.join("rows");
+        if !rows_dir.exists() {
+            return Ok("none".to_string());
+        }
+
+        let mut distinct_digests: HashSet<String> = HashSet::new();
+
+        for entry in fs::read_dir(&rows_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            for sub_entry in fs::read_dir(entry.path())? {
+                let sub_entry = sub_entry?;
+                let path = sub_entry.path();
+                if path.extension().is_some_and(|ext| ext == "partial") || !path.is_file() {
+                    continue;
+                }
+                let filename = sub_entry.file_name().to_string_lossy().to_string();
+                // The filename is the fingerprint hex.
+                if let Some(digest_hex) = self.model_index.get(&filename) {
+                    distinct_digests.insert(digest_hex.to_string());
+                }
+            }
+        }
+
+        if distinct_digests.is_empty() {
+            Ok("none".to_string())
+        } else if distinct_digests.len() == 1 {
+            Ok(distinct_digests.into_iter().next().unwrap())
+        } else {
+            Ok("multiple".to_string())
+        }
+    }
+
+    /// Persist the model-digest index to `model_index.json`.
+    fn persist_model_index(&self) -> Result<(), CacheError> {
+        let path = self.root.join(MODEL_INDEX_FILENAME);
+        let tmp = path.with_extension("tmp");
+        let data = serde_json::to_vec_pretty(&self.model_index)?;
+        fs::write(&tmp, &data)?;
+        fs::rename(&tmp, &path)?;
+        Ok(())
     }
 
     /// Byte-budget eviction: remove oldest unreferenced rows until
@@ -738,18 +850,10 @@ impl GlobalEmbeddingCache {
         let tracked_references = self.refs.tracked_count();
         let hit_ratio = self.telemetry.hit_ratio();
 
-        // Model identity: gather distinct model digests from stored rows.
-        // Since read_row gives us just the vector, we use the fingerprint
-        // prefix as the identity key (the fingerprint already includes model
-        // digest). For the report, we just show the tracked count + a summary.
-        let model_identity = if row_count == 0 {
-            "none".to_string()
-        } else {
-            // The cache key includes model_digest, so every row is inherently
-            // namespaced by model. We report "content-addressed" since all
-            // rows are keyed by model+content hash.
-            "content-addressed (model-digest namespaced)".to_string()
-        };
+        // Model identity: gather distinct model digests from stored rows by
+        // consulting the model index sidecar. Each row's fingerprint maps to
+        // the model_digest that was used when the row was written.
+        let model_identity = self.compute_model_identity()?;
 
         Ok(CacheStatsReport {
             cache_bytes,
@@ -1015,6 +1119,16 @@ fn load_telemetry(root: &Path) -> Result<CacheTelemetry, CacheError> {
     let path = root.join(TELEMETRY_FILENAME);
     if !path.exists() {
         return Ok(CacheTelemetry::default());
+    }
+    let data = fs::read(&path)?;
+    Ok(serde_json::from_slice(&data)?)
+}
+
+/// Load the model-digest index from `model_index.json`, or return empty if absent.
+fn load_model_index(root: &Path) -> Result<ModelIndex, CacheError> {
+    let path = root.join(MODEL_INDEX_FILENAME);
+    if !path.exists() {
+        return Ok(ModelIndex::default());
     }
     let data = fs::read(&path)?;
     Ok(serde_json::from_slice(&data)?)
@@ -1336,10 +1450,10 @@ mod tests {
         );
         assert!(stats.max_bytes > 0, "max_bytes must be set");
         assert!(stats.max_entry_bytes > 0, "max_entry_bytes must be set");
-        assert_eq!(
-            stats.model_identity,
-            "content-addressed (model-digest namespaced)"
-        );
+        // model_identity should report the actual model digest hex, not a
+        // fixed opaque string.
+        let expected_model = hex_encode(&CacheKey::model_digest(b"model-bytes"));
+        assert_eq!(stats.model_identity, expected_model);
     }
 
     /// Task 6: Telemetry tracks hit/miss/eviction counts.
@@ -1521,10 +1635,9 @@ mod tests {
         assert!(stats.cache_bytes > 0);
         assert!(stats.max_bytes > 0);
         assert!(stats.max_entry_bytes > 0);
-        assert_eq!(
-            stats.model_identity,
-            "content-addressed (model-digest namespaced)"
-        );
+        // model_identity reports the actual model digest hex.
+        let expected_model = hex_encode(&CacheKey::model_digest(b"model-bytes"));
+        assert_eq!(stats.model_identity, expected_model);
 
         // Verify the report is serializable (for JSON output).
         let json = serde_json::to_string(&stats).unwrap();
@@ -1942,5 +2055,152 @@ mod tests {
         for (a, b) in v.iter().zip(original.iter()) {
             assert_eq!(a.to_bits(), b.to_bits());
         }
+    }
+
+    // ── Model identity (fix-sp5-model-identity) ──────────────────────
+
+    /// Helper: create a CacheKey with a specific model digest.
+    fn key_with_model(model_bytes: &[u8], content: &str, dim: u32) -> CacheKey {
+        CacheKey {
+            model_digest: CacheKey::model_digest(model_bytes),
+            tokenizer_digest: CacheKey::tokenizer_digest(b"tokenizer-config"),
+            prompt_role_and_version: 0,
+            pooling: Pooling::Mean,
+            normalization: Normalization::L2,
+            output_dimensions: dim,
+            content_hash: CacheKey::content_hash(content),
+        }
+    }
+
+    /// model_identity is "none" when the cache has no rows.
+    #[test]
+    fn test_model_identity_none_for_empty_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
+        let stats = cache.cache_stats().unwrap();
+        assert_eq!(stats.model_identity, "none");
+    }
+
+    /// model_identity reports the actual model digest hex when all rows
+    /// share the same model.
+    #[test]
+    fn test_model_identity_single_model_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
+
+        let model_bytes = b"my-specific-model-v1";
+        let expected_hex = hex_encode(&CacheKey::model_digest(model_bytes));
+
+        // Put multiple rows under the same model.
+        let key1 = key_with_model(model_bytes, "text one", 4);
+        let key2 = key_with_model(model_bytes, "text two", 4);
+        let key3 = key_with_model(model_bytes, "text three", 4);
+
+        cache.put(&key1, &[0.1, 0.2, 0.3, 0.4], None).unwrap();
+        cache.put(&key2, &[0.5, 0.6, 0.7, 0.8], None).unwrap();
+        cache.put(&key3, &[0.9, 1.0, 1.1, 1.2], None).unwrap();
+
+        let stats = cache.cache_stats().unwrap();
+        assert_eq!(stats.row_count, 3);
+        assert_eq!(
+            stats.model_identity, expected_hex,
+            "model_identity must report the actual model digest hex"
+        );
+    }
+
+    /// model_identity is "multiple" when rows from different models exist.
+    #[test]
+    fn test_model_identity_multiple_models() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
+
+        let key_a = key_with_model(b"model-alpha", "shared text", 4);
+        let key_b = key_with_model(b"model-beta", "shared text", 4);
+
+        cache.put(&key_a, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
+        cache.put(&key_b, &[5.0, 6.0, 7.0, 8.0], None).unwrap();
+
+        let stats = cache.cache_stats().unwrap();
+        assert_eq!(stats.row_count, 2);
+        assert_eq!(
+            stats.model_identity, "multiple",
+            "model_identity must be 'multiple' when different model digests are cached"
+        );
+    }
+
+    /// model_identity survives cache reopen (model_index persisted).
+    #[test]
+    fn test_model_identity_persists_across_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_bytes = b"persist-model-test";
+        let expected_hex = hex_encode(&CacheKey::model_digest(model_bytes));
+
+        {
+            let mut cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
+            let key = key_with_model(model_bytes, "persist content", 4);
+            cache.put(&key, &[0.1, 0.2, 0.3, 0.4], None).unwrap();
+        }
+
+        // Reopen and check model_identity is still the correct digest.
+        let cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
+        let stats = cache.cache_stats().unwrap();
+        assert_eq!(stats.model_identity, expected_hex);
+    }
+
+    /// model_identity reflects the actual digest, not a fixed opaque string.
+    #[test]
+    fn test_model_identity_not_opaque_string() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
+
+        let key = key_with_model(b"unique-model-bytes-123", "content", 4);
+        cache.put(&key, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
+
+        let stats = cache.cache_stats().unwrap();
+        // Must NOT be the old opaque string.
+        assert_ne!(
+            stats.model_identity, "content-addressed (model-digest namespaced)",
+            "model_identity must not be the old fixed opaque string"
+        );
+        // Must be a 64-character hex string (32-byte blake3 digest).
+        assert_eq!(stats.model_identity.len(), 64);
+        assert!(
+            stats.model_identity.chars().all(|c| c.is_ascii_hexdigit()),
+            "model_identity must be a valid hex string"
+        );
+    }
+
+    /// After GC removes rows, model_identity is recomputed correctly.
+    #[test]
+    fn test_model_identity_after_gc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
+
+        // Two models, one referenced (survives GC), one not (evicted).
+        let key_survive = key_with_model(b"survive-model", "survive content", 4);
+        let key_evict = key_with_model(b"evict-model", "evict content", 4);
+
+        cache
+            .put(&key_survive, &[1.0, 2.0, 3.0, 4.0], None)
+            .unwrap();
+        cache.put(&key_evict, &[5.0, 6.0, 7.0, 8.0], None).unwrap();
+
+        // Before GC: two models → "multiple".
+        let stats = cache.cache_stats().unwrap();
+        assert_eq!(stats.model_identity, "multiple");
+
+        // Reference the survive key so it isn't collected.
+        let fp = key_survive.fingerprint();
+        cache.add_reference(&fp, "project-a", 1);
+
+        // GC removes the unreferenced key.
+        let report = cache.gc().unwrap();
+        assert_eq!(report.rows_removed, 1);
+
+        // After GC: only one model remains → its digest.
+        let expected_hex = hex_encode(&CacheKey::model_digest(b"survive-model"));
+        let stats = cache.cache_stats().unwrap();
+        assert_eq!(stats.row_count, 1);
+        assert_eq!(stats.model_identity, expected_hex);
     }
 }
