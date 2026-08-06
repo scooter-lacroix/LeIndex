@@ -1402,7 +1402,7 @@ impl WorkerRuntime {
 
         // Step 1: Probe the cache.
         if let Some(cache_arc) = &self.cache {
-            let cache = cache_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let mut cache = cache_arc.lock().unwrap_or_else(|p| p.into_inner());
             match cache.probe(cache_keys) {
                 Ok(probe_result) => {
                     // Place hits into the output.
@@ -1447,7 +1447,7 @@ impl WorkerRuntime {
 
         // Step 4: Write misses back to cache.
         if let Some(cache_arc) = &self.cache {
-            let cache = cache_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let mut cache = cache_arc.lock().unwrap_or_else(|p| p.into_inner());
             for (i, &miss_idx) in miss_indices.iter().enumerate() {
                 let key = &cache_keys[miss_idx];
                 let start = i * expected_dim;
@@ -1539,7 +1539,7 @@ impl WorkerRuntime {
             });
         };
 
-        let cache = cache_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let mut cache = cache_arc.lock().unwrap_or_else(|p| p.into_inner());
         let probe_result = cache.probe(&probe_req.keys).map_err(|e| WorkerError {
             kind: ErrorKind::Internal,
             message: format!("cache probe failed: {}", e),

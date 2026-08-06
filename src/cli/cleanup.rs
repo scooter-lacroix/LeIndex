@@ -704,17 +704,21 @@ pub fn best_effort_cleanup(path: &Path) {
 /// Produce a read-only retention report for a project's generation store.
 ///
 /// This is the backing implementation for `leindex retention --report`
-/// (WS4 Task 9). It resolves the project's storage root (`.leindex/`, or the
-/// `LEINDEX_HOME`/XDG/tmp fallbacks via [`resolve_existing_storage_path`]),
-/// opens the CAS store, and scans `generations/` and `jobs/` to report the
-/// generation count, CAS bytes, job bytes, dedup ratio, and GC candidates.
+/// (WS4 Task 9, WS10 Task 6). It resolves the project's storage root
+/// (`.leindex/`, or the `LEINDEX_HOME`/XDG/tmp fallbacks via
+/// [`resolve_existing_storage_path`]), opens the CAS store, and scans
+/// `generations/` and `jobs/` to report the generation count, CAS bytes,
+/// job bytes, dedup ratio, and GC candidates.
+///
+/// WS10 Task 6: Also reports embedding cache stats from the user-level
+/// cache (`~/.leindex/embed-cache/`): cache bytes, row count, hit/miss/
+/// eviction telemetry, entry-size rejections, and model identity
+/// (spec section 10.3). Count-only reporting is prohibited.
 ///
 /// The report is purely observational: no generations, blobs, or jobs are
 /// modified. A project that has not been indexed yet (no storage root, or no
 /// CAS store) yields an all-zero report rather than an error.
-pub fn retention_report_cli(
-    project: Option<&Path>,
-) -> anyhow::Result<crate::storage::generation::GenerationRetentionReport> {
+pub fn retention_report_cli(project: Option<&Path>) -> anyhow::Result<RetentionReportOutput> {
     use crate::storage::cas::CasStore;
     use crate::storage::generation::GENERATIONS_DIR;
     use crate::storage::generation::retention::retention_report;
@@ -730,17 +734,81 @@ pub fn retention_report_cli(
         .unwrap_or_else(|| canonical.join(".leindex"));
 
     let cas_dir = storage_root.join("cas");
-    if !storage_root.exists() || !cas_dir.exists() {
-        // Nothing has been written for this project yet.
-        return Ok(crate::storage::generation::GenerationRetentionReport::default());
-    }
+    let generation_report = if !storage_root.exists() || !cas_dir.exists() {
+        crate::storage::generation::GenerationRetentionReport::default()
+    } else {
+        let cas = CasStore::open(&cas_dir).map_err(|e| {
+            anyhow::anyhow!("failed to open CAS store at {}: {e}", cas_dir.display())
+        })?;
+        let gens_dir = storage_root.join(GENERATIONS_DIR);
+        let jobs_dir = storage_root.join("jobs");
+        retention_report(&cas, &gens_dir, &jobs_dir)
+            .map_err(|e| anyhow::anyhow!("retention report failed: {e}"))?
+    };
 
-    let cas = CasStore::open(&cas_dir)
-        .map_err(|e| anyhow::anyhow!("failed to open CAS store at {}: {e}", cas_dir.display()))?;
-    let gens_dir = storage_root.join(GENERATIONS_DIR);
-    let jobs_dir = storage_root.join("jobs");
-    retention_report(&cas, &gens_dir, &jobs_dir)
-        .map_err(|e| anyhow::anyhow!("retention report failed: {e}"))
+    // WS10 Task 6: Also report embedding cache stats (spec section 10.3).
+    // Only available when the onnx feature is compiled in (embed module).
+    #[cfg(feature = "onnx")]
+    let cache_stats = report_embed_cache_stats();
+
+    #[cfg(feature = "onnx")]
+    {
+        Ok(RetentionReportOutput {
+            generation_report,
+            cache_stats,
+        })
+    }
+    #[cfg(not(feature = "onnx"))]
+    {
+        Ok(RetentionReportOutput { generation_report })
+    }
+}
+
+/// WS10 Task 6: Report embedding cache stats from `~/.leindex/embed-cache/`.
+///
+/// Opens the user-level global embedding cache (if it exists) and generates
+/// a stats report including cache bytes, row count, hit/miss/eviction
+/// telemetry, entry-size rejections, max bytes config, and model identity
+/// (spec section 10.3 — count-only prohibited).
+#[cfg(feature = "onnx")]
+fn report_embed_cache_stats() -> Option<crate::embed::cache::CacheStatsReport> {
+    let home = crate::config::resolve_leindex_home()?;
+    let cache_root = home.join("embed-cache");
+    if !cache_root.exists() {
+        return None;
+    }
+    let cache = crate::embed::cache::GlobalEmbeddingCache::open(&cache_root).ok()?;
+    cache.cache_stats().ok()
+}
+
+/// Combined retention report output: generation store + embedding cache.
+#[derive(Debug)]
+pub struct RetentionReportOutput {
+    /// Generation store retention report (CAS blobs, generations, jobs).
+    pub generation_report: crate::storage::generation::GenerationRetentionReport,
+    /// Embedding cache stats (if the global cache exists). Spec section 10.3.
+    /// `None` when the onnx feature is not compiled in or no cache exists.
+    #[cfg(feature = "onnx")]
+    pub cache_stats: Option<crate::embed::cache::CacheStatsReport>,
+}
+
+impl std::fmt::Display for RetentionReportOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.generation_report)?;
+        #[cfg(feature = "onnx")]
+        {
+            if let Some(ref cache) = self.cache_stats {
+                write!(f, "{}", cache)?;
+            } else {
+                writeln!(f, "  Embedding Cache: (not initialized)")?;
+            }
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            writeln!(f, "  Embedding Cache: (onnx feature not compiled)")?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

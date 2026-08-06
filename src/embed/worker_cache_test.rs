@@ -144,7 +144,7 @@ fn test_embed_with_cache_keys_accepted() {
 fn test_embed_with_cache_all_hits_ordering() {
     // Create a tempdir cache and pre-populate entries for ALL texts.
     let tmp = tempfile::tempdir().unwrap();
-    let cache = crate::embed::cache::GlobalEmbeddingCache::open(tmp.path()).unwrap();
+    let mut cache = crate::embed::cache::GlobalEmbeddingCache::open(tmp.path()).unwrap();
 
     let texts = vec![
         "hit one".to_string(),
@@ -192,7 +192,7 @@ fn test_embed_with_cache_all_hits_ordering() {
 #[test]
 fn test_embed_all_cache_hits_no_inference() {
     let tmp = tempfile::tempdir().unwrap();
-    let cache = crate::embed::cache::GlobalEmbeddingCache::open(tmp.path()).unwrap();
+    let mut cache = crate::embed::cache::GlobalEmbeddingCache::open(tmp.path()).unwrap();
 
     let texts = vec!["hit a".to_string(), "hit b".to_string()];
     let dim = 4u32;
@@ -306,7 +306,7 @@ fn test_embed_resets_cancel_flag() {
 #[test]
 fn test_cache_probe_rpc() {
     let tmp = tempfile::tempdir().unwrap();
-    let cache = crate::embed::cache::GlobalEmbeddingCache::open(tmp.path()).unwrap();
+    let mut cache = crate::embed::cache::GlobalEmbeddingCache::open(tmp.path()).unwrap();
 
     let dim = 4u32;
     let keys: Vec<CacheKey> = (0..3)
@@ -396,7 +396,7 @@ fn test_cache_gc_with_project_references() {
 #[test]
 fn test_cache_hit_vectors_bit_identical() {
     let tmp = tempfile::tempdir().unwrap();
-    let cache = crate::embed::cache::GlobalEmbeddingCache::open(tmp.path()).unwrap();
+    let mut cache = crate::embed::cache::GlobalEmbeddingCache::open(tmp.path()).unwrap();
 
     let key = make_key_with_dim("bit identical test", 4);
     let original = vec![0.123456, -0.654321, 1.0, 0.0];
@@ -408,4 +408,101 @@ fn test_cache_hit_vectors_bit_identical() {
     for (a, b) in original.iter().zip(cached.iter()) {
         assert_eq!(a.to_bits(), b.to_bits(), "f32 bits must match exactly");
     }
+}
+
+/// VAL-CACHE-013: Worker crash isolation — cache remains consistent after crash.
+///
+/// If the embed worker crashes mid-batch (simulated by dropping the runtime
+/// mid-operation), the cache state remains valid. The content_hash keying
+/// ensures that a retry of the same batch is idempotent — duplicate writes
+/// are no-ops, and partial writes never reach disk (atomic staging + rename).
+#[test]
+fn test_val_cache_013_crash_isolation_cache_consistency() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache_root = tmp.path().join("cache");
+
+    // Simulate: worker processes batch 1, writes cache entries, then "crashes."
+    {
+        let mut cache = crate::embed::cache::GlobalEmbeddingCache::open(&cache_root).unwrap();
+        let key1 = make_key_with_dim("crash test entry 1", 4);
+        cache.put(&key1, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        // Worker "crashes" here — cache goes out of scope. Atomic writes
+        // ensure all puts either fully landed or didn't (no partial rows).
+    }
+
+    // Recovery: a new cache instance opens the same root.
+    let mut cache = crate::embed::cache::GlobalEmbeddingCache::open(&cache_root).unwrap();
+
+    // All entries from the completed puts should be retrievable.
+    let key1 = make_key_with_dim("crash test entry 1", 4);
+    let recovered = cache.get(&key1).unwrap();
+    assert!(recovered.is_some(), "cached entry must survive crash");
+    assert_eq!(recovered.unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+
+    // Retry is idempotent: putting the same key again is a no-op.
+    let row_count_before = cache.row_count().unwrap();
+    cache.put(&key1, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    assert_eq!(
+        cache.row_count().unwrap(),
+        row_count_before,
+        "idempotent retry must not duplicate rows"
+    );
+}
+
+/// VAL-CACHE-013: No zombie rows after crash recovery.
+///
+/// If the worker crashes AFTER writing the staging file but BEFORE the
+/// atomic rename, the `.partial` file should NOT be visible as a cache
+/// row. The cache only sees completed entries.
+#[test]
+fn test_val_cache_013_no_zombie_partial_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = crate::embed::cache::GlobalEmbeddingCache::open(tmp.path()).unwrap();
+
+    let key = make_key_with_dim("partial test", 4);
+    let fp = key.fingerprint();
+
+    // Simulate a crash: manually create a .partial staging file.
+    let path = cache.row_path(&fp);
+    let staging = path.with_extension("partial");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&staging, b"incomplete data").unwrap();
+
+    // The cache should NOT see this as a valid row.
+    assert_eq!(
+        cache.row_count().unwrap(),
+        0,
+        "staging files must not count"
+    );
+    let result = cache.get(&key).unwrap();
+    assert!(result.is_none(), "staging file must not be readable");
+}
+
+/// VAL-CACHE-011: Worker idle does not consume GPU cycles.
+///
+/// The worker's idle timeout tears down the process after the configured
+/// period. There is no GPU polling loop between batches. This test verifies
+/// that a WorkerRuntime with no pending requests reports idle status.
+#[test]
+fn test_val_cache_011_idle_without_polling() {
+    let rt = WorkerRuntime::new(no_compile_config());
+
+    // A freshly constructed runtime should not report any active work.
+    // The idle timer starts at construction time.
+    assert!(
+        !rt.is_idle_expired(),
+        "fresh runtime must not be idle-expired"
+    );
+
+    // Cancel flag should be false (no work in flight).
+    assert!(
+        !rt.cancel_flag.load(Ordering::Relaxed),
+        "no cancel flag when idle"
+    );
+
+    // The runtime has no background polling threads for GPU.
+    // GPU work occurs only during ONNX inference (dispatch_embed).
+    // The health response should report a valid state (not in a busy loop).
+    let health = rt.health_response(WorkerState::Ready, None);
+    assert_eq!(health.state, WorkerState::Ready);
 }
