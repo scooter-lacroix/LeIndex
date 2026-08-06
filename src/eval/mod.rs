@@ -21,10 +21,13 @@
 //! ships without passing the gates below. Public MTEB/CodeSearchNet numbers
 //! shortlist only; they do NOT select.
 
+pub mod budget_ledger;
 pub mod candidates;
 pub mod corpus;
 pub mod gates;
 pub mod harness;
+pub mod int8_parity;
 pub mod metrics;
+pub mod production_profile;
 pub mod report;
 pub mod reranker_ablation;

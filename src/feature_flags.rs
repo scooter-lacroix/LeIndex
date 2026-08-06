@@ -90,6 +90,12 @@ pub enum FeatureFlag {
     /// source text is persisted unless this flag (or the legacy
     /// `LEINDEX_EMBED_CACHE_DEBUG` env var, or `CacheConfig::debug_mode`) is set.
     DebugEscapeHatch,
+    /// Enable the WS11 validated model profile as the production default
+    /// (WS11 Task 7). When ON, the embed worker uses the model bake-off
+    /// winner (CodeRankEmbed 137M, INT8 quantized, no reranker) instead of
+    /// the legacy FP16 Qwen3 + reranker baseline. Default OFF — legacy
+    /// behavior (FP16 Qwen3) stays active until WS12 rollout phase.
+    ValidatedModel,
 }
 
 impl FeatureFlag {
@@ -112,6 +118,7 @@ impl FeatureFlag {
             Self::StreamingNeural => "LEINDEX_FEATURE_STREAMING_NEURAL",
             Self::GlobalEmbedCache => "LEINDEX_FEATURE_GLOBAL_EMBED_CACHE",
             Self::DebugEscapeHatch => "LEINDEX_FEATURE_EMBED_CACHE_DEBUG",
+            Self::ValidatedModel => "LEINDEX_FEATURE_VALIDATED_MODEL",
         }
     }
 
@@ -181,6 +188,9 @@ impl FeatureFlag {
             Self::DebugEscapeHatch => {
                 "Embedding-cache debug escape hatch: store source text alongside rows"
             }
+            Self::ValidatedModel => {
+                "Use WS11 validated model profile (CodeRankEmbed-INT8, no reranker)"
+            }
         }
     }
 }
@@ -219,6 +229,7 @@ impl FlagStore {
             FeatureFlag::StreamingNeural,
             FeatureFlag::GlobalEmbedCache,
             FeatureFlag::DebugEscapeHatch,
+            FeatureFlag::ValidatedModel,
         ] {
             let enabled = match env::var(flag.env_var()) {
                 Ok(v) => matches!(
@@ -306,6 +317,7 @@ pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
         FeatureFlag::StreamingNeural,
         FeatureFlag::GlobalEmbedCache,
         FeatureFlag::DebugEscapeHatch,
+        FeatureFlag::ValidatedModel,
     ]
     .into_iter()
     .map(|f| (f, f.is_enabled()))
@@ -383,5 +395,25 @@ mod test {
         assert!(FeatureFlag::GenerationReaders.is_enabled());
         clear_flag_overrides_for_test();
         assert!(!FeatureFlag::GenerationReaders.is_enabled());
+    }
+
+    #[test]
+    fn test_validated_model_flag_default_off() {
+        // The validated model profile MUST default OFF until WS12 rollout.
+        // Legacy FP16 Qwen3 + reranker stays active.
+        assert_eq!(
+            FeatureFlag::ValidatedModel.env_var(),
+            "LEINDEX_FEATURE_VALIDATED_MODEL"
+        );
+        assert!(!FeatureFlag::ValidatedModel.default_value());
+    }
+
+    #[test]
+    fn test_validated_model_override_toggles() {
+        let _g = FLAG_TEST_LOCK.lock().unwrap();
+        set_flag_override_for_test(FeatureFlag::ValidatedModel, true);
+        assert!(FeatureFlag::ValidatedModel.is_enabled());
+        clear_flag_overrides_for_test();
+        assert!(!FeatureFlag::ValidatedModel.is_enabled());
     }
 }
