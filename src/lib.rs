@@ -87,6 +87,10 @@ pub mod feature_flags;
 // LEINDEX_FEATURE_BOUNDED_SCHEDULER)
 pub mod scheduler;
 
+// Model evaluation harness (always available; pure-Rust metrics + corpus)
+// WS11 Tasks 1-3: gates, corpus, metrics, fused-retrieval harness.
+pub mod eval;
+
 // Observability infrastructure (always available)
 pub mod observability;
 
