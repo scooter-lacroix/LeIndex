@@ -76,6 +76,12 @@ pub enum FeatureFlag {
     /// Enable the streaming neural enrichment stage (WS6-9 Task 6):
     /// NeuralRowWriter replaces Vec accumulation, direct staged writes.
     StreamingNeural,
+    /// Enable the global content-addressed embedding cache (WS10 Task 1-2).
+    /// The cache stores embedding vectors at user-level (e.g.
+    /// `~/.leindex/embed-cache/`) keyed by a 6-tuple CacheKey (model digest,
+    /// tokenizer digest, prompt role/version, pooling, normalization, output
+    /// dimensions, content hash). Cross-project dedup is automatic.
+    GlobalEmbedCache,
 }
 
 impl FeatureFlag {
@@ -96,6 +102,7 @@ impl FeatureFlag {
             Self::StreamingPdg => "LEINDEX_FEATURE_STREAMING_PDG",
             Self::StreamingTfidf => "LEINDEX_FEATURE_STREAMING_TFIDF",
             Self::StreamingNeural => "LEINDEX_FEATURE_STREAMING_NEURAL",
+            Self::GlobalEmbedCache => "LEINDEX_FEATURE_GLOBAL_EMBED_CACHE",
         }
     }
 
@@ -159,6 +166,9 @@ impl FeatureFlag {
             Self::StreamingNeural => {
                 "Streaming neural enrichment via NeuralRowWriter (kills Vec accumulation)"
             }
+            Self::GlobalEmbedCache => {
+                "Global content-addressed embedding cache with cross-project dedup"
+            }
         }
     }
 }
@@ -195,6 +205,7 @@ impl FlagStore {
             FeatureFlag::StreamingPdg,
             FeatureFlag::StreamingTfidf,
             FeatureFlag::StreamingNeural,
+            FeatureFlag::GlobalEmbedCache,
         ] {
             let enabled = match env::var(flag.env_var()) {
                 Ok(v) => matches!(
@@ -280,6 +291,7 @@ pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
         FeatureFlag::StreamingPdg,
         FeatureFlag::StreamingTfidf,
         FeatureFlag::StreamingNeural,
+        FeatureFlag::GlobalEmbedCache,
     ]
     .into_iter()
     .map(|f| (f, f.is_enabled()))
