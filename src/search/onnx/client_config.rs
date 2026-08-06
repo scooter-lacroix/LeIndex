@@ -506,6 +506,12 @@ pub(super) fn worker_health_snapshot(
         provider,
         model: model.unwrap_or_else(|| "qwen3-embed-0.6b".to_string()),
         error,
+        model_digest: None,
+        tokenizer_digest: None,
+        config_digest: None,
+        host_rss_mib: None,
+        gpu_vram_mib: None,
+        provider_compile_cache: None,
     }
 }
 
@@ -587,7 +593,7 @@ pub(super) fn probe_daemon_health_with_timeout(
             .decode_payload::<Response>()
             .map_err(|error| ClientError::Ipc(error.to_string()))?
         {
-            Response::Health(health) => Ok(health),
+            Response::Health(health) => Ok(*health),
             _ => Err(ClientError::Protocol(
                 "expected Health response payload".to_string(),
             )),

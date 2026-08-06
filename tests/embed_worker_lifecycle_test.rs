@@ -119,6 +119,7 @@ fn test_worker_uses_local_ipc_only() {
     let request = EmbedRequest {
         texts: vec!["local ipc test".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
     let wire = frame.encode_wire().unwrap();
@@ -144,6 +145,7 @@ fn test_worker_cold_starts_on_first_demand() {
     let request = EmbedRequest {
         texts: vec!["cold start test".to_string()],
         expected_dim: 8,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
     let response_frame = rt.dispatch(&frame);
@@ -186,6 +188,7 @@ fn test_worker_reusable_across_batches() {
     let request1 = EmbedRequest {
         texts: vec!["first batch".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame1 = protocol::embed_request_frame(BatchId::new(1), request1).unwrap();
     let response1 = rt.dispatch(&frame1);
@@ -195,6 +198,7 @@ fn test_worker_reusable_across_batches() {
     let request2 = EmbedRequest {
         texts: vec!["second batch".to_string(), "extra text".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame2 = protocol::embed_request_frame(BatchId::new(2), request2).unwrap();
     let response2 = rt.dispatch(&frame2);
@@ -204,6 +208,7 @@ fn test_worker_reusable_across_batches() {
     let request3 = EmbedRequest {
         texts: vec!["third".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame3 = protocol::embed_request_frame(BatchId::new(3), request3).unwrap();
     let response3 = rt.dispatch(&frame3);
@@ -231,6 +236,7 @@ fn test_worker_reusable_via_run_loop() {
         let request = EmbedRequest {
             texts: vec![format!("batch {}", i)],
             expected_dim: 4,
+            cache_keys: vec![],
         };
         let frame = protocol::embed_request_frame(BatchId::new(i as u64), request).unwrap();
         let wire = frame.encode_wire().unwrap();
@@ -299,6 +305,7 @@ fn test_worker_restart_after_teardown() {
     let request1 = EmbedRequest {
         texts: vec!["before teardown".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame1 = protocol::embed_request_frame(BatchId::new(1), request1).unwrap();
     let response1 = rt1.dispatch(&frame1);
@@ -311,6 +318,7 @@ fn test_worker_restart_after_teardown() {
     let request2 = EmbedRequest {
         texts: vec!["after restart".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame2 = protocol::embed_request_frame(BatchId::new(2), request2).unwrap();
     let response2 = rt2.dispatch(&frame2);
@@ -566,6 +574,7 @@ fn test_embed_response_flat_row_major() {
             "text3".to_string(),
         ],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
     let response_frame = rt.dispatch(&frame);
@@ -609,6 +618,7 @@ fn test_batch_ordering_preserved() {
     let request = EmbedRequest {
         texts: texts.clone(),
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
 
@@ -658,6 +668,7 @@ fn test_oversized_batch_split_and_stitch() {
     let request = EmbedRequest {
         texts: texts.clone(),
         expected_dim: dim,
+        cache_keys: vec![],
     };
 
     let batch_id = BatchId::new(42);
@@ -713,6 +724,7 @@ fn test_split_preserves_batch_identity() {
     let request = EmbedRequest {
         texts,
         expected_dim: 8,
+        cache_keys: vec![],
     };
 
     let batch_id = BatchId::new(0xDEAD);
@@ -739,6 +751,7 @@ fn test_oversized_single_text_truncated() {
     let request = EmbedRequest {
         texts: vec![long_text],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
 
@@ -797,6 +810,7 @@ fn test_batch_truncate_multiple_oversized_texts() {
             "another extremely long text that should be truncated before IPC framing".to_string(),
         ],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
     let response_frame = rt.dispatch(&frame);
@@ -836,6 +850,7 @@ fn test_full_lifecycle_cold_start_reuse_teardown_restart() {
     let request = EmbedRequest {
         texts: vec!["cold start".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
     let wire = frame.encode_wire().unwrap();
@@ -853,6 +868,7 @@ fn test_full_lifecycle_cold_start_reuse_teardown_restart() {
     let request2 = EmbedRequest {
         texts: vec!["after restart".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame2 = protocol::embed_request_frame(BatchId::new(2), request2).unwrap();
     let wire2 = frame2.encode_wire().unwrap();

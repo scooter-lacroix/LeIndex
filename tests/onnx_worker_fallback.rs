@@ -136,6 +136,7 @@ fn test_worker_failure_triggers_retry() {
     let request = EmbedRequest {
         texts: vec!["test".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame = leindex::embed::protocol::embed_request_frame(BatchId::new(1), request)
         .expect("frame construction");
@@ -147,6 +148,7 @@ fn test_worker_failure_triggers_retry() {
     let request2 = EmbedRequest {
         texts: vec!["test".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame2 = leindex::embed::protocol::embed_request_frame(BatchId::new(2), request2)
         .expect("frame construction");
@@ -188,6 +190,7 @@ fn test_second_failure_triggers_tfidf_fallback() {
     let request = EmbedRequest {
         texts: vec!["test text".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame1 = leindex::embed::protocol::embed_request_frame(BatchId::new(1), request.clone())
         .expect("frame construction");
@@ -224,6 +227,7 @@ fn test_fallback_only_affects_failed_batch() {
     let request1 = EmbedRequest {
         texts: vec!["batch 1 text".to_string()],
         expected_dim: dim,
+        cache_keys: vec![],
     };
     let _frame1 = leindex::embed::protocol::embed_request_frame(BatchId::new(1), request1)
         .expect("frame construction");
@@ -242,6 +246,7 @@ fn test_fallback_only_affects_failed_batch() {
     let request3 = EmbedRequest {
         texts: vec!["batch 3 text".to_string()],
         expected_dim: dim,
+        cache_keys: vec![],
     };
     let _frame3 = leindex::embed::protocol::embed_request_frame(BatchId::new(3), request3)
         .expect("frame construction");
@@ -383,6 +388,7 @@ fn test_fresh_worker_after_fallback_episode() {
     let request1 = EmbedRequest {
         texts: vec!["first request".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame1 = leindex::embed::protocol::embed_request_frame(BatchId::new(1), request1)
         .expect("frame construction");
@@ -395,6 +401,7 @@ fn test_fresh_worker_after_fallback_episode() {
     let request1b = EmbedRequest {
         texts: vec!["first request".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame1b = leindex::embed::protocol::embed_request_frame(BatchId::new(2), request1b)
         .expect("frame construction");
@@ -409,6 +416,7 @@ fn test_fresh_worker_after_fallback_episode() {
     let request2 = EmbedRequest {
         texts: vec!["second request after recovery".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame2 = leindex::embed::protocol::embed_request_frame(BatchId::new(3), request2)
         .expect("frame construction");
@@ -441,6 +449,7 @@ fn test_multiple_fallback_recovery_cycles() {
         let request = EmbedRequest {
             texts: vec![format!("cycle {} request", cycle)],
             expected_dim: 4,
+            cache_keys: vec![],
         };
         let frame =
             leindex::embed::protocol::embed_request_frame(BatchId::new(cycle as u64 * 10), request)
@@ -454,6 +463,7 @@ fn test_multiple_fallback_recovery_cycles() {
         let request2 = EmbedRequest {
             texts: vec![format!("cycle {} recovery", cycle)],
             expected_dim: 4,
+            cache_keys: vec![],
         };
         let frame2 = leindex::embed::protocol::embed_request_frame(
             BatchId::new(cycle as u64 * 10 + 1),
@@ -626,6 +636,7 @@ mod dead_worker_tests {
         let request = EmbedRequest {
             texts: vec!["test".to_string()],
             expected_dim: 4,
+            cache_keys: vec![],
         };
         let frame =
             leindex::embed::protocol::embed_request_frame(BatchId::new(1), request).unwrap();
@@ -659,6 +670,7 @@ mod dead_worker_tests {
         let request = EmbedRequest {
             texts: vec!["partial".to_string()],
             expected_dim: 4,
+            cache_keys: vec![],
         };
         let frame =
             leindex::embed::protocol::embed_request_frame(BatchId::new(2), request).unwrap();
@@ -686,6 +698,7 @@ mod dead_worker_tests {
         let request = EmbedRequest {
             texts: vec!["clear test".to_string()],
             expected_dim: 4,
+            cache_keys: vec![],
         };
         let frame =
             leindex::embed::protocol::embed_request_frame(BatchId::new(3), request).unwrap();
@@ -734,6 +747,7 @@ mod dead_worker_tests {
         let request = EmbedRequest {
             texts: vec!["cleanup test".to_string()],
             expected_dim: 4,
+            cache_keys: vec![],
         };
         let frame =
             leindex::embed::protocol::embed_request_frame(BatchId::new(4), request).unwrap();
@@ -799,6 +813,7 @@ mod dead_worker_tests {
         let request = EmbedRequest {
             texts: vec!["normal request".to_string()],
             expected_dim: 4,
+            cache_keys: vec![],
         };
         let frame =
             leindex::embed::protocol::embed_request_frame(BatchId::new(5), request).unwrap();

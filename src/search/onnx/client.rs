@@ -1249,6 +1249,7 @@ impl EmbeddingClient {
             let request = EmbedRequest {
                 texts: texts.to_vec(),
                 expected_dim,
+                cache_keys: vec![],
             };
 
             let frame = protocol::embed_request_frame(batch_id, request)
@@ -1307,8 +1308,8 @@ impl EmbeddingClient {
         let request = EmbedRequest {
             texts: texts.to_vec(),
             expected_dim,
+            cache_keys: vec![],
         };
-
         let frame = protocol::embed_request_frame(batch_id, request)
             .map_err(|e| ClientError::Ipc(e.to_string()))?;
 

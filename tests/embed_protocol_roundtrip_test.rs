@@ -30,6 +30,7 @@ fn test_embed_request_roundtrip_single_text() {
     let request = EmbedRequest {
         texts: vec!["fn main() {}".to_string()],
         expected_dim: 1024,
+        cache_keys: vec![],
     };
 
     let frame = embed_request_frame(batch_id, request).unwrap();
@@ -56,6 +57,7 @@ fn test_embed_request_roundtrip_batch() {
     let request = EmbedRequest {
         texts: texts.clone(),
         expected_dim: 768,
+        cache_keys: vec![],
     };
 
     let frame = embed_request_frame(batch_id, request).unwrap();
@@ -84,6 +86,7 @@ fn test_embed_request_roundtrip_unicode() {
             "Ünïcödé".to_string(),
         ],
         expected_dim: 256,
+        cache_keys: vec![],
     };
 
     let frame = embed_request_frame(batch_id, request).unwrap();
@@ -300,6 +303,7 @@ fn test_batch_id_preserved_across_all_message_types() {
         EmbedRequest {
             texts: vec!["test".to_string()],
             expected_dim: 4,
+            cache_keys: vec![],
         },
     )
     .unwrap();
@@ -346,6 +350,7 @@ fn test_wire_format_has_length_prefix() {
         EmbedRequest {
             texts: vec!["test".to_string()],
             expected_dim: 4,
+            cache_keys: vec![],
         },
     )
     .unwrap();
@@ -370,6 +375,7 @@ fn test_empty_embed_request_roundtrip() {
     let request = EmbedRequest {
         texts: vec![],
         expected_dim: 1024,
+        cache_keys: vec![],
     };
 
     let frame = embed_request_frame(batch_id, request).unwrap();

@@ -251,6 +251,12 @@ fn run_socket_worker(config: RuntimeConfig, socket_path: PathBuf) -> anyhow::Res
         provider: Some(config.execution_provider.clone()),
         model: config.model_name.clone(),
         error: None,
+        model_digest: None,
+        tokenizer_digest: None,
+        config_digest: None,
+        host_rss_mib: None,
+        gpu_vram_mib: None,
+        provider_compile_cache: None,
     };
     write_worker_pid(&pid_path, process::id())?;
     #[cfg(target_os = "linux")]
@@ -743,6 +749,12 @@ mod tests {
                 provider: Some("cpu".to_string()),
                 model: "test-model".to_string(),
                 error: None,
+                model_digest: None,
+                tokenizer_digest: None,
+                config_digest: None,
+                host_rss_mib: None,
+                gpu_vram_mib: None,
+                provider_compile_cache: None,
             },
             DEFAULT_MAX_FRAME_SIZE,
         ));
@@ -782,6 +794,7 @@ mod tests {
             protocol::EmbedRequest {
                 texts: vec!["test".to_string()],
                 expected_dim: 4,
+                cache_keys: vec![],
             },
         )
         .unwrap();
@@ -813,6 +826,7 @@ mod worker_entry_tests {
         let request = EmbedRequest {
             texts: vec!["hello".to_string(), "world".to_string()],
             expected_dim: 4,
+            cache_keys: vec![],
         };
         let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
         let wire = frame.encode_wire().unwrap();
@@ -828,6 +842,7 @@ mod worker_entry_tests {
         let request = EmbedRequest {
             texts: vec!["test".to_string()],
             expected_dim: 8,
+            cache_keys: vec![],
         };
         let frame = protocol::embed_request_frame(BatchId::new(42), request).unwrap();
         let response_frame = rt.dispatch(&frame);
@@ -846,6 +861,7 @@ mod worker_entry_tests {
         let request = EmbedRequest {
             texts: vec!["hello".to_string()],
             expected_dim: 4,
+            cache_keys: vec![],
         };
         let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
         let wire = frame.encode_wire().unwrap();

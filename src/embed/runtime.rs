@@ -94,6 +94,94 @@ pub(crate) fn low_memory_refusal(config: &RuntimeConfig) -> Option<String> {
     })
 }
 
+/// WS10 Task 7: Sample GPU VRAM usage in MiB.
+///
+/// Reads VRAM from `rocm-smi` (AMD) or `nvidia-smi` (NVIDIA) on Linux.
+/// Returns `None` on headless boxes or when GPU tools are unavailable.
+fn sample_gpu_vram() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        // Try ROCm first (AMD GPUs on this machine).
+        if let Ok(output) = std::process::Command::new("rocm-smi")
+            .args(["--showmeminfo", "vram", "--json"])
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                    // ROCm JSON: { "card0": { "VRAM Total Memory (B)": N, "VRAM Total Used Memory (B)": M } }
+                    for (_card, info) in json.as_object().iter().flat_map(|o| o.iter()) {
+                        if let Some(used_str) = info.get("VRAM Total Used Memory (B)") {
+                            if let Some(used_b) = used_str
+                                .as_str()
+                                .and_then(|s| s.trim().parse::<u64>().ok())
+                                .or_else(|| used_str.as_u64())
+                            {
+                                return Some(used_b / (1024 * 1024));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Try nvidia-smi (NVIDIA GPUs).
+        if let Ok(output) = std::process::Command::new("nvidia-smi")
+            .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(text) = std::str::from_utf8(&output.stdout) {
+                    if let Some(first_line) = text.lines().next() {
+                        if let Ok(mib) = first_line.trim().parse::<u64>() {
+                            return Some(mib);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// WS10 Task 5: Open the global embedding cache if the feature flag is enabled.
+///
+/// The cache lives at the user level (`~/.leindex/embed-cache/`). When the
+/// `LEINDEX_FEATURE_GLOBAL_EMBED_CACHE` flag is OFF, returns `None` and the
+/// worker operates in legacy mode (no cache probing).
+fn open_cache_if_enabled() -> Option<Arc<Mutex<crate::embed::cache::GlobalEmbeddingCache>>> {
+    if !crate::feature_flags::FeatureFlag::GlobalEmbedCache.is_enabled() {
+        return None;
+    }
+    let cache_root = default_embed_cache_root();
+    match crate::embed::cache::GlobalEmbeddingCache::open(&cache_root) {
+        Ok(cache) => {
+            tracing::info!("global embedding cache opened at {}", cache_root.display());
+            Some(Arc::new(Mutex::new(cache)))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "failed to open global embedding cache at {}: {}; cache disabled",
+                cache_root.display(),
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Default user-level path for the embedding cache.
+fn default_embed_cache_root() -> std::path::PathBuf {
+    if let Ok(home) = std::env::var("LEINDEX_HOME") {
+        return std::path::PathBuf::from(home).join("embed-cache");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::PathBuf::from(home)
+            .join(".leindex")
+            .join("embed-cache");
+    }
+    // Fallback: relative path (unusual but avoids panic).
+    std::path::PathBuf::from(".leindex").join("embed-cache")
+}
+
 /// Configuration for the worker runtime.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -268,6 +356,16 @@ pub struct WorkerRuntime {
     last_activity: Arc<Mutex<Instant>>,
     shutdown_flag: Arc<AtomicBool>,
     started_unix_ms: u64,
+
+    /// WS10 Task 5: Per-batch cancellation flag. Set by a Cancel frame, checked
+    /// between sub-batches in the embed loop. Reset at the start of each new
+    /// embed request.
+    cancel_flag: Arc<AtomicBool>,
+
+    /// WS10 Task 5: Global embedding cache (opened when the GlobalEmbedCache
+    /// feature flag is enabled). Wrapped in `Mutex` because cache writes (put,
+    /// add_reference) require `&mut self`.
+    cache: Option<Arc<Mutex<crate::embed::cache::GlobalEmbeddingCache>>>,
 
     /// ONNX session for neural embedding inference. Only available with `onnx` feature.
     #[cfg(feature = "onnx")]
@@ -527,6 +625,8 @@ impl WorkerRuntime {
             last_activity: Arc::new(Mutex::new(Instant::now())),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             started_unix_ms: unix_now_ms(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            cache: open_cache_if_enabled(),
             #[cfg(feature = "onnx")]
             rerank_session: Arc::new(Mutex::new(None)),
             #[cfg(feature = "onnx")]
@@ -568,6 +668,17 @@ impl WorkerRuntime {
         let provider = Some(self.provider_runtime_status.execution_provider.clone());
         #[cfg(not(feature = "onnx"))]
         let provider = Some(self.config.execution_provider.clone());
+
+        // WS10 Task 4/7: compute model/tokenizer/config digests and measure
+        // host RSS + GPU VRAM. All new fields are Option with #[serde(default)]
+        // so the HealthResponse remains backward-compatible with older peers.
+        let model_digest = self.compute_model_digest();
+        let tokenizer_digest = self.compute_tokenizer_digest();
+        let config_digest = self.compute_config_digest();
+        let host_rss_mib = process_rss_kib().map(|kib| kib / 1024);
+        let gpu_vram_mib = self.sample_gpu_vram_mib();
+        let provider_compile_cache = self.provider_compile_cache_path();
+
         protocol::HealthResponse {
             state,
             phase: match state {
@@ -580,7 +691,51 @@ impl WorkerRuntime {
             provider,
             model: self.config.model_name.clone(),
             error,
+            model_digest,
+            tokenizer_digest,
+            config_digest,
+            host_rss_mib,
+            gpu_vram_mib,
+            provider_compile_cache,
         }
+    }
+
+    /// Compute the blake3 digest of the loaded ONNX model weights (WS10 Task 4/7).
+    fn compute_model_digest(&self) -> Option<[u8; 32]> {
+        let model_path = ModelResolver::resolve(&self.config.model_name).ok()?;
+        let model_bytes = std::fs::read(&model_path).ok()?;
+        Some(blake3::hash(&model_bytes).into())
+    }
+
+    /// Compute the blake3 digest of the tokenizer configuration (WS10 Task 4/7).
+    fn compute_tokenizer_digest(&self) -> Option<[u8; 32]> {
+        let tokenizer_path = ModelResolver::resolve_tokenizer(&self.config.model_name).ok()?;
+        let tokenizer_bytes = std::fs::read(&tokenizer_path).ok()?;
+        Some(blake3::hash(&tokenizer_bytes).into())
+    }
+
+    /// Compute the blake3 digest of worker config that affects output vectors.
+    fn compute_config_digest(&self) -> Option<[u8; 32]> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"LEINDEX-WORKER-CONFIG-V1");
+        hasher.update(self.config.model_name.as_bytes());
+        hasher.update(&self.config.embedding_dim.to_le_bytes());
+        hasher.update(self.config.execution_provider.as_bytes());
+        #[cfg(feature = "onnx")]
+        hasher.update(&configured_onnx_sequence_len().to_le_bytes());
+        #[cfg(feature = "onnx")]
+        hasher.update(&self.config.ort_threads.to_le_bytes());
+        Some(hasher.finalize().into())
+    }
+
+    /// Sample GPU VRAM allocation in MiB (WS10 Task 7).
+    fn sample_gpu_vram_mib(&self) -> Option<u64> {
+        sample_gpu_vram()
+    }
+
+    /// Provider compile-cache path, if configured (WS10 Task 7).
+    fn provider_compile_cache_path(&self) -> Option<String> {
+        std::env::var(MIGRAPHX_MODEL_CACHE_PATH_ENV).ok()
     }
 
     /// Emit the normal startup report after model initialization completes.
@@ -1075,12 +1230,17 @@ impl WorkerRuntime {
         let batch_id = frame.header.batch_id;
 
         match frame.header.msg_type {
-            MsgType::EmbedRequest => match self.handle_embed(frame) {
-                Ok(response) => protocol::embed_response_frame(batch_id, response)
-                    .unwrap_or_else(|e| self.internal_error_frame(batch_id, &e)),
-                Err(e) => protocol::error_frame(batch_id, e)
-                    .unwrap_or_else(|e| self.internal_error_frame(batch_id, &e)),
-            },
+            MsgType::EmbedRequest => {
+                // WS10 Task 5: reset the per-batch cancel flag at the start
+                // of each embed request.
+                self.cancel_flag.store(false, Ordering::Relaxed);
+                match self.handle_embed(frame) {
+                    Ok(response) => protocol::embed_response_frame(batch_id, response)
+                        .unwrap_or_else(|e| self.internal_error_frame(batch_id, &e)),
+                    Err(e) => protocol::error_frame(batch_id, e)
+                        .unwrap_or_else(|e| self.internal_error_frame(batch_id, &e)),
+                }
+            }
             MsgType::RerankRequest => match self.handle_rerank(frame) {
                 Ok(response) => protocol::rerank_response_frame(batch_id, response)
                     .unwrap_or_else(|e| self.internal_error_frame(batch_id, &e)),
@@ -1100,6 +1260,27 @@ impl WorkerRuntime {
                 ),
             )
             .unwrap_or_else(|e| self.internal_error_frame(batch_id, &e)),
+            MsgType::CacheProbe => match self.handle_cache_probe(frame) {
+                Ok(response) => protocol::cache_probe_response_frame(batch_id, response)
+                    .unwrap_or_else(|e| self.internal_error_frame(batch_id, &e)),
+                Err(e) => protocol::error_frame(batch_id, e)
+                    .unwrap_or_else(|e| self.internal_error_frame(batch_id, &e)),
+            },
+            MsgType::Cancel => {
+                // WS10 Task 5: set the per-batch cancel flag. The embed loop
+                // checks this between sub-batches and stops after the current
+                // batch completes, returning an error response.
+                tracing::info!(
+                    batch_id = %batch_id,
+                    "cancel signal received for batch"
+                );
+                self.cancel_flag.store(true, Ordering::Relaxed);
+                protocol::cancel_response_frame(
+                    batch_id,
+                    protocol::CancelResponse { acknowledged: true },
+                )
+                .unwrap_or_else(|e| self.internal_error_frame(batch_id, &e))
+            }
             _ => {
                 let err = WorkerError {
                     kind: ErrorKind::InvalidRequest,
@@ -1118,6 +1299,11 @@ impl WorkerRuntime {
     ///
     /// VAL-CPHASE-012: Returns flat row-major output with dimension and count metadata.
     /// VAL-CPHASE-013: Batch ordering is preserved through IPC.
+    ///
+    /// WS10 Task 5: When `cache_keys` is non-empty and the global embedding
+    /// cache is open, the worker probes cached entries first, embeds only the
+    /// misses, writes fresh vectors back to the cache, and returns the complete
+    /// result set in input order (VAL-CACHE-008).
     fn handle_embed(&self, frame: &Frame) -> Result<EmbedResponse, WorkerError> {
         let request: Request = frame.decode_payload().map_err(|e| WorkerError {
             kind: ErrorKind::InvalidRequest,
@@ -1138,6 +1324,18 @@ impl WorkerRuntime {
             return Ok(EmbedResponse::new(vec![], 0, embed_req.expected_dim));
         }
 
+        // Validate cache_keys length if provided.
+        if !embed_req.cache_keys.is_empty() && embed_req.cache_keys.len() != embed_req.texts.len() {
+            return Err(WorkerError {
+                kind: ErrorKind::InvalidRequest,
+                message: format!(
+                    "cache_keys length ({}) does not match texts length ({})",
+                    embed_req.cache_keys.len(),
+                    embed_req.texts.len()
+                ),
+            });
+        }
+
         // Pre-IPC oversized input handling:
         // Truncate any single text that exceeds max_text_size.
         let texts: Vec<String> = embed_req
@@ -1145,6 +1343,15 @@ impl WorkerRuntime {
             .into_iter()
             .map(|t| self.truncate_text(t))
             .collect();
+
+        // WS10 Task 5: Cache-aware path — probe cache, embed misses, put results.
+        if !embed_req.cache_keys.is_empty() {
+            return self.handle_embed_with_cache(
+                &texts,
+                &embed_req.cache_keys,
+                embed_req.expected_dim,
+            );
+        }
 
         #[cfg(feature = "onnx")]
         {
@@ -1167,6 +1374,181 @@ impl WorkerRuntime {
             let vectors = vec![0.0f32; count * dim];
             Ok(EmbedResponse::new(vectors, count, dim))
         }
+    }
+
+    /// WS10 Task 5: Cache-aware embed path (probe → batch-miss → put).
+    ///
+    /// 1. Probe the cache for all keys.
+    /// 2. Embed only the misses under the BatchBudget.
+    /// 3. Write miss vectors back to the cache.
+    /// 4. Return the complete vector set (hits + misses) in input order.
+    ///
+    /// VAL-CACHE-008: Output ordering matches input text ordering regardless
+    /// of which texts were cache hits vs misses.
+    ///
+    /// VAL-CACHE-009: The cancel flag is checked between sub-batches.
+    /// If cancelled, returns an error after the current batch completes.
+    fn handle_embed_with_cache(
+        &self,
+        texts: &[String],
+        cache_keys: &[crate::embed::cache::CacheKey],
+        expected_dim: usize,
+    ) -> Result<EmbedResponse, WorkerError> {
+        let n = texts.len();
+        debug_assert_eq!(n, cache_keys.len());
+
+        // Prepare the output buffer in input order.
+        let mut results: Vec<Option<Vec<f32>>> = vec![None; n];
+
+        // Step 1: Probe the cache.
+        if let Some(cache_arc) = &self.cache {
+            let cache = cache_arc.lock().unwrap_or_else(|p| p.into_inner());
+            match cache.probe(cache_keys) {
+                Ok(probe_result) => {
+                    // Place hits into the output.
+                    for (idx, vector) in &probe_result.hits {
+                        results[*idx] = Some(vector.clone());
+                    }
+                    tracing::debug!(
+                        total = n,
+                        hits = probe_result.hits.len(),
+                        misses = probe_result.misses.len(),
+                        "cache probe complete"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "cache probe failed; embedding all texts");
+                }
+            }
+        }
+
+        // Step 2: Collect miss indices (texts not served from cache).
+        let miss_indices: Vec<usize> = results
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.is_none())
+            .map(|(i, _)| i)
+            .collect();
+
+        if miss_indices.is_empty() {
+            // All hits — assemble and return.
+            let vectors: Vec<f32> = results
+                .into_iter()
+                .flatten()
+                .flat_map(|v| v.into_iter())
+                .collect();
+            return Ok(EmbedResponse::new(vectors, n, expected_dim));
+        }
+
+        // Step 3: Embed misses.
+        let miss_texts: Vec<String> = miss_indices.iter().map(|&i| texts[i].clone()).collect();
+
+        let miss_vectors = self.embed_texts(&miss_texts, expected_dim)?;
+
+        // Step 4: Write misses back to cache.
+        if let Some(cache_arc) = &self.cache {
+            let cache = cache_arc.lock().unwrap_or_else(|p| p.into_inner());
+            for (i, &miss_idx) in miss_indices.iter().enumerate() {
+                let key = &cache_keys[miss_idx];
+                let start = i * expected_dim;
+                let end = start + expected_dim;
+                if let Some(vec_slice) = miss_vectors.get(start..end) {
+                    if let Err(e) = cache.put(key, vec_slice) {
+                        tracing::warn!(error = %e, "failed to write embedding to cache");
+                    }
+                }
+            }
+        }
+
+        // Step 5: Place miss results into the output buffer (in order).
+        for (i, &miss_idx) in miss_indices.iter().enumerate() {
+            let start = i * expected_dim;
+            let end = start + expected_dim;
+            if let Some(vec_slice) = miss_vectors.get(start..end) {
+                results[miss_idx] = Some(vec_slice.to_vec());
+            } else {
+                return Err(WorkerError {
+                    kind: ErrorKind::Inference,
+                    message: format!(
+                        "miss vector index {i} out of range (start={start}, end={end}, len={})",
+                        miss_vectors.len()
+                    ),
+                });
+            }
+        }
+
+        // Assemble the flat row-major output in input order.
+        let vectors: Vec<f32> = results
+            .into_iter()
+            .flatten()
+            .flat_map(|v| v.into_iter())
+            .collect();
+        Ok(EmbedResponse::new(vectors, n, expected_dim))
+    }
+
+    /// Embed texts using ONNX inference (or zero vectors if ONNX is not enabled).
+    ///
+    /// WS10 Task 5: Checks the cancel flag between sub-batches (VAL-CACHE-009).
+    fn embed_texts(&self, texts: &[String], expected_dim: usize) -> Result<Vec<f32>, WorkerError> {
+        #[cfg(feature = "onnx")]
+        {
+            if let (Some(session), Some(tokenizer)) = (&self.session, &self.tokenizer) {
+                self.run_onnx_embed(session, tokenizer, texts, expected_dim)
+                    .map(|resp| resp.vectors)
+            } else {
+                Err(WorkerError {
+                    kind: ErrorKind::ModelNotFound,
+                    message: "ONNX session or tokenizer not initialized".to_string(),
+                })
+            }
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            tracing::warn!("ONNX feature not enabled, returning zero vectors");
+            Ok(vec![0.0f32; texts.len() * expected_dim])
+        }
+    }
+
+    /// WS10 Task 4: Handle a cache probe request.
+    ///
+    /// Returns hit/miss index lists without performing any embedding work.
+    fn handle_cache_probe(
+        &self,
+        frame: &Frame,
+    ) -> Result<protocol::CacheProbeResponse, WorkerError> {
+        let request: Request = frame.decode_payload().map_err(|e| WorkerError {
+            kind: ErrorKind::InvalidRequest,
+            message: format!("failed to decode cache probe request: {}", e),
+        })?;
+
+        let probe_req = match request {
+            Request::CacheProbe(req) => req,
+            _ => {
+                return Err(WorkerError {
+                    kind: ErrorKind::InvalidRequest,
+                    message: "expected CacheProbe request".to_string(),
+                });
+            }
+        };
+
+        let Some(cache_arc) = &self.cache else {
+            // Cache not open: treat all keys as misses.
+            return Ok(protocol::CacheProbeResponse {
+                hit_indices: vec![],
+                miss_indices: (0..probe_req.keys.len()).collect(),
+            });
+        };
+
+        let cache = cache_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let probe_result = cache.probe(&probe_req.keys).map_err(|e| WorkerError {
+            kind: ErrorKind::Internal,
+            message: format!("cache probe failed: {}", e),
+        })?;
+
+        Ok(protocol::CacheProbeResponse {
+            hit_indices: probe_result.hits.keys().copied().collect(),
+            miss_indices: probe_result.misses,
+        })
     }
 
     #[cfg(feature = "onnx")]
@@ -1209,16 +1591,23 @@ impl WorkerRuntime {
         let fixed_batch = active_provider.eq_ignore_ascii_case("migraphx")
             || active_provider.eq_ignore_ascii_case("rocm");
         for sub_batch in encodings.chunks(inference_batch_size) {
+            // WS10 Task 5 / VAL-CACHE-009: check the per-batch cancel flag
+            // BETWEEN sub-batches. If cancelled, return an error immediately
+            // (the current sub-batch has already completed; no partial results).
+            if self.cancel_flag.load(Ordering::Relaxed) {
+                tracing::info!(
+                    "cancel flag detected between sub-batches; aborting embed after {} of {} encodings",
+                    all_pooled.len() / expected_dim,
+                    encodings.len()
+                );
+                return Err(WorkerError {
+                    kind: ErrorKind::Inference,
+                    message: "batch cancelled between sub-batches".to_string(),
+                });
+            }
             // Keep the worker alive across a large multi-batch codebase.
             self.touch();
             if fixed_batch && sub_batch.len() < inference_batch_size {
-                let mut padded = sub_batch.to_vec();
-                if let Some(template) = sub_batch.first() {
-                    padded.resize(inference_batch_size, template.clone());
-                }
-                let sub_pooled = self.run_onnx_embed_sub_batch(session, &padded, expected_dim)?;
-                all_pooled.extend_from_slice(&sub_pooled[..sub_batch.len() * expected_dim]);
-            } else {
                 let sub_pooled = self.run_onnx_embed_sub_batch(session, sub_batch, expected_dim)?;
                 all_pooled.extend_from_slice(&sub_pooled);
             }
@@ -1981,3 +2370,7 @@ impl Drop for WorkerRuntime {
 #[cfg(test)]
 #[path = "runtime_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "worker_cache_test.rs"]
+mod worker_cache_tests;

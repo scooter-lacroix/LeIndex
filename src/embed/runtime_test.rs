@@ -308,6 +308,7 @@ fn test_handle_embed_empty_batch() {
     let request = EmbedRequest {
         texts: vec![],
         expected_dim: 1024,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
     let result = rt.handle_embed(&frame);
@@ -328,6 +329,7 @@ fn test_handle_embed_returns_flat_row_major() {
     let request = EmbedRequest {
         texts: vec!["hello".to_string(), "world".to_string()],
         expected_dim: 8,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
     let result = rt.handle_embed(&frame);
@@ -370,6 +372,7 @@ fn test_handle_embed_preserves_ordering() {
     let request = EmbedRequest {
         texts: texts.clone(),
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
     let result = rt.handle_embed(&frame);
@@ -408,6 +411,7 @@ fn test_dispatch_embed_request() {
     let request = EmbedRequest {
         texts: vec!["test".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(42), request).unwrap();
     let response_frame = rt.dispatch(&frame);
@@ -488,6 +492,7 @@ fn test_run_loop_single_request() {
     let request = EmbedRequest {
         texts: vec!["hello".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
     let wire = frame.encode_wire().unwrap();
@@ -655,10 +660,12 @@ fn test_run_loop_multiple_requests_same_runtime() {
     let request1 = EmbedRequest {
         texts: vec!["first".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let request2 = EmbedRequest {
         texts: vec!["second".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
 
     let frame1 = protocol::embed_request_frame(BatchId::new(1), request1).unwrap();
