@@ -82,6 +82,14 @@ pub enum FeatureFlag {
     /// tokenizer digest, prompt role/version, pooling, normalization, output
     /// dimensions, content hash). Cross-project dedup is automatic.
     GlobalEmbedCache,
+    /// Enable the embedding-cache debug escape hatch (WS10 privacy remediation).
+    ///
+    /// When ON *and* the caller provides source text to `GlobalEmbeddingCache::put`,
+    /// the source text is appended to the row bytes after the vector payload for
+    /// development troubleshooting. Default OFF — privacy gate preserved: no
+    /// source text is persisted unless this flag (or the legacy
+    /// `LEINDEX_EMBED_CACHE_DEBUG` env var, or `CacheConfig::debug_mode`) is set.
+    DebugEscapeHatch,
 }
 
 impl FeatureFlag {
@@ -103,6 +111,7 @@ impl FeatureFlag {
             Self::StreamingTfidf => "LEINDEX_FEATURE_STREAMING_TFIDF",
             Self::StreamingNeural => "LEINDEX_FEATURE_STREAMING_NEURAL",
             Self::GlobalEmbedCache => "LEINDEX_FEATURE_GLOBAL_EMBED_CACHE",
+            Self::DebugEscapeHatch => "LEINDEX_FEATURE_EMBED_CACHE_DEBUG",
         }
     }
 
@@ -169,6 +178,9 @@ impl FeatureFlag {
             Self::GlobalEmbedCache => {
                 "Global content-addressed embedding cache with cross-project dedup"
             }
+            Self::DebugEscapeHatch => {
+                "Embedding-cache debug escape hatch: store source text alongside rows"
+            }
         }
     }
 }
@@ -206,6 +218,7 @@ impl FlagStore {
             FeatureFlag::StreamingTfidf,
             FeatureFlag::StreamingNeural,
             FeatureFlag::GlobalEmbedCache,
+            FeatureFlag::DebugEscapeHatch,
         ] {
             let enabled = match env::var(flag.env_var()) {
                 Ok(v) => matches!(
@@ -292,6 +305,7 @@ pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
         FeatureFlag::StreamingTfidf,
         FeatureFlag::StreamingNeural,
         FeatureFlag::GlobalEmbedCache,
+        FeatureFlag::DebugEscapeHatch,
     ]
     .into_iter()
     .map(|f| (f, f.is_enabled()))
@@ -333,6 +347,31 @@ mod test {
         );
         assert!(!FeatureFlag::GenerationReaders.default_value());
         assert!(!FeatureFlag::GenerationReaders.is_enabled());
+    }
+
+    #[test]
+    fn test_debug_escape_hatch_default_off_and_named_correctly() {
+        // The privacy escape hatch for the embedding cache MUST default OFF.
+        // Source text must never be persisted unless the user explicitly opts
+        // in via the env var, the feature flag, or CacheConfig::debug_mode.
+        assert_eq!(
+            FeatureFlag::DebugEscapeHatch.env_var(),
+            "LEINDEX_FEATURE_EMBED_CACHE_DEBUG"
+        );
+        assert!(!FeatureFlag::DebugEscapeHatch.default_value());
+        // is_enabled reads from the cached FlagStore, which reflects unset env
+        // as default_value(). Other tests may have set the override so we use
+        // default_value() to confirm the production default.
+    }
+
+    #[test]
+    fn test_debug_escape_hatch_override_toggles_state() {
+        let _g = FLAG_TEST_LOCK.lock().unwrap();
+        assert!(!FeatureFlag::DebugEscapeHatch.is_enabled());
+        set_flag_override_for_test(FeatureFlag::DebugEscapeHatch, true);
+        assert!(FeatureFlag::DebugEscapeHatch.is_enabled());
+        clear_flag_overrides_for_test();
+        assert!(!FeatureFlag::DebugEscapeHatch.is_enabled());
     }
 
     #[test]

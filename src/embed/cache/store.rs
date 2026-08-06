@@ -25,6 +25,18 @@
 //! [payload: dim * sizeof(f32) BYTES]
 //! ```
 //!
+//! When the debug escape hatch is explicitly enabled (any of
+//! `LEINDEX_EMBED_CACHE_DEBUG` env var, `LEINDEX_FEATURE_EMBED_CACHE_DEBUG`
+//! feature flag, or `CacheConfig::debug_mode`) AND the caller supplies
+//! `Some(source_text)` to `put`, the row is extended with:
+//!
+//! ```text
+//! [debug_text_len u32 LE] [debug_text bytes]
+//! ```
+//!
+//! The corruption hash covers only the vector payload, not the debug
+//! appendix; readers ignore any trailing bytes past `dim * sizeof(f32)`.
+//!
 //! ## Privacy (spec §10.1)
 //!
 //! No source text is stored after hashing. The cache row contains only the
@@ -55,6 +67,10 @@ pub const ROW_HEADER_LEN: usize = 9 + 1 + ROW_PAD_LEN + 32 + 4 + 32;
 const REFS_FILENAME: &str = "refs.json";
 /// Filename for persisted telemetry counters.
 const TELEMETRY_FILENAME: &str = "telemetry.json";
+/// Environment variable that enables debug escape hatch (stores source text
+/// alongside vector rows). The feature-flag equivalent is
+/// `LEINDEX_FEATURE_EMBED_CACHE_DEBUG` (see `FeatureFlag::DebugEscapeHatch`).
+pub const DEBUG_ENV_VAR: &str = "LEINDEX_EMBED_CACHE_DEBUG";
 
 /// A cache probe result: the vector for a hit, or nothing for a miss.
 #[derive(Debug)]
@@ -141,6 +157,14 @@ pub struct CacheConfig {
     /// Maximum bytes for a single cache entry. Entries exceeding this are
     /// rejected (not stored) and counted in telemetry.
     pub max_entry_bytes: u64,
+    /// When `true`, `put` calls that supply `Some(source_text)` will append the
+    /// source text after the vector payload in the row file. Privacy gate:
+    /// defaults to `false`. This can also be toggled at runtime via the
+    /// `LEINDEX_EMBED_CACHE_DEBUG` env var or the
+    /// `LEINDEX_FEATURE_EMBED_CACHE_DEBUG` feature flag (any of the three
+    /// enabling the behaviour is sufficient).
+    #[serde(default)]
+    pub debug_mode: bool,
 }
 
 impl Default for CacheConfig {
@@ -150,6 +174,8 @@ impl Default for CacheConfig {
             max_bytes: 1024 * 1024 * 1024,
             // 1 MiB max per entry (dim=8192 * 4 bytes = 32KiB, so this is generous).
             max_entry_bytes: 1024 * 1024,
+            // Privacy default: never persist source text.
+            debug_mode: false,
         }
     }
 }
@@ -404,11 +430,25 @@ impl GlobalEmbeddingCache {
     /// VAL-CACHE-007: The stored vector is bit-identical to the one passed in;
     /// no precision loss occurs during serialization.
     ///
+    /// VAL-CACHE-015 / Privacy gate (spec §10.1): when `source_text` is
+    /// `Some(_)` AND the debug escape hatch is active
+    /// ([`is_debug_escape_hatch_active`]), the source text is appended after
+    /// the vector payload in the row file. Otherwise the source text is
+    /// dropped (never persisted). The default is privacy: no source text is
+    /// stored unless an explicit opt-in (`CacheConfig::debug_mode`,
+    /// `LEINDEX_EMBED_CACHE_DEBUG` env var, or
+    /// `LEINDEX_FEATURE_EMBED_CACHE_DEBUG` feature flag) is set.
+    ///
     /// WS10 Task 6: Entry-size rejection — if the computed row size exceeds
     /// `max_entry_bytes`, the entry is rejected and counted in telemetry.
     /// Byte-budget enforcement — if adding the entry would exceed `max_bytes`,
     /// an eviction sweep is triggered on unreferenced rows first.
-    pub fn put(&mut self, key: &CacheKey, vector: &[f32]) -> Result<(), CacheError> {
+    pub fn put(
+        &mut self,
+        key: &CacheKey,
+        vector: &[f32],
+        source_text: Option<&str>,
+    ) -> Result<(), CacheError> {
         let fingerprint = key.fingerprint();
         let final_path = self.row_path(&fingerprint);
         if final_path.exists() {
@@ -416,7 +456,10 @@ impl GlobalEmbeddingCache {
         }
 
         let dim = key.output_dimensions as usize;
-        let row_bytes = encode_row(&fingerprint, dim, vector);
+        let debug_active = is_debug_escape_hatch_active(self.config.debug_mode);
+        // Privacy gate: never persist source text unless explicitly enabled.
+        let debug_payload = if debug_active { source_text } else { None };
+        let row_bytes = encode_row(&fingerprint, dim, vector, debug_payload);
         let entry_size = row_bytes.len() as u64;
 
         // Entry-size rejection (spec section 10.3).
@@ -754,16 +797,36 @@ impl GlobalEmbeddingCache {
 
 /// Encode a cache row as a byte vector.
 ///
-/// Layout: `[magic(9)] [version(1)] [pad(2)] [fingerprint(32)] [dim u32 LE(4)] [content_hash(32)] [payload]`.
+/// Layout without debug suffix:
+/// `[magic(9)] [version(1)] [pad(2)] [fingerprint(32)] [dim u32 LE(4)]
+/// [content_hash(32)] [payload: dim * sizeof(f32)]`
+///
+/// Layout with debug suffix (only when `debug_text` is `Some(_)`):
+/// `... [payload] [debug_text_len u32 LE(4)] [debug_text bytes]`
 ///
 /// The "content hash" is a blake3 of the raw f32 bytes of the payload,
-/// enabling corruption detection on read.
-pub fn encode_row(fingerprint: &[u8; 32], dim: usize, vector: &[f32]) -> Vec<u8> {
+/// enabling corruption detection on read. The debug suffix is not covered by
+/// the content hash (it is mutable development metadata, not vector data).
+pub fn encode_row(
+    fingerprint: &[u8; 32],
+    dim: usize,
+    vector: &[f32],
+    debug_text: Option<&str>,
+) -> Vec<u8> {
     assert_eq!(vector.len(), dim, "vector length must match dim");
     let payload_bytes = f32_slice_to_bytes(vector);
     let payload_hash: [u8; 32] = blake3::hash(&payload_bytes).into();
 
-    let mut buf = Vec::with_capacity(ROW_HEADER_LEN + payload_bytes.len());
+    let debug_bytes = debug_text.map(str::as_bytes).unwrap_or(&[]);
+    let mut buf = Vec::with_capacity(
+        ROW_HEADER_LEN
+            + payload_bytes.len()
+            + if debug_bytes.is_empty() {
+                0
+            } else {
+                4 + debug_bytes.len()
+            },
+    );
     buf.extend_from_slice(ROW_MAGIC);
     buf.push(ROW_VERSION);
     buf.extend_from_slice(&[0u8; ROW_PAD_LEN]);
@@ -771,13 +834,19 @@ pub fn encode_row(fingerprint: &[u8; 32], dim: usize, vector: &[f32]) -> Vec<u8>
     buf.extend_from_slice(&(dim as u32).to_le_bytes());
     buf.extend_from_slice(&payload_hash);
     buf.extend_from_slice(&payload_bytes);
+    if !debug_bytes.is_empty() {
+        buf.extend_from_slice(&(debug_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(debug_bytes);
+    }
     buf
 }
 
 /// Read and validate a cache row, returning the embedded vector.
 ///
-/// VAL-CACHE-004: Corruption is detected by re-hashing the payload and
-/// comparing against the stored content hash.
+/// VAL-CACHE-004: Corruption is detected by re-hashing the vector payload and
+/// comparing against the stored content hash. Only the vector bytes (first
+/// `dim * sizeof(f32)` bytes after the header) are hashed; any trailing debug
+/// suffix (stored when the debug escape hatch is enabled) is ignored on read.
 pub fn read_row(path: &Path, expected_fingerprint: &[u8; 32]) -> Result<Vec<f32>, CacheError> {
     let bytes = fs::read(path)?;
     if bytes.len() < ROW_HEADER_LEN {
@@ -817,19 +886,21 @@ pub fn read_row(path: &Path, expected_fingerprint: &[u8; 32]) -> Result<Vec<f32>
     let mut stored_hash = [0u8; 32];
     stored_hash.copy_from_slice(&bytes[48..80]);
 
-    // payload starts at offset 80
-    let payload = &bytes[ROW_HEADER_LEN..];
+    // payload starts at offset 80. Anything past `dim * sizeof(f32)` is the
+    // optional debug suffix and must not be covered by the corruption hash.
     let expected_payload_len = dim * std::mem::size_of::<f32>();
-    if payload.len() != expected_payload_len {
+    let trailing = &bytes[ROW_HEADER_LEN..];
+    if trailing.len() < expected_payload_len {
         return Err(CacheError::BadRow(format!(
-            "payload length mismatch: got {}, expected {}",
-            payload.len(),
+            "payload length mismatch: got {}, need at least {}",
+            trailing.len(),
             expected_payload_len
         )));
     }
+    let vector_bytes = &trailing[..expected_payload_len];
 
-    // Re-hash the vector payload and compare against stored content_hash.
-    let computed_hash: [u8; 32] = blake3::hash(payload).into();
+    // Re-hash only the vector bytes (debug suffix intentionally excluded).
+    let computed_hash: [u8; 32] = blake3::hash(vector_bytes).into();
     if computed_hash != stored_hash {
         return Err(CacheError::BadRow(
             "hash mismatch: stored vector hash does not match recomputed hash".to_string(),
@@ -837,7 +908,7 @@ pub fn read_row(path: &Path, expected_fingerprint: &[u8; 32]) -> Result<Vec<f32>
     }
 
     // Convert raw bytes back to f32 vector.
-    Ok(bytes_to_f32_vec(payload))
+    Ok(bytes_to_f32_vec(vector_bytes))
 }
 
 /// Convert a &[f32] slice to raw bytes (little-endian on most platforms;
@@ -899,6 +970,36 @@ fn hex_nibble(c: u8) -> Option<u8> {
     }
 }
 
+/// Returns `true` if the debug escape hatch is active.
+///
+/// Debug mode is active if any of the following is set:
+/// - The `LEINDEX_EMBED_CACHE_DEBUG` env var (this module's legacy trigger)
+/// - The `LEINDEX_FEATURE_EMBED_CACHE_DEBUG` feature flag
+///   ([`FeatureFlag::DebugEscapeHatch`](crate::feature_flags::FeatureFlag::DebugEscapeHatch))
+/// - The [`CacheConfig::debug_mode`] struct field on the open cache
+///
+/// When active and the caller supplies `Some(source_text)` to
+/// [`GlobalEmbeddingCache::put`], the source text is appended to the row file
+/// after the vector payload. Otherwise the source text is dropped (privacy
+/// gate, spec §10.1).
+pub fn is_debug_escape_hatch_active(config_debug_mode: bool) -> bool {
+    if config_debug_mode {
+        return true;
+    }
+    if std::env::var(DEBUG_ENV_VAR)
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "enable" | "enabled"
+            )
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    crate::feature_flags::FeatureFlag::DebugEscapeHatch.is_enabled()
+}
+
 /// Load the project refs from `refs.json`, or return empty refs if not present.
 fn load_refs(root: &Path) -> Result<ProjectRefs, CacheError> {
     let path = root.join(REFS_FILENAME);
@@ -953,8 +1054,8 @@ mod tests {
         let vec1 = sample_vector(4, 0.1);
         let vec2 = sample_vector(4, 0.2);
 
-        cache.put(&key1, &vec1).unwrap();
-        cache.put(&key2, &vec2).unwrap();
+        cache.put(&key1, &vec1, None).unwrap();
+        cache.put(&key2, &vec2, None).unwrap();
 
         let result = cache.probe(&[key1, key2, key3]).unwrap();
         assert_eq!(result.hits.len(), 2);
@@ -976,7 +1077,7 @@ mod tests {
         let key = sample_key("exact text", 8);
         let original = sample_vector(8, 0.5);
 
-        cache.put(&key, &original).unwrap();
+        cache.put(&key, &original, None).unwrap();
 
         let gotten = cache.get(&key).unwrap().unwrap();
         assert_eq!(gotten.len(), original.len());
@@ -992,7 +1093,7 @@ mod tests {
         let mut cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
 
         let key = sample_key("text to corrupt", 4);
-        cache.put(&key, &sample_vector(4, 0.1)).unwrap();
+        cache.put(&key, &sample_vector(4, 0.1), None).unwrap();
 
         // Corrupt by flipping one byte in the vector payload area.
         let path = cache.row_path(&key.fingerprint());
@@ -1022,11 +1123,11 @@ mod tests {
         let vec = sample_vector(4, 0.3);
 
         // Project A puts the vector.
-        cache.put(&key, &vec).unwrap();
+        cache.put(&key, &vec, None).unwrap();
         assert_eq!(cache.row_count().unwrap(), 1);
 
         // Project B puts the same vector (same key) — dedup, no second row.
-        cache.put(&key, &vec).unwrap();
+        cache.put(&key, &vec, None).unwrap();
         assert_eq!(cache.row_count().unwrap(), 1);
     }
 
@@ -1037,7 +1138,7 @@ mod tests {
         let mut cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
 
         let key = sample_key("shared text", 4);
-        cache.put(&key, &sample_vector(4, 0.1)).unwrap();
+        cache.put(&key, &sample_vector(4, 0.1), None).unwrap();
 
         let fp = key.fingerprint();
         cache.add_reference(&fp, "project-a", 1);
@@ -1062,8 +1163,8 @@ mod tests {
         let key_live = sample_key("live text", 4);
         let key_dead = sample_key("dead text", 4);
 
-        cache.put(&key_live, &sample_vector(4, 0.1)).unwrap();
-        cache.put(&key_dead, &sample_vector(4, 0.2)).unwrap();
+        cache.put(&key_live, &sample_vector(4, 0.1), None).unwrap();
+        cache.put(&key_dead, &sample_vector(4, 0.2), None).unwrap();
 
         // Mark key_live as referenced by a project.
         let fp_live = key_live.fingerprint();
@@ -1101,8 +1202,8 @@ mod tests {
         let mut cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
 
         let key = sample_key("idempotent text", 4);
-        cache.put(&key, &[0.1, 0.2, 0.3, 0.4]).unwrap();
-        cache.put(&key, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+        cache.put(&key, &[0.1, 0.2, 0.3, 0.4], None).unwrap();
+        cache.put(&key, &[0.1, 0.2, 0.3, 0.4], None).unwrap();
 
         assert_eq!(cache.row_count().unwrap(), 1);
     }
@@ -1115,7 +1216,7 @@ mod tests {
         assert!(cache_root.join("rows").exists());
 
         let key = sample_key("after open", 2);
-        cache.put(&key, &[1.0, 2.0]).unwrap();
+        cache.put(&key, &[1.0, 2.0], None).unwrap();
         assert_eq!(cache.row_count().unwrap(), 1);
     }
 
@@ -1125,7 +1226,7 @@ mod tests {
         let mut cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
 
         let key = sample_key("persist test", 4);
-        cache.put(&key, &[0.5, 0.6, 0.7, 0.8]).unwrap();
+        cache.put(&key, &[0.5, 0.6, 0.7, 0.8], None).unwrap();
 
         let fp = key.fingerprint();
         cache.add_reference(&fp, "proj", 42);
@@ -1148,7 +1249,7 @@ mod tests {
         let mut cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
 
         let key = sample_key("multi-ref text", 4);
-        cache.put(&key, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+        cache.put(&key, &[0.1, 0.2, 0.3, 0.4], None).unwrap();
         let fp = key.fingerprint();
 
         cache.add_reference(&fp, "proj-a", 1);
@@ -1171,7 +1272,7 @@ mod tests {
         assert_eq!(cycles_before, 0);
 
         let key = sample_key("bytes test", 4);
-        cache.put(&key, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        cache.put(&key, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
         let bytes_after = cache.total_bytes().unwrap();
         assert_eq!(bytes_after, (ROW_HEADER_LEN + 4 * 4) as u64);
     }
@@ -1184,7 +1285,7 @@ mod tests {
 
         let secret_text = "this is a secret symbol name fn_do_not_store_me";
         let key = sample_key(secret_text, 4);
-        cache.put(&key, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+        cache.put(&key, &[0.1, 0.2, 0.3, 0.4], None).unwrap();
 
         // Inspect the raw row file on disk.
         let path = cache.row_path(&key.fingerprint());
@@ -1223,8 +1324,8 @@ mod tests {
         let key1 = sample_key("stats one", 4);
         let key2 = sample_key("stats two", 4);
 
-        cache.put(&key1, &[0.1, 0.2, 0.3, 0.4]).unwrap();
-        cache.put(&key2, &[0.5, 0.6, 0.7, 0.8]).unwrap();
+        cache.put(&key1, &[0.1, 0.2, 0.3, 0.4], None).unwrap();
+        cache.put(&key2, &[0.5, 0.6, 0.7, 0.8], None).unwrap();
 
         let stats = cache.cache_stats().unwrap();
         assert_eq!(stats.row_count, 2);
@@ -1250,7 +1351,7 @@ mod tests {
         let key1 = sample_key("telemetry hit", 4);
         let key2 = sample_key("telemetry miss", 4);
 
-        cache.put(&key1, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        cache.put(&key1, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
 
         // Probe with one hit, one miss.
         let result = cache.probe(&[key1, key2]).unwrap();
@@ -1270,11 +1371,12 @@ mod tests {
         let config = CacheConfig {
             max_bytes: 0,       // unlimited budget
             max_entry_bytes: 8, // tiny: ROW_HEADER_LEN alone is 80 bytes
+            debug_mode: false,
         };
         let mut cache = GlobalEmbeddingCache::open_with_config(tmp.path(), config).unwrap();
 
         let key = sample_key("too big", 4);
-        cache.put(&key, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        cache.put(&key, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
 
         // The entry should have been rejected (not stored).
         assert_eq!(cache.row_count().unwrap(), 0);
@@ -1294,6 +1396,7 @@ mod tests {
         let config = CacheConfig {
             max_bytes: 100,
             max_entry_bytes: u64::MAX,
+            debug_mode: false,
         };
         let mut cache = GlobalEmbeddingCache::open_with_config(tmp.path(), config).unwrap();
 
@@ -1301,11 +1404,11 @@ mod tests {
         let key2 = sample_key("second entry", dim);
 
         // Put first entry.
-        cache.put(&key1, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        cache.put(&key1, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
         assert_eq!(cache.row_count().unwrap(), 1);
 
         // Put second entry — should trigger eviction of key1 (unreferenced).
-        cache.put(&key2, &[5.0, 6.0, 7.0, 8.0]).unwrap();
+        cache.put(&key2, &[5.0, 6.0, 7.0, 8.0], None).unwrap();
         assert_eq!(
             cache.row_count().unwrap(),
             1,
@@ -1330,16 +1433,17 @@ mod tests {
         let config = CacheConfig {
             max_bytes: 100,
             max_entry_bytes: u64::MAX,
+            debug_mode: false,
         };
         let mut cache = GlobalEmbeddingCache::open_with_config(tmp.path(), config).unwrap();
 
         let key1 = sample_key("referenced", dim);
-        cache.put(&key1, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        cache.put(&key1, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
         let fp = key1.fingerprint();
         cache.add_reference(&fp, "project-a", 1);
 
         let key2 = sample_key("newcomer", dim);
-        cache.put(&key2, &[5.0, 6.0, 7.0, 8.0]).unwrap();
+        cache.put(&key2, &[5.0, 6.0, 7.0, 8.0], None).unwrap();
 
         // key1 must survive — it has a live project reference.
         assert!(cache.get(&key1).unwrap().is_some());
@@ -1352,7 +1456,7 @@ mod tests {
         let mut cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
 
         let key = sample_key("persist telemetry", 4);
-        cache.put(&key, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        cache.put(&key, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
         cache.probe(&[key]).unwrap();
 
         let telemetry_before = cache.telemetry().clone();
@@ -1374,7 +1478,7 @@ mod tests {
         // Add many unreferenced rows.
         for i in 0..10 {
             let key = sample_key(&format!("dead row {i}"), 4);
-            cache.put(&key, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+            cache.put(&key, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
         }
         assert_eq!(cache.row_count().unwrap(), 10);
 
@@ -1400,8 +1504,8 @@ mod tests {
 
         let key1 = sample_key("report key 1", 4);
         let key2 = sample_key("report key 2", 4);
-        cache.put(&key1, &[0.1, 0.2, 0.3, 0.4]).unwrap();
-        cache.put(&key2, &[0.5, 0.6, 0.7, 0.8]).unwrap();
+        cache.put(&key1, &[0.1, 0.2, 0.3, 0.4], None).unwrap();
+        cache.put(&key2, &[0.5, 0.6, 0.7, 0.8], None).unwrap();
 
         // Probe for telemetry.
         cache.probe(&[key1.clone(), key2.clone()]).unwrap();
@@ -1453,7 +1557,7 @@ mod tests {
 
         // Simulate embedding project A (first worktree).
         for key in &keys_a {
-            cache.put(key, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+            cache.put(key, &[0.1, 0.2, 0.3, 0.4], None).unwrap();
         }
 
         // Simulate probing project B (second worktree with same content).
@@ -1495,7 +1599,7 @@ mod tests {
             .map(|t| sample_key(t, dim))
             .collect();
         for key in &keys_a {
-            cache.put(key, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+            cache.put(key, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
         }
 
         // Project B: shared + unique_b.
@@ -1532,7 +1636,7 @@ mod tests {
 
         // Simulate embedding all of project A.
         for (i, key) in keys_a.iter().enumerate() {
-            cache.put(key, &[(i as f32), 1.0, 2.0, 3.0]).unwrap();
+            cache.put(key, &[(i as f32), 1.0, 2.0, 3.0], None).unwrap();
         }
 
         // Project B has the SAME content (worktree of the same repo).
@@ -1557,7 +1661,7 @@ mod tests {
         let original: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.123_456_79).collect();
 
         // Store the "freshly embedded" vector.
-        cache.put(&key, &original).unwrap();
+        cache.put(&key, &original, None).unwrap();
 
         // Retrieve (simulating a cache hit).
         let cached = cache.get(&key).unwrap().unwrap();
@@ -1585,7 +1689,7 @@ mod tests {
 
         for text in &secret_texts {
             let key = sample_key(text, 4);
-            cache.put(&key, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+            cache.put(&key, &[0.1, 0.2, 0.3, 0.4], None).unwrap();
 
             // Inspect the raw row file.
             let path = cache.row_path(&key.fingerprint());
@@ -1596,6 +1700,247 @@ mod tests {
                 "source text '{}' must not appear in cache file",
                 text
             );
+        }
+    }
+
+    // ── VAL-CACHE-015 privacy escape hatch (LEINDEX_EMBED_CACHE_DEBUG) ──
+
+    /// Privacy gate (default): when debug_mode is OFF and no env var or feature
+    /// flag enables it, source text passed to `put` is dropped — never written
+    /// to the row file.
+    #[test]
+    fn test_debug_escape_hatch_default_private_drops_source_text() {
+        // Ensure no env var or feature flag leaks in from the outside.
+        let _g = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        crate::feature_flags::clear_flag_overrides_for_test();
+        // SAFETY (env-var mutation): tests are serialized via FLAG_TEST_LOCK
+        // and we restore the var at the end. std::env::set_var is safe on the
+        // Linux CI where this test runs.
+        // Explicitly clear the legacy debug env var.
+        // SAFETY: serialized by FLAG_TEST_LOCK; documented test-only mutation.
+        unsafe {
+            std::env::remove_var(DEBUG_ENV_VAR);
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = CacheConfig {
+            debug_mode: false,
+            ..CacheConfig::default()
+        };
+        let mut cache = GlobalEmbeddingCache::open_with_config(tmp.path(), config).unwrap();
+
+        let secret = "fn debug_should_not_store_me() { todo!() }";
+        let key = sample_key(secret, 4);
+
+        // Even though we pass Some(secret), privacy gate drops it.
+        cache
+            .put(&key, &[0.1, 0.2, 0.3, 0.4], Some(secret))
+            .unwrap();
+
+        let path = cache.row_path(&key.fingerprint());
+        let raw = fs::read(&path).unwrap();
+
+        assert!(
+            !raw.windows(secret.len()).any(|w| w == secret.as_bytes()),
+            "default-private mode must not persist source text"
+        );
+
+        // The helper should agree.
+        assert!(!is_debug_escape_hatch_active(false));
+    }
+
+    /// Debug-visible path: when `CacheConfig::debug_mode` is `true` AND the
+    /// caller supplies source text, the text IS written after the vector
+    /// payload. The vector is still read back bit-identical.
+    #[test]
+    fn test_debug_escape_hatch_config_debug_mode_appends_source_text() {
+        let _g = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        crate::feature_flags::clear_flag_overrides_for_test();
+        // SAFETY: serialized by FLAG_TEST_LOCK; documented test-only mutation.
+        unsafe {
+            std::env::remove_var(DEBUG_ENV_VAR);
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = CacheConfig {
+            debug_mode: true,
+            ..CacheConfig::default()
+        };
+        let mut cache = GlobalEmbeddingCache::open_with_config(tmp.path(), config).unwrap();
+
+        let source = "fn debug_visible_function(x: i32) -> i32 { x + 1 }";
+        let key = sample_key(source, 4);
+        let vector = [0.5, 0.6, 0.7, 0.8];
+
+        cache.put(&key, &vector, Some(source)).unwrap();
+
+        // 1. The source text appears in the raw row file.
+        let path = cache.row_path(&key.fingerprint());
+        let raw = fs::read(&path).unwrap();
+        assert!(
+            raw.windows(source.len()).any(|w| w == source.as_bytes()),
+            "debug_mode must persist source text after the vector payload"
+        );
+
+        // 2. The vector still reads back bit-identical (debug suffix is ignored).
+        let recovered = cache.get(&key).unwrap().unwrap();
+        assert_eq!(recovered.len(), vector.len());
+        for (a, b) in recovered.iter().zip(vector.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+
+        // 3. The total row size includes the debug appendix (len prefix + text).
+        let expected_min = ROW_HEADER_LEN + 4 * 4 + 4 + source.len();
+        assert!(
+            raw.len() >= expected_min,
+            "row must include debug appendix: got {} bytes, need at least {expected_min}",
+            raw.len()
+        );
+
+        assert!(is_debug_escape_hatch_active(true));
+    }
+
+    /// If debug mode is enabled but the caller passes `None` (no source text),
+    /// no debug appendix is written — the row is the standard layout.
+    #[test]
+    fn test_debug_escape_hatch_no_source_text_no_appendix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = CacheConfig {
+            debug_mode: true,
+            ..CacheConfig::default()
+        };
+        let mut cache = GlobalEmbeddingCache::open_with_config(tmp.path(), config).unwrap();
+
+        let key = sample_key("no source supplied", 4);
+        cache.put(&key, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
+
+        let path = cache.row_path(&key.fingerprint());
+        let raw = fs::read(&path).unwrap();
+        // Should be exactly the standard layout (no debug appendix).
+        assert_eq!(raw.len(), ROW_HEADER_LEN + 4 * 4);
+    }
+
+    /// The feature flag (`LEINDEX_FEATURE_EMBED_CACHE_DEBUG`) also enables the
+    /// debug escape hatch without touching `CacheConfig::debug_mode`.
+    #[test]
+    fn test_debug_escape_hatch_feature_flag_enables_debug() {
+        let _g = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        crate::feature_flags::clear_flag_overrides_for_test();
+        // SAFETY: serialized by FLAG_TEST_LOCK; documented test-only mutation.
+        unsafe {
+            std::env::remove_var(DEBUG_ENV_VAR);
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
+        let mut cache = cache;
+
+        let source = "fn flag_enabled_debug() -> u32 { 42 }";
+        let key = sample_key(source, 4);
+
+        // Override the feature flag ON.
+        crate::feature_flags::set_flag_override_for_test(
+            crate::feature_flags::FeatureFlag::DebugEscapeHatch,
+            true,
+        );
+
+        let vector = [0.9, 0.8, 0.7, 0.6];
+        cache.put(&key, &vector, Some(source)).unwrap();
+
+        let path = cache.row_path(&key.fingerprint());
+        let raw = fs::read(&path).unwrap();
+        assert!(
+            raw.windows(source.len()).any(|w| w == source.as_bytes()),
+            "FeatureFlag::DebugEscapeHatch must enable source text persistence"
+        );
+
+        // Vector still intact.
+        let recovered = cache.get(&key).unwrap().unwrap();
+        assert_eq!(recovered, vector);
+
+        // Helper reflects the flag.
+        assert!(is_debug_escape_hatch_active(false));
+
+        crate::feature_flags::clear_flag_overrides_for_test();
+    }
+
+    /// The legacy `LEINDEX_EMBED_CACHE_DEBUG` env var also enables the hatch.
+    /// SAFETY: env-var mutation is serialized behind FLAG_TEST_LOCK; we restore
+    /// the var at the end of the test.
+    #[test]
+    fn test_debug_escape_hatch_env_var_enables_debug() {
+        let _g = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        crate::feature_flags::clear_flag_overrides_for_test();
+        // Snapshot the prior value so we can restore it.
+        let prior = std::env::var(DEBUG_ENV_VAR).ok();
+        // SAFETY: serialized by FLAG_TEST_LOCK; documented test-only mutation.
+        unsafe {
+            std::env::set_var(DEBUG_ENV_VAR, "1");
+        }
+
+        // Cache was opened with default config (debug_mode = false), but env
+        // var flips the hatch at put() time.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
+
+        // Sanity: the helper sees the env var.
+        assert!(
+            is_debug_escape_hatch_active(false),
+            "LEINDEX_EMBED_CACHE_DEBUG=1 should activate the escape hatch"
+        );
+
+        let source = "fn env_var_debug_path() {}";
+        let key = sample_key(source, 2);
+        cache.put(&key, &[0.1, 0.2], Some(source)).unwrap();
+
+        let path = cache.row_path(&key.fingerprint());
+        let raw = fs::read(&path).unwrap();
+        assert!(
+            raw.windows(source.len()).any(|w| w == source.as_bytes()),
+            "LEINDEX_EMBED_CACHE_DEBUG=1 must persist source text"
+        );
+
+        // Restore.
+        // SAFETY: serialized by FLAG_TEST_LOCK; documented test-only mutation.
+        match prior {
+            Some(v) => unsafe { std::env::set_var(DEBUG_ENV_VAR, v) },
+            None => unsafe { std::env::remove_var(DEBUG_ENV_VAR) },
+        }
+    }
+
+    /// Probe still returns bit-identical vectors for rows that carry a debug
+    /// appendix (read_row must ignore trailing bytes when re-hashing).
+    #[test]
+    fn test_probe_round_trips_through_debug_row() {
+        let _g = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        crate::feature_flags::clear_flag_overrides_for_test();
+        // SAFETY: serialized by FLAG_TEST_LOCK; documented test-only mutation.
+        unsafe {
+            std::env::remove_var(DEBUG_ENV_VAR);
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = CacheConfig {
+            debug_mode: true,
+            ..CacheConfig::default()
+        };
+        let mut cache = GlobalEmbeddingCache::open_with_config(tmp.path(), config).unwrap();
+
+        let source = "fn probe_with_debug(row: &[u8]) -> bool { true }";
+        let key = sample_key(source, 4);
+        let original = [0.123_456_79, -0.654_321, 1.0, 0.0];
+        cache.put(&key, &original, Some(source)).unwrap();
+
+        // Reopen so we exercise the on-disk read path (not in-memory state).
+        let mut reopened = GlobalEmbeddingCache::open(tmp.path()).unwrap();
+        // But reopened uses the default config (debug_mode = false). The debug
+        // appendix must still be ignored on read.
+        let result = reopened.probe(std::slice::from_ref(&key)).unwrap();
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.misses.len(), 0);
+        let v = result.hits.get(&0).unwrap();
+        for (a, b) in v.iter().zip(original.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
         }
     }
 }

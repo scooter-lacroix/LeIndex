@@ -157,9 +157,9 @@ fn test_embed_with_cache_all_hits_ordering() {
     let vec0 = vec![0.10, 0.11, 0.12, 0.13];
     let vec1 = vec![0.20, 0.21, 0.22, 0.23];
     let vec2 = vec![0.30, 0.31, 0.32, 0.33];
-    cache.put(&keys[0], &vec0).unwrap();
-    cache.put(&keys[1], &vec1).unwrap();
-    cache.put(&keys[2], &vec2).unwrap();
+    cache.put(&keys[0], &vec0, None).unwrap();
+    cache.put(&keys[1], &vec1, None).unwrap();
+    cache.put(&keys[2], &vec2, None).unwrap();
 
     let mut rt = WorkerRuntime::new(no_compile_config());
     rt.cache = Some(std::sync::Arc::new(std::sync::Mutex::new(cache)));
@@ -200,8 +200,8 @@ fn test_embed_all_cache_hits_no_inference() {
 
     let vec_a = vec![1.0, 2.0, 3.0, 4.0];
     let vec_b = vec![5.0, 6.0, 7.0, 8.0];
-    cache.put(&keys[0], &vec_a).unwrap();
-    cache.put(&keys[1], &vec_b).unwrap();
+    cache.put(&keys[0], &vec_a, None).unwrap();
+    cache.put(&keys[1], &vec_b, None).unwrap();
 
     let mut rt = WorkerRuntime::new(no_compile_config());
     rt.cache = Some(std::sync::Arc::new(std::sync::Mutex::new(cache)));
@@ -314,8 +314,8 @@ fn test_cache_probe_rpc() {
         .collect();
 
     // Pre-populate key[0] and key[2].
-    cache.put(&keys[0], &[0.1, 0.2, 0.3, 0.4]).unwrap();
-    cache.put(&keys[2], &[0.5, 0.6, 0.7, 0.8]).unwrap();
+    cache.put(&keys[0], &[0.1, 0.2, 0.3, 0.4], None).unwrap();
+    cache.put(&keys[2], &[0.5, 0.6, 0.7, 0.8], None).unwrap();
 
     let mut rt = WorkerRuntime::new(no_compile_config());
     rt.cache = Some(std::sync::Arc::new(std::sync::Mutex::new(cache)));
@@ -374,8 +374,8 @@ fn test_cache_gc_with_project_references() {
     let key_live = make_key_with_dim("live", dim);
     let key_dead = make_key_with_dim("dead", dim);
 
-    cache.put(&key_live, &[1.0, 2.0, 3.0, 4.0]).unwrap();
-    cache.put(&key_dead, &[5.0, 6.0, 7.0, 8.0]).unwrap();
+    cache.put(&key_live, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
+    cache.put(&key_dead, &[5.0, 6.0, 7.0, 8.0], None).unwrap();
 
     // Add a reference for key_live.
     let fp_live = key_live.fingerprint();
@@ -401,7 +401,7 @@ fn test_cache_hit_vectors_bit_identical() {
     let key = make_key_with_dim("bit identical test", 4);
     let original = vec![0.123456, -0.654321, 1.0, 0.0];
 
-    cache.put(&key, &original).unwrap();
+    cache.put(&key, &original, None).unwrap();
 
     // Read back and compare bit-for-bit.
     let cached = cache.get(&key).unwrap().unwrap();
@@ -425,7 +425,7 @@ fn test_val_cache_013_crash_isolation_cache_consistency() {
     {
         let mut cache = crate::embed::cache::GlobalEmbeddingCache::open(&cache_root).unwrap();
         let key1 = make_key_with_dim("crash test entry 1", 4);
-        cache.put(&key1, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        cache.put(&key1, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
         // Worker "crashes" here — cache goes out of scope. Atomic writes
         // ensure all puts either fully landed or didn't (no partial rows).
     }
@@ -441,7 +441,7 @@ fn test_val_cache_013_crash_isolation_cache_consistency() {
 
     // Retry is idempotent: putting the same key again is a no-op.
     let row_count_before = cache.row_count().unwrap();
-    cache.put(&key1, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    cache.put(&key1, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
     assert_eq!(
         cache.row_count().unwrap(),
         row_count_before,

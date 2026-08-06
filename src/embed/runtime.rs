@@ -1453,7 +1453,12 @@ impl WorkerRuntime {
                 let start = i * expected_dim;
                 let end = start + expected_dim;
                 if let Some(vec_slice) = miss_vectors.get(start..end) {
-                    if let Err(e) = cache.put(key, vec_slice) {
+                    // Thread the source text so the debug escape hatch can
+                    // persist it for development troubleshooting when
+                    // explicitly enabled via LEINDEX_EMBED_CACHE_DEBUG or
+                    // the LEINDEX_FEATURE_EMBED_CACHE_DEBUG feature flag.
+                    let source_text = texts.get(miss_idx).map(String::as_str);
+                    if let Err(e) = cache.put(key, vec_slice, source_text) {
                         tracing::warn!(error = %e, "failed to write embedding to cache");
                     }
                 }
