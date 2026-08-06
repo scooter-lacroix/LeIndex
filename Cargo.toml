@@ -403,6 +403,26 @@ path = "src/bin/leindexd.rs"
 required-features = ["cli"]
 doc = false
 
+# §13 verification matrix: functional scenarios 1-6 (VAL-ROLLOUT-007).
+[[test]]
+name = "fault_scenarios_01_06"
+path = "tests/fault/scenarios_01_06_test.rs"
+
+# §13 verification matrix: functional scenarios 7-12 (VAL-ROLLOUT-007).
+[[test]]
+name = "fault_scenarios_07_12"
+path = "tests/fault/scenarios_07_12_test.rs"
+
+# §13 verification matrix: soak/fault/edge scenarios 13-18 (VAL-ROLLOUT-008/009).
+[[test]]
+name = "soak_scenarios_13_18"
+path = "tests/soak/scenarios_13_18_test.rs"
+
+# §13 verification matrix: soak/fault/edge scenarios 19-24 (VAL-ROLLOUT-008).
+[[test]]
+name = "soak_scenarios_19_24"
+path = "tests/soak/scenarios_19_24_test.rs"
+
 [[bench]]
 name = "simd_benchmarks"
 path = "benches/simd_benchmarks.rs"

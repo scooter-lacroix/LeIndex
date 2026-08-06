@@ -142,7 +142,25 @@ impl FeatureFlag {
             // per-deployment rollout-KILL (explicit `false` disables; unset
             // follows normal config). Genuinely new/experimental features below
             // still default off.
-            Self::StreamingMcp | Self::GlobalAutoSync | Self::NeuralSearch => true,
+            Self::StreamingMcp
+            | Self::GlobalAutoSync
+            | Self::NeuralSearch
+            // v2.0.0 rollout phase 8: all section 16 acceptance gates pass.
+            // The v2.0.0 resource architecture (CAS generations, daemon + shim,
+            // bounded scheduler, streaming pipeline, global embed cache,
+            // validated model) is now the production default. Each flag acts as
+            // a rollout-KILL: setting it to "0"/"false" reverts to legacy
+            // behavior for scoped rollback.
+            | Self::DaemonClient
+            | Self::GenerationReaders
+            | Self::BoundedScheduler
+            | Self::StreamingScan
+            | Self::StreamingParse
+            | Self::StreamingPdg
+            | Self::StreamingTfidf
+            | Self::StreamingNeural
+            | Self::GlobalEmbedCache
+            | Self::ValidatedModel => true,
             // Everything else defaults off
             _ => false,
         }
@@ -399,15 +417,16 @@ mod test {
     }
 
     #[test]
-    fn test_generation_readers_is_new_and_off_by_default() {
-        // A genuinely new/experimental feature must ship default OFF so the
-        // legacy heap-mirror read path stays the default until proven.
+    fn test_generation_readers_now_default_on_after_rollout() {
+        // v2.0.0 rollout phase 8: all section 16 acceptance gates pass.
+        // GenerationReaders now defaults ON as the production read-path.
+        // The flag acts as a rollout-KILL: explicit "0"/"false" reverts to
+        // the legacy heap-mirror read-path for scoped rollback.
         assert_eq!(
             FeatureFlag::GenerationReaders.env_var(),
             "LEINDEX_FEATURE_GENERATION_READERS"
         );
-        assert!(!FeatureFlag::GenerationReaders.default_value());
-        assert!(!FeatureFlag::GenerationReaders.is_enabled());
+        assert!(FeatureFlag::GenerationReaders.default_value());
     }
 
     #[test]
@@ -439,40 +458,41 @@ mod test {
     fn test_override_toggles_flag() {
         // Serialize the shared override store across this test only.
         let _g = FLAG_TEST_LOCK.lock().unwrap();
-        assert!(!FeatureFlag::GenerationReaders.is_enabled());
-        set_flag_override_for_test(FeatureFlag::GenerationReaders, true);
         assert!(FeatureFlag::GenerationReaders.is_enabled());
-        clear_flag_overrides_for_test();
+        set_flag_override_for_test(FeatureFlag::GenerationReaders, false);
         assert!(!FeatureFlag::GenerationReaders.is_enabled());
+        clear_flag_overrides_for_test();
+        assert!(FeatureFlag::GenerationReaders.is_enabled());
     }
 
     #[test]
-    fn test_validated_model_flag_default_off() {
-        // The validated model profile MUST default OFF until WS12 rollout.
-        // Legacy FP16 Qwen3 + reranker stays active.
+    fn test_validated_model_flag_default_on_after_rollout() {
+        // v2.0.0 rollout phase 8: all section 16 acceptance gates pass.
+        // The WS11 validated model profile (CodeRankEmbed INT8, no reranker)
+        // is now the production default. The flag acts as a rollout-KILL.
         assert_eq!(
             FeatureFlag::ValidatedModel.env_var(),
             "LEINDEX_FEATURE_VALIDATED_MODEL"
         );
-        assert!(!FeatureFlag::ValidatedModel.default_value());
+        assert!(FeatureFlag::ValidatedModel.default_value());
     }
 
     #[test]
     fn test_validated_model_override_toggles() {
         let _g = FLAG_TEST_LOCK.lock().unwrap();
-        set_flag_override_for_test(FeatureFlag::ValidatedModel, true);
         assert!(FeatureFlag::ValidatedModel.is_enabled());
-        clear_flag_overrides_for_test();
+        set_flag_override_for_test(FeatureFlag::ValidatedModel, false);
         assert!(!FeatureFlag::ValidatedModel.is_enabled());
+        clear_flag_overrides_for_test();
+        assert!(FeatureFlag::ValidatedModel.is_enabled());
     }
 
-    /// VAL-ROLLOUT-001: Every new WS3-WS11 feature flag defaults OFF.
-    ///
-    /// The rollout gates must not silently enable any workstream. This test
-    /// exercises the `default_value()` path (the production default), not the
-    /// `is_enabled()` path (which may see test overrides from sibling tests).
+    /// VAL-ROLLOUT-001 (phase 1-7) → VAL-ROLLOUT-012 (phase 8):
+    /// After all section 16 acceptance gates pass, all rollout flags flip
+    /// to default ON. Each flag acts as a rollout-KILL: explicit "false"
+    /// reverts to legacy behavior for scoped rollback.
     #[test]
-    fn test_all_rollout_flags_default_off() {
+    fn test_all_rollout_flags_default_on_after_phase8() {
         let _g = FLAG_TEST_LOCK.lock().unwrap();
         clear_flag_overrides_for_test();
         let rollout_flags = [
@@ -489,29 +509,29 @@ mod test {
         ];
         for flag in &rollout_flags {
             assert!(
-                !flag.default_value(),
-                "{} should default OFF (legacy behavior)",
+                flag.default_value(),
+                "{} should default ON after phase 8 rollout (rollout-KILL semantics)",
                 flag.env_var()
             );
         }
     }
 
     #[test]
-    fn test_daemon_client_flag_added_and_off_by_default() {
+    fn test_daemon_client_flag_added_and_on_after_rollout() {
         assert_eq!(
             FeatureFlag::DaemonClient.env_var(),
             "LEINDEX_FEATURE_DAEMON_CLIENT"
         );
-        assert!(!FeatureFlag::DaemonClient.default_value());
+        assert!(FeatureFlag::DaemonClient.default_value());
     }
 
     #[test]
     fn test_daemon_client_override_toggles() {
         let _g = FLAG_TEST_LOCK.lock().unwrap();
-        assert!(!FeatureFlag::DaemonClient.is_enabled());
-        set_flag_override_for_test(FeatureFlag::DaemonClient, true);
         assert!(FeatureFlag::DaemonClient.is_enabled());
-        clear_flag_overrides_for_test();
+        set_flag_override_for_test(FeatureFlag::DaemonClient, false);
         assert!(!FeatureFlag::DaemonClient.is_enabled());
+        clear_flag_overrides_for_test();
+        assert!(FeatureFlag::DaemonClient.is_enabled());
     }
 }

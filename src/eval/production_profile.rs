@@ -288,13 +288,13 @@ mod tests {
     }
 
     #[test]
-    fn test_validated_profile_feature_flag_off_by_default() {
+    fn test_validated_profile_feature_flag_on_after_rollout() {
         let _g = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
         crate::feature_flags::clear_flag_overrides_for_test();
         let profile = ProductionModelProfile::validated();
         assert!(
-            !profile.feature_flag_on,
-            "ValidatedModel must default OFF until WS12 rollout"
+            profile.feature_flag_on,
+            "ValidatedModel must default ON after phase 8 rollout"
         );
     }
 
@@ -346,7 +346,9 @@ mod tests {
     fn test_active_model_identifier_default() {
         let _g = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
         crate::feature_flags::clear_flag_overrides_for_test();
-        assert_eq!(active_model_identifier(), legacy_model_identifier());
+        // After phase 8 rollout, ValidatedModel defaults ON, so the active
+        // model is the validated profile.
+        assert_eq!(active_model_identifier(), validated_model_identifier());
     }
 
     #[test]

@@ -1960,7 +1960,20 @@ impl LeIndex {
         else {
             return Ok(false);
         };
-        if crate::storage::generation::lease::read_current_generation(&storage_path).is_none() {
+        let Some(generation) =
+            crate::storage::generation::lease::read_current_generation(&storage_path)
+        else {
+            return Ok(false);
+        };
+        // Check whether a CAS manifest exists for this generation. Legacy
+        // layouts (pre-migration full-copy) write a CURRENT file but do not
+        // have a manifest. In that case gracefully fall back to the legacy
+        // heap-mirror path instead of erroring.
+        let manifest_path = storage_path
+            .join(crate::storage::generation::lease::GENERATIONS_DIR)
+            .join(generation.to_string())
+            .join(crate::storage::generation::lease::MANIFEST_FILE);
+        if !manifest_path.exists() {
             return Ok(false);
         }
         let snapshot = crate::storage::generation::GenerationSnapshot::open(&storage_path)

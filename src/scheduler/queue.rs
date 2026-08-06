@@ -59,6 +59,16 @@ pub struct TargetRef {
     pub source_fingerprint: String,
 }
 
+impl TargetRef {
+    /// Build a coalescing target from a project id and a source fingerprint.
+    pub fn new(project: impl Into<String>, source_fingerprint: impl Into<String>) -> Self {
+        Self {
+            project: project.into(),
+            source_fingerprint: source_fingerprint.into(),
+        }
+    }
+}
+
 /// A single queued unit of work.
 pub struct DrrEntry<P> {
     /// Stable job id handed to callers.
