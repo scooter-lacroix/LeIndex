@@ -885,16 +885,21 @@ pub fn cleanup_project_store(
 
     if !storage_root.exists() || !cas_dir.exists() {
         // No CAS store → nothing to clean. Return empty report.
-        let report = ProjectCleanupReport {
-            generations: crate::storage::generation::GenerationRetentionReport::default(),
-            ..Default::default()
-        };
-        // Still check for embed-cache compaction.
         #[cfg(feature = "onnx")]
         {
-            report.cache = compact_embed_cache(dry_run);
+            return Ok(ProjectCleanupReport {
+                generations: crate::storage::generation::GenerationRetentionReport::default(),
+                cache: compact_embed_cache(dry_run),
+                ..Default::default()
+            });
         }
-        return Ok(report);
+        #[cfg(not(feature = "onnx"))]
+        {
+            return Ok(ProjectCleanupReport {
+                generations: crate::storage::generation::GenerationRetentionReport::default(),
+                ..Default::default()
+            });
+        }
     }
 
     let mut cas = CasStore::open(&cas_dir)
@@ -913,15 +918,11 @@ pub fn cleanup_project_store(
             .map_err(|e| anyhow::anyhow!("retention sweep failed: {e}"))?
     };
 
-    let mut report = ProjectCleanupReport {
-        generations: gen_report,
-        ..Default::default()
-    };
+    let mut staging_files_removed = 0usize;
 
     // Phase 2: Remove abandoned staging files (crash recovery).
     let staging_dir = cas_dir.join(".staging");
     if staging_dir.exists() {
-        let mut removed = 0usize;
         if let Ok(entries) = fs::read_dir(&staging_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -936,22 +937,26 @@ pub fn cleanup_project_store(
                                 );
                             }
                         } else {
-                            removed += 1;
+                            staging_files_removed += 1;
                         }
                     } else {
-                        removed += 1;
+                        staging_files_removed += 1;
                     }
                 }
             }
         }
-        report.staging_files_removed = removed;
     }
 
     // Phase 3: Embedding-cache compaction (WS10).
     #[cfg(feature = "onnx")]
-    {
-        report.cache = compact_embed_cache(dry_run);
-    }
+    let cache_compaction = compact_embed_cache(dry_run);
+
+    let report = ProjectCleanupReport {
+        generations: gen_report,
+        staging_files_removed,
+        #[cfg(feature = "onnx")]
+        cache: cache_compaction,
+    };
 
     Ok(report)
 }

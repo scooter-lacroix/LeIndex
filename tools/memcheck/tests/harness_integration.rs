@@ -68,7 +68,21 @@ fn memcheck_lock() -> std::sync::MutexGuard<'static, ()> {
     MEMCHECK_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("memcheck test lock poisoned")
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Helper: check if a phase is a worker-gated phase whose placeholder report
+/// (produced when the embed worker binary is unavailable) carries `u64::MAX`
+/// sentinel RSS values. Such phases must be skipped when checking RSS bounds
+/// to avoid assertion failures on sentinel values.
+///
+/// Worker-gated phases: `embed_idle`, `embed_active`, `embed_teardown`,
+/// `worker_ort_threads`. When `sample_count == 0`, the worker binary was not
+/// available and `placeholder_report()` injected `u64::MAX` for
+/// `rss_max_kib` and `combined_rss_max_kib`.
+fn is_unsampled_worker_gated(phase_name: &str, sample_count: u64) -> bool {
+    let is_worker_gated = phase_name.starts_with("embed_") || phase_name == "worker_ort_threads";
+    is_worker_gated && sample_count == 0
 }
 
 /// Helper: run the memcheck binary and return (exit_code, stdout, stderr).
@@ -320,12 +334,11 @@ fn test_val_measure_003_per_phase_schema_has_required_metrics() {
             );
         }
 
-        // sample_count should be positive for the non-worker-gated phases.
-        // Worker-gated phases (embed_*, worker_ort_threads) may have 0 samples
-        // if the worker binary is not available (placeholder reports).
+        // sample_count should be positive unless this is a worker-gated
+        // phase with no samples (worker binary not available → placeholder).
         let phase_name = phase.get("phase").unwrap().as_str().unwrap_or("");
         let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
-        if !phase_name.starts_with("embed_") && phase_name != "worker_ort_threads" {
+        if !is_unsampled_worker_gated(phase_name, sample_count) {
             assert!(
                 sample_count > 0,
                 "phase {} ('{}') should have at least 1 sample",
@@ -334,9 +347,10 @@ fn test_val_measure_003_per_phase_schema_has_required_metrics() {
             );
         }
 
-        // duration_ms should be positive for the non-worker-gated phases
+        // duration_ms should be positive unless this is a worker-gated
+        // placeholder phase (0 duration when unsampled).
         let duration = phase.get("duration_ms").unwrap().as_u64().unwrap();
-        if !phase_name.starts_with("embed_") && phase_name != "worker_ort_threads" {
+        if !is_unsampled_worker_gated(phase_name, sample_count) {
             assert!(
                 duration > 0,
                 "phase {} ('{}') should have positive duration",
@@ -406,9 +420,7 @@ fn test_val_measure_005_linux_rss_is_primary_metric() {
 
         // Skip worker-gated phases that had no samples (worker binary not
         // available → placeholder reports carry u64::MAX sentinels).
-        if (phase_name.starts_with("embed_") || phase_name == "worker_ort_threads")
-            && sample_count == 0
-        {
+        if is_unsampled_worker_gated(phase_name, sample_count) {
             continue;
         }
 
@@ -449,12 +461,18 @@ fn test_val_measure_006_mapped_file_and_anon_captured() {
 
     for phase in phases {
         let phase_name = phase.get("phase").unwrap().as_str().unwrap();
+        let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
+
+        // Skip worker-gated placeholder phases (unsampled → u64::MAX sentinels).
+        if is_unsampled_worker_gated(phase_name, sample_count) {
+            continue;
+        }
+
         let mapped = phase.get("mapped_file_kib").unwrap().as_u64().unwrap();
         let anon = phase.get("anon_kib").unwrap().as_u64().unwrap();
 
         // On Linux, at least one of mapped_file or anon should be populated
         // for phases that actually sampled the process.
-        let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
         if sample_count > 0 {
             // On Linux, we expect at least one of these to be non-zero
             // (the process has both file-backed and anonymous mappings).
@@ -568,8 +586,8 @@ fn test_idle_phases_have_reasonable_duration() {
             || name == "mcp_idle_proliferation"
             || (name.starts_with("embed_") && name != "embed_active")
         {
-            // Skip phases with no samples (worker binary not available)
-            if name.starts_with("embed_") && sample_count == 0 {
+            // Skip unsampled worker-gated phases (worker binary not available)
+            if is_unsampled_worker_gated(name, sample_count) {
                 continue;
             }
             let duration = phase.get("duration_ms").unwrap().as_u64().unwrap();
