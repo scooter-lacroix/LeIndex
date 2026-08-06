@@ -199,6 +199,8 @@ The embedding model is selected through LeIndex's full fused-retrieval path (TF-
 
 All gates are evidenced before the default-on flip. The default-on phase is gated by phases 1 to 7 passing their runbooks, all 24 verification scenarios passing, and all section 16 gates evidenced. Any unmet gate blocks the flip; no pass is ever manufactured (anti-cheat items 12 and 14).
 
+These results are **captured, not self-reported**: the live acceptance runs below were executed against the default-on v2.0.0 release binary and their raw output committed to the repository as evidence files — `docs/baselines/2026-08-04-post-v200-memcheck-gate.txt` (the `cargo build --release && cargo test -p memcheck -- --test-threads=1` gate plus the measured per-phase RSS table) and `docs/baselines/2026-08-04-post-v200-validation-sweep.txt` (the full `fmt + clippy + test --workspace --exclude memcheck + memcheck` sweep). Reproduce with the commands in the "Reproducing these numbers" section below.
+
 ### Resource
 
 | Gate | Status | Evidence |
@@ -242,11 +244,14 @@ All gates are evidenced before the default-on flip. The default-on phase is gate
 
 ### Repository quality
 
-| Gate | Status |
-|---|:---:|
-| `cargo fmt --all --check` | PASS |
-| `cargo clippy --workspace --all-targets -- -D warnings` | PASS (zero warnings) |
-| `cargo test --workspace` | PASS (1,763 lib + 4 binary + integration/verification suites) |
+| Gate | Status | Captured evidence |
+|---|:---:|---|
+| `cargo fmt --all --check` | PASS | `docs/baselines/2026-08-04-post-v200-validation-sweep.txt` (STEP 1) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS (zero warnings) | `docs/baselines/2026-08-04-post-v200-validation-sweep.txt` (STEP 2) |
+| `cargo test --workspace` | PASS (1,763 lib + 4 binary + integration/verification suites) | `docs/baselines/2026-08-04-post-v200-validation-sweep.txt` (STEP 3, `--exclude memcheck`) |
+| memcheck acceptance gate (`cargo test -p memcheck -- --test-threads=1`) | PASS (55 unit + 10 diff + 13 harness integration) | `docs/baselines/2026-08-04-post-v200-memcheck-gate.txt` (gate run + measured per-phase RSS table) |
+
+Each "PASS" above is a reproduction of the exact command captured in the named evidence file with its real exit code — a genuine measured result, not a manual assertion.
 
 ---
 

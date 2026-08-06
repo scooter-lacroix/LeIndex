@@ -1,0 +1,2538 @@
+================================================================
+LeIndex v2.0.0 full validation sweep (default-on build)
+Command: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --exclude memcheck && cargo test -p memcheck -- --test-threads=1
+Captured: 2026-08-06T23:48:52Z (UTC)
+Git HEAD: 12fea12434bb1e4ed5943a3ae41ecd4e56cac500 (fix(rollout): document two-state flag lifecycle + adjust flag-default tests)
+=================================================================
+
+===== STEP 1/4: cargo fmt --all --check =====
+STEP1_FMT_EXIT=0
+
+===== STEP 2/4: cargo clippy --workspace --all-targets -- -D warnings =====
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.18s
+STEP2_CLIPPY_EXIT=0
+
+===== STEP 3/4: cargo test --workspace --exclude memcheck =====
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running unittests src/lib.rs (target/debug/deps/leindex-bcade3c69e05684b)
+
+running 1765 tests
+test cli::cleanup::tests::test_gc_report_display ... ok
+test cli::cleanup::tests::test_best_effort_cleanup_skips_non_temp ... ok
+test cli::cleanup::tests::test_artifact_age_falls_back_to_dir_mtime ... ok
+test cli::cleanup::tests::test_artifact_age_uses_marker ... ok
+test cli::cleanup::tests::test_dir_size ... ok
+test cli::cleanup::tests::test_is_locked_detects_held_write_lock ... ok
+test cli::cleanup::tests::test_is_locked_on_writable_dir ... ok
+test cli::cleanup::tests::test_is_leindex_artifact_by_pattern ... ok
+test cli::cleanup::tests::test_marker_idempotent ... ok
+test cli::cleanup::tests::test_register_skips_in_project_dir ... ok
+test cli::cleanup::tests::test_register_and_flush_temp_cleanup ... ok
+test cli::cleanup::tests::test_marker_write_and_detect ... ok
+test cli::cleanup::tests::test_sweep_dry_run_counts_without_removing ... ok
+test cli::cleanup::tests::test_never_removes_in_project_leindex ... ok
+test cli::cleanup::tests::test_sweep_ignores_unrelated_files ... ok
+test cli::cleanup::tests::test_sweep_keeps_live_daemon_endpoint ... ok
+test cli::cleanup::tests::test_sweep_keeps_live_pid_stem ... ok
+test cli::cleanup::tests::test_sweep_keeps_malformed_pid_stem_recent_sidecars ... ok
+test cli::cleanup::tests::test_sweep_removes_dead_daemon_endpoint ... ok
+test cli::cleanup::tests::test_sweep_removes_malformed_daemon_endpoint ... ok
+test cli::cleanup::tests::test_sweep_removes_dead_pid_stem ... ok
+test cli::cli::mcp_commands::tests::test_framed_response_mode_is_sticky ... ok
+test cli::cli::mcp_commands::tests::test_read_stdio_input_reads_content_length_body ... ok
+test cli::cli::mcp_commands::tests::test_read_stdio_input_reads_newline_json ... ok
+test cli::cli::mcp_commands::tests::test_effective_mcp_idle_timeout_priority_and_zero ... ok
+test cli::cli::mcp_commands::tests::test_read_stdio_input_rejects_malformed_header_termination ... ok
+test cli::cli::mcp_commands::tests::test_read_stdio_input_rejects_truncated_frame ... ok
+test cli::cli::mcp_commands::tests::test_read_stdio_input_returns_end_at_eof ... ok
+test cli::cleanup::tests::test_sweep_removes_old_nonpid_sidecar ... ok
+test cli::cli::mcp_commands::tests::test_read_stdio_input_skips_blank_line ... ok
+test cli::cleanup::tests::test_sweep_sweeps_recycled_unrelated_pid_stem ... ok
+test cli::cli::mcp_commands::tests::test_read_stdio_input_skips_invalid_content_length ... ok
+test cli::cli::mcp_commands::tests::test_framed_parse_error_is_marked_for_write_failure_recovery ... ok
+test cli::cli::mcp_commands::tests::test_write_stdio_response_preserves_framed_wire_format ... ok
+test cli::cli::mcp_commands::tests::test_write_stdio_response_preserves_newline_wire_format ... ok
+test cli::cli::mcp_commands::tests::test_response_for_payload_omits_notification_response ... ok
+test cli::cleanup::tests::test_run_gc_on_empty_dirs ... ok
+test cli::cli::tests::test_cli_parsing ... ok
+test cli::cli::tests::test_cleanup_command_with_flags ... ok
+test cli::cli::tests::test_cleanup_command_parsing ... ok
+test cli::cli::tests::test_dashboard_command_parsing ... ok
+test cli::cli::tests::test_dashboard_command_prod ... ok
+test cli::cleanup::tests::test_gc_skips_non_stale_artifacts ... ok
+test cli::cli::tests::test_find_tool_handler_accepts_short_and_full_names ... ok
+test cli::cli::tests::test_dashboard_command_with_port ... ok
+test cli::cli::tests::test_retention_command_parsing ... ok
+test cli::cli::tests::test_mcp_command_parsing ... ok
+test cli::cli::tests::test_memory_report_flag_parsing ... ok
+test cli::cli::tests::test_memory_report_flag_absent_by_default ... ok
+test cli::cli::tests::test_retention_command_without_report_flag ... ok
+test cli::cli::tests::test_phase_command_parsing ... ok
+test cli::cli::tests::test_search_command ... ok
+test cli::cli::tests::test_setup_command_check ... ok
+test cli::cli::tests::test_setup_command_gpu_amd ... ok
+test cli::cli::tests::test_setup_command_gpu_nvidia ... ok
+test cli::cli::tests::test_setup_command_neural_no_neural_conflict_rejected ... ok
+test cli::cli::tests::test_setup_command_neural_gpu_conflict_rejected ... ok
+test cli::cli::tests::test_setup_command_parsing ... ok
+test cli::config::tests::test_default_config ... ok
+test cli::cli::tests::test_setup_command_no_neural ... ok
+test cli::cli::tests::test_stdio_flag_parsing ... ok
+test cli::config::tests::test_exclusion_build_output_dirs ... ok
+test cli::cli::tests::test_setup_help_is_valid ... ok
+test cli::config::tests::test_exclusion_patterns ... ok
+test cli::config::tests::test_exclusion_minified_and_generated_files ... ok
+test cli::config::tests::test_language_extensions ... ok
+test cli::config::tests::test_language_to_extensions_complete ... ok
+test cli::config::tests::test_language_extensions_complete ... ok
+test cli::config::tests::test_string_pattern ... ok
+test cli::cli::tests::test_tools_run_command_parsing ... ok
+test cli::cli::tests::test_tools_help_command_parsing ... ok
+test cli::daemon::endpoint::test::test_absent_sidecar_wins ... ok
+test cli::config::tests::test_config_serialization ... ok
+test cli::daemon::endpoint::test::test_first_caller_wins_second_connects ... ok
+test cli::daemon::endpoint::test::test_dead_pid_is_stolen ... ok
+test cli::daemon::endpoint::test::test_live_current_pid_is_connected ... ok
+test cli::daemon::endpoint::test::test_malformed_sidecar_recovers ... ok
+test cli::daemon::handshake::test::test_artifact_mismatch_actionable_message ... ok
+test cli::daemon::handshake::test::test_artifact_version_mismatch_rejected ... ok
+test cli::daemon::handshake::test::test_current_reads_constants ... ok
+test cli::daemon::handshake::test::test_matching_handshake_ok ... ok
+test cli::daemon::handshake::test::test_protocol_mismatch_actionable_message ... ok
+test cli::daemon::handshake::test::test_protocol_version_mismatch_rejected ... ok
+test cli::daemon::handshake::test::test_validate_labels_correctly ... ok
+test cli::daemon::endpoint::test::test_protocol_version_mismatch_is_stolen ... ok
+test cli::errors::tests::test_corruption_status ... ok
+test cli::errors::tests::test_error_creation ... ok
+test cli::errors::tests::test_partial_result ... ok
+test cli::errors::tests::test_recoverable_check ... ok
+test cli::errors::tests::test_recovery_strategy ... ok
+test cli::index_builder::fragment::test::test_chunk_naive_zero_max_bytes_no_infinite_loop ... ok
+test cli::index_builder::fragment::test::test_chunk_code_zero_max_bytes_returns_whole_source ... ok
+test cli::index_builder::fragment::test::test_chunk_code_never_emits_empty_fragments ... ok
+test cli::index_builder::fragment::test::test_chunker ... ok
+test cli::index_builder::fragment::test::test_chunker_large_chunk ... ok
+test cli::index_builder::fragment::test::test_chunker_max_bytes ... ok
+test cli::index_builder::fragment::test::test_enrich_orphan_module_header ... ok
+test cli::index_builder::fragment::test::test_enrich_fragment_prepends_header_doc_and_symbol ... ok
+test cli::index_builder::fragment::test::test_chunk_semantic_oversized_leaf_bytes_not_dropped ... ok
+test cli::index_builder::fragment::test::test_orphan_empty_complement_yields_zero_rows ... ok
+test cli::index_builder::fragment::test::test_basic_rust_chunking ... ok
+test cli::index_builder::fragment::test::test_orphan_invalid_utf8_yields_zero_rows ... ok
+test cli::index_builder::fragment::test::test_orphan_file_doc_region_excluded ... ok
+test cli::index_builder::fragment::test::test_extract_orphans_for_top_level_only_file ... ok
+test cli::index_builder::fragment::test::test_owner_header_format ... ok
+test cli::index_builder::fragment::test::test_orphan_module_level_statements_retrievable ... ok
+test cli::index_builder::fragment::test::test_panic_regression_byte_boundary ... ok
+test cli::index_builder::fragment::test::test_root_hash_deterministic_and_content_sensitive ... ok
+test cli::index_builder::fragment::test::test_no_fragment_crosses_owner_range ... ok
+test cli::index_builder::fragment::test::test_store_dedup_one_row_many_refs ... ok
+test cli::index_builder::fragment::test::test_root_load_missing_is_none ... ok
+test cli::index_builder::fragment::test::test_store_owner_mapping ... ok
+test cli::index_builder::fragment::test::test_store_load_missing_is_none ... ok
+test cli::daemon::endpoint::test::test_write_endpoint_sidecar_atomic_write ... ok
+test cli::index_builder::fragment::test::test_store_persist_load_roundtrip ... ok
+test cli::index_builder::fragment::test::test_root_persist_load_roundtrip ... ok
+test cli::index_builder::fragment::test::test_root_schema_mismatch_rejected ... ok
+test cli::index_builder::fragment::test::test_store_schema_mismatch_rejected ... ok
+test cli::index_builder::fragment::test::test_sync_manifest_roundtrip ... ok
+test cli::index_builder::fragment::test::test_store_persist_atomic_no_temp_leftover ... ok
+test cli::index_builder::fragment::test::test_sync_mid_build_generation_serves_last_complete_root ... ok
+test cli::index_builder::fragment::test::test_sync_partial_failure_does_not_commit_identity ... ok
+test cli::index_builder::fragment::test::test_utf8_accented_characters ... ok
+test cli::index_builder::fragment::test::test_utf8_boundary_edge_cases ... ok
+test cli::index_builder::fragment::test::test_utf8_emoji_chunking ... ok
+test cli::index_builder::fragment::test::test_utf8_line_endings_with_multibyte ... ok
+test cli::index_builder::fragment::test::test_utf8_mixed_characters ... ok
+test cli::index_builder::fragment::test::test_utf8_single_multibyte_character ... ok
+test cli::index_builder::test::file_summary_context_collects_same_file_symbols_excluding_summary_nodes ... ok
+test cli::index_builder::test::pdg_search_fingerprint_is_order_independent_and_content_sensitive ... ok
+test cli::index_builder::test::test_cache_key_fragment_enabled_change_invalidates ... ok
+test cli::index_builder::test::test_cache_key_fragment_knobs_deterministic ... ok
+test cli::index_builder::test::test_cache_key_fragment_root_hash_change_invalidates ... ok
+test cli::index_builder::test::test_cache_key_fragment_weight_change_invalidates ... ok
+test cli::index_builder::test::test_cache_key_legacy_v2_without_fragment_fields_parses ... ok
+test cli::cli::mcp_commands::tests::test_read_stdio_input_drains_oversized_frame_and_preserves_alignment ... ok
+test cli::index_builder::test::test_detect_changed_manifests_cold_start_no_false_positive ... ok
+test cli::index_builder::test::test_detect_changed_manifests_detects_real_change ... ok
+test cli::index_builder::fragment::test::test_sync_read_failure_drops_stale_rows ... ok
+test cli::index_builder::fragment::test::test_sync_unchanged_file_zero_reembeds ... ok
+test cli::index_builder::fragment::test::test_sync_removed_partial_file_clears_rows ... ok
+test cli::index_builder::test::test_fragment_mmap_missing_is_none ... ok
+test cli::index_builder::test::test_empty_fragment_persist_removes_stale_mmap ... ok
+test cli::index_builder::test::test_hybrid_embedder_compare_backends ... ok
+test cli::index_builder::test::test_hybrid_embedder_embed_tfidf ... ok
+test cli::index_builder::test::test_fragment_mmap_roundtrip ... ok
+test cli::index_builder::test::test_hybrid_embedder_local_feature_not_enabled ... ok
+test cli::cleanup::tests::test_cleanup_removes_abandoned_staging ... ok
+test cli::index_builder::test::test_hybrid_embedder_tfidf_only_default ... ok
+test cli::index_builder::test::test_hybrid_embedder_tfidf_only ... ok
+test cli::index_builder::test::test_hybrid_scoring_weights ... ok
+test cli::index_builder::test::test_hybrid_scoring_weights_normalize ... ok
+test cli::index_builder::test::test_index_nodes_accumulates_df_across_passes ... ok
+test cli::index_builder::test::test_preceding_doc_context_is_bounded_and_ordered ... ok
+test cli::index_builder::test::test_read_file_once_empty_file ... ok
+test cli::index_builder::test::test_read_file_once_error ... ok
+test cli::index_builder::test::test_detect_changed_manifests_uses_in_memory_cache_first ... ok
+test cli::index_builder::test::test_read_file_once_hash_and_content ... ok
+test cli::index_builder::test::test_sanitize_for_prefix_keeps_full_project_id ... ok
+test cli::index_builder::test::test_clear_query_caches_keeps_project_id_prefix_siblings ... ok
+test cli::index_builder::test::test_tfidf_embedder_empty_corpus ... ok
+test cli::index_builder::test::test_tfidf_embedder_clone_roundtrip ... ok
+test cli::index_builder::test::test_tfidf_embedder_freshness_checks_pdg_counts ... ok
+test cli::index_builder::test::test_tfidf_embedder_missing_file_returns_none ... ok
+test cli::index_builder::test::test_tfidf_embedder_persist_roundtrip ... ok
+test cli::index_builder::test::test_tfidf_embedding_dimension ... ok
+test cli::index_builder::test::test_tfidf_embedding_normalized ... ok
+test cli::index_builder::test::test_index_nodes_respects_batch_size_and_matches_results ... ok
+test cli::index_builder::test::test_tfidf_build_from_tokens_is_deterministic_across_batch_sizes ... ok
+test cli::index_builder::test::test_tfidf_zero_vector_for_unseen_terms ... ok
+test cli::index_builder::test::test_tokenize_code_acronyms_and_digits ... ok
+test cli::index_builder::test::test_tokenize_code_camel_case ... ok
+test cli::index_builder::test::test_tfidf_related_content_higher_similarity ... ok
+test cli::index_builder::test::test_tokenize_code_empty ... ok
+test cli::index_builder::test::test_tokenize_code_filters_short_tokens ... ok
+test cli::index_builder::test::test_tokenize_code_snake_case ... ok
+test cli::index_builder::tfidf::tfidf_persistence_tests::accepts_valid_state_and_preserves_fingerprint ... ok
+test cli::index_builder::tfidf::tfidf_persistence_tests::rejects_dimension_mismatch ... ok
+test cli::index_builder::tfidf::tfidf_persistence_tests::rejects_unknown_schema_version ... ok
+test cli::index_builder::tfidf::tfidf_persistence_tests::rejects_vocab_idf_length_mismatch ... ok
+test cli::index_freshness::tests::build_already_listed_passes_through_absolute_paths ... ok
+test cli::index_freshness::tests::build_already_listed_resolves_relative_paths_against_project_path ... ok
+test cli::index_freshness::tests::fast_file_stat_scan_is_bounded ... ok
+test cli::index_freshness::tests::find_new_nested_manifest_detects_monorepo_package_json ... ok
+test cli::index_freshness::tests::find_new_nested_manifest_detects_cargo_toml_at_depth_3 ... ok
+test cli::index_freshness::tests::find_new_nested_manifest_ignores_dotfile_dirs ... ok
+test cli::index_freshness::tests::find_new_nested_manifest_respects_already_listed ... ok
+test cli::index_freshness::tests::find_new_nested_manifest_respects_max_depth_5 ... ok
+test cli::index_freshness::tests::find_new_nested_manifest_returns_false_when_no_manifests ... ok
+test cli::index_builder::test::test_tfidf_incremental_batches_match_full_build ... ok
+test cli::index_freshness::tests::find_new_nested_manifest_skips_node_modules ... ok
+test cli::index_freshness::tests::find_new_nested_manifest_skips_target ... ok
+test cli::index_freshness::tests::find_new_root_manifest_detects_new_cargo_toml ... ok
+test cli::index_freshness::tests::find_new_root_manifest_does_not_flag_listed_manifest ... ok
+test cli::index_freshness::tests::find_new_root_manifest_ignores_setup_py_when_cached ... ok
+test cli::index_freshness::tests::legacy_scan_falls_back_to_build_already_listed ... ok
+test cli::index_job::tests::job_is_single_flight_and_publishes_core_layers ... ok
+test cli::index_job::tests::lexical_checkpoint_admitted_ids_are_backward_compatible ... ok
+test cli::index_job::tests::lexical_checkpoint_payload_is_deterministic_when_ids_are_sorted ... ok
+test cli::index_freshness::tests::pre_canonicalized_manifest_paths_match_build_already_listed ... ok
+test cli::index_builder::fragment::test::test_sync_single_edit_only_affected_reembedded ... ok
+test cli::index_builder::fragment::test::test_sync_root_mismatch_forces_rebuild ... ok
+test cli::index_builder::test::test_fragment_layer_is_valid_rejects_stale_root ... ok
+test cli::index_builder::test::test_persist_search_snapshot_writes_fragment_artifacts ... ok
+test cli::leindex::indexing::helpers::tests::test_path_contains_component_boundary_normalizes_separators ... ok
+test cli::leindex::indexing::streaming::fragment::test::test_fragment_budget_enforced ... ok
+test cli::leindex::indexing::streaming::fragment::test::test_fragment_cache_probe_before_embed ... ok
+test cli::leindex::indexing::streaming::fragment::test::test_fragment_empty_input ... ok
+test cli::leindex::indexing::streaming::fragment::test::test_fragment_no_hashmap_load_of_all_priors ... ok
+test cli::leindex::indexing::streaming::fragment::test::test_model_digest_isolates_cache ... ok
+test cli::leindex::indexing::streaming::neural::test::test_batch_budget_enforced ... ok
+test cli::leindex::indexing::streaming::neural::test::test_batch_inputs_boundaries ... ok
+test cli::leindex::indexing::streaming::neural::test::test_empty_input ... ok
+test cli::leindex::indexing::streaming::neural::test::test_mock_embedder_deterministic ... ok
+test cli::leindex::indexing::streaming::neural::test::test_rss_independent_of_corpus ... ok
+test cli::leindex::indexing::streaming::neural::test::test_streaming_neural_bit_identical ... ok
+test cli::leindex::indexing::streaming::parse::test::test_chunk_scan_records_respects_byte_limit ... ok
+test cli::leindex::indexing::streaming::parse::test::test_chunk_scan_records_respects_file_limit ... ok
+test cli::leindex::indexing::streaming::parse::test::test_heuristic_extractor_python ... ok
+test cli::leindex::indexing::streaming::parse::test::test_heuristic_extractor_rust ... ok
+test cli::leindex::indexing::streaming::parse::test::test_parsed_record_persisted_immediately ... ok
+test cli::leindex::indexing::streaming::parse::test::test_stream_parse_no_accumulation ... ok
+test cli::leindex::indexing::streaming::pdg::test::test_build_fragment_from_parsed ... ok
+test cli::leindex::indexing::streaming::pdg::test::test_merge_empty_fragments ... ok
+test cli::leindex::indexing::streaming::pdg::test::test_merge_no_clone ... ok
+test cli::leindex::indexing::streaming::pdg::test::test_pdg_segment_roundtrip ... ok
+test cli::leindex::indexing::streaming::pdg::test::test_symbol_table_dedup ... ok
+test cli::leindex::indexing::streaming::scan::test::test_hash_file_streaming_buffer_bounded ... ok
+test cli::leindex::indexing::streaming::scan::test::test_scan_records_roundtrip ... ok
+test cli::leindex::indexing::streaming::scan::test::test_stream_scan_detects_language ... ok
+test cli::leindex::indexing::streaming::scan::test::test_stream_scan_empty_dir ... ok
+test cli::leindex::indexing::streaming::scan::test::test_stream_scan_no_source_retention ... ok
+test cli::leindex::indexing::streaming::scan::test::test_stream_scan_skips_hidden_dirs ... ok
+test cli::leindex::indexing::streaming::scan::test::test_stream_scan_stats ... ok
+test cli::leindex::indexing::streaming::test::test_batch_budget_enforces_all_ceilings ... ok
+test cli::leindex::indexing::streaming::test::test_batch_budget_short_vs_long_different_shapes ... ok
+test cli::leindex::indexing::streaming::test::test_content_hash_deterministic ... ok
+test cli::leindex::indexing::streaming::test::test_estimate_tokens_heuristic ... ok
+test cli::leindex::indexing::streaming::test::test_streaming_state_no_corpus_fields ... ok
+test cli::leindex::indexing::streaming::tfidf::test::test_compute_single_row_zero_tokens ... ok
+test cli::leindex::indexing::streaming::tfidf::test::test_freeze_vocab_empty ... ok
+test cli::leindex::indexing::streaming::tfidf::test::test_streaming_tfidf_empty_docs ... ok
+test cli::leindex::indexing::streaming::tfidf::test::test_streaming_tfidf_no_corpus_vec ... ok
+test cli::leindex::indexing::streaming::tfidf::test::test_tfidf_rows_normalized ... ok
+test cli::leindex::indexing::streaming::tfidf::test::test_tfidf_rows_roundtrip ... ok
+test cli::leindex::indexing::streaming::tfidf::test::test_tokenize_code_basic ... ok
+test cli::leindex::indexing::tests::admitted_node_ids_are_sorted_for_checkpoint_payloads ... ok
+test cli::leindex::indexing::tests::admitted_node_ids_restore_from_lexical_checkpoint ... ok
+test cli::leindex::indexing::tests::fragment_sync_failure_clear_empties_engine_fragment_state ... ok
+test cli::leindex::indexing::tests::missing_lexical_checkpoint_restores_empty_admission_set ... ok
+test cli::leindex::indexing::tests::per_chunk_scratch_has_capacity_one ... ok
+test cli::leindex::indexing::tests::pipeline_state_has_no_cross_phase_file_cache ... ok
+test cli::index_builder::fragment::test::test_sync_extraction_identity_change_forces_resync ... ok
+test cli::leindex::model_download::tests::test_check_result_mismatch_on_wrong_checksum ... ok
+test cli::leindex::model_download::tests::test_check_result_missing_for_absent_file ... ok
+test cli::leindex::model_download::tests::test_check_result_no_entry_when_manifest_lacks_filename ... ok
+test cli::cleanup::tests::test_cleanup_removes_orphaned_cas_blobs ... ok
+test cli::leindex::model_download::tests::test_curl_download_args_avoid_modern_retry_flags ... ok
+test cli::leindex::model_download::tests::test_check_result_verified_on_match ... ok
+test cli::leindex::model_download::tests::test_default_retries_constant_is_at_least_one ... ok
+test cli::leindex::model_download::tests::test_hex_lower_basic ... ok
+test cli::leindex::model_download::tests::test_hf_url_format ... ok
+test cli::leindex::model_download::tests::test_human_bytes_thresholds ... ok
+test cli::leindex::model_download::tests::test_is_curl_network_error_exit_codes ... ok
+test cli::leindex::model_download::tests::test_is_curl_network_error_ignores_unrelated_failures ... ok
+test cli::leindex::model_download::tests::test_is_curl_network_error_stderr_heuristic ... ok
+test cli::leindex::model_download::tests::test_model_download_error_curl_not_found_message_mentions_curl ... ok
+test cli::leindex::model_download::tests::test_model_download_error_io_message_names_path ... ok
+test cli::leindex::model_download::tests::test_model_download_error_network_message_mentions_connectivity ... ok
+test cli::leindex::model_download::tests::test_model_files_include_required_set ... ok
+test cli::leindex::model_download::tests::test_onnx_remote_path_is_under_onnx_subdir ... ok
+test cli::leindex::model_download::tests::test_parse_checksums_ignores_blank_and_comment_lines ... ok
+test cli::leindex::model_download::tests::test_parse_checksums_lowercases_hash ... ok
+test cli::leindex::model_download::tests::test_parse_checksums_rejects_non_hex_hash ... ok
+test cli::leindex::model_download::tests::test_parse_checksums_strips_dot_slash_prefix ... ok
+test cli::leindex::model_download::tests::test_parse_checksums_single_space_and_binary_mode ... ok
+test cli::leindex::model_download::tests::test_parse_checksums_two_space_format ... ok
+test cli::leindex::model_download::tests::test_sha256_of_known_bytes ... ok
+test cli::leindex::query::tests::simple_stem_handles_multibyte_double_consonant ... ok
+test cli::leindex::query::tests::simple_stem_handles_single_multibyte_base_before_suffix ... ok
+test cli::leindex::setup::tests::env_var_guard_restores_original_value_on_panic ... ok
+test cli::leindex::setup::tests::preserve_existing_sections_keeps_fragment_knobs_across_rerun ... ok
+test cli::leindex::setup::tests::preserve_existing_sections_keeps_mcp_knobs_across_rerun ... ok
+test cli::leindex::setup::tests::test_auto_smoke_result_accepts_any_concrete_including_cpu ... ok
+test cli::leindex::setup::tests::test_auto_smoke_result_fails_when_worker_reports_none ... ok
+test cli::leindex::setup::tests::test_build_config_records_ort_version ... ok
+test cli::leindex::setup::tests::test_build_config_selects_dynamic_qwen_model_for_all_local_providers ... ok
+test cli::leindex::setup::tests::test_build_config_without_version ... ok
+test cli::leindex::setup::tests::test_check_provider_available_auto_returns_false ... ok
+test cli::leindex::setup::tests::test_conflict_cpu_gpu ... ok
+test cli::leindex::setup::tests::test_conflict_neural_no_neural ... ok
+test cli::leindex::setup::tests::test_copy_bundled_models_creates_symlinks_not_copies ... ok
+test cli::leindex::setup::tests::test_coreml_smoke_result_accepts_coreml_runtime ... ok
+test cli::leindex::setup::tests::test_coreml_smoke_result_fails_on_cpu_runtime ... ok
+test cli::leindex::setup::tests::test_cpu_implies_neural ... ok
+test cli::leindex::setup::tests::test_curl_not_found_error_mentions_curl ... ok
+test cli::leindex::setup::tests::test_default_gpu_vendor_index_matches_detection ... ok
+test cli::leindex::setup::tests::test_detect_amd_gpu_honors_existing_rocm_path ... ok
+test cli::leindex::setup::tests::test_detect_amd_gpu_no_false_positive_on_clean_system ... ok
+test cli::leindex::setup::tests::test_detect_gpu_vendor_returns_enum ... ok
+test cli::leindex::setup::tests::test_detect_nvidia_gpu_with_cuda_path_env ... ok
+test cli::leindex::setup::tests::test_detected_gpu_variants_are_distinct ... ok
+test cli::leindex::setup::tests::test_dynamic_model_assets_require_complete_single_file_download ... ok
+test cli::index_job::tests::registry_snapshot_uses_durable_status_file ... ok
+test cli::leindex::setup::tests::test_ensure_home_writable_fails_for_read_only_dir ... ok
+test cli::leindex::setup::tests::test_ensure_home_writable_succeeds_for_writable_leindex_home ... ok
+test cli::leindex::setup::tests::test_ensure_home_writable_uses_leindex_home_location ... ok
+test cli::leindex::setup::tests::test_ensure_models_rejects_unknown_name_before_model_directory_resolution ... ok
+test cli::leindex::setup::tests::test_execution_provider_config_values ... ok
+test cli::leindex::setup::tests::test_execution_provider_pip_package ... ok
+test cli::leindex::setup::tests::test_existing_model_without_manifest_is_kept_and_reported_present ... ok
+test cli::leindex::setup::tests::test_find_ort_lib_in_dir_prefers_exact_name_over_versioned_runtime ... ok
+test cli::index_job::tests::lexical_checkpoint_writer_canonicalizes_admitted_ids ... ok
+test cli::index_builder::test::test_tfidf_partition_matches_sort_selection ... ok
+test cli::index_job::tests::checkpoint_artifacts_are_atomic_and_hash_validated ... ok
+test cli::leindex::setup::tests::test_gpu_implies_neural ... ok
+test cli::leindex::setup::tests::test_gpu_smoke_result_fails_provider_mismatch ... ok
+test cli::leindex::setup::tests::test_install_candidate_auto_resolves_to_concrete ... ok
+test cli::leindex::setup::tests::test_install_candidate_resolves_explicit_to_self ... ok
+test cli::leindex::setup::tests::test_install_downloaded_model_file_preserves_destination_when_staging_fails ... ok
+test cli::leindex::setup::tests::test_is_concrete_distinguishes_auto ... ok
+test cli::leindex::setup::tests::test_is_network_error_detects_common_failures ... ok
+test cli::leindex::setup::tests::test_is_network_error_ignores_normal_output ... ok
+test cli::leindex::setup::tests::test_min_ort_version_constant_is_sensible ... ok
+test cli::leindex::setup::tests::test_model_checksum_post_download_error_names_file_and_hashes ... ok
+test cli::cleanup::tests::test_cleanup_never_removes_current_generation ... ok
+test cli::leindex::setup::tests::test_model_download_generic_error_is_actionable ... ok
+test cli::cleanup::tests::test_cleanup_never_removes_previous_generation ... ok
+test cli::leindex::setup::tests::test_model_download_network_error_mentions_connectivity ... ok
+test cli::leindex::setup::tests::test_model_download_profile_uses_hugging_face_cli_assets ... ok
+test cli::leindex::setup::tests::test_model_unavailable_error_names_dynamic_assets ... ok
+test cli::leindex::setup::tests::test_no_flags_errors ... ok
+test cli::leindex::setup::tests::test_parse_gpu_vendor_amd ... ok
+test cli::leindex::setup::tests::test_parse_gpu_vendor_invalid ... ok
+test cli::leindex::setup::tests::test_parse_gpu_vendor_nvidia ... ok
+test cli::leindex::setup::tests::test_parse_pip_bin_rejects_arbitrary_multi_arg_command ... ok
+test cli::leindex::setup::tests::test_parse_version_invalid ... ok
+test cli::leindex::setup::tests::test_parse_version_missing_patch_defaults_to_zero ... ok
+test cli::leindex::setup::tests::test_parse_version_simple ... ok
+test cli::leindex::setup::tests::test_parse_version_with_prerelease ... ok
+test cli::leindex::setup::tests::test_partial_setup_states_preserve_ort_install_decision ... ok
+test cli::leindex::setup::tests::test_permission_denied_error_names_path_and_leindex_home ... ok
+test cli::leindex::setup::tests::test_pip_install_failed_error_mentions_package ... ok
+test cli::leindex::setup::tests::test_pip_network_failed_error_mentions_network ... ok
+test cli::leindex::setup::tests::test_pip_not_found_error_mentions_pip_bin ... ok
+test cli::leindex::setup::tests::test_pip_ort_package_spec_is_bounded_to_supported_major ... ok
+test cli::leindex::setup::tests::test_resolve_neural_cpu ... ok
+test cli::leindex::setup::tests::test_resolve_neural_default_auto ... ok
+test cli::leindex::setup::tests::test_resolve_neural_gpu_amd ... ok
+test cli::leindex::setup::tests::test_resolve_neural_gpu_nvidia ... ok
+test cli::leindex::setup::tests::test_resolve_no_neural ... ok
+test cli::leindex::setup::tests::test_rocm_smoke_result_accepts_migraphx_runtime ... ok
+test cli::leindex::setup::tests::test_setup_error_display ... ok
+test cli::leindex::setup::tests::test_setup_ort_lib_name_accepts_versioned_linux_pip_soname ... ok
+test cli::leindex::setup::tests::test_setup_smoke_provider_label_is_configured_not_claimed_registered ... ok
+test cli::leindex::setup::tests::test_smoke_test_result_dimension_mismatch_is_fail ... ok
+test cli::leindex::setup::tests::test_smoke_test_result_fail_status_line ... ok
+test cli::leindex::setup::tests::test_smoke_test_result_pass_status_line ... ok
+test cli::leindex::setup::tests::test_smoke_test_result_pass_without_dimension_is_not_zero_dim ... ok
+test cli::leindex::setup::tests::test_truncate_for_display_long_appends_ellipsis ... ok
+test cli::leindex::setup::tests::test_truncate_for_display_short ... ok
+test cli::leindex::setup::tests::test_truncate_for_error_long ... ok
+test cli::leindex::setup::tests::test_truncate_for_error_short ... ok
+test cli::leindex::setup::tests::test_try_link_model_file_creates_symlink_on_same_filesystem ... ok
+test cli::cleanup::tests::test_cleanup_preserves_pinned_cas_blobs ... ok
+test cli::leindex::setup::tests::test_try_link_model_file_overwrites_existing ... ok
+test cli::leindex::setup::tests::test_unsupported_cpu_ort_requests_upgrade ... ok
+test cli::leindex::setup::tests::test_version_compatibility_supported ... ok
+test cli::leindex::setup::tests::test_version_compatibility_too_new ... ok
+test cli::leindex::setup::tests::test_version_compatibility_too_old ... ok
+test cli::leindex::setup::tests::test_version_compatibility_unparseable ... ok
+test cli::leindex::setup::tests::test_version_compatibility_very_old ... ok
+test cli::leindex::tests::test_analysis_result_serialization ... ok
+test cli::leindex::tests::project_write_lock_is_mutually_exclusive ... ok
+test cli::leindex::tests::test_diagnostics_serialization ... ok
+test cli::cleanup::tests::test_cleanup_removes_stale_generations ... ok
+test cli::leindex::tests::test_stats_serialization ... ok
+test cli::live_project::tests::active_storage_accepts_only_completed_decimal_generation ... ok
+test cli::mcp::edit_cache::tests::test_edit_cache_backfill_replaces_existing_hot_entry_bytes ... ok
+test cli::mcp::edit_cache::tests::test_edit_cache_entry_estimated_size ... ok
+test cli::mcp::edit_cache::tests::test_edit_cache_rejects_oversized_entry ... ok
+test cli::leindex::setup::tests::test_find_pip_empty_pip_bin_falls_through ... ok
+test cli::leindex::setup::tests::test_find_pip_honors_pip_bin_single_token ... ok
+test cli::leindex::setup::tests::test_find_pip_honors_pip_bin_with_split ... ok
+test cli::leindex::setup::tests::test_model_checksum_status_missing_for_clean_dir ... ok
+test cli::mcp::grep_symbols_handler::tests::test_grep_symbols_schema_has_pagination ... ok
+test cli::mcp::grep_symbols_handler::tests::test_paginate_to_char_budget_preserves_window_order_and_budget ... ok
+test cli::leindex::setup::tests::test_setup_persists_auto_provider ... ok
+test cli::mcp::handlers::tests::test_all_tools_have_project_path_except_index_diagnostics ... ok
+test cli::mcp::handlers::tests::test_handler_names ... ok
+test cli::mcp::handlers::tests::test_argument_schemas ... ok
+test cli::mcp::handlers::tests::test_handler_titles ... ok
+test cli::mcp::helpers::tests::test_apply_changes_in_memory_text_search_integration ... ok
+test cli::mcp::helpers::tests::test_byte_range_to_line_range_rejects_out_of_bounds ... ok
+test cli::mcp::helpers::tests::test_extract_bool_missing_uses_default ... ok
+test cli::mcp::helpers::tests::test_extract_bool_native_bool ... ok
+test cli::mcp::helpers::tests::test_extract_bool_number_coercion ... ok
+test cli::mcp::helpers::tests::test_extract_bool_string_coercion ... ok
+test cli::mcp::helpers::tests::test_extract_string ... ok
+test cli::mcp::helpers::tests::test_extract_usize ... ok
+test cli::mcp::helpers::tests::test_find_normalised_whitespace_returns_tight_span ... ok
+test cli::mcp::helpers::tests::test_get_direct_callers_empty_pdg ... ok
+test cli::mcp::helpers::tests::test_get_direct_callers_with_edge ... ok
+test cli::mcp::helpers::tests::test_make_diff_generates_structured_diff ... ok
+test cli::mcp::helpers::tests::test_node_type_str ... ok
+test cli::mcp::helpers::tests::test_parse_edit_changes_explicit_byte_offsets ... ok
+test cli::mcp::helpers::tests::test_parse_edit_changes_text_not_found_returns_error ... ok
+test cli::mcp::helpers::tests::test_parse_edit_changes_text_search_mode ... ok
+test cli::mcp::helpers::tests::test_pdg_find_by_name ... ok
+test cli::mcp::helpers::tests::test_pdg_find_by_name_in_file ... ok
+test cli::mcp::helpers::tests::test_read_source_snippet_empty_range ... ok
+test cli::mcp::helpers::tests::test_read_source_snippet_nonexistent_file ... ok
+test cli::mcp::helpers::tests::test_read_source_snippet_from_file ... ok
+test cli::mcp::helpers::tests::test_read_source_snippet_partial_range ... ok
+test cli::mcp::helpers::tests::test_replace_whole_word_basic ... ok
+test cli::mcp::helpers::tests::test_read_source_snippet_rejects_out_of_bounds_range ... ok
+test cli::mcp::helpers::tests::test_validate_file_outside_project_fails ... ok
+test cli::mcp::helpers::tests::test_validate_file_within_project_ok ... ok
+test cli::mcp::grep_symbols_handler::tests::test_catalog_symbol_matches_scope_type_and_name ... ok
+test cli::mcp::lock::tests::test_live_owner_without_start_sidecar_is_not_stolen ... ok
+test cli::mcp::lock::tests::test_lock_stem_is_deterministic_and_stable ... ok
+test cli::mcp::lock::tests::test_pid_is_owned_self ... ok
+test cli::mcp::lock::tests::test_acquire_writes_and_releases_sidecars ... ok
+test cli::mcp::lock::tests::test_release_only_removes_owned_sidecars ... ok
+test cli::mcp::lock::tests::test_different_projects_coexist ... ok
+test cli::mcp::lock::tests::test_unparseable_lock_file_is_not_stolen ... ok
+test cli::mcp::output::diff::tests::test_compute_diff_basic ... ok
+test cli::mcp::output::diff::tests::test_compute_diff_no_changes ... ok
+test cli::mcp::lock::tests::test_second_live_instance_reports_owned ... ok
+test cli::mcp::lock::tests::test_stale_lock_with_dead_pid_is_stolen ... ok
+test cli::mcp::output::diff::tests::test_render_diff_value_handles_empty_diffs_list ... ok
+test cli::mcp::output::diff::tests::test_diff_result_to_json ... ok
+test cli::mcp::output::diff::tests::test_render_diff_value_list_no_trailing_newline_on_invalid_entry ... ok
+test cli::mcp::output::diff::tests::test_render_diff_value_handles_rename_symbol_diffs_list ... ok
+test cli::mcp::output::diff::tests::test_render_diff_value_list_with_pre_rendered_string ... ok
+test cli::mcp::output::diff::tests::test_render_diff_value_passthrough_for_diff_text ... ok
+test cli::mcp::output::diff::tests::test_render_diff_value_passthrough_for_string_diff ... ok
+test cli::mcp::output::diff::tests::test_render_split_diff_has_line_numbers ... ok
+test cli::mcp::output::diff::tests::test_render_split_diff_context_rows_keep_blank_marker ... ok
+test cli::mcp::output::diff::tests::test_render_split_diff_modified_rows_respect_terminal_width ... ok
+test cli::mcp::output::diff::tests::test_render_split_diff_modified_rows_use_minus_plus_markers ... ok
+test cli::mcp::output::diff::tests::test_render_split_diff_modified_rows_use_red_and_green_color ... ok
+test cli::mcp::output::diff::tests::test_render_split_diff_respects_80_col_width ... ok
+test cli::mcp::output::diff::tests::test_render_split_diff_strips_trailing_newlines ... ok
+test cli::mcp::output::diff::tests::test_render_unified_diff_closes_header_color ... ok
+test cli::mcp::output::diff::tests::test_render_unified_diff_no_changes_closes_color ... ok
+test cli::mcp::output::diff::tests::test_split_row_right_red_arm_is_dead ... ok
+test cli::mcp::output::render::tests::test_build_tree_preserves_child_names ... ok
+test cli::mcp::output::render::tests::test_render_context_does_not_mislabel_byte_offset_as_line ... ok
+test cli::mcp::output::render::tests::test_render_context_reads_from_results_anchor ... ok
+test cli::mcp::output::render::tests::test_render_diagnostics_plain_output ... ok
+test cli::mcp::output::render::tests::test_render_context_uses_legacy_line_field ... ok
+test cli::mcp::output::render::tests::test_render_edit_apply_noop_shows_message ... ok
+test cli::mcp::output::render::tests::test_render_edit_apply_renders_object_edit_region ... ok
+test cli::mcp::output::render::tests::test_render_edit_apply_renders_partial_object_edit_region ... ok
+test cli::mcp::output::render::tests::test_render_edit_apply_shows_confirmation_not_diff ... ok
+test cli::mcp::output::render::tests::test_render_edit_apply_string_region_no_duplicate_text ... ok
+test cli::mcp::output::render::tests::test_render_file_summary_plain_output ... ok
+test cli::mcp::output::render::tests::test_render_edit_metadata_plain_output ... ok
+test cli::mcp::output::render::tests::test_render_flat_files_drops_unused_label_string ... ok
+test cli::mcp::output::render::tests::test_render_impact_plain_output ... ok
+test cli::mcp::output::render::tests::test_render_search_uses_snippet_field ... ok
+test cli::mcp::output::render::tests::test_render_search_signature_empty_falls_through_to_snippet ... ok
+test cli::mcp::output::render::tests::test_render_symbol_lookup_batch_empty ... ok
+test cli::mcp::output::render::tests::test_render_symbol_lookup_batch_renders_each_entry ... ok
+test cli::mcp::output::render::tests::test_render_tool_output_dispatches_by_name ... ok
+test cli::mcp::output::render::tests::test_render_symbol_lookup_uses_real_field_names ... ok
+test cli::mcp::output::render::tests::test_render_tool_output_falls_back_to_pretty_json ... ok
+test cli::mcp::output::render::tests::test_render_tree_basic ... ok
+test cli::mcp::output::render::tests::test_render_tree_indents_children ... ok
+test cli::mcp::output::render::tests::test_render_write_shows_confirmation_not_diff ... ok
+test cli::mcp::output::tests::test_truncate_matches_previous_contract ... ok
+test cli::mcp::output::tests::test_truncate_with_ellipsis_contracts ... ok
+test cli::mcp::output::trim::tests::test_trim_context_keeps_analysis_result ... ok
+test cli::mcp::output::trim::tests::test_thin_symbol_map_caps_callers_callees_at_5 ... ok
+test cli::mcp::output::trim::tests::test_take_n_borrows_source ... ok
+test cli::mcp::output::trim::tests::test_trim_edit_keeps_apply_result_fields ... ok
+test cli::mcp::output::trim::tests::test_trim_edit_keeps_structured_diff ... ok
+test cli::mcp::output::trim::tests::test_trim_git_status_pdg_unavailable ... ok
+test cli::mcp::output::trim::tests::test_trim_git_status_preserves_pdg_enrichment ... ok
+test cli::mcp::output::trim::tests::test_trim_grep_symbols_drops_byte_range ... ok
+test cli::mcp::output::trim::tests::test_trim_impact_borrows_impact_array ... ok
+test cli::mcp::output::trim::tests::test_trim_deep_analyze_caps_results ... ok
+test cli::mcp::output::trim::tests::test_trim_deep_analyze_caps_at_10_without_clone ... ok
+test cli::mcp::output::trim::tests::test_trim_index_collapses_parse_failures ... ok
+test cli::mcp::output::trim::tests::test_trim_llm_payload_dispatches ... ok
+test cli::mcp::output::trim::tests::test_trim_llm_payload_preserves_meta_warning ... ok
+test cli::mcp::output::trim::tests::test_trim_read_symbol_includes_dependencies_when_present ... ok
+test cli::mcp::output::trim::tests::test_trim_read_symbol_callers_more_flag_no_clone ... ok
+test cli::mcp::output::trim::tests::test_trim_read_symbol_caps_callers ... ok
+test cli::mcp::output::trim::tests::test_trim_search_drops_verbose_fields ... ok
+test cli::mcp::output::trim::tests::test_trim_rename_symbol_caps_diffs_at_25 ... ok
+test cli::mcp::output::trim::tests::test_trim_search_falls_back_to_symbol_key ... ok
+test cli::mcp::output::trim::tests::test_trim_search_falls_through_explicit_null_context ... ok
+test cli::mcp::output::trim::tests::test_trim_search_falls_through_explicit_null_symbol_name ... ok
+test cli::mcp::output::trim::tests::test_trim_search_borrows_input_array ... ok
+test cli::mcp::output::trim::tests::test_trim_search_prefers_symbol_name_when_both_present ... ok
+test cli::mcp::output::trim::tests::test_trim_search_preserves_pagination_fields ... ok
+test cli::mcp::output::trim::tests::test_trim_search_preserves_pagination_fields_no_more_no_suggestion ... ok
+test cli::mcp::output::trim::tests::test_trim_symbol_lookup_batch_with_lookup_error_entry ... ok
+test cli::mcp::output::trim::tests::test_trim_symbol_lookup_keeps_actual_fields ... ok
+test cli::mcp::output::trim::tests::test_trim_symbol_lookup_preserves_batch_results ... ok
+test cli::mcp::output::trim::tests::test_trim_text_search_preserves_context_windows ... ok
+test cli::mcp::output::trim::tests::test_trim_write_borrows_symbols_array ... ok
+test cli::mcp::output::trim::tests::test_trim_write_drops_byte_range ... ok
+test cli::mcp::phase_handler::tests::test_docs_mode_parse ... ok
+test cli::mcp::phase_handler::tests::test_format_mode_parse ... ok
+test cli::mcp::phase_handler::tests::test_handler_names ... ok
+test cli::mcp::phase_handler::tests::test_phase_c_handler_schemas ... ok
+test cli::mcp::phase_handler::tests::test_phase_schema_defaults_phase_to_all ... ok
+test cli::mcp::phase_handler::tests::test_phase_schema_docs_mode_options ... ok
+test cli::mcp::phase_handler::tests::test_phase_schema_mode_options ... ok
+test cli::mcp::phase_handler::tests::test_phase_schema_phase_and_path_are_optional ... ok
+test cli::mcp::phase_handler::tests::test_phase_selection_from_number ... ok
+test cli::leindex::query::tests::cached_search_results_use_fallback_key_without_neural_embedder ... ok
+test cli::cleanup::tests::test_cleanup_never_removes_leased_generation ... ok
+test cli::mcp::project_map_handler::tests::test_project_map_pagination_applies_offset_and_limit ... ok
+test cli::mcp::project_map_handler::tests::test_project_map_schema_has_pagination ... ok
+test cli::mcp::project_map_handler::tests::test_project_map_truncation_respects_token_budget ... ok
+test cli::mcp::protocol::tests::test_backwards_compatibility ... ok
+test cli::mcp::protocol::tests::test_error_codes ... ok
+test cli::mcp::protocol::tests::test_extract_tool_call ... ok
+test cli::mcp::protocol::tests::test_jsonrpc_message_invalid_version ... ok
+test cli::mcp::protocol::tests::test_jsonrpc_message_missing_method ... ok
+test cli::mcp::protocol::tests::test_jsonrpc_message_notification ... ok
+test cli::mcp::protocol::tests::test_jsonrpc_message_request ... ok
+test cli::mcp::protocol::tests::test_jsonrpc_notification_parsing ... ok
+test cli::mcp::protocol::tests::test_jsonrpc_request_invalid_version ... ok
+test cli::mcp::protocol::tests::test_jsonrpc_request_notification ... ok
+test cli::mcp::protocol::tests::test_jsonrpc_request_valid ... ok
+test cli::mcp::protocol::tests::test_jsonrpc_response_error ... ok
+test cli::mcp::protocol::tests::test_jsonrpc_response_success ... ok
+test cli::mcp::protocol::tests::test_jsonrpc_response_with_null_id ... ok
+test cli::mcp::protocol::tests::test_notification_types ... ok
+test cli::mcp::protocol::tests::test_progress_event_constructors_set_timestamp ... ok
+test cli::cleanup::tests::test_cleanup_report_accurate ... ok
+test cli::leindex::tests::test_project_scan_excludes_lockfiles_from_source_but_keeps_manifests ... ok
+test cli::leindex::tests::test_project_scan_is_restored_from_cache_across_instances ... ok
+test cli::mcp::grep_symbols_handler::tests::test_grep_symbols_auto_indexes_returns_empty ... ok
+test cli::mcp::file_summary_handler::tests::test_file_summary_requires_indexed_project ... ok
+test cli::mcp::rename_symbol_handler::tests::test_rename_preview_only_invalidation_is_gated ... ok
+test cli::mcp::read_symbol_handler::tests::test_read_symbol_requires_indexed_project ... ok
+test cli::mcp::rename_symbol_handler::tests::test_rename_schema_has_required_fields ... ok
+test cli::mcp::rename_symbol_handler::tests::test_rename_missing_new_name_returns_error ... ok
+test cli::mcp::search_handler::tests::test_path_in_scope_handles_files_and_directories ... ok
+test cli::mcp::search_handler::tests::test_path_in_scope_preserves_file_and_dotted_directory_boundaries ... ok
+test cli::mcp::rename_symbol_handler::tests::test_rename_missing_old_name_returns_error ... ok
+test cli::mcp::search_handler::tests::test_search_schema_has_pagination ... ok
+test cli::mcp::server::prompts_resources::tests::test_investigation_workflow_generates_for_non_empty_query ... ok
+test cli::mcp::server::prompts_resources::tests::test_investigation_workflow_requires_non_empty_query ... ok
+test cli::mcp::server::tests::test_begin_request_allocates_when_session_unknown ... ok
+test cli::mcp::server::tests::test_begin_request_clones_cached_arc_str_key ... ok
+test cli::mcp::server::tests::test_bind_with_fallback_breaks_on_port_overflow ... ok
+test cli::mcp::server::tests::test_bind_with_fallback_port_zero_skips_fallback_loop ... ok
+test cli::mcp::server::tests::test_bind_with_fallback_uses_preferred_when_free ... ok
+test cli::mcp::server::tests::test_concurrent_session_handshake_isolation ... ok
+test cli::mcp::server::tests::test_freshness_advisory_is_once_per_session_and_generation ... ok
+test cli::mcp::server::tests::test_handle_initialize_does_not_evict_in_flight_session ... ok
+test cli::mcp::server::tests::test_idle_exit_due_logic ... ok
+test cli::mcp::server::tests::test_max_http_sessions_env_override ... ok
+test cli::mcp::server::tests::test_process_idle_clock_touch_resets_idle ... ok
+test cli::mcp::server::tests::test_read_bounded_line_rejects_oversized_input_and_handles_eof ... ok
+test cli::mcp::server::tests::test_server_config_default ... ok
+test cli::mcp::server::tests::test_session_isolation_per_session ... ok
+test cli::mcp::server::tests::test_socket_cleanup_guard_removes_file ... ok
+test cli::mcp::server::tests::test_socket_connection_closes_on_malformed_or_incomplete_headers ... ok
+test cli::mcp::server::tests::test_socket_connection_preserves_newline_and_content_length_framing ... ok
+test cli::mcp::server::tests::test_socket_timeout_contract_distinguishes_initial_and_subsequent_frames ... ok
+test cli::mcp::server::tests::test_stale_session_cleanup ... ok
+test cli::mcp::edit_cache::tests::test_edit_cache_total_residency_capped ... ok
+test cli::leindex::indexing::tests::watcher_delta_publishes_current_generation ... ok
+test cli::mcp::project_map_handler::tests::test_project_map_auto_indexes_empty_project ... ok
+test cli::mcp::project_map_handler::tests::test_project_map_cache_preserves_nested_and_symbol_less_files_with_directory_depth ... ok
+test cli::mcp::symbol_lookup_handler::tests::test_symbol_lookup_schema_supports_batch ... ok
+test cli::mcp::rename_symbol_handler::tests::test_rename_apply_does_not_modify_on_symbol_not_found ... ok
+test cli::mcp::rename_symbol_handler::tests::test_rename_returns_project_not_indexed_for_empty_project ... ok
+test cli::memory::tests::test_cache_entry_size ... ok
+test cli::memory::tests::test_cache_key_generation ... ok
+test cli::memory::tests::test_cache_key_sanitization ... ok
+test cli::memory::tests::test_cache_store_get_or_load_from_disk ... ok
+test cli::memory::tests::test_cache_store_insert_get ... ok
+test cli::memory::tests::test_cache_store_max_bytes ... ok
+test cli::memory::tests::test_cache_store_pop_lru ... ok
+test cli::memory::tests::test_cache_synchronous_byte_bound ... ok
+test cli::mcp::rename_symbol_handler::tests::test_rename_preview_only_does_not_modify_file ... ok
+test cli::memory::tests::test_memory_manager_creation ... ok
+test cli::memory::tests::test_memory_stats ... ok
+test cli::memory::tests::test_restore_result ... ok
+test cli::memory::tests::test_spill_config_default ... ok
+test cli::memory::tests::test_validation_result ... ok
+test cli::memory::tests::test_warm_result ... ok
+test cli::memory::tests::test_warm_strategy ... ok
+test cli::memory_cap::tests::test_current_rss_is_reasonable ... ok
+test cli::memory_cap::tests::test_memory_cap_guard_over_cap_defers_not_errors ... ok
+test cli::memory_cap::tests::test_memory_cap_guard_throttling ... ok
+test cli::memory_cap::tests::test_memory_cap_guard_under_cap ... ok
+test cli::mcp::rename_symbol_handler::tests::test_rename_symbol_not_found_returns_error ... ok
+test cli::memory_report::tests::test_current_rss_bytes_is_reasonable ... ok
+test cli::memory_cap::tests::test_no_error_at_cap ... ok
+test cli::memory_report::tests::test_empty_env_var_ignored ... ok
+test cli::memory_report::tests::test_double_write_is_idempotent ... ok
+test cli::memory_report::tests::test_flag_takes_precedence_over_env ... ok
+test cli::memory_report::tests::test_resolve_report_path_from_env ... ok
+test cli::memory_report::tests::test_resolve_report_path_from_flag ... ok
+test cli::memory_report::tests::test_resolve_report_path_none_when_unset ... ok
+test cli::memory_report::tests::test_report_is_compact ... ok
+test cli::memory_report::tests::test_tracker_drop_writes_report ... ok
+test cli::memory_report::tests::test_tracker_writes_report ... ok
+test cli::mcp::phase_handler::tests::test_phase_analysis_defaults_to_all_when_phase_missing ... ok
+test cli::mcp::phase_handler::tests::test_phase_analysis_accepts_string_phase_number ... ok
+test cli::registry::tests::restore_latest_generation_preserves_corrupt_root ... ok
+test cli::memory::tests::test_memory_info ... ok
+test cli::registry::tests::post_core_failure_preserves_published_health ... ok
+test cli::mcp::search_handler::tests::test_search_handler_zero_results_includes_suggestion ... ok
+test cli::mcp::text_search_handler::tests::test_text_search_live_result_shape_and_pagination ... ok
+test cli::mcp::symbol_lookup_handler::tests::test_all_blank_batch_symbols_rejected ... ok
+test cli::mcp::symbol_lookup_handler::tests::test_batch_with_mixed_blank_and_valid_symbols ... ok
+test cli::registry::tests::test_registry_creation ... ok
+test cli::mcp::symbol_lookup_handler::tests::test_blank_single_symbol_rejected ... ok
+test cli::registry::tests::test_evict_cleans_stale_cache ... ok
+test cli::registry::tests::test_invalidate_stale_cache_removes_entry ... ok
+test cli::registry::tests::test_registry_no_default_project_error ... ok
+test cli::registry::tests::test_registry_nonexistent_path_error ... ok
+test cli::registry::tests::test_invalidate_stale_cache_requires_canonical_input ... ok
+test cli::registry::tests::test_evict_removes_slot_bookkeeping ... ok
+test cli::registry::tests::test_project_rwlock_blocking_write ... ok
+test cli::registry::tests::test_project_rwlock_concurrent_access_no_deadlock ... ok
+test cli::mcp::symbol_lookup_handler::tests::test_symbol_lookup_requires_indexed_project ... ok
+test cli::registry::tests::test_project_rwlock_try_write_returns_err_when_locked ... ok
+test cli::watcher::tests::test_debounce_resets_on_dirty_re_arm ... ok
+test cli::mcp::symbol_lookup_handler::tests::test_whitespace_only_single_symbol_rejected ... ok
+test cli::watcher::tests::test_watcher_debounce_interval_unchanged ... ok
+test cli::watcher::tests::test_watcher_failed_outcome_carries_reason ... ok
+test cli::watcher::tests::test_watcher_outcome_variants_are_distinct ... ok
+test config::tests::test_config_empty_uses_defaults ... ok
+test config::tests::test_config_load_returns_default_when_missing ... ok
+test config::tests::test_config_missing_keys_uses_defaults ... ok
+test config::tests::test_config_roundtrip_preserves_rerank_fields ... ok
+test config::tests::test_default_config_round_trip ... ok
+test config::tests::test_default_execution_provider_is_auto ... ok
+test config::tests::test_default_neural_weight_is_0_4 ... ok
+test config::tests::test_fragment_config_defaults ... ok
+test config::tests::test_fragment_config_round_trip ... ok
+test config::tests::test_full_config_round_trip ... ok
+test config::tests::test_load_or_recover_corrupt_file ... ok
+test config::tests::test_mcp_config_defaults ... ok
+test config::tests::test_mcp_config_round_trip ... ok
+test config::tests::test_neural_config_schema ... ok
+test config::tests::test_ort_dylib_path_skip_serializing_if_none ... ok
+test config::tests::test_parse_malformed_returns_error ... ok
+test config::tests::test_resolve_leindex_home_env_override ... ok
+test edit::command::tests_resolved::test_edit_type_equality ... ok
+test edit::command::tests_resolved::test_resolved_edit_change_delete ... ok
+test edit::command::tests_resolved::test_resolved_edit_change_insert ... ok
+test edit::command::tests_resolved::test_resolved_edit_change_new_delete ... ok
+test edit::command::tests_resolved::test_resolved_edit_change_new_insert ... ok
+test edit::command::tests_resolved::test_resolved_edit_change_new_replace ... ok
+test edit::command::tests_resolved::test_resolved_edit_change_replace ... ok
+test edit::command::tests_resolved::test_resolved_extension ... ok
+test edit::command::tests_resolved::test_resolved_infer_language ... ok
+test edit::command::tests_resolved::test_resolved_with_language ... ok
+test edit::tests::test_edit_change_clone ... ok
+test edit::tests::test_edit_change_equality ... ok
+test edit::tests::test_edit_change_extract_function ... ok
+test edit::tests::test_edit_change_inline_variable ... ok
+test edit::tests::test_edit_change_rename_symbol ... ok
+test edit::tests::test_edit_change_replace_text ... ok
+test edit::tests::test_edit_command_edit_variant ... ok
+test edit::tests::test_edit_command_rollback_point_variant ... ok
+test edit::tests::test_edit_engine_creation ... ok
+test edit::tests::test_edit_engine_history_state ... ok
+test edit::tests::test_edit_engine_preview_edit ... ok
+test edit::tests::test_edit_engine_redo_no_history ... ok
+test edit::tests::test_edit_engine_rollback_nonexistent ... ok
+test edit::tests::test_edit_engine_rollback_point ... ok
+test edit::tests::test_edit_engine_undo_no_history ... ok
+test edit::tests::test_edit_error_display ... ok
+test edit::tests::test_edit_error_invalid_range ... ok
+test edit::tests::test_edit_error_symbol_not_found ... ok
+test edit::tests::test_edit_history_default ... ok
+test edit::tests::test_edit_history_new ... ok
+test edit::tests::test_edit_history_record_command ... ok
+test edit::tests::test_edit_history_redo ... ok
+test edit::tests::test_edit_history_redo_empty ... ok
+test edit::tests::test_edit_history_rollback_nonexistent ... ok
+test edit::tests::test_edit_history_rollback_point ... ok
+test edit::tests::test_edit_history_undo ... ok
+test edit::tests::test_edit_history_undo_clears_redo_stack ... ok
+test edit::tests::test_edit_history_undo_empty ... ok
+test edit::tests::test_edit_preview_default ... ok
+test edit::tests::test_edit_request_creation ... ok
+test edit::tests::test_edit_result_clone ... ok
+test edit::tests::test_edit_result_default ... ok
+test edit::tests::test_edit_result_success ... ok
+test edit::tests::test_impact_analysis_default ... ok
+test edit::tests::test_refactor_extract_function ... ok
+test edit::tests::test_refactor_inline_variable ... ok
+test edit::tests::test_refactor_rename_symbol ... ok
+test edit::tests::test_risk_level_comparison ... ok
+test edit::tests::test_worktree_manager_new ... ok
+test eval::budget_ledger::tests::test_aggregate_budget_constant ... ok
+test eval::budget_ledger::tests::test_analyze_budget_conflict_when_no_reranker_relief ... ok
+test eval::budget_ledger::tests::test_analyze_budget_finds_fitting_candidate ... ok
+test eval::budget_ledger::tests::test_budget_fit_cpu_only_coderank_int8_no_reranker ... ok
+test eval::budget_ledger::tests::test_budget_fit_cpu_only_coderank_no_reranker ... ok
+test eval::budget_ledger::tests::test_budget_fit_fp16_qwen3_exceeds_budget ... ok
+test eval::budget_ledger::tests::test_budget_fit_gpu_coderank_no_reranker ... ok
+test eval::budget_ledger::tests::test_budget_fit_with_reranker_exceeds ... ok
+test eval::budget_ledger::tests::test_budget_markdown_contains_section7_ledger ... ok
+test eval::budget_ledger::tests::test_budget_markdown_reports_conflict_when_applicable ... ok
+test eval::budget_ledger::tests::test_budget_scenario_cpu_only_vram_zero ... ok
+test eval::budget_ledger::tests::test_embed_worker_budget_constant ... ok
+test eval::candidates::tests::test_bakeoff_best_candidate_lowest_memory ... ok
+test eval::candidates::tests::test_bakeoff_conflict_when_no_candidate_fits_budget ... ok
+test eval::candidates::tests::test_bakeoff_no_conflict_when_candidate_fits_budget ... ok
+test eval::candidates::tests::test_bakeoff_report_generation ... ok
+test eval::candidates::tests::test_bakeoff_via_full_fused_retrieval_path ... ok
+test eval::candidates::tests::test_candidate_catalog_has_7_candidates ... ok
+test eval::candidates::tests::test_candidate_fits_budget ... ok
+test eval::candidates::tests::test_candidate_profile_serialization ... ok
+test eval::candidates::tests::test_candidate_total_memory ... ok
+test eval::candidates::tests::test_catalog_contains_all_spec_candidates ... ok
+test eval::candidates::tests::test_compute_wall_time_regression ... ok
+test eval::candidates::tests::test_gate_rejects_mrr_regression_candidate ... ok
+test eval::candidates::tests::test_generate_bakeoff_markdown_contains_all_candidates ... ok
+test eval::candidates::tests::test_memory_profile_from_candidate ... ok
+test eval::candidates::tests::test_quantization_as_str ... ok
+test eval::candidates::tests::test_simulated_backend_quality_1_is_identical ... ok
+test eval::candidates::tests::test_simulated_backend_quality_below_1_degrades ... ok
+test eval::corpus::data::tests::test_all_cases_have_labels ... ok
+test eval::corpus::data::tests::test_all_categories_have_eval_split ... ok
+test eval::corpus::data::tests::test_all_categories_represented ... ok
+test eval::corpus::data::tests::test_corpus_verification_passes ... ok
+test eval::corpus::data::tests::test_default_corpus_built_and_nonempty ... ok
+test eval::corpus::data::tests::test_hard_negative_cases_have_negatives ... ok
+test eval::corpus::data::tests::test_multi_language_variety ... ok
+test eval::corpus::data::tests::test_no_duplicate_case_ids ... ok
+test eval::corpus::data::tests::test_similar_algo_cases_have_negatives ... ok
+test eval::corpus::loader::tests::test_category_counts_all_present ... ok
+test eval::corpus::loader::tests::test_corpus_languages_covers_rust ... ok
+test eval::corpus::loader::tests::test_corpus_roundtrip_json ... ok
+test eval::corpus::loader::tests::test_default_corpus_covers_all_categories ... ok
+test eval::corpus::loader::tests::test_default_corpus_has_eval_cases_for_every_category ... ok
+test eval::corpus::loader::tests::test_hard_negatives_have_hard_negative_labels ... ok
+test eval::corpus::loader::tests::test_load_and_verify_default_corpus ... ok
+test eval::corpus::loader::tests::test_multi_language_coverage ... ok
+test eval::corpus::loader::tests::test_save_and_load_corpus_file ... ok
+test eval::corpus::tests::test_category_all_returns_14 ... ok
+test eval::corpus::tests::test_category_descriptions_nonempty ... ok
+test eval::corpus::tests::test_category_roundtrip_strings ... ok
+test eval::corpus::tests::test_corpus_add_and_count ... ok
+test eval::corpus::tests::test_corpus_case_for_category ... ok
+test eval::corpus::tests::test_corpus_split_filtering ... ok
+test eval::gates::tests::test_candidate_passing_all_gates ... ok
+test eval::gates::tests::test_compute_variance_bands_empty ... ok
+test eval::gates::tests::test_compute_variance_bands_from_runs ... ok
+test eval::gates::tests::test_gates_default_values ... ok
+test eval::gates::tests::test_gates_serialize_roundtrip ... ok
+test eval::gates::tests::test_latency_regression_fails ... ok
+test eval::gates::tests::test_mrr_regression_fails_gate ... ok
+test eval::gates::tests::test_non_protected_category_regression_passes ... ok
+test eval::gates::tests::test_protected_categories ... ok
+test eval::gates::tests::test_protected_category_regression_fails ... ok
+test eval::gates::tests::test_time_execution ... ok
+test eval::gates::tests::test_variance_band_allows_noise ... ok
+test eval::gates::tests::test_wall_time_regression_fails ... ok
+test eval::gates::tests::test_zero_result_fails ... ok
+test eval::harness::tests::test_ablation_summary ... ok
+test eval::harness::tests::test_fused_profile_ablate_one ... ok
+test eval::harness::tests::test_fused_profile_default_all_signals ... ok
+test eval::harness::tests::test_fused_profile_label ... ok
+test eval::harness::tests::test_fused_profile_no_reranker ... ok
+test eval::harness::tests::test_harness_report_json_serialization ... ok
+test eval::harness::tests::test_harness_run_ablation ... ok
+test eval::harness::tests::test_harness_run_with_perfect_mock ... ok
+test eval::harness::tests::test_latency_stats_basic ... ok
+test eval::harness::tests::test_latency_stats_empty ... ok
+test eval::harness::tests::test_mock_backend_query ... ok
+test eval::harness::tests::test_mock_backend_unknown_query ... ok
+test eval::harness::tests::test_register_noisy_mock ... ok
+test eval::harness::tests::test_signal_contribution ... ok
+test eval::int8_parity::tests::test_int8_numerical_parity_384_dims ... ok
+test eval::int8_parity::tests::test_int8_numerical_parity_error_decreases_with_smaller_dims ... ok
+test eval::int8_parity::tests::test_int8_parity_gate_check_zero_regression ... ok
+test eval::int8_parity::tests::test_int8_parity_markdown_present ... ok
+test eval::int8_parity::tests::test_int8_retrieval_parity_winner_384_dims ... ok
+test eval::metrics::tests::test_aggregate_metrics_basic ... ok
+test eval::metrics::tests::test_average_precision_single_hit ... ok
+test eval::metrics::tests::test_average_precision_two_hits ... ok
+test eval::metrics::tests::test_confidence_interval_decreases_with_more_samples ... ok
+test eval::metrics::tests::test_known_answer_fixture ... ok
+test eval::metrics::tests::test_ndcg_imperfect_ranking ... ok
+test eval::metrics::tests::test_ndcg_perfect_ranking ... ok
+test eval::metrics::tests::test_per_category_metrics_split ... ok
+test eval::metrics::tests::test_recall_at_k_cutoff ... ok
+test eval::metrics::tests::test_recall_at_k_miss ... ok
+test eval::metrics::tests::test_recall_at_k_partial ... ok
+test eval::metrics::tests::test_recall_at_k_perfect ... ok
+test eval::metrics::tests::test_recall_empty_relevant ... ok
+test eval::metrics::tests::test_reciprocal_rank_beyond_k ... ok
+test eval::metrics::tests::test_reciprocal_rank_first_position ... ok
+test eval::metrics::tests::test_reciprocal_rank_not_found ... ok
+test eval::metrics::tests::test_reciprocal_rank_second_position ... ok
+test eval::metrics::tests::test_reciprocal_rank_tenth_position ... ok
+test eval::metrics::tests::test_t_value_decreasing ... ok
+test cli::registry::tests::test_registry_same_project_returns_same_handle ... ok
+test cli::registry::tests::test_registry_with_initial_project ... ok
+test eval::production_profile::tests::test_production_profile_markdown ... ok
+test eval::production_profile::tests::test_validated_profile_budget_fit ... ok
+test cli::registry_evict::tests::test_evict_idle_engines_removes_idle_project ... ok
+test eval::production_profile::tests::test_validated_profile_int8_smaller_than_fp16 ... ok
+test eval::production_profile::tests::test_validated_profile_reranker_removed ... ok
+test eval::production_profile::tests::test_validated_profile_uses_coderank_winner ... ok
+test eval::report::tests::test_ablation_summary_display ... ok
+test eval::report::tests::test_bakeoff_report_json ... ok
+test eval::report::tests::test_reranker_decision_json ... ok
+test eval::reranker_ablation::tests::test_fused_profile_for_conditional_has_reduced_weight ... ok
+test eval::reranker_ablation::tests::test_fused_profile_for_no_reranker ... ok
+test eval::reranker_ablation::tests::test_generate_reranker_ablation_markdown ... ok
+test eval::reranker_ablation::tests::test_reranker_ablation_decision ... ok
+test cli::registry_evict::tests::test_evict_idle_engines_skips_recent_and_in_flight ... ok
+test eval::reranker_ablation::tests::test_reranker_ablation_evaluates_all_4_configs ... ok
+test eval::reranker_ablation::tests::test_reranker_ablation_has_baseline ... ok
+test eval::reranker_ablation::tests::test_reranker_ablation_to_decision_report ... ok
+test eval::reranker_ablation::tests::test_reranker_config_from_policy ... ok
+test eval::reranker_ablation::tests::test_reranker_memory_costs ... ok
+test eval::reranker_ablation::tests::test_reranker_policy_all_has_4 ... ok
+test eval::reranker_ablation::tests::test_reranker_budget_analysis ... ok
+test feature_flags::test::test_daemon_client_flag_added_and_on_after_rollout ... ok
+test cli::watcher::tests::test_try_acquire_lock_is_fail_fast ... ok
+test feature_flags::test::test_debug_escape_hatch_default_off_and_named_correctly ... ok
+test eval::reranker_ablation::tests::test_reranker_quality_contribution ... ok
+test feature_flags::test::test_default_values ... ok
+test feature_flags::test::test_flag_env_var_names ... ok
+test feature_flags::test::test_generation_readers_now_default_on_after_rollout ... ok
+test feature_flags::test::test_is_legacy_revertible ... ok
+test cli::registry::tests::core_generation_refreshes_the_resident_handle ... ok
+test cli::registry::tests::test_registry_default_project_tracks_last_used ... ok
+test cli::registry::tests::test_registry_two_different_projects ... ok
+test cli::registry::tests::test_slot_map_reflects_only_live_projects ... ok
+test feature_flags::test::test_validated_model_flag_default_on_after_rollout ... ok
+test cli::registry::tests::test_registry_evicted_project_reloads ... ok
+test cli::registry::tests::test_registry_eviction_at_capacity ... ok
+test global::registry::tests::test_clone_detection ... ok
+test global::registry::tests::test_delete_project ... ok
+test global::registry::tests::test_global_registry_thin_cache_budget ... ok
+test global::registry::tests::test_is_healthy ... ok
+test global::registry::tests::test_list_projects ... ok
+test global::registry::tests::test_list_projects_propagates_invalid_row ... ok
+test global::registry::tests::test_list_projects_rejects_negative_file_count ... ok
+test global::registry::tests::test_load_existing_ids_propagates_invalid_row ... ok
+test global::registry::tests::test_register_and_get_project ... ok
+test global::registry::tests::test_register_project ... ok
+test global::registry::tests::test_registry_init_default ... ok
+test global::sync::tests::test_calculate_backoff ... ok
+test global::sync::tests::test_clone_group_structure ... ok
+test global::registry::tests::test_registry_init ... ok
+test global::sync::tests::test_sync_report_add_error ... ok
+test global::sync::tests::test_sync_report_critical_error ... ok
+test global::sync::tests::test_sync_report_new ... ok
+test global::tools::tests::test_available_tools_not_empty ... ok
+test global::tools::tests::test_detect_tool_returns_something ... ok
+test global::tools::tests::test_resolve_alias_fd ... ok
+test global::tools::tests::test_resolve_alias_ripgrep ... ok
+test global::tools::tests::test_resolve_alias_unknown ... ok
+test global::tools::tests::test_tooltype_command_names ... ok
+test global::tools::tests::test_tooltype_display ... ok
+test global::tools::tests::test_tooltype_ord ... ok
+test global::tools::tests::test_tooltype_partial_eq ... ok
+test global::tools::tests::test_walkdir_always_available ... ok
+test graph::cross_project::tests::test_add_external_ref ... ok
+test graph::cross_project::tests::test_cross_project_pdg_creation ... ok
+test graph::cross_project::tests::test_get_referenced_projects ... ok
+test graph::cross_project::tests::test_max_depth_exceeded ... ok
+test graph::cross_project::tests::test_merge_external_pdg ... ok
+test graph::cross_project::tests::test_merge_with_edges ... ok
+test graph::cross_project::tests::test_serialization ... ok
+test graph::embedding::tests::test_cache_operations ... ok
+test graph::embedding::tests::test_cosine_similarity ... ok
+test graph::embedding::tests::test_embedding_creation ... ok
+test graph::external_deps::tests::annotate_external_nodes_deduplicates_unresolved_import_names ... ok
+test graph::external_deps::tests::annotate_external_nodes_marks_builtin_modules ... ok
+test graph::external_deps::tests::annotate_external_nodes_works ... ok
+test graph::external_deps::tests::from_project_discovers_nested_workspace_manifests ... ok
+test graph::external_deps::tests::from_project_empty_dir_returns_empty ... ok
+test graph::external_deps::tests::from_project_with_cargo_lock ... ok
+test graph::external_deps::tests::from_project_with_cargo_toml_fallback ... ok
+test graph::external_deps::tests::from_project_with_go_mod ... ok
+test graph::external_deps::tests::from_project_with_package_json ... ok
+test graph::external_deps::tests::from_project_with_requirements_txt ... ok
+test graph::external_deps::tests::parse_bun_lock_basic ... ok
+test graph::external_deps::tests::parse_bun_lock_empty_and_invalid ... ok
+test graph::external_deps::tests::parse_bun_lock_scoped_packages ... ok
+test graph::external_deps::tests::parse_bun_lock_with_jsonc_comments ... ok
+test graph::external_deps::tests::parse_bun_lock_with_trailing_commas ... ok
+test graph::external_deps::tests::parse_cargo_lock ... ok
+test graph::external_deps::tests::parse_composer_lock ... ok
+test graph::external_deps::tests::parse_gemfile_lock ... ok
+test graph::external_deps::tests::parse_go_sum ... ok
+test graph::external_deps::tests::parse_package_json_dependencies ... ok
+test graph::external_deps::tests::parse_package_lock_json_v2 ... ok
+test graph::external_deps::tests::parse_pipfile_lock ... ok
+test graph::external_deps::tests::parse_pnpm_lock ... ok
+test graph::external_deps::tests::parse_poetry_lock ... ok
+test graph::external_deps::tests::parse_pyproject_toml_project_dependencies ... ok
+test graph::external_deps::tests::parse_requirements_txt ... ok
+test graph::external_deps::tests::parse_yarn_lock ... ok
+test graph::external_deps::tests::python_aliases_resolve_import_names ... ok
+test graph::external_deps::tests::resolve_normalises_import_path ... ok
+test graph::external_deps::tests::resolve_with_hyphen_underscore_normalisation ... ok
+test graph::external_deps::tests::resolve_with_prefix_matching ... ok
+test graph::external_deps::tests::strip_trailing_commas_handles_escaped_backslashes ... ok
+test graph::external_deps::tests::strip_trailing_commas_handles_escaped_quote ... ok
+test graph::external_deps::tests::strip_trailing_commas_preserves_commas_inside_strings ... ok
+test global::sync::tests::test_sync_engine_sync ... ok
+test graph::extraction::tests::cross_file_common_names_excluded ... ok
+test graph::extraction::tests::cross_file_common_names_excluded_execute ... ok
+test graph::extraction::tests::cross_file_duplicate_qnames_do_not_overwrite_callers ... ok
+test graph::extraction::tests::cross_file_exact_match ... ok
+test graph::extraction::tests::cross_file_file_owned_signatures_do_not_cross_apply_duplicate_qnames ... ok
+test graph::extraction::tests::cross_file_flow_argument_is_resolved_after_merge ... ok
+test graph::extraction::tests::cross_file_flow_uses_exact_qualified_target_without_bare_name_fallback ... ok
+test graph::extraction::tests::cross_file_import_aliases_are_scoped_to_the_calling_signature ... ok
+test graph::extraction::tests::cross_file_last_segment_fallback ... ok
+test graph::extraction::tests::cross_file_rust_qualified_names_preserve_colon_segments ... ok
+test graph::extraction::tests::cross_file_short_names_excluded_from_fallback ... ok
+test graph::extraction::tests::cross_file_suffix_match ... ok
+test graph::extraction::tests::cross_file_suffix_match_multi_segment ... ok
+test graph::extraction::tests::cyclomatic_complexity_wiring_from_signature_to_node ... ok
+test graph::extraction::tests::containment_edges_are_not_call_edges ... ok
+test graph::extraction::tests::data_flow_signal_a_produces_directed_edge ... ok
+test graph::extraction::tests::data_flow_clique_not_generated ... ok
+test graph::extraction::tests::inheritance_super_call_signal ... ok
+test graph::extraction::tests::qualified_name_from_node_handles_equivalent_path_suffixes ... ok
+test graph::extraction::tests::qualified_name_from_node_rejects_different_path_suffixes ... ok
+test graph::extraction::tests::rust_brace_import_expanded ... ok
+test graph::extraction::tests::rust_flow_channels_are_first_class_pdg_edges ... ok
+test graph::extraction::tests::test_same_file_calls_reach_all_duplicate_qualified_names ... ok
+test graph::extraction::tests::test_same_file_duplicate_qnames_keep_graph_and_search_ids_and_call_resolution ... ok
+test graph::extraction::tests::python_multiline_import_parsed ... ok
+test graph::pdg::tests::backward_traversal_works ... ok
+test graph::pdg::tests::bidirectional_traversal_works ... ok
+test graph::pdg::tests::bulk_import_edges_helper ... ok
+test graph::pdg::tests::bulk_inheritance_edges_with_confidence ... ok
+test graph::pdg::tests::confidence_filtering_works ... ok
+test graph::pdg::tests::containment_edge_type_is_separate_from_call ... ok
+test graph::pdg::tests::deserialization_backward_compat_no_embeddings ... ok
+test graph::pdg::tests::embedding_store_field_initialized_on_new_pdg ... ok
+test graph::pdg::tests::embedding_store_overwrite ... ok
+test graph::extraction::tests::typescript_multiline_import_parsed ... ok
+test graph::pdg::tests::name_file_index_maintained_on_remove ... ok
+test graph::pdg::tests::name_file_index_provides_o1_lookup ... ok
+test graph::pdg::tests::remove_file_cleans_up_all_embeddings ... ok
+test graph::pdg::tests::remove_node_cleans_up_embedding ... ok
+test graph::pdg::tests::serialization_preserves_embeddings ... ok
+test graph::pdg::tests::set_and_get_embedding_roundtrip ... ok
+test graph::pdg::tests::traversal_filters_containment_edges ... ok
+test graph::pdg::tests::traversal_respects_max_nodes ... ok
+test graph::traversal::tests::test_gravity_traversal_creation ... ok
+test graph::traversal::tests::test_traversal_config_default ... ok
+test graph::trigram::tests::test_extract_trigrams ... ok
+test graph::trigram::tests::test_extract_trigrams_short ... ok
+test graph::trigram::tests::test_intersect_empty ... ok
+test graph::trigram::tests::test_intersect_sorted ... ok
+test graph::trigram::tests::test_serialize_deserialize_roundtrip ... ok
+test graph::trigram::tests::test_trigram_index_query ... ok
+test migration::artifact::tests::test_blob_extract_payload_roundtrip ... ok
+test migration::artifact::tests::test_blob_format_identity ... ok
+test migration::artifact::tests::test_blob_rejects_bad_magic ... ok
+test migration::artifact::tests::test_blob_rejects_bad_version ... ok
+test migration::artifact::tests::test_blob_rejects_hash_mismatch ... ok
+test migration::artifact::tests::test_blob_rejects_truncated ... ok
+test migration::artifact::tests::test_blob_valid_magic_version_checksum ... ok
+test migration::artifact::tests::test_manifest_fingerprint_validation_fail_graph ... ok
+test migration::artifact::tests::test_manifest_fingerprint_validation_fail_search ... ok
+test migration::artifact::tests::test_manifest_fingerprint_validation_pass ... ok
+test migration::artifact::tests::test_manifest_format_identity ... ok
+test migration::artifact::tests::test_manifest_rejects_bad_magic ... ok
+test migration::artifact::tests::test_manifest_rejects_missing_layer ... ok
+test migration::artifact::tests::test_manifest_rejects_unsupported_version ... ok
+test migration::artifact::tests::test_manifest_rejects_version_zero ... ok
+test migration::artifact::tests::test_manifest_rejects_wrong_magic_bytes ... ok
+test migration::artifact::tests::test_manifest_valid_magic_version ... ok
+test migration::artifact::tests::test_model_digest_mismatch_triggers_rebuild ... ok
+test migration::artifact::tests::test_model_dimension_mismatch_triggers_rebuild ... ok
+test migration::artifact::tests::test_model_identity_match_returns_ok ... ok
+test migration::artifact::tests::test_model_name_mismatch_triggers_rebuild ... ok
+test migration::artifact::tests::test_rebuild_reason_actionable_message_contains_remedy ... ok
+test migration::artifact::tests::test_validate_generation_manifest_with_mismatched_identity ... ok
+test migration::artifact::tests::test_validate_generation_manifest_with_valid_identity ... ok
+test migration::artifact::tests::test_validate_generation_manifest_without_model_check ... ok
+test migration::tests::test_custom_migration_step_satisfies_trait ... ok
+test migration::tests::test_detect_format_empty_store ... ok
+test migration::tests::test_detect_format_migrated_store ... ok
+test migration::tests::test_every_step_covers_a_version_range ... ok
+test migration::tests::test_legacy_to_cas_step_versions ... ok
+test migration::tests::test_migrate_to_current_on_empty_store_is_noop ... ok
+test migration::tests::test_migration_registry_has_legacy_step ... ok
+test migration::tests::test_migration_steps_returned_are_boxed_dyn ... ok
+test migration::tests::test_needs_migration_false_for_new_store ... ok
+test graph::pdg::tests::find_by_name_in_file_no_scan_needed ... ok
+test observability::test::test_circuit_breaker_reset_on_success ... ok
+test observability::test::test_circuit_breaker_trips ... ok
+test observability::test::test_counter ... ok
+test observability::test::test_health_status_json ... ok
+test observability::test::test_histogram ... ok
+test observability::test::test_log_scrubber_api_key ... ok
+test observability::test::test_log_scrubber_bearer ... ok
+test observability::test::test_log_scrubber_preserves_non_sensitive ... ok
+test observability::test::test_log_scrubber_turso_auth ... ok
+test observability::test::test_log_scrubber_url_creds ... ok
+test observability::test::test_trace_span_propagation ... ok
+test parse::ast_tests::ast_structure_tests::test_ast_node_hierarchy ... ok
+test parse::ast_tests::ast_structure_tests::test_import_struct ... ok
+test parse::ast_tests::ast_structure_tests::test_node_type_variants ... ok
+test parse::ast_tests::ast_structure_tests::test_parameter_struct ... ok
+test parse::ast_tests::benchmark_style_tests::test_memory_overhead ... ok
+test parse::ast_tests::benchmark_style_tests::test_zero_copy_performance ... ok
+test parse::ast_tests::zero_copy_tests::test_ast_node_bounds_checking ... ok
+test parse::ast_tests::zero_copy_tests::test_ast_node_byte_range_reference ... ok
+test parse::ast_tests::zero_copy_tests::test_ast_node_lifetime_safety ... ok
+test parse::ast_tests::zero_copy_tests::test_ast_node_zero_copy_no_allocation ... ok
+test parse::ast_tests::zero_copy_tests::test_class_element_zero_copy ... ok
+test parse::ast_tests::zero_copy_tests::test_function_element_zero_copy ... ok
+test parse::ast_tests::zero_copy_tests::test_import_with_byte_range ... ok
+test parse::ast_tests::zero_copy_tests::test_memory_efficiency ... ok
+test parse::ast_tests::zero_copy_tests::test_nested_ast_nodes ... ok
+test parse::completeness::tests::score_languages_computes_composite_score ... ok
+test parse::cpp::tests::test_cpp_class_extraction ... ok
+test parse::cpp::tests::test_cpp_complexity_calculation ... ok
+test parse::cpp::tests::test_cpp_function_extraction ... ok
+test parse::cpp::tests::test_cpp_namespace_extraction ... ok
+test parse::cpp::tests::test_cpp_range_loop_cfg_has_loop_back_edge ... ok
+test parse::cpp::tests::test_cpp_struct_extraction ... ok
+test parse::csharp::tests::test_csharp_async_method ... ok
+test parse::csharp::tests::test_csharp_complexity_calculation ... ok
+test parse::csharp::tests::test_csharp_method_extraction ... ok
+test parse::debug_csharp_ast::tests::debug_csharp_ast ... ignored
+test parse::debug_go::go_debug_tests::debug_go_interface_ast ... ok
+test parse::debug_go::go_debug_tests::debug_go_struct_ast ... ok
+test parse::debug_go_params::go_param_debug_tests::debug_go_parameters_ast ... ok
+test parse::debug_go_returns::go_return_debug_tests::debug_go_multiple_functions ... ok
+test parse::debug_lua_ast::tests::debug_lua_ast ... ignored
+test parse::debug_rust::rust_debug_tests::debug_rust_async_function_ast ... ok
+test parse::debug_rust::rust_debug_tests::debug_rust_function_ast ... ok
+test parse::debug_rust::rust_debug_tests::debug_rust_self_parameters_ast ... ok
+test parse::debug_rust::rust_debug_tests::debug_rust_visibility_ast ... ok
+test parse::go::tests::test_go_complexity_calculation ... ok
+test parse::go::tests::test_go_exported_function ... ok
+test parse::go::tests::test_go_function_extraction ... ok
+test parse::go::tests::test_go_interface_extraction ... ok
+test parse::go::tests::test_go_method_extraction ... ok
+test parse::go::tests::test_go_multiple_return_values ... ok
+test parse::go::tests::test_go_struct_extraction ... ok
+test parse::go::tests::test_go_variadic_parameters ... ok
+test parse::grammar::tests::test_grammar_cache_creation ... ok
+test parse::grammar::tests::test_grammar_cache_lazy_loading ... ok
+test parse::grammar::tests::test_language_config_integration ... ok
+test parse::grammar::tests::test_language_id_case_insensitive ... ok
+test parse::grammar::tests::test_language_id_from_extension ... ok
+test parse::grammar::tests::test_unified_language_loading ... ok
+test parse::java::tests::test_java_class_extraction ... ok
+test parse::java::tests::test_java_complexity_calculation ... ok
+test parse::java::tests::test_java_enum_extraction ... ok
+test parse::java::tests::test_java_interface_extraction ... ok
+test parse::java::tests::test_java_method_extraction ... ok
+test parse::java::tests::test_java_visibility_modifiers ... ok
+test parse::javascript::tests::test_javascript_arrow_function ... ok
+test parse::javascript::tests::test_javascript_async_function ... ok
+test parse::javascript::tests::test_javascript_class_methods ... ok
+test parse::javascript::tests::test_javascript_complexity_calculation ... ok
+test parse::javascript::tests::test_javascript_complexity_counts_catch_and_switch_cases ... ok
+test parse::javascript::tests::test_javascript_empty_named_import_is_ignored ... ok
+test parse::javascript::tests::test_javascript_function_extraction ... ok
+test parse::javascript::tests::test_typescript_class_with_types ... ok
+test parse::javascript::tests::test_typescript_function_with_types ... ok
+test parse::javascript::tests::test_typescript_interface_extraction ... ok
+test parse::javascript::tests::test_typescript_type_alias ... ok
+test parse::languages::tests::test_parser_factory ... ok
+test parse::languages::tests::test_python_parser_creation ... ok
+test parse::lua::tests::test_lua_complexity_calculation ... ok
+test parse::lua::tests::test_lua_function ... ok
+test parse::parallel::tests::test_parallel_parser_multiple_files ... ok
+test parse::parallel::tests::test_parallel_parser_with_error ... ok
+test parse::parallel::tests::test_parsing_result_includes_source_bytes ... ok
+test parse::parallel::tests::test_parsing_stats ... ok
+test parse::php::tests::test_php_class_extraction ... ok
+test parse::php::tests::test_php_complexity_calculation ... ok
+test parse::php::tests::test_php_function_extraction ... ok
+test parse::python::tests::test_async_function_detection ... ok
+test parse::python::tests::test_complexity_calculation ... ok
+test parse::python::tests::test_extract_class_methods ... ok
+test parse::python::tests::test_extract_function_signature ... ok
+test parse::ruby::tests::test_ruby_class_extraction ... ok
+test parse::ruby::tests::test_ruby_complexity_calculation ... ok
+test parse::ruby::tests::test_ruby_method_extraction ... ok
+test parse::ruby::tests::test_ruby_modifier_and_ternary_complexity ... ok
+test parse::rust::tests::test_rust_async_function ... ok
+test parse::rust::tests::test_rust_complexity_calculation ... ok
+test parse::rust::tests::test_rust_complexity_combined ... ok
+test parse::rust::tests::test_rust_complexity_with_boolean_operators ... ok
+test parse::rust::tests::test_rust_complexity_with_try_and_bool ... ok
+test parse::rust::tests::test_rust_complexity_with_try_expressions ... ok
+test parse::rust::tests::test_rust_cyclomatic_complexity_populated_in_signature ... ok
+test parse::rust::tests::test_rust_enum_extraction ... ok
+test parse::rust::tests::test_rust_flow_facts_capture_command_and_state_channels ... ok
+test parse::rust::tests::test_rust_function_extraction ... ok
+test parse::rust::tests::test_rust_import_extraction ... ok
+test parse::rust::tests::test_rust_method_extraction ... ok
+test parse::rust::tests::test_rust_mod_item_extraction ... ok
+test parse::rust::tests::test_rust_scoped_identifier_extraction ... ok
+test parse::rust::tests::test_rust_self_parameter ... ok
+test parse::rust::tests::test_rust_struct_extraction ... ok
+test parse::rust::tests::test_rust_struct_instantiation_calls ... ok
+test parse::rust::tests::test_rust_trait_extraction ... ok
+test parse::rust::tests::test_rust_visibility_modifiers ... ok
+test parse::scala::tests::test_scala_class ... ok
+test parse::scala::tests::test_scala_function ... ok
+test parse::tests::language_detection_tests::test_bash_extension_detection ... ok
+test parse::tests::language_detection_tests::test_c_extension_detection ... ok
+test parse::tests::language_detection_tests::test_case_insensitive_extension_detection ... ok
+test parse::tests::language_detection_tests::test_go_extension_detection ... ok
+test parse::tests::language_detection_tests::test_javascript_extension_detection ... ok
+test parse::tests::language_detection_tests::test_json_extension_detection ... ok
+test parse::tests::language_detection_tests::test_language_config_extensions ... ok
+test parse::tests::language_detection_tests::test_python_extension_detection ... ok
+test parse::tests::language_detection_tests::test_rust_extension_detection ... ok
+test parse::tests::language_detection_tests::test_typescript_extension_detection ... ok
+test parse::tests::language_detection_tests::test_unknown_extension_returns_none ... ok
+test parse::tests::stack_overflow_regression_tests::helper_index_deep_nested_project ... ok
+test parse::tests::stack_overflow_regression_tests::test_index_deep_nested_cpp_project_does_not_overflow_stack ... ok
+test parse::tests::stack_overflow_regression_tests::test_index_deep_nested_rust_project_does_not_overflow_stack ... ok
+test parse::traits::tests::test_parse_tree_finds_descendant_and_returns_none_for_missing_id ... ok
+test phase::cache::tests::cache_corruption_is_treated_as_miss ... ok
+test phase::cache::tests::cache_envelope_mismatch_is_miss ... ok
+test phase::cache::tests::options_sensitive_cache_uses_hash_discriminator ... ok
+test phase::context::tests::cold_path_does_not_mark_failed_parse_files_as_indexed ... ok
+test phase::context::tests::normalize_file_key_keeps_absolute_paths_outside_root ... ok
+test phase::context::tests::normalize_file_key_prefers_project_relative_paths ... ok
+test phase::context::tests::persisted_refresh_replaces_changed_file_graph_and_updates_index ... ok
+test phase::context::tests::prepare_requires_explicit_root_path ... ok
+test phase::context::tests::signatures_from_results_defaults_unknown_language ... ok
+test phase::context::tests::signatures_from_results_filters_out_failed_parses ... ok
+test phase::docs::tests::analyze_docs_counts_headings_and_action_markers ... ok
+test phase::docs::tests::analyze_docs_propagates_read_error ... ok
+test phase::format::tests::format_mode_parse_and_default_char_targets ... ok
+test phase::format::tests::truncate_keeps_short_strings ... ok
+test phase::format::tests::truncate_limits_output ... ok
+test phase::freshness::tests::freshness_normalizes_relative_and_absolute_index_keys ... ok
+test phase::options::tests::default_requires_explicit_root_assignment ... ok
+test phase::options::tests::docs_mode_parse_and_flags_work ... ok
+test phase::options::tests::normalized_disables_docs_when_not_opted_in ... ok
+test phase::orchestrate::engine::tests::already_completed_all_phases_short_circuits ... ok
+test phase::orchestrate::engine::tests::marks_failed_after_retry_budget ... ok
+test phase::orchestrate::engine::tests::restore_state_snapshot_updates_engine ... ok
+test phase::orchestrate::engine::tests::resume_from_state_alias_still_restores_state ... ok
+test phase::orchestrate::engine::tests::retries_until_success ... ok
+test phase::orchestrate::engine::tests::run_selection_executes_runner_path ... ok
+test phase::orchestrate::engine::tests::timeout_budget_zero_fails_before_attempt_execution ... ok
+test phase::orchestrate::engine::tests::timeout_errors_are_retried_and_then_fail ... ok
+test phase::orchestrate::engine::tests::wallclock_timeout_budget_stops_retries ... ok
+test phase::orchestrate::parser::tests::parses_all_mode_and_path ... ok
+test phase::orchestrate::parser::tests::rejects_invalid_mode ... ok
+test phase::orchestrate::parser::tests::rejects_invalid_phase ... ok
+test phase::orchestrate::parser::tests::rejects_non_numeric_phase_token ... ok
+test cli::leindex::generation_read_tests::test_no_stall_read_during_index ... ok
+test phase::orchestrate::state::tests::loading_missing_state_returns_error ... ok
+test phase::orchestrate::state::tests::state_roundtrip_save_and_load ... ok
+test phase::pdg_utils::tests::containment_edges_preserved_through_merge ... ok
+test phase::pdg_utils::tests::permissive_config_allows_multiple_candidates ... ok
+test phase::pdg_utils::tests::relinks_external_to_internal ... ok
+test phase::pdg_utils::tests::strict_config_keeps_single_candidate ... ok
+test phase::phase1::tests::merge_completeness_adds_missing_languages ... ok
+test phase::phase1::tests::merge_completeness_all_from_pdg ... ok
+test phase::phase1::tests::merge_completeness_empty_pdg ... ok
+test phase::phase1::tests::pdg_signature_count_excludes_structural_and_summary_nodes ... ok
+test phase::orchestrate::runner::tests::default_runner_executes_phase_analysis ... ok
+test phase::phase2::tests::counts_internal_and_external_import_edges ... ok
+test phase::phase3::tests::phase3_enforces_minimum_top_n_of_one ... ok
+test phase::phase3::tests::phase3_selects_entry_points_and_focus_files ... ok
+test phase::phase4::tests::phase4_uses_configurable_hotspot_keywords ... ok
+test phase::phase5::tests::phase5_handles_empty_inputs_without_panicking ... ok
+test phase::phase5::tests::phase5_prioritizes_expected_recommendations ... ok
+test phase::tests::phase_selection_validation_works ... ok
+test phase::tests::phase3_cache_key_changes_with_top_n ... ok
+test phase::utils::tests::collect_files_respects_docs_gating_and_skips_dirs ... ok
+test phase::utils::tests::collect_files_respects_max_files_limit ... ok
+test phase::utils::tests::collect_files_skips_all_build_output_dirs ... ok
+test phase::utils::tests::collect_files_uses_focus_files_when_provided ... ok
+test phase::utils::tests::docs_mode_filters_markdown_vs_text ... ok
+test phase::utils::tests::hash_inventory_and_display_path_work ... ok
+test phase::utils::tests::should_skip_dir_covers_all_build_output_dirs ... ok
+test scheduler::admission::test::test_admission_defer_not_error ... ok
+test scheduler::admission::test::test_admission_defers_when_eviction_not_enough ... ok
+test scheduler::admission::test::test_admission_evicts_under_pressure ... ok
+test scheduler::admission::test::test_admission_never_errors ... ok
+test scheduler::admission::test::test_admission_reads_all_factors ... ok
+test scheduler::admission::test::test_admission_reduces_batch_to_fit ... ok
+test scheduler::admission::test::test_batch_shape_scaled_for_bytes ... ok
+test scheduler::admission::test::test_controller_as_decider ... ok
+test scheduler::admission::test::test_defer_above_policy ... ok
+test scheduler::admission::test::test_real_readers_do_not_panic ... ok
+test scheduler::budget::test::test_complete_only_when_all_done ... ok
+test scheduler::budget::test::test_estimate_reflects_remaining ... ok
+test scheduler::budget::test::test_estimated_next_bytes ... ok
+test scheduler::budget::test::test_step_yield_complete_semantics ... ok
+test scheduler::budget::test::test_work_budget_bounds_step ... ok
+test scheduler::budget::test::test_work_budget_never_oversteps ... ok
+test scheduler::classes::test::test_aging_boosts_starved_class_weight ... ok
+test scheduler::classes::test::test_aging_resets_on_service ... ok
+test scheduler::classes::test::test_work_class_enum_has_five_distinct_classes ... ok
+test scheduler::classes::test::test_work_class_weight_ordering ... ok
+test scheduler::index_job::test::test_estimated_next_bytes_delegates ... ok
+test scheduler::index_job::test::test_force_ignores_checkpoints ... ok
+test scheduler::index_job::test::test_killed_mid_step_resumes_at_last_checkpoint ... ok
+test scheduler::index_job::test::test_phase_ids_unique_markers ... ok
+test scheduler::index_job::test::test_step_progresses_through_phases_one_chunk_at_a_time ... ok
+test scheduler::queue::test::test_aging_boost_starved_class ... ok
+test scheduler::queue::test::test_drr_fair_interleave ... ok
+test scheduler::queue::test::test_same_project_coalesce ... ok
+test scheduler::queue::test::test_same_project_coalesce_after_completion ... ok
+test scheduler::test::test_contented_reads_not_starved_by_indexing ... ok
+test scheduler::test::test_default_scheduler_admits ... ok
+test scheduler::test::test_run_loop_admission_gates_index_chunk ... ok
+test scheduler::test::test_scheduler_admission_controller_defers_then_completes ... ok
+test search::hnsw::tests::test_hnsw_batch_insert ... ok
+test search::hnsw::tests::test_hnsw_clear ... ok
+test search::hnsw::tests::test_hnsw_custom_params ... ok
+test search::hnsw::tests::test_hnsw_estimated_memory ... ok
+test search::hnsw::tests::test_hnsw_get_returns_none ... ok
+test search::hnsw::tests::test_hnsw_index_creation ... ok
+test search::hnsw::tests::test_hnsw_index_dimension_mismatch ... ok
+test search::hnsw::tests::test_hnsw_index_duplicate_insert ... ok
+test search::hnsw::tests::test_hnsw_index_insert ... ok
+test cli::leindex::generation_read_tests::test_read_path_bit_for_bit_equivalence ... ok
+test search::hnsw::tests::test_hnsw_params_builder ... ok
+test search::hnsw::tests::test_hnsw_params_default ... ok
+test search::hnsw::tests::test_hnsw_params_validation ... ok
+test search::hnsw::tests::test_hnsw_rebuild ... ok
+test search::hnsw::tests::test_hnsw_remove ... ok
+test search::hnsw::tests::test_hnsw_search ... ok
+test search::hnsw::tests::test_hnsw_search_empty_index ... ok
+test search::hnsw::tests::test_hnsw_with_custom_dimension ... ok
+test search::quantization::distance::tests::test_adc_query_context_creation ... ok
+test search::quantization::distance::tests::test_int8_adc_distance_trait ... ok
+test search::quantization::distance::tests::test_set_and_clear_adc_context ... ok
+test search::quantization::int8::integration_tests::test_end_to_end_quantization_workflow ... ok
+test search::quantization::int8_hnsw::tests::test_int8_hnsw_batch_insert ... ok
+test search::quantization::int8_hnsw::tests::test_int8_hnsw_clear ... ok
+test search::quantization::int8_hnsw::tests::test_int8_hnsw_creation ... ok
+test search::quantization::int8_hnsw::tests::test_int8_hnsw_different_metrics ... ok
+test search::quantization::int8_hnsw::tests::test_int8_hnsw_dimension_mismatch ... ok
+test search::quantization::int8_hnsw::tests::test_int8_hnsw_duplicate_insert ... ok
+test search::quantization::int8_hnsw::tests::test_int8_hnsw_empty_search ... ok
+test search::quantization::int8_hnsw::tests::test_int8_hnsw_insert ... ok
+test search::quantization::int8_hnsw::tests::test_int8_hnsw_params_validation ... ok
+test search::quantization::int8_hnsw::tests::test_int8_hnsw_remove ... ok
+test search::quantization::int8_hnsw::tests::test_int8_hnsw_search ... ok
+test search::quantization::int8_hnsw::tests::test_int8_hnsw_search_consistency ... ok
+test search::quantization::int8_hnsw::tests::test_int8_hnsw_with_params ... ok
+test search::quantization::int8_hnsw::tests::test_int8_hnsw_wrong_dimension_search ... ok
+test observability::test::test_circuit_breaker_half_open ... ok
+test search::quantization::serialization::tests::test_serialization_roundtrip ... ok
+test search::quantization::serialization::tests::test_serialization_size ... ok
+test search::quantization::simd::fallback::tests::test_fallback_accuracy ... ok
+test search::quantization::simd::fallback::tests::test_remainder_handling ... ok
+test search::quantization::simd::tests::test_dot_product_adc_basic ... ok
+test search::quantization::simd::tests::test_various_dimensions ... ok
+test search::quantization::simd::x86_avx2::tests::test_avx2_basic ... ok
+test search::quantization::simd::x86_avx2::tests::test_avx2_matches_fallback ... ok
+test search::quantization::simd::x86_avx2::tests::test_avx2_various_dimensions ... ok
+test search::quantization::vector::tests::test_accepts_finite_values ... ok
+test search::quantization::vector::tests::test_as_slice_safety ... ok
+test search::quantization::vector::tests::test_empty_vector_handling ... ok
+test search::quantization::vector::tests::test_int8_quantized_vector_creation ... ok
+test search::quantization::vector::tests::test_int8_quantized_vector_metadata_alignment ... ok
+test search::quantization::vector::tests::test_large_dimension_vectors ... ok
+test search::quantization::vector::tests::test_metadata_from_vector ... ok
+test search::quantization::vector::tests::test_rejects_nan_values - should panic ... ok
+test search::quantization::vector::tests::test_rejects_negative_infinity - should panic ... ok
+test search::quantization::vector::tests::test_rejects_positive_infinity - should panic ... ok
+test search::quantization::vector::tests::test_simd_block_alignment ... ok
+test search::quantization::vector::tests::test_simd_block_creation ... ok
+test search::quantization::vector::tests::test_uniform_vector_quantization ... ok
+test search::quantization::vector::tests::test_very_small_dimension_vectors ... ok
+test search::quantization::vector::tests::test_zero_vector_quantization ... ok
+test search::query::tests::test_build_search_query ... ok
+test search::query::tests::test_complexity_query ... ok
+test search::query::tests::test_default_parser ... ok
+test phase::tests::single_phase_report_contains_only_requested_phase ... ok
+test search::query::tests::test_extracted_terms_are_normalized ... ok
+test search::query::tests::test_invalid_top_k_too_large ... ok
+test search::query::tests::test_invalid_top_k_too_small ... ok
+test search::query::tests::test_no_meaningful_terms ... ok
+test search::query::tests::test_parse_empty_query ... ok
+test search::query::tests::test_parse_bottlenecks_query ... ok
+test search::query::tests::test_parse_how_works_query ... ok
+test search::query::tests::test_parse_semantic_query ... ok
+test search::query::tests::test_parse_performance ... ok
+test search::query::tests::test_parse_text_query ... ok
+test search::query::tests::test_parse_whitespace_only_query ... ok
+test search::query::tests::test_parsed_query_is_send ... ok
+test search::query::tests::test_parse_where_handled_query ... ok
+test search::query::tests::test_parser_is_send_sync ... ok
+test search::query::tests::test_query_parser_creation ... ok
+test search::query::tests::test_query_too_long ... ok
+test search::query::tests::test_query_with_control_characters ... ok
+test search::query::tests::test_query_with_null_bytes ... ok
+test search::query::tests::test_query_with_question_words ... ok
+test search::query::tests::test_regex_patterns_are_static ... ok
+test search::query::tests::test_stop_words_filtering ... ok
+test search::query::tests::test_query_exactly_max_length ... ok
+test search::query::tests::test_stop_words_set_is_efficient ... ok
+test search::query::tests::test_tokenize ... ok
+test search::query::tests::test_tokenize_filters_short_words ... ok
+test search::query::tests::test_unicode_normalization ... ok
+test search::query::tests::test_valid_top_k_boundaries ... ok
+test search::query_route::tests::routes_identifier_and_natural_language_queries ... ok
+test search::ranking::tests::test_custom_weights_hybrid ... ok
+test search::ranking::tests::test_custom_weights_legacy ... ok
+test search::ranking::tests::test_for_code_scorer_with_neural ... ok
+test search::ranking::tests::test_for_code_scorer_without_neural ... ok
+test search::ranking::tests::test_for_prose_scorer ... ok
+test search::ranking::tests::test_hybrid_scorer_legacy ... ok
+test search::ranking::tests::test_hybrid_scorer_new ... ok
+test search::ranking::tests::test_renormalize_weights_sums_to_one ... ok
+test search::ranking::tests::test_rerank_hybrid_recomputes_scores_for_each_query_type ... ok
+test search::ranking::tests::test_score_creation_hybrid ... ok
+test search::query::tests::test_terms_no_duplicates ... ok
+test search::ranking::tests::test_score_creation_legacy ... ok
+test search::ranking::tests::test_score_hybrid5_fragment_component ... ok
+test search::search::tests::neural_rows_can_be_published_after_core_index ... ok
+test search::search::tests::test_content_cleared_after_indexing ... ok
+test search::search::tests::test_dimension_mismatch_error ... ok
+test search::search::tests::test_dimension_validation ... ok
+test search::search::tests::test_fragment_inert_for_exact_route_query ... ok
+test search::search::tests::test_fragment_multi_owner_refs_all_surface ... ok
+test search::search::tests::test_fragment_nonpositive_hits_do_not_activate_fusion ... ok
+test search::search::tests::test_fragment_layer_off_by_default_contributes_nothing ... ok
+test search::search::tests::test_fragment_owner_union_and_byte_range_surfacing ... ok
+test search::search::tests::test_hnsw_enable ... ok
+test search::search::tests::test_incremental_reindex_add_nodes ... ok
+test search::search::tests::test_incremental_reindex_combined_add_remove ... ok
+test search::search::tests::test_incremental_reindex_correctness_vs_full_rebuild ... ok
+test search::search::tests::test_incremental_reindex_empty_delta ... ok
+test search::search::tests::test_incremental_reindex_node_id_to_idx_consistency ... ok
+test search::search::tests::test_incremental_reindex_remove_nodes ... ok
+test search::search::tests::test_incremental_reindex_removes_empty_token_sets ... ok
+test search::search::tests::test_incremental_reindex_semantic_search_after_update ... ok
+test search::search::tests::test_incremental_reindex_update_existing_node ... ok
+test search::search::tests::test_index_nodes ... ok
+test search::search::tests::test_node_id_to_idx_cleared_on_reindex ... ok
+test search::search::tests::test_node_id_to_idx_o1_lookup_in_semantic_search ... ok
+test search::search::tests::test_node_id_to_idx_populated ... ok
+test search::search::tests::test_node_tokens_cleared_on_reindex ... ok
+test search::search::tests::test_node_tokens_populated ... ok
+test search::search::tests::test_fragment_tier_improves_conceptual_mrr ... ok
+test search::search::tests::test_node_tokens_used_in_scoring ... ok
+test search::search::tests::test_relevance_threshold ... ok
+test search::search::tests::test_search_empty_index ... ok
+test search::search::tests::test_search_engine_creation ... ok
+test search::search::tests::test_restore_fragment_index_installs_validated_mmap_twin ... ok
+test search::search::tests::test_search_snapshot_disables_fragment_on_id_count_mismatch ... ok
+test search::search::tests::test_search_snapshot_fragment_roundtrip ... ok
+test search::search::tests::test_search_snapshot_restore_rejects_wrong_tfidf_dimension ... ok
+test search::search::tests::test_search_snapshot_restore_disables_fragment_on_row_mismatch ... ok
+test search::search::tests::test_search_with_results ... ok
+test search::search::tests::test_search_snapshot_restore_round_trip ... ok
+test search::search::tests::test_semantic_search_empty_index ... ok
+test search::search::tests::test_semantic_search ... ok
+test search::search::tests_extra::test_admission_gate_admits_within_bounds ... ok
+test search::search::tests_extra::test_admission_gate_bursty_workload ... ok
+test search::search::tests::test_top_k_limit ... ok
+test search::search::tests_extra::test_admission_gate_default_caps ... ok
+test search::search::tests_extra::test_admission_gate_oversized_single_node ... ok
+test search::search::tests_extra::test_admission_gate_resets ... ok
+test search::search::tests_extra::test_admission_gate_sheds_over_byte_cap ... ok
+test search::search::tests_extra::test_admission_gate_sheds_over_node_cap ... ok
+test search::search::tests_extra::test_compat_fallback_promotes_legacy_when_needed ... ok
+test search::search::tests_extra::test_archive_files_deprioritized_in_search ... ok
+test search::search::tests_extra::test_compat_prefers_tfidf_embedding_over_legacy ... ok
+test search::search::tests_extra::test_empty_embeddings_degrade_safely ... ok
+test search::search::tests_extra::test_incremental_reindex_content_cleared ... ok
+test search::search::tests_extra::test_incremental_reindex_removes_nonexistent_node ... ok
+test search::search::tests_extra::test_is_archive_path_detection ... ok
+test search::search::tests_extra::test_legacy_payload_remains_readable ... ok
+test search::search::tests_extra::test_new_payload_serializes_only_new_shape ... ok
+test search::search::tests_extra::test_post_index_content_clearing_preserved ... ok
+test search::search::tests_extra::test_pre_tokenized_and_content_produce_same_inverted_index ... ok
+test search::search::tests_extra::test_pre_tokenized_none_falls_back_to_content ... ok
+test search::search::tests_extra::test_pre_tokenized_incremental_reindex ... ok
+test search::search::tests_extra::test_pruner_decision_is_observable ... ok
+test search::search::tests_extra::test_pruner_does_not_remove_high_signal_files ... ok
+test search::search::tests_extra::test_pre_tokenized_produces_identical_search_results ... ok
+test search::search::tests_extra::test_pruner_is_generated_path ... ok
+test search::search::tests_extra::test_pruner_keeps_short_content_with_meaningful_name ... ok
+test search::search::tests_extra::test_pruner_keeps_user_authored_code ... ok
+test search::search::tests_extra::test_pruner_prunes_bundle_js ... ok
+test search::search::tests_extra::test_pruner_prunes_generated_protobuf ... ok
+test search::search::tests_extra::test_pruner_prunes_generated_rust ... ok
+test search::search::tests_extra::test_pruner_prunes_low_information ... ok
+test search::search::tests_extra::test_pruner_prunes_minified_js ... ok
+test search::search::tests_extra::test_pruner_prunes_node_modules ... ok
+test search::search::tests_extra::test_search_mode_exact_vs_semantic_different_rankings ... ok
+test search::search::tests_extra::test_search_semantics_unchanged_after_dedup ... ok
+test search::search::tests_extra::test_set_neural_weight_clears_cache_on_change ... ok
+test search::search::tests_extra::test_set_neural_weight_preserves_cache_when_unchanged ... ok
+test search::search::tests_extra::test_work_hoister_clear ... ok
+test search::search::tests_extra::test_work_hoister_distinguishes_different_content ... ok
+test search::search::tests_extra::test_work_hoister_duplicate_work_suppressed ... ok
+test search::search::tests_extra::test_work_hoister_evicts_on_byte_cap ... ok
+test search::search::tests_extra::test_work_hoister_evicts_on_entry_cap ... ok
+test search::search::tests_extra::test_work_hoister_miss_for_unseen_content ... ok
+test search::search::tests_extra::test_work_hoister_preserves_search_results ... ok
+test search::search::tests_extra::test_work_hoister_reuses_identical_content ... ok
+test search::search::tests_extra::test_work_hoister_stores_and_retrieves ... ok
+test search::search::tests_extra::test_work_hoister_updates_existing_embedding ... ok
+test search::search::vector_impl::tests::test_remove_after_clear_no_tombstone_growth ... ok
+test search::search::vector_impl::tests::test_remove_after_clear_returns_false ... ok
+test search::semantic::tests::test_semantic_context_expansion ... ok
+test search::vector::tests::test_cosine_similarity ... ok
+test search::vector::tests::test_embedding_matrix_size_overflow_is_checked ... ok
+test search::vector::tests::test_mmap_embeddings_path_helper ... ok
+test search::vector::tests::test_mmap_empty_embeddings ... ok
+test search::vector::tests::test_mmap_entries_reports_invalid_utf8_node_id ... ok
+test search::vector::tests::test_mmap_invalid_magic ... ok
+test search::vector::tests::test_mmap_rejects_missing_offset_table ... ok
+test search::vector::tests::test_mmap_rejects_unsupported_version ... ok
+test search::vector::tests::test_mmap_roundtrip ... ok
+test search::search::tests_extra::test_search_cache_hard_capped ... ok
+test search::vector::tests::test_mmap_truncated_file ... ok
+test search::vector::tests::test_mmap_search_consistency ... ok
+test search::vector::tests::test_search_empty_index ... ok
+test search::vector::tests::test_search_respects_top_k ... ok
+test search::vector::tests::test_search_with_zero_query ... ok
+test search::vector::tests::test_vector_index_batch_insert ... ok
+test search::vector::tests::test_vector_index_clear ... ok
+test search::vector::tests::test_vector_index_creation ... ok
+test search::vector::tests::test_vector_index_dimension_mismatch ... ok
+test search::vector::tests::test_vector_index_get ... ok
+test search::vector::tests::test_vector_index_insert ... ok
+test search::vector::tests::test_vector_index_remove ... ok
+test search::vector::tests::test_vector_index_search ... ok
+test server::config::tests::test_config_from_env ... ok
+test server::config::tests::test_config_server_url ... ok
+test server::config::tests::test_config_socket_addr ... ok
+test server::config::tests::test_config_validate_empty_host ... ok
+test server::config::tests::test_config_validate_invalid_log_level ... ok
+test server::config::tests::test_config_validate_port_zero ... ok
+test server::config::tests::test_config_validate_success ... ok
+test server::config::tests::test_config_websocket_url ... ok
+test server::config::tests::test_default_config ... ok
+test server::error::tests::test_api_error_bad_request ... ok
+test server::error::tests::test_api_error_display ... ok
+test server::error::tests::test_api_error_internal ... ok
+test server::error::tests::test_api_error_not_found ... ok
+test server::error::tests::test_api_error_into_response ... ok
+test server::error::tests::test_api_error_not_implemented ... ok
+test server::error::tests::test_api_error_unavailable ... ok
+test server::error::tests::test_api_error_validation ... ok
+test server::handlers::tests::test_search_query_empty ... ok
+test server::responses::tests::test_api_response_error ... ok
+test server::handlers::tests::test_row_to_codebase_response_uses_unknown_for_missing_last_indexed ... ok
+test server::responses::tests::test_api_response_success ... ok
+test server::responses::tests::test_codebase_list_response_empty ... ok
+test server::responses::tests::test_file_node_add_child ... ok
+test server::responses::tests::test_file_node_directory ... ok
+test server::responses::tests::test_file_node_file ... ok
+test server::responses::tests::test_graph_data_empty ... ok
+test server::responses::tests::test_score_response ... ok
+test server::responses::tests::test_search_results_empty ... ok
+test server::responses::tests::test_sync_report_default ... ok
+test server::websocket::tests::test_connection_state_empty_subscribes_to_all ... ok
+test server::websocket::tests::test_connection_state_new ... ok
+test server::websocket::tests::test_connection_state_subscribe ... ok
+test server::websocket::tests::test_connection_state_unsubscribe ... ok
+test server::websocket::tests::test_ws_event_heartbeat ... ok
+test server::websocket::tests::test_ws_event_indexing_progress ... ok
+test server::websocket::tests::test_ws_event_project_added ... ok
+test server::websocket::tests::test_ws_manager_broadcast ... ok
+test server::websocket::tests::test_ws_manager_new ... ok
+test server::websocket::tests::test_ws_manager_register_connection ... ok
+test server::websocket::tests::test_ws_manager_unregister_connection ... ok
+test storage::analytics::tests::test_analytics_creation ... ok
+test storage::cas::blob::tests::test_bad_magic_alternate_values ... ok
+test storage::cas::blob::tests::test_blob_hash_deterministic ... ok
+test storage::cas::blob::tests::test_blob_hash_empty ... ok
+test storage::cas::blob::tests::test_blob_hash_large_binary ... ok
+test storage::cas::blob::tests::test_encode_blob_structure ... ok
+test storage::cas::blob::tests::test_extract_payload_roundtrip ... ok
+test storage::cas::blob::tests::test_hex_invalid_length ... ok
+test storage::cas::blob::tests::test_hex_roundtrip ... ok
+test storage::cas::blob::tests::test_validate_blob_bad_magic ... ok
+test storage::cas::blob::tests::test_validate_blob_hash_mismatch ... ok
+test storage::cas::blob::tests::test_validate_blob_ok ... ok
+test storage::cas::blob::tests::test_validate_blob_payload_truncated ... ok
+test storage::cas::blob::tests::test_validate_blob_truncated ... ok
+test storage::cas::blob::tests::test_validate_blob_wrong_version ... ok
+test storage::cas::refs::tests::test_refcount_crash_recovery_after_persist ... ok
+test storage::cas::refs::tests::test_refcount_crash_without_persist ... ok
+test storage::cas::refs::tests::test_refcount_decr_basic ... ok
+test storage::cas::refs::tests::test_refcount_decr_underflow_at_zero ... ok
+test storage::cas::refs::tests::test_refcount_incr_accumulates ... ok
+test storage::cas::refs::tests::test_refcount_persist_across_reopen ... ok
+test storage::cas::refs::tests::test_refcount_persist_zero_after_decrement_to_zero ... ok
+test storage::cas::refs::tests::test_refcount_reopen_corrupt_sidecar ... ok
+test storage::cas::refs::tests::test_refcount_reopen_missing_sidecar ... ok
+test storage::cas::refs::tests::test_refcount_tracked_and_iter ... ok
+test storage::cas::refs::tests::test_refcount_two_decrs_from_one ... ok
+test storage::cas::refs::tests::test_refcount_zero_refcount_hashes ... ok
+test storage::cas::tests::test_blob_count_excludes_staging_and_sidecar ... ok
+test search::quantization::int8_hnsw::tests::test_memory_efficiency ... ok
+test storage::cas::tests::test_blob_path_layout ... ok
+test storage::cas::tests::test_cas_cross_generation_dedup ... ok
+test storage::cas::tests::test_cas_open_empty ... ok
+test storage::cas::tests::test_corrupt_blob_rejected_get_returns_error ... ok
+test storage::cas::tests::test_gc_empty_store_noop ... ok
+test storage::cas::tests::test_gc_keeps_refcount_positive ... ok
+test storage::cas::tests::test_gc_refcount_zero_returns_reclaimed_bytes ... ok
+test storage::cas::tests::test_gc_with_pins_retains_unreferenced_but_pinned_blobs ... ok
+test storage::cas::tests::test_hash_determinism_cross_store ... ok
+test storage::cas::tests::test_put_empty_payload_roundtrip ... ok
+test storage::cas::tests::test_put_get_roundtrip ... ok
+test storage::cas::tests::test_put_idempotency ... ok
+test cli::leindex::generation_read_tests::test_read_path_no_writer_contention ... ok
+test eval::production_profile::tests::test_active_model_identifier_default ... ok
+test eval::production_profile::tests::test_active_model_identifier_validated ... ok
+test eval::production_profile::tests::test_validated_profile_feature_flag_on_after_rollout ... ok
+test feature_flags::test::test_daemon_client_override_toggles ... ok
+test feature_flags::test::test_debug_escape_hatch_override_toggles_state ... ok
+test feature_flags::test::test_legacy_unset_keeps_default_on ... ok
+test feature_flags::test::test_override_toggles_flag ... ok
+test feature_flags::test::test_rollout_flags_default_off_with_legacy_mode ... ok
+test feature_flags::test::test_rollout_flags_default_on_after_gates_passed ... ok
+test feature_flags::test::test_validated_model_override_toggles ... ok
+test storage::catalog::tests::catalog_connections_are_reused_by_path ... ok
+test storage::cas::tests::test_staging_blob_frame_on_disk_has_magic ... ok
+test storage::cas::tests::test_refcount_incr ... ok
+test storage::cas::tests::test_staging_partial_not_visible ... ok
+test storage::cas::tests::test_refcount_decr_and_persist_across_reopen ... ok
+test storage::cas::tests::test_put_multiple_distinct_payloads ... ok
+test storage::cas::tests::test_blob_count_with_fanout ... ok
+test storage::generation::db_layer::tests::test_db_to_cas_roundtrip_returns_hash ... ok
+test storage::generation::db_layer::tests::test_checkpoint_flushes_wal_before_vacuum ... ok
+test storage::cross_project::tests::test_max_depth_exceeded ... ok
+test storage::cross_project::tests::test_resolve_symbol_not_found ... ok
+test storage::cross_project::tests::test_track_external_usage ... ok
+test storage::cross_project::tests::test_find_dependents ... ok
+test storage::cross_project::tests::test_resolve_symbol_single_match ... ok
+test storage::cross_project::tests::test_persistent_cache ... ok
+test storage::cross_project::tests::test_load_external_pdg ... ok
+test storage::edges::tests::test_edge_insert_and_get ... ok
+test storage::cross_project::tests::test_propagate_changes ... ok
+test storage::generation::db_layer::tests::test_noop_reindex_identical_hash ... ok
+test storage::cross_project::tests::test_build_cross_project_pdg ... ok
+test storage::generation::lease::tests::test_read_current_generation ... ok
+test storage::generation::lease::tests::test_read_current_generation_missing ... ok
+test storage::generation::lease::tests::test_read_current_generation_non_numeric ... ok
+test storage::generation::lease::tests::test_read_generation_manifest_from_disk ... ok
+test storage::generation::lease::tests::test_read_generation_manifest_missing_file ... ok
+test storage::generation::manifest::tests::test_fingerprint_validation_detects_corruption ... ok
+test storage::generation::manifest::tests::test_fingerprint_validation_mismatch ... ok
+test storage::generation::manifest::tests::test_fingerprint_validation_ok ... ok
+test storage::generation::manifest::tests::test_layer_kind_all_variants ... ok
+test storage::generation::manifest::tests::test_manifest_compact_serialization ... ok
+test storage::generation::manifest::tests::test_manifest_extra_layer_rejected ... ok
+test storage::generation::manifest::tests::test_manifest_generation_number_preserved ... ok
+test storage::generation::manifest::tests::test_manifest_layer_completeness_ok ... ok
+test storage::generation::manifest::tests::test_manifest_layer_hashes ... ok
+test storage::generation::manifest::tests::test_manifest_magic_accepted ... ok
+test storage::generation::manifest::tests::test_manifest_magic_empty_rejected ... ok
+test storage::generation::manifest::tests::test_manifest_magic_rejected ... ok
+test storage::generation::manifest::tests::test_manifest_magic_truncated_rejected ... ok
+test storage::generation::manifest::tests::test_manifest_missing_db_rejected ... ok
+test storage::generation::manifest::tests::test_manifest_missing_neural_rejected ... ok
+test storage::generation::manifest::tests::test_manifest_missing_symbols_rejected ... ok
+test storage::generation::manifest::tests::test_manifest_roundtrip ... ok
+test storage::generation::manifest::tests::test_manifest_version_future_rejected ... ok
+test storage::generation::manifest::tests::test_manifest_version_one_accepted ... ok
+test storage::generation::manifest::tests::test_manifest_version_zero_rejected ... ok
+test storage::generation::db_layer::tests::test_hash_determinism_across_cas_stores ... ok
+test storage::generation::lease::tests::test_lease_acquire_persists_refcounts ... ok
+test storage::generation::migrate::tests::test_migration_error_on_empty_store ... ok
+test storage::generation::lease::tests::test_lease_acquires_and_increments_refcounts ... ok
+test storage::generation::lease::tests::test_lease_acquires_from_disk ... ok
+test storage::generation::lease::tests::test_lease_no_leindex_lock_required ... ok
+test storage::generation::lease::tests::test_lease_drop_decrements_refcounts ... ok
+test storage::generation::migrate::tests::test_migration_noop_on_partial_generation_dir ... ok
+test storage::generation::reader::tests::test_neural_f32_dot_correctness ... ok
+test storage::generation::lease::tests::test_lease_provides_manifest_access ... ok
+test storage::generation::db_layer::tests::test_vacuum_into_does_not_disturb_live_db ... ok
+test storage::generation::reader::tests::test_neural_reader_missing_artifact ... ok
+test storage::generation::reader::tests::test_neural_reader_bad_magic ... ok
+test storage::generation::reader::tests::test_neural_zero_copy ... ok
+test storage::generation::reader::tests::test_pdg_reader_traversal ... ok
+test storage::generation::lease::tests::test_lease_prevents_gc ... ok
+test storage::generation::reader::tests::test_reader_hash_validation ... ok
+test storage::generation::reader::tests::test_neural_int8_dot_correctness ... ok
+test storage::generation::reader::tests::test_reader_survives_generation_swap ... ok
+test storage::generation::reader::tests::test_tfidf_reader_correctness ... ok
+test storage::generation::reader::tests::test_symbols_reader_inventory ... ok
+test storage::generation::reader::tests::test_readers_no_corpus_proportional_heap ... ok
+test storage::generation::db_layer::tests::test_db_to_cas_via_storage_wrapper ... ok
+test storage::generation::lease::tests::test_multiple_leases_same_generation ... ok
+test storage::generation::retention::tests::test_cas_gc_retains_pinned_blobs ... ok
+test storage::generation::retention::tests::test_completed_job_deleted_on_publish ... ok
+test storage::generation::retention::tests::test_job_is_completed_via_status_file ... ok
+test storage::generation::retention::tests::test_job_not_completed_no_marker ... ok
+test storage::generation::retention::tests::test_retention_config_defaults ... ok
+test storage::generation::db_layer::tests::test_vacuum_dedup_identical_hash ... ok
+test storage::generation::retention::tests::test_cas_gc_no_retained_reference ... ok
+test storage::generation::retention::tests::test_job_bytes_cap ... ok
+test storage::generation::retention::tests::test_job_bytes_cap_preserves_in_progress ... ok
+test storage::generation::retention::tests::test_retention_current_pointer_anchored_not_max ... ok
+test storage::generation::retention::tests::test_retention_no_lease_only_two ... ok
+test storage::generation::retention::tests::test_retention_report_dedup_ratio ... ok
+test storage::generation::retention::tests::test_retention_report_no_deletion ... ok
+test storage::generation::retention::tests::test_footprint_jobs_under_cap_after_publish ... ok
+test storage::generation::retention::tests::test_footprint_max_two_generations_no_leases ... ok
+test storage::generation::retention::tests::test_retention_current_prev_leased ... ok
+test storage::generation::writer::tests::test_crash_after_rename_before_current ... ok
+test storage::generation::writer::tests::test_crash_before_rename ... ok
+test storage::generation::migrate::tests::test_legacy_to_cas_migration ... ok
+test storage::generation::writer::tests::test_publish_requires_all_layers ... ok
+test storage::generation::writer::tests::test_current_file_write_atomic ... ok
+test storage::generation::writer::tests::test_publish_computes_fingerprints ... ok
+test storage::generation::migrate::tests::test_migration_job_bounding ... ok
+test storage::generation::migrate::tests::test_migration_idempotent ... ok
+test storage::generation::writer::tests::test_writer_stage_dedup ... ok
+test storage::generation::migrate::tests::test_migration_report_accounting ... ok
+test storage::generation::snapshot::tests::snapshot_lease_pins_generation_layer_blobs ... ok
+test storage::generation::writer::tests::test_writer_stage_dedup_across_writers ... ok
+test storage::generation::snapshot::tests::snapshot_db_layer_is_bit_identical_and_queryable ... ok
+test storage::generation::writer::tests::test_writer_stage_different_layers_different_hashes ... ok
+test storage::generation::snapshot::tests::snapshot_opens_leased_generation_and_mmaps_layers ... ok
+test storage::generation::writer::tests::test_writer_atomic_publish ... ok
+test storage::generation::snapshot::tests::snapshot_readers_mmap_the_cas_blob_frame_in_place ... ok
+test storage::generation::migrate::tests::test_migration_footprint_goal_repo_shaped ... ok
+test storage::generation::writer::tests::test_writer_publish_creates_generation_directory ... ok
+test storage::generation::writer::tests::test_writer_publish_increments_generation ... ok
+test storage::pdg_store::tests::test_convert_edge_types ... ok
+test storage::pdg_store::tests::test_convert_node_types ... ok
+test storage::global_symbols::tests::test_batch_insert ... ok
+test storage::pdg_store::tests::test_edge_metadata_conversion ... ok
+test storage::global_symbols::tests::test_detect_conflicts ... ok
+test storage::global_symbols::tests::test_external_refs ... ok
+test storage::global_symbols::tests::test_find_public_symbols ... ok
+test storage::global_symbols::tests::test_project_deps ... ok
+test storage::project_id::tests::test_as_unique_id ... ok
+test storage::project_id::tests::test_display_clone ... ok
+test storage::project_id::tests::test_display_original ... ok
+test storage::project_id::tests::test_display_trait ... ok
+test storage::project_id::tests::test_from_string_trait ... ok
+test storage::project_id::tests::test_generate_creates_valid_id ... ok
+test storage::project_id::tests::test_generate_with_conflicting_names ... ok
+test storage::project_id::tests::test_handle_special_characters ... ok
+test storage::project_id::tests::test_handle_unicode_directory_name ... ok
+test storage::project_id::tests::test_hash_path_is_deterministic ... ok
+test storage::project_id::tests::test_hash_path_is_different_for_different_paths ... ok
+test storage::project_id::tests::test_hash_path_returns_8_chars ... ok
+test storage::project_id::tests::test_instance_counts_correctly ... ok
+test storage::project_id::tests::test_instance_increments_for_same_base_name ... ok
+test storage::project_id::tests::test_instance_starts_at_zero ... ok
+test storage::project_id::tests::test_is_clone ... ok
+test storage::project_id::tests::test_parse_id_invalid_format ... ok
+test storage::project_id::tests::test_parse_id_invalid_hash ... ok
+test storage::project_id::tests::test_parse_id_roundtrip ... ok
+test storage::project_id::tests::test_parse_id_valid ... ok
+test storage::project_id::tests::test_serialization ... ok
+test storage::project_id::tests::test_to_string_format ... ok
+test storage::project_id::tests::test_to_string_with_instance ... ok
+test storage::project_id::tests::test_unknown_fallback_for_invalid_path ... ok
+test storage::project_metadata::tests::test_project_metadata_new ... ok
+test storage::global_symbols::tests::test_resolve_by_name ... ok
+test storage::salsa::tests::test_node_hash_creation ... ok
+test storage::global_symbols::tests::test_resolve_by_name_and_type ... ok
+test storage::global_symbols::tests::test_upsert_and_get_symbol ... ok
+test storage::nodes::tests::test_find_by_hash ... ok
+test storage::nodes::tests::test_node_insert_and_get ... ok
+test storage::pdg_store::tests::test_delete_pdg ... ok
+test storage::pdg_store::tests::test_load_nonexistent_project ... ok
+test validation::drift::tests::test_analyze_semantic_drift_empty_changes ... ok
+test validation::drift::tests::test_drift_item_added ... ok
+test validation::drift::tests::test_drift_item_removed ... ok
+test validation::drift::tests::test_drift_item_signature_changed ... ok
+test validation::drift::tests::test_drift_item_type_changed ... ok
+test validation::drift::tests::test_drift_item_visibility_changed ... ok
+test validation::drift::tests::test_drift_report_add_drift ... ok
+test validation::drift::tests::test_drift_report_add_non_breaking ... ok
+test validation::drift::tests::test_drift_report_default ... ok
+test validation::drift::tests::test_drift_report_new ... ok
+test validation::drift::tests::test_drift_type_equality ... ok
+test validation::drift::tests::test_find_signature_location ... ok
+test validation::drift::tests::test_is_public_api ... ok
+test validation::drift::tests::test_semantic_drift_analyzer_new ... ok
+test validation::impact::tests::test_analyze_impact_empty_changes ... ok
+test validation::impact::tests::test_analyze_impact_single_change ... ok
+test validation::impact::tests::test_analyze_impact_with_dependencies ... ok
+test validation::impact::tests::test_impact_analyzer_new ... ok
+test validation::impact::tests::test_impact_report_minimal ... ok
+test validation::impact::tests::test_impact_report_new ... ok
+test validation::impact::tests::test_is_public_api ... ok
+test validation::impact::tests::test_is_public_api_internal_module ... ok
+test validation::impact::tests::test_is_public_api_test_file ... ok
+test validation::impact::tests::test_location_display ... ok
+test validation::impact::tests::test_location_new ... ok
+test validation::impact::tests::test_risk_level_description ... ok
+test validation::impact::tests::test_risk_level_display ... ok
+test validation::impact::tests::test_risk_level_equality ... ok
+test validation::impact::tests::test_risk_level_ordering ... ok
+test validation::reference::tests::test_extract_imports_javascript ... ok
+test validation::reference::tests::test_extract_imports_python ... ok
+test validation::reference::tests::test_extract_imports_rust ... ok
+test validation::reference::tests::test_extract_python_function_calls ... ok
+test validation::reference::tests::test_is_python_builtin ... ok
+test validation::reference::tests::test_reference_checker_new ... ok
+test validation::reference::tests::test_reference_issue_broken_import ... ok
+test validation::reference::tests::test_reference_issue_cyclic_dependency ... ok
+test validation::reference::tests::test_reference_issue_type_equality ... ok
+test validation::reference::tests::test_reference_issue_undefined_reference ... ok
+test validation::syntax::tests::test_error_severity_equality ... ok
+test validation::syntax::tests::test_syntax_error_new ... ok
+test validation::syntax::tests::test_syntax_validator_default ... ok
+test validation::syntax::tests::test_syntax_validator_new ... ok
+test validation::syntax::tests::test_syntax_validator_strict ... ok
+test validation::syntax::tests::test_validate_syntax_invalid_javascript ... ok
+test validation::syntax::tests::test_validate_syntax_invalid_json ... ok
+test validation::syntax::tests::test_validate_syntax_invalid_python ... ok
+test validation::syntax::tests::test_validate_syntax_invalid_rust ... ok
+test validation::syntax::tests::test_validate_syntax_long_line_warning ... ok
+test validation::syntax::tests::test_validate_syntax_multiple_changes ... ok
+test validation::syntax::tests::test_validate_syntax_unsupported_language ... ok
+test validation::syntax::tests::test_validate_syntax_valid_go ... ok
+test validation::syntax::tests::test_validate_syntax_valid_javascript ... ok
+test validation::syntax::tests::test_validate_syntax_valid_json ... ok
+test validation::syntax::tests::test_validate_syntax_valid_python ... ok
+test validation::syntax::tests::test_validate_syntax_valid_rust ... ok
+test validation::syntax::tests::test_validate_syntax_whitespace_only_warning ... ok
+test validation::tests::test_location_display ... ok
+test validation::tests::test_validation_result_add_reference_issue ... ok
+test validation::tests::test_validation_result_add_semantic_drift ... ok
+test validation::tests::test_validation_result_add_syntax_error ... ok
+test validation::tests::test_validation_result_default ... ok
+test validation::tests::test_validation_result_new ... ok
+test validation::tests::test_validation_result_warning_only ... ok
+test validation::tests::test_validation_to_json_empty_result ... ok
+test validation::tests::test_validation_to_json_with_reference_issue ... ok
+test validation::tests::test_validation_to_json_with_semantic_drift ... ok
+test validation::tests::test_validation_to_json_with_syntax_error ... ok
+test validation::tests::test_validation_to_json_with_warning_only ... ok
+test storage::pdg_store::tests::test_save_and_load_pdg ... ok
+test storage::pdg_store::tests::test_save_pdg_with_inheritance_and_data_dependency_edges ... ok
+test storage::pdg_store::tests::test_save_pdg_replaces_existing ... ok
+test storage::schema::tests::test_project_reader_cache_budget ... ok
+test storage::schema::tests::test_project_store_mmap_cap ... ok
+test storage::salsa::tests::test_incremental_cache ... ok
+test storage::schema::tests::test_project_writer_cache_budget ... ok
+test storage::schema::tests::close_checkpoints_wal_without_execute_return_error ... ok
+test storage::schema::tests::test_schema_initialization ... ok
+test storage::generation::migrate::tests::test_migration_crash_safe ... ok
+test storage::schema::tests::test_storage_creation ... ok
+test storage::generation::writer::tests::test_crash_every_publish_phase ... ok
+test server::server::tests::test_server_default_config ... ok
+test search::hnsw::tests::test_hnsw_large_scale ... ok
+test cli::leindex::setup::tests::test_dynamic_profile_requires_all_checksums_to_match ... ok
+
+test result: ok. 1763 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 9.76s
+
+     Running unittests src/bin/leindex.rs (target/debug/deps/leindex-aeb79d91a3c5e589)
+
+running 4 tests
+test test::test_default_workers_is_two ... ok
+test test::test_explicit_worker_count_is_respected ... ok
+test test::test_non_numeric_workers_falls_back_to_default ... ok
+test test::test_zero_workers_falls_back_to_default ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/leindexd.rs (target/debug/deps/leindexd-5b450cd731f01e41)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cache_budget.rs (target/debug/deps/cache_budget-b10f2ee29537ea16)
+
+running 30 tests
+test test_complexity_correct_after_incremental_update ... ok
+test test_compact_node_metadata_uses_row_addressing ... ok
+test test_complexity_metadata_correct_after_compression ... ok
+test test_content_clearing_preserves_search_correctness ... ok
+test test_compact_metadata_stable_lookup ... ok
+test test_compaction_coherence_after_delta_update ... ok
+test test_node_tokens_correct_after_compact_rewrite ... ok
+test test_mmap_zero_copy_read_path ... ok
+test test_read_only_mmap_no_mutable_aliasing ... ok
+test test_edit_cache_rejects_oversized ... ok
+test test_mmap_snapshot_no_heap_mirror ... ok
+test test_search_cache_returns_correct_results ... ok
+test test_search_engine_exposes_cache_bytes ... ok
+test test_semantic_search_correct_after_compaction ... ok
+test test_text_postings_correct_after_compression ... ok
+test test_search_correct_after_integer_compaction ... ok
+test test_text_postings_correct_after_delta_update ... ok
+test test_token_lookup_correct_after_compact_rewrite ... ok
+test test_work_hoister_exposes_byte_accounting ... ok
+test test_work_hoister_lookup_returns_correct_results ... ok
+test test_work_hoister_scoped_to_owner ... ok
+test test_zero_copy_search_no_heap_mirror ... ok
+test test_search_engine_estimated_memory ... ok
+test test_snapshot_avoids_full_embedding_clone ... ok
+test test_search_cache_entry_limit ... ok
+test test_search_cache_byte_limit ... ok
+test test_full_compression_cycle_under_load ... ok
+test test_large_content_not_retained_after_indexing ... ok
+test test_work_hoister_is_bounded ... ok
+test test_edit_cache_total_cap_enforced ... ok
+
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/cargo_install_layout_test.rs (target/debug/deps/cargo_install_layout_test-c1330e9dacab620f)
+
+running 18 tests
+test binary_targets::lib_exports_worker_main ... ok
+test binary_targets::root_embed_wrapper_source_exists ... ok
+test docs_packaging::crate_package_includes_embed_source ... ok
+test docs_packaging::crate_package_includes_neural_setup_doc ... ok
+test binary_targets::worker_main_module_exists ... ok
+test binary_targets::root_declares_leindex_bin_target ... ok
+test binary_targets::root_declares_leindex_embed_bin_target ... ok
+test feature_propagation::onnx_feature_enables_all_execution_providers ... ok
+test no_ort_vendoring::build_scripts_have_no_origin_rpath ... ok
+test binary_targets::root_has_exactly_two_bin_targets ... ok
+test no_ort_vendoring::cargo_config_has_no_ort_env_entries ... ok
+test feature_propagation::onnx_migraphx_feature_includes_migraphx ... ok
+test no_ort_vendoring::ort_lib_directory_removed ... ok
+test feature_propagation::ort_uses_load_dynamic ... ok
+test no_ort_vendoring::no_source_references_to_ort_lib ... ok
+test one_crate_layout::one_crate_two_bin_layout ... ok
+test feature_propagation::onnx_feature_has_no_leindex_embed_propagation ... ok
+test setup_command::setup_command_declared_in_cli ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cli_integration_test.rs (target/debug/deps/cli_integration_test-bf16a65a0a9df0a0)
+
+running 36 tests
+test cache_management_tests::test_cache_entry_creation ... ok
+test cache_management_tests::test_warm_strategy_variants ... ok
+test cache_management_tests::test_cache_key_generation ... ok
+test cache_management_tests::test_cache_spiller_creation ... ok
+test cache_management_tests::test_cache_insert_and_retrieve ... ok
+test cache_management_tests::test_cache_eviction_on_size_limit ... ok
+test cache_spill_reload_tests::test_warm_caches_pdg_only_strategy ... ok
+test cache_spill_reload_tests::test_reload_vector_without_pdg ... ok
+test cache_spill_reload_tests::test_spill_pdg_cache_when_no_pdg ... ok
+test cli_workflow_tests::test_cli_analyze_command_parsing ... ok
+test cli_workflow_tests::test_cli_diagnostics_command_parsing ... ok
+test cli_workflow_tests::test_cli_index_command_parsing ... ok
+test cli_workflow_tests::test_cli_search_command_parsing ... ok
+test cli_workflow_tests::test_cli_verbose_flag ... ok
+test cache_spill_reload_tests::test_warm_caches_all_strategy ... ok
+test cache_spill_reload_tests::test_warm_caches_recent_first_strategy ... ok
+test cache_spill_reload_tests::test_spill_all_caches ... ok
+test error_handling_tests::test_error_conversion ... ok
+test error_handling_tests::test_error_display ... ok
+test storage_persistence_tests::test_memory_config_default ... ok
+test storage_persistence_tests::test_memory_config_serialization ... ok
+test cache_spill_reload_tests::test_check_memory_and_spill_below_threshold ... ok
+test cache_spill_reload_tests::test_get_cache_stats ... ok
+test cache_spill_reload_tests::test_spill_vector_cache ... ok
+test cache_spill_reload_tests::test_cache_stats_after_spill ... ok
+test cache_spill_reload_tests::test_multiple_spill_operations ... ok
+test cache_spill_reload_tests::test_warm_caches_search_only_strategy ... ok
+test e2e_workflow_tests::test_leindex_creation_workflow ... ok
+test e2e_workflow_tests::test_diagnostics_workflow ... ok
+test e2e_workflow_tests::test_cache_integration_with_leindex ... ok
+test cache_spill_reload_tests::test_reload_pdg_when_already_loaded ... ok
+test cache_spill_reload_tests::test_search_cache_hit_rate_increases_on_repeat_query ... ok
+test cache_spill_reload_tests::test_cache_spill_and_reload_workflow ... ok
+test cache_spill_reload_tests::test_analysis_cache_persists_across_sessions ... ok
+test cache_spill_reload_tests::test_diagnostics_reports_cache_temperature ... ok
+test cli_workflow_tests::test_cli_index_handles_deeply_nested_rust_without_aborting ... ok
+
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+
+     Running tests/cli_mcp_stdio_e2e.rs (target/debug/deps/cli_mcp_stdio_e2e-e8840e879b6c016a)
+
+running 16 tests
+test test_initialize_request_parses_correctly ... ok
+test test_notification_has_no_id_field ... ok
+test test_no_double_newline_in_success_response ... ok
+test test_no_double_newline_in_error_response ... ok
+test test_jsonrpc_response_serialization_is_single_line ... ok
+test test_initialize_response_format ... ok
+test test_notification_request_has_no_id ... ok
+test test_tools_list_all_expected_names_present ... ok
+test test_tools_list_every_tool_has_description_and_schema ... ok
+test test_tools_list_returns_20_tools ... ok
+test test_tools_call_unknown_tool_returns_error ... ok
+test test_tools_call_file_summary_unindexed_returns_structured_response ... ok
+test test_tools_call_symbol_lookup_unindexed_returns_structured_response ... ok
+test test_tools_call_edit_preview_unindexed_returns_structured_response ... ok
+test test_tools_call_project_map_unindexed_returns_structured_response ... ok
+test test_tools_call_diagnostics_returns_ok ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+     Running tests/cross_area_validation_test.rs (target/debug/deps/cross_area_validation_test-68f05364d10326ac)
+
+running 32 tests
+test cross_surface_fallback_consistency::tfidf_only_embedder_variant_exists_for_zero_setup_path ... ok
+test diagnostics_ort_info::ort_discovery_exposes_last_outcome_for_diagnostics ... ok
+test cross_surface_fallback_consistency::search_query_neural_embedding_attempts_cold_worker_and_falls_back_on_failure ... ok
+test diagnostics_ort_info::mcp_diagnostics_handler_inserts_ort_info_fields ... ok
+test diagnostics_ort_info::setup_ort_path_uses_worker_discovery_chain ... ok
+test no_ort_fallback_notice::npm_wrapper_does_not_override_fallback_notice ... ok
+test npm_tfidf_fallback::npm_wrapper_does_not_exit_when_bundled_ort_missing ... ok
+test cross_surface_fallback_consistency::bundle_lib_layout_matches_discovery_chain_search_path ... ok
+test no_ort_fallback_notice::pypi_wrapper_does_not_override_fallback_notice ... ok
+test ort_discovery_priority::npm_wrapper_respects_user_ort_dylib_path_override ... ok
+test ort_discovery_priority::env_var_is_highest_priority_in_rust_discovery ... ok
+test ort_discovery_priority::pip_discovery_precedes_system_discovery ... ok
+test ort_discovery_priority::bundle_ort_discoverable_via_sibling_and_user_lib ... ok
+test no_ort_fallback_notice::worker_runtime_emits_actionable_notice_when_ort_missing ... ok
+test no_ort_fallback_notice::worker_inherits_stderr_so_notice_reaches_user ... ok
+test diagnostics_ort_info::diagnostics_does_not_load_ort_into_main_process ... ok
+test per_surface_journeys::cargo_install_lays_out_both_binaries_cooperatively ... ok
+test ort_discovery_priority::install_sh_copies_bundled_libs_to_leindex_lib ... ok
+test diagnostics_ort_info::smoke_summary_distinguishes_active_from_configured_provider ... ok
+test setup_idempotency_and_preservation::config_save_overwrites_in_place_without_duplicating ... ok
+test per_surface_journeys::cpu_provider_maps_to_plain_onnxruntime_pip_package ... ok
+test setup_idempotency_and_preservation::setup_skips_model_download_when_checksum_matches ... ok
+test per_surface_journeys::onnx_migraphx_feature_is_alias_of_onnx ... ok
+test diagnostics_ort_info::setup_check_reports_same_ort_info_shape ... ok
+test per_surface_journeys::npm_wrapper_sets_ort_dylib_path_from_bundled_lib ... ok
+test per_surface_journeys::pypi_exposes_leindex_setup_console_script ... ok
+test version_parity::one_crate_two_bin_layout ... ok
+test version_parity::all_surfaces_share_same_version ... ok
+test setup_idempotency_and_preservation::setup_loads_existing_config_before_writing ... ok
+test diagnostics_ort_info::diagnostics_command_reports_ort_info ... ok
+test setup_idempotency_and_preservation::installer_offers_selective_preserve_menu ... ok
+test setup_idempotency_and_preservation::install_sh_preserves_leindex_home_by_default ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/daemon_spawn_test.rs (target/debug/deps/daemon_spawn_test-544c6b6c58e1eaeb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/daemon_tool_parity_test.rs (target/debug/deps/daemon_tool_parity_test-52925328a0e2db92)
+
+running 2 tests
+test test_daemon_initialize_lists_server_info_and_protocol ... ok
+test test_daemon_serves_same_tool_set_as_inline ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+     Running tests/embed_bundle_pipeline_test.rs (target/debug/deps/embed_bundle_pipeline_test-a3c80c8f7260a34e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/embed_migraphx_dynamic_test.rs (target/debug/deps/embed_migraphx_dynamic_test-bdd10a39c49e0e69)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/embed_protocol_roundtrip_test.rs (target/debug/deps/embed_protocol_roundtrip_test-5b8a6c73f3d12f4a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/embed_worker_lifecycle_test.rs (target/debug/deps/embed_worker_lifecycle_test-8494568345dfcbf0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/fault/scenarios_01_06_test.rs (target/debug/deps/fault_scenarios_01_06-723c4096ee9707c2)
+
+running 11 tests
+test telemetry::test::test_telemetry_summary_is_human_readable ... ok
+test test_telemetry_sample_captures_all_metrics ... ok
+test telemetry::test::test_capture_sample_returns_rss ... ok
+test test_scenario_05_repeated_identical_index_coalesce ... ok
+test telemetry::test::test_run_with_telemetry_captures_failure ... ok
+test telemetry::test::test_run_with_telemetry_captures_latency ... ok
+test test_scenario_03_different_project_simultaneous_index ... ok
+test test_scenario_02_same_project_simultaneous_index ... ok
+test test_scenario_06_changes_mid_index_followup ... ok
+test test_scenario_04_search_during_indexing_no_stall ... ok
+test test_scenario_01_three_harness_two_project ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/fault/scenarios_07_12_test.rs (target/debug/deps/fault_scenarios_07_12-6756634d2d658e04)
+
+running 10 tests
+test telemetry::test::test_telemetry_summary_is_human_readable ... ok
+test telemetry::test::test_capture_sample_returns_rss ... ok
+test telemetry::test::test_run_with_telemetry_captures_latency ... ok
+test test_scenario_07_worker_cold_warm ... ok
+test telemetry::test::test_run_with_telemetry_captures_failure ... ok
+test test_scenario_10_cancellation_each_index_phase ... ok
+test test_scenario_08_worker_crash_mid_batch ... ok
+test test_scenario_11_huge_file ... ok
+test test_scenario_12_large_repo_multiple_generations ... ok
+test test_scenario_09_daemon_crash_each_publication_phase ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+
+     Running tests/gate_audit_test.rs (target/debug/deps/gate_audit_test-b37d27270744e069)
+
+running 9 tests
+test test_gate_phase8_all_flags_default_on ... ok
+test test_gate_quality_eval_infrastructure ... ok
+test test_gate_reliability_admission_never_errors ... ok
+test test_gate_resource_budget_ledger ... ok
+test test_gate_resource_retention_bounds ... ok
+test test_gate_quality_model_identity_reproducible ... ok
+test test_gate_reliability_crash_preserves_generation ... ok
+test test_gate_resource_thread_budget ... ok
+test test_gate_performance_query_latency ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/git_porcelain_test.rs (target/debug/deps/git_porcelain_test-6621392f49b2cace)
+
+running 7 tests
+test test_initial_or_detached_headers_have_no_branch_or_head_oid ... ok
+test test_parses_nul_delimited_porcelain_v2_records_without_splitting_paths ... ok
+test test_inventory_from_subdirectory_does_not_treat_outer_worktree_as_nested_repo ... ok
+test test_changed_source_candidates_only_returns_live_edits ... ok
+test test_inventory_uses_git_ignore_and_nested_repo_boundaries ... ok
+test test_live_source_candidates_reject_symlink_escapes ... ok
+test test_source_candidates_prefilters_fixed_string_without_full_inventory ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/index_job_recovery_test.rs (target/debug/deps/index_job_recovery_test-2f8426dad1104710)
+
+running 8 tests
+test test_bucketed_parse_artifacts_keep_path_identity ... ok
+test test_resume_each_phase ... ok
+test test_lexical_failure_keeps_core_current_and_restart_reuses_checkpoint ... ok
+test test_registry_hydrates_current_generation_not_mutable_root ... ok
+test test_disconnect_survival_job_continues_to_completion ... ok
+test test_concurrent_first_load_creates_project_once ... ok
+test test_concurrent_requests_coalesce_into_single_job ... ok
+test test_panic_during_index_sets_failed_status ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.86s
+
+     Running tests/install_script_test.rs (target/debug/deps/install_script_test-07114ea67c971c5c)
+
+running 15 tests
+test bundle_consumption::prefers_release_bundle_download ... ok
+test bundle_consumption::release_bundle_path_runs_before_rust_gate ... ok
+test exit_handling::verify_installation_does_not_require_repo_cargo_toml ... ok
+test setup_check::suggests_leindex_setup_when_unset ... ok
+test bundle_consumption::copies_bundled_ort_libs_to_leindex_lib ... ok
+test ort_env_invariants::no_ort_prefer_dynamic_link_references ... ok
+test exit_handling::setup_check_preserves_exit_status_without_or_true ... ok
+test bundle_consumption::does_not_copy_models_from_release_bundles ... ok
+test version_parity::install_sh_accepts_all_published_macos_bundles ... ok
+test ort_env_invariants::no_ort_lib_path_references ... ok
+test version_parity::script_version_matches_cargo_toml ... ok
+test setup_check::runs_setup_check_after_install ... ok
+test exit_handling::install_paths_do_not_copy_model_assets ... ok
+test build_line_invariants::build_line_does_not_use_download_binaries_or_copy_dylibs ... ok
+test build_line_invariants::build_line_uses_onnx_not_onnx_migraphx ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/leindexd_single_winner_test.rs (target/debug/deps/leindexd_single_winner_test-1b231aff3795c0ed)
+
+running 2 tests
+test test_winner_serves_initialize ... ok
+test test_single_winner_startup_lock ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+
+     Running tests/leindexd_smoke_test.rs (target/debug/deps/leindexd_smoke_test-63b1abf253d4825e)
+
+running 3 tests
+test test_daemon_serves_initialize_over_socket ... ok
+test test_daemon_idle_exit ... ok
+test test_daemon_rss_flat_at_startup ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.60s
+
+     Running tests/mcp_fast_paths_test.rs (target/debug/deps/mcp_fast_paths_test-67395b89dc18f045)
+
+running 18 tests
+test test_exact_route_classifier_is_deterministic ... ok
+test test_request_timing_collector_keeps_causal_phase_measurements ... ok
+test test_request_timing_collector_accepts_neural_worker_measurements ... ok
+test test_canonical_path_read_symbol_uses_the_same_catalog_key ... ok
+test test_canonical_path_read_symbol_rejects_files_outside_the_project ... ok
+test test_catalog_rows_cannot_escape_the_live_project_root ... ok
+test test_catalog_miss_read_symbol_uses_unscoped_live_inventory_without_hydration ... ok
+test test_default_project_catalog_reads_do_not_hydrate ... ok
+test test_exact_grep_catalog_miss_uses_live_parser_without_hydration ... ok
+test test_default_project_exact_catalog_grep_does_not_hydrate ... ok
+test test_path_metadata_primitives_are_deterministic ... ok
+test test_exact_grep_must_not_request_neural_search ... ok
+test test_stale_catalog_file_summary_does_not_attach_stale_pdg_relations ... ok
+test test_stale_unscoped_catalog_symbol_uses_its_validated_candidate ... ok
+test test_stale_catalog_symbol_uses_live_parser_without_hydration ... ok
+test test_current_fast_paths_do_not_hydrate_the_project_before_live_reads ... ok
+test test_live_fast_paths_must_not_hydrate_or_load_search_dependencies ... ok
+test test_git_status_does_not_hydrate_when_no_generation_is_resident ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s
+
+     Running tests/onnx_worker_fallback.rs (target/debug/deps/onnx_worker_fallback-caa2dbeb186344f4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/parser_fixtures_test.rs (target/debug/deps/parser_fixtures_test-226c82f8d3088166)
+
+running 10 tests
+test test_nested_cli_associated_functions_without_self_are_methods ... ok
+test test_nested_cli_parses_cli_struct ... ok
+test test_nested_cli_parses_commands_enum_and_variants ... ok
+test test_nested_cli_parses_config_module_and_config_struct ... ok
+test test_askpass_parses_standalone_main ... ok
+test test_askpass_parses_methods_with_qualified_names ... ok
+test test_askpass_parses_struct ... ok
+test test_flows_parses_registry_record_struct ... ok
+test test_flows_run_installation_calls_verify_registry_and_detect_arch ... ok
+test test_flows_parses_standalone_functions ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/release_bundle_packaging_test.rs (target/debug/deps/release_bundle_packaging_test-5ff3841d6f25764f)
+
+running 15 tests
+test build_time_invariants::build_scripts_have_no_origin_rpath ... ok
+test binary_verification::release_verifies_no_origin_rpath ... ok
+test binary_verification::release_verifies_no_needed_libonnxruntime ... ok
+test build_time_invariants::build_step_does_not_link_ort_at_build_time ... ok
+test bundle_layout::bundle_contains_both_binaries ... ok
+test bundle_layout::bundle_directory_tree_matches_spec ... ok
+test bundle_layout::amd_bundle_includes_migraphx_provider ... ok
+test ci_gates::release_runs_cargo_test ... ok
+test ci_gates::release_runs_clippy ... ok
+test distribution_coverage::release_workflow_triggers_on_distribution_files ... ok
+test bundle_layout::bundle_includes_install_txt ... ok
+test checksum_coverage::checksums_cover_lib_directory ... ok
+test checksum_coverage::bundle_checksums_are_portable_on_macos ... ok
+test bundle_layout::bundle_excludes_model_assets ... ok
+test bundle_layout::bundle_includes_ort_runtime_lib_directory ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/search_hnsw_integration.rs (target/debug/deps/search_hnsw_integration-3dfa46dc46ad0fa1)
+
+running 21 tests
+test tests::test_staged_retrieval_empty_index ... ok
+test tests::test_hnsw_custom_params ... ok
+test tests::test_hnsw_empty_vs_populated ... ok
+test tests::test_hnsw_search_results_ordering ... ok
+test tests::test_hnsw_search_consistency ... ok
+test tests::test_staged_retrieval_is_not_binary_quantization_replacement ... ok
+test tests::test_hnsw_with_search_engine ... ok
+test tests::test_hnsw_enable_disable ... ok
+test tests::test_hnsw_migration_from_bruteforce ... ok
+test tests::test_staged_retrieval_text_only_correctness ... ok
+test tests::test_hnsw_different_dimensions ... ok
+test tests::test_staged_retrieval_preserves_ranked_correctness ... ok
+test tests::test_staged_retrieval_reduces_exact_stage_work ... ok
+test tests::test_hnsw_search_accuracy ... ok
+test tests::test_staged_retrieval_with_int8_hnsw ... ok
+test tests::test_staged_retrieval_with_hnsw ... ok
+test tests::test_int8_vs_f32_search_accuracy ... ok
+test tests::test_hnsw_batch_insert_performance ... ok
+test tests::test_hnsw_search_performance ... ok
+test tests::test_hnsw_large_scale_search ... ok
+test tests::test_int8_quantized_hnsw_end_to_end ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.38s
+
+     Running tests/search_int8_gate.rs (target/debug/deps/search_int8_gate-6d051a4f9abe701d)
+
+running 26 tests
+test tests::test_int8_not_promoted_when_latency_exceeds_p50_threshold ... ok
+test tests::test_int8_not_promoted_when_latency_exceeds_p99_threshold ... ok
+test tests::test_ndcg10_drop_exceeding_threshold_fails ... ok
+test tests::test_int8_not_promoted_when_quality_gate_fails ... ok
+test tests::test_latency_percentile_edge_cases ... ok
+test tests::test_ndcg10_drop_within_threshold_passes ... ok
+test tests::test_ndcg10_no_drop_always_passes ... ok
+test tests::test_ndcg_at_10_computation ... ok
+test tests::test_ndcg_partial_ranking ... ok
+test tests::test_ndcg_perfect_ranking ... ok
+test tests::test_ndcg_with_fewer_returned_than_k ... ok
+test tests::test_ndcg_worst_ranking ... ok
+test tests::test_p50_latency_exceeding_threshold ... ok
+test tests::test_p50_latency_within_threshold ... ok
+test tests::test_p99_latency_exceeding_threshold ... ok
+test tests::test_p99_latency_within_threshold ... ok
+test tests::test_promotion_decision_is_explicit_not_silent ... ok
+test tests::test_quality_gate_all_fail ... ok
+test tests::test_quality_gate_all_pass ... ok
+test tests::test_quality_gate_ndcg_passes_latency_fails ... ok
+test tests::test_quality_gate_with_zero_baseline_latency ... ok
+test tests::test_quality_thresholds_are_configurable ... ok
+test tests::test_fp32_brute_force_path_remains_available ... ok
+test tests::test_fp32_path_remains_available_after_int8_gate ... ok
+test tests::test_fp32_hnsw_path_remains_available ... ok
+test tests::test_quality_gate_e2e_with_real_search_results ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+
+     Running tests/search_residency.rs (target/debug/deps/search_residency-39822dc03cff8fac)
+
+running 22 tests
+test test_append_only_preserves_existing_row_positions ... ok
+test test_cache_invalidated_after_removal ... ok
+test test_append_multiple_preserves_positions ... ok
+test test_compaction_rebuilds_row_map_atomically ... ok
+test test_cache_invalidated_after_update ... ok
+test test_delta_overlay_overrides_tombstoned_base ... ok
+test test_dependent_structures_coherent_after_compaction ... ok
+test test_compaction_threshold_triggered_at_threshold ... ok
+test test_compaction_threshold_not_triggered_below_threshold ... ok
+test test_incremental_flush_preserves_unaffected_rows ... ok
+test test_tombstoned_rows_excluded_from_search_results ... ok
+test test_compaction_with_mixed_operations ... ok
+test test_tombstoned_rows_invisible_to_vector_access ... ok
+test test_heap_to_mmap_swap_after_flush ... ok
+test test_mmap_rebuild_search_after_reload ... ok
+test test_mmap_search_correctness_after_flush ... ok
+test test_mmap_snapshot_reloads_coherently ... ok
+test test_heap_mirror_dropped_after_mmap_swap ... ok
+test test_compaction_atomic_swap_preserves_old_file ... ok
+test test_crash_safe_append_ignores_incomplete_tail ... ok
+test test_crash_safe_truncated_embedding_matrix ... ok
+test test_full_cycle_index_flush_compact_reload ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/search_vector_mmap.rs (target/debug/deps/search_vector_mmap-7488b3da23d8b976)
+
+running 19 tests
+test test_borrowed_slice_has_correct_dimension ... ok
+test test_borrowed_slice_cosine_similarity_correct ... ok
+test test_borrowed_slice_all_rows_stable ... ok
+test test_borrowed_slice_stable_across_repeated_reads ... ok
+test test_empty_index_invalid_row_returns_none ... ok
+test test_invalid_row_does_not_crash ... ok
+test test_invalid_row_returns_none ... ok
+test test_large_invalid_row_returns_none ... ok
+test test_node_id_lookup_returns_correct_row ... ok
+test test_node_id_lookup_stable_across_repeated_calls ... ok
+test test_node_id_lookup_unknown_returns_none ... ok
+test test_owned_copy_invalid_row_returns_none ... ok
+test test_node_id_to_row_then_slice_roundtrip ... ok
+test test_borrowed_slice_returns_correct_content ... ok
+test test_owned_copy_matches_borrowed_slice ... ok
+test test_large_dimension_borrowed_access ... ok
+test test_owned_copy_returns_vec_f32 ... ok
+test test_owned_copy_via_node_id_matches_borrowed_slice ... ok
+test test_search_results_consistent_with_borrowed_slices ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/shim_forward_test.rs (target/debug/deps/shim_forward_test-9a8a61eb649270d1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/soak/scenarios_13_18_test.rs (target/debug/deps/soak_scenarios_13_18-5bab29e23a83164e)
+
+running 10 tests
+test telemetry::test::test_telemetry_summary_is_human_readable ... ok
+test telemetry::test::test_capture_sample_returns_rss ... ok
+test telemetry::test::test_run_with_telemetry_captures_failure ... ok
+test test_scenario_17_cuda_provider ... ok
+test test_scenario_16_migraphx_provider ... ok
+test test_scenario_15_cpu_only_provider ... ok
+test telemetry::test::test_run_with_telemetry_captures_latency ... ok
+test test_scenario_18_cgroup_memory_pressure ... ok
+test test_scenario_14_idle_soak_no_resource_growth ... ok
+test test_scenario_13_100_reindex_no_monotonic_growth ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+
+     Running tests/soak/scenarios_19_24_test.rs (target/debug/deps/soak_scenarios_19_24-27f82eb003f3af95)
+
+running 10 tests
+test telemetry::test::test_telemetry_summary_is_human_readable ... ok
+test telemetry::test::test_capture_sample_returns_rss ... ok
+test telemetry::test::test_run_with_telemetry_captures_latency ... ok
+test test_scenario_21_protocol_version_compatibility ... ok
+test test_scenario_24_watcher_event_storm ... ok
+test test_scenario_23_query_cancellation_storm ... ok
+test test_scenario_22_worktrees_sharing_content ... ok
+test telemetry::test::test_run_with_telemetry_captures_failure ... ok
+test test_scenario_19_corrupt_missing_artifacts ... ok
+test test_scenario_20_model_migration_identity_mismatch ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/storage_reader_pool.rs (target/debug/deps/storage_reader_pool-d1b5943ee265551f)
+
+running 13 tests
+test test_backpressure_with_large_content ... ok
+test test_indexing_backpressure_stays_bounded ... ok
+test test_parser_pool_is_bounded ... ok
+test test_pool_opens_one_writer_and_fixed_reader_pool ... ok
+test test_pool_no_unbounded_connection_fanout ... ok
+test test_writer_and_reader_roles_are_distinct ... ok
+test test_reader_connections_have_thin_cache ... ok
+test test_reader_connections_have_correct_mmap_cap ... ok
+test test_writer_has_writer_cache_budget ... ok
+test test_pool_writer_wal_mode_enabled ... ok
+test test_writer_performs_write_operations ... ok
+test test_pool_concurrent_reads_succeed ... ok
+test test_pool_readers_see_writer_data_via_wal ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/ws11_bakeoff_report_test.rs (target/debug/deps/ws11_bakeoff_report_test-f28a79027980ee42)
+
+running 4 tests
+test test_gate_rejects_mrr_regression ... ok
+test test_gate_rejects_protected_category_regression ... ok
+test test_reranker_ablation_report_generated ... ok
+test test_embedding_bakeoff_report_generated ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/xtask-816a72eade0c1f2f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests leindex
+
+running 41 tests
+test src/cli/leindex/diagnostics.rs - cli::leindex::diagnostics::LeIndex::get_diagnostics (line 16) ... ignored
+test src/cli/leindex/mod.rs - cli::leindex::LeIndex (line 46) ... ignored
+test src/cli/leindex/mod.rs - cli::leindex::LeIndex::new (line 487) ... ignored
+test src/cli/leindex/model_download.rs - cli::leindex::model_download::hf_url (line 105) ... ignored
+test src/cli/leindex/query.rs - cli::leindex::query::LeIndex::analyze (line 378) ... ignored
+test src/cli/leindex/query.rs - cli::leindex::query::LeIndex::search (line 38) ... ignored
+test src/cli/mcp/macros.rs - cli::mcp::macros::dispatch_handler (line 12) ... ignored
+test src/cli/mcp/server.rs - cli::mcp::server::McpServer::new (line 226) ... ignored
+test src/cli/mcp/server.rs - cli::mcp::server::McpServer::run (line 421) ... ignored
+test src/feature_flags.rs - feature_flags (line 9) ... ignored
+test src/lib.rs - (line 25) ... ignored
+test src/search/hnsw.rs - search::hnsw::HNSWIndex::new (line 199) ... ignored
+test src/search/hnsw.rs - search::hnsw::HNSWIndex::rebuild (line 441) ... ignored
+test src/search/hnsw.rs - search::hnsw::HNSWIndex::with_params (line 215) ... ignored
+test src/search/quantization/int8_hnsw.rs - search::quantization::int8_hnsw::Int8HnswIndex::new (line 197) ... ignored
+test src/search/quantization/simd/mod.rs - search::quantization::simd (line 22) ... ignored
+test src/search/query.rs - search::query::QueryParser (line 212) ... ignored
+test src/search/search/int8_quality.rs - search::search::int8_quality::Int8QualityGate (line 74) ... ignored
+test src/search/search/mod.rs - search::search::SearchEngine (line 94) ... ignored
+test src/search/search/mod.rs - search::search::SearchEngine::enable_hnsw (line 1745) ... ignored
+test src/search/search/mod.rs - search::search::SearchEngine::enable_int8_hnsw (line 1804) ... ignored
+test src/search/search/mod.rs - search::search::SearchEngine::incremental_reindex (line 525) ... ignored
+test src/search/search/mod.rs - search::search::SearchEngine::semantic_search (line 1646) ... ignored
+test src/search/search/mod.rs - search::search::SearchEngine::vector_index (line 1705) ... ignored
+test src/search/search/mod.rs - search::search::SearchEngine::vector_index_mut (line 1725) ... ignored
+test src/search/search/mod.rs - search::search::SearchEngine::with_dimension (line 200) ... ignored
+test src/search/search/mod.rs - search::search::SearchEngine::with_hnsw (line 1783) ... ignored
+test src/search/vector.rs - search::vector::VectorIndex::insert (line 60) ... ignored
+test src/search/vector.rs - search::vector::VectorIndex::insert_batch (line 88) ... ignored
+test src/search/vector.rs - search::vector::VectorIndex::new (line 35) ... ignored
+test src/search/vector.rs - search::vector::VectorIndex::search (line 120) ... ignored
+test src/storage/generation/writer.rs - storage::generation::writer::GenerationWriter (line 76) ... ignored
+test src/storage/pdg_store.rs - storage::pdg_store::load_pdg (line 360) ... ignored
+test src/storage/pdg_store.rs - storage::pdg_store::save_pdg (line 162) ... ignored
+test src/storage/project_id.rs - storage::project_id::UniqueProjectId::as_unique_string (line 170) ... ok
+test src/storage/project_id.rs - storage::project_id::UniqueProjectId (line 20) ... ok
+test src/storage/project_id.rs - storage::project_id::UniqueProjectId::from_str_compat (line 275) ... ok
+test src/search/quantization/mod.rs - search::quantization::serialization (line 52) ... ok
+test src/storage/project_id.rs - storage::project_id::UniqueProjectId::generate (line 87) ... ok
+test src/storage/project_id.rs - storage::project_id::UniqueProjectId::display (line 193) ... ok
+test src/storage/project_id.rs - storage::project_id::UniqueProjectId::parse_id (line 231) ... ok
+
+test result: ok. 7 passed; 0 failed; 34 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.50s; merged doctests compilation took 0.49s
+STEP3_TEST_NO_MEMCHECK_EXIT=0
+
+===== STEP 4/4: cargo test -p memcheck -- --test-threads=1 =====
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/main.rs (target/debug/deps/memcheck-7b8d26c7b9817e63)
+
+running 55 tests
+test diff::tests::test_apply_pct ... ok
+test diff::tests::test_budget_file_serialization ... ok
+test diff::tests::test_diff_all_pass_with_baseline ... ok
+test diff::tests::test_diff_baseline_regression ... ok
+test diff::tests::test_diff_both_rules_fail ... ok
+test diff::tests::test_diff_ceiling_regression ... ok
+test diff::tests::test_diff_missing_baseline_still_enforces_ceiling ... ok
+test diff::tests::test_extract_fixture_name ... ok
+test diff::tests::test_format_diff_failure_output ... ok
+test diff::tests::test_format_diff_output ... ok
+test diff::tests::test_write_all_baselines ... ok
+test diff::tests::test_write_and_load_baseline ... ok
+test env_capture::test::test_allocator_env_captures_malloc_arena_max ... ok
+test env_capture::test::test_allocator_env_omits_unset_malloc_arena_max ... ok
+test env_capture::test::test_capture_records_kernel_and_git ... hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /home/scooter/.claude/tmp/.tmp3n3fdI/.git/
+[master (root-commit) 1f613fd] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 a.txt
+ok
+test env_capture::test::test_environment_capture_default ... ok
+test env_capture::test::test_environment_capture_serde_roundtrip ... ok
+test env_capture::test::test_hardware_info_serde_roundtrip ... ok
+test report::tests::test_memcheck_report_get_phase ... ok
+test report::tests::test_phase_report_json_fields ... ok
+test report::tests::test_phase_report_serialization ... ok
+test report::tests::test_validate_canonical_phases_success ... ok
+test report::tests::test_validate_canonical_phases_wrong_count ... ok
+test report::tests::test_validate_canonical_phases_wrong_order ... ok
+test sampler::tests::test_count_descendants_includes_spawned_child ... ok
+test sampler::tests::test_count_descendants_no_children ... ok
+test sampler::tests::test_descendant_tree_serde_roundtrip ... ok
+test sampler::tests::test_find_child_worker_rss_no_worker ... ok
+test sampler::tests::test_gpu_sample_default_is_all_none ... ok
+test sampler::tests::test_gpu_sample_is_consistent ... ok
+test sampler::tests::test_gpu_sample_returns_some_on_amdgpu_or_none_elsewhere ... ok
+test sampler::tests::test_heap_profile_missing_pid ... ok
+test sampler::tests::test_heap_profile_writes_file ... ok
+test sampler::tests::test_is_child_of_self ... ok
+test sampler::tests::test_is_vma_header ... ok
+test sampler::tests::test_read_mapped_anon_smaps_current ... ok
+test sampler::tests::test_read_proc_comm ... ok
+test sampler::tests::test_read_smaps_breakdown_current ... ok
+test sampler::tests::test_read_vm_rss_current ... ok
+test sampler::tests::test_sample_current_process ... ok
+test sampler::tests::test_sample_fast_current_process ... ok
+test workload::tests::test_build_phase_report_empty ... ok
+test workload::tests::test_build_phase_report_p95 ... ok
+test workload::tests::test_build_phase_report_peak_mapped_anon ... ok
+test workload::tests::test_build_phase_report_with_samples ... ok
+test workload::tests::test_build_phase_report_worker_aware ... ok
+test workload::tests::test_canonical_phases_count ... ok
+test workload::tests::test_canonical_phases_order ... ok
+test workload::tests::test_copy_fixture_source_excludes_root_leindex ... ok
+test workload::tests::test_find_worker_pids_finds_no_workers_for_self ... ok
+test workload::tests::test_read_proc_comm_for_self ... ok
+test workload::tests::test_read_proc_comm_missing_pid ... ok
+test workload::tests::test_read_proc_ppid_for_self ... ok
+test workload::tests::test_read_proc_ppid_missing_pid ... ok
+test workload::tests::test_reap_worker_processes_no_crash_with_no_workers ... ok
+
+test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+     Running tests/diff_logic.rs (target/debug/deps/diff_logic-f72403274bebd629)
+
+running 10 tests
+test test_diff_absolute_ceiling_regression_detected ... ok
+test test_diff_baseline_regression_detected ... ok
+test test_diff_passing_both_rules ... ok
+test test_val_measure_007_one_baseline_per_phase ... ok
+test test_val_measure_008_baseline_update_overwrites ... ok
+test test_val_measure_009_budget_file_exists ... ok
+test test_val_measure_010_both_rules_checked ... ok
+test test_val_measure_011_missing_baseline_enforces_ceiling ... ok
+test test_val_measure_012_xtask_memcheck_entrypoint ... ok
+test test_val_measure_013_update_baseline_regenerates ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/harness_integration.rs (target/debug/deps/harness_integration-12c811f52f09e66e)
+
+running 13 tests
+test test_idle_phases_have_reasonable_duration ... ok
+test test_mcp_idle_proliferation_linearity ... ok
+test test_memcheck_help_flag ... ok
+test test_memcheck_missing_fixture_fails ... ok
+test test_report_json_is_valid_and_parseable ... ok
+test test_stale_artifacts_phase_removes_dead_sidecars ... ok
+test test_val_measure_001_canonical_multi_phase_report ... ok
+test test_val_measure_002_phase_order_is_canonical ... ok
+test test_val_measure_003_per_phase_schema_has_required_metrics ... ok
+test test_val_measure_004_samples_fresh_process ... ok
+test test_val_measure_005_linux_rss_is_primary_metric ... ok
+test test_val_measure_006_mapped_file_and_anon_captured ... ok
+test test_worker_ort_threads_cap_leq_nocap ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 492.88s
+
+STEP4_TEST_MEMCHECK_EXIT=0
+
+================================================================
+SWEEP COMPLETE
+================================================================
