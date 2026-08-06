@@ -4,12 +4,15 @@
 
 A lightweight npm package that automatically downloads and configures LeIndex for use as an MCP (Model Context Protocol) server in AI coding tools.
 
-## Worker Architecture (Plan 3)
+## v2.0.0 Resource Architecture
 
-- **Version parity** with Cargo: npm package version matches `Cargo.toml` — bundles always stay in sync.
+- **Version parity** with Cargo: npm package version matches `Cargo.toml` — bundles always stay in sync (`2.0.0`).
 - **Worker bundle topology**: auto-downloads the platform-native `leindex` and `leindex-embed` binaries plus ONNX Runtime libraries; models are provisioned separately by setup.
-- **Memory targets**: idle_warm ~9852 KiB, index ~20168 KiB, query ~13480 KiB (within A+ bands).
+- **Single-daemon model**: one user-scoped `leindexd` serves all harnesses via tiny stdio shims (~8 MiB each). Aggregate steady-state RAM <= 1 GiB for three clients.
+- **Content-addressed generations**: blake3-hashed CAS blobs; zero duplication across generations; `.leindex/` 15x smaller (2.9 GiB to 190 MiB on the LeIndex self-repo).
+- **Default model**: CodeRankEmbed 137M INT8 (~135 MiB host RSS), selected via fused-retrieval evaluation. Use `--model qwen3` for the heavier Qwen3 FP16 baseline.
 - **Install** (MCP): `npx -y @leindex/mcp`.
+- Full before/after resource story: [`BENCHMARKS.md`](https://github.com/scooter-lacroix/LeIndex/blob/master/BENCHMARKS.md).
 
 ## What is This?
 
@@ -85,17 +88,17 @@ profile warmed during setup and reused through its compiled cache and resident
 worker. Indexing and semantic requests start/await the configured worker when
 it is cold; terminal provider failure preserves the core TF-IDF/PDG result.
 
-### Fragment Embeddings (1.9.5+, opt-in)
+### Fragment Embeddings (opt-in)
 
-LeIndex 1.9.5 adds a fully-local **fragment embedding layer**: large symbols
-are split into tree-sitter semantic chunks (plus module-level orphan regions)
-and embedded with the same local Qwen3 worker. Fragments are
-content-hash-addressed (blake3), so incremental indexing is idempotent and
-deduplicated, and no remote service is involved. Enable it in
-`~/.leindex/config/leindex.toml` under `[search]` with `fragment_index_enabled
-= true` (plus `fragment_weight`, `fragment_max_bytes`,
-`fragment_orphan_enabled`, `fragment_naive_fallback`). Off by default; the
-node-level index remains authoritative.
+LeIndex ships an opt-in **fragment embedding layer**: large symbols are split
+into tree-sitter semantic chunks (plus module-level orphan regions) and
+embedded with the same local worker (CodeRankEmbed 137M INT8 by default in
+v2.0.0). Fragments are content-hash-addressed (blake3), so incremental
+indexing is idempotent and deduplicated, and no remote service is involved.
+Enable it in `~/.leindex/config/leindex.toml` under `[search]` with
+`fragment_index_enabled = true` (plus `fragment_weight`,
+`fragment_max_bytes`, `fragment_orphan_enabled`, `fragment_naive_fallback`).
+Off by default; the node-level index remains authoritative.
 
 ---
 
@@ -239,7 +242,7 @@ Add to Claude Desktop config:
 To pin a specific binary release instead of `latest`:
 
 ```bash
-LEINDEX_BINARY_VERSION=1.9.5 npm install @leindex/mcp
+LEINDEX_BINARY_VERSION=2.0.0 npm install @leindex/mcp
 ```
 
 ---

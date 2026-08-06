@@ -726,7 +726,8 @@ pub fn run_full_bakeoff(
 
 /// Generate the bake-off markdown report text.
 ///
-/// This produces the full comparison table for `docs/baselines/2026-08-04-ws11-embedding-bakeoff.md`.
+/// This produces the model bake-off comparison table digested into
+/// BENCHMARKS.md Section 8 "Model bake-off winner".
 pub fn generate_bakeoff_markdown(result: &BakeoffResult) -> String {
     let mut md = String::new();
 

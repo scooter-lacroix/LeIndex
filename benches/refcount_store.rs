@@ -2,8 +2,8 @@
 //!
 //! On a 10,000-hash fixture, measures incr/decr throughput, `persist`
 //! (fsync) cost, reopen latency, and resident-memory delta for the JSON
-//! sidecar backend chosen by the Task 11 decision
-//! (`docs/baselines/2026-08-04-ws4-refcount-store.md`).
+//! sidecar backend chosen by the Task 11 decision (see BENCHMARKS.md
+//! Section 9 "CAS engineering decisions" for the digested outcome).
 //!
 //! Run: `cargo bench --bench refcount_store --features full`
 //!

@@ -29,7 +29,7 @@
 //!   are at or below `job_bytes_max`.
 //! - In-progress jobs are never deleted (they have checkpoint resume value).
 //!
-//! See `docs/superpowers/plans/2026-08-04-ws4-generation-store.md` Task 9.
+//! See BENCHMARKS.md Section 3 for the realized retention effect on this repo.
 
 use std::collections::HashSet;
 use std::fs;

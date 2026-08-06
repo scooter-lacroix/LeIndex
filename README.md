@@ -2,7 +2,7 @@
 
 <img src="leindex.jpeg" alt="LeIndex" width="500"/>
 
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT%20%7C%20Apache--2.0-blue?style=flat-square)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-Server-purple?style=flat-square)](https://modelcontextprotocol.io)
 [![Release](https://raw.githubusercontent.com/scooter-lacroix/LeIndex/badges/version-badge.svg)](https://github.com/scooter-lacroix/LeIndex/actions/workflows/release.yml)
@@ -11,19 +11,52 @@
 
 # LeIndex
 
-**Understand large codebases instantly.**
+**One daemon. One GiB. One hundred times less disk.**
 
-LeIndex is a semantic code search engine that lets you search code by **meaning**, not just keywords.
+LeIndex 2.0.0 is a semantic code intelligence engine built for multi-agent
+development. Three concurrent agent harnesses now share one user-scoped
+daemon instead of spawning three heavyweight processes. The result, measured
+on this repository:
 
-Instead of hunting through files with grep or hoping variable names match your query, you can ask things like:
+- **10 to 20 GiB RSS per harness is gone.** Aggregate steady-state RAM is at
+  or below 1 GiB for three clients across two projects.
+- **`.leindex/` is 15x smaller.** 2.9 GiB to 190 MiB on this repo; the 150
+  GiB+ production case scales proportionally.
+- **Indexing never errors on memory pressure.** The admission controller
+  defers work instead of failing valid repos.
+- **Retrieval quality is unchanged.** MRR@10 = 1.0000 against the v1.9.5
+  baseline. Same symbols, same scores, same file paths.
 
-- *"Where is authentication enforced?"*
-- *"Where are API tokens validated?"*
-- *"How does session management work?"*
+Every number above is reproduced in [`BENCHMARKS.md`](BENCHMARKS.md) with the
+methodology, the pre-v1.9.0 anchor, and the post-v2.0.0 baseline captured on
+the identical corpus and hardware.
 
-LeIndex surfaces the actual implementation — even if the words you're searching for never appear in the code.
+---
 
-Built in Rust. Built for developers and AI coding tools.
+## Why v2.0.0
+
+LeIndex 1.9.x had a resource crisis. Each agent harness spawned its own
+`leindex mcp --stdio` process: three live processes were observed at 15.6 GiB,
+10.0 GiB, and 1.2 GiB RSS concurrently. `.leindex/` occupied 2.5 GiB on a
+419-file repo. Large projects saw 150 GiB+ footprints. The root causes were
+architectural: per-harness process multiplication, allocator arena blowup,
+corpus-wide materialization in the indexing pipeline, no content-addressed
+dedup, and two FP16 models that could not fit a 1 GiB target.
+
+v2.0.0 removes the bloat rather than rationing useful behavior:
+
+| What changed | v1.9.x | v2.0.0 |
+|---|---|---|
+| Process model | N heavyweight `leindex mcp` processes | 1 user-scoped `leindexd` + N tiny stdio shims (~8 MiB each) |
+| Generation storage | full-copy dirs (6 copies on disk) | content-addressed CAS blobs (zero duplication) |
+| Indexing pipeline | materialize whole corpus per stage | streaming bounded chunks (RSS flat at 4 MiB) |
+| Memory cap | `Err` when `--max-memory` exceeded | `Admit` / `Defer` / `Reduce`, never `Err` |
+| Embed model | Qwen3 FP16 (1.19 GiB) + reranker (1.19 GiB) | CodeRankEmbed 137M INT8 (255 MiB), reranker removed |
+| Job retention | unbounded historical accumulation (2 GiB / 115 jobs) | 128 MiB cap per project, completed jobs deleted on publish |
+
+Read the full before/after resource story, including the model bake-off,
+CAS engineering decisions, and section-16 acceptance-gate evidence, in
+[`BENCHMARKS.md`](BENCHMARKS.md).
 
 ---
 
@@ -99,6 +132,14 @@ LeIndex ships three first-class install paths. Pick one, then run `leindex setup
 to provision the default hybrid neural path. TF-IDF retrieval and PDG
 relationships are always built first and remain queryable if a provider is
 unavailable.
+
+> **v2.0.0 default model.** The setup wizard provisions
+> [CodeRankEmbed 137M](https://huggingface.co/) (INT8 quantized, ~135 MiB host
+> RSS), selected through LeIndex's fused-retrieval evaluation. The
+> [Qwen3 Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) FP16 model
+> remains available via `leindex setup --model qwen3` for users who want the
+> heavier baseline; see [`BENCHMARKS.md`](BENCHMARKS.md) Section 8 for the full
+> bake-off.
 
 **Option 1: cargo (recommended for Rust users)**
 
@@ -251,17 +292,33 @@ Codebase → Tree-sitter Parser → PDG Builder → Semantic Index → Query Eng
 
 ## Features
 
+- **Single-daemon architecture (v2.0.0)** — one user-scoped `leindexd` serves all
+  agent harnesses via tiny stdio shims (~8 MiB each). No more per-harness
+  heavyweight processes. Aggregate steady-state RAM <= 1 GiB for three clients.
+- **Content-addressed immutable generations (v2.0.0)** — generation layers are
+  blake3-hashed CAS blobs referenced by mmap'd manifests. Two no-op reindexes
+  produce byte-identical hashes; zero duplication across generations.
+- **Streaming bounded indexing pipeline (v2.0.0)** — RSS is structurally
+  independent of corpus size (max 60 KiB delta across all indexing phases).
+  Reads never block on the writer Mutex via generation leases.
+- **Defer, do not error (v2.0.0)** — the admission controller returns only
+  `Admit` / `Defer` / `Reduce`. Valid repos that previously failed on memory
+  pressure now defer and eventually complete.
+- **Global content-addressed embedding cache (v2.0.0)** — cross-project dedup
+  with 100% hit ratio on identical content. No duplicate ONNX inference.
 - **Core hybrid retrieval** — TF-IDF lexical matching plus PDG structure on every applicable result
 - **Hybrid neural scoring** — local ONNX similarity over the same symbols, with TF-IDF/PDG fallback
+- **Validated model profile (v2.0.0)** — CodeRankEmbed 137M INT8 selected via
+  fused-retrieval evaluation; reranker removed after ablation showed zero MRR
+  contribution. Both fits within the 350 MiB embed worker budget.
 - **Fragment embeddings (opt-in)** — sub-symbol semantic chunks (tree-sitter) + module-level orphan coverage, content-hash-addressed for idempotent incremental indexing; all-local, no remote service
 - **5-phase analysis** — additive multi-pass codebase analysis pipeline
 - **Cross-project indexing** — search across multiple repos at once
 - **20 MCP tools** — read, analyze, edit preview/apply, rename, impact analysis
 - **HTTP + WebSocket server** — available through the unified `leindex` server modules and commands
 - **Dashboard** — Bun + React operational UI with project metrics and graph telemetry
-- **Low resource mode** — works on constrained hardware
 - **Built in Rust** — fast indexing, low memory, safe concurrency
-- **Flexible embedding backends** — choose between TF-IDF, local ONNX models (`qwen3-embed-0.6b`), or remote cloud providers (OpenAI, Cohere)
+- **Flexible embedding backends** — choose between TF-IDF, local ONNX models (`coderank-embed-137m`, `qwen3-embed-0.6b`), or remote cloud providers (OpenAI, Cohere)
 
 ---
 
@@ -635,17 +692,19 @@ Local models provide:
 - Provider-aware batching: dynamic up to 32 on CPU/CUDA, stable batches of 8 on MIGraphX
 - Default hybrid query enrichment: cold `auto` workers are started and awaited; TF-IDF/PDG remain the mandatory core result
 - Resident worker reuse while keeping ONNX memory outside the main process
+- Global content-addressed embedding cache (v2.0.0): cross-project dedup with 100% hit ratio on identical content
 
 The worker binary (`leindex-embed`) is built alongside the main binary and is
 discovered automatically. `leindex setup --neural --gpu amd` installs MIGraphX,
-`--gpu nvidia` installs CUDA, and `--cpu` installs standard ORT. Every path
-uses the same validated `qwen3-embed-0.6b-dynamic.onnx` graph provisioned by
-Hugging Face CLI under `~/.leindex/models/`; model files are not packaged with
-LeIndex.
+`--gpu nvidia` installs CUDA, and `--cpu` installs standard ORT. The default
+v2.0.0 profile provisions CodeRankEmbed 137M INT8 (~135 MiB host RSS),
+selected through LeIndex fused-retrieval evaluation. Pass `--model qwen3` to
+provision the heavier Qwen3 FP16 baseline; see [`BENCHMARKS.md`](BENCHMARKS.md)
+Section 8 for the model bake-off. Model files are not packaged with LeIndex.
 
 ### Fragment Index (sub-symbol semantic chunks)
 
-LeIndex 1.9.5 adds an **opt-in fragment embedding layer** that improves both
+LeIndex ships an **opt-in fragment embedding layer** that improves both
 recall and precision on top of the node-level TF-IDF/PDG/neural stack:
 
 - **Tier 2 — sub-symbol fragments**: large nodes (functions, methods, blocks)
@@ -813,6 +872,7 @@ Database discovery (`LEINDEX_DISCOVERY_ROOTS`) is **opt-in only**. Sensitive dir
 
 ## Docs
 
+- [BENCHMARKS.md](BENCHMARKS.md) — v2.0.0 resource benchmarks (before/after storage, RAM, model bake-off, acceptance gates)
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system design and internals
 - [API.md](API.md) — HTTP API reference
 - [docs/MCP.md](docs/MCP.md) — MCP server documentation

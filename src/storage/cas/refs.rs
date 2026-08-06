@@ -8,8 +8,8 @@
 //! produces phantom counts).
 //!
 //! WS4 Task 11 benchmarked two backends — JSON sidecar (`cas/refs.json`) and
-//! SQLite (`cas/refs.db`) — and recorded the measured decision in
-//! `docs/baselines/2026-08-04-ws4-refcount-store.md`:
+//! SQLite (`cas/refs.db`) — and the measured decision (JSON sidecar wins)
+//! is digested into BENCHMARKS.md Section 9 "CAS engineering decisions":
 //!
 //! | Metric (10k-blob fixture) | JSON sidecar | SQLite | Verdict |
 //! |---|---|---|---|

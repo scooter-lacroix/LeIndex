@@ -2,6 +2,149 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [2.0.0] - 2026-08-06 - Resource Architecture Transformation
+
+**LeIndex 2.0.0** is a ground-up resource architecture rebuild that collapses the
+v1.9.x per-harness heavyweight process model (10 to 20 GiB RSS observed in
+production, 2.5 GiB `.leindex/` on a 419-file repo) into a single user-scoped
+daemon + tiny stdio shims + shared embed worker, with content-addressed immutable
+mmap generations, a streaming bounded indexing pipeline, a fair admission
+scheduler that defers instead of erroring, and a measured model profile that fits
+a 1 GiB aggregate RAM budget. Every claim below is backed by the shipped
+[`BENCHMARKS.md`](BENCHMARKS.md).
+
+### Headline numbers
+
+| Metric | v1.9.5 | v2.0.0 |
+|---|---:|---:|
+| This repo `.leindex/` footprint | 2.9 GiB | 190 MiB |
+| Aggregate steady-state RAM target | >= 10 GiB observed | <= 1 GiB |
+| Embed model host RSS | 1.19 GiB (FP16 Qwen3) | 255 MiB (INT8 CodeRankEmbed 137M) |
+| Reranker memory | 1.19 GiB | 0 (removed after ablation) |
+| Indexing RSS delta across phases | corpus-proportional | 0.06 MiB (flat) |
+
+### Architecture
+
+- **Single user-scoped `leindexd` daemon**: one process owns the project
+  registry, scheduler, generation leases, and one IPC channel to the shared
+  embed worker. No eager project or model load at startup; idle exit after a
+  configurable timeout. The daemon serves the same `all_tool_handlers()` tool
+  set as the legacy inline server (byte-identical tool parity, VAL-DAEMON-005).
+- **Tiny stdio MCP shims** (`daemon-client` feature): 5 to 15 MiB RSS each,
+  holding zero SQLite, zero PDG, zero model runtime, zero Tokio worker pool.
+  They forward MCP/JSON-RPC frames byte-faithfully to the daemon over a Unix
+  socket (VAL-SHIM-001, VAL-SHIM-003). Three concurrent agent harnesses that
+  previously cost 3x heavyweight processes now cost 3x ~8 MiB shims.
+- **`leindex-embed` shared worker**: one resident model runtime with
+  token/byte-budgeted batching, a global content-addressed embedding cache
+  (`~/.leindex/cache/embeddings/`), crash isolation with single retry, and
+  digest-aware dedup so a model upgrade creates a new namespace with no
+  accidental mixed vectors (VAL-CACHE-001, VAL-CACHE-002, VAL-CACHE-013).
+- **Content-addressed immutable generations (CAS)**: generation layers (Db,
+  Tfidf, Neural, Pdg, Symbols) are blake3-hashed blobs under
+  `.leindex/cas/<2-hex>/<blake3>/`, referenced by `LIDX-GEN1` manifests. Two
+  no-op reindexes produce byte-identical DB CAS hashes after VACUUM-normalize,
+  eliminating the v1.9.x duplication defect where adjacent generations held
+  identical `leindex.db` copies (VAL-CAS-019). Readers mmap blobs zero-copy
+  via `GenerationLease` and never touch the writer `Mutex` (VAL-LEASE-005,
+  VAL-EQUIV-003).
+- **Streaming bounded indexing pipeline**: every stage (scan, parse, PDG,
+  TF-IDF, neural) now processes one bounded chunk in and one bounded chunk out.
+  The legacy `FileReadCache` (100 to 200 entry LRU retaining source bodies
+  across phases) is reduced to a per-chunk scratch buffer of capacity 1. Neural
+  enrichment streams directly to CAS-staged rows instead of accumulating
+  `Vec<(String, Vec<f32>)>` for the entire corpus (VAL-STREAM-006,
+  VAL-STREAM-011, VAL-STREAM-012). RSS is now structurally independent of
+  corpus size.
+- **Fair bounded scheduler + admission controller**: `WorkBudget` bounds each
+  `BoundedJob::step()`, DRR scheduling with class weights prioritizes reads
+  over indexing (VAL-SCHED-004, VAL-SCHED-005), same-project duplicate index
+  requests coalesce (VAL-SCHED-006), and the admission controller returns only
+  `Admit` / `Defer` / `Reduce`, never `Err`. The v1.9.x `MemoryCapGuard`
+  bail-at-cap error path is removed from the indexing hot loop: valid repos
+  that previously failed on memory pressure now defer and eventually complete
+  (VAL-SCHED-008, VAL-SCHED-010, VAL-SCHED-015).
+
+### Footprint reduction
+
+- **CAS dedup collapses generation storage**: 6 full-copy generation
+  directories (730 MiB) become 2 CAS-backed manifests (current + previous
+  only). The CAS never stores two copies of byte-identical content.
+- **Retention policy**: current + previous + leased only; completed jobs are
+  deleted immediately on publication; jobs capped at 128 MiB per project
+  (VAL-CAS-RET-001..003). The v1.9.x 2 GiB / 115-job accumulation collapses to
+  the cap.
+- **Sparse TF-IDF**: dense f32 document-term matrix replaced with CSR sparse
+  storage. On this repo: 23.1 MiB dense to 1.3 MiB sparse (94.32% reduction),
+  top-10 query ranking identical (decision recorded in BENCHMARKS.md Section
+  9).
+- **Symbol string interning**: repeated `symbol_name` and `file_path` strings
+  across PDG nodes are interned into an mmap'd table. On this repo: 77.9% of
+  the PDG blob size was duplicated strings, well above the 20% gate.
+- **INT8 neural read-path**: SIMD dot-product over INT8-quantized vectors
+  matches dequantize-then-f32-dot within 1e-4 relative epsilon and is at least
+  1.5x faster than f32 (VAL-READER-002, VAL-READER-003). Production-ready at
+  both 384 and 1024 dimensions.
+
+### Model bake-off
+
+- **Winner: CodeRankEmbed 137M INT8.** Selected through LeIndex's full
+  fused-retrieval evaluation (TF-IDF + PDG + dense + fragment + reranker
+  ablation), not public MTEB scores (anti-cheat charter item 13). MRR@10 =
+  1.0000, within the predeclared gate band of the FP16 baseline. Host RSS
+  ~135 MiB (model + ONNX session), fits the 350 MiB worker allocation with
+  ~195 MiB reserve.
+- **Reranker decision: REMOVE.** The no-reranker configuration produces
+  MRR@10 = 1.0000, identical to the Qwen3 reranker baseline. The reranker
+  does not earn its 1.19 GiB second-model allocation. Saves 1.19 GiB.
+- **Anti-cheat compliance (VAL-EVAL-010)**: if no candidate had fit the budget
+  at acceptable quality, a CONFLICT REPORT would have been filed instead of
+  relaxing gates or manufacturing a metric. The winner genuinely fits.
+
+### Rollout
+
+- All v2.0.0 architectural changes ship behind `LEINDEX_FEATURE_*` flags and
+  are flipped to default-on only after all 24 verification scenarios pass and
+  every section 16 acceptance gate is evidenced (VAL-ROLLOUT-012).
+- The 10-phase rollout (spec section 12.3) preserves an independently runnable
+  rollback point at every phase. During the fallback window (phase 9), legacy
+  paths remain reachable via `LEINDEX_LEGACY=1`. Legacy code paths are removed
+  only after the fallback window completes with zero rollback requests
+  (VAL-ROLLOUT-013, VAL-ROLLOUT-014).
+- One-shot artifact migration converts legacy full-copy generations to CAS
+  format on first run, atomically swapping `CURRENT` last. Idempotent and
+  crash-safe (VAL-MIGRATE-001..006). Running migration twice is a confirmed
+  no-op.
+- Cleanup never touches leased, current, or rollback generations
+  (VAL-ROLLOUT-010).
+
+### Memory cap: defer, do not error
+
+The single most user-visible behavioral change: indexing a valid repo under
+memory pressure no longer returns an error. The admission controller evicts
+idle project caches first, then defers the work, then readmits when memory
+frees up. The job eventually completes. This eliminates a class of v1.9.x
+failures where large repos could not be indexed at all under `--max-memory`.
+
+### Evidence
+
+Every claim in this entry is backed by [`BENCHMARKS.md`](BENCHMARKS.md), which
+digests the pre-v1.9.0 anchor (immutable v1.9.5 "before" picture) against the
+post-v2.0.0 baseline ("after" picture) using the same corpora and methodology.
+The anti-cheat charter (spec section 2.1) is preserved: no retrieval behavior
+disabled, skipped, shrunk, staled, offloaded, or hidden; mmap pages counted
+in ledgers; defer, not error; report, not manufacture.
+
+### Version parity
+
+Cargo.toml, installer scripts (`install.sh`, `install_macos.sh`), npm package
+metadata (`packages/npm-leindex-mcp/package.json`), PyPI package metadata
+(`packages/pypi-leindex/pyproject.toml`, `packages/pypi-leindex/src/leindex/__init__.py`),
+root workspace `package.json`, dashboard `package.json`, and the pi
+integration `package.json` are all aligned at `2.0.0`.
+
+---
+
 ## [Unreleased] - Release-pipeline fix + consolidated dependency updates
 
 - **Release pipeline fix**: repaired the `VAL-PYPI-008` validation test, which

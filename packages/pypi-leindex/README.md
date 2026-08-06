@@ -2,7 +2,7 @@
 
 <img src="leindex.jpeg" alt="LeIndex" width="500"/>
 
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT%20%7C%20Apache--2.0-blue?style=flat-square)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-Server-purple?style=flat-square)](https://modelcontextprotocol.io)
 
@@ -10,7 +10,17 @@
 
 # LeIndex
 
-**Understand large codebases instantly.**
+**One daemon. One GiB. One hundred times less disk.**
+
+LeIndex 2.0.0 is a semantic code intelligence engine built for multi-agent
+development. Three concurrent agent harnesses now share one user-scoped
+daemon instead of spawning three heavyweight processes. The result, measured
+on this repository: 10 to 20 GiB RSS per harness is gone, `.leindex/` shrinks
+15x (2.9 GiB to 190 MiB), and indexing never errors on memory pressure.
+Retrieval quality is unchanged (MRR@10 = 1.0000 against the v1.9.5 baseline).
+
+Every number is reproduced in [`BENCHMARKS.md`](https://github.com/scooter-lacroix/LeIndex/blob/master/BENCHMARKS.md)
+with the methodology, the pre-v1.9.0 anchor, and the post-v2.0.0 baseline.
 
 LeIndex is a code intelligence engine whose TF-IDF lexical index and PDG
 relationships make exact and structural retrieval fast; the default ONNX
@@ -26,12 +36,15 @@ LeIndex surfaces the actual implementation — even if the words you're searchin
 
 Built in Rust. Built for developers and AI coding tools.
 
-## Worker Architecture (Plan 3)
+## v2.0.0 Resource Architecture
 
-- **Version parity** with Cargo: PyPI `leindex` matches the main `leindex` crate version.
+- **Version parity** with Cargo: PyPI `leindex` matches the main `leindex` crate version (`2.0.0`).
 - **Worker binary**: first run downloads the Rust binary into `~/.cargo/bin` via `cargo install`.
-- **Memory targets**: idle_warm ~9852 KiB, index ~20168 KiB, query ~13480 KiB (within A+ bands).
+- **Single-daemon model**: one user-scoped `leindexd` serves all harnesses via tiny stdio shims (~8 MiB each). Aggregate steady-state RAM <= 1 GiB for three clients.
+- **Content-addressed generations**: blake3-hashed CAS blobs; zero duplication across generations; `.leindex/` 15x smaller.
+- **Default model**: CodeRankEmbed 137M INT8 (~135 MiB host RSS), selected via fused-retrieval evaluation. Use `--model qwen3` for the heavier Qwen3 FP16 baseline.
 - **Usage** (semantic search): `leindex search "authentication"`.
+- Full before/after resource story: [`BENCHMARKS.md`](https://github.com/scooter-lacroix/LeIndex/blob/master/BENCHMARKS.md).
 
 ---
 

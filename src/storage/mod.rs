@@ -8,7 +8,7 @@
 /// Storage analytics and metrics.
 pub mod analytics;
 /// Content-addressed blob store (CAS) and refcount/GC infrastructure
-/// (WS4 Tasks 1-2). See `docs/superpowers/plans/2026-08-04-ws4-generation-store.md`.
+/// (WS4 Tasks 1-2). See BENCHMARKS.md Section 9 for digested CAS decisions.
 pub mod cas;
 /// Bounded read-only catalog queries for exact MCP reads.
 pub mod catalog;
@@ -17,7 +17,7 @@ pub mod cross_project;
 /// Storage and retrieval of graph edges.
 pub mod edges;
 /// Immutable mmap generation store: manifest format, leases, readers, writers
-/// (WS4 Tasks 3+). See `docs/superpowers/plans/2026-08-04-ws4-generation-store.md`.
+/// (WS4 Tasks 3+). See BENCHMARKS.md Sections 2 and 9 for digested outcomes.
 pub mod generation;
 /// Global symbol table for cross-project indexing.
 pub mod global_symbols;

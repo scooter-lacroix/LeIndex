@@ -4,9 +4,8 @@
 //! neural, PDG, symbols) published as a [`Manifest`] referencing content-addressed
 //! CAS blobs by blake3 hash. Readers acquire a [`GenerationLease`] that pins
 //! the referenced blobs via CAS refcounts, enabling zero-copy mmap reads that
-//! never touch the writer Mutex. See
-//! `docs/superpowers/plans/2026-08-04-ws4-generation-store.md` for the full
-//! design.
+//! never touch the writer Mutex. See BENCHMARKS.md Sections 2 and 9 for the
+//! digested generation-store design and CAS engineering decisions.
 
 /// DB layer normalisation: copy a live SQLite DB into CAS via VACUUM
 /// (WS4 Task 8). See `db_layer` module docs.

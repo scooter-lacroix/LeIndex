@@ -401,7 +401,8 @@ fn compute_decision(
 
 /// Generate the reranker ablation markdown report.
 ///
-/// This produces the content for `docs/baselines/2026-08-04-ws11-reranker-ablation.md`.
+/// This produces the reranker ablation content (decision: REMOVE) digested
+/// into BENCHMARKS.md Section 8 "Model bake-off winner".
 pub fn generate_reranker_ablation_markdown(ablation: &FullRerankerAblation) -> String {
     let mut md = String::new();
 
