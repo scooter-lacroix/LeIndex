@@ -1,4 +1,4 @@
-//! LeIndex evaluation harness for model and reranker bake-off (WS11 Tasks 1-3).
+//! LeIndex evaluation harness for model and reranker bake-off (WS11 Tasks 1-5).
 //!
 //! This module provides the evaluation infrastructure for selecting the
 //! production embedding model profile and reranker policy via LeIndex-specific
@@ -11,6 +11,8 @@
 //! - [`metrics`]: Recall@k, MRR@10, nDCG@10, per-category, confidence intervals.
 //! - [`harness`]: Fused-retrieval harness with ablation support.
 //! - [`report`]: Concise and machine-readable report generation.
+//! - [`candidates`]: Embedding candidate registry and bake-off (Task 4).
+//! - [`reranker_ablation`]: Reranker ablation and keep/replace/remove decision (Task 5).
 //!
 //! The gates are recorded BEFORE any candidate model is evaluated (section 9.4).
 //! This prevents cherry-picking tolerances after seeing results.
@@ -19,8 +21,10 @@
 //! ships without passing the gates below. Public MTEB/CodeSearchNet numbers
 //! shortlist only; they do NOT select.
 
+pub mod candidates;
 pub mod corpus;
 pub mod gates;
 pub mod harness;
 pub mod metrics;
 pub mod report;
+pub mod reranker_ablation;
