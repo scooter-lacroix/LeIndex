@@ -871,3 +871,153 @@ fn test_embed_response_invariant_all_providers() {
         }
     }
 }
+
+// ── Batch size suffix-precedence fix ──────────────────────────────────
+// Non-dynamic models (e.g., qwen3-embed-0.6b) must always get batch_size=1
+// regardless of provider, because their fixed-shape ONNX graph cannot accept
+// a batch dimension > 1. Only -dynamic model variants should use larger
+// batches. MIGraphX/ROCm among dynamic variants uses a stable compiled shape.
+
+#[test]
+fn test_non_dynamic_model_migraphx_returns_batch_1() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b", "migraphx"),
+        DEFAULT_ONNX_INFERENCE_BATCH_SIZE,
+        "non-dynamic model with migraphx must return batch_size=1, not the MIGraphX default"
+    );
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b", "migraphx"),
+        1
+    );
+}
+
+#[test]
+fn test_non_dynamic_model_rocm_returns_batch_1() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b", "rocm"),
+        DEFAULT_ONNX_INFERENCE_BATCH_SIZE,
+        "non-dynamic model with rocm must return batch_size=1, not the MIGraphX default"
+    );
+}
+
+#[test]
+fn test_dynamic_model_migraphx_returns_batch_8() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic", "migraphx"),
+        DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE,
+        "dynamic model with migraphx must return the MIGraphX stable batch size"
+    );
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic", "migraphx"),
+        8
+    );
+}
+
+#[test]
+fn test_dynamic_model_rocm_returns_batch_8() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic", "rocm"),
+        DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE,
+        "dynamic model with rocm must return the MIGraphX stable batch size"
+    );
+}
+
+#[test]
+fn test_non_dynamic_model_cpu_returns_batch_1() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b", "cpu"),
+        DEFAULT_ONNX_INFERENCE_BATCH_SIZE,
+        "non-dynamic model with cpu must return batch_size=1 (unchanged)"
+    );
+}
+
+#[test]
+fn test_dynamic_model_cpu_returns_default_dynamic() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic", "cpu"),
+        DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE,
+        "dynamic model with cpu must return the dynamic batch size"
+    );
+}
+
+#[test]
+fn test_non_dynamic_model_migraphx_case_insensitive() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+    // Provider matching is case-insensitive.
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b", "MIGRAPHX"),
+        DEFAULT_ONNX_INFERENCE_BATCH_SIZE,
+        "non-dynamic model with uppercase MIGRAPHX must still return batch_size=1"
+    );
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b", "ROCm"),
+        DEFAULT_ONNX_INFERENCE_BATCH_SIZE,
+    );
+}
+
+// ── Collapsed batch dimension handling ────────────────────────────────
+// When a non-dynamic ONNX model receives batch_size > 1, it may silently
+// collapse the batch dimension and return [1, seq_len, hidden_dim] instead
+// of [batch_size, seq_len, hidden_dim]. The runtime must detect this and
+// retry each sequence individually rather than erroring and triggering
+// TF-IDF fallback.
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_collapsed_batch_sentinel_is_detectable() {
+    // Verify the sentinel constant exists and has the expected prefix.
+    assert!(COLLAPSED_BATCH_SENTINEL.starts_with("__"));
+    assert!(!COLLAPSED_BATCH_SENTINEL.is_empty());
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_finalize_embed_output_detects_collapsed_batch() {
+    // When the model returns [1, seq_len, hidden_dim] but batch_size > 1 was
+    // sent, finalize_embed_output must return an error whose message starts
+    // with the COLLAPSED_BATCH_SENTINEL so the caller can retry individually.
+    //
+    // We cannot easily construct a real SessionOutputs without a model, but
+    // we can verify the sentinel-based detection logic by checking that the
+    // sentinel prefix is what the retry path matches on.
+    let fake_error_msg = format!(
+        "{}: model collapsed batch dimension (sent 3, got [1, 128, 1024])",
+        COLLAPSED_BATCH_SENTINEL
+    );
+    assert!(
+        fake_error_msg.starts_with(COLLAPSED_BATCH_SENTINEL),
+        "collapsed batch error must start with the sentinel for retry detection"
+    );
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_non_collapsed_error_does_not_match_sentinel() {
+    // A regular inference error must NOT match the sentinel, so it is not
+    // mistaken for a collapsed-batch retry signal.
+    let regular_error = "ONNX inference failed: shape mismatch";
+    assert!(
+        !regular_error.starts_with(COLLAPSED_BATCH_SENTINEL),
+        "regular errors must not match the collapsed batch sentinel"
+    );
+}

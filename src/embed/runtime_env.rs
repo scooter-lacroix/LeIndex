@@ -59,10 +59,20 @@ pub fn configured_onnx_inference_batch_size(model_name: &str, provider: &str) ->
         .filter(|&v| v > 0)
         .map(|v| v.min(MAX_ONNX_INFERENCE_BATCH_SIZE))
         .unwrap_or_else(|| {
-            if provider.eq_ignore_ascii_case("migraphx") || provider.eq_ignore_ascii_case("rocm") {
-                DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE
-            } else if model_name.ends_with("-dynamic") {
-                DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE
+            // Check -dynamic suffix FIRST: non-dynamic models (e.g.,
+            // qwen3-embed-0.6b) must always get batch_size=1 regardless of
+            // provider, because their fixed-shape ONNX graph cannot accept a
+            // batch dimension > 1. Only -dynamic model variants benefit from
+            // larger batches, and among those, MIGraphX/ROCm needs a single
+            // stable compiled batch shape.
+            if model_name.ends_with("-dynamic") {
+                if provider.eq_ignore_ascii_case("migraphx")
+                    || provider.eq_ignore_ascii_case("rocm")
+                {
+                    DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE
+                } else {
+                    DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE
+                }
             } else {
                 DEFAULT_ONNX_INFERENCE_BATCH_SIZE
             }

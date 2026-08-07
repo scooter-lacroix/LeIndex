@@ -53,6 +53,13 @@ pub const DEFAULT_MAX_TEXT_SIZE: usize = 1024 * 1024;
 /// 128KB fits in a single read instead of many small reads).
 pub const READ_BUF_CAPACITY: usize = 128 * 1024;
 
+/// Sentinel prefix embedded in the error message when the ONNX model returns
+/// a collapsed `[1, seq_len, hidden_dim]` output despite receiving a batch
+/// with `batch_size > 1`. `run_onnx_embed_sub_batch` matches on this prefix
+/// to retry each sequence individually rather than falling back to TF-IDF.
+#[cfg(feature = "onnx")]
+const COLLAPSED_BATCH_SENTINEL: &str = "__COLLAPSED_BATCH__";
+
 pub use crate::embed::runtime_env::{
     DEFAULT_MAX_SEQ_LEN, DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE,
     configured_onnx_inference_batch_size, configured_onnx_sequence_len,
@@ -1795,7 +1802,24 @@ impl WorkerRuntime {
             message: format!("ONNX inference failed: {}", e),
         })?;
 
-        self.finalize_embed_output(&outputs, batch_size, expected_dim, &attention_mask)
+        match self.finalize_embed_output(&outputs, batch_size, expected_dim, &attention_mask) {
+            Ok(vectors) => Ok(vectors),
+            Err(ref err) if err.message.starts_with(COLLAPSED_BATCH_SENTINEL) => {
+                tracing::warn!(
+                    "ONNX model collapsed batch dimension (sent {}); retrying each sequence \
+                     individually with batch_size=1",
+                    batch_size
+                );
+                let mut all_vectors = Vec::with_capacity(batch_size * expected_dim);
+                for encoding in encodings {
+                    let single = std::slice::from_ref(encoding);
+                    let vectors = self.run_onnx_embed_sub_batch(session, single, expected_dim)?;
+                    all_vectors.extend_from_slice(&vectors);
+                }
+                Ok(all_vectors)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Validate the embed output shape, normalize a pre-pooled `[b, hidden]`
@@ -1835,6 +1859,19 @@ impl WorkerRuntime {
                     });
                 }
                 (*sl, *hd)
+            }
+            // Collapsed batch: model returned [1, seq_len, hidden_dim] when
+            // batch_size > 1 was sent. Some ONNX exports (non-dynamic variants)
+            // silently collapse the batch dimension. Signal the caller to retry
+            // each sequence individually with batch_size=1.
+            [1, sl, hd] if batch_size > 1 && *hd == expected_dim => {
+                return Err(WorkerError {
+                    kind: ErrorKind::Inference,
+                    message: format!(
+                        "{}: model collapsed batch dimension (sent {}, got [1, {}, {}])",
+                        COLLAPSED_BATCH_SENTINEL, batch_size, sl, hd
+                    ),
+                });
             }
             [bs, hd] if *bs == batch_size => {
                 if *hd != expected_dim {
