@@ -948,6 +948,17 @@ async fn cmd_analyze_impl(
     Ok(())
 }
 
+/// Maximum number of characters of code context shown in analysis output.
+///
+/// Named display budget (not a magic number) so results and context share a
+/// clear, expandable allocation. Kept well above the previous hard-coded 300
+/// chars so users can actually see the surrounding code (VAL-OUT-004).
+const CONTEXT_BUDGET: usize = 2000;
+
+/// Compile-time guarantee the context display budget never drops below the
+/// required floor (VAL-OUT-004).
+const _: () = assert!(CONTEXT_BUDGET >= 1000);
+
 fn format_analysis_output(query: &str, result: &crate::cli::leindex::AnalysisResult) -> String {
     use crate::cli::mcp::output::{BOLD, DIM, LIGHT_CYAN, RESET};
 
@@ -971,11 +982,48 @@ fn format_analysis_output(query: &str, result: &crate::cli::leindex::AnalysisRes
         BOLD, RESET, result.processing_time_ms
     ));
 
+    // Results section comes before the Context section (VAL-OUT-005). Each
+    // entry shows rank, file path, symbol name, symbol type + line number when
+    // available, and the overall relevance score (VAL-OUT-001/002/003).
+    out.push('\n');
+    if result.results.is_empty() {
+        out.push_str(&format!("  {}No results found\n", DIM));
+    } else {
+        out.push_str(&format!(
+            "  {}Results:{} ({} entries)\n",
+            BOLD,
+            RESET,
+            result.results.len()
+        ));
+        for r in &result.results {
+            out.push_str(&format!(
+                "  {}  {:>2}.{} {}{}{}  {}{}{}",
+                BOLD, r.rank, RESET, LIGHT_CYAN, r.file_path, RESET, BOLD, r.symbol_name, RESET
+            ));
+            match (&r.symbol_type, r.line_number) {
+                (Some(t), Some(l)) => {
+                    out.push_str(&format!("  {}({}, line {}){}", DIM, t, l, RESET));
+                }
+                (Some(t), None) => {
+                    out.push_str(&format!("  {}({}){}", DIM, t, RESET));
+                }
+                (None, Some(l)) => {
+                    out.push_str(&format!("  {}(line {}){}", DIM, l, RESET));
+                }
+                (None, None) => {}
+            }
+            out.push_str(&format!(
+                "  {}score: {:.3}{}\n",
+                DIM, r.score.overall, RESET
+            ));
+        }
+    }
+
     if let Some(context) = &result.context {
         out.push('\n');
         out.push_str(&format!("  {}{}{}\n", BOLD, "Context:", RESET));
         let context_str: &str = context.as_str();
-        let truncated = crate::cli::mcp::output::truncate_chars(context_str, 300);
+        let truncated = crate::cli::mcp::output::truncate_chars(context_str, CONTEXT_BUDGET);
         out.push_str(&format!("  {}{}{}", DIM, truncated, RESET));
     }
 
@@ -2157,5 +2205,161 @@ mod tests {
         assert!(result.is_err()); // clap exits with error for --help
         let err = result.unwrap_err();
         assert!(matches!(err.kind(), ErrorKind::DisplayHelp));
+    }
+
+    // -----------------------------------------------------------------------
+    // format_analysis_output (VAL-OUT-001..006)
+    // -----------------------------------------------------------------------
+
+    fn mock_search_result(
+        rank: usize,
+        file_path: &str,
+        symbol: &str,
+        score: f32,
+    ) -> crate::search::SearchResult {
+        crate::search::SearchResult {
+            rank,
+            node_id: format!("node-{rank}"),
+            file_path: file_path.to_string(),
+            symbol_name: symbol.to_string(),
+            symbol_type: Some("function".to_string()),
+            signature: None,
+            complexity: 1,
+            caller_count: None,
+            dependency_count: None,
+            language: "rust".to_string(),
+            score: crate::search::Score {
+                overall: score,
+                tfidf: 0.0,
+                neural: 0.0,
+                structural: 0.0,
+                text_match: 0.0,
+                fragment: 0.0,
+            },
+            context: None,
+            byte_range: (0, 0),
+            fragment_byte_range: None,
+            line_number: Some(10 + rank),
+        }
+    }
+
+    fn mock_analysis_result(
+        results: Vec<crate::search::SearchResult>,
+    ) -> crate::cli::leindex::AnalysisResult {
+        crate::cli::leindex::AnalysisResult {
+            query: "test query".to_string(),
+            results,
+            // > 300 chars so the context section exercises the expanded budget.
+            context: Some("context line\n".repeat(60)),
+            tokens_used: 500,
+            processing_time_ms: 12,
+        }
+    }
+
+    #[test]
+    fn test_analysis_output_shows_each_file_path() {
+        // VAL-OUT-001: every result's file_path appears as readable text.
+        let result = mock_analysis_result(vec![
+            mock_search_result(1, "src/main.rs", "main", 0.950),
+            mock_search_result(2, "src/lib.rs", "helper", 0.800),
+            mock_search_result(3, "src/util.rs", "parse", 0.600),
+        ]);
+        let out = format_analysis_output("test query", &result);
+        for path in ["src/main.rs", "src/lib.rs", "src/util.rs"] {
+            assert!(out.contains(path), "output must contain file path {}", path);
+        }
+    }
+
+    #[test]
+    fn test_analysis_output_shows_symbol_names() {
+        // VAL-OUT-002: every result's symbol_name appears as readable text.
+        let result = mock_analysis_result(vec![
+            mock_search_result(1, "src/main.rs", "main", 0.950),
+            mock_search_result(2, "src/lib.rs", "helper", 0.800),
+            mock_search_result(3, "src/util.rs", "parse", 0.600),
+        ]);
+        let out = format_analysis_output("test query", &result);
+        for symbol in ["main", "helper", "parse"] {
+            assert!(
+                out.contains(symbol),
+                "output must contain symbol {}",
+                symbol
+            );
+        }
+    }
+
+    #[test]
+    fn test_analysis_output_shows_numeric_scores() {
+        // VAL-OUT-003: score.overall rendered as a numeric value per entry.
+        let result = mock_analysis_result(vec![
+            mock_search_result(1, "src/main.rs", "main", 0.950),
+            mock_search_result(2, "src/lib.rs", "helper", 0.803),
+        ]);
+        let out = format_analysis_output("test query", &result);
+        assert!(out.contains("score: 0.950"), "output must show score 0.950");
+        assert!(out.contains("score: 0.803"), "output must show score 0.803");
+    }
+
+    #[test]
+    fn test_analysis_context_budget_at_least_1000() {
+        // VAL-OUT-004: the budget constant is >= 1000 (enforced by the
+        // `const _: () = assert!(...)` at the definition). Behaviorally, a
+        // context longer than 1000 chars must be displayed in full rather than
+        // truncated at the old 300-char cap.
+        let body = "context line\n".repeat(120); // ~1560 chars, well over 1000
+        let result = crate::cli::leindex::AnalysisResult {
+            query: "test query".to_string(),
+            results: vec![],
+            context: Some(body),
+            tokens_used: 500,
+            processing_time_ms: 12,
+        };
+        let out = format_analysis_output("test query", &result);
+        assert_eq!(
+            out.matches("context line").count(),
+            120,
+            "context longer than 1000 chars must be displayed without truncation"
+        );
+    }
+
+    #[test]
+    fn test_analysis_results_appear_before_context() {
+        // VAL-OUT-005: result entries precede the Context section.
+        let result =
+            mock_analysis_result(vec![mock_search_result(1, "src/main.rs", "main", 0.950)]);
+        let out = format_analysis_output("test query", &result);
+        let results_pos = out.find("src/main.rs").expect("file path present");
+        let context_pos = out.find("Context:").expect("context header present");
+        assert!(
+            results_pos < context_pos,
+            "results must appear before the Context section"
+        );
+    }
+
+    #[test]
+    fn test_analysis_output_not_raw_json() {
+        // VAL-OUT-006: structured, human-readable output — never raw JSON.
+        let result =
+            mock_analysis_result(vec![mock_search_result(1, "src/main.rs", "main", 0.950)]);
+        let out = format_analysis_output("test query", &result);
+        assert!(!out.starts_with('{'), "output must not be raw JSON");
+        assert!(
+            !out.contains("\"results\""),
+            "output must not contain a JSON results key"
+        );
+        assert!(
+            !out.contains("\"rank\":"),
+            "output must not contain JSON rank keys"
+        );
+    }
+
+    #[test]
+    fn test_analysis_output_empty_results_message() {
+        let result = mock_analysis_result(vec![]);
+        let out = format_analysis_output("test query", &result);
+        assert!(
+            out.contains("No results found"),
+            "empty results must print 'No results found'"
+        );
     }
 }
