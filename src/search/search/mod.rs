@@ -324,7 +324,7 @@ impl SearchEngine {
         });
         let dropped = original_len - nodes.len();
         if dropped > 0 {
-            tracing::warn!(
+            tracing::debug!(
                 "append_nodes: dropped {} duplicate node_id(s) (kept {} of {})",
                 dropped,
                 nodes.len(),

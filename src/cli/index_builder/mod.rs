@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(feature = "onnx")]
 use crate::search::onnx::{EmbedResult, EmbeddingClient};
@@ -437,7 +437,7 @@ impl FileReadCache {
 
         let (hash, bytes) = read_file_once(path)?;
         self.insert(path.to_path_buf(), bytes.clone());
-        info!(file = %path.display(), hash = %hash, "Read file once for hash and content");
+        debug!(file = %path.display(), hash = %hash, "Read file once for hash and content");
         Ok(bytes)
     }
 

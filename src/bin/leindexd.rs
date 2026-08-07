@@ -84,8 +84,11 @@ mod imp {
 
     fn init_logging() {
         let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
             .with_writer(std::io::stderr)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            )
             .finish();
         let _ = tracing::subscriber::set_global_default(subscriber);
     }
