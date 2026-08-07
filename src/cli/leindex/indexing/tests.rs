@@ -281,3 +281,80 @@ fn streaming_and_legacy_pdg_routes_produce_equivalent_graphs() {
         "expected the alpha function node in the streaming graph"
     );
 }
+
+/// The streaming PDG route must emit exactly one node per successfully parsed
+/// signature, across multiple files. (Direct caller of `build_fragment_from_parsed`.)
+#[test]
+fn build_pdg_streaming_produces_correct_node_count_for_multiple_files() {
+    // Two files, two signatures each -> four nodes total.
+    let results = vec![
+        sample_parsing_result("a.rs", "alpha", "beta"),
+        sample_parsing_result("a.rs", "gamma", "delta"),
+        sample_parsing_result("b.rs", "omega", "alpha"),
+        sample_parsing_result("b.rs", "epsilon", "omega"),
+    ];
+    let pdg = build_pdg_streaming(results);
+    assert_eq!(
+        pdg.node_count(),
+        4,
+        "streaming build must keep one node per parsed signature"
+    );
+    // Each node is keyed by its file-qualified simple name.
+    let ids: Vec<String> = pdg
+        .node_indices()
+        .filter_map(|idx| pdg.get_node(idx).map(|node| node.id.clone()))
+        .collect();
+    assert!(ids.contains(&"a.rs:alpha".to_string()));
+    assert!(ids.contains(&"a.rs:gamma".to_string()));
+    assert!(ids.contains(&"b.rs:omega".to_string()));
+    assert!(ids.contains(&"b.rs:epsilon".to_string()));
+}
+
+/// The streaming route must call `build_fragment_from_parsed` directly,
+/// NOT round-trip through `extract_pdg_from_signatures` + `fragment_from_pdg`.
+/// Detected with a method whose simple name differs from its qualified name:
+/// the streaming fragment keys nodes off the file-path + simple name and emits
+/// exactly one node per signature. If the route still delegated to
+/// `extract_pdg_from_signatures`, the qualified name ("Foo.bar") would drive
+/// the node id and containment inference would inject a second (class) node.
+#[test]
+fn streaming_route_uses_build_fragment_from_parsed_not_extract() {
+    use crate::parse::traits::{SignatureInfo, Visibility};
+    let result = crate::parse::parallel::ParsingResult {
+        file_path: std::path::PathBuf::from("src/lib.rs"),
+        language: Some("rust".to_string()),
+        signatures: vec![SignatureInfo {
+            name: "bar".to_string(),
+            qualified_name: "Foo.bar".to_string(),
+            parameters: vec![],
+            return_type: None,
+            visibility: Visibility::Public,
+            is_async: false,
+            is_method: true,
+            docstring: None,
+            calls: vec![],
+            imports: vec![],
+            byte_range: (10, 20),
+            cyclomatic_complexity: 1,
+            flow_facts: vec![],
+        }],
+        source_bytes: Some(b"impl Foo { fn bar() {} }".to_vec()),
+        error: None,
+        parse_time_ms: 0,
+    };
+    let pdg = build_pdg_streaming(vec![result]);
+    assert_eq!(
+        pdg.node_count(),
+        1,
+        "streaming must not inject extra containment/class nodes"
+    );
+    let ids: Vec<String> = pdg
+        .node_indices()
+        .filter_map(|idx| pdg.get_node(idx).map(|node| node.id.clone()))
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["src/lib.rs:bar".to_string()],
+        "streaming nodes are keyed by the simple name from the ParsedFileRecord"
+    );
+}

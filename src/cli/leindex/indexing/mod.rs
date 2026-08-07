@@ -2096,9 +2096,50 @@ fn build_pdg_legacy(
     combined
 }
 
-/// Streaming route: materialize a per-file `PdgFragment` for each parsed file,
-/// merge them into a compact `PdgSegment` via `merge_fragments_to_segment`,
-/// then rebuild the `ProgramDependenceGraph` via `pdg_from_segment`.
+/// Map a `SignatureInfo` to the canonical streaming node-type string (mirrors
+/// the legacy `signature_to_node` mapping so graphs rebuilt from streamed
+/// segments stay type-equivalent to the legacy route).
+fn streaming_signature_kind(sig: &crate::parse::traits::SignatureInfo) -> &'static str {
+    match sig.return_type.as_deref() {
+        Some("module") => "module",
+        Some("enum_variant") => "variable",
+        Some("enum") | Some("trait") => "class",
+        Some(value) if value.starts_with("struct") => "class",
+        _ if sig.is_method => "method",
+        _ => "function",
+    }
+}
+
+/// Adapt a parallel `ParsingResult` into a streaming `ParsedFileRecord` so the
+/// streaming PDG route can be fed directly to `build_fragment_from_parsed`.
+fn to_streaming_fragment_record(
+    result: &crate::parse::parallel::ParsingResult,
+) -> streaming::parse::ParsedFileRecord {
+    streaming::parse::ParsedFileRecord {
+        path: result.file_path.display().to_string(),
+        content_hash: String::new(),
+        lang: result
+            .language
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        signatures: result
+            .signatures
+            .iter()
+            .map(|sig| streaming::parse::SignatureSummary {
+                name: sig.name.clone(),
+                kind: streaming_signature_kind(sig).to_string(),
+                byte_start: sig.byte_range.0,
+                byte_end: sig.byte_range.1,
+            })
+            .collect(),
+        parse_time_ms: result.parse_time_ms,
+    }
+}
+
+/// Streaming route: build a per-file `PdgFragment` directly from each parsed
+/// file via `build_fragment_from_parsed` (no whole-PDG materialization), merge
+/// them into a compact `PdgSegment` via `merge_fragments_to_segment`, then
+/// rebuild the `ProgramDependenceGraph` via `pdg_from_segment`.
 fn build_pdg_streaming(
     parsing_results: Vec<crate::parse::parallel::ParsingResult>,
 ) -> crate::graph::pdg::ProgramDependenceGraph {
@@ -2107,16 +2148,9 @@ fn build_pdg_streaming(
         if !result.is_success() {
             continue;
         }
-        let file_path = result.file_path.display().to_string();
-        let language = result.language.as_deref().unwrap_or("unknown");
-        let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
-        let file_pdg = crate::graph::extract_pdg_from_signatures(
-            result.signatures,
-            source_bytes,
-            &file_path,
-            language,
-        );
-        fragments.push(streaming::pdg::fragment_from_pdg(&file_pdg));
+        let parsed = to_streaming_fragment_record(&result);
+        let source = String::from_utf8_lossy(result.source_bytes.as_deref().unwrap_or(&[]));
+        fragments.push(streaming::pdg::build_fragment_from_parsed(&parsed, &source));
     }
     let (segment, stats) = streaming::pdg::merge_fragments_to_segment(fragments);
     info!(
