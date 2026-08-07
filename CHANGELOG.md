@@ -145,6 +145,75 @@ integration `package.json` are all aligned at `2.0.0`.
 
 ---
 
+## [2.0.0-postinstall] - 2026-08-07 - Post-install fixes
+
+Five fixes applied after the initial v2.0.0 release, addressing neural search
+correctness, PDG storage performance, directory exclusion gaps, log flooding,
+and analysis output usability. Commits fa24b963 through cb336753 on the v2.0.0
+branch.
+
+### Fixed
+
+- **ONNX embed batching (CRITICAL)**: A missing `else` branch in the embed
+  batch loop caused CPU and CUDA providers to skip all sub-batches after the
+  first, making neural search silently fall back to TF-IDF. Every sub-batch is
+  now processed correctly. Fixed-batch providers (MIGraphX/ROCm) now receive
+  padding and trim to satisfy their fixed input shape requirement.
+- **Directory exclusion gaps**: Added `packages/` to `SKIP_DIRS`. Added
+  hidden-directory and `SKIP_DIRS` post-filtering to the git scan path, which
+  previously only filtered the non-git scan path. Hidden directories and
+  skip-listed dirs are now excluded regardless of scan mode.
+- **Log flooding**: Downgraded the duplicate `node_id` WARN message to DEBUG.
+  Daemon and worker now default to WARN log level (was INFO). Added
+  `RUST_LOG`/`EnvFilter` support to the daemon. Downgraded per-file read INFO
+  to DEBUG to eliminate per-file log noise during indexing.
+
+### Changed
+
+- **PDG storage performance**: Batched SQLite INSERTs (500 per statement) for
+  `save_nodes` and `save_edges`, reducing round-trips by ~500x for large PDGs.
+  `SerializablePDG` serialization is now clone-free via a borrowed-reference
+  shim. `merge_pdgs` uses move semantics to avoid unnecessary allocations. The
+  streaming PDG path now routes through `build_fragment_from_parsed` directly,
+  eliminating an intermediate allocation.
+- **Analysis output**: `format_analysis_output` now prints each search result
+  with file path, symbol name, type, line number, and score. Context budget
+  increased from 300 to 2000 characters. Results appear before the context
+  section. Empty result sets display "No results found" instead of a blank
+  output.
+
+---
+
+## [2.0.0-perf] - 2026-08-07 - Performance and ONNX shape fixes
+
+Three fixes applied after the post-install round, addressing ONNX batch shape
+correctness for non-dynamic models, SQLite storage throughput, and pipeline
+CPU utilization. Commits ce8ab3f8 through 5cdb39e4 on the v2.0.0 branch.
+
+### Fixed
+
+- **ONNX batch shape for non-dynamic models (CRITICAL)**: Non-dynamic models
+  (e.g. MIGraphX/ROCm) were incorrectly forced to `batch_size=8`, causing
+  shape mismatch warnings and silent TF-IDF fallback on AMD GPU providers. The
+  `-dynamic` suffix is now checked before applying the MIGraphX batch size
+  override. Non-dynamic models correctly use `batch_size=1`; dynamic models
+  retain their fixed-batch padding path.
+
+### Changed
+
+- **Storage performance**: SQLite `PRAGMA synchronous` set to `NORMAL` (was
+  `FULL`), improving write throughput with negligible durability risk on local
+  SSDs. Per-file operations (node/edge saves, fragment writes) are now wrapped
+  in batch transactions instead of individual auto-commits, reducing fsync
+  round-trips. Removed a redundant double fsync in the fragment write path.
+- **Pipeline performance**: `enriched_node_content` is now computed once per
+  node and cached (was recomputed three times per node across PDG construction,
+  hashing, and embedding). PDG construction and file hashing are parallelized
+  with rayon, utilizing all available CPU cores for the CPU-bound parsing and
+  blake3 hashing stages.
+
+---
+
 ## [Unreleased] - Release-pipeline fix + consolidated dependency updates
 
 - **Release pipeline fix**: repaired the `VAL-PYPI-008` validation test, which

@@ -60,6 +60,74 @@ CAS engineering decisions, and section-16 acceptance-gate evidence, in
 
 ---
 
+## Post-install fixes (v2.0.0 branch)
+
+Five fixes were applied after the initial v2.0.0 release (commits
+`fa24b963`..`cb336753`). Users running v2.0.0 should pull the latest on the
+`v2.0.0` branch to pick up these corrections.
+
+1. **ONNX embed batching (CRITICAL)** — A missing `else` branch in the embed
+   batch loop caused CPU and CUDA providers to skip all sub-batches after the
+   first. Neural search silently fell back to TF-IDF even when the ONNX worker
+   reported `Ready`. Every sub-batch is now processed. Fixed-batch providers
+   (MIGraphX/ROCm) now receive padding and trim to satisfy their fixed input
+   shape requirement.
+
+2. **PDG storage performance** — `save_nodes` and `save_edges` now use batched
+   SQLite INSERTs (500 per statement). `SerializablePDG` serialization is
+   clone-free via a borrowed-reference shim. `merge_pdgs` uses move semantics.
+   The streaming PDG path routes through `build_fragment_from_parsed` directly,
+   eliminating an intermediate allocation.
+
+3. **Directory exclusion gaps** — `packages/` added to `SKIP_DIRS`. The git
+   scan path now applies the same hidden-directory and `SKIP_DIRS`
+   post-filtering as the non-git path. Previously, `node_modules` and other
+   skip-listed directories inside git-tracked subtrees were indexed.
+
+4. **Log flooding** — Duplicate `node_id` WARN downgraded to DEBUG. Daemon and
+   worker default to WARN (was INFO). The daemon now respects `RUST_LOG` /
+   `EnvFilter`. Per-file read INFO downgraded to DEBUG.
+
+5. **Analysis output** — `format_analysis_output` now prints each search result
+   with file path, symbol name, type, line number, and score. Context budget
+   increased from 300 to 2000 characters. Results appear before the context
+   section. Empty results display "No results found".
+
+See [`CHANGELOG.md`](CHANGELOG.md) for the full entry.
+
+---
+
+## Performance & ONNX shape fixes (v2.0.0)
+
+Three fixes were applied after the post-install round (commits
+`ce8ab3f8`..`5cdb39e4`). Users running v2.0.0 should pull the latest on the
+`v2.0.0` branch to pick up these performance and correctness improvements.
+
+1. **ONNX batch shape fix (CRITICAL)** — Non-dynamic models (e.g.
+   MIGraphX/ROCm) now correctly use `batch_size=1` instead of being
+   incorrectly forced to `batch_size=8`. The previous behavior caused shape
+   mismatch warnings and silent TF-IDF fallback on AMD GPU providers. The
+   `-dynamic` suffix is now checked before applying the MIGraphX batch size
+   override, so dynamic models retain their fixed-batch padding path while
+   non-dynamic models use the correct single-row input shape.
+
+2. **Storage performance** — SQLite `PRAGMA synchronous` is now `NORMAL`
+   (was `FULL`), trading theoretical durability for a significant write
+   throughput increase with negligible risk on local SSDs. Per-file operations
+   (node/edge saves, fragment writes) are now wrapped in batch transactions
+   instead of individual auto-commits, reducing fsync round-trips. A redundant
+   double fsync in the fragment write path has been removed.
+
+3. **Pipeline performance** — `enriched_node_content` is now computed once
+   per node and cached (was recomputed three times per node across PDG
+   construction, hashing, and embedding). PDG construction and file hashing
+   are parallelized with rayon, utilizing all available CPU cores for the
+   CPU-bound parsing and blake3 hashing stages.
+
+See [`CHANGELOG.md`](CHANGELOG.md) for the full entry.
+
+---
+
 ## Demo: finding logic that grep and LLMs miss
 
 Imagine a codebase where authentication is implemented like this:
@@ -463,424 +531,9 @@ Add to `~/.claude/settings.json` or project-local `.claude/settings.json`:
   "mcpServers": {
     "leindex": {
       "command": "npx",
-      "args": ["-y", "@leindex/mcp"],
-      "type": "stdio"
-    }
-  }
-}
-```
-
-Optional guidance pack:
-- Install the shared skill from `integrations/skills/leindex-toolkit/` into `~/.claude/skills/leindex-toolkit/`
-- Merge `integrations/claude-code/settings.example.json` to add the LeIndex reminder hook
-</details>
-
-<details>
-<summary><b>Amp CLI (Sourcegraph)</b></summary>
-
-Add to `~/.config/amp/settings.json`:
-
-```json
-{
-  "amp.mcpServers": {
-    "leindex": {
-      "command": "npx",
       "args": ["-y", "@leindex/mcp"]
     }
   }
 }
 ```
 </details>
-
-<details>
-<summary><b>OpenCode</b></summary>
-
-Add to `~/.config/opencode/opencode.json`:
-
-```json
-{
-  "mcp": {
-    "leindex": {
-      "command": ["npx", "-y", "@leindex/mcp"],
-      "type": "local"
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>Qwen CLI</b></summary>
-
-Add to `~/.qwen/settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "command": "npx",
-      "args": ["-y", "@leindex/mcp"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>iFlow CLI</b></summary>
-
-Add to `~/.iflow/settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "command": "npx",
-      "args": ["-y", "@leindex/mcp"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>Droid (Factory)</b></summary>
-
-Add to `~/.factory/mcp.json` (note: requires `type: "stdio"`):
-
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@leindex/mcp"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>Gemini CLI</b></summary>
-
-Add to `~/.gemini/settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "command": "npx",
-      "args": ["-y", "@leindex/mcp"]
-    }
-  }
-}
-```
-</details>
-
-Agent guidance packs:
-- Claude Code: shared skill plus reminder hook
-- Codex: install `integrations/skills/leindex-toolkit/` into `~/.codex/skills/leindex-toolkit/`
-- Gemini CLI, Amp, OpenCode, Qwen, and iFlow: reuse the shared skill text as project instructions or agent rules
-- Full instructions: `docs/AGENT_GUIDANCE.md`
-
-<details>
-<summary><b>Claude Desktop</b></summary>
-
-macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-Linux: `~/.config/Claude/claude_desktop_config.json`
-
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "command": "npx",
-      "args": ["-y", "@leindex/mcp"]
-    }
-  }
-}
-```
-</details>
-
-### Dashboard (optional)
-
-```bash
-cd dashboard
-bun install
-bun run build
-leindex dashboard
-```
-
----
-
-## Memory Measurement and Profiling
-
-Plan 0 adds a lightweight memory measurement foundation so you can track LeIndex's RSS behavior without wiring up custom scripts.
-
-- `cargo xtask memcheck` builds the release binary when needed, runs the canonical `small_repo` workload, compares the results against committed baselines and budget ceilings, and exits non-zero on regressions.
-- The Linux CI workflow in `.github/workflows/memory-budget.yml` runs the same memcheck path and uploads the report artifact so baseline and budget enforcement stay consistent in automation.
-- `--memory-report PATH` and `LEINDEX_MEMORY_REPORT=PATH` opt into a compact shutdown JSON with peak RSS and phase summaries; they stay off by default for normal runs.
-- Build with `--features memprof` to enable the optional heap profiling surface for deeper memory investigations when the lightweight report is not enough.
-
----
-
-## CLI Reference
-
-```bash
-leindex index /path/to/project       # Index a project
-leindex search "query"                # Semantic search
-leindex analyze "query"               # Deep structural analysis
-leindex phase --all --path /path      # 5-phase additive analysis
-leindex diagnostics                   # System health check
-leindex mcp                           # MCP stdio mode
-leindex serve                         # HTTP/WebSocket server
-leindex dashboard                     # Launch dashboard UI
-```
-
----
-
-## Output Behavior
-
-LeIndex is designed for **token-efficient** operation when used with AI coding tools.
-
-### Clean Terminal Output
-
-- **Default log level: `WARN`** — Routine operational chatter (storage paths, cache hits, PDG node counts, indexing progress) is suppressed. Only warnings and errors are shown.
-- **Enable verbose diagnostics**: pass `--verbose` or set `RUST_LOG=debug` to see full DEBUG-level output for troubleshooting.
-
-This keeps the terminal clean and minimizes token usage when LeIndex runs as a subprocess (e.g., via MCP stdio).
-
-### Structured MCP Responses
-
-MCP responses are **framed and structured** — transport-level errors (connection drops, protocol issues) never leak into the JSON-RPC response stream. The `leindex mcp` stdio mode produces clean, parseable JSON-RPC responses suitable for LLM consumption.
-
-### Winit Event-Loop Coverage
-
-`leindex analyze` and `leindex context` expand on-demand even when symbol names differ from query terms. If an exact lookup fails, LeIndex performs a fuzzy scan of the project's PDG to discover event-loop-heavy entrypoints (e.g., `run_event_loop`, `EventLoop::run`, `main`) using case-insensitive substring matching with complexity-aware scoring. This ensures framework-heavy codebases remain discoverable without requiring exact symbol names.
-
----
-
-## Embedding Configuration
-
-LeIndex supports multiple embedding backends for semantic search:
-
-### Local ONNX Models (default)
-
-Build with the default features to use Qwen3 embeddings through ONNX Runtime.
-LeIndex keeps TF-IDF and neural vectors per PDG node, then combines semantic,
-lexical, and structural scores during retrieval. ONNX inference runs in a
-resident `leindex-embed` worker so short-lived CLI calls and MCP requests reuse
-the loaded model, GPU allocations, and compiled provider cache.
-
-```bash
-cargo build --release --features onnx
-./target/release/leindex setup          # select provider + install validated Qwen3 model
-```
-
-The `onnx` feature uses the `load-dynamic` ORT strategy: no ONNX Runtime is
-linked at build time, and the worker discovers the runtime shared library at
-startup via a discovery chain (`ORT_DYLIB_PATH` env, config, `~/.leindex/lib/`,
-sibling-to-binary, pip site-packages, system paths). See
-[docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md) for the full chain and
-troubleshooting.
-
-Local models provide:
-- Privacy (data never leaves your machine)
-- No API costs
-- Zero network latency
-- Provider-aware batching: dynamic up to 32 on CPU/CUDA, stable batches of 8 on MIGraphX
-- Default hybrid query enrichment: cold `auto` workers are started and awaited; TF-IDF/PDG remain the mandatory core result
-- Resident worker reuse while keeping ONNX memory outside the main process
-- Global content-addressed embedding cache (v2.0.0): cross-project dedup with 100% hit ratio on identical content
-
-The worker binary (`leindex-embed`) is built alongside the main binary and is
-discovered automatically. `leindex setup --neural --gpu amd` installs MIGraphX,
-`--gpu nvidia` installs CUDA, and `--cpu` installs standard ORT. The default
-v2.0.0 profile provisions CodeRankEmbed 137M INT8 (~135 MiB host RSS),
-selected through LeIndex fused-retrieval evaluation. Pass `--model qwen3` to
-provision the heavier Qwen3 FP16 baseline; see [`BENCHMARKS.md`](BENCHMARKS.md)
-Section 8 for the model bake-off. Model files are not packaged with LeIndex.
-
-### Fragment Index (sub-symbol semantic chunks)
-
-LeIndex ships an **opt-in fragment embedding layer** that improves both
-recall and precision on top of the node-level TF-IDF/PDG/neural stack:
-
-- **Tier 2 — sub-symbol fragments**: large nodes (functions, methods, blocks)
-  are split into semantic chunks with a tree-sitter chunker (ported from Warp's
-  `full_source_code_embedding`), so a conceptual query can hit the exact region
-  that answers it instead of only the whole symbol.
-- **Tier 3 — orphan coverage**: module-level regions no PDG node owns are
-  embedded too, so free-floating code, imports, and file docs stay discoverable.
-- **Content-hash store**: every fragment is addressed by a blake3 hash of its
-  exact embedded text. Incremental indexing re-embeds only changed content and
-  is fully idempotent — the same code always maps to the same fragments.
-- **All-local**: fragments are embedded with the same local Qwen3 ONNX worker.
-  No remote service is used unless you opt into a remote provider. Content
-  hashes, manifests, and embeddings never leave your machine.
-
-Enable it in `~/.leindex/config/leindex.toml`:
-
-```toml
-[search]
-# Master switch. Off by default; the node-level index stays authoritative.
-fragment_index_enabled = true
-# Fusion weight of the fragment score component (renormalized when enabled).
-fragment_weight = 0.35
-# Max bytes per fragment (~200 lines x 60 chars, mirroring Warp's default).
-fragment_max_bytes = 12000
-# Include Tier-3 module-level orphan regions.
-fragment_orphan_enabled = true
-# Naive 200-line chunking when a tree-sitter grammar is unavailable.
-fragment_naive_fallback = true
-```
-
-Fragment candidates fuse into hybrid retrieval as a renormalized score
-component and feed the existing local reranker. See
-[docs/plans/fragment-embeddings-1.11.0.md](docs/plans/fragment-embeddings-1.11.0.md)
-for the full architecture.
-
-### Remote Cloud Providers
-
-Build with the `remote-embeddings` feature to use cloud-based embedding services:
-
-```bash
-cargo build --release --features remote-embeddings
-```
-
-Supported providers:
-- **OpenAI** (`text-embedding-3-small`, `text-embedding-3-large`)
-- **Cohere** (`embed-english-v3.0`, `embed-multilingual-v3.0`)
-- **Custom** (any OpenAI-compatible endpoint)
-
-Configure via environment variables:
-
-```bash
-# OpenAI
-export OPENAI_API_KEY="your-key"
-# LeIndex will automatically use OpenAI embeddings
-
-# Cohere
-export COHERE_API_KEY="your-key"
-# LeIndex will automatically use Cohere embeddings
-
-# Custom provider
-export LEINDEX_EMBEDDING_PROVIDER="custom"
-export LEINDEX_EMBEDDING_API_KEY="your-key"
-export LEINDEX_EMBEDDING_BASE_URL="https://your-endpoint.com/v1"
-export LEINDEX_EMBEDDING_MODEL="your-model-name"
-```
-
-Remote embeddings offer:
-- Higher accuracy with state-of-the-art models
-- No local resource requirements
-- Automatic model updates
-- Multi-language support (Cohere)
-
-**Note**: Remote embeddings require network access and API keys from your provider.
-
-### TF-IDF Fallback
-
-If no embedding backend is configured (i.e. `leindex setup` has not been run),
-LeIndex falls back to TF-IDF for keyword-based search. This works offline with
-zero setup but lacks semantic understanding. A one-time notice points to
-`leindex setup` to enable neural search.
-
----
-
-## MCP Tools (20)
-
-| Tool | Purpose |
-|------|---------|
-| `LeIndex [Context]` | Expand context around a code node via PDG |
-| `LeIndex [Deep Analyze]` | Deep analysis: semantic + PDG traversal |
-| `LeIndex [Diagnostics]` | Index health and stats |
-| `LeIndex [Edit Apply]` | PRIMARY file editor (use instead of `edit_file`) |
-| `LeIndex [Edit Preview]` | Preview a code edit with impact report |
-| `LeIndex [File Summary]` | Structural file analysis |
-| `LeIndex [Git Status]` | Git status with PDG structural analysis |
-| `LeIndex [Grep Symbols]` | Structural symbol search |
-| `LeIndex [Impact Analysis]` | Blast radius analysis |
-| `LeIndex [Index]` | Index a project |
-| `LeIndex [Phase Analysis]` | 5-phase additive analysis |
-| `Phase Analysis` | Compatibility alias for `LeIndex [Phase Analysis]` (same handler, no-bracket title for legacy clients) |
-| `LeIndex [Project Map]` | Annotated project structure |
-| `LeIndex [Read File]` | PRIMARY file reader (replaces `Read`) |
-| `LeIndex [Read Symbol]` | PRIMARY symbol reader (replaces `Read` for symbols) |
-| `LeIndex [Rename Symbol]` | Rename across all references |
-| `LeIndex [Search]` | Semantic code search |
-| `LeIndex [Symbol Lookup]` | Symbol definition + callers/callees |
-| `LeIndex [Text Search]` | PRIMARY text search (replaces `Grep`/`rg`) |
-| `LeIndex [Write]` | Create or overwrite a file |
-
-MCP tool names returned by `tools/list` are the exact strings emitted
-by each handler (e.g. `leindex.index`, `leindex.search`,
-`leindex.edit-preview`, `leindex.write`). The naming is a **mix** of
-dotted and hyphenated forms — single-word tools use a dot
-(`leindex.context`, `leindex.index`, `leindex.search`, `leindex.write`,
-`leindex.diagnostics`), multi-word tools use hyphens
-(`leindex.edit-preview`, `leindex.edit-apply`, `leindex.read-file`,
-`leindex.symbol-lookup`, `leindex.phase-analysis`, etc.). Use these
-exact names when calling `tools/call` — dispatch in
-`handle_tool_call` is exact-equality on the handler name, so a
-hyphen-vs-dot mismatch (e.g. `leindex-search` vs `leindex.search`)
-returns `method-not-found`. The display form above (`LeIndex [...]`)
-is the human-readable title; it is not accepted on the wire. The
-underscore form (`leindex_edit_preview`) is only used by the CLI
-bridge (`leindex tools help`, `leindex tools run`).
-
-### Output formatting
-
-- **MCP payloads** are trimmed to the minimum needed for an LLM: short
-  snippets, capped counts, dropped internal byte ranges and verbose
-  fields. No ANSI color, no UI chrome.
-- **CLI output** is rendered for human reading: split-view color diffs
-  for `LeIndex [Edit Preview]`, `LeIndex [Edit Apply]`, and
-  `LeIndex [Rename Symbol]` (line numbers + `│` separator + paired
-  `+`/`-` markers); tree-style map for `LeIndex [Project Map]`;
-  structured tables for `LeIndex [Search]` and `LeIndex [Context]`.
-
----
-
-## Unified Module Layout
-
-LeIndex is now a single crate with feature-gated modules:
-
-| Module | Role |
-|-------|------|
-| `parse` | Language parsing and signature extraction |
-| `graph` | Graph construction and traversal |
-| `search` | Retrieval, scoring, vector search |
-| `storage` | SQLite persistence + storage |
-| `phase` | Additive phase analysis pipeline |
-| `cli` | CLI + MCP protocol handlers |
-| `global` | Cross-project discovery/registry |
-| `server` | HTTP/WebSocket API server |
-| `edit` | Edit preview/apply support |
-| `validation` | Validation and guardrails |
-
-Legacy crate-style aliases remain available from `leindex::leparse`, `leindex::legraphe`, and similar compatibility re-exports.
-
----
-
-## Security
-
-Database discovery (`LEINDEX_DISCOVERY_ROOTS`) is **opt-in only**. Sensitive directories (`.ssh`, `.aws`, `.gnupg`, etc.) are automatically excluded. All SQL operations use parameterized queries. See [ARCHITECTURE.md](ARCHITECTURE.md) for details.
-
----
-
-## Docs
-
-- [BENCHMARKS.md](BENCHMARKS.md) — v2.0.0 resource benchmarks (before/after storage, RAM, model bake-off, acceptance gates)
-- [ARCHITECTURE.md](ARCHITECTURE.md) — system design and internals
-- [API.md](API.md) — HTTP API reference
-- [docs/MCP.md](docs/MCP.md) — MCP server documentation
-- [docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md) — neural search setup and troubleshooting (CPU/GPU/AMD/NVIDIA)
-- [dashboard/README.md](dashboard/README.md) — dashboard setup
-
----
-
-## License
-
-MIT
