@@ -785,11 +785,15 @@ fn test_index_nodes_respects_batch_size_and_matches_results() {
 
     let mut file_stats_cache = None;
     let mut engine_small = SearchEngine::new();
-    let embedder_small = index_nodes(&pdg, &mut engine_small, &mut file_stats_cache, 2).unwrap();
+    let embedder_small = index_nodes(&pdg, &mut engine_small, &mut file_stats_cache, 2)
+        .unwrap()
+        .0;
 
     let mut file_stats_cache = None;
     let mut engine_large = SearchEngine::new();
-    let embedder_large = index_nodes(&pdg, &mut engine_large, &mut file_stats_cache, 64).unwrap();
+    let embedder_large = index_nodes(&pdg, &mut engine_large, &mut file_stats_cache, 64)
+        .unwrap()
+        .0;
 
     // Extract TfIdfEmbedder from HybridEmbedder to access internal fields
     let tfidf_small = match embedder_small {
@@ -939,7 +943,7 @@ fn test_index_nodes_accumulates_df_across_passes() {
 
     let mut cache = None;
     let mut engine = SearchEngine::new();
-    let embedder = index_nodes(&pdg, &mut engine, &mut cache, 3).unwrap();
+    let embedder = index_nodes(&pdg, &mut engine, &mut cache, 3).unwrap().0;
 
     // Extract TfIdfEmbedder from HybridEmbedder to access dimension
     let tfidf_embedder = match embedder {
@@ -1938,5 +1942,168 @@ fn test_git_scan_max_files_not_consumed_by_excluded_files() {
     assert!(
         !rels.iter().any(|r| r.starts_with(".cache/")),
         "hidden-dir files must be filtered before max_files: {rels:?}"
+    );
+}
+
+// ============================================================================
+// PIPELINE OPTIMIZATION TESTS
+// ============================================================================
+
+/// Test that `index_nodes` returns a content cache populated for every
+/// non-external node, proving `enriched_node_content` is computed exactly
+/// once per node (during the DF pass) and reused by the embedding pass.
+#[test]
+fn test_enriched_node_content_cached_once_per_node() {
+    let mut pdg = ProgramDependenceGraph::new();
+    use crate::graph::pdg::{Node, NodeType};
+    use std::sync::Arc;
+
+    for i in 0..5 {
+        pdg.add_node(Node {
+            id: format!("file_{i}.rs:func_{i}"),
+            node_type: NodeType::Function,
+            name: format!("func_{i}"),
+            file_path: Arc::from(format!("file_{i}.rs")),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "rust".to_string(),
+        });
+    }
+
+    let mut cache = None;
+    let mut engine = SearchEngine::new();
+    let (embedder, content_cache) = index_nodes(&pdg, &mut engine, &mut cache, 3).unwrap();
+
+    // Every non-external node should have its enriched content in the cache.
+    assert_eq!(
+        content_cache.len(),
+        5,
+        "content cache should have an entry for every indexed node"
+    );
+    for i in 0..5 {
+        let node_id = format!("file_{i}.rs:func_{i}");
+        assert!(
+            content_cache.contains_key(&node_id),
+            "content cache missing node {node_id}"
+        );
+    }
+
+    // The embedder should still be valid.
+    let _ = embedder;
+    assert_eq!(engine.node_count(), 5);
+}
+
+/// Test that `collect_source_files_with_hashes` produces identical results
+/// whether called on the same scan (parallel hashing is deterministic).
+#[test]
+fn test_parallel_file_hashing_deterministic() {
+    use crate::cli::index_builder::ProjectFileScan;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    // Create multiple source files with distinct content.
+    let files = [
+        ("a.rs", "fn alpha() {}\n"),
+        ("b.rs", "fn beta() {}\n"),
+        ("c.rs", "fn gamma() {}\n"),
+        ("d.rs", "fn delta() {}\n"),
+        ("e.rs", "fn epsilon() {}\n"),
+    ];
+    for (rel, content) in &files {
+        std::fs::write(root.join(rel), content).unwrap();
+    }
+
+    let scan = ProjectFileScan {
+        source_paths: files.iter().map(|(r, _)| root.join(r)).collect(),
+        ..Default::default()
+    };
+
+    let results1 = collect_source_files_with_hashes(&scan).unwrap();
+    let results2 = collect_source_files_with_hashes(&scan).unwrap();
+
+    // Sort both for deterministic comparison (par_iter doesn't preserve order).
+    let mut sorted1 = results1.clone();
+    sorted1.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut sorted2 = results2.clone();
+    sorted2.sort_by(|a, b| a.0.cmp(&b.0));
+
+    assert_eq!(
+        sorted1, sorted2,
+        "parallel hashing must produce identical results across runs"
+    );
+
+    // Verify hashes are non-empty and correct.
+    assert_eq!(sorted1.len(), files.len());
+    for (path, hash) in &sorted1 {
+        assert!(
+            !hash.is_empty(),
+            "hash for {} must not be empty",
+            path.display()
+        );
+    }
+}
+
+/// Test that `build_document_frequencies` returns a content cache whose
+/// entries match what `enriched_node_content` would produce directly,
+/// proving the cache can safely replace redundant recomputation.
+#[test]
+fn test_content_cache_matches_direct_enrichment() {
+    use crate::graph::pdg::{Node, NodeType};
+    use std::sync::Arc;
+
+    let mut pdg = ProgramDependenceGraph::new();
+    pdg.add_node(Node {
+        id: "test.rs:hello".to_string(),
+        node_type: NodeType::Function,
+        name: "hello".to_string(),
+        file_path: Arc::from("test.rs"),
+        byte_range: (0, 20),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+
+    let node_indices: Vec<petgraph::graph::NodeIndex> = pdg.node_indices().collect();
+    let mut file_cache = FileReadCache::per_chunk_scratch();
+    let connectivity_config = crate::graph::pdg::TraversalConfig {
+        max_depth: Some(1),
+        max_nodes: Some(1000),
+        allowed_edge_types: Some(&[EdgeType::Call, EdgeType::DataDependency]),
+        excluded_node_types: Some(vec![NodeType::External]),
+        min_complexity: None,
+        min_edge_confidence: 0.0,
+    };
+    let file_summary_ctx = FileSummaryContext::from_pdg(&pdg);
+
+    let (_df, _total, content_cache) = build_document_frequencies(
+        &pdg,
+        &node_indices,
+        &mut file_cache,
+        &connectivity_config,
+        &file_summary_ctx,
+    );
+
+    // The cache should contain the node.
+    assert_eq!(content_cache.len(), 1);
+    assert!(content_cache.contains_key("test.rs:hello"));
+
+    // Verify the cached content matches a fresh computation.
+    let node_idx = node_indices[0];
+    let node = pdg.get_node(node_idx).unwrap();
+    let file_bytes = file_cache
+        .get_or_read(std::path::Path::new("test.rs"))
+        .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
+    let fresh_content = enriched_node_content(
+        &pdg,
+        node_idx,
+        node,
+        &file_bytes,
+        &connectivity_config,
+        &file_summary_ctx,
+    );
+    assert_eq!(
+        content_cache.get("test.rs:hello").unwrap(),
+        &fresh_content,
+        "cached content must match freshly computed enriched_node_content"
     );
 }

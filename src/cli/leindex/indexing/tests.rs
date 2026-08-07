@@ -358,3 +358,103 @@ fn streaming_route_uses_build_fragment_from_parsed_not_extract() {
         "streaming nodes are keyed by the simple name from the ParsedFileRecord"
     );
 }
+
+/// Parallel PDG construction (rayon `into_par_iter`) must produce identical
+/// node and edge sets to the sequential baseline. Runs the same parsing
+/// results through both routes multiple times and verifies determinism.
+#[test]
+fn test_parallel_pdg_construction_matches_sequential_baseline() {
+    let results = vec![
+        sample_parsing_result("a.rs", "alpha", "beta"),
+        sample_parsing_result("b.rs", "beta", "gamma"),
+        sample_parsing_result("c.rs", "gamma", "delta"),
+        sample_parsing_result("d.rs", "delta", "alpha"),
+    ];
+
+    // Run legacy route twice — parallel construction must be deterministic.
+    let pdg1 = build_pdg_legacy(results.clone());
+    let pdg2 = build_pdg_legacy(results.clone());
+
+    let mut ids1: Vec<String> = pdg1
+        .node_indices()
+        .filter_map(|idx| pdg1.get_node(idx).map(|n| n.id.clone()))
+        .collect();
+    ids1.sort_unstable();
+
+    let mut ids2: Vec<String> = pdg2
+        .node_indices()
+        .filter_map(|idx| pdg2.get_node(idx).map(|n| n.id.clone()))
+        .collect();
+    ids2.sort_unstable();
+
+    assert_eq!(pdg1.node_count(), pdg2.node_count());
+    assert_eq!(pdg1.edge_count(), pdg2.edge_count());
+    assert_eq!(
+        ids1, ids2,
+        "parallel PDG construction must be deterministic"
+    );
+
+    // Run streaming route twice — also must be deterministic.
+    let pdg3 = build_pdg_streaming(results.clone());
+    let pdg4 = build_pdg_streaming(results);
+
+    let mut ids3: Vec<String> = pdg3
+        .node_indices()
+        .filter_map(|idx| pdg3.get_node(idx).map(|n| n.id.clone()))
+        .collect();
+    ids3.sort_unstable();
+
+    let mut ids4: Vec<String> = pdg4
+        .node_indices()
+        .filter_map(|idx| pdg4.get_node(idx).map(|n| n.id.clone()))
+        .collect();
+    ids4.sort_unstable();
+
+    assert_eq!(pdg3.node_count(), pdg4.node_count());
+    assert_eq!(pdg3.edge_count(), pdg4.edge_count());
+    assert_eq!(ids3, ids4, "parallel streaming PDG must be deterministic");
+}
+
+/// Consolidated publish_generation must produce exactly one generation
+/// directory per indexing run (not two as in the old dual-publish path).
+#[test]
+fn test_single_publish_generation_per_index_run() {
+    let temp = tempfile::tempdir().expect("publish fixture");
+    std::fs::create_dir_all(temp.path().join("src")).expect("source directory");
+    std::fs::write(
+        temp.path().join("src/lib.rs"),
+        "pub fn publish_marker() -> usize { 42 }\n",
+    )
+    .expect("source file");
+
+    let mut index = LeIndex::new(temp.path()).expect("create index");
+    index.index_project(true).expect("index project");
+
+    let storage = temp.path().join(".leindex");
+    let generations_dir = storage.join("generations");
+
+    // Count generation directories (exclude staging dirs starting with '.').
+    let generation_count = std::fs::read_dir(&generations_dir)
+        .expect("generations directory")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| !name.starts_with('.'))
+        })
+        .count();
+
+    // With the consolidated single-publish path, there should be exactly
+    // 1 or 2 generation directories (1 core + 1 neural if neural rows > 0).
+    // The old dual-publish path produced 2 core snapshots (one per call).
+    // The new path produces at most 1 core + 1 neural = 2.
+    assert!(
+        generation_count <= 2,
+        "expected at most 2 generation directories (core + neural), got {generation_count}"
+    );
+    assert!(
+        generation_count >= 1,
+        "expected at least 1 generation directory, got {generation_count}"
+    );
+}

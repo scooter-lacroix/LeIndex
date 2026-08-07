@@ -9,6 +9,7 @@ use crate::cli::index_job::{
 };
 use crate::cli::memory_cap::MemoryCapGuard;
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -78,6 +79,9 @@ pub(crate) struct IndexPipelineState {
     pub(crate) neural_rows: usize,
     pub(crate) neural_resume_loaded: bool,
     pub(crate) admitted_node_ids: HashSet<String>,
+    /// Cached enriched node content from the DF/indexing pass, reused by the
+    /// neural enrichment pass to avoid recomputing `enriched_node_content`.
+    pub(crate) enriched_content_cache: HashMap<String, String>,
     pub(crate) skip: bool,
 }
 
@@ -135,6 +139,7 @@ impl IndexPipelineState {
             neural_rows: 0,
             neural_resume_loaded: false,
             admitted_node_ids: HashSet::new(),
+            enriched_content_cache: HashMap::new(),
             skip: false,
         }
     }
@@ -804,7 +809,12 @@ impl LeIndex {
         let pdg = self.run_pdg(&job, &parsed)?;
         check_memory_cap(&mut cap_guard)?;
         let lexical = self.run_lexical(&job, &pdg)?;
+
+        // Publish the core (lexical-only) generation as a crash-recovery
+        // checkpoint.  If the process dies during neural, the resumed run
+        // can skip straight to the neural phase using this snapshot.
         let _core = self.publish_generation(&job, None)?;
+
         let neural = self.run_neural(&job, &lexical)?;
         let _enhanced = self.publish_generation(&job, Some(&neural))?;
 
@@ -1277,7 +1287,7 @@ impl LeIndex {
         &mut self,
         pdg: &crate::graph::pdg::ProgramDependenceGraph,
         resume_valid: bool,
-    ) -> Result<index_builder::HybridEmbedder> {
+    ) -> Result<(index_builder::HybridEmbedder, HashMap<String, String>)> {
         let batch_size = self.indexing_batch_size();
         let persisted = index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
             .ok()
@@ -1286,17 +1296,20 @@ impl LeIndex {
             return match self.load_from_mutable_storage() {
                 Ok(()) => {
                     self.search_engine.clear_neural_embeddings();
-                    self.embedder
-                        .as_ref()
-                        .map(|embedder| {
-                            index_builder::HybridEmbedder::tfidf_only(embedder.tfidf().clone())
-                        })
-                        .or_else(|| {
-                            persisted
-                                .clone()
-                                .map(index_builder::HybridEmbedder::tfidf_only)
-                        })
-                        .context("resumed lexical checkpoint has no TF-IDF embedder")
+                    Ok((
+                        self.embedder
+                            .as_ref()
+                            .map(|embedder| {
+                                index_builder::HybridEmbedder::tfidf_only(embedder.tfidf().clone())
+                            })
+                            .or_else(|| {
+                                persisted
+                                    .clone()
+                                    .map(index_builder::HybridEmbedder::tfidf_only)
+                            })
+                            .context("resumed lexical checkpoint has no TF-IDF embedder")?,
+                        HashMap::new(),
+                    ))
                 }
                 Err(error) => {
                     warn!(
@@ -1359,13 +1372,14 @@ impl LeIndex {
             .resumed_lexical
             .as_ref()
             .is_some_and(|checkpoint| checkpoint.pdg_hash == pdg_checkpoint.artifact_hash);
-        let embedder = self.build_lexical_embedder(&pdg, lexical_resume_valid)?;
+        let (embedder, content_cache) = self.build_lexical_embedder(&pdg, lexical_resume_valid)?;
         self.embedder = Some(embedder);
         if let Some(embedder) = &self.embedder {
             embedder.persist_to_storage(&self.project_path, &pdg)?;
         }
         let indexed_count = self.search_engine.node_count();
         state.admitted_node_ids = self.search_engine.live_node_ids().into_iter().collect();
+        state.enriched_content_cache = content_cache;
         self.mark_index_phase(
             super::IndexPhase::Lexical,
             super::ComponentStatus::Initializing,
@@ -1764,6 +1778,7 @@ impl LeIndex {
                     pdg,
                     neural_embedder,
                     &state.admitted_node_ids,
+                    &state.enriched_content_cache,
                 );
                 neural_rows = self.search_engine.update_neural_embeddings(rows);
             }
@@ -1807,7 +1822,10 @@ impl LeIndex {
             .pipeline
             .take()
             .context("publication started without pipeline state")?;
-        if neural.is_none() {
+
+        // Compute core health if it hasn't been set yet (consolidated single
+        // publish path — the intermediate lexical-only publish was removed).
+        if state.core_health.is_none() {
             self.update_last_indexed_timestamp()?;
             self.save_stats_to_storage()?;
             let generation = self.checkpoint_generation();
@@ -1868,13 +1886,18 @@ impl LeIndex {
                 last_failure_phase: None,
                 last_failure: None,
             };
-            let published = self.publish_generation_snapshot(generation, &health, false)?;
+            let core_published = self.publish_generation_snapshot(generation, &health, false)?;
             crate::cli::index_freshness::save_health(self.storage_path(), &health)?;
             state.core_health = Some(health);
-            injected_phase_failure("lexical")?;
-            self.pipeline = Some(state);
-            return Ok(published);
+
+            // If no neural checkpoint, return the core generation immediately.
+            if neural.is_none() {
+                injected_phase_failure("lexical")?;
+                self.pipeline = Some(state);
+                return Ok(core_published);
+            }
         }
+
         let core_health = state
             .core_health
             .clone()
@@ -2078,19 +2101,22 @@ fn build_pdg_legacy(
     parsing_results: Vec<crate::parse::parallel::ParsingResult>,
 ) -> crate::graph::pdg::ProgramDependenceGraph {
     let mut combined = crate::graph::pdg::ProgramDependenceGraph::new();
-    for result in parsing_results {
-        if !result.is_success() {
-            continue;
-        }
-        let file_path = result.file_path.display().to_string();
-        let language = result.language.as_deref().unwrap_or("unknown");
-        let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
-        let file_pdg = crate::graph::extract_pdg_from_signatures(
-            result.signatures,
-            source_bytes,
-            &file_path,
-            language,
-        );
+    let file_pdgs: Vec<_> = parsing_results
+        .into_par_iter()
+        .filter(|result| result.is_success())
+        .map(|result| {
+            let file_path = result.file_path.display().to_string();
+            let language = result.language.as_deref().unwrap_or("unknown");
+            let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
+            crate::graph::extract_pdg_from_signatures(
+                result.signatures,
+                source_bytes,
+                &file_path,
+                language,
+            )
+        })
+        .collect();
+    for file_pdg in file_pdgs {
         index_builder::merge_pdgs(&mut combined, file_pdg);
     }
     combined
@@ -2143,15 +2169,15 @@ fn to_streaming_fragment_record(
 fn build_pdg_streaming(
     parsing_results: Vec<crate::parse::parallel::ParsingResult>,
 ) -> crate::graph::pdg::ProgramDependenceGraph {
-    let mut fragments = Vec::with_capacity(parsing_results.len());
-    for result in parsing_results {
-        if !result.is_success() {
-            continue;
-        }
-        let parsed = to_streaming_fragment_record(&result);
-        let source = String::from_utf8_lossy(result.source_bytes.as_deref().unwrap_or(&[]));
-        fragments.push(streaming::pdg::build_fragment_from_parsed(&parsed, &source));
-    }
+    let fragments: Vec<_> = parsing_results
+        .into_par_iter()
+        .filter(|result| result.is_success())
+        .map(|result| {
+            let parsed = to_streaming_fragment_record(&result);
+            let source = String::from_utf8_lossy(result.source_bytes.as_deref().unwrap_or(&[]));
+            streaming::pdg::build_fragment_from_parsed(&parsed, &source)
+        })
+        .collect();
     let (segment, stats) = streaming::pdg::merge_fragments_to_segment(fragments);
     info!(
         "Streaming PDG merge: {} fragments, {} nodes, {} edges ({} cross-file resolved, {} unresolved)",
