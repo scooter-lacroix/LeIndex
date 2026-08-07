@@ -161,7 +161,7 @@ pub(crate) fn check_manifest_stale(
 ///    `package.json` / `pyproject.toml` at the project root)
 /// 5. Bounded-depth nested-manifest walkdir (`max_depth(5)`,
 ///    skipping dotfile dirs and SKIP_DIRS) — catches monorepo
-///    cases like `packages/api/package.json` where the new
+///    cases like `apps/api/package.json` where the new
 ///    manifest is not at the project root.
 pub(crate) fn is_stale_fast(
     ctx: &FreshnessContext<'_>,
@@ -520,15 +520,17 @@ mod tests {
 
     #[test]
     fn find_new_nested_manifest_detects_monorepo_package_json() {
-        // Regression: a new `packages/api/package.json` (a
-        // monorepo nested manifest) must be flagged as stale
-        // by the bounded walkdir. The previous root-only check
-        // missed this case entirely.
+        // Regression: a new `apps/api/package.json` (a monorepo
+        // nested manifest, e.g. an Nx/Turborepo `apps/` app) must
+        // be flagged as stale by the bounded walkdir. The previous
+        // root-only check missed this case entirely. Note `packages/`
+        // is excluded via SKIP_DIRS (packaging scaffolding), so this
+        // regression exercises a non-excluded nested monorepo dir.
         let (tmp, listed) = make_fixture();
         let root = tmp.path();
-        fs::create_dir_all(root.join("packages/api/src")).unwrap();
-        fs::write(root.join("packages/api/package.json"), "{}").unwrap();
-        fs::write(root.join("packages/api/src/main.rs"), "fn main() {}").unwrap();
+        fs::create_dir_all(root.join("apps/api/src")).unwrap();
+        fs::write(root.join("apps/api/package.json"), "{}").unwrap();
+        fs::write(root.join("apps/api/src/main.rs"), "fn main() {}").unwrap();
         assert!(
             find_new_nested_manifest(root, &listed),
             "monorepo package.json at depth 2 must be flagged"
@@ -583,6 +585,21 @@ mod tests {
         assert!(
             !find_new_nested_manifest(root, &listed),
             "target/Cargo.toml must be skipped"
+        );
+    }
+    #[test]
+    fn find_new_nested_manifest_skips_packages() {
+        // A new `packages/web/package.json` must NOT be flagged —
+        // `packages` is in SKIP_DIRS (npm/PyPI packaging scaffolding),
+        // so its manifests must never force a stale verdict, matching
+        // node_modules/node_modules behavior.
+        let (tmp, listed) = make_fixture();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("packages/web/src")).unwrap();
+        fs::write(root.join("packages/web/package.json"), "{}").unwrap();
+        assert!(
+            !find_new_nested_manifest(root, &listed),
+            "packages/package.json must be skipped"
         );
     }
 

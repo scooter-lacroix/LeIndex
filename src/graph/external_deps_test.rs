@@ -425,7 +425,9 @@ fn from_project_with_package_json() {
 #[test]
 fn from_project_discovers_nested_workspace_manifests() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let nested = dir.path().join("packages").join("web");
+    // Use `apps/` (a common monorepo layout, not in SKIP_DIRS) — `packages/`
+    // is excluded as packaging scaffolding via SKIP_DIRS.
+    let nested = dir.path().join("apps").join("web");
     std::fs::create_dir_all(&nested).expect("mkdir");
     std::fs::write(
         nested.join("package.json"),
@@ -436,6 +438,27 @@ fn from_project_discovers_nested_workspace_manifests() {
     let registry = ExternalDependencyRegistry::from_project(dir.path());
     assert!(registry.resolve("react").is_some());
     assert!(registry.resolve("zod").is_some());
+}
+
+#[test]
+fn from_project_excludes_packages_scaffolding() {
+    // `packages/` is npm/PyPI packaging scaffolding and therefore in
+    // SKIP_DIRS; manifests inside it must NOT be resolved (VAL-DIR-001
+    // parity for the external-deps walk).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let nested = dir.path().join("packages").join("web");
+    std::fs::create_dir_all(&nested).expect("mkdir");
+    std::fs::write(
+        nested.join("package.json"),
+        r#"{"dependencies":{"react":"^18.2.0"}}"#,
+    )
+    .expect("write");
+
+    let registry = ExternalDependencyRegistry::from_project(dir.path());
+    assert!(
+        registry.resolve("react").is_none(),
+        "manifests under packages/ must be excluded from external deps"
+    );
 }
 
 #[test]

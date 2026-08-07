@@ -1620,3 +1620,323 @@ fn test_fragment_layer_is_valid_rejects_stale_root() {
         &storage
     ));
 }
+
+// ============================================================================
+// DIRECTORY EXCLUSIONS (VAL-DIR-001..006): SKIP_DIRS + hidden-directory
+// filtering across both the git and non-git scan paths.
+// ============================================================================
+
+/// Write `files` (relative path -> contents) under `root`, then `git init` and
+/// force-track everything so every fixture file appears in `git ls-files`
+/// inventory regardless of any global ignore rules.
+fn git_scan_fixture(root: &std::path::Path, files: &[(&str, &str)]) {
+    for (rel, content) in files {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, content).unwrap();
+    }
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&["init", "-q"]);
+    run(&["add", "-f", "."]);
+}
+
+/// Render the relative (to `root`) source paths of a scan, for readable
+/// assertions.
+fn scan_relative_sources(scan: &ProjectFileScan, root: &std::path::Path) -> Vec<String> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    scan.source_paths
+        .iter()
+        .filter_map(|path| {
+            path.strip_prefix(&root)
+                .ok()
+                .map(|relative| relative.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+/// VAL-DIR-001: `SKIP_DIRS` contains `packages` so packaging scaffolding is
+/// excluded from every scan path that consults the shared list.
+#[test]
+fn test_skip_dirs_contains_packages() {
+    assert!(
+        SKIP_DIRS.contains(&"packages"),
+        "SKIP_DIRS must contain packages/"
+    );
+}
+
+/// The git-scan post-filter rejects any path whose descendant component is a
+/// hidden directory or a SKIP_DIRS entry, while never rejecting the project
+/// root itself or legitimate source directories.
+#[test]
+fn test_is_excluded_project_path_filters_skip_dirs_hidden_and_keeps_legit() {
+    let root = std::path::PathBuf::from("/proj");
+    // SKIP_DIRS entries (any depth).
+    assert!(is_excluded_project_path(
+        &root.join("packages/web/index.js"),
+        &root
+    ));
+    assert!(is_excluded_project_path(
+        &root.join("target/debug/app.rs"),
+        &root
+    ));
+    assert!(is_excluded_project_path(
+        &root.join("node_modules/pkg/lib.js"),
+        &root
+    ));
+    // Hidden directories (any depth).
+    assert!(is_excluded_project_path(
+        &root.join(".cache/snippet.rs"),
+        &root
+    ));
+    assert!(is_excluded_project_path(
+        &root.join(".github/workflows/ci.yml"),
+        &root
+    ));
+    assert!(is_excluded_project_path(
+        &root.join("src/.hidden/mod.rs"),
+        &root
+    ));
+    // The project root itself is NOT rejected (zero descendant components).
+    assert!(!is_excluded_project_path(&root, &root));
+    // Legitimate source directories are NOT excluded.
+    assert!(!is_excluded_project_path(&root.join("src/main.rs"), &root));
+    assert!(!is_excluded_project_path(&root.join("lib/utils.ts"), &root));
+    assert!(!is_excluded_project_path(&root.join("tests/mod.rs"), &root));
+    assert!(!is_excluded_project_path(
+        &root.join("benches/bench.rs"),
+        &root
+    ));
+    // A path with no components at all (the empty relative path) is kept.
+    assert!(!is_excluded_project_path(&root.join("README.md"), &root));
+}
+
+/// VAL-DIR-003: a git repo (no .gitignore) with tracked files under
+/// `target/`, `node_modules/`, and `packages/` must yield zero of those files
+/// while keeping legitimate source files.
+#[test]
+fn test_git_scan_excludes_skip_dirs_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let files = [
+        ("target/debug/app.rs", "fn main() {}\n"),
+        ("node_modules/pkg/lib.js", "const x = 1;\n"),
+        ("packages/web/lib.rs", "fn web() {}\n"),
+        ("packages/web/package.json", "{}\n"),
+        ("src/main.rs", "pub fn main() {}\n"),
+        ("lib/core.py", "def core():\n    pass\n"),
+    ];
+    git_scan_fixture(root, &files);
+
+    let scan = scan_git_project_files(root).unwrap();
+    let rels = scan_relative_sources(&scan, root);
+    for bad in [
+        "target/debug/app.rs",
+        "node_modules/pkg/lib.js",
+        "packages/web/lib.rs",
+    ] {
+        assert!(
+            !rels.iter().any(|r| r == bad),
+            "git scan must exclude {bad}, got: {rels:?}"
+        );
+    }
+    assert!(
+        rels.iter().any(|r| r == "src/main.rs"),
+        "src/main.rs must remain in git scan results: {rels:?}"
+    );
+    assert!(
+        rels.iter().any(|r| r == "lib/core.py"),
+        "lib/core.py must remain in git scan results: {rels:?}"
+    );
+    // Manifests under excluded dirs must not be collected either.
+    assert!(
+        !scan
+            .manifest_paths
+            .iter()
+            .any(|p| p.ends_with("packages/web/package.json")),
+        "manifests under SKIP_DIRS must not be collected"
+    );
+}
+
+/// VAL-DIR-002: a git repo with a tracked file under a hidden directory
+/// (`.cache/`) must exclude that file while keeping legitimate source files.
+#[test]
+fn test_git_scan_excludes_hidden_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let files = [
+        (".cache/snippet.rs", "fn cached() {}\n"),
+        (".tmp/scratch.rs", "fn scratch() {}\n"),
+        ("src/main.rs", "pub fn main() {}\n"),
+    ];
+    git_scan_fixture(root, &files);
+
+    let scan = scan_git_project_files(root).unwrap();
+    let rels = scan_relative_sources(&scan, root);
+    assert!(
+        !rels.iter().any(|r| r == ".cache/snippet.rs"),
+        "tracked file under .cache/ must be excluded: {rels:?}"
+    );
+    assert!(
+        !rels.iter().any(|r| r == ".tmp/scratch.rs"),
+        "tracked file under .tmp/ must be excluded: {rels:?}"
+    );
+    assert!(
+        rels.iter().any(|r| r == "src/main.rs"),
+        "src/main.rs must remain in git scan results: {rels:?}"
+    );
+}
+
+/// VAL-DIR-004: the non-git walker must keep excluding hidden directories and
+/// every SKIP_DIRS entry, including the newly added `packages`.
+#[test]
+fn test_non_git_scan_excludes_skip_dirs_and_hidden() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let files = [
+        (".cache/snippet.rs", "fn cached() {}\n"),
+        ("target/debug/app.rs", "fn main() {}\n"),
+        ("packages/web/lib.rs", "fn web() {}\n"),
+        ("node_modules/pkg/lib.js", "const x = 1;\n"),
+        ("src/main.rs", "pub fn main() {}\n"),
+        ("lib/core.py", "def core():\n    pass\n"),
+    ];
+    for (rel, content) in &files {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+    }
+
+    let scan = scan_non_git_project_files(root).unwrap();
+    let rels = scan_relative_sources(&scan, root);
+    for bad in [
+        ".cache/snippet.rs",
+        "target/debug/app.rs",
+        "packages/web/lib.rs",
+        "node_modules/pkg/lib.js",
+    ] {
+        assert!(
+            !rels.iter().any(|r| r == bad),
+            "non-git scan must exclude {bad}, got: {rels:?}"
+        );
+    }
+    assert!(
+        rels.iter().any(|r| r == "src/main.rs"),
+        "src/main.rs must remain in non-git scan results: {rels:?}"
+    );
+    assert!(
+        rels.iter().any(|r| r == "lib/core.py"),
+        "lib/core.py must remain in non-git scan results: {rels:?}"
+    );
+}
+
+/// VAL-DIR-005: standard source directories (`src/`, `lib/`, `tests/`,
+/// `benches/`, `docs/`, `examples/`) must NOT be excluded by either scan path.
+#[test]
+fn test_scan_keeps_legitimate_source_dirs() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let files = [
+        ("src/main.rs", "pub fn main() {}\n"),
+        ("lib/core.rs", "pub fn core() {}\n"),
+        ("tests/integration.rs", "fn test_it() {}\n"),
+        ("benches/perf.rs", "fn bench() {}\n"),
+        ("docs/api.rs", "pub fn docs() {}\n"),
+        ("examples/demo.rs", "fn demo() {}\n"),
+    ];
+    for (rel, content) in &files {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+    }
+
+    // Non-git scan.
+    let scan = scan_non_git_project_files(root).unwrap();
+    let rels = scan_relative_sources(&scan, root);
+    for (rel, _) in &files {
+        assert!(
+            rels.iter().any(|r| r == rel),
+            "non-git scan missing {rel}: {rels:?}"
+        );
+    }
+
+    // Git scan.
+    git_scan_fixture(root, &files);
+    let scan = scan_git_project_files(root).unwrap();
+    let rels = scan_relative_sources(&scan, root);
+    for (rel, _) in &files {
+        assert!(
+            rels.iter().any(|r| r == rel),
+            "git scan missing {rel}: {rels:?}"
+        );
+    }
+}
+
+/// VAL-DIR-006: the git-scan post-filter runs before the max_files limit, so
+/// excluded files do not consume the budget. With `max_files=5`, 10 files in
+/// a hidden dir (sorted before `src/`) and 3 in `src/`, all 3 `src/` files
+/// must be indexed.
+#[test]
+fn test_git_scan_max_files_not_consumed_by_excluded_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let mut files: Vec<(String, String)> = Vec::new();
+    for i in 0..10 {
+        files.push((
+            format!(".cache/build_{i}.rs"),
+            "fn cached() {}\n".to_string(),
+        ));
+    }
+    for i in 0..3 {
+        files.push((format!("src/main_{i}.rs"), "pub fn main() {}\n".to_string()));
+    }
+    for (rel, content) in &files {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+    }
+
+    // Strict 5-file budget, applied via the project config file so the scan
+    // path under test picks it up.
+    let mut config = crate::cli::config::ProjectConfig::default();
+    config.indexing.max_files = 5;
+    config.save(root).unwrap();
+
+    git_scan_fixture(
+        root,
+        &files
+            .iter()
+            .map(|(r, c)| (r.as_str(), c.as_str()))
+            .collect::<Vec<_>>(),
+    );
+
+    let scan = scan_git_project_files(root).unwrap();
+    let rels = scan_relative_sources(&scan, root);
+    for i in 0..3 {
+        assert!(
+            rels.iter().any(|r| *r == format!("src/main_{i}.rs")),
+            "src/main_{i}.rs must be indexed under max_files=5, got: {rels:?}"
+        );
+    }
+    assert_eq!(
+        rels.iter().filter(|r| r.ends_with(".rs")).count(),
+        3,
+        "excluded files must not consume the max_files budget: {rels:?}"
+    );
+    assert!(
+        !rels.iter().any(|r| r.starts_with(".cache/")),
+        "hidden-dir files must be filtered before max_files: {rels:?}"
+    );
+}

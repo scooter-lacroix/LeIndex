@@ -488,15 +488,48 @@ pub(crate) fn scan_project_files(project_path: &Path) -> Result<ProjectFileScan>
     scan_non_git_project_files(project_path)
 }
 
+/// Returns `true` when `path` is reachable only through a hidden directory
+/// (any relative component whose name starts with `.`) or a `SKIP_DIRS`
+/// entry. The project root itself is never rejected — only descendant
+/// components are inspected (a path equal to `root` has zero components).
+///
+/// Mirrors the exclusion behavior of the non-git walker so both scan paths
+/// produce identical results: the non-git scan prunes its walk on dot-prefixed
+/// names and on `SKIP_DIRS`; this filters the same rule set out of the git
+/// inventory output.
+fn is_excluded_project_path(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root).ok().is_some_and(|relative| {
+        relative.components().any(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|name| name.starts_with('.') || SKIP_DIRS.contains(&name))
+        })
+    })
+}
+
 fn scan_git_project_files(project_path: &Path) -> Result<ProjectFileScan> {
     let project_config = crate::cli::config::ProjectConfig::load(project_path).unwrap_or_default();
     let limits = &project_config.indexing;
     let inventory = crate::cli::git::source_inventory(project_path)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    // The inventory paths are joined to the canonicalized project root, so
+    // resolve it once here for the post-filter below (avoids a per-file
+    // canonicalize syscall).
+    let root = project_path
+        .canonicalize()
+        .unwrap_or_else(|_| project_path.to_path_buf());
     let mut source_paths = Vec::new();
     let mut manifest_paths = Vec::new();
     let mut total_source_size = 0u64;
     for path in inventory {
+        // Post-filter the git inventory: any path whose relative components
+        // cross a hidden directory (name starts with `.`) or a SKIP_DIRS entry
+        // is rejected. This runs BEFORE the manifest, extension, size, and
+        // max_files checks so excluded files never consume any scan limits.
+        if is_excluded_project_path(&path, &root) {
+            continue;
+        }
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
