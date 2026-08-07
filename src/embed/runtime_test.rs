@@ -706,3 +706,168 @@ fn test_idle_timeout_causes_exit() {
     let result = rt.run_loop(reader, writer);
     assert!(result.is_ok());
 }
+
+// ── VAL-ONNX embed batch loop ─────────────────────────────────────────
+// These tests exercise `run_onnx_embed_batch_loop` directly with a mocked
+// sub-batch runner (injecting a deterministic pooled vector per row) so the
+// provider batching/trimming logic is verified without needing a real ONNX
+// model. They cover the CRITICAL missing-else-branch bug (VAL-ONNX-001),
+// fixed-batch full sub-batches (VAL-ONNX-002), padding+trim for fixed-batch
+// partial sub-batches (VAL-ONNX-003), and the EmbedResponse count/dimension
+// invariant across providers and counts (VAL-ONNX-005, VAL-ONNX-006).
+
+#[cfg(feature = "onnx")]
+fn test_encoding(marker: u64) -> tokenizers::Encoding {
+    use std::collections::HashMap;
+    tokenizers::Encoding::new(
+        vec![marker as u32, (marker + 1) as u32],
+        vec![0, 0],
+        vec![marker.to_string(), (marker + 1).to_string()],
+        vec![None, None],
+        vec![(0, 1), (1, 2)],
+        vec![0, 0],
+        vec![1, 1],
+        vec![],
+        HashMap::new(),
+    )
+}
+
+#[cfg(feature = "onnx")]
+fn embed_encodings(n: usize) -> Vec<tokenizers::Encoding> {
+    (0..n).map(|i| test_encoding(i as u64)).collect()
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_embed_batch_cpu_all_sub_batches_processed() {
+    // VAL-ONNX-001: CPU/CUDA (fixed_batch == false) must process EVERY
+    // sub-batch, not silently skip them (the historical missing-else-branch
+    // bug). For N > inference_batch_size the loop should call the runner for
+    // each chunk and concatenate all rows.
+    let rt = WorkerRuntime::new(no_compile_config());
+    let encodings = embed_encodings(17);
+    let batch_size = 8usize;
+    let dim = 4usize;
+
+    let mut batches: Vec<usize> = Vec::new();
+    let all_pooled = rt
+        .run_onnx_embed_batch_loop(&encodings, batch_size, false, dim, |sub, dim| {
+            batches.push(sub.len());
+            let mut out = Vec::with_capacity(sub.len() * dim);
+            for (i, _) in sub.iter().enumerate() {
+                out.extend(std::iter::repeat_n(i as f32, dim));
+            }
+            Ok(out)
+        })
+        .unwrap();
+
+    // 17 encodings chunked by 8 => [8, 8, 1]; all sub-batches ran.
+    assert_eq!(batches, vec![8, 8, 1]);
+    assert_eq!(all_pooled.len(), 17 * dim);
+    assert_ne!(all_pooled.len(), 0, "CPU/CUDA embed must not be empty");
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_embed_batch_migraphx_full_sub_batches_no_padding() {
+    // VAL-ONNX-002: fixed-batch provider with an exact multiple of the batch
+    // size runs each full sub-batch unchanged — no padding is applied.
+    let rt = WorkerRuntime::new(no_compile_config());
+    let batch_size = 8usize;
+    let dim = 4usize;
+    let encodings = embed_encodings(16); // 2 full sub-batches of 8
+
+    let mut batches: Vec<usize> = Vec::new();
+    let all_pooled = rt
+        .run_onnx_embed_batch_loop(&encodings, batch_size, true, dim, |sub, dim| {
+            batches.push(sub.len());
+            Ok(vec![1.0f32; sub.len() * dim])
+        })
+        .unwrap();
+
+    assert_eq!(batches, vec![8, 8]);
+    assert_eq!(batches.len(), 2);
+    assert_eq!(all_pooled.len(), 16 * dim);
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_embed_batch_migraphx_partial_sub_batch_padded_and_trimmed() {
+    // VAL-ONNX-003: fixed-batch provider with a non-multiple input must pad
+    // the final partial sub-batch up to inference_batch_size before running,
+    // then TRIM the results back to the real row count. The mocked runner
+    // emits row-index-tagged rows, so we can prove the padding rows were cut.
+    let rt = WorkerRuntime::new(no_compile_config());
+    let batch_size = 8usize;
+    let dim = 4usize;
+    let encodings = embed_encodings(10); // 8 + 2 partial
+
+    let mut batches: Vec<usize> = Vec::new();
+    let all_pooled = rt
+        .run_onnx_embed_batch_loop(&encodings, batch_size, true, dim, |sub, dim| {
+            batches.push(sub.len());
+            // Rows tagged with their 0-based index within the passed sub-batch.
+            let mut out = Vec::with_capacity(sub.len() * dim);
+            for (i, _) in sub.iter().enumerate() {
+                out.extend(std::iter::repeat_n(i as f32, dim));
+            }
+            Ok(out)
+        })
+        .unwrap();
+
+    // The runner is called with an 8-sized padded batch for the 2-row tail.
+    assert_eq!(batches, vec![8, 8]);
+    // 10 real rows remain after trimming the padded (2-row) sub-batch.
+    assert_eq!(all_pooled.len(), 10 * dim);
+    // The trimmed tail rows must be the first 2 rows (indices 0 and 1) of the
+    // padded output, whose tags are 0.0 and 1.0 — not the padding rows 2..7.
+    let tail = &all_pooled[all_pooled.len() - dim..];
+    assert_eq!(
+        tail, &[1.0f32; 4],
+        "last row must be the real row 1, not padding"
+    );
+    // And the very last element equals real-row tag 1.0 (padding would be 7.0).
+    assert_eq!(*all_pooled.last().unwrap(), 1.0);
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_embed_response_invariant_all_providers() {
+    // VAL-ONNX-005/006: For every (provider, input_count) combination the
+    // batch loop must produce flattened vectors of length count*dimension,
+    // which EmbedResponse::new (debug_assert_eq!) accepts without panicking.
+    let rt = WorkerRuntime::new(no_compile_config());
+    let batch_size = 8usize;
+    let dim = 4usize;
+    let providers: &[(&str, bool)] = &[("cpu", false), ("migraphx", true)];
+    let counts: &[usize] = &[1, 3, 8, 9, 16, 17];
+
+    for (provider, fixed_batch) in providers {
+        for &count in counts {
+            let encodings = embed_encodings(count);
+            let mut batches: Vec<usize> = Vec::new();
+            let all_pooled = rt
+                .run_onnx_embed_batch_loop(&encodings, batch_size, *fixed_batch, dim, |sub, dim| {
+                    batches.push(sub.len());
+                    Ok(vec![0.5f32; sub.len() * dim])
+                })
+                .unwrap();
+            assert_eq!(
+                all_pooled.len(),
+                count * dim,
+                "{provider} count={count}: vectors.len() != count*dimension"
+            );
+            // Constructing EmbedResponse::new runs its debug_assert_eq!; if
+            // vectors.len() != count*dim it panics, flagging the regression.
+            let response = EmbedResponse::new(all_pooled.clone(), count, dim);
+            assert_eq!(response.vectors.len(), count * dim);
+            assert_eq!(response.count, count);
+            assert_eq!(response.dimension, dim);
+            assert_eq!(
+                response.vectors.len(),
+                response.count * response.dimension,
+                "EmbedResponse invariant broken for {provider} count={count}"
+            );
+        }
+    }
+}

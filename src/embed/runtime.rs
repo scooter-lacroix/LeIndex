@@ -1588,13 +1588,50 @@ impl WorkerRuntime {
         // Process encodings in sub-batches to bound peak memory.
         // Batch size is env-tunable once the selected model is validated for
         // dynamic batch; the default is safe for fixed-batch artifacts.
-        let mut all_pooled: Vec<f32> = Vec::with_capacity(encodings.len() * expected_dim);
-
         let active_provider = &self.provider_runtime_status.execution_provider;
         let inference_batch_size =
             configured_onnx_inference_batch_size(&self.config.model_name, active_provider);
         let fixed_batch = active_provider.eq_ignore_ascii_case("migraphx")
             || active_provider.eq_ignore_ascii_case("rocm");
+
+        let all_pooled = self.run_onnx_embed_batch_loop(
+            &encodings,
+            inference_batch_size,
+            fixed_batch,
+            expected_dim,
+            |sub_batch, dim| self.run_onnx_embed_sub_batch(session, sub_batch, dim),
+        )?;
+
+        let total_count = encodings.len();
+        Ok(EmbedResponse::new(all_pooled, total_count, expected_dim))
+    }
+
+    /// Drive the embed batch loop: chunk `encodings` into `inference_batch_size`
+    /// sub-batches and concatenate the flattened pooled rows.
+    ///
+    /// For fixed-batch providers (MIGraphX/ROCm), a final partial sub-batch is
+    /// padded up to `inference_batch_size` (using the first encoding as a
+    /// template) before inference and then trimmed back to the real sub-batch
+    /// count — mirroring the rerank path. For dynamic-batch providers
+    /// (CPU/CUDA), every sub-batch is forwarded unchanged and appended.
+    ///
+    /// The `run_sub_batch` closure performs inference for one sub-batch and
+    /// returns the flattened row-major pooled vectors; it receives the final
+    /// `expected_dim` so padding-aware callers can size their output.
+    #[cfg(feature = "onnx")]
+    fn run_onnx_embed_batch_loop<F>(
+        &self,
+        encodings: &[tokenizers::Encoding],
+        inference_batch_size: usize,
+        fixed_batch: bool,
+        expected_dim: usize,
+        mut run_sub_batch: F,
+    ) -> Result<Vec<f32>, WorkerError>
+    where
+        F: FnMut(&[tokenizers::Encoding], usize) -> Result<Vec<f32>, WorkerError>,
+    {
+        let mut all_pooled: Vec<f32> = Vec::with_capacity(encodings.len() * expected_dim);
+
         for sub_batch in encodings.chunks(inference_batch_size) {
             // WS10 Task 5 / VAL-CACHE-009: check the per-batch cancel flag
             // BETWEEN sub-batches. If cancelled, return an error immediately
@@ -1610,16 +1647,29 @@ impl WorkerRuntime {
                     message: "batch cancelled between sub-batches".to_string(),
                 });
             }
+
             // Keep the worker alive across a large multi-batch codebase.
             self.touch();
+
             if fixed_batch && sub_batch.len() < inference_batch_size {
-                let sub_pooled = self.run_onnx_embed_sub_batch(session, sub_batch, expected_dim)?;
+                // Fixed-batch providers (MIGraphX/ROCm) require a fixed input
+                // batch shape, so pad this final partial sub-batch up to
+                // inference_batch_size (using the first encoding as a template)
+                // before running inference, then trim the results back to the
+                // real sub-batch count. Mirrors the rerank path.
+                let mut padded = sub_batch.to_vec();
+                if let Some(template) = sub_batch.first() {
+                    padded.resize(inference_batch_size, template.clone());
+                }
+                let sub_pooled = run_sub_batch(&padded, expected_dim)?;
+                all_pooled.extend_from_slice(&sub_pooled[..sub_batch.len() * expected_dim]);
+            } else {
+                let sub_pooled = run_sub_batch(sub_batch, expected_dim)?;
                 all_pooled.extend_from_slice(&sub_pooled);
             }
         }
 
-        let total_count = encodings.len();
-        Ok(EmbedResponse::new(all_pooled, total_count, expected_dim))
+        Ok(all_pooled)
     }
 
     /// Run ONNX inference on a single sub-batch of encodings and return
