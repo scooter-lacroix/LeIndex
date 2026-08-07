@@ -24,8 +24,21 @@ Before completing any task, run the full validation suite:
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo test --workspace --exclude memcheck
 ```
+
+Validation uses a two-tier test approach:
+
+- **Standard gate (fast):** `cargo test --workspace --exclude memcheck` runs all unit
+  and integration tests except the `memcheck` harness crate. This is the default
+  validation command that must pass on every task commit and for routine scrutiny.
+- **memcheck acceptance gate (slow):** `cargo test -p memcheck -- --test-threads=1`
+  runs the memcheck integration suite (13 tests). It spawns the full 21-phase
+  canonical workload per test, requires the release binary
+  (`target/release/leindex`), and is serialized via a shared lock
+  (`--test-threads=1`). Run this separately with a longer timeout when the
+  memcheck acceptance gate is required. It skips gracefully when the release
+  binary is absent.
 
 Zero warnings. Zero errors. No exceptions for "pre-existing" issues.
 
