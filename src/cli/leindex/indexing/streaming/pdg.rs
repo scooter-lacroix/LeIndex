@@ -9,6 +9,11 @@ use std::collections::HashMap;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::graph::pdg::ProgramDependenceGraph;
+use crate::graph::pdg::{
+    Edge as PDGEdge, EdgeType as PDGEdgeType, Node as PDGNode, NodeType as PDGNodeType,
+};
+
 /// A compact node record for CAS staging. Uses stable IDs and interned string
 /// indices (no heap-heavy per-node allocations).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,10 +43,24 @@ pub struct PdgEdgeRecord {
     pub source: String,
     /// Target node ID.
     pub target: String,
-    /// Edge type ("call", "data", "inheritance", etc.).
+    /// Edge type ("call", "data_dependency", "inheritance", etc.).
     pub edge_type: String,
-    /// Confidence score (0-100 as integer to avoid f32 serialization issues).
-    pub confidence: u8,
+    /// Confidence score (0-100 as integer to avoid f32 serialization issues);
+    /// `None` when the edge carries no confidence.
+    #[serde(default)]
+    pub confidence: Option<u8>,
+    /// Call count for call edges.
+    #[serde(default)]
+    pub call_count: Option<usize>,
+    /// Variable name for data-flow edges.
+    #[serde(default)]
+    pub variable_name: Option<String>,
+    /// Flow channel (`argument`, `env`, `stdin`, etc.).
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Argument ordinal for call/data-flow edges.
+    #[serde(default)]
+    pub position: Option<usize>,
 }
 
 /// A per-file PDG fragment: the nodes and edges extracted from one file
@@ -190,6 +209,192 @@ pub fn merge_fragments_to_segment(fragments: Vec<PdgFragment>) -> (PdgSegment, P
     (segment, stats)
 }
 
+/// Map a PDG `NodeType` to its canonical string id.
+pub fn node_type_to_str(node_type: &PDGNodeType) -> &'static str {
+    match node_type {
+        PDGNodeType::Function => "function",
+        PDGNodeType::Class => "class",
+        PDGNodeType::Method => "method",
+        PDGNodeType::Variable => "variable",
+        PDGNodeType::Module => "module",
+        PDGNodeType::External => "external",
+        PDGNodeType::FileSummary => "file_summary",
+    }
+}
+
+/// Parse a canonical `NodeType` string id back into a `PDGNodeType`.
+pub fn node_type_from_str(s: &str) -> Option<PDGNodeType> {
+    Some(match s {
+        "function" => PDGNodeType::Function,
+        "class" => PDGNodeType::Class,
+        "method" => PDGNodeType::Method,
+        "variable" => PDGNodeType::Variable,
+        "module" => PDGNodeType::Module,
+        "external" => PDGNodeType::External,
+        "file_summary" => PDGNodeType::FileSummary,
+        _ => return None,
+    })
+}
+
+/// Map a `PDGEdgeType` to its canonical string id.
+pub fn edge_type_to_str(edge_type: &PDGEdgeType) -> &'static str {
+    match edge_type {
+        PDGEdgeType::Call => "call",
+        PDGEdgeType::DataDependency => "data_dependency",
+        PDGEdgeType::Inheritance => "inheritance",
+        PDGEdgeType::Import => "import",
+        PDGEdgeType::Containment => "containment",
+        PDGEdgeType::StateTransition => "state_transition",
+        PDGEdgeType::CommandArgument => "command_argument",
+        PDGEdgeType::Environment => "environment",
+        PDGEdgeType::Stdin => "stdin",
+    }
+}
+
+/// Parse a canonical `EdgeType` string id back into a `PDGEdgeType`.
+pub fn edge_type_from_str(s: &str) -> Option<PDGEdgeType> {
+    Some(match s {
+        "call" => PDGEdgeType::Call,
+        "data_dependency" => PDGEdgeType::DataDependency,
+        "inheritance" => PDGEdgeType::Inheritance,
+        "import" => PDGEdgeType::Import,
+        "containment" => PDGEdgeType::Containment,
+        "state_transition" => PDGEdgeType::StateTransition,
+        "command_argument" => PDGEdgeType::CommandArgument,
+        "environment" => PDGEdgeType::Environment,
+        "stdin" => PDGEdgeType::Stdin,
+        _ => return None,
+    })
+}
+
+/// Lossless conversion of a `PDGNode` into a compact `PdgNodeRecord`.
+///
+/// Every `Node` field (`id`, `name`, `file_path`, `byte_range`, `complexity`,
+/// `language`, `node_type`) maps onto `PdgNodeRecord`, so no information is
+/// dropped when a graph is routed through the streaming fragment/segment path.
+fn node_record(node: &PDGNode) -> PdgNodeRecord {
+    PdgNodeRecord {
+        id: node.id.clone(),
+        node_type: node_type_to_str(&node.node_type).to_string(),
+        name: node.name.clone(),
+        file_path: node.file_path.to_string(),
+        byte_start: node.byte_range.0,
+        byte_end: node.byte_range.1,
+        complexity: node.complexity,
+        language: node.language.clone(),
+    }
+}
+
+/// Convert a `PDGEdge` into a compact `PdgEdgeRecord`, preserving all
+/// `EdgeMetadata` (confidence quantized to 0-100, matching the existing
+/// compact-edge contract).
+fn edge_record(edge: &PDGEdge) -> PdgEdgeRecord {
+    PdgEdgeRecord {
+        source: String::new(), // filled in by the caller with resolved node ids
+        target: String::new(),
+        edge_type: edge_type_to_str(&edge.edge_type).to_string(),
+        confidence: edge
+            .metadata
+            .confidence
+            .map(|c| (c.clamp(0.0, 1.0) * 100.0).round() as u8),
+        call_count: edge.metadata.call_count,
+        variable_name: edge.metadata.variable_name.clone(),
+        channel: edge.metadata.channel.clone(),
+        position: edge.metadata.position,
+    }
+}
+
+/// Reconstruct a `PDGEdge` (with full `EdgeMetadata`) from a compact record.
+fn edge_from_record(record: &PdgEdgeRecord) -> Result<PDGEdge> {
+    let edge_type = edge_type_from_str(&record.edge_type)
+        .ok_or_else(|| anyhow::anyhow!("unknown edge type '{}'", record.edge_type))?;
+    Ok(PDGEdge {
+        edge_type,
+        metadata: crate::graph::pdg::EdgeMetadata {
+            call_count: record.call_count,
+            variable_name: record.variable_name.clone(),
+            confidence: record.confidence.map(|c| c as f32 / 100.0),
+            channel: record.channel.clone(),
+            position: record.position,
+        },
+    })
+}
+
+/// Materialize a per-file `PdgFragment` from an already-extracted per-file
+/// `ProgramDependenceGraph` (see `crate::graph::extraction`).
+///
+/// This is the production realization of `build_fragment_from_parsed`: it
+/// delegates node/edge extraction to the real extraction pipeline, then emits
+/// compact records. All edges within this file's graph are emitted as
+/// `intra_edges` (a per-file extracted PDG only contains its own nodes, so
+/// everything is intra-file at this point). No whole-graph clone occurs.
+pub fn fragment_from_pdg(pdg: &ProgramDependenceGraph) -> PdgFragment {
+    let mut nodes = Vec::with_capacity(pdg.node_count());
+    for idx in pdg.node_indices() {
+        // `node_indices()` only yields live nodes; `get_node` cannot be None here.
+        if let Some(node) = pdg.get_node(idx) {
+            nodes.push(node_record(node));
+        }
+    }
+
+    let mut intra_edges = Vec::with_capacity(pdg.edge_count());
+    for eidx in pdg.edge_indices() {
+        if let (Some(edge), Some((source, target))) = (pdg.get_edge(eidx), pdg.edge_endpoints(eidx))
+        {
+            if let (Some(sn), Some(tn)) = (pdg.get_node(source), pdg.get_node(target)) {
+                let mut rec = edge_record(edge);
+                rec.source = sn.id.clone();
+                rec.target = tn.id.clone();
+                intra_edges.push(rec);
+            }
+        }
+    }
+
+    PdgFragment {
+        nodes,
+        intra_edges,
+        cross_file_refs: Vec::new(),
+    }
+}
+
+/// Materialize a `ProgramDependenceGraph` from a merged `PdgSegment`.
+///
+/// This is the inverse of `fragment_from_pdg`/`merge_fragments_to_segment`:
+/// all node and edge records (with their full metadata) are reconstructed
+/// into a live graph, rebuilding every index via `add_node`/`add_edge`.
+pub fn pdg_from_segment(segment: &PdgSegment) -> ProgramDependenceGraph {
+    let mut pdg = ProgramDependenceGraph::new();
+    let mut node_ids: HashMap<String, petgraph::stable_graph::NodeIndex> =
+        HashMap::with_capacity(segment.nodes.len());
+
+    for record in &segment.nodes {
+        let node_type = node_type_from_str(&record.node_type).unwrap_or(PDGNodeType::External);
+        let node = PDGNode {
+            id: record.id.clone(),
+            node_type,
+            name: record.name.clone(),
+            file_path: std::sync::Arc::from(record.file_path.clone()),
+            byte_range: (record.byte_start, record.byte_end),
+            complexity: record.complexity,
+            language: record.language.clone(),
+        };
+        let nid = pdg.add_node(node);
+        node_ids.insert(record.id.clone(), nid);
+    }
+
+    for record in &segment.edges {
+        if let (Some(&from), Some(&to)) =
+            (node_ids.get(&record.source), node_ids.get(&record.target))
+        {
+            if let Ok(edge) = edge_from_record(record) {
+                pdg.add_edge(from, to, edge);
+            }
+        }
+    }
+
+    pdg
+}
+
 /// Serialize a PDG segment for CAS staging.
 pub fn serialize_pdg_segment(segment: &PdgSegment) -> Result<Vec<u8>> {
     Ok(bincode::serialize(segment)?)
@@ -253,7 +458,11 @@ mod test {
                     source: format!("file{i}:func"),
                     target: format!("file{}:func", (i + 1) % 5),
                     edge_type: "call".into(),
-                    confidence: 80,
+                    confidence: Some(80),
+                    call_count: None,
+                    variable_name: None,
+                    channel: None,
+                    position: None,
                 }],
             })
             .collect();
@@ -286,7 +495,11 @@ mod test {
                 source: "a:foo".into(),
                 target: "a:bar".into(),
                 edge_type: "call".into(),
-                confidence: 90,
+                confidence: Some(90),
+                call_count: None,
+                variable_name: None,
+                channel: None,
+                position: None,
             }],
             symbol_table: vec![InternedSymbol {
                 name: "foo".into(),
@@ -343,5 +556,80 @@ mod test {
         let (segment, _) = merge_fragments_to_segment(fragments);
         // Same (name, file_path) → one interned entry
         assert_eq!(segment.symbol_table.len(), 1);
+    }
+
+    /// VAL-PDG-005/006: `fragment_from_pdg` → `merge_fragments_to_segment` →
+    /// `pdg_from_segment` round-trips a graph without losing nodes, edges,
+    /// edge metadata, or internal indexing, and does so without cloning graph
+    /// weights into a `SerializablePDG` intermediate.
+    #[test]
+    fn test_pdg_segment_roundtrip_preserves_graph_and_metadata() {
+        use crate::graph::pdg::{Edge as GEdge, EdgeMetadata, EdgeType, Node, NodeType};
+
+        let mut pdg = ProgramDependenceGraph::new();
+        let a = pdg.add_node(Node {
+            id: "a.rs:foo".into(),
+            node_type: NodeType::Function,
+            name: "foo".into(),
+            file_path: std::sync::Arc::from("a.rs"),
+            byte_range: (0, 10),
+            complexity: 2,
+            language: "rust".into(),
+        });
+        let b = pdg.add_node(Node {
+            id: "a.rs:Bar".into(),
+            node_type: NodeType::Class,
+            name: "Bar".into(),
+            file_path: std::sync::Arc::from("a.rs"),
+            byte_range: (11, 20),
+            complexity: 0,
+            language: "rust".into(),
+        });
+        pdg.add_edge(
+            a,
+            b,
+            GEdge {
+                edge_type: EdgeType::Call,
+                metadata: EdgeMetadata {
+                    call_count: Some(3),
+                    variable_name: Some("x".into()),
+                    confidence: Some(0.75),
+                    channel: Some("arg".into()),
+                    position: Some(1),
+                },
+            },
+        );
+
+        let fragment = fragment_from_pdg(&pdg);
+        assert_eq!(fragment.nodes.len(), 2);
+        assert_eq!(fragment.intra_edges.len(), 1);
+
+        let (segment, stats) = merge_fragments_to_segment(vec![fragment]);
+        assert_eq!(stats.node_count, 2);
+        assert_eq!(stats.edge_count, 1);
+
+        let restored = pdg_from_segment(&segment);
+        assert_eq!(restored.node_count(), 2);
+        assert_eq!(restored.edge_count(), 1);
+
+        // Nodes are fully preserved (incl. non-id fields).
+        let foo = restored.find_by_symbol("a.rs:foo").expect("foo present");
+        let node = restored.get_node(foo).unwrap();
+        assert_eq!(node.node_type, NodeType::Function);
+        assert_eq!(node.complexity, 2);
+        assert_eq!(node.file_path.as_ref(), "a.rs");
+
+        // Edge + full metadata preserved (confidence quantized to 0-100, back).
+        let edges: Vec<_> = restored
+            .edge_indices()
+            .filter_map(|idx| restored.get_edge(idx))
+            .collect();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].edge_type, EdgeType::Call);
+        assert_eq!(edges[0].metadata.call_count, Some(3));
+        assert_eq!(edges[0].metadata.variable_name.as_deref(), Some("x"));
+        assert_eq!(edges[0].metadata.channel.as_deref(), Some("arg"));
+        assert_eq!(edges[0].metadata.position, Some(1));
+        assert_eq!(edges[0].metadata.confidence, Some(0.75));
     }
 }

@@ -10,6 +10,7 @@ use crate::graph::trigram::TrigramIndex;
 use crate::storage::edges::{EdgeMetadata as StorageEdgeMetadata, EdgeType as StorageEdgeType};
 use crate::storage::nodes::{NodeRecord, NodeType as StorageNodeType};
 use crate::storage::schema::Storage;
+use rusqlite::types::Value;
 use rusqlite::{Result as SqliteResult, params};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,6 +63,14 @@ pub enum PdgStoreError {
 
 /// Result type for PDG store operations
 pub type Result<T> = std::result::Result<T, PdgStoreError>;
+
+/// Maximum rows written per multi-row INSERT in `save_nodes` / `save_edges`.
+///
+/// Sized so a single statement stays well below SQLite's default
+/// `SQLITE_MAX_VARIABLE_NUMBER` (32766): 500 nodes × 16 columns = 8000 bound
+/// variables. For 10K / 50K nodes this lowers statement count from ~10K / 50K
+/// down to ~20 / 100.
+const PDG_INSERT_BATCH_SIZE: usize = 500;
 
 /// Convert legraphe NodeType to lestockage NodeType
 fn convert_node_type(node_type: &PDGNodeType) -> StorageNodeType {
@@ -202,63 +211,110 @@ fn save_nodes(
     pdg: &ProgramDependenceGraph,
 ) -> Result<HashMap<NodeId, i64>> {
     let mut node_id_map = HashMap::new();
+    let node_indices: Vec<NodeId> = pdg.node_indices().collect();
 
-    for node_idx in pdg.node_indices() {
-        let pdg_node = pdg
-            .get_node(node_idx)
-            .ok_or_else(|| PdgStoreError::Serialization("Missing node data".to_string()))?;
+    // Batch nodes into multi-row INSERTs. At 50K nodes this reduces ~50K
+    // individual statements down to O(100). Each batch stays well under
+    // SQLite's default `SQLITE_MAX_VARIABLE_NUMBER` (32766) and keeps the
+    // statement's bound-parameter memory bounded.
+    for chunk in node_indices.chunks(PDG_INSERT_BATCH_SIZE) {
+        let n = chunk.len();
 
-        // Note: Embeddings are now externalized to EmbeddingStore, not stored in Node.
-        // They are persisted separately if needed.
-        let record = NodeRecord {
-            id: None,
-            project_id: project_id.to_string(),
-            file_path: pdg_node.file_path.to_string(),
-            node_id: pdg_node.id.clone(),
-            symbol_name: pdg_node.name.clone(),
-            qualified_name: pdg_node
-                .id
-                .split(':')
-                .next_back()
-                .unwrap_or(&pdg_node.id)
-                .to_string(),
-            language: pdg_node.language.clone(),
-            node_type: convert_node_type(&pdg_node.node_type),
-            signature: None, // Could be populated from node content
-            complexity: Some(pdg_node.complexity as i32),
-            content_hash: blake3::hash(pdg_node.id.as_bytes()).to_hex().to_string(),
-            embedding: None, // Embeddings externalized to EmbeddingStore
-            byte_range_start: Some(pdg_node.byte_range.0 as i64),
-            byte_range_end: Some(pdg_node.byte_range.1 as i64),
-            embedding_format: Some(0),
-        };
+        // Each row carries its own set of 16 anonymous `?` placeholders, bound
+        // positionally so they align with `params` below.
+        let values_clause = (0..n)
+            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT INTO intel_nodes \
+             (project_id, file_path, node_id, symbol_name, qualified_name, \
+              language, node_type, signature, complexity, content_hash, embedding, \
+              byte_range_start, byte_range_end, created_at, updated_at, embedding_format) \
+             VALUES {values_clause} RETURNING id"
+        );
 
-        let db_id = tx.query_row(
-            "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end, created_at, updated_at, embedding_format)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
-             RETURNING id",
-            params![
-                record.project_id,
-                record.file_path,
-                record.node_id,
-                record.symbol_name,
-                record.qualified_name,
-                record.language,
-                record.node_type.as_str(),
-                record.signature,
-                record.complexity,
-                record.content_hash,
-                record.embedding.as_deref(),
-                record.byte_range_start,
-                record.byte_range_end,
-                chrono::Utc::now().timestamp(),
-                chrono::Utc::now().timestamp(),
-                record.embedding_format,
-            ],
-            |row| row.get(0),
-        )?;
+        let now = chrono::Utc::now().timestamp();
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(n * 16);
+        for &node_idx in chunk {
+            let pdg_node = pdg
+                .get_node(node_idx)
+                .ok_or_else(|| PdgStoreError::Serialization("Missing node data".to_string()))?;
 
-        node_id_map.insert(node_idx, db_id);
+            // Note: Embeddings are now externalized to EmbeddingStore, not stored in Node.
+            // They are persisted separately if needed.
+            let record = NodeRecord {
+                id: None,
+                project_id: project_id.to_string(),
+                file_path: pdg_node.file_path.to_string(),
+                node_id: pdg_node.id.clone(),
+                symbol_name: pdg_node.name.clone(),
+                qualified_name: pdg_node
+                    .id
+                    .split(':')
+                    .next_back()
+                    .unwrap_or(&pdg_node.id)
+                    .to_string(),
+                language: pdg_node.language.clone(),
+                node_type: convert_node_type(&pdg_node.node_type),
+                signature: None, // Could be populated from node content
+                complexity: Some(pdg_node.complexity as i32),
+                content_hash: blake3::hash(pdg_node.id.as_bytes()).to_hex().to_string(),
+                embedding: None, // Embeddings externalized to EmbeddingStore
+                byte_range_start: Some(pdg_node.byte_range.0 as i64),
+                byte_range_end: Some(pdg_node.byte_range.1 as i64),
+                embedding_format: Some(0),
+            };
+
+            params.push(record.project_id.into());
+            params.push(record.file_path.into());
+            params.push(record.node_id.into());
+            params.push(record.symbol_name.into());
+            params.push(record.qualified_name.into());
+            params.push(record.language.into());
+            params.push(record.node_type.as_str().to_string().into());
+            params.push(record.signature.map(Value::Text).unwrap_or(Value::Null));
+            params.push(
+                record
+                    .complexity
+                    .map(|c| Value::Integer(c.into()))
+                    .unwrap_or(Value::Null),
+            );
+            params.push(record.content_hash.into());
+            params.push(record.embedding.map(Value::Blob).unwrap_or(Value::Null));
+            params.push(
+                record
+                    .byte_range_start
+                    .map(Value::Integer)
+                    .unwrap_or(Value::Null),
+            );
+            params.push(
+                record
+                    .byte_range_end
+                    .map(Value::Integer)
+                    .unwrap_or(Value::Null),
+            );
+            params.push(Value::Integer(now));
+            params.push(Value::Integer(now));
+            params.push(
+                record
+                    .embedding_format
+                    .map(|f| Value::Integer(f.into()))
+                    .unwrap_or(Value::Null),
+            );
+        }
+
+        // `RETURNING id` emits rows in the same order as the VALUES tuples, so
+        // the returned db ids map 1:1 onto the chunk's NodeIds.
+        let mut stmt = tx.prepare(&sql)?;
+        let ids: Vec<i64> = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                row.get::<_, i64>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (node_idx, db_id) in chunk.iter().zip(ids) {
+            node_id_map.insert(*node_idx, db_id);
+        }
     }
 
     Ok(node_id_map)
@@ -269,42 +325,53 @@ fn save_edges(
     node_id_map: &HashMap<NodeId, i64>,
     pdg: &ProgramDependenceGraph,
 ) -> Result<()> {
-    for edge_idx in pdg.edge_indices() {
-        let (source, target) = pdg
-            .edge_endpoints(edge_idx)
-            .ok_or_else(|| PdgStoreError::Serialization("Edge has no endpoints".to_string()))?;
-        let pdg_edge = pdg
-            .get_edge(edge_idx)
-            .ok_or_else(|| PdgStoreError::Serialization("Missing edge data".to_string()))?;
-        let caller_id =
-            *node_id_map
-                .get(&source)
-                .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
-                    caller: source.index() as i64,
-                    callee: target.index() as i64,
-                })?;
-        let callee_id =
-            *node_id_map
-                .get(&target)
-                .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
-                    caller: source.index() as i64,
-                    callee: target.index() as i64,
-                })?;
-        let metadata = convert_edge_metadata(&pdg_edge.metadata);
-        let metadata_json = serde_json::to_string(&metadata)
-            .map_err(|e| PdgStoreError::Serialization(e.to_string()))?;
+    let edge_indices: Vec<_> = pdg.edge_indices().collect();
 
-        tx.execute(
-            "INSERT INTO intel_edges (caller_id, callee_id, edge_type, metadata)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT DO UPDATE SET metadata = excluded.metadata",
-            params![
-                caller_id,
-                callee_id,
-                convert_edge_type(&pdg_edge.edge_type).as_str(),
-                metadata_json,
-            ],
-        )?;
+    // Batch edges into multi-row INSERTs, mirroring the node batching above.
+    for chunk in edge_indices.chunks(PDG_INSERT_BATCH_SIZE) {
+        let n = chunk.len();
+        let values_clause = (0..n).map(|_| "(?,?,?,?)").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "INSERT INTO intel_edges (caller_id, callee_id, edge_type, metadata) \
+             VALUES {values_clause} \
+             ON CONFLICT DO UPDATE SET metadata = excluded.metadata"
+        );
+
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(n * 4);
+        for &edge_idx in chunk {
+            let (source, target) = pdg
+                .edge_endpoints(edge_idx)
+                .ok_or_else(|| PdgStoreError::Serialization("Edge has no endpoints".to_string()))?;
+            let pdg_edge = pdg
+                .get_edge(edge_idx)
+                .ok_or_else(|| PdgStoreError::Serialization("Missing edge data".to_string()))?;
+            let caller_id =
+                *node_id_map
+                    .get(&source)
+                    .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
+                        caller: source.index() as i64,
+                        callee: target.index() as i64,
+                    })?;
+            let callee_id =
+                *node_id_map
+                    .get(&target)
+                    .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
+                        caller: source.index() as i64,
+                        callee: target.index() as i64,
+                    })?;
+            let metadata = convert_edge_metadata(&pdg_edge.metadata);
+            let metadata_json = serde_json::to_string(&metadata)
+                .map_err(|e| PdgStoreError::Serialization(e.to_string()))?;
+
+            params.push(Value::Integer(caller_id));
+            params.push(Value::Integer(callee_id));
+            params.push(Value::Text(
+                convert_edge_type(&pdg_edge.edge_type).as_str().to_string(),
+            ));
+            params.push(Value::Text(metadata_json));
+        }
+
+        tx.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
     }
 
     Ok(())
@@ -701,7 +768,90 @@ pub fn delete_trigram_index(storage: &mut Storage, project_id: &str) -> SqliteRe
 mod tests {
     use super::*;
     use crate::storage::schema::Storage;
+    use std::ffi::CStr;
+    use std::os::raw::{c_char, c_void};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::NamedTempFile;
+
+    /// Counts of INSERT statements emitted against intel_nodes / intel_edges,
+    /// populated by a raw `sqlite3_trace` callback installed for the batch
+    /// tests below. Statics (not a captured closure) because the trace hook is
+    /// an `unsafe extern "C"` function pointer and cannot capture state.
+    struct TraceCounts {
+        node: AtomicUsize,
+        edge: AtomicUsize,
+    }
+    static TRACE_COUNTS: TraceCounts = TraceCounts {
+        node: AtomicUsize::new(0),
+        edge: AtomicUsize::new(0),
+    };
+
+    unsafe extern "C" fn sql_trace_cb(_user: *mut c_void, sql_ptr: *const c_char) {
+        if sql_ptr.is_null() {
+            return;
+        }
+        // SAFETY: sqlite3 hands us a NUL-terminated C string for the duration
+        // of the callback; we only read it, never hold it past the call.
+        let sql = unsafe { CStr::from_ptr(sql_ptr) }.to_string_lossy();
+        if sql.starts_with("INSERT INTO intel_nodes") {
+            TRACE_COUNTS.node.fetch_add(1, Ordering::Relaxed);
+        } else if sql.starts_with("INSERT INTO intel_edges") {
+            TRACE_COUNTS.edge.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Install/clear a raw `sqlite3_trace` callback on the connection.
+    ///
+    /// rusqlite's ergonomic `Connection::trace` is gated behind the unused
+    /// `trace` crate feature; the underlying `sqlite3_trace` FFI is always
+    /// available through `rusqlite::ffi`, so we call it directly to count the
+    /// exact number of executed statements deterministically.
+    fn set_sql_trace(conn: &rusqlite::Connection, enabled: bool) {
+        let db = unsafe { conn.handle() };
+        unsafe {
+            if enabled {
+                rusqlite::ffi::sqlite3_trace(db, Some(sql_trace_cb), std::ptr::null_mut());
+            } else {
+                rusqlite::ffi::sqlite3_trace(db, None, std::ptr::null_mut());
+            }
+        }
+    }
+
+    fn create_large_pdg(node_count: usize, edge_count: usize) -> ProgramDependenceGraph {
+        let mut pdg = ProgramDependenceGraph::new();
+        let mut node_ids = Vec::with_capacity(node_count);
+        for i in 0..node_count {
+            let node_id = pdg.add_node(PDGNode {
+                id: format!("src/main.rs:func{i}"),
+                node_type: PDGNodeType::Function,
+                name: format!("func{i}"),
+                file_path: Arc::from("src/main.rs"),
+                byte_range: (i * 10, i * 10 + 8),
+                complexity: (i % 7) as u32,
+                language: "rust".to_string(),
+            });
+            node_ids.push(node_id);
+        }
+        for i in 0..edge_count {
+            let a = node_ids[i];
+            let b = node_ids[(i + 1) % node_count];
+            pdg.add_edge(
+                a,
+                b,
+                PDGEdge {
+                    edge_type: PDGEdgeType::Call,
+                    metadata: PDGEdgeMetadata {
+                        call_count: Some(1),
+                        variable_name: None,
+                        confidence: Some(0.7),
+                        channel: None,
+                        position: None,
+                    },
+                },
+            );
+        }
+        pdg
+    }
 
     fn create_test_pdg() -> ProgramDependenceGraph {
         let mut pdg = ProgramDependenceGraph::new();
@@ -1023,5 +1173,56 @@ mod tests {
         // data_user should have Child as neighbor (data dependency)
         let data_user_neighbors = loaded.neighbors(data_user_id);
         assert!(data_user_neighbors.contains(&child_id));
+    }
+
+    #[test]
+    fn test_save_nodes_uses_fewer_than_100_inserts_for_10k_nodes() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+
+        let pdg = create_large_pdg(10_000, 10_000);
+
+        TRACE_COUNTS.node.store(0, Ordering::Relaxed);
+        TRACE_COUNTS.edge.store(0, Ordering::Relaxed);
+        set_sql_trace(storage.conn(), true);
+        save_pdg(&mut storage, "big_project", &pdg).unwrap();
+        set_sql_trace(storage.conn(), false);
+
+        let node_stmts = TRACE_COUNTS.node.load(Ordering::Relaxed);
+        assert!(
+            node_stmts < 100,
+            "save_nodes emitted {node_stmts} INSERT statements for 10K nodes (expected < 100)"
+        );
+        // Every row batch must map back: node_id_map -> db_id preserved correctly.
+        let loaded = load_pdg(&storage, "big_project").unwrap();
+        assert_eq!(loaded.node_count(), 10_000);
+        // Sanity-check a specific sorted node survived the round trip.
+        assert!(
+            loaded.find_by_symbol("src/main.rs:func0").is_some(),
+            "node 'src/main.rs:func0' should round-trip through batched inserts"
+        );
+    }
+
+    #[test]
+    fn test_save_edges_uses_fewer_than_100_inserts_for_10k_edges() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+
+        let pdg = create_large_pdg(10_000, 10_000);
+
+        TRACE_COUNTS.node.store(0, Ordering::Relaxed);
+        TRACE_COUNTS.edge.store(0, Ordering::Relaxed);
+        set_sql_trace(storage.conn(), true);
+        save_pdg(&mut storage, "big_project", &pdg).unwrap();
+        set_sql_trace(storage.conn(), false);
+
+        let edge_stmts = TRACE_COUNTS.edge.load(Ordering::Relaxed);
+        assert!(
+            edge_stmts < 100,
+            "save_edges emitted {edge_stmts} INSERT statements for 10K edges (expected < 100)"
+        );
+
+        let loaded = load_pdg(&storage, "big_project").unwrap();
+        assert_eq!(loaded.edge_count(), 10_000);
     }
 }

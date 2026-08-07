@@ -506,14 +506,56 @@ struct SerializablePDG {
     embeddings: HashMap<String, Vec<f32>>,
 }
 
-impl SerializablePDG {
-    fn from_pdg(pdg: &ProgramDependenceGraph) -> Self {
+// ---------------------------------------------------------------------------
+// Borrowed serialization shim
+// ---------------------------------------------------------------------------
+//
+// `SerializablePDG::from_pdg` used to deep-clone every node and edge (`Clone`)
+// into the serialization buffer, doubling peak memory for large PDGs. The
+// borrowed shim below serializes directly from the live graph — node/edge/key
+// maps are referenced rather than cloned — while producing byte-for-byte the
+// same shape `bincode::deserialize::<SerializablePDG>` expects on the read
+// side. Its fields mirror `SerializablePDG` in declaration order so bincode's
+// positional encoding lines up exactly.
+
+/// A node reference used only for serialization (no deep clone of the weight).
+#[derive(Serialize)]
+struct SerializableNodeRef<'a> {
+    index: u32,
+    node: &'a Node,
+}
+
+/// An edge reference used only for serialization (no deep clone of the weight).
+#[derive(Serialize)]
+struct SerializableEdgeRef<'a> {
+    source: u32,
+    target: u32,
+    edge: &'a Edge,
+}
+
+/// Borrowed variant of [`SerializablePDG`] used for clone-free serialization.
+#[derive(Serialize)]
+struct SerializablePDGRef<'a> {
+    nodes: Vec<SerializableNodeRef<'a>>,
+    edges: Vec<SerializableEdgeRef<'a>>,
+    symbol_index: HashMap<&'a str, u32>,
+    file_index: HashMap<&'a str, Vec<u32>>,
+    name_index: HashMap<&'a str, Vec<u32>>,
+    name_lower_index: HashMap<&'a str, Vec<u32>>,
+    embeddings: HashMap<&'a str, &'a Vec<f32>>,
+}
+
+impl SerializablePDGRef<'_> {
+    /// Build a borrowed serialization shim directly from graph references,
+    /// avoiding the per-node/per-edge `clone()` that `SerializablePDG::from_pdg`
+    /// performed.
+    fn from_pdg(pdg: &ProgramDependenceGraph) -> SerializablePDGRef<'_> {
         let nodes = pdg
             .graph
             .node_indices()
-            .map(|idx| SerializableNode {
+            .map(|idx| SerializableNodeRef {
                 index: idx.index() as u32,
-                node: pdg.graph[idx].clone(),
+                node: &pdg.graph[idx],
             })
             .collect();
 
@@ -525,10 +567,10 @@ impl SerializablePDG {
                     .graph
                     .edge_endpoints(eidx)
                     .expect("Edge endpoints must exist");
-                SerializableEdge {
+                SerializableEdgeRef {
                     source: source.index() as u32,
                     target: target.index() as u32,
-                    edge: pdg.graph[eidx].clone(),
+                    edge: &pdg.graph[eidx],
                 }
             })
             .collect();
@@ -536,35 +578,44 @@ impl SerializablePDG {
         let symbol_index = pdg
             .symbol_index
             .iter()
-            .map(|(k, v)| (k.clone(), v.index() as u32))
+            .map(|(k, v)| (k.as_str(), v.index() as u32))
             .collect();
         let file_index = pdg
             .file_index
             .iter()
-            .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
+            .map(|(k, v)| (k.as_str(), v.iter().map(|id| id.index() as u32).collect()))
             .collect();
         let name_index = pdg
             .name_index
             .iter()
-            .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
+            .map(|(k, v)| (k.as_str(), v.iter().map(|id| id.index() as u32).collect()))
             .collect();
         let name_lower_index = pdg
             .name_lower_index
             .iter()
-            .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
+            .map(|(k, v)| (k.as_str(), v.iter().map(|id| id.index() as u32).collect()))
             .collect();
 
-        Self {
+        let embeddings = pdg
+            .embedding_store
+            .embeddings
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+
+        SerializablePDGRef {
             nodes,
             edges,
             symbol_index,
             file_index,
             name_index,
             name_lower_index,
-            embeddings: pdg.embedding_store.embeddings.clone(),
+            embeddings,
         }
     }
+}
 
+impl SerializablePDG {
     fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
         let mut pdg = ProgramDependenceGraph::new();
         let index_map = self.restore_nodes(&mut pdg);
@@ -1557,7 +1608,7 @@ impl ProgramDependenceGraph {
     ///
     /// A Result containing the serialized bytes, or an error message if serialization fails.
     pub fn serialize(&self) -> Result<Vec<u8>, String> {
-        bincode::serialize(&SerializablePDG::from_pdg(self))
+        bincode::serialize(&SerializablePDGRef::from_pdg(self))
             .map_err(|e| format!("Serialize failed: {}", e))
     }
 

@@ -1090,6 +1090,7 @@ impl LeIndex {
         state: &IndexPipelineState,
         pdg: &mut crate::graph::pdg::ProgramDependenceGraph,
         parsing_results: Vec<crate::parse::parallel::ParsingResult>,
+        use_streaming: bool,
     ) -> Result<()> {
         for path in &state.deleted_files {
             index_builder::remove_file_from_pdg(pdg, path)?;
@@ -1104,21 +1105,17 @@ impl LeIndex {
                 );
             }
         }
-        for result in parsing_results {
-            if !result.is_success() {
-                continue;
-            }
+        let newly_parsed: Vec<crate::parse::parallel::ParsingResult> = parsing_results
+            .into_iter()
+            .filter(|result| result.is_success())
+            .collect();
+        // Drop stale nodes for freshly parsed files *before* the merge, so node
+        // id namespaces (file_path:qualified_name) stay disjoint when the new
+        // graphs are added.
+        let mut changed_file_count = 0usize;
+        for result in &newly_parsed {
             let file_path = result.file_path.display().to_string();
-            let language = result.language.as_deref().unwrap_or("unknown");
-            let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
             index_builder::remove_file_from_pdg(pdg, &file_path)?;
-            let file_pdg = crate::graph::extract_pdg_from_signatures(
-                result.signatures,
-                source_bytes,
-                &file_path,
-                language,
-            );
-            index_builder::merge_pdgs(pdg, file_pdg);
             if let Some(hash) = state.source_file_hashes.get(&file_path) {
                 if let Err(error) = crate::storage::pdg_store::update_indexed_file(
                     &mut self.storage,
@@ -1132,6 +1129,18 @@ impl LeIndex {
                     );
                 }
             }
+            changed_file_count += 1;
+        }
+        if !newly_parsed.is_empty() {
+            let (new_pdg, route) = build_changed_file_pdg(newly_parsed, use_streaming);
+            index_builder::merge_pdgs(pdg, new_pdg);
+            info!(
+                "PDG: rebuilt {} changed file(s) via {:?} ({} nodes, {} edges)",
+                changed_file_count,
+                route,
+                pdg.node_count(),
+                pdg.edge_count()
+            );
         }
         Ok(())
     }
@@ -1209,7 +1218,19 @@ impl LeIndex {
             std::mem::take(&mut state.parsing_results)
         };
         let parse_stats = pdg_parse_stats(&parsing_results);
-        self.apply_pdg_file_changes(&state, &mut pdg, parsing_results)?;
+        // Route PDG construction: the streaming fragment/segment pipeline
+        // (SP4) is the default; `LEINDEX_FEATURE_STREAMING_PDG=0` reverts to
+        // the legacy per-file extraction + merge loop.
+        let use_streaming = pdg_route_for_current_flag() == PdgBuildRoute::Streaming;
+        info!(
+            "PDG construction: streaming fragment pipeline {}",
+            if use_streaming {
+                "enabled"
+            } else {
+                "disabled (legacy merge)"
+            }
+        );
+        self.apply_pdg_file_changes(&state, &mut pdg, parsing_results, use_streaming)?;
         // Resume-proof FileSummary pass: covers files loaded from storage on
         // resume (the merge_pdgs loop above only fires for freshly-parsed files).
         pdg.ensure_file_summary_nodes();
@@ -2011,4 +2032,100 @@ impl LeIndex {
     fn load_from_storage_inner(&mut self, pdg_only: bool) -> Result<()> {
         self.load_from_storage_inner_at(pdg_only, None, self.storage_path.clone())
     }
+}
+
+/// Which PDG construction route produced a given combined graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PdgBuildRoute {
+    /// Compact streaming fragment/segment pipeline
+    /// (`fragment_from_pdg` + `merge_fragments_to_segment` + `pdg_from_segment`).
+    Streaming,
+    /// Legacy per-file extraction + `merge_pdgs`.
+    Legacy,
+}
+
+/// The construction route selected by the current `StreamingPdg` feature flag.
+///
+/// This is the single dispatch point the indexing phase consults so the flag
+/// cleanly toggles between the streaming fragment pipeline (default) and the
+/// legacy merge loop.
+pub(crate) fn pdg_route_for_current_flag() -> PdgBuildRoute {
+    if crate::feature_flags::FeatureFlag::StreamingPdg.is_enabled() {
+        PdgBuildRoute::Streaming
+    } else {
+        PdgBuildRoute::Legacy
+    }
+}
+
+/// Build a combined PDG for the freshly parsed files using the selected route.
+fn build_changed_file_pdg(
+    parsing_results: Vec<crate::parse::parallel::ParsingResult>,
+    use_streaming: bool,
+) -> (crate::graph::pdg::ProgramDependenceGraph, PdgBuildRoute) {
+    if use_streaming {
+        (
+            build_pdg_streaming(parsing_results),
+            PdgBuildRoute::Streaming,
+        )
+    } else {
+        (build_pdg_legacy(parsing_results), PdgBuildRoute::Legacy)
+    }
+}
+
+/// Legacy route: extract a per-file PDG via `extract_pdg_from_signatures` and
+/// merge each into a combined graph (clone-free `merge_pdgs`).
+fn build_pdg_legacy(
+    parsing_results: Vec<crate::parse::parallel::ParsingResult>,
+) -> crate::graph::pdg::ProgramDependenceGraph {
+    let mut combined = crate::graph::pdg::ProgramDependenceGraph::new();
+    for result in parsing_results {
+        if !result.is_success() {
+            continue;
+        }
+        let file_path = result.file_path.display().to_string();
+        let language = result.language.as_deref().unwrap_or("unknown");
+        let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
+        let file_pdg = crate::graph::extract_pdg_from_signatures(
+            result.signatures,
+            source_bytes,
+            &file_path,
+            language,
+        );
+        index_builder::merge_pdgs(&mut combined, file_pdg);
+    }
+    combined
+}
+
+/// Streaming route: materialize a per-file `PdgFragment` for each parsed file,
+/// merge them into a compact `PdgSegment` via `merge_fragments_to_segment`,
+/// then rebuild the `ProgramDependenceGraph` via `pdg_from_segment`.
+fn build_pdg_streaming(
+    parsing_results: Vec<crate::parse::parallel::ParsingResult>,
+) -> crate::graph::pdg::ProgramDependenceGraph {
+    let mut fragments = Vec::with_capacity(parsing_results.len());
+    for result in parsing_results {
+        if !result.is_success() {
+            continue;
+        }
+        let file_path = result.file_path.display().to_string();
+        let language = result.language.as_deref().unwrap_or("unknown");
+        let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
+        let file_pdg = crate::graph::extract_pdg_from_signatures(
+            result.signatures,
+            source_bytes,
+            &file_path,
+            language,
+        );
+        fragments.push(streaming::pdg::fragment_from_pdg(&file_pdg));
+    }
+    let (segment, stats) = streaming::pdg::merge_fragments_to_segment(fragments);
+    info!(
+        "Streaming PDG merge: {} fragments, {} nodes, {} edges ({} cross-file resolved, {} unresolved)",
+        stats.fragments,
+        stats.node_count,
+        stats.edge_count,
+        stats.cross_file_resolved,
+        stats.cross_file_unresolved
+    );
+    streaming::pdg::pdg_from_segment(&segment)
 }

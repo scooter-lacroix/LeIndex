@@ -1,5 +1,100 @@
 use super::*;
 
+/// VAL-PDG-005/006: `merge_pdgs` consumes the source by value (moving weights,
+/// no per-element clone) and produces a correct merged graph with remapped
+/// edges and intact indexes.
+#[test]
+fn test_merge_pdgs_merges_nodes_edges_and_indexes() {
+    use crate::graph::pdg::{Edge, EdgeMetadata, EdgeType, Node, NodeType};
+    use std::sync::Arc;
+
+    // Target already holds its own node before the merge.
+    let mut target = ProgramDependenceGraph::new();
+    target.add_node(Node {
+        id: "keep.rs:keeper".to_string(),
+        node_type: NodeType::Function,
+        name: "keeper".to_string(),
+        file_path: Arc::from("keep.rs"),
+        byte_range: (0, 5),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+
+    // Source graph must be consumed by value.
+    let mut source = ProgramDependenceGraph::new();
+    let a = source.add_node(Node {
+        id: "a.rs:foo".to_string(),
+        node_type: NodeType::Function,
+        name: "foo".to_string(),
+        file_path: Arc::from("a.rs"),
+        byte_range: (0, 10),
+        complexity: 3,
+        language: "rust".to_string(),
+    });
+    let b = source.add_node(Node {
+        id: "a.rs:bar".to_string(),
+        node_type: NodeType::Class,
+        name: "bar".to_string(),
+        file_path: Arc::from("a.rs"),
+        byte_range: (11, 20),
+        complexity: 0,
+        language: "rust".to_string(),
+    });
+    source.add_edge(
+        a,
+        b,
+        Edge {
+            edge_type: EdgeType::Call,
+            metadata: EdgeMetadata {
+                call_count: Some(2),
+                variable_name: None,
+                confidence: Some(0.9),
+                channel: None,
+                position: None,
+            },
+        },
+    );
+
+    merge_pdgs(&mut target, source);
+
+    // 1 unchanged target node + 2 moved source nodes, with the call edge remapped.
+    assert_eq!(target.node_count(), 3);
+    assert_eq!(target.edge_count(), 1);
+
+    assert!(target.find_by_symbol("keep.rs:keeper").is_some());
+    let foo = target.find_by_symbol("a.rs:foo").expect("foo should merge");
+    let bar = target.find_by_symbol("a.rs:bar").expect("bar should merge");
+    assert_eq!(target.get_node(foo).unwrap().complexity, 3);
+
+    // The single edge must now connect foo -> bar in the target.
+    let call_edges: Vec<_> = target
+        .edge_indices()
+        .filter_map(|idx| {
+            let edge = target.get_edge(idx)?;
+            if edge.edge_type == EdgeType::Call {
+                Some((target.edge_endpoints(idx).unwrap(), edge.metadata.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(call_edges.len(), 1);
+    let ((caller, callee), metadata) = &call_edges[0];
+    assert_eq!(*caller, foo);
+    assert_eq!(*callee, bar);
+    assert_eq!(metadata.call_count, Some(2));
+}
+
+/// Merging a source that is empty is a no-op that leaves the target intact.
+#[test]
+fn test_merge_pdgs_empty_source_is_noop() {
+    let mut target = ProgramDependenceGraph::new();
+    assert_eq!(target.node_count(), 0);
+    merge_pdgs(&mut target, ProgramDependenceGraph::new());
+    assert_eq!(target.node_count(), 0);
+    assert_eq!(target.edge_count(), 0);
+}
+
 #[test]
 fn test_tokenize_code_camel_case() {
     let toks = tokenize_code("getUserName");

@@ -432,3 +432,190 @@ fn bulk_inheritance_edges_with_confidence() {
     assert_eq!(*tgt, parent);
     assert_eq!(edge.metadata.confidence, Some(0.85));
 }
+
+/// VAL-PDG-004: serialize -> deserialize round-trips every NodeType and
+/// EdgeType variant together with their full field/edge-metadata payloads.
+///
+/// Also guards the clone-free serialization shim: this invokes
+/// `SerializablePDGRef::from_pdg` (borrowed) on the write path and
+/// `SerializablePDG::to_pdg` on the read path, verifying the two bincode
+/// layouts agree.
+#[test]
+fn serialization_roundtrip_all_node_and_edge_variants() {
+    let mut pdg = ProgramDependenceGraph::new();
+
+    let n_fn = pdg.add_node(make_node("a.rs:f", "f", "a.rs", NodeType::Function));
+    let n_class = pdg.add_node(make_node("a.rs:Cls", "Cls", "a.rs", NodeType::Class));
+    let n_method = pdg.add_node(make_node("a.rs:Cls::m", "m", "a.rs", NodeType::Method));
+    let n_var = pdg.add_node(make_node("a.rs:v", "v", "a.rs", NodeType::Variable));
+    let n_module = pdg.add_node(make_node("a.rs:mod", "mod", "a.rs", NodeType::Module));
+    let n_external = pdg.add_node(make_node("a.rs:dep", "dep", "a.rs", NodeType::External));
+    let n_summary = pdg.add_node(make_node(
+        "a.rs:summary",
+        "summary",
+        "a.rs",
+        NodeType::FileSummary,
+    ));
+    assert_eq!(pdg.node_count(), 7);
+
+    // One edge per EdgeType variant, exercising every EdgeMetadata field.
+    let edge_specs: Vec<(NodeId, NodeId, EdgeType, EdgeMetadata)> = vec![
+        (
+            n_fn,
+            n_class,
+            EdgeType::Call,
+            EdgeMetadata {
+                call_count: Some(7),
+                variable_name: None,
+                confidence: Some(0.9),
+                channel: Some("call".into()),
+                position: Some(0),
+            },
+        ),
+        (
+            n_method,
+            n_var,
+            EdgeType::DataDependency,
+            EdgeMetadata {
+                call_count: None,
+                variable_name: Some("param".to_string()),
+                confidence: Some(0.5),
+                channel: Some("flow".to_string()),
+                position: Some(2),
+            },
+        ),
+        (
+            n_class,
+            n_summary,
+            EdgeType::Inheritance,
+            EdgeMetadata::with_confidence(0.85),
+        ),
+        (
+            n_module,
+            n_external,
+            EdgeType::Import,
+            EdgeMetadata::empty(),
+        ),
+        (
+            n_class,
+            n_method,
+            EdgeType::Containment,
+            EdgeMetadata::empty(),
+        ),
+        (
+            n_var,
+            n_external,
+            EdgeType::StateTransition,
+            EdgeMetadata {
+                call_count: None,
+                variable_name: None,
+                confidence: Some(0.4),
+                channel: Some("state".to_string()),
+                position: None,
+            },
+        ),
+        (
+            n_external,
+            n_module,
+            EdgeType::CommandArgument,
+            EdgeMetadata {
+                call_count: None,
+                variable_name: Some("argv0".to_string()),
+                confidence: Some(0.3),
+                channel: None,
+                position: Some(1),
+            },
+        ),
+        (
+            n_external,
+            n_module,
+            EdgeType::Environment,
+            EdgeMetadata {
+                call_count: None,
+                variable_name: Some("HOME".to_string()),
+                confidence: Some(0.2),
+                channel: Some("env".to_string()),
+                position: None,
+            },
+        ),
+        (
+            n_external,
+            n_module,
+            EdgeType::Stdin,
+            EdgeMetadata {
+                call_count: None,
+                variable_name: Some("payload".to_string()),
+                confidence: Some(0.1),
+                channel: Some("stdin".to_string()),
+                position: Some(0),
+            },
+        ),
+    ];
+    for (source, target, edge_type, metadata) in &edge_specs {
+        pdg.add_edge(
+            *source,
+            *target,
+            Edge {
+                edge_type: edge_type.clone(),
+                metadata: metadata.clone(),
+            },
+        );
+    }
+    assert_eq!(pdg.edge_count(), 9);
+
+    // Bump an embedding so the shim's embeddings map is exercised too.
+    pdg.set_embedding("a.rs:f", vec![0.25, 0.5, 0.75]);
+
+    let bytes = pdg.serialize().expect("serialize should succeed");
+    let restored = ProgramDependenceGraph::deserialize(&bytes).expect("deserialize should succeed");
+
+    // All nodes + all edges survive.
+    assert_eq!(restored.node_count(), 7);
+    assert_eq!(restored.edge_count(), 9);
+
+    // Embeddings survive.
+    assert_eq!(
+        restored.get_embedding("a.rs:f"),
+        Some(&vec![0.25, 0.5, 0.75])
+    );
+
+    // A fully-populated edge's metadata survives the round-trip.
+    let data_edges: Vec<&Edge> = restored
+        .edge_indices()
+        .filter_map(|idx| {
+            let edge = restored.get_edge(idx)?;
+            if edge.edge_type == EdgeType::DataDependency {
+                Some(edge)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        data_edges.len(),
+        1,
+        "exactly one DataDependency edge expected"
+    );
+    assert_eq!(
+        data_edges[0].metadata.variable_name.as_deref(),
+        Some("param")
+    );
+    assert_eq!(data_edges[0].metadata.position, Some(2));
+    assert_eq!(data_edges[0].metadata.confidence, Some(0.5));
+
+    // Every node type is individually addressable after reload.
+    for id in [
+        "a.rs:f",
+        "a.rs:Cls",
+        "a.rs:Cls::m",
+        "a.rs:v",
+        "a.rs:mod",
+        "a.rs:dep",
+        "a.rs:summary",
+    ] {
+        assert!(
+            restored.find_by_symbol(id).is_some(),
+            "node '{id}' should round-trip"
+        );
+    }
+}

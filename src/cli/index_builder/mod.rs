@@ -813,20 +813,19 @@ pub(crate) fn merge_pdgs(target: &mut ProgramDependenceGraph, source: ProgramDep
         petgraph::graph::NodeIndex,
     > = std::collections::HashMap::with_capacity(source.node_count());
 
-    for node_idx in source.node_indices() {
-        if let Some(node) = source.get_node(node_idx) {
-            let new_idx = target.add_node(node.clone());
-            id_map.insert(node_idx, new_idx);
-        }
+    // Consume the source graph by value so node/edge weights are *moved*, not
+    // cloned, into the target. `into_nodes_edges_iters()` yields owned weights
+    // (with vacant slots filtered out), avoiding a per-element `clone()`.
+    let (nodes_iter, edges_iter) = source.graph.into_nodes_edges_iters();
+
+    for node in nodes_iter {
+        let new_idx = target.add_node(node.weight);
+        id_map.insert(node.index, new_idx);
     }
 
-    for edge_idx in source.edge_indices() {
-        if let Some(edge) = source.get_edge(edge_idx) {
-            if let Some((s, t)) = source.edge_endpoints(edge_idx) {
-                if let (Some(&si), Some(&ti)) = (id_map.get(&s), id_map.get(&t)) {
-                    target.add_edge(si, ti, edge.clone());
-                }
-            }
+    for edge in edges_iter {
+        if let (Some(&si), Some(&ti)) = (id_map.get(&edge.source), id_map.get(&edge.target)) {
+            target.add_edge(si, ti, edge.weight);
         }
     }
 }

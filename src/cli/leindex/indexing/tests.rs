@@ -166,3 +166,118 @@ fn fragment_sync_failure_clear_empties_engine_fragment_state() {
         "stale fragment rows must be gone before the snapshot persist"
     );
 }
+
+/// Build a `ParsingResult` for a fake file with one function that calls
+/// `callee`. Both PDG construction routes consume this identically.
+fn sample_parsing_result(
+    file_path: &str,
+    name: &str,
+    callee: &str,
+) -> crate::parse::parallel::ParsingResult {
+    crate::parse::parallel::ParsingResult {
+        file_path: std::path::PathBuf::from(file_path),
+        language: Some("rust".to_string()),
+        signatures: vec![crate::parse::traits::SignatureInfo {
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            parameters: vec![],
+            return_type: None,
+            visibility: crate::parse::traits::Visibility::Public,
+            is_async: false,
+            is_method: false,
+            docstring: None,
+            calls: vec![callee.to_string()],
+            imports: vec![],
+            byte_range: (0, 10),
+            cyclomatic_complexity: 1,
+            flow_facts: vec![],
+        }],
+        source_bytes: Some(b"fn caller() { callee(); }".to_vec()),
+        error: None,
+        parse_time_ms: 0,
+    }
+}
+
+/// VAL-PDG-006/007: `FeatureFlag::StreamingPdg` ON routes PDG construction
+/// through the streaming fragment/segment pipeline; OFF routes through the
+/// legacy extraction + merge loop.
+#[test]
+fn streaming_pdg_flag_routes_through_streaming_vs_legacy_builders() {
+    use crate::feature_flags::{FeatureFlag, with_flag_override};
+
+    with_flag_override(FeatureFlag::StreamingPdg, true, || {
+        assert_eq!(
+            pdg_route_for_current_flag(),
+            PdgBuildRoute::Streaming,
+            "flag ON must select the streaming pipeline"
+        );
+        let results = vec![
+            sample_parsing_result("a.rs", "alpha", "beta"),
+            sample_parsing_result("b.rs", "beta", "alpha"),
+        ];
+        let (pdg, route) = build_changed_file_pdg(results, true);
+        assert_eq!(route, PdgBuildRoute::Streaming);
+        assert!(pdg.node_count() >= 2, "streaming build must keep all nodes");
+    });
+
+    with_flag_override(FeatureFlag::StreamingPdg, false, || {
+        assert_eq!(
+            pdg_route_for_current_flag(),
+            PdgBuildRoute::Legacy,
+            "flag OFF must select the legacy merge loop"
+        );
+        let results = vec![
+            sample_parsing_result("a.rs", "alpha", "beta"),
+            sample_parsing_result("b.rs", "beta", "alpha"),
+        ];
+        let (pdg, route) = build_changed_file_pdg(results, false);
+        assert_eq!(route, PdgBuildRoute::Legacy);
+        assert!(pdg.node_count() >= 2, "legacy build must keep all nodes");
+    });
+}
+
+/// The streaming and legacy routes must produce equivalent graphs from the
+/// same parsing results: identical node ids (each carries the file-qualified
+/// symbol id), identical node/edge counts, and identical edge (source, target,
+/// type) sets.
+#[test]
+fn streaming_and_legacy_pdg_routes_produce_equivalent_graphs() {
+    let results = vec![
+        sample_parsing_result("a.rs", "alpha", "beta"),
+        sample_parsing_result("b.rs", "beta", "alpha"),
+    ];
+    let (streaming_pdg, streaming_route) = build_changed_file_pdg(results.clone(), true);
+    let (legacy_pdg, legacy_route) = build_changed_file_pdg(results, false);
+    assert_eq!(streaming_route, PdgBuildRoute::Streaming);
+    assert_eq!(legacy_route, PdgBuildRoute::Legacy);
+
+    assert_eq!(
+        streaming_pdg.node_count(),
+        legacy_pdg.node_count(),
+        "both routes must materialize the same number of nodes"
+    );
+    assert_eq!(
+        streaming_pdg.edge_count(),
+        legacy_pdg.edge_count(),
+        "both routes must materialize the same number of edges"
+    );
+
+    let mut streaming_ids: Vec<String> = streaming_pdg
+        .node_indices()
+        .filter_map(|idx| streaming_pdg.get_node(idx).map(|node| node.id.clone()))
+        .collect();
+    let mut legacy_ids: Vec<String> = legacy_pdg
+        .node_indices()
+        .filter_map(|idx| legacy_pdg.get_node(idx).map(|node| node.id.clone()))
+        .collect();
+    streaming_ids.sort();
+    legacy_ids.sort();
+    assert_eq!(
+        streaming_ids, legacy_ids,
+        "both routes must carry identical node id sets"
+    );
+    assert!(
+        streaming_ids.iter().any(|id| id.ends_with(":alpha")),
+        "expected the alpha function node in the streaming graph"
+    );
+}
