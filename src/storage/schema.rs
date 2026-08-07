@@ -126,6 +126,12 @@ impl Storage {
         // Enable WAL mode for better concurrency
         if config.wal_enabled {
             conn.pragma_update(None, "journal_mode", "WAL")?;
+            // With WAL mode, synchronous=NORMAL is safe: SQLite still guarantees
+            // that committed transactions are durable across application crashes;
+            // only a simultaneous OS crash + power loss can lose the last few
+            // transactions. That is acceptable for a rebuildable code index and
+            // eliminates most fsync calls on the write path.
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
         }
 
         // Allow concurrent access: wait up to 5 seconds for locks instead of
@@ -647,6 +653,38 @@ mod tests {
             cache_size, PROJECT_READER_CACHE_SIZE_KIB,
             "reader cache_size should be {} (2 MiB), got {}",
             PROJECT_READER_CACHE_SIZE_KIB, cache_size
+        );
+    }
+
+    #[test]
+    fn test_pragma_synchronous_is_normal() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let storage = Storage::open(temp_file.path()).unwrap();
+
+        // synchronous=NORMAL returns integer 1 in SQLite.
+        let sync_level: i64 = storage
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            sync_level, 1,
+            "synchronous should be NORMAL (1) when WAL is enabled, got {sync_level}"
+        );
+    }
+
+    #[test]
+    fn test_pragma_journal_mode_still_wal() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let storage = Storage::open(temp_file.path()).unwrap();
+
+        let journal_mode: String = storage
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            journal_mode.to_lowercase(),
+            "wal",
+            "journal_mode should remain WAL after adding synchronous=NORMAL"
         );
     }
 }

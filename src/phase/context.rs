@@ -7,7 +7,8 @@ use crate::phase::pdg_utils::merge_pdgs;
 use crate::phase::utils::{collect_files, hash_inventory};
 use crate::storage::{
     pdg_store::{
-        delete_file_data, get_indexed_files, load_pdg, pdg_exists, save_pdg, update_indexed_file,
+        delete_files_data_tx, get_indexed_files, load_pdg, pdg_exists, save_pdg,
+        update_indexed_file, update_indexed_files_tx,
     },
     schema::Storage,
 };
@@ -162,15 +163,14 @@ impl PhaseExecutionContext {
         let mut pdg = load_pdg(&self.storage, &self.project_id)
             .context("failed loading cached PDG for incremental phase run")?;
 
+        // Collect all file keys that need deletion (from deleted files + changed
+        // files) so we can batch them in a single transaction.
+        let mut files_to_delete: Vec<String> = Vec::new();
+
         for path in &freshness.deleted_files {
             for key in equivalent_file_keys(&self.root, path) {
                 pdg.remove_file(&key);
-                if let Err(e) = delete_file_data(&mut self.storage, &self.project_id, &key) {
-                    warn!(
-                        "Phase context: failed to delete file data for '{}' (deleted file): {}",
-                        key, e
-                    );
-                }
+                files_to_delete.push(key);
             }
         }
 
@@ -191,18 +191,51 @@ impl PhaseExecutionContext {
                 })
                 .collect::<HashMap<_, _>>();
 
-            for (file_path, (language, signatures)) in &self.signatures_by_file {
-                // Parse succeeded: now safe to replace stale file graph/state.
+            // Collect changed file keys for batch deletion.
+            for file_path in self.signatures_by_file.keys() {
                 for key in equivalent_file_keys(&self.root, file_path) {
                     pdg.remove_file(&key);
-                    if let Err(e) = delete_file_data(&mut self.storage, &self.project_id, &key) {
+                    files_to_delete.push(key);
+                }
+            }
+
+            // Batch-delete all stale file data and update indexed_files in a
+            // single transaction to avoid N x fsync overhead.
+            let mut file_updates: Vec<(String, String)> = Vec::new();
+            for file_path in self.signatures_by_file.keys() {
+                let normalized = normalize_file_key(&self.root, file_path);
+                if let Some(hash) = inventory_hashes.get(&normalized) {
+                    file_updates.push((normalized.clone(), hash.clone()));
+                }
+            }
+
+            if !files_to_delete.is_empty() || !file_updates.is_empty() {
+                let tx = self.storage.conn_mut().transaction()?;
+                if !files_to_delete.is_empty() {
+                    if let Err(e) = delete_files_data_tx(&tx, &self.project_id, &files_to_delete) {
                         warn!(
-                            "Phase context: failed to delete file data for '{}' (changed file): {}",
-                            key, e
+                            "Phase context: failed to batch-delete file data for {} files: {}",
+                            files_to_delete.len(),
+                            e
                         );
                     }
                 }
+                if !file_updates.is_empty() {
+                    if let Err(e) = update_indexed_files_tx(&tx, &self.project_id, &file_updates) {
+                        warn!(
+                            "Phase context: failed to batch-update {} indexed file records: {}",
+                            file_updates.len(),
+                            e
+                        );
+                    }
+                }
+                if let Err(e) = tx.commit() {
+                    warn!("Phase context: failed to commit batch transaction: {}", e);
+                }
+            }
 
+            // Build new PDG fragments from parsed results.
+            for (file_path, (language, signatures)) in &self.signatures_by_file {
                 // Use source_bytes from ParsingResult when available, fall back to disk read
                 let source_bytes_fallback = source_bytes_for_file(&self.root, file_path);
                 let source_bytes = source_bytes_map
@@ -216,18 +249,6 @@ impl PhaseExecutionContext {
                     language,
                 );
                 merge_pdgs(&mut pdg, &file_pdg);
-
-                let normalized = normalize_file_key(&self.root, file_path);
-                if let Some(hash) = inventory_hashes.get(&normalized) {
-                    if let Err(e) =
-                        update_indexed_file(&mut self.storage, &self.project_id, &normalized, hash)
-                    {
-                        warn!(
-                            "Phase context: failed to update indexed file record for '{}' (incremental): {}",
-                            normalized, e
-                        );
-                    }
-                }
             }
         }
 

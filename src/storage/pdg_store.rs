@@ -648,6 +648,41 @@ pub fn delete_file_data(
     Ok(())
 }
 
+/// Delete nodes and edges for a specific file within an existing transaction
+pub fn delete_file_data_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &str,
+    file_path: &str,
+) -> SqliteResult<()> {
+    tx.execute(
+        "DELETE FROM intel_edges WHERE
+         caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2) OR
+         callee_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2)",
+        params![project_id, file_path],
+    )?;
+    tx.execute(
+        "DELETE FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2",
+        params![project_id, file_path],
+    )?;
+    tx.execute(
+        "DELETE FROM indexed_files WHERE project_id = ?1 AND file_path = ?2",
+        params![project_id, file_path],
+    )?;
+    Ok(())
+}
+
+/// Delete nodes and edges for multiple files in a single transaction
+pub fn delete_files_data_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &str,
+    file_paths: &[String],
+) -> SqliteResult<()> {
+    for file_path in file_paths {
+        delete_file_data_tx(tx, project_id, file_path)?;
+    }
+    Ok(())
+}
+
 /// Get all indexed files for a project with their hashes
 pub fn get_indexed_files(
     storage: &Storage,
@@ -696,6 +731,24 @@ pub fn update_indexed_file(
          ON CONFLICT(file_path) DO UPDATE SET file_hash = ?3, last_indexed = ?4",
         params![file_path, project_id, hash, chrono::Utc::now().timestamp()],
     )?;
+    Ok(())
+}
+
+/// Update multiple indexed files within a single transaction
+pub fn update_indexed_files_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &str,
+    files: &[(String, String)], // (file_path, file_hash)
+) -> SqliteResult<()> {
+    let now = chrono::Utc::now().timestamp();
+    for (file_path, file_hash) in files {
+        tx.execute(
+            "INSERT INTO indexed_files (file_path, project_id, file_hash, last_indexed)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_path) DO UPDATE SET file_hash = ?3, last_indexed = ?4",
+            params![file_path, project_id, file_hash, now],
+        )?;
+    }
     Ok(())
 }
 
@@ -1224,5 +1277,254 @@ mod tests {
 
         let loaded = load_pdg(&storage, "big_project").unwrap();
         assert_eq!(loaded.edge_count(), 10_000);
+    }
+
+    #[test]
+    fn test_batch_delete_equivalent_to_single() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+
+        // Build a PDG with nodes across 5 files
+        let mut pdg = ProgramDependenceGraph::new();
+        let files = ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"];
+        let mut node_ids = Vec::new();
+        for (fi, file) in files.iter().enumerate() {
+            for ni in 0..3 {
+                let id = pdg.add_node(PDGNode {
+                    id: format!("{file}:func{ni}"),
+                    node_type: PDGNodeType::Function,
+                    name: format!("func_{fi}_{ni}"),
+                    file_path: Arc::from(*file),
+                    byte_range: (ni * 10, ni * 10 + 5),
+                    complexity: ni as u32,
+                    language: "rust".to_string(),
+                });
+                node_ids.push(id);
+            }
+        }
+        // Add some edges between nodes in different files
+        for i in 0..(node_ids.len() - 1) {
+            pdg.add_edge(
+                node_ids[i],
+                node_ids[i + 1],
+                PDGEdge {
+                    edge_type: PDGEdgeType::Call,
+                    metadata: PDGEdgeMetadata {
+                        call_count: Some(1),
+                        variable_name: None,
+                        confidence: None,
+                        channel: None,
+                        position: None,
+                    },
+                },
+            );
+        }
+        save_pdg(&mut storage, "proj_batch_del", &pdg).unwrap();
+
+        // Delete 3 files via single calls (a.rs, b.rs, c.rs)
+        delete_file_data(&mut storage, "proj_batch_del", "a.rs").unwrap();
+        delete_file_data(&mut storage, "proj_batch_del", "b.rs").unwrap();
+        delete_file_data(&mut storage, "proj_batch_del", "c.rs").unwrap();
+
+        let loaded_single = load_pdg(&storage, "proj_batch_del").unwrap();
+        let single_nodes = loaded_single.node_count();
+        let single_edges = loaded_single.edge_count();
+
+        // Now test batch delete on a fresh copy
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let mut storage2 = Storage::open(temp_file2.path()).unwrap();
+        save_pdg(&mut storage2, "proj_batch_del", &pdg).unwrap();
+
+        let tx = storage2.conn_mut().transaction().unwrap();
+        delete_files_data_tx(
+            &tx,
+            "proj_batch_del",
+            &["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let loaded_batch = load_pdg(&storage2, "proj_batch_del").unwrap();
+        assert_eq!(loaded_batch.node_count(), single_nodes);
+        assert_eq!(loaded_batch.edge_count(), single_edges);
+        // 5 files * 3 nodes each = 15 total, deleted 3 files * 3 = 9, expect 6 remaining
+        assert_eq!(single_nodes, 6);
+    }
+
+    #[test]
+    fn test_batch_update_equivalent_to_single() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+
+        // Update 10 indexed_files via single calls
+        for i in 0..10 {
+            update_indexed_file(
+                &mut storage,
+                "proj_batch_upd",
+                &format!("src/file{i}.rs"),
+                &format!("hash{i}"),
+            )
+            .unwrap();
+        }
+        let single_files = get_indexed_files(&storage, "proj_batch_upd").unwrap();
+
+        // Batch update on a fresh storage
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let mut storage2 = Storage::open(temp_file2.path()).unwrap();
+
+        let files: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("src/file{i}.rs"), format!("hash{i}")))
+            .collect();
+        let tx = storage2.conn_mut().transaction().unwrap();
+        update_indexed_files_tx(&tx, "proj_batch_upd", &files).unwrap();
+        tx.commit().unwrap();
+
+        let batch_files = get_indexed_files(&storage2, "proj_batch_upd").unwrap();
+
+        assert_eq!(batch_files.len(), single_files.len());
+        for (path, hash) in &single_files {
+            assert_eq!(batch_files.get(path), Some(hash));
+        }
+    }
+
+    #[test]
+    fn test_pdg_roundtrip_preserves_data() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+
+        // Create PDG with 50 nodes, 49 edges across 10 files
+        let mut pdg = ProgramDependenceGraph::new();
+        let files: Vec<String> = (0..10).map(|i| format!("src/mod{i}.rs")).collect();
+        let mut node_ids = Vec::new();
+        for i in 0..50 {
+            let file = &files[i % 10];
+            let id = pdg.add_node(PDGNode {
+                id: format!("{file}:func{i}"),
+                node_type: PDGNodeType::Function,
+                name: format!("func{i}"),
+                file_path: Arc::from(file.as_str()),
+                byte_range: (i * 20, i * 20 + 10),
+                complexity: (i % 5) as u32,
+                language: "rust".to_string(),
+            });
+            node_ids.push(id);
+        }
+        for i in 0..49 {
+            pdg.add_edge(
+                node_ids[i],
+                node_ids[i + 1],
+                PDGEdge {
+                    edge_type: PDGEdgeType::Call,
+                    metadata: PDGEdgeMetadata {
+                        call_count: Some(i + 1),
+                        variable_name: None,
+                        confidence: Some(0.9),
+                        channel: None,
+                        position: None,
+                    },
+                },
+            );
+        }
+
+        save_pdg(&mut storage, "proj_roundtrip", &pdg).unwrap();
+        let loaded = load_pdg(&storage, "proj_roundtrip").unwrap();
+
+        assert_eq!(loaded.node_count(), 50);
+        assert_eq!(loaded.edge_count(), 49);
+
+        // Verify a sampling of nodes survived intact
+        for i in [0, 10, 25, 49] {
+            let file = &files[i % 10];
+            let sym = format!("{file}:func{i}");
+            assert!(loaded.find_by_symbol(&sym).is_some(), "node {sym} missing");
+        }
+    }
+
+    #[test]
+    fn test_incremental_refresh_no_corruption() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+
+        // Phase 1: Add file_a with 2 nodes
+        let mut pdg_a = ProgramDependenceGraph::new();
+        let a1 = pdg_a.add_node(PDGNode {
+            id: "a.rs:alpha".to_string(),
+            node_type: PDGNodeType::Function,
+            name: "alpha".to_string(),
+            file_path: Arc::from("a.rs"),
+            byte_range: (0, 50),
+            complexity: 1,
+            language: "rust".to_string(),
+        });
+        let a2 = pdg_a.add_node(PDGNode {
+            id: "a.rs:beta".to_string(),
+            node_type: PDGNodeType::Function,
+            name: "beta".to_string(),
+            file_path: Arc::from("a.rs"),
+            byte_range: (50, 100),
+            complexity: 1,
+            language: "rust".to_string(),
+        });
+        pdg_a.add_edge(
+            a1,
+            a2,
+            PDGEdge {
+                edge_type: PDGEdgeType::Call,
+                metadata: PDGEdgeMetadata {
+                    call_count: Some(1),
+                    variable_name: None,
+                    confidence: None,
+                    channel: None,
+                    position: None,
+                },
+            },
+        );
+        save_pdg(&mut storage, "proj_refresh", &pdg_a).unwrap();
+        update_indexed_file(&mut storage, "proj_refresh", "a.rs", "hash_a_v1").unwrap();
+
+        // Phase 2: Delete a.rs, then re-add with modified content
+        delete_file_data(&mut storage, "proj_refresh", "a.rs").unwrap();
+
+        let mut pdg_a2 = ProgramDependenceGraph::new();
+        pdg_a2.add_node(PDGNode {
+            id: "a.rs:alpha".to_string(),
+            node_type: PDGNodeType::Function,
+            name: "alpha".to_string(),
+            file_path: Arc::from("a.rs"),
+            byte_range: (0, 60),
+            complexity: 2,
+            language: "rust".to_string(),
+        });
+        pdg_a2.add_node(PDGNode {
+            id: "a.rs:gamma".to_string(),
+            node_type: PDGNodeType::Function,
+            name: "gamma".to_string(),
+            file_path: Arc::from("a.rs"),
+            byte_range: (60, 120),
+            complexity: 3,
+            language: "rust".to_string(),
+        });
+
+        // Use transaction-aware delete + save for incremental update
+        let tx = storage.conn_mut().transaction().unwrap();
+        delete_file_data_tx(&tx, "proj_refresh", "a.rs").unwrap();
+        tx.commit().unwrap();
+
+        save_pdg(&mut storage, "proj_refresh", &pdg_a2).unwrap();
+        update_indexed_file(&mut storage, "proj_refresh", "a.rs", "hash_a_v2").unwrap();
+
+        // Verify: no orphaned nodes/edges, correct data
+        let loaded = load_pdg(&storage, "proj_refresh").unwrap();
+        assert_eq!(loaded.node_count(), 2);
+        assert_eq!(loaded.edge_count(), 0); // pdg_a2 has no edges
+
+        // Verify the right nodes are present
+        assert!(loaded.find_by_symbol("a.rs:alpha").is_some());
+        assert!(loaded.find_by_symbol("a.rs:gamma").is_some());
+        assert!(loaded.find_by_symbol("a.rs:beta").is_none()); // old node should be gone
+
+        // Verify indexed_files is correct
+        let indexed = get_indexed_files(&storage, "proj_refresh").unwrap();
+        assert_eq!(indexed.get("a.rs"), Some(&"hash_a_v2".to_string()));
     }
 }
