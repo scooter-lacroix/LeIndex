@@ -40,7 +40,7 @@ pub const MODEL_HF_REPO: &str = "onnx-community/Qwen3-Embedding-0.6B-ONNX";
 pub const MODEL_ONNX_FILENAME: &str = "qwen3-embed-0.6b.onnx";
 
 /// Dynamic-batch ONNX export used by CPU, CUDA, and MIGraphX providers.
-pub const DYNAMIC_MODEL_ONNX_FILENAME: &str = "qwen3-embed-0.6b-dynamic.onnx";
+pub const DYNAMIC_MODEL_ONNX_FILENAME: &str = "qwen3-embed-0.6b-dynamic-uint8.onnx";
 
 /// File listing within the bundled checksum manifest. The trailing
 /// `(local_filename, remote_subpath)` pairs let the local layout (flat

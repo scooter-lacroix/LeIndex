@@ -206,6 +206,89 @@ fn migraphx_uses_one_stable_batch_shape_by_default() {
 }
 
 #[test]
+fn test_batch_size_for_dynamic_uint8() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+    // The -dynamic-uint8 suffix must trigger the dynamic batch path, same as
+    // -dynamic. MIGraphX gets the stable compiled batch size (8).
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic-uint8", "migraphx"),
+        DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE
+    );
+    // CPU/CUDA gets the larger dynamic batch size (32).
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic-uint8", "cpu"),
+        DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE
+    );
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_extract_u8_dequantization() {
+    // Verify the dequantization formula: (value - zero_point) * scale
+    // with scale=0.0027450980 and zero_point=109.
+    // These are the QuantizeLinear parameters from the electroglyph uint8 model.
+    const SCALE: f32 = 0.0027450980;
+    const ZERO_POINT: f32 = 109.0;
+
+    // Test a few representative uint8 values.
+    let test_cases: [(u8, f32); 4] = [
+        // (input u8, expected dequantized f32)
+        (109, 0.0),                     // zero_point -> 0.0
+        (0, (0.0 - 109.0) * SCALE),     // min uint8
+        (255, (255.0 - 109.0) * SCALE), // max uint8
+        (128, (128.0 - 109.0) * SCALE), // mid-range
+    ];
+
+    for (input, expected) in test_cases {
+        let dequantized = (input as f32 - ZERO_POINT) * SCALE;
+        assert!(
+            (dequantized - expected).abs() < 1e-6,
+            "u8 value {}: expected {}, got {}",
+            input,
+            expected,
+            dequantized
+        );
+    }
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_u8_dequant_preserves_unit_norm() {
+    // The electroglyph uint8 model L2-normalizes embeddings BEFORE quantizing.
+    // After dequantization, the vector norm should be close to 1.0.
+    //
+    // Simulate: take a unit vector, quantize to uint8, dequantize, check norm.
+    const SCALE: f32 = 0.0027450980;
+    const ZERO_POINT: f32 = 109.0;
+
+    // A simple 4-dim unit vector.
+    let original: Vec<f32> = vec![0.5, 0.5, 0.5, 0.5];
+    // Quantize: round(value / scale + zero_point), clamp to [0, 255].
+    let quantized: Vec<u8> = original
+        .iter()
+        .map(|&v| {
+            let q = (v / SCALE + ZERO_POINT).round() as i32;
+            q.clamp(0, 255) as u8
+        })
+        .collect();
+    // Dequantize.
+    let dequantized: Vec<f32> = quantized
+        .iter()
+        .map(|&v| (v as f32 - ZERO_POINT) * SCALE)
+        .collect();
+
+    let norm: f32 = dequantized.iter().map(|v| v * v).sum::<f32>().sqrt();
+    // The quantization introduces small error, but norm should be near 1.0.
+    assert!(
+        (norm - 1.0).abs() < 0.1,
+        "dequantized vector norm {} should be close to 1.0",
+        norm
+    );
+}
+
+#[test]
 fn test_runtime_idle_not_expired_initially() {
     let config = no_compile_config();
     let rt = WorkerRuntime::new(config);

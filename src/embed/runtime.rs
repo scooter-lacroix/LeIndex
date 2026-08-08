@@ -72,17 +72,28 @@ use crate::embed::runtime_env::{
 
 #[cfg(feature = "onnx")]
 fn extract_output_tensor_f32(value: &ort::value::DynValue) -> Result<Vec<f32>, String> {
+    // Quantization parameters for the electroglyph/Qwen3-Embedding-0.6B-onnx-uint8
+    // model. The model applies QuantizeLinear with these constants to its
+    // L2-normalized sentence_embedding output. Dequantization formula:
+    //   float_value = (uint8_value - zero_point) * scale
+    const UINT8_DEQUANT_SCALE: f32 = 0.0027450980;
+    const UINT8_DEQUANT_ZERO_POINT: f32 = 109.0;
+
     match value.try_extract_array::<f32>() {
         Ok(values) => Ok(values.iter().copied().collect()),
-        Err(f32_error) => value
-            .try_extract_array::<half::f16>()
-            .map(|values| values.iter().map(|value| value.to_f32()).collect())
-            .map_err(|f16_error| {
-                format!(
-                    "output is neither f32 ({}) nor f16 ({})",
-                    f32_error, f16_error
-                )
-            }),
+        Err(f32_error) => match value.try_extract_array::<half::f16>() {
+            Ok(values) => Ok(values.iter().map(|value| value.to_f32()).collect()),
+            Err(f16_error) => match value.try_extract_array::<u8>() {
+                Ok(values) => Ok(values
+                    .iter()
+                    .map(|&value| (value as f32 - UINT8_DEQUANT_ZERO_POINT) * UINT8_DEQUANT_SCALE)
+                    .collect()),
+                Err(u8_error) => Err(format!(
+                    "output is neither f32 ({}) nor f16 ({}) nor u8 ({})",
+                    f32_error, f16_error, u8_error
+                )),
+            },
+        },
     }
 }
 /// T6 low-memory refusal: when `min_available_mb` is configured and the system
@@ -229,7 +240,7 @@ impl Default for RuntimeConfig {
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             max_text_size: DEFAULT_MAX_TEXT_SIZE,
-            model_name: "qwen3-embed-0.6b".to_string(),
+            model_name: "qwen3-embed-0.6b-dynamic-uint8".to_string(),
             embedding_dim: 1024,
             // Default to "auto" which will detect the best available provider.
             // The worker will try MIGraphX (AMD GPU), then CUDA, then CPU.
@@ -274,7 +285,7 @@ impl RuntimeConfig {
                     Some(name)
                 }
             })
-            .unwrap_or_else(|| "qwen3-embed-0.6b".to_string());
+            .unwrap_or_else(|| "qwen3-embed-0.6b-dynamic-uint8".to_string());
 
         let embedding_dim = std::env::var("LEINDEX_WORKER_EMBEDDING_DIM")
             .ok()

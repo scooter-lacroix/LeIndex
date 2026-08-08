@@ -65,7 +65,7 @@ pub fn configured_onnx_inference_batch_size(model_name: &str, provider: &str) ->
             // batch dimension > 1. Only -dynamic model variants benefit from
             // larger batches, and among those, MIGraphX/ROCm needs a single
             // stable compiled batch shape.
-            if model_name.ends_with("-dynamic") {
+            if model_name.ends_with("-dynamic") || model_name.ends_with("-dynamic-uint8") {
                 if provider.eq_ignore_ascii_case("migraphx")
                     || provider.eq_ignore_ascii_case("rocm")
                 {

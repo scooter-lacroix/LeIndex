@@ -17,7 +17,7 @@ pub const LEINDEX_HOME_ENV: &str = "LEINDEX_HOME";
 
 /// Default model directory relative to LeIndex home.
 const DEFAULT_MODEL_DIR_SUFFIX: &str = "models";
-const DEFAULT_MODEL_NAME: &str = "qwen3-embed-0.6b";
+const DEFAULT_MODEL_NAME: &str = "qwen3-embed-0.6b-dynamic-uint8";
 
 /// The complete LeIndex neural search configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -519,7 +519,7 @@ mod tests {
             ort_dylib_path: Some("/usr/local/lib/libonnxruntime.so".to_string()),
             ort_version: Some("1.25.0".to_string()),
             model_dir: "/home/user/.leindex/models".to_string(),
-            model_name: "qwen3-embed-0.6b".to_string(),
+            model_name: "qwen3-embed-0.6b-dynamic-uint8".to_string(),
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(config.search.search_mode, "hybrid");
         assert_eq!(config.search.neural_weight, 0.4);
         assert_eq!(config.indexing.batch_size, 500);
-        assert_eq!(config.neural.model_name, "qwen3-embed-0.6b");
+        assert_eq!(config.neural.model_name, "qwen3-embed-0.6b-dynamic-uint8");
     }
 
     #[test]

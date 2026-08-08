@@ -7,9 +7,9 @@ fn next_model_install_id() -> u64 {
     MODEL_INSTALL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
 }
 
-pub(super) const QWEN3_ONNX_REPOSITORY: &str = "zhiqing/Qwen3-Embedding-0.6B-ONNX";
-pub(super) const QWEN3_ONNX_REVISION: &str = "c96cc9c82d08ee7869600e2191078fc939957026";
-pub(super) const QWEN3_REMOTE_MODEL: &str = "model.onnx";
+pub(super) const QWEN3_ONNX_REPOSITORY: &str = "electroglyph/Qwen3-Embedding-0.6B-onnx-uint8";
+pub(super) const QWEN3_ONNX_REVISION: &str = "1596611504ff0d92a24cb3ed7403a9f5d5f9a13c";
+pub(super) const QWEN3_REMOTE_MODEL: &str = "dynamic_uint8.onnx";
 pub(super) const QWEN3_LOCAL_MODEL: &str =
     crate::cli::leindex::model_download::DYNAMIC_MODEL_ONNX_FILENAME;
 pub(super) const QWEN3_MODEL_FILES: &[&str] =
@@ -563,10 +563,16 @@ pub(super) fn ensure_models_present(
     let dynamic_model_name = DYNAMIC_MODEL_ONNX_FILENAME
         .strip_suffix(".onnx")
         .unwrap_or(DYNAMIC_MODEL_ONNX_FILENAME);
-    if model_name != legacy_model_name && model_name != dynamic_model_name {
+    if model_name != legacy_model_name
+        && model_name != dynamic_model_name
+        && model_name != "qwen3-embed-0.6b-dynamic"
+    {
         return Err(SetupError::InvalidModelName {
             model_name: model_name.to_string(),
-            accepted_names: format!("'{}' or '{}'", legacy_model_name, dynamic_model_name),
+            accepted_names: format!(
+                "'{}', '{}' or 'qwen3-embed-0.6b-dynamic'",
+                legacy_model_name, dynamic_model_name
+            ),
         });
     }
 
@@ -579,7 +585,9 @@ pub(super) fn ensure_models_present(
         .map_err(|e| SetupError::Io(format!("Cannot create model dir: {}", e)))?;
 
     let model_filename = format!("{}.onnx", model_name);
-    if model_filename == DYNAMIC_MODEL_ONNX_FILENAME {
+    if model_filename == DYNAMIC_MODEL_ONNX_FILENAME
+        || model_filename == "qwen3-embed-0.6b-dynamic.onnx"
+    {
         return ensure_hugging_face_model_present(model_download_profile(provider), &model_dir);
     }
 

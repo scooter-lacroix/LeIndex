@@ -34,8 +34,9 @@ execution_provider = "auto"
 model_dir = "~/.leindex/models"
 
 # Model stem to load from model_dir. The "-dynamic" suffix enables dynamic batch
-# /sequence shapes (more flexible, longer MIGraphX cold compile).
-model_name = "qwen3-embed-0.6b-dynamic"
+# /sequence shapes (more flexible, longer MIGraphX cold compile). The "-uint8"
+# variant uses a quantized model with uint8 dequantization for lower memory.
+model_name = "qwen3-embed-0.6b-dynamic-uint8"
 
 # ── Search ──────────────────────────────────────────────────────────────────
 [search]

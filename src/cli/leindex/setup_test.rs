@@ -631,7 +631,7 @@ fn test_build_config_selects_dynamic_qwen_model_for_all_local_providers() {
 
         let cfg = build_config(&choices, None, None);
 
-        assert_eq!(cfg.neural.model_name, "qwen3-embed-0.6b-dynamic");
+        assert_eq!(cfg.neural.model_name, "qwen3-embed-0.6b-dynamic-uint8");
     }
 }
 
@@ -645,13 +645,16 @@ fn test_model_download_profile_uses_hugging_face_cli_assets() {
         ExecutionProvider::CoreMl,
     ] {
         let profile = model_download_profile(Some(provider));
-        assert_eq!(profile.repository, "zhiqing/Qwen3-Embedding-0.6B-ONNX");
-        assert_eq!(profile.revision, "c96cc9c82d08ee7869600e2191078fc939957026");
-        assert_eq!(profile.remote_model, "model.onnx");
-        assert_eq!(profile.local_model, "qwen3-embed-0.6b-dynamic.onnx");
+        assert_eq!(
+            profile.repository,
+            "electroglyph/Qwen3-Embedding-0.6B-onnx-uint8"
+        );
+        assert_eq!(profile.revision, "1596611504ff0d92a24cb3ed7403a9f5d5f9a13c");
+        assert_eq!(profile.remote_model, "dynamic_uint8.onnx");
+        assert_eq!(profile.local_model, "qwen3-embed-0.6b-dynamic-uint8.onnx");
         assert_eq!(
             profile.files,
-            &["model.onnx", "tokenizer.json", "config.json"]
+            &["dynamic_uint8.onnx", "tokenizer.json", "config.json"]
         );
     }
 }

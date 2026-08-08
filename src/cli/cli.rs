@@ -1571,7 +1571,8 @@ fn should_auto_warmup(
     }
 
     // Auto-warm only when the MIGraphX cache is cold (does not exist yet).
-    let cache_path = crate::search::onnx::client::migraphx_cache_path("qwen3-embed-0.6b-dynamic");
+    let cache_path =
+        crate::search::onnx::client::migraphx_cache_path("qwen3-embed-0.6b-dynamic-uint8");
     !cache_path.exists()
 }
 
