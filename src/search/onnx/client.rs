@@ -1158,7 +1158,11 @@ impl EmbeddingClient {
     /// VAL-CPHASE-016: The returned `EmbedResult::Success` contains a flat
     /// row-major `EmbedResponse` that can be written directly into destination
     /// storage without creating a nested `Vec<Vec<f32>>` heap mirror.
-    pub fn embed_with_fallback(&self, texts: &[String], expected_dim: usize) -> EmbedResult {
+    pub fn embed_with_fallback<S: AsRef<str>>(
+        &self,
+        texts: &[S],
+        expected_dim: usize,
+    ) -> EmbedResult {
         let batch_id = Self::next_batch_id();
 
         // Attempt 1: initial try
@@ -1232,11 +1236,22 @@ impl EmbeddingClient {
         }
     }
 
-    /// Single attempt to send an embed request to the worker.
-    fn embed_attempt(
+    /// Send an embed request to the worker, sharding oversized inputs.
+    ///
+    /// VAL-FRAME-001: Batching many full contents into a single IPC frame can
+    /// exceed the worker's incoming-frame guard (32 MiB default), deterministically
+    /// killing the worker. This method estimates the serialized frame size and
+    /// splits the texts into sub-chunks that each fit within
+    /// `MAX_REQUEST_FRAME_BUDGET`, sending them sequentially and concatenating
+    /// the flat row-major vectors in input order.
+    ///
+    /// Retry semantics are preserved: `embed_with_fallback` calls this both for
+    /// its first attempt and its retry, so an oversized batch is never re-sent
+    /// as one oversized frame.
+    fn embed_attempt<S: AsRef<str>>(
         &self,
         batch_id: BatchId,
-        texts: &[String],
+        texts: &[S],
         expected_dim: usize,
     ) -> Result<EmbedResponse, ClientError> {
         #[cfg(feature = "cli")]
@@ -1246,41 +1261,59 @@ impl EmbeddingClient {
         let result = (|| {
             self.ensure_worker_ready()?;
 
-            let request = EmbedRequest {
-                texts: texts.to_vec(),
-                expected_dim,
-                cache_keys: vec![],
-            };
-
-            let frame = protocol::embed_request_frame(batch_id, request)
-                .map_err(|e| ClientError::Ipc(e.to_string()))?;
-
-            let response_frame = self.send_and_receive(frame)?;
-
-            match response_frame.header.msg_type {
-                MsgType::EmbedResponse => {
-                    let response: Response = response_frame
-                        .decode_payload()
-                        .map_err(|e| ClientError::Ipc(e.to_string()))?;
-                    match response {
-                        Response::Embed(embed_resp) => Ok(embed_resp),
-                        _ => Err(ClientError::Protocol("expected Embed response".to_string())),
-                    }
-                }
-                MsgType::Error => {
-                    let response: Response = response_frame
-                        .decode_payload()
-                        .map_err(|e| ClientError::Ipc(e.to_string()))?;
-                    match response {
-                        Response::Error(err) => Err(ClientError::Worker(err)),
-                        _ => Err(ClientError::Protocol("expected Error response".to_string())),
-                    }
-                }
-                other => Err(ClientError::Protocol(format!(
-                    "unexpected response type: {:?}",
-                    other
-                ))),
+            let total_estimate = embed_request_frame_estimate(texts);
+            if total_estimate <= MAX_REQUEST_FRAME_BUDGET {
+                // Fast path: a single frame fits the budget, send it directly.
+                let response = self.embed_attempt_shard(batch_id, texts, expected_dim)?;
+                return Ok(response);
             }
+
+            tracing::info!(
+                batch_id = %batch_id,
+                texts = texts.len(),
+                estimated_bytes = total_estimate,
+                budget = MAX_REQUEST_FRAME_BUDGET,
+                "embed request exceeds frame budget; sharding into sub-requests"
+            );
+
+            // Shard: greedily pack texts into sub-chunks that each fit the budget.
+            let mut shards: Vec<Vec<String>> = Vec::new();
+            let mut current: Vec<String> = Vec::new();
+            let mut current_estimate: usize = 0;
+            for text in texts {
+                let text_estimate = text.as_ref().len() + 32;
+                if !current.is_empty()
+                    && current_estimate + text_estimate > MAX_REQUEST_FRAME_BUDGET
+                {
+                    shards.push(std::mem::take(&mut current));
+                    current_estimate = 0;
+                }
+                current_estimate += text_estimate;
+                current.push(text.as_ref().to_string());
+            }
+            if !current.is_empty() {
+                shards.push(current);
+            }
+
+            // Send each shard in order and concatenate the flat vectors.
+            let mut all_vectors: Vec<f32> = Vec::new();
+            let mut shard_count: usize = 0;
+            for shard in shards {
+                shard_count += 1;
+                let shard_response =
+                    self.embed_attempt_shard(Self::next_batch_id(), &shard, expected_dim)?;
+                for vector in shard_response.into_vectors() {
+                    all_vectors.extend_from_slice(&vector);
+                }
+            }
+            tracing::info!(
+                batch_id = %batch_id,
+                shard_count,
+                total_texts = texts.len(),
+                "embed request sharded successfully"
+            );
+
+            Ok(EmbedResponse::new(all_vectors, texts.len(), expected_dim))
         })();
         let neural_ms = neural_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         tracing::debug!(
@@ -1291,6 +1324,55 @@ impl EmbeddingClient {
         #[cfg(feature = "cli")]
         crate::cli::mcp::request_meta::record_neural_ms(neural_ms);
         result
+    }
+
+    /// Send a single embed request frame (one shard) to the worker.
+    ///
+    /// Assumes `texts` is already sized to fit `MAX_REQUEST_FRAME_BUDGET` — call
+    /// via `embed_attempt` which shards, or directly for known-small batches.
+    fn embed_attempt_shard<S: AsRef<str>>(
+        &self,
+        batch_id: BatchId,
+        texts: &[S],
+        expected_dim: usize,
+    ) -> Result<EmbedResponse, ClientError> {
+        self.ensure_worker_ready()?;
+
+        let request = EmbedRequest {
+            texts: texts.iter().map(|t| t.as_ref().to_string()).collect(),
+            expected_dim,
+            cache_keys: vec![],
+        };
+
+        let frame = protocol::embed_request_frame(batch_id, request)
+            .map_err(|e| ClientError::Ipc(e.to_string()))?;
+
+        let response_frame = self.send_and_receive(frame)?;
+
+        match response_frame.header.msg_type {
+            MsgType::EmbedResponse => {
+                let response: Response = response_frame
+                    .decode_payload()
+                    .map_err(|e| ClientError::Ipc(e.to_string()))?;
+                match response {
+                    Response::Embed(embed_resp) => Ok(embed_resp),
+                    _ => Err(ClientError::Protocol("expected Embed response".to_string())),
+                }
+            }
+            MsgType::Error => {
+                let response: Response = response_frame
+                    .decode_payload()
+                    .map_err(|e| ClientError::Ipc(e.to_string()))?;
+                match response {
+                    Response::Error(err) => Err(ClientError::Worker(err)),
+                    _ => Err(ClientError::Protocol("expected Error response".to_string())),
+                }
+            }
+            other => Err(ClientError::Protocol(format!(
+                "unexpected response type: {:?}",
+                other
+            ))),
+        }
     }
 
     /// Send an embed request to the worker and return the response.

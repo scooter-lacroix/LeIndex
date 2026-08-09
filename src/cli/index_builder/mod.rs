@@ -1087,6 +1087,26 @@ fn index_nodes_with_embedder_inner(
 
     Ok((embedder, content_cache))
 }
+
+/// A6: cap the text sent to the neural worker so a single node's content can
+/// never approach the worker's incoming-frame guard, and to bound per-text
+/// tokenize/inference cost. TF-IDF and lexical search keep the FULL content;
+/// only the neural-embedding input is truncated. Cuts on a char boundary so
+/// the tokenizer never receives a partial UTF-8 sequence.
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+fn cap_neural_text(text: &str) -> &str {
+    const NEURAL_TEXT_CAP: usize = 64 * 1024;
+    if text.len() > NEURAL_TEXT_CAP {
+        let mut end = NEURAL_TEXT_CAP;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
+    } else {
+        text
+    }
+}
+
 /// Run deferred neural embedding for the pending batch indices, caching each
 /// result in the work hoister and storing it on the node. Sub-chunked to cap
 /// IPC payload and worker memory. No-op for an empty pending list.
@@ -1100,13 +1120,26 @@ fn embed_pending_neural_batch(
     for ipc_chunk in neural_pending.chunks(NEURAL_IPC_BATCH) {
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
         {
-            let texts: Vec<String> = ipc_chunk
-                .iter()
-                .map(|&idx| nodes[idx].content.clone())
-                .collect();
-            let batch_results = _embedder.embed_neural_batch_blocking(&texts);
-            for (i, &node_vec_idx) in ipc_chunk.iter().enumerate() {
-                let neural = batch_results.get(i).and_then(|r| r.clone());
+            // Borrow the contents instead of cloning every String, cap each at
+            // NEURAL_TEXT_CAP (A6), and dedupe identical capped texts within
+            // the chunk so each unique input is embedded once (nodes with the
+            // same body share one vector).
+            let mut result_by_content: HashMap<&str, Option<Vec<f32>>> = HashMap::new();
+            let mut unique_contents: Vec<&str> = Vec::new();
+            for &idx in ipc_chunk {
+                let capped = cap_neural_text(nodes[idx].content.as_str());
+                if !result_by_content.contains_key(capped) {
+                    result_by_content.insert(capped, None);
+                    unique_contents.push(capped);
+                }
+            }
+            let batch_results = _embedder.embed_neural_batch_blocking(&unique_contents);
+            for (content, result) in unique_contents.iter().zip(batch_results) {
+                result_by_content.insert(content, result);
+            }
+            for &node_vec_idx in ipc_chunk {
+                let capped = cap_neural_text(nodes[node_vec_idx].content.as_str());
+                let neural = result_by_content.get(capped).cloned().flatten();
                 _work_hoister.store(
                     &nodes[node_vec_idx].content,
                     nodes[node_vec_idx].tfidf_embedding.clone(),
@@ -1477,10 +1510,7 @@ fn append_neural_batch(
     pending: &[(String, String)],
     rows: &mut Vec<(String, Vec<f32>)>,
 ) {
-    let texts = pending
-        .iter()
-        .map(|(_, text)| text.clone())
-        .collect::<Vec<_>>();
+    let texts: Vec<&str> = pending.iter().map(|(_, text)| text.as_str()).collect();
     let embeddings = embedder.embed_neural_batch_blocking(&texts);
     for ((node_id, _), embedding) in pending.iter().zip(embeddings) {
         if let Some(embedding) = embedding.filter(|row| !row.is_empty()) {

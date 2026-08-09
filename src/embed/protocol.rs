@@ -407,6 +407,10 @@ pub enum ErrorKind {
     InvalidRequest,
     /// Internal worker error.
     Internal,
+    /// The incoming request frame exceeded the worker's size guard. The
+    /// client re-shards and retries; the worker treats it as a recoverable
+    /// client-side sizing error, not a worker failure (VAL-FRAME-002).
+    FrameTooLarge,
 }
 
 impl std::fmt::Display for WorkerError {

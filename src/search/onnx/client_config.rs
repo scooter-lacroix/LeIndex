@@ -21,6 +21,30 @@ pub(super) fn embed_daemon_enabled() -> bool {
 /// rejected with a clear protocol error.
 pub(super) const MAX_RESPONSE_FRAME_SIZE: u32 = 32 * 1024 * 1024; // 32 MiB
 
+/// Maximum request frame size budget for a single embed IPC frame.
+///
+/// VAL-FRAME-001: The client must never send a request frame that exceeds the
+/// worker's *incoming* frame guard (`max_frame_size * 2` = 32 MiB by default).
+/// Batching N full contents into one frame routinely exceeded that guard,
+/// deterministically killing the worker (EOF/EPIPE). This budget is chosen
+/// with headroom under the 32 MiB worker cap — bincode adds a small envelope
+/// per frame, so requests are sharded to fit comfortably.
+pub(super) const MAX_REQUEST_FRAME_BUDGET: usize = 16 * 1024 * 1024; // 16 MiB
+
+/// Estimate the serialized size of an embed request frame containing `texts`.
+///
+/// Used to shard oversized batches before framing (VAL-FRAME-001). This is a
+/// conservative upper-bound estimate: bincode adds a per-string length prefix
+/// plus the EmbedRequest envelope; `len()` bytes plus a small per-text fixed
+/// overhead is a safe over-estimate that guarantees the resulting frame fits
+/// within `MAX_REQUEST_FRAME_BUDGET`.
+pub(super) fn embed_request_frame_estimate<S: AsRef<str>>(texts: &[S]) -> usize {
+    texts
+        .iter()
+        .map(|t| t.as_ref().len() + 32) // 32 bytes overhead per string (bincode length + slack)
+        .sum()
+}
+
 /// Read buffer capacity for BufReader wrapping the inference data path.
 ///
 /// VAL-DAEMON-006: A 128KB buffer reduces the number of `read()` syscalls
@@ -655,6 +679,14 @@ pub enum ClientError {
     /// Worker reported an error.
     #[error("worker error: {0}")]
     Worker(WorkerError),
+
+    /// A request frame exceeded the worker's incoming-frame guard.
+    ///
+    /// The client shards oversized batches before sending (VAL-FRAME-001), so
+    /// this is only reached when a shard still exceeds the budget — a
+    /// configuration mismatch. The caller can down-shard further or fall back.
+    #[error("request frame too large: {0}")]
+    FrameTooLarge(String),
 
     /// Protocol-level error (unexpected message type, etc.).
     #[error("protocol error: {0}")]

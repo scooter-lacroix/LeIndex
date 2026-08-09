@@ -407,7 +407,7 @@ impl HybridEmbedder {
     /// This batches all texts into a single IPC call to the ONNX worker,
     /// reducing N round-trips to 1 per chunk.
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-    pub fn embed_neural_batch_blocking(&self, texts: &[String]) -> Vec<Option<Vec<f32>>> {
+    pub fn embed_neural_batch_blocking<S: AsRef<str>>(&self, texts: &[S]) -> Vec<Option<Vec<f32>>> {
         match self {
             Self::TfIdfOnly(_) => vec![None; texts.len()],
             #[cfg(feature = "onnx")]
