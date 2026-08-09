@@ -907,6 +907,82 @@ impl WorkerRuntime {
     }
 
     #[cfg(feature = "onnx")]
+    fn build_cpu_session(
+        model_path: &std::path::Path,
+        ort_threads: usize,
+    ) -> Result<Session, ort::Error> {
+        Session::builder()?
+            .with_intra_threads(ort_threads)?
+            .with_memory_pattern(false)?
+            .with_log_level(LogLevel::Warning)?
+            .with_optimization_level(GraphOptimizationLevel::Level1)?
+            .with_execution_providers([ort::ep::CPU::default().build()])?
+            .commit_from_file(model_path)
+    }
+
+    #[cfg(feature = "onnx")]
+    fn probe_migraphx_compile_timeout(
+        session: &Arc<Mutex<Session>>,
+        max_wait: Duration,
+    ) -> Result<(), String> {
+        let session = Arc::clone(session);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<(), String> {
+                let batch_size = 1;
+                let max_len = configured_onnx_sequence_len().min(16);
+                let make_tensor = |data: Vec<i64>, label: &str| {
+                    ort::value::Tensor::from_array(
+                        ndarray::Array2::from_shape_vec((batch_size, max_len), data)
+                            .map_err(|e| format!("{} array: {}", label, e))?,
+                    )
+                    .map_err(|e| format!("{} tensor: {}", label, e))
+                };
+                let input_ids = make_tensor(vec![0; batch_size * max_len], "input_ids")?;
+                let attention_mask = make_tensor(vec![0; batch_size * max_len], "attention_mask")?;
+                let position_ids =
+                    make_tensor(build_position_ids(batch_size, max_len), "position_ids")?;
+                let token_type_ids = make_tensor(vec![0; batch_size * max_len], "token_type_ids")?;
+                let mut guard = session.lock().map_err(|e| format!("session lock: {}", e))?;
+                let uses_position_ids = guard.inputs().iter().any(|i| i.name() == "position_ids");
+                let uses_token_type_ids =
+                    guard.inputs().iter().any(|i| i.name() == "token_type_ids");
+                let result = match (uses_position_ids, uses_token_type_ids) {
+                    (true, true) => guard.run(ort::inputs! {
+                        "input_ids" => input_ids, "attention_mask" => attention_mask,
+                        "position_ids" => position_ids, "token_type_ids" => token_type_ids,
+                    }),
+                    (true, false) => guard.run(ort::inputs! {
+                        "input_ids" => input_ids, "attention_mask" => attention_mask,
+                        "position_ids" => position_ids,
+                    }),
+                    (false, true) => guard.run(ort::inputs! {
+                        "input_ids" => input_ids, "attention_mask" => attention_mask,
+                        "token_type_ids" => token_type_ids,
+                    }),
+                    (false, false) => guard.run(ort::inputs! {
+                        "input_ids" => input_ids, "attention_mask" => attention_mask,
+                    }),
+                };
+                result
+                    .map(|_| ())
+                    .map_err(|e| format!("MIGraphX probe inference: {}", e))
+            })();
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(max_wait) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                "MIGraphX compile probe timed out after {:?}",
+                max_wait
+            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err("MIGraphX compile probe thread disconnected".to_string())
+            }
+        }
+    }
+
+    #[cfg(feature = "onnx")]
     fn build_session(
         model_path: &std::path::Path,
         provider_name: &str,
@@ -951,6 +1027,36 @@ impl WorkerRuntime {
             attach_execution_provider(session_builder, provider_name, ort_threads)?;
 
         let session = session_builder.commit_from_file(model_path)?;
+        if matches!(provider_name, "migraphx" | "rocm") {
+            const MIGRAPHX_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+            let session_arc = Arc::new(Mutex::new(session));
+            match Self::probe_migraphx_compile_timeout(&session_arc, MIGRAPHX_PROBE_TIMEOUT) {
+                Ok(()) => {
+                    let session = match Arc::try_unwrap(session_arc) {
+                        Ok(mutex) => mutex.into_inner().unwrap_or_else(|p| p.into_inner()),
+                        Err(_) => Self::build_cpu_session(model_path, ort_threads)?,
+                    };
+                    return Ok(SessionBuildOutcome {
+                        session,
+                        provider_status,
+                    });
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        "{}; falling back to CPU for {}",
+                        reason,
+                        model_path.display()
+                    );
+                    return Ok(SessionBuildOutcome {
+                        session: Self::build_cpu_session(model_path, ort_threads)?,
+                        provider_status: ProviderRuntimeStatus::fallback_to_cpu(format!(
+                            "MIGraphX compile probe: {}",
+                            reason
+                        )),
+                    });
+                }
+            }
+        }
         Ok(SessionBuildOutcome {
             session,
             provider_status,

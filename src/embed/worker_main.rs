@@ -837,7 +837,15 @@ mod worker_entry_tests {
 
     #[test]
     fn test_runtime_handles_embed_request() {
-        let config = RuntimeConfig::default();
+        // Hermetic: a non-resolvable model name makes `init_onnx` return
+        // immediately with no session, so under `--features onnx` this test
+        // never attempts a real model load/compile (which would hang the
+        // suite on hosts that have ORT + a resolvable model).
+        let config = RuntimeConfig {
+            model_name: "__leindex_test_no_model__".to_string(),
+            rerank_model_name: "__leindex_test_no_rerank_model__".to_string(),
+            ..RuntimeConfig::default()
+        };
         let rt = WorkerRuntime::new(config);
         let request = EmbedRequest {
             texts: vec!["test".to_string()],
@@ -853,8 +861,11 @@ mod worker_entry_tests {
 
     #[test]
     fn test_run_loop_single_request() {
+        // Hermetic: as above, never attempt a real model load under onnx.
         let config = RuntimeConfig {
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+            model_name: "__leindex_test_no_model__".to_string(),
+            rerank_model_name: "__leindex_test_no_rerank_model__".to_string(),
             ..RuntimeConfig::default()
         };
         let rt = WorkerRuntime::new(config);

@@ -256,15 +256,23 @@ fn test_extract_u8_dequantization() {
 #[cfg(feature = "onnx")]
 #[test]
 fn test_u8_dequant_preserves_unit_norm() {
-    // The electroglyph uint8 model L2-normalizes embeddings BEFORE quantizing.
-    // After dequantization, the vector norm should be close to 1.0.
+    // The electroglyph uint8 model L2-normalizes embeddings BEFORE quantizing,
+    // then applies QuantizeLinear(scale=0.0027450980, zero_point=109). After
+    // dequantization the vector norm should stay close to 1.0 — provided every
+    // component is within the quantizer's representable range.
     //
-    // Simulate: take a unit vector, quantize to uint8, dequantize, check norm.
+    // With these constants the representable range is
+    //   [(0 - 109)*scale, (255 - 109)*scale] = [-0.299, 0.401].
+    // So a component like 0.5 is OUT of range and clips to 255 (dequant 0.401),
+    // collapsing the norm. A valid unit-norm check must use in-range components.
+    // [0.35; 8] has norm ~0.99, all components in range, and stays close to 1.0
+    // after quantize+dequant.
     const SCALE: f32 = 0.0027450980;
     const ZERO_POINT: f32 = 109.0;
 
-    // A simple 4-dim unit vector.
-    let original: Vec<f32> = vec![0.5, 0.5, 0.5, 0.5];
+    // An 8-dim vector with all components in the quantizer's representable
+    // range and near unit norm.
+    let original: Vec<f32> = vec![0.35; 8];
     // Quantize: round(value / scale + zero_point), clamp to [0, 255].
     let quantized: Vec<u8> = original
         .iter()
