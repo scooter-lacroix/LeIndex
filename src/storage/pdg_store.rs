@@ -12,7 +12,7 @@ use crate::storage::nodes::{NodeRecord, NodeType as StorageNodeType};
 use crate::storage::schema::Storage;
 use rusqlite::types::Value;
 use rusqlite::{Result as SqliteResult, params};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Type alias for node database rows to reduce type complexity
@@ -177,21 +177,44 @@ pub fn save_pdg(
     project_id: &str,
     pdg: &ProgramDependenceGraph,
 ) -> Result<()> {
+    // C2: the write connection is normally opened with WAL + synchronous=NORMAL
+    // already, but re-assert both here so legacy databases (created before WAL
+    // was the default, or opened through a non-default config) are upgraded
+    // before the bulk write. `journal_mode` is persistent and setting it is a
+    // no-op when WAL is already active; both pragmas must run outside the
+    // transaction below.
+    storage
+        .conn_mut()
+        .pragma_update(None, "journal_mode", "WAL")?;
+    storage
+        .conn_mut()
+        .pragma_update(None, "synchronous", "NORMAL")?;
+
     let tx = storage.conn_mut().transaction()?;
 
-    // Delete existing edges for this project first (to avoid foreign key constraints)
+    // Delete existing edges for this project first (avoids foreign key
+    // constraints and stale-edge leakage). Edges are fully rebuilt every save;
+    // unchanged NODES are the hot path the upsert below skips.
     tx.execute(
         "DELETE FROM intel_edges WHERE caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1)",
         params![project_id],
     )?;
 
-    // Then delete existing nodes for this project
-    tx.execute(
-        "DELETE FROM intel_nodes WHERE project_id = ?1",
-        params![project_id],
-    )?;
+    let (node_id_map, stale_node_ids) = save_nodes(&tx, project_id, pdg)?;
 
-    let node_id_map = save_nodes(&tx, project_id, pdg)?;
+    // Remove nodes that are no longer part of the PDG. Their edges were already
+    // deleted above. The stale set is computed in Rust against the pre-query,
+    // so each DELETE stays well under SQLITE_MAX_VARIABLE_NUMBER.
+    for chunk in stale_node_ids.chunks(PDG_INSERT_BATCH_SIZE) {
+        let placeholders = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "DELETE FROM intel_nodes WHERE project_id = ?1 AND node_id IN ({placeholders})"
+        );
+        let mut params: Vec<rusqlite::types::Value> = vec![Value::Text(project_id.to_string())];
+        params.extend(chunk.iter().map(|node_id| node_id.clone().into()));
+        tx.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+    }
+
     save_edges(&tx, &node_id_map, pdg)?;
 
     // Save trigram index alongside the PDG (within the same transaction)
@@ -205,19 +228,141 @@ pub fn save_pdg(
     Ok(())
 }
 
+/// Content hash for a node — computed once per node and reused for both the
+/// persisted `content_hash` column and the unchanged-row skip check (C3).
+///
+/// Hashes the content-bearing fields only. `node_id` is deliberately excluded:
+/// it is the row identity / upsert conflict key, so a changed id is a new row,
+/// not an update. The 0x1f separator cannot appear in any field (paths and
+/// identifiers cannot contain it; complexity and byte ranges are numeric).
+fn node_content_hash(
+    file_path: &str,
+    symbol_name: &str,
+    qualified_name: &str,
+    language: &str,
+    node_type: &StorageNodeType,
+    complexity: u32,
+    byte_range: (usize, usize),
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for field in [
+        file_path.as_bytes(),
+        symbol_name.as_bytes(),
+        qualified_name.as_bytes(),
+        language.as_bytes(),
+        node_type.as_str().as_bytes(),
+    ] {
+        hasher.update(field);
+        hasher.update(&[0x1f]);
+    }
+    hasher.update(&complexity.to_le_bytes());
+    hasher.update(&[0x1f]);
+    hasher.update(&byte_range.0.to_le_bytes());
+    hasher.update(&[0x1f]);
+    hasher.update(&byte_range.1.to_le_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 fn save_nodes(
     tx: &rusqlite::Transaction<'_>,
     project_id: &str,
     pdg: &ProgramDependenceGraph,
-) -> Result<HashMap<NodeId, i64>> {
-    let mut node_id_map = HashMap::new();
-    let node_indices: Vec<NodeId> = pdg.node_indices().collect();
+) -> Result<(HashMap<NodeId, i64>, Vec<String>)> {
+    // Pre-query existing rows for the project so an unchanged node reuses its
+    // db id and issues no write (C1). A legacy row whose content_hash was
+    // computed as blake3(node_id) under the old scheme reads as changed once
+    // and is rewritten under the new scheme on the first save.
+    let mut existing: HashMap<String, (i64, String)> = HashMap::new();
+    {
+        let mut stmt =
+            tx.prepare("SELECT id, node_id, content_hash FROM intel_nodes WHERE project_id = ?1")?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (db_id, node_id, content_hash) = row?;
+            existing.insert(node_id, (db_id, content_hash));
+        }
+    }
 
-    // Batch nodes into multi-row INSERTs. At 50K nodes this reduces ~50K
-    // individual statements down to O(100). Each batch stays well under
-    // SQLite's default `SQLITE_MAX_VARIABLE_NUMBER` (32766) and keeps the
-    // statement's bound-parameter memory bounded.
-    for chunk in node_indices.chunks(PDG_INSERT_BATCH_SIZE) {
+    let node_indices: Vec<NodeId> = pdg.node_indices().collect();
+    let mut node_id_map: HashMap<NodeId, i64> = HashMap::with_capacity(node_indices.len());
+    let mut to_upsert: Vec<(usize, NodeRecord)> = Vec::with_capacity(node_indices.len());
+
+    for (pos, &node_idx) in node_indices.iter().enumerate() {
+        let pdg_node = pdg
+            .get_node(node_idx)
+            .ok_or_else(|| PdgStoreError::Serialization("Missing node data".to_string()))?;
+
+        let qualified_name = pdg_node
+            .id
+            .split(':')
+            .next_back()
+            .unwrap_or(&pdg_node.id)
+            .to_string();
+        // C3: one hash per node, reused for the column and the skip check.
+        let content_hash = node_content_hash(
+            &pdg_node.file_path,
+            &pdg_node.name,
+            &qualified_name,
+            &pdg_node.language,
+            &convert_node_type(&pdg_node.node_type),
+            pdg_node.complexity,
+            pdg_node.byte_range,
+        );
+
+        if let Some((db_id, stored_hash)) = existing.get(&pdg_node.id) {
+            if *stored_hash == content_hash {
+                // Unchanged node: reuse the existing row, issue no write.
+                node_id_map.insert(node_idx, *db_id);
+                continue;
+            }
+        }
+
+        // Note: Embeddings are externalized to EmbeddingStore, not stored here.
+        let record = NodeRecord {
+            id: None,
+            project_id: project_id.to_string(),
+            file_path: pdg_node.file_path.to_string(),
+            node_id: pdg_node.id.clone(),
+            symbol_name: pdg_node.name.clone(),
+            qualified_name,
+            language: pdg_node.language.clone(),
+            node_type: convert_node_type(&pdg_node.node_type),
+            signature: None, // Could be populated from node content
+            complexity: Some(pdg_node.complexity as i32),
+            content_hash,
+            embedding: None, // Embeddings externalized to EmbeddingStore
+            byte_range_start: Some(pdg_node.byte_range.0 as i64),
+            byte_range_end: Some(pdg_node.byte_range.1 as i64),
+            embedding_format: Some(0),
+        };
+        to_upsert.push((pos, record));
+    }
+
+    // Stale = rows present in the DB but absent from the new PDG.
+    let keep: HashSet<&str> = node_indices
+        .iter()
+        .filter_map(|&idx| pdg.get_node(idx))
+        .map(|node| node.id.as_str())
+        .collect();
+    let stale_node_ids: Vec<String> = existing
+        .keys()
+        .filter(|node_id| !keep.contains(node_id.as_str()))
+        .cloned()
+        .collect();
+
+    // Upsert only new/changed nodes in batches. `RETURNING id` emits rows in
+    // the same order as the VALUES tuples, so the returned db ids map 1:1 onto
+    // the chunk's (pos, record) pairs. The DO UPDATE ... WHERE clause is a
+    // defensive no-op guard: rows are already filtered to changed, so the
+    // update always fires; if one slipped through unchanged, the write is
+    // skipped instead of dirtying the page.
+    for chunk in to_upsert.chunks(PDG_INSERT_BATCH_SIZE) {
         let n = chunk.len();
 
         // Each row carries its own set of 16 anonymous `?` placeholders, bound
@@ -231,57 +376,56 @@ fn save_nodes(
              (project_id, file_path, node_id, symbol_name, qualified_name, \
               language, node_type, signature, complexity, content_hash, embedding, \
               byte_range_start, byte_range_end, created_at, updated_at, embedding_format) \
-             VALUES {values_clause} RETURNING id"
+             VALUES {values_clause} \
+             ON CONFLICT(project_id, node_id) DO UPDATE SET \
+               file_path = excluded.file_path, \
+               symbol_name = excluded.symbol_name, \
+               qualified_name = excluded.qualified_name, \
+               language = excluded.language, \
+               node_type = excluded.node_type, \
+               signature = excluded.signature, \
+               complexity = excluded.complexity, \
+               content_hash = excluded.content_hash, \
+               embedding = excluded.embedding, \
+               byte_range_start = excluded.byte_range_start, \
+               byte_range_end = excluded.byte_range_end, \
+               embedding_format = excluded.embedding_format, \
+               updated_at = excluded.updated_at \
+             WHERE intel_nodes.content_hash != excluded.content_hash \
+             RETURNING id"
         );
 
         let now = chrono::Utc::now().timestamp();
         let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(n * 16);
-        for &node_idx in chunk {
-            let pdg_node = pdg
-                .get_node(node_idx)
-                .ok_or_else(|| PdgStoreError::Serialization("Missing node data".to_string()))?;
-
-            // Note: Embeddings are now externalized to EmbeddingStore, not stored in Node.
-            // They are persisted separately if needed.
-            let record = NodeRecord {
-                id: None,
-                project_id: project_id.to_string(),
-                file_path: pdg_node.file_path.to_string(),
-                node_id: pdg_node.id.clone(),
-                symbol_name: pdg_node.name.clone(),
-                qualified_name: pdg_node
-                    .id
-                    .split(':')
-                    .next_back()
-                    .unwrap_or(&pdg_node.id)
-                    .to_string(),
-                language: pdg_node.language.clone(),
-                node_type: convert_node_type(&pdg_node.node_type),
-                signature: None, // Could be populated from node content
-                complexity: Some(pdg_node.complexity as i32),
-                content_hash: blake3::hash(pdg_node.id.as_bytes()).to_hex().to_string(),
-                embedding: None, // Embeddings externalized to EmbeddingStore
-                byte_range_start: Some(pdg_node.byte_range.0 as i64),
-                byte_range_end: Some(pdg_node.byte_range.1 as i64),
-                embedding_format: Some(0),
-            };
-
-            params.push(record.project_id.into());
-            params.push(record.file_path.into());
-            params.push(record.node_id.into());
-            params.push(record.symbol_name.into());
-            params.push(record.qualified_name.into());
-            params.push(record.language.into());
+        for (_, record) in chunk {
+            params.push(record.project_id.clone().into());
+            params.push(record.file_path.clone().into());
+            params.push(record.node_id.clone().into());
+            params.push(record.symbol_name.clone().into());
+            params.push(record.qualified_name.clone().into());
+            params.push(record.language.clone().into());
             params.push(record.node_type.as_str().to_string().into());
-            params.push(record.signature.map(Value::Text).unwrap_or(Value::Null));
+            params.push(
+                record
+                    .signature
+                    .clone()
+                    .map(Value::Text)
+                    .unwrap_or(Value::Null),
+            );
             params.push(
                 record
                     .complexity
                     .map(|c| Value::Integer(c.into()))
                     .unwrap_or(Value::Null),
             );
-            params.push(record.content_hash.into());
-            params.push(record.embedding.map(Value::Blob).unwrap_or(Value::Null));
+            params.push(record.content_hash.clone().into());
+            params.push(
+                record
+                    .embedding
+                    .clone()
+                    .map(Value::Blob)
+                    .unwrap_or(Value::Null),
+            );
             params.push(
                 record
                     .byte_range_start
@@ -304,20 +448,18 @@ fn save_nodes(
             );
         }
 
-        // `RETURNING id` emits rows in the same order as the VALUES tuples, so
-        // the returned db ids map 1:1 onto the chunk's NodeIds.
         let mut stmt = tx.prepare(&sql)?;
         let ids: Vec<i64> = stmt
             .query_map(rusqlite::params_from_iter(params.iter()), |row| {
                 row.get::<_, i64>(0)
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (node_idx, db_id) in chunk.iter().zip(ids) {
-            node_id_map.insert(*node_idx, db_id);
+        for (&(pos, _), db_id) in chunk.iter().zip(ids) {
+            node_id_map.insert(node_indices[pos], db_id);
         }
     }
 
-    Ok(node_id_map)
+    Ok((node_id_map, stale_node_ids))
 }
 
 fn save_edges(
@@ -1277,6 +1419,68 @@ mod tests {
 
         let loaded = load_pdg(&storage, "big_project").unwrap();
         assert_eq!(loaded.edge_count(), 10_000);
+    }
+
+    #[test]
+    fn test_resave_unchanged_pdg_issues_no_node_writes() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+
+        let pdg = create_large_pdg(1_000, 1_000);
+        save_pdg(&mut storage, "resave_proj", &pdg).unwrap();
+
+        // Second save with an identical PDG: every node's content hash matches
+        // its stored row, so the upsert path must issue ZERO node writes and
+        // reuse the existing db ids. Edges are still fully rebuilt by design.
+        TRACE_COUNTS.node.store(0, Ordering::Relaxed);
+        TRACE_COUNTS.edge.store(0, Ordering::Relaxed);
+        set_sql_trace(storage.conn(), true);
+        save_pdg(&mut storage, "resave_proj", &pdg).unwrap();
+        set_sql_trace(storage.conn(), false);
+
+        let node_stmts = TRACE_COUNTS.node.load(Ordering::Relaxed);
+        assert_eq!(
+            node_stmts, 0,
+            "unchanged resave emitted {node_stmts} node INSERT/upsert statements (expected 0)"
+        );
+
+        let loaded = load_pdg(&storage, "resave_proj").unwrap();
+        assert_eq!(loaded.node_count(), 1_000);
+        assert_eq!(loaded.edge_count(), 1_000);
+    }
+
+    #[test]
+    fn test_resave_with_changed_node_writes_only_changed_rows() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+
+        let mut pdg = create_large_pdg(100, 100);
+        save_pdg(&mut storage, "resave_proj", &pdg).unwrap();
+
+        // Mutate exactly one node's complexity; the other 99 are unchanged.
+        let first_node = pdg.node_indices().next().expect("pdg has nodes");
+        pdg.get_node_mut(first_node)
+            .expect("node exists")
+            .complexity += 1;
+
+        TRACE_COUNTS.node.store(0, Ordering::Relaxed);
+        TRACE_COUNTS.edge.store(0, Ordering::Relaxed);
+        set_sql_trace(storage.conn(), true);
+        save_pdg(&mut storage, "resave_proj", &pdg).unwrap();
+        set_sql_trace(storage.conn(), false);
+
+        let node_stmts = TRACE_COUNTS.node.load(Ordering::Relaxed);
+        assert_eq!(
+            node_stmts, 1,
+            "one-node change emitted {node_stmts} node INSERT/upsert statements (expected 1)"
+        );
+
+        let loaded = load_pdg(&storage, "resave_proj").unwrap();
+        assert_eq!(loaded.node_count(), 100);
+        assert_eq!(loaded.edge_count(), 100);
+        // The changed node's complexity round-tripped.
+        let changed = loaded.get_node(first_node).expect("node survived resave");
+        assert!(changed.complexity > 0);
     }
 
     #[test]

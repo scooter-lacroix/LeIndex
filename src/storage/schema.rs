@@ -368,6 +368,10 @@ impl Storage {
             "CREATE INDEX IF NOT EXISTS idx_nodes_file ON intel_nodes(file_path)",
             "CREATE INDEX IF NOT EXISTS idx_nodes_symbol ON intel_nodes(symbol_name)",
             "CREATE INDEX IF NOT EXISTS idx_nodes_hash ON intel_nodes(content_hash)",
+            // Natural node key for the save_pdg upsert
+            // (`ON CONFLICT(project_id, node_id) DO UPDATE`). The v3->v4
+            // migration dedupes legacy rows before this index is created.
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_intel_nodes_project_node ON intel_nodes(project_id, node_id)",
             "CREATE INDEX IF NOT EXISTS idx_nodes_project_file_name ON intel_nodes(project_id, file_path, symbol_name COLLATE NOCASE)",
             "CREATE INDEX IF NOT EXISTS idx_nodes_project_qualified ON intel_nodes(project_id, qualified_name COLLATE NOCASE)",
             "CREATE INDEX IF NOT EXISTS idx_global_symbols_name ON global_symbols(symbol_name)",
@@ -444,7 +448,7 @@ impl Storage {
     }
 
     /// Current schema version. Increment when adding migrations.
-    pub const SCHEMA_VERSION: u32 = 3;
+    pub const SCHEMA_VERSION: u32 = 4;
 
     /// Run database migrations based on the stored schema version.
     /// Creates the version tracking table if it doesn't exist.
@@ -484,6 +488,11 @@ impl Storage {
         }
         if current < 3 {
             self.migrate_v2_to_v3()?;
+        }
+        // Migration v3 to v4: dedupe intel_nodes so (project_id, node_id) can
+        // become the upsert conflict target, then create the unique index.
+        if current < 4 {
+            self.migrate_v3_to_v4()?;
         }
 
         // Update stored version
@@ -545,6 +554,42 @@ impl Storage {
         )?;
         Ok(())
     }
+
+    /// Migration from v3 to v4: unique (project_id, node_id) for the save_pdg
+    /// upsert conflict target.
+    ///
+    /// Legacy rows predate the natural node key and may carry a `node_id` that
+    /// defaults to `symbol_name`, which repeats across files (e.g. two `init`
+    /// functions). `ON CONFLICT(project_id, node_id)` requires a UNIQUE index,
+    /// so duplicate keys must be collapsed first: keep the lowest `id` per
+    /// `(project_id, node_id)` and drop the rest together with any edges that
+    /// referenced them. The unique index itself is created by
+    /// `initialize_query_indexes` (also covers fresh databases), so this
+    /// migration only has to make the table safe for it.
+    fn migrate_v3_to_v4(&mut self) -> SqliteResult<()> {
+        let table_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'intel_nodes')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !table_exists {
+            return Ok(());
+        }
+        self.conn.execute_batch(
+            "DELETE FROM intel_edges
+             WHERE caller_id IN (
+                 SELECT id FROM intel_nodes
+                 WHERE id NOT IN (SELECT MIN(id) FROM intel_nodes GROUP BY project_id, node_id)
+             )
+                OR callee_id IN (
+                 SELECT id FROM intel_nodes
+                 WHERE id NOT IN (SELECT MIN(id) FROM intel_nodes GROUP BY project_id, node_id)
+             );
+             DELETE FROM intel_nodes
+             WHERE id NOT IN (SELECT MIN(id) FROM intel_nodes GROUP BY project_id, node_id);",
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -590,6 +635,70 @@ mod tests {
             .unwrap();
 
         assert_eq!(table_count, 8); // intel_nodes, intel_edges, analysis_cache, cache_telemetry, global_symbols, external_refs, project_deps, project_metadata
+    }
+
+    #[test]
+    fn test_v3_to_v4_migration_dedupes_duplicate_node_ids() {
+        let temp_file = NamedTempFile::new().unwrap();
+
+        // Simulate a legacy v3 database: open (creates v4 schema), then drop the
+        // v4 unique index and downgrade the schema version so re-opening runs
+        // the v3 -> v4 migration against real duplicate rows.
+        {
+            let mut storage = Storage::open(temp_file.path()).unwrap();
+            storage
+                .conn_mut()
+                .execute_batch(
+                    "DROP INDEX IF EXISTS uq_intel_nodes_project_node;
+                     DELETE FROM schema_version WHERE key = 'schema';
+                     INSERT INTO schema_version (key, version) VALUES ('schema', 3);
+                     INSERT INTO intel_nodes
+                       (project_id, file_path, node_id, symbol_name, qualified_name, language,
+                        node_type, signature, complexity, content_hash, embedding,
+                        byte_range_start, byte_range_end, created_at, updated_at, embedding_format)
+                     VALUES
+                       ('proj', 'a.rs', 'dup', 'f1', 'dup', 'rust', 'Function', NULL, 1, 'h1', NULL, 0, 10, 1, 1, 0),
+                       ('proj', 'b.rs', 'dup', 'f2', 'dup', 'rust', 'Function', NULL, 2, 'h2', NULL, 0, 10, 1, 1, 0),
+                       ('proj', 'c.rs', 'uniq', 'f3', 'uniq', 'rust', 'Function', NULL, 3, 'h3', NULL, 0, 10, 1, 1, 0);",
+                )
+                .unwrap();
+            storage.close().expect("WAL checkpoint on close");
+        }
+
+        // Re-open: the v3 -> v4 migration dedupes (keeps the lowest id per
+        // (project_id, node_id)) and initialize_query_indexes recreates the
+        // unique index the upsert depends on.
+        let storage = Storage::open(temp_file.path()).unwrap();
+
+        let rows: Vec<(i64, String, String)> = {
+            let mut stmt = storage
+                .conn()
+                .prepare(
+                    "SELECT id, node_id, symbol_name FROM intel_nodes WHERE project_id = 'proj' ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        // 'dup' collapsed to the lowest-id row (a.rs / f1) plus the 'uniq' row.
+        assert_eq!(rows.len(), 2, "duplicate node_id rows must be deduped");
+        assert_eq!(rows[0], (1, "dup".to_string(), "f1".to_string()));
+        assert_eq!(rows[1], (3, "uniq".to_string(), "f3".to_string()));
+
+        let idx_count: i64 = storage
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'uq_intel_nodes_project_node'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            idx_count, 1,
+            "unique (project_id, node_id) index must exist"
+        );
     }
 
     // A+ VAL-APLUS-007: Project writer SQLite connection uses the writer cache cap
