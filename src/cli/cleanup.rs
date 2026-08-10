@@ -1051,8 +1051,15 @@ mod tests {
         assert!(!is_locked(dir.path()));
     }
 
+    // Shared lock so registry-mutating cleanup tests run serially: the
+    // AT_EXIT_PATHS global is drained on every flush, so parallel tests that
+    // register+flush would interfere with each other (non-deterministic misses).
+    use std::sync::Mutex;
+    static TEST_CLEANUP_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_register_and_flush_temp_cleanup() {
+        let _g = TEST_CLEANUP_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("storage");
         fs::create_dir_all(&path).unwrap();
@@ -1067,6 +1074,7 @@ mod tests {
 
     #[test]
     fn test_register_skips_in_project_dir() {
+        let _g = TEST_CLEANUP_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let in_project = dir.path().join(".leindex");
         fs::create_dir_all(&in_project).unwrap();
