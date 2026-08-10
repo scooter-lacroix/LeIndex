@@ -1412,6 +1412,71 @@ impl EmbeddingClient {
         }
     }
 
+    /// Send a batch-scoped Cancel request over a daemon socket.
+    ///
+    /// Socket mode uses a separate connection so the cancel frame can reach the
+    /// worker while another client connection is performing synchronous embed
+    /// inference. Pipe mode cannot safely dispatch a second frame while its
+    /// single worker loop is synchronously handling Embed.
+    #[cfg(unix)]
+    pub fn cancel_batch(
+        &self,
+        batch_id: BatchId,
+        reason: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        if !self.use_daemon {
+            return Err(ClientError::Ipc(
+                "pipe-mode cancellation is unavailable while embed is synchronous".to_string(),
+            ));
+        }
+        let config = self.cached_config();
+        let provider = std::env::var("LEINDEX_WORKER_EXECUTION_PROVIDER")
+            .ok()
+            .or(config.execution_provider.clone());
+        let model = std::env::var("LEINDEX_WORKER_MODEL")
+            .ok()
+            .or(config.model_name.clone());
+        let socket_path = daemon_socket_path(provider.as_deref(), model.as_deref())
+            .ok_or_else(|| ClientError::Ipc("worker daemon socket path unavailable".to_string()))?;
+        let mut stream = UnixStream::connect(socket_path).map_err(|error| {
+            ClientError::Ipc(format!("failed to connect cancel socket: {}", error))
+        })?;
+        let frame = protocol::cancel_request_frame(
+            batch_id,
+            protocol::CancelRequest {
+                reason: reason.into(),
+            },
+        )
+        .map_err(|error| ClientError::Ipc(error.to_string()))?;
+        let wire = frame
+            .encode_wire()
+            .map_err(|error| ClientError::Ipc(error.to_string()))?;
+        stream
+            .write_all(&wire)
+            .and_then(|_| stream.flush())
+            .map_err(|error| ClientError::Ipc(format!("failed to send cancel: {}", error)))?;
+        let response_bytes = read_frame(&mut stream)?;
+        let response = Frame::from_wire_bytes(&response_bytes)
+            .map_err(|error| ClientError::Ipc(error.to_string()))?;
+        if response.header.batch_id != batch_id || response.header.msg_type != MsgType::Cancel {
+            return Err(ClientError::Protocol(
+                "unexpected cancel response frame".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub fn cancel_batch(
+        &self,
+        _batch_id: BatchId,
+        _reason: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        Err(ClientError::Ipc(
+            "socket-mode cancellation requires Unix IPC".to_string(),
+        ))
+    }
+
     /// Send a rerank request to the worker and return the response.
     pub fn rerank(
         &self,
@@ -1765,6 +1830,19 @@ mod tests {
         EmbeddingClient::spawn_stderr_thread(FailingReader, report)
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn test_cancel_batch_rejects_pipe_mode_without_touching_worker() {
+        let client = EmbeddingClient::new_pipe();
+        let error = client
+            .cancel_batch(BatchId::new(99), "test")
+            .expect_err("pipe mode must reject cancellation");
+        assert!(
+            error
+                .to_string()
+                .contains("pipe-mode cancellation is unavailable")
+        );
     }
 
     #[test]
