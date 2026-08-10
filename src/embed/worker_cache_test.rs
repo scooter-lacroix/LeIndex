@@ -251,25 +251,20 @@ fn test_embed_cache_keys_length_mismatch() {
     }
 }
 
-/// VAL-CACHE-009: Cancel sets the cancel_flag on the runtime.
+/// VAL-CACHE-009: Cancel targets only a registered active batch.
 #[test]
-fn test_cancel_sets_cancel_flag() {
+fn test_cancel_targets_registered_batch() {
     let rt = WorkerRuntime::new(no_compile_config());
+    let (_guard, token) = rt.register_embed_cancel(BatchId::new(42)).unwrap();
+    assert!(!token.load(Ordering::Acquire));
 
-    // Initially false.
-    assert!(!rt.cancel_flag.load(Ordering::Relaxed));
-
-    // Send a Cancel frame.
     let cancel_req = CancelRequest {
         reason: "test cancellation".to_string(),
     };
     let frame = protocol::cancel_request_frame(BatchId::new(42), cancel_req).unwrap();
     let response = rt.dispatch(&frame);
 
-    // The cancel flag should be set.
-    assert!(rt.cancel_flag.load(Ordering::Relaxed));
-
-    // Response should be a CancelResponse.
+    assert!(token.load(Ordering::Acquire));
     assert_eq!(response.header.msg_type, MsgType::Cancel);
     let decoded: Response = response.decode_payload().unwrap();
     match decoded {
@@ -278,28 +273,37 @@ fn test_cancel_sets_cancel_flag() {
     }
 }
 
-/// VAL-CACHE-009: A new embed request resets the cancel flag.
 #[test]
-fn test_embed_resets_cancel_flag() {
+fn test_cancel_unknown_batch_is_acknowledged_noop() {
     let rt = WorkerRuntime::new(no_compile_config());
-
-    // Set the cancel flag manually.
-    rt.cancel_flag.store(true, Ordering::Relaxed);
-    assert!(rt.cancel_flag.load(Ordering::Relaxed));
-
-    // Send an embed request — should reset the flag.
-    let request = EmbedRequest {
-        texts: vec!["hello".to_string()],
-        expected_dim: 4,
-        cache_keys: vec![],
-    };
-    let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-    let _ = rt.dispatch(&frame);
-
+    let frame = protocol::cancel_request_frame(
+        BatchId::new(404),
+        CancelRequest {
+            reason: "unknown".to_string(),
+        },
+    )
+    .unwrap();
+    let response = rt.dispatch(&frame);
+    assert_eq!(response.header.msg_type, MsgType::Cancel);
     assert!(
-        !rt.cancel_flag.load(Ordering::Relaxed),
-        "embed request should reset cancel flag"
+        rt.active_embed_cancels
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
     );
+}
+
+#[test]
+fn test_duplicate_active_batch_id_is_rejected_and_guard_cleans_up() {
+    let rt = WorkerRuntime::new(no_compile_config());
+    let (guard, _) = rt.register_embed_cancel(BatchId::new(7)).unwrap();
+    let duplicate = match rt.register_embed_cancel(BatchId::new(7)) {
+        Ok(_) => panic!("duplicate active batch id must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(duplicate.kind, ErrorKind::InvalidRequest);
+    drop(guard);
+    assert!(rt.register_embed_cancel(BatchId::new(7)).is_ok());
 }
 
 /// CacheProbe RPC returns hit/miss lists.
@@ -494,10 +498,13 @@ fn test_val_cache_011_idle_without_polling() {
         "fresh runtime must not be idle-expired"
     );
 
-    // Cancel flag should be false (no work in flight).
+    // No active embed cancellation registrations when idle.
     assert!(
-        !rt.cancel_flag.load(Ordering::Relaxed),
-        "no cancel flag when idle"
+        rt.active_embed_cancels
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty(),
+        "no active embed cancellation tokens when idle"
     );
 
     // The runtime has no background polling threads for GPU.

@@ -402,7 +402,7 @@ fn test_handle_embed_empty_batch() {
         cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-    let result = rt.handle_embed(&frame);
+    let result = rt.handle_embed(&frame, &Arc::new(AtomicBool::new(false)));
 
     // Empty batch returns Ok early (before any ONNX session check),
     // so .unwrap() is safe regardless of feature flag.
@@ -423,7 +423,7 @@ fn test_handle_embed_returns_flat_row_major() {
         cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-    let result = rt.handle_embed(&frame);
+    let result = rt.handle_embed(&frame, &Arc::new(AtomicBool::new(false)));
 
     // When ORT or the model is unavailable (no model on disk, ORT not
     // discovered, etc.), the worker returns ModelNotFound. On a developer
@@ -466,7 +466,7 @@ fn test_handle_embed_preserves_ordering() {
         cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-    let result = rt.handle_embed(&frame);
+    let result = rt.handle_embed(&frame, &Arc::new(AtomicBool::new(false)));
 
     // Same rationale as test_handle_embed_returns_flat_row_major: developer
     // machines with ORT + a real model present may reach inference and
@@ -980,6 +980,7 @@ fn test_embed_text_batch_loop_tokenizes_and_infers_per_sub_batch() {
             8,
             false,
             dim,
+            &Arc::new(AtomicBool::new(false)),
             |sub_texts| {
                 tokenized_sizes.push(sub_texts.len());
                 events
@@ -1026,6 +1027,7 @@ fn test_embed_text_batch_loop_fixed_batch_pads_after_per_batch_tokenization() {
             8,
             true,
             dim,
+            &Arc::new(AtomicBool::new(false)),
             |sub_texts| {
                 tokenized_sizes.push(sub_texts.len());
                 Ok(embed_encodings(sub_texts.len()))
@@ -1056,6 +1058,7 @@ fn test_embed_text_batch_loop_later_tokenizer_error_stops_before_next_inference(
             8,
             false,
             2,
+            &Arc::new(AtomicBool::new(false)),
             |_sub_texts| {
                 tokenizer_calls += 1;
                 if tokenizer_calls == 2 {
@@ -1086,6 +1089,8 @@ fn test_embed_text_batch_loop_checks_cancel_between_sub_batches() {
     let rt = WorkerRuntime::new(no_compile_config());
     let texts: Vec<String> = (0..10).map(|i| format!("text-{i}")).collect();
     let mut inferred_batches = Vec::new();
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    let cancel_from_runner = Arc::clone(&cancel_token);
 
     let error = rt
         .run_onnx_embed_text_batch_loop(
@@ -1093,10 +1098,11 @@ fn test_embed_text_batch_loop_checks_cancel_between_sub_batches() {
             8,
             false,
             2,
+            &cancel_token,
             |_sub_texts| Ok(embed_encodings(8)),
             |encodings, dim| {
                 inferred_batches.push(encodings.len());
-                rt.cancel_flag.store(true, Ordering::Relaxed);
+                cancel_from_runner.store(true, Ordering::Release);
                 Ok(vec![1.0f32; encodings.len() * dim])
             },
         )
