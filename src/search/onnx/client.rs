@@ -416,23 +416,12 @@ impl EmbeddingClient {
                 }
             }
         }
-        // VAL-SETUP-020/VAL-ORT-006: When ORT_DYLIB_PATH is not already in the
-        // ambient environment, propagate the path recorded in
-        // `~/.leindex/config/leindex.toml` so the worker reliably loads the
-        // ORT build chosen during `leindex setup`. This keeps the discovery
-        // chain consistent across both the interactive setup flow (which
-        // installs ORT via pip and remembers the discovered `.so`) and the
-        // plain-spawn path used by searches.
-        // An empty value is treated as unset so the config fallback fires.
-        let ort_dylib_unset = match std::env::var_os("ORT_DYLIB_PATH") {
-            None => true,
-            Some(v) => v.is_empty(),
-        };
-        if ort_dylib_unset {
-            if let Some(path) = &config_env.ort_dylib_path {
-                cmd.env("ORT_DYLIB_PATH", path);
-            }
-        }
+        // ORT_DYLIB_PATH is an explicit user override only. Do not promote the
+        // persisted `neural.ort_dylib_path` hint into this highest-priority env
+        // var: setup records a versioned pip soname that may disappear on an
+        // upgrade. The worker reads the same config and intelligently resolves a
+        // stale path to a sibling version before continuing through bundled,
+        // pip, system, and bare-loader fallbacks.
     }
 
     fn spawn_pipe_worker(
