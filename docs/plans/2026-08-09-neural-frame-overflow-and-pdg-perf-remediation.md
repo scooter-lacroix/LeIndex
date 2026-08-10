@@ -57,18 +57,15 @@ response frame**. The chain:
 Contributing: `send_and_receive` (`client.rs:1402`) has **zero request-side size
 check** — it only enforces `MAX_RESPONSE_FRAME_SIZE` on reads.
 
-### Issue 2 — GPU idle sources
+### Issue 2 — GPU idle sources (historical diagnosis; current status below)
 
-- `run_onnx_embed` tokenizes the **entire batch** with a single
-  `tokenizer.encode_batch` call, then sub-batches inference at
-  `configured_onnx_inference_batch_size` (default 8 for MIGraphX).
-- `run_onnx_embed_batch_loop` runs each sub-batch **serially through one
-  `session.lock()`** — no overlap between tokenization of sub-batch N+1 and
-  inference of sub-batch N, no pipelining, no double buffering.
-- MiGraphX JIT shape is fixed (batch 8 / seq 128); with 256-text frames this is
-  32 sequential `session.run()` calls, GPU idle between calls and during
-  tokenization.
-
+The original diagnosis found that `run_onnx_embed` tokenized the entire batch
+before serial inference, with no overlap or double buffering. That diagnosis
+motivated the bounded sequential Fix B implementation. The current runtime now
+tokenizes only one inference-sized text chunk at a time and starts inference
+immediately after that chunk is ready. It still intentionally performs the
+stages sequentially; true overlap remains a future task described in the Fix B
+handoff and execution tracking documents.
 ### Issue 1 — Build/save hot paths
 
 - **Save** (`src/storage/pdg_store.rs:175` `save_pdg`): full
@@ -156,8 +153,9 @@ check** — it only enforces `MAX_RESPONSE_FRAME_SIZE` on reads.
 - `src/search/onnx/client_config.rs` — `ClientError`, request-frame budget
   constant, `MAX_REQUEST_FRAME_SIZE`.
 - `src/embed/protocol.rs` — `ErrorKind::FrameTooLarge`, `error_frame` reuse.
-- `src/embed/runtime.rs` — reader-thread graceful oversized-frame error write;
-  tokenize/infer pipelining.
+- `src/embed/runtime.rs` — reader-thread graceful oversized-frame error;
+  bounded per-sub-batch tokenization and immediate sequential inference;
+  future producer/consumer pipeline described in the Fix B handoff.
 - `src/storage/pdg_store.rs` — upsert save, WAL/NORMAL pragma, hash reuse,
   unchanged-skip.
 - `src/graph/extraction_cross_file.rs` — build call index once.

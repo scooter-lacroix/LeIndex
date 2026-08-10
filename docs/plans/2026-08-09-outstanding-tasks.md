@@ -39,7 +39,7 @@
 ### B3 — Decide and implement the intended concurrency level
 
 - [x] Explicitly define completed Fix B scope as bounded sequential tokenization followed immediately by inference.
-- [ ] True tokenizer/inference overlap remains unimplemented and requires a separate bounded producer/consumer design if later required.
+- [ ] True tokenizer/inference overlap remains unimplemented and requires the detailed design in `docs/plans/2026-08-09-fix-b-handoff-memory.md` before implementation.
 
 ### B4 — Add behavioral tests
 

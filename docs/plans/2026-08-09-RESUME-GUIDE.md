@@ -43,7 +43,11 @@ The current implementation and task status are tracked in:
 
 ---
 
-## CRITICAL FINDING — MIGraphX compile hang (production blocker)
+## Historical audit: MIGraphX compile-hang finding
+
+The following evidence and wording describe the pre-fallback failure mode. The
+current implementation includes the bounded probe and CPU fallback; retain this
+section only as root-cause history.
 
 ### What happens (proven empirically, not assumed)
 
@@ -145,10 +149,6 @@ The following section records the recovery procedure used earlier in this
 session. It is retained for auditability; the listed runtime work is now
 implemented and verified as described in the current-state section above.
 
-`src/embed/runtime.rs` is currently at **git HEAD (v2.0.0)** — 2479 lines. It
-needs these three changes re-applied. They were previously verified (`cargo check
---features onnx` + onnx-gated tests passed) before the corruption.
-
 ### Redo 1 — Fix B: tokenize per sub-batch in `run_onnx_embed` (GPU utilization)
 
 In `run_onnx_embed` (around the embed-attempt body), replace the single up-front
@@ -230,9 +230,17 @@ probe into `build_session` as shown. **This is the most important remaining item
 
 ---
 
-## Completed & verified (in the 9 surviving files)
+## Historical implementation audit
 
-### Fix A — neural worker frame overflow (all ✅, in working tree)
+The following section records the files and validation state during the earlier
+corruption/recovery incident. It is retained for auditability only. The
+current-state banner and execution-tracking document are authoritative.
+
+### Historical Fix A audit
+
+The Fix A details below describe the earlier recovery snapshot; they are not a
+current working-tree status report. Current status is authoritative in the
+execution-tracking table above.
 
 - **A1** `src/embed/protocol.rs`: `ErrorKind::FrameTooLarge` variant.
 - **A2/A3** `src/search/onnx/client_config.rs`: `ClientError::FrameTooLarge`,
@@ -241,22 +249,21 @@ probe into `build_session` as shown. **This is the most important remaining item
   (estimate → fast-path single frame or split → per-shard `embed_attempt_shard`
   → concatenate `into_vectors()`). Genericized over `AsRef<str>`:
   `embed_with_fallback<S>`, `embed_attempt<S>`, `embed_attempt_shard<S>`.
-- **A5** `src/embed/runtime.rs` (IN runtime.rs — lost, see Redo): worker-side
+- **A5** `src/embed/runtime.rs` (historical recovery item): worker-side
   graceful `FrameTooLarge` in `run_loop` (`FrameReadError` enum, batch-id peek,
-  error-frame + continue). **NOTE:** this was in the corrupted runtime.rs; it
-  must be re-applied too (it's part of the A5 work). Check the plan doc for the
-  `FrameReadError` enum spec.
+  error-frame + continue). This was re-applied and is present in the current
+  runtime.
 - **A6** `src/cli/index_builder/mod.rs`: `cap_neural_text` (64 KiB UTF-8-safe
   truncation, `#[cfg(any(onnx, remote-embeddings))]`) + borrowed `&str` dedupe
   in `embed_pending_neural_batch`.
 
-### Fix B — GPU utilization (B1/B2 in runtime.rs — LOST, see Redo; B3 ✅)
+### Historical Fix B audit
 
 - **B1/B2** were in runtime.rs (tokenize-per-sub-batch + dead-loop removal) —
   lost in corruption, must be redone (Redo 1 & 2 above).
 - **B3** compile-verify: was GREEN before corruption.
 
-### Fix C — PDG build/save perf (all ✅, in working tree, tests pass)
+### Historical Fix C audit
 
 - **C1** `src/storage/pdg_store.rs`: `save_pdg` upsert (`ON CONFLICT(project_id,
   node_id) DO UPDATE ... WHERE content_hash != excluded.content_hash`), pre-query
@@ -305,30 +312,33 @@ probe into `build_session` as shown. **This is the most important remaining item
 | `src/embed/protocol.rs` | ✅ modified | `ErrorKind::FrameTooLarge`. |
 | `src/embed/worker_main.rs` | ✅ modified | hermetic test model names. |
 | `src/embed/runtime_test.rs` | ✅ modified | fixed `test_u8_dequant...` in-range data. |
-| **`src/embed/runtime.rs`** | ⚠️ **RESTORED TO HEAD** | Lost: B1/B2 tokenize-per-sub-batch, A5 `FrameReadError` worker graceful error, test helper, **and the new MIGraphX compile-hang guard**. Redo per §"runtime.rs redo". |
+| `src/embed/runtime.rs` | ✅ current | Contains frame-too-large handling, MIGraphX fallback, bounded per-sub-batch tokenization, test-only pre-tokenized batching helper, and raw inner inference helper. |
 
-## Validation status
+## Historical validation snapshot
 
-- `cargo fmt --all --check`: ✅ (run after each batch; redo after runtime.rs changes)
-- `cargo check` (no features): ✅
-- `cargo check --features onnx`: ❌ blocked on runtime.rs redo (the test helper + probe reference items only present after redo)
-- `cargo clippy --workspace --all-targets -- -D warnings`: was ✅ before corruption; redo after runtime.rs
-- `cargo test --lib` (no features): ✅ 1804 passed (includes new storage tests)
-- `cargo test --lib storage::`: ✅ 209 passed
-- `cargo test --lib --features onnx embed::`: ❌ blocked on runtime.rs redo
-- **Runtime proof (the key one):** ❌ pending runtime.rs redo + the MIGraphX guard
+The failure/pending entries below are retained as incident history only. They
+were superseded by commit `1e9687e5` and the successful post-commit validation
+recorded in `docs/plans/2026-08-09-execution-tracking.md`.
 
-## How to resume (for a new agent)
+### Historical validation outcomes
 
-1. **Read this doc fully** (especially §"THE FIX" and §"runtime.rs redo").
-2. Confirm `src/embed/runtime.rs` is at HEAD (2479 lines) and the other 9 files
-   carry the modifications listed above (`git diff --stat`).
-3. Re-apply the **three runtime.rs changes** (Redo 1, 2, 3). Redo 3 (MIGraphX
-   guard) is the highest-value item — it unblocks production on ROCm 7.2.4.
-4. Run the verification list in §"Verification after runtime.rs redo".
-5. Run the **definitive runtime proof**: `timeout 60 leindex setup --neural
-   --gpu amd --warmup` must complete (via CPU fallback) instead of hanging.
-6. Update this doc + the plan doc with final status.
+- Earlier `cargo fmt --all --check`: ✅
+- Earlier no-feature checks/tests: ✅
+- Earlier ONNX checks/tests: pending at that incident point; superseded by the
+  current successful ONNX clippy/runtime and workspace validation recorded in
+  `docs/plans/2026-08-09-execution-tracking.md`.
+- Manual installation/indexing verification remains pending.
+
+## How to resume after a future interruption
+
+1. Read the current-state banner, `docs/plans/2026-08-09-execution-tracking.md`,
+   and `docs/plans/2026-08-09-outstanding-tasks.md`.
+2. Confirm the runtime and documentation status with `git status` and the
+   authoritative tracking table.
+3. Do not repeat historical redo instructions unless the current tree actually
+   lacks the named symbols.
+4. Run the documented validation gate before installation/indexing.
+5. Manual installation/indexing verification remains the final pending gate.
 
 ## Process notes / hazards
 

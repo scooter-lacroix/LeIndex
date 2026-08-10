@@ -4,9 +4,11 @@
 **Branch:** `v2.0.0`
 **Scope:** Verify the actual Fix B implementation against the intended GPU-utilization and bounded-memory goal before installation testing.
 
-## Executive conclusion
+## Initial investigation record (historical)
 
-Fix B is **not fully implemented**.
+The findings below describe the pre-implementation state observed before commit
+`1e9687e5`. They are retained as an audit trail. The **Implementation update**
+section at the end of this document is the authoritative current status.
 
 The current code implements the earlier ONNX sub-batch correctness fix:
 

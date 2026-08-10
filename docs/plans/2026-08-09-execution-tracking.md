@@ -63,7 +63,7 @@
 | V1 | `cargo fmt --all --check` | ✅ | Passes. |
 | V2 | `cargo check --features onnx` | ✅ | Passes. |
 | V3 | `cargo clippy --workspace --all-targets -- -D warnings` | ✅ | Passes. |
-| V4 | `cargo test --workspace --exclude memcheck` | 🔄 | `cargo test --lib` (non-onnx): 1804 passed, 0 failed. `cargo test --lib --features onnx`: 231 embed passed, 0 failed. Full workspace gate pending (long-running; embed real-worker integration tests are hermetic now so it completes). |
+| V4 | `cargo test --workspace --exclude memcheck` | ✅ | Completed after the final Fix B commit; workspace tests and doctests passed with 0 failures. |
 | V5 | Manual `leindex index --force` on a mid-size repo (no "worker process died"; `total_admitted` matches prior; save phase ms) | ⬜ | Pending final manual verification. |
 
 ---
