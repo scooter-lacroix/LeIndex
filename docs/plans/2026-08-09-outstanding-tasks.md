@@ -36,10 +36,17 @@
 - [x] Ensure collapsed-batch single-row retries call the inner helper directly and cannot recursively reapply padding.
 - [x] Preserve input ordering, expected dimension checks, pooling, normalization, and output shape validation.
 
-### B3 — Decide and implement the intended concurrency level
+### B3 — True tokenizer/inference overlap prerequisites and implementation
 
 - [x] Explicitly define completed Fix B scope as bounded sequential tokenization followed immediately by inference.
-- [ ] True tokenizer/inference overlap remains unimplemented and requires the detailed design in `docs/plans/2026-08-09-fix-b-handoff-memory.md` before implementation.
+- [ ] Benchmark the sequential path and pass the pipeline go/no-go threshold before implementation.
+- [ ] Replace the shared global cancel flag with a batch-scoped cancellation registry as an independent correctness fix; define duplicate/unknown/completed BatchId behavior, thread context through direct/cache-miss embedding paths, and verify concurrent requests cannot reset/cancel each other.
+- [ ] Document/test pipe-mode versus socket-mode cancellation and the non-interruptible ORT inference boundary.
+- [ ] Add a cancellation-aware `Mutex + Condvar + RAII` per-runtime embed execution permit that does not block Cancel/health handling.
+- [ ] Verify `Tokenizer`, `Encoding`, scoped-thread references, and pipeline message `Send`/`Sync` contracts at compile time.
+- [ ] Implement the scoped producer and request-thread consumer using a rendezvous channel and cancellation-aware `try_send`/`recv_timeout` loops.
+- [ ] Add all concurrency, boundedness, provider, error, panic, shutdown, and benchmark acceptance tests specified in `docs/plans/2026-08-09-fix-b-handoff-memory.md`.
+- [ ] Keep production sequential/default-off until the correctness and performance acceptance gates pass.
 
 ### B4 — Add behavioral tests
 
