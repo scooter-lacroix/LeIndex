@@ -13,6 +13,7 @@
 // checks this and exits cleanly so the main daemon can respawn on
 // next demand.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -375,10 +376,10 @@ pub struct WorkerRuntime {
     shutdown_flag: Arc<AtomicBool>,
     started_unix_ms: u64,
 
-    /// WS10 Task 5: Per-batch cancellation flag. Set by a Cancel frame, checked
-    /// between sub-batches in the embed loop. Reset at the start of each new
-    /// embed request.
-    cancel_flag: Arc<AtomicBool>,
+    /// Active embed cancellation tokens, keyed by wire BatchId. Socket worker
+    /// handlers share the runtime, so cancellation must be request-scoped:
+    /// one request may never reset or cancel another request's work.
+    active_embed_cancels: Arc<Mutex<HashMap<BatchId, Arc<AtomicBool>>>>,
 
     /// WS10 Task 5: Global embedding cache (opened when the GlobalEmbedCache
     /// feature flag is enabled). Wrapped in `Mutex` because cache writes (put,
@@ -418,6 +419,24 @@ pub struct WorkerRuntime {
     /// socket requests).
     #[cfg(feature = "onnx")]
     rerank_init_lock: Arc<Mutex<()>>,
+}
+
+struct ActiveEmbedCancelGuard {
+    batch_id: BatchId,
+    token: Arc<AtomicBool>,
+    registry: Arc<Mutex<HashMap<BatchId, Arc<AtomicBool>>>>,
+}
+
+impl Drop for ActiveEmbedCancelGuard {
+    fn drop(&mut self) {
+        let mut registry = self.registry.lock().unwrap_or_else(|p| p.into_inner());
+        if registry
+            .get(&self.batch_id)
+            .is_some_and(|active| Arc::ptr_eq(active, &self.token))
+        {
+            registry.remove(&self.batch_id);
+        }
+    }
 }
 
 /// Reranker idle eviction threshold: after this many seconds with no rerank
@@ -643,7 +662,7 @@ impl WorkerRuntime {
             last_activity: Arc::new(Mutex::new(Instant::now())),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             started_unix_ms: unix_now_ms(),
-            cancel_flag: Arc::new(AtomicBool::new(false)),
+            active_embed_cancels: Arc::new(Mutex::new(HashMap::new())),
             cache: open_cache_if_enabled(),
             #[cfg(feature = "onnx")]
             rerank_session: Arc::new(Mutex::new(None)),
@@ -1354,17 +1373,16 @@ impl WorkerRuntime {
         let batch_id = frame.header.batch_id;
 
         match frame.header.msg_type {
-            MsgType::EmbedRequest => {
-                // WS10 Task 5: reset the per-batch cancel flag at the start
-                // of each embed request.
-                self.cancel_flag.store(false, Ordering::Relaxed);
-                match self.handle_embed(frame) {
+            MsgType::EmbedRequest => match self.register_embed_cancel(batch_id) {
+                Ok((_guard, cancel_token)) => match self.handle_embed(frame, &cancel_token) {
                     Ok(response) => protocol::embed_response_frame(batch_id, response)
                         .unwrap_or_else(|e| self.internal_error_frame(batch_id, &e)),
                     Err(e) => protocol::error_frame(batch_id, e)
                         .unwrap_or_else(|e| self.internal_error_frame(batch_id, &e)),
-                }
-            }
+                },
+                Err(e) => protocol::error_frame(batch_id, e)
+                    .unwrap_or_else(|e| self.internal_error_frame(batch_id, &e)),
+            },
             MsgType::RerankRequest => match self.handle_rerank(frame) {
                 Ok(response) => protocol::rerank_response_frame(batch_id, response)
                     .unwrap_or_else(|e| self.internal_error_frame(batch_id, &e)),
@@ -1398,7 +1416,15 @@ impl WorkerRuntime {
                     batch_id = %batch_id,
                     "cancel signal received for batch"
                 );
-                self.cancel_flag.store(true, Ordering::Relaxed);
+                if let Some(token) = self
+                    .active_embed_cancels
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&batch_id)
+                    .cloned()
+                {
+                    token.store(true, Ordering::Release);
+                }
                 protocol::cancel_response_frame(
                     batch_id,
                     protocol::CancelResponse { acknowledged: true },
@@ -1419,6 +1445,33 @@ impl WorkerRuntime {
         }
     }
 
+    fn register_embed_cancel(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<(ActiveEmbedCancelGuard, Arc<AtomicBool>), WorkerError> {
+        let token = Arc::new(AtomicBool::new(false));
+        let mut registry = self
+            .active_embed_cancels
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if registry.contains_key(&batch_id) {
+            return Err(WorkerError {
+                kind: ErrorKind::InvalidRequest,
+                message: format!("duplicate active embed batch id: {batch_id}"),
+            });
+        }
+        registry.insert(batch_id, Arc::clone(&token));
+        drop(registry);
+        Ok((
+            ActiveEmbedCancelGuard {
+                batch_id,
+                token: Arc::clone(&token),
+                registry: Arc::clone(&self.active_embed_cancels),
+            },
+            token,
+        ))
+    }
+
     /// Handle an embed request.
     ///
     /// VAL-CPHASE-012: Returns flat row-major output with dimension and count metadata.
@@ -1428,7 +1481,11 @@ impl WorkerRuntime {
     /// cache is open, the worker probes cached entries first, embeds only the
     /// misses, writes fresh vectors back to the cache, and returns the complete
     /// result set in input order (VAL-CACHE-008).
-    fn handle_embed(&self, frame: &Frame) -> Result<EmbedResponse, WorkerError> {
+    fn handle_embed(
+        &self,
+        frame: &Frame,
+        cancel_token: &Arc<AtomicBool>,
+    ) -> Result<EmbedResponse, WorkerError> {
         let request: Request = frame.decode_payload().map_err(|e| WorkerError {
             kind: ErrorKind::InvalidRequest,
             message: format!("failed to decode embed request: {}", e),
@@ -1474,13 +1531,20 @@ impl WorkerRuntime {
                 &texts,
                 &embed_req.cache_keys,
                 embed_req.expected_dim,
+                cancel_token,
             );
         }
 
         #[cfg(feature = "onnx")]
         {
             if let (Some(session), Some(tokenizer)) = (&self.session, &self.tokenizer) {
-                self.run_onnx_embed(session, tokenizer, &texts, embed_req.expected_dim)
+                self.run_onnx_embed(
+                    session,
+                    tokenizer,
+                    &texts,
+                    embed_req.expected_dim,
+                    cancel_token,
+                )
             } else {
                 Err(WorkerError {
                     kind: ErrorKind::ModelNotFound,
@@ -1517,112 +1581,126 @@ impl WorkerRuntime {
         texts: &[String],
         cache_keys: &[crate::embed::cache::CacheKey],
         expected_dim: usize,
+        cancel_token: &Arc<AtomicBool>,
     ) -> Result<EmbedResponse, WorkerError> {
         let n = texts.len();
         debug_assert_eq!(n, cache_keys.len());
+        if expected_dim == 0 {
+            return Err(WorkerError {
+                kind: ErrorKind::InvalidRequest,
+                message: "expected_dim must be non-zero".to_string(),
+            });
+        }
 
-        // Prepare the output buffer in input order.
-        let mut results: Vec<Option<Vec<f32>>> = vec![None; n];
+        let total_values = n.checked_mul(expected_dim).ok_or_else(|| WorkerError {
+            kind: ErrorKind::InvalidRequest,
+            message: "embedding response size overflow".to_string(),
+        })?;
+        let mut vectors = vec![0.0f32; total_values];
+        let mut filled = vec![false; n];
 
-        // Step 1: Probe the cache.
+        // Probe while holding the cache lock, then release it before inference.
         if let Some(cache_arc) = &self.cache {
             let mut cache = cache_arc.lock().unwrap_or_else(|p| p.into_inner());
             match cache.probe(cache_keys) {
                 Ok(probe_result) => {
-                    // Place hits into the output.
-                    for (idx, vector) in &probe_result.hits {
-                        results[*idx] = Some(vector.clone());
+                    let hit_count = probe_result.hits.len();
+                    for (idx, vector) in probe_result.hits {
+                        if idx < n && vector.len() == expected_dim {
+                            let start = idx * expected_dim;
+                            vectors[start..start + expected_dim].copy_from_slice(&vector);
+                            filled[idx] = true;
+                        } else {
+                            tracing::warn!(
+                                index = idx,
+                                cached_dim = vector.len(),
+                                expected_dim,
+                                "ignoring malformed embedding cache row"
+                            );
+                        }
                     }
                     tracing::debug!(
                         total = n,
-                        hits = probe_result.hits.len(),
-                        misses = probe_result.misses.len(),
+                        hits = hit_count,
+                        misses = filled.iter().filter(|&&is_filled| !is_filled).count(),
                         "cache probe complete"
                     );
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "cache probe failed; embedding all texts");
-                }
+                Err(e) => tracing::warn!(error = %e, "cache probe failed; embedding all texts"),
             }
         }
 
-        // Step 2: Collect miss indices (texts not served from cache).
-        let miss_indices: Vec<usize> = results
+        let miss_indices: Vec<usize> = filled
             .iter()
             .enumerate()
-            .filter(|(_, v)| v.is_none())
-            .map(|(i, _)| i)
+            .filter_map(|(i, is_filled)| (!is_filled).then_some(i))
             .collect();
-
         if miss_indices.is_empty() {
-            // All hits — assemble and return.
-            let vectors: Vec<f32> = results
-                .into_iter()
-                .flatten()
-                .flat_map(|v| v.into_iter())
-                .collect();
-            return Ok(EmbedResponse::new(vectors, n, expected_dim));
+            return EmbedResponse::try_new(vectors, n, expected_dim).map_err(|message| {
+                WorkerError {
+                    kind: ErrorKind::Inference,
+                    message,
+                }
+            });
         }
 
-        // Step 3: Embed misses.
-        let miss_texts: Vec<String> = miss_indices.iter().map(|&i| texts[i].clone()).collect();
+        // Borrow miss texts instead of cloning their String bodies.
+        let miss_texts: Vec<&str> = miss_indices.iter().map(|&i| texts[i].as_str()).collect();
+        let miss_vectors = self.embed_texts(&miss_texts, expected_dim, cancel_token)?;
+        let expected_miss_values = miss_indices.len() * expected_dim;
+        if miss_vectors.len() != expected_miss_values {
+            return Err(WorkerError {
+                kind: ErrorKind::Inference,
+                message: format!(
+                    "miss embedding output length mismatch: got {}, expected {}",
+                    miss_vectors.len(),
+                    expected_miss_values
+                ),
+            });
+        }
 
-        let miss_vectors = self.embed_texts(&miss_texts, expected_dim)?;
+        // Copy directly into final flat row ranges; no nested per-row vectors.
+        for (miss_row, &output_row) in miss_indices.iter().enumerate() {
+            let source_start = miss_row * expected_dim;
+            let target_start = output_row * expected_dim;
+            vectors[target_start..target_start + expected_dim]
+                .copy_from_slice(&miss_vectors[source_start..source_start + expected_dim]);
+            filled[output_row] = true;
+        }
 
-        // Step 4: Write misses back to cache.
+        // Write misses after inference; never hold the cache mutex across ORT.
         if let Some(cache_arc) = &self.cache {
             let mut cache = cache_arc.lock().unwrap_or_else(|p| p.into_inner());
-            for (i, &miss_idx) in miss_indices.iter().enumerate() {
-                let key = &cache_keys[miss_idx];
-                let start = i * expected_dim;
-                let end = start + expected_dim;
-                if let Some(vec_slice) = miss_vectors.get(start..end) {
-                    // Thread the source text so the debug escape hatch can
-                    // persist it for development troubleshooting when
-                    // explicitly enabled via LEINDEX_EMBED_CACHE_DEBUG or
-                    // the LEINDEX_FEATURE_EMBED_CACHE_DEBUG feature flag.
-                    let source_text = texts.get(miss_idx).map(String::as_str);
-                    if let Err(e) = cache.put(key, vec_slice, source_text) {
-                        tracing::warn!(error = %e, "failed to write embedding to cache");
-                    }
+            for (miss_row, &miss_idx) in miss_indices.iter().enumerate() {
+                let start = miss_row * expected_dim;
+                let vec_slice = &miss_vectors[start..start + expected_dim];
+                let source_text = texts.get(miss_idx).map(String::as_str);
+                if let Err(e) = cache.put(&cache_keys[miss_idx], vec_slice, source_text) {
+                    tracing::warn!(error = %e, "failed to write embedding to cache");
                 }
             }
         }
 
-        // Step 5: Place miss results into the output buffer (in order).
-        for (i, &miss_idx) in miss_indices.iter().enumerate() {
-            let start = i * expected_dim;
-            let end = start + expected_dim;
-            if let Some(vec_slice) = miss_vectors.get(start..end) {
-                results[miss_idx] = Some(vec_slice.to_vec());
-            } else {
-                return Err(WorkerError {
-                    kind: ErrorKind::Inference,
-                    message: format!(
-                        "miss vector index {i} out of range (start={start}, end={end}, len={})",
-                        miss_vectors.len()
-                    ),
-                });
-            }
-        }
-
-        // Assemble the flat row-major output in input order.
-        let vectors: Vec<f32> = results
-            .into_iter()
-            .flatten()
-            .flat_map(|v| v.into_iter())
-            .collect();
-        Ok(EmbedResponse::new(vectors, n, expected_dim))
+        debug_assert!(filled.into_iter().all(|value| value));
+        EmbedResponse::try_new(vectors, n, expected_dim).map_err(|message| WorkerError {
+            kind: ErrorKind::Inference,
+            message,
+        })
     }
 
     /// Embed texts using ONNX inference (or zero vectors if ONNX is not enabled).
     ///
     /// WS10 Task 5: Checks the cancel flag between sub-batches (VAL-CACHE-009).
-    fn embed_texts(&self, texts: &[String], expected_dim: usize) -> Result<Vec<f32>, WorkerError> {
+    fn embed_texts<S: AsRef<str>>(
+        &self,
+        texts: &[S],
+        expected_dim: usize,
+        cancel_token: &Arc<AtomicBool>,
+    ) -> Result<Vec<f32>, WorkerError> {
         #[cfg(feature = "onnx")]
         {
             if let (Some(session), Some(tokenizer)) = (&self.session, &self.tokenizer) {
-                self.run_onnx_embed(session, tokenizer, texts, expected_dim)
+                self.run_onnx_embed(session, tokenizer, texts, expected_dim, cancel_token)
                     .map(|resp| resp.vectors)
             } else {
                 Err(WorkerError {
@@ -1681,12 +1759,13 @@ impl WorkerRuntime {
     }
 
     #[cfg(feature = "onnx")]
-    fn run_onnx_embed(
+    fn run_onnx_embed<S: AsRef<str>>(
         &self,
         session: &Arc<Mutex<Session>>,
         tokenizer: &Arc<tokenizers::Tokenizer>,
-        texts: &[String],
+        texts: &[S],
         expected_dim: usize,
+        cancel_token: &Arc<AtomicBool>,
     ) -> Result<EmbedResponse, WorkerError> {
         if expected_dim == 0 {
             return Err(WorkerError {
@@ -1710,9 +1789,10 @@ impl WorkerRuntime {
             inference_batch_size,
             fixed_batch,
             expected_dim,
+            cancel_token,
             |sub_texts| {
                 tokenizer
-                    .encode_batch(sub_texts.to_vec(), true)
+                    .encode_batch(sub_texts.iter().map(|text| text.as_ref()).collect(), true)
                     .map_err(|e| WorkerError {
                         kind: ErrorKind::Tokenizer,
                         message: format!("tokenization failed: {}", e),
@@ -1721,7 +1801,12 @@ impl WorkerRuntime {
             |encodings, dim| self.run_onnx_embed_sub_batch(session, encodings, dim),
         )?;
 
-        Ok(EmbedResponse::new(all_pooled, texts.len(), expected_dim))
+        EmbedResponse::try_new(all_pooled, texts.len(), expected_dim).map_err(|message| {
+            WorkerError {
+                kind: ErrorKind::Inference,
+                message,
+            }
+        })
     }
 
     /// Tokenize and infer one bounded text sub-batch at a time.
@@ -1732,17 +1817,19 @@ impl WorkerRuntime {
     /// must preserve the same cancellation, padding, ordering, and error
     /// semantics before it can replace this helper.
     #[cfg(feature = "onnx")]
-    fn run_onnx_embed_text_batch_loop<T, R>(
+    fn run_onnx_embed_text_batch_loop<S, T, R>(
         &self,
-        texts: &[String],
+        texts: &[S],
         inference_batch_size: usize,
         fixed_batch: bool,
         expected_dim: usize,
+        cancel_token: &Arc<AtomicBool>,
         mut tokenize: T,
         mut run_sub_batch: R,
     ) -> Result<Vec<f32>, WorkerError>
     where
-        T: FnMut(&[&str]) -> Result<Vec<tokenizers::Encoding>, WorkerError>,
+        S: AsRef<str>,
+        T: FnMut(&[S]) -> Result<Vec<tokenizers::Encoding>, WorkerError>,
         R: FnMut(&[tokenizers::Encoding], usize) -> Result<Vec<f32>, WorkerError>,
     {
         if inference_batch_size == 0 {
@@ -1754,7 +1841,7 @@ impl WorkerRuntime {
 
         let mut all_pooled = Vec::with_capacity(texts.len() * expected_dim);
         for sub_texts in texts.chunks(inference_batch_size) {
-            if self.cancel_flag.load(Ordering::Relaxed) {
+            if cancel_token.load(Ordering::Acquire) {
                 tracing::info!(
                     "cancel flag detected between tokenized sub-batches; aborting embed after {} of {} texts",
                     all_pooled.len() / expected_dim.max(1),
@@ -1767,8 +1854,7 @@ impl WorkerRuntime {
             }
             self.touch();
 
-            let sub_refs: Vec<&str> = sub_texts.iter().map(String::as_str).collect();
-            let encodings = tokenize(&sub_refs)?;
+            let encodings = tokenize(sub_texts)?;
             if encodings.len() != sub_texts.len() {
                 return Err(WorkerError {
                     kind: ErrorKind::Tokenizer,
@@ -1787,25 +1873,51 @@ impl WorkerRuntime {
                     padded.resize(inference_batch_size, template);
                 }
                 let pooled = run_sub_batch(&padded, expected_dim)?;
-                let real_values = real_count * expected_dim;
-                if pooled.len() < real_values {
+                let expected_values = inference_batch_size * expected_dim;
+                if pooled.len() != expected_values {
                     return Err(WorkerError {
                         kind: ErrorKind::Inference,
                         message: format!(
-                            "inference returned {} values for {} real rows of dimension {}",
+                            "fixed-batch inference returned {} values, expected {} ({} rows x {} dim)",
                             pooled.len(),
-                            real_count,
+                            expected_values,
+                            inference_batch_size,
                             expected_dim
                         ),
                     });
                 }
+                let real_values = real_count * expected_dim;
                 all_pooled.extend_from_slice(&pooled[..real_values]);
             } else {
                 let pooled = run_sub_batch(&encodings, expected_dim)?;
+                let expected_values = encodings.len() * expected_dim;
+                if pooled.len() != expected_values {
+                    return Err(WorkerError {
+                        kind: ErrorKind::Inference,
+                        message: format!(
+                            "inference returned {} values, expected {} ({} rows x {} dim)",
+                            pooled.len(),
+                            expected_values,
+                            encodings.len(),
+                            expected_dim
+                        ),
+                    });
+                }
                 all_pooled.extend_from_slice(&pooled);
             }
         }
 
+        let expected_total = texts.len() * expected_dim;
+        if all_pooled.len() != expected_total {
+            return Err(WorkerError {
+                kind: ErrorKind::Inference,
+                message: format!(
+                    "aggregate inference output length mismatch: got {}, expected {}",
+                    all_pooled.len(),
+                    expected_total
+                ),
+            });
+        }
         Ok(all_pooled)
     }
 
@@ -1833,22 +1945,7 @@ impl WorkerRuntime {
         let mut all_pooled: Vec<f32> = Vec::with_capacity(encodings.len() * expected_dim);
 
         for sub_batch in encodings.chunks(inference_batch_size) {
-            // WS10 Task 5 / VAL-CACHE-009: check the per-batch cancel flag
-            // BETWEEN sub-batches. If cancelled, return an error immediately
-            // (the current sub-batch has already completed; no partial results).
-            if self.cancel_flag.load(Ordering::Relaxed) {
-                tracing::info!(
-                    "cancel flag detected between sub-batches; aborting embed after {} of {} encodings",
-                    all_pooled.len() / expected_dim,
-                    encodings.len()
-                );
-                return Err(WorkerError {
-                    kind: ErrorKind::Inference,
-                    message: "batch cancelled between sub-batches".to_string(),
-                });
-            }
-
-            // Keep the worker alive across a large multi-batch codebase.
+            // Keep the worker alive across a large multi-batch test drive.
             self.touch();
 
             if fixed_batch && sub_batch.len() < inference_batch_size {

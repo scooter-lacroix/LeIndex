@@ -177,12 +177,32 @@ pub struct EmbedResponse {
 impl EmbedResponse {
     /// Create a new embed response from a flat buffer.
     pub fn new(vectors: Vec<f32>, count: usize, dimension: usize) -> Self {
-        debug_assert_eq!(vectors.len(), count * dimension);
-        Self {
+        Self::try_new(vectors, count, dimension)
+            .expect("EmbedResponse vectors must equal count * dimension")
+    }
+
+    /// Create a response while validating the flat-buffer invariant in every
+    /// build profile. Use this for data-dependent runtime output so malformed
+    /// provider/cache results become recoverable worker errors rather than
+    /// inconsistent wire metadata.
+    pub fn try_new(vectors: Vec<f32>, count: usize, dimension: usize) -> Result<Self, String> {
+        let expected = count
+            .checked_mul(dimension)
+            .ok_or_else(|| "embedding response size overflow".to_string())?;
+        if vectors.len() != expected {
+            return Err(format!(
+                "embedding response length mismatch: got {}, expected {} ({} rows x {} dim)",
+                vectors.len(),
+                expected,
+                count,
+                dimension
+            ));
+        }
+        Ok(Self {
             vectors,
             count,
             dimension,
-        }
+        })
     }
 
     /// Extract the embedding for a specific index.
