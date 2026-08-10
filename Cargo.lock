@@ -331,6 +331,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bincode"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd6a120d2e16b3e1b4a24bd70f23b12d3e16b81f113364a26935f8db7245452d"
+
+[[package]]
 name = "bindgen"
 version = "0.66.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1411,7 +1417,7 @@ checksum = "43a5258f079b97bf2e8311ff9579e903c899dcbac0d9a138d62e9a066778bd07"
 dependencies = [
  "anndists",
  "anyhow",
- "bincode",
+ "bincode 1.3.3",
  "cfg-if",
  "cpu-time",
  "env_logger",
@@ -1959,7 +1965,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum 0.8.9",
- "bincode",
+ "bincode 3.0.0",
  "blake3",
  "bytemuck",
  "bytes",
@@ -2075,7 +2081,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "base64 0.21.7",
- "bincode",
+ "bincode 1.3.3",
  "bitflags 2.13.1",
  "bytes",
  "fallible-iterator 0.3.0",
