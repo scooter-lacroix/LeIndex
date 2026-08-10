@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::embed::model_path::ModelResolver;
@@ -390,6 +390,9 @@ pub struct WorkerRuntime {
     #[cfg(feature = "onnx")]
     session: Option<Arc<Mutex<Session>>>,
 
+    #[cfg(feature = "onnx")]
+    input_names: Arc<OnceLock<(bool, bool)>>,
+
     /// Tokenizer for text preprocessing. Only available with `onnx` feature.
     #[cfg(feature = "onnx")]
     tokenizer: Option<Arc<tokenizers::Tokenizer>>,
@@ -664,6 +667,8 @@ impl WorkerRuntime {
             started_unix_ms: unix_now_ms(),
             active_embed_cancels: Arc::new(Mutex::new(HashMap::new())),
             cache: open_cache_if_enabled(),
+            #[cfg(feature = "onnx")]
+            input_names: Arc::new(OnceLock::new()),
             #[cfg(feature = "onnx")]
             rerank_session: Arc::new(Mutex::new(None)),
             #[cfg(feature = "onnx")]
@@ -941,66 +946,152 @@ impl WorkerRuntime {
 
     #[cfg(feature = "onnx")]
     fn probe_migraphx_compile_timeout(
-        session: &Arc<Mutex<Session>>,
+        model_path: &std::path::Path,
+        provider_name: &str,
+        ort_threads: usize,
         max_wait: Duration,
     ) -> Result<(), String> {
-        let session = Arc::clone(session);
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<(), String> {
-                let batch_size = 1;
-                let max_len = configured_onnx_sequence_len().min(16);
-                let make_tensor = |data: Vec<i64>, label: &str| {
-                    ort::value::Tensor::from_array(
-                        ndarray::Array2::from_shape_vec((batch_size, max_len), data)
-                            .map_err(|e| format!("{} array: {}", label, e))?,
-                    )
-                    .map_err(|e| format!("{} tensor: {}", label, e))
-                };
-                let input_ids = make_tensor(vec![0; batch_size * max_len], "input_ids")?;
-                let attention_mask = make_tensor(vec![0; batch_size * max_len], "attention_mask")?;
-                let position_ids =
-                    make_tensor(build_position_ids(batch_size, max_len), "position_ids")?;
-                let token_type_ids = make_tensor(vec![0; batch_size * max_len], "token_type_ids")?;
-                let mut guard = session.lock().map_err(|e| format!("session lock: {}", e))?;
-                let uses_position_ids = guard.inputs().iter().any(|i| i.name() == "position_ids");
-                let uses_token_type_ids =
-                    guard.inputs().iter().any(|i| i.name() == "token_type_ids");
-                let result = match (uses_position_ids, uses_token_type_ids) {
-                    (true, true) => guard.run(ort::inputs! {
-                        "input_ids" => input_ids, "attention_mask" => attention_mask,
-                        "position_ids" => position_ids, "token_type_ids" => token_type_ids,
-                    }),
-                    (true, false) => guard.run(ort::inputs! {
-                        "input_ids" => input_ids, "attention_mask" => attention_mask,
-                        "position_ids" => position_ids,
-                    }),
-                    (false, true) => guard.run(ort::inputs! {
-                        "input_ids" => input_ids, "attention_mask" => attention_mask,
-                        "token_type_ids" => token_type_ids,
-                    }),
-                    (false, false) => guard.run(ort::inputs! {
-                        "input_ids" => input_ids, "attention_mask" => attention_mask,
-                    }),
-                };
-                result
-                    .map(|_| ())
-                    .map_err(|e| format!("MIGraphX probe inference: {}", e))
-            })();
-            let _ = tx.send(result);
-        });
-        match rx.recv_timeout(max_wait) {
-            Ok(result) => result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
-                "MIGraphX compile probe timed out after {:?}",
-                max_wait
-            )),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err("MIGraphX compile probe thread disconnected".to_string())
+        if std::env::var_os("LEINDEX_MIGRAPHX_PROBE_CHILD").is_some() {
+            return Err("refusing recursive MIGraphX probe child".to_string());
+        }
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("failed to resolve worker executable: {}", error))?;
+        let mut child = std::process::Command::new(executable)
+            .arg("--migraphx-probe")
+            .arg(model_path)
+            .arg(provider_name)
+            .arg(ort_threads.to_string())
+            .env("LEINDEX_MIGRAPHX_PROBE_CHILD", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| format!("failed to spawn MIGraphX probe child: {}", error))?;
+        let deadline = Instant::now() + max_wait;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(status)) => {
+                    return Err(format!(
+                        "MIGraphX probe child exited with status {}",
+                        status
+                    ));
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "MIGraphX compile probe timed out after {:?}; child killed",
+                        max_wait
+                    ));
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("MIGraphX probe child wait failed: {}", error));
+                }
             }
         }
     }
 
+    #[cfg(feature = "onnx")]
+    pub(crate) fn run_migraphx_probe_child(
+        model_path: &std::path::Path,
+        provider_name: &str,
+        ort_threads: usize,
+    ) -> Result<(), String> {
+        if std::env::var_os("LEINDEX_MIGRAPHX_PROBE_CHILD").is_none() {
+            return Err("MIGraphX probe child marker is missing".to_string());
+        }
+        match crate::embed::ort_discovery::discover_and_init() {
+            crate::embed::ort_discovery::InitResult::Initialized(_) => {}
+            crate::embed::ort_discovery::InitResult::NotFound { last_error, .. } => {
+                return Err(format!(
+                    "failed to initialize ONNX Runtime: {}",
+                    last_error.unwrap_or_else(|| "unknown ORT discovery error".to_string())
+                ));
+            }
+        }
+        let (session, provider_status) =
+            Self::build_session_without_probe(model_path, provider_name, ort_threads)
+                .map_err(|error| format!("failed to build probe session: {}", error))?;
+        if provider_status.execution_provider != "migraphx" {
+            return Err(format!(
+                "probe provider was {} instead of MIGraphX",
+                provider_status.execution_provider
+            ));
+        }
+        let session = Arc::new(Mutex::new(session));
+        let batch_size = 1;
+        let max_len = configured_onnx_sequence_len().min(16);
+        let make_tensor = |data: Vec<i64>, label: &str| {
+            ort::value::Tensor::from_array(
+                ndarray::Array2::from_shape_vec((batch_size, max_len), data)
+                    .map_err(|error| format!("{} array: {}", label, error))?,
+            )
+            .map_err(|error| format!("{} tensor: {}", label, error))
+        };
+        let input_ids = make_tensor(vec![0; batch_size * max_len], "input_ids")?;
+        let attention_mask = make_tensor(vec![0; batch_size * max_len], "attention_mask")?;
+        let position_ids = make_tensor(build_position_ids(batch_size, max_len), "position_ids")?;
+        let token_type_ids = make_tensor(vec![0; batch_size * max_len], "token_type_ids")?;
+        let mut guard = session
+            .lock()
+            .map_err(|error| format!("session lock: {}", error))?;
+        let uses_position_ids = guard
+            .inputs()
+            .iter()
+            .any(|input| input.name() == "position_ids");
+        let uses_token_type_ids = guard
+            .inputs()
+            .iter()
+            .any(|input| input.name() == "token_type_ids");
+        let result = match (uses_position_ids, uses_token_type_ids) {
+            (true, true) => guard.run(ort::inputs! {
+                "input_ids" => input_ids, "attention_mask" => attention_mask,
+                "position_ids" => position_ids, "token_type_ids" => token_type_ids,
+            }),
+            (true, false) => guard.run(ort::inputs! {
+                "input_ids" => input_ids, "attention_mask" => attention_mask,
+                "position_ids" => position_ids,
+            }),
+            (false, true) => guard.run(ort::inputs! {
+                "input_ids" => input_ids, "attention_mask" => attention_mask,
+                "token_type_ids" => token_type_ids,
+            }),
+            (false, false) => guard.run(ort::inputs! {
+                "input_ids" => input_ids, "attention_mask" => attention_mask,
+            }),
+        };
+        result
+            .map(|_| ())
+            .map_err(|error| format!("MIGraphX probe inference: {}", error))
+    }
+
+    #[cfg(feature = "onnx")]
+    fn build_session_without_probe(
+        model_path: &std::path::Path,
+        provider_name: &str,
+        ort_threads: usize,
+    ) -> Result<(Session, ProviderRuntimeStatus), ort::Error> {
+        let optimization_level = match provider_name {
+            "migraphx" | "rocm" => GraphOptimizationLevel::Level3,
+            _ => GraphOptimizationLevel::Level1,
+        };
+        let session_builder = Session::builder()?
+            .with_intra_threads(ort_threads)?
+            .with_memory_pattern(false)?
+            .with_log_level(LogLevel::Warning)?
+            .with_optimization_level(optimization_level)?;
+        let (mut session_builder, provider_status) =
+            attach_execution_provider(session_builder, provider_name, ort_threads)?;
+        session_builder
+            .commit_from_file(model_path)
+            .map(|session| (session, provider_status))
+    }
     #[cfg(feature = "onnx")]
     fn build_session(
         model_path: &std::path::Path,
@@ -1048,18 +1139,16 @@ impl WorkerRuntime {
         let session = session_builder.commit_from_file(model_path)?;
         if matches!(provider_name, "migraphx" | "rocm") {
             const MIGRAPHX_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
-            let session_arc = Arc::new(Mutex::new(session));
-            match Self::probe_migraphx_compile_timeout(&session_arc, MIGRAPHX_PROBE_TIMEOUT) {
-                Ok(()) => {
-                    let session = match Arc::try_unwrap(session_arc) {
-                        Ok(mutex) => mutex.into_inner().unwrap_or_else(|p| p.into_inner()),
-                        Err(_) => Self::build_cpu_session(model_path, ort_threads)?,
-                    };
-                    return Ok(SessionBuildOutcome {
-                        session,
-                        provider_status,
-                    });
-                }
+            return match Self::probe_migraphx_compile_timeout(
+                model_path,
+                provider_name,
+                ort_threads,
+                MIGRAPHX_PROBE_TIMEOUT,
+            ) {
+                Ok(()) => Ok(SessionBuildOutcome {
+                    session,
+                    provider_status,
+                }),
                 Err(reason) => {
                     tracing::warn!(
                         "{}; falling back to CPU for {}",
@@ -1074,7 +1163,7 @@ impl WorkerRuntime {
                         )),
                     });
                 }
-            }
+            };
         }
         Ok(SessionBuildOutcome {
             session,
@@ -2087,14 +2176,18 @@ impl WorkerRuntime {
             message: format!("failed to lock ONNX session: {}", e),
         })?;
 
-        let uses_position_ids = session_guard
-            .inputs()
-            .iter()
-            .any(|input| input.name() == "position_ids");
-        let uses_token_type_ids = session_guard
-            .inputs()
-            .iter()
-            .any(|input| input.name() == "token_type_ids");
+        let (uses_position_ids, uses_token_type_ids) = *self.input_names.get_or_init(|| {
+            (
+                session_guard
+                    .inputs()
+                    .iter()
+                    .any(|input| input.name() == "position_ids"),
+                session_guard
+                    .inputs()
+                    .iter()
+                    .any(|input| input.name() == "token_type_ids"),
+            )
+        });
         // Feed only the inputs the model declares; extras would be rejected.
         // Arms are mutually exclusive, so each tensor moves on exactly one path.
         let outputs = match (uses_position_ids, uses_token_type_ids) {

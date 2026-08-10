@@ -86,6 +86,12 @@ pub fn run() -> ! {
         process::exit(0);
     }
 
+    if let Some((model_path, provider_name, ort_threads)) = parse_migraphx_probe_arg(&argv) {
+        let result =
+            WorkerRuntime::run_migraphx_probe_child(&model_path, &provider_name, ort_threads);
+        process::exit(if result.is_ok() { 0 } else { 1 });
+    }
+
     let socket_path = match parse_socket_arg(&argv) {
         Ok(path) => path,
         Err(message) => {
@@ -221,6 +227,16 @@ pub fn run() -> ! {
 
     tracing::info!("leindex-embed worker exiting cleanly");
     process::exit(0);
+}
+
+fn parse_migraphx_probe_arg(argv: &[String]) -> Option<(PathBuf, String, usize)> {
+    if argv.get(1).map(String::as_str) != Some("--migraphx-probe") || argv.len() != 5 {
+        return None;
+    }
+    let model_path = PathBuf::from(&argv[2]);
+    let provider_name = argv[3].clone();
+    let ort_threads = argv[4].parse().ok()?;
+    Some((model_path, provider_name, ort_threads))
 }
 
 fn parse_socket_arg(argv: &[String]) -> Result<Option<PathBuf>, &'static str> {
@@ -816,10 +832,46 @@ mod tests {
 /// protocol/runtime exercise — no socket, no platform gating.
 #[cfg(test)]
 mod worker_entry_tests {
+    use super::{parse_migraphx_probe_arg, parse_socket_arg};
     use crate::embed::protocol::{self, BatchId, EmbedRequest, Frame, MsgType};
     use crate::embed::runtime::{DEFAULT_IDLE_TIMEOUT_SECS, RuntimeConfig, WorkerRuntime};
     use std::io::Cursor;
     use std::time::Duration;
+
+    #[test]
+    fn test_parse_migraphx_probe_arg_requires_exact_shape() {
+        let args = vec![
+            "leindex-embed".to_string(),
+            "--migraphx-probe".to_string(),
+            "/tmp/model.onnx".to_string(),
+            "migraphx".to_string(),
+            "4".to_string(),
+        ];
+        let parsed = parse_migraphx_probe_arg(&args).expect("valid probe args");
+        assert_eq!(parsed.0.to_string_lossy(), "/tmp/model.onnx");
+        assert_eq!(parsed.1, "migraphx");
+        assert_eq!(parsed.2, 4);
+    }
+
+    #[test]
+    fn test_parse_migraphx_probe_arg_rejects_invalid_args() {
+        let missing = vec!["worker".to_string(), "--migraphx-probe".to_string()];
+        assert!(parse_migraphx_probe_arg(&missing).is_none());
+        let invalid_threads = vec![
+            "worker".to_string(),
+            "--migraphx-probe".to_string(),
+            "model.onnx".to_string(),
+            "migraphx".to_string(),
+            "not-a-number".to_string(),
+        ];
+        assert!(parse_migraphx_probe_arg(&invalid_threads).is_none());
+    }
+
+    #[test]
+    fn test_parse_socket_arg_remains_independent_of_probe_mode() {
+        let args = vec!["worker".to_string(), "--migraphx-probe".to_string()];
+        assert_eq!(parse_socket_arg(&args), Ok(None));
+    }
 
     #[test]
     fn test_binary_embed_roundtrip_via_runtime() {
