@@ -291,7 +291,7 @@ petgraph = { version = "0.8", features = ["serde"], optional = true }
 
 # Storage feature dependencies
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
-libsql = { version = "0.5.0", optional = true }
+libsql = { version = "0.9.30", optional = true }
 rusqlite_migration = { version = "1.0.0", optional = true }
 
 # Search feature dependencies
