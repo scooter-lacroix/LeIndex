@@ -306,7 +306,7 @@ unicode-normalization = { version = "0.1", optional = true }
 # linking; the worker dlopens libonnxruntime at runtime. EP features
 # (cuda/migraphx/rocm/coreml) are ort-sys marker/API features, not SDK links.
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["ndarray", "std", "tracing", "load-dynamic", "api-23"] }
-tokenizers = { version = "0.20", optional = true }
+tokenizers = { version = "0.23", optional = true }
 ndarray = { version = "0.17", optional = true }
 half = { version = "2.1", optional = true, default-features = false }
 
