@@ -76,7 +76,7 @@ fn extract_output_tensor_f32(value: &ort::value::DynValue) -> Result<Vec<f32>, S
     // model. The model applies QuantizeLinear with these constants to its
     // L2-normalized sentence_embedding output. Dequantization formula:
     //   float_value = (uint8_value - zero_point) * scale
-    const UINT8_DEQUANT_SCALE: f32 = 0.0027450980;
+    const UINT8_DEQUANT_SCALE: f32 = 0.002_745_098;
     const UINT8_DEQUANT_ZERO_POINT: f32 = 109.0;
 
     match value.try_extract_array::<f32>() {
@@ -1688,20 +1688,6 @@ impl WorkerRuntime {
         texts: &[String],
         expected_dim: usize,
     ) -> Result<EmbedResponse, WorkerError> {
-        // Batch tokenize all texts. Borrow as &str to avoid cloning every text
-        // into the tokenizer call (the texts are already owned by the caller).
-        let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        let encodings = tokenizer
-            .encode_batch(text_refs, true)
-            .map_err(|e| WorkerError {
-                kind: ErrorKind::Tokenizer,
-                message: format!("tokenization failed: {}", e),
-            })?;
-
-        if encodings.is_empty() {
-            return Ok(EmbedResponse::new(vec![], 0, expected_dim));
-        }
-
         if expected_dim == 0 {
             return Err(WorkerError {
                 kind: ErrorKind::InvalidRequest,
@@ -1709,30 +1695,120 @@ impl WorkerRuntime {
             });
         }
 
-        // Process encodings in sub-batches to bound peak memory.
-        // Batch size is env-tunable once the selected model is validated for
-        // dynamic batch; the default is safe for fixed-batch artifacts.
+        if texts.is_empty() {
+            return Ok(EmbedResponse::new(vec![], 0, expected_dim));
+        }
+
         let active_provider = &self.provider_runtime_status.execution_provider;
         let inference_batch_size =
             configured_onnx_inference_batch_size(&self.config.model_name, active_provider);
         let fixed_batch = active_provider.eq_ignore_ascii_case("migraphx")
             || active_provider.eq_ignore_ascii_case("rocm");
 
-        let all_pooled = self.run_onnx_embed_batch_loop(
-            &encodings,
+        let all_pooled = self.run_onnx_embed_text_batch_loop(
+            texts,
             inference_batch_size,
             fixed_batch,
             expected_dim,
-            |sub_batch, dim| self.run_onnx_embed_sub_batch(session, sub_batch, dim),
+            |sub_texts| {
+                tokenizer
+                    .encode_batch(sub_texts.to_vec(), true)
+                    .map_err(|e| WorkerError {
+                        kind: ErrorKind::Tokenizer,
+                        message: format!("tokenization failed: {}", e),
+                    })
+            },
+            |encodings, dim| self.run_onnx_embed_sub_batch(session, encodings, dim),
         )?;
 
-        let total_count = encodings.len();
-        Ok(EmbedResponse::new(all_pooled, total_count, expected_dim))
+        Ok(EmbedResponse::new(all_pooled, texts.len(), expected_dim))
     }
 
-    /// Drive the embed batch loop: chunk `encodings` into `inference_batch_size`
-    /// sub-batches and concatenate the flattened pooled rows.
+    /// Tokenize and infer one bounded text sub-batch at a time.
     ///
+    /// This is deliberately sequential: it bounds tokenizer memory and lets
+    /// inference begin as soon as the first sub-batch is ready without sharing
+    /// the tokenizer or ORT session across threads. A future pipelined design
+    /// must preserve the same cancellation, padding, ordering, and error
+    /// semantics before it can replace this helper.
+    #[cfg(feature = "onnx")]
+    fn run_onnx_embed_text_batch_loop<T, R>(
+        &self,
+        texts: &[String],
+        inference_batch_size: usize,
+        fixed_batch: bool,
+        expected_dim: usize,
+        mut tokenize: T,
+        mut run_sub_batch: R,
+    ) -> Result<Vec<f32>, WorkerError>
+    where
+        T: FnMut(&[&str]) -> Result<Vec<tokenizers::Encoding>, WorkerError>,
+        R: FnMut(&[tokenizers::Encoding], usize) -> Result<Vec<f32>, WorkerError>,
+    {
+        if inference_batch_size == 0 {
+            return Err(WorkerError {
+                kind: ErrorKind::InvalidRequest,
+                message: "inference batch size must be non-zero".to_string(),
+            });
+        }
+
+        let mut all_pooled = Vec::with_capacity(texts.len() * expected_dim);
+        for sub_texts in texts.chunks(inference_batch_size) {
+            if self.cancel_flag.load(Ordering::Relaxed) {
+                tracing::info!(
+                    "cancel flag detected between tokenized sub-batches; aborting embed after {} of {} texts",
+                    all_pooled.len() / expected_dim.max(1),
+                    texts.len()
+                );
+                return Err(WorkerError {
+                    kind: ErrorKind::Inference,
+                    message: "batch cancelled between sub-batches".to_string(),
+                });
+            }
+            self.touch();
+
+            let sub_refs: Vec<&str> = sub_texts.iter().map(String::as_str).collect();
+            let encodings = tokenize(&sub_refs)?;
+            if encodings.len() != sub_texts.len() {
+                return Err(WorkerError {
+                    kind: ErrorKind::Tokenizer,
+                    message: format!(
+                        "tokenizer returned {} encodings for {} texts",
+                        encodings.len(),
+                        sub_texts.len()
+                    ),
+                });
+            }
+
+            if fixed_batch && encodings.len() < inference_batch_size {
+                let real_count = encodings.len();
+                let mut padded = encodings;
+                if let Some(template) = padded.first().cloned() {
+                    padded.resize(inference_batch_size, template);
+                }
+                let pooled = run_sub_batch(&padded, expected_dim)?;
+                let real_values = real_count * expected_dim;
+                if pooled.len() < real_values {
+                    return Err(WorkerError {
+                        kind: ErrorKind::Inference,
+                        message: format!(
+                            "inference returned {} values for {} real rows of dimension {}",
+                            pooled.len(),
+                            real_count,
+                            expected_dim
+                        ),
+                    });
+                }
+                all_pooled.extend_from_slice(&pooled[..real_values]);
+            } else {
+                let pooled = run_sub_batch(&encodings, expected_dim)?;
+                all_pooled.extend_from_slice(&pooled);
+            }
+        }
+
+        Ok(all_pooled)
+    }
+
     /// For fixed-batch providers (MIGraphX/ROCm), a final partial sub-batch is
     /// padded up to `inference_batch_size` (using the first encoding as a
     /// template) before inference and then trimmed back to the real sub-batch
@@ -1742,7 +1818,7 @@ impl WorkerRuntime {
     /// The `run_sub_batch` closure performs inference for one sub-batch and
     /// returns the flattened row-major pooled vectors; it receives the final
     /// `expected_dim` so padding-aware callers can size their output.
-    #[cfg(feature = "onnx")]
+    #[cfg(all(feature = "onnx", test))]
     fn run_onnx_embed_batch_loop<F>(
         &self,
         encodings: &[tokenizers::Encoding],
@@ -1796,10 +1872,42 @@ impl WorkerRuntime {
         Ok(all_pooled)
     }
 
-    /// Run ONNX inference on a single sub-batch of encodings and return
-    /// the pooled + L2-normalized vectors (flattened row-major).
+    /// Run ONNX inference on a single sub-batch, including collapsed-batch
+    /// recovery. Fixed-batch padding is performed by the text/encoding batch
+    /// loop so collapsed single-row retries cannot be padded recursively.
     #[cfg(feature = "onnx")]
     fn run_onnx_embed_sub_batch(
+        &self,
+        session: &Arc<Mutex<Session>>,
+        encodings: &[tokenizers::Encoding],
+        expected_dim: usize,
+    ) -> Result<Vec<f32>, WorkerError> {
+        match self.run_onnx_embed_sub_batch_inner(session, encodings, expected_dim) {
+            Ok(vectors) => Ok(vectors),
+            Err(ref err) if err.message.starts_with(COLLAPSED_BATCH_SENTINEL) => {
+                tracing::warn!(
+                    "ONNX model collapsed batch dimension (sent {}); retrying each sequence \
+                     individually with batch_size=1",
+                    encodings.len()
+                );
+                let mut all_vectors = Vec::with_capacity(encodings.len() * expected_dim);
+                for encoding in encodings {
+                    let single = std::slice::from_ref(encoding);
+                    let vectors =
+                        self.run_onnx_embed_sub_batch_inner(session, single, expected_dim)?;
+                    all_vectors.extend_from_slice(&vectors);
+                }
+                Ok(all_vectors)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Run one already-shaped ONNX sub-batch: build tensors, invoke ORT once,
+    /// and validate/pool/normalize the outputs. The caller owns padding and
+    /// collapsed-batch recovery policy.
+    #[cfg(feature = "onnx")]
+    fn run_onnx_embed_sub_batch_inner(
         &self,
         session: &Arc<Mutex<Session>>,
         encodings: &[tokenizers::Encoding],
@@ -1921,20 +2029,6 @@ impl WorkerRuntime {
 
         match self.finalize_embed_output(&outputs, batch_size, expected_dim, &attention_mask) {
             Ok(vectors) => Ok(vectors),
-            Err(ref err) if err.message.starts_with(COLLAPSED_BATCH_SENTINEL) => {
-                tracing::warn!(
-                    "ONNX model collapsed batch dimension (sent {}); retrying each sequence \
-                     individually with batch_size=1",
-                    batch_size
-                );
-                let mut all_vectors = Vec::with_capacity(batch_size * expected_dim);
-                for encoding in encodings {
-                    let single = std::slice::from_ref(encoding);
-                    let vectors = self.run_onnx_embed_sub_batch(session, single, expected_dim)?;
-                    all_vectors.extend_from_slice(&vectors);
-                }
-                Ok(all_vectors)
-            }
             Err(err) => Err(err),
         }
     }

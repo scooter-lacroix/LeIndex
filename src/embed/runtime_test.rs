@@ -229,7 +229,7 @@ fn test_extract_u8_dequantization() {
     // Verify the dequantization formula: (value - zero_point) * scale
     // with scale=0.0027450980 and zero_point=109.
     // These are the QuantizeLinear parameters from the electroglyph uint8 model.
-    const SCALE: f32 = 0.0027450980;
+    const SCALE: f32 = 0.002_745_098;
     const ZERO_POINT: f32 = 109.0;
 
     // Test a few representative uint8 values.
@@ -267,7 +267,7 @@ fn test_u8_dequant_preserves_unit_norm() {
     // collapsing the norm. A valid unit-norm check must use in-range components.
     // [0.35; 8] has norm ~0.99, all components in range, and stays close to 1.0
     // after quantize+dequant.
-    const SCALE: f32 = 0.0027450980;
+    const SCALE: f32 = 0.002_745_098;
     const ZERO_POINT: f32 = 109.0;
 
     // An 8-dim vector with all components in the quantizer's representable
@@ -961,6 +961,150 @@ fn test_embed_response_invariant_all_providers() {
             );
         }
     }
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_embed_text_batch_loop_tokenizes_and_infers_per_sub_batch() {
+    // Fix B: tokenization must be bounded to the inference batch and inference
+    // must begin before later text batches are tokenized.
+    let rt = WorkerRuntime::new(no_compile_config());
+    let texts: Vec<String> = (0..17).map(|i| format!("text-{i}")).collect();
+    let mut tokenized_sizes = Vec::new();
+    let events = std::cell::RefCell::new(Vec::new());
+    let dim = 4usize;
+
+    let pooled = rt
+        .run_onnx_embed_text_batch_loop(
+            &texts,
+            8,
+            false,
+            dim,
+            |sub_texts| {
+                tokenized_sizes.push(sub_texts.len());
+                events
+                    .borrow_mut()
+                    .push(format!("tokenize-{}", sub_texts.len()));
+                Ok(embed_encodings(sub_texts.len()))
+            },
+            |encodings, dim| {
+                events
+                    .borrow_mut()
+                    .push(format!("infer-{}", encodings.len()));
+                Ok(vec![1.0f32; encodings.len() * dim])
+            },
+        )
+        .unwrap();
+
+    assert_eq!(tokenized_sizes, vec![8, 8, 1]);
+    assert_eq!(pooled.len(), texts.len() * dim);
+    assert_eq!(
+        events.into_inner(),
+        vec![
+            "tokenize-8".to_string(),
+            "infer-8".to_string(),
+            "tokenize-8".to_string(),
+            "infer-8".to_string(),
+            "tokenize-1".to_string(),
+            "infer-1".to_string(),
+        ]
+    );
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_embed_text_batch_loop_fixed_batch_pads_after_per_batch_tokenization() {
+    let rt = WorkerRuntime::new(no_compile_config());
+    let texts: Vec<String> = (0..10).map(|i| format!("text-{i}")).collect();
+    let mut tokenized_sizes = Vec::new();
+    let mut inferred_sizes = Vec::new();
+    let dim = 2usize;
+
+    let pooled = rt
+        .run_onnx_embed_text_batch_loop(
+            &texts,
+            8,
+            true,
+            dim,
+            |sub_texts| {
+                tokenized_sizes.push(sub_texts.len());
+                Ok(embed_encodings(sub_texts.len()))
+            },
+            |encodings, dim| {
+                inferred_sizes.push(encodings.len());
+                Ok(vec![0.5f32; encodings.len() * dim])
+            },
+        )
+        .unwrap();
+
+    assert_eq!(tokenized_sizes, vec![8, 2]);
+    assert_eq!(inferred_sizes, vec![8, 8]);
+    assert_eq!(pooled.len(), texts.len() * dim);
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_embed_text_batch_loop_later_tokenizer_error_stops_before_next_inference() {
+    let rt = WorkerRuntime::new(no_compile_config());
+    let texts: Vec<String> = (0..10).map(|i| format!("text-{i}")).collect();
+    let mut inferred_batches = Vec::new();
+    let mut tokenizer_calls = 0usize;
+
+    let error = rt
+        .run_onnx_embed_text_batch_loop(
+            &texts,
+            8,
+            false,
+            2,
+            |_sub_texts| {
+                tokenizer_calls += 1;
+                if tokenizer_calls == 2 {
+                    Err(WorkerError {
+                        kind: ErrorKind::Tokenizer,
+                        message: "synthetic tokenizer failure".to_string(),
+                    })
+                } else {
+                    Ok(embed_encodings(8))
+                }
+            },
+            |encodings, dim| {
+                inferred_batches.push(encodings.len());
+                Ok(vec![1.0f32; encodings.len() * dim])
+            },
+        )
+        .unwrap_err();
+
+    assert_eq!(inferred_batches, vec![8]);
+    assert_eq!(tokenizer_calls, 2);
+    assert_eq!(error.kind, ErrorKind::Tokenizer);
+    assert!(error.message.contains("synthetic tokenizer failure"));
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_embed_text_batch_loop_checks_cancel_between_sub_batches() {
+    let rt = WorkerRuntime::new(no_compile_config());
+    let texts: Vec<String> = (0..10).map(|i| format!("text-{i}")).collect();
+    let mut inferred_batches = Vec::new();
+
+    let error = rt
+        .run_onnx_embed_text_batch_loop(
+            &texts,
+            8,
+            false,
+            2,
+            |_sub_texts| Ok(embed_encodings(8)),
+            |encodings, dim| {
+                inferred_batches.push(encodings.len());
+                rt.cancel_flag.store(true, Ordering::Relaxed);
+                Ok(vec![1.0f32; encodings.len() * dim])
+            },
+        )
+        .unwrap_err();
+
+    assert_eq!(inferred_batches, vec![8]);
+    assert_eq!(error.kind, ErrorKind::Inference);
+    assert!(error.message.contains("cancelled"));
 }
 
 // ── Batch size suffix-precedence fix ──────────────────────────────────

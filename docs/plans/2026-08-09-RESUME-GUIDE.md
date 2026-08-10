@@ -9,25 +9,37 @@
 > remaining work. A file-corruption incident destroyed one file's uncommitted
 > edits; that is documented below with the precise redo instructions.
 
+## Current verified runtime state (updated 2026-08-09 19:59 EDT)
+
+The earlier corruption note below is historical and no longer describes the
+working tree. `src/embed/runtime.rs` now contains the MIGraphX compile-timeout
+CPU fallback, bounded sequential per-sub-batch tokenization, the test-only
+pre-tokenized batching helper, and `run_onnx_embed_sub_batch_inner`.
+
+Fix B is implemented as **bounded sequential tokenization followed immediately
+by inference**. It intentionally does not overlap tokenizer work with ORT
+inference; true two-stage pipelining remains a separate, explicitly unstarted
+task. New hermetic tests verify tokenizer batch sizes, tokenize→infer ordering,
+fixed-batch padding, later tokenizer failure, and cancellation.
+
+The current implementation and task status are tracked in:
+`docs/plans/2026-08-09-outstanding-tasks.md` and
+`docs/plans/2026-08-09-execution-tracking.md`.
+
 ---
 
 ## TL;DR — current state
 
-- **Fixes A (A1–A6), B (B1–B3), C (C1–C5) are implemented and verified** across
-  9 source files (schema, pdg_store, index_builder, hybrid, client, client_config,
-  protocol, runtime_test, worker_main). `cargo fmt`, `cargo clippy -D warnings`,
-  and `cargo test --lib` (1804 passed) are GREEN on the non-onnx build.
-- **`src/embed/runtime.rs` was restored to git HEAD** after a shell-escaping
-  accident destroyed its uncommitted working-tree edits. It therefore does NOT
-  currently contain: (1) the Fix-B tokenize-per-sub-batch rewrite, (2) the
-  `run_onnx_embed_batch_loop` test helper, or (3) the **new MIGraphX compile-hang
-  guard + CPU fallback** (the major discovery of this session). These three must
-  be re-applied — exact specs in §"runtime.rs redo" below.
-- A **deep performance investigation** (this session) discovered the **real**
-  production blocker: ROCm 7.2.4's MIGraphX compiler (2.15.0) enters a
-  non-converging `repeat_while_changes` pass loop during ORT's lazy compile on
-  the first `session.run()`, hanging the worker forever. The fix design (bounded
-  warmup probe + CPU fallback) is fully specified and ready to implement.
+- **Fixes A (A1–A6), bounded sequential Fix B (B1–B3), and C (C1–C5)
+  are implemented and verified.**
+- `src/embed/runtime.rs` contains the MIGraphX compile-hang guard and CPU
+  fallback, per-sub-batch tokenization, the test-only pre-tokenized batching
+  helper, and the raw `run_onnx_embed_sub_batch_inner` inference helper.
+- True tokenizer/inference overlap is intentionally not implemented. It remains
+  a separate future task because it requires a bounded producer/consumer design
+  and careful cancellation/thread-safety handling.
+- The historical corruption and redo instructions below are retained as audit
+  history only; they are not a description of the current working tree.
 
 ---
 
@@ -127,7 +139,11 @@ rapid; if they can't be, degrade instead of hang."
 
 ---
 
-## runtime.rs redo (the 3 things lost in the corruption)
+### Historical runtime redo instructions
+
+The following section records the recovery procedure used earlier in this
+session. It is retained for auditability; the listed runtime work is now
+implemented and verified as described in the current-state section above.
 
 `src/embed/runtime.rs` is currently at **git HEAD (v2.0.0)** — 2479 lines. It
 needs these three changes re-applied. They were previously verified (`cargo check

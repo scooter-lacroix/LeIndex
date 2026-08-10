@@ -104,6 +104,19 @@ There is no overlap between tokenization of batch N+1 and inference of batch N. 
 | Tokenization sequencing tests | Missing |
 | MIGraphX compile timeout/CPU fallback | Implemented separately |
 
-## Recommendation
+## Implementation update
 
-Do not treat the remediation plan as complete or spend installation/indexing time expecting the full Fix B performance goal until the outstanding tasks are implemented and verified. Fix A, Fix C, the earlier ONNX batching correctness fix, and the MIGraphX fallback are present; Fix B requires additional runtime and test work.
+The bounded sequential Fix B implementation is now present:
+
+- `run_onnx_embed_text_batch_loop` chunks source texts before tokenization;
+- each chunk is tokenized with at most `inference_batch_size` texts;
+- inference starts immediately after each chunk is tokenized;
+- fixed-batch padding and trimming are preserved;
+- `run_onnx_embed_sub_batch_inner` owns one raw ORT call;
+- collapsed-batch recovery calls the inner helper directly for single rows;
+- hermetic tests verify batch sizes, event ordering, fixed padding, later
+  tokenizer failure, and cancellation.
+
+The implementation is deliberately sequential. True tokenizer/inference
+pipelining remains outstanding and is tracked as B4 in
+`docs/plans/2026-08-09-execution-tracking.md`.

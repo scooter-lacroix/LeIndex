@@ -29,20 +29,17 @@
 
 ---
 
-## Fix B — GPU (MiGraphX) utilization (Issue 2)
+## Fix B — bounded per-sub-batch tokenization (Issue 2)
 
 | # | Task | Status | Notes / Verification |
 |---|------|--------|----------------------|
-| B1 | Tokenize **per sub-batch** in `run_onnx_embed` (`runtime.rs`) instead of one whole-batch `encode_batch` — inference starts after first sub-batch; only `inference_batch_size` encodings live at once (lower RAM + less GPU idle) | ✅ | Implemented inline in `run_onnx_embed` (fixed-batch padding + cancel-flag checks preserved per sub-batch). |
-| B2 | Remove now-dead `run_onnx_embed_batch_loop` (only caller was the rewritten `run_onnx_embed`) | ✅ | 3183 chars removed; zero references in production. |
-| B3 | Compile-verify Fix B | ✅ | `cargo check --features onnx` + `cargo clippy --workspace --all-targets -- -D warnings` both PASS. |
+| B1 | Tokenize and infer one bounded text sub-batch at a time | ✅ | `run_onnx_embed_text_batch_loop` chunks source texts, calls `Tokenizer::encode_batch` for only the current chunk, then immediately infers it. This bounds live encodings and reduces time-to-first-inference. |
+| B2 | Preserve provider padding, output shape, ordering, and collapsed-batch recovery | ✅ | Fixed-provider partial chunks are padded/trimmed; `run_onnx_embed_sub_batch_inner` owns one raw ORT call; wrapper retries collapsed batches with direct single-row inner calls, avoiding recursive padding. |
+| B3 | Hermetic behavioral tests for sequencing and failure paths | ✅ | Added tests for per-call sizes and tokenize→infer ordering, fixed-batch padding, later tokenizer failure, and cancellation between sub-batches. ONNX runtime test module: 53 passed. |
+| B4 | True tokenizer/inference pipeline | ⬜ | Intentionally not implemented. Current Fix B is bounded sequential tokenization/inference. A concurrent two-stage pipeline requires a separate design and must not be claimed by this plan. |
+| B5 | Compile/lint verification | ✅ | `cargo fmt --all --check`, `cargo check --features onnx`, and `cargo clippy --workspace --all-targets --features onnx -- -D warnings` pass. |
 
-**Test-binding remediation (B2 fallout):** 4 onnx tests in `runtime_test.rs` still referenced `run_onnx_embed_batch_loop`, and 2 `worker_entry_tests` in `worker_main.rs` used `RuntimeConfig::default()` (a real model name) → under `--features onnx`, `WorkerRuntime::new` attempted a real model load/compile and **hung the whole embed suite >60s**. Root causes fixed:
-- Added a `#[cfg(test)]` `run_onnx_embed_batch_loop` helper (mockable runner, chunk/pad/trim semantics) that the 4 VAL-ONNX tests use to verify the chunking contract without a real model.
-- Made `test_runtime_handles_embed_request` / `test_run_loop_single_request` her-metic with `__leindex_test_no_model__` so `init_onnx` returns `(None, None)` instantly instead of loading a real model.
-- Fixed `test_u8_dequant_preserves_unit_norm`: the old data used `0.5` components, which are OUT of the quantizer's representable range `[-0.299, 0.401]` (clip to 255 → norm 0.80, failing). Switched to in-range `[0.35; 8]` (norm 0.99) consistent with the model's L2-normalize-then-quantize contract.
-- Verified: `cargo test --lib --features onnx embed::` → **231 passed, 0 failed in 0.34s**.
-
+**Scope clarification:** The implemented Fix B goal is bounded sequential per-sub-batch tokenization with immediate inference. It does not overlap tokenizer work with ORT inference. The prior whole-request tokenization claim has been removed from the runtime; the old production `run_onnx_embed_batch_loop` is now test-only, while the text loop owns production batching.
 ---
 
 ## Fix C — PDG build/save performance (Issue 1)

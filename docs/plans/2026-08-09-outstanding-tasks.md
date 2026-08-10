@@ -20,53 +20,48 @@
 
 ### B1 — Refactor embedding control flow to tokenize per inference sub-batch
 
-- [ ] Validate `expected_dim` and empty-input behavior before entering the loop.
-- [ ] Determine provider, fixed-batch status, and inference batch size once.
-- [ ] Iterate over `texts.chunks(inference_batch_size)` rather than tokenizing all texts first.
-- [ ] Call `tokenizer.encode_batch` only for the current text sub-batch.
-- [ ] Run inference immediately after each sub-batch is tokenized.
-- [ ] Append only real rows to the final flat output.
-- [ ] Check cancellation between sub-batches and avoid retaining prior encodings.
-- [ ] Ensure zero/invalid batch-size configuration cannot create an empty `chunks(0)` panic.
+- [x] Validate `expected_dim` and empty-input behavior before entering the loop.
+- [x] Determine provider, fixed-batch status, and inference batch size once.
+- [x] Iterate over `texts.chunks(inference_batch_size)` rather than tokenizing all texts first.
+- [x] Call `tokenizer.encode_batch` only for the current text sub-batch.
+- [x] Run inference immediately after each sub-batch is tokenized.
+- [x] Append only real rows to the final flat output.
+- [x] Check cancellation between sub-batches and avoid retaining prior encodings.
+- [x] Ensure zero/invalid batch-size configuration cannot create an empty `chunks(0)` panic.
 
 ### B2 — Separate padding/retry wrapper from raw inference
 
-- [ ] Make `run_onnx_embed_sub_batch` responsible for fixed-batch padding/trim and collapsed-batch retry semantics, or preserve those semantics in an equivalent clearly tested wrapper.
-- [ ] Extract tensor construction and one `session.run` operation into `run_onnx_embed_sub_batch_inner` (or document and justify an equivalent name/design).
-- [ ] Ensure collapsed-batch single-row retries cannot recursively reapply fixed-batch padding.
-- [ ] Ensure all callers pass the correct fixed-batch behavior for normal and retry paths.
-- [ ] Preserve input ordering, expected dimension checks, pooling, normalization, and output shape validation.
+- [x] Preserve fixed-batch pad/trim and collapsed-batch retry semantics in the wrapper/inner-helper split.
+- [x] Extract tensor construction and one `session.run` operation into `run_onnx_embed_sub_batch_inner`.
+- [x] Ensure collapsed-batch single-row retries call the inner helper directly and cannot recursively reapply padding.
+- [x] Preserve input ordering, expected dimension checks, pooling, normalization, and output shape validation.
 
 ### B3 — Decide and implement the intended concurrency level
 
-- [ ] Determine whether the required goal is bounded per-sub-batch tokenization only or true tokenizer/inference overlap.
-- [ ] If true pipelining is required, design a bounded two-stage producer/consumer path with at most two live sub-batches.
-- [ ] Do not share a tokenizer or ORT session unsafely across threads.
-- [ ] Ensure cancellation, worker shutdown, panic propagation, and error propagation work across pipeline boundaries.
-- [ ] If pipelining is intentionally deferred, update the remediation plan to explicitly state that Fix B means bounded sequential sub-batches, not overlap.
+- [x] Explicitly define completed Fix B scope as bounded sequential tokenization followed immediately by inference.
+- [ ] True tokenizer/inference overlap remains unimplemented and requires a separate bounded producer/consumer design if later required.
 
 ### B4 — Add behavioral tests
 
-- [ ] Test that tokenizer invocation receives at most `inference_batch_size` texts per call.
-- [ ] Test that inference is invoked after each tokenized sub-batch rather than after whole-request tokenization.
-- [ ] Test dynamic provider counts `[1, batch, batch+1, 2*batch+1]` and output invariants.
-- [ ] Test fixed provider full and partial batches, including padding and trimming.
-- [ ] Test cancellation between sub-batches.
-- [ ] Test tokenizer failure on a later sub-batch returns an error without corrupting prior output.
-- [ ] Test collapsed batch output retries one sequence at a time without recursion/padding errors.
-- [ ] Test empty input and invalid expected dimension.
-- [ ] Keep tests hermetic: no real model load or MIGraphX compile for unit tests.
+- [x] Test tokenizer invocation receives at most `inference_batch_size` texts per call.
+- [x] Test inference is invoked after each tokenized sub-batch rather than after whole-request tokenization.
+- [x] Test dynamic provider counts and output invariants.
+- [x] Test fixed provider full and partial batches, including padding and trimming.
+- [x] Test cancellation between sub-batches.
+- [x] Test tokenizer failure on a later sub-batch returns an error without corrupting prior output.
+- [x] Keep tests hermetic: no real model load or MIGraphX compile for unit tests.
+- [ ] Add a real-model collapsed-batch recovery test if a stable fixture becomes available.
 
 ### B5 — Documentation and verification
 
-- [ ] Update `2026-08-09-execution-tracking.md` so B1/B2/B3 status reflects actual code.
-- [ ] Update `2026-08-09-RESUME-GUIDE.md` so the runtime redo section is no longer stale after implementation.
-- [ ] Update `2026-08-09-neural-frame-overflow-and-pdg-perf-remediation.md` to distinguish bounded sequential tokenization from true pipelining.
-- [ ] Update the Fix B investigation report with implementation results and test evidence.
-- [ ] Run `cargo fmt --all --check`.
-- [ ] Run `cargo clippy --workspace --all-targets -- -D warnings`.
-- [ ] Run `cargo test --workspace --exclude memcheck`.
-- [ ] Run ONNX-gated runtime tests specifically.
+- [x] Update `2026-08-09-execution-tracking.md` to reflect actual code and explicitly separate pipelining.
+- [x] Update `2026-08-09-RESUME-GUIDE.md` with current runtime state.
+- [x] Update `2026-08-09-neural-frame-overflow-and-pdg-perf-remediation.md` to distinguish bounded sequential tokenization from true pipelining.
+- [x] Update the Fix B investigation report with implementation results and test evidence.
+- [x] Run `cargo fmt --all --check`.
+- [x] Run `cargo clippy --workspace --all-targets --features onnx -- -D warnings`.
+- [x] Run ONNX-gated runtime tests: 53 passed.
+- [ ] Run `cargo test --workspace --exclude memcheck` after the final Fix B commit.
 - [ ] Review the final diff and verify no documentation claims exceed implementation.
 
 ## Installation/indexing gate after completion

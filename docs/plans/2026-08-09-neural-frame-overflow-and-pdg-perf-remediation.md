@@ -108,24 +108,31 @@ check** — it only enforces `MAX_RESPONSE_FRAME_SIZE` on reads.
    boundary), capping per-text cost and aggregate frame size; TF-IDF keeps the
    full content path untouched.
 
-### Fix B (Issue 2) — GPU pipelining
+### Fix B — bounded sequential sub-batches
 
-5. In `run_onnx_embed_batch_loop` / `run_onnx_embed`, overlap tokenization with
-   inference: tokenize sub-batch N+1 while `session.run()` executes sub-batch N
-   (software pipelining within the single worker thread pool). For
-   fixed-batch providers, keep the padding; for dynamic-batch providers, use
-   larger sub-batches. Bounded change in `src/embed/runtime.rs` only.
+5. In `run_onnx_embed`, tokenize source texts in bounded chunks of
+   `configured_onnx_inference_batch_size`, then run inference immediately for
+   each tokenized chunk. This bounds live tokenizer encodings and reduces
+   time-to-first-inference. Fixed-batch providers retain pad/trim behavior.
+6. Keep the raw tensor construction and one `session.run` operation in an inner
+   helper, while the outer helper owns collapsed-batch recovery. Single-row
+   recovery must call the inner helper directly so fixed-batch padding is not
+   recursively reapplied.
+7. This implementation is intentionally sequential. True tokenizer/inference
+   overlap is a separate future design requiring bounded producer/consumer
+   ownership, cancellation propagation, and thread-safety review; it is not
+   claimed as part of the completed Fix B scope.
 
 ### Fix C (Issue 1) — build/save perf
 
-6. **`save_pdg` upsert**: `INSERT ... ON CONFLICT(project_id, node_id) DO
+8. **`save_pdg` upsert**: `INSERT ... ON CONFLICT(project_id, node_id) DO
    UPDATE` keyed by natural `node_id`; skip rows whose `content_hash` is
    unchanged (hash once, reuse); drop the per-node `blake3` recompute where the
    value is only a synthetic column; set `PRAGMA journal_mode=WAL;
    synchronous=NORMAL` on the write connection; keep the batching.
-7. **Cross-file index once**: build the call-index (name → signatures) once over
+9. **Cross-file index once**: build the call-index (name → signatures) once over
    all signatures, then add call edges — eliminate the O(S²) rescan.
-8. **RAM**: avoid cloning 256 contents in `embed_pending_neural_batch` (borrow
+10. **RAM**: avoid cloning 256 contents in `embed_pending_neural_batch` (borrow
    `&str`); skip neural for contents already hoisted (they already have
    `cached_neural`).
 
