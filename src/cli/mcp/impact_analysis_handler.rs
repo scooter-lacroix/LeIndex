@@ -179,6 +179,10 @@ to understand the blast radius of your change. No equivalent in standard tools."
                 "symbol": node.name,
                 "file": node.file_path,
                 "change_type": change_type,
+                // Direction label: the audit flagged the 351-vs-9 confusion
+                // against symbol-lookup; this tool measures backward
+                // (dependents) reach at the requested depth.
+                "direction": "backward (symbols that depend on this one)",
                 "direct_callers": direct_callers,
                 "transitive_affected_symbols": affected_symbols,
                 "transitive_affected_files": affected_files.len(),

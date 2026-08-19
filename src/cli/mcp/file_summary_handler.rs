@@ -137,8 +137,20 @@ async fn catalog_file_summary(
     // Resolve each symbol's live path; skip (drop) symbols whose lookup fails
     // rather than aborting the whole request. All-stale -> empty -> the caller
     // falls back to live parsing.
+    //
+    // A file's DEFINITIONS are what a summary should inventory. `external`
+    // rows are import/reference markers (qualified paths like
+    // `crate.cli.index_job.IndexJobSnapshot` from call-target resolution) —
+    // the audit found them dominating the list and drowning the file's own
+    // symbols. Drop them here rather than in the shared catalog query so
+    // other catalog consumers keep their semantics.
     let mut resolved = Vec::with_capacity(symbols.len());
+    let mut dropped_external = 0usize;
     for mut symbol in symbols {
+        if symbol.node_type.eq_ignore_ascii_case("external") {
+            dropped_external += 1;
+            continue;
+        }
         match live.file(&symbol.file_path.to_string_lossy()) {
             Ok(path) => {
                 symbol.file_path = path;
@@ -153,8 +165,10 @@ async fn catalog_file_summary(
     }
 
     let catalog_total = catalog.count_symbols_in_file(file).await.ok();
+    // The row cap compares against ALL rows (externals included), so add the
+    // filtered markers back when deciding whether the DEFINITION list was cut.
     let catalog_truncated = catalog_total
-        .map(|total| total > symbols.len())
+        .map(|total| total > symbols.len() + dropped_external)
         .unwrap_or(symbols.len() >= 200);
     let bytes = read_live_bytes(file.to_path_buf()).await?;
     if !catalog_is_fresh(&catalog, file, &bytes).await {

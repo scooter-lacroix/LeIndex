@@ -289,6 +289,9 @@ For the exact source implementation use LeIndex [Read Symbol]."
             .filter_map(|&nid| pdg.get_node(nid).map(|n| n.file_path.as_ref()))
             .collect();
         let impact_radius = serde_json::json!({
+            // Direction label: the audit flagged 351-vs-9 confusion against
+            // impact-analysis; this figure is forward (dependents) reach.
+            "direction": "forward (symbols that depend on this one)",
             "affected_symbols": forward.len(),
             "affected_files": affected_files.len()
         });

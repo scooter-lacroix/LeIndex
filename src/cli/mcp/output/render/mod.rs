@@ -1769,6 +1769,21 @@ pub fn render_tool_output(name: &str, data: &Value, args: &Value) -> String {
     render_tool_output_with_color(name, data, args, true)
 }
 
+/// Render a tool's value with the freshness footer split out.
+///
+/// CLI one-shot consumers (`tools run`) print the body to stdout and the
+/// footer to stderr so JSON-emitting tools stay parseable with a plain
+/// `json.load`; the MCP transport concatenates both via
+/// [`render_tool_output`].
+pub fn render_tool_output_split(
+    name: &str,
+    data: &Value,
+    args: &Value,
+) -> (String, Option<String>) {
+    let (rendered, footer) = render_tool_output_inner(name, data, args, true);
+    (rendered, footer)
+}
+
 /// Render a tool's value *without* ANSI color codes. Used by the MCP
 /// transport to produce clean text for the LLM (the CLI uses the
 /// colored `render_tool_output`).
@@ -1777,11 +1792,24 @@ pub fn render_tool_output_plain(name: &str, data: &Value, args: &Value) -> Strin
 }
 
 fn render_tool_output_with_color(name: &str, data: &Value, args: &Value, color: bool) -> String {
+    let (mut rendered, footer) = render_tool_output_inner(name, data, args, color);
+    if let Some(footer) = footer {
+        rendered.push_str(&footer);
+    }
+    rendered
+}
+
+fn render_tool_output_inner(
+    name: &str,
+    data: &Value,
+    args: &Value,
+    color: bool,
+) -> (String, Option<String>) {
     let normalized = normalize_tool_name(name);
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let node_id = args.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
 
-    let mut rendered = match normalized.as_str() {
+    let rendered = match normalized.as_str() {
         "leindex_search" | "search" => render_search(data, query, color),
         "leindex_context" | "context" => render_context(data, node_id, color),
         "leindex_diagnostics" | "diagnostics" => render_diagnostics(data, color),
@@ -1824,14 +1852,13 @@ fn render_tool_output_with_color(name: &str, data: &Value, args: &Value, color: 
             .get("advisory")
             .and_then(Value::as_str)
             .or_else(|| freshness.get("warning").and_then(Value::as_str));
-        rendered.push_str(&format!(
-            "\nFreshness: status={status}, generation={generation}\n"
-        ));
+        let mut footer = format!("\nFreshness: status={status}, generation={generation}\n");
         if let Some(advisory) = advisory {
-            rendered.push_str(&format!("Advisory: {advisory}\n"));
+            footer.push_str(&format!("Advisory: {advisory}\n"));
         }
+        return (rendered, Some(footer));
     }
-    rendered
+    (rendered, None)
 }
 
 // =============================================================================

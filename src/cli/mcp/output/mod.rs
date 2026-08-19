@@ -174,7 +174,7 @@ pub use diff::{
 pub use render::{
     DiagnosticsFormatter, FileSummaryFormatter, GitStatusFormatter, ImpactFormatter,
     PhaseFormatter, ProjectMapFormatter, SearchFormatter, SymbolLookupFormatter,
-    render_tool_output, render_tool_output_plain, render_tree,
+    render_tool_output, render_tool_output_plain, render_tool_output_split, render_tree,
 };
 pub use trim::trim_llm_payload;
 

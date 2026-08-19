@@ -500,12 +500,20 @@ async fn catalog_exact_response(
     );
     let shown = results.len();
     let mut pdg_status = "not_loaded";
+    let mut enrichment_note = None;
     if let Some(handle) = registry.try_get_loaded(live.root()).await {
         let guard = handle.read().await;
         if let Some(pdg) = guard.pdg() {
             pdg_status = "fresh";
             enrich_catalog_results(pdg, &mut results);
         }
+    }
+    if pdg_status == "not_loaded" {
+        // Honest degradation (audit #1): an absent PDG means the graph
+        // columns are empty because enrichment never ran, not because the
+        // symbols have no relations.
+        enrichment_note =
+            Some("PDG not loaded; caller/callee enrichment unavailable in this response");
     }
     Ok(Some(serde_json::json!({
         "results": results,
@@ -515,6 +523,7 @@ async fn catalog_exact_response(
         "mode": "exact",
         "truncated": total_matches.saturating_sub(offset).min(max_results) > shown,
         "pdg_status": pdg_status,
+        "enrichment_note": enrichment_note,
         "symbol_index_miss": symbol_index_miss,
         "retrieval": {
             "tfidf_status": "not_used_exact",
