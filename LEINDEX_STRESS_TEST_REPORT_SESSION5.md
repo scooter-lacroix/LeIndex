@@ -307,3 +307,28 @@ Gates: fmt clean, `clippy -D warnings` clean (both feature sets), `cargo test --
 ### C. Verification matrix this wave
 - 17 new regression tests (edge-diff ×4, trigram skip, snapshot sidecar skip, corruption-under-lock, init_failed text ×2, WAL-sidecar cleanup, JoinError ×2, impact-note ×5, trim keeps degradation fields, trim keeps dry_run).
 - Live: force rebuild gen 38 fresh; no-op saves ~300 ms; dry-run render correct; `save_pdg` lookup 27 symbols/15 files; search ranked results intact; `retention --gc` reclaimed 472 MB of test generations.
+
+---
+
+## §10.3 Session-9 addendum — the "saving to storage" tail: 85.7s → 5.0s (17x) + RAM-safety wave
+
+**Attribution (from the 14:06Z run's artifacts):** the stall after "Indexing: saving to storage…" was 85.7 s: ~26 s embed-daemon cold start (spawn + ORT/MIGraphX init + SFR model load incl. one first-batch collapse retry), 58.3 s ONNX inference of all 10,211 rows at b8/s128 (~5.7 ms/row), ~1.4 s persist/publish. The reported `Time: 4083ms` stopped at lexical persist — the entire neural tail was silent and unaccounted.
+
+**Root cause of the recurring inference:** the WS10 global embedding cache was worker-complete but client-unwired (`cache_keys: vec![]` at both call sites; telemetry 0/0). Embedding is a deterministic function of (model, tokenizer, text) — the cache keys hash exactly that — so every re-index recomputed what it already had.
+
+**Fixes (commits 4e707862, d28cb88c, 4eb617b4, f7d86c85, 17cf4df7):**
+1. **Client-side cache probe + miss-only dispatch** (`embed_cache_frontend`): hits apply without touching the worker — an all-hit batch never spawns the multi-GiB daemon. Keys mirror worker semantics (last-token pooling, L2, streamed model/tokenizer digests).
+2. **`put_batch`**: the per-row `put` (fsync + full `model_index.json` rewrite per row) turned a 58 s phase into 287 s at 10K rows; the batch variant budgets once, writes fsync-free (rows are re-hash-verified; torn rows read as misses), persists metadata once.
+3. **FileSummary list canonicalization**: per-file symbol lists followed parallel-parse completion order, so summary cache keys changed every run (~450 permanent misses). Sorted now.
+4. **Lazy CPU-fallback guard**: `cpu_fallback_reason` eagerly spawned the daemon on every index start — 26 s of pure waste once the cache answers everything. The quality gate moved to embed time. Zombie-aware `daemon_pid_alive` + stale-lock cleanup stop 20 s readiness polls against dead sockets.
+5. **Daemon RAM lifecycle** (OOM evidence: Maestro cgroup 26.4 GB RAM + 11.4 GB swap, two resident daemons, rust-analyzer killed): single-daemon policy with superseded-GC, default `LEINDEX_WORKER_MAX_RSS_MB=10240` (measured SFR peak 8.06 GiB — an 8 GiB cap killed the worker mid-run), sibling-RSS-aware load floor, socket idle 600 s → 180 s, CLI keeps the daemon warm for bursts (opt-outs documented).
+6. **Registry byte budget** (1.5 GiB default) + honest `estimated_memory_bytes` (token sets now counted); **streamed mmap writer** (no whole-file heap buffer; layout unchanged); progress narration + true wall time in the CLI output.
+
+**Measured outcomes (release, this repo, sfr-400m @ MIGraphX b8):**
+- No-change force index: **85.7 s → 5.0 s (17x)**; 41/41 batches cache-hit; zero worker dispatches; zero daemons resident. Requirement was ≥7x.
+- Delta run (source edited since last index): only changed content embeds; with a warm daemon the tail stays seconds.
+- First-ever index (cold cache): unchanged full pass (~85 s; b32 `.mxr` remains the future lever for that one-time case).
+- Search: ranked, relevant results (72–75% on the pipeline query), ~4 s CLI cold, no daemon residency in steady state.
+- Gates: fmt clean, `clippy -D warnings` clean (default + onnx), `cargo test --workspace --exclude memcheck` 38/38 binaries green (incl. 6 new tests this wave; trace-harness tests serialized after a process-global-hook flake was root-caused).
+
+**Known bounds documented:** the two `20260811_*_Fork__.md` scratch files remain untracked (unrelated prior engagement); `madvise` after matrix scans deliberately skipped (page-cache accounting makes it cosmetic; re-fault costs latency).
