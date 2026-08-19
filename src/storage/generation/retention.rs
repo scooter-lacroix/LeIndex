@@ -442,6 +442,103 @@ fn prune_generations(
     Ok((retained_count, removed, pinned_hashes))
 }
 
+/// Prune a legacy (pre-CAS, full-copy) generation store.
+///
+/// Legacy layout: `generations/<N>/` directories each contain complete
+/// layer files (`leindex.db`, `embeddings.bin`, …) with NO `manifest` and
+/// NO CAS blobs. Every generation is self-contained, so deleting a
+/// directory can never corrupt another generation — unlike CAS stores,
+/// where blobs are shared across generations and manifest pinning is
+/// mandatory before GC. Leases cannot exist in this layout (a lease is a
+/// CAS refcount), so the retention window is purely positional: the
+/// current generation plus its `max_generations - 1` immediate
+/// predecessors.
+///
+/// This is the reclaim path for stores that predate the CAS migration
+/// (`leindex storage --migrate`) and therefore have no `cas/` directory;
+/// [`retain_after_publish`] refuses to run without a CAS store, which is
+/// how legacy stores historically accumulated unbounded generations.
+///
+/// When `dry_run` is true nothing is deleted; the report reflects what
+/// *would* be removed.
+pub fn retain_generations_no_cas(
+    gens_dir: &Path,
+    jobs_dir: &Path,
+    max_generations: usize,
+    dry_run: bool,
+) -> Result<GenerationRetentionReport, RetentionError> {
+    let mut report = GenerationRetentionReport::default();
+    let current_gen = read_current_generation_from_gens_dir(gens_dir);
+
+    let mut gen_numbers: Vec<u64> = Vec::new();
+    if gens_dir.exists() {
+        for entry in fs::read_dir(gens_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if let Ok(num) = entry.file_name().to_string_lossy().parse::<u64>() {
+                gen_numbers.push(num);
+            }
+        }
+    }
+    gen_numbers.sort_unstable();
+    report.generation_count = gen_numbers.len();
+
+    if gen_numbers.is_empty() {
+        report.job_bytes_remaining = dir_total_bytes(jobs_dir);
+        return Ok(report);
+    }
+
+    // Anchor the retention window at CURRENT; fall back to the newest
+    // generation when the pointer is missing or dangling.
+    let current = current_gen
+        .filter(|g| gen_numbers.contains(g))
+        .unwrap_or_else(|| gen_numbers[gen_numbers.len() - 1]);
+    let keep_count = max_generations.max(1);
+    let idx = gen_numbers.iter().position(|g| *g == current).unwrap_or(0);
+    let start = idx.saturating_sub(keep_count - 1);
+    let retained: HashSet<u64> = gen_numbers[start..=idx].iter().copied().collect();
+
+    for gen_num in &gen_numbers {
+        if retained.contains(gen_num) {
+            continue;
+        }
+        if dry_run {
+            report.generations_removed += 1;
+            continue;
+        }
+        let gen_dir = gens_dir.join(gen_num.to_string());
+        debug!(
+            "retention: removing legacy generation {} (outside the {}-generation window)",
+            gen_num, keep_count
+        );
+        match fs::remove_dir_all(&gen_dir) {
+            Ok(()) => report.generations_removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(
+                    "retention: failed to remove legacy generation {}: {}",
+                    gen_num, e
+                );
+            }
+        }
+    }
+    report.generations_retained = retained.len();
+
+    if !dry_run {
+        let (completed_deleted, byte_capped, job_bytes_reclaimed) =
+            prune_jobs(jobs_dir, Some(current), DEFAULT_JOB_BYTES_MAX)?;
+        report.jobs_completed_deleted = completed_deleted;
+        report.jobs_byte_capped = byte_capped;
+        report.job_bytes_reclaimed = job_bytes_reclaimed;
+    }
+    report.job_bytes_remaining = dir_total_bytes(jobs_dir);
+    report.generation_count = count_generation_dirs(gens_dir);
+
+    Ok(report)
+}
+
 // ---------------------------------------------------------------------------
 // Job pruning
 // ---------------------------------------------------------------------------
@@ -571,24 +668,34 @@ fn read_current_generation_from_gens_dir(gens_dir: &Path) -> Option<u64> {
 ///
 /// Jobs record their target generation in a `generation` file inside the
 /// job directory. The file contains the generation number as ASCII digits.
+/// Checkpoint-style job stores name the directory after the generation
+/// (plain digits) — those match on exact name as well.
 fn job_produced_generation(job_dir: &Path, generation: u64) -> bool {
     let gen_file = job_dir.join("generation");
     if let Ok(content) = fs::read_to_string(&gen_file) {
         return content.trim() == generation.to_string();
     }
     // Fallback: check directory name for the generation number pattern.
-    // Some job directories are named `<gen>-<timestamp>` or `<gen>_<id>`.
+    // Some job directories are named `<gen>-<timestamp>` or `<gen>_<id>`;
+    // checkpoint stores use the bare `<gen>`.
     let name = job_dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    name.starts_with(&format!("{}-", generation)) || name.starts_with(&format!("{}_", generation))
+    name == generation.to_string()
+        || name.starts_with(&format!("{}-", generation))
+        || name.starts_with(&format!("{}_", generation))
 }
 
 /// Check if a job is marked completed.
 ///
-/// A job is "completed" if it has a `completed` marker file or a `status`
-/// file containing "completed".
+/// A job is "completed" if it has a `completed` marker file, a `status`
+/// file containing "completed", a `checkpoint.json` recording completion,
+/// or — the checkpoint-store layout — all three phase-complete markers
+/// (`lexical.complete`, `pdg.complete`, `neural.complete`). The last phase
+/// (`neural.complete`) only exists after the final phase succeeded, so its
+/// presence alone also proves completion; requiring all three keeps the
+/// check conservative against partially-renamed markers.
 fn job_is_completed(job_dir: &Path) -> bool {
     // Check for a `completed` marker file.
     if job_dir.join("completed").exists() {
@@ -596,13 +703,22 @@ fn job_is_completed(job_dir: &Path) -> bool {
     }
     // Check for a `status` file containing "completed".
     if let Ok(content) = fs::read_to_string(job_dir.join("status")) {
-        return content.trim().eq_ignore_ascii_case("completed");
+        if content.trim().eq_ignore_ascii_case("completed") {
+            return true;
+        }
     }
     // Check for `checkpoint.json` with a "completed" status.
     if let Ok(content) = fs::read_to_string(job_dir.join("checkpoint.json")) {
         if content.contains("\"completed\"") || content.contains("\"status\":\"completed\"") {
             return true;
         }
+    }
+    // Checkpoint-store layout: phase-complete markers.
+    if job_dir.join("neural.complete").exists()
+        && job_dir.join("pdg.complete").exists()
+        && job_dir.join("lexical.complete").exists()
+    {
+        return true;
     }
     false
 }

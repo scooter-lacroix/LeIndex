@@ -576,3 +576,122 @@ fn dir_total(path: &Path) -> u64 {
 fn count_gen_dirs(gens_dir: &Path) -> usize {
     super::count_generation_dirs(gens_dir)
 }
+
+// ---------------------------------------------------------------------------
+// Legacy (no-CAS) store pruning
+// ---------------------------------------------------------------------------
+
+/// Build a legacy full-copy generation store: `generations/<N>/` with real
+/// files, NO manifest, NO cas/ directory, and a CURRENT pointer.
+fn build_legacy_store(
+    generations: &[u64],
+    current: Option<u64>,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let gens_dir = root.join(GENERATIONS_DIR);
+    let jobs_dir = root.join("jobs");
+    fs::create_dir_all(&gens_dir).unwrap();
+    fs::create_dir_all(&jobs_dir).unwrap();
+    for &gen_num in generations {
+        let gen_dir = gens_dir.join(gen_num.to_string());
+        fs::create_dir_all(&gen_dir).unwrap();
+        fs::write(gen_dir.join("leindex.db"), format!("db-{gen_num}")).unwrap();
+        fs::write(gen_dir.join("embeddings.bin"), format!("emb-{gen_num}")).unwrap();
+    }
+    if let Some(current) = current {
+        fs::write(root.join(CURRENT_FILE), current.to_string()).unwrap();
+    }
+    (dir, root)
+}
+
+#[test]
+fn test_no_cas_prune_keeps_current_window() {
+    use crate::storage::generation::retention::retain_generations_no_cas;
+    let (_dir, root) = build_legacy_store(&[1, 2, 3, 4, 5, 6], Some(6));
+    let gens_dir = root.join(GENERATIONS_DIR);
+    let jobs_dir = root.join("jobs");
+
+    let report =
+        retain_generations_no_cas(&gens_dir, &jobs_dir, 3, false).expect("prune must succeed");
+
+    assert_eq!(report.generations_removed, 3, "gens 1-3 pruned");
+    assert_eq!(report.generations_retained, 3, "gens 4-6 retained");
+    assert_eq!(count_gen_dirs(&gens_dir), 3);
+    for kept in [4u64, 5, 6] {
+        assert!(gens_dir.join(kept.to_string()).exists(), "gen {kept} kept");
+    }
+    for removed in [1u64, 2, 3] {
+        assert!(
+            !gens_dir.join(removed.to_string()).exists(),
+            "gen {removed} removed"
+        );
+    }
+}
+
+#[test]
+fn test_no_cas_prune_dry_run_removes_nothing() {
+    use crate::storage::generation::retention::retain_generations_no_cas;
+    let (_dir, root) = build_legacy_store(&[1, 2, 3, 4], Some(4));
+    let gens_dir = root.join(GENERATIONS_DIR);
+
+    let report =
+        retain_generations_no_cas(&gens_dir, &root.join("jobs"), 2, true).expect("dry run");
+
+    assert_eq!(report.generations_removed, 2, "dry run reports candidates");
+    assert_eq!(count_gen_dirs(&gens_dir), 4, "dry run deletes nothing");
+}
+
+#[test]
+fn test_no_cas_prune_missing_current_falls_back_to_newest() {
+    use crate::storage::generation::retention::retain_generations_no_cas;
+    let (_dir, root) = build_legacy_store(&[10, 11, 12, 13], None);
+    let gens_dir = root.join(GENERATIONS_DIR);
+
+    let report = retain_generations_no_cas(&gens_dir, &root.join("jobs"), 2, false).expect("prune");
+
+    // No CURRENT: window anchors at the newest (13): keep 12, 13.
+    assert_eq!(report.generations_removed, 2);
+    assert!(gens_dir.join("13").exists());
+    assert!(gens_dir.join("12").exists());
+    assert!(!gens_dir.join("11").exists());
+    assert!(!gens_dir.join("10").exists());
+}
+
+#[test]
+fn test_no_cas_prune_max_one_keeps_only_current() {
+    use crate::storage::generation::retention::retain_generations_no_cas;
+    let (_dir, root) = build_legacy_store(&[1, 2, 3], Some(2));
+    let gens_dir = root.join(GENERATIONS_DIR);
+
+    let report = retain_generations_no_cas(&gens_dir, &root.join("jobs"), 1, false).expect("prune");
+
+    assert_eq!(report.generations_retained, 1);
+    assert!(gens_dir.join("2").exists(), "current always kept");
+    assert!(
+        !gens_dir.join("3").exists(),
+        "newer-than-current dirs are still pruned"
+    );
+    assert!(!gens_dir.join("1").exists());
+}
+
+#[test]
+fn test_no_cas_prune_deletes_completed_job_for_current_generation() {
+    use crate::storage::generation::retention::retain_generations_no_cas;
+    let (_dir, root) = build_legacy_store(&[1, 2, 3], Some(3));
+    let jobs_dir = root.join("jobs");
+    let job_dir = jobs_dir.join("job-a");
+    fs::create_dir_all(&job_dir).unwrap();
+    fs::write(job_dir.join("generation"), "3").unwrap();
+    fs::write(job_dir.join("completed"), "").unwrap();
+    fs::write(job_dir.join("checkpoint.bin"), "checkpoint").unwrap();
+
+    let report =
+        retain_generations_no_cas(&root.join(GENERATIONS_DIR), &jobs_dir, 2, false).expect("prune");
+
+    assert_eq!(
+        report.jobs_completed_deleted, 1,
+        "completed job for current gen removed"
+    );
+    assert!(!job_dir.exists());
+}

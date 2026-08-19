@@ -734,20 +734,107 @@ pub fn retention_report_cli(project: Option<&Path>) -> anyhow::Result<RetentionR
         .unwrap_or_else(|| canonical.join(".leindex"));
 
     let cas_dir = storage_root.join("cas");
-    let generation_report = if !storage_root.exists() || !cas_dir.exists() {
-        crate::storage::generation::GenerationRetentionReport::default()
-    } else {
+    let gens_dir = storage_root.join(GENERATIONS_DIR);
+    let jobs_dir = storage_root.join("jobs");
+    let generation_report = if cas_dir.exists() {
         let cas = CasStore::open(&cas_dir).map_err(|e| {
             anyhow::anyhow!("failed to open CAS store at {}: {e}", cas_dir.display())
         })?;
-        let gens_dir = storage_root.join(GENERATIONS_DIR);
-        let jobs_dir = storage_root.join("jobs");
         retention_report(&cas, &gens_dir, &jobs_dir)
             .map_err(|e| anyhow::anyhow!("retention report failed: {e}"))?
+    } else if gens_dir.exists() {
+        // Legacy (pre-CAS) full-copy store: report what the no-CAS sweep
+        // would reclaim. A default (empty) report here is what made legacy
+        // stores look "clean" while accumulating dozens of generations.
+        crate::storage::generation::retention::retain_generations_no_cas(
+            &gens_dir,
+            &jobs_dir,
+            crate::storage::generation::retention::DEFAULT_MAX_GENERATIONS,
+            true,
+        )
+        .map_err(|e| anyhow::anyhow!("legacy retention report failed: {e}"))?
+    } else {
+        crate::storage::generation::GenerationRetentionReport::default()
     };
 
     // WS10 Task 6: Also report embedding cache stats (spec section 10.3).
     // Only available when the onnx feature is compiled in (embed module).
+    #[cfg(feature = "onnx")]
+    let cache_stats = report_embed_cache_stats();
+
+    #[cfg(feature = "onnx")]
+    {
+        Ok(RetentionReportOutput {
+            generation_report,
+            cache_stats,
+        })
+    }
+    #[cfg(not(feature = "onnx"))]
+    {
+        Ok(RetentionReportOutput { generation_report })
+    }
+}
+
+/// Run the retention GC from the CLI (`leindex retention --gc`).
+///
+/// Prunes generations outside the retained window (the current generation
+/// plus its `max_generations - 1` immediate predecessors), GCs orphaned CAS
+/// blobs on CAS stores, and byte-caps completed jobs. Works on both store
+/// layouts: CAS-backed stores run [`retain_after_publish`]; legacy
+/// full-copy stores (no `cas/`) run the no-CAS directory prune, which is
+/// safe because legacy generations are self-contained. With `dry_run`
+/// nothing is deleted.
+pub fn retention_gc_cli(
+    project: Option<&Path>,
+    max_generations: usize,
+    dry_run: bool,
+) -> anyhow::Result<RetentionReportOutput> {
+    use crate::storage::cas::CasStore;
+    use crate::storage::generation::GENERATIONS_DIR;
+    use crate::storage::generation::retention::{
+        RetentionConfig, retain_after_publish, retain_generations_no_cas,
+    };
+
+    let project_path = project
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
+    let canonical = project_path
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("failed to canonicalize project path: {e}"))?;
+
+    let storage_root = crate::cli::leindex::resolve_existing_storage_path(&canonical)
+        .unwrap_or_else(|| canonical.join(".leindex"));
+
+    let cas_dir = storage_root.join("cas");
+    let gens_dir = storage_root.join(GENERATIONS_DIR);
+    let jobs_dir = storage_root.join("jobs");
+
+    let generation_report = if cas_dir.exists() {
+        let mut cas = CasStore::open(&cas_dir).map_err(|e| {
+            anyhow::anyhow!("failed to open CAS store at {}: {e}", cas_dir.display())
+        })?;
+        let cfg = RetentionConfig {
+            max_generations: max_generations.max(1),
+            ..RetentionConfig::default()
+        };
+        if dry_run {
+            crate::storage::generation::retention::retention_report(&cas, &gens_dir, &jobs_dir)
+                .map_err(|e| anyhow::anyhow!("retention report failed: {e}"))?
+        } else {
+            retain_after_publish(&mut cas, &gens_dir, &jobs_dir, &cfg)
+                .map_err(|e| anyhow::anyhow!("retention sweep failed: {e}"))?
+        }
+    } else {
+        if !gens_dir.exists() {
+            anyhow::bail!(
+                "no generation store found at {} (expected `generations/` or `cas/`)",
+                storage_root.display()
+            );
+        }
+        retain_generations_no_cas(&gens_dir, &jobs_dir, max_generations, dry_run)
+            .map_err(|e| anyhow::anyhow!("legacy retention sweep failed: {e}"))?
+    };
+
     #[cfg(feature = "onnx")]
     let cache_stats = report_embed_cache_stats();
 
@@ -882,9 +969,16 @@ pub fn cleanup_project_store(
     use crate::storage::generation::retention::{RetentionConfig, retain_after_publish};
 
     let cas_dir = storage_root.join("cas");
+    let gens_dir = storage_root.join(GENERATIONS_DIR);
+    let jobs_dir = storage_root.join("jobs");
 
-    if !storage_root.exists() || !cas_dir.exists() {
-        // No CAS store → nothing to clean. Return empty report.
+    // Legacy (pre-CAS) stores have no `cas/` directory: every generation is
+    // a self-contained full copy. Skipping them entirely is how legacy
+    // stores accumulated unbounded generations (98 dirs / 17 GB observed).
+    // Generation-directory pruning is safe without CAS — no shared blobs —
+    // so run the no-CAS variant and keep only the CAS-specific phases
+    // (staging sweep, blob GC) for stores that actually have a CAS.
+    if !storage_root.exists() || (!cas_dir.exists() && !gens_dir.exists()) {
         #[cfg(feature = "onnx")]
         {
             return Ok(ProjectCleanupReport {
@@ -902,20 +996,33 @@ pub fn cleanup_project_store(
         }
     }
 
-    let mut cas = CasStore::open(&cas_dir)
-        .map_err(|e| anyhow::anyhow!("failed to open CAS store at {}: {e}", cas_dir.display()))?;
-    let gens_dir = storage_root.join(GENERATIONS_DIR);
-    let jobs_dir = storage_root.join("jobs");
+    let mut cas = if cas_dir.exists() {
+        Some(CasStore::open(&cas_dir).map_err(|e| {
+            anyhow::anyhow!("failed to open CAS store at {}: {e}", cas_dir.display())
+        })?)
+    } else {
+        None
+    };
 
     // Phase 1: Generation retention + CAS GC + job pruning (WS4).
     let cfg = RetentionConfig::default();
-    let gen_report = if dry_run {
-        // Read-only report for dry-run mode.
-        crate::storage::generation::retention::retention_report(&cas, &gens_dir, &jobs_dir)
-            .map_err(|e| anyhow::anyhow!("retention report failed: {e}"))?
+    let gen_report = if let Some(cas) = cas.as_mut() {
+        if dry_run {
+            // Read-only report for dry-run mode.
+            crate::storage::generation::retention::retention_report(cas, &gens_dir, &jobs_dir)
+                .map_err(|e| anyhow::anyhow!("retention report failed: {e}"))?
+        } else {
+            retain_after_publish(cas, &gens_dir, &jobs_dir, &cfg)
+                .map_err(|e| anyhow::anyhow!("retention sweep failed: {e}"))?
+        }
     } else {
-        retain_after_publish(&mut cas, &gens_dir, &jobs_dir, &cfg)
-            .map_err(|e| anyhow::anyhow!("retention sweep failed: {e}"))?
+        crate::storage::generation::retention::retain_generations_no_cas(
+            &gens_dir,
+            &jobs_dir,
+            cfg.max_generations,
+            dry_run,
+        )
+        .map_err(|e| anyhow::anyhow!("legacy retention sweep failed: {e}"))?
     };
 
     let mut staging_files_removed = 0usize;
@@ -1491,6 +1598,44 @@ mod tests {
             "previous (rollback) generation must survive cleanup"
         );
         assert_eq!(report.generations.generations_retained, 2);
+    }
+
+    /// Legacy (no-CAS) stores must be pruned too: full-copy generation dirs
+    /// accumulated unboundedly because cleanup returned an empty report
+    /// whenever `cas/` was missing (98 dirs / 17 GB observed in the wild).
+    #[test]
+    fn test_cleanup_prunes_legacy_full_copy_store() {
+        use crate::storage::generation::lease::{CURRENT_FILE, GENERATIONS_DIR};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let gens_dir = root.join(GENERATIONS_DIR);
+        std::fs::create_dir_all(&gens_dir).unwrap();
+        std::fs::create_dir_all(root.join("jobs")).unwrap();
+        for gen_num in 1u64..=5 {
+            let gen_dir = gens_dir.join(gen_num.to_string());
+            std::fs::create_dir_all(&gen_dir).unwrap();
+            std::fs::write(gen_dir.join("leindex.db"), format!("db-{gen_num}")).unwrap();
+        }
+        std::fs::write(root.join(CURRENT_FILE), "5").unwrap();
+
+        let report = cleanup_project_store(&root, false).unwrap();
+
+        assert_eq!(
+            report.generations.generations_removed, 3,
+            "legacy gens outside the current+previous window must be pruned"
+        );
+        for kept in [4u64, 5] {
+            assert!(
+                gens_dir.join(kept.to_string()).exists(),
+                "legacy gen {kept} must survive (window)"
+            );
+        }
+        for removed in [1u64, 2, 3] {
+            assert!(
+                !gens_dir.join(removed.to_string()).exists(),
+                "legacy gen {removed} must be reclaimed"
+            );
+        }
     }
 
     /// Cleanup must remove stale generations (not current/previous/leased).
