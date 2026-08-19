@@ -877,12 +877,20 @@ pub fn write_mmap_embeddings(
     let lengths_table_size = embeddings.len() * 4;
     let ids_end = header_size + offsets_table_size + lengths_table_size + id_bytes.len();
     let embedding_matrix_offset = (ids_end + 3) & !3; // align to 4 bytes
-    let _padding_len = embedding_matrix_offset - ids_end;
-    let embedding_matrix_size = embeddings.len() * (dimension as usize) * 4;
-    let total_size = embedding_matrix_offset + embedding_matrix_size;
+    let padding_len = embedding_matrix_offset - ids_end;
 
-    // Allocate buffer and write.
-    let mut buf = vec![0u8; total_size];
+    // Ensure parent directory exists.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(MmapError::Io)?;
+    }
+
+    // Stream the file through a BufWriter instead of materializing the whole
+    // output as one heap buffer: the neural matrix alone is ~43 MB and the
+    // previous `vec![0u8; total_size]` doubled the transient footprint of
+    // every persist (RAM-spike trim). The byte layout is unchanged.
+    use std::io::Write;
+    let file = std::fs::File::create(path).map_err(MmapError::Io)?;
+    let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
 
     // Header
     let header = MmapHeader {
@@ -891,43 +899,45 @@ pub fn write_mmap_embeddings(
         node_count,
         dimension,
     };
-    header.write_to(&mut buf[0..header_size]);
+    let mut header_buf = [0u8; MmapHeader::SIZE];
+    header.write_to(&mut header_buf);
+    writer.write_all(&header_buf).map_err(MmapError::Io)?;
 
     // Offset table
-    let offsets_start = header_size;
-    for (i, off) in id_offsets.iter().enumerate() {
-        let start = offsets_start + i * 8;
-        buf[start..start + 8].copy_from_slice(&off.to_le_bytes());
+    let mut table_buf = Vec::with_capacity(offsets_table_size);
+    for off in &id_offsets {
+        table_buf.extend_from_slice(&off.to_le_bytes());
     }
+    writer.write_all(&table_buf).map_err(MmapError::Io)?;
 
     // Length table
-    let lengths_start = offsets_start + offsets_table_size;
-    for (i, len) in id_lengths.iter().enumerate() {
-        let start = lengths_start + i * 4;
-        buf[start..start + 4].copy_from_slice(&len.to_le_bytes());
+    table_buf.clear();
+    table_buf.reserve(lengths_table_size);
+    for len in &id_lengths {
+        table_buf.extend_from_slice(&len.to_le_bytes());
+    }
+    writer.write_all(&table_buf).map_err(MmapError::Io)?;
+
+    // ID strings + alignment padding
+    writer.write_all(&id_bytes).map_err(MmapError::Io)?;
+    if padding_len > 0 {
+        writer
+            .write_all(&vec![0u8; padding_len])
+            .map_err(MmapError::Io)?;
     }
 
-    // ID strings
-    let ids_start = lengths_start + lengths_table_size;
-    buf[ids_start..ids_start + id_bytes.len()].copy_from_slice(&id_bytes);
-
-    // Padding (already zeroed)
-
-    // Embedding matrix
+    // Embedding matrix — one row (dim × 4 bytes) at a time.
     let dim = dimension as usize;
-    for (i, (_, embedding)) in embeddings.iter().enumerate() {
-        for (d, val) in embedding.iter().enumerate().take(dim) {
-            let byte_offset = embedding_matrix_offset + i * dim * 4 + d * 4;
-            buf[byte_offset..byte_offset + 4].copy_from_slice(&val.to_le_bytes());
+    let mut row_buf = Vec::with_capacity(dim.saturating_mul(4));
+    for (_, embedding) in embeddings {
+        row_buf.clear();
+        for val in embedding.iter().take(dim) {
+            row_buf.extend_from_slice(&val.to_le_bytes());
         }
+        writer.write_all(&row_buf).map_err(MmapError::Io)?;
     }
 
-    // Ensure parent directory exists.
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(MmapError::Io)?;
-    }
-
-    std::fs::write(path, &buf).map_err(MmapError::Io)?;
+    writer.flush().map_err(MmapError::Io)?;
     Ok(())
 }
 

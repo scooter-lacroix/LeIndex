@@ -1477,10 +1477,15 @@ impl ProjectRegistry {
         true
     }
 
-    /// Evict the least-recently-used project if we're at or over capacity.
+    /// Evict the least-recently-used project if we're at or over capacity,
+    /// or if the aggregate estimated heap of resident projects exceeds the
+    /// byte budget (RAM safety: count-based capping alone allowed ~5 × 500 MB
+    /// of hydrated projects on the stress-test box). The byte budget is
+    /// env-tunable via LEINDEX_REGISTRY_MAX_HEAP_MB (default 1536); 0
+    /// disables the byte check.
     async fn evict_lru_if_needed(&self) {
         let current_count = self.projects.read().await.len();
-        if current_count < self.max_projects {
+        if current_count < self.max_projects && !self.over_heap_budget().await {
             return;
         }
 
@@ -1522,6 +1527,50 @@ impl ProjectRegistry {
             }
         }
     }
+
+    /// True when the aggregate estimated search-engine heap of resident
+    /// projects exceeds the byte budget. Collects handles under the map read
+    /// lock, then locks each project AFTER releasing it — no map-lock/project
+    /// lock ordering inversion with the eviction path.
+    async fn over_heap_budget(&self) -> bool {
+        let budget_bytes = registry_heap_budget_bytes();
+        if budget_bytes == 0 {
+            return false;
+        }
+        let handles: Vec<ProjectHandle> = {
+            let projects = self.projects.read().await;
+            if projects.len() < 2 {
+                // A single project is never evicted by the byte budget — the
+                // count cap and the OS manage the one-project case.
+                return false;
+            }
+            projects.values().cloned().collect()
+        };
+        let mut total: usize = 0;
+        for handle in &handles {
+            let idx = handle.read().await;
+            total = total.saturating_add(idx.search_engine.estimated_memory_bytes());
+        }
+        if total > budget_bytes {
+            warn!(
+                estimated_bytes = total,
+                budget_bytes, "registry heap budget exceeded; evicting LRU projects"
+            );
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Resident-heap budget for the project registry in bytes.
+/// `LEINDEX_REGISTRY_MAX_HEAP_MB` overrides (0 disables); default 1536.
+fn registry_heap_budget_bytes() -> usize {
+    let mb = std::env::var("LEINDEX_REGISTRY_MAX_HEAP_MB")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(1536);
+    mb.saturating_mul(1024 * 1024)
 }
 
 fn restore_latest_generation(storage_path: &Path) -> bool {
@@ -1636,6 +1685,37 @@ mod tests {
         let error = panicking.await.unwrap_err();
         assert!(error.is_panic());
         assert!(join_error_should_mark_failure(&error));
+    }
+
+    #[test]
+    fn test_registry_heap_budget_env_parse() {
+        // Default budget: 1536 MiB.
+        assert_eq!(registry_heap_budget_bytes(), 1536 * 1024 * 1024);
+    }
+
+    #[cfg(all(unix, feature = "onnx"))]
+    #[test]
+    fn test_terminate_superseded_daemons_cleans_stale_artifacts() {
+        // Stale pid files (dead/missing pid) must have their socket/status
+        // artifacts removed; the keep-socket's own pid file must survive.
+        let dir = tempfile::tempdir().unwrap();
+        let keep_socket = dir.path().join("leindex-embed-aaaa.sock");
+        let keep_pid = dir.path().join("leindex-embed-aaaa.pid");
+        std::fs::write(&keep_pid, "1234\n").unwrap();
+
+        let stale_pid = dir.path().join("leindex-embed-bbbb.pid");
+        std::fs::write(&stale_pid, "999999999\n").unwrap(); // no such pid
+        let stale_socket = dir.path().join("leindex-embed-bbbb.sock");
+        let stale_status = dir.path().join("leindex-embed-bbbb.status");
+        std::fs::write(&stale_socket, b"x").unwrap();
+        std::fs::write(&stale_status, b"x").unwrap();
+
+        crate::search::onnx::client::terminate_superseded_daemons(&keep_socket);
+
+        assert!(keep_pid.exists(), "keep-socket pid file must survive");
+        assert!(!stale_pid.exists(), "stale pid file removed");
+        assert!(!stale_socket.exists(), "stale socket removed");
+        assert!(!stale_status.exists(), "stale status removed");
     }
 
     #[test]

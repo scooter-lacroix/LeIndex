@@ -1853,8 +1853,24 @@ impl SearchEngine {
             .values()
             .map(|set| set.len() * std::mem::size_of::<String>())
             .sum::<usize>();
+        // The per-node token sets are a real heap resident (string-duplicated
+        // at hydration); omitting them under-reported warm projects by
+        // hundreds of MB against the stress-test's measured footprints.
+        let node_tokens_size = self
+            .node_tokens
+            .iter()
+            .map(|(node_id, tokens)| {
+                node_id.len()
+                    + tokens.len() * std::mem::size_of::<String>()
+                    + tokens.iter().map(String::len).sum::<usize>()
+            })
+            .sum::<usize>();
 
-        nodes_size + cache_size + text_index_size + self.vector_index.estimated_memory_bytes()
+        nodes_size
+            + cache_size
+            + text_index_size
+            + node_tokens_size
+            + self.vector_index.estimated_memory_bytes()
     }
 
     /// Estimate byte size of a slice of search results for cache accounting.
