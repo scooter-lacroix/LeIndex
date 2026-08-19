@@ -143,6 +143,15 @@ pub(crate) fn trim_search(data: &Value) -> Value {
     if let Some(v) = data.get("suggestion") {
         out.insert("suggestion".to_string(), v.clone());
     }
+    // Low-signal signal (F-07): when the handler flags that the top match
+    // scores below the confidence floor, that warning and the numeric
+    // top_score are the model's cue to distrust the results.
+    if let Some(v) = data.get("low_signal") {
+        out.insert("low_signal".to_string(), v.clone());
+    }
+    if let Some(v) = data.get("top_score") {
+        out.insert("top_score".to_string(), v.clone());
+    }
     Value::Object(out)
 }
 
@@ -302,6 +311,9 @@ fn trim_symbol_lookup_single(data: &Value) -> Value {
         "callers",
         "callees",
         "impact_radius",
+        "impact_note",
+        "index_freshness",
+        "pdg_status",
         "source",
     ] {
         if let Some(v) = data.get(k) {
@@ -330,7 +342,7 @@ fn trim_phase(data: &Value) -> Value {
         data,
         &mut out,
         &[
-            "generation",
+            "analysis_fingerprint",
             "executed_phases",
             "cache_hit",
             "changed_files",
@@ -754,6 +766,37 @@ fn trim_write(data: &Value) -> Value {
 }
 
 fn trim_index(data: &Value) -> Value {
+    // The index tool returns an IndexJobSnapshot (job_id/status/phase/
+    // generation/completed_units/total_units/published/last_error), not the
+    // legacy IndexStats shape. Projecting the legacy field names onto a job
+    // snapshot produced an ALL-NULL stats block on every call (N-12) — the
+    // job could complete and the MCP response still said nothing about it.
+    // Handle both shapes: job snapshots surface their lifecycle fields (and
+    // the failure-path last_known_state); legacy IndexStats payloads keep
+    // the original projection.
+    if data.get("job_id").is_some() || data.get("status").and_then(Value::as_str).is_some() {
+        let mut out = serde_json::Map::new();
+        for key in [
+            "job_id",
+            "status",
+            "phase",
+            "generation",
+            "completed_units",
+            "total_units",
+            "last_error",
+        ] {
+            if let Some(value) = data.get(key) {
+                out.insert(key.to_string(), value.clone());
+            }
+        }
+        if let Some(published) = data.get("published") {
+            out.insert("published".to_string(), published.clone());
+        }
+        if let Some(last_known) = data.get("last_known_state") {
+            out.insert("last_known_state".to_string(), last_known.clone());
+        }
+        return Value::Object(out);
+    }
     // IndexStats is already small. Collapse parse-success into a single
     // failure count and drop the dependency-resolution breakdown unless
     // the LLM is debugging deps.
@@ -801,6 +844,7 @@ fn trim_edit(data: &Value) -> Value {
         // apply-shaped
         "success",
         "changes_applied",
+        "dry_run",
         "file_path",
         "edit_region",
         "message",

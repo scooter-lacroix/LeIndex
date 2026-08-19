@@ -346,6 +346,20 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
     for (idx, r) in arr.iter().enumerate() {
         out.push_str(&render_search_result(r, idx, color));
     }
+    // Low-signal warning (F-07): when the top composite score is below the
+    // confidence floor the handler flags it; make that visible in the text
+    // surface too so agents do not act on coincidental token-overlap hits.
+    if data.get("low_signal").and_then(Value::as_bool) == Some(true) {
+        let score = data
+            .get("top_score")
+            .and_then(Value::as_f64)
+            .map(|s| format!(" ({:.2})", s))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "\n  ⚠ low signal{}: results may be coincidental token overlap; rephrase or use Grep Symbols.\n",
+            score
+        ));
+    }
     out
 }
 
@@ -475,6 +489,15 @@ fn render_diagnostics_health(data: &Value, color: bool) -> String {
             out.push_str(&field(label, &value.to_string(), color));
         }
     }
+    // A delta-scoped signature count covers only the files parsed in the last
+    // (incremental) run — annotate it so it is not read as the project total.
+    if health.get("signature_scope").and_then(Value::as_str) == Some("delta") {
+        out.push_str(&field(
+            "  Signature scope",
+            "delta — count covers only files parsed in the last incremental run",
+            color,
+        ));
+    }
     if let Some(value) = health.get("embedding_model").and_then(|v| v.as_str()) {
         out.push_str(&field("  Embedding model", value, color));
     }
@@ -555,6 +578,24 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
     if let Some(v) = data.get("execution_provider").and_then(|v| v.as_str()) {
         out.push_str(&field("Execution provider", v, color));
     }
+    // The configured provider is a request; the worker reports what actually
+    // loaded. When they differ (e.g. migraphx requested, cpu active after a
+    // provider-library load failure) surface the fallback explicitly instead
+    // of letting the requested value masquerade as the active one.
+    if let Some(active) = data
+        .get("execution_provider_active")
+        .and_then(|v| v.as_str())
+    {
+        if let Some(requested) = data.get("execution_provider").and_then(|v| v.as_str()) {
+            if active != requested {
+                out.push_str(&field(
+                    "Provider fallback",
+                    &format!("{requested} requested, {active} ACTIVE"),
+                    color,
+                ));
+            }
+        }
+    }
     out.push_str(&render_diagnostics_health(data, color));
     out.push_str(&render_diagnostics_issues(data, color));
     out
@@ -595,11 +636,33 @@ fn render_project_map(data: &Value, color: bool) -> String {
     }
     // Also show total_files_in_scope from the handler output
     // (the handler puts this at top level, not under "stats")
+    let scoped = data
+        .get("total_files_in_scope")
+        .and_then(|v| v.as_u64())
+        .is_some_and(|count| count > 0);
     if let Some(v) = data.get("total_files_in_scope").and_then(|v| v.as_u64()) {
         if data.get("stats").is_none() {
             out.push('\n');
         }
-        out.push_str(&field("Files in scope", &v.to_string(), color));
+        // N-14: state the count basis — "Files in scope" counts source files
+        // under the scoped path, which is deliberately different from the
+        // indexed-file total shown by diagnostics (skip lists, exclusions,
+        // and scoping all apply).
+        out.push_str(&field(
+            "Files in scope",
+            &format!("{} (source files under the scoped path)", v),
+            color,
+        ));
+    }
+    // N-14: one legend line for the bracket annotations — `[out→in]` is
+    // outgoing→incoming dependency counts and `[N symbols]` is the file's
+    // indexed symbol count. Previously nowhere documented.
+    if scoped || data.get("tree").is_some() || data.get("root").is_some() {
+        out.push_str(&format!(
+            "\n  {}Legend: [N symbols] = indexed symbol count; [out→in] = outgoing→incoming dependencies{}\n",
+            if color { DIM } else { "" },
+            if color { RESET } else { "" },
+        ));
     }
     out
 }
@@ -1056,6 +1119,16 @@ fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
             color,
         ));
     }
+    // N-15 honest degradation: a zero-impact figure from a stale index or a
+    // degraded graph must not read as fact.
+    if let Some(note) = data.get("impact_note").and_then(|v| v.as_str()) {
+        out.push_str(&field("Note", &format!("⚠ {note}"), color));
+    }
+    if let Some(freshness) = data.get("index_freshness").and_then(|v| v.as_str()) {
+        if freshness != "fresh" {
+            out.push_str(&field("Index freshness", freshness, color));
+        }
+    }
     out.push_str(&render_symbol_source(data, color));
 
     out.push_str(&render_symbol_relationships(
@@ -1218,9 +1291,15 @@ fn render_phase(data: &Value, color: bool) -> String {
         ));
     }
 
-    // Show generation
-    if let Some(r#gen) = data.get("generation").and_then(|v| v.as_str()) {
-        out.push_str(&field("Generation", r#gen, color));
+    // Show the analysis fingerprint (a content hash over the analyzed
+    // inventory — distinct from the store's generation counter in the
+    // freshness footer; N-07).
+    if let Some(fingerprint) = data
+        .get("analysis_fingerprint")
+        .and_then(|v| v.as_str())
+        .or_else(|| data.get("generation").and_then(|v| v.as_str()))
+    {
+        out.push_str(&field("Analysis fingerprint", fingerprint, color));
     }
 
     out.push_str(&render_phase_section(data, 1, color));
@@ -1341,6 +1420,45 @@ fn render_read_file(data: &Value, color: bool) -> String {
             if color { RESET } else { "" },
             line,
         ));
+    }
+    // `include_symbol_map=true` requests per-symbol PDG annotations for the
+    // read range; the handler builds them and the trimmer keeps them, but
+    // this renderer silently dropped the field — the parameter looked like a
+    // no-op (N-08). Render a compact map when present.
+    if let Some(symbols) = data.get("symbol_map").and_then(|v| v.as_array()) {
+        if !symbols.is_empty() {
+            out.push_str(&format!(
+                "\n  {}Symbols in range ({}):{}\n",
+                if color { DIM } else { "" },
+                symbols.len(),
+                if color { RESET } else { "" },
+            ));
+            for symbol in symbols.iter().take(20) {
+                let name = symbol.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let typ = symbol.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let line_start = symbol.get("line_start").and_then(|v| v.as_u64());
+                let line_end = symbol.get("line_end").and_then(|v| v.as_u64());
+                let location = match (line_start, line_end) {
+                    (Some(s), Some(e)) => format!(":{s}-{e}"),
+                    (Some(s), None) => format!(":{s}"),
+                    _ => String::new(),
+                };
+                out.push_str(&format!(
+                    "    {}{}{} {}{}{}{}\n",
+                    if color { LIGHT_CYAN } else { "" },
+                    name,
+                    if color { RESET } else { "" },
+                    if color { DIM } else { "" },
+                    if typ.is_empty() {
+                        String::new()
+                    } else {
+                        format!("[{typ}]")
+                    },
+                    location,
+                    if color { RESET } else { "" },
+                ));
+            }
+        }
     }
     out
 }
@@ -1590,6 +1708,13 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
         .unwrap_or(0);
     let (status_label, status_color) = if !success {
         ("Edit apply failed", if color { LIGHT_RED } else { "" })
+    } else if data.get("dry_run").and_then(|v| v.as_bool()) == Some(true) {
+        // A dry run always reports zero applied changes by design; labeling
+        // it "No-op (content identical)" misdescribes a real preview.
+        (
+            "Dry run (no changes written)",
+            if color { LIGHT_YELLOW } else { "" },
+        )
     } else if changes_applied == 0 {
         (
             "No-op (content identical)",

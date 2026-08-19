@@ -1,6 +1,6 @@
 use super::helpers::{
-    extract_bool, extract_string, extract_usize, get_direct_callers, node_type_str,
-    read_source_snippet, resolve_scope, wrap_with_meta,
+    extract_bool, extract_string, extract_usize, get_direct_callees, get_direct_callers,
+    node_type_str, read_source_snippet_resolved, resolve_scope, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use super::read_symbol_handler::{catalog_is_fresh, parse_live_file, read_live_bytes};
@@ -23,6 +23,9 @@ struct SymbolEntryOpts {
     context_lines: usize,
     include_source: bool,
     score: Option<Score>,
+    /// Live project root used to resolve (possibly relative) indexed paths
+    /// when reading symbol source. `None` means "read the stored path as-is".
+    project_root: Option<PathBuf>,
 }
 
 /// Build a JSON symbol entry from a PDG node.
@@ -38,14 +41,15 @@ fn build_symbol_entry(pdg: &ProgramDependenceGraph, nid: NodeId, opts: &SymbolEn
     let caller_ids = get_direct_callers(pdg, nid);
     let callers: Vec<String> = caller_ids
         .iter()
-        .take(50)
         .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
+        .take(50)
         .collect();
-    let callee_ids = pdg.neighbors(nid);
-    let callees: Vec<String> = callee_ids
-        .iter()
+    // Callees are Call edges only (N-04 semantics; includes External
+    // markers), deduped so dependency_count matches the emitted list.
+    let callees: Vec<String> = get_direct_callees(pdg, nid)
+        .into_iter()
+        .filter_map(|id| pdg.get_node(id).map(|n| n.name.clone()))
         .take(50)
-        .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
         .collect();
 
     let mut entry = serde_json::json!({
@@ -54,7 +58,9 @@ fn build_symbol_entry(pdg: &ProgramDependenceGraph, nid: NodeId, opts: &SymbolEn
         "file": node.file_path,
         "byte_range": node.byte_range,
         "complexity": node.complexity,
-        "caller_count": caller_ids.len(),
+        // Count == emitted list (N-02): the count describes the rendered
+        // callers exactly, after dedup; the list is capped at 50 names.
+        "caller_count": callers.len(),
         "dependency_count": callees.len(),
         "callers": callers,
         "callees": callees,
@@ -66,7 +72,11 @@ fn build_symbol_entry(pdg: &ProgramDependenceGraph, nid: NodeId, opts: &SymbolEn
     }
 
     let source = if opts.context_lines > 0 || opts.include_source {
-        read_source_snippet(&node.file_path, node.byte_range)
+        read_source_snippet_resolved(
+            &node.file_path,
+            node.byte_range,
+            opts.project_root.as_deref(),
+        )
     } else {
         None
     };
@@ -120,9 +130,13 @@ fn build_catalog_symbol_entry(
     opts: &SymbolEntryOpts,
     content: Option<&str>,
 ) -> Value {
+    // A `(0, 0)` byte range means the symbol has no known range in the index
+    // (external/module-level rows persist NULLs for both bounds). Slicing
+    // `content[0..0]` would silently emit an empty string as if the source
+    // were unavailable — treat unknown ranges as no source instead.
     let source = content.and_then(|content| {
         let (start, end) = symbol.byte_range;
-        (start <= end
+        (start < end
             && end <= content.len()
             && content.is_char_boundary(start)
             && content.is_char_boundary(end))
@@ -378,29 +392,29 @@ fn enrich_catalog_results(pdg: &ProgramDependenceGraph, results: &mut [Value]) {
             continue;
         };
         let callers = get_direct_callers(pdg, node_index);
-        let callees = pdg.neighbors(node_index);
-        result["caller_count"] = Value::from(callers.len());
-        result["dependency_count"] = Value::from(callees.len());
-        result["callers"] = Value::Array(
-            callers
-                .iter()
-                .take(50)
-                .filter_map(|id| {
-                    pdg.get_node(*id)
-                        .map(|node| Value::String(node.name.clone()))
-                })
-                .collect(),
-        );
-        result["callees"] = Value::Array(
-            callees
-                .iter()
-                .take(50)
-                .filter_map(|id| {
-                    pdg.get_node(*id)
-                        .map(|node| Value::String(node.name.clone()))
-                })
-                .collect(),
-        );
+        // Callees are Call edges only (N-04 semantics; includes External
+        // markers); counts always equal the emitted lists (N-02).
+        let callees: Vec<_> = get_direct_callees(pdg, node_index);
+        let caller_names: Vec<Value> = callers
+            .iter()
+            .filter_map(|id| {
+                pdg.get_node(*id)
+                    .map(|node| Value::String(node.name.clone()))
+            })
+            .take(50)
+            .collect();
+        let callee_names: Vec<Value> = callees
+            .iter()
+            .filter_map(|id| {
+                pdg.get_node(*id)
+                    .map(|node| Value::String(node.name.clone()))
+            })
+            .take(50)
+            .collect();
+        result["caller_count"] = Value::from(caller_names.len());
+        result["dependency_count"] = Value::from(callee_names.len());
+        result["callers"] = Value::Array(caller_names);
+        result["callees"] = Value::Array(callee_names);
     }
 }
 
@@ -479,6 +493,9 @@ async fn catalog_exact_response(
             context_lines,
             include_source,
             score: None,
+            // Catalog entries slice source from live bytes already resolved
+            // against the project root; no extra path resolution needed.
+            project_root: None,
         },
     );
     let shown = results.len();
@@ -615,6 +632,7 @@ fn semantic_matches(
                 context_lines: opts.context_lines,
                 include_source: opts.include_source,
                 score: Some(result.score),
+                project_root: opts.project_root.clone(),
             },
         ));
     }
@@ -646,6 +664,12 @@ fn semantic_response(
         index
             .ensure_pdg_loaded()
             .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+        let semantic_opts = SymbolEntryOpts {
+            context_lines: opts.context_lines,
+            include_source: opts.include_source,
+            score: None,
+            project_root: Some(index.project_path().to_path_buf()),
+        };
         all_matches = semantic_matches(
             index.pdg().unwrap(),
             &candidate_results,
@@ -653,7 +677,7 @@ fn semantic_response(
             scope_prefix.as_deref(),
             scope_exact,
             type_filter,
-            opts,
+            &semantic_opts,
         );
         if all_matches.is_empty() && !candidate_results.is_empty() {
             let expanded = (candidate_limit * 10).min(MAX_CANDIDATE_LIMIT);
@@ -666,6 +690,50 @@ fn semantic_response(
             }
         }
         break;
+    }
+    if all_matches.is_empty() {
+        // Semantic symbol mode can return zero useful matches even for
+        // queries with an obvious on-the-nose symbol ("scrub secrets from
+        // logs" vs `LogScrubber::redact`). The full phrase can never
+        // substring-match a symbol name, so the fallback first tries the
+        // whole pattern, then each informative token longest-first (the
+        // exact matcher is case-insensitive substring — "scrub" hits
+        // `LogScrubber` where the longest token "secrets" hits nothing).
+        // The response reports the fallback so callers know the match basis.
+        let mut tokens: Vec<&str> = pattern
+            .split_whitespace()
+            .filter(|token| token.chars().any(char::is_alphanumeric) && token.len() >= 4)
+            .collect();
+        tokens.sort_by_key(|token| std::cmp::Reverse(token.len()));
+        let fallback_patterns = std::iter::once(pattern).chain(tokens);
+        for fallback_pattern in fallback_patterns {
+            let mut fallback = exact_response(
+                index,
+                fallback_pattern,
+                type_filter,
+                scope,
+                max_results,
+                offset,
+                char_budget,
+                opts,
+            );
+            let has_results = fallback
+                .get("results")
+                .and_then(|results| results.as_array())
+                .is_some_and(|results| !results.is_empty());
+            if has_results {
+                if let Some(obj) = fallback.as_object_mut() {
+                    obj.insert(
+                        "mode_note".to_string(),
+                        serde_json::json!(format!(
+                            "semantic match returned no symbols; results are exact/substring matches for '{}'",
+                            fallback_pattern
+                        )),
+                    );
+                }
+                return Ok(fallback);
+            }
+        }
     }
     Ok(response_from_matches(
         index,
@@ -951,6 +1019,7 @@ impl GrepSymbolsHandler {
             context_lines,
             include_source,
             score: None,
+            project_root: Some(index.project_path().to_path_buf()),
         };
 
         if route == QueryRoute::Semantic {
@@ -1071,6 +1140,50 @@ mod tests {
             entries[1..]
         );
         assert!(paginate_to_char_budget(entries, 0, 3, 0).is_empty());
+    }
+
+    #[test]
+    fn test_catalog_source_omitted_for_unknown_byte_range() {
+        // A `(0, 0)` byte range (NULL bounds in the catalog) must not be
+        // silently rendered as an empty `"source": ""` string.
+        let symbol = CatalogSymbol {
+            node_id: "node".to_string(),
+            symbol_name: "SearchEngine".to_string(),
+            qualified_name: "SearchEngine".to_string(),
+            file_path: std::path::PathBuf::from("/project/src/engine.rs"),
+            language: "rust".to_string(),
+            node_type: "class".to_string(),
+            complexity: 0,
+            byte_range: (0, 0),
+        };
+        let opts = SymbolEntryOpts {
+            context_lines: 0,
+            include_source: true,
+            score: None,
+            project_root: None,
+        };
+        let entry = build_catalog_symbol_entry(symbol, &opts, Some("pub struct SearchEngine {}\n"));
+        assert!(
+            entry.get("source").is_none(),
+            "unknown byte range must not emit an empty source, got: {}",
+            entry
+        );
+
+        // A valid byte range still yields the source.
+        let symbol = CatalogSymbol {
+            node_id: "node2".to_string(),
+            symbol_name: "greet".to_string(),
+            qualified_name: "greet".to_string(),
+            file_path: std::path::PathBuf::from("/project/src/lib.rs"),
+            language: "rust".to_string(),
+            node_type: "function".to_string(),
+            complexity: 0,
+            byte_range: (0, 23),
+        };
+        let content = "pub fn greet() { hi() }";
+        let entry = build_catalog_symbol_entry(symbol, &opts, Some(content));
+        assert_eq!(entry["source"], content);
+        assert_eq!(entry["byte_range"][1], content.len() as u64);
     }
 
     #[test]

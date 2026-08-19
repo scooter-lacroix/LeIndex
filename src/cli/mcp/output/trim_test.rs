@@ -78,6 +78,28 @@ fn test_trim_symbol_lookup_keeps_actual_fields() {
 }
 
 #[test]
+fn test_trim_symbol_lookup_keeps_degradation_fields() {
+    // N-15: the honest-degradation fields must survive trimming so the LLM
+    // sees WHY a zero-impact figure is not authoritative.
+    let input = v(r#"{
+            "symbol": "orphan_fn",
+            "type": "function",
+            "file": "src/orphan.rs",
+            "callers": [],
+            "callees": [],
+            "impact_radius": {"affected_symbols": 0, "affected_files": 0},
+            "pdg_status": "fresh",
+            "index_freshness": "stale",
+            "impact_note": "the index is stale relative to the worktree; the zero impact figure may reflect missing data — re-index for authoritative impact"
+        }"#);
+    let t = trim_symbol_lookup(&input);
+    assert_eq!(t["index_freshness"], "stale");
+    assert_eq!(t["pdg_status"], "fresh");
+    let note = t["impact_note"].as_str().unwrap();
+    assert!(note.contains("stale"), "note: {note}");
+}
+
+#[test]
 fn test_trim_search_drops_verbose_fields() {
     let input = v(r#"{
             "results": [
@@ -209,6 +231,27 @@ fn test_trim_edit_keeps_apply_result_fields() {
     assert_eq!(t["file_path"], "src/foo.rs");
     assert!(t["edit_region"].is_object());
     assert_eq!(t["message"], "Applied 3 changes");
+}
+
+#[test]
+fn test_trim_edit_keeps_dry_run_flag() {
+    // Regression (audit N-09): the handler wraps dry-run responses with
+    // success=true, changes_applied=0, dry_run=true — but the trim dropped
+    // `dry_run`, so the renderer's dry-run branch was dead and every dry run
+    // rendered as "No-op (content identical)".
+    let input = v(r#"{
+            "success": true,
+            "dry_run": true,
+            "changes_applied": 0,
+            "file_path": "src/foo.rs",
+            "message": "Dry run: no changes written. See `preview` for the diff and validation.",
+            "diff_text": "--- a/src/foo.rs\n+++ b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new\n"
+        }"#);
+    let t = trim_edit(&input);
+    assert_eq!(
+        t["dry_run"], true,
+        "trim must preserve dry_run for the renderer"
+    );
 }
 
 #[test]

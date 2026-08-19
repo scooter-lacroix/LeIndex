@@ -65,7 +65,35 @@ results publish first, then the configured neural worker is actively evaluated f
         let snapshot = registry
             .start_index_job(Some(&project_path), force_reindex, wait)
             .await?;
-        serde_json::to_value(snapshot)
-            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
+        let mut value = serde_json::to_value(snapshot)
+            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?;
+
+        // A failed job should still carry the last-known-good persisted state
+        // (file count, generation, failure phase) so the caller gets partial
+        // data instead of a bare failure.
+        if value.get("status").and_then(Value::as_str) == Some("failed") {
+            if let Some(health) = crate::cli::index_freshness::load_health(
+                &crate::cli::leindex::resolve_existing_storage_path(std::path::Path::new(
+                    &project_path,
+                ))
+                .unwrap_or_else(|| std::path::PathBuf::from(&project_path).join(".leindex")),
+            ) {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert(
+                        "last_known_state".to_string(),
+                        serde_json::json!({
+                            "generation": health.generation,
+                            "status": serde_json::to_value(health.status)
+                                .unwrap_or(Value::Null),
+                            "phase": serde_json::to_value(health.phase).unwrap_or(Value::Null),
+                            "indexed_file_count": health.indexed_file_count,
+                            "last_failure_phase": serde_json::to_value(health.last_failure_phase)
+                                .unwrap_or(Value::Null),
+                        }),
+                    );
+                }
+            }
+        }
+        Ok(value)
     }
 }

@@ -47,12 +47,25 @@ impl DiagnosticsHandler {
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let project_path = args.get("project_path").and_then(|v| v.as_str());
-        let handle = registry.get_or_create(project_path).await?;
+        // Use get_or_load (no auto-index): diagnostics must report the current
+        // state even when indexing itself is failing, otherwise a failed
+        // persist phase turns the tool into an error instead of a status
+        // report.
+        let handle = registry.get_or_load(project_path).await?;
         let guard = handle.read().await;
 
-        let diagnostics = guard.get_diagnostics().map_err(|e| {
-            JsonRpcError::internal_error(format!("Failed to get diagnostics: {}", e))
-        })?;
+        // Live diagnostics are best-effort; a failure degrades to the
+        // persisted health snapshot below rather than a null/error response.
+        let diagnostics: Option<crate::cli::leindex::Diagnostics> = match guard.get_diagnostics() {
+            Ok(diagnostics) => Some(diagnostics),
+            Err(error) => {
+                tracing::warn!(
+                    project = %guard.project_path().display(),
+                    "Live diagnostics unavailable; returning persisted health only: {error}"
+                );
+                None
+            }
+        };
 
         // MCP diagnostics reads the persisted health snapshot and one live
         // Git status. It must not hash/stat every indexed file on the hot
@@ -108,18 +121,47 @@ impl DiagnosticsHandler {
             })
         });
 
-        // Extract values from diagnostics before it's consumed by serde
+        // Extract values from diagnostics before it's consumed by serde.
+        // Every live value falls back to the persisted health snapshot (or a
+        // safe zero) so a degraded diagnostics path still returns partial data.
         let indexed_files_ct = health
             .as_ref()
             .map(|snapshot| snapshot.indexed_file_count)
-            .unwrap_or(diagnostics.stats.files_parsed);
-        let symbol_count = diagnostics.stats.indexed_nodes;
-        let memory_rss_mb =
-            (diagnostics.memory_usage_bytes as f64 / 1024.0 / 1024.0 * 100.0).round() / 100.0;
-        let size_mb = diagnostics.memory_usage_bytes as f64 / 1024.0 / 1024.0;
-        let failed_parses = diagnostics.stats.failed_parses;
-        let index_health = diagnostics.index_health.clone();
-        let is_stale = stale_fast || !changed.is_empty() || !deleted.is_empty();
+            .or_else(|| diagnostics.as_ref().map(|d| d.stats.files_parsed))
+            .unwrap_or(0);
+        let symbol_count = diagnostics
+            .as_ref()
+            .map(|d| d.stats.indexed_nodes)
+            .unwrap_or(0);
+        let memory_usage_bytes = diagnostics
+            .as_ref()
+            .map(|d| d.memory_usage_bytes)
+            .unwrap_or(0);
+        // Real process RSS, not the index-size estimate. Both this and
+        // `index_size_mb` previously derived from `memory_usage_bytes` (an
+        // index-heap estimate), so "Memory RSS" always equaled "Index size"
+        // exactly — a copy bug, not a measurement.
+        let process_rss_bytes = crate::cli::memory_report::current_rss_bytes();
+        let memory_rss_mb = (process_rss_bytes as f64 / 1024.0 / 1024.0 * 100.0).round() / 100.0;
+        let size_mb = memory_usage_bytes as f64 / 1024.0 / 1024.0;
+        let failed_parses = diagnostics
+            .as_ref()
+            .map(|d| d.stats.failed_parses)
+            .unwrap_or(0);
+        let index_health = diagnostics
+            .as_ref()
+            .map(|d| d.index_health.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        // Staleness reflects whether the persisted index health says the
+        // index is degraded (stale/partial/failed) — the authoritative
+        // post-index state. Git dirt must NOT drive this flag: the indexer
+        // indexes the working tree, so files modified-vs-HEAD are fully
+        // indexed, and counting them as "stale" produced the
+        // self-contradiction of "Stale: true" next to
+        // "Freshness: status=fresh" in one payload. The git-dirty lists
+        // remain available below as informational metadata
+        // (`uncommitted_git_files`).
+        let is_stale = stale_fast;
         // When is_stale_fast() reported stale, we ran check_freshness() which
         // is authoritative (hash-based). If check_freshness found no changes,
         // the is_stale_fast positive was a false positive (e.g., same-second
@@ -129,23 +171,49 @@ impl DiagnosticsHandler {
         // pdg.edge_count()). These reflect the current state of the loaded
         // PDG and may differ from the index-time snapshot in stats.pdg_nodes
         // / stats.pdg_edges if the PDG was partially loaded or modified.
-        let pdg_nodes = diagnostics.pdg_nodes;
-        let pdg_edges = diagnostics.pdg_edges;
-        let embedding_model = diagnostics.embedding_model.clone();
-        let pdg_loaded = diagnostics.pdg_loaded;
-        let search_index_nodes = diagnostics.search_index_nodes;
-        let total_signatures = diagnostics.stats.total_signatures;
-        let indexed_nodes = diagnostics.stats.indexed_nodes;
-        let files_parsed = diagnostics.stats.files_parsed;
-        let indexing_time_ms = diagnostics.stats.indexing_time_ms;
+        let pdg_nodes = diagnostics.as_ref().map(|d| d.pdg_nodes).unwrap_or(0);
+        let pdg_edges = diagnostics.as_ref().map(|d| d.pdg_edges).unwrap_or(0);
+        let embedding_model = diagnostics
+            .as_ref()
+            .map(|d| d.embedding_model.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let pdg_loaded = diagnostics.as_ref().map(|d| d.pdg_loaded).unwrap_or(false);
+        let search_index_nodes = diagnostics
+            .as_ref()
+            .map(|d| d.search_index_nodes)
+            .unwrap_or(0);
+        let total_signatures = diagnostics
+            .as_ref()
+            .map(|d| d.stats.total_signatures)
+            .unwrap_or(0);
+        let signature_scope = diagnostics
+            .as_ref()
+            .map(|d| d.stats.signature_scope.clone())
+            .unwrap_or_else(|| "full".to_string());
+        let indexed_nodes = diagnostics
+            .as_ref()
+            .map(|d| d.stats.indexed_nodes)
+            .unwrap_or(0);
+        let files_parsed = diagnostics
+            .as_ref()
+            .map(|d| d.stats.files_parsed)
+            .unwrap_or(0);
+        let indexing_time_ms = diagnostics
+            .as_ref()
+            .map(|d| d.stats.indexing_time_ms)
+            .unwrap_or(0);
+        let diagnostics_available = diagnostics.is_some();
 
-        let mut diag_json = serde_json::to_value(diagnostics)
-            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?;
+        let mut diag_json = match diagnostics {
+            Some(diagnostics) => serde_json::to_value(diagnostics)
+                .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?,
+            None => serde_json::json!({}),
+        };
 
         // ORT diagnostics: share the exact same collection used by the
         // `leindex diagnostics` CLI so MCP output has parity (ort_path,
-        // ort_version, execution_provider).
-        let (ort_path, ort_version, execution_provider) =
+        // ort_version, execution_provider, execution_provider_active).
+        let (ort_path, ort_version, execution_provider, execution_provider_active) =
             crate::cli::cli::collect_ort_diagnostics();
 
         if let Value::Object(ref mut map) = diag_json {
@@ -156,6 +224,14 @@ impl DiagnosticsHandler {
             map.insert(
                 "execution_provider".to_string(),
                 serde_json::json!(execution_provider),
+            );
+            // The provider the embed worker actually activated (live daemon
+            // health probe); `None` when no worker is running yet. Differs
+            // from `execution_provider` when a requested GPU provider failed
+            // to load and the worker fell back to CPU.
+            map.insert(
+                "execution_provider_active".to_string(),
+                serde_json::json!(execution_provider_active),
             );
             map.insert(
                 "memory_rss_mb".to_string(),
@@ -186,6 +262,7 @@ impl DiagnosticsHandler {
                     "search_index_nodes": search_index_nodes,
                     "embedding_model": embedding_model,
                     "total_signatures": total_signatures,
+                    "signature_scope": signature_scope,
                     "indexed_nodes": indexed_nodes,
                     "files_parsed": files_parsed,
                     "failed_parses": failed_parses,
@@ -216,6 +293,12 @@ impl DiagnosticsHandler {
                     "message": format!("{} files failed to parse", failed_parses),
                 }));
             }
+            if !diagnostics_available {
+                issues.push(serde_json::json!({
+                    "severity": "warning",
+                    "message": "Live diagnostics unavailable — showing persisted health snapshot only. Reindex (LeIndex [Index] with force_reindex=true) to restore full diagnostics.",
+                }));
+            }
             if stale_bool {
                 issues.push(serde_json::json!({
                     "severity": "warning",
@@ -229,6 +312,11 @@ impl DiagnosticsHandler {
                     "status": "fresh",
                     "changed_files": 0,
                     "deleted_files": 0,
+                    // Informational: working-tree files that differ from the
+                    // git HEAD commit. They are indexed (the indexer reads
+                    // the working tree); the count is surfaced so agents can
+                    // tell "dirty worktree" apart from "stale index".
+                    "uncommitted_git_files": changed.len() + deleted.len(),
                 })
             } else {
                 serde_json::json!({

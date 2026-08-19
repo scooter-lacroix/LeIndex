@@ -296,6 +296,28 @@ to auto-switch/auto-index projects."
         let page: Vec<_> = filtered.into_iter().skip(offset).take(top_k).collect();
         let total_returned = page.len();
 
+        // Low-signal detection (F-07): expose the top composite score so
+        // agents can judge confidence, and flag results whose best match is
+        // weak. The floor is deliberately conservative (0.25): TF-IDF gives
+        // partial credit for a single shared token, so a garbage query with
+        // one common word can still score ~0.7 — those are not flaggable
+        // without risking false negatives on legitimate short queries, but
+        // `top_score` makes the judgment possible at the consumer.
+        let top_score = page
+            .iter()
+            .map(|result| result.score.overall)
+            .fold(0.0_f32, f32::max);
+        let low_signal = total_returned > 0 && top_score < 0.25;
+        let low_signal_json = if low_signal {
+            serde_json::json!({
+                "low_signal": true,
+                "top_score": top_score,
+                "suggestion": "Top match scores below the confidence floor; results may be coincidental token overlap. Rephrase with more specific terms or use LeIndex [Grep Symbols] for exact names.",
+            })
+        } else {
+            serde_json::json!({ "top_score": top_score })
+        };
+
         if total_filtered == 0 {
             return Ok(wrap_with_meta(
                 serde_json::json!({
@@ -315,17 +337,35 @@ to auto-switch/auto-index projects."
             ));
         }
 
-        Ok(wrap_with_meta(
-            serde_json::json!({
-                "results": serde_json::to_value(&page).map_err(|e|
-                    JsonRpcError::internal_error(format!("Serialization error: {}", e)))?,
-                "offset": offset,
-                "count": total_returned,
-                "has_more": offset + total_returned < total_filtered,
-                "retrieval": retrieval_meta(&guard, route, route_name, &budget, started)
-            }),
-            &guard,
-        ))
+        let mut payload = serde_json::json!({
+            "results": serde_json::to_value(&page).map_err(|e|
+                JsonRpcError::internal_error(format!("Serialization error: {}", e)))?,
+            "offset": offset,
+            "count": total_returned,
+            "has_more": offset + total_returned < total_filtered,
+            "retrieval": retrieval_meta(&guard, route, route_name, &budget, started)
+        });
+        // Bimodal-latency marker: the first neural call after a server or
+        // daemon start pays the ~15–20 s model load; every later call is
+        // milliseconds. Without this hint agents timeout-and-retry on the
+        // first call of every session (session-5 §5.1).
+        if started.elapsed().as_millis() > 5000 {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("cold_start".to_string(), serde_json::json!(true));
+                obj.insert(
+                    "note".to_string(),
+                    serde_json::json!(
+                        "This call included a one-time neural model load; subsequent searches are milliseconds"
+                    ),
+                );
+            }
+        }
+        if let (Some(obj), Some(target)) = (payload.as_object_mut(), low_signal_json.as_object()) {
+            for (key, value) in target {
+                obj.insert(key.clone(), value.clone());
+            }
+        }
+        Ok(wrap_with_meta(payload, &guard))
     }
 }
 

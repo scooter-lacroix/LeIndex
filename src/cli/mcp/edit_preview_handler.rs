@@ -84,21 +84,21 @@ LeIndex [Edit Apply] to understand the blast radius of your change."
         let project_path_arg = args.get("project_path").and_then(|v| v.as_str());
         let handle = registry.get_or_create(project_path_arg).await?;
 
-        // 1. Resolve path and ensure PDG loaded with WRITE lock (if needed)
-        let (abs_file_path, storage_path) = {
+        // 1. Resolve path; the PDG load is best-effort. A preview of a plain
+        // text edit must never be blocked by a degraded/unavailable index —
+        // the diff is exact and self-contained, and validation/impact simply
+        // degrade to file-level only when no PDG can be loaded.
+        let (abs_file_path, storage_path, pdg_available) = {
             let mut guard = handle.write().await;
-            guard
-                .ensure_pdg_loaded()
-                .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
-
-            if guard.pdg().is_none() {
-                return Err(JsonRpcError::project_not_indexed(
-                    guard.project_path().display().to_string(),
-                ));
+            if let Err(error) = guard.ensure_pdg_loaded() {
+                tracing::warn!(
+                    project = %guard.project_path().display(),
+                    "PDG unavailable for edit preview; continuing with file-level validation only: {error}"
+                );
             }
-
+            let pdg_available = guard.pdg().is_some();
             let abs = validate_file_within_project(&file_path, guard.project_path())?;
-            (abs, guard.storage_path().to_path_buf())
+            (abs, guard.storage_path().to_path_buf(), pdg_available)
         };
         // Write lock dropped
 
@@ -170,6 +170,19 @@ LeIndex [Edit Apply] to understand the blast radius of your change."
             "risk_level": risk,
             "change_count": changes.len()
         });
+        if !pdg_available {
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("pdg_status".to_string(), serde_json::json!("not_loaded"));
+                obj.insert(
+                    "warning".to_string(),
+                    serde_json::json!(
+                        "Index unavailable — this preview shows the exact diff only, without \
+                        PDG impact analysis or syntax validation. Reindex (LeIndex [Index] with \
+                        force_reindex=true) to restore full preview capabilities."
+                    ),
+                );
+            }
+        }
 
         // Include validation results
         if let Some(validation) = validation_json {

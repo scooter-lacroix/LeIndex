@@ -265,10 +265,26 @@ pub enum Commands {
     #[command(visible_alias = "leindex_retention")]
     Retention {
         /// Print the retention report (generation count, CAS bytes, job
-        /// bytes, dedup ratio, GC candidates). This is the only implemented
-        /// mode; the command never deletes data.
+        /// bytes, dedup ratio, GC candidates). Read-only; deletes nothing.
         #[arg(long = "report")]
         report: bool,
+
+        /// Run the retention sweep: prune generations outside the retained
+        /// window (current + its `--max-generations - 1` predecessors),
+        /// GC orphaned CAS blobs (CAS stores), and byte-cap completed jobs.
+        /// Safe for both CAS and legacy full-copy stores; the current
+        /// generation is never removed.
+        #[arg(long = "gc")]
+        gc: bool,
+
+        /// Number of generations to retain when running `--gc`
+        /// (default 3: current + two rollback points).
+        #[arg(long = "max-generations", default_value_t = 3)]
+        max_generations: usize,
+
+        /// With `--gc`: report what would be removed without deleting.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 
     /// One-time legacy → CAS generation-store migration (WS4 Task 10)
@@ -484,7 +500,12 @@ impl Cli {
             } => {
                 cmd_cleanup_impl(max_age_days, dry_run, stale_daemons, store, global_project).await
             }
-            Commands::Retention { report } => cmd_retention_impl(report, global_project).await,
+            Commands::Retention {
+                report,
+                gc,
+                max_generations,
+                dry_run,
+            } => cmd_retention_impl(report, gc, max_generations, dry_run, global_project).await,
             Commands::Storage {
                 migrate,
                 status,
@@ -833,7 +854,15 @@ async fn cmd_index_impl(
     println!("  Files parsed: {}", stats.files_parsed);
     println!("  Successful: {}", stats.successful_parses);
     println!("  Failed: {}", stats.failed_parses);
-    println!("  Signatures: {}", stats.total_signatures);
+    println!(
+        "  Signatures: {}{}",
+        stats.total_signatures,
+        if stats.signature_scope == "delta" {
+            " (changed files only; project total unchanged since last full index)"
+        } else {
+            ""
+        }
+    );
     println!("  PDG nodes: {}", stats.pdg_nodes);
     println!("  PDG edges: {}", stats.pdg_edges);
     println!("  Indexed nodes: {}", stats.indexed_nodes);
@@ -1177,7 +1206,8 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     // command must NOT load ORT itself (the leindex-embed worker does), so we
     // walk the chain via `discover_path_only()` and fall back to the config
     // file when no candidate exists on disk.
-    let (ort_path, ort_version, execution_provider) = collect_ort_diagnostics();
+    let (ort_path, ort_version, execution_provider, execution_provider_active) =
+        collect_ort_diagnostics();
 
     // Convert to JSON for formatter
     let diag_json = serde_json::json!({
@@ -1192,6 +1222,7 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         "ort_path": ort_path,
         "ort_version": ort_version,
         "execution_provider": execution_provider,
+        "execution_provider_active": execution_provider_active,
         "issues": issues,
     });
 
@@ -1210,7 +1241,7 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 /// VAL-CROSS-015 / VAL-ORT-022: surfaces the same ORT info shape on every
 /// install surface (cargo, npm, PyPI, GitHub Release bundle) so support
 /// engineers can debug identically. Returns a `(ort_path, ort_version,
-/// execution_provider)` triple where:
+/// execution_provider, active_provider)` tuple where:
 ///
 ///   * `ort_path` is the resolved ORT dylib path the discovery chain would
 ///     load right now, falling back to the path recorded in the user's config
@@ -1221,42 +1252,91 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 ///   * `execution_provider` is the configured provider string ("cpu",
 ///     "cuda", "migraphx", or "auto"). Defaults to "auto" when no config
 ///     exists, matching the setup command's default.
+///   * `active_provider` is the provider the embed worker ACTUALLY
+///     activated, probed live from the daemon's health socket. `None` when
+///     no worker is running or it has not reported a provider yet. When it
+///     differs from the configured value the worker fell back (e.g.
+///     migraphx requested, cpu active) — the single most important signal
+///     for "why is neural search slow".
 ///
 /// This function does NOT call `ort::init_from()` and therefore does NOT
 /// load ORT into the main daemon process. That keeps the diagnostics command
 /// cheap and side-effect-free; the leindex-embed worker performs its own
 /// discovery at spawn time.
-pub(crate) fn collect_ort_diagnostics() -> (Option<String>, Option<String>, String) {
+///
+/// The expensive static parts (dylib discovery walk, version lookup) are
+/// cached per process: a live version query spawns Python and imports
+/// onnxruntime (~110–130 ms), which single-handedly blew the 100 ms
+/// diagnostics budget on every call. The config-recorded version
+/// (VAL-SETUP-020) is preferred; a live query runs only when the config
+/// lacks a version, and its result is cached for the process lifetime.
+/// The ACTIVE provider probe stays per-call (bounded ≤50 ms) so a CPU
+/// fallback is reported promptly.
+pub(crate) fn collect_ort_diagnostics() -> (Option<String>, Option<String>, String, Option<String>)
+{
     use crate::cli::leindex::setup;
+    use std::sync::Mutex;
 
-    // ort_path: prefer the live discovery chain, fall back to configured path.
-    #[cfg(feature = "onnx")]
-    let live_path = crate::embed::ort_discovery::discover_path_only()
-        .map(|outcome| outcome.path.display().to_string());
-    #[cfg(not(feature = "onnx"))]
-    let live_path: Option<String> = None;
+    static CACHED: std::sync::OnceLock<Mutex<Option<(Option<String>, Option<String>)>>> =
+        std::sync::OnceLock::new();
 
-    let config_path = crate::config::LeIndexConfig::load()
-        .ok()
-        .and_then(|c| c.neural.ort_dylib_path);
+    let (ort_path, ort_version) = {
+        let cache = CACHED.get_or_init(|| Mutex::new(None));
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = guard.clone() {
+            cached
+        } else {
+            // ort_path: prefer the live discovery chain, fall back to configured path.
+            #[cfg(feature = "onnx")]
+            let live_path = crate::embed::ort_discovery::discover_path_only()
+                .map(|outcome| outcome.path.display().to_string());
+            #[cfg(not(feature = "onnx"))]
+            let live_path: Option<String> = None;
 
-    let ort_path = live_path.or(config_path);
+            let config_path = crate::config::LeIndexConfig::load()
+                .ok()
+                .and_then(|c| c.neural.ort_dylib_path);
+            let ort_path = live_path.or(config_path);
 
-    // ort_version: prefer the live-detected version, fall back to the recorded one.
-    let live_version = setup::get_ort_version();
-    let recorded_version = crate::config::LeIndexConfig::load()
-        .ok()
-        .and_then(|c| c.neural.ort_version);
-    let ort_version = live_version.or(recorded_version);
+            // ort_version: prefer the version recorded in the config
+            // (VAL-SETUP-020 exists exactly so re-querying pip is
+            // unnecessary); fall back to a live Python query only when the
+            // config has none, and cache that result for the process.
+            let recorded_version = crate::config::LeIndexConfig::load()
+                .ok()
+                .and_then(|c| c.neural.ort_version);
+            let ort_version = match recorded_version {
+                Some(version) => Some(version),
+                None => setup::get_ort_version(),
+            };
+
+            let value = (ort_path, ort_version);
+            *guard = Some(value.clone());
+            value
+        }
+    };
 
     // execution_provider: from config, default to "auto" when unset.
-    let execution_provider = crate::config::LeIndexConfig::load()
-        .ok()
-        .map(|c| c.neural.execution_provider)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "auto".to_string());
+    let execution_provider = crate::config::LeIndexConfig::load_cached()
+        .neural
+        .execution_provider
+        .clone();
+    let execution_provider = if execution_provider.is_empty() {
+        "auto".to_string()
+    } else {
+        execution_provider
+    };
 
-    (ort_path, ort_version, execution_provider)
+    // active_provider: live-probe the embed daemon for what actually loaded.
+    #[cfg(feature = "onnx")]
+    let active_provider =
+        crate::search::onnx::daemon_active_provider().map(|(provider, _phase)| provider);
+    #[cfg(not(feature = "onnx"))]
+    let active_provider: Option<String> = None;
+
+    (ort_path, ort_version, execution_provider, active_provider)
 }
 
 /// Serve command implementation - Start MCP server
@@ -1667,13 +1747,34 @@ async fn cmd_cleanup_impl(
 /// store's retention report (generation count, CAS bytes, job bytes, dedup
 /// ratio, GC candidates) without modifying anything. The report logic lives
 /// in [`crate::cli::cleanup::retention_report_cli`].
-async fn cmd_retention_impl(report: bool, project: Option<PathBuf>) -> AnyhowResult<()> {
+async fn cmd_retention_impl(
+    report: bool,
+    gc: bool,
+    max_generations: usize,
+    dry_run: bool,
+    project: Option<PathBuf>,
+) -> AnyhowResult<()> {
+    if gc {
+        let output =
+            crate::cli::cleanup::retention_gc_cli(project.as_deref(), max_generations, dry_run)?;
+        if dry_run {
+            println!("LeIndex Retention GC (dry run)\n");
+        } else {
+            println!("LeIndex Retention GC\n");
+        }
+        println!("{}", output.generation_report);
+        return Ok(());
+    }
     if !report {
         println!(
             "LeIndex Retention\n\n\
              Use `leindex retention --report` to print the generation-store\n\
              retention report (generation count, CAS bytes, job bytes, dedup\n\
-             ratio, GC candidates). The command is read-only."
+             ratio, GC candidates) without deleting anything, or\n\
+             `leindex retention --gc [--max-generations N] [--dry-run]` to\n\
+             prune generations outside the retained window, GC orphaned CAS\n\
+             blobs, and byte-cap completed jobs. The current generation is\n\
+             never removed."
         );
         return Ok(());
     }
@@ -2081,7 +2182,7 @@ mod tests {
         // WS4 Task 9: `leindex retention --report` is registered.
         let cli = Cli::try_parse_from(["leindex", "retention", "--report"]).unwrap();
         match cli.command {
-            Some(Commands::Retention { report }) => {
+            Some(Commands::Retention { report, .. }) => {
                 assert!(report, "--report must be parsed");
             }
             _ => panic!("Expected Retention command"),
@@ -2092,8 +2193,27 @@ mod tests {
     fn test_retention_command_without_report_flag() {
         let cli = Cli::try_parse_from(["leindex", "retention"]).unwrap();
         match cli.command {
-            Some(Commands::Retention { report }) => {
+            Some(Commands::Retention { report, .. }) => {
                 assert!(!report, "report flag defaults to false");
+            }
+            _ => panic!("Expected Retention command"),
+        }
+    }
+
+    #[test]
+    fn test_retention_gc_command_parsing() {
+        let cli = Cli::try_parse_from(["leindex", "retention", "--gc", "--max-generations", "3"])
+            .unwrap();
+        match cli.command {
+            Some(Commands::Retention {
+                gc,
+                max_generations,
+                dry_run,
+                ..
+            }) => {
+                assert!(gc, "--gc must be parsed");
+                assert_eq!(max_generations, 3, "--max-generations must be parsed");
+                assert!(!dry_run, "dry_run defaults to false");
             }
             _ => panic!("Expected Retention command"),
         }

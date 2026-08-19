@@ -1,4 +1,6 @@
-use super::helpers::{byte_range_to_line_range, extract_bool, extract_string, extract_usize};
+use super::helpers::{
+    byte_range_to_line_range, extract_bool, extract_string, extract_usize, get_direct_callees,
+};
 use super::protocol::JsonRpcError;
 use super::request_meta::WorkBudget;
 use crate::cli::live_project::LiveProject;
@@ -128,7 +130,10 @@ async fn catalog_lookup(
     let Ok(symbols) = catalog.find_symbol(symbol, file).await else {
         return Ok(CatalogLookup::Miss);
     };
-    let Some(mut node) = symbols.into_iter().next() else {
+    // A symbol can live in several files (overloads, re-exports, shadowing).
+    // Pick the best-ranked candidate instead of blindly taking the first row
+    // so a struct definition beats a same-named variable in another file.
+    let Some(mut node) = symbols.into_iter().min_by_key(|s| symbol_rank(s, symbol)) else {
         return Ok(CatalogLookup::Miss);
     };
     node.file_path = live
@@ -157,14 +162,40 @@ async fn parse_live_symbol(
     Ok((parsed, node))
 }
 
+/// Rank candidate symbols for disambiguation. Lower tuple values win:
+///
+/// 1. Exactness: a case-sensitive name/qualified-name match beats a
+///    case-insensitive one.
+/// 2. Type: definition-like nodes (class/struct, then function/method) beat
+///    variables and modules, so a `struct Storage` is preferred over a
+///    same-named CLI variable.
+/// 3. Size: a larger byte range is treated as the real definition over a
+///    reference or re-export with the same name.
+fn symbol_rank(node: &CatalogSymbol, symbol: &str) -> (u8, u8, std::cmp::Reverse<usize>) {
+    let exact = if node.symbol_name == symbol || node.qualified_name == symbol {
+        0
+    } else {
+        1
+    };
+    let type_rank = match node.node_type.as_str() {
+        "class" => 0,
+        "function" | "method" => 1,
+        "module" => 2,
+        _ => 3,
+    };
+    let size = node.byte_range.1.saturating_sub(node.byte_range.0);
+    (exact, type_rank, std::cmp::Reverse(size))
+}
+
 fn find_live_symbol(parsed: &LiveParse, symbol: &str) -> Option<CatalogSymbol> {
     parsed
         .symbols
         .iter()
-        .find(|node| {
+        .filter(|node| {
             node.symbol_name.eq_ignore_ascii_case(symbol)
                 || node.qualified_name.eq_ignore_ascii_case(symbol)
         })
+        .min_by_key(|node| symbol_rank(node, symbol))
         .cloned()
 }
 
@@ -205,6 +236,11 @@ async fn find_live_symbol_in_inventory(
     // (consistent with the eq_ignore_ascii_case catalog fallback).
     let symbol_lower = symbol.to_ascii_lowercase();
     let mut parsed = 0usize;
+    // Collect the best-ranked match across *all* scanned files rather than
+    // returning the first file that mentions the symbol: a later-sorting file
+    // can hold the real definition while an earlier one only shadows or
+    // re-exports the name.
+    let mut best: Option<(LiveParse, CatalogSymbol)> = None;
     for (inspected, candidate) in candidates.into_iter().enumerate() {
         if parsed >= 20 || inspected >= 200 {
             break;
@@ -222,14 +258,23 @@ async fn find_live_symbol_in_inventory(
         let Ok(live_parsed) = parse_live_file(candidate).await else {
             continue;
         };
-        if let Some(node) = find_live_symbol(&live_parsed, symbol) {
-            return Ok((live_parsed, node));
+        let Some(node) = find_live_symbol(&live_parsed, symbol) else {
+            continue;
+        };
+        let is_better = best
+            .as_ref()
+            .is_none_or(|(_, current)| symbol_rank(&node, symbol) < symbol_rank(current, symbol));
+        if is_better {
+            best = Some((live_parsed, node));
         }
     }
-    Err(JsonRpcError::invalid_params(format!(
-        "Symbol '{}' not found: scanned up to 200 live source candidates and parsed up to 20",
-        symbol
-    )))
+    let Some((live_parsed, node)) = best else {
+        return Err(JsonRpcError::invalid_params(format!(
+            "Symbol '{}' not found: scanned up to 200 live source candidates and parsed up to 20",
+            symbol
+        )));
+    };
+    Ok((live_parsed, node))
 }
 
 fn symbol_response(
@@ -460,7 +505,7 @@ async fn resident_relations(
             pdg_status: "partial",
         };
     }
-    let callees = relation_nodes_to_json(pdg, live, pdg.neighbors(node_id));
+    let callees = relation_nodes_to_json(pdg, live, get_direct_callees(pdg, node_id));
     let callers =
         relation_nodes_to_json(pdg, live, super::helpers::get_direct_callers(pdg, node_id));
     ResidentRelations {
@@ -484,8 +529,12 @@ fn relation_nodes_to_json(
     live: &LiveProject,
     node_ids: impl IntoIterator<Item = crate::graph::pdg::NodeId>,
 ) -> Vec<Value> {
+    // Neighbors yields one entry per edge; the same related node can reach
+    // the anchor through several edge types and must render once (N-01).
+    let mut seen = std::collections::HashSet::new();
     node_ids
         .into_iter()
+        .filter(|id| seen.insert(*id))
         .filter_map(|id| {
             let node = pdg.get_node(id)?;
             let file = live.file(&node.file_path).ok()?;
@@ -511,5 +560,82 @@ mod tests {
         let registry = test_registry_for(dir.path());
         let args = serde_json::json!({ "symbol": "my_func" });
         assert!(ReadSymbolHandler.execute(&registry, args).await.is_err());
+    }
+
+    fn catalog_symbol(name: &str, node_type: &str, byte_range: (usize, usize)) -> CatalogSymbol {
+        CatalogSymbol {
+            node_id: format!("{name}:{byte_range:?}"),
+            symbol_name: name.to_string(),
+            qualified_name: name.to_string(),
+            file_path: std::path::PathBuf::from(format!("/project/{name}.rs")),
+            language: "rust".to_string(),
+            node_type: node_type.to_string(),
+            complexity: 0,
+            byte_range,
+        }
+    }
+
+    #[test]
+    fn test_find_live_symbol_prefers_struct_over_variable() {
+        // Regression: a same-named CLI variable must not shadow the struct
+        // definition (read_symbol previously returned the first match).
+        let parsed = LiveParse {
+            bytes: Vec::new(),
+            symbols: vec![
+                catalog_symbol("Storage", "variable", (10, 20)),
+                catalog_symbol("Storage", "class", (30, 90)),
+            ],
+        };
+        let found = find_live_symbol(&parsed, "Storage").unwrap();
+        assert_eq!(found.node_type, "class", "struct/class must beat variable");
+    }
+
+    #[test]
+    fn test_find_live_symbol_prefers_exact_over_case_insensitive() {
+        let parsed = LiveParse {
+            bytes: Vec::new(),
+            symbols: vec![
+                catalog_symbol("storage", "function", (10, 30)),
+                catalog_symbol("Storage", "class", (40, 60)),
+            ],
+        };
+        let found = find_live_symbol(&parsed, "Storage").unwrap();
+        assert_eq!(found.symbol_name, "Storage", "exact case match must win");
+    }
+
+    #[test]
+    fn test_find_live_symbol_prefers_larger_range_within_same_type() {
+        let parsed = LiveParse {
+            bytes: Vec::new(),
+            symbols: vec![
+                catalog_symbol("helper", "function", (5, 9)),
+                catalog_symbol("helper", "function", (20, 60)),
+            ],
+        };
+        let found = find_live_symbol(&parsed, "helper").unwrap();
+        assert_eq!(found.byte_range, (20, 60), "definition-like range must win");
+    }
+
+    #[tokio::test]
+    async fn test_find_live_symbol_in_inventory_picks_best_across_files() {
+        // A variable in an earlier-sorting file must not win over the struct
+        // definition in a later file.
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a_cli.rs"),
+            "pub const Storage: usize = 42;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b_storage.rs"),
+            "pub struct Storage { field: u32 }\n",
+        )
+        .unwrap();
+        let live = LiveProject::resolve(&dir.path().to_string_lossy()).unwrap();
+        let (_parsed, node) = find_live_symbol_in_inventory(&live, "Storage")
+            .await
+            .expect("symbol must be found");
+        assert_eq!(node.node_type, "class");
+        assert!(node.file_path.ends_with("b_storage.rs"));
     }
 }

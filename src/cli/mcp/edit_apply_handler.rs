@@ -259,20 +259,50 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
         let dry_run = extract_bool(&args, "dry_run", false);
 
         if dry_run {
-            // Delegate to preview
-            return EditPreviewHandler.execute(registry, args).await;
+            // Delegate to preview, but wrap the preview payload in an
+            // explicit dry-run envelope. Delegating raw made the apply
+            // renderer read the preview-shaped payload (no `success` field)
+            // as "Edit apply failed" with no detail — a dry-run that
+            // reports failure without a reason is worse than none (N-09).
+            let preview = EditPreviewHandler.execute(registry, args).await?;
+            let mut envelope = serde_json::json!({
+                "success": true,
+                "dry_run": true,
+                "changes_applied": 0,
+                "message": "Dry run: no changes written. See `preview` for the diff and validation.",
+            });
+            if let (Some(obj), Some(preview_obj)) = (envelope.as_object_mut(), preview.as_object())
+            {
+                for (key, value) in preview_obj {
+                    if key == "content" || key == "isError" {
+                        continue;
+                    }
+                    obj.insert(key.clone(), value.clone());
+                }
+            }
+            return Ok(envelope);
         }
 
         let (file_path, project_path_arg, provided_token) = apply_request_args(&args)?;
         let handle = registry.get_or_create(project_path_arg.as_deref()).await?;
 
-        // 0. Ensure PDG is loaded for BOTH branches (parsing and impact analysis)
-        {
+        // 0. Best-effort PDG load. Applying a plain text edit must never be
+        // blocked by a degraded/unavailable index: the atomic write + expected-
+        // content guard is the safety net, and impact/validation simply report
+        // as unavailable when no PDG can be loaded.
+        let pdg_loaded = {
             let mut guard = handle.write().await;
-            guard
-                .ensure_pdg_loaded()
-                .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
-        }
+            match guard.ensure_pdg_loaded() {
+                Ok(()) => guard.pdg().is_some(),
+                Err(error) => {
+                    tracing::warn!(
+                        project = %guard.project_path().display(),
+                        "PDG unavailable for edit-apply; continuing without PDG impact analysis: {error}"
+                    );
+                    false
+                }
+            }
+        };
 
         // 1. Resolve path and check cache (avoid awaiting while holding lock)
         let (canonical_path, storage_path) = {
@@ -352,13 +382,26 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
             edit_impact(guard.pdg(), &changes, &canonical_path)
         };
 
-        let response = edit_response(
+        let mut response = edit_response(
             &canonical_path,
             changes.len(),
             edit_region(&original, &modified),
             impact,
             validation_json,
         );
+        if !pdg_loaded {
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("pdg_status".to_string(), serde_json::json!("not_loaded"));
+                obj.insert(
+                    "warning".to_string(),
+                    serde_json::json!(
+                        "Index unavailable — edit applied with file-level safety only \
+                        (no PDG impact analysis or validation). Reindex (LeIndex [Index] with \
+                        force_reindex=true) to restore full editing safeguards."
+                    ),
+                );
+            }
+        }
 
         let guard = handle.read().await;
         Ok(wrap_with_meta(response, &guard))

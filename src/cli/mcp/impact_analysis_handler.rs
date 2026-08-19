@@ -71,13 +71,35 @@ to understand the blast radius of your change. No equivalent in standard tools."
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
 
-        guard
-            .ensure_pdg_loaded()
-            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
-
-        if guard.pdg().is_none() {
-            return Err(JsonRpcError::project_not_indexed(
-                guard.project_path().display().to_string(),
+        // Best-effort PDG load. Transitive impact is inherently PDG-based, so
+        // when the graph is unavailable the tool reports a structured degraded
+        // result instead of a hard error — the caller learns the index state
+        // and what to do about it.
+        let pdg_available = match guard.ensure_pdg_loaded() {
+            Ok(()) => guard.pdg().is_some(),
+            Err(error) => {
+                tracing::warn!(
+                    project = %guard.project_path().display(),
+                    "PDG unavailable for impact analysis: {error}"
+                );
+                false
+            }
+        };
+        if !pdg_available {
+            return Ok(wrap_with_meta(
+                serde_json::json!({
+                    "symbol": symbol,
+                    "change_type": change_type,
+                    "pdg_status": "not_loaded",
+                    "direct_callers": [],
+                    "transitive_affected_symbols": [],
+                    "transitive_affected_files": 0,
+                    "transitive_callers": 0,
+                    "risk_level": "unknown",
+                    "warning": "Impact analysis requires the program dependence graph, which is currently unavailable. Reindex (LeIndex [Index] with force_reindex=true) to restore transitive impact analysis.",
+                    "summary": format!("Cannot analyze impact of '{}': the program dependence graph is unavailable.", symbol)
+                }),
+                &guard,
             ));
         }
 
@@ -108,36 +130,34 @@ to understand the blast radius of your change. No equivalent in standard tools."
             .filter_map(|&cid| pdg.get_node(cid).map(|n| n.name.clone()))
             .collect();
 
-        let forward = pdg.forward_impact(
+        // Impact semantics: changing a symbol breaks its DEPENDENTS (the
+        // callers upstream), so the affected set is the backward traversal.
+        // The previous code used the forward traversal (callees), which
+        // under-reports whenever callee resolution is incomplete (e.g.
+        // cross-struct method calls) — producing "affects 0 symbols in 0
+        // files" while listing 10 direct callers in the same payload.
+        let affected = pdg.backward_impact(
             node_id,
             &crate::graph::pdg::TraversalConfig {
                 max_depth: Some(depth),
                 ..crate::graph::pdg::TraversalConfig::for_impact_analysis()
             },
         );
-        let affected_symbols: Vec<String> = forward
+        let affected_symbols: Vec<String> = affected
             .iter()
             .filter_map(|&nid| pdg.get_node(nid).map(|n| n.name.clone()))
             .take(50)
             .collect();
-        let affected_files: std::collections::HashSet<&str> = forward
+        let affected_files: std::collections::HashSet<&str> = affected
             .iter()
             .filter_map(|&nid| pdg.get_node(nid).map(|n| n.file_path.as_ref()))
             .collect();
 
-        let backward = pdg.backward_impact(
-            node_id,
-            &crate::graph::pdg::TraversalConfig {
-                max_depth: Some(depth),
-                ..crate::graph::pdg::TraversalConfig::for_impact_analysis()
-            },
-        );
-
         let risk = match change_type.as_str() {
             "remove" | "change_signature" => {
-                if forward.len() > 5 || affected_files.len() > 3 {
+                if affected.len() > 5 || affected_files.len() > 3 {
                     "high"
-                } else if !forward.is_empty() {
+                } else if !affected.is_empty() {
                     "medium"
                 } else {
                     "low"
@@ -162,11 +182,11 @@ to understand the blast radius of your change. No equivalent in standard tools."
                 "direct_callers": direct_callers,
                 "transitive_affected_symbols": affected_symbols,
                 "transitive_affected_files": affected_files.len(),
-                "transitive_callers": backward.len(),
+                "transitive_callers": affected.len(),
                 "risk_level": risk,
                 "summary": format!(
-                    "Changing '{}' directly affects {} symbols in {} files (risk: {})",
-                    node.name, forward.len(), affected_files.len(), risk
+                    "Changing '{}' affects {} dependent symbols in {} files (risk: {})",
+                    node.name, affected.len(), affected_files.len(), risk
                 )
             }),
             &guard,

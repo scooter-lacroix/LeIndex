@@ -404,7 +404,30 @@ impl JsonRpcError {
     }
 
     /// Create an initialization failure error with multi-step remediation.
+    ///
+    /// Transient lock contention (tagged `[transient:lock-contention]` by
+    /// `LeIndex::open_storage_with_retry`) must not advise deleting a valid
+    /// database — the data is intact and the call succeeds on retry once the
+    /// competing writer finishes.
     pub fn init_failed(path: &str, inner: &str) -> Self {
+        if inner.contains("[transient:lock-contention]") {
+            return Self::with_data(
+                error_codes::INIT_FAILED,
+                format!(
+                    "Failed to initialize LeIndex for '{}'.\n\
+                     Inner error: {}\n\n\
+                     Another leindex process is currently writing this project's \
+                     database. The index data is intact; retry shortly.",
+                    path, inner
+                ),
+                serde_json::json!({
+                    "error_type": "storage_locked",
+                    "inner_error": inner,
+                    "retryable": true,
+                    "suggestion": "Retry the call; no cleanup is needed.",
+                }),
+            );
+        }
         Self::with_data(
             error_codes::INIT_FAILED,
             format!(
@@ -655,6 +678,44 @@ mod tests {
         ];
 
         assert!(events.iter().all(|event| event.timestamp_ms > 0));
+    }
+
+    #[test]
+    fn test_init_failed_transient_lock_omits_delete_guidance() {
+        // The stress-test audit's -32008 report: a lock-contention failure
+        // told the user to "Delete .leindex/ directory and retry" over a
+        // perfectly valid database whose only problem was a concurrent
+        // writer. The transient branch must advise retrying instead.
+        let inner = "Failed to open storage at /p/.leindex/leindex.db after 6 attempts \
+                     [transient:lock-contention]. Another leindex process is writing \
+                     the database; the data is intact — retry once it completes.";
+        let error = JsonRpcError::init_failed("/p", inner);
+        let message = error.message.clone();
+        assert!(message.contains("retry"), "message: {message}");
+        assert!(
+            !message.to_lowercase().contains("delete"),
+            "transient lock must not advise deletion: {message}"
+        );
+        let data = error.data.expect("transient branch carries data");
+        assert_eq!(
+            data.get("error_type"),
+            Some(&serde_json::json!("storage_locked"))
+        );
+        assert_eq!(data.get("retryable"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn test_init_failed_genuine_failure_keeps_remediation() {
+        let inner = "unable to open database file";
+        let error = JsonRpcError::init_failed("/p", inner);
+        assert!(error.message.contains("Remediation"));
+        assert!(error.message.contains("Delete .leindex/"));
+        let data = error.data.expect("data present");
+        assert_eq!(
+            data.get("error_type"),
+            Some(&serde_json::json!("init_failed"))
+        );
+        assert_eq!(data.get("retryable"), None);
     }
 
     #[test]

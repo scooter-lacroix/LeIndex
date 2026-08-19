@@ -1,6 +1,6 @@
 use super::helpers::{
-    extract_bool, extract_string, extract_usize, get_direct_callers, node_type_str,
-    read_source_snippet, resolve_scope, wrap_with_meta,
+    extract_bool, extract_string, extract_usize, get_direct_callees, get_direct_callers,
+    node_type_str, read_source_snippet_resolved, resolve_scope, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use super::request_meta::WorkBudget;
@@ -139,6 +139,26 @@ For the exact source implementation use LeIndex [Read Symbol]."
         }
 
         let pdg = guard.pdg().unwrap();
+        let project_root = guard.project_path().to_path_buf();
+
+        // Index-freshness context for honest degradation (N-15): a zero-impact
+        // result served from a stale index or a degraded graph must say so,
+        // not present "0 symbols / 0 files" as fact.
+        let storage_root = crate::cli::leindex::resolve_existing_storage_path(&project_root)
+            .unwrap_or_else(|| project_root.join(".leindex"));
+        let health = crate::cli::index_freshness::load_health(&storage_root);
+        let index_stale = super::helpers::is_index_genuinely_stale(&health, &project_root);
+        let index_freshness = match health.as_ref().map(|h| h.status) {
+            Some(crate::cli::leindex::ComponentStatus::Fresh) => "fresh",
+            Some(crate::cli::leindex::ComponentStatus::Stale) => "stale",
+            Some(crate::cli::leindex::ComponentStatus::Failed) => "failed",
+            Some(crate::cli::leindex::ComponentStatus::Partial) => "partial",
+            _ => "unknown",
+        };
+        let graph_has_call_edges = pdg.edge_indices().any(|edge| {
+            pdg.get_edge(edge)
+                .is_some_and(|e| e.edge_type == crate::graph::pdg::EdgeType::Call)
+        });
 
         // For batch mode, collect results for each symbol
         if symbols.len() > 1 {
@@ -151,6 +171,7 @@ For the exact source implementation use LeIndex [Read Symbol]."
                     pdg,
                     symbol,
                     &scope,
+                    &project_root,
                     include_source,
                     include_callers,
                     include_callees,
@@ -158,6 +179,9 @@ For the exact source implementation use LeIndex [Read Symbol]."
                     per_symbol_budget,
                     started,
                     budget,
+                    index_freshness,
+                    index_stale,
+                    graph_has_call_edges,
                 ) {
                     Ok(mut val) => {
                         add_retrieval_meta(&mut val, budget, started);
@@ -187,6 +211,7 @@ For the exact source implementation use LeIndex [Read Symbol]."
             pdg,
             &symbols[0],
             &scope,
+            &project_root,
             include_source,
             include_callers,
             include_callees,
@@ -194,6 +219,9 @@ For the exact source implementation use LeIndex [Read Symbol]."
             char_budget,
             started,
             budget,
+            index_freshness,
+            index_stale,
+            graph_has_call_edges,
         )?;
 
         let mut single = single;
@@ -203,11 +231,13 @@ For the exact source implementation use LeIndex [Read Symbol]."
 
     /// Resolve and return full structural context for a single symbol.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::fn_params_excessive_bools)]
     fn lookup_single_symbol(
         &self,
         pdg: &crate::graph::pdg::ProgramDependenceGraph,
         symbol: &str,
         scope: &Option<String>,
+        project_root: &std::path::Path,
         include_source: bool,
         include_callers: bool,
         include_callees: bool,
@@ -215,6 +245,9 @@ For the exact source implementation use LeIndex [Read Symbol]."
         char_budget: usize,
         started: Instant,
         budget: WorkBudget,
+        index_freshness: &'static str,
+        index_stale: bool,
+        graph_has_call_edges: bool,
     ) -> Result<Value, JsonRpcError> {
         let node_id = resolve_symbol_node(pdg, symbol, scope)?;
 
@@ -225,7 +258,7 @@ For the exact source implementation use LeIndex [Read Symbol]."
 
         // Callees (direct)
         let (callees, callees_truncated) = if include_callees && !partial {
-            summarize_nodes(pdg, pdg.neighbors(node_id))
+            summarize_nodes(pdg, get_direct_callees(pdg, node_id))
         } else {
             (Vec::new(), false)
         };
@@ -261,6 +294,9 @@ For the exact source implementation use LeIndex [Read Symbol]."
         });
 
         partial |= budget.elapsed(started);
+        let relations_empty = callers.is_empty() && callees.is_empty() && forward.is_empty();
+        let impact_note =
+            impact_degradation_note(relations_empty, index_stale, graph_has_call_edges, partial);
         let mut result = serde_json::json!({
             "symbol": node.name,
             "type": node_type_str(&node.node_type),
@@ -274,11 +310,17 @@ For the exact source implementation use LeIndex [Read Symbol]."
             "callees_truncated": callees_truncated,
             "impact_radius": impact_radius,
             "pdg_status": if partial { "partial" } else { "fresh" },
+            "index_freshness": index_freshness,
             "retrieval": retrieval_meta_with_partial(budget, partial)
         });
+        if let Some(note) = impact_note {
+            result["impact_note"] = Value::String(note.to_string());
+        }
 
         if include_source && !partial {
-            if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
+            if let Some(src) =
+                read_source_snippet_resolved(&node.file_path, node.byte_range, Some(project_root))
+            {
                 let truncated: String = src.chars().take(char_budget / 2).collect();
                 result["source"] = Value::String(truncated);
             }
@@ -286,6 +328,46 @@ For the exact source implementation use LeIndex [Read Symbol]."
 
         Ok(result)
     }
+}
+
+/// Honest-degradation note for empty lookup relations (N-15).
+///
+/// A zero-impact result is only a fact when the index is fresh AND the graph
+/// actually carries call edges. Otherwise "Impact: 0 symbols / 0 files" is a
+/// data-availability statement, and saying nothing silently misled callers
+/// (the stress-test audit found ground-truth call sites rendered as zero
+/// impact with no warning). Precedence: budget truncation > degraded graph >
+/// stale index.
+fn impact_degradation_note(
+    relations_empty: bool,
+    index_stale: bool,
+    graph_has_call_edges: bool,
+    partial: bool,
+) -> Option<&'static str> {
+    if !relations_empty {
+        return None;
+    }
+    if partial {
+        return Some(
+            "relations were skipped because the latency budget was exhausted \
+             (allow_partial); the zero impact figure is not authoritative — \
+             retry with a larger max_latency_ms",
+        );
+    }
+    if !graph_has_call_edges {
+        return Some(
+            "the loaded PDG has no call edges — the graph is degraded \
+             (incomplete or corrupted index); the zero impact figure reflects \
+             missing graph data, not isolation; re-index with force_reindex=true",
+        );
+    }
+    if index_stale {
+        return Some(
+            "the index is stale relative to the worktree; the zero impact \
+             figure may reflect missing data — re-index for authoritative impact",
+        );
+    }
+    None
 }
 
 fn resolve_symbol_node(
@@ -380,8 +462,12 @@ fn summarize_nodes(
     pdg: &crate::graph::pdg::ProgramDependenceGraph,
     node_ids: Vec<crate::graph::pdg::NodeId>,
 ) -> (Vec<Value>, bool) {
+    // Neighbors/predecessors yield one entry per edge; a related node with
+    // several edge types to the anchor must render once (N-01).
+    let mut seen = std::collections::HashSet::new();
     let capped_nodes: Vec<Value> = node_ids
         .into_iter()
+        .filter(|node_id| seen.insert(*node_id))
         .filter_map(|node_id| {
             pdg.get_node(node_id).map(|node| {
                 serde_json::json!({
@@ -400,10 +486,19 @@ fn summarize_nodes(
 fn parse_symbols(args: &Value) -> Result<Vec<String>, JsonRpcError> {
     // Determine symbol list: single "symbol" or batch "symbols"
     let symbols = if let Some(arr) = args.get("symbols").and_then(|v| v.as_array()) {
+        // The schema documents maxItems: 20 — enforce it with a clear error
+        // instead of silently dropping the tail (a caller batching 21
+        // symbols previously got 20 results with no indication anything was
+        // truncated).
+        if arr.len() > 20 {
+            return Err(JsonRpcError::invalid_params(format!(
+                "'symbols' accepts at most 20 entries; got {}. Split into multiple calls.",
+                arr.len()
+            )));
+        }
         arr.iter()
             .filter_map(|v| v.as_str().map(str::to_owned))
             .filter(|s| !s.trim().is_empty())
-            .take(20)
             .collect()
     } else if let Ok(sym) = extract_string(args, "symbol") {
         if sym.trim().is_empty() {
@@ -470,6 +565,36 @@ mod tests {
         let props = schema.get("properties").unwrap();
         assert!(props.get("symbol").is_some());
         assert!(props.get("symbols").is_some());
+    }
+
+    #[test]
+    fn test_impact_note_absent_when_relations_present() {
+        assert!(impact_degradation_note(false, true, false, false).is_none());
+    }
+
+    #[test]
+    fn test_impact_note_absent_when_index_fresh_and_graph_sound() {
+        // Zero relations with a fresh index and a live call graph are a fact,
+        // not degradation.
+        assert!(impact_degradation_note(true, false, true, false).is_none());
+    }
+
+    #[test]
+    fn test_impact_note_flags_degraded_graph_before_staleness() {
+        let note = impact_degradation_note(true, true, false, false).unwrap();
+        assert!(note.contains("no call edges"), "note: {note}");
+    }
+
+    #[test]
+    fn test_impact_note_flags_stale_index() {
+        let note = impact_degradation_note(true, true, true, false).unwrap();
+        assert!(note.contains("stale"), "note: {note}");
+    }
+
+    #[test]
+    fn test_impact_note_flags_budget_truncation_first() {
+        let note = impact_degradation_note(true, true, false, true).unwrap();
+        assert!(note.contains("latency budget"), "note: {note}");
     }
 
     #[tokio::test]

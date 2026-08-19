@@ -60,6 +60,11 @@ fn string_array(args: &Value, name: &str) -> Vec<String> {
 
 fn parse_text_search_params(args: &Value) -> Result<TextSearchParams, JsonRpcError> {
     let query = extract_string(args, "query")?;
+    if query.trim().is_empty() {
+        return Err(JsonRpcError::invalid_params(
+            "'query' must be a non-empty string",
+        ));
+    }
     let is_regex = extract_bool(args, "is_regex", false);
     let case_sensitive = extract_bool(args, "case_sensitive", false);
     let regex = if is_regex {
@@ -520,6 +525,24 @@ mod tests {
     use super::*;
     use crate::cli::mcp::helpers::test_registry_for;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_text_search_rejects_empty_query() {
+        let directory = tempdir().unwrap();
+        let registry = test_registry_for(directory.path());
+        for empty in ["", "   "] {
+            let result = TextSearchHandler
+                .execute(&registry, serde_json::json!({ "query": empty }))
+                .await;
+            assert!(result.is_err(), "empty query must be rejected");
+            let err = result.unwrap_err();
+            assert!(
+                err.message.contains("non-empty"),
+                "expected non-empty rejection, got: {}",
+                err.message
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_text_search_live_result_shape_and_pagination() {
