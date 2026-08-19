@@ -126,6 +126,18 @@ pub(super) fn progress_stderr(msg: &str) {
     }
 }
 
+/// Cumulative (hits, misses) of the client-side embed cache for this
+/// process — surfaces cache effectiveness in neural-phase progress lines.
+#[cfg(feature = "onnx")]
+pub(super) fn neural_cache_counters() -> (u64, u64) {
+    crate::search::onnx::embed_cache_frontend::counters()
+}
+
+#[cfg(not(feature = "onnx"))]
+pub(super) fn neural_cache_counters() -> (u64, u64) {
+    (0, 0)
+}
+
 /// Clear the progress line on stderr (when terminal).
 pub(super) fn progress_clear() {
     use std::io::{IsTerminal, Write};

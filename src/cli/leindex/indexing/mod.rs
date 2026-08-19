@@ -1826,17 +1826,30 @@ impl LeIndex {
                     .pdg
                     .as_ref()
                     .context("PDG is resident before neural enrichment")?;
+                progress_stderr(&format!(
+                    "Indexing: neural embedding {} admitted nodes (content cache may skip most)...",
+                    state.admitted_node_ids.len()
+                ));
+                let (cache_hits_before, _) = neural_cache_counters();
                 let rows = index_builder::enrich_neural_embeddings(
                     pdg,
                     neural_embedder,
                     &state.admitted_node_ids,
                     &state.enriched_content_cache,
                 );
+                let (cache_hits_after, cache_misses) = neural_cache_counters();
+                progress_stderr(&format!(
+                    "Indexing: neural done — {} rows ({} from embed cache, {} embedded)...",
+                    rows.len(),
+                    cache_hits_after - cache_hits_before,
+                    cache_misses
+                ));
                 neural_rows = self.search_engine.update_neural_embeddings(rows);
             }
         }
         self.persist_neural_mmap(neural_resume_loaded, neural_rows)?;
         self.persist_neural_snapshot(&state, neural_rows, neural_embedder)?;
+        progress_stderr("Indexing: publishing enhanced generation...");
         let neural_checkpoint = NeuralCheckpoint {
             lexical_hash,
             mmap_path: self.project_path.join(".leindex/neural_embeddings.bin"),
