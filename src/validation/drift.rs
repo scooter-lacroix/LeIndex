@@ -1,6 +1,6 @@
 //! Semantic drift detection for signature changes and API breakage
 
-use crate::edit::ResolvedEditChange;
+use crate::edit::{EditType, ResolvedEditChange};
 use crate::graph::ProgramDependenceGraph;
 use crate::graph::pdg::NodeType;
 use crate::parse::traits::{CodeIntelligence, SignatureInfo};
@@ -22,6 +22,11 @@ pub enum DriftType {
     Removed,
     /// Symbol was added
     Added,
+    /// Symbol was renamed (old name removed, new name added, body
+    /// otherwise structurally identical). Informational: a rename edit is
+    /// remove+add by name *by definition*, so paired removal/addition under
+    /// an `EditType::Rename` is the expected outcome, not drift.
+    Renamed,
 }
 
 /// A semantic drift item
@@ -112,6 +117,16 @@ impl DriftItem {
             impact_description: format!("New symbol '{}' added", symbol_name),
             symbol_name,
             drift_type: DriftType::Added,
+            location,
+        }
+    }
+
+    /// Informational drift item for a paired rename (no error).
+    pub fn renamed(old_name: String, new_name: String, location: Location) -> Self {
+        Self {
+            impact_description: format!("Symbol '{}' renamed to '{}'", old_name, new_name),
+            symbol_name: new_name,
+            drift_type: DriftType::Renamed,
             location,
         }
     }
@@ -285,22 +300,62 @@ impl SemanticDriftAnalyzer {
 
         let new_map: HashMap<_, _> = new.iter().map(|sig| (&sig.name, sig)).collect();
 
-        // Check for removed symbols
-        for name in original_map.keys() {
-            if !new_map.contains_key(name) {
-                // Find location in original content
-                let location =
-                    self.find_signature_location(change, original_map.get(name).unwrap());
-                drift_items.push(DriftItem::removed(name.to_string(), location));
+        // Collect removals and additions by name.
+        let mut removed: Vec<(&String, &SignatureInfo)> = original_map
+            .keys()
+            .filter(|name| !new_map.contains_key(*name))
+            .map(|name| (*name, *original_map.get(*name).unwrap()))
+            .collect();
+        let mut added: Vec<(&String, &SignatureInfo)> = new_map
+            .keys()
+            .filter(|name| !original_map.contains_key(*name))
+            .map(|name| (*name, *new_map.get(*name).unwrap()))
+            .collect();
+
+        // A rename edit is remove+add by name BY DEFINITION: before this
+        // pairing, every `EditType::Rename` change produced a Removed(old)
+        // + Added(new) pair, `has_errors()` classified the removal as an
+        // error, and the rename tool hard-rejected its own output — apply
+        // mode could never succeed. Under a rename edit, pair each removal
+        // with a structurally identical addition (same parameter count,
+        // return type, and method flag — i.e. the same symbol under a new
+        // name) and report the pair as informational `Renamed`. Only
+        // unpaired removals/additions remain as drift errors.
+        if change.edit_type == EditType::Rename {
+            let mut unpaired_removals: Vec<(&String, &SignatureInfo)> = Vec::new();
+            for (old_name, old_sig) in removed.drain(..) {
+                let pair_index = added.iter().position(|(_, new_sig)| {
+                    new_sig.parameters.len() == old_sig.parameters.len()
+                        && new_sig.return_type == old_sig.return_type
+                        && new_sig.is_method == old_sig.is_method
+                });
+                match pair_index {
+                    Some(idx) => {
+                        let (new_name, new_sig) = added.remove(idx);
+                        let location = self.find_signature_location(change, new_sig);
+                        drift_items.push(DriftItem::renamed(
+                            old_name.to_string(),
+                            new_name.to_string(),
+                            location,
+                        ));
+                    }
+                    None => unpaired_removals.push((old_name, old_sig)),
+                }
             }
+            // Anything still unpaired below keeps the legacy error semantics.
+            removed = unpaired_removals;
+        }
+
+        // Check for removed symbols
+        for (name, sig) in removed {
+            let location = self.find_signature_location(change, sig);
+            drift_items.push(DriftItem::removed(name.to_string(), location));
         }
 
         // Check for added symbols
-        for name in new_map.keys() {
-            if !original_map.contains_key(name) {
-                let location = self.find_signature_location(change, new_map.get(name).unwrap());
-                drift_items.push(DriftItem::added(name.to_string(), location));
-            }
+        for (name, sig) in added {
+            let location = self.find_signature_location(change, sig);
+            drift_items.push(DriftItem::added(name.to_string(), location));
         }
 
         // Check for modified symbols
@@ -570,5 +625,91 @@ mod tests {
         let location = analyzer.find_signature_location(&change, &sig);
         assert_eq!(location.line, 1);
         assert_eq!(location.column, 1);
+    }
+}
+
+#[cfg(test)]
+mod rename_pairing_tests {
+    use super::*;
+    use crate::edit::{EditType, ResolvedEditChange};
+    use std::path::PathBuf;
+
+    fn analyzer() -> SemanticDriftAnalyzer {
+        SemanticDriftAnalyzer::new(std::sync::Arc::new(ProgramDependenceGraph::new()))
+    }
+
+    fn rename_change(original: &str, new: &str) -> ResolvedEditChange {
+        ResolvedEditChange::new(
+            PathBuf::from("fixture.rs"),
+            original.to_string(),
+            new.to_string(),
+        )
+        .with_edit_type(EditType::Rename)
+    }
+
+    #[test]
+    fn test_rename_pairs_removed_and_added_instead_of_erroring() {
+        // N-00 regression: a rename edit is remove+add by name by
+        // definition. Before the pairing fix, this produced Removed(old) +
+        // Added(new), `has_errors()` classified the removal as an error, and
+        // rename-symbol apply mode hard-rejected every rename.
+        let original = "pub fn stress_alpha(x: u32) -> u32 {\n    x + 1\n}\n";
+        let new = "pub fn stress_alpha_prime(x: u32) -> u32 {\n    x + 1\n}\n";
+        let items = analyzer()
+            .analyze_semantic_drift(&[rename_change(original, new)])
+            .unwrap();
+
+        assert!(
+            items
+                .iter()
+                .any(|item| item.drift_type == DriftType::Renamed),
+            "a structurally identical rename must be reported as Renamed, got {:?}",
+            items.iter().map(|i| &i.drift_type).collect::<Vec<_>>()
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.drift_type == DriftType::Removed),
+            "paired removal must not surface as a Removed drift error"
+        );
+    }
+
+    #[test]
+    fn test_rename_with_structural_change_still_errors() {
+        // A rename that ALSO changes the signature (extra parameter) is a
+        // rename + signature change; the pairing must refuse to pair it and
+        // keep the legacy Removed error so callers cannot silently change
+        // signatures under the rename flag.
+        let original = "pub fn stress_alpha(x: u32) -> u32 {\n    x + 1\n}\n";
+        let new = "pub fn stress_alpha_prime(x: u32, y: u32) -> u32 {\n    x + y\n}\n";
+        let items = analyzer()
+            .analyze_semantic_drift(&[rename_change(original, new)])
+            .unwrap();
+
+        assert!(
+            items
+                .iter()
+                .any(|item| item.drift_type == DriftType::Removed),
+            "an unpaired removal must keep the legacy error semantics"
+        );
+    }
+
+    #[test]
+    fn test_replace_edit_still_reports_removals() {
+        // Non-rename edits must be completely unaffected.
+        let original = "pub fn stress_alpha(x: u32) -> u32 {\n    x + 1\n}\n";
+        let new = "pub fn something_else(x: u32) -> u32 {\n    x + 1\n}\n";
+        let change = ResolvedEditChange::new(
+            PathBuf::from("fixture.rs"),
+            original.to_string(),
+            new.to_string(),
+        );
+        let items = analyzer().analyze_semantic_drift(&[change]).unwrap();
+
+        assert!(
+            items
+                .iter()
+                .any(|item| item.drift_type == DriftType::Removed)
+        );
     }
 }
