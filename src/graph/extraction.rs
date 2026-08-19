@@ -43,6 +43,25 @@ pub fn extract_pdg_from_signatures(
 
     // Phase 1a: Create function/method nodes
     for sig in &signatures {
+        // Import-marker signatures (`return_type == "use"`) exist so callers
+        // can discover a file's imports from the parser API; they are NOT
+        // code symbols. Creating PDG nodes for them indexed every `use`
+        // path segment as a searchable "function" — `Arc`, `Lazy`, `*` and
+        // bare module names — polluting search ranking, grep output, and
+        // git-status enrichment. They carry no calls, parameters, or
+        // imports, so no edge phase references their node ids; skipping
+        // them here is safe and simply never materializes the noise.
+        if sig.return_type.as_deref() == Some("use") {
+            continue;
+        }
+        // Defensive name guard: a symbol with a blank or glob-star name is
+        // never a navigable definition (observed from macro-generated and
+        // re-export extractions across parsers); indexing it produces
+        // blank bullets in enrichment output and unaddressable nodes.
+        let trimmed_name = sig.name.trim();
+        if trimmed_name.is_empty() || trimmed_name == "*" {
+            continue;
+        }
         let mut node = signature_to_node(sig, file_path, language);
         if duplicate_qnames.contains(sig.qualified_name.as_str()) {
             node.id = format!(
@@ -81,9 +100,28 @@ pub fn extract_pdg_from_signatures(
     let inheritance = extract_inheritance_edges(&signatures, &node_ids);
     pdg.add_inheritance_edges(inheritance);
 
-    // Phase 4: Explicit call edges from parser
-    let call_edges = extract_call_edges_for_nodes(&signatures, &local_node_ids);
+    // Phase 4: Explicit call edges from parser, plus one shared External
+    // node per distinct std/external call target so relationship renders can
+    // show `String.truncate [external]` instead of guessing a project
+    // namesake (N-03).
+    let (call_edges, external_calls) =
+        extract_call_edges_and_externals(&signatures, &local_node_ids);
     pdg.add_call_edges(call_edges);
+    for (caller_id, external_target) in external_calls {
+        let external_id = format!("external::{}", external_target);
+        let target_id = pdg.find_by_id(&external_id).unwrap_or_else(|| {
+            pdg.add_node(Node {
+                id: external_id,
+                node_type: NodeType::External,
+                name: external_target,
+                file_path: std::sync::Arc::from(file_path),
+                byte_range: (0, 0),
+                complexity: 0,
+                language: "external".to_string(),
+            })
+        });
+        pdg.add_call_edges(vec![(caller_id, target_id)]);
+    }
 
     // Phase 4b: source-level value/state/command channels. These edges are
     // intentionally bounded and additive; ordinary call extraction remains
@@ -1019,19 +1057,34 @@ fn local_call_targets(
         let normalized = normalize_symbol(candidate);
         let segments: Vec<&str> = normalized.split('.').filter(|s| !s.is_empty()).collect();
 
+        // Exact qualified-name matches are always trusted (multiple ids can
+        // legitimately exist for the same qualified name across files).
         if let Some(ids) = exact_map.get(&normalized) {
             targets.extend(ids);
         }
+        // Fuzzy fallbacks (bare last segment, 2-3 segment suffix) resolve to
+        // a project namesake in ANOTHER file. When the same short name is
+        // defined in several files — the common case for utility names like
+        // `truncate` — linking the call to ALL of them merged every
+        // namesake's relationships into one conflation blob (N-04), and a
+        // std/external call (`String::truncate`) linked to whichever
+        // project namesake shared the method name (N-03). These fallbacks
+        // now only fire when the name is UNAMBIGUOUS project-wide; an
+        // ambiguous short name resolves to none of the namesakes.
         if let Some(last) = segments.last() {
             if let Some(ids) = last_map.get(*last) {
-                targets.extend(ids);
+                if ids.len() == 1 {
+                    targets.extend(ids);
+                }
             }
         }
         for len in 2..=3_usize.min(segments.len()) {
             let start = segments.len() - len;
             let suffix = segments[start..].join(".");
             if let Some(ids) = suffix_map.get(&suffix) {
-                targets.extend(ids);
+                if ids.len() == 1 {
+                    targets.extend(ids);
+                }
             }
         }
     }
@@ -1039,6 +1092,38 @@ fn local_call_targets(
     targets.sort_unstable();
     targets.dedup();
     targets
+}
+
+/// Call targets that are standard-library/external and must never resolve to
+/// project namesakes (N-03): explicit `std`/`core`/`alloc` namespaces plus
+/// the common Rust prelude/container types whose methods (`String::truncate`,
+/// `Vec::push`, `Option::unwrap`, …) routinely collide with short project
+/// symbol names.
+fn is_external_call_target(call_target: &str) -> bool {
+    let normalized = normalize_symbol(call_target);
+    let first = normalized.split('.').next().unwrap_or("");
+    matches!(
+        first,
+        "std"
+            | "core"
+            | "alloc"
+            | "String"
+            | "str"
+            | "Vec"
+            | "Option"
+            | "Result"
+            | "Box"
+            | "Arc"
+            | "Rc"
+            | "Cell"
+            | "RefCell"
+            | "HashMap"
+            | "BTreeMap"
+            | "HashSet"
+            | "BTreeSet"
+    ) || call_target.starts_with("std::")
+        || call_target.starts_with("core::")
+        || call_target.starts_with("alloc::")
 }
 
 fn type_node_target(
@@ -1095,8 +1180,27 @@ fn extract_call_edges_for_nodes(
     signatures: &[SignatureInfo],
     node_ids: &LocalNodeIds,
 ) -> Vec<(crate::graph::pdg::NodeId, crate::graph::pdg::NodeId)> {
+    extract_call_edges_and_externals(signatures, node_ids).0
+}
+
+/// Extract call edges plus the set of distinct external call targets made by
+/// each caller. External targets (`String::truncate`, `Vec::push`, …) are
+/// deliberately NOT resolved to project symbols (N-03); the caller links
+/// them to one shared External node per distinct target so relationship
+/// renders can show `String.truncate [external]` instead of guessing a
+/// project namesake (N-03/N-04).
+#[allow(clippy::type_complexity)]
+fn extract_call_edges_and_externals(
+    signatures: &[SignatureInfo],
+    node_ids: &LocalNodeIds,
+) -> (
+    Vec<(crate::graph::pdg::NodeId, crate::graph::pdg::NodeId)>,
+    Vec<(crate::graph::pdg::NodeId, String)>,
+) {
     let mut edges = Vec::new();
+    let mut external_calls = Vec::new();
     let mut seen = HashSet::new();
+    let mut seen_external = HashSet::new();
     let mut exact_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::new();
     let mut last_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::new();
     let mut suffix_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::new();
@@ -1129,6 +1233,15 @@ fn extract_call_edges_for_nodes(
 
         for &caller_id in caller_ids {
             for call_target in &signature.calls {
+                if is_external_call_target(call_target) {
+                    // External call: record one marker per distinct target
+                    // for this caller; never resolve it into project nodes.
+                    let normalized = normalize_symbol(call_target);
+                    if seen_external.insert((caller_id, normalized.clone())) {
+                        external_calls.push((caller_id, normalized));
+                    }
+                    continue;
+                }
                 let candidates =
                     ordered_resolution_candidates(call_target, &alias_map, caller_ns.as_deref());
 
@@ -1148,7 +1261,7 @@ fn extract_call_edges_for_nodes(
         }
     }
 
-    edges
+    (edges, external_calls)
 }
 
 fn add_local_flow_fact_edge(

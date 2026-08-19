@@ -1133,6 +1133,33 @@ impl ProgramDependenceGraph {
             .collect()
     }
 
+    /// Nodes reached from `node_id` through edges of a specific type in the
+    /// given direction, deduplicated.
+    ///
+    /// "Callers"/"callees" semantics: relationship renders must report CALL
+    /// edges, not every edge type — data-flow heuristics (every function
+    /// taking/returning `String` connected to every other) and containment
+    /// (an impl block "calling" its own methods) previously leaked into
+    /// caller lists, conflating unrelated same-typed symbols (N-04).
+    pub fn neighbors_by_edge_type(
+        &self,
+        node_id: NodeId,
+        edge_type: EdgeType,
+        direction: petgraph::Direction,
+    ) -> Vec<NodeId> {
+        use petgraph::visit::EdgeRef;
+        let mut seen = std::collections::HashSet::new();
+        self.graph
+            .edges_directed(node_id, direction)
+            .filter(|edge| edge.weight().edge_type == edge_type)
+            .map(|edge| match direction {
+                petgraph::Direction::Outgoing => edge.target(),
+                petgraph::Direction::Incoming => edge.source(),
+            })
+            .filter(|id| seen.insert(*id))
+            .collect()
+    }
+
     /// Returns the count of incoming predecessor nodes.
     ///
     /// # Arguments

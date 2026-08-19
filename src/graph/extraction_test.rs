@@ -1128,3 +1128,74 @@ fn qualified_name_from_node_rejects_different_path_suffixes() {
 
     assert_eq!(qualified_name_from_node(&node), None);
 }
+
+/// N-03: std/external call targets (`String::truncate` and friends) must
+/// never resolve to a project namesake — the link goes to one shared
+/// External marker node instead.
+#[test]
+fn external_call_target_never_resolves_to_project_namesake() {
+    let mut caller = sig("redact", "redact", false);
+    caller.calls = vec!["String::truncate".to_string()];
+    let namesake = sig("truncate", "truncate", false);
+    let signatures = vec![caller, namesake];
+
+    let pdg = extract_pdg_from_signatures(signatures, b"fn redact() { }", "obs.rs", "rust");
+    let caller_id = pdg.find_by_name("redact").unwrap();
+    let namesake_id = pdg.find_by_name("truncate").unwrap();
+
+    let callee_ids: Vec<_> = pdg.neighbors(caller_id);
+    assert!(
+        !callee_ids.contains(&namesake_id),
+        "String::truncate must not link to the project truncate namesake"
+    );
+    // ...and the marker node exists, typed External.
+    let marker = pdg
+        .find_by_id("external::String.truncate")
+        .expect("external marker node must exist");
+    let node = pdg.get_node(marker).unwrap();
+    assert!(matches!(
+        node.node_type,
+        crate::graph::pdg::NodeType::External
+    ));
+}
+
+/// N-04: a bare short-name call resolves to a project symbol only when the
+/// name is UNAMBIGUOUS project-wide; multiple same-named definitions
+/// resolve to none of them (previously: to ALL of them, conflating
+/// unrelated symbols into one relationship blob).
+#[test]
+fn ambiguous_short_name_resolves_to_none() {
+    let mut caller = sig("driver", "driver", false);
+    caller.calls = vec!["helper".to_string()];
+    let signatures = vec![
+        caller,
+        sig("helper", "moda::helper", false),
+        sig("helper", "modb::helper", false),
+    ];
+
+    let pdg = extract_pdg_from_signatures(signatures, b"fn driver() {}", "drv.rs", "rust");
+    let caller_id = pdg.find_by_name("driver").unwrap();
+    let callee_ids: Vec<_> = pdg.neighbors(caller_id);
+    assert!(
+        callee_ids.is_empty(),
+        "ambiguous short name must not link to any namesake, got {:?}",
+        callee_ids.len()
+    );
+}
+
+/// Unambiguous short names keep resolving (same-file/local helper calls).
+#[test]
+fn unambiguous_short_name_still_resolves() {
+    let mut caller = sig("driver", "driver", false);
+    caller.calls = vec!["helper".to_string()];
+    let signatures = vec![caller, sig("helper", "helper", false)];
+
+    let pdg = extract_pdg_from_signatures(signatures, b"fn driver() {}", "drv.rs", "rust");
+    let caller_id = pdg.find_by_name("driver").unwrap();
+    let callee_ids: Vec<_> = pdg.neighbors(caller_id);
+    assert_eq!(
+        callee_ids.len(),
+        1,
+        "unique short name resolves to its symbol"
+    );
+}
