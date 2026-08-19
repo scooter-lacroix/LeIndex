@@ -834,15 +834,18 @@ async fn cmd_index_impl(
     // (VAL-INDEX-005). If not indexed at all, fall through to full index.
 
     let max_memory_bytes = max_memory.map(|mb| mb * 1024 * 1024);
+    let index_started = std::time::Instant::now();
     let stats = tokio::task::spawn_blocking(move || {
         let result = leindex.index_project_with_memory_cap(force, max_memory_bytes);
-        // Force-shutdown any persistent ONNX daemon spawned during indexing.
-        // CLI commands are short-lived: the daemon has no reason to persist
-        // beyond the process lifetime. Without this, the daemon survives as
-        // an orphan, living until its idle timeout (up to 10 minutes).
-        // This runs regardless of success or failure to ensure cleanup in
-        // all exit paths.
-        leindex.shutdown_daemon();
+        // Keep the embed daemon WARM after indexing by default: the next
+        // index or search in the same working burst reuses the loaded model
+        // instead of paying a ~26 s cold start. The daemon still exits on its
+        // own idle timeout, and the worker's RSS cap bounds its residency.
+        // Set LEINDEX_CLI_SHUTDOWN_DAEMON=1 to restore the old
+        // shutdown-after-run behavior.
+        if std::env::var_os("LEINDEX_CLI_SHUTDOWN_DAEMON").is_some() {
+            leindex.shutdown_daemon();
+        }
         result
     })
     .await
@@ -851,6 +854,11 @@ async fn cmd_index_impl(
 
     // Print results
     println!("\n✓ Indexing complete!");
+    println!(
+        "  Wall time: {}s (core pipeline: {}ms; the remainder is neural embedding and publication)",
+        index_started.elapsed().as_secs_f32(),
+        stats.indexing_time_ms
+    );
     println!("  Files parsed: {}", stats.files_parsed);
     println!("  Successful: {}", stats.successful_parses);
     println!("  Failed: {}", stats.failed_parses);
@@ -898,8 +906,11 @@ async fn cmd_search_impl(
         .search(&query, top_k, None)
         .context("Search failed")?;
 
-    // Force-shutdown any persistent ONNX daemon spawned during search.
-    leindex.shutdown_daemon();
+    // Keep the embed daemon warm for follow-up calls (same policy as index:
+    // LEINDEX_CLI_SHUTDOWN_DAEMON=1 restores shutdown-after-run).
+    if std::env::var_os("LEINDEX_CLI_SHUTDOWN_DAEMON").is_some() {
+        leindex.shutdown_daemon();
+    }
 
     if results.is_empty() {
         println!("No results found for: {}", query);
@@ -967,8 +978,11 @@ async fn cmd_analyze_impl(
         .analyze(&query, token_budget)
         .context("Analysis failed")?;
 
-    // Force-shutdown any persistent ONNX daemon spawned during analysis.
-    leindex.shutdown_daemon();
+    // Keep the embed daemon warm for follow-up calls (same policy as index:
+    // LEINDEX_CLI_SHUTDOWN_DAEMON=1 restores shutdown-after-run).
+    if std::env::var_os("LEINDEX_CLI_SHUTDOWN_DAEMON").is_some() {
+        leindex.shutdown_daemon();
+    }
 
     // Print results with nice formatting
     let output = format_analysis_output(&query, &result);

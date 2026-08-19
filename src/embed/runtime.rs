@@ -61,14 +61,14 @@ pub const READ_BUF_CAPACITY: usize = 128 * 1024;
 #[cfg(feature = "onnx")]
 const COLLAPSED_BATCH_SENTINEL: &str = "__COLLAPSED_BATCH__";
 
+use crate::embed::runtime_env::{
+    DEFAULT_MAX_RSS_MB, DEFAULT_MIN_AVAILABLE_MB, MIGRAPHX_EXHAUSTIVE_TUNE_ENV, MIGRAPHX_FP16_ENV,
+    MIGRAPHX_MODEL_CACHE_PATH_ENV, ONNX_LOG_SHAPES_ENV, build_position_ids, default_ort_threads,
+    env_flag, mem_available_kib, process_rss_kib, prune_migraphx_cache, unix_now_ms,
+};
 pub use crate::embed::runtime_env::{
     DEFAULT_MAX_SEQ_LEN, DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE,
     configured_onnx_inference_batch_size, configured_onnx_sequence_len,
-};
-use crate::embed::runtime_env::{
-    DEFAULT_MIN_AVAILABLE_MB, MIGRAPHX_EXHAUSTIVE_TUNE_ENV, MIGRAPHX_FP16_ENV,
-    MIGRAPHX_MODEL_CACHE_PATH_ENV, ONNX_LOG_SHAPES_ENV, build_position_ids, default_ort_threads,
-    env_flag, mem_available_kib, process_rss_kib, prune_migraphx_cache, unix_now_ms,
 };
 
 #[cfg(feature = "onnx")]
@@ -101,16 +101,71 @@ fn extract_output_tensor_f32(value: &ort::value::DynValue) -> Result<Vec<f32>, S
 /// has less `MemAvailable` than that, return the refusal reason so the caller
 /// can abort BEFORE loading the (multi-GiB) ONNX model. `None` when unset or
 /// when `MemAvailable` cannot be determined (no-op, documented).
+///
+/// RAM safety: the floor is checked against MemAvailable MINUS the resident
+/// memory of any sibling `leindex-embed` processes. The stress-test OOM had
+/// two workers each passing the floor alone while jointly exhausting the
+/// cgroup — the second model load must price in the first.
 pub(crate) fn low_memory_refusal(config: &RuntimeConfig) -> Option<String> {
     let min_mb = config.min_available_mb?;
     let available_kib = mem_available_kib()?;
-    (available_kib < min_mb.saturating_mul(1024)).then(|| {
+    let siblings_kib = sibling_embed_workers_rss_kib().unwrap_or(0);
+    (available_kib.saturating_sub(siblings_kib) < min_mb.saturating_mul(1024)).then(|| {
         format!(
-            "system MemAvailable is {} KiB, below LEINDEX_WORKER_MIN_AVAILABLE_MB={} MB; \
-             refusing to load the ONNX model (memory-pressure T6)",
-            available_kib, min_mb
+            "system MemAvailable is {} KiB ({} KiB already held by other leindex-embed \
+             workers), below LEINDEX_WORKER_MIN_AVAILABLE_MB={} MB; refusing to load \
+             the ONNX model (memory-pressure T6)",
+            available_kib, siblings_kib, min_mb
         )
     })
+}
+
+/// Sum of resident memory (KiB) of OTHER `leindex-embed` processes. Best
+/// effort: unreadable entries are skipped; non-Linux returns `None`.
+#[cfg(target_os = "linux")]
+fn sibling_embed_workers_rss_kib() -> Option<u64> {
+    let self_pid = std::process::id();
+    let mut total = 0u64;
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !comm.starts_with("leindex-embed") {
+            continue;
+        }
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue;
+        };
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kib = rest
+                    .trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(0);
+                total += kib;
+                break;
+            }
+        }
+    }
+    Some(total)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sibling_embed_workers_rss_kib() -> Option<u64> {
+    None
 }
 
 /// WS10 Task 7: Sample GPU VRAM usage in MiB.
@@ -324,10 +379,26 @@ impl RuntimeConfig {
         // floor defaults to the documented 2048 MiB so the guard is active even
         // when the env var is unset — an unset variable must not silently
         // bypass the refusal (Codex P1).
-        let max_rss_mb = std::env::var("LEINDEX_WORKER_MAX_RSS_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&v| v > 0);
+        let max_rss_mb = match std::env::var("LEINDEX_WORKER_MAX_RSS_MB") {
+            Ok(v) => match v.trim().parse::<u64>() {
+                Ok(0) => None,
+                Ok(n) => Some(n),
+                Err(_) => {
+                    tracing::warn!(
+                        value = %v,
+                        "malformed LEINDEX_WORKER_MAX_RSS_MB; falling back to \
+                         {} MiB (memory-pressure T6)",
+                        DEFAULT_MAX_RSS_MB
+                    );
+                    Some(DEFAULT_MAX_RSS_MB)
+                }
+            },
+            // Default 8192 MiB: the stress-test OOM post-mortem found two
+            // concurrently-resident embed daemons (total_vm ~15 GiB each)
+            // pushing a shared cgroup past its limits. An unset variable
+            // must not mean "unbounded"; `0` disables.
+            Err(_) => Some(DEFAULT_MAX_RSS_MB),
+        };
         let min_available_mb = match std::env::var("LEINDEX_WORKER_MIN_AVAILABLE_MB") {
             Ok(v) => match v.trim().parse::<u64>() {
                 Ok(0) => None,

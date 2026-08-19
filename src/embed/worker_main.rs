@@ -189,7 +189,12 @@ pub fn run() -> ! {
     // Build runtime config from environment
     let mut config = RuntimeConfig::from_env();
     if socket_path.is_some() {
-        config.idle_timeout = Duration::from_secs(600);
+        // Socket daemons hold a multi-GiB model resident for FOLLOW-UP calls
+        // in the same working burst (index → search). 180 s covers that burst
+        // while freeing the memory promptly afterwards; the previous 600 s
+        // retention was a direct contributor to the stress-test OOM (two
+        // idle daemons stacking ~15 GiB total_vm in a shared cgroup).
+        config.idle_timeout = Duration::from_secs(180);
     }
 
     // T6: refuse to load the (multi-GiB) ONNX model when the system is below

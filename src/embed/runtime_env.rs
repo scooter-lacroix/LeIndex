@@ -51,6 +51,14 @@ pub(crate) const MIGRAPHX_MODEL_CACHE_PATH_ENV: &str = "ORT_MIGRAPHX_MODEL_CACHE
 /// active in the default configuration (Codex P1).
 pub const DEFAULT_MIN_AVAILABLE_MB: u64 = 2048;
 
+/// Documented default for `LEINDEX_WORKER_MAX_RSS_MB`: the worker self-exits
+/// when its resident set exceeds this, so the parent respawns a lean worker
+/// instead of compounding swap pressure. Sized above the measured active
+/// working set of the sfr-embedding-code-400m MIGraphX stack — 8.06 GiB peak
+/// during b8/s128 inference (a lower 8 GiB cap killed the worker mid-run) —
+/// with headroom; `0` disables the cap entirely.
+pub const DEFAULT_MAX_RSS_MB: u64 = 10240;
+
 #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
 pub fn configured_onnx_inference_batch_size(model_name: &str, provider: &str) -> usize {
     std::env::var(ONNX_INFERENCE_BATCH_SIZE_ENV)

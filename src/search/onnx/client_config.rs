@@ -456,6 +456,85 @@ pub(super) fn cleanup_daemon_paths(socket_path: &Path) {
     let _ = std::fs::remove_file(socket_path.with_extension("status"));
     let _ = std::fs::remove_file(socket_path.with_extension("pid"));
     let _ = std::fs::remove_file(socket_path.with_extension("start"));
+    // Advisory spawn locks outlive crashed daemons; two stale ones were left
+    // on the stress-test box from the pre-cleanup era. Harmless (flock-based)
+    // but they accumulate — remove them with the rest of the artifact set.
+    let _ = std::fs::remove_file(socket_path.with_extension("lock"));
+}
+
+/// Single-daemon enforcement: terminate live embed daemons whose descriptor
+/// differs from `keep_socket` (the daemon this client is about to spawn).
+///
+/// The daemon socket is keyed by (version, provider, model, batch, seq), so
+/// a config change leaves the PREVIOUS daemon resident until its idle
+/// timeout — the stress-test OOM post-mortem measured two concurrent
+/// daemons at total_vm ~15 GiB each inside one Maestro cgroup. Newest
+/// config wins. Opt out with `LEINDEX_ALLOW_MULTIPLE_EMBED_DAEMONS=1`
+/// (multi-model setups).
+///
+/// Only pid files whose process still exists AND still looks like an embed
+/// worker are signalled; stale artifacts are cleaned.
+#[cfg(unix)]
+pub(crate) fn terminate_superseded_daemons(keep_socket: &Path) {
+    if std::env::var_os("LEINDEX_ALLOW_MULTIPLE_EMBED_DAEMONS").is_some() {
+        return;
+    }
+    let Some(run_dir) = keep_socket.parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&run_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(base) = name.strip_suffix(".pid") else {
+            continue;
+        };
+        if !base.starts_with("leindex-embed-") {
+            continue;
+        }
+        let foreign_socket = run_dir.join(format!("{base}.sock"));
+        if foreign_socket == keep_socket {
+            continue;
+        }
+        let pid_path = entry.path();
+        let Some(pid) = std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
+        else {
+            // No readable pid — stale artifact set.
+            let _ = std::fs::remove_file(&pid_path);
+            let _ = std::fs::remove_file(&foreign_socket);
+            let _ = std::fs::remove_file(foreign_socket.with_extension("status"));
+            continue;
+        };
+        let alive = unsafe { libc::kill(pid, 0) == 0 };
+        if !alive {
+            let _ = std::fs::remove_file(&pid_path);
+            let _ = std::fs::remove_file(&foreign_socket);
+            let _ = std::fs::remove_file(foreign_socket.with_extension("status"));
+            continue;
+        }
+        // Confirm the pid is still an embed worker before signalling it.
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !comm.starts_with("leindex-embed") {
+            continue;
+        }
+        tracing::warn!(
+            pid,
+            socket = %foreign_socket.display(),
+            "terminating superseded embed daemon (single-daemon policy; \
+             set LEINDEX_ALLOW_MULTIPLE_EMBED_DAEMONS=1 to keep it)"
+        );
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -608,7 +687,19 @@ pub(super) fn daemon_pid_alive(path: &Path) -> bool {
         return false;
     }
     let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    if !(result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)) {
+        return false;
+    }
+    // A zombie still answers kill(0) but will never serve the socket — the
+    // stress-test index runs repeatedly left defunct workers whose pid files
+    // passed this check and drove 20 s of readiness-poll retries against a
+    // dead socket.
+    matches!(
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).ok(),
+        Some(stat) if !stat.rsplit_once(") ").is_some_and(|(_, fields)| {
+            fields.split_whitespace().next() == Some("Z")
+        })
+    )
 }
 
 #[cfg(unix)]
@@ -1061,10 +1152,12 @@ impl EmbeddingClient {
         if !requested_gpu {
             return None;
         }
-        // Bring the worker up so its actual provider is observable. This spawns
-        // the daemon the enrichment pass would spawn anyway, so it is not net
-        // extra work; on a fast CPU fallback the worker reports Ready quickly.
-        let _ = self.ensure_worker_ready();
+        // Resident-observation only: NEVER spawn the worker from this guard.
+        // It runs on every index start; with the embed cache serving all
+        // hits, spawning here would cold-start a multi-GiB daemon that the
+        // run then never uses (measured: ~26 s added to every cache-hit
+        // index). The CPU-fallback quality gate still applies — at embed
+        // time, where the cost decision actually sits.
         match self.active_execution_provider().as_deref() {
             Some("cpu") => Some(format!(
                 "neural worker fell back to CPU although `{}` was requested; \
