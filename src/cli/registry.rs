@@ -284,11 +284,18 @@ pub struct ProjectRegistry {
     /// Per-project last-access timestamps for idle-engine eviction (D-2).
     ///
     /// Touched on every `get_or_load`; `evict_idle_engines` (defined in
-    /// `registry_evict.rs`) drops projects that have been unused for
+    /// `registry_evict.rs`) drops projects that are unused for
     /// `[mcp] engine_max_idle_secs` so a long-lived MCP process releases
     /// loaded-project mmaps instead of retaining every project it ever
     /// touched (memory-pressure remediation).
     pub(crate) last_used: RwLock<HashMap<PathBuf, std::time::Instant>>,
+
+    /// One-shot mode (CLI `tools run`): the process exits right after the
+    /// tool call, so a spawned background incremental refresh can never
+    /// finish — it just logs a cancellation warning and races the exit.
+    /// When set, `maybe_incremental_refresh` is a no-op; the next invocation
+    /// re-evaluates staleness anyway.
+    one_shot: std::sync::atomic::AtomicBool,
 }
 
 impl ProjectRegistry {
@@ -306,7 +313,16 @@ impl ProjectRegistry {
             failed_index_attempts: RwLock::new(HashMap::new()),
             incremental_refresh_guard: Mutex::new(HashMap::new()),
             last_used: RwLock::new(HashMap::new()),
+            one_shot: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Mark this registry as belonging to a one-shot process (CLI
+    /// `tools run`): background incremental refreshes are suppressed because
+    /// the process exits before they could complete.
+    pub fn mark_one_shot(&self) {
+        self.one_shot
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Create a registry pre-loaded with one project (the initial startup project).
@@ -347,6 +363,7 @@ impl ProjectRegistry {
             failed_index_attempts: RwLock::new(HashMap::new()),
             incremental_refresh_guard: Mutex::new(HashMap::new()),
             last_used: RwLock::new(last_used),
+            one_shot: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -523,6 +540,12 @@ impl ProjectRegistry {
         _handle: &ProjectHandle,
         project_path: &Path,
     ) {
+        // One-shot processes (CLI `tools run`) exit before a spawned
+        // refresh could finish; the cancellation would only log noise and
+        // race the exit. The next invocation re-evaluates staleness.
+        if self.one_shot.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         // Check if a refresh is already in progress for this project.
         {
             let guard = self.incremental_refresh_guard.try_lock();

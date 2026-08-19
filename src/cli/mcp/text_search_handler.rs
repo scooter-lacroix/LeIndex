@@ -156,7 +156,7 @@ async fn snapshot_pdg_spans(handle: Option<&ProjectHandle>, source_paths: &[Path
         return HashMap::new();
     };
     let guard = handle.read().await;
-    guard
+    let spans: PdgSpans = guard
         .pdg()
         .map(|pdg| {
             source_paths
@@ -179,7 +179,15 @@ async fn snapshot_pdg_spans(handle: Option<&ProjectHandle>, source_paths: &[Path
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    tracing::debug!(
+        files_with_spans = spans.len(),
+        total_spans = spans.values().map(Vec::len).sum::<usize>(),
+        sample_key = ?spans.keys().next().map(String::as_str),
+        pdg_resident = guard.pdg().is_some(),
+        "text-search PDG span snapshot"
+    );
+    spans
 }
 
 async fn resolve_live_search_context(
@@ -197,6 +205,24 @@ async fn resolve_live_search_context(
     };
     let scope = resolve_scope(args, &project_root)?;
     let handle = registry.try_get_loaded(&project_root).await;
+    // The resident handle can lack a PDG (fresh one-shot process, or an
+    // auto-index swapped in a new LeIndex whose graph was dropped at
+    // completion) — which starved the owning-symbol enrichment entirely
+    // (audit #3). Load it on demand; unindexed projects fail harmlessly
+    // and keep the live-scan-only behavior.
+    let handle = match handle {
+        Some(handle) => {
+            {
+                let mut guard = handle.write().await;
+                if guard.pdg().is_none() {
+                    let _ = guard.load_from_storage();
+                    let _ = guard.ensure_pdg_loaded();
+                }
+            }
+            Some(handle)
+        }
+        None => None,
+    };
     let source_paths = source_paths_for_scope(&project_root, scope.as_deref()).await?;
     let pdg_spans = snapshot_pdg_spans(handle.as_ref(), &source_paths).await;
 

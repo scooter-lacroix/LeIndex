@@ -46,15 +46,32 @@ pub(super) async fn cmd_tools_impl(
             set,
         } => {
             let parsed_args = parse_tool_args_json(&args_json)?;
-            let args = merge_tool_args(parsed_args.clone(), &set, project.as_ref())?;
+            let mut args = merge_tool_args(parsed_args.clone(), &set, project.as_ref())?;
+            // One-shot CLI mode: hydration happens inside this process
+            // (~1-2 s), which the 250 ms resident-server default budget can
+            // never cover — every enrichment silently downgraded to empty.
+            // Raise the default when the caller didn't choose one.
+            if !args
+                .as_object()
+                .is_some_and(|object| object.contains_key("max_latency_ms"))
+            {
+                if let Some(object) = args.as_object_mut() {
+                    object.insert("max_latency_ms".to_string(), serde_json::json!(5000));
+                }
+            }
             let value = execute_tool_handler(&name, args, project).await?;
 
             // Use the unified renderer — same path used by the MCP transport
-            // so CLI and LLM-visible payloads stay in lock-step.
-            let formatted =
-                crate::cli::mcp::output::render_tool_output(&name, &value, &parsed_args);
+            // so CLI and LLM-visible payloads stay in lock-step. The
+            // freshness footer goes to stderr so stdout remains parseable
+            // JSON for tools that emit raw JSON.
+            let (formatted, footer) =
+                crate::cli::mcp::output::render_tool_output_split(&name, &value, &parsed_args);
 
             println!("{}", formatted);
+            if let Some(footer) = footer {
+                eprintln!("{}", footer);
+            }
             Ok(())
         }
     }
@@ -678,11 +695,17 @@ fn build_tool_registry(project: Option<PathBuf>) -> AnyhowResult<Arc<ProjectRegi
     let mut leindex =
         LeIndex::new(&project_root).context("Failed to create LeIndex instance for tool run")?;
     let _ = leindex.load_from_storage();
+    // One-shot mode starves every `try_get_loaded` enrichment (read-file
+    // symbol maps, text-search owning symbols, grep-catalog relations)
+    // unless the pre-loaded project carries its PDG — load it up front.
+    let _ = leindex.ensure_pdg_loaded();
 
-    Ok(Arc::new(ProjectRegistry::with_initial_project(
+    let registry = Arc::new(ProjectRegistry::with_initial_project(
         DEFAULT_MAX_PROJECTS,
         leindex,
-    )))
+    ));
+    registry.mark_one_shot();
+    Ok(registry)
 }
 /// Handle a single MCP request and return the response.
 #[allow(clippy::needless_return)]

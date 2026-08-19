@@ -453,6 +453,18 @@ impl LeIndex {
             String::from("/* No PDG available for context expansion */")
         };
 
+        // Per-result context snippets for the top hits: the serialized
+        // SearchResult carries a `context` field that rendered "null" on
+        // every result in the CLI audit, even though the top-level expansion
+        // existed. Fill the first few with a bounded opening snippet so the
+        // field is honest without duplicating the full expansion.
+        let mut results = results;
+        for result in results.iter_mut().take(3) {
+            if result.context.is_none() {
+                result.context = self.opening_snippet(&result.file_path, result.byte_range);
+            }
+        }
+
         // Estimate tokens used (rough approximation: 4 chars per token)
         let tokens_used = context.len() / 4;
         let analysis = super::AnalysisResult {
@@ -581,6 +593,17 @@ impl LeIndex {
             None
         };
 
+        // The tool's contract promises callers/callees/data-dependency
+        // sections beside the source expansion — assemble them from the
+        // resolved node's DIRECT edges (Call edges for calls, DataDependency
+        // edges for data) so they are always present regardless of how the
+        // gravity traversal orders the source snippets. Bounded lists; the
+        // sections go FIRST so a token-budget truncation of the snippets
+        // cannot hide the graph relations (the audit's #4: relations never
+        // appeared at all).
+        let relation_sections = self.node_relation_sections(pdg, &result_node_id);
+        let relation_tokens = relation_sections.len() / 4;
+
         let results = vec![SearchResult {
             rank: 1,
             node_id: result_node_id,
@@ -601,6 +624,12 @@ impl LeIndex {
 
         let context = self.expand_context(pdg, &results, token_budget)?;
         let tokens_used = context.len() / 4;
+        let context = if relation_sections.is_empty() {
+            context
+        } else {
+            format!("{relation_sections}\n{context}")
+        };
+        let tokens_used = tokens_used + relation_tokens;
 
         Ok(super::AnalysisResult {
             query: format!("Context for node {}", node_id),
@@ -609,6 +638,100 @@ impl LeIndex {
             tokens_used,
             processing_time_ms: start_time.elapsed().as_millis() as u64,
         })
+    }
+
+    /// First ~3 lines of a symbol's source (bounded), used to fill the
+    /// per-result `context` field so it never renders as a bare null.
+    fn opening_snippet(&self, file_path: &str, byte_range: (usize, usize)) -> Option<String> {
+        let abs_path = self.resolve_indexed_file_path(file_path);
+        let content = std::fs::read(&abs_path).ok()?;
+        let start = byte_range.0.min(content.len());
+        let end = byte_range.1.min(content.len());
+        if end <= start {
+            return None;
+        }
+        let text = std::str::from_utf8(&content[start..end]).ok()?;
+        let snippet: String = text.lines().take(3).collect::<Vec<_>>().join("\n");
+        (!snippet.is_empty()).then_some(snippet)
+    }
+
+    /// Bounded callers/callees/data-dependency summary for one node, rendered
+    /// as comment sections. Empty when the node has no graph relations.
+    fn node_relation_sections(&self, pdg: &ProgramDependenceGraph, node_id: &str) -> String {
+        use crate::graph::pdg::EdgeType;
+        let Some(nid) = pdg.find_by_symbol(node_id) else {
+            return String::new();
+        };
+        let describe = |target: crate::graph::pdg::NodeId| -> String {
+            pdg.get_node(target)
+                .map(|node| {
+                    format!(
+                        "{} [{}] ({})",
+                        node.name,
+                        node.file_path,
+                        match node.node_type {
+                            crate::graph::pdg::NodeType::External => "external",
+                            _ => "project",
+                        }
+                    )
+                })
+                .unwrap_or_else(|| "<missing>".to_string())
+        };
+
+        let callers: Vec<String> = pdg
+            .neighbors_by_edge_type(nid, EdgeType::Call, petgraph::Direction::Incoming)
+            .into_iter()
+            .take(12)
+            .map(&describe)
+            .collect();
+        let callees: Vec<String> = pdg
+            .neighbors_by_edge_type(nid, EdgeType::Call, petgraph::Direction::Outgoing)
+            .into_iter()
+            .take(12)
+            .map(&describe)
+            .collect();
+        let data_deps: Vec<String> = pdg
+            .neighbors_by_edge_type(nid, EdgeType::DataDependency, petgraph::Direction::Outgoing)
+            .into_iter()
+            .take(12)
+            .map(&describe)
+            .collect();
+
+        let mut sections = String::new();
+        if !callers.is_empty() {
+            sections.push_str(&format!(
+                "/* Callers (direct, {}): */\n{}\n",
+                callers.len(),
+                callers
+                    .iter()
+                    .map(|line| format!("//   ← {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        if !callees.is_empty() {
+            sections.push_str(&format!(
+                "/* Callees (direct, {}): */\n{}\n",
+                callees.len(),
+                callees
+                    .iter()
+                    .map(|line| format!("//   → {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        if !data_deps.is_empty() {
+            sections.push_str(&format!(
+                "/* Data dependencies (direct, {}): */\n{}\n",
+                data_deps.len(),
+                data_deps
+                    .iter()
+                    .map(|line| format!("//   ⇄ {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        sections
     }
 
     /// Generate an embedding for a query string.

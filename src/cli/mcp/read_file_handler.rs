@@ -403,6 +403,23 @@ Works for any text file including configs and docs."
             .map(|extension| extension.to_ascii_lowercase());
         let language = ext_lower.as_deref().map(detect_language).unwrap_or("text");
 
+        // An explicit symbol-map request must not silently degrade: a handle
+        // can lack a resident PDG (fresh one-shot process, or an auto-index
+        // swapped in a new LeIndex whose graph was dropped at completion).
+        // Load it on demand in that case (audit #7: the flag was a no-op).
+        let maybe_handle = match maybe_handle {
+            Some(handle) if include_symbol_map => {
+                let mut guard = handle.write().await;
+                if guard.pdg().is_none() {
+                    let _ = guard.load_from_storage();
+                    let _ = guard.ensure_pdg_loaded();
+                }
+                drop(guard);
+                Some(handle)
+            }
+            other => other,
+        };
+
         let pdg_snapshot = if let Some(ref handle) = maybe_handle {
             let guard = handle.read().await;
             guard.pdg().cloned()
