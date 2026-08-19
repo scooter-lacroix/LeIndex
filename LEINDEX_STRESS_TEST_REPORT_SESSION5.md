@@ -332,3 +332,23 @@ Gates: fmt clean, `clippy -D warnings` clean (both feature sets), `cargo test --
 - Gates: fmt clean, `clippy -D warnings` clean (default + onnx), `cargo test --workspace --exclude memcheck` 38/38 binaries green (incl. 6 new tests this wave; trace-harness tests serialized after a process-global-hook flake was root-caused).
 
 **Known bounds documented:** the two `20260811_*_Fork__.md` scratch files remain untracked (unrelated prior engagement); `madvise` after matrix scans deliberately skipped (page-cache accounting makes it cosmetic; re-fault costs latency).
+
+---
+
+## §10.4 Session-10 addendum — one-shot CLI audit remediation
+
+**Audit context:** the independent CLI audit ran `leindex tools run` against the installed 2.0.0 binaries while concurrent index churn was in flight. Its semantic-search half (#6) resolved after a force reindex (its own retest: neural≈0.78, deep-analyze 14× faster — the session-9 cache at work). The remaining findings were one structural defect with many faces plus honest-reporting gaps — all fixed and live-verified this wave (commits 67c53805, 6c3a7480):
+
+**Root cause (#1/#2/#3/#4/#7):** one-shot CLI runs starve every PDG-backed enrichment. The pre-loaded project never had a resident graph; an auto-index swaps in a fresh `LeIndex` whose graph is dropped at completion; and the 250 ms enrichment budget (tuned for a resident MCP server) expires inside ~2 s of one-shot hydration.
+
+Fixes, each verified live on this repo:
+- `tools run` defaults `max_latency_ms` to 5000 (caller value respected); one-shot registries suppress background refreshes whose cancellation-only fate was WARN noise on every call (verified: 0 cancelled/refresh-failed lines).
+- read-file loads the PDG on demand for `include_symbol_map` → "Symbols in range (5)" renders with names/types/lines (#7).
+- text-search snapshots spans from an on-demand-loaded graph → `in_symbol: save_pdg | function` on matches (#3); stdout is now parseable JSON with the freshness footer on stderr.
+- context emits Callers/Callees/Data-dependency sections ahead of the source expansion (#4) — always present, budget-truncation-proof.
+- deep-analyze fills per-result context snippets for top hits (was `null` on all).
+- file-summary inventories definitions only — external import markers filtered (140 → 91 entries; truncation flag adjusted) (#5).
+- grep-symbols catalog results carry an explicit note when the graph isn't loaded; symbol-lookup and impact-analysis label their direction (forward vs backward) (#cross-cutting).
+- SKILL.md CLI fallback syntax corrected (`--args '<json>'`), both instances.
+
+Gates: fmt clean, `clippy -D warnings` clean (default + onnx), `cargo test --workspace --exclude memcheck` 38/38 green. Binaries rebuilt (`--features onnx`) and installed.
