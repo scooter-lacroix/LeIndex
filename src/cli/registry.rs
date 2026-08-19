@@ -54,6 +54,16 @@ pub const DEFAULT_MAX_PROJECTS: usize = 5;
 /// of tool calls shares one freshness check.
 pub const STALE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Cooldown after a failed auto-index before `get_or_create` retries the full
+/// index for the same project.
+///
+/// A degraded index (e.g. a storage layer that cannot persist the PDG) would
+/// otherwise trigger a full, slow index attempt on *every* tool call. The
+/// cooldown bounds that to one attempt per window while still letting a
+/// recovered environment (disk space freed, lock released, schema repaired)
+/// reindex on the next call after the window elapses.
+pub const INDEX_ATTEMPT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Environment variable that explicitly enables the file-watcher auto-reindex.
 ///
 /// Default is OFF because the recursive watcher is the single largest source
@@ -258,6 +268,14 @@ pub struct ProjectRegistry {
     /// file edit becomes visible to subsequent reads within reasonable time.
     stale_cache: RwLock<HashMap<PathBuf, (std::time::Instant, bool)>>,
 
+    /// Per-project timestamp of the last failed auto-index attempt.
+    ///
+    /// Populated by `get_or_create` when the best-effort auto-index fails;
+    /// a fresh entry suppresses further full-index attempts until
+    /// `INDEX_ATTEMPT_COOLDOWN` elapses so a degraded storage layer does not
+    /// serialize a full reindex behind every tool call.
+    failed_index_attempts: RwLock<HashMap<PathBuf, std::time::Instant>>,
+
     /// Per-project incremental refresh guard. When `true`, an incremental
     /// refresh is in progress for that project and new requests skip the
     /// refresh to avoid duplicate work.
@@ -285,6 +303,7 @@ impl ProjectRegistry {
             max_projects,
             watchers: Mutex::new(HashMap::new()),
             stale_cache: RwLock::new(HashMap::new()),
+            failed_index_attempts: RwLock::new(HashMap::new()),
             incremental_refresh_guard: Mutex::new(HashMap::new()),
             last_used: RwLock::new(HashMap::new()),
         }
@@ -325,6 +344,7 @@ impl ProjectRegistry {
             max_projects,
             watchers: Mutex::new(watchers),
             stale_cache: RwLock::new(HashMap::new()),
+            failed_index_attempts: RwLock::new(HashMap::new()),
             incremental_refresh_guard: Mutex::new(HashMap::new()),
             last_used: RwLock::new(last_used),
         }
@@ -359,6 +379,32 @@ impl ProjectRegistry {
         {
             let projects = self.projects.read().await;
             if let Some(handle) = projects.get(&canonical) {
+                // N-13: an external rebuild (CLI --force, another MCP
+                // server) advances the persisted CURRENT pointer while this
+                // process keeps serving its in-memory snapshot —
+                // diagnostics then reported generation-4 stats under a
+                // generation-6 "fresh" footer. CURRENT is a tiny read;
+                // when it has moved past the hydrated generation, evict so
+                // this call re-hydrates from the new generation.
+                let advanced = {
+                    let idx = handle.read().await;
+                    idx.hydrated_generation().is_some_and(|hydrated| {
+                        let storage_root =
+                            crate::cli::leindex::resolve_existing_storage_path(&canonical)
+                                .unwrap_or_else(|| canonical.join(".leindex"));
+                        crate::storage::generation::lease::read_current_generation(&storage_root)
+                            .is_some_and(|disk| disk > hydrated)
+                    })
+                };
+                if advanced {
+                    drop(projects);
+                    warn!(
+                        project = %canonical.display(),
+                        "Persisted generation advanced past the hydrated snapshot; re-hydrating"
+                    );
+                    self.evict(&canonical).await;
+                    return self.create_and_insert(canonical).await;
+                }
                 self.touch_lru(&canonical).await;
                 self.touch_last_used(&canonical).await;
                 self.set_default(&canonical).await;
@@ -419,7 +465,33 @@ impl ProjectRegistry {
         };
 
         if needs_index {
-            self.index_handle(&handle, false).await?;
+            // Auto-index is best-effort: a failed index attempt (degraded
+            // storage, transient lock contention, disk pressure) must not turn
+            // every subsequent tool call into a hard error. Tools that can
+            // operate without an index (read, edit, text search, git status)
+            // degrade gracefully; tools that need the index report their own
+            // "not indexed" errors with remediation guidance.
+            let skip_attempt = {
+                let cache = self.failed_index_attempts.read().await;
+                cache
+                    .get(&canonical)
+                    .is_some_and(|ts| ts.elapsed() < INDEX_ATTEMPT_COOLDOWN)
+            };
+            if skip_attempt {
+                debug!(
+                    project = %canonical.display(),
+                    "Skipping auto-index within cooldown after a recent failure"
+                );
+            } else if let Err(error) = self.index_handle(&handle, false).await {
+                warn!(
+                    project = %canonical.display(),
+                    "Auto-index failed; serving project without a fresh index: {error}"
+                );
+                self.failed_index_attempts
+                    .write()
+                    .await
+                    .insert(canonical.clone(), std::time::Instant::now());
+            }
             // stale_cache is invalidated inside index_handle() after successful swap
         } else if needs_refresh {
             // The index is stale but still usable. Serve existing results
@@ -1177,11 +1249,37 @@ impl ProjectRegistry {
                 return Err(error);
             }
             Err(error) => {
-                let error = JsonRpcError::internal_error(format!("Task join error: {}", error));
+                // JoinError splits into two very different cases:
+                // - cancellation (runtime shutdown / task abort): the index
+                //   pipeline did NOT fail — it was abandoned. Persisting
+                //   last_failure here poisoned freshness for an intact
+                //   generation (audit Issue 5): every later diagnostics read
+                //   "failed" until a full reindex cleared it.
+                // - panic: a genuine pipeline defect; mark failure as before.
+                let should_mark_failure = join_error_should_mark_failure(&error);
+                let cancelled = error.is_cancelled();
+                let error = JsonRpcError::internal_error(format!(
+                    "{} error: {}",
+                    if cancelled {
+                        "Indexing task cancelled"
+                    } else {
+                        "Task join"
+                    },
+                    error
+                ));
                 let core_published = self
                     .refresh_core_after_index_failure(&project_path, resident_core_generation)
                     .await;
-                mark_index_failure(&project_path, &error.to_string(), core_published);
+                if should_mark_failure {
+                    mark_index_failure(&project_path, &error.to_string(), core_published);
+                } else {
+                    warn!(
+                        project = %project_path.display(),
+                        "Indexing task was cancelled; leaving generation health untouched \
+                         (cancellation is not an indexing failure): {}",
+                        error.to_string()
+                    );
+                }
                 return Err(error);
             }
         };
@@ -1195,6 +1293,12 @@ impl ProjectRegistry {
         // the pre-indexing staleness result. `project_path` is
         // already canonical (from `LeIndex::project_path`).
         self.stale_cache.write().await.remove(&project_path);
+        // A successful index clears any recent auto-index failure marker so
+        // the next get_or_create call can rely on the fresh index.
+        self.failed_index_attempts
+            .write()
+            .await
+            .remove(&project_path);
 
         let stats = {
             let idx = handle.read().await;
@@ -1449,6 +1553,14 @@ fn restore_latest_generation(storage_path: &Path) -> bool {
             let _ = std::fs::remove_file(&next);
             return false;
         }
+        // The swapped-in database must not inherit the old database's WAL/SHM
+        // side files: their salts are keyed to the replaced main file, and
+        // SQLite refuses to open (or "recovers" garbage from) a mismatched
+        // pair — turning a repair into a permanently unopenable store
+        // (persistent -32008 on every tool call). Best-effort removal; the
+        // files are recreated cleanly on the next open.
+        let _ = std::fs::remove_file(storage_path.join("leindex.db-wal"));
+        let _ = std::fs::remove_file(storage_path.join("leindex.db-shm"));
         let _ = std::fs::write(storage_path.join("CURRENT"), format!("{generation}\n"));
         return true;
     }
@@ -1465,6 +1577,15 @@ fn restore_latest_generation(storage_path: &Path) -> bool {
 /// disk full) carry no sentinel and brick as before.
 fn is_transient_storage_open_failure(message: &str) -> bool {
     message.contains("[transient:lock-contention]")
+}
+
+/// Whether a `spawn_blocking` JoinError from the index pipeline should persist
+/// an index-health failure. Cancellation (runtime shutdown / task abort) means
+/// the pipeline was abandoned, not that it failed — marking failure there
+/// poisons freshness for an intact generation. A panic is a genuine defect and
+/// still marks.
+fn join_error_should_mark_failure(error: &tokio::task::JoinError) -> bool {
+    !error.is_cancelled()
 }
 
 fn mark_index_failure(project_path: &Path, message: &str, core_published: bool) {
@@ -1500,9 +1621,108 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn test_join_error_cancellation_does_not_mark_failure() {
+        // Audit Issue 5: a cancelled index task must not poison freshness.
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        let error = cancelled.await.unwrap_err();
+        assert!(error.is_cancelled());
+        assert!(!join_error_should_mark_failure(&error));
+    }
+
+    #[tokio::test]
+    async fn test_join_error_panic_marks_failure() {
+        let panicking = tokio::spawn(async { panic!("pipeline defect") });
+        let error = panicking.await.unwrap_err();
+        assert!(error.is_panic());
+        assert!(join_error_should_mark_failure(&error));
+    }
+
+    #[test]
+    fn test_restore_latest_generation_removes_stale_wal_sidecars() {
+        // The permanent-brick vector: after swapping a generation's DB over the
+        // live leindex.db, the OLD database's -wal/-shm side files must be
+        // removed. Their salts are keyed to the replaced main file, so SQLite
+        // refuses to open (or "recovers" garbage from) the mismatched pair —
+        // every subsequent tool call then fails -32008 forever.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("store");
+        let gen_dir = storage.join("generations").join("7");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+
+        // Valid generation DB (contents never opened by restore, only copied).
+        std::fs::write(gen_dir.join("leindex.db"), b"generation-db-bytes").unwrap();
+        // Live DB plus stale side files from the pre-swap database.
+        std::fs::write(storage.join("leindex.db"), b"old-live-db-bytes").unwrap();
+        std::fs::write(storage.join("leindex.db-wal"), b"stale-wal").unwrap();
+        std::fs::write(storage.join("leindex.db-shm"), b"stale-shm").unwrap();
+
+        assert!(restore_latest_generation(&storage));
+        assert_eq!(
+            std::fs::read(storage.join("leindex.db")).unwrap(),
+            b"generation-db-bytes"
+        );
+        assert!(
+            !storage.join("leindex.db-wal").exists(),
+            "stale WAL sidecar must be removed with the swapped DB"
+        );
+        assert!(
+            !storage.join("leindex.db-shm").exists(),
+            "stale SHM sidecar must be removed with the swapped DB"
+        );
+        assert_eq!(
+            std::fs::read_to_string(storage.join("CURRENT"))
+                .unwrap()
+                .trim(),
+            "7"
+        );
+    }
+
+    #[tokio::test]
     async fn test_registry_creation() {
         let registry = ProjectRegistry::new(5);
         assert_eq!(registry.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_or_create_skips_auto_index_within_failure_cooldown() {
+        // A recent failed auto-index must suppress further full-index attempts
+        // (coalescing the degraded state) while get_or_create still succeeds
+        // so read/edit tools can degrade gracefully instead of erroring.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+
+        let registry = Arc::new(ProjectRegistry::new(5));
+        // Simulate an auto-index attempt that failed moments ago.
+        registry
+            .failed_index_attempts
+            .write()
+            .await
+            .insert(canonical.clone(), std::time::Instant::now());
+
+        let handle = registry
+            .get_or_create(Some(&canonical.to_string_lossy()))
+            .await
+            .expect("get_or_create must not fail when the index attempt is skipped");
+        assert!(
+            !handle.read().await.is_indexed(),
+            "full index attempt must be skipped within the failure cooldown"
+        );
+
+        // An explicit index request still works and clears the failure marker.
+        registry
+            .index_project(Some(&canonical.to_string_lossy()), false)
+            .await
+            .expect("explicit index must succeed on a healthy project");
+        assert!(
+            !registry
+                .failed_index_attempts
+                .read()
+                .await
+                .contains_key(&canonical),
+            "a successful index must clear the failure marker"
+        );
     }
 
     #[test]

@@ -444,13 +444,34 @@ pub fn detect_corruption<P: AsRef<Path>>(project_path: P) -> Result<CorruptionSt
     match crate::storage::schema::Storage::open(&db_path) {
         Ok(_) => Ok(CorruptionStatus::Healthy),
         Err(e) => {
-            if e.to_string().contains("corrupted") {
+            let message = e.to_string();
+            let lower = message.to_lowercase();
+            // Lock contention is NOT corruption. `Storage::open`'s schema init
+            // takes write locks, so a competing leindex writer (external CLI
+            // rebuild, another MCP server) can make the probe fail with
+            // SQLITE_BUSY/LOCKED. Classifying that as Severe would send
+            // `create_and_insert` down the destructive
+            // `restore_latest_generation` path — renaming the live database
+            // out from under the running writer. Transient locks must stay
+            // usable so the caller simply retries after the writer finishes.
+            let is_lock_contention = lower.contains("database is locked")
+                || lower.contains("database table is locked")
+                || lower.contains("could not obtain a lock")
+                || lower.contains("database is busy");
+            if is_lock_contention {
+                tracing::warn!(
+                    "Corruption probe hit lock contention (another writer active); \
+                     treating store as healthy: {}",
+                    message
+                );
+                Ok(CorruptionStatus::Healthy)
+            } else if lower.contains("corrupted") {
                 Ok(CorruptionStatus::Major {
-                    description: format!("Database corruption detected: {}", e),
+                    description: format!("Database corruption detected: {}", message),
                 })
             } else {
                 Ok(CorruptionStatus::Severe {
-                    description: format!("Cannot access database: {}", e),
+                    description: format!("Cannot access database: {}", message),
                 })
             }
         }
@@ -559,5 +580,41 @@ mod tests {
 
         let message = status.message();
         assert!(message.contains("healthy"));
+    }
+
+    #[test]
+    fn test_detect_corruption_treats_lock_contention_as_healthy() {
+        // Reproduces the stale-server -32008 chain: a competing writer holds
+        // the database (external `leindex index --force` mid-run), and
+        // `Storage::open`'s schema init fails with SQLITE_BUSY. That must
+        // classify as Healthy — the old code returned Severe, which sent
+        // `create_and_insert` down the destructive `restore_latest_generation`
+        // path (renaming the live DB out from under the running writer).
+        let dir = tempfile::tempdir().unwrap();
+        let leindex_dir = dir.path().join(".leindex");
+        std::fs::create_dir_all(&leindex_dir).unwrap();
+        let db_path = leindex_dir.join("leindex.db");
+
+        // Create a valid database the probe can otherwise open.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE t(v INTEGER);").unwrap();
+        }
+
+        // Hold the write lock on another connection; WAL allows the reader to
+        // open, but `Storage::open`'s schema statements (CREATE TABLE IF NOT
+        // EXISTS ...) need the write lock and fail with "database is locked"
+        // after the busy timeout.
+        let holder = rusqlite::Connection::open(&db_path).unwrap();
+        holder
+            .execute_batch("BEGIN IMMEDIATE; CREATE TABLE lock_probe(v INTEGER);")
+            .unwrap();
+
+        let status = detect_corruption(dir.path()).unwrap();
+        assert!(
+            status.is_usable(),
+            "lock contention must never classify as corruption: {:?}",
+            status.message()
+        );
     }
 }
