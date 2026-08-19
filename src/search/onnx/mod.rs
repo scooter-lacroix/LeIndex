@@ -22,6 +22,11 @@ pub mod chunking;
 #[cfg(feature = "onnx")]
 pub mod client;
 
+/// Client-side global embedding cache access (probe hits locally, dispatch
+/// only misses to the worker, store fresh vectors under the same keys).
+#[cfg(feature = "onnx")]
+pub(crate) mod embed_cache_frontend;
+
 /// Remote embedding providers (OpenAI, Cohere, etc.)
 ///
 /// Provides integration with cloud-based embedding services as an

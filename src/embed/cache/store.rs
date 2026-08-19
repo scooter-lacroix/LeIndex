@@ -574,6 +574,109 @@ impl GlobalEmbeddingCache {
         }
     }
 
+    /// Store a batch of vectors in one pass (bulk counterpart of [`put`]).
+    ///
+    /// The single-row `put` is durability-oriented: staging write, `sync_all`,
+    /// rename, and a full `model_index.json` rewrite PER ROW. At index time
+    /// the client stores ~10K rows in one run, where per-row fsyncs and the
+    /// O(n²) metadata rewrite turned a 58 s neural phase into a 287 s one.
+    /// The cache is a REBUILDABLE cache: rows are content-addressed and
+    /// re-hash-verified on read (VAL-CACHE-004), so a torn row simply reads
+    /// as a miss and is recomputed. This batch variant therefore:
+    /// - checks the byte budget ONCE and evicts up front if needed;
+    /// - writes staging + rename WITHOUT per-row fsync;
+    /// - persists `model_index.json` and telemetry ONCE at the end;
+    /// - skips rows that already exist (dedup, same as `put`).
+    ///
+    /// Returns the number of rows newly written.
+    pub fn put_batch(&mut self, entries: &[(CacheKey, Vec<f32>)]) -> Result<usize, CacheError> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        // Encode up front, deduping by fingerprint and against existing rows.
+        let mut encoded: Vec<([u8; 32], Vec<u8>, [u8; 32])> = Vec::with_capacity(entries.len());
+        let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        let mut skipped_oversized = 0u64;
+        for (key, vector) in entries {
+            let dim = key.output_dimensions as usize;
+            if vector.len() != dim || vector.is_empty() {
+                continue;
+            }
+            let fingerprint = key.fingerprint();
+            if !seen.insert(fingerprint) {
+                continue;
+            }
+            if self.row_path(&fingerprint).exists() {
+                continue;
+            }
+            // Privacy: the batch path never persists source text.
+            let row_bytes = encode_row(&fingerprint, dim, vector, None);
+            if row_bytes.len() as u64 > self.config.max_entry_bytes {
+                skipped_oversized += 1;
+                continue;
+            }
+            encoded.push((fingerprint, row_bytes, key.model_digest));
+        }
+        if skipped_oversized > 0 {
+            self.telemetry
+                .record_entry_rejection(skipped_oversized * 1024);
+        }
+        if encoded.is_empty() {
+            return Ok(0);
+        }
+
+        // Byte-budget enforcement once for the whole batch.
+        if self.config.max_bytes > 0 {
+            let batch_bytes: u64 = encoded.iter().map(|(_, bytes, _)| bytes.len() as u64).sum();
+            let current = self.total_bytes()?;
+            if current + batch_bytes > self.config.max_bytes {
+                self.evict_unreferenced(current + batch_bytes - self.config.max_bytes)?;
+            }
+        }
+
+        let mut created_dirs: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        let mut written = 0usize;
+        for (fingerprint, row_bytes, _) in &encoded {
+            let final_path = self.row_path(fingerprint);
+            if let Some(parent) = final_path.parent() {
+                if created_dirs.insert(parent.to_path_buf()) {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+            let staging_path = final_path.with_extension("partial");
+            {
+                let file = fs::File::create(&staging_path)?;
+                let mut writer = std::io::BufWriter::new(file);
+                writer.write_all(row_bytes)?;
+                writer.flush()?;
+                // Deliberately NO sync_all: see the method doc.
+            }
+            match fs::rename(&staging_path, &final_path) {
+                Ok(()) => {
+                    written += 1;
+                }
+                Err(_) if final_path.exists() => {
+                    let _ = fs::remove_file(&staging_path);
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&staging_path);
+                    return Err(CacheError::Io(e));
+                }
+            }
+        }
+
+        // Metadata + telemetry once per batch.
+        for (fingerprint, _, model_digest) in &encoded {
+            let fingerprint_hex = hex_encode(fingerprint);
+            let model_digest_hex = hex_encode(model_digest);
+            self.model_index.insert(&fingerprint_hex, &model_digest_hex);
+        }
+        let _ = self.persist_model_index();
+
+        Ok(written)
+    }
+
     /// Add a project-generation reference for a fingerprint.
     ///
     /// This prevents GC from dropping a row that is still live for a project.

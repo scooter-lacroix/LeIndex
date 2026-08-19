@@ -253,6 +253,14 @@ impl FileSummaryContext {
                 }
             }
         }
+        // Canonical order. Node insertion order follows PARALLEL parse
+        // completion order, which varies run to run; the file-summary text
+        // embeds this list verbatim, so an unsorted list made the summary's
+        // content hash (and thus its embedding-cache key) unstable — every
+        // index re-embedded ~450 file summaries from scratch.
+        for names in file_symbols.values_mut() {
+            names.sort_unstable();
+        }
         Self { file_symbols }
     }
 }

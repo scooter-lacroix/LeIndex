@@ -37,6 +37,7 @@ use crate::embed::protocol::{
 
 #[path = "client_config.rs"]
 mod client_config;
+pub(crate) use client_config::terminate_superseded_daemons;
 use client_config::*;
 pub use client_config::{
     ClientError, EmbedResult, EmbeddingClient, WorkerAvailability, daemon_active_provider,
@@ -571,6 +572,14 @@ impl EmbeddingClient {
         if let Some(handle) = self.connect_daemon_when_ready(&socket_path, None)? {
             return Ok(Some(handle));
         }
+
+        // Single-daemon enforcement (RAM safety): before bringing a NEW
+        // daemon online, terminate live daemons whose descriptor differs
+        // from this one. The stress-test OOM post-mortem found two
+        // concurrently-resident embed daemons (one per config descriptor,
+        // total_vm ~15 GiB each) exhausting a shared cgroup. Newest config
+        // wins; opt out with LEINDEX_ALLOW_MULTIPLE_EMBED_DAEMONS=1.
+        terminate_superseded_daemons(&socket_path);
 
         Self::spawn_locked_daemon(worker_path, config_env, configured_provider, socket_path)
             .map(Some)
@@ -1222,7 +1231,69 @@ impl EmbeddingClient {
         texts: &[S],
         expected_dim: usize,
     ) -> EmbedResult {
-        let batch_id = Self::next_batch_id();
+        // Client-side embed cache (WS10 completion): probe the shared
+        // content-addressed store FIRST. Hits are applied without touching
+        // the worker — an all-hit batch never spawns the multi-GiB embed
+        // daemon. Only misses reach the embed path, and their fresh vectors
+        // are stored back under the same keys the worker would have used.
+        // A cache that is unavailable (flag off, open failure, model
+        // mismatch) returns None and the flow is exactly the pre-cache path.
+        if let Some(outcome) = self.probe_embed_cache(texts, expected_dim) {
+            if outcome.miss_positions.is_empty() {
+                tracing::debug!(
+                    hits = outcome.hits.len(),
+                    "embed cache: all hits; worker not required"
+                );
+                let vectors = ordered_vectors(&outcome.hits, &outcome.miss_positions, &[]);
+                return EmbedResult::Success(flatten_into_response(vectors, expected_dim));
+            }
+            let miss_texts: Vec<&str> = outcome
+                .miss_positions
+                .iter()
+                .map(|&position| texts[position].as_ref())
+                .collect();
+            let miss_result =
+                self.embed_with_retry(Self::next_batch_id(), &miss_texts, expected_dim);
+            match miss_result {
+                EmbedResult::Success(response) => {
+                    let miss_vectors = response.into_vectors();
+                    super::embed_cache_frontend::store_misses(&outcome, &miss_vectors);
+                    let vectors =
+                        ordered_vectors(&outcome.hits, &outcome.miss_positions, &miss_vectors);
+                    EmbedResult::Success(flatten_into_response(vectors, expected_dim))
+                }
+                // Miss-path failure degrades the whole batch, matching the
+                // uncached contract (rare: worker unavailable).
+                EmbedResult::Fallback { batch_id, error } => {
+                    EmbedResult::Fallback { batch_id, error }
+                }
+            }
+        } else {
+            self.embed_with_retry(Self::next_batch_id(), texts, expected_dim)
+        }
+    }
+
+    /// The pre-cache retry-once embed machinery, unchanged.
+    fn embed_with_retry<S: AsRef<str>>(
+        &self,
+        batch_id: BatchId,
+        texts: &[S],
+        expected_dim: usize,
+    ) -> EmbedResult {
+        // CPU-fallback quality gate, applied at the moment of cost: a GPU
+        // provider was requested but the (resident) worker reports CPU. The
+        // old eager check in `cpu_fallback_reason` spawned the daemon on
+        // every index start, which the embed cache made pure waste.
+        if let Some(reason) = self.cpu_fallback_reason() {
+            tracing::warn!("{}", reason);
+            return EmbedResult::Fallback {
+                batch_id,
+                error: ClientError::Worker(crate::embed::protocol::WorkerError {
+                    kind: crate::embed::protocol::ErrorKind::OnnxRuntime,
+                    message: reason,
+                }),
+            };
+        }
 
         // Attempt 1: initial try
         match self.embed_attempt(batch_id, texts, expected_dim) {
@@ -1293,6 +1364,24 @@ impl EmbeddingClient {
                 }
             }
         }
+    }
+
+    /// Probe the client-side embed cache for `texts` under the model this
+    /// client is configured for (env override first, then leindex.toml — the
+    /// same precedence `availability()` uses for the daemon descriptor).
+    /// Returns None when the cache is unavailable; never fails the call.
+    fn probe_embed_cache<S: AsRef<str>>(
+        &self,
+        texts: &[S],
+        expected_dim: usize,
+    ) -> Option<super::embed_cache_frontend::CacheProbeOutcome> {
+        if texts.is_empty() {
+            return None;
+        }
+        let model = std::env::var("LEINDEX_WORKER_MODEL")
+            .ok()
+            .or_else(|| self.cached_config().model_name.clone())?;
+        super::embed_cache_frontend::probe_texts(&model, expected_dim, texts)
     }
 
     /// Send an embed request to the worker, sharding oversized inputs.
@@ -1741,6 +1830,40 @@ impl Drop for EmbeddingClient {
             Self::shutdown_worker_handle(&mut handle, false);
         }
     }
+}
+
+/// Reassemble per-text vectors in ORIGINAL request order: cached hits at
+/// their positions, freshly computed miss vectors in miss order.
+fn ordered_vectors(
+    hits: &std::collections::HashMap<usize, Vec<f32>>,
+    miss_positions: &[usize],
+    miss_vectors: &[Vec<f32>],
+) -> Vec<Vec<f32>> {
+    let total = hits.len() + miss_positions.len();
+    let mut ordered = Vec::with_capacity(total);
+    let mut next_miss = 0usize;
+    for position in 0..total {
+        if let Some(vector) = hits.get(&position) {
+            ordered.push(vector.clone());
+        } else if let Some(vector) = miss_vectors.get(next_miss) {
+            ordered.push(vector.clone());
+            next_miss += 1;
+        }
+        // Positions beyond both sources cannot occur: every position is
+        // either a hit or a miss by construction.
+    }
+    ordered
+}
+
+/// Flatten per-text vectors into the row-major `EmbedResponse` the callers
+/// of `embed_with_fallback` expect.
+fn flatten_into_response(vectors: Vec<Vec<f32>>, expected_dim: usize) -> EmbedResponse {
+    let count = vectors.len();
+    let mut flat = Vec::with_capacity(count * expected_dim);
+    for vector in vectors {
+        flat.extend_from_slice(&vector);
+    }
+    EmbedResponse::new(flat, count, expected_dim)
 }
 
 #[cfg(test)]
