@@ -72,6 +72,67 @@ pub type Result<T> = std::result::Result<T, PdgStoreError>;
 /// down to ~20 / 100.
 const PDG_INSERT_BATCH_SIZE: usize = 500;
 
+/// Maximum full-transaction retries when SQLite reports a transient
+/// busy/locked condition. The MCP server can hold the same database open on
+/// several connections (writer + reader pool + catalog readers); a competing
+/// lock is a normal condition, not a corruption, so a bounded retry with
+/// backoff turns intermittent "database is locked" failures into successful
+/// saves instead of failed index generations.
+const SAVE_PDG_MAX_RETRIES: u32 = 3;
+
+/// Base delay (ms) before the first retry; each retry multiplies it.
+const SAVE_PDG_RETRY_BASE_DELAY_MS: u64 = 100;
+
+/// WAL auto-checkpoint threshold (pages) re-asserted before every bulk save.
+/// 1000 pages ≈ 4 MiB; keeping the WAL near this size bounds checkpoint
+/// latency and prevents unbounded WAL growth on long-lived servers.
+const SAVE_PDG_WAL_AUTOCHECKPOINT_PAGES: i64 = 1000;
+
+/// Re-assert connection-level pragmas required for a safe bulk write. These
+/// are normally set by `Storage::open_with_config`, but legacy databases
+/// (opened before WAL became the default) and connections created through
+/// non-standard configs may lack them; re-asserting is a no-op when already
+/// active and runs outside any transaction.
+fn ensure_write_connection_pragmas(storage: &mut Storage) -> Result<()> {
+    storage
+        .conn_mut()
+        .pragma_update(None, "journal_mode", "WAL")?;
+    storage
+        .conn_mut()
+        .pragma_update(None, "synchronous", "NORMAL")?;
+    // Wait up to 5s for a competing writer instead of failing immediately.
+    storage
+        .conn_mut()
+        .pragma_update(None, "busy_timeout", 5000)?;
+    // Bound WAL growth so a long-lived MCP server does not accumulate a
+    // multi-hundred-MB WAL between checkpoints.
+    storage.conn_mut().pragma_update(
+        None,
+        "wal_autocheckpoint",
+        SAVE_PDG_WAL_AUTOCHECKPOINT_PAGES,
+    )?;
+    // Best-effort passive checkpoint: trims the WAL before the bulk write
+    // grows it again. Passive never blocks readers or other writers; if the
+    // WAL is busy it simply returns SQLITE_BUSY, which we ignore here.
+    let _ = storage
+        .conn_mut()
+        .execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
+    Ok(())
+}
+
+/// Whether a rusqlite error represents a transient lock condition that a
+/// bounded retry can plausibly clear.
+fn is_transient_lock_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(ferror, _)
+            if matches!(
+                ferror.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
 /// Convert legraphe NodeType to lestockage NodeType
 fn convert_node_type(node_type: &PDGNodeType) -> StorageNodeType {
     match node_type {
@@ -177,34 +238,67 @@ pub fn save_pdg(
     project_id: &str,
     pdg: &ProgramDependenceGraph,
 ) -> Result<()> {
-    // C2: the write connection is normally opened with WAL + synchronous=NORMAL
-    // already, but re-assert both here so legacy databases (created before WAL
-    // was the default, or opened through a non-default config) are upgraded
-    // before the bulk write. `journal_mode` is persistent and setting it is a
-    // no-op when WAL is already active; both pragmas must run outside the
-    // transaction below.
-    storage
+    ensure_write_connection_pragmas(storage)?;
+
+    // Retry the whole transaction on transient lock contention. Each attempt
+    // rebuilds the transaction from scratch, so a partially executed attempt
+    // is rolled back and never leaks partial state.
+    let mut attempt = 0u32;
+    loop {
+        match save_pdg_inner(storage, project_id, pdg) {
+            Ok(()) => return Ok(()),
+            Err(PdgStoreError::Sqlite(error))
+                if is_transient_lock_error(&error) && attempt < SAVE_PDG_MAX_RETRIES =>
+            {
+                attempt += 1;
+                tracing::warn!(
+                    project = project_id,
+                    attempt,
+                    error = %error,
+                    "save_pdg blocked by a competing connection; retrying"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(
+                    SAVE_PDG_RETRY_BASE_DELAY_MS * u64::from(attempt),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Single non-retrying attempt at persisting a PDG. See [`save_pdg`].
+fn save_pdg_inner(
+    storage: &mut Storage,
+    project_id: &str,
+    pdg: &ProgramDependenceGraph,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    // BEGIN IMMEDIATE, not the default deferred BEGIN: the diff reads rows
+    // before writing, and SQLite refuses a read→write transaction upgrade
+    // with an open read snapshot by returning SQLITE_BUSY IMMEDIATELY — the
+    // busy_timeout is not consulted, so every retry would fail instantly
+    // while a competing writer (external rebuild, another MCP server) holds
+    // the lock. Taking the write lock upfront makes busy_timeout apply and
+    // the bounded retry loop actually able to wait the writer out. The
+    // previous delete-first ordering achieved the same effect by accident.
+    let tx = storage
         .conn_mut()
-        .pragma_update(None, "journal_mode", "WAL")?;
-    storage
-        .conn_mut()
-        .pragma_update(None, "synchronous", "NORMAL")?;
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-    let tx = storage.conn_mut().transaction()?;
-
-    // Delete existing edges for this project first (avoids foreign key
-    // constraints and stale-edge leakage). Edges are fully rebuilt every save;
-    // unchanged NODES are the hot path the upsert below skips.
-    tx.execute(
-        "DELETE FROM intel_edges WHERE caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1)",
-        params![project_id],
-    )?;
-
+    // Nodes are diffed against the persisted rows (unchanged nodes reuse their
+    // db ids and issue no write); edges are diffed in save_edges the same way.
+    // Edge deletion happens INSIDE save_edges so the edges of stale nodes are
+    // gone before the nodes themselves are deleted (FK-safe ordering).
     let (node_id_map, stale_node_ids) = save_nodes(&tx, project_id, pdg)?;
+    let nodes_elapsed = started.elapsed();
 
-    // Remove nodes that are no longer part of the PDG. Their edges were already
-    // deleted above. The stale set is computed in Rust against the pre-query,
-    // so each DELETE stays well under SQLITE_MAX_VARIABLE_NUMBER.
+    let edge_stats = save_edges(&tx, project_id, &node_id_map, pdg)?;
+    let edges_elapsed = started.elapsed();
+
+    // Remove nodes that are no longer part of the PDG. Their edges were
+    // already removed by the edge diff above. The stale set is computed in
+    // Rust against the pre-query, so each DELETE stays well under
+    // SQLITE_MAX_VARIABLE_NUMBER.
     for chunk in stale_node_ids.chunks(PDG_INSERT_BATCH_SIZE) {
         let placeholders = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
         let sql = format!(
@@ -215,8 +309,6 @@ pub fn save_pdg(
         tx.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
     }
 
-    save_edges(&tx, &node_id_map, pdg)?;
-
     // Save trigram index alongside the PDG (within the same transaction)
     if let Err(e) = save_trigram_index_tx(&tx, project_id, pdg.trigram_index()) {
         // Log but don't fail — the trigram index is a performance optimization,
@@ -225,7 +317,26 @@ pub fn save_pdg(
     }
 
     tx.commit()?;
+    tracing::info!(
+        project = project_id,
+        total_ms = started.elapsed().as_millis() as u64,
+        nodes_until_ms = nodes_elapsed.as_millis() as u64,
+        edges_until_ms = edges_elapsed.as_millis() as u64,
+        pdg_nodes = pdg.node_count(),
+        pdg_edges = pdg.edge_count(),
+        edges_written = edge_stats.written,
+        edges_deleted = edge_stats.deleted,
+        edges_skipped = pdg.edge_count().saturating_sub(edge_stats.written),
+        "save_pdg diff summary"
+    );
     Ok(())
+}
+
+/// Write accounting for one `save_edges` pass, used for logging and tests.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct EdgeSaveStats {
+    written: usize,
+    deleted: usize,
 }
 
 /// Content hash for a node — computed once per node and reused for both the
@@ -358,10 +469,19 @@ fn save_nodes(
 
     // Upsert only new/changed nodes in batches. `RETURNING id` emits rows in
     // the same order as the VALUES tuples, so the returned db ids map 1:1 onto
-    // the chunk's (pos, record) pairs. The DO UPDATE ... WHERE clause is a
-    // defensive no-op guard: rows are already filtered to changed, so the
-    // update always fires; if one slipped through unchanged, the write is
-    // skipped instead of dirtying the page.
+    // the chunk's (pos, record) pairs. The invariant that makes this mapping
+    // sound is that the statement returns EXACTLY one row per input tuple.
+    //
+    // A previous `DO UPDATE ... WHERE content_hash != excluded.content_hash`
+    // guard violated that invariant: when a chunk contains duplicate
+    // `node_id`s (the graph legitimately holds same-named symbols from
+    // different files), the second tuple's guard evaluated false, suppressed
+    // the UPDATE, and `RETURNING` returned fewer rows than the chunk. The
+    // `zip` below then silently dropped the tail nodes from `node_id_map`,
+    // so their edges referenced non-existent rows and the whole persist
+    // failed with `EdgeNodeMissing`. Unchanged rows are already filtered out
+    // by the Rust-side content_hash comparison above, so the guard was both
+    // redundant and harmful; it is removed here.
     for chunk in to_upsert.chunks(PDG_INSERT_BATCH_SIZE) {
         let n = chunk.len();
 
@@ -391,7 +511,6 @@ fn save_nodes(
                byte_range_end = excluded.byte_range_end, \
                embedding_format = excluded.embedding_format, \
                updated_at = excluded.updated_at \
-             WHERE intel_nodes.content_hash != excluded.content_hash \
              RETURNING id"
         );
 
@@ -454,6 +573,16 @@ fn save_nodes(
                 row.get::<_, i64>(0)
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        // The statement now returns exactly one row per tuple. If this ever
+        // regresses (e.g. a future conditional guard), fail loudly rather than
+        // silently dropping nodes from the map and corrupting edge references.
+        if ids.len() != chunk.len() {
+            return Err(PdgStoreError::Serialization(format!(
+                "node upsert returned {} ids for {} tuples; refusing to save a partial node map",
+                ids.len(),
+                chunk.len(),
+            )));
+        }
         for (&(pos, _), db_id) in chunk.iter().zip(ids) {
             node_id_map.insert(node_indices[pos], db_id);
         }
@@ -462,15 +591,153 @@ fn save_nodes(
     Ok((node_id_map, stale_node_ids))
 }
 
+/// Persisted-row identity of an edge: the `intel_edges` primary key.
+type EdgeKey = (i64, i64, String);
+
+/// Persist edges by DIFFING against the rows already stored for the project,
+/// mirroring the node content-hash skip: an edge whose (caller, callee, type)
+/// row already exists with identical metadata JSON issues no write at all.
+///
+/// This replaces the previous unconditional delete-all + reinsert, which
+/// rewrote every edge row (110K+ on large projects) on every save, including
+/// one-file incremental deltas where nothing changed.
+///
+/// Semantics preserved from the old implementation:
+/// - duplicate parallel edges with the same PK collapse last-wins (the desired
+///   map's `insert` overwrites, matching "later INSERT wins" upsert order);
+/// - rows whose caller node belongs to another project are never touched (the
+///   existing-rows query filters by caller-side project membership, exactly
+///   like the old bulk DELETE did).
 fn save_edges(
     tx: &rusqlite::Transaction<'_>,
+    project_id: &str,
     node_id_map: &HashMap<NodeId, i64>,
     pdg: &ProgramDependenceGraph,
-) -> Result<()> {
-    let edge_indices: Vec<_> = pdg.edge_indices().collect();
+) -> Result<EdgeSaveStats> {
+    // Existing rows for the project: one sequential read (no WAL growth)
+    // instead of a full-table rewrite. NULL metadata (legacy rows) reads as
+    // the empty string, which never equals serialized JSON, so such rows are
+    // rewritten once and converge.
+    let mut existing: HashMap<EdgeKey, String> = HashMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT e.caller_id, e.callee_id, e.edge_type, e.metadata
+             FROM intel_edges e
+             WHERE e.caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1)",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            ))
+        })?;
+        for row in rows {
+            let (caller, callee, edge_type, metadata) = row?;
+            existing.insert((caller, callee, edge_type), metadata);
+        }
+    }
 
-    // Batch edges into multi-row INSERTs, mirroring the node batching above.
-    for chunk in edge_indices.chunks(PDG_INSERT_BATCH_SIZE) {
+    let mut desired: HashMap<EdgeKey, String> = HashMap::with_capacity(pdg.edge_count());
+    for edge_idx in pdg.edge_indices() {
+        let (source, target) = pdg
+            .edge_endpoints(edge_idx)
+            .ok_or_else(|| PdgStoreError::Serialization("Edge has no endpoints".to_string()))?;
+        let pdg_edge = pdg
+            .get_edge(edge_idx)
+            .ok_or_else(|| PdgStoreError::Serialization("Missing edge data".to_string()))?;
+        let caller_id =
+            *node_id_map
+                .get(&source)
+                .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
+                    caller: source.index() as i64,
+                    callee: target.index() as i64,
+                })?;
+        let callee_id =
+            *node_id_map
+                .get(&target)
+                .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
+                    caller: source.index() as i64,
+                    callee: target.index() as i64,
+                })?;
+        let metadata = convert_edge_metadata(&pdg_edge.metadata);
+        let metadata_json = serde_json::to_string(&metadata)
+            .map_err(|e| PdgStoreError::Serialization(e.to_string()))?;
+        desired.insert(
+            (
+                caller_id,
+                callee_id,
+                convert_edge_type(&pdg_edge.edge_type).as_str().to_string(),
+            ),
+            metadata_json,
+        );
+    }
+
+    // Stale = persisted rows absent from the desired set (includes every edge
+    // of a removed node, since those keys cannot be produced from the current
+    // node_id_map).
+    let stale: Vec<EdgeKey> = existing
+        .keys()
+        .filter(|key| !desired.contains_key(key))
+        .cloned()
+        .collect();
+
+    let mut stats = EdgeSaveStats::default();
+
+    // When most of the table churns (major refactor / different content), the
+    // single subquery DELETE beats thousands of parameterized OR clauses and
+    // every desired edge becomes a fresh insert — i.e. the old full-rebuild
+    // path. Otherwise delete exactly the stale rows via their primary key.
+    let bulk = existing.len() >= 64 && stale.len() * 2 > existing.len();
+    if stale.is_empty() {
+        // Nothing to delete.
+    } else if bulk {
+        tx.execute(
+            "DELETE FROM intel_edges WHERE caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1)",
+            params![project_id],
+        )?;
+        stats.deleted = stale.len();
+    } else {
+        // Row-value IN over a VALUES table: flat (no expression-tree depth
+        // growth — a chain of ORs nests left-associatively and blows
+        // SQLITE_LIMIT_EXPR_DEPTH=1000 at ~1000 rows), and the planner can
+        // use the (caller_id, callee_id, edge_type) PK index for the probe.
+        // 3 bound params per row; 1000 rows = 3000 params, well under
+        // SQLITE_MAX_VARIABLE_NUMBER (32766).
+        const EDGE_DELETE_CHUNK: usize = 1000;
+        for chunk in stale.chunks(EDGE_DELETE_CHUNK) {
+            let values = (0..chunk.len())
+                .map(|_| "(?,?,?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "DELETE FROM intel_edges WHERE (caller_id, callee_id, edge_type) IN (VALUES {values})"
+            );
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 3);
+            for (caller, callee, edge_type) in chunk {
+                params.push(Value::Integer(*caller));
+                params.push(Value::Integer(*callee));
+                params.push(Value::Text(edge_type.clone()));
+            }
+            tx.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+            stats.deleted += chunk.len();
+        }
+    }
+
+    // After a bulk delete every desired edge is a fresh insert; otherwise only
+    // new rows and rows whose metadata JSON changed are written (the upsert's
+    // DO UPDATE arm covers changed metadata).
+    let mut to_write: Vec<(i64, i64, String, String)> = Vec::new();
+    for (key, metadata) in &desired {
+        let unchanged = !bulk && existing.get(key).is_some_and(|stored| stored == metadata);
+        if !unchanged {
+            to_write.push((key.0, key.1, key.2.clone(), metadata.clone()));
+        }
+    }
+
+    // Batch inserts into multi-row statements, mirroring the node batching.
+    for chunk in to_write.chunks(PDG_INSERT_BATCH_SIZE) {
         let n = chunk.len();
         let values_clause = (0..n).map(|_| "(?,?,?,?)").collect::<Vec<_>>().join(", ");
         let sql = format!(
@@ -480,46 +747,26 @@ fn save_edges(
         );
 
         let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(n * 4);
-        for &edge_idx in chunk {
-            let (source, target) = pdg
-                .edge_endpoints(edge_idx)
-                .ok_or_else(|| PdgStoreError::Serialization("Edge has no endpoints".to_string()))?;
-            let pdg_edge = pdg
-                .get_edge(edge_idx)
-                .ok_or_else(|| PdgStoreError::Serialization("Missing edge data".to_string()))?;
-            let caller_id =
-                *node_id_map
-                    .get(&source)
-                    .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
-                        caller: source.index() as i64,
-                        callee: target.index() as i64,
-                    })?;
-            let callee_id =
-                *node_id_map
-                    .get(&target)
-                    .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
-                        caller: source.index() as i64,
-                        callee: target.index() as i64,
-                    })?;
-            let metadata = convert_edge_metadata(&pdg_edge.metadata);
-            let metadata_json = serde_json::to_string(&metadata)
-                .map_err(|e| PdgStoreError::Serialization(e.to_string()))?;
-
-            params.push(Value::Integer(caller_id));
-            params.push(Value::Integer(callee_id));
-            params.push(Value::Text(
-                convert_edge_type(&pdg_edge.edge_type).as_str().to_string(),
-            ));
-            params.push(Value::Text(metadata_json));
+        for (caller_id, callee_id, edge_type, metadata_json) in chunk {
+            params.push(Value::Integer(*caller_id));
+            params.push(Value::Integer(*callee_id));
+            params.push(Value::Text(edge_type.clone()));
+            params.push(Value::Text(metadata_json.clone()));
         }
 
         tx.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+        stats.written += n;
     }
 
-    Ok(())
+    Ok(stats)
 }
 
 /// Save trigram index within an existing transaction.
+///
+/// Hash-skip: the serialized index is a pure function of the PDG's node set,
+/// so when the stored content hash matches, the multi-MB blob rewrite is
+/// skipped entirely (no-op re-saves and unchanged-graph watcher passes pay
+/// only the serialize + blake3 cost, not the write).
 fn save_trigram_index_tx(
     tx: &rusqlite::Transaction<'_>,
     project_id: &str,
@@ -529,20 +776,41 @@ fn save_trigram_index_tx(
     let node_count = trigram_index.node_count() as i64;
     let trigram_count = trigram_index.trigram_count() as i64;
 
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&serialized);
+    let content_hash = hasher.finalize().to_hex().to_string();
+
+    let stored: Option<String> = tx
+        .query_row(
+            "SELECT content_hash FROM trigram_index WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map(Some)
+        .or_else(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    if stored.as_deref() == Some(content_hash.as_str()) {
+        return Ok(());
+    }
+
     tx.execute(
-        "INSERT INTO trigram_index (project_id, index_data, node_count, trigram_count, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO trigram_index (project_id, index_data, node_count, trigram_count, updated_at, content_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(project_id) DO UPDATE SET
             index_data = excluded.index_data,
             node_count = excluded.node_count,
             trigram_count = excluded.trigram_count,
-            updated_at = excluded.updated_at",
+            updated_at = excluded.updated_at,
+            content_hash = excluded.content_hash",
         params![
             project_id,
             serialized,
             node_count,
             trigram_count,
             chrono::Utc::now().timestamp(),
+            content_hash,
         ],
     )?;
 
@@ -968,17 +1236,22 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::NamedTempFile;
 
-    /// Counts of INSERT statements emitted against intel_nodes / intel_edges,
-    /// populated by a raw `sqlite3_trace` callback installed for the batch
-    /// tests below. Statics (not a captured closure) because the trace hook is
-    /// an `unsafe extern "C"` function pointer and cannot capture state.
+    /// Counts of INSERT/DELETE statements emitted against intel_nodes /
+    /// intel_edges, populated by a raw `sqlite3_trace` callback installed for
+    /// the batch tests below. Statics (not a captured closure) because the
+    /// trace hook is an `unsafe extern "C"` function pointer and cannot
+    /// capture state. Note: legacy sqlite3_trace delivers SQL with bound
+    /// values EXPANDED inline, so only prefix/statement-level matching is
+    /// sound — never count "?," tuples in the traced text.
     struct TraceCounts {
         node: AtomicUsize,
         edge: AtomicUsize,
+        edge_delete: AtomicUsize,
     }
     static TRACE_COUNTS: TraceCounts = TraceCounts {
         node: AtomicUsize::new(0),
         edge: AtomicUsize::new(0),
+        edge_delete: AtomicUsize::new(0),
     };
 
     unsafe extern "C" fn sql_trace_cb(_user: *mut c_void, sql_ptr: *const c_char) {
@@ -992,6 +1265,8 @@ mod tests {
             TRACE_COUNTS.node.fetch_add(1, Ordering::Relaxed);
         } else if sql.starts_with("INSERT INTO intel_edges") {
             TRACE_COUNTS.edge.fetch_add(1, Ordering::Relaxed);
+        } else if sql.starts_with("DELETE FROM intel_edges") {
+            TRACE_COUNTS.edge_delete.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1106,6 +1381,329 @@ mod tests {
         let func1 = loaded.find_by_symbol("func1").unwrap();
         let node1 = loaded.get_node(func1).unwrap();
         assert_eq!(node1.complexity, 5);
+    }
+
+    #[test]
+    fn test_is_transient_lock_error_classification() {
+        use rusqlite::ErrorCode;
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: ErrorCode::DatabaseBusy,
+                extended_code: 5,
+            },
+            None,
+        );
+        assert!(is_transient_lock_error(&busy));
+        let locked = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: ErrorCode::DatabaseLocked,
+                extended_code: 6,
+            },
+            None,
+        );
+        assert!(is_transient_lock_error(&locked));
+        let constraint = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: ErrorCode::ConstraintViolation,
+                extended_code: 19,
+            },
+            None,
+        );
+        assert!(!is_transient_lock_error(&constraint));
+    }
+
+    #[test]
+    fn test_save_pdg_survives_competing_writer_lock() {
+        // A competing connection holds the write lock briefly while save_pdg
+        // runs. The busy_timeout (re-asserted by save_pdg) must wait out the
+        // competing writer instead of failing the index persist.
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+        let pdg = create_test_pdg();
+
+        let db_path = temp_file.path().to_path_buf();
+        let holder = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(db_path).unwrap();
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE IF NOT EXISTS lock_probe(value INTEGER);
+                 INSERT INTO lock_probe VALUES (1);",
+            )
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            conn.execute_batch("ROLLBACK;").unwrap();
+        });
+
+        // Give the holder time to acquire the write lock before saving.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let started = std::time::Instant::now();
+        save_pdg(&mut storage, "lock_proj", &pdg)
+            .expect("save_pdg must wait out a brief competing write lock");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "save_pdg should not exceed the busy window for a short lock"
+        );
+        holder.join().unwrap();
+
+        let loaded = load_pdg(&storage, "lock_proj").unwrap();
+        assert_eq!(loaded.node_count(), 2);
+        assert_eq!(loaded.edge_count(), 1);
+    }
+
+    #[test]
+    fn test_large_save_pdg_survives_pinned_reader_and_wal_stays_bounded() {
+        // Reproduces the stress-test report's actual failure signature: the
+        // MCP server's long-lived catalog/search connections hold a read
+        // snapshot that pins the WAL, so `wal_checkpoint(TRUNCATE)` cannot
+        // shrink it and it grows without bound (57MB in the report). This
+        // must not fail the writer — WAL readers do not block writers — and
+        // once the reader releases, the WAL must be recoverable to a bounded
+        // size rather than leaking forever.
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_path_buf();
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", db_path.display()));
+
+        let mut storage = Storage::open(&db_path).unwrap();
+        // A multi-thousand-node PDG so the write genuinely produces a
+        // multi-page WAL instead of a trivial one.
+        let pdg = create_large_pdg(2000, 1999);
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let reader_db = db_path.clone();
+        let reader = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(reader_db).unwrap();
+            // Open a read transaction and hold its snapshot open: this is what
+            // pins the WAL and blocks `wal_checkpoint(TRUNCATE)`.
+            conn.execute_batch("BEGIN").unwrap();
+            let _count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM intel_nodes", [], |row| row.get(0))
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            conn.execute_batch("COMMIT").unwrap();
+        });
+
+        // Wait until the reader has actually pinned its snapshot before writing.
+        ready_rx.recv().unwrap();
+
+        save_pdg(&mut storage, "pinned_reader_proj", &pdg)
+            .expect("save_pdg must commit while a reader pins the WAL");
+
+        let loaded = load_pdg(&storage, "pinned_reader_proj").unwrap();
+        assert_eq!(loaded.node_count(), 2000);
+        assert_eq!(loaded.edge_count(), 1999);
+
+        // Release the reader and checkpoint; the WAL must shrink back to a
+        // bounded size, proving the bloat came from the pinned reader and not
+        // from a leaked/corrupted WAL.
+        release_tx.send(()).unwrap();
+        reader.join().unwrap();
+        storage
+            .conn()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let wal_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            wal_len < 1024 * 1024,
+            "WAL should shrink below 1MiB after the reader releases; got {wal_len}"
+        );
+    }
+
+    #[test]
+    fn test_save_pdg_retries_after_busy_timeout_expires() {
+        // Distinguishes the retry loop from the busy_timeout alone: the
+        // competing writer holds the write lock *longer* than the 5s
+        // busy_timeout, so the first attempt must fail with SQLITE_BUSY and
+        // the bounded retry must rescue the save. A lock held briefly (as in
+        // test_save_pdg_survives_competing_writer_lock) is absorbed by
+        // busy_timeout and never exercises the retry path.
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+        let pdg = create_test_pdg();
+
+        let db_path = temp_file.path().to_path_buf();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(db_path).unwrap();
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE IF NOT EXISTS lock_probe(value INTEGER);
+                 INSERT INTO lock_probe VALUES (1);",
+            )
+            .unwrap();
+            held_tx.send(()).unwrap();
+            // Hold past the 5s busy_timeout so the writer's first attempt
+            // genuinely fails with SQLITE_BUSY and the retry loop must run.
+            std::thread::sleep(std::time::Duration::from_millis(6000));
+            conn.execute_batch("ROLLBACK;").unwrap();
+        });
+
+        // Start the writer only after the lock is held.
+        held_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        save_pdg(&mut storage, "retry_proj", &pdg)
+            .expect("save_pdg must retry after busy_timeout expires");
+        holder.join().unwrap();
+
+        // The save must have taken at least the full busy_timeout window,
+        // proving the retry (not just busy_timeout) rescued the commit.
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(5000),
+            "expected save_pdg to exhaust busy_timeout and retry"
+        );
+        let loaded = load_pdg(&storage, "retry_proj").unwrap();
+        assert_eq!(loaded.node_count(), 2);
+    }
+
+    #[test]
+    fn test_save_pdg_duplicate_node_id_keeps_all_edges_referencable() {
+        // Reproduces the real stress-test root cause. The graph legitimately
+        // holds multiple nodes that share the same `node_id` string (e.g.
+        // `__external__` import nodes collapse to the same symbol in
+        // different files). When those land in the same upsert chunk, a
+        // conditional `DO UPDATE ... WHERE content_hash != excluded.content_hash`
+        // used to suppress the second UPDATE, so `RETURNING id` returned fewer
+        // rows than the chunk and the tail nodes were dropped from the
+        // `node_id_map` — their edges then failed with `EdgeNodeMissing` and
+        // the whole persist aborted. The upsert must return exactly one id per
+        // tuple so every node (and thus every edge) resolves.
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+
+        let mut pdg = ProgramDependenceGraph::new();
+        // Two distinct nodes with the SAME `id` string, so they collide on the
+        // unique (project_id, node_id) index. They must both end up in the
+        // node map (mapping to the same db row id is fine — the DB dedupes by
+        // node_id, the graph keeps both for in-memory analysis).
+        let duplicate_id = "shared.rs:collide";
+        let a = pdg.add_node(PDGNode {
+            id: duplicate_id.to_string(),
+            node_type: PDGNodeType::External,
+            name: "collide".to_string(),
+            file_path: Arc::from("shared.rs"),
+            byte_range: (0, 10),
+            complexity: 0,
+            language: "external".to_string(),
+        });
+        let b = pdg.add_node(PDGNode {
+            id: duplicate_id.to_string(),
+            node_type: PDGNodeType::External,
+            name: "collide".to_string(),
+            file_path: Arc::from("shared.rs"),
+            byte_range: (0, 10),
+            complexity: 0,
+            language: "external".to_string(),
+        });
+        let importer = pdg.add_node(PDGNode {
+            id: "src/main.rs:main".to_string(),
+            node_type: PDGNodeType::Function,
+            name: "main".to_string(),
+            file_path: Arc::from("src/main.rs"),
+            byte_range: (0, 50),
+            complexity: 1,
+            language: "rust".to_string(),
+        });
+        // Two Import edges whose targets are the colliding nodes. Before the
+        // fix, the colliding node b fell out of the map and this save failed.
+        pdg.add_edge(
+            importer,
+            a,
+            PDGEdge {
+                edge_type: PDGEdgeType::Import,
+                metadata: PDGEdgeMetadata::empty(),
+            },
+        );
+        pdg.add_edge(
+            importer,
+            b,
+            PDGEdge {
+                edge_type: PDGEdgeType::Import,
+                metadata: PDGEdgeMetadata::empty(),
+            },
+        );
+
+        save_pdg(&mut storage, "dup_proj", &pdg)
+            .expect("duplicate node_id must not drop nodes from the map");
+
+        let loaded = load_pdg(&storage, "dup_proj").unwrap();
+        // The DB dedupes the duplicate node_id to a single row (unique
+        // (project_id, node_id) index) and the two identical Import edges onto
+        // the single (caller, callee, edge_type) row. The point of this test
+        // is that the save SUCCEEDS with both edges resolved — before the fix
+        // the colliding node fell out of the map and save_pdg failed with
+        // `EdgeNodeMissing`.
+        assert_eq!(loaded.node_count(), 2);
+        assert_eq!(loaded.edge_count(), 1);
+    }
+
+    #[test]
+    fn test_legacy_schema_missing_timestamp_columns_repaired() {
+        // Simulate a database created before intel_nodes had created_at/
+        // updated_at columns. `CREATE TABLE IF NOT EXISTS` never repairs an
+        // existing table, so Storage::open must add the columns through the
+        // ensure-columns path; otherwise save_pdg's INSERT fails with
+        // "no such column" and every index generation dies at persist.
+        let temp_file = NamedTempFile::new().unwrap();
+        {
+            let conn = rusqlite::Connection::open(temp_file.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE intel_nodes (
+                    id INTEGER PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    symbol_name TEXT NOT NULL,
+                    qualified_name TEXT NOT NULL,
+                    language TEXT NOT NULL DEFAULT 'unknown',
+                    node_type TEXT NOT NULL,
+                    signature TEXT,
+                    complexity INTEGER,
+                    embedding BLOB,
+                    byte_range_start INTEGER,
+                    byte_range_end INTEGER,
+                    embedding_format INTEGER
+                );
+                CREATE TABLE intel_edges (
+                    caller_id INTEGER NOT NULL,
+                    callee_id INTEGER NOT NULL,
+                    edge_type TEXT NOT NULL,
+                    metadata TEXT,
+                    FOREIGN KEY(caller_id) REFERENCES intel_nodes(id),
+                    FOREIGN KEY(callee_id) REFERENCES intel_nodes(id),
+                    PRIMARY KEY(caller_id, callee_id, edge_type)
+                );",
+            )
+            .unwrap();
+        }
+
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+        let columns: Vec<String> = storage
+            .conn()
+            .prepare("PRAGMA table_info(intel_nodes)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            columns.iter().any(|column| column == "created_at"),
+            "legacy schema must gain created_at"
+        );
+        assert!(
+            columns.iter().any(|column| column == "updated_at"),
+            "legacy schema must gain updated_at"
+        );
+        assert!(
+            columns.iter().any(|column| column == "content_hash"),
+            "legacy schema must gain content_hash"
+        );
+
+        // A full save/load round-trip must work on the repaired schema.
+        let pdg = create_test_pdg();
+        save_pdg(&mut storage, "legacy_proj", &pdg).unwrap();
+        let loaded = load_pdg(&storage, "legacy_proj").unwrap();
+        assert_eq!(loaded.node_count(), 2);
     }
 
     #[test]
@@ -1481,6 +2079,238 @@ mod tests {
         // The changed node's complexity round-tripped.
         let changed = loaded.get_node(first_node).expect("node survived resave");
         assert!(changed.complexity > 0);
+    }
+
+    #[test]
+    fn test_resave_unchanged_pdg_skips_trigram_blob_rewrite() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+
+        let pdg = create_test_pdg();
+        save_pdg(&mut storage, "trigram_skip_proj", &pdg).unwrap();
+        let first_updated_at: i64 = storage
+            .conn()
+            .query_row(
+                "SELECT updated_at FROM trigram_index WHERE project_id = 'trigram_skip_proj'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // An identical re-save must skip the blob rewrite: updated_at would
+        // move forward on any write, so a stalled timestamp proves the skip.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        save_pdg(&mut storage, "trigram_skip_proj", &pdg).unwrap();
+        let second_updated_at: i64 = storage
+            .conn()
+            .query_row(
+                "SELECT updated_at FROM trigram_index WHERE project_id = 'trigram_skip_proj'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            first_updated_at, second_updated_at,
+            "unchanged trigram index must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn test_resave_unchanged_pdg_issues_no_edge_writes() {
+        // The save-PDG hot path: an identical re-save used to DELETE and
+        // re-INSERT every edge row (110K+ on large projects). The edge diff
+        // must issue ZERO edge write statements when nothing changed.
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+
+        let pdg = create_large_pdg(1_000, 1_000);
+        save_pdg(&mut storage, "edge_resave_proj", &pdg).unwrap();
+
+        TRACE_COUNTS.node.store(0, Ordering::Relaxed);
+        TRACE_COUNTS.edge.store(0, Ordering::Relaxed);
+        TRACE_COUNTS.edge_delete.store(0, Ordering::Relaxed);
+        set_sql_trace(storage.conn(), true);
+        save_pdg(&mut storage, "edge_resave_proj", &pdg).unwrap();
+        set_sql_trace(storage.conn(), false);
+
+        let inserted = TRACE_COUNTS.edge.load(Ordering::Relaxed);
+        let deleted = TRACE_COUNTS.edge_delete.load(Ordering::Relaxed);
+        assert_eq!(
+            inserted, 0,
+            "unchanged resave emitted {inserted} edge INSERT statements (expected 0)"
+        );
+        assert_eq!(
+            deleted, 0,
+            "unchanged resave emitted {deleted} edge DELETE statements (expected 0)"
+        );
+
+        let loaded = load_pdg(&storage, "edge_resave_proj").unwrap();
+        assert_eq!(loaded.node_count(), 1_000);
+        assert_eq!(loaded.edge_count(), 1_000);
+    }
+
+    #[test]
+    fn test_resave_edge_delta_persists_exactly_the_delta() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+
+        let mut pdg = create_large_pdg(100, 99);
+        save_pdg(&mut storage, "edge_delta_proj", &pdg).unwrap();
+
+        // Delta: flip one edge's call_count, drop the LAST edge, add one
+        // node+edge. (Legacy sqlite3_trace expands bound values into the SQL
+        // text, so row counts are asserted through persisted DB state rather
+        // than statement text.)
+        let first_edge = pdg.edge_indices().next().expect("pdg has edges");
+        pdg.graph[first_edge].metadata.call_count = Some(42);
+        let last_edge = pdg.edge_indices().last().expect("pdg has edges");
+        let (last_from, last_to) = pdg.edge_endpoints(last_edge).expect("endpoints");
+        let removed_pair = (
+            pdg.get_node(last_from).expect("node").id.clone(),
+            pdg.get_node(last_to).expect("node").id.clone(),
+        );
+        pdg.remove_edge(last_edge);
+        let extra = pdg.add_node(PDGNode {
+            id: "src/main.rs:extra".to_string(),
+            node_type: PDGNodeType::Function,
+            name: "extra".to_string(),
+            file_path: Arc::from("src/main.rs"),
+            byte_range: (9_000, 9_010),
+            complexity: 1,
+            language: "rust".to_string(),
+        });
+        let any_node = pdg.node_indices().next().expect("pdg has nodes");
+        pdg.add_edge(
+            any_node,
+            extra,
+            PDGEdge {
+                edge_type: PDGEdgeType::Call,
+                metadata: PDGEdgeMetadata {
+                    call_count: Some(7),
+                    variable_name: None,
+                    confidence: None,
+                    channel: None,
+                    position: None,
+                },
+            },
+        );
+
+        save_pdg(&mut storage, "edge_delta_proj", &pdg).unwrap();
+
+        // Persisted state reflects exactly the delta:
+        let loaded = load_pdg(&storage, "edge_delta_proj").unwrap();
+        assert_eq!(loaded.node_count(), 101);
+        // 99 - 1 removed + 1 added.
+        assert_eq!(loaded.edge_count(), 99);
+        // The changed edge's metadata round-tripped.
+        let changed = loaded
+            .edge_indices()
+            .map(|edge| loaded.get_edge(edge).expect("edge"))
+            .filter(|edge| edge.metadata.call_count == Some(42))
+            .count();
+        assert_eq!(changed, 1, "changed edge metadata must persist");
+        // The new edge exists with its distinctive call_count.
+        let added = loaded
+            .edge_indices()
+            .map(|edge| loaded.get_edge(edge).expect("edge"))
+            .filter(|edge| edge.metadata.call_count == Some(7))
+            .count();
+        assert_eq!(added, 1, "new edge must persist");
+        // The removed edge is gone: no edge connects the removed pair.
+        let (from_id, to_id) = &removed_pair;
+        let from_loaded = loaded.find_by_id(from_id).expect("from node survived");
+        let to_loaded = loaded.find_by_id(to_id).expect("to node survived");
+        let still_connected = loaded.edge_indices().any(|edge| {
+            let (source, target) = loaded.edge_endpoints(edge).expect("endpoints");
+            (source == from_loaded && target == to_loaded)
+                || (source == to_loaded && target == from_loaded)
+        });
+        assert!(!still_connected, "removed edge must not survive the resave");
+    }
+
+    #[test]
+    fn test_resave_after_node_removal_cleans_its_edges() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+
+        // Path graph 0→1→...→49: node 0 participates in exactly ONE edge.
+        let mut pdg = create_large_pdg(50, 49);
+        save_pdg(&mut storage, "node_removal_proj", &pdg).unwrap();
+
+        let victim = pdg.node_indices().next().expect("pdg has nodes");
+        let victim_id = pdg.get_node(victim).expect("node").id.clone();
+        pdg.remove_node(victim);
+
+        save_pdg(&mut storage, "node_removal_proj", &pdg).unwrap();
+
+        let loaded = load_pdg(&storage, "node_removal_proj").unwrap();
+        assert_eq!(loaded.node_count(), 49);
+        assert_eq!(
+            loaded.edge_count(),
+            48,
+            "node 0's single edge must be removed with it (49 - 1)"
+        );
+        assert!(loaded.find_by_id(&victim_id).is_none());
+    }
+
+    #[test]
+    fn test_save_pdg_bulk_rebuild_on_major_edge_churn() {
+        // When most edges churn (different node identities), the diff takes
+        // the bulk subquery DELETE + full reinsert path. Correctness must
+        // match the row-by-row path.
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+
+        let before = create_large_pdg(2_000, 1_999);
+        save_pdg(&mut storage, "churn_proj", &before).unwrap();
+
+        // Completely different node ids (different file path) ⇒ zero shared
+        // edges ⇒ stale fraction 100% ⇒ bulk path.
+        let after = {
+            let mut pdg = ProgramDependenceGraph::new();
+            let mut ids = Vec::new();
+            for i in 0..500 {
+                ids.push(pdg.add_node(PDGNode {
+                    id: format!("src/other.rs:func{i}"),
+                    node_type: PDGNodeType::Function,
+                    name: format!("func{i}"),
+                    file_path: Arc::from("src/other.rs"),
+                    byte_range: (i * 10, i * 10 + 8),
+                    complexity: (i % 5) as u32,
+                    language: "rust".to_string(),
+                }));
+            }
+            for i in 0..499 {
+                pdg.add_edge(
+                    ids[i],
+                    ids[i + 1],
+                    PDGEdge {
+                        edge_type: PDGEdgeType::Call,
+                        metadata: PDGEdgeMetadata {
+                            call_count: Some(1),
+                            variable_name: None,
+                            confidence: None,
+                            channel: None,
+                            position: None,
+                        },
+                    },
+                );
+            }
+            pdg
+        };
+        save_pdg(&mut storage, "churn_proj", &after).unwrap();
+
+        let loaded = load_pdg(&storage, "churn_proj").unwrap();
+        assert_eq!(
+            loaded.node_count(),
+            500,
+            "old nodes must be pruned on churn"
+        );
+        assert_eq!(loaded.edge_count(), 499);
+        assert!(
+            loaded.find_by_symbol("src/other.rs:func0").is_some(),
+            "new graph must fully replace the old one"
+        );
     }
 
     #[test]

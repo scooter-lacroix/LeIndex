@@ -253,6 +253,15 @@ impl Storage {
                 None,
             ),
             (
+                // Content hash column required by save_pdg's unchanged-row
+                // skip and by the idx_nodes_hash index; an ancient table
+                // without it cannot even open (CREATE INDEX fails). Empty
+                // hashes mark rows as changed, so the next save rewrites them.
+                "content_hash",
+                "ALTER TABLE intel_nodes ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+                None,
+            ),
+            (
                 "byte_range_start",
                 "ALTER TABLE intel_nodes ADD COLUMN byte_range_start INTEGER",
                 None,
@@ -265,6 +274,25 @@ impl Storage {
             (
                 "embedding_format",
                 "ALTER TABLE intel_nodes ADD COLUMN embedding_format INTEGER",
+                None,
+            ),
+            // Timestamp columns used by the save_pdg upsert (pdg_store.rs).
+            // Databases created before these columns existed in the CREATE
+            // TABLE must be repaired here — `CREATE TABLE IF NOT EXISTS`
+            // never adds columns to an existing table, and the save_pdg
+            // INSERT references them by name, so a legacy schema would fail
+            // every PDG save with "table intel_nodes has no column named
+            // created_at". A default is required because SQLite cannot add
+            // a NOT NULL column without one; 0 marks pre-migration rows and
+            // is corrected on the next save_pdg upsert.
+            (
+                "created_at",
+                "ALTER TABLE intel_nodes ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
+                None,
+            ),
+            (
+                "updated_at",
+                "ALTER TABLE intel_nodes ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
                 None,
             ),
         ] {
@@ -390,8 +418,26 @@ impl Storage {
                 index_data BLOB NOT NULL,
                 node_count INTEGER NOT NULL DEFAULT 0,
                 trigram_count INTEGER NOT NULL DEFAULT 0,
-                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
-            )"])
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                content_hash TEXT NOT NULL DEFAULT ''
+            )"])?;
+        // CREATE TABLE IF NOT EXISTS never adds columns to an existing table;
+        // stores created before the hash-skip need the column added (empty
+        // hash ⇒ first save rewrites once and converges).
+        let has_column = self
+            .conn
+            .prepare("PRAGMA table_info(trigram_index)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<SqliteResult<Vec<String>>>()?
+            .iter()
+            .any(|column| column == "content_hash");
+        if !has_column {
+            self.conn.execute(
+                "ALTER TABLE trigram_index ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     /// Get the underlying connection
