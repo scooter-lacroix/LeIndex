@@ -105,10 +105,26 @@ impl GitStatusHandler {
         let started = Instant::now();
 
         // This lookup is deliberately after the complete live Git response is built.
-        // It neither creates nor loads an index generation.
+        // It neither creates nor loads an index generation — but the resident
+        // handle can lack its graph (one-shot process, or an auto-index
+        // swapped in a fresh LeIndex whose PDG was dropped at completion),
+        // which rendered enrichment permanently "unavailable" in the CLI
+        // audit. Load it on demand; unindexed projects degrade as before.
         let Some(handle) = registry.try_get_loaded(&root).await else {
             return Ok(result);
         };
+        let guard = handle.read().await;
+        if guard.pdg().is_none() {
+            drop(guard);
+            let mut write_guard = handle.write().await;
+            if write_guard.pdg().is_none() {
+                let _ = write_guard.load_from_storage();
+                let _ = write_guard.ensure_pdg_loaded();
+            }
+            drop(write_guard);
+        } else {
+            drop(guard);
+        }
         let guard = handle.read().await;
         let Some(pdg) = guard.pdg() else {
             return Ok(result);

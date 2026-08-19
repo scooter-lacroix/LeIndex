@@ -143,7 +143,14 @@ impl DiagnosticsHandler {
         // exactly — a copy bug, not a measurement.
         let process_rss_bytes = crate::cli::memory_report::current_rss_bytes();
         let memory_rss_mb = (process_rss_bytes as f64 / 1024.0 / 1024.0 * 100.0).round() / 100.0;
-        let size_mb = memory_usage_bytes as f64 / 1024.0 / 1024.0;
+        // "Index size" must mean DISK, or readers assume a bug: after the
+        // heap estimate was made honest it legitimately tracks RSS, and the
+        // audit flagged the identical values as a conflation. Report the
+        // real on-disk store size, and keep the estimate under its own name.
+        let store_disk_bytes = storage_dir_size_bytes(std::path::Path::new(&storage_path));
+        let size_mb = (store_disk_bytes as f64 / 1024.0 / 1024.0 * 100.0).round() / 100.0;
+        let heap_estimate_mb =
+            (memory_usage_bytes as f64 / 1024.0 / 1024.0 * 100.0).round() / 100.0;
         let failed_parses = diagnostics
             .as_ref()
             .map(|d| d.stats.failed_parses)
@@ -245,6 +252,10 @@ impl DiagnosticsHandler {
             );
             map.insert("symbol_count".to_string(), serde_json::json!(symbol_count));
             map.insert("index_size_mb".to_string(), serde_json::json!(size_mb));
+            map.insert(
+                "index_heap_estimate_mb".to_string(),
+                serde_json::json!(heap_estimate_mb),
+            );
             map.insert("stale".to_string(), serde_json::json!(stale_bool));
 
             // System health metrics: index freshness, live PDG node/edge
@@ -336,4 +347,28 @@ impl DiagnosticsHandler {
 
         Ok(wrap_with_meta(diag_json, &guard))
     }
+}
+
+/// On-disk size (bytes) of the project's `.leindex` store — the number a
+/// reader expects under "Index size". Bounded walk of the store directory
+/// (index artifacts, snapshots, generations); missing paths read as 0.
+fn storage_dir_size_bytes(root: &std::path::Path) -> u64 {
+    fn dir_size(dir: &std::path::Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut total = 0u64;
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                total += dir_size(&entry.path());
+            } else if file_type.is_file() {
+                total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+        total
+    }
+    dir_size(root)
 }

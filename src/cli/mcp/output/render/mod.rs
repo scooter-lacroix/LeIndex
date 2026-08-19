@@ -549,7 +549,18 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
         out.push_str(&field("Symbols", &v.to_string(), color));
     }
     if let Some(v) = data.get("index_size_mb").and_then(|v| v.as_f64()) {
-        out.push_str(&field("Index size", &format!("{:.2} MB", v), color));
+        out.push_str(&field(
+            "Index size (on disk)",
+            &format!("{:.2} MB", v),
+            color,
+        ));
+    }
+    if let Some(v) = data.get("index_heap_estimate_mb").and_then(|v| v.as_f64()) {
+        out.push_str(&field(
+            "Index heap (estimated)",
+            &format!("{:.2} MB", v),
+            color,
+        ));
     }
     if let Some(v) = data.get("memory_rss_mb").and_then(|v| v.as_f64()) {
         out.push_str(&field("Memory RSS", &format!("{:.2} MB", v), color));
