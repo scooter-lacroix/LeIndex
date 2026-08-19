@@ -1087,6 +1087,7 @@ fn cache_key_stats() -> IndexStats {
         successful_parses: 3,
         failed_parses: 0,
         total_signatures: 7,
+        signature_scope: "full".to_string(),
         pdg_nodes: 7,
         pdg_edges: 6,
         indexed_nodes: 7,
@@ -1504,6 +1505,61 @@ fn file_summary_context_collects_same_file_symbols_excluding_summary_nodes() {
         ctx.file_symbols.get("src/other.rs"),
         Some(&vec!["delta".to_string()])
     );
+}
+
+#[test]
+fn test_persist_search_snapshot_skips_identical_rewrite() {
+    use crate::search::search::{DEFAULT_EMBEDDING_DIMENSION, NodeInfo, SearchEngine};
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let project_path = temp.path();
+    let storage = project_path.join(".leindex");
+    std::fs::create_dir_all(&storage).unwrap();
+
+    let mut engine = SearchEngine::new();
+    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf_embedding[0] = 1.0;
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "a.rs:alpha".to_string(),
+        file_path: "a.rs".to_string(),
+        symbol_name: "alpha".to_string(),
+        language: "rust".to_string(),
+        content: "fn alpha() {}".to_string(),
+        byte_range: (0, 14),
+        tfidf_embedding,
+        neural_embedding: None,
+        complexity: 1,
+        signature: None,
+        pre_tokenized: None,
+    }]);
+
+    let snapshot_path = storage.join("search_snapshot.bin");
+    let sidecar_path = storage.join("search_snapshot.identity");
+
+    persist_search_snapshot(&engine, project_path, 1, 0, "fp-1".to_string()).unwrap();
+    assert!(snapshot_path.is_file(), "first persist writes the snapshot");
+    assert!(sidecar_path.is_file(), "identity sidecar written");
+
+    // Corrupt the snapshot but keep the identity sidecar: an identical
+    // persist must SKIP (garbage stays), proving no rewrite happened.
+    std::fs::write(&snapshot_path, b"stale-marker").unwrap();
+    persist_search_snapshot(&engine, project_path, 1, 0, "fp-1".to_string()).unwrap();
+    assert_eq!(
+        std::fs::read(&snapshot_path).unwrap(),
+        b"stale-marker",
+        "identical identity must skip the snapshot rewrite"
+    );
+
+    // A changed fingerprint rewrites: the garbage must be replaced by a real
+    // snapshot that hydrates.
+    persist_search_snapshot(&engine, project_path, 2, 1, "fp-2".to_string()).unwrap();
+    assert_ne!(
+        std::fs::read(&snapshot_path).unwrap(),
+        b"stale-marker",
+        "changed identity must rewrite the snapshot"
+    );
+    let reloaded = try_load_search_snapshot_from_storage(&storage).unwrap();
+    assert_eq!(reloaded.pdg_fingerprint, "fp-2");
 }
 
 #[test]

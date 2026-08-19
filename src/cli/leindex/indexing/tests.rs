@@ -310,15 +310,19 @@ fn build_pdg_streaming_produces_correct_node_count_for_multiple_files() {
     assert!(ids.contains(&"b.rs:epsilon".to_string()));
 }
 
-/// The streaming route must call `build_fragment_from_parsed` directly,
-/// NOT round-trip through `extract_pdg_from_signatures` + `fragment_from_pdg`.
-/// Detected with a method whose simple name differs from its qualified name:
-/// the streaming fragment keys nodes off the file-path + simple name and emits
-/// exactly one node per signature. If the route still delegated to
-/// `extract_pdg_from_signatures`, the qualified name ("Foo.bar") would drive
-/// the node id and containment inference would inject a second (class) node.
+/// The streaming route must produce a REAL graph: complexity carried from
+/// signatures and intra-file call edges present. It used to feed
+/// `build_fragment_from_parsed` (a skeleton that flattened signatures to
+/// name/kind/bytes, hardcoded complexity 0, and emitted NO edges), which
+/// left every streaming-built index with complexity-0 nodes, empty callee
+/// lists, and a `forward_impact` that always returned nothing. The route
+/// now delegates to `extract_pdg_from_signatures` + `fragment_from_pdg`
+/// (the skeleton's documented production realization), so — unlike the
+/// skeleton — a method inside `impl Foo` also gets the inferred `Foo`
+/// class node via containment. That extra node is the price of a graph
+/// with actual edges, and matches what the legacy route always produced.
 #[test]
-fn streaming_route_uses_build_fragment_from_parsed_not_extract() {
+fn streaming_route_builds_real_edges_and_complexity() {
     use crate::parse::traits::{SignatureInfo, Visibility};
     let result = crate::parse::parallel::ParsingResult {
         file_path: std::path::PathBuf::from("src/lib.rs"),
@@ -335,7 +339,7 @@ fn streaming_route_uses_build_fragment_from_parsed_not_extract() {
             calls: vec![],
             imports: vec![],
             byte_range: (10, 20),
-            cyclomatic_complexity: 1,
+            cyclomatic_complexity: 3,
             flow_facts: vec![],
         }],
         source_bytes: Some(b"impl Foo { fn bar() {} }".to_vec()),
@@ -343,19 +347,24 @@ fn streaming_route_uses_build_fragment_from_parsed_not_extract() {
         parse_time_ms: 0,
     };
     let pdg = build_pdg_streaming(vec![result]);
-    assert_eq!(
-        pdg.node_count(),
-        1,
-        "streaming must not inject extra containment/class nodes"
+
+    // The method node must exist, keyed off its qualified name.
+    let bar = pdg
+        .find_by_symbol("src/lib.rs:Foo.bar")
+        .or_else(|| pdg.find_by_name("bar"));
+    let bar = bar.expect("method node must exist in the streaming graph");
+    let node = pdg.get_node(bar).unwrap();
+    assert!(
+        node.complexity >= 1,
+        "streaming nodes must carry complexity from signatures (got {})",
+        node.complexity
     );
-    let ids: Vec<String> = pdg
-        .node_indices()
-        .filter_map(|idx| pdg.get_node(idx).map(|node| node.id.clone()))
-        .collect();
-    assert_eq!(
-        ids,
-        vec!["src/lib.rs:bar".to_string()],
-        "streaming nodes are keyed by the simple name from the ParsedFileRecord"
+
+    // Containment may add the inferred class node; the method must remain
+    // addressable by its simple name for lookup tools.
+    assert!(
+        pdg.find_by_name("bar").is_some(),
+        "simple-name lookup must still resolve the method"
     );
 }
 

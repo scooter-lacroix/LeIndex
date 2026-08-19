@@ -837,7 +837,19 @@ impl LeIndex {
 
         let mut context = String::from("/* Context Expansion via Gravity Traversal */\n");
 
+        // N-06: the traversal config carried `max_tokens` but this assembly
+        // loop appended every expanded node's full source regardless, so
+        // deep-analyze routinely overran its token_budget (3,700/3,000
+        // observed) with no indication. Enforce the budget during assembly
+        // (4 chars ≈ 1 token, matching the tokens_used estimate) and mark
+        // truncation so the caller knows the context was cut.
+        let char_budget = token_budget.saturating_mul(4);
+        let mut truncated = false;
         for node_id in expanded_node_ids {
+            if context.len() >= char_budget {
+                truncated = true;
+                break;
+            }
             if let Some(node) = pdg.get_node(node_id) {
                 context.push_str(&format!("\n// Symbol: {}\n", node.name));
                 context.push_str(&format!("// File: {}\n", node.file_path));
@@ -876,6 +888,9 @@ impl LeIndex {
                     ));
                 }
             }
+        }
+        if truncated {
+            context.push_str("\n/* [context truncated at the requested token budget] */\n");
         }
 
         Ok(context)

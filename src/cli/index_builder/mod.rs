@@ -489,6 +489,25 @@ pub(crate) fn scan_project_files(project_path: &Path) -> Result<ProjectFileScan>
     scan_non_git_project_files(project_path)
 }
 
+/// `tests/fixtures/**` (a `fixtures` directory directly inside a `tests`
+/// directory, at any depth): test-fixture trees are test INPUTS, not
+/// production source. Indexing them put fixture symbols into the production
+/// graph, where they won name-resolution races against real code (the
+/// `String::truncate` → tests/fixtures namesake conflation, N-03) and
+/// polluted search/context output. Excluded from the scan so both the git
+/// and non-git paths drop them.
+fn is_test_fixture_path(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root).ok().is_some_and(|relative| {
+        let mut previous: Option<&str> = None;
+        relative.components().any(|component| {
+            let name = component.as_os_str().to_str();
+            let hit = matches!((previous, name), (Some("tests"), Some("fixtures")));
+            previous = name;
+            hit
+        })
+    })
+}
+
 /// Returns `true` when `path` is reachable only through a hidden directory
 /// (any relative component whose name starts with `.`) or a `SKIP_DIRS`
 /// entry. The project root itself is never rejected — only descendant
@@ -497,8 +516,12 @@ pub(crate) fn scan_project_files(project_path: &Path) -> Result<ProjectFileScan>
 /// Mirrors the exclusion behavior of the non-git walker so both scan paths
 /// produce identical results: the non-git scan prunes its walk on dot-prefixed
 /// names and on `SKIP_DIRS`; this filters the same rule set out of the git
-/// inventory output.
+/// inventory output. `tests/fixtures/**` is additionally excluded (see
+/// [`is_test_fixture_path`]).
 fn is_excluded_project_path(path: &Path, root: &Path) -> bool {
+    if is_test_fixture_path(path, root) {
+        return true;
+    }
     path.strip_prefix(root).ok().is_some_and(|relative| {
         relative.components().any(|component| {
             component
@@ -625,6 +648,18 @@ fn scan_non_git_project_files(project_path: &Path) -> Result<ProjectFileScan> {
 
         if entry.file_type().is_dir() {
             if SKIP_DIRS.contains(&file_name.as_ref()) {
+                walker.skip_current_dir();
+            }
+            // Prune `tests/fixtures/` trees during the walk too (the git
+            // path filters them via `is_excluded_project_path`; the walker
+            // can skip the whole directory instead of filtering files).
+            if file_name == "fixtures"
+                && path
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    == Some("tests")
+            {
                 walker.skip_current_dir();
             }
             continue;

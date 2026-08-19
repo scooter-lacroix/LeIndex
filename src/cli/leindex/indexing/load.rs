@@ -359,6 +359,15 @@ impl LeIndex {
             .context("Failed to persist search snapshot during hydration")?;
         }
         // Persist neural embeddings separately for fast load_from_storage.
+        // Record which generation this in-memory state was loaded from so
+        // the registry can detect external rebuilds (N-13).
+        if let Some(generation) =
+            crate::storage::generation::lease::read_current_generation(&self.storage_path)
+        {
+            self.hydrated_generation
+                .store(generation, std::sync::atomic::Ordering::Release);
+        }
+
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
         {
             if !persist_artifacts {

@@ -175,6 +175,13 @@ pub struct FileStats {
     pub incoming_deps: usize,
 }
 
+/// Serde default for [`IndexStats::signature_scope`] — legacy persisted stats
+/// predate the field and are treated as full-run counts (their historical
+/// meaning).
+fn default_signature_scope() -> String {
+    "full".to_string()
+}
+
 /// Statistics from indexing operations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexStats {
@@ -192,6 +199,15 @@ pub struct IndexStats {
 
     /// Total number of code signatures extracted across all files
     pub total_signatures: usize,
+
+    /// Scope of `total_signatures`: `"full"` when the whole project was
+    /// parsed this run; `"delta"` when only changed files were (incremental
+    /// reindex), in which case the count covers JUST the files parsed this
+    /// run — the project-wide total is unchanged since the last full index.
+    /// Previously an incremental run reported e.g. `2` with no scope marker
+    /// and readers mistook it for the project total collapsing.
+    #[serde(default = "default_signature_scope")]
+    pub signature_scope: String,
 
     /// Number of PDG nodes recorded at indexing time (persisted to storage).
     /// This is a snapshot from the last `index_project` run and may differ

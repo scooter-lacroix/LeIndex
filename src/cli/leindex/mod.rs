@@ -93,6 +93,14 @@ pub struct LeIndex {
     /// lifetime of this process, so reads never touch the writer Mutex and
     /// never race a concurrent publish.
     pub(crate) generation_snapshot: Option<crate::storage::generation::GenerationSnapshot>,
+
+    /// The generation this process's in-memory PDG/search state was loaded
+    /// from (set at hydration and at each successful publish; 0 = never
+    /// hydrated). Atomic because publish paths hold `&self`. The registry
+    /// compares it against the persisted `CURRENT` pointer to detect
+    /// external rebuilds (another server or a CLI `--force`) and re-hydrate
+    /// instead of serving a stale snapshot under a fresh footer (N-13).
+    pub(crate) hydrated_generation: std::sync::atomic::AtomicU64,
 }
 
 /// Cross-process exclusive lock guarding writes to a project's storage.
@@ -405,6 +413,15 @@ impl LeIndex {
     }
 
     /// Open storage with retry and exponential backoff.
+    ///
+    /// Each `Storage::open` attempt itself waits out SQLite's 5s busy_timeout
+    /// (schema init takes write locks), so the retry budget must outlast a
+    /// competing writer's WHOLE indexing run, not just one transaction: an
+    /// external `leindex index --force` holds intermittent write locks for
+    /// tens of seconds on large projects (stress-test measured ~31s on this
+    /// repo with the legacy full-rewrite save). 6 attempts ≈ 6×5s busy
+    /// windows + capped backoff ≈ 36s worst case, which covers the rebuild
+    /// while remaining bounded.
     fn open_storage_with_retry(db_path: &Path, max_retries: u32) -> Result<Storage> {
         let mut attempt = 0;
         loop {
@@ -412,7 +429,10 @@ impl LeIndex {
                 Ok(s) => return Ok(s),
                 Err(e) if attempt < max_retries => {
                     attempt += 1;
-                    let delay = std::time::Duration::from_millis(100 * 2u64.pow(attempt));
+                    // Cap the backoff so late attempts do not stack multi-second
+                    // sleeps on top of the multi-second busy windows.
+                    let delay_ms = (100 * 2u64.saturating_pow(attempt)).min(2_000);
+                    let delay = std::time::Duration::from_millis(delay_ms);
                     warn!(
                         "Storage open attempt {}/{} failed: {}. Retrying in {:?}",
                         attempt, max_retries, e, delay
@@ -426,8 +446,10 @@ impl LeIndex {
                     // contention case is tagged `[transient:lock-contention]` so
                     // the registry layer can avoid permanently bricking a
                     // generation on a transient storm (see
-                    // `is_transient_storage_open_failure`). A genuine failure
-                    // still bricks, correctly.
+                    // `is_transient_storage_open_failure`) and the MCP layer can
+                    // render honest "retry shortly" remediation instead of
+                    // telling the user to delete a perfectly valid database. A
+                    // genuine failure still bricks, correctly.
                     let lower = e.to_string().to_lowercase();
                     // Whitelist the exact SQLite transient-lock messages
                     // (SQLITE_BUSY/LOCKED from rusqlite) rather than a loose
@@ -438,13 +460,15 @@ impl LeIndex {
                     // transient storm.
                     let is_lock_contention = lower.contains("database is locked")
                         || lower.contains("database table is locked")
-                        || lower.contains("could not obtain a lock");
+                        || lower.contains("could not obtain a lock")
+                        || lower.contains("database is busy");
                     return Err(e).with_context(|| {
                         if is_lock_contention {
                             format!(
                                 "Failed to open storage at {} after {} attempts \
                                  [transient:lock-contention]. Another leindex process \
-                                 likely holds the database; retry once it completes.",
+                                 is writing the database; the data is intact — retry \
+                                 once it completes. Do NOT delete the database.",
                                 db_path.display(),
                                 max_retries,
                             )
@@ -549,7 +573,7 @@ impl LeIndex {
         }
 
         let db_path = storage_path.join("leindex.db");
-        let storage = Self::open_storage_with_retry(&db_path, 3)?;
+        let storage = Self::open_storage_with_retry(&db_path, 6)?;
 
         // Generate unique project ID with conflict resolution
         // Load existing projects with same base name
@@ -601,6 +625,7 @@ impl LeIndex {
                 successful_parses: 0,
                 failed_parses: 0,
                 total_signatures: 0,
+                signature_scope: "full".to_string(),
                 pdg_nodes: 0,
                 pdg_edges: 0,
                 indexed_nodes: 0,
@@ -614,6 +639,7 @@ impl LeIndex {
             embedder: None,
             pipeline: None,
             generation_snapshot: None,
+            hydrated_generation: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Restore persisted index stats (if any) so diagnostics can report

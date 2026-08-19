@@ -273,37 +273,81 @@ impl LeIndex {
 
     fn publish_generation_snapshot(
         &self,
-        generation: u64,
-        health: &super::IndexHealth,
+        requested_generation: u64,
+        health: &mut super::IndexHealth,
         include_neural: bool,
     ) -> Result<PublishedGeneration> {
         let generations = self.storage_path().join("generations");
         std::fs::create_dir_all(&generations)?;
-        let target = generations.join(generation.to_string());
-        if target.exists() {
-            bail!(
-                "generation {} already exists; refusing to overwrite an immutable snapshot",
-                generation
-            );
+
+        // Allocate the generation number under contention. The requested
+        // number is only a hint computed earlier (max+1 at planning time —
+        // a TOCTOU guess): a concurrent writer (a second MCP server, or the
+        // edit-triggered incremental refresh racing the watcher refresh)
+        // may publish the same number between planning and this call.
+        // Previously the loser bailed with "generation N already exists",
+        // which failed the entire index job and left the store
+        // status=failed with a wrecked signature count (N-10). Snapshots
+        // are immutable, but the NUMBER is allocatable: bump past every
+        // number that exists on disk — or that wins the rename race — and
+        // retry.
+        let mut generation = requested_generation;
+        loop {
+            while generations.join(generation.to_string()).exists() {
+                generation += 1;
+            }
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            let staging = generations.join(format!(
+                ".staging-{generation}-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&staging).with_context(|| {
+                format!("create staging generation directory {}", staging.display())
+            })?;
+            // The health record embedded in the snapshot (and later
+            // persisted by the caller) must carry the number actually
+            // published, not the stale planning hint.
+            health.generation = generation;
+            let target = generations.join(generation.to_string());
+            let attempt = self
+                .prepare_generation_snapshot(&staging, health, include_neural)
+                .and_then(|()| {
+                    self.promote_generation_snapshot(&staging, &target, &generations, generation)
+                });
+            if let Err(error) = attempt {
+                let _ = std::fs::remove_dir_all(&staging);
+                // Lost the rename race to a concurrent publisher: the
+                // target appeared between the exists() check and the
+                // atomic rename. Retry on the next free number; anything
+                // else is a real failure.
+                if target.exists() {
+                    generation += 1;
+                    continue;
+                }
+                return Err(error);
+            }
+            self.hydrated_generation
+                .store(generation, std::sync::atomic::Ordering::Release);
+            return Ok(PublishedGeneration {
+                generation,
+                storage_path: target,
+                health: health.clone(),
+            });
         }
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let staging = generations.join(format!(
-            ".staging-{generation}-{}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&staging).with_context(|| {
-            format!("create staging generation directory {}", staging.display())
-        })?;
-        self.prepare_generation_snapshot(&staging, health, include_neural)?;
-        self.promote_generation_snapshot(&staging, &target, &generations, generation)?;
-        Ok(PublishedGeneration {
-            generation,
-            storage_path: target,
-            health: health.clone(),
-        })
+    }
+
+    /// The generation this process's in-memory index state was hydrated (or
+    /// last published) from — `None` until the first hydration. Compared by
+    /// the registry against the persisted `CURRENT` pointer to detect
+    /// external rebuilds (N-13).
+    pub fn hydrated_generation(&self) -> Option<u64> {
+        let value = self
+            .hydrated_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        (value > 0).then_some(value)
     }
 
     /// Persist a tiny phase marker so diagnostics and owned MCP jobs can show
@@ -514,7 +558,7 @@ impl LeIndex {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
-        let health = super::IndexHealth {
+        let mut health = super::IndexHealth {
             generation,
             phase: super::IndexPhase::Complete,
             status: super::ComponentStatus::Fresh,
@@ -529,7 +573,7 @@ impl LeIndex {
             last_failure_phase: None,
             last_failure: None,
         };
-        self.publish_generation_snapshot(generation, &health, true)?;
+        self.publish_generation_snapshot(generation, &mut health, true)?;
         crate::cli::index_freshness::save_health(self.storage_path(), &health)?;
 
         // Clear search query and analysis caches so stale results are not
@@ -1407,6 +1451,14 @@ impl LeIndex {
             successful_parses: state.successful,
             failed_parses: state.failed,
             total_signatures: state.total_sigs,
+            // An incremental run parses only the changed subset; its signature
+            // count is a delta, not the project total — label it so readers
+            // stop mistaking "2" for a collapse from thousands.
+            signature_scope: if state.files_parsed < state.source_files_with_hashes.len() {
+                "delta".to_string()
+            } else {
+                "full".to_string()
+            },
             pdg_nodes: pdg_node_count,
             pdg_edges: pdg_edge_count,
             indexed_nodes: indexed_count,
@@ -1871,7 +1923,7 @@ impl LeIndex {
                 .iter()
                 .filter(|path| !indexed_paths.contains(*path))
                 .count();
-            let health = super::IndexHealth {
+            let mut health = super::IndexHealth {
                 generation,
                 phase: super::IndexPhase::Complete,
                 status: super::ComponentStatus::Fresh,
@@ -1886,7 +1938,8 @@ impl LeIndex {
                 last_failure_phase: None,
                 last_failure: None,
             };
-            let core_published = self.publish_generation_snapshot(generation, &health, false)?;
+            let core_published =
+                self.publish_generation_snapshot(generation, &mut health, false)?;
             crate::cli::index_freshness::save_health(self.storage_path(), &health)?;
             state.core_health = Some(health);
 
@@ -1903,11 +1956,12 @@ impl LeIndex {
             .clone()
             .context("neural publication missing core health")?;
         let published = if neural.is_some_and(|checkpoint| checkpoint.rows > 0) {
-            let health = super::IndexHealth {
+            let mut health = super::IndexHealth {
                 generation: core_health.generation.saturating_add(1),
                 ..core_health.clone()
             };
-            let published = self.publish_generation_snapshot(health.generation, &health, true)?;
+            let published =
+                self.publish_generation_snapshot(health.generation, &mut health, true)?;
             crate::cli::index_freshness::save_health(self.storage_path(), &health)?;
             published
         } else {
@@ -2038,6 +2092,8 @@ impl LeIndex {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| storage_path.clone());
         self.load_from_storage_inner_at(false, Some(&generation_db), artifact_path)?;
+        self.hydrated_generation
+            .store(snapshot.generation(), std::sync::atomic::Ordering::Release);
         self.generation_snapshot = Some(snapshot);
         info!(
             project = %self.project_path.display(),
@@ -2125,45 +2181,9 @@ fn build_pdg_legacy(
 /// Map a `SignatureInfo` to the canonical streaming node-type string (mirrors
 /// the legacy `signature_to_node` mapping so graphs rebuilt from streamed
 /// segments stay type-equivalent to the legacy route).
-fn streaming_signature_kind(sig: &crate::parse::traits::SignatureInfo) -> &'static str {
-    match sig.return_type.as_deref() {
-        Some("module") => "module",
-        Some("enum_variant") => "variable",
-        Some("enum") | Some("trait") => "class",
-        Some(value) if value.starts_with("struct") => "class",
-        _ if sig.is_method => "method",
-        _ => "function",
-    }
-}
-
-/// Adapt a parallel `ParsingResult` into a streaming `ParsedFileRecord` so the
-/// streaming PDG route can be fed directly to `build_fragment_from_parsed`.
-fn to_streaming_fragment_record(
-    result: &crate::parse::parallel::ParsingResult,
-) -> streaming::parse::ParsedFileRecord {
-    streaming::parse::ParsedFileRecord {
-        path: result.file_path.display().to_string(),
-        content_hash: String::new(),
-        lang: result
-            .language
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string()),
-        signatures: result
-            .signatures
-            .iter()
-            .map(|sig| streaming::parse::SignatureSummary {
-                name: sig.name.clone(),
-                kind: streaming_signature_kind(sig).to_string(),
-                byte_start: sig.byte_range.0,
-                byte_end: sig.byte_range.1,
-            })
-            .collect(),
-        parse_time_ms: result.parse_time_ms,
-    }
-}
-
-/// Streaming route: build a per-file `PdgFragment` directly from each parsed
-/// file via `build_fragment_from_parsed` (no whole-PDG materialization), merge
+/// Streaming route: build a per-file `PdgFragment` from each parsed file
+/// via the real extraction pipeline, merge fragments into a compact
+/// segment, and materialize the combined graph from it.
 /// them into a compact `PdgSegment` via `merge_fragments_to_segment`, then
 /// rebuild the `ProgramDependenceGraph` via `pdg_from_segment`.
 fn build_pdg_streaming(
@@ -2173,9 +2193,30 @@ fn build_pdg_streaming(
         .into_par_iter()
         .filter(|result| result.is_success())
         .map(|result| {
-            let parsed = to_streaming_fragment_record(&result);
-            let source = String::from_utf8_lossy(result.source_bytes.as_deref().unwrap_or(&[]));
-            streaming::pdg::build_fragment_from_parsed(&parsed, &source)
+            let file_path = result.file_path.display().to_string();
+            let language = result
+                .language
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
+            // Route through the REAL extraction pipeline
+            // (`extract_pdg_from_signatures` → `fragment_from_pdg`, its
+            // documented production realization) instead of the skeleton
+            // `build_fragment_from_parsed`. The skeleton flattened
+            // signatures to name/kind/bytes, hardcoding complexity 0 and
+            // dropping ALL intra-file call/data edges — which is why the
+            // streaming route's stored graph showed complexity 0 on every
+            // node, empty callee lists, and `forward_impact` returning
+            // nothing. The per-file PDG here is single-file (cheap to
+            // build), so the streaming memory contract (no whole-graph
+            // clone, compact per-file records) is preserved.
+            let file_pdg = crate::graph::extract_pdg_from_signatures(
+                result.signatures,
+                source_bytes,
+                &file_path,
+                &language,
+            );
+            streaming::pdg::fragment_from_pdg(&file_pdg)
         })
         .collect();
     let (segment, stats) = streaming::pdg::merge_fragments_to_segment(fragments);

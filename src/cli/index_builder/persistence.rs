@@ -92,6 +92,34 @@ pub(crate) fn persist_search_snapshot(
     }
 
     let path = search_snapshot_path(project_path);
+    // Identity sidecar: `SearchSnapshot` carries no timestamps — it is a pure
+    // function of (PDG content, indexed node set, fragment layer). When every
+    // identity field matches what is already on disk, the ~11MB bincode
+    // rewrite is byte-equivalent and can be skipped. This matters on no-op
+    // re-saves and watcher loops that previously rewrote the full snapshot on
+    // every pass.
+    let sidecar_path = project_path
+        .join(".leindex")
+        .join("search_snapshot.identity");
+    let identity = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        snapshot.version,
+        snapshot.pdg_nodes,
+        snapshot.pdg_edges,
+        snapshot.pdg_fingerprint,
+        snapshot.indexed_nodes,
+        snapshot.fragment_root_hash.as_deref().unwrap_or(""),
+        snapshot.fragment_rows,
+    );
+    if path.is_file()
+        && std::fs::read_to_string(&sidecar_path).ok().as_deref() == Some(identity.as_str())
+    {
+        tracing::debug!(
+            path = %path.display(),
+            "Search snapshot unchanged; skipping rewrite"
+        );
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -104,6 +132,12 @@ pub(crate) fn persist_search_snapshot(
     let bytes = bincode::serialize(&snapshot).context("Failed to serialize search snapshot")?;
     std::fs::write(&path, bytes)
         .with_context(|| format!("Failed to write search snapshot: {}", path.display()))?;
+    std::fs::write(&sidecar_path, identity).with_context(|| {
+        format!(
+            "Failed to write search snapshot identity sidecar: {}",
+            sidecar_path.display()
+        )
+    })?;
     info!(
         count = snapshot.indexed_nodes,
         path = %path.display(),

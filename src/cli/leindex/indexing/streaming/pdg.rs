@@ -113,43 +113,12 @@ pub struct PdgStats {
     pub cross_file_unresolved: usize,
 }
 
-/// Build a per-file PDG fragment from parsed file records.
-///
-/// In production this delegates to the tree-sitter extraction pipeline; here
-/// we provide a streaming interface that produces fragments one at a time,
-/// each immediately available for CAS staging without holding all fragments.
-pub fn build_fragment_from_parsed(
-    parsed: &super::parse::ParsedFileRecord,
-    _source: &str,
-) -> PdgFragment {
-    let mut nodes = Vec::new();
-    let mut intra_edges = Vec::new();
-
-    for sig in &parsed.signatures {
-        nodes.push(PdgNodeRecord {
-            id: format!("{}:{}", parsed.path, sig.name),
-            node_type: sig.kind.clone(),
-            name: sig.name.clone(),
-            file_path: parsed.path.clone(),
-            byte_start: sig.byte_start,
-            byte_end: sig.byte_end,
-            complexity: 0,
-            language: parsed.lang.clone(),
-        });
-    }
-
-    // Intra-file edges would be extracted from AST; for the streaming skeleton
-    // we leave them empty. The key invariant is that this function returns a
-    // self-contained fragment without cloning the whole PDG.
-    intra_edges.sort_by(|a: &PdgEdgeRecord, b: &PdgEdgeRecord| a.source.cmp(&b.source));
-    intra_edges.dedup_by(|a, b| a.source == b.source && a.target == b.target);
-
-    PdgFragment {
-        nodes,
-        intra_edges,
-        cross_file_refs: Vec::new(),
-    }
-}
+// `build_fragment_from_parsed` (the original streaming skeleton) was
+// removed: it flattened signatures to name/kind/bytes, hardcoded
+// complexity 0, and emitted no intra-file edges, which is why
+// streaming-built indexes showed complexity-0 nodes and empty callee
+// graphs. `fragment_from_pdg` — its documented production realization —
+// is the only fragment builder now, fed by `extract_pdg_from_signatures`.
 
 /// Merge per-file fragments into a compact CAS-ready segment.
 ///
@@ -407,36 +376,7 @@ pub fn deserialize_pdg_segment(data: &[u8]) -> Result<PdgSegment> {
 
 #[cfg(all(test, feature = "full"))]
 mod test {
-    use super::super::parse::{ParsedFileRecord, SignatureSummary};
     use super::*;
-
-    #[test]
-    fn test_build_fragment_from_parsed() {
-        let parsed = ParsedFileRecord {
-            path: "src/main.rs".into(),
-            content_hash: "abc".into(),
-            lang: "rust".into(),
-            signatures: vec![
-                SignatureSummary {
-                    name: "foo".into(),
-                    kind: "function".into(),
-                    byte_start: 0,
-                    byte_end: 10,
-                },
-                SignatureSummary {
-                    name: "Bar".into(),
-                    kind: "class".into(),
-                    byte_start: 11,
-                    byte_end: 20,
-                },
-            ],
-            parse_time_ms: 1,
-        };
-        let fragment = build_fragment_from_parsed(&parsed, "fn foo() {}");
-        assert_eq!(fragment.nodes.len(), 2);
-        assert_eq!(fragment.nodes[0].name, "foo");
-        assert_eq!(fragment.nodes[1].name, "Bar");
-    }
 
     /// VAL-STREAM-004: No whole-PDG clone during merge.
     #[test]
