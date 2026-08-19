@@ -89,6 +89,12 @@ pub fn run() -> ! {
     if let Some((model_path, provider_name, ort_threads)) = parse_migraphx_probe_arg(&argv) {
         let result =
             WorkerRuntime::run_migraphx_probe_child(&model_path, &provider_name, ort_threads);
+        if let Err(error) = &result {
+            // The parent only observes the exit status; without this line a
+            // probe failure (missing provider lib, compile crash, timeout)
+            // is completely silent and undiagnosable from the daemon log.
+            eprintln!("migraphx probe failed: {error}");
+        }
         process::exit(if result.is_ok() { 0 } else { 1 });
     }
 

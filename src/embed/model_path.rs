@@ -108,13 +108,23 @@ impl ModelResolver {
 
     /// Resolve the tokenizer file path for the given model name.
     ///
-    /// Uses the same precedence chain as model resolution.
+    /// Uses the same precedence chain as model resolution. A model-specific
+    /// `<model-stem>-tokenizer.json` beside the model is preferred when it
+    /// exists (the same convention the reranker uses); the shared
+    /// `tokenizer.json` remains the fallback for models without their own
+    /// file. Without this, switching the embed model silently kept the
+    /// previous model's vocabulary — e.g. running the BERT-family
+    /// sfr-embedding-code-400m (WordPiece, `token_type_ids`) with the qwen3
+    /// BPE tokenizer produces garbage embeddings that still "work".
     pub fn resolve_tokenizer(model_name: &str) -> Result<PathBuf, ModelResolutionError> {
-        // Tokenizer is typically shared across model variants
-        let _ = model_name; // Model name may be used for variant-specific tokenizers in future
+        let model_specific = format!("{}-tokenizer.json", model_name);
 
         // 1. Explicit env override
         if let Ok(path) = std::env::var("LEINDEX_MODEL_PATH") {
+            let per_model = PathBuf::from(&path).join(&model_specific);
+            if per_model.exists() {
+                return Ok(per_model);
+            }
             let tokenizer_path = PathBuf::from(path).join("tokenizer.json");
             if tokenizer_path.exists() {
                 return Ok(tokenizer_path);
@@ -123,6 +133,10 @@ impl ModelResolver {
 
         // 2. Bundled models
         for bundled_dir in Self::bundled_model_dirs() {
+            let per_model = bundled_dir.join(&model_specific);
+            if per_model.exists() {
+                return Ok(per_model);
+            }
             let tokenizer_path = bundled_dir.join("tokenizer.json");
             if tokenizer_path.exists() {
                 return Ok(tokenizer_path);
@@ -131,6 +145,10 @@ impl ModelResolver {
 
         // 3. User cache fallback
         for user_models in Self::user_model_dirs() {
+            let per_model = user_models.join(&model_specific);
+            if per_model.exists() {
+                return Ok(per_model);
+            }
             let tokenizer_path = user_models.join("tokenizer.json");
             if tokenizer_path.exists() {
                 return Ok(tokenizer_path);

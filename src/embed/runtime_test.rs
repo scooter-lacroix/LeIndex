@@ -93,6 +93,13 @@ fn onnx_inference_batch_size_defaults_to_fixed_batch_safe_value() {
         configured_onnx_inference_batch_size("qwen3-embed-0.6b", "cpu"),
         1
     );
+    // MIGraphX compiles one fixed shape for every model, including the
+    // statically exported b8-s128 qwen3-embed-0.6b graph; a batch-1 policy
+    // could never match its compiled .mxr cache.
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b", "migraphx"),
+        DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE
+    );
 }
 
 #[test]
@@ -1113,37 +1120,41 @@ fn test_embed_text_batch_loop_checks_cancel_between_sub_batches() {
     assert!(error.message.contains("cancelled"));
 }
 
-// ── Batch size suffix-precedence fix ──────────────────────────────────
-// Non-dynamic models (e.g., qwen3-embed-0.6b) must always get batch_size=1
-// regardless of provider, because their fixed-shape ONNX graph cannot accept
-// a batch dimension > 1. Only -dynamic model variants should use larger
-// batches. MIGraphX/ROCm among dynamic variants uses a stable compiled shape.
+// ── Batch size provider-precedence fix ────────────────────────────────
+// MIGraphX compiles ONE fixed input shape per model, so every model —
+// dynamic or statically exported — runs at the fixed MIGraphX batch on
+// that provider (the batch loop pads the final partial batch). The
+// statically exported qwen3-embed-0.6b graph is itself b8-s128 (verified
+// empirically: ORT rejects batch-1 inputs with "Got: 1, Expected: 8"), and
+// its compiled .mxr cache is keyed to that shape, so the previous
+// batch-1 policy could never use the GPU. CPU keeps the model-specific
+// defaults (batch 1 for static exports, 32 for -dynamic variants).
 
 #[test]
-fn test_non_dynamic_model_migraphx_returns_batch_1() {
+fn test_non_dynamic_model_migraphx_returns_fixed_batch() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
 
     assert_eq!(
         configured_onnx_inference_batch_size("qwen3-embed-0.6b", "migraphx"),
-        DEFAULT_ONNX_INFERENCE_BATCH_SIZE,
-        "non-dynamic model with migraphx must return batch_size=1, not the MIGraphX default"
+        DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE,
+        "non-dynamic model with migraphx must return the fixed MIGraphX batch (the static graph is b8-s128)"
     );
     assert_eq!(
         configured_onnx_inference_batch_size("qwen3-embed-0.6b", "migraphx"),
-        1
+        8
     );
 }
 
 #[test]
-fn test_non_dynamic_model_rocm_returns_batch_1() {
+fn test_non_dynamic_model_rocm_returns_fixed_batch() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
 
     assert_eq!(
         configured_onnx_inference_batch_size("qwen3-embed-0.6b", "rocm"),
-        DEFAULT_ONNX_INFERENCE_BATCH_SIZE,
-        "non-dynamic model with rocm must return batch_size=1, not the MIGraphX default"
+        DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE,
+        "non-dynamic model with rocm must return the fixed MIGraphX batch"
     );
 }
 
@@ -1207,12 +1218,12 @@ fn test_non_dynamic_model_migraphx_case_insensitive() {
     // Provider matching is case-insensitive.
     assert_eq!(
         configured_onnx_inference_batch_size("qwen3-embed-0.6b", "MIGRAPHX"),
-        DEFAULT_ONNX_INFERENCE_BATCH_SIZE,
-        "non-dynamic model with uppercase MIGRAPHX must still return batch_size=1"
+        DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE,
+        "non-dynamic model with uppercase MIGRAPHX must return the fixed MIGraphX batch"
     );
     assert_eq!(
         configured_onnx_inference_batch_size("qwen3-embed-0.6b", "ROCm"),
-        DEFAULT_ONNX_INFERENCE_BATCH_SIZE,
+        DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE,
     );
 }
 

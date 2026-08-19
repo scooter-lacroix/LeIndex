@@ -399,6 +399,52 @@ pub(super) fn daemon_status_path(
     daemon_socket_path(provider, model_name).map(|path| path.with_extension("status"))
 }
 
+/// Probe the configured embed daemon and report the execution provider the
+/// worker actually activated, plus its lifecycle phase.
+///
+/// `None` when no daemon socket exists (worker never spawned), the daemon
+/// is unreachable, or the worker has not reported a provider yet. This is
+/// the truth source for diagnostics: `leindex.toml` records what provider
+/// was *requested*, while the worker records what *loaded* — e.g.
+/// `migraphx` requested but `cpu` active after a provider-library load
+/// failure. Surfacing the active value keeps diagnostics from reporting a
+/// GPU that is not in use.
+#[cfg(unix)]
+pub fn daemon_active_provider() -> Option<(String, String)> {
+    let config = crate::config::LeIndexConfig::load_cached();
+    let provider = std::env::var("LEINDEX_WORKER_EXECUTION_PROVIDER")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let configured = config.neural.execution_provider.clone();
+            (!configured.is_empty()).then_some(configured)
+        });
+    let model = std::env::var("LEINDEX_WORKER_MODEL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let configured = config.neural.model_name.clone();
+            (!configured.is_empty()).then_some(configured)
+        });
+    let socket_path = daemon_socket_path(provider.as_deref(), model.as_deref())?;
+    if !socket_path.exists() {
+        return None;
+    }
+    // Diagnostics must stay fast; a busy worker answering its health socket
+    // slowly must not add the full 250ms DAEMON_HEALTH_WAIT to every
+    // diagnostics call. A short 50ms probe budget reports the active
+    // provider in the common case and degrades to `None` (configured value
+    // shown) under contention.
+    let health =
+        probe_daemon_health_with_timeout(&socket_path, Some(Duration::from_millis(50))).ok()?;
+    Some((health.provider?, health.phase))
+}
+
+#[cfg(not(unix))]
+pub fn daemon_active_provider() -> Option<(String, String)> {
+    None
+}
+
 #[cfg(unix)]
 pub(super) fn daemon_pid_path(provider: Option<&str>, model_name: Option<&str>) -> Option<PathBuf> {
     daemon_socket_path(provider, model_name).map(|path| path.with_extension("pid"))

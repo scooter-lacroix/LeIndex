@@ -39,8 +39,8 @@ use crate::embed::protocol::{
 mod client_config;
 use client_config::*;
 pub use client_config::{
-    ClientError, EmbedResult, EmbeddingClient, WorkerAvailability, migraphx_cache_path,
-    prune_stale_migraphx_profiles,
+    ClientError, EmbedResult, EmbeddingClient, WorkerAvailability, daemon_active_provider,
+    migraphx_cache_path, prune_stale_migraphx_profiles,
 };
 
 /// Classify a `std::io::Error` as one that indicates the worker process has
@@ -49,6 +49,48 @@ pub use client_config::{
 /// VAL-DEADWORKER-001: When the worker process dies, `read_exact` on the
 /// `UnixStream` returns one of these error kinds. This is a deterministic
 /// transport-level signal, not an arbitrary wall-clock timeout.
+/// ROCm/MIGraphX library directories that must be on the worker's loader
+/// path for the MIGraphX execution provider to load.
+///
+/// ORT's `libonnxruntime_providers_migraphx.so` links against
+/// `libmigraphx*.so` variant libraries that ROCm installs under
+/// `<rocm>/lib/migraphx/lib` — a directory the dynamic loader does not
+/// search by default. When the worker is spawned without that directory on
+/// `LD_LIBRARY_PATH`, provider registration fails with
+/// "libmigraphx_tf.so.<ver>: cannot open shared object file" and the worker
+/// silently falls back to CPU inference (100-1000x slower than GPU).
+/// Returning the existing dirs here lets the spawn path prepend them so
+/// provider loading matches a working shell setup. The MIGraphX compile
+/// probe child inherits the worker environment and benefits identically.
+fn migraphx_loader_dirs() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for key in ["ROCM_PATH", "HIP_PATH"] {
+        if let Ok(value) = std::env::var(key) {
+            if !value.is_empty() {
+                let root = PathBuf::from(value);
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+        }
+    }
+    let default_rocm = PathBuf::from("/opt/rocm");
+    if !roots.contains(&default_rocm) {
+        roots.push(default_rocm);
+    }
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        for sub in ["lib/migraphx/lib", "lib"] {
+            let dir = root.join(sub);
+            if dir.is_dir() && !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
+}
+
 fn is_worker_dead_io_error(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
@@ -398,6 +440,34 @@ impl EmbeddingClient {
             cmd.env("LEINDEX_WORKER_MODEL", &model_name);
         } else if let Some(model_name) = &config_env.model_name {
             cmd.env("LEINDEX_WORKER_MODEL", model_name);
+        }
+        if matches!(
+            configured_provider,
+            Some("migraphx" | "rocm" | "auto") | None
+        ) {
+            // Prepend ROCm's MIGraphX provider-library directories to the
+            // child's loader path. See `migraphx_loader_dirs` for why this
+            // is required for the MIGraphX EP to load at all on standard
+            // ROCm installs. Missing dirs are a no-op; existing entries are
+            // preserved (prepended, deduplicated).
+            let dirs = migraphx_loader_dirs();
+            if !dirs.is_empty() {
+                let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+                let have: Vec<&str> = existing.split(':').filter(|s| !s.is_empty()).collect();
+                let missing: Vec<String> = dirs
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .filter(|dir| !have.contains(&dir.as_str()))
+                    .collect();
+                if !missing.is_empty() {
+                    let combined = if existing.is_empty() {
+                        missing.join(":")
+                    } else {
+                        format!("{}:{}", missing.join(":"), existing)
+                    };
+                    cmd.env("LD_LIBRARY_PATH", combined);
+                }
+            }
         }
         if matches!(
             configured_provider,

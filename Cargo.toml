@@ -468,7 +468,18 @@ required-features = ["full"]
 name = "refcount_store"
 path = "benches/refcount_store.rs"
 harness = false
-required-features = ["full"]
+
+[[bench]]
+name = "worker_batch_bench"
+path = "benches/worker_batch_bench.rs"
+harness = false
+required-features = ["onnx"]
+
+[[bench]]
+name = "gpu_embed_bench"
+path = "benches/gpu_embed_bench.rs"
+harness = false
+required-features = ["onnx"]
 
 [profile.release]
 lto = "thin"

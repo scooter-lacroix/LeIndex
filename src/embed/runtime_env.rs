@@ -59,20 +59,16 @@ pub fn configured_onnx_inference_batch_size(model_name: &str, provider: &str) ->
         .filter(|&v| v > 0)
         .map(|v| v.min(MAX_ONNX_INFERENCE_BATCH_SIZE))
         .unwrap_or_else(|| {
-            // Check -dynamic suffix FIRST: non-dynamic models (e.g.,
-            // qwen3-embed-0.6b) must always get batch_size=1 regardless of
-            // provider, because their fixed-shape ONNX graph cannot accept a
-            // batch dimension > 1. Only -dynamic model variants benefit from
-            // larger batches, and among those, MIGraphX/ROCm needs a single
-            // stable compiled batch shape.
-            if model_name.ends_with("-dynamic") || model_name.ends_with("-dynamic-uint8") {
-                if provider.eq_ignore_ascii_case("migraphx")
-                    || provider.eq_ignore_ascii_case("rocm")
-                {
-                    DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE
-                } else {
-                    DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE
-                }
+            // MIGraphX compiles one fixed input shape, so every model —
+            // dynamic or statically exported — runs at the same fixed batch
+            // on that provider (the batch loop pads the final partial
+            // batch). The statically exported qwen3-embed-0.6b graph is
+            // b8-s128, matching this constant; its compiled .mxr cache is
+            // keyed to that shape and a batch-1 session can never use it.
+            if provider.eq_ignore_ascii_case("migraphx") || provider.eq_ignore_ascii_case("rocm") {
+                DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE
+            } else if model_name.ends_with("-dynamic") || model_name.ends_with("-dynamic-uint8") {
+                DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE
             } else {
                 DEFAULT_ONNX_INFERENCE_BATCH_SIZE
             }

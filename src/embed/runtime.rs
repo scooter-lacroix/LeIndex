@@ -700,6 +700,51 @@ impl WorkerRuntime {
         }
     }
 
+    /// Accessors exposed to the GPU measurement bench (no behavior change).
+    /// These are doc-hidden: the bench is the only public caller.
+    #[cfg(feature = "onnx")]
+    #[doc(hidden)]
+    pub fn bench_session(&self) -> Option<Arc<Mutex<Session>>> {
+        self.session.clone()
+    }
+
+    #[cfg(feature = "onnx")]
+    #[doc(hidden)]
+    pub fn bench_tokenizer(&self) -> Option<Arc<tokenizers::Tokenizer>> {
+        self.tokenizer.clone()
+    }
+
+    #[cfg(feature = "onnx")]
+    #[doc(hidden)]
+    pub fn bench_provider_status(&self) -> &str {
+        &self.provider_runtime_status.execution_provider
+    }
+
+    #[cfg(feature = "onnx")]
+    #[doc(hidden)]
+    pub fn bench_embed_dim(&self) -> usize {
+        self.config.embedding_dim
+    }
+
+    #[cfg(feature = "onnx")]
+    #[doc(hidden)]
+    pub fn bench_model_name(&self) -> &str {
+        &self.config.model_name
+    }
+
+    #[cfg(feature = "onnx")]
+    #[doc(hidden)]
+    pub fn bench_run_onnx_embed<S: AsRef<str>>(
+        &self,
+        session: &Arc<Mutex<Session>>,
+        tokenizer: &Arc<tokenizers::Tokenizer>,
+        texts: &[S],
+        expected_dim: usize,
+        cancel_token: &Arc<AtomicBool>,
+    ) -> Result<EmbedResponse, WorkerError> {
+        self.run_onnx_embed(session, tokenizer, texts, expected_dim, cancel_token)
+    }
+
     /// Build a control-plane health response without touching model work.
     pub fn health_response(
         &self,
@@ -1024,9 +1069,33 @@ impl WorkerRuntime {
                 provider_status.execution_provider
             ));
         }
+        // Smoke-inference shapes must match the model's declared input
+        // shape. A statically exported graph accepts ONLY its exact
+        // dimensions — e.g. the b8-s128 qwen3 export rejects the previously
+        // hardcoded b1-s16 probe tensors ("Got: 1, Expected: 8"), which
+        // failed the probe on every start and forced the worker onto CPU.
+        // Static (positive) dims are taken from the session metadata;
+        // dynamic dims (negative in ORT metadata) keep the small probe
+        // defaults.
+        let declared_dims: Vec<i64> = session
+            .inputs()
+            .iter()
+            .find(|input| input.name() == "input_ids")
+            .and_then(|input| {
+                input
+                    .dtype()
+                    .tensor_shape()
+                    .map(|shape| shape.iter().copied().collect())
+            })
+            .unwrap_or_default();
+        let static_dim = |index: usize| -> Option<usize> {
+            declared_dims
+                .get(index)
+                .and_then(|dim| (*dim > 0).then_some(*dim as usize))
+        };
+        let batch_size = static_dim(0).unwrap_or(1);
+        let max_len = static_dim(1).unwrap_or_else(|| configured_onnx_sequence_len().min(16));
         let session = Arc::new(Mutex::new(session));
-        let batch_size = 1;
-        let max_len = configured_onnx_sequence_len().min(16);
         let make_tensor = |data: Vec<i64>, label: &str| {
             ort::value::Tensor::from_array(
                 ndarray::Array2::from_shape_vec((batch_size, max_len), data)
@@ -1138,12 +1207,24 @@ impl WorkerRuntime {
 
         let session = session_builder.commit_from_file(model_path)?;
         if matches!(provider_name, "migraphx" | "rocm") {
-            const MIGRAPHX_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+            // First-time MIGraphX compilation of a large model (the 0.6B
+            // reranker compiles for well over 20s on cold cache) exceeds the
+            // old hardcoded 20s budget, which silently forced the model onto
+            // CPU — the single worst latency outcome (minutes of CPU
+            // inference for one rerank batch). Default raised to 120s and
+            // overridable via LEINDEX_MIGRAPHX_PROBE_TIMEOUT_SECS for
+            // constrained environments.
+            let default_probe_timeout = Duration::from_secs(120);
+            let probe_timeout = std::env::var("LEINDEX_MIGRAPHX_PROBE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(default_probe_timeout);
             return match Self::probe_migraphx_compile_timeout(
                 model_path,
                 provider_name,
                 ort_threads,
-                MIGRAPHX_PROBE_TIMEOUT,
+                probe_timeout,
             ) {
                 Ok(()) => Ok(SessionBuildOutcome {
                     session,
@@ -1906,7 +1987,7 @@ impl WorkerRuntime {
     /// must preserve the same cancellation, padding, ordering, and error
     /// semantics before it can replace this helper.
     #[cfg(feature = "onnx")]
-    fn run_onnx_embed_text_batch_loop<S, T, R>(
+    pub fn run_onnx_embed_text_batch_loop<S, E, T, R>(
         &self,
         texts: &[S],
         inference_batch_size: usize,
@@ -1918,8 +1999,9 @@ impl WorkerRuntime {
     ) -> Result<Vec<f32>, WorkerError>
     where
         S: AsRef<str>,
-        T: FnMut(&[S]) -> Result<Vec<tokenizers::Encoding>, WorkerError>,
-        R: FnMut(&[tokenizers::Encoding], usize) -> Result<Vec<f32>, WorkerError>,
+        E: Clone,
+        T: FnMut(&[S]) -> Result<Vec<E>, WorkerError>,
+        R: FnMut(&[E], usize) -> Result<Vec<f32>, WorkerError>,
     {
         if inference_batch_size == 0 {
             return Err(WorkerError {
