@@ -1253,6 +1253,11 @@ mod tests {
         edge: AtomicUsize::new(0),
         edge_delete: AtomicUsize::new(0),
     };
+    /// The sqlite3_trace hook is process-global: two tests enabling it
+    /// concurrently cross-contaminate the static counters (observed as a
+    /// phantom node upsert in the unchanged-resave test). Every trace-harness
+    /// test holds this lock across its enable/save/disable window.
+    static TRACE_HARNESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     unsafe extern "C" fn sql_trace_cb(_user: *mut c_void, sql_ptr: *const c_char) {
         if sql_ptr.is_null() {
@@ -1975,11 +1980,13 @@ mod tests {
 
         let pdg = create_large_pdg(10_000, 10_000);
 
+        let _harness = TRACE_HARNESS_LOCK.lock().unwrap();
         TRACE_COUNTS.node.store(0, Ordering::Relaxed);
         TRACE_COUNTS.edge.store(0, Ordering::Relaxed);
         set_sql_trace(storage.conn(), true);
         save_pdg(&mut storage, "big_project", &pdg).unwrap();
         set_sql_trace(storage.conn(), false);
+        drop(_harness);
 
         let node_stmts = TRACE_COUNTS.node.load(Ordering::Relaxed);
         assert!(
@@ -2003,11 +2010,13 @@ mod tests {
 
         let pdg = create_large_pdg(10_000, 10_000);
 
+        let _harness = TRACE_HARNESS_LOCK.lock().unwrap();
         TRACE_COUNTS.node.store(0, Ordering::Relaxed);
         TRACE_COUNTS.edge.store(0, Ordering::Relaxed);
         set_sql_trace(storage.conn(), true);
         save_pdg(&mut storage, "big_project", &pdg).unwrap();
         set_sql_trace(storage.conn(), false);
+        drop(_harness);
 
         let edge_stmts = TRACE_COUNTS.edge.load(Ordering::Relaxed);
         assert!(
@@ -2030,11 +2039,13 @@ mod tests {
         // Second save with an identical PDG: every node's content hash matches
         // its stored row, so the upsert path must issue ZERO node writes and
         // reuse the existing db ids. Edges are still fully rebuilt by design.
+        let _harness = TRACE_HARNESS_LOCK.lock().unwrap();
         TRACE_COUNTS.node.store(0, Ordering::Relaxed);
         TRACE_COUNTS.edge.store(0, Ordering::Relaxed);
         set_sql_trace(storage.conn(), true);
         save_pdg(&mut storage, "resave_proj", &pdg).unwrap();
         set_sql_trace(storage.conn(), false);
+        drop(_harness);
 
         let node_stmts = TRACE_COUNTS.node.load(Ordering::Relaxed);
         assert_eq!(
@@ -2061,11 +2072,13 @@ mod tests {
             .expect("node exists")
             .complexity += 1;
 
+        let _harness = TRACE_HARNESS_LOCK.lock().unwrap();
         TRACE_COUNTS.node.store(0, Ordering::Relaxed);
         TRACE_COUNTS.edge.store(0, Ordering::Relaxed);
         set_sql_trace(storage.conn(), true);
         save_pdg(&mut storage, "resave_proj", &pdg).unwrap();
         set_sql_trace(storage.conn(), false);
+        drop(_harness);
 
         let node_stmts = TRACE_COUNTS.node.load(Ordering::Relaxed);
         assert_eq!(
@@ -2126,12 +2139,14 @@ mod tests {
         let pdg = create_large_pdg(1_000, 1_000);
         save_pdg(&mut storage, "edge_resave_proj", &pdg).unwrap();
 
+        let _harness = TRACE_HARNESS_LOCK.lock().unwrap();
         TRACE_COUNTS.node.store(0, Ordering::Relaxed);
         TRACE_COUNTS.edge.store(0, Ordering::Relaxed);
         TRACE_COUNTS.edge_delete.store(0, Ordering::Relaxed);
         set_sql_trace(storage.conn(), true);
         save_pdg(&mut storage, "edge_resave_proj", &pdg).unwrap();
         set_sql_trace(storage.conn(), false);
+        drop(_harness);
 
         let inserted = TRACE_COUNTS.edge.load(Ordering::Relaxed);
         let deleted = TRACE_COUNTS.edge_delete.load(Ordering::Relaxed);
