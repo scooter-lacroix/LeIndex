@@ -352,3 +352,15 @@ Fixes, each verified live on this repo:
 - SKILL.md CLI fallback syntax corrected (`--args '<json>'`), both instances.
 
 Gates: fmt clean, `clippy -D warnings` clean (default + onnx), `cargo test --workspace --exclude memcheck` 38/38 green. Binaries rebuilt (`--features onnx`) and installed.
+
+---
+
+## §10.5 Session-11 addendum — final-round tightening, docs, and README
+
+**Audit disposition (16/17 tools green in the final audit):** the two anomalies were real and are fixed (commit `f0937615`):
+- **diagnostics RSS == index size**: the label lied, not the measurement — `index_size_mb` was a heap estimate; after the estimate was made honest it legitimately tracks RSS. "Index size" now measures the on-disk store, the estimate ships as `index_heap_estimate_mb`, and the renderer labels all three (verified live: 10,363.76 MB disk / 411.47 MB heap / 411.48 MB RSS).
+- **git-status "PDG enrichment: unavailable"**: the resident handle lacked a graph in one-shot processes. The PDG now loads on demand — verified live: changed symbols with caller counts, "416 affected symbols across 115 files".
+
+**Docs sweep:** MCP tool descriptions verified against the live 18-tool inventory; SKILL.md updated to match the MCP schema (18-tool inventory including `leindex.write`, corrected `--args` CLI fallback syntax, honest-degradation response-field notes for `direction`/`impact_note`/`in_symbol`/`enrichment_note`). README rewritten as a marketing-grade but complete product page leading with the v2.0.0 story and measured numbers (85.7s→5.0s, cache, daemon rails), retaining all operational content; PyPI and npm parity copies regenerated per the repo hygiene rule (commit `78ba449c`).
+
+Gates: fmt clean, `clippy -D warnings` clean (default + onnx), `cargo test --workspace --exclude memcheck` 38/38 green. Store housekeeping: `retention --gc` after the test runs.
