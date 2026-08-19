@@ -492,13 +492,17 @@ impl SearchEngine {
 
     /// Extract signature from node content.
     ///
-    /// Returns the first non-empty, non-comment line after the header.
+    /// Returns the first non-empty line that is actual code. The content is
+    /// prefixed with enrichment comments (stats header, `// name in path`,
+    /// `// review_context:` doc blocks), so every `//`-prefixed line is
+    /// skipped — filtering only `// [`-prefixed lines previously let the
+    /// `// <name> in <path>` header through, making every search result's
+    /// signature a name/path echo instead of the symbol's code.
     pub fn extract_signature_from_content(content: &str) -> Option<String> {
         content
             .lines()
-            .skip(1) // skip "// name in path" header
             .map(|l| l.trim())
-            .find(|l| !l.is_empty() && !l.starts_with("// [No source") && !l.starts_with("// ["))
+            .find(|l| !l.is_empty() && !l.starts_with("//"))
             .map(|l| l.to_string())
     }
 

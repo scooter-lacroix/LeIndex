@@ -72,7 +72,12 @@ impl PhaseSelection {
 pub struct PhaseAnalysisReport {
     /// Project id.
     pub project_id: String,
-    /// Freshness generation hash.
+    /// Freshness generation hash. Serialized as `analysis_fingerprint`: it
+    /// is a content hash over the analyzed inventory, NOT the store's
+    /// monotonic generation counter that the freshness footer reports —
+    /// using the same key for both made payloads carry two different
+    /// "generation" values (N-07).
+    #[serde(rename = "analysis_fingerprint")]
     pub generation: String,
     /// Executed phase list.
     pub executed_phases: Vec<u8>,
