@@ -77,6 +77,7 @@ impl LeIndex {
                         crate::graph::pdg::NodeType::Variable => "variable".to_string(),
                         crate::graph::pdg::NodeType::Module => "module".to_string(),
                         crate::graph::pdg::NodeType::External => "external".to_string(),
+                        crate::graph::pdg::NodeType::DocSection => "doc_section".to_string(),
                         crate::graph::pdg::NodeType::FileSummary => "file_summary".to_string(),
                     });
 

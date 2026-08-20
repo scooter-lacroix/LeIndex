@@ -5,6 +5,7 @@ pub use crate::parse::c::CParser;
 pub use crate::parse::cpp::CppParser;
 pub use crate::parse::csharp::CSharpParser;
 pub use crate::parse::dart::DartParser;
+pub use crate::parse::docs::{DocFlavor, DocParser};
 pub use crate::parse::generic::GenericParser;
 pub use crate::parse::go::GoParser;
 pub use crate::parse::java::JavaParser;
@@ -63,6 +64,10 @@ pub fn parser_for_language(
         "embedded-template" | "ejs" | "erb" | "liquid" => {
             Some(Box::new(GenericParser::new("embedded_template")))
         }
+        "markdown" | "md" => Some(Box::new(DocParser::new(DocFlavor::Markdown))),
+        "rst" | "restructuredtext" => Some(Box::new(DocParser::new(DocFlavor::Rst))),
+        "asciidoc" | "adoc" => Some(Box::new(DocParser::new(DocFlavor::Adoc))),
+        "text" | "txt" | "plaintext" => Some(Box::new(DocParser::new(DocFlavor::Plain))),
         _ => None,
     }
 }

@@ -283,6 +283,7 @@ pub(crate) fn enriched_node_content(
             NodeType::Function => "function",
             NodeType::Class => "class",
             NodeType::Method => "method",
+            NodeType::DocSection => "doc_section",
             NodeType::Variable => "variable",
             NodeType::Module => "module",
             NodeType::External => "external",

@@ -124,6 +124,9 @@ pub enum NodeType {
     /// Imported/referenced symbol not defined in this project
     External,
 
+    /// A documentation heading section (markdown/rst/adoc/txt docs tier).
+    DocSection,
+
     /// Synthetic per-file summary node (conceptual-recall fix). Embeds the
     /// file's leading doc comment + the names of its top-level items as a
     /// single retrievable unit, so a conceptual NL query can match a file by

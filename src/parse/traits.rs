@@ -699,6 +699,24 @@ pub mod languages {
         ["ejs", "erb", "liquid"],
         tree_sitter_embedded_template::LANGUAGE
     );
+    // Docs tier: pulldown-cmark/regex parsers — no tree-sitter grammar. The
+    // language() stand-ins exist only for LanguageId completeness; the
+    // pipeline dispatches by language NAME to DocParser, which ignores the
+    // tree-sitter handle entirely.
+    tier0_language!(
+        markdown,
+        "Markdown",
+        ["md", "markdown"],
+        tree_sitter_json::LANGUAGE
+    );
+    tier0_language!(rst, "reStructuredText", ["rst"], tree_sitter_json::LANGUAGE);
+    tier0_language!(
+        adoc,
+        "AsciiDoc",
+        ["adoc", "asciidoc"],
+        tree_sitter_json::LANGUAGE
+    );
+    tier0_language!(plaintext, "Plain Text", ["txt"], tree_sitter_json::LANGUAGE);
 
     /// Resolve a tree-sitter language by registry name (used by the generic
     /// Tier-0 parser). Panics on unknown names — callers pass table-driven

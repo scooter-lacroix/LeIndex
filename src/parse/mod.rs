@@ -56,6 +56,8 @@ pub mod php;
 
 /// Dart language implementation.
 pub mod dart;
+/// Documentation parser (markdown/rst/adoc/txt heading sections).
+pub mod docs;
 /// Tier-0 generic tree-sitter parser for the breadth languages.
 pub mod generic;
 /// Kotlin language implementation.

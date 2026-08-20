@@ -102,6 +102,8 @@ pub(crate) const SOURCE_FILE_EXTENSIONS: &[&str] = &[
     "swift", "kt", "kts", "dart", "html", "htm", "css", "scss", "yaml", "yml", "cmake", "ex", "exs",
     "erl", "hrl", "hs", "pl", "pm", "r", "zig", "graphql", "gql", "hcl", "tf", "tfvars", "el",
     "jl", "d", "di", "glsl", "vert", "frag", "comp", "ejs", "erb", "liquid",
+    // Docs tier: markdown/rest/asciidoc/plain-text heading sections
+    "md", "markdown", "rst", "adoc", "asciidoc", "txt",
 ];
 
 // Directories to always skip during source collection

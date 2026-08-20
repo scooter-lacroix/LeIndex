@@ -55,6 +55,8 @@ pub enum NodeType {
     Module,
     /// Imported/referenced symbol not defined in this project
     External,
+    /// A documentation heading section (docs tier).
+    DocSection,
     /// Synthetic per-file summary node (mirrors graph::pdg::NodeType::FileSummary)
     FileSummary,
 }
@@ -69,6 +71,7 @@ impl NodeType {
             NodeType::Variable => "variable",
             NodeType::Module => "module",
             NodeType::External => "external",
+            NodeType::DocSection => "doc_section",
             NodeType::FileSummary => "file_summary",
         }
     }

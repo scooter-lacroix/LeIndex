@@ -203,6 +203,14 @@ pub enum LanguageId {
     Glsl = 36,
     /// Embedded templates (EJS/ERB/Liquid) (Tier-0)
     EmbeddedTemplate = 37,
+    /// Markdown documentation (docs tier)
+    Markdown = 38,
+    /// reStructuredText documentation (docs tier)
+    Rst = 39,
+    /// AsciiDoc documentation (docs tier)
+    Adoc = 40,
+    /// Plain text documentation (docs tier)
+    PlainText = 41,
 }
 
 impl LanguageId {
@@ -246,6 +254,10 @@ impl LanguageId {
             "d" | "di" => Some(LanguageId::D),
             "glsl" | "vert" | "frag" | "comp" => Some(LanguageId::Glsl),
             "ejs" | "erb" | "liquid" => Some(LanguageId::EmbeddedTemplate),
+            "md" | "markdown" => Some(LanguageId::Markdown),
+            "rst" => Some(LanguageId::Rst),
+            "adoc" | "asciidoc" => Some(LanguageId::Adoc),
+            "txt" => Some(LanguageId::PlainText),
             "lua" => Some(LanguageId::Lua),
             "scala" | "sc" => Some(LanguageId::Scala),
             "sh" | "bash" => Some(LanguageId::Bash),
@@ -299,6 +311,10 @@ impl LanguageId {
             LanguageId::EmbeddedTemplate => {
                 &crate::parse::traits::languages::embedded_template::CONFIG
             }
+            LanguageId::Markdown => &crate::parse::traits::languages::markdown::CONFIG,
+            LanguageId::Rst => &crate::parse::traits::languages::rst::CONFIG,
+            LanguageId::Adoc => &crate::parse::traits::languages::adoc::CONFIG,
+            LanguageId::PlainText => &crate::parse::traits::languages::plaintext::CONFIG,
         }
     }
 
@@ -346,6 +362,12 @@ impl LanguageId {
             LanguageId::Glsl => crate::parse::traits::languages::glsl::language(),
             LanguageId::EmbeddedTemplate => {
                 crate::parse::traits::languages::embedded_template::language()
+            }
+            // Doc flavors do not load a tree-sitter grammar; the DocParser
+            // never reaches load_language (it ignores the parser handle).
+            // Return a stand-in that is never installed: config-level only.
+            LanguageId::Markdown | LanguageId::Rst | LanguageId::Adoc | LanguageId::PlainText => {
+                crate::parse::traits::languages::json::language()
             }
         }
     }

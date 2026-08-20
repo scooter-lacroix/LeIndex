@@ -2043,6 +2043,7 @@ pub fn normalize_symbol(raw: &str) -> String {
 
 fn signature_to_node(sig: &SignatureInfo, file_path: &str, language: &str) -> Node {
     let node_type = match sig.return_type.as_deref() {
+        Some("doc_section") => NodeType::DocSection,
         Some("module") => NodeType::Module,
         Some("enum_variant") => NodeType::Variable,
         Some("enum") | Some("trait") => NodeType::Class,

@@ -187,6 +187,7 @@ pub fn node_type_to_str(node_type: &PDGNodeType) -> &'static str {
         PDGNodeType::Variable => "variable",
         PDGNodeType::Module => "module",
         PDGNodeType::External => "external",
+        PDGNodeType::DocSection => "doc_section",
         PDGNodeType::FileSummary => "file_summary",
     }
 }
@@ -200,6 +201,7 @@ pub fn node_type_from_str(s: &str) -> Option<PDGNodeType> {
         "variable" => PDGNodeType::Variable,
         "module" => PDGNodeType::Module,
         "external" => PDGNodeType::External,
+        "doc_section" => PDGNodeType::DocSection,
         "file_summary" => PDGNodeType::FileSummary,
         _ => return None,
     })

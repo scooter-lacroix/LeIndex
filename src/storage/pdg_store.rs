@@ -142,6 +142,7 @@ fn convert_node_type(node_type: &PDGNodeType) -> StorageNodeType {
         PDGNodeType::Variable => StorageNodeType::Variable,
         PDGNodeType::Module => StorageNodeType::Module,
         PDGNodeType::External => StorageNodeType::External,
+        PDGNodeType::DocSection => StorageNodeType::DocSection,
         PDGNodeType::FileSummary => StorageNodeType::FileSummary,
     }
 }
@@ -155,6 +156,7 @@ fn convert_storage_node_type(node_type: &StorageNodeType) -> PDGNodeType {
         StorageNodeType::Variable => PDGNodeType::Variable,
         StorageNodeType::Module => PDGNodeType::Module,
         StorageNodeType::External => PDGNodeType::External,
+        StorageNodeType::DocSection => PDGNodeType::DocSection,
         StorageNodeType::FileSummary => PDGNodeType::FileSummary,
     }
 }

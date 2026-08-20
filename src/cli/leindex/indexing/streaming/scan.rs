@@ -225,7 +225,7 @@ pub const SOURCE_EXTENSIONS: &[&str] = &[
     "hpp", "hxx", "cs", "rb", "swift", "kt", "kts", "scala", "sc", "php", "lua", "dart", "sh",
     "bash", "json", "html", "htm", "css", "scss", "yaml", "yml", "cmake", "ex", "exs", "erl",
     "hrl", "hs", "pl", "pm", "r", "zig", "graphql", "gql", "hcl", "tf", "tfvars", "el", "jl", "d",
-    "di", "glsl", "vert", "frag", "comp",
+    "di", "glsl", "vert", "frag", "comp", "md", "markdown", "rst", "adoc", "asciidoc", "txt",
 ];
 
 /// Serialize a batch of scan records to bytes for CAS staging.
@@ -247,7 +247,7 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.rs"), "fn main() {}").unwrap();
         fs::write(dir.path().join("b.py"), "def foo():\n  pass\n").unwrap();
-        fs::write(dir.path().join("c.txt"), "not a source file\n").unwrap();
+        fs::write(dir.path().join("c.docx"), "not a source file\n").unwrap();
         fs::create_dir(dir.path().join(".hidden")).unwrap();
         fs::write(dir.path().join(".hidden/secret.rs"), "fn secret() {}").unwrap();
         dir
