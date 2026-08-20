@@ -97,6 +97,11 @@ pub(crate) const SOURCE_FILE_EXTENSIONS: &[&str] = &[
     // Systems languages
     "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Scripting & other
     "cs", "rb", "php", "lua", "scala", "sc", "sh", "bash", "json",
+    // Tier-0 breadth wave (2026-08-20) — must stay in lockstep with
+    // docs/LANGUAGES.md and the parser registry
+    "swift", "kt", "kts", "dart", "html", "htm", "css", "scss", "yaml", "yml", "cmake", "ex", "exs",
+    "erl", "hrl", "hs", "pl", "pm", "r", "zig", "graphql", "gql", "hcl", "tf", "tfvars", "el",
+    "jl", "d", "di", "glsl", "vert", "frag", "comp", "ejs", "erb", "liquid",
 ];
 
 // Directories to always skip during source collection

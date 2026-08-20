@@ -54,12 +54,17 @@ pub mod ruby;
 /// PHP language implementation.
 pub mod php;
 
-/// Swift language implementation (disabled due to tree-sitter version conflicts)
-// pub mod swift;
-/// Kotlin language implementation (disabled due to tree-sitter version conflicts)
-// pub mod kotlin;
-/// Dart language implementation (disabled due to tree-sitter version conflicts)
-// pub mod dart;
+/// Dart language implementation.
+pub mod dart;
+/// Tier-0 generic tree-sitter parser for the breadth languages.
+pub mod generic;
+/// Kotlin language implementation.
+pub mod kotlin;
+/// Swift language implementation.
+pub mod swift;
+
+#[cfg(test)]
+mod generic_test;
 /// Lua language implementation.
 pub mod lua;
 

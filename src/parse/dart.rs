@@ -192,11 +192,9 @@ fn extract_dart_parameters(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Pa
 
 #[cfg(feature = "parse")]
 fn extract_dart_return_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
-    if let Some(return_node) = node.child_by_field_name("return_type") {
-        Some(return_node.utf8_text(source).unwrap_or("void").to_string())
-    } else {
-        None
-    }
+    node.child_by_field_name("return_type")
+        .and_then(|return_node| return_node.utf8_text(source).ok())
+        .map(|text| text.to_string())
 }
 
 #[cfg(feature = "parse")]

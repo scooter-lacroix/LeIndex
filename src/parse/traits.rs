@@ -610,54 +610,156 @@ pub mod languages {
         }
     }
 
-    /// Swift language implementation (disabled due to tree-sitter version conflicts)
-    // #[cfg(feature = "parse")]
-    // pub mod swift {
-    //     use super::{LanguageConfig, Language};
-    //     use once_cell::sync::Lazy;
-    //
-    //     pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
-    //         name: "Swift".to_string(),
-    //         extensions: vec!["swift".to_string()],
-    //         queries: LanguageConfig::default_queries(),
-    //     });
-    //
-    //     pub fn language() -> Language {
-    //         tree_sitter_swift::LANGUAGE.into()
-    //     }
-    // }
-    /// Kotlin language implementation (disabled due to tree-sitter version conflicts)
-    // #[cfg(feature = "parse")]
-    // pub mod kotlin {
-    //     use super::{LanguageConfig, Language};
-    //     use once_cell::sync::Lazy;
-    //
-    //     pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
-    //         name: "Kotlin".to_string(),
-    //         extensions: vec!["kt".to_string(), "kts".to_string()],
-    //         queries: LanguageConfig::default_queries(),
-    //     });
-    //
-    //     pub fn language() -> Language {
-    //         unsafe { std::mem::transmute(tree_sitter_kotlin::language()) }
-    //     }
-    // }
-    /// Dart language implementation (disabled due to tree-sitter version conflicts)
-    // #[cfg(feature = "parse")]
-    // pub mod dart {
-    //     use super::{LanguageConfig, Language};
-    //     use once_cell::sync::Lazy;
-    //
-    //     pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
-    //         name: "Dart".to_string(),
-    //         extensions: vec!["dart".to_string()],
-    //         queries: LanguageConfig::default_queries(),
-    //     });
-    //
-    //     pub fn language() -> Language {
-    //         tree_sitter_dart::LANGUAGE.into()
-    //     }
-    // }
+    /// Define a Tier-0 language module: CONFIG + tree-sitter loader.
+    ///
+    /// One line per language keeps the 100+ breadth goal maintainable; the
+    /// bespoke parsers (kotlin/swift/dart) and the generic Tier-0 parser
+    /// (`parse::generic`) consume these through `language_by_name`.
+    macro_rules! tier0_language {
+        ($modname:ident, $display:expr, $exts:expr, $loader:expr) => {
+            /// Tier-0 language module (see the table in `parse::generic`).
+            pub mod $modname {
+                use super::{Language, LanguageConfig};
+                use once_cell::sync::Lazy;
+
+                /// Language configuration.
+                pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
+                    name: $display.to_string(),
+                    extensions: $exts.iter().map(|e| e.to_string()).collect(),
+                    queries: LanguageConfig::default_queries(),
+                });
+
+                /// Get the tree-sitter language.
+                pub fn language() -> Language {
+                    $loader.into()
+                }
+            }
+        };
+    }
+
+    tier0_language!(swift, "Swift", ["swift"], tree_sitter_swift::LANGUAGE);
+    tier0_language!(
+        kotlin,
+        "Kotlin",
+        ["kt", "kts"],
+        tree_sitter_kotlin_ng::LANGUAGE
+    );
+    tier0_language!(dart, "Dart", ["dart"], tree_sitter_dart::LANGUAGE);
+    tier0_language!(html, "HTML", ["html", "htm"], tree_sitter_html::LANGUAGE);
+    tier0_language!(css, "CSS", ["css"], tree_sitter_css::LANGUAGE);
+    tier0_language!(scss, "SCSS", ["scss"], tree_sitter_scss::language());
+    tier0_language!(yaml, "YAML", ["yaml", "yml"], tree_sitter_yaml::LANGUAGE);
+    tier0_language!(cmake, "CMake", ["cmake"], tree_sitter_cmake::LANGUAGE);
+    tier0_language!(
+        elixir,
+        "Elixir",
+        ["ex", "exs"],
+        tree_sitter_elixir::LANGUAGE
+    );
+    tier0_language!(
+        erlang,
+        "Erlang",
+        ["erl", "hrl"],
+        tree_sitter_erlang::LANGUAGE
+    );
+    tier0_language!(haskell, "Haskell", ["hs"], tree_sitter_haskell::LANGUAGE);
+    tier0_language!(perl, "Perl", ["pl", "pm"], tree_sitter_perl::LANGUAGE);
+    tier0_language!(r, "R", ["r", "R"], tree_sitter_r::LANGUAGE);
+    tier0_language!(zig, "Zig", ["zig"], tree_sitter_zig::LANGUAGE);
+    tier0_language!(
+        graphql,
+        "GraphQL",
+        ["graphql", "gql"],
+        tree_sitter_graphql::LANGUAGE
+    );
+    tier0_language!(
+        hcl,
+        "HCL",
+        ["hcl", "tf", "tfvars"],
+        tree_sitter_hcl::LANGUAGE
+    );
+    tier0_language!(
+        make,
+        "Make",
+        ["makefile", "mak", "mk"],
+        tree_sitter_make::LANGUAGE
+    );
+    tier0_language!(elisp, "Emacs Lisp", ["el"], tree_sitter_elisp::LANGUAGE);
+    tier0_language!(julia, "Julia", ["jl"], tree_sitter_julia::LANGUAGE);
+    tier0_language!(d, "D", ["d", "di"], tree_sitter_d::LANGUAGE);
+    tier0_language!(
+        glsl,
+        "GLSL",
+        ["glsl", "vert", "frag", "comp"],
+        tree_sitter_glsl::LANGUAGE_GLSL
+    );
+    tier0_language!(
+        embedded_template,
+        "Embedded Template",
+        ["ejs", "erb", "liquid"],
+        tree_sitter_embedded_template::LANGUAGE
+    );
+
+    /// Resolve a tree-sitter language by registry name (used by the generic
+    /// Tier-0 parser). Panics on unknown names — callers pass table-driven
+    /// names that are compile-time verified by the registry test.
+    pub fn language_by_name(name: &str) -> Language {
+        match name {
+            "swift" => swift::language(),
+            "kotlin" => kotlin::language(),
+            "dart" => dart::language(),
+            "html" => html::language(),
+            "css" => css::language(),
+            "scss" => scss::language(),
+            "yaml" => yaml::language(),
+            "cmake" => cmake::language(),
+            "elixir" => elixir::language(),
+            "erlang" => erlang::language(),
+            "haskell" => haskell::language(),
+            "perl" => perl::language(),
+            "r" => r::language(),
+            "zig" => zig::language(),
+            "graphql" => graphql::language(),
+            "hcl" => hcl::language(),
+            "make" => make::language(),
+            "elisp" => elisp::language(),
+            "julia" => julia::language(),
+            "d" => d::language(),
+            "glsl" => glsl::language(),
+            "embedded_template" => embedded_template::language(),
+            _ => panic!("language_by_name: unknown language {name}"),
+        }
+    }
+
+    /// Whether `name` has a Tier-0 language module (registry test helper).
+    pub fn language_by_name_is_registered(name: &str) -> bool {
+        matches!(
+            name,
+            "swift"
+                | "kotlin"
+                | "dart"
+                | "html"
+                | "css"
+                | "scss"
+                | "yaml"
+                | "cmake"
+                | "elixir"
+                | "erlang"
+                | "haskell"
+                | "perl"
+                | "r"
+                | "zig"
+                | "graphql"
+                | "hcl"
+                | "make"
+                | "elisp"
+                | "julia"
+                | "d"
+                | "glsl"
+                | "embedded_template"
+        )
+    }
+
     /// Lua language support.
     pub mod lua {
         use super::{Language, LanguageConfig};

@@ -222,7 +222,10 @@ fn stream_scan_inner<W: ScanRecordWriter>(
 /// Common source file extensions for scanning.
 pub const SOURCE_EXTENSIONS: &[&str] = &[
     "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java", "c", "h", "cpp", "cc", "cxx",
-    "hpp", "hxx", "cs", "rb", "swift", "kt", "kts", "scala", "php", "lua", "dart", "sh", "bash",
+    "hpp", "hxx", "cs", "rb", "swift", "kt", "kts", "scala", "sc", "php", "lua", "dart", "sh",
+    "bash", "json", "html", "htm", "css", "scss", "yaml", "yml", "cmake", "ex", "exs", "erl",
+    "hrl", "hs", "pl", "pm", "r", "zig", "graphql", "gql", "hcl", "tf", "tfvars", "el", "jl", "d",
+    "di", "glsl", "vert", "frag", "comp",
 ];
 
 /// Serialize a batch of scan records to bytes for CAS staging.

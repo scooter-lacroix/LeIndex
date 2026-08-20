@@ -146,11 +146,9 @@ pub enum LanguageId {
     Ruby = 8,
     /// PHP programming language
     Php = 9,
-    // BREAKING CHANGE: Swift (10), Kotlin (11), and Dart (12) variants removed in v1.6.6
-    // due to tree-sitter version conflicts. These languages are unsupported until
-    // conflicts are resolved. Downstream crates depending on these numeric values
-    // or variants will need to update. LanguageId enum discriminants are now
-    // renumbered to: Lua=10, Scala=11, C=12, Bash=13, Json=14.
+    // Lua=10..Json=14 were renumbered in v1.6.6 when Swift/Kotlin/Dart were
+    // disabled; the Tier-0 breadth wave (2026-08-20) appends new variants
+    // from 15 upward without renumbering existing discriminants.
     /// Lua programming language
     Lua = 10,
     /// Scala programming language
@@ -161,6 +159,50 @@ pub enum LanguageId {
     Bash = 13,
     /// JSON data format
     Json = 14,
+    /// Swift programming language (Tier-0 breadth wave)
+    Swift = 15,
+    /// Kotlin programming language (Tier-0 breadth wave)
+    Kotlin = 16,
+    /// Dart programming language (Tier-0 breadth wave)
+    Dart = 17,
+    /// HTML markup (Tier-0)
+    Html = 18,
+    /// CSS (Tier-0)
+    Css = 19,
+    /// SCSS (Tier-0)
+    Scss = 20,
+    /// YAML (Tier-0)
+    Yaml = 21,
+    /// CMake (Tier-0)
+    Cmake = 22,
+    /// Elixir (Tier-0)
+    Elixir = 24,
+    /// Erlang (Tier-0)
+    Erlang = 25,
+    /// Haskell (Tier-0)
+    Haskell = 26,
+    /// Perl (Tier-0)
+    Perl = 27,
+    /// R (Tier-0)
+    R = 28,
+    /// Zig (Tier-0)
+    Zig = 29,
+    /// GraphQL (Tier-0)
+    Graphql = 30,
+    /// HCL / Terraform (Tier-0)
+    Hcl = 31,
+    /// Makefile (Tier-0)
+    Make = 32,
+    /// Emacs Lisp (Tier-0)
+    Elisp = 33,
+    /// Julia (Tier-0)
+    Julia = 34,
+    /// D programming language (Tier-0)
+    D = 35,
+    /// GLSL shaders (Tier-0)
+    Glsl = 36,
+    /// Embedded templates (EJS/ERB/Liquid) (Tier-0)
+    EmbeddedTemplate = 37,
 }
 
 impl LanguageId {
@@ -182,8 +224,28 @@ impl LanguageId {
             "cs" => Some(LanguageId::CSharp),
             "rb" => Some(LanguageId::Ruby),
             "php" => Some(LanguageId::Php),
-            // Swift, Kotlin, and Dart extensions intentionally excluded
-            // as their parsers are disabled due to tree-sitter version conflicts
+            "swift" => Some(LanguageId::Swift),
+            "kt" | "kts" => Some(LanguageId::Kotlin),
+            "dart" => Some(LanguageId::Dart),
+            "html" | "htm" => Some(LanguageId::Html),
+            "css" => Some(LanguageId::Css),
+            "scss" => Some(LanguageId::Scss),
+            "yaml" | "yml" => Some(LanguageId::Yaml),
+            "cmake" => Some(LanguageId::Cmake),
+            "ex" | "exs" => Some(LanguageId::Elixir),
+            "erl" | "hrl" => Some(LanguageId::Erlang),
+            "hs" => Some(LanguageId::Haskell),
+            "pl" | "pm" => Some(LanguageId::Perl),
+            "r" => Some(LanguageId::R),
+            "zig" => Some(LanguageId::Zig),
+            "graphql" | "gql" => Some(LanguageId::Graphql),
+            "hcl" | "tf" | "tfvars" => Some(LanguageId::Hcl),
+            "makefile" | "mak" | "mk" => Some(LanguageId::Make),
+            "el" => Some(LanguageId::Elisp),
+            "jl" => Some(LanguageId::Julia),
+            "d" | "di" => Some(LanguageId::D),
+            "glsl" | "vert" | "frag" | "comp" => Some(LanguageId::Glsl),
+            "ejs" | "erb" | "liquid" => Some(LanguageId::EmbeddedTemplate),
             "lua" => Some(LanguageId::Lua),
             "scala" | "sc" => Some(LanguageId::Scala),
             "sh" | "bash" => Some(LanguageId::Bash),
@@ -213,6 +275,30 @@ impl LanguageId {
             LanguageId::C => &crate::parse::traits::languages::c::CONFIG,
             LanguageId::Bash => &crate::parse::traits::languages::bash::CONFIG,
             LanguageId::Json => &crate::parse::traits::languages::json::CONFIG,
+            LanguageId::Swift => &crate::parse::traits::languages::swift::CONFIG,
+            LanguageId::Kotlin => &crate::parse::traits::languages::kotlin::CONFIG,
+            LanguageId::Dart => &crate::parse::traits::languages::dart::CONFIG,
+            LanguageId::Html => &crate::parse::traits::languages::html::CONFIG,
+            LanguageId::Css => &crate::parse::traits::languages::css::CONFIG,
+            LanguageId::Scss => &crate::parse::traits::languages::scss::CONFIG,
+            LanguageId::Yaml => &crate::parse::traits::languages::yaml::CONFIG,
+            LanguageId::Cmake => &crate::parse::traits::languages::cmake::CONFIG,
+            LanguageId::Elixir => &crate::parse::traits::languages::elixir::CONFIG,
+            LanguageId::Erlang => &crate::parse::traits::languages::erlang::CONFIG,
+            LanguageId::Haskell => &crate::parse::traits::languages::haskell::CONFIG,
+            LanguageId::Perl => &crate::parse::traits::languages::perl::CONFIG,
+            LanguageId::R => &crate::parse::traits::languages::r::CONFIG,
+            LanguageId::Zig => &crate::parse::traits::languages::zig::CONFIG,
+            LanguageId::Graphql => &crate::parse::traits::languages::graphql::CONFIG,
+            LanguageId::Hcl => &crate::parse::traits::languages::hcl::CONFIG,
+            LanguageId::Make => &crate::parse::traits::languages::make::CONFIG,
+            LanguageId::Elisp => &crate::parse::traits::languages::elisp::CONFIG,
+            LanguageId::Julia => &crate::parse::traits::languages::julia::CONFIG,
+            LanguageId::D => &crate::parse::traits::languages::d::CONFIG,
+            LanguageId::Glsl => &crate::parse::traits::languages::glsl::CONFIG,
+            LanguageId::EmbeddedTemplate => {
+                &crate::parse::traits::languages::embedded_template::CONFIG
+            }
         }
     }
 
@@ -237,6 +323,30 @@ impl LanguageId {
             LanguageId::C => crate::parse::traits::languages::c::language(),
             LanguageId::Bash => crate::parse::traits::languages::bash::language(),
             LanguageId::Json => crate::parse::traits::languages::json::language(),
+            LanguageId::Swift => crate::parse::traits::languages::swift::language(),
+            LanguageId::Kotlin => crate::parse::traits::languages::kotlin::language(),
+            LanguageId::Dart => crate::parse::traits::languages::dart::language(),
+            LanguageId::Html => crate::parse::traits::languages::html::language(),
+            LanguageId::Css => crate::parse::traits::languages::css::language(),
+            LanguageId::Scss => crate::parse::traits::languages::scss::language(),
+            LanguageId::Yaml => crate::parse::traits::languages::yaml::language(),
+            LanguageId::Cmake => crate::parse::traits::languages::cmake::language(),
+            LanguageId::Elixir => crate::parse::traits::languages::elixir::language(),
+            LanguageId::Erlang => crate::parse::traits::languages::erlang::language(),
+            LanguageId::Haskell => crate::parse::traits::languages::haskell::language(),
+            LanguageId::Perl => crate::parse::traits::languages::perl::language(),
+            LanguageId::R => crate::parse::traits::languages::r::language(),
+            LanguageId::Zig => crate::parse::traits::languages::zig::language(),
+            LanguageId::Graphql => crate::parse::traits::languages::graphql::language(),
+            LanguageId::Hcl => crate::parse::traits::languages::hcl::language(),
+            LanguageId::Make => crate::parse::traits::languages::make::language(),
+            LanguageId::Elisp => crate::parse::traits::languages::elisp::language(),
+            LanguageId::Julia => crate::parse::traits::languages::julia::language(),
+            LanguageId::D => crate::parse::traits::languages::d::language(),
+            LanguageId::Glsl => crate::parse::traits::languages::glsl::language(),
+            LanguageId::EmbeddedTemplate => {
+                crate::parse::traits::languages::embedded_template::language()
+            }
         }
     }
 
