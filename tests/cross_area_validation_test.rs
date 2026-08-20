@@ -476,7 +476,7 @@ mod version_parity {
     fn one_crate_two_bin_layout() {
         read_file("src/embed/mod.rs");
         read_file("src/embed/worker_main.rs");
-        read_file("src/bin/leindex-embed.rs");
+        // Single binary: no wrapper to read; worker_main is the subject.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         assert!(
             !root.join("crates/leindex-embed").exists(),
@@ -653,17 +653,23 @@ mod per_surface_journeys {
     /// cargo install layout tests; here we ensure the inference codepath can
     /// reach neural scoring via the worker spawn.
     #[test]
-    fn cargo_install_lays_out_both_binaries_cooperatively() {
+    fn cargo_install_lays_out_single_binary() {
+        // Single binary (2026-08-20): the ONNX worker is a hidden re-exec of
+        // `leindex --internal-embed-worker`, so a second [[bin]] target must
+        // NOT exist — shipping one reintroduces the discovery/version-
+        // mismatch failure class the re-exec removes.
         let cargo = read_file("Cargo.toml");
-
-        // The root Cargo.toml declares the worker bin target gated on the
-        // onnx feature so `cargo install --features onnx` co-installs it.
-        let has_embed_target = cargo
-            .lines()
-            .any(|line| line.trim().contains("name = \"leindex-embed\""));
         assert!(
-            has_embed_target,
-            "VAL-CROSS-001 / VAL-CARGO-002: root Cargo.toml must declare the leindex-embed bin target"
+            !cargo
+                .lines()
+                .any(|line| line.trim().contains("name = \"leindex-embed\"")),
+            "VAL-CROSS-001: root Cargo.toml must NOT declare a leindex-embed bin target (single binary)"
+        );
+        let bin_main = read_file("src/bin/leindex.rs");
+        assert!(
+            bin_main.contains("INTERNAL_WORKER_TOKEN")
+                || bin_main.contains("--internal-embed-worker"),
+            "src/bin/leindex.rs must dispatch the hidden worker token"
         );
     }
 
@@ -706,34 +712,12 @@ mod per_surface_journeys {
             toml.contains("leindex-setup = \"leindex.bootstrap:setup_main\""),
             "VAL-PYPI-005: pyproject.toml must declare the leindex-setup console script"
         );
-        // VAL-PYPI-008: the bootstrap must ensure the leindex-embed worker
-        // binary is present so neural search functions after setup. Post
-        // embed-merge the worker is a `[[bin]]` of the root crate, so a single
-        // `cargo install leindex --features onnx` co-installs it; the former
-        // standalone `install_embed_worker` helper no longer exists. The
-        // bootstrap tracks the worker via `embed_binary` and repairs a
-        // partial install (main-only) through `ensure_worker_present`.
+        // Single binary: the worker ships inside leindex; the bootstrap
+        // keeps a no-op ensure_worker_present for call-site compatibility.
         let bootstrap = read_file("packages/pypi-leindex/src/leindex/bootstrap.py");
         assert!(
-            bootstrap.contains("embed_binary: Path"),
-            "VAL-PYPI-008: bootstrap must track the leindex-embed worker binary (embed_binary: Path)"
-        );
-        assert!(
             bootstrap.contains("def ensure_worker_present("),
-            "VAL-PYPI-008: bootstrap must define ensure_worker_present()"
-        );
-        // The worker must be a [[bin]] of the root crate, onnx-gated, so the
-        // single cargo install co-installs it (VAL-CARGO-005 invariant). The
-        // `required-features` must sit in the SAME [[bin]] section that
-        // declares the worker, not merely somewhere else in Cargo.toml.
-        let cargo = read_file("Cargo.toml");
-        let embed_bin_section = cargo
-            .split("[[bin]]")
-            .find(|section| section.contains("name = \"leindex-embed\""))
-            .expect("Cargo.toml must declare a [[bin]] section for leindex-embed");
-        assert!(
-            embed_bin_section.contains("required-features = [\"onnx\"]"),
-            "VAL-PYPI-008: the leindex-embed [[bin]] section must declare required-features = [\"onnx\"]"
+            "bootstrap must keep the ensure_worker_present stub"
         );
         // The bootstrap installs with the `onnx` feature so the `setup`
         // subcommand is present in the freshly installed binary.

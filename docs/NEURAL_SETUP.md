@@ -114,7 +114,7 @@ performance. They are opt-in so the default path remains reproducible.
 ## Runtime Behavior
 
 On Unix, LeIndex connects to a local socket whose identity includes the model,
-provider, batch size, and sequence length. The resident `leindex-embed` process retains the ONNX session,
+provider, batch size, and sequence length. The resident embed-worker process (a `leindex --internal-embed-worker` re-exec; named `leindex-embed` in process listings) retains the ONNX session,
 GPU allocations, and compiled cache across short-lived CLI commands and MCP
 calls. It exits after ten minutes without a client. Non-Unix and setup smoke
 paths use direct worker IPC with a one-minute idle limit.

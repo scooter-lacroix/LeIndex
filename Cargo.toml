@@ -427,18 +427,6 @@ path = "src/bin/leindex.rs"
 required-features = ["cli"]
 doc = false
 
-# VAL-CARGO-005: Worker binary co-installed via `cargo install leindex --features onnx`.
-# `cargo install <pkg>` only installs `[[bin]]` targets from `<pkg>`'s own
-# Cargo.toml, so the worker lives as a root bin wrapper
-# (`src/bin/leindex-embed.rs`) around `leindex::embed::worker_main::run()`.
-# Gated by `required-features = ["onnx"]` so default installs without neural
-# support are unaffected.
-[[bin]]
-name = "leindex-embed"
-path = "src/bin/leindex-embed.rs"
-required-features = ["onnx"]
-doc = false
-
 # VAL-DAEMON-003/004/005/009: leindexd user-scoped daemon binary.
 # Wraps McpServer::run_socket with a hard startup lock, post-bind
 # endpoint sidecar, and configurable idle exit. Gated by `cli` so

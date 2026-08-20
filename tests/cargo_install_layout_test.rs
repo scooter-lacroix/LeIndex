@@ -86,80 +86,41 @@ fn bin_blocks(cargo_toml: &str) -> Vec<String> {
 mod binary_targets {
     use super::*;
 
-    /// VAL-CARGO-002/005: The root package declares a `leindex-embed`
-    /// `[[bin]]` target so `cargo install leindex --features onnx` installs
-    /// both binaries from the single root crate.
+    /// Single-binary (2026-08-20): the worker is reached by `leindex
+    /// --internal-embed-worker` re-exec. A separate `leindex-embed` [[bin]]
+    /// must NOT return — shipping two binaries reintroduces the
+    /// discovery/version-mismatch failure class the re-exec removes.
     #[test]
-    fn root_declares_leindex_embed_bin_target() {
-        let toml = root_cargo_toml();
-        let bins = bin_blocks(&toml);
-
-        let embed_bin = bins.iter().find(|b| b.contains("name = \"leindex-embed\""));
+    fn test_root_has_no_embed_bin_target() {
+        let cargo = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
         assert!(
-            embed_bin.is_some(),
-            "Root Cargo.toml MUST declare a [[bin]] target named 'leindex-embed' \
-             so cargo install co-installs the worker. Found bin blocks: {:?}",
-            bins.iter()
-                .map(|b| b.lines().next().unwrap_or(""))
-                .collect::<Vec<_>>()
-        );
-
-        let embed = embed_bin.unwrap();
-        assert!(
-            embed.contains("path = \"src/bin/leindex-embed.rs\""),
-            "leindex-embed bin target should point to src/bin/leindex-embed.rs, got: {}",
-            embed
+            !cargo.contains("name = \"leindex-embed\""),
+            "Root Cargo.toml must NOT declare a [[bin]] target named 'leindex-embed' \
+             (worker mode is a hidden re-exec of the single binary)"
         );
         assert!(
-            embed.contains("required-features = [\"onnx\"]"),
-            "leindex-embed bin target must have required-features = [\"onnx\"], got: {}",
-            embed
+            !repo_root()
+                .join("src")
+                .join("bin")
+                .join("leindex-embed.rs")
+                .exists(),
+            "src/bin/leindex-embed.rs must not exist"
         );
     }
 
-    /// VAL-CARGO-001/004: The root package also declares the `leindex` main binary.
-    #[test]
-    fn root_declares_leindex_bin_target() {
-        let toml = root_cargo_toml();
-        let bins = bin_blocks(&toml);
-
-        let main_bin = bins.iter().find(|b| b.contains("name = \"leindex\""));
-        assert!(
-            main_bin.is_some(),
-            "Root Cargo.toml MUST declare [[bin]] 'leindex'. Found: {:?}",
-            bins.iter()
-                .map(|b| b.lines().next().unwrap_or(""))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    /// VAL-CARGO-005: There should be exactly three bin targets in the root
-    /// (leindex, leindex-embed, leindexd).
+    /// (leindex, leindexd).
     #[test]
     fn root_has_exactly_two_bin_targets() {
         let toml = root_cargo_toml();
         let bins = bin_blocks(&toml);
         assert_eq!(
             bins.len(),
-            3,
-            "Expected exactly 3 [[bin]] targets (leindex, leindex-embed, leindexd), got {}: {:?}",
+            2,
+            "Expected exactly 2 [[bin]] targets (leindex, leindexd), got {}: {:?}",
             bins.len(),
             bins.iter()
                 .map(|b| b.lines().next().unwrap_or(""))
                 .collect::<Vec<_>>()
-        );
-    }
-
-    /// VAL-CARGO-002: The root wrapper source exists and calls the worker run fn.
-    #[test]
-    fn root_embed_wrapper_source_exists() {
-        let path = repo_root().join("src").join("bin").join("leindex-embed.rs");
-        assert!(path.exists(), "src/bin/leindex-embed.rs must exist");
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
-        assert!(
-            src.contains("leindex::embed::worker_main::run"),
-            "Wrapper must call leindex::embed::worker_main::run()"
         );
     }
 
@@ -396,7 +357,7 @@ mod one_crate_layout {
     use super::*;
 
     /// VAL-CARGO-012: The retired leindex-embed subcrate is gone; worker source
-    /// lives at src/embed/ and the wrapper at src/bin/leindex-embed.rs.
+    /// lives at src/embed/ (single-binary re-exec; no wrapper).
     #[test]
     fn one_crate_two_bin_layout() {
         let root = repo_root();
@@ -412,10 +373,12 @@ mod one_crate_layout {
                 .is_file()
         );
         assert!(
-            root.join("src")
+            !root
+                .join("src")
                 .join("bin")
                 .join("leindex-embed.rs")
-                .is_file()
+                .is_file(),
+            "single-binary: the wrapper must stay removed (worker is a re-exec)"
         );
     }
 }

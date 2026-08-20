@@ -102,7 +102,11 @@ pub fn run_from(argv: Vec<String>) -> ! {
     // the release version. VAL-RELEASE-002 requires the same from the
     // release bundle worker binary. This must run before logging init so
     // the version string is the only stdout output (no tracing noise).
-    if argv.len() >= 2 && argv[1..].iter().any(|arg| arg == "--version" || arg == "-V") {
+    if argv.len() >= 2
+        && argv[1..]
+            .iter()
+            .any(|arg| arg == "--version" || arg == "-V")
+    {
         // Use the subcrate version (same as Cargo.toml version, kept in
         // parity with the root crate by AGENTS.md version-parity rule).
         println!("leindex-embed {}", env!("CARGO_PKG_VERSION"));

@@ -364,7 +364,6 @@ jobs:
             STRIP="aarch64-linux-gnu-strip"
           fi
           $STRIP target/${{ matrix.target }}/release/leindex
-          $STRIP target/${{ matrix.target }}/release/leindex-embed
 
       # ── Verify binaries: no NEEDED libonnxruntime, no $ORIGIN rpath ──
       # VAL-RELEASE-012/013: with load-dynamic, the produced binaries
@@ -379,7 +378,7 @@ jobs:
         run: |
           set -e
           BIN_DIR="target/${{ matrix.target }}/release"
-          for bin in leindex leindex-embed; do
+          for bin in leindex; do
             echo "Inspecting $BIN_DIR/$bin ..."
             if [[ "$RUNNER_OS" == "macOS" ]]; then
               LOAD_DEPS=$(otool -L "$BIN_DIR/$bin")
@@ -434,7 +433,6 @@ jobs:
 
           # Copy both binaries
           cp "target/${{ matrix.target }}/release/leindex${EXT}" "$BUNDLE_DIR/bin/leindex${EXT}"
-          cp "target/${{ matrix.target }}/release/leindex-embed${EXT}" "$BUNDLE_DIR/bin/leindex-embed${EXT}"
 
           # ── Copy ORT runtime libraries into lib/ ──
           # VAL-RELEASE-005/011: ORT is extracted from the pip wheel (above)
@@ -509,7 +507,7 @@ jobs:
           LeIndex is a code intelligence tool providing semantic and lexical
           (TF-IDF) search over your source tree. This bundle contains:
 
-            bin/        leindex and leindex-embed binaries
+            bin/        leindex binary (worker mode: leindex --internal-embed-worker)
             lib/        ONNX Runtime shared libraries (loaded dynamically)
             INSTALL.txt this file
 
@@ -517,7 +515,7 @@ jobs:
           -----------
 
           1. Add this directory to your PATH (or copy bin/leindex and
-             bin/leindex-embed to ~/.cargo/bin/):
+             worker mode is built into leindex):
 
                export PATH="$PWD/$BUNDLE_DIR/bin:\$PATH"
 
@@ -1021,7 +1019,7 @@ jobs:
           echo "- **npm**: Binary wrapper with GH Release download (optional — needs NPM_TOKEN)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "### Bundle topology" >> "$GITHUB_STEP_SUMMARY"
-          echo "Each platform archive includes \`leindex\`, \`leindex-embed\` (ONNX worker), and ONNX Runtime libraries. Models are provisioned by \`leindex setup\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "Each platform archive includes \`leindex\` (single binary; ONNX worker via the hidden re-exec mode) and ONNX Runtime libraries. Models are provisioned by \`leindex setup\`." >> "$GITHUB_STEP_SUMMARY"
 
   # ── Update version badge ─────────────────────────────────────────────
   badge:

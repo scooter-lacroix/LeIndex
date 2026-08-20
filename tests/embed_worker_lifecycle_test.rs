@@ -978,9 +978,9 @@ fn test_worker_exits_when_parent_killed() {
     // to PATH. This keeps the test self-contained on dev machines and in
     // CI where CARGO_TARGET_DIR layout places the binaries as siblings.
     let worker_path = {
-        let candidate = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("leindex-embed")));
+        // Single binary: the worker IS the main binary re-exec'd with the
+        // hidden token.
+        let candidate = std::env::current_exe().ok();
         match candidate {
             Some(p) if p.exists() => p,
             _ => {
@@ -988,7 +988,7 @@ fn test_worker_exits_when_parent_killed() {
                 // built at all, skip the test rather than fail — the unit
                 // tests above already cover the policy invariants.
                 let which = Command::new("which")
-                    .arg("leindex-embed")
+                    .arg("leindex")
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
                     .output()
@@ -1021,6 +1021,7 @@ fn test_worker_exits_when_parent_killed() {
     // IPC frames. We do NOT send any frames — the worker should block on
     // read_exact, and the only thing that should kill it is our SIGKILL.
     let mut child = match Command::new(&worker_path)
+        .arg("--internal-embed-worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

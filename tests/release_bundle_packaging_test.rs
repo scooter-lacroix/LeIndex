@@ -4,7 +4,7 @@
 //! the GitHub Release bundle layout produced by the release pipeline satisfies
 //! the distribution contract:
 //!
-//!   * `bin/` carries both `leindex` and `leindex-embed`
+//!   * `bin/` carries the single `leindex` binary (worker built in)
 //!   * Model files are excluded; `leindex setup` provisions them through
 //!     Hugging Face CLI
 //!   * `lib/` contains ORT runtime libraries obtained from a pip wheel extract
@@ -146,7 +146,7 @@ mod bundle_layout {
     use super::*;
 
     /// VAL-RELEASE-001 / VAL-RELEASE-002: The Package step must copy both
-    /// `leindex` and `leindex-embed` into `bin/`.
+    /// `leindex` into `bin/` (single binary).
     #[test]
     fn bundle_contains_both_binaries() {
         let yml = release_yml();
@@ -161,8 +161,8 @@ mod bundle_layout {
             "package step must lay out bin/leindex"
         );
         assert!(
-            package_section.contains("leindex-embed"),
-            "package step must lay out bin/leindex-embed"
+            !package_section.contains("/release/leindex-embed"),
+            "single binary: package step must NOT copy a separate leindex-embed"
         );
     }
 

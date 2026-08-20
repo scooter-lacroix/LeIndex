@@ -4,7 +4,7 @@
  * LeIndex MCP - Post-install script
  * 
  * Automatically downloads the appropriate LeIndex bundle for the current platform.
- * The bundle includes the main binary, the ONNX worker binary (leindex-embed),
+ * The bundle includes the single main binary (worker mode built in),
  * and ONNX Runtime libraries. `leindex setup` downloads model assets.
  */
 
@@ -269,7 +269,8 @@ function getBinaryName() {
 }
 
 function getWorkerBinaryName() {
-  return process.platform === 'win32' ? 'leindex-embed.exe' : 'leindex-embed';
+  // Single binary (2026-08-20): worker mode is built into leindex itself.
+  return process.platform === 'win32' ? 'leindex.exe' : 'leindex';
 }
 
 function requestResponse(url, options = {}, redirectCount = 0) {
@@ -645,21 +646,23 @@ async function installFromBundle(release) {
       throw new Error(`Main binary not found in bundle: bin/${binaryName}`);
     }
 
-    if (fs.existsSync(srcWorker)) {
+    if (srcWorker && srcWorker !== srcMain && fs.existsSync(srcWorker)) {
       copyRegularBundledFile(srcWorker, path.join(BIN_DIR, workerName), 'worker binary');
       if (process.platform !== 'win32') {
         fs.chmodSync(path.join(BIN_DIR, workerName), 0o755);
       }
       console.log('   ✓ Worker binary installed');
+    } else if (srcWorker === srcMain) {
+      console.log('   ✓ Worker mode built into the main binary (no separate worker)');
     } else {
-      // The leindex-embed worker binary is part of the bundle; if it is
+      // Worker binary check: single-binary bundles have none (worker
       // missing, neural (ONNX) search is unavailable — there is NO
       // in-process ONNX fallback (the client delegates all inference to
       // the worker process). TF-IDF search still works. Recover with:
       //   npm install (re-fetch the bundle)  |  cargo install leindex --features onnx
       //   |  leindex setup --neural after obtaining the worker.
       throw new Error(
-        `Worker binary (leindex-embed) not found in bundle at bin/${workerName}. ` +
+        `Worker binary not found in bundle at bin/${workerName}. ` +
           'Neural search is unavailable until it is installed. ' +
           'Re-run `npm install`, or run `cargo install leindex --features onnx` ' +
           'to build both binaries from source, then `leindex setup --neural`.'
@@ -871,12 +874,12 @@ async function install() {
     
     try {
       // One published crate (leindex) ships BOTH binaries: `cargo install
-      // leindex --features onnx` installs `leindex` and `leindex-embed`
+      // leindex --features onnx` installs the single `leindex` binary
       // (VAL-CARGO-005). The retired leindex-embed subcrate is gone, so
       // there is no separate worker crate to install — a second
       // `cargo install leindex-embed` would now fail.
       execSync('cargo install leindex --force --features onnx', { stdio: 'inherit' });
-      console.log('\n   ✓ Installed leindex + leindex-embed via cargo (one crate, two binaries)');
+      console.log('\n   ✓ Installed leindex (single binary, worker mode built in)');
 
       // Link cargo-installed binaries to our bin directory.
       try {
@@ -896,7 +899,7 @@ async function install() {
         } else {
           // No in-process ONNX fallback exists: if the worker is absent,
           // neural search is unavailable until it is obtained.
-          console.log('   ⚠ Worker binary (leindex-embed) missing from cargo install; neural search unavailable. Re-run `cargo install leindex --features onnx`.');
+          console.log('   ⚠ leindex binary missing from cargo install; neural search unavailable. Re-run `cargo install leindex --features onnx`.');
         }
       } catch (linkErr) {
         console.log('   ⚠ Could not link binary, but cargo install succeeded');

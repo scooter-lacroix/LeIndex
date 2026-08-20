@@ -675,8 +675,6 @@ install_leindex() {
     # ORT at runtime depending on which library is discovered.
     log_info "Building LeIndex..."
     # One published crate (leindex) builds BOTH binaries (leindex and
-    # leindex-embed). The retired leindex-embed subcrate is gone, so we do
-    # NOT pass -p leindex-embed or leindex-embed/onnx — building -p leindex
     # with the onnx feature compiles the worker [[bin]] target too.
     if cargo build --release -p leindex --features leindex/onnx 2>&1 | tee -a "$INSTALL_LOG"; then
         log_success "Build completed successfully"
@@ -691,7 +689,6 @@ install_leindex() {
 
     # Install main binary
     local binary="target/release/$PROJECT_SLUG"
-    local worker_binary="target/release/leindex-embed"
     if [[ -f "$binary" ]]; then
         log_info "Installing to cargo bin: $INSTALL_BIN_DIR"
         echo ""
@@ -716,14 +713,12 @@ install_leindex() {
 
     # Install ONNX worker binary
     if [[ -f "$worker_binary" ]]; then
-        local worker_install_path="${INSTALL_BIN_DIR}/leindex-embed"
         if cp "$worker_binary" "$worker_install_path" && chmod +x "$worker_install_path"; then
             log_success "Worker binary installed to: $worker_install_path"
         else
             log_warn "Failed to install worker binary to $worker_install_path"
         fi
     else
-        log_warn "Worker binary (leindex-embed) not found; neural search unavailable. Rebuild with: cargo build --release -p leindex --features leindex/onnx"
     fi
 
     # Install bundled ORT runtime libraries (from release bundle lib/
@@ -819,7 +814,6 @@ try_install_from_release_bundle() {
     #
     # The bundle layout (produced by .github/workflows/release.yml) is:
     #   leindex-<version>-<platform>/
-    #   ├── bin/   (leindex, leindex-embed)
     #   ├── lib/   (ORT runtime libraries for zero-setup neural search)
     #   └── INSTALL.txt
     #
@@ -914,7 +908,6 @@ try_install_from_release_bundle() {
     ensure_cargo_home_ready
 
     local main_bin="${bundle_dir}/bin/leindex"
-    local worker_bin="${bundle_dir}/bin/leindex-embed"
 
     if [[ -f "$main_bin" ]]; then
         if cp "$main_bin" "$INSTALL_BIN_PATH" && chmod +x "$INSTALL_BIN_PATH"; then
@@ -932,7 +925,6 @@ try_install_from_release_bundle() {
     fi
 
     if [[ -f "$worker_bin" ]]; then
-        local worker_install_path="${INSTALL_BIN_DIR}/leindex-embed"
         if cp "$worker_bin" "$worker_install_path" && chmod +x "$worker_install_path"; then
             log_success "Worker binary installed to: $worker_install_path"
         else
