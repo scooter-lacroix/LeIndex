@@ -85,6 +85,7 @@ impl NodeType {
             "variable" => Some(NodeType::Variable),
             "module" => Some(NodeType::Module),
             "external" => Some(NodeType::External),
+            "doc_section" => Some(NodeType::DocSection),
             "file_summary" => Some(NodeType::FileSummary),
             _ => None,
         }

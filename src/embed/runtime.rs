@@ -1073,6 +1073,7 @@ impl WorkerRuntime {
         let executable = std::env::current_exe()
             .map_err(|error| format!("failed to resolve worker executable: {}", error))?;
         let mut child = std::process::Command::new(executable)
+            .arg(crate::embed::worker_main::INTERNAL_WORKER_TOKEN)
             .arg("--migraphx-probe")
             .arg(model_path)
             .arg(provider_name)

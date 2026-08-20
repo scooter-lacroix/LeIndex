@@ -59,6 +59,16 @@ fn build_runtime() -> tokio::runtime::Runtime {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Single-binary worker mode: `leindex --internal-embed-worker [args...]`
+    // re-executes this same executable as the ONNX embed worker. Token-only
+    // (never an env var — a leaked env value would silently turn every
+    // invocation into the worker). The token is stripped before dispatch so
+    // worker_main's position-based parsing sees a clean argv; `run_from` -> !
+    if leindex::embed::worker_main::is_internal_worker_invocation() {
+        let mut argv: Vec<String> = std::env::args().collect();
+        argv.remove(1);
+        leindex::embed::worker_main::run_from(argv);
+    }
     let rt = build_runtime();
     rt.block_on(cli::main())
 }

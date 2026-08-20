@@ -91,13 +91,6 @@ pub(super) const DAEMON_READY_MAX_WAIT: Duration = Duration::from_secs(120);
 /// request-path timeout and does not cancel inference.
 pub(super) const STALE_DAEMON_KILL_GRACE: Duration = Duration::from_secs(1);
 
-pub(super) fn platform_binary_name(binary_name: &str) -> String {
-    if cfg!(windows) {
-        format!("{}.exe", binary_name)
-    } else {
-        binary_name.to_string()
-    }
-}
 
 /// Env var override for the worker binary path. When set, the value must point
 /// to a worker that exists; a broken explicit path is an actionable error, not
@@ -111,7 +104,6 @@ pub(super) const WORKER_PATH_ENV: &str = "LEINDEX_WORKER_PATH";
 /// `env!("CARGO_PKG_VERSION")` is the compatibility check. See
 /// `src/embed/worker_main.rs` (`run`): `leindex-embed --version` prints exactly
 /// `leindex-embed <CARGO_PKG_VERSION>`.
-const EXPECTED_WORKER_VERSION_LINE: &str = concat!("leindex-embed ", env!("CARGO_PKG_VERSION"));
 
 /// Resolve the path to the worker binary.
 ///
@@ -125,44 +117,13 @@ const EXPECTED_WORKER_VERSION_LINE: &str = concat!("leindex-embed ", env!("CARGO
 ///    the output `leindex-embed <CARGO_PKG_VERSION>`. Stale/incompatible PATH
 ///    workers are rejected with `NotFound`.
 pub(super) fn resolve_worker_binary() -> Result<PathBuf, std::io::Error> {
-    let binary_name = platform_binary_name("leindex-embed");
-    let exe_dirs: Vec<PathBuf> = std::env::current_exe()
-        .ok()
-        .and_then(|exe| {
-            let dir = exe.parent()?.to_path_buf();
-            let grandparent = exe
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|p| p.to_path_buf());
-            Some(vec![Some(dir), grandparent])
-        })
-        .map(|v| v.into_iter().flatten().collect())
-        .unwrap_or_default();
-
-    let path_lookup = |name: &str| which::which(name);
-    resolve_worker_binary_with(
-        std::env::var_os(WORKER_PATH_ENV),
-        &exe_dirs,
-        &binary_name,
-        &path_lookup,
-    )
-}
-
-/// Pure resolution core, factored out for testing without touching the real
-/// environment or `current_exe`.
-///
-/// `explicit` is the raw `LEINDEX_WORKER_PATH` value (if set). `exe_dirs` are
-/// the trusted sibling search dirs (exe dir then its parent). `path_lookup`
-/// is the `which`-style PATH resolver, injectable so tests never touch the
-/// user's real PATH.
-fn resolve_worker_binary_with(
-    explicit: Option<std::ffi::OsString>,
-    exe_dirs: &[PathBuf],
-    binary_name: &str,
-    path_lookup: &dyn Fn(&str) -> Result<PathBuf, which::Error>,
-) -> Result<PathBuf, std::io::Error> {
-    // 1. Explicit override: set means it must work, never silently fall through.
-    if let Some(raw) = explicit {
+    // Single-binary mode: the worker is THIS executable re-exec'd with the
+    // hidden token. current_exe is version-identical by construction, so the
+    // sibling/grandparent/PATH-probe discovery chain (and its version
+    // validation) is unnecessary. The explicit LEINDEX_WORKER_PATH override
+    // remains for development workflows pointing at a separately built
+    // worker binary.
+    if let Some(raw) = std::env::var_os(WORKER_PATH_ENV) {
         let candidate = PathBuf::from(raw);
         if candidate.is_file() {
             return Ok(candidate);
@@ -171,60 +132,20 @@ fn resolve_worker_binary_with(
             std::io::ErrorKind::NotFound,
             format!(
                 "{} is set to '{}' but no worker binary exists there \
-                 (remove the override or point it at a valid leindex-embed)",
+                 (remove the override or point it at a valid leindex binary)",
                 WORKER_PATH_ENV,
                 candidate.display()
             ),
         ));
     }
-
-    // 2. Sibling binary — trusted by location, no version spawn.
-    for dir in exe_dirs {
-        let sibling = dir.join(binary_name);
-        if sibling.is_file() {
-            return Ok(sibling);
-        }
-    }
-
-    // 3. PATH fallback — must be version-compatible.
-    let candidate = path_lookup(binary_name).map_err(|e| {
+    std::env::current_exe().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("worker binary '{}' not found in PATH: {}", binary_name, e),
+            format!("failed to resolve current executable for worker re-exec: {e}"),
         )
-    })?;
-    if path_candidate_version_matches(&candidate) {
-        Ok(candidate)
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "PATH worker '{}' did not report the expected version \
-                 (want '{}'); remove or update it",
-                candidate.display(),
-                EXPECTED_WORKER_VERSION_LINE
-            ),
-        ))
-    }
+    })
 }
 
-/// Run `<candidate> --version` and accept only an exact match against the
-/// current crate version. Used solely for the PATH fallback; sibling and
-/// explicit-override candidates are trusted by location and skip this spawn.
-fn path_candidate_version_matches(candidate: &std::path::Path) -> bool {
-    let output = match std::process::Command::new(candidate)
-        .arg("--version")
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return false,
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.trim_end() == EXPECTED_WORKER_VERSION_LINE
-}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct WorkerConfigEnv {

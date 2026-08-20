@@ -72,14 +72,37 @@ impl Drop for SocketClientSlotGuard {
 /// release version (matching `leindex --version`) and exits 0 so install
 /// verification scripts can confirm both binaries are present and correct.
 pub fn run() -> ! {
-    // Handle --version / -V before any heavy initialization.
+    run_from(std::env::args().collect())
+}
+
+/// True when this process was invoked with the hidden single-binary worker
+/// token at argv[1]. Token-only by design: an env-var trigger would leak
+/// into persistent shells/CI and silently turn every `leindex` invocation
+/// into the worker.
+pub fn is_internal_worker_invocation() -> bool {
+    let mut args = std::env::args();
+    let _program = args.next();
+    args.next().is_some_and(|arg| arg == INTERNAL_WORKER_TOKEN)
+}
+
+/// The hidden argv token selecting worker mode inside the single binary.
+pub const INTERNAL_WORKER_TOKEN: &str = "--internal-embed-worker";
+
+/// Entry point for a re-exec'd single-binary worker invocation: the caller
+/// (src/bin/leindex.rs) strips the hidden `--internal-embed-worker` token
+/// before dispatch, so `argv[0]` is the binary and the remaining tokens are
+/// worker arguments exactly as the standalone binary would see them.
+pub fn run_from(argv: Vec<String>) -> ! {
+    // Handle --version / -V before any heavy initialization. Token-position
+    // robust: scan for the flag anywhere (the hidden worker token precedes
+    // it in single-binary mode and argv.len()==2 checks would silently miss
+    // it — the exact bug the original single-binary plan flagged).
     //
     // VAL-CARGO-005: evidence requires `leindex-embed --version` to print
     // the release version. VAL-RELEASE-002 requires the same from the
     // release bundle worker binary. This must run before logging init so
     // the version string is the only stdout output (no tracing noise).
-    let argv: Vec<String> = std::env::args().collect();
-    if argv.len() == 2 && (argv[1] == "--version" || argv[1] == "-V") {
+    if argv.len() >= 2 && argv[1..].iter().any(|arg| arg == "--version" || arg == "-V") {
         // Use the subcrate version (same as Cargo.toml version, kept in
         // parity with the root crate by AGENTS.md version-parity rule).
         println!("leindex-embed {}", env!("CARGO_PKG_VERSION"));
@@ -133,6 +156,16 @@ pub fn run() -> ! {
     // their idle timeout fires (up to 10 minutes).
     #[cfg(target_os = "linux")]
     {
+        // Process-name visibility: single-binary re-exec mode runs inside a
+        // `leindex` executable; keep monitoring, `ps`, and the audit trails
+        // seeing the familiar `leindex-embed` name (best-effort — failure
+        // is cosmetic, never fatal).
+        // SAFETY: `prctl(PR_SET_NAME, ptr, 0, 0, 0)` reads a NUL-terminated
+        // name from static storage for the duration of the call.
+        unsafe {
+            let name = b"leindex-embed\0";
+            let _ = libc::prctl(libc::PR_SET_NAME, name.as_ptr() as usize, 0, 0, 0);
+        }
         // SAFETY: `prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0)` is a simple
         // scalar kernel syscall with no pointer arguments. The second
         // argument is the signal number (SIGKILL). The remaining arguments

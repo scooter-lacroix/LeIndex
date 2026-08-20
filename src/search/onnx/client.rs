@@ -503,6 +503,7 @@ impl EmbeddingClient {
     ) -> Result<WorkerHandle, ClientError> {
         let mut cmd = Command::new(worker_path);
         Self::configure_worker_command(&mut cmd, config_env, configured_provider);
+        cmd.arg(crate::embed::worker_main::INTERNAL_WORKER_TOKEN);
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -606,6 +607,7 @@ impl EmbeddingClient {
         }
         let stderr = Self::daemon_stderr();
         let mut child = cmd
+            .arg(crate::embed::worker_main::INTERNAL_WORKER_TOKEN)
             .arg("--socket")
             .arg(&socket_path)
             .stdin(Stdio::null())
