@@ -789,6 +789,11 @@ pub struct ProgramDependenceGraph {
     /// ~300MB; this optional store is populated on demand.
     pub embedding_store: EmbeddingStore,
 
+    /// Leiden community per node (roadmap Part IV), populated post-
+    /// construction by `graph::community::detect_communities`.
+    #[cfg(feature = "community")]
+    pub communities: HashMap<NodeId, u32>,
+
     /// O(1) lookup by (name, file_path) pair.
     ///
     /// Used by `find_by_name_in_file()` when a file hint is provided,
@@ -822,6 +827,8 @@ impl Clone for ProgramDependenceGraph {
             name_index: self.name_index.clone(),
             name_lower_index: self.name_lower_index.clone(),
             embedding_store: self.embedding_store.clone(),
+            #[cfg(feature = "community")]
+            communities: self.communities.clone(),
             name_file_index: self.name_file_index.clone(),
             bfs_scratch: Mutex::new(Vec::new()),
             trigram_index: self.trigram_index.clone(),
@@ -839,6 +846,8 @@ impl ProgramDependenceGraph {
             name_index: HashMap::new(),
             name_lower_index: HashMap::new(),
             embedding_store: EmbeddingStore::new(),
+            #[cfg(feature = "community")]
+            communities: HashMap::new(),
             name_file_index: HashMap::new(),
             bfs_scratch: Mutex::new(Vec::new()),
             trigram_index: TrigramIndex::new(),

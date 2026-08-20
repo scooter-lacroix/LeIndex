@@ -484,18 +484,56 @@ impl LeIndex {
             });
         self.persist_and_publish_watcher_delta(pdg, embedder, source_files_with_hashes, start_time)
     }
+    /// Compute Leiden communities over the completed PDG and persist them in
+    /// one batched transaction (roadmap Part IV). Placement: after PDG edge
+    /// construction and cross-file relinking, before embeddings — communities
+    /// depend on edges, not vectors. Feature-flagged; failures degrade to
+    /// "no communities" and never fail the index.
+    #[cfg(feature = "community")]
+    fn compute_and_persist_communities(
+        &mut self,
+        pdg: &mut crate::graph::pdg::ProgramDependenceGraph,
+    ) {
+        if !crate::feature_flags::FeatureFlag::CommunityDetection.is_enabled() {
+            return;
+        }
+        match crate::storage::community_store::compute_and_persist(
+            &mut self.storage,
+            &self.project_id,
+            pdg,
+        ) {
+            Ok(stats) => tracing::info!(
+                communities = stats.community_count,
+                quality = stats.quality,
+                recompute_ms = stats.recompute_ms,
+                "community detection complete"
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "community persistence failed; community metadata unavailable")
+            }
+        }
+    }
+
+    #[cfg(not(feature = "community"))]
+    fn compute_and_persist_communities(
+        &mut self,
+        _pdg: &mut crate::graph::pdg::ProgramDependenceGraph,
+    ) {
+    }
+
     /// Persist the watcher-reindex delta (PDG, embeddings, snapshot, neural) and
     /// publish the new generation with fresh health. Owns all post-merge I/O so
     /// the reindex orchestrator stays a thin pipeline.
     fn persist_and_publish_watcher_delta(
         &mut self,
-        pdg: crate::graph::pdg::ProgramDependenceGraph,
+        mut pdg: crate::graph::pdg::ProgramDependenceGraph,
         embedder: index_builder::HybridEmbedder,
         source_files_with_hashes: Vec<(PathBuf, String)>,
         start_time: std::time::Instant,
     ) -> Result<super::IndexStats> {
         // Persist the updated PDG to storage so changes survive restart
         index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)?;
+        self.compute_and_persist_communities(&mut pdg);
 
         self.pdg = Some(pdg);
         self.embedder = Some(embedder);
@@ -1404,7 +1442,7 @@ impl LeIndex {
             .pipeline
             .take()
             .context("lexical phase started without pipeline state")?;
-        let pdg = state
+        let mut pdg = state
             .pdg
             .take()
             .or_else(|| self.pdg.take())
@@ -1435,6 +1473,7 @@ impl LeIndex {
             super::ComponentStatus::Initializing,
         );
         index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)?;
+        self.compute_and_persist_communities(&mut pdg);
         let checkpoint_store = state
             .checkpoint_store
             .as_ref()

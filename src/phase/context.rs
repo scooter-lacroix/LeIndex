@@ -89,6 +89,31 @@ impl PhaseExecutionContext {
         Ok(context)
     }
 
+    #[cfg(feature = "community")]
+    fn compute_and_persist_communities(&mut self) -> Result<()> {
+        if !crate::feature_flags::FeatureFlag::CommunityDetection.is_enabled() {
+            return Ok(());
+        }
+        let stats = crate::storage::community_store::compute_and_persist(
+            &mut self.storage,
+            &self.project_id,
+            &mut self.pdg,
+        )
+        .context("community persistence failed")?;
+        tracing::info!(
+            communities = stats.community_count,
+            quality = stats.quality,
+            recompute_ms = stats.recompute_ms,
+            "community detection complete"
+        );
+        Ok(())
+    }
+
+    #[cfg(not(feature = "community"))]
+    fn compute_and_persist_communities(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     fn load_or_refresh_graph(
         &mut self,
         options: &PhaseOptions,
@@ -130,6 +155,8 @@ impl PhaseExecutionContext {
 
         save_pdg(&mut self.storage, &self.project_id, &self.pdg)
             .context("failed saving full PDG for phase analysis")?;
+        self.compute_and_persist_communities()
+            .context("failed persisting communities for phase analysis")?;
 
         let inventory_hashes = freshness
             .file_inventory
@@ -162,6 +189,14 @@ impl PhaseExecutionContext {
     fn refresh_persisted_graph(&mut self, freshness: &FreshnessState) -> Result<()> {
         let mut pdg = load_pdg(&self.storage, &self.project_id)
             .context("failed loading cached PDG for incremental phase run")?;
+        #[cfg(feature = "community")]
+        if let Err(error) = crate::storage::community_store::load_community_memberships(
+            &self.storage,
+            &self.project_id,
+            &mut pdg,
+        ) {
+            warn!(%error, "Phase context: failed to hydrate community memberships");
+        }
 
         // Collect all file keys that need deletion (from deleted files + changed
         // files) so we can batch them in a single transaction.
@@ -262,6 +297,9 @@ impl PhaseExecutionContext {
         }
 
         self.pdg = pdg;
+        if !freshness.deleted_files.is_empty() || !self.signatures_by_file.is_empty() {
+            self.compute_and_persist_communities()?;
+        }
         Ok(())
     }
 }

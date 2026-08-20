@@ -26,6 +26,14 @@ impl LeIndex {
             None => crate::storage::pdg_store::load_pdg(&self.storage, &self.project_id),
         }
         .context("Failed to load PDG from storage")?;
+        #[cfg(feature = "community")]
+        if let Err(error) = crate::storage::community_store::load_community_memberships(
+            storage_override.unwrap_or(&self.storage),
+            &self.project_id,
+            &mut pdg,
+        ) {
+            warn!(%error, "Failed to hydrate persisted community memberships");
+        }
         let persist_artifacts = artifact_path == self.storage_path;
 
         let pdg_node_count = pdg.node_count();

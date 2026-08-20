@@ -94,6 +94,10 @@ pub enum FeatureFlag {
     /// tokenizer digest, prompt role/version, pooling, normalization, output
     /// dimensions, content hash). Cross-project dedup is automatic.
     GlobalEmbedCache,
+    /// Leiden community detection over the PDG (roadmap Part IV). Kill
+    /// with LEINDEX_FEATURE_COMMUNITY_DETECTION=false to skip computation
+    /// and serving of community metadata.
+    CommunityDetection,
     /// Enable the embedding-cache debug escape hatch (WS10 privacy remediation).
     ///
     /// When ON *and* the caller provides source text to `GlobalEmbeddingCache::put`,
@@ -130,6 +134,7 @@ impl FeatureFlag {
             Self::StreamingTfidf => "LEINDEX_FEATURE_STREAMING_TFIDF",
             Self::StreamingNeural => "LEINDEX_FEATURE_STREAMING_NEURAL",
             Self::GlobalEmbedCache => "LEINDEX_FEATURE_GLOBAL_EMBED_CACHE",
+            Self::CommunityDetection => "LEINDEX_FEATURE_COMMUNITY_DETECTION",
             Self::DebugEscapeHatch => "LEINDEX_FEATURE_EMBED_CACHE_DEBUG",
             Self::ValidatedModel => "LEINDEX_FEATURE_VALIDATED_MODEL",
         }
@@ -175,6 +180,7 @@ impl FeatureFlag {
             | Self::StreamingTfidf
             | Self::StreamingNeural
             | Self::GlobalEmbedCache
+            | Self::CommunityDetection
             | Self::ValidatedModel => true,
             // Everything else defaults off
             _ => false,
@@ -239,6 +245,9 @@ impl FeatureFlag {
             Self::GlobalEmbedCache => {
                 "Global content-addressed embedding cache with cross-project dedup"
             }
+            Self::CommunityDetection => {
+                "Leiden community detection over the PDG (project_map grouping, impact boundaries)"
+            }
             Self::DebugEscapeHatch => {
                 "Embedding-cache debug escape hatch: store source text alongside rows"
             }
@@ -300,6 +309,7 @@ const LEGACY_REVERTIBLE_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::StreamingTfidf,
     FeatureFlag::StreamingNeural,
     FeatureFlag::GlobalEmbedCache,
+    FeatureFlag::CommunityDetection,
     FeatureFlag::ValidatedModel,
 ];
 
@@ -335,6 +345,7 @@ impl FlagStore {
             FeatureFlag::GlobalEmbedCache,
             FeatureFlag::DebugEscapeHatch,
             FeatureFlag::ValidatedModel,
+            FeatureFlag::CommunityDetection,
         ] {
             let enabled = match env::var(flag.env_var()) {
                 Ok(v) => matches!(
@@ -652,6 +663,7 @@ mod test {
             FeatureFlag::StreamingNeural,
             FeatureFlag::GlobalEmbedCache,
             FeatureFlag::ValidatedModel,
+            FeatureFlag::CommunityDetection,
         ] {
             assert!(
                 !flag.is_enabled(),

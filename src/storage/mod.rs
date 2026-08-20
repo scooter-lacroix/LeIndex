@@ -34,6 +34,9 @@ pub mod project_metadata;
 pub mod salsa;
 /// Database schema and connection management.
 pub mod schema;
+
+#[cfg(feature = "community")]
+pub mod community_store;
 /// Configuration for Turso and hybrid storage backends.
 #[cfg(feature = "turso")]
 pub mod turso_config;

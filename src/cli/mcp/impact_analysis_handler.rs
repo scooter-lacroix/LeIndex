@@ -54,6 +54,54 @@ to understand the blast radius of your change. No equivalent in standard tools."
         })
     }
 
+    /// Same-community vs cross-boundary split of the affected set, from the
+    /// in-memory communities map (populated by index-time detection). Zero
+    /// extra computation: membership lookups only.
+    fn community_breakdown(
+        &self,
+        pdg: &crate::graph::pdg::ProgramDependenceGraph,
+        node_id: crate::graph::pdg::NodeId,
+        affected: &[crate::graph::pdg::NodeId],
+    ) -> Value {
+        #[cfg(feature = "community")]
+        {
+            use std::collections::HashMap;
+            let Some(&origin) = pdg.communities.get(&node_id) else {
+                return Value::Null;
+            };
+            let mut same = 0usize;
+            let mut crossing = 0usize;
+            let mut boundaries: HashMap<(u32, u32), usize> = HashMap::new();
+            for &affected_id in affected {
+                match pdg.communities.get(&affected_id) {
+                    Some(&community) if community == origin => same += 1,
+                    Some(&community) => {
+                        crossing += 1;
+                        *boundaries.entry((origin, community)).or_default() += 1;
+                    }
+                    None => {}
+                }
+            }
+            let boundaries: Vec<Value> = boundaries
+                .into_iter()
+                .take(10)
+                .map(|((from, to), symbols)| {
+                    serde_json::json!({ "from": from, "to": to, "symbols": symbols })
+                })
+                .collect();
+            serde_json::json!({
+                "same_community": same,
+                "crossing": crossing,
+                "boundaries": boundaries,
+            })
+        }
+        #[cfg(not(feature = "community"))]
+        {
+            let _ = (pdg, node_id, affected);
+            Value::Null
+        }
+    }
+
     pub async fn execute(
         &self,
         registry: &Arc<ProjectRegistry>,
@@ -174,6 +222,8 @@ to understand the blast radius of your change. No equivalent in standard tools."
             }
         };
 
+        let community_breakdown = self.community_breakdown(pdg, node_id, &affected);
+
         Ok(wrap_with_meta(
             serde_json::json!({
                 "symbol": node.name,
@@ -187,6 +237,7 @@ to understand the blast radius of your change. No equivalent in standard tools."
                 "transitive_affected_symbols": affected_symbols,
                 "transitive_affected_files": affected_files.len(),
                 "transitive_callers": affected.len(),
+                "community_breakdown": community_breakdown,
                 "risk_level": risk,
                 "summary": format!(
                     "Changing '{}' affects {} dependent symbols in {} files (risk: {})",

@@ -1130,7 +1130,12 @@ fn test_trim_impact_borrows_impact_array() {
             "transitive_affected_symbols": ["callee_x", "callee_y", "callee_z"],
             "transitive_affected_files": 2,
             "transitive_callers": 5,
-            "summary": "Changing 'Foo::bar' directly affects 3 symbols in 2 files (risk: medium)"
+            "summary": "Changing 'Foo::bar' directly affects 3 symbols in 2 files (risk: medium)",
+            "community_breakdown": {
+                "same_community": 4,
+                "crossing": 1,
+                "boundaries": [{"from": 3, "to": 9, "symbols": 1}]
+            }
         }"#);
     let t = trim_impact(&input);
     // Top-level: all handler fields are preserved.
@@ -1153,6 +1158,9 @@ fn test_trim_impact_borrows_impact_array() {
     assert_eq!(affected[0], "callee_x");
     // summary string preserved
     assert!(t["summary"].as_str().unwrap().contains("3 symbols"));
+    assert_eq!(t["community_breakdown"]["same_community"], 4);
+    assert_eq!(t["community_breakdown"]["crossing"], 1);
+    assert_eq!(t["community_breakdown"]["boundaries"][0]["to"], 9);
 }
 
 #[test]

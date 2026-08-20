@@ -255,6 +255,10 @@ fn trim_impact(data: &Value) -> Value {
         "transitive_callers": data.get("transitive_callers"),
         "risk_level": data.get("risk_level"),
         "summary": data.get("summary"),
+        // Community boundary data is compact and is part of the impact
+        // contract; dropping it here makes the MCP-visible result disagree
+        // with the handler and CLI renderer.
+        "community_breakdown": data.get("community_breakdown"),
     })
 }
 

@@ -615,7 +615,9 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
 fn render_project_map(data: &Value, color: bool) -> String {
     let mut out = header("Project Structure", color);
     out.push('\n');
-    if let Some(tree) = data.get("tree").and_then(|v| v.as_array()) {
+    if data.get("group_by").and_then(|v| v.as_str()) == Some("community") {
+        out.push_str(&render_community_groups(data, color));
+    } else if let Some(tree) = data.get("tree").and_then(|v| v.as_array()) {
         out.push_str(&render_tree(tree, color));
     } else if let Some(roots) = data.get("root").map(|v| vec![v.clone()]) {
         out.push_str(&render_tree(&roots, color));
@@ -674,6 +676,93 @@ fn render_project_map(data: &Value, color: bool) -> String {
             if color { DIM } else { "" },
             if color { RESET } else { "" },
         ));
+    }
+    out
+}
+
+fn render_community_groups(data: &Value, color: bool) -> String {
+    let Some(communities) = data.get("communities").and_then(|v| v.as_array()) else {
+        return "  (no community assignments)\n".to_string();
+    };
+    if communities.is_empty() {
+        let note = data
+            .get("note")
+            .and_then(|v| v.as_str())
+            .map(|value| format!(" — {value}"))
+            .unwrap_or_default();
+        return format!("  (no communities{note})\n");
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "  {}Community groups ({}):{}\n",
+        if color { BOLD } else { "" },
+        communities.len(),
+        if color { RESET } else { "" },
+    ));
+    for community in communities {
+        let id = community
+            .get("community")
+            .and_then(|v| v.as_i64())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let label = community
+            .get("label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unlabeled");
+        let file_count = community
+            .get("file_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "\n    {}Community {}{} — {} ({} files){}\n",
+            if color { LIGHT_MAGENTA } else { "" },
+            id,
+            if color { RESET } else { "" },
+            label,
+            file_count,
+            if color { RESET } else { "" },
+        ));
+        if let Some(files) = community.get("files").and_then(|v| v.as_array()) {
+            for file in files {
+                let path = file
+                    .get("relative_path")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| file.get("path").and_then(|v| v.as_str()))
+                    .unwrap_or("?");
+                let symbols = file
+                    .get("symbol_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                out.push_str(&format!(
+                    "      {}•{} {}{}{}  [{} symbols]\n",
+                    if color { LIGHT_YELLOW } else { "" },
+                    if color { RESET } else { "" },
+                    if color { LIGHT_YELLOW } else { "" },
+                    path,
+                    if color { RESET } else { "" },
+                    symbols,
+                ));
+            }
+        }
+    }
+    if let Some(files) = data.get("ungrouped_files").and_then(|v| v.as_array()) {
+        if !files.is_empty() {
+            out.push_str(&format!(
+                "\n    {}Ungrouped ({} files):{}\n",
+                if color { BOLD } else { "" },
+                files.len(),
+                if color { RESET } else { "" },
+            ));
+            for file in files {
+                let path = file
+                    .get("relative_path")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| file.get("path").and_then(|v| v.as_str()))
+                    .unwrap_or("?");
+                out.push_str(&format!("      • {path}\n"));
+            }
+        }
     }
     out
 }
@@ -895,6 +984,58 @@ fn render_impact_list(
     out
 }
 
+fn render_impact_communities(data: &Value, color: bool) -> String {
+    let Some(breakdown) = data.get("community_breakdown") else {
+        return String::new();
+    };
+    if breakdown.is_null() {
+        return String::new();
+    }
+    let same = breakdown
+        .get("same_community")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let crossing = breakdown
+        .get("crossing")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let mut out = String::from("\n");
+    out.push_str(&format!(
+        "  {}Community boundaries:{}\n",
+        if color { BOLD } else { "" },
+        if color { RESET } else { "" },
+    ));
+    out.push_str(&format!("    Same community: {same}\n"));
+    out.push_str(&format!("    Crossing communities: {crossing}\n"));
+    if let Some(boundaries) = breakdown.get("boundaries").and_then(|v| v.as_array()) {
+        for boundary in boundaries {
+            let from = boundary
+                .get("from")
+                .and_then(|v| v.as_u64())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let to = boundary
+                .get("to")
+                .and_then(|v| v.as_u64())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let symbols = boundary
+                .get("symbols")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            out.push_str(&format!(
+                "    {}{} → {}{}: {} symbols\n",
+                if color { LIGHT_MAGENTA } else { "" },
+                from,
+                to,
+                if color { RESET } else { "" },
+                symbols,
+            ));
+        }
+    }
+    out
+}
+
 fn render_impact_counts(data: &Value, color: bool) -> String {
     let affected_files = data
         .get("transitive_affected_files")
@@ -962,6 +1103,7 @@ fn render_impact(data: &Value, color: bool) -> String {
     }
 
     out.push_str(&render_impact_counts(data, color));
+    out.push_str(&render_impact_communities(data, color));
 
     out
 }

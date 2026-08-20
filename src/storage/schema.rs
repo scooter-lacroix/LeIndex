@@ -168,7 +168,8 @@ impl Storage {
         self.initialize_cache_tables()?;
         self.initialize_cross_project_tables()?;
         self.initialize_query_indexes()?;
-        self.initialize_trigram_index_table()
+        self.initialize_trigram_index_table()?;
+        self.initialize_community_tables()
     }
 
     fn execute_schema_statements(&self, statements: &[&str]) -> SqliteResult<()> {
@@ -295,6 +296,13 @@ impl Storage {
                 "ALTER TABLE intel_nodes ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
                 None,
             ),
+            (
+                // Leiden community membership (roadmap Part IV). NULL = not
+                // yet computed for this node's generation.
+                "community_id",
+                "ALTER TABLE intel_nodes ADD COLUMN community_id INTEGER",
+                None,
+            ),
         ] {
             self.ensure_intel_node_column(&columns, name, addition, repair)?;
         }
@@ -390,6 +398,21 @@ impl Storage {
         ])
     }
 
+    fn initialize_community_tables(&self) -> SqliteResult<()> {
+        self.execute_schema_statements(&["CREATE TABLE IF NOT EXISTS intel_communities (
+                id INTEGER PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                community INTEGER NOT NULL,
+                algorithm TEXT NOT NULL,
+                quality_name TEXT NOT NULL,
+                resolution REAL NOT NULL,
+                node_count INTEGER NOT NULL,
+                quality_score REAL,
+                label TEXT,
+                computed_at INTEGER NOT NULL
+            )"])
+    }
+
     fn initialize_query_indexes(&self) -> SqliteResult<()> {
         self.execute_schema_statements(&[
             "CREATE INDEX IF NOT EXISTS idx_nodes_project ON intel_nodes(project_id)",
@@ -434,6 +457,21 @@ impl Storage {
         if !has_column {
             self.conn.execute(
                 "ALTER TABLE trigram_index ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        // Leiden timing metric: CREATE IF NOT EXISTS never alters existing
+        // tables, so the PRAGMA-check+ALTER repair applies here too.
+        let telemetry_has_column = self
+            .conn
+            .prepare("PRAGMA table_info(cache_telemetry)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<SqliteResult<Vec<String>>>()?
+            .iter()
+            .any(|column| column == "community_recompute_ms");
+        if !telemetry_has_column {
+            self.conn.execute(
+                "ALTER TABLE cache_telemetry ADD COLUMN community_recompute_ms INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
         }
@@ -680,7 +718,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(table_count, 8); // intel_nodes, intel_edges, analysis_cache, cache_telemetry, global_symbols, external_refs, project_deps, project_metadata
+        assert_eq!(table_count, 9); // intel_nodes, intel_edges, analysis_cache, cache_telemetry, global_symbols, external_refs, project_deps, project_metadata, intel_communities
     }
 
     #[test]

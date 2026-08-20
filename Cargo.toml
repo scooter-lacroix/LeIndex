@@ -77,11 +77,14 @@ full = [
     "edit",
     "validation",
     "bounded-scheduler",
+    "community",
 ]
 
 # Minimal feature set (parsing and search only)
 minimal = ["parse", "search"]
 
+# Community detection over the PDG (Leiden)
+community = ["graph", "dep:leiden-rs"]
 # Individual modules (follows dependency DAG)
 # Parse is base, no internal dependencies
 parse = [
@@ -347,6 +350,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 
 # Graph feature dependencies
 petgraph = { version = "0.8", features = ["serde"], optional = true }
+leiden-rs = { version = "0.8", optional = true, features = ["petgraph"] }
 
 # Storage feature dependencies
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }

@@ -5,6 +5,10 @@
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
+/// Program Dependence Graph implementation.
+/// Leiden community detection over the PDG (module-boundary discovery).
+#[cfg(feature = "community")]
+pub mod community;
 /// Multi-project graph integration and cross-referencing.
 pub mod cross_project;
 /// Graph node embedding and vector representation.
@@ -13,7 +17,7 @@ pub mod embedding;
 pub mod external_deps;
 /// Extraction logic for building PDGs from signatures.
 pub mod extraction;
-/// Program Dependence Graph implementation.
+/// Program Dependence Graph: nodes, edges, indexes, traversal.
 pub mod pdg;
 /// Gravity-based graph traversal algorithms.
 pub mod traversal;
