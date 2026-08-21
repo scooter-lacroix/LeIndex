@@ -1005,6 +1005,10 @@ fn legacy_edge_type_code(edge_type: &str) -> u32 {
         "import" | "imports" | "dependency" => 3,
         "definition" | "defines" => 4,
         "inherit" | "inherits" | "extends" | "implements" => 5,
+        // Keep this code aligned with the PDG edge-key encoding. TypeOf was
+        // added after the original migration mapping and must not be erased
+        // as an unknown legacy edge during conversion.
+        "type_of" => 10,
         _ => 0,
     }
 }

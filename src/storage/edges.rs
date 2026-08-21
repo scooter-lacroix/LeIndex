@@ -30,6 +30,8 @@ pub enum EdgeType {
     Import,
     /// Structural containment (Class -> Method, Module -> Function)
     Containment,
+    /// Precise type-of relationship confirmed by SCIP.
+    TypeOf,
     /// State transition (for example install result -> verification).
     StateTransition,
     /// External command argv channel.
@@ -49,6 +51,7 @@ impl EdgeType {
             EdgeType::Inheritance => "inheritance",
             EdgeType::Import => "import",
             EdgeType::Containment => "containment",
+            EdgeType::TypeOf => "type_of",
             EdgeType::StateTransition => "state_transition",
             EdgeType::CommandArgument => "command_argument",
             EdgeType::Environment => "environment",
@@ -64,6 +67,7 @@ impl EdgeType {
             "inheritance" => Some(EdgeType::Inheritance),
             "import" => Some(EdgeType::Import),
             "containment" => Some(EdgeType::Containment),
+            "type_of" => Some(EdgeType::TypeOf),
             "state_transition" => Some(EdgeType::StateTransition),
             "command_argument" => Some(EdgeType::CommandArgument),
             "environment" => Some(EdgeType::Environment),
@@ -246,6 +250,7 @@ mod tests {
             byte_range_start: Some(0),
             byte_range_end: Some(100),
             embedding_format: None,
+            precision: false,
         };
         let node2 = crate::storage::nodes::NodeRecord {
             id: None,
@@ -263,6 +268,7 @@ mod tests {
             byte_range_start: Some(0),
             byte_range_end: Some(100),
             embedding_format: None,
+            precision: false,
         };
         let id1 = node_store.insert(&node1).unwrap();
         let id2 = node_store.insert(&node2).unwrap();

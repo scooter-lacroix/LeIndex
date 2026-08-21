@@ -65,6 +65,10 @@ pub mod edit;
 #[cfg(feature = "validation")]
 pub mod validation;
 
+/// SCIP-backed precision ingestion and PDG merge helpers.
+#[cfg(feature = "precision")]
+pub mod intel;
+
 /// Shared directory exclusions used by graph and CLI traversals.
 #[cfg(any(feature = "graph", feature = "cli"))]
 pub mod skip_dirs;

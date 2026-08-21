@@ -227,7 +227,8 @@ impl Storage {
                 byte_range_end INTEGER,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
-                embedding_format INTEGER
+                embedding_format INTEGER,
+                precision INTEGER NOT NULL DEFAULT 0
             )",
         ])?;
         self.ensure_intel_node_columns()
@@ -301,6 +302,12 @@ impl Storage {
                 // yet computed for this node's generation.
                 "community_id",
                 "ALTER TABLE intel_nodes ADD COLUMN community_id INTEGER",
+                None,
+            ),
+            (
+                // SCIP precision definition marker. Legacy rows remain Tier-0.
+                "precision",
+                "ALTER TABLE intel_nodes ADD COLUMN precision INTEGER NOT NULL DEFAULT 0",
                 None,
             ),
         ] {

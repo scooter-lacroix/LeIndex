@@ -578,6 +578,23 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
     if let Some(v) = data.get("embedding_model").and_then(|v| v.as_str()) {
         out.push_str(&field("Embedding model", v, color));
     }
+    if let Some(enabled) = data.get("precision_enabled").and_then(|v| v.as_bool()) {
+        let status = if enabled { "enabled" } else { "disabled" };
+        out.push_str(&field("SCIP precision", status, color));
+    }
+    if let Some(v) = data.get("precision_nodes").and_then(|v| v.as_u64()) {
+        out.push_str(&field("Precision nodes", &v.to_string(), color));
+    }
+    if let Some(languages) = data.get("precision_languages").and_then(|v| v.as_array()) {
+        let names = languages
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !names.is_empty() {
+            out.push_str(&field("Precision languages", &names, color));
+        }
+    }
     // VAL-CROSS-015 / VAL-ORT-022: surface resolved ORT library info so support
     // engineers can debug any install surface identically via `leindex diagnostics`.
     if let Some(v) = data.get("ort_version").and_then(|v| v.as_str()) {

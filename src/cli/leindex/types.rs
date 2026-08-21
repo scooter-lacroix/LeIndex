@@ -355,6 +355,15 @@ pub struct Diagnostics {
     /// Embedding model status: "tfidf_only", "onnx_hybrid", "remote_hybrid", or "unknown"
     #[serde(default)]
     pub embedding_model: String,
+    /// Whether the SCIP precision feature is compiled and enabled at runtime.
+    #[serde(default)]
+    pub precision_enabled: bool,
+    /// Number of canonical PDG nodes confirmed by SCIP precision ingest.
+    #[serde(default)]
+    pub precision_nodes: usize,
+    /// Languages represented by SCIP-confirmed canonical nodes.
+    #[serde(default)]
+    pub precision_languages: Vec<String>,
 }
 
 /// Coverage report of indexed vs source files.

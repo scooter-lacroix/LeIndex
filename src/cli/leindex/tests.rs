@@ -186,6 +186,9 @@ fn test_diagnostics_serialization() {
         pdg_nodes: 500,
         pdg_edges: 800,
         embedding_model: "tfidf_only".to_string(),
+        precision_enabled: false,
+        precision_nodes: 0,
+        precision_languages: Vec::new(),
     };
 
     let json = serde_json::to_string(&diagnostics).unwrap();

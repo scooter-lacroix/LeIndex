@@ -1,5 +1,6 @@
 //! Server instance management
 
+use rusqlite::params;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -229,27 +230,62 @@ fn discover_leindex_dbs() -> Vec<PathBuf> {
 fn ingest_project_db(target: &mut Storage, project_db: &Path) -> Result<(), ApiError> {
     let db_str = project_db
         .to_str()
-        .ok_or_else(|| ApiError::internal("Invalid project db path"))?
-        .replace('\'', "''");
+        .ok_or_else(|| ApiError::internal("Invalid project db path"))?;
+
+    let conn = target.conn();
+    conn.execute("ATTACH DATABASE ?1 AS project", params![db_str])
+        .map_err(|e| ApiError::internal(format!("Ingest failed: {}", e)))?;
+
+    // Keep the import explicit rather than relying on column positions. The
+    // precision marker was added after older project databases were written;
+    // omitting it when it is absent lets SQLite apply the target default.
+    let source_columns = conn
+        .prepare("PRAGMA project.table_info(intel_nodes)")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|e| ApiError::internal(format!("Ingest failed: {}", e)))?;
+    let target_columns = conn
+        .prepare("PRAGMA main.table_info(intel_nodes)")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|e| ApiError::internal(format!("Ingest failed: {}", e)))?;
+
+    let node_columns = "id, project_id, file_path, node_id, symbol_name, qualified_name, \
+        language, node_type, signature, complexity, content_hash, embedding, \
+        byte_range_start, byte_range_end, created_at, updated_at, embedding_format";
+    let mut node_insert_columns = node_columns.to_string();
+    let mut node_select_columns = node_columns.to_string();
+    for optional in ["precision", "community_id"] {
+        if source_columns.iter().any(|column| column == optional)
+            && target_columns.iter().any(|column| column == optional)
+        {
+            node_insert_columns.push_str(", ");
+            node_insert_columns.push_str(optional);
+            node_select_columns.push_str(", ");
+            node_select_columns.push_str(optional);
+        }
+    }
 
     let sql = format!(
         "
-        ATTACH DATABASE '{db}' AS project;
         INSERT OR IGNORE INTO project_metadata SELECT * FROM project.project_metadata;
         INSERT OR IGNORE INTO indexed_files SELECT * FROM project.indexed_files;
-        INSERT OR IGNORE INTO intel_nodes SELECT * FROM project.intel_nodes;
+        INSERT OR IGNORE INTO intel_nodes ({node_insert_columns})
+            SELECT {node_select_columns} FROM project.intel_nodes;
         INSERT OR IGNORE INTO intel_edges SELECT * FROM project.intel_edges;
         INSERT OR IGNORE INTO global_symbols SELECT * FROM project.global_symbols;
         INSERT OR IGNORE INTO external_refs SELECT * FROM project.external_refs;
         INSERT OR IGNORE INTO project_deps SELECT * FROM project.project_deps;
-        DETACH DATABASE project;
-        ",
-        db = db_str
+        "
     );
 
-    target
-        .conn()
-        .execute_batch(&sql)
+    conn.execute_batch(&sql)
+        .map_err(|e| ApiError::internal(format!("Ingest failed: {}", e)))?;
+    conn.execute_batch("DETACH DATABASE project;")
         .map_err(|e| ApiError::internal(format!("Ingest failed: {}", e)))?;
 
     Ok(())
@@ -274,5 +310,117 @@ mod tests {
 
         // Clean up the test database
         let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn test_ingest_legacy_project_without_precision_column() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target_path = temp_dir.path().join("target.db");
+        let project_path = temp_dir.path().join("project.db");
+        let mut target = Storage::open(&target_path).unwrap();
+        let project = rusqlite::Connection::open(&project_path).unwrap();
+
+        project
+            .execute_batch(
+                "CREATE TABLE project_metadata (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    unique_project_id TEXT UNIQUE NOT NULL,
+                    base_name TEXT NOT NULL,
+                    path_hash TEXT NOT NULL,
+                    instance INTEGER DEFAULT 0,
+                    canonical_path TEXT NOT NULL,
+                    display_name TEXT,
+                    is_clone BOOLEAN DEFAULT 0,
+                    cloned_from TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_indexed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(canonical_path)
+                );
+                CREATE TABLE indexed_files (
+                    file_path TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    file_hash TEXT NOT NULL,
+                    last_indexed INTEGER NOT NULL
+                );
+                CREATE TABLE intel_nodes (
+                    id INTEGER PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    symbol_name TEXT NOT NULL,
+                    qualified_name TEXT NOT NULL,
+                    language TEXT NOT NULL DEFAULT 'unknown',
+                    node_type TEXT NOT NULL,
+                    signature TEXT,
+                    complexity INTEGER,
+                    content_hash TEXT NOT NULL,
+                    embedding BLOB,
+                    byte_range_start INTEGER,
+                    byte_range_end INTEGER,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    embedding_format INTEGER
+                );
+                CREATE TABLE intel_edges (
+                    caller_id INTEGER NOT NULL,
+                    callee_id INTEGER NOT NULL,
+                    edge_type TEXT NOT NULL,
+                    metadata TEXT,
+                    PRIMARY KEY(caller_id, callee_id, edge_type)
+                );
+                CREATE TABLE global_symbols (
+                    symbol_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    symbol_name TEXT NOT NULL,
+                    symbol_type TEXT NOT NULL,
+                    signature TEXT,
+                    file_path TEXT NOT NULL,
+                    byte_range_start INTEGER,
+                    byte_range_end INTEGER,
+                    complexity INTEGER DEFAULT 1,
+                    is_public INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                    UNIQUE(project_id, symbol_name, signature)
+                );
+                CREATE TABLE external_refs (
+                    ref_id TEXT PRIMARY KEY,
+                    source_project_id TEXT NOT NULL,
+                    source_symbol_id TEXT NOT NULL,
+                    target_project_id TEXT NOT NULL,
+                    target_symbol_id TEXT NOT NULL,
+                    ref_type TEXT NOT NULL
+                );
+                CREATE TABLE project_deps (
+                    dep_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    depends_on_project_id TEXT NOT NULL,
+                    dependency_type TEXT NOT NULL,
+                    UNIQUE(project_id, depends_on_project_id)
+                );
+                INSERT INTO intel_nodes (
+                    id, project_id, file_path, node_id, symbol_name, qualified_name,
+                    language, node_type, signature, complexity, content_hash,
+                    embedding, byte_range_start, byte_range_end, created_at,
+                    updated_at, embedding_format
+                ) VALUES (
+                    1, 'legacy-project', 'src/lib.rs', 'fn:main', 'main', 'main',
+                    'rust', 'function', NULL, 1, 'hash', NULL, 0, 10, 1, 1, 0
+                );",
+            )
+            .unwrap();
+        drop(project);
+
+        ingest_project_db(&mut target, &project_path).unwrap();
+
+        let (node_count, precision): (i64, i64) = target
+            .conn()
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(precision), -1) FROM intel_nodes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(node_count, 1);
+        assert_eq!(precision, 0, "legacy rows receive the target default");
     }
 }

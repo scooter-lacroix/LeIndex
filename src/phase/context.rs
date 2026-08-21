@@ -114,6 +114,72 @@ impl PhaseExecutionContext {
         Ok(())
     }
 
+    #[cfg(feature = "precision")]
+    fn run_precision_ingest(&mut self) {
+        if !crate::feature_flags::FeatureFlag::PrecisionIngest.is_enabled() {
+            return;
+        }
+        let report = crate::intel::run_precision_ingest(&mut self.pdg, &self.root);
+        if report.definitions_seen > 0 || report.relationships_seen > 0 {
+            tracing::info!(
+                definitions_seen = report.definitions_seen,
+                definitions_matched = report.definitions_matched,
+                relationships_upgraded = report.relationships_upgraded,
+                relationships_added = report.relationships_added,
+                "SCIP precision ingest complete"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "precision"))]
+    fn run_precision_ingest(&mut self) {}
+
+    #[cfg(feature = "precision")]
+    fn run_precision_ingest_for(&self, pdg: &mut ProgramDependenceGraph) {
+        if !crate::feature_flags::FeatureFlag::PrecisionIngest.is_enabled() {
+            return;
+        }
+        let report = crate::intel::run_precision_ingest(pdg, &self.root);
+        if report.definitions_seen > 0 || report.relationships_seen > 0 {
+            tracing::info!(
+                definitions_seen = report.definitions_seen,
+                definitions_matched = report.definitions_matched,
+                relationships_upgraded = report.relationships_upgraded,
+                relationships_added = report.relationships_added,
+                "SCIP precision ingest complete"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "precision"))]
+    fn run_precision_ingest_for(&self, _pdg: &mut ProgramDependenceGraph) {}
+
+    fn should_run_precision_ingest(
+        pdg: &ProgramDependenceGraph,
+        freshness: &FreshnessState,
+    ) -> bool {
+        #[cfg(feature = "precision")]
+        {
+            if !crate::feature_flags::FeatureFlag::PrecisionIngest.is_enabled()
+                || !freshness.changed_files.is_empty()
+                || !freshness.deleted_files.is_empty()
+            {
+                return false;
+            }
+
+            // The no-change path still needs one precision pass for legacy or
+            // Tier-0-only persisted graphs. Once SCIP has confirmed at least
+            // one canonical node, the marker set is the cheap durable guard
+            // that prevents launching an external indexer on every request.
+            pdg.precision_symbols.is_empty()
+        }
+        #[cfg(not(feature = "precision"))]
+        {
+            let _ = (pdg, freshness);
+            false
+        }
+    }
+
     fn load_or_refresh_graph(
         &mut self,
         options: &PhaseOptions,
@@ -153,6 +219,7 @@ impl PhaseExecutionContext {
         );
         self.pdg = pdg;
 
+        self.run_precision_ingest();
         save_pdg(&mut self.storage, &self.project_id, &self.pdg)
             .context("failed saving full PDG for phase analysis")?;
         self.compute_and_persist_communities()
@@ -287,17 +354,27 @@ impl PhaseExecutionContext {
             }
         }
 
-        if !freshness.deleted_files.is_empty() || !self.signatures_by_file.is_empty() {
+        let graph_changed =
+            !freshness.deleted_files.is_empty() || !self.signatures_by_file.is_empty();
+        if graph_changed {
             crate::phase::pdg_utils::relink_external_import_edges(
                 &mut pdg,
                 &crate::phase::pdg_utils::RelinkConfig::default(),
             );
+            self.run_precision_ingest_for(&mut pdg);
             save_pdg(&mut self.storage, &self.project_id, &pdg)
                 .context("failed saving refreshed PDG")?;
+        } else if Self::should_run_precision_ingest(&pdg, freshness) {
+            // A persisted Tier-0 graph can predate precision ingest (or have
+            // no matched markers yet). Allow that opt-in pass to run even when
+            // freshness reports no source delta, then persist its markers.
+            self.run_precision_ingest_for(&mut pdg);
+            save_pdg(&mut self.storage, &self.project_id, &pdg)
+                .context("failed saving precision-enriched PDG")?;
         }
 
         self.pdg = pdg;
-        if !freshness.deleted_files.is_empty() || !self.signatures_by_file.is_empty() {
+        if graph_changed {
             self.compute_and_persist_communities()?;
         }
         Ok(())
@@ -638,5 +715,144 @@ mod tests {
                 .map(String::as_str),
             Some("changed-hash")
         );
+    }
+
+    #[cfg(feature = "precision")]
+    #[test]
+    fn test_no_change_precision_trigger_is_gated_by_flag_and_markers() {
+        let freshness = FreshnessState::default();
+        let mut marked = ProgramDependenceGraph::new();
+        marked.mark_precision_symbol("src/main.py:main");
+
+        crate::feature_flags::with_flag_override(
+            crate::feature_flags::FeatureFlag::PrecisionIngest,
+            true,
+            || {
+                assert!(PhaseExecutionContext::should_run_precision_ingest(
+                    &ProgramDependenceGraph::new(),
+                    &freshness
+                ));
+                assert!(!PhaseExecutionContext::should_run_precision_ingest(
+                    &marked, &freshness
+                ));
+            },
+        );
+        crate::feature_flags::with_flag_override(
+            crate::feature_flags::FeatureFlag::PrecisionIngest,
+            false,
+            || {
+                assert!(!PhaseExecutionContext::should_run_precision_ingest(
+                    &ProgramDependenceGraph::new(),
+                    &freshness
+                ));
+            },
+        );
+    }
+
+    #[cfg(all(feature = "precision", unix))]
+    #[test]
+    fn test_no_change_persisted_refresh_runs_precision_ingest() {
+        use protobuf::Message;
+        use scip::types::{self, PositionEncoding, SymbolRole};
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let source = root.join("src/main.py");
+        std::fs::create_dir_all(source.parent().expect("source parent")).expect("mkdir");
+        std::fs::write(&source, "def main():\n    pass\n").expect("write source");
+
+        let mut index = types::Index::new();
+        let mut document = types::Document::new();
+        document.relative_path = "src/main.py".to_string();
+        document.text = "def main():\n    pass\n".to_string();
+        document.position_encoding =
+            protobuf::EnumOrUnknown::new(PositionEncoding::UTF8CodeUnitOffsetFromLineStart);
+        let mut symbol = types::SymbolInformation::new();
+        symbol.symbol = "python test src/main.py/main".to_string();
+        symbol.display_name = "main".to_string();
+        let mut occurrence = types::Occurrence::new();
+        occurrence.symbol = symbol.symbol.clone();
+        occurrence.symbol_roles = SymbolRole::Definition as i32;
+        occurrence.range = vec![0, 4, 0, 8];
+        document.occurrences.push(occurrence);
+        document.symbols.push(symbol);
+        index.documents.push(document);
+        std::fs::write(
+            root.join(".scip-fixture"),
+            index.write_to_bytes().expect("encode SCIP fixture"),
+        )
+        .expect("write SCIP fixture");
+
+        let indexer_dir = tempfile::tempdir().expect("indexer tempdir");
+        let indexer = indexer_dir.path().join("scip-python-fixture.sh");
+        std::fs::write(&indexer, "#!/bin/sh\ncp \"$1/.scip-fixture\" \"$2\"\n")
+            .expect("write indexer fixture");
+        let mut permissions = std::fs::metadata(&indexer)
+            .expect("indexer metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&indexer, permissions).expect("chmod indexer fixture");
+
+        let storage = open_storage(&root).expect("open storage");
+        let project_id = project_id(&root);
+        let mut persisted = ProgramDependenceGraph::new();
+        persisted.add_node(crate::graph::pdg::Node {
+            id: "src/main.py:main".to_string(),
+            node_type: crate::graph::pdg::NodeType::Function,
+            name: "main".to_string(),
+            file_path: Arc::from("src/main.py"),
+            byte_range: (4, 8),
+            complexity: 1,
+            language: "python".to_string(),
+        });
+        let mut storage = storage;
+        save_pdg(&mut storage, &project_id, &persisted).expect("save Tier-0 graph");
+        update_indexed_file(&mut storage, &project_id, "src/main.py", "hash")
+            .expect("save indexed file");
+
+        let mut context = PhaseExecutionContext {
+            root: root.clone(),
+            project_id: project_id.clone(),
+            storage,
+            file_inventory: vec![(source.clone(), "hash".to_string())],
+            changed_files: Vec::new(),
+            deleted_files: Vec::new(),
+            parse_results: Vec::new(),
+            signatures_by_file: HashMap::new(),
+            pdg: ProgramDependenceGraph::new(),
+            docs_summary: None,
+            generation_hash: "same".to_string(),
+        };
+        let freshness = FreshnessState {
+            generation_hash: "same".to_string(),
+            file_inventory: vec![(source, "hash".to_string())],
+            changed_files: Vec::new(),
+            deleted_files: Vec::new(),
+        };
+
+        let _flag_guard = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        crate::feature_flags::set_flag_override_for_test(
+            crate::feature_flags::FeatureFlag::PrecisionIngest,
+            true,
+        );
+        unsafe {
+            std::env::set_var("LEINDEX_SCIP_PYTHON_BIN", &indexer);
+            std::env::set_var("LEINDEX_SCIP_MIN_AVAILABLE_MB", "0");
+            std::env::set_var("LEINDEX_SCIP_TIMEOUT_SECS", "1");
+        }
+        let refresh = context.refresh_persisted_graph(&freshness);
+        unsafe {
+            std::env::remove_var("LEINDEX_SCIP_PYTHON_BIN");
+            std::env::remove_var("LEINDEX_SCIP_MIN_AVAILABLE_MB");
+            std::env::remove_var("LEINDEX_SCIP_TIMEOUT_SECS");
+        }
+        crate::feature_flags::clear_flag_overrides_for_test();
+        refresh.expect("no-change precision refresh");
+
+        assert!(context.pdg.is_precision_symbol("src/main.py:main"));
+        let loaded = load_pdg(&context.storage, &project_id).expect("reload persisted graph");
+        assert!(loaded.is_precision_symbol("src/main.py:main"));
     }
 }

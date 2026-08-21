@@ -94,6 +94,46 @@ impl LeIndex {
             }
         };
 
+        let precision_enabled = cfg!(feature = "precision")
+            && crate::feature_flags::FeatureFlag::PrecisionIngest.is_enabled();
+        let mut precision_languages = std::collections::BTreeSet::new();
+        // Resident PDG is authoritative; the lightweight one-shot path (no
+        // hydration) falls back to the persisted marker column, mirroring how
+        // search_index_nodes falls back to persisted stats above.
+        let precision_nodes = match self.pdg.as_ref() {
+            Some(pdg) => {
+                for node_id in &pdg.precision_symbols {
+                    if let Some(node) = pdg.find_by_id(node_id).and_then(|id| pdg.get_node(id)) {
+                        precision_languages.insert(node.language.to_ascii_lowercase());
+                    }
+                }
+                pdg.precision_symbols.len()
+            }
+            None => {
+                let conn = self.storage.conn();
+                let nodes: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM intel_nodes WHERE project_id = ?1 AND precision = 1",
+                        rusqlite::params![self.project_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT DISTINCT language FROM intel_nodes \
+                     WHERE project_id = ?1 AND precision = 1",
+                ) {
+                    if let Ok(languages) = stmt
+                        .query_map(rusqlite::params![self.project_id], |row| {
+                            row.get::<_, String>(0)
+                        })
+                    {
+                        precision_languages.extend(languages.flatten());
+                    }
+                }
+                nodes as usize
+            }
+        };
+
         Ok(super::Diagnostics {
             project_path: self.project_path.display().to_string(),
             project_id: self.project_id.clone(),
@@ -124,6 +164,9 @@ impl LeIndex {
             pdg_nodes,
             pdg_edges,
             embedding_model,
+            precision_enabled,
+            precision_nodes,
+            precision_languages: precision_languages.into_iter().collect(),
         })
     }
 

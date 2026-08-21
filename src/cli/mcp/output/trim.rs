@@ -231,6 +231,9 @@ fn trim_diagnostics(data: &Value) -> Value {
         "stale": data.get("stale"),
         "last_indexed_secs_ago": data.get("last_indexed_secs_ago"),
         "embedding_model": data.get("embedding_model"),
+        "precision_enabled": data.get("precision_enabled"),
+        "precision_nodes": data.get("precision_nodes"),
+        "precision_languages": data.get("precision_languages"),
         // VAL-CROSS-015 / VAL-ORT-022: ORT info is part of the diagnostics
         // contract surfaced by the diagnostics command. Keep these fields in
         // the LLM-facing payload so MCP tools/call sees the same shape as

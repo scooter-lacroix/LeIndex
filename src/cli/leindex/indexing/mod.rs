@@ -521,6 +521,26 @@ impl LeIndex {
     ) {
     }
 
+    #[cfg(feature = "precision")]
+    fn run_precision_ingest(&self, pdg: &mut crate::graph::pdg::ProgramDependenceGraph) {
+        if !crate::feature_flags::FeatureFlag::PrecisionIngest.is_enabled() {
+            return;
+        }
+        let report = crate::intel::run_precision_ingest(pdg, &self.project_path);
+        if report.definitions_seen > 0 || report.relationships_seen > 0 {
+            tracing::info!(
+                definitions_seen = report.definitions_seen,
+                definitions_matched = report.definitions_matched,
+                relationships_upgraded = report.relationships_upgraded,
+                relationships_added = report.relationships_added,
+                "SCIP precision ingest complete"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "precision"))]
+    fn run_precision_ingest(&self, _pdg: &mut crate::graph::pdg::ProgramDependenceGraph) {}
+
     /// Persist the watcher-reindex delta (PDG, embeddings, snapshot, neural) and
     /// publish the new generation with fresh health. Owns all post-merge I/O so
     /// the reindex orchestrator stays a thin pipeline.
@@ -531,6 +551,8 @@ impl LeIndex {
         source_files_with_hashes: Vec<(PathBuf, String)>,
         start_time: std::time::Instant,
     ) -> Result<super::IndexStats> {
+        // Precision relationships must be present before persistence and community detection.
+        self.run_precision_ingest(&mut pdg);
         // Persist the updated PDG to storage so changes survive restart
         index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)?;
         self.compute_and_persist_communities(&mut pdg);
@@ -1339,6 +1361,9 @@ impl LeIndex {
         self.annotate_external_dependencies(&mut state, &mut pdg);
         add_submodule_summary_nodes(&mut pdg, &self.project_path);
         index_builder::normalize_external_nodes(&mut pdg);
+        // Precision must be merged before checkpoint counts and fingerprints are
+        // captured; otherwise resumable artifacts describe a different graph.
+        self.run_precision_ingest(&mut pdg);
         let pdg_node_count = pdg.node_count();
         let pdg_edge_count = pdg.edge_count();
         let pdg_checkpoint = checkpoint_store.write_pdg(parsed.scan_hash.clone(), &pdg)?;

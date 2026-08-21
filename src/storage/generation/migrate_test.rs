@@ -15,9 +15,10 @@ use crate::storage::cas::CasStore;
 use crate::storage::generation::lease::read_current_generation;
 
 use super::{
-    MigrationConfig, MigrationReport, dir_total_bytes, is_legacy_full_copy_layout,
-    is_migrated_store, migrate_legacy_store, read_generation_manifest,
+    MigrationConfig, MigrationReport, dir_total_bytes, encode_pdg_layer,
+    is_legacy_full_copy_layout, is_migrated_store, migrate_legacy_store, read_generation_manifest,
 };
+use crate::storage::generation::reader::{PDG_HEADER_LEN, PDG_NODE_LEN};
 
 /// Migration config for tests: silent, no crash hook, footprint goal capped.
 fn test_cfg() -> MigrationConfig {
@@ -191,6 +192,41 @@ fn build_in_progress_jobs(root: &Path, start: u64, count: u64, bytes: u64) {
             .set_len(bytes)
             .unwrap();
     }
+}
+
+#[test]
+fn test_legacy_type_of_edge_encoding_preserves_type() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE intel_nodes (
+            id INTEGER PRIMARY KEY,
+            symbol_name TEXT NOT NULL,
+            node_type TEXT NOT NULL,
+            file_path TEXT NOT NULL
+        );
+        CREATE TABLE intel_edges (
+            caller_id INTEGER NOT NULL,
+            callee_id INTEGER NOT NULL,
+            edge_type TEXT NOT NULL
+        );
+        INSERT INTO intel_nodes VALUES
+            (1, 'value', 'variable', '/src/a.rs'),
+            (2, 'Type', 'class', '/src/a.rs');
+        INSERT INTO intel_edges VALUES (1, 2, 'type_of');",
+    )
+    .unwrap();
+
+    let payload = encode_pdg_layer(&conn).unwrap();
+    let edge_offset = PDG_HEADER_LEN + PDG_NODE_LEN * 2;
+    assert_eq!(
+        u32::from_le_bytes(
+            payload[edge_offset + 8..edge_offset + 12]
+                .try_into()
+                .unwrap()
+        ),
+        10,
+        "legacy type_of edges must retain the TypeOf code"
+    );
 }
 
 #[test]

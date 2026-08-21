@@ -35,6 +35,7 @@ include = [
     "/src/embed/**",
     "/src/global/**",
     "/src/graph/**",
+    "/src/intel/**",
     "/src/parse/**",
     "/src/phase/**",
     "/src/search/**",
@@ -78,6 +79,7 @@ full = [
     "validation",
     "bounded-scheduler",
     "community",
+    "precision",
 ]
 
 # Minimal feature set (parsing and search only)
@@ -85,6 +87,9 @@ minimal = ["parse", "search"]
 
 # Community detection over the PDG (Leiden)
 community = ["graph", "dep:leiden-rs"]
+# SCIP precision ingestion is optional at compile time; runtime discovery
+# silently falls back to the Tier-0 PDG when no language indexer is present.
+precision = ["graph", "storage", "dep:scip", "dep:protobuf", "dep:flate2"]
 # Individual modules (follows dependency DAG)
 # Parse is base, no internal dependencies
 parse = [
@@ -351,6 +356,9 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # Graph feature dependencies
 petgraph = { version = "0.8", features = ["serde"], optional = true }
 leiden-rs = { version = "0.8", optional = true, features = ["petgraph"] }
+scip = { version = "0.9", optional = true }
+protobuf = { version = "=3.7.2", optional = true }
+flate2 = { version = "1.1", optional = true, default-features = true }
 
 # Storage feature dependencies
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }

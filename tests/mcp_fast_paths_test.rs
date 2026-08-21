@@ -356,6 +356,7 @@ fn catalog_fixture() -> (TempDir, std::path::PathBuf) {
             byte_range_start: Some(0),
             byte_range_end: Some(19),
             embedding_format: None,
+            precision: false,
         })
         .expect("store catalog symbol");
     storage

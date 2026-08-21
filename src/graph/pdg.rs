@@ -8,8 +8,10 @@
 //   - `add_edge` returns `EdgeId` directly (was misleadingly Option<EdgeId>)
 //   - All public traversal methods take `TraversalConfig` — callers must be explicit
 
+use bincode::Options;
 use petgraph::stable_graph::StableGraph;
 use petgraph::visit::EdgeRef;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -137,7 +139,7 @@ pub enum NodeType {
 /// Edge types — now includes Containment for structural (non-semantic) relationships.
 ///
 /// Filtering guidance for callers:
-///   - Call + DataDependency + Inheritance = semantic graph (use for impact analysis)
+///   - Call + DataDependency + Inheritance + TypeOf = semantic graph (use for impact analysis)
 ///   - Containment = structural graph (use for hierarchy display, not reachability)
 ///   - Import = module-level dependency graph
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -161,6 +163,11 @@ pub enum EdgeType {
     Environment,
     /// Bytes or a value passed to command standard input.
     Stdin,
+    /// A precise type-of relationship confirmed by SCIP.
+    ///
+    /// Kept at the end of the enum to preserve bincode discriminants for the
+    /// pre-TypeOf edge variants.
+    TypeOf,
 }
 
 /// An edge in the Program Dependence Graph representing a relationship between nodes.
@@ -287,8 +294,8 @@ impl EdgeMetadata {
 /// | Use case                    | max_depth | max_nodes | allowed_edge_types              |
 /// |-----------------------------|-----------|-----------|----------------------------------|
 /// | LLM context window (tight)  | 3         | 50        | Call, DataDependency             |
-/// | LLM context window (broad)  | 5         | 150       | Call, DataDependency, Inheritance|
-/// | Impact analysis (full)      | None      | 500       | Call, DataDependency, Inheritance|
+/// | LLM context window (broad)  | 5         | 150       | Call, DataDependency, Inheritance, TypeOf|
+/// | Impact analysis (full)      | None      | 500       | Call, DataDependency, Inheritance, TypeOf|
 /// | Module dependency map       | 10        | 1000      | Import                           |
 /// | Class hierarchy display     | 8         | 200       | Inheritance, Containment         |
 #[derive(Debug, Clone)]
@@ -330,7 +337,8 @@ impl TraversalConfig {
         }
     }
 
-    /// Broad semantic analysis — includes inheritance, moderate limits.
+    /// Broad semantic analysis — includes inheritance and precise type edges,
+    /// with moderate limits.
     pub fn for_semantic_analysis() -> Self {
         Self {
             max_depth: Some(5),
@@ -339,6 +347,7 @@ impl TraversalConfig {
                 EdgeType::Call,
                 EdgeType::DataDependency,
                 EdgeType::Inheritance,
+                EdgeType::TypeOf,
                 EdgeType::StateTransition,
                 EdgeType::CommandArgument,
                 EdgeType::Environment,
@@ -350,7 +359,8 @@ impl TraversalConfig {
         }
     }
 
-    /// Full impact analysis — all semantic edges, hard node cap.
+    /// Full impact analysis — all semantic edges, including precise type
+    /// relationships, with a hard node cap.
     pub fn for_impact_analysis() -> Self {
         Self {
             max_depth: None,
@@ -359,6 +369,7 @@ impl TraversalConfig {
                 EdgeType::Call,
                 EdgeType::DataDependency,
                 EdgeType::Inheritance,
+                EdgeType::TypeOf,
                 EdgeType::StateTransition,
                 EdgeType::CommandArgument,
                 EdgeType::Environment,
@@ -507,8 +518,331 @@ struct SerializablePDG {
     /// Keyed by node.id string, value is the embedding vector.
     #[serde(default)]
     embeddings: HashMap<String, Vec<f32>>,
+    /// Stable node identifiers confirmed by SCIP precision ingest.
+    ///
+    /// This is the final field so older bincode payloads can be retried with a
+    /// legacy schema when they do not contain precision markers.
+    #[serde(default)]
+    precision_symbols: HashSet<String>,
 }
 
+/// The bincode schema written before precision markers were added.
+///
+/// `serde(default)` does not make a missing trailing field backward-compatible
+/// for bincode, so `deserialize()` explicitly retries this schema for existing
+/// graph fixtures and caches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializablePDGWithoutPrecision {
+    nodes: Vec<SerializableNode>,
+    edges: Vec<SerializableEdge>,
+    symbol_index: HashMap<String, u32>,
+    file_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_lower_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    embeddings: HashMap<String, Vec<f32>>,
+}
+
+/// The bincode schema from before embeddings were externalized.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializablePDGWithoutEmbeddings {
+    nodes: Vec<SerializableNode>,
+    edges: Vec<SerializableEdge>,
+    symbol_index: HashMap<String, u32>,
+    file_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_lower_index: HashMap<String, Vec<u32>>,
+}
+
+/// The pre-name-lower-index form of the post-embedding schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializablePDGWithoutEmbeddingsAndNameLower {
+    nodes: Vec<SerializableNode>,
+    edges: Vec<SerializableEdge>,
+    symbol_index: HashMap<String, u32>,
+    file_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_index: HashMap<String, Vec<u32>>,
+}
+
+/// Edge metadata used by artifacts written before flow-channel fields existed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyEdgeMetadata {
+    call_count: Option<usize>,
+    variable_name: Option<String>,
+    confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum LegacyEdgeType {
+    Call,
+    DataDependency,
+    Inheritance,
+    Import,
+    Containment,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyEdge {
+    edge_type: LegacyEdgeType,
+    metadata: LegacyEdgeMetadata,
+}
+
+/// Node schema from the period when embeddings were stored inline on nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyNode {
+    id: String,
+    node_type: NodeType,
+    name: String,
+    file_path: String,
+    byte_range: (usize, usize),
+    complexity: u32,
+    language: String,
+    embedding: Option<Vec<f32>>,
+}
+
+/// Node schema immediately before embeddings were externalized.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyNodeWithoutEmbedding {
+    id: String,
+    node_type: NodeType,
+    name: String,
+    file_path: String,
+    byte_range: (usize, usize),
+    complexity: u32,
+    language: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySerializableNode<N> {
+    index: u32,
+    node: N,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySerializableEdge {
+    source: u32,
+    target: u32,
+    edge: LegacyEdge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializablePDGWithInlineEmbeddings {
+    nodes: Vec<LegacySerializableNode<LegacyNode>>,
+    edges: Vec<LegacySerializableEdge>,
+    symbol_index: HashMap<String, u32>,
+    file_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_lower_index: HashMap<String, Vec<u32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializablePDGWithoutInlineEmbeddings {
+    nodes: Vec<LegacySerializableNode<LegacyNodeWithoutEmbedding>>,
+    edges: Vec<LegacySerializableEdge>,
+    symbol_index: HashMap<String, u32>,
+    file_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_lower_index: HashMap<String, Vec<u32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializablePDGWithInlineEmbeddingsWithoutNameLower {
+    nodes: Vec<LegacySerializableNode<LegacyNode>>,
+    edges: Vec<LegacySerializableEdge>,
+    symbol_index: HashMap<String, u32>,
+    file_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_index: HashMap<String, Vec<u32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializablePDGWithoutInlineEmbeddingsAndNameLower {
+    nodes: Vec<LegacySerializableNode<LegacyNodeWithoutEmbedding>>,
+    edges: Vec<LegacySerializableEdge>,
+    symbol_index: HashMap<String, u32>,
+    file_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_index: HashMap<String, Vec<u32>>,
+}
+
+fn convert_legacy_edge(edge: &LegacyEdge) -> Edge {
+    Edge {
+        edge_type: match edge.edge_type {
+            LegacyEdgeType::Call => EdgeType::Call,
+            LegacyEdgeType::DataDependency => EdgeType::DataDependency,
+            LegacyEdgeType::Inheritance => EdgeType::Inheritance,
+            LegacyEdgeType::Import => EdgeType::Import,
+            LegacyEdgeType::Containment => EdgeType::Containment,
+        },
+        metadata: EdgeMetadata {
+            call_count: edge.metadata.call_count,
+            variable_name: edge.metadata.variable_name.clone(),
+            confidence: edge.metadata.confidence,
+            channel: None,
+            position: None,
+        },
+    }
+}
+
+fn convert_legacy_node(node: &LegacyNode) -> Node {
+    Node {
+        id: node.id.clone(),
+        node_type: node.node_type.clone(),
+        name: node.name.clone(),
+        file_path: Arc::from(node.file_path.as_str()),
+        byte_range: node.byte_range,
+        complexity: node.complexity,
+        language: node.language.clone(),
+    }
+}
+
+fn convert_legacy_node_without_embedding(node: &LegacyNodeWithoutEmbedding) -> Node {
+    Node {
+        id: node.id.clone(),
+        node_type: node.node_type.clone(),
+        name: node.name.clone(),
+        file_path: Arc::from(node.file_path.as_str()),
+        byte_range: node.byte_range,
+        complexity: node.complexity,
+        language: node.language.clone(),
+    }
+}
+
+fn convert_legacy_edges(edges: &[LegacySerializableEdge]) -> Vec<SerializableEdge> {
+    edges
+        .iter()
+        .map(|serialized| SerializableEdge {
+            source: serialized.source,
+            target: serialized.target,
+            edge: convert_legacy_edge(&serialized.edge),
+        })
+        .collect()
+}
+
+impl SerializablePDGWithInlineEmbeddings {
+    fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|serialized| SerializableNode {
+                index: serialized.index,
+                node: convert_legacy_node(&serialized.node),
+            })
+            .collect();
+        let embeddings = self
+            .nodes
+            .iter()
+            .filter_map(|serialized| {
+                serialized
+                    .node
+                    .embedding
+                    .clone()
+                    .map(|embedding| (serialized.node.id.clone(), embedding))
+            })
+            .collect();
+        SerializablePDG {
+            nodes,
+            edges: convert_legacy_edges(&self.edges),
+            symbol_index: self.symbol_index.clone(),
+            file_index: self.file_index.clone(),
+            name_index: self.name_index.clone(),
+            name_lower_index: self.name_lower_index.clone(),
+            embeddings,
+            precision_symbols: HashSet::new(),
+        }
+        .to_pdg()
+    }
+}
+
+impl SerializablePDGWithoutInlineEmbeddings {
+    fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDG {
+            nodes: self
+                .nodes
+                .iter()
+                .map(|serialized| SerializableNode {
+                    index: serialized.index,
+                    node: convert_legacy_node_without_embedding(&serialized.node),
+                })
+                .collect(),
+            edges: convert_legacy_edges(&self.edges),
+            symbol_index: self.symbol_index.clone(),
+            file_index: self.file_index.clone(),
+            name_index: self.name_index.clone(),
+            name_lower_index: self.name_lower_index.clone(),
+            embeddings: HashMap::new(),
+            precision_symbols: HashSet::new(),
+        }
+        .to_pdg()
+    }
+}
+
+impl SerializablePDGWithInlineEmbeddingsWithoutNameLower {
+    fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|serialized| SerializableNode {
+                index: serialized.index,
+                node: convert_legacy_node(&serialized.node),
+            })
+            .collect();
+        let embeddings = self
+            .nodes
+            .iter()
+            .filter_map(|serialized| {
+                serialized
+                    .node
+                    .embedding
+                    .clone()
+                    .map(|embedding| (serialized.node.id.clone(), embedding))
+            })
+            .collect();
+        SerializablePDG {
+            nodes,
+            edges: convert_legacy_edges(&self.edges),
+            symbol_index: self.symbol_index.clone(),
+            file_index: self.file_index.clone(),
+            name_index: self.name_index.clone(),
+            name_lower_index: HashMap::new(),
+            embeddings,
+            precision_symbols: HashSet::new(),
+        }
+        .to_pdg()
+    }
+}
+
+impl SerializablePDGWithoutInlineEmbeddingsAndNameLower {
+    fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDG {
+            nodes: self
+                .nodes
+                .iter()
+                .map(|serialized| SerializableNode {
+                    index: serialized.index,
+                    node: convert_legacy_node_without_embedding(&serialized.node),
+                })
+                .collect(),
+            edges: convert_legacy_edges(&self.edges),
+            symbol_index: self.symbol_index.clone(),
+            file_index: self.file_index.clone(),
+            name_index: self.name_index.clone(),
+            name_lower_index: HashMap::new(),
+            embeddings: HashMap::new(),
+            precision_symbols: HashSet::new(),
+        }
+        .to_pdg()
+    }
+}
 // ---------------------------------------------------------------------------
 // Borrowed serialization shim
 // ---------------------------------------------------------------------------
@@ -546,6 +880,7 @@ struct SerializablePDGRef<'a> {
     name_index: HashMap<&'a str, Vec<u32>>,
     name_lower_index: HashMap<&'a str, Vec<u32>>,
     embeddings: HashMap<&'a str, &'a Vec<f32>>,
+    precision_symbols: &'a HashSet<String>,
 }
 
 impl SerializablePDGRef<'_> {
@@ -614,7 +949,56 @@ impl SerializablePDGRef<'_> {
             name_index,
             name_lower_index,
             embeddings,
+            precision_symbols: &pdg.precision_symbols,
         }
+    }
+}
+
+impl SerializablePDGWithoutPrecision {
+    fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDG {
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+            symbol_index: self.symbol_index.clone(),
+            file_index: self.file_index.clone(),
+            name_index: self.name_index.clone(),
+            name_lower_index: self.name_lower_index.clone(),
+            embeddings: self.embeddings.clone(),
+            precision_symbols: HashSet::new(),
+        }
+        .to_pdg()
+    }
+}
+
+impl SerializablePDGWithoutEmbeddings {
+    fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDG {
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+            symbol_index: self.symbol_index.clone(),
+            file_index: self.file_index.clone(),
+            name_index: self.name_index.clone(),
+            name_lower_index: self.name_lower_index.clone(),
+            embeddings: HashMap::new(),
+            precision_symbols: HashSet::new(),
+        }
+        .to_pdg()
+    }
+}
+
+impl SerializablePDGWithoutEmbeddingsAndNameLower {
+    fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDG {
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+            symbol_index: self.symbol_index.clone(),
+            file_index: self.file_index.clone(),
+            name_index: self.name_index.clone(),
+            name_lower_index: HashMap::new(),
+            embeddings: HashMap::new(),
+            precision_symbols: HashSet::new(),
+        }
+        .to_pdg()
     }
 }
 
@@ -625,6 +1009,7 @@ impl SerializablePDG {
         self.restore_indexes(&mut pdg, &index_map);
         self.restore_edges(&mut pdg, &index_map)?;
         self.restore_embeddings(&mut pdg);
+        self.restore_precision_symbols(&mut pdg);
         Self::rebuild_name_file_index(&mut pdg);
 
         if pdg.trigram_index.is_empty() {
@@ -722,6 +1107,16 @@ impl SerializablePDG {
         }
     }
 
+    fn restore_precision_symbols(&self, pdg: &mut ProgramDependenceGraph) {
+        let restored = self
+            .precision_symbols
+            .iter()
+            .filter(|symbol| pdg.find_by_symbol(symbol).is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        pdg.precision_symbols.extend(restored);
+    }
+
     fn rebuild_name_file_index(pdg: &mut ProgramDependenceGraph) {
         for node_id in pdg.graph.node_indices() {
             if let Some(node) = pdg.graph.node_weight(node_id) {
@@ -794,6 +1189,12 @@ pub struct ProgramDependenceGraph {
     #[cfg(feature = "community")]
     pub communities: HashMap<NodeId, u32>,
 
+    /// Stable node IDs confirmed by SCIP precision ingest.
+    ///
+    /// Strings are used instead of transient `NodeId` values so the marker
+    /// remains meaningful across graph reloads and generation rebuilds.
+    pub precision_symbols: HashSet<String>,
+
     /// O(1) lookup by (name, file_path) pair.
     ///
     /// Used by `find_by_name_in_file()` when a file hint is provided,
@@ -829,6 +1230,7 @@ impl Clone for ProgramDependenceGraph {
             embedding_store: self.embedding_store.clone(),
             #[cfg(feature = "community")]
             communities: self.communities.clone(),
+            precision_symbols: self.precision_symbols.clone(),
             name_file_index: self.name_file_index.clone(),
             bfs_scratch: Mutex::new(Vec::new()),
             trigram_index: self.trigram_index.clone(),
@@ -848,6 +1250,7 @@ impl ProgramDependenceGraph {
             embedding_store: EmbeddingStore::new(),
             #[cfg(feature = "community")]
             communities: HashMap::new(),
+            precision_symbols: HashSet::new(),
             name_file_index: HashMap::new(),
             bfs_scratch: Mutex::new(Vec::new()),
             trigram_index: TrigramIndex::new(),
@@ -952,6 +1355,7 @@ impl ProgramDependenceGraph {
     pub fn remove_node(&mut self, node_id: NodeId) -> Option<Node> {
         if let Some(node) = self.graph.remove_node(node_id) {
             self.symbol_index.remove(&node.id);
+            self.precision_symbols.remove(&node.id);
             self.embedding_store.remove(&node.id);
             let remove_file_entry = if let Some(v) = self.file_index.get_mut(&*node.file_path) {
                 v.retain(|&id| id != node_id);
@@ -1066,13 +1470,28 @@ impl ProgramDependenceGraph {
     ///
     /// # Arguments
     ///
-    /// * `id` - The ID of the edge to retrieve
+    /// * `id` - The ID of the edge
     ///
     /// # Returns
     ///
     /// An optional reference to the edge if it exists.
     pub fn get_edge(&self, id: EdgeId) -> Option<&Edge> {
         self.graph.edge_weight(id)
+    }
+
+    /// Retrieves a mutable edge reference for metadata upgrades.
+    pub fn get_edge_mut(&mut self, id: EdgeId) -> Option<&mut Edge> {
+        self.graph.edge_weight_mut(id)
+    }
+
+    /// Mark a stable node identifier as confirmed by SCIP.
+    pub fn mark_precision_symbol(&mut self, node_id: impl Into<String>) {
+        self.precision_symbols.insert(node_id.into());
+    }
+
+    /// Return whether a stable node identifier has SCIP confirmation.
+    pub fn is_precision_symbol(&self, node_id: &str) -> bool {
+        self.precision_symbols.contains(node_id)
     }
 
     /// Returns the total number of nodes in the graph.
@@ -1654,6 +2073,8 @@ impl ProgramDependenceGraph {
     /// Deserializes a PDG from binary data.
     ///
     /// Restores a ProgramDependenceGraph from bytes previously serialized with `serialize()`.
+    /// Payloads written before precision markers were introduced are accepted
+    /// with an empty marker set.
     ///
     /// # Arguments
     ///
@@ -1663,9 +2084,35 @@ impl ProgramDependenceGraph {
     ///
     /// A Result containing the deserialized PDG, or an error message if deserialization fails.
     pub fn deserialize(data: &[u8]) -> Result<Self, String> {
-        bincode::deserialize::<SerializablePDG>(data)
-            .map_err(|e| format!("Deserialize failed: {}", e))
-            .and_then(|s| s.to_pdg())
+        let mut errors = Vec::new();
+        deserialize_schema::<SerializablePDG>(data, &mut errors)
+            .or_else(|| deserialize_schema::<SerializablePDGWithoutPrecision>(data, &mut errors))
+            .or_else(|| deserialize_schema::<SerializablePDGWithoutEmbeddings>(data, &mut errors))
+            .or_else(|| {
+                deserialize_schema::<SerializablePDGWithoutEmbeddingsAndNameLower>(
+                    data,
+                    &mut errors,
+                )
+            })
+            .or_else(|| {
+                deserialize_schema::<SerializablePDGWithInlineEmbeddings>(data, &mut errors)
+            })
+            .or_else(|| {
+                deserialize_schema::<SerializablePDGWithoutInlineEmbeddings>(data, &mut errors)
+            })
+            .or_else(|| {
+                deserialize_schema::<SerializablePDGWithInlineEmbeddingsWithoutNameLower>(
+                    data,
+                    &mut errors,
+                )
+            })
+            .or_else(|| {
+                deserialize_schema::<SerializablePDGWithoutInlineEmbeddingsAndNameLower>(
+                    data,
+                    &mut errors,
+                )
+            })
+            .ok_or_else(|| format!("Deserialize failed: {}", errors.join("; ")))
     }
 
     // Legacy API aliases for backward compatibility during migration
@@ -1766,6 +2213,82 @@ impl ProgramDependenceGraph {
     /// * `calls` - A vector of (caller, callee) node ID pairs
     pub fn add_call_graph_edges(&mut self, calls: Vec<(NodeId, NodeId)>) {
         self.add_call_edges(calls);
+    }
+}
+
+fn deserialize_schema<T>(data: &[u8], errors: &mut Vec<String>) -> Option<ProgramDependenceGraph>
+where
+    T: DeserializeOwned,
+    T: IntoPdg,
+{
+    match bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize::<T>(data)
+    {
+        Ok(serialized) => match serialized.to_pdg() {
+            Ok(pdg) => Some(pdg),
+            Err(error) => {
+                errors.push(error);
+                None
+            }
+        },
+        Err(error) => {
+            errors.push(error.to_string());
+            None
+        }
+    }
+}
+
+trait IntoPdg {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String>;
+}
+
+impl IntoPdg for SerializablePDG {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDG::to_pdg(&self)
+    }
+}
+
+impl IntoPdg for SerializablePDGWithoutPrecision {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDGWithoutPrecision::to_pdg(&self)
+    }
+}
+
+impl IntoPdg for SerializablePDGWithoutEmbeddings {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDGWithoutEmbeddings::to_pdg(&self)
+    }
+}
+
+impl IntoPdg for SerializablePDGWithoutEmbeddingsAndNameLower {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDGWithoutEmbeddingsAndNameLower::to_pdg(&self)
+    }
+}
+
+impl IntoPdg for SerializablePDGWithInlineEmbeddings {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDGWithInlineEmbeddings::to_pdg(&self)
+    }
+}
+
+impl IntoPdg for SerializablePDGWithoutInlineEmbeddings {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDGWithoutInlineEmbeddings::to_pdg(&self)
+    }
+}
+
+impl IntoPdg for SerializablePDGWithInlineEmbeddingsWithoutNameLower {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDGWithInlineEmbeddingsWithoutNameLower::to_pdg(&self)
+    }
+}
+
+impl IntoPdg for SerializablePDGWithoutInlineEmbeddingsAndNameLower {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDGWithoutInlineEmbeddingsAndNameLower::to_pdg(&self)
     }
 }
 

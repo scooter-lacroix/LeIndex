@@ -30,6 +30,7 @@ type NodeDbRow = (
     Option<i64>,
     Option<i64>,
     Option<i32>,
+    i32,
 );
 
 /// Errors that can occur during PDG persistence
@@ -169,6 +170,7 @@ fn convert_edge_type(edge_type: &PDGEdgeType) -> StorageEdgeType {
         PDGEdgeType::Inheritance => StorageEdgeType::Inheritance,
         PDGEdgeType::Import => StorageEdgeType::Import,
         PDGEdgeType::Containment => StorageEdgeType::Containment,
+        PDGEdgeType::TypeOf => StorageEdgeType::TypeOf,
         PDGEdgeType::StateTransition => StorageEdgeType::StateTransition,
         PDGEdgeType::CommandArgument => StorageEdgeType::CommandArgument,
         PDGEdgeType::Environment => StorageEdgeType::Environment,
@@ -184,6 +186,7 @@ fn convert_storage_edge_type(edge_type: &StorageEdgeType) -> PDGEdgeType {
         StorageEdgeType::Inheritance => PDGEdgeType::Inheritance,
         StorageEdgeType::Import => PDGEdgeType::Import,
         StorageEdgeType::Containment => PDGEdgeType::Containment,
+        StorageEdgeType::TypeOf => PDGEdgeType::TypeOf,
         StorageEdgeType::StateTransition => PDGEdgeType::StateTransition,
         StorageEdgeType::CommandArgument => PDGEdgeType::CommandArgument,
         StorageEdgeType::Environment => PDGEdgeType::Environment,
@@ -385,20 +388,22 @@ fn save_nodes(
     // db id and issues no write (C1). A legacy row whose content_hash was
     // computed as blake3(node_id) under the old scheme reads as changed once
     // and is rewritten under the new scheme on the first save.
-    let mut existing: HashMap<String, (i64, String)> = HashMap::new();
+    let mut existing: HashMap<String, (i64, String, bool)> = HashMap::new();
     {
-        let mut stmt =
-            tx.prepare("SELECT id, node_id, content_hash FROM intel_nodes WHERE project_id = ?1")?;
+        let mut stmt = tx.prepare(
+            "SELECT id, node_id, content_hash, precision FROM intel_nodes WHERE project_id = ?1",
+        )?;
         let rows = stmt.query_map(params![project_id], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, i32>(3)? != 0,
             ))
         })?;
         for row in rows {
-            let (db_id, node_id, content_hash) = row?;
-            existing.insert(node_id, (db_id, content_hash));
+            let (db_id, node_id, content_hash, precision) = row?;
+            existing.insert(node_id, (db_id, content_hash, precision));
         }
     }
 
@@ -428,8 +433,9 @@ fn save_nodes(
             pdg_node.byte_range,
         );
 
-        if let Some((db_id, stored_hash)) = existing.get(&pdg_node.id) {
-            if *stored_hash == content_hash {
+        let graph_precision = pdg.is_precision_symbol(&pdg_node.id);
+        if let Some((db_id, stored_hash, stored_precision)) = existing.get(&pdg_node.id) {
+            if *stored_hash == content_hash && *stored_precision == graph_precision {
                 // Unchanged node: reuse the existing row, issue no write.
                 node_id_map.insert(node_idx, *db_id);
                 continue;
@@ -453,6 +459,7 @@ fn save_nodes(
             byte_range_start: Some(pdg_node.byte_range.0 as i64),
             byte_range_end: Some(pdg_node.byte_range.1 as i64),
             embedding_format: Some(0),
+            precision: graph_precision,
         };
         to_upsert.push((pos, record));
     }
@@ -487,17 +494,17 @@ fn save_nodes(
     for chunk in to_upsert.chunks(PDG_INSERT_BATCH_SIZE) {
         let n = chunk.len();
 
-        // Each row carries its own set of 16 anonymous `?` placeholders, bound
+        // Each row carries its own set of 17 anonymous `?` placeholders, bound
         // positionally so they align with `params` below.
         let values_clause = (0..n)
-            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
             "INSERT INTO intel_nodes \
              (project_id, file_path, node_id, symbol_name, qualified_name, \
               language, node_type, signature, complexity, content_hash, embedding, \
-              byte_range_start, byte_range_end, created_at, updated_at, embedding_format) \
+              byte_range_start, byte_range_end, created_at, updated_at, embedding_format, precision) \
              VALUES {values_clause} \
              ON CONFLICT(project_id, node_id) DO UPDATE SET \
                file_path = excluded.file_path, \
@@ -512,12 +519,13 @@ fn save_nodes(
                byte_range_start = excluded.byte_range_start, \
                byte_range_end = excluded.byte_range_end, \
                embedding_format = excluded.embedding_format, \
+               precision = excluded.precision, \
                updated_at = excluded.updated_at \
              RETURNING id"
         );
 
         let now = chrono::Utc::now().timestamp();
-        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(n * 16);
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(n * 17);
         for (_, record) in chunk {
             params.push(record.project_id.clone().into());
             params.push(record.file_path.clone().into());
@@ -567,6 +575,7 @@ fn save_nodes(
                     .map(|f| Value::Integer(f.into()))
                     .unwrap_or(Value::Null),
             );
+            params.push(Value::Integer(record.precision as i64));
         }
 
         let mut stmt = tx.prepare(&sql)?;
@@ -862,7 +871,7 @@ fn load_nodes(
     pdg: &mut ProgramDependenceGraph,
 ) -> Result<HashMap<i64, NodeId>> {
     let mut nodes_stmt = storage.conn().prepare(
-        "SELECT id, file_path, node_id, symbol_name, qualified_name, language, node_type, complexity, content_hash, embedding, byte_range_start, byte_range_end, embedding_format
+        "SELECT id, file_path, node_id, symbol_name, qualified_name, language, node_type, complexity, content_hash, embedding, byte_range_start, byte_range_end, embedding_format, precision
          FROM intel_nodes WHERE project_id = ?1",
     )?;
     let node_rows: Vec<NodeDbRow> = nodes_stmt
@@ -884,6 +893,7 @@ fn load_nodes(
         start,
         end,
         _embedding_format,
+        precision,
     ) in node_rows
     {
         let node_type = StorageNodeType::from_str_name(&node_type_str).ok_or_else(|| {
@@ -898,7 +908,11 @@ fn load_nodes(
             complexity: complexity.unwrap_or(0) as u32,
             language,
         };
+        let stable_id = pdg_node.id.clone();
         let node_id = pdg.add_node(pdg_node);
+        if precision != 0 {
+            pdg.mark_precision_symbol(stable_id);
+        }
         db_id_to_node_id.insert(db_id, node_id);
     }
 
@@ -920,6 +934,7 @@ fn read_node_row(row: &rusqlite::Row<'_>) -> SqliteResult<NodeDbRow> {
         row.get::<_, Option<i64>>(10)?,
         row.get::<_, Option<i64>>(11)?,
         row.get::<_, Option<i32>>(12)?,
+        row.get::<_, i32>(13)?,
     ))
 }
 
@@ -1255,10 +1270,10 @@ mod tests {
         edge: AtomicUsize::new(0),
         edge_delete: AtomicUsize::new(0),
     };
-    /// The sqlite3_trace hook is process-global: two tests enabling it
-    /// concurrently cross-contaminate the static counters (observed as a
-    /// phantom node upsert in the unchanged-resave test). Every trace-harness
-    /// test holds this lock across its enable/save/disable window.
+    /// The sqlite3_trace hook is connection-scoped, but this callback writes to
+    /// process-global counters. Two trace-harness tests running concurrently
+    /// would therefore cross-contaminate counts, so every trace-harness test
+    /// holds this lock across its enable/save/disable window.
     static TRACE_HARNESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     unsafe extern "C" fn sql_trace_cb(_user: *mut c_void, sql_ptr: *const c_char) {
@@ -1369,6 +1384,64 @@ mod tests {
         );
 
         pdg
+    }
+
+    #[test]
+    #[cfg(feature = "precision")]
+    fn test_precision_marker_round_trips_through_pdg_store() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+        let mut pdg = create_test_pdg();
+        pdg.mark_precision_symbol("func1");
+
+        save_pdg(&mut storage, "precision_roundtrip", &pdg).unwrap();
+        let loaded = load_pdg(&storage, "precision_roundtrip").unwrap();
+
+        assert!(loaded.is_precision_symbol("func1"));
+        assert!(!loaded.is_precision_symbol("func2"));
+        let precision: i32 = storage
+            .conn()
+            .query_row(
+                "SELECT precision FROM intel_nodes WHERE project_id = ?1 AND node_id = ?2",
+                params!["precision_roundtrip", "func1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(precision, 1);
+    }
+
+    #[test]
+    #[cfg(feature = "precision")]
+    fn test_precision_marker_change_invalidates_node_noop() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+        let mut pdg = create_test_pdg();
+        save_pdg(&mut storage, "precision_change", &pdg).unwrap();
+
+        pdg.mark_precision_symbol("func1");
+        save_pdg(&mut storage, "precision_change", &pdg).unwrap();
+
+        let precision: i32 = storage
+            .conn()
+            .query_row(
+                "SELECT precision FROM intel_nodes WHERE project_id = ?1 AND node_id = ?2",
+                params!["precision_change", "func1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(precision, 1);
+
+        pdg.precision_symbols.clear();
+        save_pdg(&mut storage, "precision_change", &pdg).unwrap();
+        let cleared: i32 = storage
+            .conn()
+            .query_row(
+                "SELECT precision FROM intel_nodes WHERE project_id = ?1 AND node_id = ?2",
+                params!["precision_change", "func1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cleared, 0);
     }
 
     #[test]

@@ -39,6 +39,30 @@ fn traversal_respects_max_nodes() {
 }
 
 #[test]
+fn traversal_includes_typeof_edges_in_semantic_and_impact_configs() {
+    let mut pdg = ProgramDependenceGraph::new();
+    let source = pdg.add_node(make_node("f:source", "source", "f.rs", NodeType::Function));
+    let target = pdg.add_node(make_node("f:target", "target", "f.rs", NodeType::Class));
+    pdg.add_edge(
+        source,
+        target,
+        Edge {
+            edge_type: EdgeType::TypeOf,
+            metadata: EdgeMetadata::empty(),
+        },
+    );
+
+    assert!(
+        pdg.forward_impact(source, &TraversalConfig::for_semantic_analysis())
+            .contains(&target)
+    );
+    assert!(
+        pdg.forward_impact(source, &TraversalConfig::for_impact_analysis())
+            .contains(&target)
+    );
+}
+
+#[test]
 fn traversal_filters_containment_edges() {
     let mut pdg = ProgramDependenceGraph::new();
     let cls = pdg.add_node(make_node("f:MyClass", "MyClass", "f.rs", NodeType::Class));
@@ -117,6 +141,17 @@ fn name_file_index_maintained_on_remove() {
     assert!(pdg.file_index.contains_key("b.rs"));
     assert!(pdg.name_index.contains_key("bar"));
     assert!(pdg.name_lower_index.contains_key("bar"));
+}
+
+#[test]
+fn remove_node_cleans_up_precision_marker() {
+    let mut pdg = ProgramDependenceGraph::new();
+    let node = pdg.add_node(make_node("f:marked", "marked", "f.rs", NodeType::Function));
+    pdg.mark_precision_symbol("f:marked");
+
+    assert!(pdg.is_precision_symbol("f:marked"));
+    assert!(pdg.remove_node(node).is_some());
+    assert!(!pdg.is_precision_symbol("f:marked"));
 }
 
 #[test]
@@ -308,13 +343,15 @@ fn embedding_store_overwrite() {
 }
 
 #[test]
-fn serialization_preserves_embeddings() {
+fn serialization_preserves_precision_symbols_and_embeddings() {
     let mut pdg = ProgramDependenceGraph::new();
     let n1 = pdg.add_node(make_node("f:foo", "foo", "f.rs", NodeType::Function));
     let n2 = pdg.add_node(make_node("f:bar", "bar", "f.rs", NodeType::Function));
     pdg.add_call_edges(vec![(n1, n2)]);
     pdg.set_embedding("f:foo", vec![0.1, 0.2, 0.3]);
     pdg.set_embedding("f:bar", vec![0.4, 0.5, 0.6]);
+    pdg.mark_precision_symbol("f:foo");
+    pdg.mark_precision_symbol("f:bar");
 
     // Serialize
     let bytes = pdg.serialize().expect("Serialization should succeed");
@@ -327,6 +364,8 @@ fn serialization_preserves_embeddings() {
     assert_eq!(restored.get_embedding("f:foo"), Some(&vec![0.1, 0.2, 0.3]));
     assert_eq!(restored.get_embedding("f:bar"), Some(&vec![0.4, 0.5, 0.6]));
     assert_eq!(restored.embedding_count(), 2);
+    assert!(restored.is_precision_symbol("f:foo"));
+    assert!(restored.is_precision_symbol("f:bar"));
 }
 
 #[test]
@@ -378,14 +417,98 @@ fn deserialization_backward_compat_no_embeddings() {
             .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
             .collect(),
         embeddings: HashMap::new(), // No embeddings — simulates old format
+        precision_symbols: HashSet::new(),
     };
 
     let bytes = bincode::serialize(&old_format).expect("Serialize old format");
     let restored = ProgramDependenceGraph::deserialize(&bytes)
         .expect("Should deserialize old format without error");
 
+    let legacy_without_precision = SerializablePDGWithoutPrecision {
+        nodes: old_format.nodes.clone(),
+        edges: old_format.edges.clone(),
+        symbol_index: old_format.symbol_index.clone(),
+        file_index: old_format.file_index.clone(),
+        name_index: old_format.name_index.clone(),
+        name_lower_index: old_format.name_lower_index.clone(),
+        embeddings: old_format.embeddings.clone(),
+    };
+    let legacy_bytes =
+        bincode::serialize(&legacy_without_precision).expect("Serialize legacy format");
+    let legacy_restored = ProgramDependenceGraph::deserialize(&legacy_bytes)
+        .expect("Should deserialize pre-precision format without error");
+
     assert_eq!(restored.embedding_count(), 0);
     assert_eq!(restored.node_count(), 1);
+    assert!(!restored.is_precision_symbol("f:foo"));
+    assert_eq!(legacy_restored.node_count(), 1);
+    assert!(!legacy_restored.is_precision_symbol("f:foo"));
+
+    let pre_embedding = SerializablePDGWithoutEmbeddings {
+        nodes: old_format.nodes.clone(),
+        edges: old_format.edges.clone(),
+        symbol_index: old_format.symbol_index.clone(),
+        file_index: old_format.file_index.clone(),
+        name_index: old_format.name_index.clone(),
+        name_lower_index: old_format.name_lower_index.clone(),
+    };
+    let pre_embedding_bytes =
+        bincode::serialize(&pre_embedding).expect("Serialize pre-embedding format");
+    let pre_embedding_restored = ProgramDependenceGraph::deserialize(&pre_embedding_bytes)
+        .expect("Should deserialize pre-embedding format without error");
+    assert_eq!(pre_embedding_restored.node_count(), 1);
+    assert_eq!(pre_embedding_restored.embedding_count(), 0);
+    assert!(!pre_embedding_restored.is_precision_symbol("f:foo"));
+}
+
+#[test]
+fn deserialization_backward_compat_pre_embedding_inline_node_embeddings() {
+    let node = LegacyNode {
+        id: "f:legacy".to_string(),
+        node_type: NodeType::Function,
+        name: "legacy".to_string(),
+        file_path: "f.rs".to_string(),
+        byte_range: (0, 10),
+        complexity: 2,
+        language: "rust".to_string(),
+        embedding: Some(vec![0.7, 0.8]),
+    };
+    let old_format = SerializablePDGWithInlineEmbeddings {
+        nodes: vec![LegacySerializableNode { index: 0, node }],
+        edges: Vec::new(),
+        symbol_index: HashMap::from([(String::from("f:legacy"), 0)]),
+        file_index: HashMap::from([(String::from("f.rs"), vec![0])]),
+        name_index: HashMap::from([(String::from("legacy"), vec![0])]),
+        name_lower_index: HashMap::from([(String::from("legacy"), vec![0])]),
+    };
+
+    let bytes = bincode::serialize(&old_format).expect("Serialize pre-embedding format");
+    let restored = ProgramDependenceGraph::deserialize(&bytes)
+        .expect("Should deserialize pre-embedding format without error");
+
+    assert_eq!(restored.node_count(), 1);
+    assert_eq!(restored.get_embedding("f:legacy"), Some(&vec![0.7, 0.8]));
+    assert!(!restored.is_precision_symbol("f:legacy"));
+}
+
+#[test]
+fn deserialization_drops_precision_markers_for_missing_nodes() {
+    let mut pdg = ProgramDependenceGraph::new();
+    pdg.add_node(make_node(
+        "f:present",
+        "present",
+        "f.rs",
+        NodeType::Function,
+    ));
+    pdg.mark_precision_symbol("f:present");
+    pdg.mark_precision_symbol("f:missing");
+
+    let bytes = pdg.serialize().expect("Serialization should succeed");
+    let restored =
+        ProgramDependenceGraph::deserialize(&bytes).expect("Deserialization should succeed");
+
+    assert!(restored.is_precision_symbol("f:present"));
+    assert!(!restored.is_precision_symbol("f:missing"));
 }
 
 #[test]

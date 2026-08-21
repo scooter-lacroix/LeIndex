@@ -98,6 +98,8 @@ pub enum FeatureFlag {
     /// with LEINDEX_FEATURE_COMMUNITY_DETECTION=false to skip computation
     /// and serving of community metadata.
     CommunityDetection,
+    /// Enable SCIP precision ingestion when a supported external indexer is available.
+    PrecisionIngest,
     /// Enable the embedding-cache debug escape hatch (WS10 privacy remediation).
     ///
     /// When ON *and* the caller provides source text to `GlobalEmbeddingCache::put`,
@@ -135,6 +137,7 @@ impl FeatureFlag {
             Self::StreamingNeural => "LEINDEX_FEATURE_STREAMING_NEURAL",
             Self::GlobalEmbedCache => "LEINDEX_FEATURE_GLOBAL_EMBED_CACHE",
             Self::CommunityDetection => "LEINDEX_FEATURE_COMMUNITY_DETECTION",
+            Self::PrecisionIngest => "LEINDEX_FEATURE_PRECISION_INGEST",
             Self::DebugEscapeHatch => "LEINDEX_FEATURE_EMBED_CACHE_DEBUG",
             Self::ValidatedModel => "LEINDEX_FEATURE_VALIDATED_MODEL",
         }
@@ -248,6 +251,9 @@ impl FeatureFlag {
             Self::CommunityDetection => {
                 "Leiden community detection over the PDG (project_map grouping, impact boundaries)"
             }
+            Self::PrecisionIngest => {
+                "Opt-in SCIP precision ingestion with silent Tier-0 fallback when no indexer is available"
+            }
             Self::DebugEscapeHatch => {
                 "Embedding-cache debug escape hatch: store source text alongside rows"
             }
@@ -310,6 +316,7 @@ const LEGACY_REVERTIBLE_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::StreamingNeural,
     FeatureFlag::GlobalEmbedCache,
     FeatureFlag::CommunityDetection,
+    FeatureFlag::PrecisionIngest,
     FeatureFlag::ValidatedModel,
 ];
 
@@ -346,6 +353,7 @@ impl FlagStore {
             FeatureFlag::DebugEscapeHatch,
             FeatureFlag::ValidatedModel,
             FeatureFlag::CommunityDetection,
+            FeatureFlag::PrecisionIngest,
         ] {
             let enabled = match env::var(flag.env_var()) {
                 Ok(v) => matches!(
@@ -472,6 +480,7 @@ pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
         FeatureFlag::StreamingTfidf,
         FeatureFlag::StreamingNeural,
         FeatureFlag::GlobalEmbedCache,
+        FeatureFlag::PrecisionIngest,
         FeatureFlag::DebugEscapeHatch,
         FeatureFlag::ValidatedModel,
     ]
@@ -503,6 +512,15 @@ mod test {
         // normal config) rather than gating a not-yet-released capability.
         assert!(FeatureFlag::NeuralSearch.default_value());
         assert!(FeatureFlag::StreamingMcp.default_value());
+    }
+
+    #[test]
+    fn test_precision_ingest_defaults_off_until_explicitly_enabled() {
+        assert_eq!(
+            FeatureFlag::PrecisionIngest.env_var(),
+            "LEINDEX_FEATURE_PRECISION_INGEST"
+        );
+        assert!(!FeatureFlag::PrecisionIngest.default_value());
     }
 
     #[test]
@@ -664,6 +682,7 @@ mod test {
             FeatureFlag::GlobalEmbedCache,
             FeatureFlag::ValidatedModel,
             FeatureFlag::CommunityDetection,
+            FeatureFlag::PrecisionIngest,
         ] {
             assert!(
                 !flag.is_enabled(),
