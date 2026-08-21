@@ -260,14 +260,27 @@ impl TfIdfEmbedder {
     }
 
     fn persisted_state(&self, pdg: &ProgramDependenceGraph) -> TfIdfPersistedState {
+        self.persisted_state_with_identity(
+            pdg.node_count(),
+            pdg.edge_count(),
+            pdg_search_fingerprint(pdg),
+        )
+    }
+
+    fn persisted_state_with_identity(
+        &self,
+        pdg_nodes: usize,
+        pdg_edges: usize,
+        pdg_fingerprint: String,
+    ) -> TfIdfPersistedState {
         TfIdfPersistedState {
             schema_version: TFIDF_SCHEMA_VERSION,
             vocab: self.vocab.clone(),
             idf: self.idf.clone(),
             dimension: self.dimension,
-            pdg_nodes: pdg.node_count(),
-            pdg_edges: pdg.edge_count(),
-            pdg_fingerprint: pdg_search_fingerprint(pdg),
+            pdg_nodes,
+            pdg_edges,
+            pdg_fingerprint,
         }
     }
 
@@ -326,12 +339,17 @@ impl TfIdfEmbedder {
 
     /// Persist the TF-IDF embedder to storage
     ///
-    /// Serializes the embedder state (vocabulary, IDF scores, PDG counts)
+    /// Serializes the embedder state (vocabulary, IDF scores, PDG identity)
     /// to the project's `.leindex/tfidf_embedder.bin` file for future loading.
+    /// The freshness identity defaults to the in-memory PDG's; callers that
+    /// just saved to storage pass `persisted_identity` so `is_fresh` compares
+    /// against what a DB load actually reconstructs (in-memory graphs may
+    /// hold duplicate node_ids the upsert collapses).
     pub fn persist_to_storage(
         &self,
         project_path: &Path,
         pdg: &ProgramDependenceGraph,
+        persisted_identity: Option<(usize, usize, String)>,
     ) -> Result<()> {
         let path = Self::storage_path(project_path);
         if let Some(parent) = path.parent() {
@@ -339,8 +357,13 @@ impl TfIdfEmbedder {
                 format!("Failed to create embedder directory: {}", parent.display())
             })?;
         }
-        let payload = bincode::serialize(&self.persisted_state(pdg))
-            .context("Failed to serialize embedder")?;
+        let state = match persisted_identity {
+            Some((nodes, edges, fingerprint)) => {
+                self.persisted_state_with_identity(nodes, edges, fingerprint)
+            }
+            None => self.persisted_state(pdg),
+        };
+        let payload = bincode::serialize(&state).context("Failed to serialize embedder")?;
         std::fs::write(&path, payload)
             .with_context(|| format!("Failed to persist embedder: {}", path.display()))
     }

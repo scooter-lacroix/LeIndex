@@ -442,6 +442,12 @@ impl LeIndex {
         // Resume-proof FileSummary pass: covers ALL files (the incremental merge
         // loop only touched changed files; existing files keep/refresh summaries).
         pdg.ensure_file_summary_nodes();
+        // Match the full-index pipeline: external/import nodes from the
+        // re-parsed files must be normalized to NodeType::External BEFORE
+        // save, or the DB stores a graph whose fingerprint changes again
+        // during hydration's post-load normalization — permanently defeating
+        // the snapshot fast path for watcher-published generations.
+        index_builder::normalize_external_nodes(&mut pdg);
 
         // Build the set of changed file paths so we only include nodes from
         // those files in the incremental delta.
@@ -551,16 +557,27 @@ impl LeIndex {
         source_files_with_hashes: Vec<(PathBuf, String)>,
         start_time: std::time::Instant,
     ) -> Result<super::IndexStats> {
-        // Precision relationships must be present before persistence and community detection.
-        self.run_precision_ingest(&mut pdg);
+        // Precision does NOT run on the watcher/edit-apply path: a full SCIP
+        // indexer pass (minutes with rust-analyzer) would block the project
+        // write lock every time a file is saved. Markers for changed files
+        // drop until the next explicit index, which re-merges precision.
         // Persist the updated PDG to storage so changes survive restart
         index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)?;
         self.compute_and_persist_communities(&mut pdg);
 
+        // Snapshot/embedder freshness must describe the graph as the DB
+        // reconstructs it (duplicate node_ids collapse on save); otherwise
+        // every later cold hydration takes the full TF-IDF rebuild path.
+        let persisted_identity =
+            index_builder::persisted_search_identity(&self.storage, &self.project_id);
         self.pdg = Some(pdg);
         self.embedder = Some(embedder);
         if let Some(embedder) = &self.embedder {
-            embedder.persist_to_storage(&self.project_path, self.pdg.as_ref().unwrap())?;
+            embedder.persist_to_storage(
+                &self.project_path,
+                self.pdg.as_ref().unwrap(),
+                persisted_identity.clone(),
+            )?;
         }
         self.build_file_stats_cache();
         self.stats.indexing_time_ms = start_time.elapsed().as_millis() as u64;
@@ -573,20 +590,23 @@ impl LeIndex {
         // text/byte ranges (Codex wave-4 P2). Node-level ranking stays
         // authoritative; the fragment layer is simply off for this generation.
         self.sync_fragment_layer_or_clear();
-        let (pdg_node_count, pdg_edge_count) = self
-            .pdg
-            .as_ref()
-            .map(|pdg| (pdg.node_count(), pdg.edge_count()))
-            .unwrap_or((self.stats.pdg_nodes, self.stats.pdg_edges));
+        let (pdg_node_count, pdg_edge_count, pdg_fingerprint) = persisted_identity
+            .or_else(|| {
+                self.pdg.as_ref().map(|pdg| {
+                    (
+                        pdg.node_count(),
+                        pdg.edge_count(),
+                        index_builder::pdg_search_fingerprint(pdg),
+                    )
+                })
+            })
+            .unwrap_or((self.stats.pdg_nodes, self.stats.pdg_edges, String::new()));
         index_builder::persist_search_snapshot(
             &self.search_engine,
             &self.project_path,
             pdg_node_count,
             pdg_edge_count,
-            self.pdg
-                .as_ref()
-                .map(index_builder::pdg_search_fingerprint)
-                .unwrap_or_default(),
+            pdg_fingerprint,
         )?;
         // Persist neural embeddings separately for fast load_from_storage
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
@@ -1481,9 +1501,6 @@ impl LeIndex {
             .is_some_and(|checkpoint| checkpoint.pdg_hash == pdg_checkpoint.artifact_hash);
         let (embedder, content_cache) = self.build_lexical_embedder(&pdg, lexical_resume_valid)?;
         self.embedder = Some(embedder);
-        if let Some(embedder) = &self.embedder {
-            embedder.persist_to_storage(&self.project_path, &pdg)?;
-        }
         let indexed_count = self.search_engine.node_count();
         state.admitted_node_ids = self.search_engine.live_node_ids().into_iter().collect();
         state.enriched_content_cache = content_cache;
@@ -1498,6 +1515,14 @@ impl LeIndex {
             super::ComponentStatus::Initializing,
         );
         index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)?;
+        // Snapshot/embedder freshness identity must describe the graph as the
+        // DB reconstructs it (the in-memory graph may hold duplicate node_ids
+        // the upsert collapses), so compute it from storage AFTER the save.
+        let persisted_identity =
+            index_builder::persisted_search_identity(&self.storage, &self.project_id);
+        if let Some(embedder) = &self.embedder {
+            embedder.persist_to_storage(&self.project_path, &pdg, persisted_identity.clone())?;
+        }
         self.compute_and_persist_communities(&mut pdg);
         let checkpoint_store = state
             .checkpoint_store
@@ -1543,15 +1568,14 @@ impl LeIndex {
         // persist. On failure the layer is CLEARED (not just logged) — see
         // `sync_fragment_layer_or_clear` (Codex wave-4 P2).
         self.sync_fragment_layer_or_clear();
+        let (identity_nodes, identity_edges, identity_fingerprint) =
+            persisted_identity.unwrap_or_else(|| (pdg_node_count, pdg_edge_count, String::new()));
         index_builder::persist_search_snapshot(
             &self.search_engine,
             &self.project_path,
-            pdg_node_count,
-            pdg_edge_count,
-            self.pdg
-                .as_ref()
-                .map(index_builder::pdg_search_fingerprint)
-                .unwrap_or_default(),
+            identity_nodes,
+            identity_edges,
+            identity_fingerprint,
         )?;
         let admitted_node_ids = sorted_admitted_node_ids(&state.admitted_node_ids);
         let lexical_checkpoint = LexicalCheckpoint {
@@ -1659,15 +1683,18 @@ impl LeIndex {
         // persist. On failure the layer is CLEARED (not just logged) — see
         // `sync_fragment_layer_or_clear` (Codex wave-4 P2).
         self.sync_fragment_layer_or_clear();
+        // Neural rows attach to an already-persisted graph; re-derive the
+        // identity from storage so hydration's fingerprint check agrees even
+        // when the in-memory graph still holds duplicate node_ids.
+        let (identity_nodes, identity_edges, identity_fingerprint) =
+            index_builder::persisted_search_identity(&self.storage, &self.project_id)
+                .unwrap_or_else(|| (state.pdg_node_count, state.pdg_edge_count, String::new()));
         index_builder::persist_search_snapshot(
             &self.search_engine,
             &self.project_path,
-            state.pdg_node_count,
-            state.pdg_edge_count,
-            self.pdg
-                .as_ref()
-                .map(index_builder::pdg_search_fingerprint)
-                .unwrap_or_default(),
+            identity_nodes,
+            identity_edges,
+            identity_fingerprint,
         )
     }
 

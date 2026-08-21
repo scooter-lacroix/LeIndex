@@ -25,12 +25,71 @@ pub use scip_ingest::{
 static PRECISION_RUN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static PRECISION_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Marker recording the last precision attempt (unix seconds) so repeated
+/// tool-driven invocations do not re-spawn external indexers back to back.
+fn precision_attempt_marker(project_root: &Path) -> std::path::PathBuf {
+    project_root.join(".leindex").join("precision_attempt")
+}
+
+fn min_attempt_interval_secs() -> u64 {
+    std::env::var("LEINDEX_SCIP_MIN_ATTEMPT_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(900)
+}
+
+fn precision_attempt_allowed(project_root: &Path) -> bool {
+    if std::env::var("LEINDEX_SCIP_FORCE")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    {
+        return true;
+    }
+    let interval = min_attempt_interval_secs();
+    if interval == 0 {
+        return true;
+    }
+    let Ok(contents) = std::fs::read_to_string(precision_attempt_marker(project_root)) else {
+        return true;
+    };
+    let Ok(last) = contents.trim().parse::<u64>() else {
+        return true;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    if now.saturating_sub(last) < interval {
+        tracing::debug!(
+            last_attempt_secs_ago = now.saturating_sub(last),
+            interval_secs = interval,
+            "SCIP precision attempt throttled; set LEINDEX_SCIP_FORCE=1 to override"
+        );
+        return false;
+    }
+    true
+}
+
+fn record_precision_attempt(project_root: &Path) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let marker = precision_attempt_marker(project_root);
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&marker, now.to_string());
+}
+
 /// Run the bounded, serialized SCIP precision pass for languages with a
 /// discoverable external indexer.
 ///
 /// Missing indexers, low memory, timeout, malformed output, and oversized
 /// outputs all degrade silently to the canonical Tier-0 PDG. Temporary SCIP
-/// outputs are removed after every language attempt.
+/// outputs are removed after every language attempt. Attempts are throttled
+/// per project (default once per 15 minutes; `LEINDEX_SCIP_FORCE=1` or
+/// `LEINDEX_SCIP_MIN_ATTEMPT_INTERVAL_SECS=0` overrides) so interactive
+/// tool paths never spawn external indexers back to back.
 pub fn run_precision_ingest(
     pdg: &mut ProgramDependenceGraph,
     project_root: &Path,
@@ -40,6 +99,10 @@ pub fn run_precision_ingest(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .expect("SCIP precision run lock poisoned");
+    if !precision_attempt_allowed(project_root) {
+        return total;
+    }
+    record_precision_attempt(project_root);
     let languages: BTreeSet<String> = pdg
         .node_indices()
         .filter_map(|node_id| {
@@ -194,6 +257,81 @@ mod tests {
                 .unwrap()
                 .next()
                 .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_precision_attempt_throttled_within_interval_and_forced() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let ran_marker = directory.path().join("indexer_ran");
+        let executable = directory.path().join("fixture.sh");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\ntouch {}\ncp /dev/null \"$2\"\n",
+                ran_marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let mut pdg = ProgramDependenceGraph::new();
+        pdg.add_node(Node {
+            id: "src/main.py:main".to_owned(),
+            node_type: NodeType::Function,
+            name: "main".to_owned(),
+            file_path: std::sync::Arc::from("src/main.py"),
+            byte_range: (0, 4),
+            complexity: 1,
+            language: "python".to_owned(),
+        });
+
+        // A fresh attempt marker dated "now" must suppress the run entirely.
+        let project_root = directory.path().join("project");
+        std::fs::create_dir_all(project_root.join(".leindex")).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::write(
+            project_root.join(".leindex/precision_attempt"),
+            now.to_string(),
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("LEINDEX_SCIP_PYTHON_BIN", &executable);
+            std::env::set_var("LEINDEX_SCIP_MIN_AVAILABLE_MB", "0");
+            std::env::set_var("LEINDEX_SCIP_TIMEOUT_SECS", "5");
+        }
+        let throttled = run_precision_ingest(&mut pdg, &project_root);
+        assert_eq!(throttled, PrecisionReport::default());
+        assert!(
+            !ran_marker.is_file(),
+            "throttled attempt must not spawn the indexer"
+        );
+
+        // LEINDEX_SCIP_FORCE=1 overrides the throttle and records a new attempt.
+        unsafe {
+            std::env::set_var("LEINDEX_SCIP_FORCE", "1");
+        }
+        let forced = run_precision_ingest(&mut pdg, &project_root);
+        unsafe {
+            std::env::remove_var("LEINDEX_SCIP_FORCE");
+            std::env::remove_var("LEINDEX_SCIP_PYTHON_BIN");
+            std::env::remove_var("LEINDEX_SCIP_MIN_AVAILABLE_MB");
+            std::env::remove_var("LEINDEX_SCIP_TIMEOUT_SECS");
+        }
+        assert_eq!(forced, PrecisionReport::default()); // empty .scip degrades
+        assert!(
+            ran_marker.is_file(),
+            "forced attempt must spawn the indexer"
         );
     }
 }

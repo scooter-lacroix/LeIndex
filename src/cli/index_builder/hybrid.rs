@@ -456,8 +456,10 @@ impl HybridEmbedder {
         &self,
         project_path: &Path,
         pdg: &ProgramDependenceGraph,
+        persisted_identity: Option<(usize, usize, String)>,
     ) -> Result<()> {
-        self.tfidf().persist_to_storage(project_path, pdg)
+        self.tfidf()
+            .persist_to_storage(project_path, pdg, persisted_identity)
     }
 
     /// Unload the ONNX session if the hybrid backend uses one (A+ idle-unload).

@@ -334,3 +334,41 @@ alternatives burned 14.6k–73k and pure grep 43.7k for worse ranking. zoekt's
 0.000 on CoSQA is its native AND semantics over long natural-language queries
 (match nothing); its OR mode floods ranking — both are real characteristics,
 reported side by side. Report: docs/baselines/2026-08-21-headtohead-indexers.md.
+
+## 10. Interactive tool latency regression — root cause and fix (2026-08-21)
+
+Symptom: edit-preview/edit-apply (and read tools transitively) ran for long
+periods with no output. Three stacked defects, all fixed:
+
+1. **Snapshot/embedder identity described the wrong graph.** Search-snapshot
+   freshness metadata was recorded from the IN-MEMORY index-time PDG, but
+   hydration compares it against the DB-RECONSTRUCTED graph. The in-memory
+   graph legitimately holds duplicate node_ids (external-import dupes) that
+   the (project_id, node_id) upsert collapses, so on any real repo the
+   identity never matched: EVERY cold hydration took the full TF-IDF rebuild
+   path, re-reading every source file (~8-9s CPU per one-shot tool process,
+   ~18s when the cwd default project hydrated too). Fix:
+   `persisted_search_identity()` derives the identity from the same
+   `load_pdg` hydration uses (post-save, post-normalize), recorded at every
+   persist site; hydration's rebuild path persists the corrected identity.
+2. **Incremental generations drifted from their own fingerprints.** The
+   watcher delta (every edit-apply) didn't normalize external nodes before
+   save (one node-type flip changes the fingerprint), and the TF-IDF mmap
+   was never rewritten after incremental growth (`is_mmap_backed && exists`
+   skipped forever → "mmap row count != snapshot indexed_nodes"). Both fixed;
+   the mmap now rewrites on row-count drift.
+3. **Precision ingest on the hot path.** edit-apply runs its incremental
+   reindex synchronously under the project write lock; with precision
+   default-on that added a full external SCIP pass (2.5+ min of
+   rust-analyzer here) per edit, blocking every other tool on the project.
+   Precision no longer runs on the watcher/edit-apply path (re-merges on
+   the next explicit index) and all remaining attempts are throttled per
+   project (default 15 min; `LEINDEX_SCIP_FORCE=1` /
+   `LEINDEX_SCIP_MIN_ATTEMPT_INTERVAL_SECS` control it).
+
+Measured (this repo, 27,770-node graph): edit-preview/read-symbol
+9.5s+ → **~2.0s**; edit-apply steady-state → **~2.9s** (was minutes);
+read_file fast path 11ms. One full re-index is needed to migrate existing
+stores onto the corrected identity (immutable generations can't self-heal).
+Regression tests: duplicate-node-id identity round-trip, watcher-delta
+never spawns indexers, throttle honored.

@@ -333,8 +333,14 @@ impl LeIndex {
 
         if persist_artifacts {
             if let Some(embedder) = &self.embedder {
+                // The rebuild path only runs when the snapshot identity
+                // mismatched; persist the corrected identity from storage so
+                // the NEXT hydration takes the fast path instead of looping
+                // on the same mismatch.
+                let persisted_identity =
+                    index_builder::persisted_search_identity(&self.storage, &self.project_id);
                 embedder
-                    .persist_to_storage(&self.project_path, &pdg)
+                    .persist_to_storage(&self.project_path, &pdg, persisted_identity)
                     .context("Failed to persist TF-IDF embedder during hydration")?;
             }
         }

@@ -968,7 +968,9 @@ fn test_tfidf_embedder_persist_roundtrip() {
     let docs = vec![("a".to_string(), "fn alpha beta gamma".to_string())];
     let embedder = TfIdfEmbedder::build(&docs);
     let pdg = { crate::graph::pdg::ProgramDependenceGraph::new() };
-    embedder.persist_to_storage(temp.path(), &pdg).unwrap();
+    embedder
+        .persist_to_storage(temp.path(), &pdg, None)
+        .unwrap();
     let loaded = TfIdfEmbedder::load_from_storage(temp.path())
         .unwrap()
         .unwrap();
@@ -2161,5 +2163,70 @@ fn test_content_cache_matches_direct_enrichment() {
         content_cache.get("test.rs:hello").unwrap(),
         &fresh_content,
         "cached content must match freshly computed enriched_node_content"
+    );
+}
+
+#[test]
+fn test_persisted_search_identity_matches_load_with_duplicate_node_ids() {
+    use crate::storage::pdg_store::load_pdg;
+    use crate::storage::schema::Storage;
+    use std::sync::Arc;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut storage = Storage::open(temp.path().join("leindex.db")).unwrap();
+
+    let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
+    let main = pdg.add_node(crate::graph::pdg::Node {
+        id: "src/a.rs:main".to_string(),
+        node_type: crate::graph::pdg::NodeType::Function,
+        name: "main".to_string(),
+        file_path: Arc::from("src/a.rs"),
+        byte_range: (0, 10),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+    // Two nodes sharing one node_id: the external-import duplicate pattern
+    // the (project_id, node_id) upsert collapses to a single DB row.
+    let external_id = "src/a.rs:__external__:serde::Serialize";
+    let ext = pdg.add_node(crate::graph::pdg::Node {
+        id: external_id.to_string(),
+        node_type: crate::graph::pdg::NodeType::External,
+        name: "serde::Serialize".to_string(),
+        file_path: Arc::from("src/a.rs"),
+        byte_range: (0, 0),
+        complexity: 1,
+        language: "external".to_string(),
+    });
+    let ext_dup = pdg.add_node(crate::graph::pdg::Node {
+        id: external_id.to_string(),
+        node_type: crate::graph::pdg::NodeType::External,
+        name: "serde::Serialize".to_string(),
+        file_path: Arc::from("src/a.rs"),
+        byte_range: (0, 0),
+        complexity: 1,
+        language: "external".to_string(),
+    });
+    pdg.add_call_edges(vec![(main, ext), (main, ext_dup)]);
+
+    crate::cli::index_builder::save_to_storage(&mut storage, "dup_proj", &pdg).unwrap();
+
+    let identity = super::persistence::persisted_search_identity(&storage, "dup_proj")
+        .expect("persisted identity computable after save");
+
+    let loaded = load_pdg(&storage, "dup_proj").unwrap();
+    assert_eq!(identity.0, loaded.node_count(), "nodes must match load");
+    assert_eq!(identity.1, loaded.edge_count(), "edges must match load");
+    assert_eq!(
+        identity.2,
+        super::pdg_search_fingerprint(&loaded),
+        "fingerprint must match the DB-reconstructed graph"
+    );
+
+    // The in-memory graph genuinely disagrees with its own persisted state —
+    // the divergence that used to force the slow rebuild path forever.
+    assert_ne!(
+        identity.0,
+        pdg.node_count(),
+        "in-memory count includes the duplicate; persisted identity must not"
     );
 }

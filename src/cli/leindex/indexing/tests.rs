@@ -97,8 +97,15 @@ fn missing_lexical_checkpoint_restores_empty_admission_set() {
     assert!(restored_admitted_node_ids(None).is_empty());
 }
 
+/// Serializes tests that index Rust projects while `LEINDEX_SCIP_RUST_BIN`
+/// may be set: env is process-global, so a concurrent full-index in another
+/// watcher test would otherwise discover (and invoke) another test's
+/// indexer fixture.
+static WATCHER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn watcher_delta_publishes_current_generation() {
+    let _env_guard = WATCHER_ENV_LOCK.lock().unwrap();
     let temp = tempfile::tempdir().expect("watcher fixture");
     std::fs::create_dir_all(temp.path().join("src")).expect("source directory");
     let source = temp.path().join("src/lib.rs");
@@ -465,5 +472,65 @@ fn test_single_publish_generation_per_index_run() {
     assert!(
         generation_count >= 1,
         "expected at least 1 generation directory, got {generation_count}"
+    );
+}
+
+/// The watcher/edit-apply incremental path must never spawn external SCIP
+/// indexers: it runs synchronously under the project write lock, where a
+/// full `rust-analyzer scip` pass (minutes) would stall every other tool on
+/// the project. Precision re-merges on the next explicit index instead.
+#[test]
+fn watcher_delta_does_not_spawn_precision_indexer() {
+    let _guard = WATCHER_ENV_LOCK.lock().unwrap();
+
+    let indexer_dir = tempfile::tempdir().expect("indexer fixture dir");
+    let ran_marker = indexer_dir.path().join("indexer_ran");
+    let indexer = indexer_dir.path().join("fake-scip.sh");
+    let temp = tempfile::tempdir().expect("watcher fixture");
+    // The env override is process-global and other concurrently-running
+    // tests perform full Rust indexes that legitimately invoke precision
+    // with THEIR project roots. Record only invocations against THIS
+    // project: a watcher-delta precision spawn would pass exactly it.
+    std::fs::write(
+        &indexer,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"{}\" ]; then touch {}; fi\ncp /dev/null \"$2\"\n",
+            temp.path().display(),
+            ran_marker.display()
+        ),
+    )
+    .expect("write indexer fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&indexer).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&indexer, permissions).unwrap();
+    }
+
+    std::fs::create_dir_all(temp.path().join("src")).expect("source directory");
+    let source = temp.path().join("src/lib.rs");
+    std::fs::write(&source, "pub fn no_precision_marker() -> usize { 1 }\n").expect("source");
+
+    let mut index = LeIndex::new(temp.path()).expect("create index");
+    // Initial full index BEFORE the override exists, so only the watcher
+    // delta below could possibly spawn the fixture.
+    index.index_project(true).expect("initial generation");
+
+    unsafe {
+        std::env::set_var("LEINDEX_SCIP_RUST_BIN", &indexer);
+        std::env::set_var("LEINDEX_SCIP_FORCE", "1");
+    }
+    std::fs::write(&source, "pub fn no_precision_marker() -> usize { 2 }\n").expect("changed");
+    let result = index.incremental_reindex_from_watcher();
+    unsafe {
+        std::env::remove_var("LEINDEX_SCIP_RUST_BIN");
+        std::env::remove_var("LEINDEX_SCIP_FORCE");
+    }
+    result.expect("watcher delta");
+
+    assert!(
+        !ran_marker.is_file(),
+        "watcher delta must not invoke external SCIP indexers"
     );
 }
