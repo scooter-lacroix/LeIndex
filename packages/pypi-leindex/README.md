@@ -53,6 +53,29 @@ with zombie-aware cleanup and a sibling-aware memory floor, and honest
 reporting end to end (impact direction labels, `impact_note` when a zero
 could mean degradation, `signature_scope` on incremental counts).
 
+### The intelligence stack behind it
+
+- **37 active language grammars** today — Rust, TypeScript/JavaScript, Go,
+  Python, Java, C/C++, C#, Ruby, PHP, Swift, Kotlin, Scala, Elixir, Erlang,
+  Haskell, Zig, R, and more — on a roadmap to **100+**; each grammar is an
+  individually gated crate that cannot regress the build.
+- **Documentation is first-class**: markdown/rst/adoc/txt files index as
+  heading-section nodes, so "how do generations work" retrieves the exact
+  ARCHITECTURE section — not the whole handbook.
+- **Leiden community detection** (feature-flagged, default on) clusters the
+  call/data/containment graph; `project-map` can group by community and
+  `impact-analysis` reports community crossings.
+- **SCIP precision tier** (opt-in, `LEINDEX_FEATURE_PRECISION_INGEST=1`):
+  when a language indexer such as `rust-analyzer scip` is present, LeIndex
+  merges its exact definitions and relationships into the PDG — upgrading
+  heuristic edges to confidence 1.0 and marking precision-confirmed symbols.
+  Missing indexers degrade silently to the tree-sitter tier.
+
+The retrieval quality claims are gated by a deterministic benchmark —
+internal fixtures plus a vendored subset of the CoSQA (ACL 2021)
+human-annotated query/code benchmark — see the
+[agent-task benchmark methodology](https://github.com/scooter-lacroix/LeIndex/blob/master/docs/baselines/AGENT_TASKS_METHODOLOGY.md).
+
 ---
 
 ## What agents see: 18 MCP tools

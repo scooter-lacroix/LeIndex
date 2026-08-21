@@ -267,3 +267,40 @@ Validation: `cargo fmt --all --check` clean; `cargo clippy --workspace --all-tar
 5. ~~Cold-start reduction~~ partially addressed (session 4: sfr-400m loads faster); remaining: persistent `leindexd`, model preload at server start, or fp16 export (would also cut the 7 GB active-inference worker RSS — MIGraphX runtime dominates).
 6. **Reranker cache pre-compile or removal** — currently disabled; re-enable only with a compiled .mxr.
 7. `phase-analysis` Generation-field naming consistency (hash vs counter); ranking-weight retuning now that noise symbols are gone.
+
+## 8. W6 Addendum — deterministic agent-task benchmark + external validation (2026-08-20)
+
+Roadmap W6 complete. Two new eval modules extend the WS11 harness (no new harness):
+
+- `src/eval/agent_tasks.rs` — deterministic agent-task suite: 29 tasks over 3
+  fixture repositories (leindex-self-mirror, polyglot-checkout, docs-corpus),
+  ground-truth recall@10 / MRR@10 / nDCG@10, token cost (chars/4) and
+  tool-call count vs a naive ls+grep+Read emulation. Doc-section ground
+  truths measure the docs tier; deep-section placement in a 12-section
+  architecture doc reproduces the whole-file-read failure mode.
+- `src/eval/external_suite.rs` + `src/eval/corpus/cosqa/` — external
+  validation on CoSQA (ACL 2021): every-8th-record subset (63 records) of the
+  official `cosqa-retrieval-test-500.json` split vendored under C-UDA 1.0
+  with canonical license text and provenance README. Landscape survey
+  (CodeSearchNet, CodeXGLUE, CodeQueries, CoSQA+) documented in
+  `docs/baselines/AGENT_TASKS_METHODOLOGY.md` with an out-of-band protocol
+  for the suites that cannot be vendored.
+
+Gated results (tests/agent_tasks_benchmark_test.rs, ws11 report pattern):
+
+| suite | backend | recall@10 | MRR@10 | nDCG@10 | tokens | calls |
+|---|---|---:|---:|---:|---:|---:|
+| internal (29 tasks) | leindex lexical | 1.000 | 0.970 | 0.974 | 400 | 1.0 |
+| internal | naive | 0.897 | 0.702 | 0.751 | 1181 | 4.8 |
+| doc sections (9) | leindex | 1.000 | 1.000 | 1.000 | 400 | 1.0 |
+| CoSQA real (63) | leindex lexical | 0.905 | 0.621 | 0.689 | 400 | 1.0 |
+| CoSQA real | naive | 0.683 | 0.585 | 0.610 | 264 | 4.9 |
+
+Reports: `docs/baselines/2026-08-20-w6-agent-tasks.md`,
+`docs/baselines/2026-08-20-w6-cosqa-external.md`. README parity (root +
+pypi + npm) now states the 37-language/100+-goal breadth, docs tier, Leiden
+communities, SCIP precision tier, and links the methodology. Benchmark
+development itself surfaced and fixed two emulation-fidelity defects
+(cosine-only fusion under-ranked real web queries; unrealistically small
+fixture files hid the token-cost gap) — both fixed by matching the production
+ranking shape and realistic file sizes rather than by relaxing gates.
