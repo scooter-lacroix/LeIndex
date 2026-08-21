@@ -304,3 +304,33 @@ development itself surfaced and fixed two emulation-fidelity defects
 (cosine-only fusion under-ranked real web queries; unrealistically small
 fixture files hid the token-cost gap) — both fixed by matching the production
 ranking shape and realistic file sizes rather than by relaxing gates.
+
+## 9. Head-to-head vs real indexers + precision default-on (2026-08-21)
+
+`LEINDEX_FEATURE_PRECISION_INGEST` now defaults ON (silent Tier-0 fallback
+keeps indexer-less machines unchanged; `=false` remains the rollout kill).
+Verified live: diagnostics reports SCIP precision enabled with no env vars.
+
+Real head-to-head (`tools/headtohead/headtohead.py`; same corpora, queries,
+ground truth, and metric formulas for every system; zoekt 2026-08-18 build
+installed for the run then uninstalled):
+
+| corpus | system | recall@10 | MRR@10 | avg tokens |
+|---|---|---:|---:|---:|
+| CoSQA real queries (63) | **leindex (hybrid)** | **0.921** | **0.702** | **317** |
+| | ripgrep 15 (aider/cline/kilo/roo backend) | 0.857 | 0.633 | 250 |
+| | universal-ctags 6.2 | 0.603 | 0.392 | 172 |
+| | zoekt AND (native) | 0.000 | 0.000 | 555 |
+| | zoekt OR (parity) | 0.079 | 0.015 | 1253 |
+| LeIndex repo (12 curated) | **leindex (hybrid)** | **0.833** | **0.533** | **310** |
+| | zoekt AND (native) | 0.750 | 0.438 | 14,561 |
+| | universal-ctags 6.2 | 0.750 | 0.381 | 73,084 |
+| | ripgrep 15 | 0.417 | 0.069 | 43,727 |
+| | zoekt OR (parity) | 0.083 | 0.012 | 1,474,876 |
+
+Reading: LeIndex led every system on both corpora. On the real repo the cost
+gap dominates — LeIndex answered in ~310 tokens where the indexer-backed
+alternatives burned 14.6k–73k and pure grep 43.7k for worse ranking. zoekt's
+0.000 on CoSQA is its native AND semantics over long natural-language queries
+(match nothing); its OR mode floods ranking — both are real characteristics,
+reported side by side. Report: docs/baselines/2026-08-21-headtohead-indexers.md.

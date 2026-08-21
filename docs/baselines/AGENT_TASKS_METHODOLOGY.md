@@ -109,6 +109,31 @@ The integration test enforces, on every run:
    must not lose to raw token counting).
 5. Determinism: two runs produce identical aggregates.
 
+## Head-to-head with real indexers
+
+`tools/headtohead/headtohead.py` runs the SAME queries through REAL external
+systems — the installed LeIndex binary (full hybrid), ripgrep 15 (the search
+backend aider/cline/kilo/roo agents shell out to), Universal Ctags 6.2, and
+Sourcegraph's zoekt (both its native AND-keyword mode and OR-any-token parity
+mode) — over two corpora: the materialized CoSQA subset and the LeIndex
+repository itself. Identical metric formulas; tokens = chars/4.
+
+Results live in the dated `docs/baselines/*-headtohead-indexers.md` report
+(regenerate with `python3 tools/headtohead/headtohead.py`; external binaries
+are optional — missing systems are skipped and recorded). The harness is
+informational evidence, not CI-gated: the gated comparison remains the
+LeIndex-vs-naive baseline above, and external rankings depend on locally
+installed tool versions.
+
+Representative findings (2026-08-21 run): LeIndex led every system on both
+corpora — CoSQA 0.921 recall@10 / 0.702 MRR vs ripgrep 0.857/0.633, ctags
+0.603/0.392, zoekt-AND 0.000 (long natural-language ANDs match nothing),
+zoekt-OR 0.079 (disjunctions flood its ranking); repo corpus 0.833/0.533 at
+~310 tokens per query vs zoekt-AND 0.750/0.438 at ~14.6k tokens, ctags
+0.750/0.381 at ~73k, ripgrep 0.417/0.069 at ~44k. zoekt OR-mode on the repo
+averaged ~1.47M tokens per query — the disjunction flood made nearly every
+file a hit.
+
 ## Known limitations
 
 - Lexical-only: the deployed hybrid (neural embeddings + reranker) is
