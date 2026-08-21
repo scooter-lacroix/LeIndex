@@ -66,7 +66,7 @@ could mean degradation, `signature_scope` on incremental counts).
 - **Leiden community detection** (feature-flagged, default on) clusters the
   call/data/containment graph; `project-map` can group by community and
   `impact-analysis` reports community crossings.
-- **SCIP precision tier** (opt-in, `LEINDEX_FEATURE_PRECISION_INGEST=1`):
+- **SCIP precision tier** (on by default; `LEINDEX_FEATURE_PRECISION_INGEST=false` disables):
   when a language indexer such as `rust-analyzer scip` is present, LeIndex
   merges its exact definitions and relationships into the PDG — upgrading
   heuristic edges to confidence 1.0 and marking precision-confirmed symbols.

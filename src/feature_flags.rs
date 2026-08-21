@@ -184,7 +184,12 @@ impl FeatureFlag {
             | Self::StreamingNeural
             | Self::GlobalEmbedCache
             | Self::CommunityDetection
-            | Self::ValidatedModel => true,
+            | Self::ValidatedModel
+            // SCIP precision ingest degrades silently to the Tier-0 PDG when
+            // no external indexer is discoverable, so defaulting ON is safe:
+            // machines without indexers behave exactly as before, machines
+            // with them get precise edges. Rollout-KILL via explicit "false".
+            | Self::PrecisionIngest => true,
             // Everything else defaults off
             _ => false,
         }
@@ -252,7 +257,7 @@ impl FeatureFlag {
                 "Leiden community detection over the PDG (project_map grouping, impact boundaries)"
             }
             Self::PrecisionIngest => {
-                "Opt-in SCIP precision ingestion with silent Tier-0 fallback when no indexer is available"
+                "SCIP precision ingestion (default on) with silent Tier-0 fallback when no indexer is available; set LEINDEX_FEATURE_PRECISION_INGEST=false to disable"
             }
             Self::DebugEscapeHatch => {
                 "Embedding-cache debug escape hatch: store source text alongside rows"
@@ -515,12 +520,15 @@ mod test {
     }
 
     #[test]
-    fn test_precision_ingest_defaults_off_until_explicitly_enabled() {
+    fn test_precision_ingest_defaults_on_with_kill_switch() {
+        // Precision ingest defaults ON: without a discoverable external
+        // indexer it degrades silently to Tier-0, so the default is safe.
+        // The flag remains a rollout-KILL (explicit false disables).
         assert_eq!(
             FeatureFlag::PrecisionIngest.env_var(),
             "LEINDEX_FEATURE_PRECISION_INGEST"
         );
-        assert!(!FeatureFlag::PrecisionIngest.default_value());
+        assert!(FeatureFlag::PrecisionIngest.default_value());
     }
 
     #[test]
