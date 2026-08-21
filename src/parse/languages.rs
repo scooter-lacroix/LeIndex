@@ -57,17 +57,21 @@ pub fn parser_for_language(
         "graphql" | "gql" => Some(Box::new(GenericParser::new("graphql"))),
         "hcl" | "terraform" | "tf" => Some(Box::new(GenericParser::new("hcl"))),
         "make" | "makefile" => Some(Box::new(GenericParser::new("make"))),
-        "elisp" | "emacs-lisp" => Some(Box::new(GenericParser::new("elisp"))),
+        "elisp" | "emacs-lisp" | "emacs lisp" => Some(Box::new(GenericParser::new("elisp"))),
         "julia" | "jl" => Some(Box::new(GenericParser::new("julia"))),
         "d" => Some(Box::new(GenericParser::new("d"))),
         "glsl" => Some(Box::new(GenericParser::new("glsl"))),
-        "embedded-template" | "ejs" | "erb" | "liquid" => {
+        "embedded-template" | "embedded template" | "ejs" | "erb" | "liquid" => {
             Some(Box::new(GenericParser::new("embedded_template")))
         }
         "markdown" | "md" => Some(Box::new(DocParser::new(DocFlavor::Markdown))),
         "rst" | "restructuredtext" => Some(Box::new(DocParser::new(DocFlavor::Rst))),
         "asciidoc" | "adoc" => Some(Box::new(DocParser::new(DocFlavor::Adoc))),
-        "text" | "txt" | "plaintext" => Some(Box::new(DocParser::new(DocFlavor::Plain))),
+        // `parallel.rs` resolves parsers by the language's DISPLAY name, so
+        // the label forms ("Plain Text", "Emacs Lisp") must resolve too.
+        "text" | "txt" | "plaintext" | "plain text" | "plain" => {
+            Some(Box::new(DocParser::new(DocFlavor::Plain)))
+        }
         _ => None,
     }
 }
@@ -138,5 +142,30 @@ mod tests {
 
         let parser = parser_for_language("unknown");
         assert!(parser.is_none());
+    }
+    /// Completeness gate: every registered file extension must resolve to a
+    /// parser THROUGH ITS DISPLAY NAME — `parallel.rs` looks parsers up by
+    /// `LanguageConfig::name` (e.g. "Plain Text"), not by registry key. This
+    /// class of bug shipped once: .txt files failed with "No parser found for
+    /// language: Plain Text" because the registry arm only listed
+    /// "text"|"txt"|"plaintext".
+    #[test]
+    fn test_every_registered_extension_resolves_a_parser_via_display_name() {
+        let representative_extensions = [
+            "py", "js", "ts", "go", "rs", "java", "cpp", "hpp", "h", "c", "cs", "rb", "php", "lua",
+            "scala", "sh", "json", "swift", "kt", "dart", "html", "htm", "css", "scss", "yaml",
+            "yml", "cmake", "ex", "exs", "erl", "hrl", "hs", "pl", "pm", "r", "zig", "graphql",
+            "gql", "hcl", "tf", "tfvars", "makefile", "mak", "mk", "el", "jl", "d", "di", "glsl",
+            "vert", "frag", "comp", "ejs", "erb", "liquid", "md", "markdown", "rst", "adoc", "txt",
+        ];
+        for ext in representative_extensions {
+            let id = crate::parse::grammar::LanguageId::from_extension(ext)
+                .unwrap_or_else(|| panic!("extension .{ext} has no LanguageId"));
+            let name = id.config().name.clone();
+            assert!(
+                parser_for_language(&name).is_some(),
+                "language display name {name:?} (from .{ext}) resolves to no parser"
+            );
+        }
     }
 }
