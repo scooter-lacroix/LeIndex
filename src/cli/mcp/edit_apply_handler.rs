@@ -190,7 +190,7 @@ pub struct EditApplyHandler;
 #[allow(missing_docs)]
 impl EditApplyHandler {
     pub fn name(&self) -> &str {
-        "leindex.edit-apply"
+        "leindex_edit_apply"
     }
 
     pub fn title(&self) -> &str {
@@ -358,25 +358,27 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
             .clear(&storage_path, &canonical_path)
             .await;
 
-        // 5. Incremental reindex to refresh the index with the edited file changes
-        // This ensures the index is fresh so subsequent tool calls don't show stale warnings
-        let mut guard = handle.write().await;
-        if let Err(e) = guard.incremental_reindex_from_watcher() {
-            tracing::warn!("Failed to refresh index after edit-apply: {}", e);
-            // Continue despite reindex failure - edit was applied successfully
-        }
-        let project_root = guard.project_path().to_path_buf();
-        drop(guard); // Release write lock before continuing
-
-        // 5a. Invalidate the registry's staleness cache so the next
+        // 5. Invalidate the registry's staleness cache so the next
         // read tool re-runs `is_stale_fast` instead of reusing a
         // pre-write `false` cached result. The watcher (when enabled)
         // does this on its own reindex path; this explicit call
         // covers the watcher-disabled default mode where the
         // 30-second negative-cache TTL would otherwise silently
         // mask the edit.
+        let project_root = {
+            let guard = handle.read().await;
+            guard.project_path().to_path_buf()
+        };
         registry.invalidate_stale_cache(&project_root).await;
 
+        // 6. Build the response NOW — the edit is durable and every field
+        // is already computed (impact runs against the pre-edit PDG loaded
+        // above; validation ran before the write). The MCP caller must
+        // receive this the moment it exists: the incremental reindex used
+        // to run inline here under the project write lock, holding the
+        // response for seconds-to-minutes (and queuing behind any other
+        // lock holder) until MCP clients timed out while the file had in
+        // fact been edited.
         let impact = {
             let guard = handle.read().await;
             edit_impact(guard.pdg(), &changes, &canonical_path)
@@ -404,7 +406,43 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
         }
 
         let guard = handle.read().await;
-        Ok(wrap_with_meta(response, &guard))
+        let response = wrap_with_meta(response, &guard);
+        drop(guard);
+
+        // 7. Index maintenance AFTER the response value exists. One-shot
+        // CLI processes run it inline (the process exits once the response
+        // is printed, so a spawned task would be killed mid-write); the
+        // long-running MCP server/daemon spawns it so the caller's latency
+        // is exactly the edit, never the reindex.
+        if registry.is_one_shot() {
+            let mut guard = handle.write().await;
+            if let Err(e) = guard.incremental_reindex_from_watcher() {
+                tracing::warn!("Failed to refresh index after edit-apply: {}", e);
+            }
+        } else {
+            let registry = Arc::clone(registry);
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move {
+                // Serialized behind the project write lock: concurrent
+                // edit-applies queue their refreshes instead of racing.
+                let mut guard = handle.write().await;
+                let root = guard.project_path().to_path_buf();
+                if let Err(e) = guard.incremental_reindex_from_watcher() {
+                    tracing::warn!(
+                        project = %root.display(),
+                        "Background refresh after edit-apply failed: {e}"
+                    );
+                }
+                drop(guard);
+                registry.invalidate_stale_cache(&root).await;
+                tracing::debug!(
+                    project = %root.display(),
+                    "Background refresh after edit-apply complete"
+                );
+            });
+        }
+
+        Ok(response)
     }
 
     fn get_changes_from_args(&self, args: &Value) -> Result<Value, JsonRpcError> {

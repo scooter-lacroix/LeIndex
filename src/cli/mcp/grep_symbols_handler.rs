@@ -849,7 +849,7 @@ pub struct GrepSymbolsHandler;
 #[allow(missing_docs)]
 impl GrepSymbolsHandler {
     pub fn name(&self) -> &str {
-        "leindex.grep-symbols"
+        "leindex_grep_symbols"
     }
 
     pub fn title(&self) -> &str {

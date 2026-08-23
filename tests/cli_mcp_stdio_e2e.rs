@@ -173,29 +173,29 @@ fn test_tools_list_all_expected_names_present() {
         .collect();
 
     let expected_names = [
-        "leindex.index",
-        "leindex.search",
-        "leindex.deep-analyze",
-        "leindex.context",
-        "leindex.diagnostics",
-        "leindex.phase-analysis",
+        "leindex_index",
+        "leindex_search",
+        "leindex_deep_analyze",
+        "leindex_context",
+        "leindex_diagnostics",
+        "leindex_phase_analysis",
         "phase_analysis",
         // Phase C
-        "leindex.file-summary",
-        "leindex.symbol-lookup",
-        "leindex.project-map",
-        "leindex.grep-symbols",
-        "leindex.read-symbol",
-        "leindex.write",
+        "leindex_file_summary",
+        "leindex_symbol_lookup",
+        "leindex_project_map",
+        "leindex_grep_symbols",
+        "leindex_read_symbol",
+        "leindex_write",
         // Phase D
-        "leindex.edit-preview",
-        "leindex.edit-apply",
-        "leindex.rename-symbol",
-        "leindex.impact-analysis",
+        "leindex_edit_preview",
+        "leindex_edit_apply",
+        "leindex_rename_symbol",
+        "leindex_impact_analysis",
         // Phase E
-        "leindex.text-search",
-        "leindex.read-file",
-        "leindex.git-status",
+        "leindex_text_search",
+        "leindex_read_file",
+        "leindex_git_status",
     ];
 
     for expected in &expected_names {
@@ -272,7 +272,7 @@ async fn test_tools_call_file_summary_unindexed_returns_structured_response() {
 
     let req = make_tool_call(
         2,
-        "leindex.file-summary",
+        "leindex_file_summary",
         serde_json::json!({ "file_path": "/nonexistent/file.rs" }),
     );
 
@@ -300,7 +300,7 @@ async fn test_tools_call_symbol_lookup_unindexed_returns_structured_response() {
 
     let req = make_tool_call(
         3,
-        "leindex.symbol-lookup",
+        "leindex_symbol_lookup",
         serde_json::json!({ "symbol": "some_function" }),
     );
 
@@ -321,7 +321,7 @@ async fn test_tools_call_project_map_unindexed_returns_structured_response() {
     let state = make_state(&tmp);
     let handlers = all_handlers();
 
-    let req = make_tool_call(4, "leindex.project-map", serde_json::json!({}));
+    let req = make_tool_call(4, "leindex_project_map", serde_json::json!({}));
 
     let result = handle_tool_call(&state, &handlers, &req).await;
     assert!(result.is_ok());
@@ -341,7 +341,7 @@ async fn test_tools_call_edit_preview_unindexed_returns_structured_response() {
 
     let req = make_tool_call(
         5,
-        "leindex.edit-preview",
+        "leindex_edit_preview",
         serde_json::json!({
             "file_path": "/nonexistent/file.rs",
             "changes": [{"type": "replace_text", "old_text": "foo", "new_text": "bar"}]
@@ -361,7 +361,7 @@ async fn test_tools_call_diagnostics_returns_ok() {
     let state = make_state(&tmp);
     let handlers = all_handlers();
 
-    let req = make_tool_call(6, "leindex.diagnostics", serde_json::json!({}));
+    let req = make_tool_call(6, "leindex_diagnostics", serde_json::json!({}));
     let result = handle_tool_call(&state, &handlers, &req).await;
     assert!(result.is_ok());
 
@@ -403,5 +403,112 @@ fn test_jsonrpc_response_serialization_is_single_line() {
         !s.contains('\n'),
         "serde_json::to_string must not produce embedded newlines. Got: {}",
         s
+    );
+}
+
+// ============================================================================
+// Tool-name canonicalization — legacy dotted/dashed names resolve identically
+// ============================================================================
+
+/// Several MCP client implementations mishandle dots in tool names, so the
+/// canonical names are underscore-form (`leindex_diagnostics`). Configs
+/// written against the historical dotted names (`leindex.diagnostics`) and
+/// dashed forms (`leindex-diagnostics`) must resolve to the same handler —
+/// the dispatch normalizes both sides before matching.
+#[tokio::test]
+async fn test_tools_call_accepts_legacy_dotted_and_dashed_names() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp);
+    let handlers = all_handlers();
+
+    for legacy in ["leindex.diagnostics", "leindex-diagnostics"] {
+        let req = make_tool_call(10, legacy, serde_json::json!({}));
+        let result = handle_tool_call(&state, &handlers, &req).await;
+        assert!(
+            result.is_ok(),
+            "legacy tool name '{legacy}' must dispatch to the canonical handler"
+        );
+        let response = result.unwrap();
+        assert!(
+            response.get("isError").is_some() || response.get("content").is_some(),
+            "legacy dispatch must produce a normal MCP response"
+        );
+    }
+
+    // Unknown names still fail — normalization is not a wildcard.
+    let req = make_tool_call(11, "leindex.nonexistent", serde_json::json!({}));
+    assert!(handle_tool_call(&state, &handlers, &req).await.is_err());
+}
+
+/// edit-apply must return the moment the edit is durable: the incremental
+/// reindex runs in a background task (server mode), never between the write
+/// and the response. Regression for the reported hang where MCP clients
+/// timed out on every edit-apply because the response waited on a full
+/// reindex (and the project write lock) after the file had already changed.
+#[tokio::test]
+async fn test_edit_apply_returns_immediately_and_refreshes_in_background() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let source = project.join("lib.rs");
+    std::fs::write(&source, "pub fn marker() -> u32 { 1 }\n").unwrap();
+
+    let registry = std::sync::Arc::new(leindex::cli::registry::ProjectRegistry::new(4));
+    let handlers = all_handlers();
+
+    // Server (non-one-shot) mode: background refresh is spawned, not inline.
+    assert!(!registry.is_one_shot());
+
+    let req = make_tool_call(
+        12,
+        "leindex_edit_apply",
+        serde_json::json!({
+            "file_path": source.display().to_string(),
+            "old_text": "pub fn marker() -> u32 { 1 }",
+            "new_text": "pub fn marker() -> u32 { 2 }",
+            "project_path": project.display().to_string(),
+        }),
+    );
+
+    let started = std::time::Instant::now();
+    let result = handle_tool_call(&registry, &handlers, &req).await;
+    let elapsed = started.elapsed();
+    let response = result.expect("edit-apply must return a response");
+    assert!(
+        response
+            .get("isError")
+            .map(|v| v != &serde_json::json!(true))
+            .unwrap_or(true),
+        "edit must apply successfully: {response:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&source).unwrap(),
+        "pub fn marker() -> u32 { 2 }\n",
+        "edit must be durable before the response returns"
+    );
+    // The response must not wait for index maintenance: on this fixture the
+    // inline reindex path (pre-fix behavior) includes a full first-index of
+    // the project; the response returning in well under that (and the
+    // background task still landing, below) proves the split.
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "edit-apply response waited {elapsed:?} — index maintenance is on the response path"
+    );
+
+    // The spawned refresh must actually run: poll for the store's CURRENT
+    // generation marker (created by the first index this process performs)
+    // without blocking the test forever.
+    let storage = project.join(".leindex");
+    let mut refreshed = false;
+    for _ in 0..300 {
+        if storage.join("CURRENT").is_file() {
+            refreshed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        refreshed,
+        "background refresh after edit-apply never published a generation"
     );
 }

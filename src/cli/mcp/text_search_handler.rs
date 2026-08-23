@@ -394,7 +394,7 @@ fn scan_source_paths(
 #[allow(missing_docs)]
 impl TextSearchHandler {
     pub fn name(&self) -> &str {
-        "leindex.text-search"
+        "leindex_text_search"
     }
 
     pub fn title(&self) -> &str {

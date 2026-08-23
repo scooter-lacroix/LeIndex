@@ -993,15 +993,21 @@ async fn handle_tool_call_timed(
     let tool_call = req.extract_tool_call()?;
     debug!("Tool call: name={}", tool_call.name);
 
+    // Tool names are canonicalized to underscore form (`leindex_edit_apply`).
+    // Historical dotted/dashed spellings (`leindex.edit-apply`) resolve to
+    // the same handler: several MCP client implementations mishandle dots in
+    // tool names, and this dispatch was previously the one place that
+    // bypassed the shared normalizer (so legacy configs keep working).
+    let canonical_name = crate::cli::mcp::output::normalize_tool_name(&tool_call.name);
     let handler = handlers
         .iter()
-        .find(|h| h.name() == tool_call.name)
+        .find(|h| crate::cli::mcp::output::normalize_tool_name(h.name()) == canonical_name)
         .ok_or_else(|| JsonRpcError::method_not_found(tool_call.name.clone()))?;
 
     // Clone arguments before moving them into execute (we need them
     // for render_tool_output_plain which needs the original args).
     let call_args = tool_call.arguments.clone();
-    let call_name = tool_call.name.clone();
+    let call_name = canonical_name;
 
     // Execute the tool and wrap the result in standard MCP content format
     let (handler_result, mut timings) =

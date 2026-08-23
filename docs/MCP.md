@@ -102,6 +102,13 @@ code navigation tasks. The table below shows the token efficiency advantage:
 
 ## Available Tools
 
+> **Tool names are underscore-form** (`leindex_edit_apply`, `leindex_read_file`).
+> Several MCP client implementations mishandle dots in tool names, so the
+> canonical names dropped them. Historical dotted/dashed spellings
+> (`leindex.edit-apply`, `leindex-edit-apply`) are accepted as aliases and
+> dispatch to the same tool, so existing configs keep working.
+
+
 ### `leindex_index`
 
 Start or poll a registry-owned index job. The build parses source files, makes
@@ -171,7 +178,7 @@ cannot cancel an in-progress build.
 }
 ```
 
-Poll by calling `leindex.index` again with the same project and
+Poll by calling `leindex_index` again with the same project and
 `force_reindex: false`; the response is the existing job snapshot. Use
 `wait: true` only when the caller intentionally wants to await `complete` or
 `failed`. A failed attempt leaves the last published generation available and
@@ -1650,7 +1657,7 @@ Response includes:
 
 ### Performance Tips
 
-1. **Start, then poll**: Call `leindex.index` with the default `wait=false`; poll the returned job rather than retrying a second build
+1. **Start, then poll**: Call `leindex_index` with the default `wait=false`; poll the returned job rather than retrying a second build
 2. **Use `token_budget`**: Limit context expansion for large codebases (see table above)
 3. **Incremental Re-index**: Set `force_reindex: false` to skip unchanged files
 4. **SSE for large projects**: Use streaming or job polling for projects with 1000+ files

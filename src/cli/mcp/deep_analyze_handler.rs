@@ -14,7 +14,7 @@ pub struct DeepAnalyzeHandler;
 impl DeepAnalyzeHandler {
     /// Returns the name of this MCP tool (MCP-compliant: ASCII letters, digits, underscore, hyphen, dot only)
     pub fn name(&self) -> &str {
-        "leindex.deep-analyze"
+        "leindex_deep_analyze"
     }
 
     /// Returns the human-readable display title for this tool

@@ -13,7 +13,7 @@ pub struct IndexHandler;
 impl IndexHandler {
     /// Returns the name of this MCP tool (MCP-compliant: ASCII letters, digits, underscore, hyphen, dot only)
     pub fn name(&self) -> &str {
-        "leindex.index"
+        "leindex_index"
     }
 
     /// Returns the human-readable display title for this tool

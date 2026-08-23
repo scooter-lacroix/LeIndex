@@ -81,17 +81,17 @@ human-annotated query/code benchmark — see
 
 ## What agents see: 18 MCP tools
 
-Search and navigation: `leindex.search` (hybrid semantic), `leindex.text-search`
-(matches carry the owning symbol), `leindex.grep-symbols`, `leindex.read-file`
-(symbol maps + imports/dependents), `leindex.read-symbol`, `leindex.symbol-lookup`
-(batch, impact radius + direction), `leindex.context` (callers/callees/data-deps
-sections), `leindex.deep-analyze` (semantic + PDG traversal), `leindex.file-summary`,
-`leindex.project-map`, `leindex.phase-analysis` (5-phase architectural review),
-`leindex.diagnostics`, `leindex.git-status` (PDG-enriched).
+Search and navigation: `leindex_search` (hybrid semantic), `leindex_text_search`
+(matches carry the owning symbol), `leindex_grep_symbols`, `leindex_read_file`
+(symbol maps + imports/dependents), `leindex_read_symbol`, `leindex_symbol_lookup`
+(batch, impact radius + direction), `leindex_context` (callers/callees/data-deps
+sections), `leindex_deep_analyze` (semantic + PDG traversal), `leindex_file_summary`,
+`leindex_project_map`, `leindex_phase_analysis` (5-phase architectural review),
+`leindex_diagnostics`, `leindex_git_status` (PDG-enriched).
 
-Safe editing: `leindex.edit-preview` → `leindex.edit-apply` (dry-run supported),
-`leindex.rename-symbol` (atomic multi-file, preview-first), `leindex.write`
-(immediate symbol discovery for new files), `leindex.impact-analysis`
+Safe editing: `leindex_edit_preview` → `leindex_edit_apply` (dry-run supported),
+`leindex_rename_symbol` (atomic multi-file, preview-first), `leindex_write`
+(immediate symbol discovery for new files), `leindex_impact_analysis`
 (transitive blast radius with risk rating).
 
 Every tool is also on the CLI — the same handlers, the same output:
@@ -99,7 +99,7 @@ Every tool is also on the CLI — the same handlers, the same output:
 ```bash
 leindex tools list
 leindex tools help leindex-project-map
-leindex tools run leindex.search --args '{"query":"retry policy","top_k":5}'
+leindex tools run leindex_search --args '{"query":"retry policy","top_k":5}'
 ```
 
 ---

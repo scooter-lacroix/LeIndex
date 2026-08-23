@@ -258,7 +258,7 @@ leindex index /path/to/project
 Or use the MCP tool:
 ```json
 {
-  "name": "leindex.index",
+  "name": "leindex_index",
   "arguments": {
     "project_path": "/path/to/project"
   }
@@ -274,7 +274,7 @@ leindex search "how is authentication handled"
 Or use the MCP tool:
 ```json
 {
-  "name": "leindex.search",
+  "name": "leindex_search",
   "arguments": {
     "query": "how is authentication handled",
     "limit": 10
@@ -291,7 +291,7 @@ leindex analyze --symbol "User::authenticate"
 Or use the MCP tool:
 ```json
 {
-  "name": "leindex.deep-analyze",
+  "name": "leindex_deep_analyze",
   "arguments": {
     "query": "User::authenticate"
   }

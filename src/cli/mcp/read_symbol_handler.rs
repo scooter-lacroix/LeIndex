@@ -19,7 +19,7 @@ pub struct ReadSymbolHandler;
 #[allow(missing_docs)]
 impl ReadSymbolHandler {
     pub fn name(&self) -> &str {
-        "leindex.read-symbol"
+        "leindex_read_symbol"
     }
     pub fn title(&self) -> &str {
         "LeIndex [Read Symbol]"

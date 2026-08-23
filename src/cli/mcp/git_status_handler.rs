@@ -21,7 +21,7 @@ pub struct GitStatusHandler;
 #[allow(missing_docs)]
 impl GitStatusHandler {
     pub fn name(&self) -> &str {
-        "leindex.git-status"
+        "leindex_git_status"
     }
 
     pub fn title(&self) -> &str {

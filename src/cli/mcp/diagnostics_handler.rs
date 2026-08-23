@@ -13,7 +13,7 @@ pub struct DiagnosticsHandler;
 impl DiagnosticsHandler {
     /// Returns the name of this MCP tool (MCP-compliant: ASCII letters, digits, underscore, hyphen, dot only)
     pub fn name(&self) -> &str {
-        "leindex.diagnostics"
+        "leindex_diagnostics"
     }
 
     /// Returns the human-readable display title for this tool

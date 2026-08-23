@@ -312,7 +312,7 @@ pub struct RenameSymbolHandler;
 #[allow(missing_docs)]
 impl RenameSymbolHandler {
     pub fn name(&self) -> &str {
-        "leindex.rename-symbol"
+        "leindex_rename_symbol"
     }
 
     pub fn title(&self) -> &str {

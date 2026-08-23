@@ -325,6 +325,15 @@ impl ProjectRegistry {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Whether this registry belongs to a one-shot process (CLI `tools run`).
+    /// Handlers use this to decide between inline post-processing (one-shot:
+    /// the process exits when the response is written, so background work
+    /// would be killed) and spawned background work (server: keeps the
+    /// response latency off the slow path).
+    pub fn is_one_shot(&self) -> bool {
+        self.one_shot.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Create a registry pre-loaded with one project (the initial startup project).
     pub fn with_initial_project(max_projects: usize, leindex: LeIndex) -> Self {
         let path = leindex.project_path().to_path_buf();

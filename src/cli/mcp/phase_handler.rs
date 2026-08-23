@@ -13,7 +13,7 @@ pub struct PhaseAnalysisHandler;
 impl PhaseAnalysisHandler {
     /// Returns the name of this MCP tool (MCP-compliant: leindex.phase-analysis)
     pub fn name(&self) -> &str {
-        "leindex.phase-analysis"
+        "leindex_phase_analysis"
     }
 
     /// Returns the human-readable display title for this tool
@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn test_handler_names() {
         let primary = PhaseAnalysisHandler;
-        assert_eq!(primary.name(), "leindex.phase-analysis");
+        assert_eq!(primary.name(), "leindex_phase_analysis");
         assert_eq!(primary.title(), "LeIndex [Phase Analysis]");
 
         let alias = PhaseAnalysisAliasHandler;
