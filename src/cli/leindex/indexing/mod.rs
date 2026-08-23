@@ -2151,8 +2151,27 @@ impl LeIndex {
     /// [`GenerationLease`] keeps the generation's CAS blobs pinned for the
     /// lifetime of this process.
     pub(crate) fn try_hydrate_from_generation(&mut self) -> Result<bool> {
+        self.try_hydrate_from_generation_inner(false)
+    }
+
+    /// Graph-only variant: hydrate the PDG from the leased generation WITHOUT
+    /// restoring the search engine (snapshot + embedding mmaps). Graph-only
+    /// tools (read-symbol, symbol-lookup, project-map) never query the search
+    /// engine, so paying ~1s of artifact restoration per cold call was pure
+    /// added latency.
+    pub(crate) fn try_hydrate_generation_pdg_only(&mut self) -> Result<bool> {
+        if self.pdg.is_some() {
+            return Ok(true);
+        }
+        self.try_hydrate_from_generation_inner(true)
+    }
+
+    fn try_hydrate_from_generation_inner(&mut self, pdg_only: bool) -> Result<bool> {
         if !crate::feature_flags::FeatureFlag::GenerationReaders.is_enabled() {
             return Ok(false);
+        }
+        if pdg_only && self.pdg.is_some() {
+            return Ok(true);
         }
         if self.generation_snapshot.is_some() {
             return Ok(true);
@@ -2195,7 +2214,7 @@ impl LeIndex {
             .parent()
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| storage_path.clone());
-        self.load_from_storage_inner_at(false, Some(&generation_db), artifact_path)?;
+        self.load_from_storage_inner_at(pdg_only, Some(&generation_db), artifact_path)?;
         self.hydrated_generation
             .store(snapshot.generation(), std::sync::atomic::Ordering::Release);
         self.generation_snapshot = Some(snapshot);

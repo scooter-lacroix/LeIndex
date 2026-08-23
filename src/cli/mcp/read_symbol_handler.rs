@@ -467,7 +467,9 @@ async fn resident_relations(
     // dependency list for a requested enrichment layer.
     if include_dependencies {
         let mut guard = handle.write().await;
-        if guard.pdg().is_none() && guard.load_from_storage().is_err() {
+        // Graph-only hydration (see ensure_pdg_loaded_graph_only): relations
+        // never need the search engine.
+        if guard.pdg().is_none() && guard.ensure_pdg_loaded_graph_only().is_err() {
             return ResidentRelations {
                 callers: Vec::new(),
                 callees: Vec::new(),

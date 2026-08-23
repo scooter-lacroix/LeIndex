@@ -292,7 +292,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
         // as unavailable when no PDG can be loaded.
         let pdg_loaded = {
             let mut guard = handle.write().await;
-            match guard.ensure_pdg_loaded() {
+            match guard.ensure_pdg_loaded_graph_only() {
                 Ok(()) => guard.pdg().is_some(),
                 Err(error) => {
                     tracing::warn!(

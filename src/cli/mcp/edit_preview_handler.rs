@@ -90,7 +90,7 @@ LeIndex [Edit Apply] to understand the blast radius of your change."
         // degrade to file-level only when no PDG can be loaded.
         let (abs_file_path, storage_path, pdg_available) = {
             let mut guard = handle.write().await;
-            if let Err(error) = guard.ensure_pdg_loaded() {
+            if let Err(error) = guard.ensure_pdg_loaded_graph_only() {
                 tracing::warn!(
                     project = %guard.project_path().display(),
                     "PDG unavailable for edit preview; continuing with file-level validation only: {error}"

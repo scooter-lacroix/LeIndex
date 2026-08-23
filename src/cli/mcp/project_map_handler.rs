@@ -118,8 +118,10 @@ scoping to subdirectories, sorting, and pagination."
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
 
+        // Graph-only hydration: this tool never queries the search engine,
+        // so skip snapshot/embedding-mmap restoration (~1s per cold call).
         guard
-            .ensure_pdg_loaded()
+            .ensure_pdg_loaded_graph_only()
             .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
 
         if guard.pdg().is_none() {

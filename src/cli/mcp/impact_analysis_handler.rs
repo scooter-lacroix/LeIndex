@@ -123,7 +123,7 @@ to understand the blast radius of your change. No equivalent in standard tools."
         // when the graph is unavailable the tool reports a structured degraded
         // result instead of a hard error — the caller learns the index state
         // and what to do about it.
-        let pdg_available = match guard.ensure_pdg_loaded() {
+        let pdg_available = match guard.ensure_pdg_loaded_graph_only() {
             Ok(()) => guard.pdg().is_some(),
             Err(error) => {
                 tracing::warn!(

@@ -411,8 +411,9 @@ Works for any text file including configs and docs."
             Some(handle) if include_symbol_map => {
                 let mut guard = handle.write().await;
                 if guard.pdg().is_none() {
-                    let _ = guard.load_from_storage();
-                    let _ = guard.ensure_pdg_loaded();
+                    // The symbol map lists graph nodes only; the full engine
+                    // load here added ~1s to every cold read with a map.
+                    let _ = guard.ensure_pdg_loaded_graph_only();
                 }
                 drop(guard);
                 Some(handle)

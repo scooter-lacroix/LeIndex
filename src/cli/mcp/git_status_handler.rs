@@ -118,8 +118,9 @@ impl GitStatusHandler {
             drop(guard);
             let mut write_guard = handle.write().await;
             if write_guard.pdg().is_none() {
-                let _ = write_guard.load_from_storage();
-                let _ = write_guard.ensure_pdg_loaded();
+                // Enrichment reads graph facts only; the full engine load
+                // here stalled every git-status response on cold projects.
+                let _ = write_guard.ensure_pdg_loaded_graph_only();
             }
             drop(write_guard);
         } else {

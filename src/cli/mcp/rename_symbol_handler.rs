@@ -365,7 +365,7 @@ Grep + multi-file Edit with a single atomic operation."
         let handle = registry.get_or_create(project_path.as_deref()).await?;
         let (filtered_files, pdg_available) = {
             let mut index = handle.write().await;
-            let pdg_available = match index.ensure_pdg_loaded() {
+            let pdg_available = match index.ensure_pdg_loaded_graph_only() {
                 Ok(()) => index.pdg().is_some(),
                 Err(error) => {
                     tracing::warn!(

@@ -936,6 +936,37 @@ impl LeIndex {
         Ok(())
     }
 
+    /// Ensure ONLY the PDG is loaded — never the search engine.
+    ///
+    /// Graph-only tools (read-symbol relations, symbol-lookup, project-map)
+    /// traverse the graph but never query TF-IDF/neural vectors; hydrating
+    /// the snapshot + embedding mmaps + index structures for them was ~1s of
+    /// pure added latency per cold call. Falls back to the plain DB
+    /// `load_pdg_from_storage` when the generation-read path is unavailable
+    /// (legacy layout).
+    pub fn ensure_pdg_loaded_graph_only(&mut self) -> Result<()> {
+        if self.pdg.is_some() {
+            return Ok(());
+        }
+        match self.try_hydrate_generation_pdg_only() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    "Generation read path unavailable ({}); falling back to legacy PDG-only load",
+                    e
+                );
+            }
+        }
+        let has_content = self.active_has_indexed_files();
+        if has_content {
+            // An empty/unindexed graph surfaces as pdg=None here; callers
+            // already report "not loaded" semantics for that.
+            let _ = self.load_pdg_from_storage();
+        }
+        Ok(())
+    }
+
     /// Ensure the searchable context is ready for deep analysis / context tools.
     ///
     /// This loads the PDG if needed and performs a focused refresh when the
@@ -986,7 +1017,11 @@ impl LeIndex {
     /// Check if the project has been indexed.
     #[inline]
     pub fn is_indexed(&self) -> bool {
-        self.search_engine.node_count() > 0
+        // Persisted-stats truth, NOT the resident search engine: hydration
+        // is lazy (graph-only tools never populate the engine), and keying
+        // this on the engine would make every lazily-loaded project look
+        // unindexed and trigger pointless auto-reindexes.
+        self.stats.indexed_nodes > 0
     }
 
     /// Close the LeIndex and ensure WAL is checkpointed.

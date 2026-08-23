@@ -433,7 +433,6 @@ impl ProjectRegistry {
                 }
                 self.touch_lru(&canonical).await;
                 self.touch_last_used(&canonical).await;
-                self.set_default(&canonical).await;
                 return Ok(handle.clone());
             }
         }
@@ -1025,17 +1024,25 @@ impl ProjectRegistry {
     }
 
     /// Resolve an optional `project_path` string to a canonical `PathBuf`.
+    ///
+    /// Precedence: an explicit per-call argument wins; then the startup
+    /// `--project` / `-p` designation (`default_project`, set once at process
+    /// start and never mutated afterwards); then the process CWD — which is
+    /// what an MCP client's workspace resolves to when the server was started
+    /// without an explicit project. Last-touched projects can NEVER become the
+    /// fallback, and `$HOME` is rejected outright.
     async fn resolve_path(&self, project_path: Option<&str>) -> Result<PathBuf, JsonRpcError> {
         let path = if let Some(raw) = project_path {
             Path::new(raw).to_path_buf()
+        } else if let Some(designated) = self.default_project.read().await.clone() {
+            designated
+        } else if let Ok(cwd) = std::env::current_dir() {
+            cwd
         } else {
-            let default = self.default_project.read().await;
-            default.clone().ok_or_else(|| {
-                JsonRpcError::invalid_params(
-                    "No project_path provided and no project has been loaded yet. \
-                     Pass project_path on the first call.",
-                )
-            })?
+            return Err(JsonRpcError::invalid_params(
+                "No project_path provided, no startup --project given, and CWD is \
+                 unavailable. Pass project_path on the first call.",
+            ));
         };
 
         // Canonicalize first to resolve symlinks and relative paths
@@ -1078,7 +1085,6 @@ impl ProjectRegistry {
             let projects = self.projects.read().await;
             if let Some(handle) = projects.get(&canonical) {
                 self.touch_lru(&canonical).await;
-                self.set_default(&canonical).await;
                 return Ok(handle.clone());
             }
         }
@@ -1086,28 +1092,15 @@ impl ProjectRegistry {
         let mut leindex = LeIndex::new(&canonical).map_err(|e| {
             JsonRpcError::init_failed(&canonical.display().to_string(), &e.to_string())
         })?;
-        // Load from storage to populate search_engine (is_indexed() depends on it).
-        // PDG remains in memory; ensure_pdg_loaded() is a no-op after this.
-        let hydration_started = std::time::Instant::now();
-        let hydration_result = leindex.load_from_active_storage();
-        let hydrate_ms = hydration_started
-            .elapsed()
-            .as_millis()
-            .min(u64::MAX as u128) as u64;
-        tracing::debug!(
-            project = %canonical.display(),
-            hydrate_ms,
-            "MCP project hydration attempt complete"
-        );
+        // Hydration is LAZY and need-based: `LeIndex::new` already restored
+        // persisted stats (so is_indexed() is truthful), and every tool
+        // hydrates exactly what it uses — graph-only tools via
+        // ensure_pdg_loaded_graph_only, search tools via
+        // ensure_analysis_context_loaded. Eagerly loading PDG + search
+        // snapshot + embedding mmaps here cost ~1.5s per cold project for
+        // every tool, including ones that never touch the engine.
+        let hydrate_ms = 0_u64;
         crate::cli::mcp::request_meta::record_hydrate_ms(hydrate_ms);
-        if let Err(e) = hydration_result {
-            warn!(
-                "Failed to load project from storage for {}: {}. \
-                 The project will be auto-indexed on first tool call.",
-                canonical.display(),
-                e
-            );
-        }
 
         // Corruption detection and auto-repair. Never delete the whole
         // storage root: an interrupted build may still have reusable job
@@ -1174,7 +1167,6 @@ impl ProjectRegistry {
         }
 
         self.touch_lru(&canonical).await;
-        self.set_default(&canonical).await;
 
         let mut slots = self.index_slots.lock().await;
         slots
@@ -1356,19 +1348,12 @@ impl ProjectRegistry {
         lru.push_back(path.to_path_buf());
     }
 
-    /// Update the default project path.
-    async fn set_default(&self, path: &Path) {
-        let mut default = self.default_project.write().await;
-        *default = Some(path.to_path_buf());
-    }
-
     /// Set the default project path without loading the project.
     ///
     /// Used by MCP stdio to register the `--project` CLI argument as the
     /// default so that subsequent tool calls that omit `project_path` resolve
     /// to it. The actual `LeIndex` creation happens lazily on first tool call
     /// via `get_or_load()`.
-    /// Set the default project path (canonicalized).
     pub async fn set_default_path(&self, path: PathBuf) {
         let canonical = path.canonicalize().unwrap_or_else(|err| {
             // Canonicalization can fail for a transiently-missing mount or a
@@ -1881,10 +1866,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_registry_no_default_project_error() {
+    async fn test_resolve_path_defaults_to_cwd_without_startup_project() {
+        // No explicit arg and no startup --project: resolution must fall back
+        // to the process CWD (the MCP client's workspace) — never to $HOME or
+        // to whichever project another tool touched most recently.
         let registry = ProjectRegistry::new(5);
-        let result = registry.get_or_load(None).await;
-        assert!(result.is_err());
+        let resolved = registry.resolve_path(None).await.unwrap();
+        let expected = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert_eq!(resolved, expected);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_path_startup_project_beats_cwd() {
+        // A daemon started with `-p`/`--project` must keep serving path-less
+        // calls from that designation even when its process CWD differs.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let leindex = LeIndex::new(tmp.path()).unwrap();
+        let registry = ProjectRegistry::with_initial_project(5, leindex);
+
+        let resolved = registry.resolve_path(None).await.unwrap();
+        assert_eq!(resolved, tmp.path().canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_path_explicit_arg_beats_everything() {
+        // An explicit per-call project_path always wins over both the startup
+        // designation and the CWD fallback.
+        let tmp1 = tempfile::tempdir().unwrap();
+        std::fs::write(tmp1.path().join("main.rs"), "fn one() {}\n").unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        std::fs::write(tmp2.path().join("main.rs"), "fn two() {}\n").unwrap();
+
+        let leindex = LeIndex::new(tmp1.path()).unwrap();
+        let registry = ProjectRegistry::with_initial_project(5, leindex);
+
+        let resolved = registry
+            .resolve_path(Some(tmp2.path().to_str().unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(resolved, tmp2.path().canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_path_rejects_home_directory() {
+        let registry = ProjectRegistry::new(5);
+        let home = dirs::home_dir().expect("test requires a resolvable home directory");
+        let result = registry
+            .resolve_path(Some(home.to_str().unwrap()))
+            .await
+            .unwrap_err();
+        assert!(
+            result.message.contains("home"),
+            "expected home-dir rejection, got: {}",
+            result.message
+        );
     }
 
     #[tokio::test]
@@ -2020,7 +2056,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_registry_default_project_tracks_last_used() {
+    async fn test_registry_default_project_never_tracks_last_used() {
+        // The old last-touched-wins behavior made a path-less call silently
+        // bind to whichever project another tool touched most recently —
+        // the reported cross-project binding bug. The startup designation is
+        // immutable: touching tmp2 must not move it.
         let tmp1 = tempfile::tempdir().unwrap();
         let tmp2 = tempfile::tempdir().unwrap();
         std::fs::write(tmp1.path().join("a.rs"), "fn a() {}\n").unwrap();
@@ -2036,9 +2076,16 @@ mod tests {
         let p2 = tmp2.path().to_string_lossy().to_string();
         let _ = registry.get_or_load(Some(&p2)).await.unwrap();
 
+        // Path-less resolution still lands on the startup project...
         let h2 = registry.get_or_load(None).await.unwrap();
         let path2 = h2.read().await.project_path().to_path_buf();
-        assert_eq!(path2, tmp2.path().canonicalize().unwrap());
+        assert_eq!(path2, tmp1.path().canonicalize().unwrap());
+
+        // ...and resolve_path agrees.
+        assert_eq!(
+            registry.resolve_path(None).await.unwrap(),
+            tmp1.path().canonicalize().unwrap()
+        );
     }
 
     /// Concurrency test: verify that the `ProjectRwLock` wrapper correctly

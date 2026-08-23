@@ -670,8 +670,10 @@ fn semantic_response(
     let scope_exact = scope.map(|scope| scope.trim_end_matches(std::path::MAIN_SEPARATOR));
     let mut all_matches = Vec::new();
     for _attempt in 0..2 {
+        // The engine was hydrated by the caller (ensure_analysis_context_loaded
+        // on the Semantic route); this re-check only guards the graph.
         index
-            .ensure_pdg_loaded()
+            .ensure_pdg_loaded_graph_only()
             .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let semantic_opts = SymbolEntryOpts {
             context_lines: opts.context_lines,
@@ -1014,9 +1016,19 @@ impl GrepSymbolsHandler {
         let mut index = handle.write().await;
         let scope = resolve_scope(&args, index.project_path())?;
 
-        index
-            .ensure_pdg_loaded()
-            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+        // Exact mode only traverses the PDG; semantic mode additionally runs
+        // TF-IDF queries, so it needs the engine hydrated before index.search().
+        // Graph-only hydration keeps the common exact path off the snapshot +
+        // embedding-mmap load (~1s of added latency on a cold project).
+        if route == QueryRoute::Semantic {
+            index.ensure_analysis_context_loaded().map_err(|e| {
+                JsonRpcError::indexing_failed(format!("Failed to load search context: {}", e))
+            })?;
+        } else {
+            index
+                .ensure_pdg_loaded_graph_only()
+                .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+        }
         if index.pdg().is_none() {
             return Err(JsonRpcError::project_not_indexed(
                 index.project_path().display().to_string(),

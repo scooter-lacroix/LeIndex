@@ -215,8 +215,9 @@ async fn resolve_live_search_context(
             {
                 let mut guard = handle.write().await;
                 if guard.pdg().is_none() {
-                    let _ = guard.load_from_storage();
-                    let _ = guard.ensure_pdg_loaded();
+                    // Span enrichment never queries the search engine; the
+                    // full engine load here starved every live text search.
+                    let _ = guard.ensure_pdg_loaded_graph_only();
                 }
             }
             Some(handle)
