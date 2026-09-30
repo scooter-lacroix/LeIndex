@@ -108,3 +108,23 @@ fn test_new_unindexed_file_in_source_directory_is_acknowledged_by_a_clean_scan()
         "a scan that finds nothing to index must acknowledge the directory change"
     );
 }
+
+#[test]
+fn test_fixture_manifests_do_not_keep_the_index_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    std::fs::write(root.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+    // The scanner excludes tests/fixtures/**; the freshness check must agree.
+    std::fs::create_dir_all(root.join("tests/fixtures/app")).unwrap();
+    std::fs::write(root.join("tests/fixtures/app/Cargo.toml"), "[package]\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "initial"]);
+
+    let mut index = LeIndex::new(root).unwrap();
+    index.index_project(true).unwrap();
+    assert!(
+        !index.is_stale_fast(),
+        "a fixture manifest the scanner ignores must not make the index stale"
+    );
+}

@@ -462,6 +462,13 @@ pub(crate) fn find_new_nested_manifest(
             if SKIP_DIRS.contains(&name) {
                 return false;
             }
+            // The scanner never records manifests under `tests/fixtures/**`
+            // (fixture trees are test inputs, not project source). Prune them
+            // here too, otherwise a fixture manifest is "new" on every check
+            // and the index can never become fresh.
+            if crate::cli::index_builder::is_test_fixture_path(e.path(), project_path) {
+                return false;
+            }
             true
         });
     for entry in walker {
@@ -516,6 +523,32 @@ mod tests {
     fn make_fixture() -> (tempfile::TempDir, std::collections::HashSet<PathBuf>) {
         let tmp = tempfile::tempdir().unwrap();
         (tmp, std::collections::HashSet::new())
+    }
+
+    #[test]
+    fn find_new_nested_manifest_ignores_manifests_the_scanner_excludes() {
+        // Regression: the scanner drops `tests/fixtures/**` before recording
+        // manifests, but this walker did not, so a fixture `Cargo.toml` was
+        // reported as a "new nested manifest" forever, keeping the index stale
+        // and re-launching a background refresh after every tool call.
+        let (tmp, listed) = make_fixture();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("tests/fixtures/sample_app")).unwrap();
+        fs::write(
+            root.join("tests/fixtures/sample_app/Cargo.toml"),
+            "[package]",
+        )
+        .unwrap();
+        fs::write(root.join("tests/fixtures/sample_app/package.json"), "{}").unwrap();
+        assert!(
+            !find_new_nested_manifest(root, &listed),
+            "manifests under tests/fixtures must not count as new"
+        );
+
+        // A real nested manifest elsewhere is still detected.
+        fs::create_dir_all(root.join("apps/api")).unwrap();
+        fs::write(root.join("apps/api/package.json"), "{}").unwrap();
+        assert!(find_new_nested_manifest(root, &listed));
     }
 
     #[test]

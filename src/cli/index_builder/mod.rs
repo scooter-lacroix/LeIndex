@@ -523,7 +523,7 @@ pub(crate) fn scan_project_files(project_path: &Path) -> Result<ProjectFileScan>
 /// `String::truncate` → tests/fixtures namesake conflation, N-03) and
 /// polluted search/context output. Excluded from the scan so both the git
 /// and non-git paths drop them.
-fn is_test_fixture_path(path: &Path, root: &Path) -> bool {
+pub(crate) fn is_test_fixture_path(path: &Path, root: &Path) -> bool {
     path.strip_prefix(root).ok().is_some_and(|relative| {
         let mut previous: Option<&str> = None;
         relative.components().any(|component| {
