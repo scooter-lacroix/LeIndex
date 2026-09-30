@@ -140,10 +140,14 @@ fn test_daemon_serves_same_tool_set_as_inline() {
     let tools_response = list_tools(&mut stream);
     let daemon_tools = parse_tool_names(&tools_response);
 
-    // Get the inline tool set from all_tool_handlers().
-    let inline_tools: Vec<String> = leindex::cli::mcp::handlers::all_tool_handlers()
+    // The inline server advertises the public tool surface (the four routers).
+    let inline_tools: Vec<String> = leindex::cli::mcp::server::list_tools_json(
+        &leindex::cli::mcp::handlers::all_tool_handlers(),
+    )["tools"]
+        .as_array()
+        .expect("tools array")
         .iter()
-        .map(|h| h.name().to_string())
+        .filter_map(|tool| tool["name"].as_str().map(str::to_string))
         .collect();
 
     // Sort both lists for comparison.
@@ -169,12 +173,16 @@ fn test_daemon_serves_same_tool_set_as_inline() {
         "daemon and inline tool sets must be identical"
     );
 
-    // Verify all 21 tools are present (anti-cheat: no tool omitted).
-    assert!(
-        daemon_sorted.len() >= 20,
-        "expected at least 20 tools; got {}: {:?}",
-        daemon_sorted.len(),
-        daemon_sorted
+    // Anti-cheat: the four routers, none omitted.
+    assert_eq!(
+        daemon_sorted,
+        [
+            "leindex_analyze",
+            "leindex_edit",
+            "leindex_explore",
+            "leindex_manage"
+        ],
+        "daemon must serve the four routers"
     );
 }
 

@@ -916,7 +916,7 @@ impl GrepSymbolsHandler {
                     "description": "Include up to 4000 chars of symbol source code in results (default: false)",
                     "default": false
                 },
-                "mode": {
+                "grep_mode": {
                     "type": "string",
                     "enum": ["exact", "semantic"],
                     "description": "Search mode: 'exact' for name substring matching (default), 'semantic' for concept-based similarity search using TF-IDF embeddings",
@@ -954,8 +954,11 @@ impl GrepSymbolsHandler {
         let context_lines = extract_usize(&args, "include_context_lines", 0)?.min(10);
         let offset = extract_usize(&args, "offset", 0)?;
         let include_source = extract_bool(&args, "include_source", false);
+        // `grep_mode` is the router-safe spelling; bare `mode` is still honoured
+        // for direct `leindex_grep_symbols` calls made before the rename.
         let mode = args
-            .get("mode")
+            .get("grep_mode")
+            .or_else(|| args.get("mode"))
             .and_then(|v| v.as_str())
             .unwrap_or("exact")
             .to_owned();

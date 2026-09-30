@@ -17,26 +17,40 @@ pub(super) async fn cmd_tools_impl(
     project: Option<PathBuf>,
 ) -> AnyhowResult<()> {
     match command {
-        ToolCommands::List => {
-            // Display as `LeIndex [Tool Name]  description` so the user sees the
-            // human-readable title first (what they'll write in prompts), with
-            // the canonical dotted name available via `leindex tools help`.
-            let mut handlers = all_tool_handlers();
-            handlers.sort_by(|a, b| a.title().cmp(b.title()));
-            for handler in handlers {
-                println!("{}\t{}", handler.title(), handler.description());
-            }
+        ToolCommands::List { verbose } => {
+            print!("{}", crate::cli::mcp::grouped::cli_tools_table(verbose));
+            println!(
+                "\nRun `leindex tools inspect <tool>` for arguments, or `leindex tools run <tool> --set mode=<branch> ...`."
+            );
             Ok(())
         }
-        ToolCommands::Help { name } => {
-            let handler = find_tool_handler(&name)
-                .ok_or_else(|| anyhow::anyhow!("Unknown tool '{}'", name))?;
+        ToolCommands::Inspect { name } => {
+            if let Some(group) = crate::cli::mcp::grouped::group_by_name(&name) {
+                println!(
+                    "{}\n{}\n",
+                    group.title,
+                    crate::cli::mcp::grouped::full_description(group)
+                );
+                println!("Schema:");
+                print_json_value(&crate::cli::mcp::grouped::group_schema_oneof(
+                    group,
+                    &all_tool_handlers(),
+                ))?;
+                return Ok(());
+            }
+            let handler = find_tool_handler(&name).ok_or_else(|| tool_not_found(&name))?;
             print_tool_help(&handler);
             Ok(())
         }
         ToolCommands::Schema { name } => {
-            let handler = find_tool_handler(&name)
-                .ok_or_else(|| anyhow::anyhow!("Unknown tool '{}'", name))?;
+            if let Some(group) = crate::cli::mcp::grouped::group_by_name(&name) {
+                print_json_value(&crate::cli::mcp::grouped::group_schema_oneof(
+                    group,
+                    &all_tool_handlers(),
+                ))?;
+                return Ok(());
+            }
+            let handler = find_tool_handler(&name).ok_or_else(|| tool_not_found(&name))?;
             print_json_value(&handler.argument_schema())?;
             Ok(())
         }
@@ -58,6 +72,15 @@ pub(super) async fn cmd_tools_impl(
                 if let Some(object) = args.as_object_mut() {
                     object.insert("max_latency_ms".to_string(), serde_json::json!(5000));
                 }
+            }
+            // The four public tools pick their operation with `action`
+            // (`--set action=text`); resolve to the underlying tool so the
+            // CLI renders exactly what the MCP transport does.
+            let (name, args) = crate::cli::mcp::grouped::resolve_call(&name, args)
+                .map_err(|error| anyhow::anyhow!("{}", error))?;
+            let mut parsed_args = parsed_args;
+            if let Some(object) = parsed_args.as_object_mut() {
+                object.remove("action");
             }
             let value = execute_tool_handler(&name, args, project).await?;
 
@@ -168,7 +191,8 @@ pub(super) async fn cmd_mcp_stdio_impl(
         }
     });
 
-    let mut stdout = io::stdout().lock();
+    let writer = StdioWriter::spawn();
+    let dispatcher = StdioDispatcher::new(writer.sender());
     let mut framed_responses = false;
     let mut idle_ticker = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
@@ -184,12 +208,19 @@ pub(super) async fn cmd_mcp_stdio_impl(
                 };
                 // Any payload (including ping/notifications) resets the clock.
                 idle_clock.touch();
-                if !process_stdio_payload(input, &mut framed_responses, &mut stdout).await {
+                if !dispatcher.dispatch(input, &mut framed_responses).await {
                     break;
                 }
             }
             _ = idle_ticker.tick() => {
-                if idle_exit_due(idle_clock.idle_duration(), idle_timeout) {
+                if writer.failed() {
+                    tracing::debug!("MCP stdio: stdout closed, shutting down");
+                    break;
+                }
+                // A call that outlives the idle window is not "idle".
+                if dispatcher.in_flight() == 0
+                    && idle_exit_due(idle_clock.idle_duration(), idle_timeout)
+                {
                     info!(
                         "MCP stdio server idle for {:?}; exiting (D-1 memory-pressure idle exit)",
                         idle_timeout
@@ -199,36 +230,175 @@ pub(super) async fn cmd_mcp_stdio_impl(
             }
         }
     }
+    // Answer everything already accepted before the process exits (a piped
+    // `printf ... | leindex mcp` closes stdin right after the last request).
+    dispatcher.drain().await;
+    drop(dispatcher);
+    writer.finish();
     Ok(())
 }
 
-/// Process one stdio payload and write its response. Returns `false` when the
-/// server loop should exit (stdin `End`, fatal write failure). Extracted from
-/// `cmd_mcp_stdio_impl` so the entry function stays under the CCN-15 gate.
-async fn process_stdio_payload(
-    input: StdioInput,
-    framed_responses: &mut bool,
-    stdout: &mut impl Write,
-) -> bool {
-    let json = match input {
-        StdioInput::Payload { json, framed } => {
-            *framed_responses |= framed;
-            json
-        }
-        StdioInput::Skip => return true,
-        StdioInput::End => return false,
-    };
-    let Some((response, parse_error)) = response_for_payload(&json).await else {
-        return true;
-    };
-    if write_stdio_response(stdout, &response, *framed_responses).is_err() {
-        if *framed_responses && parse_error {
-            return true;
-        }
-        tracing::debug!("MCP stdio: failed to write to stdout");
-        return false;
+/// Upper bound on tool calls executing at once on one stdio connection.
+const MAX_CONCURRENT_STDIO_CALLS: usize = 64;
+
+/// One response queued for the stdout writer.
+struct StdioOutbound {
+    response: String,
+    framed: bool,
+    /// A framed parse-error reply may fail to write without ending the session.
+    recoverable: bool,
+}
+
+/// Owns stdout on a dedicated thread so response writes (a pipe that a slow
+/// client drains lazily) can never park a tokio worker.
+struct StdioWriter {
+    tx: tokio::sync::mpsc::UnboundedSender<StdioOutbound>,
+    thread: std::thread::JoinHandle<()>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StdioWriter {
+    fn spawn() -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StdioOutbound>();
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failed_flag = Arc::clone(&failed);
+        let thread = std::thread::spawn(move || {
+            let mut stdout = io::stdout().lock();
+            while let Some(out) = rx.blocking_recv() {
+                if write_stdio_response(&mut stdout, &out.response, out.framed).is_err() {
+                    if out.framed && out.recoverable {
+                        continue;
+                    }
+                    tracing::debug!("MCP stdio: failed to write to stdout");
+                    failed_flag.store(true, std::sync::atomic::Ordering::Release);
+                    break;
+                }
+            }
+        });
+        Self { tx, thread, failed }
     }
-    true
+
+    fn sender(&self) -> tokio::sync::mpsc::UnboundedSender<StdioOutbound> {
+        self.tx.clone()
+    }
+
+    fn failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Flush what is queued and join the writer thread.
+    fn finish(self) {
+        drop(self.tx);
+        let _ = self.thread.join();
+    }
+}
+
+/// Routes stdio payloads. Cheap protocol methods (`initialize`, `ping`,
+/// `tools/list`, ...) are answered inline so ordering guarantees hold — the
+/// handshake completes before anything after it runs. `tools/call` is
+/// spawned: a slow or blocked tool must not queue every other request
+/// (including `ping`) behind it, which is how a single cold index used to
+/// make the whole MCP server look hung while the one-shot CLI was fine.
+struct StdioDispatcher {
+    out: tokio::sync::mpsc::UnboundedSender<StdioOutbound>,
+    calls: std::sync::Mutex<tokio::task::JoinSet<()>>,
+    limiter: Arc<tokio::sync::Semaphore>,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl StdioDispatcher {
+    fn new(out: tokio::sync::mpsc::UnboundedSender<StdioOutbound>) -> Self {
+        Self {
+            out,
+            calls: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+            limiter: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STDIO_CALLS)),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Returns `false` when the server loop should exit (stdin `End`).
+    async fn dispatch(&self, input: StdioInput, framed_responses: &mut bool) -> bool {
+        let json = match input {
+            StdioInput::Payload { json, framed } => {
+                *framed_responses |= framed;
+                json
+            }
+            StdioInput::Skip => return true,
+            StdioInput::End => return false,
+        };
+        let framed = *framed_responses;
+        match tool_call_id(&json) {
+            Some(id) => self.spawn_tool_call(json, id, framed),
+            None => {
+                if let Some((response, recoverable)) = response_for_payload(&json).await {
+                    let _ = self.out.send(StdioOutbound {
+                        response,
+                        framed,
+                        recoverable,
+                    });
+                }
+            }
+        }
+        true
+    }
+
+    fn spawn_tool_call(&self, json: String, id: Value, framed: bool) {
+        use std::sync::atomic::Ordering;
+        let out = self.out.clone();
+        let limiter = Arc::clone(&self.limiter);
+        let in_flight = Arc::clone(&self.in_flight);
+        in_flight.fetch_add(1, Ordering::AcqRel);
+        let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+        // Reap finished tasks so the set does not grow for the whole session.
+        while calls.try_join_next().is_some() {}
+        calls.spawn(async move {
+            let _permit = limiter.acquire_owned().await.ok();
+            // A panicking handler must still answer: a request that never
+            // gets a response is indistinguishable from a hang to the client.
+            let response =
+                match tokio::spawn(async move { response_for_payload(&json).await }).await {
+                    Ok(response) => response.map(|(body, _)| body),
+                    Err(error) => {
+                        tracing::error!("MCP tool call task failed: {error}");
+                        let failure = JsonRpcResponse::error(
+                            id,
+                            JsonRpcError::internal_error(format!("Tool call aborted: {error}")),
+                        );
+                        serde_json::to_string(&failure).ok()
+                    }
+                };
+            if let Some(response) = response {
+                let _ = out.send(StdioOutbound {
+                    response,
+                    framed,
+                    recoverable: false,
+                });
+            }
+            in_flight.fetch_sub(1, Ordering::AcqRel);
+        });
+    }
+
+    /// Wait for every accepted tool call to publish its response.
+    async fn drain(&self) {
+        let mut pending = {
+            let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *calls)
+        };
+        while pending.join_next().await.is_some() {}
+    }
+}
+
+/// `Some(id)` when `payload` is a `tools/call` request (has an id).
+fn tool_call_id(payload: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(payload).ok()?;
+    if value.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return None;
+    }
+    value.get("id").cloned()
 }
 
 /// Resolve the effective MCP idle self-exit window (D-1): the CLI flag wins
@@ -617,6 +787,10 @@ fn format_tool_title(title: &str) -> String {
     }
 }
 
+fn tool_not_found(name: &str) -> anyhow::Error {
+    anyhow::anyhow!("{}", crate::cli::mcp::grouped::suggest_unknown_tool(name))
+}
+
 pub(super) fn find_tool_handler(name: &str) -> Option<ToolHandler> {
     let normalized = normalize_tool_name(name);
 
@@ -666,8 +840,7 @@ pub(super) async fn execute_tool_handler(
     args: Value,
     project: Option<PathBuf>,
 ) -> AnyhowResult<Value> {
-    let handler =
-        find_tool_handler(name).ok_or_else(|| anyhow::anyhow!("Unknown tool '{}'", name))?;
+    let handler = find_tool_handler(name).ok_or_else(|| tool_not_found(name))?;
     let registry = build_tool_registry(project)?;
     handler
         .execute(&registry, args)
@@ -714,7 +887,8 @@ async fn handle_mcp_request(
     _project_path: PathBuf,
 ) -> anyhow::Result<Option<JsonRpcResponse>> {
     use crate::cli::mcp::server::{
-        HANDLERS, SERVER_INSTANCE, SERVER_STATE, handle_tool_call, list_tools_json,
+        HANDLERS, SERVER_INSTANCE, SERVER_STATE, handle_prompt_get, handle_resource_read,
+        handle_tool_call, list_prompts_json, list_resources_json, list_tools_json,
     };
 
     let method_name = request.method.clone();
@@ -820,6 +994,19 @@ async fn handle_mcp_request(
                 list_tools_json(handlers),
             )))
         }
+        // Prompts/resources are served on the HTTP and socket transports;
+        // stdio answered them with method-not-found, which clients that probe
+        // them at startup (before any tool call) treat as a broken server.
+        "prompts/list" => Ok(Some(JsonRpcResponse::success(id, list_prompts_json()))),
+        "prompts/get" => Ok(Some(JsonRpcResponse::from_result(
+            id,
+            handle_prompt_get(&request),
+        ))),
+        "resources/list" => Ok(Some(JsonRpcResponse::success(id, list_resources_json()))),
+        "resources/read" => Ok(Some(JsonRpcResponse::from_result(
+            id,
+            handle_resource_read(&request),
+        ))),
         _ => Ok(Some(JsonRpcResponse::error(
             id,
             crate::cli::mcp::protocol::JsonRpcError::method_not_found(method_name),

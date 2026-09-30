@@ -3,19 +3,13 @@
 // Tests the full JSON-RPC dispatch stack as used by the stdio transport:
 //   - JSON serialization/deserialization correctness
 //   - Protocol method routing (initialize, tools/list, tools/call, notifications)
-//   - All 16 tool handlers registered and named correctly
+//   - Every tool handler registered and named correctly
 //   - Error responses carry proper structure
 //   - No double-newline in serialized responses (the transport bug from Task A.1)
 
 #![cfg(feature = "cli")]
 
-use leindex::cli::mcp::handlers::{
-    ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, EditApplyHandler, EditPreviewHandler,
-    FileSummaryHandler, GitStatusHandler, GrepSymbolsHandler, ImpactAnalysisHandler, IndexHandler,
-    PhaseAnalysisAliasHandler, PhaseAnalysisHandler, ProjectMapHandler, ReadFileHandler,
-    ReadSymbolHandler, RenameSymbolHandler, SearchHandler, SymbolLookupHandler, TextSearchHandler,
-    ToolHandler, WriteHandler,
-};
+use leindex::cli::mcp::handlers::{ToolHandler, all_tool_handlers};
 use leindex::cli::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use leindex::cli::mcp::server::{handle_tool_call, list_tools_json};
 use std::sync::Arc;
@@ -25,33 +19,9 @@ use tempfile::TempDir;
 // Test helpers
 // ============================================================================
 
-/// Build the full set of 16 tool handlers (mirrors cli.rs and server.rs setup).
+/// The full handler set, exactly as the server registers it.
 fn all_handlers() -> Vec<ToolHandler> {
-    vec![
-        ToolHandler::DeepAnalyze(DeepAnalyzeHandler),
-        ToolHandler::Diagnostics(DiagnosticsHandler),
-        ToolHandler::Index(IndexHandler),
-        ToolHandler::Context(ContextHandler),
-        ToolHandler::Search(SearchHandler),
-        ToolHandler::PhaseAnalysis(PhaseAnalysisHandler),
-        ToolHandler::PhaseAnalysisAlias(PhaseAnalysisAliasHandler),
-        // Phase C: Tool Supremacy
-        ToolHandler::FileSummary(FileSummaryHandler),
-        ToolHandler::SymbolLookup(SymbolLookupHandler),
-        ToolHandler::ProjectMap(ProjectMapHandler),
-        ToolHandler::GrepSymbols(GrepSymbolsHandler),
-        ToolHandler::ReadSymbol(ReadSymbolHandler),
-        ToolHandler::Write(WriteHandler),
-        // Phase D: Context-Aware Editing
-        ToolHandler::EditPreview(EditPreviewHandler),
-        ToolHandler::EditApply(EditApplyHandler),
-        ToolHandler::RenameSymbol(RenameSymbolHandler),
-        ToolHandler::ImpactAnalysis(ImpactAnalysisHandler),
-        // Phase E: Precision Tooling
-        ToolHandler::TextSearch(TextSearchHandler),
-        ToolHandler::ReadFile(ReadFileHandler),
-        ToolHandler::GitStatus(GitStatusHandler),
-    ]
+    all_tool_handlers()
 }
 
 /// Create a minimal LeIndex state backed by a temp directory (not indexed).
@@ -149,30 +119,32 @@ fn test_no_double_newline_in_success_response() {
 // ============================================================================
 
 #[test]
-fn test_tools_list_returns_20_tools() {
+fn test_tools_list_advertises_the_four_routers() {
     let handlers = all_handlers();
     let result = list_tools_json(&handlers);
     let tools = result["tools"].as_array().expect("tools must be an array");
-    assert_eq!(
-        tools.len(),
-        20,
-        "Expected exactly 20 registered tools, got {}",
-        tools.len()
-    );
-}
-
-#[test]
-fn test_tools_list_all_expected_names_present() {
-    let handlers = all_handlers();
-    let result = list_tools_json(&handlers);
-    let tools = result["tools"].as_array().unwrap();
-
     let names: Vec<&str> = tools
         .iter()
         .map(|t| t["name"].as_str().expect("tool name must be a string"))
         .collect();
+    assert_eq!(
+        names,
+        [
+            "leindex_explore",
+            "leindex_analyze",
+            "leindex_edit",
+            "leindex_manage"
+        ],
+        "tools/list must advertise exactly the four routers"
+    );
+}
 
-    let expected_names = [
+#[test]
+fn test_every_individual_tool_remains_dispatchable_by_name() {
+    // The individual tool names are no longer advertised, but configs,
+    // prompts and scripts written against them must keep working.
+    let handlers = all_handlers();
+    for expected in [
         "leindex_index",
         "leindex_search",
         "leindex_deep_analyze",
@@ -180,30 +152,24 @@ fn test_tools_list_all_expected_names_present() {
         "leindex_diagnostics",
         "leindex_phase_analysis",
         "phase_analysis",
-        // Phase C
         "leindex_file_summary",
         "leindex_symbol_lookup",
         "leindex_project_map",
         "leindex_grep_symbols",
         "leindex_read_symbol",
         "leindex_write",
-        // Phase D
         "leindex_edit_preview",
         "leindex_edit_apply",
         "leindex_rename_symbol",
         "leindex_impact_analysis",
-        // Phase E
         "leindex_text_search",
         "leindex_read_file",
         "leindex_git_status",
-    ];
-
-    for expected in &expected_names {
+        "leindex_git_diff",
+    ] {
         assert!(
-            names.contains(expected),
-            "Missing tool '{}' from tools/list. Got: {:?}",
-            expected,
-            names
+            handlers.iter().any(|h| h.name() == expected),
+            "missing handler '{expected}'"
         );
     }
 }
@@ -258,10 +224,16 @@ async fn test_tools_call_unknown_tool_returns_error() {
     let req = make_tool_call(1, "leindex_nonexistent_tool", serde_json::json!({}));
     let result = handle_tool_call(&state, &handlers, &req).await;
 
-    // Should be an Err (method not found) or an Ok with isError:true
-    // The server wraps errors as isError:true for MCP compliance
-    // handle_tool_call returns Err for method-not-found
-    assert!(result.is_err(), "Expected error for unknown tool");
+    // MCP convention: a bad tool call is a successful JSON-RPC response with
+    // `isError: true`, and the text names the closest real tool so the model
+    // can self-correct instead of retrying blindly.
+    let value = result.expect("unknown tool must be reported as content, not a transport error");
+    assert_eq!(value["isError"], true);
+    let text = value["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("Unknown tool") && text.contains("leindex_explore"),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -437,7 +409,10 @@ async fn test_tools_call_accepts_legacy_dotted_and_dashed_names() {
 
     // Unknown names still fail — normalization is not a wildcard.
     let req = make_tool_call(11, "leindex.nonexistent", serde_json::json!({}));
-    assert!(handle_tool_call(&state, &handlers, &req).await.is_err());
+    let response = handle_tool_call(&state, &handlers, &req)
+        .await
+        .expect("an unknown tool is reported as content, not a transport error");
+    assert_eq!(response["isError"], true);
 }
 
 /// edit-apply must return the moment the edit is durable: the incremental

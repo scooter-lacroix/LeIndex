@@ -11,6 +11,7 @@ pub use super::diagnostics_handler::DiagnosticsHandler;
 pub use super::edit_apply_handler::EditApplyHandler;
 pub use super::edit_preview_handler::EditPreviewHandler;
 pub use super::file_summary_handler::FileSummaryHandler;
+pub use super::git_diff_handler::GitDiffHandler;
 pub use super::git_status_handler::GitStatusHandler;
 pub use super::grep_symbols_handler::GrepSymbolsHandler;
 pub use super::impact_analysis_handler::ImpactAnalysisHandler;
@@ -73,6 +74,8 @@ dispatch_handler! {
     ReadFile            => ReadFileHandler,
     /// Handler for git status
     GitStatus           => GitStatusHandler,
+    /// Handler for PDG-enriched git diff
+    GitDiff             => GitDiffHandler,
 }
 
 #[cfg(test)]

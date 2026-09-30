@@ -27,6 +27,8 @@ pub mod lock;
 /// Dispatch macro for `ToolHandler` enum and match-arm generation.
 #[macro_use]
 pub mod macros;
+/// Grouped four-tool public surface (`action`-selected sub-tools).
+pub mod grouped;
 /// Request handlers for MCP tools.
 pub mod handlers;
 /// Shared helpers for MCP request processing.
@@ -37,6 +39,8 @@ pub mod output;
 pub mod protocol;
 /// Request budgets, timing metadata, and causal-path counters.
 pub mod request_meta;
+/// Response detail tiers (`l0` identity card, `l1` overview, `l2` full detail).
+pub mod tier;
 
 /// Handler for LeIndex [Context] — PDG-based context expansion.
 pub mod context_handler;
@@ -52,6 +56,8 @@ pub mod edit_cache;
 pub mod edit_preview_handler;
 /// Handler for LeIndex [File Summary] — structured file analysis.
 pub mod file_summary_handler;
+/// Handler for LeIndex [Git Diff] — PDG-enriched diff.
+pub mod git_diff_handler;
 /// Handler for LeIndex [Git Status] — PDG-aware git status.
 pub mod git_status_handler;
 /// Handler for LeIndex [Grep Symbols] — structurally-aware symbol search.

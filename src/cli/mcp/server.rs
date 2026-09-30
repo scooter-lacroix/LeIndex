@@ -998,11 +998,33 @@ async fn handle_tool_call_timed(
     // the same handler: several MCP client implementations mishandle dots in
     // tool names, and this dispatch was previously the one place that
     // bypassed the shared normalizer (so legacy configs keep working).
-    let canonical_name = crate::cli::mcp::output::normalize_tool_name(&tool_call.name);
-    let handler = handlers
+    //
+    // The four public tools (`leindex_index|search|analyze|edit`) select their
+    // underlying handler with `action`; resolve that first so rendering and
+    // trimming below are keyed by the real tool.
+    let (resolved_name, mut resolved_args) =
+        match crate::cli::mcp::grouped::resolve_call(&tool_call.name, tool_call.arguments) {
+            Ok(resolved) => resolved,
+            Err(error) => return Ok(tool_error_result(&error, None)),
+        };
+    let tier = match crate::cli::mcp::tier::Tier::take_from(&mut resolved_args) {
+        Ok(tier) => tier,
+        Err(error) => return Ok(tool_error_result(&error, None)),
+    };
+    let canonical_name = crate::cli::mcp::output::normalize_tool_name(&resolved_name);
+    let tool_call = super::protocol::ToolCallParams {
+        name: resolved_name,
+        arguments: resolved_args,
+    };
+    let Some(handler) = handlers
         .iter()
         .find(|h| crate::cli::mcp::output::normalize_tool_name(h.name()) == canonical_name)
-        .ok_or_else(|| JsonRpcError::method_not_found(tool_call.name.clone()))?;
+    else {
+        return Ok(tool_error_result(
+            &crate::cli::mcp::grouped::suggest_unknown_tool(&tool_call.name),
+            None,
+        ));
+    };
 
     // Clone arguments before moving them into execute (we need them
     // for render_tool_output_plain which needs the original args).
@@ -1046,14 +1068,27 @@ async fn handle_tool_call_timed(
             // The CLI surface uses `render_tool_output` (colored); the
             // MCP transport uses the same render functions but without
             // ANSI codes so the LLM sees clean text.
-            let rendered =
-                crate::cli::mcp::output::render_tool_output_plain(&call_name, &trimmed, &call_args);
-            let is_substantive = rendered.trim().lines().count() > 1 || rendered.trim().len() > 80;
-            let payload = if is_substantive {
-                rendered
-            } else {
-                serde_json::to_string_pretty(&trimmed)
-                    .unwrap_or_else(|_| "Error serializing result".to_string())
+            let payload = match tier {
+                // Identity card: a few lines regardless of result size.
+                crate::cli::mcp::tier::Tier::L0 => {
+                    crate::cli::mcp::tier::identity_card(&call_name, &trimmed)
+                }
+                // Full detail: the complete, untrimmed handler result.
+                crate::cli::mcp::tier::Tier::L2 => serde_json::to_string_pretty(&value)
+                    .unwrap_or_else(|_| "Error serializing result".to_string()),
+                crate::cli::mcp::tier::Tier::L1 => {
+                    let rendered = crate::cli::mcp::output::render_tool_output_plain(
+                        &call_name, &trimmed, &call_args,
+                    );
+                    let is_substantive =
+                        rendered.trim().lines().count() > 1 || rendered.trim().len() > 80;
+                    if is_substantive {
+                        rendered
+                    } else {
+                        serde_json::to_string_pretty(&trimmed)
+                            .unwrap_or_else(|_| "Error serializing result".to_string())
+                    }
+                }
             };
             Ok(serde_json::json!({
                 "content": [
@@ -1073,7 +1108,7 @@ async fn handle_tool_call_timed(
                 "content": [
                     {
                         "type": "text",
-                        "text": format!("Error: {}", e)
+                        "text": format!("Error: {}", e.message_with_hint())
                     }
                 ],
                 "isError": true,
@@ -1083,20 +1118,30 @@ async fn handle_tool_call_timed(
     }
 }
 
-/// List tools as JSON
-pub fn list_tools_json(handlers: &[ToolHandler]) -> Value {
-    let tools: Vec<_> = handlers
-        .iter()
-        .map(|handler| {
-            serde_json::json!({
-                "name": handler.name(),
-                "description": handler.description(),
-                "inputSchema": handler.argument_schema()
-            })
-        })
-        .collect();
+/// A tool-level failure as MCP content (`isError: true`), with the remediation
+/// hint inlined: models read `content`, not JSON-RPC `error.data`.
+fn tool_error_result(
+    error: &JsonRpcError,
+    timings: Option<&super::request_meta::PhaseTimings>,
+) -> Value {
+    let mut result = serde_json::json!({
+        "content": [{ "type": "text", "text": format!("Error: {}", error.message_with_hint()) }],
+        "isError": true,
+    });
+    if let Some(timings) = timings {
+        result["_meta"] = serde_json::json!({ "timings": timings });
+    }
+    result
+}
 
-    serde_json::json!({ "tools": tools })
+/// List the public tool surface as JSON.
+///
+/// Four grouped tools are advertised (`leindex_index`, `leindex_search`,
+/// `leindex_analyze`, `leindex_edit`), each selecting its operation with an
+/// `action` argument. The individual per-operation tools remain callable by
+/// name; set `LEINDEX_MCP_LEGACY_TOOLS=1` to advertise them too.
+pub fn list_tools_json(handlers: &[ToolHandler]) -> Value {
+    serde_json::json!({ "tools": crate::cli::mcp::grouped::public_tools_json(handlers) })
 }
 
 /// List tools handler

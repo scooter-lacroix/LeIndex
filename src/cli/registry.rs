@@ -64,6 +64,26 @@ pub const STALE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// reindex on the next call after the window elapses.
 pub const INDEX_ATTEMPT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Environment variable overriding how long a tool call waits for a cold
+/// first-use index before continuing in the background (milliseconds).
+pub const AUTO_INDEX_WAIT_ENV: &str = "LEINDEX_AUTO_INDEX_WAIT_MS";
+
+/// Default wait for a cold first-use index inside a tool call.
+///
+/// Small projects finish inside the window and the call returns real
+/// results; larger ones hand back immediately with the index still building
+/// (see [`ProjectRegistry::get_or_create`]) instead of stalling the client.
+pub const DEFAULT_AUTO_INDEX_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Resolve the bounded cold-index wait (`0` = do not wait at all).
+pub fn auto_index_wait() -> std::time::Duration {
+    std::env::var(AUTO_INDEX_WAIT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(DEFAULT_AUTO_INDEX_WAIT)
+}
+
 /// Environment variable that explicitly enables the file-watcher auto-reindex.
 ///
 /// Default is OFF because the recursive watcher is the single largest source
@@ -507,7 +527,7 @@ impl ProjectRegistry {
                     project = %canonical.display(),
                     "Skipping auto-index within cooldown after a recent failure"
                 );
-            } else if let Err(error) = self.index_handle(&handle, false).await {
+            } else if let Err(error) = self.auto_index(&handle, &canonical).await {
                 warn!(
                     project = %canonical.display(),
                     "Auto-index failed; serving project without a fresh index: {error}"
@@ -534,6 +554,48 @@ impl ProjectRegistry {
         }
 
         Ok(handle)
+    }
+
+    /// First-use indexing for a tool call on an unindexed project.
+    ///
+    /// One-shot processes (the CLI) index inline: the process exits with the
+    /// response, so there is nothing to keep responsive. A long-lived MCP
+    /// server must never hold a request open for a whole cold index — clients
+    /// time out, and on the stdio transport everything queued behind it
+    /// stalls. It starts (or coalesces with) the owned, detached index job and
+    /// waits at most [`auto_index_wait`]; on timeout the job keeps running in
+    /// the background and the call proceeds against whatever is resident, so
+    /// index-dependent tools answer "not indexed / indexing in progress"
+    /// immediately and the next call sees the finished index.
+    async fn auto_index(
+        self: &Arc<Self>,
+        handle: &ProjectHandle,
+        canonical: &Path,
+    ) -> Result<(), JsonRpcError> {
+        if self.is_one_shot() {
+            return self.index_handle(handle, false).await.map(|_| ());
+        }
+        let path_string = canonical.to_string_lossy().into_owned();
+        let job = self.start_index_job(Some(&path_string), false, true);
+        match tokio::time::timeout(auto_index_wait(), job).await {
+            Ok(Ok(snapshot)) if snapshot.status == JobStatus::Failed => {
+                Err(JsonRpcError::indexing_failed(
+                    snapshot
+                        .last_error
+                        .unwrap_or_else(|| "background index job failed".to_string()),
+                ))
+            }
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
+                info!(
+                    project = %canonical.display(),
+                    wait_ms = auto_index_wait().as_millis() as u64,
+                    "Cold index still running; continuing in the background"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Trigger a lightweight incremental index refresh in the background if one

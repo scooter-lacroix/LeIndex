@@ -353,18 +353,23 @@ pub enum Commands {
 /// Subcommands for inspecting and executing MCP tools from the CLI.
 #[derive(Subcommand, Debug)]
 pub enum ToolCommands {
-    /// List every MCP/CLI tool name and description
-    List,
+    /// List the MCP tools (the four routers and their branches)
+    List {
+        /// Include descriptions and a one-line summary per branch
+        #[arg(long)]
+        verbose: bool,
+    },
 
     /// Show comprehensive help for a tool
-    Help {
-        /// Tool name (for example: leindex_project_map, project_map, or project-map)
+    #[command(alias = "help")]
+    Inspect {
+        /// Tool name (for example: leindex_explore, explore, or leindex-explore)
         name: String,
     },
 
-    /// Print the JSON argument schema for a tool
+    /// Print the JSON argument schema for a tool (routers print their oneOf form)
     Schema {
-        /// Tool name (for example: leindex_project_map, project_map, or project-map)
+        /// Tool name (for example: leindex_explore, explore, or leindex-explore)
         name: String,
     },
 
@@ -2080,7 +2085,7 @@ mod tests {
         let cli = Cli::try_parse_from(["leindex", "tools", "help", "project_map"]).unwrap();
         match cli.command {
             Some(Commands::Tools {
-                command: ToolCommands::Help { name },
+                command: ToolCommands::Inspect { name },
             }) => assert_eq!(name, "project_map"),
             _ => panic!("Expected tools help command"),
         }

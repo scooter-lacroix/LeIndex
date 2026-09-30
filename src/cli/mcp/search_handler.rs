@@ -274,6 +274,15 @@ to auto-switch/auto-index projects."
 
         let scope = resolve_scope(&args, guard.project_path())?;
 
+        // Project handles hydrate lazily (graph-only tools never build the
+        // TF-IDF engine), so a cold MCP session reaches here with an empty
+        // engine even for an indexed project. The one-shot CLI pre-loads
+        // everything, which is why `leindex search` worked while the MCP
+        // tool reported "Project not indexed".
+        guard.ensure_analysis_context_loaded().map_err(|e| {
+            JsonRpcError::indexing_failed(format!("Failed to load search context: {e}"))
+        })?;
+
         if guard.search_engine().is_empty() {
             return Err(JsonRpcError::project_not_indexed(
                 guard.project_path().display().to_string(),

@@ -397,7 +397,7 @@ impl JsonRpcError {
             "Project not indexed — call LeIndex [Index] or pass project_path to auto-index",
             serde_json::json!({
                 "project": project,
-                "suggestion": "Pass project_path to any tool to auto-index on first use, or call LeIndex [Index] explicitly.",
+                "suggestion": "Pass project_path to any tool to auto-index on first use, or call LeIndex [Index] explicitly. If a first-use index is already building in the background, retry shortly; LeIndex [Index] reports its progress without starting a second job.",
                 "error_type": "project_not_indexed"
             }),
         )
@@ -522,6 +522,27 @@ impl JsonRpcError {
 impl std::fmt::Display for JsonRpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "[{}] {}", self.code, self.message)
+    }
+}
+
+impl JsonRpcError {
+    /// The remediation hint carried in `data.suggestion`, if any.
+    pub fn suggestion(&self) -> Option<&str> {
+        self.data
+            .as_ref()
+            .and_then(|data| data.get("suggestion"))
+            .and_then(Value::as_str)
+    }
+
+    /// Message plus remediation hint, for text an LLM reads (tool errors are
+    /// returned as content, where `data.suggestion` would otherwise be lost).
+    pub fn message_with_hint(&self) -> String {
+        match self.suggestion() {
+            Some(hint) if !self.message.contains(hint) => {
+                format!("{}\nHint: {hint}", self.message)
+            }
+            _ => self.message.clone(),
+        }
     }
 }
 
