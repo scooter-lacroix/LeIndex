@@ -848,11 +848,36 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
     Ok(pdg)
 }
 
+/// Hasher for the dense integer row ids of `intel_nodes`. Row ids are trusted
+/// local integers, so SipHash's DoS resistance buys nothing: every loaded edge
+/// probes this map twice (~275k probes on a mid-size project).
+#[derive(Default, Clone, Copy)]
+struct RowIdHasher(u64);
+
+impl std::hash::Hasher for RowIdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 =
+                (self.0.rotate_left(5) ^ u64::from(byte)).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+
+    fn write_i64(&mut self, value: i64) {
+        self.0 = (value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 32)
+    }
+}
+
+type RowIdMap = HashMap<i64, NodeId, std::hash::BuildHasherDefault<RowIdHasher>>;
+
 fn load_nodes(
     storage: &Storage,
     project_id: &str,
     pdg: &mut ProgramDependenceGraph,
-) -> Result<HashMap<i64, NodeId>> {
+) -> Result<RowIdMap> {
     // Only the columns a graph node needs: `qualified_name`, `content_hash`,
     // `embedding` and `embedding_format` are not part of a `PDGNode`, and rows
     // are streamed straight into the graph rather than collected first.
@@ -861,7 +886,7 @@ fn load_nodes(
          FROM intel_nodes WHERE project_id = ?1",
     )?;
     let mut rows = nodes_stmt.query(params![project_id])?;
-    let mut db_id_to_node_id = HashMap::new();
+    let mut db_id_to_node_id = RowIdMap::default();
     // One `Arc<str>` per file, shared by all of its nodes.
     let mut files: HashMap<String, Arc<str>> = HashMap::new();
 
@@ -923,7 +948,7 @@ fn load_edges(
     storage: &Storage,
     project_id: &str,
     pdg: &mut ProgramDependenceGraph,
-    db_id_to_node_id: &HashMap<i64, NodeId>,
+    db_id_to_node_id: &RowIdMap,
 ) -> Result<()> {
     // No join against `intel_nodes`: `db_id_to_node_id` already holds exactly
     // this project's nodes, so an edge belongs to the project iff both

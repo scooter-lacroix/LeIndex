@@ -340,13 +340,23 @@ pub fn pdg_from_segment(segment: &PdgSegment) -> ProgramDependenceGraph {
     let mut node_ids: HashMap<String, petgraph::stable_graph::NodeIndex> =
         HashMap::with_capacity(segment.nodes.len());
 
+    // Nodes of one file share a single path allocation.
+    let mut file_paths: HashMap<&str, std::sync::Arc<str>> = HashMap::new();
     for record in &segment.nodes {
         let node_type = node_type_from_str(&record.node_type).unwrap_or(PDGNodeType::External);
+        let file_path = match file_paths.get(record.file_path.as_str()) {
+            Some(shared) => std::sync::Arc::clone(shared),
+            None => {
+                let shared: std::sync::Arc<str> = std::sync::Arc::from(record.file_path.as_str());
+                file_paths.insert(record.file_path.as_str(), std::sync::Arc::clone(&shared));
+                shared
+            }
+        };
         let node = PDGNode {
             id: record.id.clone(),
             node_type,
             name: record.name.clone(),
-            file_path: std::sync::Arc::from(record.file_path.clone()),
+            file_path,
             byte_range: (record.byte_start, record.byte_end),
             complexity: record.complexity,
             language: record.language.clone(),

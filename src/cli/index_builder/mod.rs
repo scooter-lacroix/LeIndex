@@ -276,7 +276,6 @@ pub(crate) fn enriched_node_content(
     connectivity_config: &crate::graph::pdg::TraversalConfig,
     file_summary_ctx: &FileSummaryContext,
 ) -> String {
-    let content = String::from_utf8_lossy(file_bytes);
     let mut enrichment = format!(
         "// type:{} lang:{}",
         match node.node_type {
@@ -334,8 +333,11 @@ pub(crate) fn enriched_node_content(
         );
     }
 
-    if !content.is_empty() && node.byte_range.1 > node.byte_range.0 {
-        let content_bytes = content.as_bytes();
+    // Slice the raw bytes (byte ranges refer to the file as written) and decode
+    // only the snippet. Decoding the whole file for every node was quadratic in
+    // the number of symbols per file.
+    if !file_bytes.is_empty() && node.byte_range.1 > node.byte_range.0 {
+        let content_bytes = file_bytes;
         let start = node.byte_range.0.min(content_bytes.len());
         let end = node.byte_range.1.min(content_bytes.len());
         if start < end {
