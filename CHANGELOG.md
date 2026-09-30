@@ -99,6 +99,20 @@ was lost; everything below is on `v2.0.0` and covered by tests.
   with admission and hoisting applied in node order (identical output); the text
   index builds beside the neural phase. Forced index of this repository
   14.2 s → 6.7 s.
+- Storage: superseded generations were never removed unless someone ran
+  `leindex retention --gc`, so every index left another full copy behind (this
+  repository: 13 generations + 460 MB of job scratch = 2.5 GB for 20 MB of
+  source). A successful index now keeps the current generation and its rollback
+  predecessor and caps completed job artifacts: 2.5 GB → ~550 MB, and it stays
+  there.
+- One-shot CLI: `leindex tools run` no longer loads the whole graph and search
+  engine up front. Each tool loads what it needs, like the MCP server:
+  `find` 420 ms → 19 ms, `read_file` → 18 ms, graph tools ~230 ms, search/deep
+  ~400 ms (they need the engine).
+- Indexing: file-summary enrichment no longer UTF-8-validates the whole file for
+  every symbol (quadratic in symbols per file); a full rebuild adopts the built
+  graph instead of re-inserting it into an empty one; nodes of a file share one
+  path allocation; the persisted-graph loader probes row ids with a cheap hasher.
 - Agent skill: `integrations/skills/leindex-toolkit` is now
   `integrations/skills/leindex-code-intelligence`, rewritten for the four tools;
   the Claude Code hook, `MCP_COMPATIBILITY.md`, `docs/CLI.md`, `docs/AGENT_GUIDANCE.md`
