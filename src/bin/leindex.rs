@@ -75,6 +75,24 @@ fn main() -> anyhow::Result<()> {
         // Without the onnx feature the worker does not exist; a stray token
         // falls through to clap's unknown-argument error.
     }
+    // Stdio MCP launches go through the user's daemon when one is available.
+    // This runs before the async runtime, the config loader and the CLI parser
+    // exist: the shim is a couple of threads copying bytes, and it must be
+    // ready to answer the client within a millisecond or two.
+    #[cfg(all(feature = "daemon-client", unix))]
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if let Some(project) = leindex::cli::daemon::client::eligible_project(&args) {
+            match leindex::cli::daemon::client::run(project) {
+                leindex::cli::daemon::client::Outcome::Done(status) => {
+                    std::process::exit(status);
+                }
+                leindex::cli::daemon::client::Outcome::Fallback(reason) => {
+                    eprintln!("leindex: running standalone ({reason})");
+                }
+            }
+        }
+    }
     let rt = build_runtime();
     rt.block_on(cli::main())
 }

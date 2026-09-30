@@ -175,7 +175,7 @@ pub fn write_endpoint_sidecar(run_dir: &Path, endpoint: &DaemonEndpoint) -> io::
 /// Read and parse the sidecar file. Returns `Ok(None)` if the file does not
 /// exist. Malformed JSON is treated as "no endpoint" so the caller wins by
 /// default (idempotent recovery from a half-written sidecar left by a crash).
-fn read_sidecar(path: &Path) -> io::Result<Option<DaemonEndpoint>> {
+pub fn read_sidecar(path: &Path) -> io::Result<Option<DaemonEndpoint>> {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<DaemonEndpoint>(&bytes) {
             Ok(ep) => Ok(Some(ep)),

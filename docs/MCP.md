@@ -49,6 +49,47 @@ leindex mcp --stdio
 
 This reads JSON-RPC from stdin and writes responses to stdout, with logs to stderr.
 
+### Process model: one daemon, many tiny shims
+
+`leindex mcp` does not normally run a server. It is a **shim**: a few
+milliseconds of synchronous code (no async runtime, no config load) that connects
+to the per-user `leindexd` and copies bytes both ways. Ten editors on the same
+machine therefore share **one** loaded graph and search engine per project
+instead of holding ten copies (about 150 MB each on a 700-file repository).
+
+```
+editor ──stdio──▶ leindex mcp (shim, ~2 MB) ──┐
+editor ──stdio──▶ leindex mcp (shim)          ├─▶ $LEINDEX_HOME/run/leindexd.sock ─▶ leindexd
+editor ──stdio──▶ leindex mcp (shim)          ┘   (one per user; lazy; idle-exits)
+```
+
+- **Start-up.** The first shim starts `leindexd` detached (`setsid`); any number
+  of shims may race to do so. `leindexd` holds an exclusive `flock` on
+  `run/leindexd.lock` for its whole life, so exactly one wins and the kernel
+  releases the lock however the daemon dies (no stale-pid heuristics).
+- **Preamble.** Each connection opens with one hello line (`{"leindex_hello":…}`)
+  carrying the client's working directory; the daemon answers with one ack line.
+  Both are consumed by the shim/daemon pair; the MCP client never sees them and
+  the rest of the stream is byte-transparent.
+- **Default project.** The daemon starts warming the client's project graph and
+  search engine the moment it connects, and fills in `project_path` for tool
+  calls that omit it — exactly what the inline server's default project did.
+  A client started in `/` or your home directory gets no default.
+- **Concurrency.** Tool calls on a connection run concurrently (up to 64), so a
+  slow index never queues `ping` or the next call; responses keep the framing
+  (newline or `Content-Length`) of the request. Idle connections are never
+  dropped.
+- **Lifetime.** The daemon exits after `--idle-timeout-secs` (default 900) with
+  **no client attached**; an attached editor keeps it alive however quiet it is.
+  Idle project engines are still evicted after `[mcp] engine_max_idle_secs`.
+- **Upgrades.** A daemon whose version, wire version, or binary is older than
+  the shim's is replaced when nothing else is attached; if other editors are
+  attached the new shim runs a standalone server for that session instead.
+- **Fallback.** No `leindexd` next to `leindex`, a spawn failure, or
+  `LEINDEX_FEATURE_DAEMON_CLIENT=0` run the ordinary inline server, with the
+  reason on stderr. `LEINDEXD_BIN` points the shim at a daemon binary elsewhere.
+- **Security.** `run/` is mode 0700: only your user can connect.
+
 ### Server Lifecycle (idle exit & engine eviction)
 
 Long-lived MCP servers can accumulate resident memory — each loaded project engine

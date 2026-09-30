@@ -9,10 +9,15 @@
 //! helpers that pull in tokio/UnixStream dependencies are feature-flagged under
 //! `daemon-client` in later tasks.
 
+/// Synchronous, `std`-only stdio shim used by `leindex mcp` (wire v2).
+#[cfg(all(feature = "daemon-client", unix))]
+pub mod client;
 /// Daemon endpoint discovery + liveness checking.
 pub mod endpoint;
 /// Protocol-version handshake (spec §12.1).
 pub mod handshake;
+/// Connection preamble (hello/ack) between shim and daemon, wire v2.
+pub mod proto;
 /// Stdio shim forwarder: connects to `leindexd` and byte-faithfully proxies
 /// MCP/JSON-RPC frames between stdin/stdout and the daemon Unix socket
 /// (spec §4.1).

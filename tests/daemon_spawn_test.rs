@@ -84,6 +84,12 @@ async fn test_spawn_helper_launches_daemon_and_waits_for_socket() {
     // The endpoint sidecar should now be readable. The daemon writes it to
     // $LEINDEX_HOME/run/daemon.endpoint.
     let sidecar = dir.path().join("run").join("daemon.endpoint");
+    // The daemon publishes the sidecar right after it binds the socket, so the
+    // two appear a moment apart: wait for the second instead of racing it.
+    let sidecar_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !sidecar.exists() && std::time::Instant::now() < sidecar_deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert!(
         sidecar.exists(),
         "endpoint sidecar must exist after daemon binds"

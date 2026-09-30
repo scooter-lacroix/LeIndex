@@ -27,8 +27,9 @@
 mod imp {
     use std::path::PathBuf;
 
+    use leindex::cli::daemon::client::{LOCK_NAME, SOCKET_NAME};
     use leindex::cli::daemon::endpoint::{
-        DaemonEndpoint, ENDPOINT_SIDECAR, StartupOutcome, resolve_endpoint, write_endpoint_sidecar,
+        DaemonEndpoint, ENDPOINT_SIDECAR, read_sidecar, write_endpoint_sidecar,
     };
     use leindex::cli::daemon::handshake::DAEMON_PROTOCOL_VERSION;
     use leindex::cli::mcp::server::{McpServer, McpServerConfig, ProcessIdleClock};
@@ -44,9 +45,9 @@ mod imp {
     /// Default Tokio worker thread count (spec §8.1 containment).
     const DEFAULT_TOKIO_WORKERS: usize = 2;
 
-    /// Default idle timeout in seconds (5 minutes). Overridable via
+    /// Default idle timeout in seconds (15 minutes with no client attached). Overridable via
     /// `--idle-timeout-secs`.
-    const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+    const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
 
     fn configured_worker_count() -> usize {
         std::env::var(TOKIO_WORKERS_ENV)
@@ -82,6 +83,24 @@ mod imp {
         None
     }
 
+    /// Take the daemon's exclusive lock. The returned file must stay alive for
+    /// the daemon's lifetime.
+    fn acquire_daemon_lock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        // SAFETY: `flock` on a descriptor we own; no memory is touched.
+        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if locked == 0 {
+            Ok(file)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
     fn init_logging() {
         let subscriber = tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
@@ -99,16 +118,6 @@ mod imp {
 
         let args: Vec<String> = std::env::args().skip(1).collect();
 
-        // Parse --socket <path> (required)
-        let socket_path: PathBuf = parse_arg_value(&args, "--socket")
-            .map(|(v, _)| PathBuf::from(v))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "missing required --socket <path> argument\n\
-                 Usage: leindexd --socket <path> [--idle-timeout-secs <n>]"
-                )
-            })?;
-
         // Parse --idle-timeout-secs <n> (optional, default 300 = 5 min)
         let idle_timeout_secs: u64 = parse_arg_value(&args, "--idle-timeout-secs")
             .map(|(v, _)| v.parse::<u64>().unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS))
@@ -118,22 +127,34 @@ mod imp {
         let run_dir = leindex::config::resolve_leindex_home()
             .ok_or_else(|| anyhow::anyhow!("cannot resolve LeIndex home directory"))?
             .join("run");
-
-        // Ensure the run directory exists so the sidecar and socket live there.
         std::fs::create_dir_all(&run_dir)?;
 
-        // Hard startup lock: refuse to run if a live daemon already exists.
-        let outcome = resolve_endpoint(&run_dir, DAEMON_PROTOCOL_VERSION)?;
-        match outcome {
-            StartupOutcome::Connect(ep) => {
-                anyhow::bail!(
-                    "daemon already live at {} (pid {}); refusing second instance",
-                    ep.socket_path.display(),
-                    ep.pid
-                );
+        // The socket defaults to the well-known path the shim connects to.
+        let socket_path: PathBuf = parse_arg_value(&args, "--socket")
+            .map(|(v, _)| PathBuf::from(v))
+            .unwrap_or_else(|| run_dir.join(SOCKET_NAME));
+
+        // Single winner: an exclusive advisory lock held for the daemon's whole
+        // life. The kernel drops it when the process dies, however it dies, so
+        // there is no stale-lock heuristic (pid reuse, start times) to get
+        // wrong, and any number of shims may race to start a daemon.
+        let _lock = match acquire_daemon_lock(&run_dir.join(LOCK_NAME)) {
+            Ok(lock) => lock,
+            Err(_) => {
+                let holder = read_sidecar(&run_dir.join(ENDPOINT_SIDECAR)).ok().flatten();
+                match holder {
+                    Some(ep) => anyhow::bail!(
+                        "daemon already live at {} (pid {}); refusing second instance",
+                        ep.socket_path.display(),
+                        ep.pid
+                    ),
+                    None => anyhow::bail!(
+                        "daemon already live (lock {} is held); refusing second instance",
+                        run_dir.join(LOCK_NAME).display()
+                    ),
+                }
             }
-            StartupOutcome::Won(_) => { /* proceed — this process won */ }
-        }
+        };
 
         info!(
             "leindexd starting; socket={}, idle_timeout_secs={}",
@@ -180,14 +201,22 @@ mod imp {
                 }
             };
 
-            server
-                .run_socket(
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            tokio::select! {
+                served = server.run_socket(
                     &socket_path,
                     ProcessIdleClock::new(),
                     idle_timeout,
                     Some(&post_bind),
-                )
-                .await
+                ) => served,
+                _ = terminate.recv() => {
+                    // A replacement daemon or the user asked us to stop.
+                    info!("leindexd received SIGTERM; exiting");
+                    let _ = std::fs::remove_file(&socket_path);
+                    Ok(())
+                }
+            }
         })
     }
 }

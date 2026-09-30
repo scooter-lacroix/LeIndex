@@ -90,6 +90,8 @@ fn test_daemon_serves_initialize_over_socket() {
     let socket = dir.path().join("d.sock");
 
     let mut child = std::process::Command::new(leindexd_bin())
+        // Each daemon takes an exclusive per-home lock; tests run in parallel.
+        .env("LEINDEX_HOME", dir.path())
         .arg("--socket")
         .arg(&socket)
         .arg("--idle-timeout-secs")
@@ -145,6 +147,8 @@ fn test_daemon_rss_flat_at_startup() {
     let socket = dir.path().join("d2.sock");
 
     let mut child = std::process::Command::new(leindexd_bin())
+        // Each daemon takes an exclusive per-home lock; tests run in parallel.
+        .env("LEINDEX_HOME", dir.path())
         .arg("--socket")
         .arg(&socket)
         .arg("--idle-timeout-secs")
@@ -202,6 +206,8 @@ fn test_daemon_idle_exit() {
 
     let start = Instant::now();
     let mut child = std::process::Command::new(leindexd_bin())
+        // Each daemon takes an exclusive per-home lock; tests run in parallel.
+        .env("LEINDEX_HOME", dir.path())
         .arg("--socket")
         .arg(&socket)
         .arg("--idle-timeout-secs")

@@ -32,20 +32,6 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
 
-#[cfg(unix)]
-const SOCKET_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-#[cfg(unix)]
-const INITIAL_SOCKET_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
-#[cfg(unix)]
-fn socket_read_timeout(first_frame: bool) -> std::time::Duration {
-    if first_frame {
-        INITIAL_SOCKET_READ_TIMEOUT
-    } else {
-        SOCKET_READ_TIMEOUT
-    }
-}
-
 /// Global server state — multi-project registry.
 ///
 /// Replaces the old `Arc<Mutex<LeIndex>>` singleton. Multiple projects can
@@ -1335,6 +1321,10 @@ impl McpServer {
             socket_path.display()
         );
 
+        if let Some(registry) = SERVER_STATE.get() {
+            registry.disable_default_prewarm();
+        }
+
         // Post-bind callback: the daemon writes its endpoint sidecar here so
         // clients discover it only after the socket is actually live.
         if let Some(cb) = post_bind {
@@ -1384,7 +1374,10 @@ impl McpServer {
                     }
                 }
                 _ = idle_ticker.tick() => {
-                    if idle_exit_due(idle_clock.idle_duration(), idle_timeout) {
+                    // Attached clients keep the daemon alive however quiet they are.
+                    if daemon_conn::attached_clients().load(Ordering::Acquire) == 0
+                        && idle_exit_due(idle_clock.idle_duration(), idle_timeout)
+                    {
                         info!(
                             "MCP socket server idle for {idle_timeout:?}; exiting (D-1 memory-pressure idle exit)"
                         );
@@ -1435,143 +1428,6 @@ async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 #[cfg(unix)]
-#[derive(Debug)]
-enum SocketFrame {
-    Message {
-        payload: String,
-        content_length: bool,
-    },
-    Error {
-        response: String,
-        content_length: bool,
-    },
-}
-
-#[cfg(unix)]
-async fn read_socket_frame<R>(
-    reader: &mut R,
-    session_id: &str,
-    first_frame: bool,
-) -> Option<SocketFrame>
-where
-    R: tokio::io::AsyncBufRead + tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-    const MAX_LINE_LENGTH: usize = 10_240;
-    const MAX_PAYLOAD_SIZE: usize = 10_485_760;
-    let line_timeout = socket_read_timeout(first_frame);
-
-    let line = match tokio::time::timeout(line_timeout, read_bounded_line(reader, MAX_PAYLOAD_SIZE))
-        .await
-    {
-        Ok(Ok(Some(line))) => line,
-        Ok(Ok(None)) => return None,
-        Ok(Err(error)) => {
-            debug!(
-                "Socket read error / line too long (session {}): {}",
-                session_id, error
-            );
-            let error_response = JsonRpcResponse::error(
-                serde_json::Value::Null,
-                JsonRpcError::new(-32600, "request payload exceeds maximum size"),
-            );
-            return serde_json::to_string(&error_response).ok().map(|response| {
-                SocketFrame::Error {
-                    response,
-                    content_length: false,
-                }
-            });
-        }
-        Err(_) => {
-            debug!("Socket read timed out (session {})", session_id);
-            return None;
-        }
-    };
-
-    let line_trim = line.trim_end();
-    if line_trim.is_empty() {
-        return Some(SocketFrame::Message {
-            payload: String::new(),
-            content_length: false,
-        });
-    }
-    if !line_trim
-        .to_ascii_lowercase()
-        .starts_with("content-length:")
-    {
-        return Some(SocketFrame::Message {
-            payload: line_trim.to_string(),
-            content_length: false,
-        });
-    }
-
-    let len_str = line_trim.split(':').nth(1).unwrap_or("").trim();
-    let length = match len_str.parse::<usize>() {
-        Ok(length) => length,
-        Err(error) => {
-            debug!("Invalid Content-Length header: {}", error);
-            let response = JsonRpcResponse::error(
-                serde_json::Value::Null,
-                JsonRpcError::new(-32600, "invalid Content-Length header"),
-            );
-            return serde_json::to_string(&response)
-                .ok()
-                .map(|response| SocketFrame::Error {
-                    response,
-                    content_length: false,
-                });
-        }
-    };
-    if length > MAX_PAYLOAD_SIZE {
-        debug!(
-            "Payload too large (session {}): {} bytes",
-            session_id, length
-        );
-        let response = JsonRpcResponse::error(
-            serde_json::Value::Null,
-            JsonRpcError::new(-32600, "request payload exceeds maximum size"),
-        );
-        return serde_json::to_string(&response)
-            .ok()
-            .map(|response| SocketFrame::Error {
-                response,
-                content_length: true,
-            });
-    }
-
-    loop {
-        let header = match tokio::time::timeout(
-            SOCKET_READ_TIMEOUT,
-            read_bounded_line(reader, MAX_LINE_LENGTH),
-        )
-        .await
-        {
-            Ok(Ok(Some(header))) => header,
-            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return None,
-        };
-        if header.trim().is_empty() {
-            break;
-        }
-    }
-
-    let mut buffer = vec![0u8; length];
-    match tokio::time::timeout(SOCKET_READ_TIMEOUT, reader.read_exact(&mut buffer)).await {
-        Ok(Ok(_)) => Some(SocketFrame::Message {
-            payload: String::from_utf8_lossy(&buffer).into_owned(),
-            content_length: true,
-        }),
-        Ok(Err(error)) => {
-            debug!("Failed to read JSON payload: {}", error);
-            None
-        }
-        Err(_) => {
-            debug!("Socket payload read timed out (session {})", session_id);
-            None
-        }
-    }
-}
-
-#[cfg(unix)]
 async fn write_socket_frame<W>(writer: &mut W, response: &str, content_length: bool) -> bool
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -1593,53 +1449,14 @@ async fn handle_socket_connection(
     handshake_complete: Arc<AtomicBool>,
     idle_clock: ProcessIdleClock,
 ) {
-    use tokio::io::BufReader;
-
-    debug!("Accepted Unix socket connection (session: {})", session_id);
-    idle_clock.touch();
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-
-    let mut first_frame = true;
-    loop {
-        let Some(frame) = read_socket_frame(&mut reader, &session_id, first_frame).await else {
-            break;
-        };
-        first_frame = false;
-        let (json_payload, content_length) = match frame {
-            SocketFrame::Message {
-                payload,
-                content_length,
-            } => (payload, content_length),
-            SocketFrame::Error {
-                response,
-                content_length,
-            } => {
-                let _ = write_socket_frame(&mut writer, &response, content_length).await;
-                break;
-            }
-        };
-        if json_payload.is_empty() {
-            continue;
-        }
-        idle_clock.touch();
-        let Some(response) = handle_socket_message(
-            &json_payload,
-            &session_id,
-            &session_handshakes,
-            &handshake_complete,
-        )
-        .await
-        else {
-            continue;
-        };
-        if !write_socket_frame(&mut writer, &response, content_length).await {
-            break;
-        }
-    }
-
-    session_handshakes.remove(session_id.as_str());
-    debug!("Socket connection closed (session: {})", session_id);
+    daemon_conn::serve(
+        stream,
+        session_id,
+        session_handshakes,
+        handshake_complete,
+        idle_clock,
+    )
+    .await;
 }
 
 /// Handle a single JSON-RPC message received over a Unix socket connection.
@@ -1795,6 +1612,10 @@ mod tests;
 
 #[path = "prompts_resources.rs"]
 mod prompts_resources;
+
+#[cfg(unix)]
+#[path = "daemon_conn.rs"]
+mod daemon_conn;
 pub use prompts_resources::{
     Prompt, PromptArgument, PromptContent, PromptMessage, Resource, ResourceContent, get_prompt,
     get_prompts, get_resource, get_resources, handle_prompt_get, handle_resource_read,

@@ -639,17 +639,3 @@ async fn test_bind_with_fallback_port_zero_skips_fallback_loop() {
     // The IP is preserved through the fast path.
     assert_eq!(bound.ip(), preferred.ip());
 }
-
-#[cfg(unix)]
-#[test]
-fn test_socket_timeout_contract_distinguishes_initial_and_subsequent_frames() {
-    assert_eq!(
-        socket_read_timeout(true),
-        std::time::Duration::from_secs(120)
-    );
-    assert_eq!(
-        socket_read_timeout(false),
-        std::time::Duration::from_secs(30)
-    );
-    assert!(socket_read_timeout(true) > socket_read_timeout(false));
-}

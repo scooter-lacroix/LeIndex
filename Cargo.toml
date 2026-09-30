@@ -80,6 +80,7 @@ full = [
     "bounded-scheduler",
     "community",
     "precision",
+    "daemon-client",
 ]
 
 # Minimal feature set (parsing and search only)
@@ -281,11 +282,10 @@ remote-embeddings = ["search", "onnx", "dep:reqwest", "dep:async-trait"]
 # VAL-MEASURE-027: memprof is excluded from CI gating.
 memprof = ["dep:tikv-jemallocator"]
 
-# Daemon-client: enables the stdio shim that forwards MCP frames to `leindexd`
-# instead of running the full inline server. When this feature is OFF (default),
-# `leindex mcp --stdio` runs the legacy inline server identical to v1.9.x.
-# When ON, the shim discovers or spawns the daemon and forwards byte-faithfully
-# (spec §4.1, §12.3 rollout phase 3).
+# Daemon-client: enables the stdio shim that serves `leindex mcp` through the
+# user's `leindexd` (one shared index for every editor) instead of running a
+# full inline server per session. On by default; turn it off at run time with
+# LEINDEX_FEATURE_DAEMON_CLIENT=0. Any failure falls back to the inline server.
 daemon-client = ["dep:which"]
 
 [dependencies]

@@ -332,6 +332,8 @@ pub struct ProjectRegistry {
     prewarm_started: std::sync::atomic::AtomicBool,
     /// Single-flight latches for off-lock hydration, one per project.
     hydration_flights: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
+    /// Projects a `spawn_prewarm_at` is currently warming.
+    prewarming: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
 }
 
 impl ProjectRegistry {
@@ -352,6 +354,7 @@ impl ProjectRegistry {
             one_shot: std::sync::atomic::AtomicBool::new(false),
             prewarm_started: std::sync::atomic::AtomicBool::new(false),
             hydration_flights: Mutex::new(HashMap::new()),
+            prewarming: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -384,12 +387,33 @@ impl ProjectRegistry {
     /// been indexed is left alone. One-shot processes skip it entirely.
     pub fn spawn_prewarm(self: &Arc<Self>) {
         use std::sync::atomic::Ordering;
+        if self.is_one_shot() || self.prewarm_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.spawn_prewarm_at(None);
+    }
+
+    /// Stop `initialize` from warming the process's default project. A daemon
+    /// serves many clients whose projects it learns from their hello, so
+    /// warming whatever directory it happened to be started in would only cost
+    /// memory.
+    pub fn disable_default_prewarm(&self) {
+        self.prewarm_started
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Warm a specific project (the daemon calls this with each client's
+    /// working directory as soon as it connects). `None` means the default
+    /// project. Calls for a project already being warmed are dropped, and a
+    /// project that is already resident returns immediately, so repeated
+    /// connections cost nothing.
+    pub fn spawn_prewarm_at(self: &Arc<Self>, target: Option<PathBuf>) {
         // Initialize handlers can be reached from synchronous code (and tests)
         // with no runtime; pre-warming is an optimization, so skip quietly.
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        if self.is_one_shot() || self.prewarm_started.swap(true, Ordering::AcqRel) {
+        if self.is_one_shot() {
             return;
         }
         let mode = crate::config::LeIndexConfig::load_cached()
@@ -401,36 +425,57 @@ impl ProjectRegistry {
             "graph" => false,
             _ => true,
         };
+        if let Some(path) = &target {
+            let mut in_flight = self
+                .prewarming
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !in_flight.insert(path.clone()) {
+                return;
+            }
+        }
         let registry = Arc::clone(self);
         runtime.spawn(async move {
-            let Ok(path) = registry.default_project_path().await else {
-                return;
-            };
-            let has_index = crate::cli::live_project::LiveProject::resolve(&path.to_string_lossy())
-                .is_ok_and(|live| live.active_storage().join("leindex.db").is_file());
-            if !has_index {
-                debug!(project = %path.display(), "Prewarm skipped: project is not indexed");
-                return;
+            let requested = target
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned());
+            registry.prewarm_project(requested.as_deref(), full).await;
+            if let Some(path) = &target {
+                registry
+                    .prewarming
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(path);
             }
-            let started = std::time::Instant::now();
-            if !registry.ensure_hydrated(None, Hydration::Graph).await {
-                debug!("Prewarm: graph load did not complete");
-                return;
-            }
-            let graph_ms = started.elapsed().as_millis() as u64;
-            if !full {
-                info!(project = %path.display(), graph_ms, "Prewarmed project graph");
-                return;
-            }
-            let engine_ok = registry.ensure_hydrated(None, Hydration::Full).await;
-            info!(
-                project = %path.display(),
-                graph_ms,
-                total_ms = started.elapsed().as_millis() as u64,
-                engine_ok,
-                "Prewarmed project graph and search engine"
-            );
         });
+    }
+
+    async fn prewarm_project(self: &Arc<Self>, requested: Option<&str>, full: bool) {
+        let Ok(path) = self.resolve_path(requested).await else {
+            return;
+        };
+        let has_index = crate::cli::live_project::LiveProject::resolve(&path.to_string_lossy())
+            .is_ok_and(|live| live.active_storage().join("leindex.db").is_file());
+        if !has_index {
+            debug!(project = %path.display(), "Prewarm skipped: project is not indexed");
+            return;
+        }
+        let started = std::time::Instant::now();
+        // Full loads the graph and the engine together (the engine restore
+        // runs beside the graph read), which beats graph-then-engine.
+        let level = if full {
+            Hydration::Full
+        } else {
+            Hydration::Graph
+        };
+        let ok = self.ensure_hydrated(requested, level).await;
+        info!(
+            project = %path.display(),
+            total_ms = started.elapsed().as_millis() as u64,
+            ok,
+            full,
+            "Prewarmed project"
+        );
     }
 
     /// Make sure `level` of the project is resident, without holding the
@@ -564,6 +609,7 @@ impl ProjectRegistry {
             one_shot: std::sync::atomic::AtomicBool::new(false),
             prewarm_started: std::sync::atomic::AtomicBool::new(false),
             hydration_flights: Mutex::new(HashMap::new()),
+            prewarming: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
