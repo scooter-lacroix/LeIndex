@@ -69,6 +69,38 @@ pub fn find_node_by_id<'tree>(
     None
 }
 
+thread_local! {
+    static LITE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard that switches the current thread into signature-only extraction.
+///
+/// While alive, parser leaf helpers that compute data callers of
+/// [`CodeIntelligence::get_signatures_lite`] never read (call lists, flow
+/// facts, docstrings, imports, complexity) return empty values. The flag is
+/// thread-local, so rayon closures must create their own guard.
+pub struct LiteGuard(());
+
+impl LiteGuard {
+    /// Enter signature-only extraction on the current thread.
+    pub fn enter() -> Self {
+        LITE_DEPTH.with(|d| d.set(d.get() + 1));
+        LiteGuard(())
+    }
+}
+
+impl Drop for LiteGuard {
+    fn drop(&mut self) {
+        LITE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// True when the current thread is inside a [`LiteGuard`] scope.
+#[inline]
+pub fn lite() -> bool {
+    LITE_DEPTH.with(|d| d.get() > 0)
+}
+
 /// Compute cyclomatic-complexity metrics for a node and its descendants.
 ///
 /// The skeleton (nesting depth, line floor, token/child count, recursion) is
@@ -337,6 +369,23 @@ pub trait CodeIntelligence {
         // Default implementation delegates to get_signatures
         // Implementations should override this to provide pooling benefits
         self.get_signatures(source)
+    }
+
+    /// Extract only the signature header fields (`name`, `qualified_name`,
+    /// `parameters`, `return_type`, `visibility`, `is_async`, `is_method`,
+    /// `byte_range`).
+    ///
+    /// `calls`, `flow_facts`, `docstring`, `imports` and `cyclomatic_complexity`
+    /// are left empty. Header fields are identical to the full extraction, so
+    /// correctness never depends on a parser opting in: the default enters a
+    /// [`LiteGuard`] and delegates to [`Self::get_signatures_with_parser`].
+    fn get_signatures_lite(
+        &self,
+        source: &[u8],
+        parser: &mut tree_sitter::Parser,
+    ) -> Result<Vec<SignatureInfo>> {
+        let _guard = LiteGuard::enter();
+        self.get_signatures_with_parser(source, parser)
     }
 
     /// Compute control flow graph for a node

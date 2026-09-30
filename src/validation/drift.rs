@@ -3,11 +3,23 @@
 use crate::edit::{EditType, ResolvedEditChange};
 use crate::graph::ProgramDependenceGraph;
 use crate::graph::pdg::NodeType;
+use crate::parse::go::GoParser;
+use crate::parse::java::JavaParser;
+use crate::parse::javascript::{JavaScriptParser, TypeScriptParser};
+use crate::parse::python::PythonParser;
+use crate::parse::rust::RustParser;
 use crate::parse::traits::{CodeIntelligence, SignatureInfo};
 use crate::validation::Location;
 use crate::validation::ValidationError;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Upper bound on memoised signature lists; the cache is cleared when full.
+const SIGNATURE_CACHE_CAP: usize = 256;
+
+static SIGNATURE_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<[u8; 32], Arc<Vec<SignatureInfo>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Type of semantic drift detected
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,68 +243,84 @@ impl SemanticDriftAnalyzer {
         Ok(drift_items)
     }
 
-    /// Extract signatures from content
+    /// Extract signatures from content, memoised by (language, content hash).
+    ///
+    /// The original file does not change between successive previews of the
+    /// same edit, so repeat calls skip the parse entirely. Lite extraction is a
+    /// pure function of `(language, bytes)`, which makes the key sound.
     fn extract_signatures(
         &self,
         change: &ResolvedEditChange,
         content: &str,
-    ) -> Result<Vec<SignatureInfo>, ValidationError> {
+    ) -> Result<Arc<Vec<SignatureInfo>>, ValidationError> {
         if content.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Arc::new(Vec::new()));
         }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(change.infer_language().as_bytes());
+        hasher.update(&[0]);
+        hasher.update(content.as_bytes());
+        let key: [u8; 32] = *hasher.finalize().as_bytes();
 
+        if let Some(hit) = SIGNATURE_CACHE
+            .lock()
+            .ok()
+            .and_then(|c| c.get(&key).cloned())
+        {
+            return Ok(hit);
+        }
+        let sigs = Arc::new(self.extract_signatures_uncached(change, content)?);
+        if let Ok(mut cache) = SIGNATURE_CACHE.lock() {
+            if cache.len() >= SIGNATURE_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(key, Arc::clone(&sigs));
+        }
+        Ok(sigs)
+    }
+
+    fn extract_signatures_uncached(
+        &self,
+        change: &ResolvedEditChange,
+        content: &str,
+    ) -> Result<Vec<SignatureInfo>, ValidationError> {
         let lang = change.infer_language();
         let source = content.as_bytes();
+        let mut ts_parser = tree_sitter::Parser::new();
 
-        // Get the appropriate parser for this language
-        match lang {
-            "python" => {
-                use crate::parse::python::PythonParser;
-                let parser = PythonParser::new();
-                parser
-                    .get_signatures(source)
-                    .map_err(|e| ValidationError::Parse(format!("Failed to parse Python: {}", e)))
-            }
-            "javascript" => {
-                use crate::parse::javascript::JavaScriptParser;
-                let parser = JavaScriptParser::new();
-                parser.get_signatures(source).map_err(|e| {
-                    ValidationError::Parse(format!("Failed to parse JavaScript: {}", e))
-                })
-            }
-            "typescript" => {
-                use crate::parse::javascript::TypeScriptParser;
-                let parser = TypeScriptParser::new();
-                parser.get_signatures(source).map_err(|e| {
-                    ValidationError::Parse(format!("Failed to parse TypeScript: {}", e))
-                })
-            }
-            "rust" => {
-                use crate::parse::rust::RustParser;
-                let parser = RustParser::new();
-                parser
-                    .get_signatures(source)
-                    .map_err(|e| ValidationError::Parse(format!("Failed to parse Rust: {}", e)))
-            }
-            "go" => {
-                use crate::parse::go::GoParser;
-                let parser = GoParser::new();
-                parser
-                    .get_signatures(source)
-                    .map_err(|e| ValidationError::Parse(format!("Failed to parse Go: {}", e)))
-            }
-            "java" => {
-                use crate::parse::java::JavaParser;
-                let parser = JavaParser::new();
-                parser
-                    .get_signatures(source)
-                    .map_err(|e| ValidationError::Parse(format!("Failed to parse Java: {}", e)))
-            }
-            _ => {
-                // For unsupported languages, return empty
-                Ok(Vec::new())
-            }
-        }
+        // Drift reads only header fields, so use signature-only extraction
+        // (no calls, flow facts, docstrings, imports or complexity). The
+        // lite flag is thread-local and `get_signatures_lite` sets it on the
+        // calling thread, which is the rayon worker running this closure.
+        let (label, result) = match lang {
+            "python" => (
+                "Python",
+                PythonParser::new().get_signatures_lite(source, &mut ts_parser),
+            ),
+            "javascript" => (
+                "JavaScript",
+                JavaScriptParser::new().get_signatures_lite(source, &mut ts_parser),
+            ),
+            "typescript" => (
+                "TypeScript",
+                TypeScriptParser::new().get_signatures_lite(source, &mut ts_parser),
+            ),
+            "rust" => (
+                "Rust",
+                RustParser::new().get_signatures_lite(source, &mut ts_parser),
+            ),
+            "go" => (
+                "Go",
+                GoParser::new().get_signatures_lite(source, &mut ts_parser),
+            ),
+            "java" => (
+                "Java",
+                JavaParser::new().get_signatures_lite(source, &mut ts_parser),
+            ),
+            // For unsupported languages, return empty
+            _ => return Ok(Vec::new()),
+        };
+        result.map_err(|e| ValidationError::Parse(format!("Failed to parse {}: {}", label, e)))
     }
 
     /// Compare signatures to detect drift
@@ -336,6 +364,7 @@ impl SemanticDriftAnalyzer {
                     new_sig.parameters.len() == old_sig.parameters.len()
                         && new_sig.return_type == old_sig.return_type
                         && new_sig.is_method == old_sig.is_method
+                        && new_sig.is_async == old_sig.is_async
                 });
                 match pair_index {
                     Some(idx) => {
@@ -420,6 +449,17 @@ impl SemanticDriftAnalyzer {
                 location,
                 &format!("{:?}", original.visibility),
                 &format!("{:?}", new.visibility),
+            )));
+        }
+
+        // Check for async changes: sync <-> async changes how callers must
+        // invoke the symbol, so it is a real signature change.
+        if original.is_async != new.is_async {
+            return Ok(Some(DriftItem::signature_changed(
+                new.name.clone(),
+                location,
+                if original.is_async { "async" } else { "sync" },
+                if new.is_async { "async" } else { "sync" },
             )));
         }
 
@@ -719,5 +759,57 @@ mod rename_pairing_tests {
                 .iter()
                 .any(|item| item.drift_type == DriftType::Removed)
         );
+    }
+}
+
+#[cfg(test)]
+mod async_drift_tests {
+    use super::*;
+    use crate::edit::ResolvedEditChange;
+    use std::path::PathBuf;
+
+    fn drift(path: &str, original: &str, new: &str) -> Vec<DriftItem> {
+        let analyzer =
+            SemanticDriftAnalyzer::new(std::sync::Arc::new(ProgramDependenceGraph::new()));
+        let change =
+            ResolvedEditChange::new(PathBuf::from(path), original.to_string(), new.to_string());
+        analyzer.analyze_semantic_drift(&[change]).unwrap()
+    }
+
+    #[test]
+    fn test_sync_to_async_is_signature_drift() {
+        let items = drift(
+            "fixture.rs",
+            "pub fn load(x: u32) -> u32 {\n    x\n}\n",
+            "pub async fn load(x: u32) -> u32 {\n    x\n}\n",
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| i.symbol_name == "load" && i.drift_type == DriftType::SignatureChanged),
+            "sync -> async must be reported as SignatureChanged, got {:?}",
+            items.iter().map(|i| &i.drift_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_async_to_sync_is_signature_drift_python() {
+        let items = drift(
+            "fixture.py",
+            "async def load(x):\n    return x\n",
+            "def load(x):\n    return x\n",
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| i.symbol_name == "load" && i.drift_type == DriftType::SignatureChanged),
+            "async -> sync must be reported as SignatureChanged"
+        );
+    }
+
+    #[test]
+    fn test_unchanged_async_reports_no_drift() {
+        let src = "pub async fn load(x: u32) -> u32 {\n    x\n}\n";
+        assert!(drift("fixture.rs", src, src).is_empty());
     }
 }

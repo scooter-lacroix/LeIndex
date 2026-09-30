@@ -152,6 +152,9 @@ fn calculate_complexity(
 }
 
 fn extract_bash_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut imports = Vec::new();
 
     fn add_import(imports: &mut Vec<ImportInfo>, path: &str) {
@@ -198,6 +201,9 @@ fn extract_bash_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Impor
 }
 
 fn extract_bash_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut calls = Vec::new();
 
     fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {
@@ -230,6 +236,9 @@ fn extract_bash_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
 }
 
 fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let prev_sibling = node.prev_sibling();
     if let Some(sibling) = prev_sibling {
         if sibling.kind() == "comment" {

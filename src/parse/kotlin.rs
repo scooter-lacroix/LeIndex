@@ -103,6 +103,9 @@ impl CodeIntelligence for KotlinParser {
 
 #[cfg(feature = "parse")]
 fn extract_kotlin_imports(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut imports = Vec::new();
     if node.kind() == "import_list" {
         for child in node.children(&mut node.walk()) {

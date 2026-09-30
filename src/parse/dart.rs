@@ -103,6 +103,9 @@ impl CodeIntelligence for DartParser {
 
 #[cfg(feature = "parse")]
 fn extract_dart_imports(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut imports = Vec::new();
     if node.kind() == "import_declaration" {
         let text = node.utf8_text(source).unwrap_or("");

@@ -182,6 +182,9 @@ impl CodeIntelligence for GoParser {
 }
 
 fn extract_go_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut imports = Vec::new();
 
     fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
@@ -329,6 +332,9 @@ fn extract_method_signature(
 
 /// Extract function calls from a Go node
 fn extract_go_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut calls = Vec::new();
 
     fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {
@@ -440,6 +446,9 @@ fn extract_go_parameters(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<Par
 
 /// Extract docstring from a node
 fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     // Look for comment before the node
     let prev_sibling = node.prev_sibling();
 

@@ -221,6 +221,9 @@ fn extract_function_signature(
 }
 
 fn extract_c_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut imports = Vec::new();
 
     fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
@@ -261,6 +264,9 @@ fn extract_c_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportIn
 }
 
 fn extract_c_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut calls = Vec::new();
 
     let mut stack = vec![*node];
@@ -286,6 +292,9 @@ fn extract_c_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
 }
 
 fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let prev_sibling = node.prev_sibling();
     if let Some(sibling) = prev_sibling {
         if sibling.kind() == "comment" {

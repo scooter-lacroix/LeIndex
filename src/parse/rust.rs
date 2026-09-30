@@ -39,9 +39,11 @@ impl RustParser {
                 "function_item" => {
                     if let Some(mut sig) = extract_function_signature(&node, source, &parent_path) {
                         // Extract and populate cyclomatic complexity
-                        let body_node = node.child_by_field_name("body").unwrap_or(node);
-                        let complexity_metrics = self.extract_complexity(&body_node);
-                        sig.cyclomatic_complexity = complexity_metrics.cyclomatic.max(1) as u32;
+                        if !crate::parse::traits::lite() {
+                            let body_node = node.child_by_field_name("body").unwrap_or(node);
+                            let complexity_metrics = self.extract_complexity(&body_node);
+                            sig.cyclomatic_complexity = complexity_metrics.cyclomatic.max(1) as u32;
+                        }
                         signatures.push(sig);
                     }
                     // Don't recurse into function bodies.
@@ -216,9 +218,11 @@ impl RustParser {
             // Every function declared in an impl belongs to the implementing type,
             // including associated functions that have no `self` parameter.
             sig.is_method = true;
-            let body_node = node.child_by_field_name("body").unwrap_or(*node);
-            let complexity_metrics = self.extract_complexity(&body_node);
-            sig.cyclomatic_complexity = complexity_metrics.cyclomatic.max(1) as u32;
+            if !crate::parse::traits::lite() {
+                let body_node = node.child_by_field_name("body").unwrap_or(*node);
+                let complexity_metrics = self.extract_complexity(&body_node);
+                sig.cyclomatic_complexity = complexity_metrics.cyclomatic.max(1) as u32;
+            }
             signatures.push(sig);
         }
     }
@@ -371,6 +375,9 @@ impl CodeIntelligence for RustParser {
 
 /// Extract imports from a Rust file
 fn extract_rust_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut imports = Vec::new();
 
     fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
@@ -503,6 +510,9 @@ fn extract_function_signature(
 /// call arguments, returns, common state verbs, and command-builder channels.
 /// It does not attempt alias analysis, macro expansion, or type inference.
 fn extract_rust_flow_facts(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<FlowFact> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut facts = Vec::new();
     let mut stack = vec![*node];
 
@@ -569,6 +579,9 @@ fn extract_rust_call_flow_facts(
     source: &[u8],
     facts: &mut Vec<FlowFact>,
 ) {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let callee = node
         .child_by_field_name("function")
         .and_then(|name| name.utf8_text(source).ok())
@@ -676,6 +689,9 @@ fn extract_rust_method_flow_facts(
     source: &[u8],
     facts: &mut Vec<FlowFact>,
 ) {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let method = node
         .child_by_field_name("method")
         .or_else(|| node.child_by_field_name("name"))
@@ -757,6 +773,9 @@ fn extract_rust_let_flow_facts(
     source: &[u8],
     facts: &mut Vec<FlowFact>,
 ) {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let pattern = node
         .child_by_field_name("pattern")
         .and_then(|pattern| pattern.utf8_text(source).ok())
@@ -856,6 +875,9 @@ fn chained_method_name(callee: &str) -> Option<&str> {
 
 /// Extract function calls from a Rust node
 fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut calls = Vec::new();
 
     fn clean_call_text(raw: &str) -> String {
@@ -1082,6 +1104,9 @@ fn extract_rust_parameters(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<P
 
 /// Extract docstring from a node
 fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     // Look for doc comments before the node
     let prev_sibling = node.prev_sibling();
 

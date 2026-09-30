@@ -104,6 +104,10 @@ pub mod prelude;
 #[cfg(test)]
 mod tests;
 
+/// Equivalence tests between full and signature-only (lite) extraction.
+#[cfg(test)]
+mod lite_test;
+
 /// Library initialization.
 pub fn init() {
     // Initialize logging if not already set up
