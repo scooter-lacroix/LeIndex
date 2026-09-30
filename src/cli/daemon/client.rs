@@ -65,11 +65,8 @@ pub fn eligible_project(args: &[String]) -> Option<Option<PathBuf>> {
             "--stdio" => {}
             "--project" | "-p" => project = Some(PathBuf::from(iter.next()?)),
             other => {
-                if let Some(value) = other.strip_prefix("--project=") {
-                    project = Some(PathBuf::from(value));
-                } else {
-                    return None;
-                }
+                let value = other.strip_prefix("--project=")?;
+                project = Some(PathBuf::from(value));
             }
         }
     }

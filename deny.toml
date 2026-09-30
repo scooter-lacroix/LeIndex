@@ -19,7 +19,6 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102.8 via opt-in libsql/turso feature (not in default build); bump libsql to resolve" },
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102.8 via opt-in libsql/turso feature (not in default build); bump libsql to resolve" },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102.8 via opt-in libsql/turso feature (not in default build); bump libsql to resolve" },
-    { id = "RUSTSEC-2026-0185", reason = "quinn-proto via opt-in libsql/turso feature -> tonic (not in default build); bump libsql to resolve" },
 ]
 # Parity with prior cargo-audit behavior: unmaintained crates (bincode,
 # number_prefix, paste, rustls-pemfile) are reported but do not fail the gate.
