@@ -34,6 +34,38 @@ impl LeIndex {
         let _ = crate::cli::index_freshness::save_health(self.storage_path(), &health);
     }
 
+    /// Acknowledge a scan that proved the indexed content still matches the
+    /// working tree ("no changes detected").
+    ///
+    /// The fast freshness check (`is_stale_fast`) compares the current git tree
+    /// and the mtimes of source directories against what was recorded when the
+    /// index was last written. A no-op scan writes nothing, so a commit that
+    /// only touched non-indexed files, or a new non-indexed file in a source
+    /// directory, would leave both comparisons failing permanently and make
+    /// every request re-launch the scan. This records the present tree/HEAD in
+    /// the health snapshot and advances the `leindex.db` reference time to when
+    /// the scan began (changes made after that still count as stale).
+    pub(super) fn record_clean_scan(&self, scanned_at: std::time::SystemTime) {
+        if let Some(mut health) = crate::cli::index_freshness::load_health(self.storage_path()) {
+            if let Some(tree_oid) = git_tree_oid(&self.project_path) {
+                if health.tree_oid.as_deref() != Some(tree_oid.as_str()) {
+                    health.tree_oid = Some(tree_oid);
+                    if let Some(head_oid) = crate::cli::git::status(&self.project_path)
+                        .ok()
+                        .and_then(|status| status.head_oid)
+                    {
+                        health.head_oid = Some(head_oid);
+                    }
+                    let _ = crate::cli::index_freshness::save_health(self.storage_path(), &health);
+                }
+            }
+        }
+        let db = self.storage_path().join("leindex.db");
+        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&db) {
+            let _ = file.set_modified(scanned_at);
+        }
+    }
+
     pub(crate) fn incremental_reindex_from_watcher(&mut self) -> Result<super::super::IndexStats> {
         // NOTE: the cross-process write lock is acquired by the WATCHER
         // (non-blocking, skip-on-busy) before calling this fn — see

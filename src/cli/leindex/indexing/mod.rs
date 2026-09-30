@@ -46,6 +46,9 @@ pub(crate) mod streaming;
 pub(crate) struct IndexPipelineState {
     pub(crate) force: bool,
     pub(crate) start_time: Instant,
+    /// Wall-clock instant the run began (before the scan). A no-op run
+    /// acknowledges only filesystem changes made before it.
+    pub(crate) started_at: std::time::SystemTime,
     pub(crate) job: JobPaths,
     pub(crate) checkpoint_store: Option<CheckpointStore>,
     pub(crate) indexed_files: HashMap<String, String>,
@@ -106,6 +109,7 @@ impl IndexPipelineState {
         Self {
             force,
             start_time,
+            started_at: std::time::SystemTime::now(),
             job,
             checkpoint_store: None,
             indexed_files: HashMap::new(),
@@ -749,6 +753,12 @@ impl LeIndex {
         {
             info!("No changes detected, skipping indexing");
             self.mark_index_phase(super::IndexPhase::Complete, super::ComponentStatus::Fresh);
+            // Content is current, but HEAD may have moved or a directory may
+            // have changed (a commit or new file that touches nothing indexed).
+            // Acknowledge that, otherwise the freshness check keeps reporting
+            // drift and re-launches this scan in the background after every
+            // request, forever.
+            self.record_clean_scan(state.started_at);
             state.skip = true;
             let result = ParseCheckpoint {
                 scan_hash: scan.input_hash.clone(),
