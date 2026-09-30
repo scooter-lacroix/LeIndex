@@ -5,6 +5,8 @@
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
+/// Engram: persistent, content-addressed phrase-book of query embeddings.
+pub mod engram;
 /// Hierarchical Navigable Small World (HNSW) implementation for vector search.
 pub mod hnsw;
 /// INT8 Quantization system.

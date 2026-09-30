@@ -241,6 +241,7 @@ fn trim_diagnostics(data: &Value) -> Value {
         "execution_provider": data.get("execution_provider"),
         "freshness": data.get("freshness"),
         "system_health": data.get("system_health"),
+        "engram": data.get("engram"),
         "issues": data.get("issues"),
     })
 }

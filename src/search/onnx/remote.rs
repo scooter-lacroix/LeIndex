@@ -393,6 +393,9 @@ impl RemoteEmbeddingProvider for CohereEmbeddingProvider {
 #[derive(Clone)]
 pub struct GenericRemoteProvider {
     provider: Arc<dyn RemoteEmbeddingProvider>,
+    /// Stable embedder identity (provider, model, endpoint, dimension). Never
+    /// contains credentials.
+    identity: String,
 }
 
 impl std::fmt::Debug for GenericRemoteProvider {
@@ -406,6 +409,15 @@ impl std::fmt::Debug for GenericRemoteProvider {
 impl GenericRemoteProvider {
     /// Create a remote provider from configuration
     pub fn from_config(config: RemoteEmbeddingConfig) -> Result<Self, RemoteEmbeddingError> {
+        let (kind, model) = match &config.provider {
+            RemoteProvider::OpenAI { model } => ("openai", model.as_str()),
+            RemoteProvider::Cohere { model } => ("cohere", model.as_str()),
+            RemoteProvider::Custom { endpoint } => ("custom", endpoint.as_str()),
+        };
+        let identity_prefix = format!(
+            "remote|{kind}|{model}|{}",
+            config.base_url.as_deref().unwrap_or("")
+        );
         let provider: Arc<dyn RemoteEmbeddingProvider> = match &config.provider {
             RemoteProvider::OpenAI { .. } => Arc::new(OpenAIEmbeddingProvider::new(config)?),
             RemoteProvider::Cohere { .. } => Arc::new(CohereEmbeddingProvider::new(config)?),
@@ -416,7 +428,13 @@ impl GenericRemoteProvider {
             }
         };
 
-        Ok(Self { provider })
+        let identity = format!("{identity_prefix}|{}", provider.dimension());
+        Ok(Self { provider, identity })
+    }
+
+    /// Stable identity of this provider for embedding caches (no secrets).
+    pub fn identity(&self) -> &str {
+        &self.identity
     }
 }
 
@@ -445,6 +463,27 @@ mod tests {
             model: "text-embedding-3-small".to_string(),
         };
         assert_eq!(provider.default_dimension(), 1536);
+    }
+
+    #[test]
+    fn test_remote_identity_names_model_and_never_leaks_credentials() {
+        let secret = "sk-super-secret-value";
+        let config = RemoteEmbeddingConfig::openai(secret.to_string(), None);
+        let provider = GenericRemoteProvider::from_config(config).unwrap();
+        let identity = provider.identity();
+        assert!(identity.starts_with("remote|openai|text-embedding-3-small|"));
+        assert!(identity.ends_with(&format!("|{}", provider.dimension())));
+        assert!(!identity.contains(secret));
+
+        let other = GenericRemoteProvider::from_config(RemoteEmbeddingConfig {
+            provider: RemoteProvider::OpenAI {
+                model: "text-embedding-3-large".to_string(),
+            },
+            api_key: Some(secret.to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_ne!(identity, other.identity());
     }
 
     #[test]

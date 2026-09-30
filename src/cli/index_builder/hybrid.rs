@@ -216,6 +216,19 @@ impl HybridEmbedder {
         }
     }
 
+    /// Identity of the neural embedder for the Engram query phrase-book, or
+    /// `None` when there is no neural embedder or its identity cannot be
+    /// established (the phrase-book is then bypassed, never guessed).
+    pub fn engram_identity(&self) -> Option<String> {
+        match self {
+            Self::TfIdfOnly(_) => None,
+            #[cfg(feature = "onnx")]
+            Self::HybridLocal { neural, .. } => neural.engram_identity(NEURAL_EMBEDDING_DIMENSION),
+            #[cfg(feature = "remote-embeddings")]
+            Self::HybridRemote { remote, .. } => Some(remote.identity().to_string()),
+        }
+    }
+
     /// Get the neural weight for scoring
     pub fn neural_weight(&self) -> f32 {
         match self {

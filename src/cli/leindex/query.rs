@@ -761,8 +761,28 @@ impl LeIndex {
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
     pub fn generate_query_neural_embedding(&self, query: &str) -> Option<Vec<f32>> {
         let emb = self.embedder.as_ref()?;
+        // Engram phrase-book: a repeat query is answered from the persistent
+        // table without waking the embedder (no worker spawn, no model
+        // digest, no network). Only real embedder output is ever stored.
+        let engram = crate::search::engram::Engram::global().and_then(|engram| {
+            let dim = emb.neural_dimension()?;
+            let identity = emb.engram_identity()?;
+            Some((engram, identity, dim))
+        });
+        if let Some((engram, identity, dim)) = &engram {
+            if let Some(hit) = engram.get(identity, query, *dim) {
+                return Some(hit);
+            }
+        }
         match emb.embed_neural_blocking(query) {
-            Some(Ok(embedding)) => Some(embedding),
+            Some(Ok(embedding)) => {
+                if let Some((engram, identity, dim)) = &engram {
+                    if embedding.len() == *dim {
+                        engram.put(identity, query, &embedding);
+                    }
+                }
+                Some(embedding)
+            }
             Some(Err(error)) => {
                 debug!("Neural query embedding failed ({error}); using TF-IDF fallback");
                 None

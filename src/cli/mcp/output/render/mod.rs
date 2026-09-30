@@ -578,6 +578,21 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
     if let Some(v) = data.get("embedding_model").and_then(|v| v.as_str()) {
         out.push_str(&field("Embedding model", v, color));
     }
+    if let Some(engram) = data.get("engram") {
+        let enabled = engram.get("enabled").and_then(|v| v.as_bool()) == Some(true);
+        let summary = if enabled {
+            let count = |key: &str| engram.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+            format!(
+                "on ({} hits / {} misses, {} entries)",
+                count("hits"),
+                count("misses"),
+                count("entries")
+            )
+        } else {
+            "off (LEINDEX_FEATURE_ENGRAM=1 to enable)".to_string()
+        };
+        out.push_str(&field("Engram", &summary, color));
+    }
     if let Some(enabled) = data.get("precision_enabled").and_then(|v| v.as_bool()) {
         let status = if enabled { "enabled" } else { "disabled" };
         out.push_str(&field("SCIP precision", status, color));

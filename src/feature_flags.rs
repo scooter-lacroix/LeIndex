@@ -114,6 +114,11 @@ pub enum FeatureFlag {
     /// the legacy FP16 Qwen3 + reranker baseline. Default OFF — legacy
     /// behavior (FP16 Qwen3) stays active until WS12 rollout phase.
     ValidatedModel,
+    /// Engram: a persistent, content-addressed phrase-book of neural query
+    /// embeddings (`~/.leindex/engram/`). Repeat queries skip the embedder
+    /// entirely (no worker spawn, no model digest, no network round trip).
+    /// New capability: defaults OFF until enabled per deployment.
+    Engram,
 }
 
 impl FeatureFlag {
@@ -140,6 +145,7 @@ impl FeatureFlag {
             Self::PrecisionIngest => "LEINDEX_FEATURE_PRECISION_INGEST",
             Self::DebugEscapeHatch => "LEINDEX_FEATURE_EMBED_CACHE_DEBUG",
             Self::ValidatedModel => "LEINDEX_FEATURE_VALIDATED_MODEL",
+            Self::Engram => "LEINDEX_FEATURE_ENGRAM",
         }
     }
 
@@ -267,6 +273,9 @@ impl FeatureFlag {
             Self::ValidatedModel => {
                 "Use WS11 validated model profile (CodeRankEmbed-INT8, no reranker)"
             }
+            Self::Engram => {
+                "Engram: persistent phrase-book of neural query embeddings (repeat queries skip the embedder)"
+            }
         }
     }
 }
@@ -361,6 +370,7 @@ impl FlagStore {
             FeatureFlag::ValidatedModel,
             FeatureFlag::CommunityDetection,
             FeatureFlag::PrecisionIngest,
+            FeatureFlag::Engram,
         ] {
             let enabled = match env::var(flag.env_var()) {
                 Ok(v) => matches!(
@@ -517,9 +527,11 @@ pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
         FeatureFlag::StreamingTfidf,
         FeatureFlag::StreamingNeural,
         FeatureFlag::GlobalEmbedCache,
+        FeatureFlag::CommunityDetection,
         FeatureFlag::PrecisionIngest,
         FeatureFlag::DebugEscapeHatch,
         FeatureFlag::ValidatedModel,
+        FeatureFlag::Engram,
     ]
     .into_iter()
     .map(|f| (f, f.is_enabled()))
@@ -549,6 +561,19 @@ mod test {
         // normal config) rather than gating a not-yet-released capability.
         assert!(FeatureFlag::NeuralSearch.default_value());
         assert!(FeatureFlag::StreamingMcp.default_value());
+    }
+
+    #[test]
+    fn test_engram_is_opt_in_and_listed() {
+        // New capabilities default OFF (AGENTS.md progressive rollout).
+        assert!(!FeatureFlag::Engram.default_value());
+        assert_eq!(FeatureFlag::Engram.env_var(), "LEINDEX_FEATURE_ENGRAM");
+        assert!(all_flags().iter().any(|(f, _)| *f == FeatureFlag::Engram));
+        assert!(
+            all_flags()
+                .iter()
+                .any(|(f, _)| *f == FeatureFlag::CommunityDetection)
+        );
     }
 
     #[test]

@@ -1368,6 +1368,36 @@ impl EmbeddingClient {
         }
     }
 
+    /// Cheap, sound identity of the configured neural embedder for the Engram
+    /// query phrase-book: model name, dimension and the size + modification
+    /// time of the exact model and tokenizer files the worker would load
+    /// (two `stat`s, no hashing). Any change to those files yields a different
+    /// identity, so stale vectors are never served. `None` when the model
+    /// cannot be resolved, in which case callers bypass the phrase-book.
+    pub(crate) fn engram_identity(&self, expected_dim: usize) -> Option<String> {
+        let model = std::env::var("LEINDEX_WORKER_MODEL")
+            .ok()
+            .or_else(|| self.cached_config().model_name.clone())?;
+        let model_path = crate::embed::model_path::ModelResolver::resolve(&model).ok()?;
+        let tokenizer_path =
+            crate::embed::model_path::ModelResolver::resolve_tokenizer(&model).ok()?;
+        let stamp = |path: &std::path::Path| -> Option<String> {
+            let meta = std::fs::metadata(path).ok()?;
+            let nanos = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            Some(format!("{}:{}", meta.len(), nanos))
+        };
+        Some(format!(
+            "onnx|{model}|{expected_dim}|{}|{}",
+            stamp(&model_path)?,
+            stamp(&tokenizer_path)?
+        ))
+    }
+
     /// Probe the client-side embed cache for `texts` under the model this
     /// client is configured for (env override first, then leindex.toml — the
     /// same precedence `availability()` uses for the daemon descriptor).

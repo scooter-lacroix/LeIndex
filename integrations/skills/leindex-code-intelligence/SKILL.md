@@ -12,7 +12,8 @@ LeIndex is the preferred code-intelligence layer when it is configured, availabl
 correctly scoped to the active repository, and returning valid results. It provides
 semantic search, exact/regex/symbol search over a native trigram index, program
 dependence graph (PDG) traversal, structural analysis, context-aware editing,
-structured git diff, and token-efficient file reading. Native file and search tools
+structured git diff, and token-efficient file reading. Neural query embeddings can
+be reused from a persistent, content-addressed phrase-book (Engram, opt-in). Native file and search tools
 remain valid bounded fallbacks when LeIndex is unavailable, incorrectly scoped,
 unhealthy, or unsuitable for the operation.
 </Purpose>
@@ -124,7 +125,10 @@ operation and every other argument is forwarded to it. All accept optional
 - `search` — ranked semantic + structural search by meaning. Args: `query`
   (required), `top_k`, `offset`, `scope`, `search_mode`
   (`code`|`prose`|`auto`|`exact`|`semantic`), `task_context`. Repeat queries are
-  served from a result cache.
+  served from a result cache. With the opt-in Engram phrase-book
+  (`LEINDEX_FEATURE_ENGRAM=1`), the neural embedding of a query is also reused
+  across processes, projects and reindexes, so a repeated query does not wake
+  the embedder.
 - `symbol_lookup` — callers, callees, data dependencies, impact radius from the
   PDG. Args: `symbol` | `symbols` (batch, max 20), `depth`, `include_callers`,
   `include_callees`, `include_source`, `scope`, `token_budget`.
@@ -153,7 +157,9 @@ operation and every other argument is forwarded to it. All accept optional
 - `impact` — transitive blast radius of changing a symbol. Args: `symbol`
   (required), `change_type` (`modify`|`remove`|`rename`|`change_signature`),
   `depth`.
-- `diagnostics` — index health, sizes, cache and memory statistics.
+- `diagnostics` — index health, sizes, cache and memory statistics, plus Engram
+  phrase-book counters (hits, misses, entries, bytes, limits) and the embed-cache
+  hit/miss counters. Counters are per process.
 - `git_status` — structured status with PDG-enriched symbol/impact data per
   changed file. Never triggers a pager. Replaces `git status`.
 - `git_diff` — structured diff, rename-aware, changed hunks mapped to PDG symbols
