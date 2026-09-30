@@ -2,7 +2,7 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
-## [2.0.0] - Unreleased additions - Four tools, native text search, millisecond cold starts
+## [2.0.0] - 2026-09-30 - Four tools, native text search, millisecond cold starts
 
 Reconstruction and continuation of the tool layer after the local working tree
 was lost; everything below is on `v2.0.0` and covered by tests.
@@ -151,14 +151,43 @@ was lost; everything below is on `v2.0.0` and covered by tests.
     read-only connection. Cold `search` 440 ms → ~300 ms; pre-warm loads both
     together.
   - Rename/edit validation parses the before/after of every changed file (and
-    the syntax pass) in parallel; the import check looks names up in a
-    lower-cased corpus built once instead of lower-casing every graph node per
-    `use` line, and impact analysis fans its per-symbol traversals out across
-    cores (same per-symbol caps, same result set). Warm rename preview
-    ~300 ms → ~90 ms.
-  - Forced full index of this repository: 14 s → ~6 s. Cold CLI calls: search
-    ~330 → ~300 ms, symbol lookup ~210 ms, rename preview ~360 ms including the
-    graph load.
+    the syntax pass) in parallel, and impact analysis fans its per-symbol
+    traversals out across cores (same per-symbol caps, same result set).
+  - Signature-only extraction. Drift reads only `name`, `parameters`,
+    `return_type`, `visibility`, `is_method` and `byte_range`, but ran the full
+    parse path (calls, flow facts, complexity, docstrings, imports). A
+    thread-local `LiteGuard` and `CodeIntelligence::get_signatures_lite` (the
+    default delegates to `get_signatures_with_parser` under the guard, so a
+    parser never has to opt in) gate the expensive leaf helpers in all 17
+    parsers. Equivalence tests assert the header fields are identical between
+    lite and full output for every language fixture. Drift memoises signatures
+    by (language, blake3 of content) and now also treats a sync↔async change as
+    a signature change (`is_async` was extracted but never compared).
+    `docstring` remains parse-only: it is not persisted on `Node`.
+  - One shared, seedless `FastHasher` (`src/fast_hash.rs`: 8 bytes per step,
+    folded 128-bit multiply, final avalanche) replaces SipHash in the PDG
+    indexes, extraction maps, traversal sets, trigram postings and the row-id
+    maps of the graph loader, and the two bespoke hashers are gone. Tests cover
+    determinism, prefix/padding collisions, avalanche (~50% of output bits flip
+    per input bit), bucket uniformity of the low bits and of hashbrown's top 7
+    bits, and that bincode output is byte-identical to a std map (existing
+    snapshots still load). Loader maps are pre-sized from a row count.
+  - The import-check name corpus moved from a per-validator `OnceLock` (rebuilt
+    by every per-request validator) onto the PDG, memoised against a
+    process-unique node revision that changes on every node add, remove or
+    mutation; clones share it until they diverge.
+  - Measured on this repository against the start of this pass (`8ce59b5`),
+    release build, deterministic whole-process instruction counts (callgrind,
+    one-shot CLI): rename preview −13.9%, symbol lookup −9.0%, impact −9.0%,
+    search −4.3%. Warm session (daemon), median of 20 calls, two alternating
+    rounds: rename preview 47.5 / 176.6 ms → 25.1 / 22.8 ms, deep 12.9 / 16.9 →
+    9.2 / 8.0 ms, symbol lookup 24.0 / 21.2 → 11.2 / 11.5 ms, search
+    14.1 / 14.6 → 10.6 / 8.9 ms; the `find` (grep) branch is unchanged (~12 ms).
+    Cold one-shot wall time is flat within run-to-run noise (interleaved
+    symbol lookup 208 vs 211 ms) apart from rename preview (252 → 203 ms):
+    process start, SQLite and git dominate it.
+  - Forced full index of this repository: 14 s → ~6–7 s (fresh clone, release
+    build: 7.2 s at the start of this pass, 6.9 s now).
   - Error and welcome text now names the four routers
     (`leindex_manage action=index`) instead of retired tool names.
 - Agent skill: `integrations/skills/leindex-toolkit` is now
@@ -168,8 +197,54 @@ was lost; everything below is on `v2.0.0` and covered by tests.
 - Phase analysis: a run whose phases are all cached no longer loads the graph
   (warm ~500 ms → ~17 ms), and the file inventory is hashed in parallel.
 
+### Added
+
+- **Engram** (opt-in, `LEINDEX_FEATURE_ENGRAM=1`): a persistent,
+  content-addressed phrase-book of neural query embeddings under
+  `~/.leindex/engram/`. A repeated query is served without waking the embedder
+  (no worker spawn, no model digest, no network round trip). Keys are
+  `blake3(embedder identity, dimension, exact query text)`; the identity is the
+  model name, dimension and size + mtime of the resolved model and tokenizer
+  files (local ONNX) or provider/model/endpoint/dimension without credentials
+  (remote), so a replaced model never serves stale vectors, and an unknown
+  identity bypasses the table. Rows are immutable, written by staging + atomic
+  rename and verified against a blake3 checksum on read (a corrupt row is
+  deleted and counted as a miss); the table is bounded (20,000 rows / 256 MiB,
+  `LEINDEX_ENGRAM_MAX_ENTRIES`, `LEINDEX_ENGRAM_MAX_MB`) with LRU eviction and a
+  small in-process front. Only real embedder output is stored. Hit/miss/entry
+  counters appear under `engram` in `leindex_analyze mode=diagnostics`. Scope:
+  query embeddings only. Index-time neural vectors are already reused by the
+  global embed cache, and ranked results by the existing result cache.
+
 ### Fixed
 
+- **A warm session paid +130–240 ms on every fourth graph-tool call, for ever.**
+  The registry re-launches a background incremental scan whenever
+  `is_stale_fast()` is true and drops its stale cache when that scan ends. Three
+  things kept the answer true after a scan that found nothing to do: (1) the
+  "No changes detected" path recorded a stale `tree_oid`, so a commit that
+  touched nothing indexed left the index flagged as tree-drifted; (2) it did not
+  advance the `leindex.db` reference time, so a new non-indexed file in a source
+  directory kept the directory-mtime sentinel firing; (3) the nested-manifest
+  walker did not apply the scanner's own `tests/fixtures/**` exclusion, so any
+  repository with a fixture `Cargo.toml` or `package.json` was permanently
+  "stale". Each request then ran `git status`, `git ls-files` ×2,
+  `git rev-parse` and a hash pass beside the foreground call. All three are
+  fixed (a clean scan now acknowledges the tree and the directory time; the
+  walker shares the scanner's exclusion). Four regression tests fail without the
+  change and a fifth checks that a real source edit is still detected. While the
+  loop was active, warm p90 for graph tools on this repository was 141–217 ms;
+  it is now 9–13 ms, and steady-state calls dropped from ~12 ms to ~7 ms because
+  nothing contends with them.
+- Quality Gates feature matrix: `--no-default-features --features minimal` and
+  `--features onnx` did not compile (`migration` needs `storage`;
+  `eval::{agent_tasks,external_suite}` need `cli`; one bench, two examples and
+  one test lacked `required-features`/`cfg` guards), plus dead-code and
+  `unused_mut` warnings in those configurations. All four configurations now
+  pass `cargo check --all-targets`.
+- Eleven source files exceeded the 2000-line Large File gate (largest 3023).
+  They are split into child modules and `*_test.rs` files by pure code motion;
+  a test that scraped `src/embed/runtime.rs` now reads the whole module.
 - Phase analysis and the indexer shared one store but disagreed about which
   files exist and what an import is. The phase run saw dotfiles, ignored paths
   and a different language list, treated every indexed doc as "deleted", and
