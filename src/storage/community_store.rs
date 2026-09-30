@@ -42,7 +42,10 @@ pub fn compute_and_persist(
     pdg: &mut ProgramDependenceGraph,
 ) -> rusqlite::Result<CommunityStats> {
     let (communities, stats) = crate::graph::community::detect_communities(pdg);
-    pdg.communities = communities.clone();
+    pdg.communities = communities
+        .iter()
+        .map(|(node, community)| (*node, *community))
+        .collect();
     let (assignments, labels) = assignments_for_pdg(pdg, &communities);
     save_communities_by_node_id(
         storage,

@@ -38,7 +38,7 @@ fn verify_installation() {}
     let pdg = extract_pdg_from_signatures(signatures, source, "flows.rs", "rust");
     let from = pdg.find_by_name("execute_native_command").unwrap();
 
-    let mut channels = HashSet::new();
+    let mut channels = HashSet::default();
     for edge_id in pdg.edge_indices() {
         let Some((source_id, target_id)) = pdg.edge_endpoints(edge_id) else {
             continue;
@@ -162,7 +162,7 @@ fn test_same_file_calls_reach_all_duplicate_qualified_names() {
 fn data_flow_signal_a_produces_directed_edge() {
     let producer = sig_with_types("make_user", "make_user", vec![], Some("User"));
     let consumer = sig_with_types("save_user", "save_user", vec![("u", "User")], None);
-    let mut nids = HashMap::new();
+    let mut nids = HashMap::default();
     let mut pdg = ProgramDependenceGraph::new();
     let p = pdg.add_node(signature_to_node(&producer, "f.rs", "rust"));
     let c = pdg.add_node(signature_to_node(&consumer, "f.rs", "rust"));
@@ -192,7 +192,7 @@ fn data_flow_clique_not_generated() {
             )
         })
         .collect();
-    let mut nids = HashMap::new();
+    let mut nids = HashMap::default();
     let mut pdg = ProgramDependenceGraph::new();
     for s in &sigs {
         let nid = pdg.add_node(signature_to_node(s, "f.rs", "rust"));

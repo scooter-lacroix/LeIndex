@@ -33,6 +33,9 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+/// Fast deterministic hasher and map/set aliases for internal indexes.
+pub mod fast_hash;
+
 // Core modules (base of dependency DAG)
 #[cfg(feature = "parse")]
 pub mod parse;

@@ -10,33 +10,8 @@
 // intersection typically reduces the candidate set to <1% of all nodes.
 
 use crate::graph::pdg::{NodeId, ProgramDependenceGraph};
-use std::collections::HashMap as StdHashMap;
 
-/// Multiplicative hasher for the `u32` trigram keys. The map is internal and
-/// its keys are derived from node text, so SipHash's DoS resistance buys
-/// nothing while costing a large share of index build time (millions of
-/// inserts).
-#[derive(Default, Clone, Copy)]
-pub struct TrigramHasher(u64);
-
-impl std::hash::Hasher for TrigramHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.0 =
-                (self.0.rotate_left(5) ^ u64::from(byte)).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
-        }
-    }
-
-    fn write_u32(&mut self, value: u32) {
-        self.0 = u64::from(value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
-
-    fn finish(&self) -> u64 {
-        self.0 ^ (self.0 >> 29)
-    }
-}
-
-type HashMap<K, V> = StdHashMap<K, V, std::hash::BuildHasherDefault<TrigramHasher>>;
+type HashMap<K, V> = crate::fast_hash::FastMap<K, V>;
 
 /// A trigram stored as a packed u32 (3 ASCII bytes + zero high byte).
 /// This avoids heap-allocating a String for every trigram.

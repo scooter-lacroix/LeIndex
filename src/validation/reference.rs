@@ -2,11 +2,12 @@
 
 use crate::edit::ResolvedEditChange;
 use crate::graph::ProgramDependenceGraph;
+use crate::graph::pdg::NameCorpus;
 use crate::validation::Location;
 use crate::validation::ValidationError;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 /// Type of reference issue found
 #[derive(Debug, Clone, PartialEq)]
@@ -97,42 +98,18 @@ impl ReferenceIssue {
 pub struct ReferenceChecker {
     /// PDG for reference checking
     pdg: Arc<ProgramDependenceGraph>,
-    /// Lower-cased distinct symbol names and file paths, built on first use.
-    /// Import checks probe these instead of lower-casing every PDG node once
-    /// per import (tens of thousands of allocations per `use` line).
-    names: Arc<OnceLock<NameCorpus>>,
-}
-
-/// Distinct lower-cased node names and file paths of a PDG.
-struct NameCorpus {
-    names: Vec<String>,
-    files: Vec<String>,
 }
 
 impl ReferenceChecker {
     /// Create a new reference checker
     pub fn new(pdg: Arc<ProgramDependenceGraph>) -> Self {
-        Self {
-            pdg,
-            names: Arc::new(OnceLock::new()),
-        }
+        Self { pdg }
     }
 
-    fn corpus(&self) -> &NameCorpus {
-        self.names.get_or_init(|| {
-            let mut names = HashSet::new();
-            let mut files = HashSet::new();
-            for node_id in self.pdg.node_indices() {
-                if let Some(node) = self.pdg.get_node(node_id) {
-                    names.insert(node.name.to_lowercase());
-                    files.insert(node.file_path.to_lowercase());
-                }
-            }
-            NameCorpus {
-                names: names.into_iter().collect(),
-                files: files.into_iter().collect(),
-            }
-        })
+    /// Lower-cased names/paths of the PDG. Owned by the PDG and cached per
+    /// revision, so a validator created per request does not rebuild it.
+    fn corpus(&self) -> Arc<NameCorpus> {
+        self.pdg.name_corpus()
     }
 
     /// Check references for edit changes

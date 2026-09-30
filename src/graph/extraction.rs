@@ -9,10 +9,10 @@
 
 #![warn(missing_docs)]
 
+use crate::fast_hash::{FastMap as HashMap, FastSet as HashSet};
 use crate::graph::pdg::{Edge, EdgeMetadata, EdgeType, Node, NodeType, ProgramDependenceGraph};
 use crate::parse::prelude::{FlowChannel, FlowFact, ImportInfo, SignatureInfo};
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -30,9 +30,9 @@ pub fn extract_pdg_from_signatures(
     language: &str,
 ) -> ProgramDependenceGraph {
     let mut pdg = ProgramDependenceGraph::new();
-    let mut node_ids: HashMap<String, crate::graph::pdg::NodeId> = HashMap::new();
-    let mut local_node_ids = LocalNodeIds::new();
-    let mut seen_qnames = HashSet::new();
+    let mut node_ids: HashMap<String, crate::graph::pdg::NodeId> = HashMap::default();
+    let mut local_node_ids = LocalNodeIds::default();
+    let mut seen_qnames = HashSet::default();
     let duplicate_qnames: HashSet<&str> = signatures
         .iter()
         .filter_map(|sig| {
@@ -154,7 +154,7 @@ fn infer_class_nodes_and_containment(
     file_path: &str,
     language: &str,
 ) -> Vec<(crate::graph::pdg::NodeId, crate::graph::pdg::NodeId)> {
-    let mut class_methods: HashMap<String, HashSet<crate::graph::pdg::NodeId>> = HashMap::new();
+    let mut class_methods: HashMap<String, HashSet<crate::graph::pdg::NodeId>> = HashMap::default();
 
     for sig in signatures {
         if !sig.is_method {
@@ -393,7 +393,7 @@ fn extract_data_flow_edges_for_nodes(
 ) -> Vec<DataFlowEdge> {
     let indexes = build_data_flow_indexes(signatures);
     let mut edges = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
 
     add_return_to_parameter_edges(&indexes, node_ids, &mut edges, &mut seen);
     add_shared_return_call_edges(&indexes, node_ids, &mut edges, &mut seen);
@@ -404,10 +404,10 @@ fn extract_data_flow_edges_for_nodes(
 
 fn build_data_flow_indexes(signatures: &[SignatureInfo]) -> DataFlowIndexes<'_> {
     let mut indexes = DataFlowIndexes {
-        producers: HashMap::new(),
-        consumers: HashMap::new(),
-        call_set: HashMap::new(),
-        by_normalized_name: HashMap::new(),
+        producers: HashMap::default(),
+        consumers: HashMap::default(),
+        call_set: HashMap::default(),
+        by_normalized_name: HashMap::default(),
     };
 
     for sig in signatures {
@@ -722,7 +722,7 @@ impl InheritanceEvidence {
 }
 
 fn group_methods_by_class(signatures: &[SignatureInfo]) -> HashMap<String, Vec<&SignatureInfo>> {
-    let mut class_methods: HashMap<String, Vec<&SignatureInfo>> = HashMap::new();
+    let mut class_methods: HashMap<String, Vec<&SignatureInfo>> = HashMap::default();
 
     for sig in signatures {
         if !sig.is_method {
@@ -1199,11 +1199,11 @@ fn extract_call_edges_and_externals(
 ) {
     let mut edges = Vec::new();
     let mut external_calls = Vec::new();
-    let mut seen = HashSet::new();
-    let mut seen_external = HashSet::new();
-    let mut exact_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::new();
-    let mut last_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::new();
-    let mut suffix_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::new();
+    let mut seen = HashSet::default();
+    let mut seen_external = HashSet::default();
+    let mut exact_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::default();
+    let mut last_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::default();
+    let mut suffix_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::default();
 
     for signature in signatures {
         if let Some(ids) = node_ids.get(&signature.qualified_name) {
@@ -1303,8 +1303,8 @@ fn extract_flow_edges(
     node_ids: &HashMap<String, crate::graph::pdg::NodeId>,
     pdg: &mut ProgramDependenceGraph,
 ) {
-    let mut by_normalized: HashMap<String, crate::graph::pdg::NodeId> = HashMap::new();
-    let mut by_last: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::new();
+    let mut by_normalized: HashMap<String, crate::graph::pdg::NodeId> = HashMap::default();
+    let mut by_last: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::default();
     for sig in signatures {
         if let Some(&id) = node_ids.get(&sig.qualified_name) {
             by_normalized.insert(normalize_symbol(&sig.qualified_name), id);
@@ -1314,7 +1314,7 @@ fn extract_flow_edges(
         }
     }
 
-    let mut external: HashMap<String, crate::graph::pdg::NodeId> = HashMap::new();
+    let mut external: HashMap<String, crate::graph::pdg::NodeId> = HashMap::default();
     for sig in signatures {
         let Some(&caller_id) = node_ids.get(&sig.qualified_name) else {
             continue;
@@ -1466,7 +1466,7 @@ fn qualified_name_from_node(node: &Node) -> Option<&str> {
 }
 
 fn import_alias_map(imports: &[ImportInfo]) -> HashMap<String, String> {
-    let mut alias_map = HashMap::new();
+    let mut alias_map = HashMap::default();
     for import in imports {
         let alias = import.alias.clone().or_else(|| {
             import
@@ -1547,7 +1547,7 @@ fn import_alias_map(imports: &[ImportInfo]) -> HashMap<String, String> {
 /// A HashSet of unique import paths/modules found in the source code.
 pub fn extract_import_paths_from_source(source_code: &[u8], language: &str) -> HashSet<String> {
     let Ok(source) = std::str::from_utf8(source_code) else {
-        return HashSet::new();
+        return HashSet::default();
     };
     let lang = language.to_ascii_lowercase();
     let source = strip_block_comments(&lang, source);
@@ -1564,7 +1564,7 @@ pub fn extract_import_paths_from_source(source_code: &[u8], language: &str) -> H
         "lua" => extract_lua_imports(&source),
         "scala" => extract_scala_imports(&source),
         "c" | "cpp" | "c++" | "cxx" | "cc" | "h" | "hpp" => extract_c_imports(&source),
-        _ => HashSet::new(),
+        _ => HashSet::default(),
     }
 }
 
@@ -1600,7 +1600,7 @@ fn strip_block_comments(lang: &str, source: &str) -> String {
 }
 
 fn extract_python_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
+    let mut imports = HashSet::default();
 
     // `import x, y, z` (simple)
     let re_import = Regex::new(r"(?m)^import\s+([\w,\s.]+)").unwrap();
@@ -1639,7 +1639,7 @@ fn extract_python_imports(source: &str) -> HashSet<String> {
 }
 
 fn extract_js_ts_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
+    let mut imports = HashSet::default();
 
     // import { A, B } from 'x' — multi-line
     let re_named =
@@ -1672,7 +1672,7 @@ fn extract_js_ts_imports(source: &str) -> HashSet<String> {
 }
 
 fn extract_rust_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
+    let mut imports = HashSet::default();
 
     // `use x::y::{A, B, C};` — multi-line via collapse
     // Collapse the entire source to handle multi-line use statements
@@ -1768,7 +1768,7 @@ fn collapse_multiline(source: &str, prefix: &str, terminator: char) -> Vec<Strin
 }
 
 fn extract_go_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
+    let mut imports = HashSet::default();
 
     // Single: import "pkg"
     let re_single = Regex::new(r#"import\s+["']([^"']+)["']"#).unwrap();
@@ -1790,7 +1790,7 @@ fn extract_go_imports(source: &str) -> HashSet<String> {
 }
 
 fn extract_java_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
+    let mut imports = HashSet::default();
     let re = Regex::new(r"(?m)^import(?:\s+static)?\s+([\w.*]+)\s*;").unwrap();
     for cap in re.captures_iter(source) {
         imports.insert(cap[1].trim().to_string());
@@ -1799,7 +1799,7 @@ fn extract_java_imports(source: &str) -> HashSet<String> {
 }
 
 fn extract_csharp_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
+    let mut imports = HashSet::default();
     // `using X.Y.Z;` and `using static X.Y.Z;`
     let re = Regex::new(r"(?m)^using(?:\s+static)?\s+([\w.]+)\s*;").unwrap();
     for cap in re.captures_iter(source) {
@@ -1809,7 +1809,7 @@ fn extract_csharp_imports(source: &str) -> HashSet<String> {
 }
 
 fn extract_ruby_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
+    let mut imports = HashSet::default();
     let re = Regex::new(r#"(?:require|require_relative|load)\s*['"]([^'"]+)['"]"#).unwrap();
     for cap in re.captures_iter(source) {
         imports.insert(cap[1].trim().to_string());
@@ -1818,7 +1818,7 @@ fn extract_ruby_imports(source: &str) -> HashSet<String> {
 }
 
 fn extract_php_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
+    let mut imports = HashSet::default();
     // use X\Y\Z; and use X\Y\Z as Alias;
     let re = Regex::new(r"(?m)^use\s+([\w\\]+)(?:\s+as\s+\w+)?\s*;").unwrap();
     for cap in re.captures_iter(source) {
@@ -1835,7 +1835,7 @@ fn extract_php_imports(source: &str) -> HashSet<String> {
 }
 
 fn extract_lua_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
+    let mut imports = HashSet::default();
     let re = Regex::new(r#"require\s*\(?['"]([^'"]+)['"]\)?"#).unwrap();
     for cap in re.captures_iter(source) {
         imports.insert(cap[1].replace('.', "/").trim().to_string());
@@ -1844,7 +1844,7 @@ fn extract_lua_imports(source: &str) -> HashSet<String> {
 }
 
 fn extract_scala_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
+    let mut imports = HashSet::default();
     let re = Regex::new(r"(?m)^\s*import\s+([^\n]+)$").unwrap();
     let selector_re = Regex::new(r"^([\w.]+)(?:\.\{([^}]+)\}|\.(\w+|\*))?$").unwrap();
 
@@ -1871,7 +1871,7 @@ fn extract_scala_imports(source: &str) -> HashSet<String> {
 }
 
 fn extract_c_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
+    let mut imports = HashSet::default();
     // #include <x> and #include "x"
     let re = Regex::new(r#"#include\s*[<"']([^>"']+)[>"']"#).unwrap();
     for cap in re.captures_iter(source) {
@@ -1893,7 +1893,8 @@ fn extract_import_edges(
     source_code: &[u8],
 ) -> Vec<(crate::graph::pdg::NodeId, crate::graph::pdg::NodeId)> {
     let mut edges = Vec::new();
-    let mut seen: HashSet<(crate::graph::pdg::NodeId, crate::graph::pdg::NodeId)> = HashSet::new();
+    let mut seen: HashSet<(crate::graph::pdg::NodeId, crate::graph::pdg::NodeId)> =
+        HashSet::default();
 
     let mut unique_paths: HashSet<String> = signatures
         .iter()
@@ -1918,7 +1919,7 @@ fn extract_import_edges(
         })
     });
 
-    let mut symbol_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::new();
+    let mut symbol_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::default();
     for sig in signatures {
         if let Some(&nid) = node_ids.get(&sig.qualified_name) {
             let norm = normalize_symbol(&sig.qualified_name);
@@ -1929,7 +1930,7 @@ fn extract_import_edges(
         }
     }
 
-    let mut external_nodes: HashMap<String, crate::graph::pdg::NodeId> = HashMap::new();
+    let mut external_nodes: HashMap<String, crate::graph::pdg::NodeId> = HashMap::default();
 
     for path in unique_paths {
         let targets = resolve_import_targets(&path, &symbol_map);

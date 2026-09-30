@@ -8,13 +8,15 @@
 //   - `add_edge` returns `EdgeId` directly (was misleadingly Option<EdgeId>)
 //   - All public traversal methods take `TraversalConfig` — callers must be explicit
 
+use crate::fast_hash::{FastMap as HashMap, FastSet as HashSet};
 use bincode::Options;
 use petgraph::stable_graph::StableGraph;
 use petgraph::visit::EdgeRef;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 use crate::graph::trigram::TrigramIndex;
 
@@ -757,7 +759,7 @@ impl SerializablePDGWithInlineEmbeddings {
             name_index: self.name_index.clone(),
             name_lower_index: self.name_lower_index.clone(),
             embeddings,
-            precision_symbols: HashSet::new(),
+            precision_symbols: HashSet::default(),
         }
         .to_pdg()
     }
@@ -779,8 +781,8 @@ impl SerializablePDGWithoutInlineEmbeddings {
             file_index: self.file_index.clone(),
             name_index: self.name_index.clone(),
             name_lower_index: self.name_lower_index.clone(),
-            embeddings: HashMap::new(),
-            precision_symbols: HashSet::new(),
+            embeddings: HashMap::default(),
+            precision_symbols: HashSet::default(),
         }
         .to_pdg()
     }
@@ -813,9 +815,9 @@ impl SerializablePDGWithInlineEmbeddingsWithoutNameLower {
             symbol_index: self.symbol_index.clone(),
             file_index: self.file_index.clone(),
             name_index: self.name_index.clone(),
-            name_lower_index: HashMap::new(),
+            name_lower_index: HashMap::default(),
             embeddings,
-            precision_symbols: HashSet::new(),
+            precision_symbols: HashSet::default(),
         }
         .to_pdg()
     }
@@ -836,9 +838,9 @@ impl SerializablePDGWithoutInlineEmbeddingsAndNameLower {
             symbol_index: self.symbol_index.clone(),
             file_index: self.file_index.clone(),
             name_index: self.name_index.clone(),
-            name_lower_index: HashMap::new(),
-            embeddings: HashMap::new(),
-            precision_symbols: HashSet::new(),
+            name_lower_index: HashMap::default(),
+            embeddings: HashMap::default(),
+            precision_symbols: HashSet::default(),
         }
         .to_pdg()
     }
@@ -964,7 +966,7 @@ impl SerializablePDGWithoutPrecision {
             name_index: self.name_index.clone(),
             name_lower_index: self.name_lower_index.clone(),
             embeddings: self.embeddings.clone(),
-            precision_symbols: HashSet::new(),
+            precision_symbols: HashSet::default(),
         }
         .to_pdg()
     }
@@ -979,8 +981,8 @@ impl SerializablePDGWithoutEmbeddings {
             file_index: self.file_index.clone(),
             name_index: self.name_index.clone(),
             name_lower_index: self.name_lower_index.clone(),
-            embeddings: HashMap::new(),
-            precision_symbols: HashSet::new(),
+            embeddings: HashMap::default(),
+            precision_symbols: HashSet::default(),
         }
         .to_pdg()
     }
@@ -994,9 +996,9 @@ impl SerializablePDGWithoutEmbeddingsAndNameLower {
             symbol_index: self.symbol_index.clone(),
             file_index: self.file_index.clone(),
             name_index: self.name_index.clone(),
-            name_lower_index: HashMap::new(),
-            embeddings: HashMap::new(),
-            precision_symbols: HashSet::new(),
+            name_lower_index: HashMap::default(),
+            embeddings: HashMap::default(),
+            precision_symbols: HashSet::default(),
         }
         .to_pdg()
     }
@@ -1045,6 +1047,7 @@ impl SerializablePDG {
         source: &HashMap<String, u32>,
         index_map: &HashMap<u32, NodeId>,
     ) {
+        destination.reserve(source.len());
         for (symbol, old_index) in source {
             if let Some(&node_id) = index_map.get(old_index) {
                 destination.insert(symbol.clone(), node_id);
@@ -1057,6 +1060,7 @@ impl SerializablePDG {
         source: &HashMap<String, Vec<u32>>,
         index_map: &HashMap<u32, NodeId>,
     ) {
+        destination.reserve(source.len());
         for (name, old_indices) in source {
             let node_ids: Vec<NodeId> = old_indices
                 .iter()
@@ -1069,6 +1073,9 @@ impl SerializablePDG {
     }
 
     fn rebuild_name_indexes(pdg: &mut ProgramDependenceGraph) {
+        let node_count = pdg.graph.node_count();
+        pdg.name_index.reserve(node_count);
+        pdg.name_lower_index.reserve(node_count);
         for node_id in pdg.graph.node_indices() {
             if let Some(node) = pdg.graph.node_weight(node_id) {
                 pdg.name_index
@@ -1209,6 +1216,33 @@ pub struct ProgramDependenceGraph {
     /// Built lazily on first fuzzy search, or eagerly during indexing.
     /// Persisted alongside the PDG in SQLite.
     trigram_index: TrigramIndex,
+
+    /// Process-unique revision of the node set. Assigned when the graph is
+    /// created and replaced with a fresh value on every node mutation, so two
+    /// graphs (or two states of one graph) never share a revision unless one is
+    /// an unmodified clone of the other.
+    revision: u64,
+
+    /// Lower-cased distinct names/paths, memoised against `revision`.
+    name_corpus: Mutex<Option<(u64, Arc<NameCorpus>)>>,
+}
+
+static NEXT_PDG_REVISION: AtomicU64 = AtomicU64::new(1);
+
+fn next_revision() -> u64 {
+    NEXT_PDG_REVISION.fetch_add(1, AtomicOrdering::Relaxed)
+}
+
+/// Distinct lower-cased node names and file paths of a PDG.
+///
+/// Import validation probes these with `contains` instead of lower-casing every
+/// node per import. Built once per PDG revision and shared via `Arc`.
+#[derive(Debug, Default)]
+pub struct NameCorpus {
+    /// Distinct lower-cased node names.
+    pub names: Vec<String>,
+    /// Distinct lower-cased node file paths.
+    pub files: Vec<String>,
 }
 
 impl Clone for ProgramDependenceGraph {
@@ -1225,6 +1259,13 @@ impl Clone for ProgramDependenceGraph {
             precision_symbols: self.precision_symbols.clone(),
             name_file_index: self.name_file_index.clone(),
             trigram_index: self.trigram_index.clone(),
+            revision: self.revision,
+            name_corpus: Mutex::new(
+                self.name_corpus
+                    .lock()
+                    .ok()
+                    .and_then(|cached| cached.clone()),
+            ),
         }
     }
 }
@@ -1234,17 +1275,55 @@ impl ProgramDependenceGraph {
     pub fn new() -> Self {
         Self {
             graph: StableGraph::new(),
-            symbol_index: HashMap::new(),
-            file_index: HashMap::new(),
-            name_index: HashMap::new(),
-            name_lower_index: HashMap::new(),
+            symbol_index: HashMap::default(),
+            file_index: HashMap::default(),
+            name_index: HashMap::default(),
+            name_lower_index: HashMap::default(),
             embedding_store: EmbeddingStore::new(),
             #[cfg(feature = "community")]
-            communities: HashMap::new(),
-            precision_symbols: HashSet::new(),
-            name_file_index: HashMap::new(),
+            communities: HashMap::default(),
+            precision_symbols: HashSet::default(),
+            name_file_index: HashMap::default(),
             trigram_index: TrigramIndex::new(),
+            revision: next_revision(),
+            name_corpus: Mutex::new(None),
         }
+    }
+
+    /// Revision of the node set; changes whenever nodes are added, removed or
+    /// mutated. Suitable as a cache key for data derived from node contents.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn touch(&mut self) {
+        self.revision = next_revision();
+    }
+
+    /// Distinct lower-cased node names and file paths, built once per
+    /// [`revision`](Self::revision) and shared by every caller.
+    pub fn name_corpus(&self) -> Arc<NameCorpus> {
+        let mut cached = match self.name_corpus.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some((revision, corpus)) = cached.as_ref() {
+            if *revision == self.revision {
+                return Arc::clone(corpus);
+            }
+        }
+        let mut names: HashSet<String> = HashSet::default();
+        let mut files: HashSet<String> = HashSet::default();
+        for node in self.graph.node_weights() {
+            names.insert(node.name.to_lowercase());
+            files.insert(node.file_path.to_lowercase());
+        }
+        let corpus = Arc::new(NameCorpus {
+            names: names.into_iter().collect(),
+            files: files.into_iter().collect(),
+        });
+        *cached = Some((self.revision, Arc::clone(&corpus)));
+        corpus
     }
 
     // -----------------------------------------------------------------------
@@ -1272,8 +1351,8 @@ impl ProgramDependenceGraph {
     /// (conceptual-recall fix.)
     pub fn ensure_file_summary_nodes(&mut self) {
         use std::collections::{HashMap, HashSet};
-        let mut file_lang: HashMap<String, String> = HashMap::new();
-        let mut have_summary: HashSet<String> = HashSet::new();
+        let mut file_lang: HashMap<String, String> = HashMap::default();
+        let mut have_summary: HashSet<String> = HashSet::default();
         for ni in self.node_indices() {
             if let Some(n) = self.get_node(ni) {
                 let fp = n.file_path.to_string();
@@ -1303,6 +1382,16 @@ impl ProgramDependenceGraph {
         id
     }
 
+    /// Pre-size the node graph and per-node lookup indexes for `additional`
+    /// upcoming insertions (bulk loads know the count up front).
+    pub fn reserve_nodes(&mut self, additional: usize) {
+        self.graph.reserve_nodes(additional);
+        self.symbol_index.reserve(additional);
+        self.name_index.reserve(additional);
+        self.name_lower_index.reserve(additional);
+        self.name_file_index.reserve(additional);
+    }
+
     /// Add a node to the graph and every lookup index *except* the trigram
     /// index.
     ///
@@ -1318,6 +1407,7 @@ impl ProgramDependenceGraph {
         let lower = name.to_lowercase();
         let file_path = Arc::clone(&node.file_path);
         let id = self.graph.add_node(node);
+        self.touch();
 
         self.symbol_index.insert(symbol, id);
         // Look up by &str first: most nodes share a file / name with an earlier
@@ -1372,6 +1462,7 @@ impl ProgramDependenceGraph {
     /// The removed node if it existed, or None if not found.
     pub fn remove_node(&mut self, node_id: NodeId) -> Option<Node> {
         if let Some(node) = self.graph.remove_node(node_id) {
+            self.touch();
             self.symbol_index.remove(&node.id);
             self.precision_symbols.remove(&node.id);
             self.embedding_store.remove(&node.id);
@@ -1475,12 +1566,14 @@ impl ProgramDependenceGraph {
     ///
     /// An optional mutable reference to the node if it exists.
     pub fn get_node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        self.touch();
         self.graph.node_weight_mut(id)
     }
 
     /// Returns a mutable slice of all node weights.
     /// Used for bulk node mutations (e.g., external node normalization).
     pub fn node_weights_mut(&mut self) -> impl Iterator<Item = &mut Node> {
+        self.touch();
         self.graph.node_weights_mut()
     }
 
@@ -1597,7 +1690,7 @@ impl ProgramDependenceGraph {
         direction: petgraph::Direction,
     ) -> Vec<NodeId> {
         use petgraph::visit::EdgeRef;
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::default();
         self.graph
             .edges_directed(node_id, direction)
             .filter(|edge| edge.weight().edge_type == edge_type)
@@ -2011,7 +2104,7 @@ impl ProgramDependenceGraph {
     }
 
     fn bfs_directed(&self, start: NodeId, config: &TraversalConfig, dir: Direction) -> Vec<NodeId> {
-        let mut visited: HashSet<NodeId> = HashSet::new();
+        let mut visited: HashSet<NodeId> = HashSet::default();
         let mut queue: VecDeque<(NodeId, usize)> = VecDeque::new();
         let mut result: Vec<NodeId> = Vec::new();
         let mut scratch: Vec<NodeId> = Vec::new();

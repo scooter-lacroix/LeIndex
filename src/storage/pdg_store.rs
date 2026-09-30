@@ -593,7 +593,8 @@ type EdgeKey = (i64, i64, &'static str);
 /// all-null literal that ~70% of edges carry, so most keys hold no string at all.
 type EdgeMeta = Option<String>;
 
-type EdgeMap = HashMap<EdgeKey, EdgeMeta, std::hash::BuildHasherDefault<RowIdHasher>>;
+type EdgeMap =
+    HashMap<EdgeKey, EdgeMeta, std::hash::BuildHasherDefault<crate::fast_hash::FastHasher>>;
 
 /// Persist edges by DIFFING against the rows already stored for the project,
 /// mirroring the node content-hash skip: an edge whose (caller, callee, type)
@@ -913,43 +914,13 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
     Ok(pdg)
 }
 
-/// Hasher for the dense integer row ids of `intel_nodes`. Row ids are trusted
-/// local integers, so SipHash's DoS resistance buys nothing: every loaded edge
-/// probes this map twice (~275k probes on a mid-size project).
-#[derive(Default, Clone, Copy)]
-struct RowIdHasher(u64);
-
-impl std::hash::Hasher for RowIdHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.0 =
-                (self.0.rotate_left(5) ^ u64::from(byte)).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
-        }
-    }
-
-    fn write_u32(&mut self, value: u32) {
-        self.0 = u64::from(value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
-
-    fn write_usize(&mut self, value: usize) {
-        self.0 = (value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
-
-    fn write_i64(&mut self, value: i64) {
-        self.0 = (value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
-
-    fn finish(&self) -> u64 {
-        self.0 ^ (self.0 >> 32)
-    }
-}
-
-type RowIdMap = HashMap<i64, NodeId, std::hash::BuildHasherDefault<RowIdHasher>>;
+type RowIdMap = HashMap<i64, NodeId, std::hash::BuildHasherDefault<crate::fast_hash::FastHasher>>;
 
 /// Graph node -> row id, hashed the same way.
-type NodeRowMap = HashMap<NodeId, i64, std::hash::BuildHasherDefault<RowIdHasher>>;
+type NodeRowMap = HashMap<NodeId, i64, std::hash::BuildHasherDefault<crate::fast_hash::FastHasher>>;
 
-type RowIdSet = std::collections::HashSet<i64, std::hash::BuildHasherDefault<RowIdHasher>>;
+type RowIdSet =
+    std::collections::HashSet<i64, std::hash::BuildHasherDefault<crate::fast_hash::FastHasher>>;
 
 fn load_nodes(
     storage: &Storage,
@@ -964,9 +935,21 @@ fn load_nodes(
          FROM intel_nodes WHERE project_id = ?1",
     )?;
     let mut rows = nodes_stmt.query(params![project_id])?;
-    let mut db_id_to_node_id = RowIdMap::default();
+    // Pre-size every per-node map: rehash-and-grow while streaming ~30k rows
+    // showed up in hydration profiles.
+    let node_count: usize = storage
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM intel_nodes WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as usize)
+        .unwrap_or(0);
+    let mut db_id_to_node_id = RowIdMap::with_capacity_and_hasher(node_count, Default::default());
+    pdg.reserve_nodes(node_count);
     // One `Arc<str>` per file, shared by all of its nodes.
-    let mut files: HashMap<String, Arc<str>> = HashMap::new();
+    let mut files: crate::fast_hash::FastMap<String, Arc<str>> = Default::default();
 
     while let Some(row) = rows.next()? {
         let db_id: i64 = row.get(0)?;

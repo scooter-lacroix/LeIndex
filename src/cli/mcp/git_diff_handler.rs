@@ -599,7 +599,7 @@ fn enrich_files(
     budget: WorkBudget,
     started: Instant,
 ) -> Enrichment {
-    let mut roots: HashSet<NodeId> = HashSet::new();
+    let mut roots: crate::fast_hash::FastSet<NodeId> = Default::default();
     let mut changed_symbols = Vec::new();
     let mut partial = false;
 

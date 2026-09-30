@@ -1,8 +1,9 @@
 // Gravity-based traversal algorithm
 
+use crate::fast_hash::FastSet as HashSet;
 use crate::graph::pdg::{NodeId, ProgramDependenceGraph};
 use serde::{Deserialize, Serialize};
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 
 /// Configuration for gravity traversal
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +60,7 @@ impl GravityTraversal {
         entry_nodes: Vec<NodeId>,
     ) -> Vec<NodeId> {
         let mut pq = BinaryHeap::new();
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = HashSet::default();
         let mut context = Vec::new();
         let mut current_tokens = 0;
 

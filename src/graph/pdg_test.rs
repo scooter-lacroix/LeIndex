@@ -416,8 +416,8 @@ fn deserialization_backward_compat_no_embeddings() {
             .iter()
             .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
             .collect(),
-        embeddings: HashMap::new(), // No embeddings — simulates old format
-        precision_symbols: HashSet::new(),
+        embeddings: HashMap::default(), // No embeddings — simulates old format
+        precision_symbols: HashSet::default(),
     };
 
     let bytes = bincode::serialize(&old_format).expect("Serialize old format");
@@ -476,10 +476,10 @@ fn deserialization_backward_compat_pre_embedding_inline_node_embeddings() {
     let old_format = SerializablePDGWithInlineEmbeddings {
         nodes: vec![LegacySerializableNode { index: 0, node }],
         edges: Vec::new(),
-        symbol_index: HashMap::from([(String::from("f:legacy"), 0)]),
-        file_index: HashMap::from([(String::from("f.rs"), vec![0])]),
-        name_index: HashMap::from([(String::from("legacy"), vec![0])]),
-        name_lower_index: HashMap::from([(String::from("legacy"), vec![0])]),
+        symbol_index: HashMap::from_iter([(String::from("f:legacy"), 0)]),
+        file_index: HashMap::from_iter([(String::from("f.rs"), vec![0])]),
+        name_index: HashMap::from_iter([(String::from("legacy"), vec![0])]),
+        name_lower_index: HashMap::from_iter([(String::from("legacy"), vec![0])]),
     };
 
     let bytes = bincode::serialize(&old_format).expect("Serialize pre-embedding format");
@@ -741,4 +741,58 @@ fn serialization_roundtrip_all_node_and_edge_variants() {
             "node '{id}' should round-trip"
         );
     }
+}
+
+#[test]
+fn test_name_corpus_is_cached_per_revision_and_invalidates_on_mutation() {
+    let mut pdg = ProgramDependenceGraph::new();
+    let a = pdg.add_node(make_node("a", "Alpha", "Src/A.rs", NodeType::Function));
+    let first = pdg.name_corpus();
+    assert_eq!(first.names, vec!["alpha".to_string()]);
+    assert_eq!(first.files, vec!["src/a.rs".to_string()]);
+
+    // Unchanged graph: same Arc, no rebuild.
+    let rev = pdg.revision();
+    assert!(Arc::ptr_eq(&first, &pdg.name_corpus()));
+    assert_eq!(rev, pdg.revision());
+
+    // Adding a node invalidates.
+    let b = pdg.add_node(make_node("b", "Beta", "src/b.rs", NodeType::Function));
+    assert_ne!(rev, pdg.revision());
+    let second = pdg.name_corpus();
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert!(second.names.contains(&"beta".to_string()));
+
+    // Mutating a node in place (rename) invalidates.
+    pdg.get_node_mut(a).unwrap().name = "Gamma".to_string();
+    let third = pdg.name_corpus();
+    assert!(third.names.contains(&"gamma".to_string()));
+    assert!(!third.names.contains(&"alpha".to_string()));
+
+    // Removing a node invalidates.
+    pdg.remove_node(b);
+    let fourth = pdg.name_corpus();
+    assert!(!fourth.names.contains(&"beta".to_string()));
+}
+
+#[test]
+fn test_name_corpus_clones_share_until_they_diverge() {
+    let mut original = ProgramDependenceGraph::new();
+    original.add_node(make_node("a", "Alpha", "a.rs", NodeType::Function));
+    let built = original.name_corpus();
+
+    let mut clone = original.clone();
+    assert_eq!(clone.revision(), original.revision());
+    assert!(Arc::ptr_eq(&built, &clone.name_corpus()));
+
+    clone.add_node(make_node("b", "Beta", "b.rs", NodeType::Function));
+    assert_ne!(clone.revision(), original.revision());
+    assert!(clone.name_corpus().names.contains(&"beta".to_string()));
+    assert!(
+        !original.name_corpus().names.contains(&"beta".to_string()),
+        "a diverged clone must not leak names into the original"
+    );
+
+    let other = ProgramDependenceGraph::new();
+    assert_ne!(other.revision(), original.revision());
 }
