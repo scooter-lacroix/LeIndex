@@ -515,6 +515,22 @@ required-features = ["full"]
 name = "refcount_store"
 path = "benches/refcount_store.rs"
 harness = false
+required-features = ["storage"]
+
+[[example]]
+name = "hydrate_profile"
+path = "examples/hydrate_profile.rs"
+required-features = ["storage"]
+
+[[example]]
+name = "engine_profile"
+path = "examples/engine_profile.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "textsearch_bench"
+path = "examples/textsearch_bench.rs"
+required-features = ["search"]
 
 [[bench]]
 name = "worker_batch_bench"

@@ -248,16 +248,20 @@ impl DiagnosticsHandler {
             // Engram query phrase-book counters plus the global embed-cache
             // counters (index-time neural reuse), so cache effectiveness is
             // visible in one place. Counters are per process.
-            let mut engram = serde_json::to_value(crate::search::engram::global_stats())
+            let engram = serde_json::to_value(crate::search::engram::global_stats())
                 .unwrap_or_else(|_| serde_json::json!({}));
             #[cfg(feature = "onnx")]
-            if let Value::Object(ref mut engram_map) = engram {
-                let (hits, misses) = crate::search::onnx::embed_cache_frontend::counters();
-                engram_map.insert(
-                    "embed_cache".to_string(),
-                    serde_json::json!({ "hits": hits, "misses": misses }),
-                );
-            }
+            let engram = {
+                let mut engram = engram;
+                if let Value::Object(ref mut engram_map) = engram {
+                    let (hits, misses) = crate::search::onnx::embed_cache_frontend::counters();
+                    engram_map.insert(
+                        "embed_cache".to_string(),
+                        serde_json::json!({ "hits": hits, "misses": misses }),
+                    );
+                }
+                engram
+            };
             map.insert("engram".to_string(), engram);
 
             // Flat fields expected by trim_diagnostics / render_diagnostics

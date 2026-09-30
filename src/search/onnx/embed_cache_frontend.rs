@@ -64,6 +64,7 @@ static OPEN_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// Cumulative (hits, misses) observed by this process — surfaced in index
 /// progress logs so cache effectiveness is visible.
+#[cfg(any(feature = "cli", test))]
 pub(crate) fn counters() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }

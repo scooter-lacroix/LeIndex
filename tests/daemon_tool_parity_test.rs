@@ -6,7 +6,7 @@
 //! disabled, omitted, or stubbed in the daemon path. Both paths use the same
 //! `all_tool_handlers()` registration, so the tool list must be identical.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "cli"))]
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;

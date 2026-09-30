@@ -90,7 +90,9 @@ pub mod embed;
 // Feature flag infrastructure (always available)
 pub mod feature_flags;
 
-// Cross-version artifact migration (always available; §12.2)
+// Cross-version artifact migration (§12.2). Reads and writes the SQLite/CAS
+// stores, so it exists whenever the `storage` feature does.
+#[cfg(feature = "storage")]
 pub mod migration;
 
 // Fair bounded scheduler (always available; gated at runtime by

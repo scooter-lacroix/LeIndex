@@ -1374,6 +1374,7 @@ impl EmbeddingClient {
     /// (two `stat`s, no hashing). Any change to those files yields a different
     /// identity, so stale vectors are never served. `None` when the model
     /// cannot be resolved, in which case callers bypass the phrase-book.
+    #[cfg(feature = "cli")]
     pub(crate) fn engram_identity(&self, expected_dim: usize) -> Option<String> {
         let model = std::env::var("LEINDEX_WORKER_MODEL")
             .ok()

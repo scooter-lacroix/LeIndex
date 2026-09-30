@@ -160,6 +160,7 @@ impl TokenIndex {
         dictionary + keys + postings + per_node
     }
 
+    #[cfg(any(feature = "storage", test))]
     /// Persistable form for the nodes in `order`: a compact dictionary of the
     /// tokens still in use, and for each node its ascending ids into it.
     pub(super) fn to_dictionary<'a>(
@@ -194,6 +195,7 @@ impl TokenIndex {
         (dictionary, per_node)
     }
 
+    #[cfg(any(feature = "storage", test))]
     /// Rebuild from a persisted dictionary. `node_ids[i]` owns `per_node[i]`.
     /// Returns `None` if any id is out of range or a list is not ascending.
     pub(super) fn from_dictionary<'a>(

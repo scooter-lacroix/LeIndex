@@ -21,10 +21,13 @@
 //! ships without passing the gates below. Public MTEB/CodeSearchNet numbers
 //! shortlist only; they do NOT select.
 
+// Needs the TF-IDF embedder from the CLI index builder.
+#[cfg(feature = "cli")]
 pub mod agent_tasks;
 pub mod budget_ledger;
 pub mod candidates;
 pub mod corpus;
+#[cfg(feature = "cli")]
 pub mod external_suite;
 pub mod gates;
 pub mod harness;
