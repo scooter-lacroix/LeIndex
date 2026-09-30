@@ -832,7 +832,7 @@ mod tests {
             deleted_files: Vec::new(),
         };
 
-        let _flag_guard = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        let _flag_guard = crate::feature_flags::lock_flag_tests();
         crate::feature_flags::set_flag_override_for_test(
             crate::feature_flags::FeatureFlag::PrecisionIngest,
             true,

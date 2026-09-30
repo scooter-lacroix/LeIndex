@@ -2,6 +2,94 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [2.0.0] - Unreleased additions - Four tools, native text search, millisecond cold starts
+
+Reconstruction and continuation of the tool layer after the local working tree
+was lost; everything below is on `v2.0.0` and covered by tests.
+
+### Four tools instead of twenty
+
+- `tools/list` advertises `leindex_explore` (`mode`), `leindex_analyze` (`mode`),
+  `leindex_edit` (`action`, required — an ambiguous call must not guess at a
+  mutation) and `leindex_manage` (`action`). The operation is a discriminator
+  argument; all other arguments are forwarded unchanged to the existing handler.
+  The advertised listing is well under half the size of the old one and is
+  guarded by a size test.
+- Every router accepts `tier` (`l0` identity card, `l1` overview, `l2` full),
+  points at the `leindex://tools/guide` resource for per-branch arguments, and
+  answers unknown tools/branches with a "did you mean" hint as an `isError`
+  result. `leindex://docs/q` is a one-screen cheat sheet.
+- The original tool names (dotted/dashed spellings included) stay callable but are
+  not advertised. `LEINDEX_MCP_LEGACY_TOOLS=1` advertises them;
+  `LEINDEX_MCP_SCHEMA=oneof` switches `tools/list` to `oneOf` + `discriminator`
+  schemas (the form `leindex tools schema` prints).
+- `leindex tools list [--verbose]`, `tools inspect`, `tools schema`, `tools run`.
+- New `leindex_analyze mode=git_diff`: working tree / staged / commit / range,
+  changed hunks mapped to PDG symbols, callers and affected files.
+
+### Native text search replaces grep and text_search
+
+- New `leindex_explore mode=find` (`leindex_find`): an in-process, memory-mapped
+  trigram index (the technique behind Zoekt) with regex→trigram query planning.
+  About 1 ms per search on a 700-file repository (was ~980 ms for the previous
+  text search); the index is 2.4 MB and builds in ~150 ms during indexing.
+- Always correct: hits are read from the live file; files edited, added or never
+  indexed are detected and scanned directly. Any directory or file on the
+  machine can be searched with `paths` — a live parallel scan, no index, no side
+  effects. Hits carry their enclosing symbol from the index (no PDG load).
+- Unbounded but paged (`limit=0`, `offset`, `next_offset`), smart-case, whole
+  word, include/exclude globs, context lines, `output` = matches | files | count
+  | symbols, `target=symbols` for definitions by name (exact first).
+- `leindex_grep_symbols` and `leindex_text_search` are removed; calls by those
+  names, and the `grep`/`text` modes, redirect to `find`. The grep tool's
+  semantic mode is gone (`mode=search` covers it).
+
+### MCP hangs fixed (MCP hung while the one-shot CLI was fine)
+
+- Semantic search reported "Project not indexed" on every cold MCP session: the
+  need-based hydration change stopped loading the search engine and search never
+  hydrated it. The CLI pre-loads everything, which hid it.
+- The stdio loop handled requests serially: one slow call (a cold auto-index
+  measured at 10 s) blocked `ping` and everything queued behind it. Requests now
+  run concurrently behind a dedicated writer thread, with panic-safe replies,
+  bounded concurrency, drain-on-EOF, and idle-exit suppressed while calls run.
+- First-use auto-indexing inside a tool call held the request for the whole
+  index. In a server it now starts/joins the owned background job and waits at
+  most `LEINDEX_AUTO_INDEX_WAIT_MS` (default 5000).
+- stdio now answers `prompts/*` and `resources/*` like HTTP and socket.
+
+### Cold-start performance
+
+| Cold first call | before | after | after + prewarm |
+|---|---:|---:|---:|
+| `explore search` | 3.6 s | 1.3 s | ~30 ms |
+| `explore context` | 2.7 s | 1.2 s | ~30 ms |
+| `analyze deep` | 3.3 s | 1.4 s | ~130 ms |
+| `explore symbol_lookup` | 754 ms | 212 ms | ~20 ms |
+| `explore project_map` | 876 ms | 351 ms | ~15 ms |
+| `analyze impact` | 817 ms | 225 ms | ~20 ms |
+| full forced index (this repo) | 14.2 s | 9.8 s | — |
+
+- Search engine restore 1.39 s → ~0.15 s (interned `Arc<str>` tokens and node
+  ids, staged postings, fast hasher). PDG load 710 ms → ~165 ms (bulk load without
+  the throw-away incremental trigram build, streamed rows and only needed columns,
+  no edge self-join, no JSON parse for empty edge metadata). PDG fingerprint is
+  hashed in parallel. TF-IDF document-frequency pass runs in parallel.
+- Background pre-warm after `initialize` (`[mcp] prewarm = "full" | "graph" | "off"`,
+  default `full`): the default project's graph, then its search engine, load while
+  the model is still thinking. Only already-indexed projects; never builds an
+  index or creates storage.
+
+### Fixed
+
+- `grep_symbols`' `mode` argument collided with the router selector and clobbered
+  it in merged schemas; it is now `grep_mode` (bare `mode` still honoured on direct
+  calls), and the merge can no longer overwrite reserved keys.
+- Test flake with a 5-test cascade: a fixed wall-clock bound flaked under load and,
+  panicking while holding `FLAG_TEST_LOCK`, poisoned it for unrelated tests. The
+  lock is poison-tolerant, overrides reset on unwind, and timing bounds scale with
+  a measured baseline.
+
 ## [2.0.0] - 2026-08-06 - Resource Architecture Transformation
 
 **LeIndex 2.0.0** is a ground-up resource architecture rebuild that collapses the

@@ -15,24 +15,6 @@ use rusqlite::{Result as SqliteResult, params};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// Type alias for node database rows to reduce type complexity
-type NodeDbRow = (
-    i64,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    Option<i32>,
-    String,
-    Option<Vec<u8>>,
-    Option<i64>,
-    Option<i64>,
-    Option<i32>,
-    i32,
-);
-
 /// Errors that can occur during PDG persistence
 #[derive(Debug, thiserror::Error)]
 pub enum PdgStoreError {
@@ -857,10 +839,11 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
     // Try to load persisted trigram index; fall back to rebuilding from nodes.
     // The trigram index is maintained incrementally via add_node during load,
     // but loading the persisted version is faster for large PDGs.
-    if let Ok(Some(trigram_idx)) = load_trigram_index(storage, project_id) {
-        pdg.set_trigram_index(trigram_idx);
+    match load_trigram_index(storage, project_id) {
+        Ok(Some(trigram_idx)) => pdg.set_trigram_index(trigram_idx),
+        // Nodes were bulk-loaded without trigrams; build them once.
+        _ => pdg.rebuild_trigram_index(),
     }
-    // If no persisted index, the one built incrementally via add_node is already correct.
 
     Ok(pdg)
 }
@@ -870,47 +853,59 @@ fn load_nodes(
     project_id: &str,
     pdg: &mut ProgramDependenceGraph,
 ) -> Result<HashMap<i64, NodeId>> {
+    // Only the columns a graph node needs: `qualified_name`, `content_hash`,
+    // `embedding` and `embedding_format` are not part of a `PDGNode`, and rows
+    // are streamed straight into the graph rather than collected first.
     let mut nodes_stmt = storage.conn().prepare(
-        "SELECT id, file_path, node_id, symbol_name, qualified_name, language, node_type, complexity, content_hash, embedding, byte_range_start, byte_range_end, embedding_format, precision
+        "SELECT id, file_path, node_id, symbol_name, language, node_type, complexity, byte_range_start, byte_range_end, precision
          FROM intel_nodes WHERE project_id = ?1",
     )?;
-    let node_rows: Vec<NodeDbRow> = nodes_stmt
-        .query_map(params![project_id], read_node_row)?
-        .collect::<SqliteResult<Vec<_>>>()?;
+    let mut rows = nodes_stmt.query(params![project_id])?;
     let mut db_id_to_node_id = HashMap::new();
+    // One `Arc<str>` per file, shared by all of its nodes.
+    let mut files: HashMap<String, Arc<str>> = HashMap::new();
 
-    for (
-        db_id,
-        file_path,
-        node_id_str,
-        symbol_name,
-        _qualified_name,
-        language,
-        node_type_str,
-        complexity,
-        _content_hash,
-        _embedding_blob,
-        start,
-        end,
-        _embedding_format,
-        precision,
-    ) in node_rows
-    {
-        let node_type = StorageNodeType::from_str_name(&node_type_str).ok_or_else(|| {
+    while let Some(row) = rows.next()? {
+        let db_id: i64 = row.get(0)?;
+        let file_path = row
+            .get_ref(1)?
+            .as_str()
+            .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
+        let node_type_str = row
+            .get_ref(5)?
+            .as_str()
+            .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
+        let node_type = StorageNodeType::from_str_name(node_type_str).ok_or_else(|| {
             PdgStoreError::Deserialization(format!("Invalid node type: {}", node_type_str))
         })?;
+        let file_path: Arc<str> = match files.get(file_path) {
+            Some(shared) => Arc::clone(shared),
+            None => {
+                let shared: Arc<str> = Arc::from(file_path);
+                files.insert(file_path.to_string(), Arc::clone(&shared));
+                shared
+            }
+        };
+        let start: Option<i64> = row.get(7)?;
+        let end: Option<i64> = row.get(8)?;
+        let complexity: Option<i32> = row.get(6)?;
+        let precision: i32 = row.get(9)?;
         let pdg_node = PDGNode {
-            id: node_id_str,
+            id: row.get(2)?,
             node_type: convert_storage_node_type(&node_type),
-            name: symbol_name,
-            file_path: Arc::from(file_path),
+            name: row.get(3)?,
+            file_path,
             byte_range: (start.unwrap_or(0) as usize, end.unwrap_or(0) as usize),
             complexity: complexity.unwrap_or(0) as u32,
-            language,
+            language: row.get(4)?,
         };
-        let stable_id = pdg_node.id.clone();
-        let node_id = pdg.add_node(pdg_node);
-        if precision != 0 {
+        let stable_id = if precision != 0 {
+            Some(pdg_node.id.clone())
+        } else {
+            None
+        };
+        let node_id = pdg.add_node_without_trigrams(pdg_node);
+        if let Some(stable_id) = stable_id {
             pdg.mark_precision_symbol(stable_id);
         }
         db_id_to_node_id.insert(db_id, node_id);
@@ -919,24 +914,10 @@ fn load_nodes(
     Ok(db_id_to_node_id)
 }
 
-fn read_node_row(row: &rusqlite::Row<'_>) -> SqliteResult<NodeDbRow> {
-    Ok((
-        row.get::<_, i64>(0)?,
-        row.get::<_, String>(1)?,
-        row.get::<_, String>(2)?,
-        row.get::<_, String>(3)?,
-        row.get::<_, String>(4)?,
-        row.get::<_, String>(5)?,
-        row.get::<_, String>(6)?,
-        row.get::<_, Option<i32>>(7)?,
-        row.get::<_, String>(8)?,
-        row.get::<_, Option<Vec<u8>>>(9)?,
-        row.get::<_, Option<i64>>(10)?,
-        row.get::<_, Option<i64>>(11)?,
-        row.get::<_, Option<i32>>(12)?,
-        row.get::<_, i32>(13)?,
-    ))
-}
+/// What an edge with no metadata serializes to (`StorageEdgeMetadata` with every
+/// field `None`); `load_edges` recognises it without parsing.
+const EMPTY_EDGE_METADATA_JSON: &[u8] =
+    br#"{"call_count":null,"variable_name":null,"confidence":null,"channel":null,"position":null}"#;
 
 fn load_edges(
     storage: &Storage,
@@ -944,32 +925,38 @@ fn load_edges(
     pdg: &mut ProgramDependenceGraph,
     db_id_to_node_id: &HashMap<i64, NodeId>,
 ) -> Result<()> {
-    let mut edges_stmt = storage.conn().prepare(
-        "SELECT e.caller_id, e.callee_id, e.edge_type, e.metadata
-         FROM intel_edges e
-         INNER JOIN intel_nodes n1 ON e.caller_id = n1.id
-         INNER JOIN intel_nodes n2 ON e.callee_id = n2.id
-         WHERE n1.project_id = ?1 AND n2.project_id = ?1",
-    )?;
-    let edge_rows: Vec<(i64, i64, String, Option<String>)> = edges_stmt
-        .query_map(params![project_id], read_edge_row)?
-        .collect::<SqliteResult<Vec<_>>>()?;
-
-    for (caller_id, callee_id, edge_type_str, metadata_json) in edge_rows {
-        let caller_node_id = *db_id_to_node_id
-            .get(&caller_id)
-            .ok_or_else(|| PdgStoreError::NodeNotFound(caller_id))?;
-        let callee_node_id = *db_id_to_node_id
-            .get(&callee_id)
-            .ok_or_else(|| PdgStoreError::NodeNotFound(callee_id))?;
-        let edge_type = StorageEdgeType::from_str_name(&edge_type_str).ok_or_else(|| {
+    // No join against `intel_nodes`: `db_id_to_node_id` already holds exactly
+    // this project's nodes, so an edge belongs to the project iff both
+    // endpoints are in it. (The double self-join cost ~150 ms of the load.)
+    let _ = project_id;
+    let mut edges_stmt = storage
+        .conn()
+        .prepare("SELECT caller_id, callee_id, edge_type, metadata FROM intel_edges")?;
+    let mut rows = edges_stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let caller_id: i64 = row.get(0)?;
+        let callee_id: i64 = row.get(1)?;
+        let (Some(&caller_node_id), Some(&callee_node_id)) = (
+            db_id_to_node_id.get(&caller_id),
+            db_id_to_node_id.get(&callee_id),
+        ) else {
+            continue;
+        };
+        let edge_type_str = row
+            .get_ref(2)?
+            .as_str()
+            .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
+        let edge_type = StorageEdgeType::from_str_name(edge_type_str).ok_or_else(|| {
             PdgStoreError::Deserialization(format!("Invalid edge type: {}", edge_type_str))
         })?;
-        let metadata = match metadata_json.as_deref() {
-            Some(json) => serde_json::from_str(json).map_err(|e| {
-                PdgStoreError::Deserialization(format!("Invalid edge metadata: {}", e))
-            })?,
-            None => StorageEdgeMetadata {
+        let metadata = match row.get_ref(3)? {
+            // ~70% of edges carry the all-null literal; skip the JSON parse.
+            rusqlite::types::ValueRef::Text(bytes) if bytes != EMPTY_EDGE_METADATA_JSON => {
+                serde_json::from_slice(bytes).map_err(|e| {
+                    PdgStoreError::Deserialization(format!("Invalid edge metadata: {}", e))
+                })?
+            }
+            _ => StorageEdgeMetadata {
                 call_count: None,
                 variable_name: None,
                 confidence: None,
@@ -977,6 +964,7 @@ fn load_edges(
                 position: None,
             },
         };
+
         let pdg_edge = PDGEdge {
             edge_type: convert_storage_edge_type(&edge_type),
             metadata: convert_storage_edge_metadata(&metadata),
@@ -985,15 +973,6 @@ fn load_edges(
     }
 
     Ok(())
-}
-
-fn read_edge_row(row: &rusqlite::Row<'_>) -> SqliteResult<(i64, i64, String, Option<String>)> {
-    Ok((
-        row.get::<_, i64>(0)?,
-        row.get::<_, i64>(1)?,
-        row.get::<_, String>(2)?,
-        row.get::<_, Option<String>>(3)?,
-    ))
 }
 
 /// Check if a PDG exists for a project

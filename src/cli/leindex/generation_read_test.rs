@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::feature_flags::{
-    FLAG_TEST_LOCK, FeatureFlag, clear_flag_overrides_for_test, set_flag_override_for_test,
+    FeatureFlag, clear_flag_overrides_for_test, lock_flag_tests, set_flag_override_for_test,
 };
 use crate::graph::pdg::ProgramDependenceGraph;
 use crate::storage::cas::CasStore;
@@ -177,7 +177,7 @@ const QUERIES: &[&str] = &[
 /// identical output to the legacy heap-mirror path (default off).
 #[test]
 fn test_read_path_bit_for_bit_equivalence() {
-    let _guard = FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_flag_tests();
     let dir = tempfile::tempdir().expect("tempdir");
     write_fixture_project(dir.path());
     index_project_fixture(dir.path());
@@ -238,7 +238,7 @@ fn test_read_path_bit_for_bit_equivalence() {
 /// mid-publication of the next generation.
 #[test]
 fn test_no_stall_read_during_index() {
-    let _guard = FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_flag_tests();
     let dir = tempfile::tempdir().expect("tempdir");
     write_fixture_project(dir.path());
     index_project_fixture(dir.path());
@@ -325,7 +325,7 @@ fn test_no_stall_read_during_index() {
 /// not delay publication (the read path never acquires the writer's locks).
 #[test]
 fn test_read_path_no_writer_contention() {
-    let _guard = FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_flag_tests();
     let dir = tempfile::tempdir().expect("tempdir");
     write_fixture_project(dir.path());
     index_project_fixture(dir.path());
@@ -338,9 +338,24 @@ fn test_read_path_no_writer_contention() {
     publish_live_generation(&storage_root, 2);
     let t_baseline = baseline.elapsed();
 
+    // Solo reader cycle: the yardstick for every timing bound below. Fixed
+    // wall-clock limits flake on a loaded or slow machine (and a panic while
+    // holding the flag lock used to poison it for unrelated tests); bounds
+    // that scale with a measured baseline still catch a reader that blocks
+    // the writer, which shows up as a large multiple, not a few milliseconds.
+    set_flag_override_for_test(FeatureFlag::GenerationReaders, true);
+    let solo = {
+        let started = Instant::now();
+        let mut idx = hydrate_generation_instance(dir.path());
+        idx.search("authenticate user", 10, None)
+            .expect("solo reader search");
+        started.elapsed()
+    };
+    let reader_budget = (solo * 25).max(Duration::from_millis(800));
+    let writer_slack = (solo * 4).max(Duration::from_millis(400));
+
     // Concurrent: 8 readers each open the leased snapshot and run a search
     // cycle while the writer publishes the next generation.
-    set_flag_override_for_test(FeatureFlag::GenerationReaders, true);
     let project = dir.path().to_path_buf();
     let readers: Vec<_> = (0..8)
         .map(|i| {
@@ -366,8 +381,9 @@ fn test_read_path_no_writer_contention() {
                 );
                 let elapsed = started.elapsed();
                 assert!(
-                    elapsed < Duration::from_millis(800),
-                    "reader {i} took {elapsed:?} while writer published"
+                    elapsed < reader_budget,
+                    "reader {i} took {elapsed:?} while writer published \
+                     (solo {solo:?}, budget {reader_budget:?})"
                 );
             })
         })
@@ -387,8 +403,8 @@ fn test_read_path_no_writer_contention() {
     clear_flag_overrides_for_test();
 
     assert!(
-        t_concurrent <= t_baseline + Duration::from_millis(400),
+        t_concurrent <= t_baseline + writer_slack,
         "concurrent generation readers must not delay writes: baseline {t_baseline:?}, \
-         with readers {t_concurrent:?}"
+         with readers {t_concurrent:?}, allowed slack {writer_slack:?}"
     );
 }

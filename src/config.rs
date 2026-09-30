@@ -173,6 +173,17 @@ pub struct McpConfig {
     /// Default 600 (10 min).
     #[serde(default = "default_mcp_engine_max_idle_secs")]
     pub engine_max_idle_secs: u64,
+
+    /// What a long-lived MCP server loads in the background right after the
+    /// client's `initialize`, for the default project (only when it is
+    /// already indexed — never builds an index):
+    /// `"full"` (default) the PDG, then the search engine; `"graph"` the PDG
+    /// only; `"off"` nothing (everything loads on first use).
+    ///
+    /// Cold hydration is the only slow part of a first call; the model's
+    /// think-time after the handshake is long enough to hide it.
+    #[serde(default = "default_mcp_prewarm")]
+    pub prewarm: String,
 }
 
 // ── Defaults ─────────────────────────────────────────────────────────────
@@ -220,6 +231,7 @@ impl Default for McpConfig {
         Self {
             idle_timeout_secs: default_mcp_idle_timeout_secs(),
             engine_max_idle_secs: default_mcp_engine_max_idle_secs(),
+            prewarm: default_mcp_prewarm(),
         }
     }
 }
@@ -292,6 +304,10 @@ fn default_mcp_idle_timeout_secs() -> u64 {
     // short enough that an idle swapped-out server self-terminates instead of
     // holding multi-GB of swap for hours (memory-pressure remediation 1.11.0).
     1800
+}
+
+fn default_mcp_prewarm() -> String {
+    "full".to_string()
 }
 
 fn default_mcp_engine_max_idle_secs() -> u64 {
@@ -634,6 +650,7 @@ mod tests {
             mcp: McpConfig {
                 idle_timeout_secs: 3600,
                 engine_max_idle_secs: 1200,
+                prewarm: "graph".to_string(),
             },
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -647,6 +664,7 @@ mod tests {
         let config = LeIndexConfig::default();
         assert_eq!(config.mcp.idle_timeout_secs, 1800);
         assert_eq!(config.mcp.engine_max_idle_secs, 600);
+        assert_eq!(config.mcp.prewarm, "full");
 
         // Parse from empty TOML -> same defaults (backward compatible: existing
         // configs without an [mcp] section keep working).

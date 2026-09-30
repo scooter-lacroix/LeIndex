@@ -740,6 +740,7 @@ pub async fn index_with_progress(
 fn handle_initialize(server: &McpServer) -> (Value, Option<String>) {
     // Generate a session ID for HTTP transport
     let session_id = generate_session_id();
+    server._registry.spawn_prewarm();
 
     // Store in per-session map with eviction logic
     {
@@ -1698,6 +1699,7 @@ async fn handle_socket_message(
                     // Mark session as handshaked
                     handshake_complete.store(true, Ordering::SeqCst);
                     session_handshakes.insert(Arc::<str>::from(session_id), (true, Instant::now()));
+                    state.spawn_prewarm();
 
                     let result = serde_json::json!({
                         "protocolVersion": "2024-11-05",

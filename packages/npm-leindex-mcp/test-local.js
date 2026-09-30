@@ -125,25 +125,13 @@ async function testToolsList() {
         setTimeout(() => {
           proc.kill();
           
+          // tools/list advertises four routers; the individual operations
+          // are branches selected with `mode` / `action`.
           const tools = [
-            'leindex_index',
-            'leindex_search',
-            'leindex_deep_analyze',
-            'leindex_context',
-            'leindex_symbol_lookup',
-            'leindex_file_summary',
-            'leindex_project_map',
-            'leindex_grep_symbols',
-            'leindex_read_symbol',
-            'leindex_edit_preview',
-            'leindex_edit_apply',
-            'leindex_rename_symbol',
-            'leindex_impact_analysis',
-            'leindex_text_search',
-            'leindex_read_file',
-            'leindex_git_status',
-            'leindex_diagnostics',
-            'leindex_phase_analysis'
+            'leindex_explore',
+            'leindex_analyze',
+            'leindex_edit',
+            'leindex_manage'
           ];
           
           const missing = tools.filter(t => !stdout.includes(t));
@@ -187,8 +175,9 @@ async function testToolCall() {
           id: 2,
           method: 'tools/call',
           params: {
-            name: 'leindex_search',
+            name: 'leindex_explore',
             arguments: {
+              mode: 'search',
               query: 'MCP server',
               top_k: 3,
               project_path: PROJECT_PATH

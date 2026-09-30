@@ -316,6 +316,9 @@ pub struct ProjectRegistry {
     /// When set, `maybe_incremental_refresh` is a no-op; the next invocation
     /// re-evaluates staleness anyway.
     one_shot: std::sync::atomic::AtomicBool,
+
+    /// Background pre-warm has been started (once per registry).
+    prewarm_started: std::sync::atomic::AtomicBool,
 }
 
 impl ProjectRegistry {
@@ -334,6 +337,7 @@ impl ProjectRegistry {
             incremental_refresh_guard: Mutex::new(HashMap::new()),
             last_used: RwLock::new(HashMap::new()),
             one_shot: std::sync::atomic::AtomicBool::new(false),
+            prewarm_started: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -352,6 +356,82 @@ impl ProjectRegistry {
     /// response latency off the slow path).
     pub fn is_one_shot(&self) -> bool {
         self.one_shot.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Start loading the default project in the background (once).
+    ///
+    /// Called when a client completes `initialize`. Cold hydration is the only
+    /// slow part of a first tool call; the model spends longer than that
+    /// deciding what to ask, so doing it now hides it. Two phases, so a tool
+    /// that needs only the graph never waits for the search engine:
+    /// the PDG first (~0.2 s), then the engine (`[mcp] prewarm = "full"`).
+    ///
+    /// Never builds an index and never creates storage: a project that has not
+    /// been indexed is left alone. One-shot processes skip it entirely.
+    pub fn spawn_prewarm(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        // Initialize handlers can be reached from synchronous code (and tests)
+        // with no runtime; pre-warming is an optimization, so skip quietly.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self.is_one_shot() || self.prewarm_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mode = crate::config::LeIndexConfig::load_cached()
+            .mcp
+            .prewarm
+            .clone();
+        let full = match mode.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "none" | "0" => return,
+            "graph" => false,
+            _ => true,
+        };
+        let registry = Arc::clone(self);
+        runtime.spawn(async move {
+            let Ok(path) = registry.default_project_path().await else {
+                return;
+            };
+            let has_index = crate::cli::live_project::LiveProject::resolve(&path.to_string_lossy())
+                .is_ok_and(|live| live.active_storage().join("leindex.db").is_file());
+            if !has_index {
+                debug!(project = %path.display(), "Prewarm skipped: project is not indexed");
+                return;
+            }
+            let Ok(handle) = registry.get_or_load(None).await else {
+                return;
+            };
+            let started = std::time::Instant::now();
+            let graph = {
+                let handle = handle.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut index = handle.blocking_write();
+                    index.ensure_pdg_loaded_graph_only()
+                })
+                .await
+            };
+            if !matches!(graph, Ok(Ok(()))) {
+                debug!("Prewarm: graph load did not complete");
+                return;
+            }
+            let graph_ms = started.elapsed().as_millis() as u64;
+            if !full {
+                info!(project = %path.display(), graph_ms, "Prewarmed project graph");
+                return;
+            }
+            let engine = tokio::task::spawn_blocking(move || {
+                let mut index = handle.blocking_write();
+                index.ensure_analysis_context_loaded()
+            })
+            .await;
+            info!(
+                project = %path.display(),
+                graph_ms,
+                total_ms = started.elapsed().as_millis() as u64,
+                engine_ok = matches!(engine, Ok(Ok(()))),
+                "Prewarmed project graph and search engine"
+            );
+        });
     }
 
     /// Create a registry pre-loaded with one project (the initial startup project).
@@ -393,6 +473,7 @@ impl ProjectRegistry {
             incremental_refresh_guard: Mutex::new(HashMap::new()),
             last_used: RwLock::new(last_used),
             one_shot: std::sync::atomic::AtomicBool::new(false),
+            prewarm_started: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2381,5 +2462,84 @@ mod tests {
             !registry.stale_cache.read().await.contains_key(&canonical),
             "stale cache entry must be removed on invalidate with canonical input"
         );
+    }
+
+    // ── Background pre-warm ──────────────────────────────────────────────
+
+    fn write_prewarm_fixture(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn authenticate_user(name: &str) -> bool {\n    !name.is_empty()\n}\n\npub fn hash_password(p: &str) -> u64 {\n    p.len() as u64\n}\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_leaves_an_unindexed_project_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        write_prewarm_fixture(dir.path());
+        let registry = Arc::new(ProjectRegistry::new(2));
+        registry
+            .set_default_path(dir.path().canonicalize().unwrap())
+            .await;
+        registry.spawn_prewarm();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            registry.len().await,
+            0,
+            "an unindexed project is never loaded"
+        );
+        assert!(
+            !dir.path().join(".leindex").exists(),
+            "prewarm must not create storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_loads_graph_and_engine_of_an_indexed_project() {
+        let dir = tempfile::tempdir().unwrap();
+        write_prewarm_fixture(dir.path());
+        let root = dir.path().canonicalize().unwrap();
+        {
+            let mut index = LeIndex::new(&root).unwrap();
+            index.index_project(true).unwrap();
+        }
+        let registry = Arc::new(ProjectRegistry::new(2));
+        registry.set_default_path(root.clone()).await;
+        registry.spawn_prewarm();
+        registry.spawn_prewarm(); // idempotent
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if let Some(handle) = registry.try_get_loaded(&root).await {
+                let index = handle.read().await;
+                if index.pdg().is_some() && !index.search_engine().is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "prewarm never completed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_one_shot_registry_never_prewarms() {
+        let dir = tempfile::tempdir().unwrap();
+        write_prewarm_fixture(dir.path());
+        let root = dir.path().canonicalize().unwrap();
+        {
+            let mut index = LeIndex::new(&root).unwrap();
+            index.index_project(true).unwrap();
+        }
+        let registry = Arc::new(ProjectRegistry::new(2));
+        registry.mark_one_shot();
+        registry.set_default_path(root).await;
+        registry.spawn_prewarm();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(registry.len().await, 0);
     }
 }

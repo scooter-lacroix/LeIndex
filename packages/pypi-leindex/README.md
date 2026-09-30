@@ -78,27 +78,33 @@ human-annotated query/code benchmark — see the
 
 ---
 
-## What agents see: 18 MCP tools
+## What agents see: 4 MCP tools
 
-Search and navigation: `leindex_search` (hybrid semantic), `leindex_text_search`
-(matches carry the owning symbol), `leindex_grep_symbols`, `leindex_read_file`
-(symbol maps + imports/dependents), `leindex_read_symbol`, `leindex_symbol_lookup`
-(batch, impact radius + direction), `leindex_context` (callers/callees/data-deps
-sections), `leindex_deep_analyze` (semantic + PDG traversal), `leindex_file_summary`,
-`leindex_project_map`, `leindex_phase_analysis` (5-phase architectural review),
-`leindex_diagnostics`, `leindex_git_status` (PDG-enriched).
+Four routers instead of twenty schemas — a `mode` / `action` argument picks the
+operation, every other argument passes straight through:
 
-Safe editing: `leindex_edit_preview` → `leindex_edit_apply` (dry-run supported),
-`leindex_rename_symbol` (atomic multi-file, preview-first), `leindex_write`
-(immediate symbol discovery for new files), `leindex_impact_analysis`
-(transitive blast radius with risk rating).
+| Tool | Selector | Branches |
+|---|---|---|
+| `leindex_explore` | `mode` | `search` (hybrid semantic, default) · `find` (exact text / regex / symbol names — indexed, always live, **any path on disk**) · `symbol_lookup` · `read_file` · `read_symbol` · `project_map` · `file_summary` · `context` |
+| `leindex_analyze` | `mode` | `deep` (semantic + PDG traversal, default) · `impact` (transitive blast radius) · `diagnostics` · `git_status` · `git_diff` (PDG-enriched) |
+| `leindex_edit` | `action` (required) | `preview` → `apply` (dry-run supported) · `rename` (atomic multi-file, preview-first) · `write` |
+| `leindex_manage` | `action` | `index` (pollable job, default) · `phase` (5-phase architectural review) |
+
+`find` is a native trigram index (the technique behind Zoekt) built with each
+index run: about a millisecond on a 700-file repository, results always read from
+the live file, and any directory outside the index is scanned on the fly with no
+setup. Every branch takes `tier` (`l0` card · `l1` overview · `l2` full detail),
+and argument detail lives in the `leindex://tools/guide` MCP resource. The
+original per-tool names (`leindex_search`, `leindex_edit_apply`, …) still work
+as direct calls.
 
 Every tool is also on the CLI — the same handlers, the same output:
 
 ```bash
-leindex tools list
-leindex tools help leindex-project-map
-leindex tools run leindex_search --args '{"query":"retry policy","top_k":5}'
+leindex tools list --verbose
+leindex tools inspect leindex_explore
+leindex tools run leindex_explore --set mode=find --set pattern=retry
+leindex tools run leindex_explore --args '{"mode":"search","query":"retry policy","top_k":5}'
 ```
 
 ---

@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_validated_profile_feature_flag_on_after_rollout() {
-        let _g = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        let _g = crate::feature_flags::lock_flag_tests();
         crate::feature_flags::clear_flag_overrides_for_test();
         let profile = ProductionModelProfile::validated();
         assert!(
@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn test_active_model_identifier_default() {
-        let _g = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        let _g = crate::feature_flags::lock_flag_tests();
         crate::feature_flags::clear_flag_overrides_for_test();
         // After phase 8 rollout, ValidatedModel defaults ON, so the active
         // model is the validated profile.
@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn test_active_model_identifier_validated() {
-        let _g = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        let _g = crate::feature_flags::lock_flag_tests();
         crate::feature_flags::set_flag_override_for_test(FeatureFlag::ValidatedModel, true);
         assert_eq!(active_model_identifier(), validated_model_identifier());
         crate::feature_flags::clear_flag_overrides_for_test();

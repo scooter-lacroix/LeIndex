@@ -2122,7 +2122,6 @@ fn test_content_cache_matches_direct_enrichment() {
     });
 
     let node_indices: Vec<petgraph::graph::NodeIndex> = pdg.node_indices().collect();
-    let mut file_cache = FileReadCache::per_chunk_scratch();
     let connectivity_config = crate::graph::pdg::TraversalConfig {
         max_depth: Some(1),
         max_nodes: Some(1000),
@@ -2133,13 +2132,10 @@ fn test_content_cache_matches_direct_enrichment() {
     };
     let file_summary_ctx = FileSummaryContext::from_pdg(&pdg);
 
-    let (_df, _total, content_cache) = build_document_frequencies(
-        &pdg,
-        &node_indices,
-        &mut file_cache,
-        &connectivity_config,
-        &file_summary_ctx,
-    );
+    let (_df, _total, content_cache) =
+        build_document_frequencies(&pdg, &node_indices, &connectivity_config, &file_summary_ctx);
+
+    let mut file_cache = FileReadCache::per_chunk_scratch();
 
     // The cache should contain the node.
     assert_eq!(content_cache.len(), 1);
@@ -2229,4 +2225,79 @@ fn test_persisted_search_identity_matches_load_with_duplicate_node_ids() {
         pdg.node_count(),
         "in-memory count includes the duplicate; persisted identity must not"
     );
+}
+
+/// The parallel document-frequency pass must produce exactly what a plain
+/// sequential loop over the same nodes produces: same per-token counts, same
+/// document total, same cached contents.
+#[test]
+fn test_parallel_document_frequencies_match_a_sequential_reference() {
+    use crate::graph::pdg::{Node, NodeType};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut pdg = ProgramDependenceGraph::new();
+    for file in 0..12 {
+        let path = dir.path().join(format!("file_{file}.rs"));
+        let mut source = String::new();
+        for func in 0..40 {
+            source.push_str(&format!(
+                "fn func_{file}_{func}(input: u32) -> u32 {{ helper_{} (input) + {func} }}\n",
+                func % 5
+            ));
+        }
+        std::fs::write(&path, &source).unwrap();
+        let mut offset = 0usize;
+        for func in 0..40 {
+            let line = source[offset..].lines().next().unwrap();
+            pdg.add_node(Node {
+                id: format!("{}:func_{file}_{func}", path.display()),
+                node_type: NodeType::Function,
+                name: format!("func_{file}_{func}"),
+                file_path: Arc::from(path.to_string_lossy().as_ref()),
+                byte_range: (offset, offset + line.len()),
+                complexity: 1,
+                language: "rust".to_string(),
+            });
+            offset += line.len() + 1;
+        }
+    }
+    let node_indices: Vec<petgraph::graph::NodeIndex> = pdg.node_indices().collect();
+    let config = crate::graph::pdg::TraversalConfig {
+        max_depth: Some(1),
+        max_nodes: Some(1000),
+        allowed_edge_types: Some(&[EdgeType::Call, EdgeType::DataDependency]),
+        excluded_node_types: Some(vec![NodeType::External]),
+        min_complexity: None,
+        min_edge_confidence: 0.0,
+    };
+    let ctx = FileSummaryContext::from_pdg(&pdg);
+
+    let (df, total, contents) = build_document_frequencies(&pdg, &node_indices, &config, &ctx);
+
+    // Sequential reference.
+    let mut expected_df: HashMap<String, usize> = HashMap::new();
+    let mut expected_contents: HashMap<String, String> = HashMap::new();
+    let mut expected_total = 0;
+    let mut cache = FileReadCache::per_chunk_scratch();
+    for &idx in &node_indices {
+        let node = pdg.get_node(idx).unwrap();
+        let bytes = cache
+            .get_or_read(std::path::Path::new(&*node.file_path))
+            .unwrap();
+        let content = enriched_node_content(&pdg, idx, node, &bytes, &config, &ctx);
+        let unique: std::collections::HashSet<String> =
+            tokenize_code(&content).into_iter().collect();
+        for token in unique {
+            *expected_df.entry(token).or_insert(0) += 1;
+        }
+        expected_total += 1;
+        expected_contents.insert(node.id.clone(), content);
+    }
+
+    assert_eq!(total, expected_total);
+    assert_eq!(df, expected_df);
+    assert_eq!(contents, expected_contents);
+    assert_eq!(total, 12 * 40);
 }

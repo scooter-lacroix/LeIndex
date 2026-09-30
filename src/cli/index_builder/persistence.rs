@@ -240,9 +240,15 @@ pub(crate) fn pdg_search_fingerprint(pdg: &ProgramDependenceGraph) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"leindex-pdg-search-v2");
 
-    let mut nodes: Vec<[u8; 32]> = pdg
-        .node_indices()
-        .filter_map(|node_idx| {
+    // Each record is hashed independently and the digests are sorted, so the
+    // result is order-independent by construction — which makes the per-record
+    // work (167k BLAKE3 hashes on a mid-size project, ~110 ms serial) safe to
+    // spread across cores.
+    use rayon::prelude::*;
+    let node_ids: Vec<_> = pdg.node_indices().collect();
+    let mut nodes: Vec<[u8; 32]> = node_ids
+        .par_iter()
+        .filter_map(|&node_idx| {
             pdg.get_node(node_idx).map(|node| {
                 let mut record = blake3::Hasher::new();
                 write!(
@@ -262,14 +268,15 @@ pub(crate) fn pdg_search_fingerprint(pdg: &ProgramDependenceGraph) -> String {
             })
         })
         .collect();
-    nodes.sort_unstable();
+    nodes.par_sort_unstable();
     for node in nodes {
         hasher.update(&node);
     }
 
-    let mut edges: Vec<[u8; 32]> = pdg
-        .edge_indices()
-        .filter_map(|edge_idx| {
+    let edge_ids: Vec<_> = pdg.edge_indices().collect();
+    let mut edges: Vec<[u8; 32]> = edge_ids
+        .par_iter()
+        .filter_map(|&edge_idx| {
             let edge = pdg.get_edge(edge_idx)?;
             let (from, to) = pdg.edge_endpoints(edge_idx)?;
             let from = pdg.get_node(from)?;
@@ -289,7 +296,7 @@ pub(crate) fn pdg_search_fingerprint(pdg: &ProgramDependenceGraph) -> String {
             Some(*record.finalize().as_bytes())
         })
         .collect();
-    edges.sort_unstable();
+    edges.par_sort_unstable();
     for edge in edges {
         hasher.update(&edge);
     }

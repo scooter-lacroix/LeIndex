@@ -63,7 +63,35 @@ idle_timeout_secs = 1800
 # Unload a loaded project engine after this many seconds idle. It is reloaded
 # transparently on the next tool call. 0 = keep loaded once touched. Default: 600.
 engine_max_idle_secs = 600
+# What to load in the background right after the client connects, for the default
+# project when it is already indexed (an index is never built here):
+#   "full"  the dependency graph, then the search engine  (default)
+#   "graph" the dependency graph only
+#   "off"   nothing; everything loads on first use
+prewarm = "full"
 ```
+
+**Pre-warm.** Loading a project's graph and search engine from disk is the only
+slow part of a first tool call (about 0.2 s and 1 s respectively on a 700-file
+repository, down from 0.7 s and 3 s before the loader was reworked). A long-lived
+server therefore starts loading the default project as soon as the client
+completes `initialize`, graph first so graph-only tools never wait for the engine.
+The model's think-time hides it: after a 1.5 s pause the first semantic search
+measured 29 ms. `find` needs no hydration at all.
+
+**Concurrency.** Requests are handled concurrently — `ping`, `tools/list` and
+cheap calls are never queued behind a slow one — and responses are written by a
+single dedicated writer, so a client that drains stdout slowly cannot stall the
+runtime. A `tools/call` that panics still gets a JSON-RPC error reply, and the
+server drains in-flight calls before exiting on stdin EOF.
+
+**First-use indexing.** A tool call on a project that has no index starts (or
+joins) the owned background index job and waits at most `LEINDEX_AUTO_INDEX_WAIT_MS`
+(default 5000) before proceeding. A small project finishes inside the window and
+the call returns real results; a large one returns immediately with the index still
+building, index-dependent tools say so, and `leindex_manage action=index` polls the
+job's progress. The one-shot CLI still indexes inline. Nothing ever holds a request
+open for a whole cold index.
 
 The `--mcp-idle-timeout-secs <N>` flag overrides `idle_timeout_secs` for a single
 `leindex mcp` invocation (highest priority; `0` disables). MCP clients respawn the
@@ -78,35 +106,117 @@ run only between requests.
 LeIndex tools are designed to **replace or supersede** standard Claude Code tools for
 code navigation tasks. The table below shows the token efficiency advantage:
 
-| Task | Standard Tools | Tokens | LeIndex Tool | Tokens | Savings |
+| Task | Standard Tools | Tokens | LeIndex call | Tokens | Savings |
 |------|---------------|-------:|--------------|-------:|--------:|
-| Understand a file | `Read` (full file) | ~2 000 | `leindex_file_summary` | ~380 | **81%** |
-| Find all callers | `Grep` + 3×`Read` | ~5 800 | `leindex_symbol_lookup` | ~420 | **93%** |
-| Navigate project | `Glob` + 5×`Read` | ~8 500 | `leindex_project_map` | ~650 | **92%** |
-| Find symbol uses | `Grep` | ~1 200 | `leindex_grep_symbols` | ~310 | **74%** |
-| Read a function | `Read` (full file) | ~1 800 | `leindex_read_symbol` | ~220 | **88%** |
-| Preview a rename | N/A | ∞ | `leindex_edit_preview` | ~280 | **New** |
-| Cross-file rename | `Grep` + N×`Edit` | ~12 000 | `leindex_rename_symbol` | ~340 | **97%** |
-| Change impact | N/A | ∞ | `leindex_impact_analysis` | ~260 | **New** |
+| Understand a file | `Read` (full file) | ~2 000 | `leindex_explore` `mode=file_summary` | ~380 | **81%** |
+| Find all callers | `Grep` + 3×`Read` | ~5 800 | `leindex_explore` `mode=symbol_lookup` | ~420 | **93%** |
+| Navigate project | `Glob` + 5×`Read` | ~8 500 | `leindex_explore` `mode=project_map` | ~650 | **92%** |
+| Find symbol uses | `Grep` | ~1 200 | `leindex_explore` `mode=find` | ~310 | **74%** |
+| Read a function | `Read` (full file) | ~1 800 | `leindex_explore` `mode=read_symbol` | ~220 | **88%** |
+| Preview a rename | N/A | ∞ | `leindex_edit` `action=preview` | ~280 | **New** |
+| Cross-file rename | `Grep` + N×`Edit` | ~12 000 | `leindex_edit` `action=rename` | ~340 | **97%** |
+| Change impact | N/A | ∞ | `leindex_analyze` `mode=impact` | ~260 | **New** |
 
 > See [TOOL_SUPREMACY_BENCHMARKS.md](TOOL_SUPREMACY_BENCHMARKS.md) for detailed analysis.
 
 **Correctness Notes (v1.5.0):**
 - `leindex_file_summary` now reports `byte_range` (previously mislabeled as `line_range`)
-- `leindex_grep_symbols` description accurately reflects supported search modes (exact match and substring)
+- Exact/substring symbol search is now `leindex_find` (`target=symbols`), backed by the text index
 - `leindex_symbol_lookup` and `leindex_impact_analysis` now honor the `depth` parameter for bounded traversal
 - `leindex_rename_symbol` uses word-boundary-aware matching to prevent false-positive substring replacements
 - `leindex_edit_apply` sorts byte-range changes in reverse order to prevent offset corruption in multi-change requests
 
 ---
 
-## Available Tools
+## The Four Tools
 
-> **Tool names are underscore-form** (`leindex_edit_apply`, `leindex_read_file`).
-> Several MCP client implementations mishandle dots in tool names, so the
-> canonical names dropped them. Historical dotted/dashed spellings
-> (`leindex.edit-apply`, `leindex-edit-apply`) are accepted as aliases and
-> dispatch to the same tool, so existing configs keep working.
+`tools/list` advertises **four tools** instead of twenty. Each is a router: a
+discriminator argument selects the operation ("branch") and every other argument
+is forwarded unchanged to it. This roughly halves the tool-description overhead a
+model pays on every session and removes the choice between near-synonyms.
+
+| Tool | Selector | Branches |
+|---|---|---|
+| `leindex_explore` | `mode` | `search` (default), `find`, `symbol_lookup`, `read_file`, `read_symbol`, `project_map`, `file_summary`, `context` |
+| `leindex_analyze` | `mode` | `deep` (default), `impact`, `diagnostics`, `git_status`, `git_diff` |
+| `leindex_edit` | `action` (**required**) | `preview`, `apply`, `rename`, `write` |
+| `leindex_manage` | `action` | `index` (default), `phase` |
+
+`leindex_edit` has no default on purpose: an ambiguous call must fail rather than
+guess at a mutation. The read-only routers default to their most common branch,
+so a call with no selector behaves like the old single tool.
+
+```json
+{ "name": "leindex_explore", "arguments": { "mode": "find", "pattern": "TODO", "limit": 20 } }
+{ "name": "leindex_analyze", "arguments": { "mode": "git_diff", "range": "HEAD~3..HEAD" } }
+{ "name": "leindex_edit",    "arguments": { "action": "preview", "file_path": "src/a.rs", "old_text": "a", "new_text": "b" } }
+{ "name": "leindex_manage",  "arguments": { "action": "index", "project_path": "/repo", "wait": false } }
+```
+
+**Conventions**
+
+- `project_path` is accepted on every branch (omit it to use the server's project).
+- `tier` is accepted on every branch: `l0` (a few-line identity card), `l1`
+  (bounded overview, the default) or `l2` (the complete, untrimmed result as JSON).
+- Selector spellings are forgiving: `mode`/`action` are interchangeable when the
+  value names one of the router's branches, and a branch may be given by the old
+  tool's name (`text_search`, `edit_apply`, `deep_analyze`, …).
+- Errors that a model can fix (missing `action`, unknown branch, unknown tool) come
+  back as `isError` results with a hint naming the closest valid choice — for
+  example `Did you mean leindex_explore with mode="find"?`.
+- Argument detail lives in the MCP resource **`leindex://tools/guide`** (every
+  branch, its arguments, defaults and bounds); `leindex://docs/q` is a one-screen
+  cheat sheet. `leindex tools inspect <tool>` prints the same from the CLI.
+
+**Schemas.** By default `tools/list` returns one flat object per router (the union
+of its branches' arguments, with a per-branch usage line in the selector's
+description) because some LLM APIs reject a top-level `oneOf`. `leindex tools schema
+<tool>` — and `LEINDEX_MCP_SCHEMA=oneof` for `tools/list` — return the
+discriminated-union form (`oneOf` with `{"const": "<branch>"}` per branch and a
+`discriminator`). Set `LEINDEX_MCP_LEGACY_TOOLS=1` to advertise the individual
+tools as well.
+
+### Compatibility
+
+The individual tool names below remain callable (with dotted/dashed spellings such
+as `leindex.edit-apply`), so existing configs, prompts and scripts keep working —
+they are simply not advertised. `leindex_text_search` and `leindex_grep_symbols`
+were folded into `leindex_find`; calls by those names are redirected to it
+(`grep_symbols` with `target=auto`: symbol names first, then text). The grep
+tool's semantic mode is gone; use `mode=search`.
+
+| Old tool | Now |
+|---|---|
+| `leindex_search` | `leindex_explore` `mode=search` |
+| `leindex_text_search`, `leindex_grep_symbols` | `leindex_explore` `mode=find` |
+| `leindex_symbol_lookup`, `_read_file`, `_read_symbol`, `_project_map`, `_file_summary`, `_context` | `leindex_explore` `mode=…` |
+| `leindex_deep_analyze`, `_impact_analysis`, `_diagnostics`, `_git_status` | `leindex_analyze` `mode=deep` / `impact` / `diagnostics` / `git_status` |
+| *(new)* | `leindex_analyze` `mode=git_diff` |
+| `leindex_edit_preview`, `_edit_apply`, `_rename_symbol`, `_write` | `leindex_edit` `action=preview` / `apply` / `rename` / `write` |
+| `leindex_index`, `leindex_phase_analysis` | `leindex_manage` `action=index` / `phase` |
+
+### `git_diff` (`leindex_analyze` `mode=git_diff`)
+
+A PDG-enriched diff: the working tree (default), the index (`staged=true`), one
+commit against its parent (`ref="HEAD~1"`), or a range (`range="main..feature"`).
+Returns per-file status and line counts, an optionally bounded `patch`
+(`include_patch`, `max_patch_chars`, `stat_only`), and — for working-tree diffs —
+the **symbols whose bodies the changed hunks touch**, with their callers and the
+files affected by the change (`enrich_pdg`). For historical refs and ranges the
+symbols are reported per changed file (`symbol_mapping: "file"`), since the
+current graph describes the current tree. Revision arguments cannot smuggle git
+options.
+
+---
+
+## Branch Reference
+
+> The sections below document each branch's arguments under the tool name it had
+> before the four-router surface; the names still work as direct calls, and each
+> branch is reached as described above. **Tool names are underscore-form**
+> (`leindex_edit_apply`, `leindex_read_file`): several MCP client implementations
+> mishandle dots, so the canonical names dropped them, and historical
+> dotted/dashed spellings (`leindex.edit-apply`) are accepted as aliases.
 
 
 ### `leindex_index`
@@ -706,30 +816,53 @@ hotspots, and inter-module dependency arrows. **Replaces Glob + directory reads.
 
 ---
 
-### `leindex_grep_symbols`
+### `leindex_find` (`leindex_explore` `mode=find`)
 
-Search for symbols across the indexed codebase with structural awareness. Unlike
-text-based grep, results include symbol type, dependency graph role, and optional
-source context lines.
+Exact search — literal text, regular expressions, and symbol *definitions by name*
+— across the project **and any other path on the machine**. It replaces the former
+`grep_symbols` and `text_search` tools (their names and the `grep` / `text` modes
+still resolve here).
+
+How it works, and why it is fast and always correct:
+
+- **Indexed roots** use a memory-mapped trigram index (the technique behind Zoekt
+  and Google Code Search), built right after each index run. The query is reduced
+  to the trigrams a matching file must contain, so a search reads only the few
+  candidate files: about **1 ms** engine time on a 700-file repository (a full
+  live scan of the same tree is about 10 ms).
+- **Results are never stale.** The index only decides *which files to read*; every
+  hit comes from the file on disk right now. Files edited or added since the index
+  was built are detected by size/mtime and scanned directly; files the tool itself
+  edits are picked up immediately.
+- **Anything outside an index is searched live** — a parallel, gitignore-aware
+  scan with no setup, no indexing and no side effects. Pass `paths` to search
+  directories or files anywhere on disk (`"paths": ["/etc/nginx", "~/notes"]`).
+- **Hits carry their enclosing symbol** for indexed files, read from the index
+  itself (no PDG load), and are grouped by file and symbol to keep the output small.
+- **Unbounded but paged.** `limit` (default 50, `0` = no limit) and `offset` page a
+  deterministic order (root, path, line); `next_offset` is returned while
+  `has_more` is true. `timeout_ms` (default 20 s) returns partial results rather
+  than hanging.
 
 **Parameters:**
 
-```json
-{
-  "type": "object",
-  "properties": {
-    "pattern": { "type": "string", "description": "Symbol name, substring, or query" },
-    "project_path": { "type": "string", "description": "Project directory (auto-indexes on first use)" },
-    "scope": { "type": "string", "description": "Limit to file/directory path" },
-    "type_filter": { "type": "string", "enum": ["function", "class", "method", "variable", "module", "all"], "default": "all" },
-    "token_budget": { "type": "integer", "default": 1500 },
-    "include_context_lines": { "type": "integer", "default": 0, "minimum": 0, "maximum": 10, "description": "Source context lines around each match" },
-    "max_results": { "type": "integer", "default": 20, "minimum": 1, "maximum": 200 },
-    "offset": { "type": "integer", "default": 0, "description": "Skip the first N results for pagination" }
-  },
-  "required": ["pattern"]
-}
-```
+| Argument | Default | Meaning |
+|---|---|---|
+| `pattern` (required) | — | Text to find; a regex when `regex=true` |
+| `target` | `text` | `text` (matching lines), `symbols` (definitions whose name matches, exact names first), `auto` (symbols, else text) |
+| `regex` | `false` | Treat `pattern` as a regular expression |
+| `case` | `smart` | `smart` (ignore case unless the pattern has an uppercase letter), `sensitive`, `insensitive` |
+| `word` | `false` | Whole-word matches only |
+| `paths` | project | Extra files/directories anywhere on disk (no index needed) |
+| `scope` | — | Restrict to a project-relative directory or file |
+| `include_globs`, `exclude_globs` | — | e.g. `["*.rs"]`, `["vendor/", "*_test.rs"]` |
+| `output` | `matches` | `matches`, `files` (paths + counts), `count` (totals only), `symbols` (enclosing symbols ranked by hits) |
+| `kind` | — | With `target=symbols`: `function`, `class`, `struct`, … |
+| `context_lines` | `0` | Lines of context (max 10) |
+| `limit` / `offset` | `50` / `0` | Paging; `limit=0` returns everything |
+| `per_file_cap` | `20` | Shown per file (all are counted) |
+| `max_line_chars` | `200` | Long lines are windowed around the match |
+| `timeout_ms` | `20000` | Time budget; `0` = none |
 
 **Example:**
 
@@ -737,13 +870,25 @@ source context lines.
 {
   "jsonrpc": "2.0", "id": 13, "method": "tools/call",
   "params": {
-    "name": "leindex_grep_symbols",
-    "arguments": { "pattern": "auth", "type_filter": "function", "max_results": 10 }
+    "name": "leindex_explore",
+    "arguments": { "mode": "find", "pattern": "handle_tool_call", "context_lines": 1, "limit": 20 }
   }
 }
 ```
 
-**Response includes:** Array of matches with `name`, `file`, `line_range`, `node_type`, `complexity`.
+**Response (rendered):**
+
+```text
+27 match(es) in 7 file(s) for "handle_tool_call" · 8ms · indexed
+src/cli/mcp/server.rs
+ handle_tool_call (function)
+  976: pub async fn handle_tool_call(
+ json_rpc_handler (function)
+  950:             handle_tool_call_timed(&state, handlers, &json_req, transport_started, advisory).await
+… more results: offset=20
+```
+
+Set `LEINDEX_FIND_THREADS` to change the scan worker count (default `min(4, cores)`).
 
 ---
 
@@ -1277,7 +1422,7 @@ Tools with large result sets support `offset` and `limit` parameters for paginat
 { "name": "leindex_project_map", "arguments": { "offset": 0, "limit": 50 } }
 
 // Grep symbols with pagination
-{ "name": "leindex_grep_symbols", "arguments": { "pattern": "auth", "max_results": 10, "offset": 0 } }
+{ "name": "leindex_explore", "arguments": { "mode": "find", "pattern": "auth", "limit": 10, "offset": 0 } }
 ```
 
 Paginated responses include `offset`, `count`, and `has_more` fields.
@@ -1661,9 +1806,9 @@ Response includes:
 2. **Use `token_budget`**: Limit context expansion for large codebases (see table above)
 3. **Incremental Re-index**: Set `force_reindex: false` to skip unchanged files
 4. **SSE for large projects**: Use streaming or job polling for projects with 1000+ files
-5. **Paginate Large Results**: Use `offset`/`limit` on `grep_symbols`, `project_map`, `search`
+5. **Paginate Large Results**: Use `offset`/`limit` on `find`, `project_map`, `search`
 6. **Batch Symbol Lookups**: Use `symbols[]` array instead of multiple single calls
-7. **Scope Your Queries**: Use `scope` on `grep_symbols` or `path` on `phase_analysis` to narrow results
+7. **Scope Your Queries**: Use `scope`, `paths` or `include_globs` on `find`, or `path` on `phase`, to narrow results
 
 ---
 

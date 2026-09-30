@@ -203,11 +203,13 @@ impl FeatureFlag {
     /// A test-only override (set via [`set_flag_override_for_test`]) takes
     /// precedence so a single process can exercise both sides of a feature.
     pub fn is_enabled(&self) -> bool {
-        if let Ok(guard) = TEST_OVERRIDES.lock() {
-            if let Some(map) = guard.as_ref() {
-                if let Some(v) = map.get(self) {
-                    return *v;
-                }
+        if let Some(map) = TEST_OVERRIDES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            if let Some(v) = map.get(self) {
+                return *v;
             }
         }
         // Phase-9 legacy fallback: when LEINDEX_LEGACY=1 is active, all
@@ -391,14 +393,18 @@ static TEST_OVERRIDES: Mutex<Option<HashMap<FeatureFlag, bool>>> = Mutex::new(No
 /// mutation races. Production callers must not use this.
 #[doc(hidden)]
 pub fn set_flag_override_for_test(flag: FeatureFlag, value: bool) {
-    let mut guard = TEST_OVERRIDES.lock().expect("flag override mutex poisoned");
+    let mut guard = TEST_OVERRIDES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.get_or_insert_with(HashMap::new).insert(flag, value);
 }
 
 /// Test-only: clear all overrides, restoring env-derived flag behavior.
 #[doc(hidden)]
 pub fn clear_flag_overrides_for_test() {
-    let mut guard = TEST_OVERRIDES.lock().expect("flag override mutex poisoned");
+    let mut guard = TEST_OVERRIDES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = None;
 }
 
@@ -410,15 +416,41 @@ pub fn clear_flag_overrides_for_test() {
 #[doc(hidden)]
 pub static FLAG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// Take [`FLAG_TEST_LOCK`], ignoring poison.
+///
+/// A test that panics while holding the lock poisons it; with a plain
+/// `lock().unwrap()` every later test that takes the lock then fails too, so
+/// one failure (or one timing flake) cascades into unrelated ones. The guarded
+/// state is just the override map, which each test resets itself, so poison
+/// carries no information worth propagating.
+#[doc(hidden)]
+pub fn lock_flag_tests() -> std::sync::MutexGuard<'static, ()> {
+    FLAG_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Clears all overrides when dropped, including on unwind.
+#[doc(hidden)]
+pub struct FlagOverrideReset;
+
+impl Drop for FlagOverrideReset {
+    fn drop(&mut self) {
+        clear_flag_overrides_for_test();
+    }
+}
+
 /// Run `f` with `flag` overridden to `value`, restoring the env-derived state
 /// afterwards. Serialized by [`FLAG_TEST_LOCK`] so tests never race the shared
 /// override store.
 #[doc(hidden)]
 pub fn with_flag_override(flag: FeatureFlag, value: bool, f: impl FnOnce()) {
-    let _g = FLAG_TEST_LOCK.lock().expect("flag test lock poisoned");
+    let _g = lock_flag_tests();
+    // Reset even if `f` panics, so a failing test cannot leak its override
+    // into the next one.
+    let _reset = FlagOverrideReset;
     set_flag_override_for_test(flag, value);
     f();
-    clear_flag_overrides_for_test();
 }
 
 fn flag_store() -> &'static FlagStore {

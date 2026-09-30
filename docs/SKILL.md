@@ -8,37 +8,57 @@ LeIndex provides semantic code search and analysis capabilities through MCP tool
 
 ## Tool Selection Guide
 
+LeIndex exposes **four tools**; a `mode` (explore, analyze) or `action` (edit,
+manage) argument picks the operation and every other argument is forwarded to it.
+The rest of this guide names operations by their original tool names
+(`leindex_context`, `leindex_edit_apply`, …) — those names still work as direct
+calls, and each is a branch of one of the four:
+
+| Original name | Call it as |
+|---|---|
+| `leindex_search` | `leindex_explore` `mode=search` |
+| `leindex_grep_symbols`, `leindex_text_search` | `leindex_explore` `mode=find` |
+| `leindex_symbol_lookup`, `_read_file`, `_read_symbol`, `_project_map`, `_file_summary`, `_context` | `leindex_explore` `mode=…` |
+| `leindex_deep_analyze`, `_impact_analysis`, `_diagnostics`, `_git_status` | `leindex_analyze` `mode=deep` / `impact` / `diagnostics` / `git_status` |
+| *(new)* PDG-enriched diff | `leindex_analyze` `mode=git_diff` |
+| `leindex_edit_preview`, `_edit_apply`, `_rename_symbol`, `_write` | `leindex_edit` `action=preview` / `apply` / `rename` / `write` |
+| `leindex_index`, `leindex_phase_analysis` | `leindex_manage` `action=index` / `phase` |
+
+Full argument reference: the `leindex://tools/guide` resource; one-screen cheat
+sheet: `leindex://docs/q`.
+
 ### Quick Reference Table
 
-| What you want to do | Tool to use | Why |
-|---------------------|-------------|-----|
-| Find code by meaning | `leindex_search` | Semantic search understands intent |
-| Find symbols by name | `leindex_grep_symbols` | Fast structural search |
-| Understand a symbol deeply | `leindex_deep_analyze` | Full PDG + semantic analysis |
-| See how a symbol is used | `leindex_context` | Shows callers, callees, dependencies |
-| Read a file with context | `leindex_read_file` | PDG-annotated file contents |
-| Get file overview | `leindex_file_summary` | Structural summary without full content |
-| Find where a symbol is defined | `leindex_symbol_lookup` | Direct symbol navigation |
-| See project structure | `leindex_project_map` | Annotated project tree |
-| Check for impacts | `leindex_impact_analysis` | Transitive dependency analysis |
-| Preview edits | `leindex_edit_preview` | See changes before applying |
-| Apply edits | `leindex_edit_apply` | Safe code modifications |
-| Rename symbols | `leindex_rename_symbol` | Cross-file renaming |
-| Check git status | `leindex_git_status` | PDG-aware git operations |
+| What you want to do | Call | Why |
+|---------------------|------|-----|
+| Find code by meaning | `leindex_explore` `mode=search` | Semantic search understands intent |
+| Find exact text, a regex, or a symbol by name | `leindex_explore` `mode=find` | Millisecond, always live; works on any path, even unindexed |
+| Understand a symbol deeply | `leindex_analyze` `mode=deep` | Full PDG + semantic analysis |
+| See how a symbol is used | `leindex_explore` `mode=context` | Shows callers, callees, dependencies |
+| Read a file with context | `leindex_explore` `mode=read_file` | PDG-annotated file contents |
+| Get file overview | `leindex_explore` `mode=file_summary` | Structural summary without full content |
+| Find where a symbol is defined | `leindex_explore` `mode=symbol_lookup` | Direct symbol navigation |
+| See project structure | `leindex_explore` `mode=project_map` | Annotated project tree |
+| Check for impacts | `leindex_analyze` `mode=impact` | Transitive dependency analysis |
+| Review what changed | `leindex_analyze` `mode=git_diff` | Changed symbols and their callers |
+| Preview edits | `leindex_edit` `action=preview` | See changes before applying |
+| Apply edits | `leindex_edit` `action=apply` | Safe code modifications |
+| Rename symbols | `leindex_edit` `action=rename` | Cross-file renaming |
+| Check git status | `leindex_analyze` `mode=git_status` | PDG-aware git operations |
 
-### When to use `leindex_search` vs `leindex_grep_symbols`
+### When to use `search` vs `find`
 
-**Use `leindex_search`** when:
+**Use `search`** (semantic) when:
 - You know what you want to find but not the exact name
 - You're exploring unfamiliar code
 - Your query is conceptual ("how is authentication handled")
 - You want semantic similarity, not exact matches
 
-**Use `leindex_grep_symbols`** when:
-- You know the exact symbol name
-- You want fast structural lookup
-- You're searching for patterns in symbol names
-- You need precise symbol navigation
+**Use `find`** when:
+- You know the exact text, identifier, or a regex
+- You want every occurrence, not the top-k (`limit=0`, or page with `offset`)
+- You need definitions by name (`target=symbols`), or matches grouped by enclosing symbol
+- The files are outside the project — pass `paths: ["/any/dir"]`; no index needed
 
 **Example workflow:**
 ```

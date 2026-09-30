@@ -222,7 +222,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_precision_run_cleans_nested_scip_output_directory_on_ingest_failure() {
-        let _guard = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        let _guard = crate::feature_flags::lock_flag_tests();
         let (directory, executable) = shell_fixture("printf invalid-scip > \\\"$2\\\"");
         let mut pdg = ProgramDependenceGraph::new();
         pdg.add_node(Node {
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn test_precision_attempt_throttled_within_interval_and_forced() {
         use std::os::unix::fs::PermissionsExt;
-        let _guard = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        let _guard = crate::feature_flags::lock_flag_tests();
 
         let directory = tempfile::tempdir().unwrap();
         let ran_marker = directory.path().join("indexer_ran");

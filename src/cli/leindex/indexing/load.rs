@@ -34,19 +34,17 @@ impl LeIndex {
         ) {
             warn!(%error, "Failed to hydrate persisted community memberships");
         }
-        let persist_artifacts = artifact_path == self.storage_path;
-
-        let pdg_node_count = pdg.node_count();
-        let pdg_edge_count = pdg.edge_count();
-
         info!(
             "Loaded PDG with {} nodes and {} edges",
-            pdg_node_count, pdg_edge_count
+            pdg.node_count(),
+            pdg.edge_count()
         );
 
         index_builder::normalize_external_nodes(&mut pdg);
 
         if pdg_only {
+            let pdg_node_count = pdg.node_count();
+            let pdg_edge_count = pdg.edge_count();
             // Skip search engine population — caller will call index_nodes() later.
             self.embedder = None;
             self.stats.pdg_nodes = pdg_node_count;
@@ -54,6 +52,34 @@ impl LeIndex {
             self.pdg = Some(pdg);
             return Ok(());
         }
+
+        self.hydrate_search_after_pdg(pdg, artifact_path)
+    }
+
+    /// Hydrate the search engine on top of a PDG that is *already resident*.
+    ///
+    /// A graph-only load followed by a search used to fall back to a complete
+    /// `load_from_storage`, reading and rebuilding the whole PDG a second time
+    /// just to get the engine. This runs only the engine half. If the graph is
+    /// not loaded yet, it loads everything.
+    pub(crate) fn hydrate_search_engine_from_loaded_pdg(&mut self) -> Result<()> {
+        let Some(pdg) = self.pdg.take() else {
+            return self.load_from_storage();
+        };
+        let artifact_path = self.active_storage_path();
+        self.hydrate_search_after_pdg(pdg, artifact_path)
+    }
+
+    /// Restore the search engine for `pdg` from a persisted snapshot when it is
+    /// current, otherwise rebuild it, then finalize (neural, stats, `self.pdg`).
+    fn hydrate_search_after_pdg(
+        &mut self,
+        pdg: crate::graph::pdg::ProgramDependenceGraph,
+        artifact_path: std::path::PathBuf,
+    ) -> Result<()> {
+        let persist_artifacts = artifact_path == self.storage_path;
+        let pdg_node_count = pdg.node_count();
+        let pdg_edge_count = pdg.edge_count();
 
         let persisted_embedder =
             index_builder::TfIdfEmbedder::load_from_artifact_path(&artifact_path)

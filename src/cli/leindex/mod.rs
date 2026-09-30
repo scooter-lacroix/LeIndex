@@ -985,7 +985,9 @@ impl LeIndex {
         }
         self.ensure_pdg_loaded()?;
         if self.search_engine.is_empty() && self.active_has_indexed_files() {
-            self.load_from_storage()?;
+            // The graph may already be resident (graph-only tool, prewarm):
+            // hydrate just the engine on top of it rather than reloading both.
+            self.hydrate_search_engine_from_loaded_pdg()?;
         }
         Ok(())
     }

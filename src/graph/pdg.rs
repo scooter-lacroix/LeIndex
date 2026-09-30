@@ -1303,27 +1303,55 @@ impl ProgramDependenceGraph {
 
     /// Add a node to the graph, returning its stable `NodeId`.
     pub fn add_node(&mut self, node: Node) -> NodeId {
-        let id = self.graph.add_node(node.clone());
-        self.symbol_index.insert(node.id.clone(), id);
-        self.file_index
-            .entry(node.file_path.to_string())
-            .or_default()
-            .push(id);
-        self.name_index
-            .entry(node.name.clone())
-            .or_default()
-            .push(id);
-        self.name_lower_index
-            .entry(node.name.to_lowercase())
-            .or_default()
-            .push(id);
-        self.name_file_index
-            .insert((node.name.clone(), node.file_path.to_string()), id);
-
+        let name = node.name.clone();
+        let node_id_str = node.id.clone();
+        let file_path = Arc::clone(&node.file_path);
+        let id = self.add_node_without_trigrams(node);
         // Update trigram index incrementally
         self.trigram_index
-            .add_node(id, &node.name, &node.id, &node.file_path);
+            .add_node(id, &name, &node_id_str, &file_path);
+        id
+    }
 
+    /// Add a node to the graph and every lookup index *except* the trigram
+    /// index.
+    ///
+    /// Bulk loading uses this: the trigram index costs ~300 posting inserts
+    /// per node, and a persisted copy replaces it wholesale afterwards
+    /// ([`set_trigram_index`](Self::set_trigram_index)), so building it
+    /// incrementally was pure waste (~250 ms per cold start on a 28k-node
+    /// graph). Callers must install or [rebuild](Self::rebuild_trigram_index)
+    /// the trigram index when done.
+    pub fn add_node_without_trigrams(&mut self, node: Node) -> NodeId {
+        let symbol = node.id.clone();
+        let name = node.name.clone();
+        let lower = name.to_lowercase();
+        let file_path = Arc::clone(&node.file_path);
+        let id = self.graph.add_node(node);
+
+        self.symbol_index.insert(symbol, id);
+        // Look up by &str first: most nodes share a file / name with an earlier
+        // one, and `entry(key.to_string())` would allocate on every call.
+        match self.file_index.get_mut(&*file_path) {
+            Some(nodes) => nodes.push(id),
+            None => {
+                self.file_index.insert(file_path.to_string(), vec![id]);
+            }
+        }
+        match self.name_index.get_mut(name.as_str()) {
+            Some(nodes) => nodes.push(id),
+            None => {
+                self.name_index.insert(name.clone(), vec![id]);
+            }
+        }
+        match self.name_lower_index.get_mut(lower.as_str()) {
+            Some(nodes) => nodes.push(id),
+            None => {
+                self.name_lower_index.insert(lower, vec![id]);
+            }
+        }
+        self.name_file_index
+            .insert((name, file_path.to_string()), id);
         id
     }
 

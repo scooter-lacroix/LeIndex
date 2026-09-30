@@ -43,8 +43,8 @@ impl SearchEngine {
             .map(|node| {
                 let mut tokens: Vec<String> = self
                     .node_tokens
-                    .get(&node.node_id)
-                    .map(|set| set.iter().cloned().collect())
+                    .get(node.node_id.as_str())
+                    .map(|set| set.iter().map(|token| token.to_string()).collect())
                     .unwrap_or_default();
                 tokens.sort();
 

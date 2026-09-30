@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn test_environment_override_is_honored() {
-        let _guard = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        let _guard = crate::feature_flags::lock_flag_tests();
         let path = PathBuf::from("/tmp/leindex-scip-fixture");
         unsafe { env::set_var("LEINDEX_SCIP_RUST_BIN", &path) };
         let spec = discover_indexer("rust").unwrap();

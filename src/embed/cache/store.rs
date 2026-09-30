@@ -1927,7 +1927,7 @@ mod tests {
     #[test]
     fn test_debug_escape_hatch_default_private_drops_source_text() {
         // Ensure no env var or feature flag leaks in from the outside.
-        let _g = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        let _g = crate::feature_flags::lock_flag_tests();
         crate::feature_flags::clear_flag_overrides_for_test();
         // SAFETY (env-var mutation): tests are serialized via FLAG_TEST_LOCK
         // and we restore the var at the end. std::env::set_var is safe on the
@@ -1970,7 +1970,7 @@ mod tests {
     /// payload. The vector is still read back bit-identical.
     #[test]
     fn test_debug_escape_hatch_config_debug_mode_appends_source_text() {
-        let _g = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        let _g = crate::feature_flags::lock_flag_tests();
         crate::feature_flags::clear_flag_overrides_for_test();
         // SAFETY: serialized by FLAG_TEST_LOCK; documented test-only mutation.
         unsafe {
@@ -2040,7 +2040,7 @@ mod tests {
     /// debug escape hatch without touching `CacheConfig::debug_mode`.
     #[test]
     fn test_debug_escape_hatch_feature_flag_enables_debug() {
-        let _g = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        let _g = crate::feature_flags::lock_flag_tests();
         crate::feature_flags::clear_flag_overrides_for_test();
         // SAFETY: serialized by FLAG_TEST_LOCK; documented test-only mutation.
         unsafe {
@@ -2085,7 +2085,7 @@ mod tests {
     /// the var at the end of the test.
     #[test]
     fn test_debug_escape_hatch_env_var_enables_debug() {
-        let _g = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        let _g = crate::feature_flags::lock_flag_tests();
         crate::feature_flags::clear_flag_overrides_for_test();
         // Snapshot the prior value so we can restore it.
         let prior = std::env::var(DEBUG_ENV_VAR).ok();
@@ -2128,7 +2128,7 @@ mod tests {
     /// appendix (read_row must ignore trailing bytes when re-hashing).
     #[test]
     fn test_probe_round_trips_through_debug_row() {
-        let _g = crate::feature_flags::FLAG_TEST_LOCK.lock().unwrap();
+        let _g = crate::feature_flags::lock_flag_tests();
         crate::feature_flags::clear_flag_overrides_for_test();
         // SAFETY: serialized by FLAG_TEST_LOCK; documented test-only mutation.
         unsafe {

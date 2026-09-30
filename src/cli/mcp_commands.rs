@@ -947,6 +947,8 @@ async fn handle_mcp_request(
             server_instance
                 .handshake_complete
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            // Hide the cold project load behind the model's think-time.
+            state.spawn_prewarm();
 
             // Return server capabilities with comprehensive description
             return Ok(Some(JsonRpcResponse::success(
