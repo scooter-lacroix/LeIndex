@@ -6,7 +6,7 @@ use crate::validation::Location;
 use crate::validation::ValidationError;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Type of reference issue found
 #[derive(Debug, Clone, PartialEq)]
@@ -97,12 +97,42 @@ impl ReferenceIssue {
 pub struct ReferenceChecker {
     /// PDG for reference checking
     pdg: Arc<ProgramDependenceGraph>,
+    /// Lower-cased distinct symbol names and file paths, built on first use.
+    /// Import checks probe these instead of lower-casing every PDG node once
+    /// per import (tens of thousands of allocations per `use` line).
+    names: Arc<OnceLock<NameCorpus>>,
+}
+
+/// Distinct lower-cased node names and file paths of a PDG.
+struct NameCorpus {
+    names: Vec<String>,
+    files: Vec<String>,
 }
 
 impl ReferenceChecker {
     /// Create a new reference checker
     pub fn new(pdg: Arc<ProgramDependenceGraph>) -> Self {
-        Self { pdg }
+        Self {
+            pdg,
+            names: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn corpus(&self) -> &NameCorpus {
+        self.names.get_or_init(|| {
+            let mut names = HashSet::new();
+            let mut files = HashSet::new();
+            for node_id in self.pdg.node_indices() {
+                if let Some(node) = self.pdg.get_node(node_id) {
+                    names.insert(node.name.to_lowercase());
+                    files.insert(node.file_path.to_lowercase());
+                }
+            }
+            NameCorpus {
+                names: names.into_iter().collect(),
+                files: files.into_iter().collect(),
+            }
+        })
     }
 
     /// Check references for edit changes
@@ -117,6 +147,7 @@ impl ReferenceChecker {
         changes: &[ResolvedEditChange],
     ) -> Result<Vec<ReferenceIssue>, ValidationError> {
         let mut issues = Vec::new();
+        let mut import_cache: HashMap<String, bool> = HashMap::new();
 
         for change in changes {
             // Extract imports from new content
@@ -124,7 +155,10 @@ impl ReferenceChecker {
 
             // Check each import against the PDG
             for import in imports {
-                if !self.import_exists_in_pdg(&import) {
+                let known = *import_cache
+                    .entry(import.clone())
+                    .or_insert_with(|| self.import_exists_in_pdg(&import));
+                if !known {
                     issues.push(ReferenceIssue::broken_import(
                         import,
                         change.file_path.clone(),
@@ -277,26 +311,16 @@ impl ReferenceChecker {
         // Check if the import exists as a module or symbol in the PDG
         let import_lower = import.to_lowercase();
 
-        // Check if any node in the PDG matches the import
-        for node_id in self.pdg.node_indices() {
-            if let Some(node) = self.pdg.get_node(node_id) {
-                let node_name_lower = node.name.to_lowercase();
-                if node_name_lower.contains(&import_lower)
-                    || import_lower.contains(&node_name_lower)
-                {
-                    return true;
-                }
-            }
+        let corpus = self.corpus();
+        if corpus
+            .names
+            .iter()
+            .any(|name| name.contains(&import_lower) || import_lower.contains(name.as_str()))
+        {
+            return true;
         }
-
-        // Also check file paths
-        for node_id in self.pdg.node_indices() {
-            if let Some(node) = self.pdg.get_node(node_id) {
-                let file_path_lower = node.file_path.to_lowercase();
-                if file_path_lower.contains(&import_lower) {
-                    return true;
-                }
-            }
+        if corpus.files.iter().any(|file| file.contains(&import_lower)) {
+            return true;
         }
 
         false

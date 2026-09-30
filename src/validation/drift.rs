@@ -207,19 +207,27 @@ impl SemanticDriftAnalyzer {
         &self,
         changes: &[ResolvedEditChange],
     ) -> Result<Vec<DriftItem>, ValidationError> {
+        use rayon::prelude::*;
+
+        // Each change parses two documents (before and after); a rename touches
+        // several files. The parses are independent, so they run across cores:
+        // this was 40% of a rename preview when done one after another.
+        let per_change: Vec<Result<Vec<DriftItem>, ValidationError>> = changes
+            .par_iter()
+            .map(|change| {
+                let (original, new) = rayon::join(
+                    || self.extract_signatures(change, &change.original_content),
+                    || self.extract_signatures(change, &change.new_content),
+                );
+                // Compare signatures to detect drift
+                self.compare_signatures(change, &original?, &new?)
+            })
+            .collect();
+
         let mut drift_items = Vec::new();
-
-        for change in changes {
-            // Extract signatures from original content
-            let original_sigs = self.extract_signatures(change, &change.original_content)?;
-
-            // Extract signatures from new content
-            let new_sigs = self.extract_signatures(change, &change.new_content)?;
-
-            // Compare signatures to detect drift
-            drift_items.extend(self.compare_signatures(change, &original_sigs, &new_sigs)?);
+        for items in per_change {
+            drift_items.extend(items?);
         }
-
         Ok(drift_items)
     }
 
