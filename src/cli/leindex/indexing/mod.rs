@@ -971,7 +971,47 @@ impl LeIndex {
                 .to_hex()
                 .to_string(),
         );
+        self.retain_published_generations();
         Ok(self.stats.clone())
+    }
+
+    /// Bound the store's disk use after a successful publish: keep the current
+    /// generation and its predecessor (the rollback point), drop older
+    /// generations, and cap completed job artifacts.
+    ///
+    /// Nothing ran this automatically -- retention was only reachable through
+    /// `leindex retention --gc` -- so every index run left another full copy
+    /// behind (13 generations and 460 MB of job scratch, 2.5 GB, for a 20 MB
+    /// repository). Best effort: a failure here never fails indexing.
+    fn retain_published_generations(&self) {
+        use crate::storage::generation::retention::{
+            DEFAULT_MAX_GENERATIONS, RetentionConfig, retain_after_publish,
+            retain_generations_no_cas,
+        };
+        let root = self.storage_path();
+        let gens = root.join("generations");
+        let jobs = root.join("jobs");
+        let cas_dir = root.join("cas");
+        let outcome = if cas_dir.exists() {
+            crate::storage::cas::CasStore::open(&cas_dir)
+                .map_err(|error| error.to_string())
+                .and_then(|mut cas| {
+                    retain_after_publish(&mut cas, &gens, &jobs, &RetentionConfig::default())
+                        .map_err(|error| error.to_string())
+                })
+        } else {
+            retain_generations_no_cas(&gens, &jobs, DEFAULT_MAX_GENERATIONS, false)
+                .map_err(|error| error.to_string())
+        };
+        match outcome {
+            Ok(report) if report.generations_removed > 0 => info!(
+                removed = report.generations_removed,
+                retained = report.generations_retained,
+                "Pruned superseded generations"
+            ),
+            Ok(_) => {}
+            Err(error) => warn!("Generation retention failed (store keeps growing): {error}"),
+        }
     }
 
     pub(crate) fn run_scan(&mut self, _job: &JobPaths) -> Result<ScanCheckpoint> {
@@ -1275,7 +1315,14 @@ impl LeIndex {
         }
         if !newly_parsed.is_empty() {
             let (new_pdg, route) = build_changed_file_pdg(newly_parsed, use_streaming);
-            index_builder::merge_pdgs(pdg, new_pdg);
+            if pdg.node_count() == 0 {
+                // A full rebuild merges into an empty graph: adopt the built
+                // one instead of re-inserting every node and edge (and
+                // rebuilding its trigram index) a second time.
+                *pdg = new_pdg;
+            } else {
+                index_builder::merge_pdgs(pdg, new_pdg);
+            }
             info!(
                 "PDG: rebuilt {} changed file(s) via {:?} ({} nodes, {} edges)",
                 changed_file_count,

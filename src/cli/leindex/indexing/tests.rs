@@ -645,3 +645,41 @@ fn test_graph_only_hydration_reads_published_generation_not_mutable_root() {
         "graph-only load must come from the published generation"
     );
 }
+
+/// Every index run used to leave another full generation behind (nothing ran
+/// retention automatically). Only the current generation and its rollback
+/// predecessor may remain.
+#[test]
+fn test_repeated_indexing_keeps_only_current_and_previous_generation() {
+    let _guard = crate::feature_flags::lock_flag_tests();
+    let temp = tempfile::tempdir().expect("fixture");
+    std::fs::create_dir_all(temp.path().join("src")).unwrap();
+    std::fs::write(
+        temp.path().join("src/a.rs"),
+        "pub fn alpha() -> u32 { 1 }\n",
+    )
+    .unwrap();
+
+    let mut indexer = LeIndex::new(temp.path()).expect("create index");
+    for round in 0..4 {
+        std::fs::write(
+            temp.path().join("src/a.rs"),
+            format!("pub fn alpha() -> u32 {{ {round} }}\n"),
+        )
+        .unwrap();
+        indexer.index_project(true).expect("index");
+    }
+    let generations = indexer.storage_path().join("generations");
+    let mut kept: Vec<String> = std::fs::read_dir(&generations)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.parse::<u64>().is_ok())
+        .collect();
+    kept.sort();
+    assert!(
+        kept.len() <= 2,
+        "expected current + previous only, found {kept:?}"
+    );
+}
