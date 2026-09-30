@@ -101,7 +101,7 @@ async fn live_reference_files(
             return Err(JsonRpcError::invalid_params(format!(
                 "Rename conflict: '{}' already occurs in the live source ({}). \
                 Renaming '{}' to '{}' would create a duplicate. \
-                Use LeIndex [Grep Symbols] to inspect '{}'.",
+                Use leindex_explore mode=find target=symbols to inspect '{}'.",
                 new_name,
                 sample.join(", "),
                 old_name,
@@ -112,7 +112,7 @@ async fn live_reference_files(
         if files.is_empty() {
             return Err(JsonRpcError::invalid_params(format!(
                 "Symbol '{}' not found in project source. \
-                Try LeIndex [Grep Symbols] to find the exact name.",
+                Try leindex_explore mode=find target=symbols to find the exact name.",
                 old_name
             )));
         }
@@ -141,7 +141,7 @@ fn reference_files(
             JsonRpcError::invalid_params(format!(
                 "Symbol '{}' not found in project index. The index uses short symbol names \
                 (e.g., 'health_check', not 'ClassName.health_check'). \
-                Try LeIndex [Grep Symbols] to find the exact name.",
+                Try leindex_explore mode=find target=symbols to find the exact name.",
                 old_name
             ))
         })?;
@@ -153,7 +153,7 @@ fn reference_files(
         return Err(JsonRpcError::invalid_params(format!(
             "Rename conflict: symbol '{}' already exists in the project index. \
             Renaming '{}' to '{}' would create a duplicate. \
-            Use LeIndex [Grep Symbols] to inspect '{}'.",
+            Use leindex_explore mode=find target=symbols to inspect '{}'.",
             new_name, old_name, new_name, new_name
         )));
     }

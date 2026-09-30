@@ -356,7 +356,7 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
             .map(|s| format!(" ({:.2})", s))
             .unwrap_or_default();
         out.push_str(&format!(
-            "\n  ⚠ low signal{}: results may be coincidental token overlap; rephrase or use Grep Symbols.\n",
+            "\n  ⚠ low signal{}: results may be coincidental token overlap; rephrase or use mode=find.\n",
             score
         ));
     }

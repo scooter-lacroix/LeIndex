@@ -431,7 +431,7 @@ impl LeIndex {
         } else {
             parser.parse_files(changed_files)
         };
-        let mut pdg = self.pdg.take().unwrap_or_default();
+        let mut pdg = self.take_owned_pdg().unwrap_or_default();
         let removed_node_ids = self.apply_incremental_pdg_changes(
             &mut pdg,
             &deleted_files,
@@ -570,7 +570,7 @@ impl LeIndex {
         // every later cold hydration takes the full TF-IDF rebuild path.
         let persisted_identity =
             index_builder::persisted_search_identity(&self.storage, &self.project_id);
-        self.pdg = Some(pdg);
+        self.pdg = Some(std::sync::Arc::new(pdg));
         self.embedder = Some(embedder);
         if let Some(embedder) = &self.embedder {
             embedder.persist_to_storage(
@@ -1359,7 +1359,7 @@ impl LeIndex {
             state
                 .pdg
                 .take()
-                .or_else(|| self.pdg.take())
+                .or_else(|| self.take_owned_pdg())
                 .unwrap_or_default()
         };
         let parsing_results = if resumed_pdg_loaded {
@@ -1506,7 +1506,7 @@ impl LeIndex {
         let mut pdg = state
             .pdg
             .take()
-            .or_else(|| self.pdg.take())
+            .or_else(|| self.take_owned_pdg())
             .context("lexical phase missing resident PDG")?;
         let pdg_node_count = pdg.node_count();
         let pdg_edge_count = pdg.edge_count();
@@ -1574,7 +1574,7 @@ impl LeIndex {
             external_deps_total: state.ext_total,
             external_deps_builtin: state.ext_builtin,
         };
-        self.pdg = Some(pdg);
+        self.pdg = Some(std::sync::Arc::new(pdg));
         // A core generation is intentionally lexical/PDG-only. Existing
         // neural rows are reattached only by run_neural after CURRENT moves.
         self.search_engine.clear_neural_embeddings();
@@ -2245,6 +2245,25 @@ impl LeIndex {
     /// Used by index_project() when it will call index_nodes() afterwards.
     pub fn load_pdg_from_storage(&mut self) -> Result<()> {
         self.load_from_storage_inner(true)
+    }
+
+    /// Graph-only hydration from the generation selected by `CURRENT`.
+    ///
+    /// Reading the mutable root here would pair a PDG that a concurrent or
+    /// failed index run has since rewritten with the search artifacts of the
+    /// published generation. Those never agree, so every hydration would
+    /// rebuild the search index and never persist the result.
+    pub(crate) fn load_pdg_from_active_storage(&mut self) -> Result<()> {
+        let active = self.active_storage_path();
+        if active == self.storage_path || !active.join("leindex.db").is_file() {
+            return self.load_pdg_from_storage();
+        }
+        let active_storage =
+            crate::storage::schema::Storage::open_readonly(active.join("leindex.db"))
+                .with_context(|| {
+                    format!("Failed to open active generation at {}", active.display())
+                })?;
+        self.load_from_storage_inner_at(true, Some(&active_storage), active)
     }
 
     fn load_from_storage_inner(&mut self, pdg_only: bool) -> Result<()> {

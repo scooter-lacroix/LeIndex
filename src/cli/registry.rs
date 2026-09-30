@@ -654,7 +654,7 @@ impl ProjectRegistry {
         canonical: &Path,
     ) -> Result<(), JsonRpcError> {
         if self.is_one_shot() {
-            return self.index_handle(handle, false).await.map(|_| ());
+            return self.index_handle(handle, false, false).await.map(|_| ());
         }
         let path_string = canonical.to_string_lossy().into_owned();
         let job = self.start_index_job(Some(&path_string), false, true);
@@ -735,7 +735,12 @@ impl ProjectRegistry {
 
             // Run the incremental index (force_reindex=false means only
             // changed files are re-parsed).
-            let result = registry.index_project(Some(&path_string), false).await;
+            // It runs on the low-priority refresh pool so it never competes
+            // with foreground tool calls for CPU.
+            let result = match registry.get_or_load(Some(&path_string)).await {
+                Ok(handle) => registry.index_handle(&handle, false, true).await,
+                Err(error) => Err(error),
+            };
 
             match result {
                 Ok(stats) => {
@@ -765,7 +770,7 @@ impl ProjectRegistry {
         force_reindex: bool,
     ) -> Result<IndexStats, JsonRpcError> {
         let handle = self.get_or_load(project_path).await?;
-        self.index_handle(&handle, force_reindex).await
+        self.index_handle(&handle, force_reindex, false).await
     }
 
     /// Start (or coalesce with) an owned indexing job.
@@ -1174,6 +1179,20 @@ impl ProjectRegistry {
     /// what an MCP client's workspace resolves to when the server was started
     /// without an explicit project. Last-touched projects can NEVER become the
     /// fallback, and `$HOME` is rejected outright.
+    /// The canonical project root a call refers to, without loading, indexing
+    /// or refreshing anything (same resolution rules as every other tool:
+    /// explicit path, else the startup designation, else the CWD).
+    ///
+    /// Tools that only need to know *where* the project is — and bring their
+    /// own analysis pipeline — use this instead of `get_or_create`, which
+    /// would also start an index or background refresh they do not need.
+    pub async fn resolve_project_root(
+        &self,
+        project_path: Option<&str>,
+    ) -> Result<PathBuf, JsonRpcError> {
+        self.resolve_path(project_path).await
+    }
+
     async fn resolve_path(&self, project_path: Option<&str>) -> Result<PathBuf, JsonRpcError> {
         let path = if let Some(raw) = project_path {
             Path::new(raw).to_path_buf()
@@ -1328,10 +1347,15 @@ impl ProjectRegistry {
     /// Build a fresh index for the project behind `handle`, then swap it in.
     ///
     /// Uses a per-project slot lock so concurrent index requests coalesce.
+    ///
+    /// `background` runs the (CPU-heavy) build on the low-priority refresh
+    /// pool, used by opportunistic staleness refreshes so a user's foreground
+    /// call is never starved by work they did not ask for.
     async fn index_handle(
         &self,
         handle: &ProjectHandle,
         force_reindex: bool,
+        background: bool,
     ) -> Result<IndexStats, JsonRpcError> {
         let project_path = {
             let idx = handle.read().await;
@@ -1373,8 +1397,15 @@ impl ProjectRegistry {
             let mut temp = LeIndex::new(&path_for_blocking).map_err(|e| {
                 JsonRpcError::init_failed(&path_for_blocking.display().to_string(), &e.to_string())
             })?;
-            temp.index_project(force_reindex)
-                .map_err(|e| JsonRpcError::indexing_failed(format!("Indexing failed: {}", e)))?;
+            let run = |temp: &mut LeIndex| {
+                temp.index_project(force_reindex)
+                    .map_err(|e| JsonRpcError::indexing_failed(format!("Indexing failed: {}", e)))
+            };
+            if background {
+                background_pool().install(|| run(&mut temp))?;
+            } else {
+                run(&mut temp)?;
+            }
             Ok::<LeIndex, JsonRpcError>(temp)
         });
         tokio::pin!(indexing);
@@ -1725,6 +1756,43 @@ impl ProjectRegistry {
 
 /// Resident-heap budget for the project registry in bytes.
 /// `LEINDEX_REGISTRY_MAX_HEAP_MB` overrides (0 disables); default 1536.
+/// Thread pool for opportunistic background index refreshes.
+///
+/// A stale index triggers a refresh on the first call after startup. That
+/// work is CPU-bound (parse, TF-IDF, fingerprinting) and would otherwise
+/// contend with the foreground tool call that caused it, so it gets at most
+/// half the cores (capped at two) and runs at a lowered scheduling priority.
+fn background_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads((cores / 2).clamp(1, 2))
+            .thread_name(|i| format!("leindex-refresh-{i}"))
+            .start_handler(|_| lower_thread_priority())
+            .build()
+            .unwrap_or_else(|error| panic!("failed to build refresh pool: {error}"))
+    })
+}
+
+/// Lower the calling thread's scheduling priority (nice +10). Best effort:
+/// failure only means the refresh competes at normal priority.
+#[cfg(target_os = "linux")]
+fn lower_thread_priority() {
+    // SAFETY: `gettid` and `setpriority` take plain integers and have no
+    // memory-safety preconditions. On Linux, PRIO_PROCESS with a thread id
+    // adjusts only that thread.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        let _ = libc::setpriority(libc::PRIO_PROCESS, tid, 10);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lower_thread_priority() {}
+
 fn registry_heap_budget_bytes() -> usize {
     let mb = std::env::var("LEINDEX_REGISTRY_MAX_HEAP_MB")
         .ok()
@@ -1828,6 +1896,22 @@ fn mark_index_failure(project_path: &Path, message: &str, core_published: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_background_pool_is_small_and_runs_at_lower_priority() {
+        let pool = background_pool();
+        assert!((1..=2).contains(&pool.current_num_threads()));
+        let name = pool.install(|| std::thread::current().name().map(str::to_owned));
+        assert!(name.unwrap_or_default().starts_with("leindex-refresh-"));
+        #[cfg(target_os = "linux")]
+        {
+            let nice = pool.install(|| unsafe {
+                let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+                libc::getpriority(libc::PRIO_PROCESS, tid)
+            });
+            assert!(nice >= 10, "refresh thread nice was {nice}");
+        }
+    }
 
     #[tokio::test]
     async fn test_join_error_cancellation_does_not_mark_failure() {

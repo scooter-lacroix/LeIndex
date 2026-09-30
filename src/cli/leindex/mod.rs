@@ -68,7 +68,10 @@ pub struct LeIndex {
     pub(crate) search_engine: SearchEngine,
 
     /// Program Dependence Graph
-    pub(crate) pdg: Option<ProgramDependenceGraph>,
+    /// Shared, copy-on-write: a validator (or any reader) can hold the graph
+    /// without cloning it, and writers use [`Self::take_owned_pdg`], which only
+    /// copies if a reader is still alive.
+    pub(crate) pdg: Option<std::sync::Arc<ProgramDependenceGraph>>,
 
     /// Cache subsystem (spiller, project scan, file stats)
     pub(crate) cache: crate::cli::index_cache::IndexCache,
@@ -873,7 +876,18 @@ impl LeIndex {
     /// Get the PDG, if the project has been indexed.
     #[inline]
     pub fn pdg(&self) -> Option<&ProgramDependenceGraph> {
-        self.pdg.as_ref()
+        self.pdg.as_deref()
+    }
+
+    /// Take the graph out as an owned value for mutation.
+    ///
+    /// Unshared (the normal case) it is unwrapped without copying; if a
+    /// validator still holds it, it is cloned so that reader keeps a consistent
+    /// snapshot.
+    pub(crate) fn take_owned_pdg(&mut self) -> Option<ProgramDependenceGraph> {
+        self.pdg.take().map(|shared| {
+            std::sync::Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone())
+        })
     }
 
     /// Create a LogicValidator for this project's PDG and storage.
@@ -894,7 +908,7 @@ impl LeIndex {
         let storage = crate::storage::schema::Storage::open(&db_path).ok()?;
 
         Some(crate::validation::LogicValidator::new(
-            std::sync::Arc::new(pdg.clone()),
+            std::sync::Arc::clone(pdg),
             // Storage wraps rusqlite::Connection which is not Sync;
             // Arc is required by the LogicValidator interface for shared ownership.
             #[allow(clippy::arc_with_non_send_sync)]
@@ -942,8 +956,8 @@ impl LeIndex {
     /// traverse the graph but never query TF-IDF/neural vectors; hydrating
     /// the snapshot + embedding mmaps + index structures for them was ~1s of
     /// pure added latency per cold call. Falls back to the plain DB
-    /// `load_pdg_from_storage` when the generation-read path is unavailable
-    /// (legacy layout).
+    /// `load_pdg_from_active_storage` when the generation-read path is unavailable
+    /// (legacy layout); it reads the published generation, never the mutable root.
     pub fn ensure_pdg_loaded_graph_only(&mut self) -> Result<()> {
         if self.pdg.is_some() {
             return Ok(());
@@ -962,7 +976,7 @@ impl LeIndex {
         if has_content {
             // An empty/unindexed graph surfaces as pdg=None here; callers
             // already report "not loaded" semantics for that.
-            let _ = self.load_pdg_from_storage();
+            let _ = self.load_pdg_from_active_storage();
         }
         Ok(())
     }
@@ -1077,8 +1091,7 @@ impl LeIndex {
     /// Reload vector index from PDG.
     pub fn reload_vector_from_pdg(&mut self) -> Result<usize> {
         let pdg = self
-            .pdg
-            .take()
+            .take_owned_pdg()
             .ok_or_else(|| anyhow::anyhow!("No PDG available for vector rebuild"))?;
 
         let batch_size = self.indexing_batch_size();
@@ -1093,7 +1106,7 @@ impl LeIndex {
         );
         let indexed_count = self.search_engine.node_count();
 
-        self.pdg = Some(pdg);
+        self.pdg = Some(std::sync::Arc::new(pdg));
         self.build_file_stats_cache();
 
         info!("Rebuilt vector index from PDG: {} nodes", indexed_count);

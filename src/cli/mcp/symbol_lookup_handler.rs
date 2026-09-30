@@ -416,7 +416,7 @@ fn resolve_symbol_node(
         let total_files = pdg.file_count();
         let suggestion = format!(
             "Symbol '{}' not found among {} indexed symbols across {} files. Try: \
-            check spelling, use LeIndex [Grep Symbols] for partial matches, \
+            check spelling, use leindex_explore mode=find target=symbols for partial matches, \
             or LeIndex [Text Search] for raw content search.",
             symbol, total_symbols, total_files
         );

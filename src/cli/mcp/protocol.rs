@@ -477,7 +477,7 @@ impl JsonRpcError {
                  Remediation:\n\
                  1. Ensure the project is indexed (call LeIndex [Index])\n\
                  2. Try a simpler query (single term instead of complex pattern)\n\
-                 3. Use LeIndex [Grep Symbols] for exact/regex pattern matching\n\
+                 3. Use leindex_explore mode=find target=symbols for exact/regex pattern matching\n\
                  4. Try force_reindex=true if the index may be stale",
                 m
             ),
@@ -496,7 +496,7 @@ impl JsonRpcError {
                 "{}\n\n\
                  Remediation:\n\
                  1. Check that the node_id exists in the indexed project\n\
-                 2. Use LeIndex [Grep Symbols] to find valid symbol names\n\
+                 2. Use leindex_explore mode=find target=symbols to find valid symbol names\n\
                  3. Try force_reindex=true if the index may be stale",
                 m
             ),
@@ -882,7 +882,7 @@ mod tests {
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "LeIndex [Search]",
+                "name": "leindex_explore mode=search",
                 "arguments": {"query": "test"}
             }
         }"#;
@@ -890,7 +890,7 @@ mod tests {
         let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
         let tool_call = req.extract_tool_call().unwrap();
 
-        assert_eq!(tool_call.name, "LeIndex [Search]");
+        assert_eq!(tool_call.name, "leindex_explore mode=search");
         assert_eq!(tool_call.arguments["query"], "test");
     }
 

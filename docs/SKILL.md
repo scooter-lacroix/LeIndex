@@ -167,8 +167,9 @@ LeIndex **automatically indexes projects on first use**. You don't need to manua
 1. **Search for error location**
    ```json
    {
-     "name": "leindex_grep_symbols",
+     "name": "leindex_explore",
      "arguments": {
+       "mode": "find",
        "pattern": "error|exception|panic",
        "language": "rust"
      }

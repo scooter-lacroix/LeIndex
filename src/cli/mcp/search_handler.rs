@@ -167,7 +167,7 @@ impl SearchHandler {
 
     /// Returns the human-readable display title for this tool
     pub fn title(&self) -> &str {
-        "LeIndex [Search]"
+        "leindex_explore mode=search"
     }
 
     /// Returns the description of this RPC method
@@ -321,7 +321,7 @@ to auto-switch/auto-index projects."
             serde_json::json!({
                 "low_signal": true,
                 "top_score": top_score,
-                "suggestion": "Top match scores below the confidence floor; results may be coincidental token overlap. Rephrase with more specific terms or use LeIndex [Grep Symbols] for exact names.",
+                "suggestion": "Top match scores below the confidence floor; results may be coincidental token overlap. Rephrase with more specific terms or use leindex_explore mode=find target=symbols for exact names.",
             })
         } else {
             serde_json::json!({ "top_score": top_score })
@@ -336,7 +336,7 @@ to auto-switch/auto-index projects."
                     "has_more": false,
                     "suggestion": format!(
                         "No semantic matches found for '{}'. The project contains {} indexed files. \
-                        Try: rephrase query, use different keywords, or try LeIndex [Grep Symbols] for exact symbol names.",
+                        Try: rephrase query, use different keywords, or try leindex_explore mode=find target=symbols for exact symbol names.",
                         query,
                         guard.source_file_paths().map(|p| p.len()).unwrap_or(0)
                     ),

@@ -79,9 +79,23 @@ was lost; everything below is on `v2.0.0` and covered by tests.
   default `full`): the default project's graph, then its search engine, load while
   the model is still thinking. Only already-indexed projects; never builds an
   index or creates storage.
+- Opportunistic staleness refreshes run on a small, low-priority thread pool
+  (at most half the cores, capped at two, nice +10 on Linux) so background work a
+  caller did not ask for no longer competes with the foreground call.
+- `leindex_manage action=phase` no longer creates a project or starts a competing
+  refresh (41–78 s before, ~7 s cold and <1 s warm now); the validator shares the
+  graph copy-on-write instead of deep-cloning it per request.
 
 ### Fixed
 
+- Graph-only hydration read the mutable index root while its search artifacts came
+  from the published generation. After any refresh that wrote the root and did not
+  publish (a failure, a concurrent run) the two never agreed, so every server start
+  rebuilt the search index and never persisted it (~1–2 s on the first calls,
+  forever). It now reads the published generation like every other path; covered
+  by a regression test.
+- Error hints named retired tools (`LeIndex [Grep Symbols]`); they now name the
+  `leindex_explore` branches.
 - `grep_symbols`' `mode` argument collided with the router selector and clobbered
   it in merged schemas; it is now `grep_mode` (bare `mode` still honoured on direct
   calls), and the merge can no longer overwrite reserved keys.

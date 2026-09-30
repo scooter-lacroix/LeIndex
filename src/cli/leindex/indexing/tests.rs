@@ -534,3 +534,114 @@ fn watcher_delta_does_not_spawn_precision_indexer() {
         "watcher delta must not invoke external SCIP indexers"
     );
 }
+
+/// `create_validator` must share the resident graph, not copy it: the copy
+/// (28k nodes / 139k edges on a mid-size project) was ~0.4 s of every edit
+/// preview and rename preview. Mutation while a reader is alive must still
+/// leave that reader a consistent snapshot.
+#[test]
+fn validator_shares_the_resident_graph_and_mutation_leaves_readers_a_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("lib.rs"),
+        "pub fn alpha() -> u32 { beta() }\npub fn beta() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    let mut index = LeIndex::new(dir.path()).unwrap();
+    index.index_project(true).unwrap();
+    index.ensure_pdg_loaded().unwrap();
+    let shared = index.pdg.clone().expect("graph resident after indexing");
+    let baseline = std::sync::Arc::strong_count(&shared);
+
+    let validator = index
+        .create_validator()
+        .expect("validator for an indexed project");
+    assert!(
+        std::sync::Arc::strong_count(&shared) >= baseline + 3,
+        "the validator and its three checkers must hold references to the resident \
+         graph (count {} vs baseline {baseline}), not a private copy",
+        std::sync::Arc::strong_count(&shared)
+    );
+
+    // A writer that needs ownership while the validator is alive gets a copy,
+    // and the validator's snapshot is unaffected.
+    let nodes_before = shared.node_count();
+    let mut owned = index.take_owned_pdg().expect("owned graph");
+    owned.add_node(crate::graph::pdg::Node {
+        id: "x.rs:extra".into(),
+        node_type: crate::graph::pdg::NodeType::Function,
+        name: "extra".into(),
+        file_path: std::sync::Arc::from("x.rs"),
+        byte_range: (0, 1),
+        complexity: 1,
+        language: "rust".into(),
+    });
+    assert_eq!(owned.node_count(), nodes_before + 1);
+    assert_eq!(
+        shared.node_count(),
+        nodes_before,
+        "readers keep their snapshot"
+    );
+    drop(validator);
+    drop(shared);
+
+    // Unshared, taking the graph is a move (try_unwrap succeeds), not a copy.
+    let expected_nodes = owned.node_count();
+    index.pdg = Some(std::sync::Arc::new(owned));
+    assert_eq!(
+        std::sync::Arc::strong_count(index.pdg.as_ref().unwrap()),
+        1,
+        "nothing else holds the graph"
+    );
+    let taken = index.take_owned_pdg().unwrap();
+    assert_eq!(taken.node_count(), expected_nodes);
+    assert!(index.pdg.is_none());
+}
+
+/// Graph-only hydration must read the published generation, not the mutable
+/// root. A root rewritten after publish (a failed or concurrent refresh) used
+/// to pair a different PDG with the generation's search artifacts, so every
+/// hydration rebuilt the search index and never persisted it.
+#[test]
+fn test_graph_only_hydration_reads_published_generation_not_mutable_root() {
+    let _guard = crate::feature_flags::lock_flag_tests();
+    let temp = tempfile::tempdir().expect("fixture");
+    std::fs::create_dir_all(temp.path().join("src")).unwrap();
+    std::fs::write(
+        temp.path().join("src/a.rs"),
+        "pub fn alpha() -> u32 { 1 }\npub fn beta() -> u32 { alpha() + 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("src/b.rs"),
+        "pub fn gamma() -> u32 { 3 }\npub fn delta() -> u32 { gamma() + 1 }\n",
+    )
+    .unwrap();
+
+    let mut indexer = LeIndex::new(temp.path()).expect("create index");
+    indexer.index_project(true).expect("index");
+    let published_nodes = indexer.get_stats().pdg_nodes;
+    let storage = indexer.storage_path().to_path_buf();
+    drop(indexer);
+    assert!(published_nodes > 0);
+
+    // Diverge the mutable root from the published generation.
+    {
+        let conn = rusqlite::Connection::open(storage.join("leindex.db")).unwrap();
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        conn.execute("DELETE FROM intel_nodes WHERE file_path LIKE '%b.rs'", [])
+            .unwrap();
+    }
+
+    let mut reader = LeIndex::new(temp.path()).expect("reader");
+    if reader.active_storage_path() == reader.storage_path().to_path_buf() {
+        // No published generation in this layout: nothing to diverge from.
+        return;
+    }
+    reader.ensure_pdg_loaded_graph_only().expect("graph load");
+    assert_eq!(
+        reader.pdg().expect("pdg resident").node_count(),
+        published_nodes,
+        "graph-only load must come from the published generation"
+    );
+}

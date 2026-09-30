@@ -199,7 +199,7 @@ impl IndexCache {
     pub fn spill_pdg_cache(
         &mut self,
         project_id: &str,
-        pdg: &mut Option<ProgramDependenceGraph>,
+        pdg: &mut Option<std::sync::Arc<ProgramDependenceGraph>>,
     ) -> Result<()> {
         let pdg_ref = pdg
             .as_ref()
@@ -264,7 +264,7 @@ impl IndexCache {
     pub fn spill_all_caches(
         &mut self,
         project_id: &str,
-        pdg: &mut Option<ProgramDependenceGraph>,
+        pdg: &mut Option<std::sync::Arc<ProgramDependenceGraph>>,
         search_node_count: usize,
     ) -> Result<(usize, usize)> {
         let mut pdg_bytes = 0;

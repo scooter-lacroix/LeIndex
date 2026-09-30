@@ -1,4 +1,4 @@
-use super::helpers::{extract_bool, extract_usize, phase_analysis_schema, wrap_with_meta};
+use super::helpers::{extract_bool, extract_usize, phase_analysis_schema, wrap_live_with_meta};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use crate::phase::{DocsMode, FormatMode, PhaseOptions, PhaseSelection, run_phase_analysis};
@@ -295,17 +295,25 @@ async fn execute_phase_analysis(
     args: Value,
 ) -> Result<Value, JsonRpcError> {
     let project_path = args.get("project_path").and_then(Value::as_str);
-    let handle = registry.get_or_create(project_path).await?;
-    let base_project_root = handle.read().await.project_path().to_path_buf();
+    // The phase pipeline brings its own incremental analysis and cache, so it
+    // needs only to know *where* the project is. Going through `get_or_create`
+    // here also started an index / background refresh — a second writer on the
+    // same SQLite file the phase run opens, so a phase call on a project with
+    // any changed file spent tens of seconds waiting on busy-timeouts for a
+    // reindex it never needed.
+    let base_project_root = registry.resolve_project_root(project_path).await?;
     let request = phase_request(&args, &base_project_root)?;
 
     let file_symbols_json = if let Some(file_path) = request.single_file_target.as_deref() {
+        // Single-file enrichment reads the graph: load it (graph only, no
+        // index, no refresh) on demand.
+        let handle = registry.get_or_load(project_path).await?;
         let file_path = file_path.to_path_buf();
-        let handle = handle.clone();
         tokio::task::spawn_blocking(move || {
             let content = std::fs::read_to_string(&file_path).unwrap_or_default();
-            let reader = handle.blocking_read();
-            reader
+            let mut index = handle.blocking_write();
+            let _ = index.ensure_pdg_loaded_graph_only();
+            index
                 .pdg()
                 .map(|pdg| file_symbols(pdg, &file_path, &content))
         })
@@ -328,8 +336,7 @@ async fn execute_phase_analysis(
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?,
         file_symbols_json,
     );
-    let index_for_meta = handle.read().await;
-    Ok(wrap_with_meta(report_value, &index_for_meta))
+    Ok(wrap_live_with_meta(report_value, &base_project_root))
 }
 
 #[cfg(test)]

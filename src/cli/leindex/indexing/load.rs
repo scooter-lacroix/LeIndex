@@ -49,7 +49,7 @@ impl LeIndex {
             self.embedder = None;
             self.stats.pdg_nodes = pdg_node_count;
             self.stats.pdg_edges = pdg_edge_count;
-            self.pdg = Some(pdg);
+            self.pdg = Some(std::sync::Arc::new(pdg));
             return Ok(());
         }
 
@@ -63,7 +63,7 @@ impl LeIndex {
     /// just to get the engine. This runs only the engine half. If the graph is
     /// not loaded yet, it loads everything.
     pub(crate) fn hydrate_search_engine_from_loaded_pdg(&mut self) -> Result<()> {
-        let Some(pdg) = self.pdg.take() else {
+        let Some(pdg) = self.take_owned_pdg() else {
             return self.load_from_storage();
         };
         let artifact_path = self.active_storage_path();
@@ -96,7 +96,7 @@ impl LeIndex {
             &current_pdg_fingerprint,
             persisted_embedder.as_ref(),
         ) {
-            self.pdg = Some(pdg);
+            self.pdg = Some(std::sync::Arc::new(pdg));
             return Ok(());
         }
 
@@ -382,7 +382,7 @@ impl LeIndex {
         self.stats.pdg_edges = pdg_edge_count;
         self.stats.indexed_nodes = indexed_count;
 
-        self.pdg = Some(pdg);
+        self.pdg = Some(std::sync::Arc::new(pdg));
         self.build_file_stats_cache();
 
         // R10: Persist embeddings to mmap file for fast read-only access.

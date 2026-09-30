@@ -573,7 +573,7 @@ impl LeIndex {
                 // degenerate empty result that confuses the caller.
                 return Err(anyhow::anyhow!(
                     "Node '{}' not found in the project index. \
-                    Use LeIndex [Search] or LeIndex [Grep Symbols] to find valid node IDs. \
+                    Use leindex_explore mode=search or leindex_explore mode=find target=symbols to find valid node IDs. \
                     The index uses short symbol names (e.g., 'handle_tool_call', not 'server.rs:handle_tool_call').",
                     node_id
                 ));
