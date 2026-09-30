@@ -72,12 +72,20 @@ prewarm = "full"
 ```
 
 **Pre-warm.** Loading a project's graph and search engine from disk is the only
-slow part of a first tool call (about 0.2 s and 1 s respectively on a 700-file
-repository, down from 0.7 s and 3 s before the loader was reworked). A long-lived
-server therefore starts loading the default project as soon as the client
-completes `initialize`, graph first so graph-only tools never wait for the engine.
-The model's think-time hides it: after a 1.5 s pause the first semantic search
-measured 29 ms. `find` needs no hydration at all.
+slow part of a first tool call (about 0.2 s and 0.13 s on a 700-file repository;
+the engine was 3 s before the loader was reworked and 0.75 s before the search
+snapshot stored its token dictionary). A long-lived server therefore starts
+loading the default project as soon as the client completes `initialize`, graph
+first so graph-only tools never wait for the engine. The model's think-time hides
+it: after a 1.5 s pause the first semantic search measured 29 ms. `find` needs no
+hydration at all.
+
+**Loading never freezes other calls.** The graph and engine are built on a
+detached copy of the project and swapped in under the project lock for a few
+microseconds, so a `read_file` or `git_status` sent while the search engine is
+still loading answers immediately instead of queueing behind it. Concurrent calls
+that need the same data share one build, and a build that raced a newly published
+generation is discarded and redone on demand.
 
 **Concurrency.** Requests are handled concurrently — `ping`, `tools/list` and
 cheap calls are never queued behind a slow one — and responses are written by a
@@ -1186,12 +1194,12 @@ a single line of JSON (no double-newlines), which is required for the MCP protoc
 ```
 
 Optional LeIndex guidance pack:
-- Shared skill: `integrations/skills/leindex-toolkit/`
+- Shared skill: `integrations/skills/leindex-code-intelligence/`
 - Reminder hook: `integrations/claude-code/hooks/use-leindex-instead.py`
 - Example merged settings: `integrations/claude-code/settings.example.json`
 
 Other agent guidance:
-- Codex can install the same shared skill into `~/.codex/skills/leindex-toolkit/`
+- Codex can install the same shared skill into `~/.codex/skills/leindex-code-intelligence/`
 - Gemini CLI, Amp, OpenCode, Qwen, and iFlow can reuse the shared skill text as project rules
 - See [`docs/AGENT_GUIDANCE.md`](AGENT_GUIDANCE.md) for install details
 

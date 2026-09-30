@@ -442,15 +442,15 @@ fn test_content_cleared_after_indexing() {
 
     // Also verify text_index is populated
     assert!(
-        !engine.text_index.is_empty(),
+        engine.tokens.token_count() > 0,
         "text_index should be populated"
     );
     assert!(
-        engine.text_index.contains_key("func1"),
+        engine.tokens.has_token("func1"),
         "text_index should contain 'func1' token"
     );
     assert!(
-        engine.text_index.contains_key("func2"),
+        engine.tokens.has_token("func2"),
         "text_index should contain 'func2' token"
     );
 }
@@ -463,19 +463,19 @@ fn test_node_tokens_populated() {
     engine.index_nodes(nodes);
 
     // node_tokens should have an entry for each node
-    assert_eq!(engine.node_tokens.len(), 2);
-    assert!(engine.node_tokens.contains_key("func1"));
-    assert!(engine.node_tokens.contains_key("func2"));
+    assert_eq!(engine.tokens.node_count(), 2);
+    assert!(engine.tokens.has_node("func1"));
+    assert!(engine.tokens.has_node("func2"));
 
     // Verify tokens contain expected normalized content
-    let func1_tokens = engine.node_tokens.get("func1").unwrap();
+    let func1_tokens = engine.node_tokens("func1").unwrap();
     assert!(
         func1_tokens.contains("func1"),
         "func1 tokens should contain 'func1', got: {:?}",
         func1_tokens
     );
 
-    let func2_tokens = engine.node_tokens.get("func2").unwrap();
+    let func2_tokens = engine.node_tokens("func2").unwrap();
     assert!(
         func2_tokens.contains("func2"),
         "func2 tokens should contain 'func2', got: {:?}",
@@ -488,7 +488,7 @@ fn test_node_tokens_cleared_on_reindex() {
     // T14: Verify node_tokens is cleared when re-indexing
     let mut engine = SearchEngine::new();
     engine.index_nodes(create_test_nodes());
-    assert_eq!(engine.node_tokens.len(), 2);
+    assert_eq!(engine.tokens.node_count(), 2);
 
     // Re-index with different nodes
     engine.index_nodes(vec![NodeInfo {
@@ -504,9 +504,9 @@ fn test_node_tokens_cleared_on_reindex() {
         signature: None,
         pre_tokenized: None,
     }]);
-    assert_eq!(engine.node_tokens.len(), 1);
-    assert!(engine.node_tokens.contains_key("new_func"));
-    assert!(!engine.node_tokens.contains_key("func1"));
+    assert_eq!(engine.tokens.node_count(), 1);
+    assert!(engine.tokens.has_node("new_func"));
+    assert!(!engine.tokens.has_node("func1"));
 }
 
 #[test]
@@ -577,7 +577,7 @@ fn test_incremental_reindex_add_nodes() {
     // Should now have 3 nodes
     assert_eq!(engine.node_count(), 3);
     assert_eq!(engine.node_id_to_idx.len(), 3);
-    assert_eq!(engine.node_tokens.len(), 3);
+    assert_eq!(engine.tokens.node_count(), 3);
     assert_eq!(engine.complexity_cache.len(), 3);
 
     // Search should find the new node
@@ -597,9 +597,9 @@ fn test_incremental_reindex_add_nodes() {
     assert_eq!(results[0].node_id, "func3");
 
     // text_index should contain "func3" token
-    assert!(engine.text_index.contains_key("func3"));
+    assert!(engine.tokens.has_token("func3"));
     // "db" and "query" tokens should also be indexed
-    assert!(engine.text_index.contains_key("query"));
+    assert!(engine.tokens.has_token("query"));
 }
 
 #[test]
@@ -623,16 +623,17 @@ fn test_incremental_reindex_remove_nodes() {
 
     // func1's tokens should be removed from text_index
     // "func1" token should no longer map to func1
-    if let Some(ids) = engine.text_index.get("func1") {
-        assert!(
-            !ids.contains("func1"),
-            "func1 should be removed from text_index"
-        );
-    }
+    assert!(
+        !engine
+            .tokens
+            .nodes_with_token("func1")
+            .any(|id| id == "func1"),
+        "func1 should be removed from text_index"
+    );
 
     // node_tokens should not contain func1
-    assert!(!engine.node_tokens.contains_key("func1"));
-    assert!(engine.node_tokens.contains_key("func2"));
+    assert!(!engine.tokens.has_node("func1"));
+    assert!(engine.tokens.has_node("func2"));
 
     // Search for func1 should not find it
     let query = SearchQuery {
@@ -685,8 +686,8 @@ fn test_incremental_reindex_update_existing_node() {
     assert_eq!(engine.complexity_cache.get("func1"), Some(&5));
 
     // New tokens should be indexed
-    assert!(engine.node_tokens.get("func1").unwrap().contains("logic"));
-    assert!(engine.text_index.contains_key("logic"));
+    assert!(engine.tokens.node_has_token("func1", "logic"));
+    assert!(engine.tokens.has_token("logic"));
 
     // Search for new content should work
     let query = SearchQuery {
@@ -822,7 +823,7 @@ fn test_incremental_reindex_removes_empty_token_sets() {
     ]);
 
     // "zebra" token should exist and map to unique1 only
-    assert!(engine.text_index.contains_key("zebra"));
+    assert!(engine.tokens.has_token("zebra"));
 
     // Remove unique1 — "zebra" token set should be cleaned up entirely
     let delta = TextIndexDelta {
@@ -833,12 +834,12 @@ fn test_incremental_reindex_removes_empty_token_sets() {
 
     // "zebra" token should no longer exist in text_index (no remaining nodes have it)
     assert!(
-        !engine.text_index.contains_key("zebra"),
+        !engine.tokens.has_token("zebra"),
         "Token with no remaining nodes should be removed from text_index"
     );
 
     // "apple" should still exist
-    assert!(engine.text_index.contains_key("apple"));
+    assert!(engine.tokens.has_token("apple"));
 }
 
 #[test]

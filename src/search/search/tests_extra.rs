@@ -51,13 +51,7 @@ fn test_incremental_reindex_content_cleared() {
     }
 
     // But func3 tokens should still be searchable
-    assert!(
-        engine
-            .node_tokens
-            .get("func3")
-            .unwrap()
-            .contains("important")
-    );
+    assert!(engine.tokens.node_has_token("func3", "important"));
 }
 
 // ----------------------------------------------------------------
@@ -111,12 +105,8 @@ fn test_pre_tokenized_produces_identical_search_results() {
 
     // Both inverted indexes should be identical
     assert_eq!(
-        engine_pre.text_index, engine_fallback.text_index,
+        engine_pre.tokens, engine_fallback.tokens,
         "Pre-tokenized and fallback should produce identical text_index"
-    );
-    assert_eq!(
-        engine_pre.node_tokens, engine_fallback.node_tokens,
-        "Pre-tokenized and fallback should produce identical node_tokens"
     );
 
     // Search for "calculate" should find the node in both
@@ -158,9 +148,9 @@ fn test_pre_tokenized_none_falls_back_to_content() {
     }]);
 
     // Should still find via content-based tokenization
-    assert!(engine.text_index.contains_key("legacy"));
-    assert!(engine.text_index.contains_key("func"));
-    assert!(engine.node_tokens.contains_key("backward_compat"));
+    assert!(engine.tokens.has_token("legacy"));
+    assert!(engine.tokens.has_token("func"));
+    assert!(engine.tokens.has_node("backward_compat"));
 
     let query = SearchQuery {
         query: "legacy".to_string(),
@@ -230,12 +220,10 @@ fn test_pre_tokenized_and_content_produce_same_inverted_index() {
     // Both should have identical text_index entries
     for token in &["handle", "http", "request", "response", "pub", "async"] {
         assert_eq!(
-            engine_a.text_index.get(*token),
-            engine_b.text_index.get(*token),
-            "Mismatch for token '{}': pre_tokenized={:?}, content={:?}",
-            token,
-            engine_a.text_index.get(*token),
-            engine_b.text_index.get(*token)
+            engine_a.token_lookup(token),
+            engine_b.token_lookup(token),
+            "Mismatch for token '{}'",
+            token
         );
     }
 }
@@ -275,9 +263,9 @@ fn test_pre_tokenized_incremental_reindex() {
     assert_eq!(engine.node_count(), 3);
 
     // Pre-tokenized tokens should be in the inverted index
-    assert!(engine.text_index.contains_key("compute"));
-    assert!(engine.text_index.contains_key("metrics"));
-    assert!(engine.text_index.contains_key("data"));
+    assert!(engine.tokens.has_token("compute"));
+    assert!(engine.tokens.has_token("metrics"));
+    assert!(engine.tokens.has_token("data"));
 
     // Search should find the new node
     let query = SearchQuery {

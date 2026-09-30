@@ -14,13 +14,12 @@ use crate::search::quantization::int8_hnsw::{Int8HnswIndex, Int8HnswParams};
 use crate::search::query::{MAX_EMBEDDING_DIMENSION, MIN_EMBEDDING_DIMENSION};
 use crate::search::ranking::{HybridScorer, Score};
 use crate::search::vector::VectorIndex;
-use fx::{FastMap, FastSet};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+pub use token_index::StrSet;
+use token_index::TokenIndex;
 
 // ============================================================================
 // CONSTANTS & VALIDATION
@@ -60,6 +59,7 @@ mod pruner;
 #[cfg(feature = "storage")]
 mod snapshot;
 mod staged_retrieval;
+mod token_index;
 mod vector_impl;
 
 pub use int8_quality::*;
@@ -143,13 +143,10 @@ pub struct SearchEngine {
     /// (token, node) pair — cold start used to clone a `String` for each of
     /// roughly a million pairs — and the maps use a fast non-cryptographic
     /// hasher (see [`fx`]).
-    text_index: FastMap<Arc<str>, FastSet<Arc<str>>>,
+    tokens: TokenIndex,
     /// Node ID to index mapping for O(1) node lookups (fixes A1)
     /// Populated during index_nodes() and maintained on updates
     node_id_to_idx: HashMap<String, usize>,
-    /// Per-node token cache: node_id -> set of normalized tokens
-    /// Populated during index_nodes() to avoid re-tokenization in scoring
-    node_tokens: FastMap<Arc<str>, FastSet<Arc<str>>>,
     /// Result cache for repeated queries (A+ Section 8.1: bounded by entries and bytes)
     search_cache: LruCache<String, Vec<SearchResult>>,
     /// Tracked byte estimate for the search cache
@@ -178,9 +175,8 @@ impl SearchEngine {
                 DEFAULT_EMBEDDING_DIMENSION,
             )),
             complexity_cache: HashMap::new(),
-            text_index: FastMap::default(),
+            tokens: TokenIndex::default(),
             node_id_to_idx: HashMap::new(),
-            node_tokens: FastMap::default(),
             search_cache: LruCache::new(NonZeroUsize::new(SEARCH_CACHE_MAX_ENTRIES).unwrap()),
             search_cache_bytes: 0,
             neural_weight: 0.4,
@@ -224,9 +220,8 @@ impl SearchEngine {
             scorer: HybridScorer::new(),
             vector_index: VectorIndexImpl::BruteForce(VectorIndex::new(dimension)),
             complexity_cache: HashMap::new(),
-            text_index: FastMap::default(),
+            tokens: TokenIndex::default(),
             node_id_to_idx: HashMap::new(),
-            node_tokens: FastMap::default(),
             search_cache: LruCache::new(NonZeroUsize::new(SEARCH_CACHE_MAX_ENTRIES).unwrap()),
             search_cache_bytes: 0,
             neural_weight: 0.4,
@@ -291,11 +286,10 @@ impl SearchEngine {
     pub fn clear_index(&mut self) {
         self.nodes.clear();
         self.complexity_cache.clear();
-        self.text_index.clear();
+        self.tokens.clear();
         self.search_cache.clear();
         self.search_cache_bytes = 0;
         self.node_id_to_idx.clear();
-        self.node_tokens.clear();
         self.vector_index.clear();
         // Also drop the lazy-paged neural ANN so a stale mmap isn't reused
         // after a full reindex rebuilds the lexical index from scratch.
@@ -353,62 +347,30 @@ impl SearchEngine {
         self.search_cache.clear();
         self.search_cache_bytes = 0;
 
-        // Build node_id_to_idx for O(1) node lookups (A1 optimization),
-        // the complexity cache, the inverted index and the per-node token
-        // cache.
+        // Build node_id_to_idx for O(1) node lookups (A1 optimization), the
+        // complexity cache and the integer-addressed token index.
         //
         // R8: pre-tokenized tokens (already lowercase, >= 2 chars) skip
         // re-tokenization; content-based tokenization is the fallback.
-        //
-        // Cold start builds ~1M (token, node) pairs, so each distinct token
-        // and each node id is allocated once as an `Arc<str>` and shared;
-        // per-pair work is a hash lookup and a refcount bump, not a `String`
-        // allocation.
-        let mut interned: FastMap<Arc<str>, ()> = FastMap::default();
-        let mut intern = |token: &str| -> Arc<str> {
-            if let Some((existing, _)) = interned.get_key_value(token) {
-                return Arc::clone(existing);
-            }
-            let shared: Arc<str> = Arc::from(token);
-            interned.insert(Arc::clone(&shared), ());
-            shared
-        };
-        let mut staged_index: FastMap<Arc<str>, Vec<Arc<str>>> = FastMap::default();
         for (idx, node) in nodes.iter().enumerate() {
             let global_idx = self.nodes.len() + idx;
             self.node_id_to_idx.insert(node.node_id.clone(), global_idx);
             self.complexity_cache
                 .insert(node.node_id.clone(), node.complexity);
-
-            let node_arc: Arc<str> = Arc::from(node.node_id.as_str());
-            let mut tokens: FastSet<Arc<str>> = FastSet::default();
-            let mut add = |token: &str, tokens: &mut FastSet<Arc<str>>| {
-                if tokens.contains(token) {
-                    return;
-                }
-                let shared = intern(token);
-                staged_index
-                    .entry(Arc::clone(&shared))
-                    .or_default()
-                    .push(Arc::clone(&node_arc));
-                tokens.insert(shared);
-            };
             if let Some(pre_tok) = &node.pre_tokenized {
-                for token in pre_tok {
-                    add(token, &mut tokens);
-                }
+                self.tokens
+                    .insert_node(&node.node_id, pre_tok.iter().map(String::as_str));
             } else {
-                for token in node.content.split(|c: char| !c.is_alphanumeric()) {
-                    // Skip empty and 1-char tokens to reduce noise.
-                    if token.len() >= 2 {
-                        add(&token.to_ascii_lowercase(), &mut tokens);
-                    }
-                }
+                // Skip empty and 1-char tokens to reduce noise.
+                let lowered: Vec<String> = node
+                    .content
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|token| token.len() >= 2)
+                    .map(str::to_ascii_lowercase)
+                    .collect();
+                self.tokens
+                    .insert_node(&node.node_id, lowered.iter().map(String::as_str));
             }
-            self.node_tokens.insert(node_arc, tokens);
-        }
-        for (token, node_ids) in staged_index {
-            self.text_index.entry(token).or_default().extend(node_ids);
         }
 
         // Build vector index from TF-IDF embeddings — clone only embeddings (A4 optimization)
@@ -594,18 +556,8 @@ impl SearchEngine {
             return; // Node not in index, nothing to do
         };
 
-        // Remove from text_index: for each token the node contributed to,
-        // remove the node_id from the token's set. Clean up empty sets.
-        if let Some(tokens) = self.node_tokens.remove(node_id) {
-            for token in tokens {
-                if let Entry::Occupied(mut entry) = self.text_index.entry(token) {
-                    entry.get_mut().remove(node_id);
-                    if entry.get().is_empty() {
-                        entry.remove();
-                    }
-                }
-            }
-        }
+        // Remove from the token index (postings and the node's token list).
+        self.tokens.remove_node(node_id);
 
         // Remove from complexity_cache
         self.complexity_cache.remove(node_id);
@@ -643,34 +595,19 @@ impl SearchEngine {
         //
         // R8: Use pre-tokenized tokens when available to skip re-tokenization.
         // Falls back to content-based tokenization for backward compatibility.
-        let node_arc: Arc<str> = Arc::from(node_id.as_str());
-        let mut tokens: FastSet<Arc<str>> = FastSet::default();
-        let add = |token: &str,
-                   tokens: &mut FastSet<Arc<str>>,
-                   index: &mut FastMap<Arc<str>, FastSet<Arc<str>>>| {
-            let shared: Arc<str> = match index.get_key_value(token) {
-                Some((existing, _)) => Arc::clone(existing),
-                None => Arc::from(token),
-            };
-            index
-                .entry(Arc::clone(&shared))
-                .or_default()
-                .insert(Arc::clone(&node_arc));
-            tokens.insert(shared);
-        };
         if let Some(pre_tok) = &node.pre_tokenized {
-            for token in pre_tok {
-                add(token, &mut tokens, &mut self.text_index);
-            }
+            self.tokens
+                .insert_node(&node_id, pre_tok.iter().map(String::as_str));
         } else {
-            for token in node.content.split(|c: char| !c.is_alphanumeric()) {
-                let normalized_token = token.to_ascii_lowercase();
-                if normalized_token.len() >= 2 {
-                    add(&normalized_token, &mut tokens, &mut self.text_index);
-                }
-            }
+            let lowered: Vec<String> = node
+                .content
+                .split(|c: char| !c.is_alphanumeric())
+                .map(str::to_ascii_lowercase)
+                .filter(|token| token.len() >= 2)
+                .collect();
+            self.tokens
+                .insert_node(&node_id, lowered.iter().map(String::as_str));
         }
-        self.node_tokens.insert(Arc::clone(&node_arc), tokens);
 
         // Update node_id_to_idx
         self.node_id_to_idx.insert(node_id.clone(), new_idx);
@@ -813,14 +750,15 @@ impl SearchEngine {
     }
 
     /// Return the tokens associated with a given node.
-    pub fn node_tokens(&self, node_id: &str) -> Option<&FastSet<Arc<str>>> {
-        self.node_tokens.get(node_id)
+    pub fn node_tokens(&self, node_id: &str) -> Option<StrSet<'_>> {
+        self.tokens.tokens_of_node(node_id).map(StrSet::new)
     }
 
     /// Check whether a token exists in the text index and, if so, which
     /// node IDs contain it.
-    pub fn token_lookup(&self, token: &str) -> Option<&FastSet<Arc<str>>> {
-        self.text_index.get(token)
+    pub fn token_lookup(&self, token: &str) -> Option<StrSet<'_>> {
+        let nodes: Vec<&str> = self.tokens.nodes_with_token(token).collect();
+        (!nodes.is_empty()).then(|| StrSet::new(nodes))
     }
 
     /// Return the number of entries currently in the search cache.
@@ -856,10 +794,10 @@ impl SearchEngine {
 
         // Build compact token → set-of-rows index
         let mut token_rows: HashMap<String, HashSet<u32>> = HashMap::new();
-        for (token, node_ids) in &self.text_index {
+        for (token, node_ids) in self.tokens.entries() {
             let mut rows = HashSet::new();
             for node_id in node_ids {
-                if let Some(&idx) = self.node_id_to_idx.get(&**node_id) {
+                if let Some(&idx) = self.node_id_to_idx.get(node_id) {
                     rows.insert(idx as u32);
                 }
             }
@@ -927,15 +865,15 @@ impl SearchEngine {
 
         // node_tokens must have an entry for every live node
         for node in &self.nodes {
-            if !self.node_tokens.contains_key(node.node_id.as_str()) {
+            if !self.tokens.has_node(node.node_id.as_str()) {
                 return Err(format!("node_tokens missing entry for {}", node.node_id));
             }
         }
 
         // text_index must not reference removed nodes
-        for (token, node_ids) in &self.text_index {
+        for (token, node_ids) in self.tokens.entries() {
             for id in node_ids {
-                if !self.node_id_to_idx.contains_key(&**id) {
+                if !self.node_id_to_idx.contains_key(id) {
                     return Err(format!(
                         "text_index token '{}' references non-live node '{}'",
                         token, id
@@ -1109,10 +1047,8 @@ impl SearchEngine {
         }
         let mut candidate_ids: HashSet<&str> = HashSet::new();
         for token in &text_query.query_tokens {
-            if let Some(node_ids) = self.text_index.get(token.as_str()) {
-                for node_id in node_ids {
-                    candidate_ids.insert(&**node_id);
-                }
+            for node_id in self.tokens.nodes_with_token(token.as_str()) {
+                candidate_ids.insert(node_id);
             }
         }
         let no_matches = candidate_ids.is_empty()
@@ -1242,10 +1178,8 @@ impl SearchEngine {
         let text_query = TextQueryPreprocessed::from_query(&query.query);
         let mut coarse_candidate_ids: HashSet<String> = HashSet::new();
         for token in &text_query.query_tokens {
-            if let Some(node_ids) = self.text_index.get(token.as_str()) {
-                for id in node_ids {
-                    coarse_candidate_ids.insert(id.to_string());
-                }
+            for id in self.tokens.nodes_with_token(token.as_str()) {
+                coarse_candidate_ids.insert(id.to_string());
             }
         }
 
@@ -1653,12 +1587,12 @@ impl SearchEngine {
         let base_score = if precomputed.query_tokens.is_empty() {
             // No meaningful tokens in query
             0.0
-        } else if let Some(node_tokens) = self.node_tokens.get(node_id) {
+        } else if self.tokens.has_node(node_id) {
             // Count overlap between query tokens and cached node tokens
             let matching = precomputed
                 .query_tokens
                 .iter()
-                .filter(|token| node_tokens.contains(token.as_str()))
+                .filter(|token| self.tokens.node_has_token(node_id, token.as_str()))
                 .count();
             matching as f32 / precomputed.query_tokens.len() as f32
         } else {
@@ -1885,29 +1819,9 @@ impl SearchEngine {
         let nodes_size = self.nodes.len() * std::mem::size_of::<NodeInfo>();
         let cache_size = self.complexity_cache.len()
             * (std::mem::size_of::<String>() + std::mem::size_of::<u32>());
-        // Tokens and node ids are interned `Arc<str>`s: each distinct token
-        // string is stored once (as a `text_index` key) and every set entry is
-        // a fat pointer plus ~1 byte of table control.
-        let entry = std::mem::size_of::<Arc<str>>() + 1;
-        let text_index_size = self
-            .text_index
-            .iter()
-            .map(|(token, set)| token.len() + entry + set.len() * entry)
-            .sum::<usize>();
-        // The per-node token sets are a real heap resident; omitting them
-        // under-reported warm projects against the stress-test's measured
-        // footprints.
-        let node_tokens_size = self
-            .node_tokens
-            .iter()
-            .map(|(node_id, tokens)| node_id.len() + entry + tokens.len() * entry)
-            .sum::<usize>();
+        let token_index_size = self.tokens.estimated_bytes();
 
-        nodes_size
-            + cache_size
-            + text_index_size
-            + node_tokens_size
-            + self.vector_index.estimated_memory_bytes()
+        nodes_size + cache_size + token_index_size + self.vector_index.estimated_memory_bytes()
     }
 
     /// Estimate byte size of a slice of search results for cache accounting.

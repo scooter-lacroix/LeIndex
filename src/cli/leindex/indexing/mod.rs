@@ -938,9 +938,16 @@ impl LeIndex {
         // checkpoint.  If the process dies during neural, the resumed run
         // can skip straight to the neural phase using this snapshot.
         let _core = self.publish_generation(&job, None)?;
-        self.refresh_text_index();
+        // The text index only needs the core generation's symbols, so it builds
+        // beside the neural phase instead of after it.
+        let text_index_job = self.spawn_text_index_refresh();
 
-        let neural = self.run_neural(&job, &lexical)?;
+        let neural = self.run_neural(&job, &lexical);
+        // Never leave the builder running past this run, even on failure.
+        if text_index_job.join().is_err() {
+            warn!("Text index build panicked (search will scan live)");
+        }
+        let neural = neural?;
         let _enhanced = self.publish_generation(&job, Some(&neural))?;
 
         let state = self
@@ -1320,16 +1327,19 @@ impl LeIndex {
     /// (Re)build the trigram text index used by `leindex_find`, with symbol
     /// spans read from the generation just published. Best effort: search
     /// falls back to live scanning, so a failure here never fails indexing.
-    fn refresh_text_index(&self) {
+    /// Runs on its own thread; join the handle before the run ends.
+    fn spawn_text_index_refresh(&self) -> std::thread::JoinHandle<()> {
         let root = self.project_path().to_path_buf();
         let storage = self.storage_path().to_path_buf();
         let db = crate::cli::live_project::LiveProject::resolve(&root.to_string_lossy())
             .map(|live| live.active_storage().join("leindex.db"))
             .ok()
             .filter(|db| db.is_file());
-        if let Err(error) = crate::cli::textindex::build(&root, &storage, db.as_deref()) {
-            warn!("Text index build failed (search will scan live): {error}");
-        }
+        std::thread::spawn(move || {
+            if let Err(error) = crate::cli::textindex::build(&root, &storage, db.as_deref()) {
+                warn!("Text index build failed (search will scan live): {error}");
+            }
+        })
     }
 
     pub(crate) fn run_pdg(

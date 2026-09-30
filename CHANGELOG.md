@@ -85,9 +85,39 @@ was lost; everything below is on `v2.0.0` and covered by tests.
 - `leindex_manage action=phase` no longer creates a project or starts a competing
   refresh (41–78 s before, ~7 s cold and <1 s warm now); the validator shares the
   graph copy-on-write instead of deep-cloning it per request.
+- Off-lock hydration: the graph and search engine are built on a detached copy
+  and swapped in, so calls that need neither (`read_file`, `git_status`, `find`)
+  no longer wait behind the background pre-warm. Tools declare what they need
+  (`Hydration::{None, Graph, Full}`) and the router loads it before the handler
+  takes the project lock.
+- Search snapshot v2: an integer-addressed inverted index (token dictionary +
+  sorted postings, `search/search/token_index.rs`) replaces the two hash-of-hash
+  string maps. Engine restore 750 ms → ~125 ms, snapshot 25 MB → 15 MB, far less
+  resident memory. Existing v1 snapshots are ignored and rebuilt: run
+  `leindex index --force` once (or any reindex) to write the new format.
+- Indexing: TF-IDF pass 2 (enrichment, tokenization, vectors) runs across cores
+  with admission and hoisting applied in node order (identical output); the text
+  index builds beside the neural phase. Forced index of this repository
+  14.2 s → 6.7 s.
+- Agent skill: `integrations/skills/leindex-toolkit` is now
+  `integrations/skills/leindex-code-intelligence`, rewritten for the four tools;
+  the Claude Code hook, `MCP_COMPATIBILITY.md`, `docs/CLI.md`, `docs/AGENT_GUIDANCE.md`
+  and the pi skill use the router names.
+- Phase analysis: a run whose phases are all cached no longer loads the graph
+  (warm ~500 ms → ~17 ms), and the file inventory is hashed in parallel.
 
 ### Fixed
 
+- Phase analysis and the indexer shared one store but disagreed about which
+  files exist and what an import is. The phase run saw dotfiles, ignored paths
+  and a different language list, treated every indexed doc as "deleted", and
+  saved its resolved-import form of the graph, so a phase call after an index
+  re-parsed and rewrote ~100 files and deleted ~4,000 external nodes (62 s), and
+  the next index undid it. That flip-flop is also what left the shared graph
+  without its docs and made every server start refresh the index. Phase now
+  collects exactly the indexer's file set, counts only files that are really
+  gone as deleted, and resolves imports in memory without persisting that form
+  (index → phase 62 s → 3 s).
 - Graph-only hydration read the mutable index root while its search artifacts came
   from the published generation. After any refresh that wrote the root and did not
   publish (a failure, a concurrent run) the two never agreed, so every server start

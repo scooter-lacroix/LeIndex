@@ -44,6 +44,17 @@ pub struct PhaseExecutionContext {
     pub docs_summary: Option<DocsSummary>,
     /// Freshness generation hash.
     pub generation_hash: String,
+
+    /// Graph refresh that has not run yet. A run whose phases are all cached
+    /// never needs the graph, so loading it (~0.3 s, plus community and
+    /// storage work) waits for the first cache miss; see [`Self::ensure_graph`].
+    pub(crate) pending_graph: Option<PendingGraph>,
+}
+
+/// Inputs for the deferred graph load/refresh.
+pub(crate) struct PendingGraph {
+    options: PhaseOptions,
+    freshness: FreshnessState,
 }
 
 impl PhaseExecutionContext {
@@ -78,15 +89,26 @@ impl PhaseExecutionContext {
             pdg: ProgramDependenceGraph::new(),
             docs_summary: None,
             generation_hash: freshness.generation_hash.clone(),
+            pending_graph: Some(PendingGraph {
+                options: options.clone(),
+                freshness,
+            }),
         };
-
-        context.load_or_refresh_graph(options, &freshness)?;
 
         if options.include_docs {
             context.docs_summary = Some(analyze_docs(&collected.docs_files)?);
         }
 
         Ok(context)
+    }
+
+    /// Load or refresh the graph if that has not happened yet. Phases call this
+    /// before computing anything; a cached phase result never does.
+    pub fn ensure_graph(&mut self) -> Result<()> {
+        if let Some(PendingGraph { options, freshness }) = self.pending_graph.take() {
+            self.load_or_refresh_graph(&options, &freshness)?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "community")]
@@ -213,15 +235,12 @@ impl PhaseExecutionContext {
                 extract_pdg_from_signatures(signatures.clone(), source_bytes, file_path, language);
             merge_pdgs(&mut pdg, &file_pdg);
         }
-        crate::phase::pdg_utils::relink_external_import_edges(
-            &mut pdg,
-            &crate::phase::pdg_utils::RelinkConfig::default(),
-        );
         self.pdg = pdg;
 
         self.run_precision_ingest();
         save_pdg(&mut self.storage, &self.project_id, &self.pdg)
             .context("failed saving full PDG for phase analysis")?;
+        relink_for_analysis(&mut self.pdg);
         self.compute_and_persist_communities()
             .context("failed persisting communities for phase analysis")?;
 
@@ -357,10 +376,6 @@ impl PhaseExecutionContext {
         let graph_changed =
             !freshness.deleted_files.is_empty() || !self.signatures_by_file.is_empty();
         if graph_changed {
-            crate::phase::pdg_utils::relink_external_import_edges(
-                &mut pdg,
-                &crate::phase::pdg_utils::RelinkConfig::default(),
-            );
             self.run_precision_ingest_for(&mut pdg);
             save_pdg(&mut self.storage, &self.project_id, &pdg)
                 .context("failed saving refreshed PDG")?;
@@ -373,12 +388,28 @@ impl PhaseExecutionContext {
                 .context("failed saving precision-enriched PDG")?;
         }
 
+        relink_for_analysis(&mut pdg);
         self.pdg = pdg;
         if graph_changed {
             self.compute_and_persist_communities()?;
         }
         Ok(())
     }
+}
+
+/// Resolve import edges to internal symbols for the analysis, in memory only.
+///
+/// The persisted graph is shared with the indexer, which keeps unresolved
+/// imports as external placeholder nodes. Saving the resolved form made the
+/// two writers trade thousands of nodes on every alternating run (a phase call
+/// after an index spent ~15 s deleting ~4,000 external nodes, and the next
+/// index re-created them). The analysis sees the resolved graph; storage keeps
+/// the form the indexer wrote.
+fn relink_for_analysis(pdg: &mut ProgramDependenceGraph) {
+    crate::phase::pdg_utils::relink_external_import_edges(
+        pdg,
+        &crate::phase::pdg_utils::RelinkConfig::default(),
+    );
 }
 
 fn signatures_from_results(
@@ -617,6 +648,7 @@ mod tests {
             pdg: ProgramDependenceGraph::new(),
             docs_summary: None,
             generation_hash: "gen".to_string(),
+            pending_graph: None,
         };
 
         let freshness = FreshnessState {
@@ -666,6 +698,7 @@ mod tests {
             pdg: ProgramDependenceGraph::new(),
             docs_summary: None,
             generation_hash: "initial".to_string(),
+            pending_graph: None,
         };
         let initial_freshness = FreshnessState {
             generation_hash: "initial".to_string(),
@@ -824,6 +857,7 @@ mod tests {
             pdg: ProgramDependenceGraph::new(),
             docs_summary: None,
             generation_hash: "same".to_string(),
+            pending_graph: None,
         };
         let freshness = FreshnessState {
             generation_hash: "same".to_string(),
@@ -854,5 +888,35 @@ mod tests {
         assert!(context.pdg.is_precision_symbol("src/main.py:main"));
         let loaded = load_pdg(&context.storage, &project_id).expect("reload persisted graph");
         assert!(loaded.is_precision_symbol("src/main.py:main"));
+    }
+    #[test]
+    fn test_prepare_defers_graph_until_first_use() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn alpha() {}\npub fn beta() { alpha() }\n",
+        )
+        .expect("write");
+        let options = PhaseOptions {
+            root: dir.path().to_path_buf(),
+            ..PhaseOptions::default()
+        };
+        let mut context = PhaseExecutionContext::prepare(&options).expect("prepare");
+        assert!(context.pending_graph.is_some());
+        assert_eq!(
+            context.pdg.node_count(),
+            0,
+            "an all-cached run must not pay for the graph"
+        );
+        assert!(
+            !context.file_inventory.is_empty(),
+            "freshness is still computed"
+        );
+
+        context.ensure_graph().expect("ensure graph");
+        assert!(context.pending_graph.is_none());
+        assert!(context.pdg.node_count() > 0);
+        context.ensure_graph().expect("second call is a no-op");
     }
 }

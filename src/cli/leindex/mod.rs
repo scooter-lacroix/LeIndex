@@ -981,6 +981,44 @@ impl LeIndex {
         Ok(())
     }
 
+    /// Whether this instance already holds what `full` (graph + search engine)
+    /// or graph-only tools need.
+    pub(crate) fn is_hydrated(&self, full: bool) -> bool {
+        self.pdg.is_some() && (!full || !self.search_engine.is_empty())
+    }
+
+    /// Take over hydrated state built off-lock by `other` (a sibling instance
+    /// of the same project).
+    ///
+    /// Building the graph and search engine takes up to a second; doing it on
+    /// the instance that lives behind the per-project lock stalls every other
+    /// call for that long. Callers build a detached instance instead and swap
+    /// its state in here, which is a handful of pointer moves. Returns `false`
+    /// (leaving `self` untouched) when `self` was hydrated in the meantime or
+    /// `other` did not produce what was asked for.
+    pub(crate) fn adopt_hydration(&mut self, mut other: LeIndex, full: bool) -> bool {
+        if self.is_hydrated(full) || !other.is_hydrated(full) {
+            return false;
+        }
+        self.pdg = other.pdg.take();
+        self.stats.pdg_nodes = other.stats.pdg_nodes;
+        self.stats.pdg_edges = other.stats.pdg_edges;
+        self.generation_snapshot = other.generation_snapshot.take();
+        self.hydrated_generation.store(
+            other
+                .hydrated_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            std::sync::atomic::Ordering::Release,
+        );
+        if full {
+            self.search_engine = std::mem::take(&mut other.search_engine);
+            self.embedder = other.embedder.take();
+            self.stats = other.stats.clone();
+            self.cache.file_stats_cache = other.cache.file_stats_cache.take();
+        }
+        true
+    }
+
     /// Ensure the searchable context is ready for deep analysis / context tools.
     ///
     /// This loads the PDG if needed and performs a focused refresh when the

@@ -19,7 +19,7 @@ use super::*;
 use crate::search::vector::MmapEmbeddingIndex;
 
 /// Cli-only snapshot format version (persistence lives in `src/cli/`).
-const SEARCH_SNAPSHOT_VERSION: u32 = 1;
+const SEARCH_SNAPSHOT_VERSION: u32 = 2;
 
 /// Output dimension of the bundled Qwen3 embedding model (neural + fragment
 /// mmap hydration validation).
@@ -37,27 +37,22 @@ impl SearchEngine {
         pdg_edges: usize,
         pdg_fingerprint: String,
     ) -> SearchSnapshot {
+        let (dictionary, mut token_ids) = self
+            .tokens
+            .to_dictionary(self.nodes.iter().map(|node| node.node_id.as_str()));
         let nodes = self
             .nodes
             .iter()
-            .map(|node| {
-                let mut tokens: Vec<String> = self
-                    .node_tokens
-                    .get(node.node_id.as_str())
-                    .map(|set| set.iter().map(|token| token.to_string()).collect())
-                    .unwrap_or_default();
-                tokens.sort();
-
-                SearchSnapshotNode {
-                    node_id: node.node_id.clone(),
-                    file_path: node.file_path.clone(),
-                    symbol_name: node.symbol_name.clone(),
-                    language: node.language.clone(),
-                    byte_range: node.byte_range,
-                    complexity: node.complexity,
-                    signature: node.signature.clone(),
-                    tokens,
-                }
+            .zip(token_ids.iter_mut())
+            .map(|(node, ids)| SearchSnapshotNode {
+                node_id: node.node_id.clone(),
+                file_path: node.file_path.clone(),
+                symbol_name: node.symbol_name.clone(),
+                language: node.language.clone(),
+                byte_range: node.byte_range,
+                complexity: node.complexity,
+                signature: node.signature.clone(),
+                token_ids: std::mem::take(ids),
             })
             .collect();
 
@@ -68,6 +63,7 @@ impl SearchEngine {
             pdg_fingerprint,
             indexed_nodes: self.nodes.len(),
             nodes,
+            dictionary,
             // Fragment layer (Task 5): rows come from the hydrated fragment
             // index; the root hash is filled by the cli-side
             // `persist_search_snapshot` (the search crate cannot read the
@@ -90,7 +86,7 @@ impl SearchEngine {
     /// implies storage; gating on `storage` keeps cli symbols out of `search`).
     pub(crate) fn restore_from_search_snapshot(
         &mut self,
-        snapshot: SearchSnapshot,
+        mut snapshot: SearchSnapshot,
         tfidf_mmap: Arc<MmapEmbeddingIndex>,
         neural_mmap: Option<Arc<MmapEmbeddingIndex>>,
         fragment_mmap: Option<Arc<MmapEmbeddingIndex>>,
@@ -98,13 +94,18 @@ impl SearchEngine {
     ) -> Result<usize, String> {
         validate_snapshot_shape(&snapshot, &tfidf_mmap, neural_mmap.as_ref())?;
         let nodes = hydrate_snapshot_nodes(&snapshot, &tfidf_mmap)?;
+        let per_node: Vec<Vec<u32>> = snapshot
+            .nodes
+            .iter_mut()
+            .map(|node| std::mem::take(&mut node.token_ids))
+            .collect();
 
         let preserved_neural_weight = self.neural_weight;
         let preserved_fragment_enabled = self.fragment_index_enabled;
         let preserved_fragment_weight = self.fragment_weight;
         let preserved_fragment_refs = self.fragment_refs.clone();
         let mut staged = SearchEngine::new();
-        staged.append_nodes(nodes);
+        staged.install_restored_nodes(nodes, &snapshot.dictionary, per_node)?;
         let node_ids = staged
             .nodes
             .iter()
@@ -145,6 +146,41 @@ impl SearchEngine {
         staged.fragment_refs = preserved_fragment_refs;
         *self = staged;
         Ok(self.nodes.len())
+    }
+
+    /// Install nodes restored from a snapshot together with their token index.
+    ///
+    /// Unlike `append_nodes` this never tokenizes or hashes per (token, node)
+    /// pair: the persisted dictionary is already the index.
+    fn install_restored_nodes(
+        &mut self,
+        nodes: Vec<NodeInfo>,
+        dictionary: &[String],
+        per_node: Vec<Vec<u32>>,
+    ) -> Result<(), String> {
+        let tokens = TokenIndex::from_dictionary(
+            dictionary,
+            nodes.iter().map(|node| node.node_id.as_str()),
+            per_node,
+        )
+        .ok_or_else(|| "corrupt token dictionary in search snapshot".to_string())?;
+        if tokens.node_count() != nodes.len() {
+            return Err(format!(
+                "snapshot has duplicate node ids ({} unique of {})",
+                tokens.node_count(),
+                nodes.len()
+            ));
+        }
+        self.node_id_to_idx.reserve(nodes.len());
+        self.complexity_cache.reserve(nodes.len());
+        for (idx, node) in nodes.iter().enumerate() {
+            self.node_id_to_idx.insert(node.node_id.clone(), idx);
+            self.complexity_cache
+                .insert(node.node_id.clone(), node.complexity);
+        }
+        self.nodes = nodes;
+        self.tokens = tokens;
+        Ok(())
     }
 
     /// Build the lazy-paged neural ANN — reuses MmapVectorIndex, the SAME
@@ -323,7 +359,7 @@ fn hydrate_snapshot_nodes(
             neural_embedding: None,
             complexity: snap.complexity,
             signature: snap.signature.clone(),
-            pre_tokenized: Some(snap.tokens.clone()),
+            pre_tokenized: None,
         });
     }
     if missing_tfidf > 0 {

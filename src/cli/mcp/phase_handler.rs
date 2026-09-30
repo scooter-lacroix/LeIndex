@@ -282,12 +282,28 @@ fn phase_request(args: &Value, project_root: &Path) -> Result<PhaseRequest, Json
         include_docs,
         docs_mode,
         hotspot_keywords: PhaseOptions::default().hotspot_keywords,
+        universe: Default::default(),
     };
     Ok(PhaseRequest {
         selection,
         options,
         single_file_target,
     })
+}
+
+/// Keep a phase run inside the file set the index tracks for the same root.
+///
+/// The phase store is the index store, so a run that saw a different set of
+/// files (dotfiles, ignored paths, other languages) re-parsed and rewrote the
+/// difference on every call and the indexer then undid it: the shared graph
+/// flip-flopped and a phase call after an index took ~60 s.
+pub(crate) fn attach_index_universe(options: &mut PhaseOptions) {
+    if !options.focus_files.is_empty() {
+        return;
+    }
+    if let Ok(scan) = crate::cli::index_builder::scan_project_files(&options.root) {
+        options.universe = Arc::new(scan.source_paths);
+    }
 }
 
 async fn execute_phase_analysis(
@@ -325,11 +341,14 @@ async fn execute_phase_analysis(
         None
     };
 
-    let report =
-        tokio::task::spawn_blocking(move || run_phase_analysis(request.options, request.selection))
-            .await
-            .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))?
-            .map_err(|e| JsonRpcError::internal_error(format!("Phase analysis failed: {}", e)))?;
+    let report = tokio::task::spawn_blocking(move || {
+        let mut options = request.options;
+        attach_index_universe(&mut options);
+        run_phase_analysis(options, request.selection)
+    })
+    .await
+    .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))?
+    .map_err(|e| JsonRpcError::internal_error(format!("Phase analysis failed: {}", e)))?;
 
     let report_value = enrich_report(
         serde_json::to_value(report)

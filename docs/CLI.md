@@ -559,7 +559,7 @@ Add to `~/.claude/settings.json` or project-local `.claude/settings.json`:
 ```
 
 Optional guidance pack:
-- Shared skill: `integrations/skills/leindex-toolkit/`
+- Shared skill: `integrations/skills/leindex-code-intelligence/`
 - Reminder hook example: `integrations/claude-code/settings.example.json`
 
 #### Cursor Integration
@@ -584,9 +584,9 @@ Every MCP tool is also runnable from the CLI:
 
 ```bash
 leindex tools list
-leindex tools help leindex_project_map
-leindex tools schema leindex_rename_symbol
-leindex tools run leindex_project_map --args '{"path":"src","depth":2}'
+leindex tools inspect leindex_explore
+leindex tools schema leindex_edit
+leindex tools run leindex_explore --set mode=project_map --set path=src --set depth=2
 ```
 
 #### Output (to stderr)

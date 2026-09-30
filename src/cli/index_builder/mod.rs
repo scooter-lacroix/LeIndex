@@ -1048,26 +1048,37 @@ fn index_nodes_with_embedder_inner(
         // Reset the per-chunk scratch so no file body from a prior batch
         // persists. RSS stays bounded by one file body, not corpus size
         // (VAL-STREAM-012).
-        let mut file_cache = FileReadCache::per_chunk_scratch();
+        // Everything that depends only on the immutable PDG and file bytes
+        // (enriched content, pruning verdict, tokens, TF-IDF vector, signature)
+        // is computed across cores. The stateful admission gate and work
+        // hoister then run in node order, so the outcome is identical to a
+        // sequential pass. Each task owns a capacity-1 file cache, keeping the
+        // one-file-body-per-worker RSS bound (VAL-STREAM-012).
+        let tfidf = embedder.tfidf();
+        let prepared: Vec<PreparedNode> = batch
+            .par_iter()
+            .map_init(FileReadCache::per_chunk_scratch, |file_cache, &node_idx| {
+                prepare_indexed_node(
+                    pdg,
+                    node_idx,
+                    file_cache,
+                    &connectivity_config,
+                    &pruner,
+                    tfidf,
+                    &file_summary_ctx,
+                    &content_cache,
+                )
+            })
+            .collect();
         // Collect index-into-nodes for nodes that need a neural embedding.
         let mut neural_pending: Vec<usize> = Vec::new();
-        for &node_idx in batch {
-            let Some(node) = pdg.get_node(node_idx) else {
-                continue;
-            };
-            match build_indexed_node(
-                pdg,
-                node_idx,
-                node,
-                &mut file_cache,
-                &connectivity_config,
-                &pruner,
+        for prepared in prepared {
+            match admit_prepared_node(
+                prepared,
                 &mut admission_gate,
                 &mut work_hoister,
                 &embedder,
-                &file_summary_ctx,
                 _allow_neural,
-                &content_cache,
             ) {
                 NodeBuildOutcome::SkippedExternal => external_skipped_count += 1,
                 NodeBuildOutcome::Pruned => pruned_count += 1,
@@ -1209,27 +1220,47 @@ enum NodeBuildOutcome {
     SkippedExternal,
 }
 
-/// Build a single indexable `NodeInfo` from a PDG node, applying the external
-/// skip, content pruning, and bound-gated admission filters plus work-hoister
-/// embedding reuse and neural-embedding deferral. Returns the outcome so the
-/// caller can accumulate per-batch counts and the neural-pending queue.
+/// A node after the order-independent part of indexing.
+enum PreparedNode {
+    SkippedExternal,
+    Pruned,
+    Ready(Box<ReadyNode>),
+}
+
+/// Everything about one node that does not depend on other nodes.
+struct ReadyNode {
+    node_id: String,
+    file_path: String,
+    symbol_name: String,
+    language: String,
+    content: String,
+    byte_range: (usize, usize),
+    complexity: u32,
+    tfidf_embedding: Vec<f32>,
+    signature: Option<String>,
+    search_tokens: Vec<String>,
+}
+
+/// Order-independent half of indexing one PDG node: the external skip, content
+/// enrichment, the pruning verdict, tokenization and the TF-IDF vector. Safe to
+/// run for many nodes at once; the stateful admission/hoisting half is
+/// [`admit_prepared_node`].
 #[allow(clippy::too_many_arguments)]
-fn build_indexed_node(
+fn prepare_indexed_node(
     pdg: &ProgramDependenceGraph,
     node_idx: petgraph::graph::NodeIndex,
-    node: &crate::graph::pdg::Node,
     file_cache: &mut FileReadCache,
     connectivity_config: &crate::graph::pdg::TraversalConfig,
     pruner: &crate::search::search::ContentPruner,
-    admission_gate: &mut crate::search::search::IndexingAdmissionGate,
-    work_hoister: &mut crate::search::search::WorkHoister,
-    embedder: &HybridEmbedder,
+    tfidf: &TfIdfEmbedder,
     file_summary_ctx: &FileSummaryContext,
-    allow_neural: bool,
     content_cache: &HashMap<String, String>,
-) -> NodeBuildOutcome {
+) -> PreparedNode {
+    let Some(node) = pdg.get_node(node_idx) else {
+        return PreparedNode::SkippedExternal;
+    };
     if is_external_node_excluded(node) {
-        return NodeBuildOutcome::SkippedExternal;
+        return PreparedNode::SkippedExternal;
     }
 
     let node_content = if let Some(cached) = content_cache.get(&node.id) {
@@ -1250,32 +1281,11 @@ fn build_indexed_node(
 
     let pruning_decision = pruner.evaluate(&node.file_path, &node_content, &node.name);
     if pruning_decision != crate::search::search::PruningDecision::Keep {
-        return NodeBuildOutcome::Pruned;
-    }
-
-    if !admission_gate.try_admit(node_content.len()) {
-        return NodeBuildOutcome::Shed;
+        return PreparedNode::Pruned;
     }
 
     let tokens = tokenize_code(&node_content);
-
-    // Repeated-work hoisting: reuse a cached embedding pair when available.
-    let (tfidf_embedding, cached_neural, hoisted) = match work_hoister.lookup(&node_content) {
-        Some((tfidf, neural)) => (tfidf, neural, true),
-        None => (embedder.embed_tfidf(&tokens), None, false),
-    };
-
-    // Determine neural embedding: use the cache hit, defer to the batch call,
-    // or store a TF-IDF-only pair when neural is unavailable/disabled.
-    let (neural_embedding, needs_batch_neural) = if cached_neural.is_some() {
-        (cached_neural, false)
-    } else if embedder.has_neural() && allow_neural {
-        (None, true)
-    } else {
-        work_hoister.store(&node_content, tfidf_embedding.clone(), None);
-        (None, false)
-    };
-
+    let tfidf_embedding = tfidf.embed_tokens(&tokens);
     let signature =
         crate::search::search::SearchEngine::extract_signature_from_content(&node_content);
     // R8: pre-tokenize for the search engine (different tokenizer than TF-IDF).
@@ -1285,17 +1295,82 @@ fn build_indexed_node(
         .filter(|s| s.len() >= 2)
         .collect();
 
+    PreparedNode::Ready(Box::new(ReadyNode {
+        node_id: node.id.clone(),
+        file_path: node.file_path.to_string(),
+        symbol_name: node.name.clone(),
+        language: node.language.clone(),
+        content: node_content,
+        byte_range: node.byte_range,
+        complexity: node.complexity,
+        tfidf_embedding,
+        signature,
+        search_tokens,
+    }))
+}
+
+/// Order-dependent half of indexing: bound-gated admission and work-hoister
+/// reuse of a cached embedding pair, plus neural-embedding deferral. Must see
+/// nodes in PDG order.
+fn admit_prepared_node(
+    prepared: PreparedNode,
+    admission_gate: &mut crate::search::search::IndexingAdmissionGate,
+    work_hoister: &mut crate::search::search::WorkHoister,
+    embedder: &HybridEmbedder,
+    allow_neural: bool,
+) -> NodeBuildOutcome {
+    let ready = match prepared {
+        PreparedNode::SkippedExternal => return NodeBuildOutcome::SkippedExternal,
+        PreparedNode::Pruned => return NodeBuildOutcome::Pruned,
+        PreparedNode::Ready(ready) => *ready,
+    };
+    let ReadyNode {
+        node_id,
+        file_path,
+        symbol_name,
+        language,
+        content,
+        byte_range,
+        complexity,
+        tfidf_embedding,
+        signature,
+        search_tokens,
+    } = ready;
+
+    if !admission_gate.try_admit(content.len()) {
+        return NodeBuildOutcome::Shed;
+    }
+
+    // Repeated-work hoisting: reuse a cached neural embedding when the same
+    // content was embedded before (the TF-IDF vector is a pure function of the
+    // content, so the precomputed one is identical to the cached one).
+    let (cached_neural, hoisted) = match work_hoister.lookup(&content) {
+        Some((_, neural)) => (neural, true),
+        None => (None, false),
+    };
+
+    // Determine neural embedding: use the cache hit, defer to the batch call,
+    // or store a TF-IDF-only pair when neural is unavailable/disabled.
+    let (neural_embedding, needs_batch_neural) = if cached_neural.is_some() {
+        (cached_neural, false)
+    } else if embedder.has_neural() && allow_neural {
+        (None, true)
+    } else {
+        work_hoister.store(&content, tfidf_embedding.clone(), None);
+        (None, false)
+    };
+
     NodeBuildOutcome::Indexed {
         node: NodeInfo {
-            node_id: node.id.clone(),
-            file_path: node.file_path.to_string(),
-            symbol_name: node.name.clone(),
-            language: node.language.clone(),
-            content: node_content,
-            byte_range: node.byte_range,
+            node_id,
+            file_path,
+            symbol_name,
+            language,
+            content,
+            byte_range,
             tfidf_embedding,
             neural_embedding,
-            complexity: node.complexity,
+            complexity,
             signature,
             pre_tokenized: Some(search_tokens),
         },
@@ -1546,7 +1621,7 @@ pub(crate) fn enrich_neural_embeddings(
             let Some(node) = pdg.get_node(node_idx) else {
                 continue;
             };
-            // Match build_indexed_node's inclusion rule: external/excluded nodes
+            // Match prepare_indexed_node's inclusion rule: external/excluded nodes
             // never enter the lexical index, so don't send them to the neural batch.
             if is_external_node_excluded(node) {
                 continue;

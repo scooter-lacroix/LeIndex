@@ -109,7 +109,7 @@ pub fn run_phase_analysis(
     selection: PhaseSelection,
 ) -> Result<PhaseAnalysisReport> {
     let options = options.normalized();
-    let context = PhaseExecutionContext::prepare(&options)?;
+    let mut context = PhaseExecutionContext::prepare(&options)?;
     let cache = PhaseCache::new(&context.root);
     let mut executed_phases = Vec::new();
     let mut cache_hit = false;
@@ -121,25 +121,25 @@ pub fn run_phase_analysis(
     let mut phase5_summary = None;
 
     if should_run(1, selection) {
-        let (summary, hit) = run_phase1(&cache, &context)?;
+        let (summary, hit) = run_phase1(&cache, &mut context)?;
         phase1_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(1);
     }
     if should_run(2, selection) {
-        let (summary, hit) = run_phase2(&cache, &context)?;
+        let (summary, hit) = run_phase2(&cache, &mut context)?;
         phase2_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(2);
     }
     if should_run(3, selection) {
-        let (summary, hit) = run_phase3(&cache, &context, &options)?;
+        let (summary, hit) = run_phase3(&cache, &mut context, &options)?;
         phase3_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(3);
     }
     if should_run(4, selection) {
-        let (summary, hit) = run_phase4(&cache, &context, &options)?;
+        let (summary, hit) = run_phase4(&cache, &mut context, &options)?;
         phase4_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(4);
@@ -147,7 +147,7 @@ pub fn run_phase_analysis(
     if should_run(5, selection) {
         let (summary, hit) = run_phase5(
             &cache,
-            &context,
+            &mut context,
             &options,
             phase1_summary.as_ref(),
             phase2_summary.as_ref(),
@@ -187,7 +187,7 @@ pub fn run_phase_analysis(
 
 fn run_phase1(
     cache: &PhaseCache,
-    context: &PhaseExecutionContext,
+    context: &mut PhaseExecutionContext,
 ) -> Result<(Phase1Summary, bool)> {
     if let Some(cached) =
         cache.load::<Phase1Summary>(&context.project_id, &context.generation_hash, 1)?
@@ -195,6 +195,7 @@ fn run_phase1(
         return Ok((cached.payload, true));
     }
 
+    context.ensure_graph()?;
     let summary = phase1::run(context);
     cache.save(&context.project_id, &context.generation_hash, 1, &summary)?;
     Ok((summary, false))
@@ -202,7 +203,7 @@ fn run_phase1(
 
 fn run_phase2(
     cache: &PhaseCache,
-    context: &PhaseExecutionContext,
+    context: &mut PhaseExecutionContext,
 ) -> Result<(Phase2Summary, bool)> {
     if let Some(cached) =
         cache.load::<Phase2Summary>(&context.project_id, &context.generation_hash, 2)?
@@ -210,6 +211,7 @@ fn run_phase2(
         return Ok((cached.payload, true));
     }
 
+    context.ensure_graph()?;
     let summary = phase2::run(context);
     cache.save(&context.project_id, &context.generation_hash, 2, &summary)?;
     Ok((summary, false))
@@ -217,7 +219,7 @@ fn run_phase2(
 
 fn run_phase3(
     cache: &PhaseCache,
-    context: &PhaseExecutionContext,
+    context: &mut PhaseExecutionContext,
     options: &PhaseOptions,
 ) -> Result<(Phase3Summary, bool)> {
     let key = options_hash_for_phase(3, options);
@@ -230,6 +232,7 @@ fn run_phase3(
         return Ok((cached.payload, true));
     }
 
+    context.ensure_graph()?;
     let summary = phase3::run(context, options);
     cache.save_with_options(
         &context.project_id,
@@ -243,7 +246,7 @@ fn run_phase3(
 
 fn run_phase4(
     cache: &PhaseCache,
-    context: &PhaseExecutionContext,
+    context: &mut PhaseExecutionContext,
     options: &PhaseOptions,
 ) -> Result<(Phase4Summary, bool)> {
     let key = options_hash_for_phase(4, options);
@@ -256,6 +259,7 @@ fn run_phase4(
         return Ok((cached.payload, true));
     }
 
+    context.ensure_graph()?;
     let summary = phase4::run(context, options);
     cache.save_with_options(
         &context.project_id,
@@ -269,7 +273,7 @@ fn run_phase4(
 
 fn run_phase5(
     cache: &PhaseCache,
-    context: &PhaseExecutionContext,
+    context: &mut PhaseExecutionContext,
     options: &PhaseOptions,
     phase1_summary: Option<&Phase1Summary>,
     phase2_summary: Option<&Phase2Summary>,
@@ -288,6 +292,7 @@ fn run_phase5(
         return Ok((cached.payload, true));
     }
 
+    context.ensure_graph()?;
     let phase1_summary = match phase1_summary {
         Some(summary) => summary.clone(),
         None => compute_and_cache_phase1(cache, context)?,

@@ -6,21 +6,21 @@ LeIndex now ships a reusable guidance pack for AI coding agents that should pref
 
 Canonical skill location in this repo:
 
-- `integrations/skills/leindex-toolkit/`
+- `integrations/skills/leindex-code-intelligence/`
 
 What it contains:
 
-- `SKILL.md`: when to prefer LeIndex and the complete tool list.
+- `SKILL.md`: when to prefer LeIndex, the four tools (`leindex_explore`, `leindex_analyze`, `leindex_edit`, `leindex_manage`) and the operation each discriminator value selects.
 - `references/tool-selection.md`: replacement map for `Read`, `Grep`, `Glob`, `rg`, `find`, `ls`, `cat`, and related workflows.
-- `references/tool-schemas.md`: per-tool JSON schemas exported from the live CLI surface.
+- `references/tool-schemas.md`: per-tool JSON schemas (the `oneOf` form) exported from the live CLI surface with `leindex tools schema <tool>`. Regenerate it whenever a tool argument changes.
 
 ## Claude Code
 
 Use both the shared skill and the hook.
 
 1. Copy the skill directory to either:
-- `~/.claude/skills/leindex-toolkit/`
-- `.claude/skills/leindex-toolkit/`
+- `~/.claude/skills/leindex-code-intelligence/`
+- `.claude/skills/leindex-code-intelligence/`
 
 2. Merge `integrations/claude-code/settings.example.json` into:
 - `~/.claude/settings.json`
@@ -32,13 +32,13 @@ Use both the shared skill and the hook.
 chmod +x integrations/claude-code/hooks/use-leindex-instead.py
 ```
 
-The hook blocks `Read`, `Grep`, `Glob`, and shell-based `rg`/`grep`/`find`/`ls`/`cat` style exploration and reminds Claude which LeIndex tool to use instead.
+The hook blocks `Read`, `Grep`, `Glob`, and shell-based `rg`/`grep`/`find`/`ls`/`cat` style exploration and reminds Claude which `leindex_explore` mode to use instead (`find` for text and symbols, `project_map` for structure, `read_file` / `read_symbol` / `file_summary` for reads).
 
 ## Codex
 
 Install the same shared skill pack into:
 
-- `~/.codex/skills/leindex-toolkit/`
+- `~/.codex/skills/leindex-code-intelligence/`
 
 Codex already understands `SKILL.md`-based skills, so no extra translation layer is needed.
 
@@ -46,7 +46,7 @@ Codex already understands `SKILL.md`-based skills, so no extra translation layer
 
 These agents already have MCP config examples in the public README surfaces. Reuse the shared skill content as your project or global instruction pack:
 
-- Copy the guidance from `integrations/skills/leindex-toolkit/SKILL.md`
+- Copy the guidance from `integrations/skills/leindex-code-intelligence/SKILL.md`
 - Keep `references/tool-selection.md` nearby for tool-choice reminders
 - Use `references/tool-schemas.md` when you need the exact LeIndex arguments
 

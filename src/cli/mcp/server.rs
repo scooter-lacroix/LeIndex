@@ -6,7 +6,7 @@
 use super::handlers::{ToolHandler, all_tool_handlers};
 use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use super::request_meta::{collect_request_timings, elapsed_ms};
-use crate::cli::registry::ProjectRegistry;
+use crate::cli::registry::{Hydration, ProjectRegistry};
 use anyhow::Context;
 use axum::{
     Router,
@@ -983,6 +983,25 @@ pub async fn handle_tool_call(
 }
 
 /// Handle a tool call with a transport timestamp captured at message receipt.
+/// What a tool needs resident before its handler runs (see
+/// [`ProjectRegistry::ensure_hydrated`]).
+fn hydration_for_tool(canonical_name: &str) -> Hydration {
+    match canonical_name {
+        "leindex_search" | "leindex_deep_analyze" | "leindex_context" => Hydration::Full,
+        "leindex_symbol_lookup"
+        | "leindex_project_map"
+        | "leindex_read_symbol"
+        | "leindex_impact_analysis"
+        | "leindex_edit_preview"
+        | "leindex_edit_apply"
+        | "leindex_rename_symbol"
+        | "leindex_git_status"
+        | "leindex_git_diff"
+        | "leindex_phase_analysis" => Hydration::Graph,
+        _ => Hydration::None,
+    }
+}
+
 async fn handle_tool_call_timed(
     registry: &Arc<ProjectRegistry>,
     handlers: &[ToolHandler],
@@ -1031,6 +1050,15 @@ async fn handle_tool_call_timed(
     // for render_tool_output_plain which needs the original args).
     let call_args = tool_call.arguments.clone();
     let call_name = canonical_name;
+
+    // Load the graph / search engine off the project lock so this call (and
+    // every other one queued behind it) is not frozen while it builds.
+    registry
+        .ensure_hydrated(
+            call_args.get("project_path").and_then(Value::as_str),
+            hydration_for_tool(&call_name),
+        )
+        .await;
 
     // Execute the tool and wrap the result in standard MCP content format
     let (handler_result, mut timings) =

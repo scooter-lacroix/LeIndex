@@ -9,23 +9,23 @@ import sys
 
 
 DIRECT_TOOL_ADVICE = {
-    "Read": "Use `leindex_file_summary` for orientation, `leindex_read_symbol` for a specific implementation, or `leindex_read_file` for exact contents with PDG annotations.",
-    "Grep": "Use `leindex_grep_symbols` for symbol lookup or `leindex_text_search` for exact text and regex matches.",
-    "Glob": "Use `leindex_project_map` for directory and file exploration instead of raw globbing.",
+    "Read": "Use `leindex_explore` with mode=file_summary for orientation, mode=read_symbol for a specific implementation, or mode=read_file for exact contents with PDG annotations.",
+    "Grep": "Use `leindex_explore` with mode=find for exact text, regex and symbol matches (add target=symbols for definitions; paths=[...] for directories outside the project).",
+    "Glob": "Use `leindex_explore` with mode=project_map for directory and file exploration instead of raw globbing.",
 }
 
 SHELL_PATTERNS = [
     (
         re.compile(r"(^|[|(;&\s])(?:rg|grep|git\s+grep|ag|ack)(?:$|[\s|;&])"),
-        "Use `leindex_text_search` for literal or regex search, or `leindex_grep_symbols` for symbol-aware lookup.",
+        "Use `leindex_explore` with mode=find for literal or regex search (target=symbols for definitions, paths=[...] outside the project).",
     ),
     (
         re.compile(r"(^|[|(;&\s])(?:find|fd|ls|tree)(?:$|[\s|;&])"),
-        "Use `leindex_project_map` for project structure instead of shell directory scans.",
+        "Use `leindex_explore` with mode=project_map for project structure instead of shell directory scans.",
     ),
     (
         re.compile(r"(^|[|(;&\s])(?:cat|head|tail|less|more)(?:$|[\s|;&])|sed\s+-n|awk\s+"),
-        "Use `leindex_read_file`, `leindex_read_symbol`, or `leindex_file_summary` instead of raw file reads when exploring code.",
+        "Use `leindex_explore` with mode=read_file, read_symbol or file_summary instead of raw file reads when exploring code.",
     ),
 ]
 

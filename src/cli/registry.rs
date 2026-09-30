@@ -104,6 +104,17 @@ pub fn watcher_enabled() -> bool {
     }
 }
 
+/// How much of a project a tool needs resident before it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hydration {
+    /// Nothing beyond the persisted stats (text search, reads, index control).
+    None,
+    /// The program dependence graph only (symbol, impact, edit, diff tools).
+    Graph,
+    /// The graph plus the semantic search engine (search, deep analyze, context).
+    Full,
+}
+
 // ---------------------------------------------------------------------------
 // ProjectRwLock — read/write API over a Mutex for !Sync inner types
 // ---------------------------------------------------------------------------
@@ -319,6 +330,8 @@ pub struct ProjectRegistry {
 
     /// Background pre-warm has been started (once per registry).
     prewarm_started: std::sync::atomic::AtomicBool,
+    /// Single-flight latches for off-lock hydration, one per project.
+    hydration_flights: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
 impl ProjectRegistry {
@@ -338,6 +351,7 @@ impl ProjectRegistry {
             last_used: RwLock::new(HashMap::new()),
             one_shot: std::sync::atomic::AtomicBool::new(false),
             prewarm_started: std::sync::atomic::AtomicBool::new(false),
+            hydration_flights: Mutex::new(HashMap::new()),
         }
     }
 
@@ -398,19 +412,8 @@ impl ProjectRegistry {
                 debug!(project = %path.display(), "Prewarm skipped: project is not indexed");
                 return;
             }
-            let Ok(handle) = registry.get_or_load(None).await else {
-                return;
-            };
             let started = std::time::Instant::now();
-            let graph = {
-                let handle = handle.clone();
-                tokio::task::spawn_blocking(move || {
-                    let mut index = handle.blocking_write();
-                    index.ensure_pdg_loaded_graph_only()
-                })
-                .await
-            };
-            if !matches!(graph, Ok(Ok(()))) {
+            if !registry.ensure_hydrated(None, Hydration::Graph).await {
                 debug!("Prewarm: graph load did not complete");
                 return;
             }
@@ -419,19 +422,93 @@ impl ProjectRegistry {
                 info!(project = %path.display(), graph_ms, "Prewarmed project graph");
                 return;
             }
-            let engine = tokio::task::spawn_blocking(move || {
-                let mut index = handle.blocking_write();
-                index.ensure_analysis_context_loaded()
-            })
-            .await;
+            let engine_ok = registry.ensure_hydrated(None, Hydration::Full).await;
             info!(
                 project = %path.display(),
                 graph_ms,
                 total_ms = started.elapsed().as_millis() as u64,
-                engine_ok = matches!(engine, Ok(Ok(()))),
+                engine_ok,
                 "Prewarmed project graph and search engine"
             );
         });
+    }
+
+    /// Make sure `level` of the project is resident, without holding the
+    /// project lock while it loads.
+    ///
+    /// The graph and search engine take up to a second to build. Building them
+    /// on the instance behind the per-project lock froze every other call —
+    /// even ones that need neither — for that long. This builds a detached
+    /// sibling instance on a blocking thread and takes the lock only to swap
+    /// its state in. Concurrent callers share one build (single flight). A
+    /// build that raced a newly published generation is discarded, and the
+    /// handler's own on-demand load then runs as before, so this is purely an
+    /// accelerator: it never builds an index and never creates storage.
+    ///
+    /// Returns whether the project is hydrated to `level` afterwards.
+    pub async fn ensure_hydrated(
+        self: &Arc<Self>,
+        project_path: Option<&str>,
+        level: Hydration,
+    ) -> bool {
+        let full = match level {
+            Hydration::None => return true,
+            Hydration::Graph => false,
+            Hydration::Full => true,
+        };
+        if self.is_one_shot() {
+            return false;
+        }
+        let Ok(handle) = self.get_or_load(project_path).await else {
+            return false;
+        };
+        let (root, indexed) = {
+            let idx = handle.read().await;
+            if idx.is_hydrated(full) {
+                return true;
+            }
+            (idx.project_path().to_path_buf(), idx.is_indexed())
+        };
+        if !indexed {
+            return false;
+        }
+        let flight = {
+            let mut flights = self.hydration_flights.lock().await;
+            Arc::clone(flights.entry(root.clone()).or_default())
+        };
+        let _flight = flight.lock().await;
+        if handle.read().await.is_hydrated(full) {
+            return true;
+        }
+        let generation = || {
+            crate::cli::leindex::resolve_existing_storage_path(&root).and_then(|storage| {
+                crate::storage::generation::lease::read_current_generation(&storage)
+            })
+        };
+        let before = generation();
+        let build_root = root.clone();
+        let built = tokio::task::spawn_blocking(move || {
+            let mut sibling = LeIndex::new(&build_root).ok()?;
+            let loaded = if full {
+                sibling.ensure_analysis_context_loaded()
+            } else {
+                sibling.ensure_pdg_loaded_graph_only()
+            };
+            loaded.ok()?;
+            Some(sibling)
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(sibling) = built else {
+            return false;
+        };
+        if generation() != before {
+            debug!(project = %root.display(), "Discarding off-lock hydration: a new generation was published");
+            return false;
+        }
+        handle.write().await.adopt_hydration(sibling, full);
+        handle.read().await.is_hydrated(full)
     }
 
     /// Create a registry pre-loaded with one project (the initial startup project).
@@ -474,6 +551,7 @@ impl ProjectRegistry {
             last_used: RwLock::new(last_used),
             one_shot: std::sync::atomic::AtomicBool::new(false),
             prewarm_started: std::sync::atomic::AtomicBool::new(false),
+            hydration_flights: Mutex::new(HashMap::new()),
         }
     }
 

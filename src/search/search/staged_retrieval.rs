@@ -25,6 +25,10 @@ pub(crate) struct SearchSnapshot {
     pub(crate) pdg_fingerprint: String,
     pub(crate) indexed_nodes: usize,
     pub(crate) nodes: Vec<SearchSnapshotNode>,
+    /// Token dictionary: each node's `token_ids` index into it. Storing ids
+    /// instead of strings shrinks the snapshot and lets the inverted index be
+    /// rebuilt with vector pushes rather than a million string hashes.
+    pub(crate) dictionary: Vec<String>,
     /// Fragment layer root hash (filled by the cli-side persist path;
     /// `None` for legacy/feature-off snapshots).
     #[serde(default)]
@@ -46,7 +50,8 @@ pub(crate) struct SearchSnapshotNode {
     pub(crate) byte_range: (usize, usize),
     pub(crate) complexity: u32,
     pub(crate) signature: Option<String>,
-    pub(crate) tokens: Vec<String>,
+    /// Ascending ids into [`SearchSnapshot::dictionary`].
+    pub(crate) token_ids: Vec<u32>,
 }
 
 // A+ Search cache budget constants (Section 8.1)
