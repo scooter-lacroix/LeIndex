@@ -1195,7 +1195,7 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     if stale {
         issues.push(serde_json::json!({
             "severity": "warning",
-            "message": "Index may be stale. Call LeIndex [Index] with force_reindex=true for fresh results.",
+            "message": "Index may be stale. Call leindex_manage action=index with force_reindex=true for fresh results.",
         }));
     }
 

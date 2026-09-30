@@ -113,6 +113,54 @@ was lost; everything below is on `v2.0.0` and covered by tests.
   every symbol (quadratic in symbols per file); a full rebuild adopts the built
   graph instead of re-inserting it into an empty one; nodes of a file share one
   path allocation; the persisted-graph loader probes row ids with a cheap hasher.
+- Daemon architecture (wire v2), on by default. `leindex mcp` is now a
+  synchronous, `std`-only shim that runs before the async runtime exists and
+  copies bytes to one per-user `leindexd`, so any number of editors share one
+  loaded graph and search engine per project. The daemon single-winner lock is
+  a kernel `flock` (no stale-pid heuristics); the connection opens with a hello
+  carrying the client's cwd, which starts warming that project immediately and
+  supplies `project_path` for calls that omit it; tool calls run concurrently
+  per connection (the socket loop used to be serial, the same hang the stdio
+  transport had); idle connections are no longer dropped after 30 s; the daemon
+  idles out only when no client is attached (default 15 min); stale daemons are
+  replaced, or bypassed when other clients are attached. See `docs/MCP.md`.
+  Previously the daemon path was compiled out of default builds, so every
+  session ran a full 150 MB inline server.
+- Engine pass (measured with callgrind on a symbol-bearing build):
+  - `ProgramDependenceGraph` kept its BFS scratch buffer in a `Mutex` shared by
+    every traversal, so the two parallel indexing passes (two traversals per
+    symbol, all cores) serialized on one lock. Local buffer: TF-IDF pass 1
+    1.8 s → 0.8 s.
+  - `normalize_symbol` (run for every call target and comparison in cross-file
+    resolution) chained five `replace` calls: one pass now, ~10% of indexing CPU
+    saved; proven identical to the old chain on 20,000 generated strings.
+  - `preceding_doc_context` decoded the whole file prefix for every symbol;
+    it now walks back a line at a time (identical output, tested against the old
+    code).
+  - The graph trigram index serialized in hash-map order, so its bytes (and
+    content hash) differed on every save and the blob was rewritten each time.
+    Now deterministic, on a fast hasher.
+  - `save_pdg` diff: sequential edge scan + in-memory membership instead of a
+    semi-join, no per-edge allocations, fast hashers ; community persistence writes only changed assignments through
+    prepared statements (0.64 s → 0.41 s); pass 2 hands finished batches to a
+    dedicated appender thread and no longer hashes content for a neural cache
+    that is off; TF-IDF embedding probes a word→slot map (~50 probes per node,
+    not 768).
+  - Loading: the search snapshot is decoded and restored on a second thread
+    while the graph is read, and edge rows are decoded on a third over their own
+    read-only connection. Cold `search` 440 ms → ~300 ms; pre-warm loads both
+    together.
+  - Rename/edit validation parses the before/after of every changed file (and
+    the syntax pass) in parallel; the import check looks names up in a
+    lower-cased corpus built once instead of lower-casing every graph node per
+    `use` line, and impact analysis fans its per-symbol traversals out across
+    cores (same per-symbol caps, same result set). Warm rename preview
+    ~300 ms → ~90 ms.
+  - Forced full index of this repository: 14 s → ~6 s. Cold CLI calls: search
+    ~330 → ~300 ms, symbol lookup ~210 ms, rename preview ~360 ms including the
+    graph load.
+  - Error and welcome text now names the four routers
+    (`leindex_manage action=index`) instead of retired tool names.
 - Agent skill: `integrations/skills/leindex-toolkit` is now
   `integrations/skills/leindex-code-intelligence`, rewritten for the four tools;
   the Claude Code hook, `MCP_COMPATIBILITY.md`, `docs/CLI.md`, `docs/AGENT_GUIDANCE.md`

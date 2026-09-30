@@ -129,7 +129,7 @@ pub fn get_prompt(
             PromptMessage {
                 role: "user".to_string(),
                 content: PromptContent::Text {
-                    text: "Welcome to LeIndex! Here's how to get started:\n\n1. **Indexing**: First, index your project with `leindex.index`\n2. **Searching**: Use `leindex.search` for semantic code search\n3. **Analysis**: Use `leindex.deep-analyze` for comprehensive code analysis\n4. **Context**: Use `leindex.context` to expand around specific symbols\n\nPro tip: LeIndex auto-indexes on first use, so you can start searching immediately!".to_string(),
+                    text: "Welcome to LeIndex! Here's how to get started:\n\n1. **Indexing**: First, index your project with `leindex_manage action=index`\n2. **Searching**: Use `leindex_explore mode=search` for semantic code search\n3. **Analysis**: Use `leindex_analyze mode=deep` for comprehensive code analysis\n4. **Context**: Use `leindex_explore mode=context` to expand around specific symbols\n\nPro tip: LeIndex auto-indexes on first use, so you can start searching immediately!".to_string(),
                 },
             },
         ]),

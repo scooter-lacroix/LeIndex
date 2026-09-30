@@ -306,7 +306,7 @@ pub(crate) fn wrap_live_with_meta_dirty(
                             if health.is_none() {
                                 "No indexed generation is loaded; exact live results remain usable."
                             } else {
-                                "Index may be stale; run leindex.index with force_reindex=true to refresh."
+                                "Index may be stale; run leindex_manage action=index with force_reindex=true to refresh."
                             }
                             .to_string(),
                         ),

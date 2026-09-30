@@ -313,7 +313,7 @@ impl DiagnosticsHandler {
             if stale_bool {
                 issues.push(serde_json::json!({
                     "severity": "warning",
-                    "message": "Index may be stale. Call LeIndex [Index] with force_reindex=true for fresh results.",
+                    "message": "Index may be stale. Call leindex_manage action=index with force_reindex=true for fresh results.",
                 }));
             }
             map.insert("issues".to_string(), serde_json::json!(issues));
@@ -336,7 +336,7 @@ impl DiagnosticsHandler {
                     "deleted_files": deleted.len(),
                     "changed_sample": changed.iter().take(10).map(|p| p.display().to_string()).collect::<Vec<_>>(),
                     "deleted_sample": deleted.iter().take(10).cloned().collect::<Vec<_>>(),
-                    "suggestion": "Call LeIndex [Index] with force_reindex=true to refresh",
+                    "suggestion": "Call leindex_manage action=index with force_reindex=true to refresh",
                 })
             };
             map.insert("freshness".to_string(), staleness);
