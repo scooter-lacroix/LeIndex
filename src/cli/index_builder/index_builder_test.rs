@@ -2301,3 +2301,71 @@ fn test_parallel_document_frequencies_match_a_sequential_reference() {
     assert_eq!(contents, expected_contents);
     assert_eq!(total, 12 * 40);
 }
+
+/// The backwards line scan must agree with the original implementation, which
+/// decoded and split the whole prefix.
+#[test]
+fn test_preceding_doc_context_matches_the_full_prefix_reference() {
+    fn reference(bytes: &[u8], start: usize) -> String {
+        let prefix = String::from_utf8_lossy(&bytes[..start.min(bytes.len())]);
+        let mut lines = Vec::new();
+        for line in prefix.lines().rev() {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() {
+                if lines.is_empty() {
+                    continue;
+                }
+                break;
+            }
+            if trimmed.starts_with("//") || trimmed.starts_with("#") || trimmed.starts_with("/*") {
+                lines.push(strip_comment_syntax(line.trim()));
+                if lines.len() == 24 {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        lines.reverse();
+        lines.join("\n")
+    }
+
+    let pieces = [
+        "/// doc one\n",
+        "// two\n",
+        "# three\r\n",
+        "\n",
+        "    \n",
+        "fn f() {}\n",
+        "/* c */\n",
+        "  //! indented\n",
+        "let x = 1;",
+        "\r\n",
+        "é// é\n",
+    ];
+    let mut state = 0x1234_5678_9ABC_DEF1u64;
+    for _ in 0..3_000 {
+        let mut text = String::new();
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let mut bits = state;
+        for _ in 0..(bits % 40) {
+            bits = bits.rotate_left(11) ^ 0xA5A5_5A5A;
+            text.push_str(pieces[(bits as usize) % pieces.len()]);
+        }
+        let bytes = text.as_bytes();
+        for start in [0, bytes.len() / 2, bytes.len(), bytes.len() + 5] {
+            // Only ever called at a symbol start, i.e. on a char boundary.
+            let mut at = start.min(bytes.len());
+            while !text.is_char_boundary(at) {
+                at -= 1;
+            }
+            assert_eq!(
+                preceding_doc_context(bytes, at),
+                reference(bytes, at),
+                "text {text:?} start {at}"
+            );
+        }
+    }
+}

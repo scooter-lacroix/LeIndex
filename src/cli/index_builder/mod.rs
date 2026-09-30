@@ -148,28 +148,40 @@ pub(crate) fn tokenize_code(text: &str) -> Vec<String> {
 /// preceding a symbol. This keeps semantic chunks useful for review language
 /// without creating a second full-file embedding document.
 pub(crate) fn preceding_doc_context(bytes: &[u8], start: usize) -> String {
-    let prefix = String::from_utf8_lossy(&bytes[..start.min(bytes.len())]);
-    let mut lines = Vec::new();
-    for line in prefix.lines().rev() {
+    // Walk backwards from `start` one line at a time. Decoding the whole file
+    // prefix for every symbol (what this used to do) made enrichment quadratic
+    // in the number of symbols per file.
+    let mut lines: Vec<String> = Vec::new();
+    let mut cursor = start.min(bytes.len());
+    loop {
+        let line_start = bytes[..cursor]
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |position| position + 1);
+        let raw = &bytes[line_start..cursor];
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let line = String::from_utf8_lossy(raw);
         let trimmed = line.trim_start();
+        let mut done = false;
         if trimmed.is_empty() {
-            if lines.is_empty() {
-                continue;
+            if !lines.is_empty() {
+                done = true;
             }
-            break;
-        }
-        if trimmed.starts_with("//") || trimmed.starts_with("#") || trimmed.starts_with("/*") {
+        } else if trimmed.starts_with("//") || trimmed.starts_with("#") || trimmed.starts_with("/*")
+        {
             // Conceptual-recall fix: strip comment markers so the doc embeds as
             // prose (markers add noise tokens that dilute the semantic signal),
             // and capture the full doc (24 lines, was 8 — long doc comments were
             // truncated mid-concept, losing the statement of purpose).
             lines.push(strip_comment_syntax(line.trim()));
-            if lines.len() == 24 {
-                break;
-            }
+            done = lines.len() == 24;
         } else {
+            done = true;
+        }
+        if done || line_start == 0 {
             break;
         }
+        cursor = line_start - 1;
     }
     lines.reverse();
     lines.join("\n")
@@ -1044,74 +1056,98 @@ fn index_nodes_with_embedder_inner(
     let mut nodes: Vec<NodeInfo> = Vec::with_capacity(batch_size);
     let mut total_admitted: usize = 0;
 
-    for batch in node_indices.chunks(batch_size) {
-        nodes.clear();
-        admission_gate.reset();
-        // Reset the per-chunk scratch so no file body from a prior batch
-        // persists. RSS stays bounded by one file body, not corpus size
-        // (VAL-STREAM-012).
-        // Everything that depends only on the immutable PDG and file bytes
-        // (enriched content, pruning verdict, tokens, TF-IDF vector, signature)
-        // is computed across cores. The stateful admission gate and work
-        // hoister then run in node order, so the outcome is identical to a
-        // sequential pass. Each task owns a capacity-1 file cache, keeping the
-        // one-file-body-per-worker RSS bound (VAL-STREAM-012).
-        let tfidf = embedder.tfidf();
-        let prepared: Vec<PreparedNode> = batch
-            .par_iter()
-            .map_init(FileReadCache::per_chunk_scratch, |file_cache, &node_idx| {
-                prepare_indexed_node(
-                    pdg,
-                    node_idx,
-                    file_cache,
-                    &connectivity_config,
-                    &pruner,
-                    tfidf,
-                    &file_summary_ctx,
-                    &content_cache,
-                )
-            })
-            .collect();
-        // Collect index-into-nodes for nodes that need a neural embedding.
-        let mut neural_pending: Vec<usize> = Vec::new();
-        for prepared in prepared {
-            match admit_prepared_node(
-                prepared,
-                &mut admission_gate,
-                &mut work_hoister,
-                &embedder,
-                _allow_neural,
-            ) {
-                NodeBuildOutcome::SkippedExternal => external_skipped_count += 1,
-                NodeBuildOutcome::Pruned => pruned_count += 1,
-                NodeBuildOutcome::Shed => shed_count += 1,
-                NodeBuildOutcome::Indexed {
-                    node: built,
-                    needs_batch_neural,
-                    hoisted,
-                } => {
-                    if hoisted {
-                        hoisted_count += 1;
+    // Appending a batch to the search engine (token index, vectors) is serial
+    // work; a dedicated thread does it while the next batch is being prepared
+    // across all cores.
+    let (batches_tx, batches_rx) = std::sync::mpsc::sync_channel::<Vec<NodeInfo>>(2);
+    std::thread::scope(|scope| {
+        let engine = &mut *search_engine;
+        let appender = scope.spawn(move || {
+            for batch in batches_rx {
+                engine.append_nodes(batch);
+            }
+        });
+
+        for batch in node_indices.chunks(batch_size) {
+            nodes.clear();
+            admission_gate.reset();
+            // Reset the per-chunk scratch so no file body from a prior batch
+            // persists. RSS stays bounded by one file body, not corpus size
+            // (VAL-STREAM-012).
+            // Everything that depends only on the immutable PDG and file bytes
+            // (enriched content, pruning verdict, tokens, TF-IDF vector, signature)
+            // is computed across cores. The stateful admission gate and work
+            // hoister then run in node order, so the outcome is identical to a
+            // sequential pass. Each task owns a capacity-1 file cache, keeping the
+            // one-file-body-per-worker RSS bound (VAL-STREAM-012).
+            let tfidf = embedder.tfidf();
+            let prepared: Vec<PreparedNode> = batch
+                .par_iter()
+                .map_init(FileReadCache::per_chunk_scratch, |file_cache, &node_idx| {
+                    prepare_indexed_node(
+                        pdg,
+                        node_idx,
+                        file_cache,
+                        &connectivity_config,
+                        &pruner,
+                        tfidf,
+                        &file_summary_ctx,
+                        &content_cache,
+                    )
+                })
+                .collect();
+            // Collect index-into-nodes for nodes that need a neural embedding.
+            let mut neural_pending: Vec<usize> = Vec::new();
+            for prepared in prepared {
+                match admit_prepared_node(
+                    prepared,
+                    &mut admission_gate,
+                    &mut work_hoister,
+                    &embedder,
+                    _allow_neural,
+                ) {
+                    NodeBuildOutcome::SkippedExternal => external_skipped_count += 1,
+                    NodeBuildOutcome::Pruned => pruned_count += 1,
+                    NodeBuildOutcome::Shed => shed_count += 1,
+                    NodeBuildOutcome::Indexed {
+                        node: built,
+                        needs_batch_neural,
+                        hoisted,
+                    } => {
+                        if hoisted {
+                            hoisted_count += 1;
+                        }
+                        if needs_batch_neural {
+                            neural_pending.push(nodes.len());
+                        }
+                        nodes.push(built);
                     }
-                    if needs_batch_neural {
-                        neural_pending.push(nodes.len());
-                    }
-                    nodes.push(built);
                 }
             }
-        }
-        // Batch neural embedding: process pending nodes in sub-chunks to cap
-        // IPC payload size and ONNX worker memory usage.
-        if !neural_pending.is_empty() {
-            embed_pending_neural_batch(&embedder, &mut nodes, &neural_pending, &mut work_hoister);
-        }
+            // Batch neural embedding: process pending nodes in sub-chunks to cap
+            // IPC payload size and ONNX worker memory usage.
+            if !neural_pending.is_empty() {
+                embed_pending_neural_batch(
+                    &embedder,
+                    &mut nodes,
+                    &neural_pending,
+                    &mut work_hoister,
+                );
+            }
 
-        search_engine.append_nodes(std::mem::replace(
-            &mut nodes,
-            Vec::with_capacity(batch_size),
-        ));
-        total_admitted += admission_gate.nodes_admitted();
-    }
+            let full = std::mem::replace(&mut nodes, Vec::with_capacity(batch_size));
+            if batches_tx.send(full).is_err() {
+                // The appender only stops early by panicking; the join below
+                // re-raises that panic.
+                break;
+            }
+            total_admitted += admission_gate.nodes_admitted();
+        }
+        drop(batches_tx);
+        if let Err(panic) = appender.join() {
+            std::panic::resume_unwind(panic);
+        }
+    });
 
     // A+ logging: run-total stats at info! level (invisible under default WARN).
     if pruned_count > 0 || shed_count > 0 || hoisted_count > 0 || external_skipped_count > 0 {
@@ -1346,19 +1382,27 @@ fn admit_prepared_node(
     // Repeated-work hoisting: reuse a cached neural embedding when the same
     // content was embedded before (the TF-IDF vector is a pure function of the
     // content, so the precomputed one is identical to the cached one).
-    let (cached_neural, hoisted) = match work_hoister.lookup(&content) {
-        Some((_, neural)) => (neural, true),
-        None => (None, false),
+    // Only a neural embedding is worth caching: the TF-IDF vector was already
+    // computed above, so without a neural provider the lookup (a BLAKE3 of the
+    // content) and the store (a copy of a 768-float vector into the LRU) were
+    // pure overhead on every node.
+    let use_neural = embedder.has_neural() && allow_neural;
+    let (cached_neural, hoisted) = if use_neural {
+        match work_hoister.lookup(&content) {
+            Some((_, neural)) => (neural, true),
+            None => (None, false),
+        }
+    } else {
+        (None, false)
     };
 
     // Determine neural embedding: use the cache hit, defer to the batch call,
     // or store a TF-IDF-only pair when neural is unavailable/disabled.
     let (neural_embedding, needs_batch_neural) = if cached_neural.is_some() {
         (cached_neural, false)
-    } else if embedder.has_neural() && allow_neural {
+    } else if use_neural {
         (None, true)
     } else {
-        work_hoister.store(&content, tfidf_embedding.clone(), None);
         (None, false)
     };
 
@@ -1528,6 +1572,7 @@ fn build_embedder_from_corpus(
         pdg_nodes: pdg.node_count(),
         pdg_edges: pdg.edge_count(),
         pdg_fingerprint: pdg_search_fingerprint(pdg),
+        slots: Default::default(),
     };
 
     build_neural_embedder(tfidf_embedder, allow_neural)

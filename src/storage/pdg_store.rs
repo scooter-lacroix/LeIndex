@@ -276,10 +276,10 @@ fn save_pdg_inner(
     // db ids and issue no write); edges are diffed in save_edges the same way.
     // Edge deletion happens INSIDE save_edges so the edges of stale nodes are
     // gone before the nodes themselves are deleted (FK-safe ordering).
-    let (node_id_map, stale_node_ids) = save_nodes(&tx, project_id, pdg)?;
+    let (node_id_map, stale_node_ids, project_rows) = save_nodes(&tx, project_id, pdg)?;
     let nodes_elapsed = started.elapsed();
 
-    let edge_stats = save_edges(&tx, project_id, &node_id_map, pdg)?;
+    let edge_stats = save_edges(&tx, project_id, &project_rows, &node_id_map, pdg)?;
     let edges_elapsed = started.elapsed();
 
     // Remove nodes that are no longer part of the PDG. Their edges were
@@ -365,7 +365,7 @@ fn save_nodes(
     tx: &rusqlite::Transaction<'_>,
     project_id: &str,
     pdg: &ProgramDependenceGraph,
-) -> Result<(HashMap<NodeId, i64>, Vec<String>)> {
+) -> Result<(NodeRowMap, Vec<String>, RowIdSet)> {
     // Pre-query existing rows for the project so an unchanged node reuses its
     // db id and issues no write (C1). A legacy row whose content_hash was
     // computed as blake3(node_id) under the old scheme reads as changed once
@@ -390,7 +390,8 @@ fn save_nodes(
     }
 
     let node_indices: Vec<NodeId> = pdg.node_indices().collect();
-    let mut node_id_map: HashMap<NodeId, i64> = HashMap::with_capacity(node_indices.len());
+    let mut node_id_map =
+        NodeRowMap::with_capacity_and_hasher(node_indices.len(), Default::default());
     let mut to_upsert: Vec<(usize, NodeRecord)> = Vec::with_capacity(node_indices.len());
 
     for (pos, &node_idx) in node_indices.iter().enumerate() {
@@ -581,11 +582,18 @@ fn save_nodes(
         }
     }
 
-    Ok((node_id_map, stale_node_ids))
+    let project_rows: RowIdSet = existing.values().map(|(db_id, _, _)| *db_id).collect();
+    Ok((node_id_map, stale_node_ids, project_rows))
 }
 
 /// Persisted-row identity of an edge: the `intel_edges` primary key.
-type EdgeKey = (i64, i64, String);
+type EdgeKey = (i64, i64, &'static str);
+
+/// Metadata JSON of an edge as compared during the diff: `None` is the
+/// all-null literal that ~70% of edges carry, so most keys hold no string at all.
+type EdgeMeta = Option<String>;
+
+type EdgeMap = HashMap<EdgeKey, EdgeMeta, std::hash::BuildHasherDefault<RowIdHasher>>;
 
 /// Persist edges by DIFFING against the rows already stored for the project,
 /// mirroring the node content-hash skip: an edge whose (caller, callee, type)
@@ -604,35 +612,53 @@ type EdgeKey = (i64, i64, String);
 fn save_edges(
     tx: &rusqlite::Transaction<'_>,
     project_id: &str,
-    node_id_map: &HashMap<NodeId, i64>,
+    project_rows: &RowIdSet,
+    node_id_map: &NodeRowMap,
     pdg: &ProgramDependenceGraph,
 ) -> Result<EdgeSaveStats> {
     // Existing rows for the project: one sequential read (no WAL growth)
     // instead of a full-table rewrite. NULL metadata (legacy rows) reads as
     // the empty string, which never equals serialized JSON, so such rows are
     // rewritten once and converge.
-    let mut existing: HashMap<EdgeKey, String> = HashMap::new();
+    let mut existing = EdgeMap::default();
+    // Rows whose type this build does not know: never desired, so always stale.
+    let mut unknown_type: Vec<(i64, i64, String)> = Vec::new();
     {
-        let mut stmt = tx.prepare(
-            "SELECT e.caller_id, e.callee_id, e.edge_type, e.metadata
-             FROM intel_edges e
-             WHERE e.caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1)",
-        )?;
-        let rows = stmt.query_map(params![project_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-            ))
-        })?;
-        for row in rows {
-            let (caller, callee, edge_type, metadata) = row?;
-            existing.insert((caller, callee, edge_type), metadata);
+        // A sequential scan of the table with an in-memory membership test is
+        // ~4x faster than the equivalent `caller_id IN (SELECT ...)` semi-join,
+        // which probed the primary-key index once per node.
+        let mut stmt =
+            tx.prepare("SELECT caller_id, callee_id, edge_type, metadata FROM intel_edges")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let caller: i64 = row.get(0)?;
+            if !project_rows.contains(&caller) {
+                continue;
+            }
+            let callee: i64 = row.get(1)?;
+            let edge_type = row
+                .get_ref(2)?
+                .as_str()
+                .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
+            let metadata: EdgeMeta = match row.get_ref(3)? {
+                rusqlite::types::ValueRef::Text(bytes) if bytes == EMPTY_EDGE_METADATA_JSON => None,
+                rusqlite::types::ValueRef::Text(bytes) => {
+                    Some(String::from_utf8_lossy(bytes).into_owned())
+                }
+                // NULL (legacy rows) reads as a value that never equals real
+                // JSON, so such rows are rewritten once and converge.
+                _ => Some(String::new()),
+            };
+            match StorageEdgeType::from_str_name(edge_type) {
+                Some(kind) => {
+                    existing.insert((caller, callee, kind.as_str()), metadata);
+                }
+                None => unknown_type.push((caller, callee, edge_type.to_string())),
+            }
         }
     }
 
-    let mut desired: HashMap<EdgeKey, String> = HashMap::with_capacity(pdg.edge_count());
+    let mut desired = EdgeMap::with_capacity_and_hasher(pdg.edge_count(), Default::default());
     for edge_idx in pdg.edge_indices() {
         let (source, target) = pdg
             .edge_endpoints(edge_idx)
@@ -655,13 +681,24 @@ fn save_edges(
                     callee: target.index() as i64,
                 })?;
         let metadata = convert_edge_metadata(&pdg_edge.metadata);
-        let metadata_json = serde_json::to_string(&metadata)
-            .map_err(|e| PdgStoreError::Serialization(e.to_string()))?;
+        let metadata_json: EdgeMeta = if metadata.call_count.is_none()
+            && metadata.variable_name.is_none()
+            && metadata.confidence.is_none()
+            && metadata.channel.is_none()
+            && metadata.position.is_none()
+        {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&metadata)
+                    .map_err(|e| PdgStoreError::Serialization(e.to_string()))?,
+            )
+        };
         desired.insert(
             (
                 caller_id,
                 callee_id,
-                convert_edge_type(&pdg_edge.edge_type).as_str().to_string(),
+                convert_edge_type(&pdg_edge.edge_type).as_str(),
             ),
             metadata_json,
         );
@@ -670,11 +707,13 @@ fn save_edges(
     // Stale = persisted rows absent from the desired set (includes every edge
     // of a removed node, since those keys cannot be produced from the current
     // node_id_map).
-    let stale: Vec<EdgeKey> = existing
+    let mut stale: Vec<(i64, i64, String)> = existing
         .keys()
         .filter(|key| !desired.contains_key(key))
-        .cloned()
+        .map(|&(caller, callee, kind)| (caller, callee, kind.to_string()))
         .collect();
+    let existing_total = existing.len() + unknown_type.len();
+    stale.extend(unknown_type);
 
     let mut stats = EdgeSaveStats::default();
 
@@ -682,7 +721,7 @@ fn save_edges(
     // single subquery DELETE beats thousands of parameterized OR clauses and
     // every desired edge becomes a fresh insert — i.e. the old full-rebuild
     // path. Otherwise delete exactly the stale rows via their primary key.
-    let bulk = existing.len() >= 64 && stale.len() * 2 > existing.len();
+    let bulk = existing_total >= 64 && stale.len() * 2 > existing_total;
     if stale.is_empty() {
         // Nothing to delete.
     } else if bulk {
@@ -721,11 +760,11 @@ fn save_edges(
     // After a bulk delete every desired edge is a fresh insert; otherwise only
     // new rows and rows whose metadata JSON changed are written (the upsert's
     // DO UPDATE arm covers changed metadata).
-    let mut to_write: Vec<(i64, i64, String, String)> = Vec::new();
+    let mut to_write: Vec<(i64, i64, &'static str, &EdgeMeta)> = Vec::new();
     for (key, metadata) in &desired {
         let unchanged = !bulk && existing.get(key).is_some_and(|stored| stored == metadata);
         if !unchanged {
-            to_write.push((key.0, key.1, key.2.clone(), metadata.clone()));
+            to_write.push((key.0, key.1, key.2, metadata));
         }
     }
 
@@ -743,8 +782,11 @@ fn save_edges(
         for (caller_id, callee_id, edge_type, metadata_json) in chunk {
             params.push(Value::Integer(*caller_id));
             params.push(Value::Integer(*callee_id));
-            params.push(Value::Text(edge_type.clone()));
-            params.push(Value::Text(metadata_json.clone()));
+            params.push(Value::Text((*edge_type).to_string()));
+            params.push(Value::Text(match metadata_json {
+                Some(json) => json.clone(),
+                None => String::from_utf8_lossy(EMPTY_EDGE_METADATA_JSON).into_owned(),
+            }));
         }
 
         tx.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
@@ -832,9 +874,32 @@ fn save_trigram_index_tx(
 /// println!("Loaded {} nodes and {} edges", pdg.node_count(), pdg.edge_count());
 /// ```
 pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependenceGraph> {
-    let mut pdg = ProgramDependenceGraph::new();
-    let db_id_to_node_id = load_nodes(storage, project_id, &mut pdg)?;
-    load_edges(storage, project_id, &mut pdg, &db_id_to_node_id)?;
+    // Edge rows are decoded on a second thread over their own read-only
+    // connection while this one reads the nodes; applying them needs the
+    // node ids, so that part runs afterwards. Falls back to a single
+    // connection for in-memory databases or if the second one cannot open.
+    let database = storage
+        .conn()
+        .path()
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from);
+    let (nodes, prefetched_edges) = std::thread::scope(|scope| {
+        let edges = database.map(|path| {
+            scope.spawn(move || {
+                let reader = Storage::open_readonly(&path).ok()?;
+                read_edges(reader.conn()).ok()
+            })
+        });
+        let mut pdg = ProgramDependenceGraph::new();
+        let nodes = load_nodes(storage, project_id, &mut pdg).map(|ids| (pdg, ids));
+        (nodes, edges.and_then(|handle| handle.join().ok().flatten()))
+    });
+    let (mut pdg, db_id_to_node_id) = nodes?;
+    let edges = match prefetched_edges {
+        Some(edges) => edges,
+        None => read_edges(storage.conn())?,
+    };
+    apply_edges(&mut pdg, &db_id_to_node_id, edges);
 
     // Try to load persisted trigram index; fall back to rebuilding from nodes.
     // The trigram index is maintained incrementally via add_node during load,
@@ -862,6 +927,14 @@ impl std::hash::Hasher for RowIdHasher {
         }
     }
 
+    fn write_u32(&mut self, value: u32) {
+        self.0 = u64::from(value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.0 = (value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
     fn write_i64(&mut self, value: i64) {
         self.0 = (value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
@@ -872,6 +945,11 @@ impl std::hash::Hasher for RowIdHasher {
 }
 
 type RowIdMap = HashMap<i64, NodeId, std::hash::BuildHasherDefault<RowIdHasher>>;
+
+/// Graph node -> row id, hashed the same way.
+type NodeRowMap = HashMap<NodeId, i64, std::hash::BuildHasherDefault<RowIdHasher>>;
+
+type RowIdSet = std::collections::HashSet<i64, std::hash::BuildHasherDefault<RowIdHasher>>;
 
 fn load_nodes(
     storage: &Storage,
@@ -944,29 +1022,18 @@ fn load_nodes(
 const EMPTY_EDGE_METADATA_JSON: &[u8] =
     br#"{"call_count":null,"variable_name":null,"confidence":null,"channel":null,"position":null}"#;
 
-fn load_edges(
-    storage: &Storage,
-    project_id: &str,
-    pdg: &mut ProgramDependenceGraph,
-    db_id_to_node_id: &RowIdMap,
-) -> Result<()> {
-    // No join against `intel_nodes`: `db_id_to_node_id` already holds exactly
-    // this project's nodes, so an edge belongs to the project iff both
-    // endpoints are in it. (The double self-join cost ~150 ms of the load.)
-    let _ = project_id;
-    let mut edges_stmt = storage
-        .conn()
-        .prepare("SELECT caller_id, callee_id, edge_type, metadata FROM intel_edges")?;
+/// Every edge row, decoded into graph edges. No join against `intel_nodes`:
+/// an edge belongs to the project iff both of its endpoints do, which
+/// [`apply_edges`] checks against the loaded node ids. (The double self-join
+/// cost ~150 ms of the load.)
+fn read_edges(conn: &rusqlite::Connection) -> Result<Vec<(i64, i64, PDGEdge)>> {
+    let mut edges_stmt =
+        conn.prepare("SELECT caller_id, callee_id, edge_type, metadata FROM intel_edges")?;
     let mut rows = edges_stmt.query([])?;
+    let mut edges = Vec::new();
     while let Some(row) = rows.next()? {
         let caller_id: i64 = row.get(0)?;
         let callee_id: i64 = row.get(1)?;
-        let (Some(&caller_node_id), Some(&callee_node_id)) = (
-            db_id_to_node_id.get(&caller_id),
-            db_id_to_node_id.get(&callee_id),
-        ) else {
-            continue;
-        };
         let edge_type_str = row
             .get_ref(2)?
             .as_str()
@@ -989,15 +1056,32 @@ fn load_edges(
                 position: None,
             },
         };
-
-        let pdg_edge = PDGEdge {
-            edge_type: convert_storage_edge_type(&edge_type),
-            metadata: convert_storage_edge_metadata(&metadata),
-        };
-        pdg.add_edge(caller_node_id, callee_node_id, pdg_edge);
+        edges.push((
+            caller_id,
+            callee_id,
+            PDGEdge {
+                edge_type: convert_storage_edge_type(&edge_type),
+                metadata: convert_storage_edge_metadata(&metadata),
+            },
+        ));
     }
+    Ok(edges)
+}
 
-    Ok(())
+/// Add the edges whose endpoints are both in `db_id_to_node_id`.
+fn apply_edges(
+    pdg: &mut ProgramDependenceGraph,
+    db_id_to_node_id: &RowIdMap,
+    edges: Vec<(i64, i64, PDGEdge)>,
+) {
+    for (caller_id, callee_id, edge) in edges {
+        if let (Some(&caller), Some(&callee)) = (
+            db_id_to_node_id.get(&caller_id),
+            db_id_to_node_id.get(&callee_id),
+        ) {
+            pdg.add_edge(caller, callee, edge);
+        }
+    }
 }
 
 /// Check if a PDG exists for a project

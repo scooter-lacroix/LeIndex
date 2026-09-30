@@ -2027,14 +2027,31 @@ fn resolve_import_targets(
 /// - `module/function` → `module.function`
 pub fn normalize_symbol(raw: &str) -> String {
     let trimmed = raw.split('(').next().unwrap_or(raw).trim();
-    trimmed
-        .replace("?.", ".")
-        .replace("::", ".")
-        .replace("->", ".")
-        .replace(['\\', '/', ':'], ".")
-        .replace("..", ".")
-        .trim_matches('.')
-        .to_string()
+    // One pass instead of five chained `replace` calls (five allocations and
+    // five scans per call, on a function that runs for every call target and
+    // every comparison during cross-file resolution -- about a tenth of all
+    // indexing CPU). The rewrites are applied left to right exactly as the
+    // chain did: `?.`, `::` and `->` become `.`, then each remaining `\`, `/`
+    // and `:` becomes `.`.
+    let mut out = String::with_capacity(trimmed.len());
+    let mut chars = trimmed.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match (ch, chars.peek().copied()) {
+            ('?', Some('.')) | (':', Some(':')) | ('-', Some('>')) => {
+                chars.next();
+                out.push('.');
+            }
+            ('\\' | '/' | ':', _) => out.push('.'),
+            _ => out.push(ch),
+        }
+    }
+    // `replace("..", ".")` runs once (not to a fixed point): `...` becomes `..`.
+    let collapsed = if out.contains("..") {
+        out.replace("..", ".")
+    } else {
+        out
+    };
+    collapsed.trim_matches('.').to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -2074,3 +2091,80 @@ fn signature_to_node(sig: &SignatureInfo, file_path: &str, language: &str) -> No
 #[cfg(test)]
 #[path = "extraction_test.rs"]
 mod tests;
+
+#[cfg(test)]
+mod normalize_symbol_test {
+    use super::normalize_symbol;
+
+    /// The original chained-`replace` implementation, kept as the reference.
+    fn reference(raw: &str) -> String {
+        let trimmed = raw.split('(').next().unwrap_or(raw).trim();
+        trimmed
+            .replace("?.", ".")
+            .replace("::", ".")
+            .replace("->", ".")
+            .replace(['\\', '/', ':'], ".")
+            .replace("..", ".")
+            .trim_matches('.')
+            .to_string()
+    }
+
+    #[test]
+    fn test_normalize_symbol_matches_the_replace_chain_on_edge_cases() {
+        for case in [
+            "",
+            ".",
+            "..",
+            "...",
+            "a::b",
+            "a:::b",
+            "a::::b",
+            "a:b",
+            "a->b",
+            "a-->b",
+            "a?.b",
+            "a?::b",
+            "a??.b",
+            "std::io::Read",
+            "obj?.property",
+            "module/function",
+            "a\\b/c:d",
+            "::a::",
+            "->x->",
+            "x(y)::z",
+            "  pad::name  ",
+            "a.b..c...d",
+            "é::ü->ñ",
+            "?",
+            "-",
+            "-:>",
+            "a?.?.b",
+            "path/to/file.rs:Type::method",
+        ] {
+            assert_eq!(normalize_symbol(case), reference(case), "input {case:?}");
+        }
+    }
+
+    #[test]
+    fn test_normalize_symbol_matches_the_replace_chain_on_generated_strings() {
+        // Deterministic pseudo-random strings over the characters that matter.
+        let alphabet: Vec<char> = "ab.:/\\-?>( _é".chars().collect();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..20_000 {
+            let mut input = String::new();
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let mut bits = state;
+            for _ in 0..(bits % 11) {
+                bits = bits.rotate_left(7) ^ 0x9E37_79B9;
+                input.push(alphabet[(bits as usize) % alphabet.len()]);
+            }
+            assert_eq!(
+                normalize_symbol(&input),
+                reference(&input),
+                "input {input:?}"
+            );
+        }
+    }
+}

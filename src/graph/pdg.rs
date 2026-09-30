@@ -14,7 +14,7 @@ use petgraph::visit::EdgeRef;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::graph::trigram::TrigramIndex;
 
@@ -1202,14 +1202,6 @@ pub struct ProgramDependenceGraph {
     /// Populated during `add_node()`, cleaned up in `remove_node()`.
     name_file_index: HashMap<(String, String), NodeId>,
 
-    /// Reusable scratch buffer for BFS neighbor collection.
-    ///
-    /// Avoids allocating a new `Vec<NodeId>` on every BFS level iteration.
-    /// Cleared at the start of each level, reused across traversals.
-    /// Wrapped in `Mutex` because the PDG is shared across threads
-    /// (e.g., via `Arc<ProgramDependenceGraph>` in validation handlers).
-    bfs_scratch: Mutex<Vec<NodeId>>,
-
     /// Trigram index for accelerating fuzzy node lookups.
     ///
     /// Maps 3-character substrings to sets of node indices, enabling
@@ -1232,7 +1224,6 @@ impl Clone for ProgramDependenceGraph {
             communities: self.communities.clone(),
             precision_symbols: self.precision_symbols.clone(),
             name_file_index: self.name_file_index.clone(),
-            bfs_scratch: Mutex::new(Vec::new()),
             trigram_index: self.trigram_index.clone(),
         }
     }
@@ -1252,7 +1243,6 @@ impl ProgramDependenceGraph {
             communities: HashMap::new(),
             precision_symbols: HashSet::new(),
             name_file_index: HashMap::new(),
-            bfs_scratch: Mutex::new(Vec::new()),
             trigram_index: TrigramIndex::new(),
         }
     }
@@ -1965,6 +1955,10 @@ impl ProgramDependenceGraph {
         let mut queue: VecDeque<(NodeId, usize)> =
             ordered_starts.into_iter().map(|id| (id, 0)).collect();
         let mut result = Vec::new();
+        // Neighbour buffer reused across levels. It was a `Mutex` field shared
+        // by every traversal, which serialized the parallel indexing passes
+        // (two traversals per symbol across all cores) on one lock.
+        let mut scratch: Vec<NodeId> = Vec::new();
 
         while let Some((current, depth)) = queue.pop_front() {
             if let Some(max_nodes) = config.max_nodes {
@@ -1984,7 +1978,6 @@ impl ProgramDependenceGraph {
                 continue;
             }
 
-            let mut scratch = self.bfs_scratch.lock().unwrap();
             scratch.clear();
             scratch.extend(
                 self.graph
@@ -2021,6 +2014,7 @@ impl ProgramDependenceGraph {
         let mut visited: HashSet<NodeId> = HashSet::new();
         let mut queue: VecDeque<(NodeId, usize)> = VecDeque::new();
         let mut result: Vec<NodeId> = Vec::new();
+        let mut scratch: Vec<NodeId> = Vec::new();
 
         visited.insert(start);
         queue.push_back((start, 0));
@@ -2047,7 +2041,6 @@ impl ProgramDependenceGraph {
             }
 
             // Reuse the scratch buffer instead of allocating a new Vec per level.
-            let mut scratch = self.bfs_scratch.lock().unwrap();
             scratch.clear();
             match dir {
                 Direction::Forward => {
@@ -2075,7 +2068,6 @@ impl ProgramDependenceGraph {
                     queue.push_back((neighbor, depth + 1));
                 }
             }
-            // scratch (MutexGuard) dropped here → lock released
         }
 
         result

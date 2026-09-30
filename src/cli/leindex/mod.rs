@@ -600,11 +600,7 @@ impl LeIndex {
         // Initialize search engine, configured with the documented `[search]`
         // knobs: `neural_weight` (previously dead config) plus the fragment
         // layer master switch + fusion weight. VAL-CONFIG.
-        let mut search_engine = SearchEngine::new();
-        let cfg = crate::config::LeIndexConfig::load_cached();
-        search_engine.set_neural_weight(cfg.neural_weight_f32());
-        search_engine.set_fragment_index_enabled(cfg.search.fragment_index_enabled);
-        search_engine.set_fragment_weight(cfg.search.fragment_weight as f32);
+        let search_engine = Self::configured_search_engine();
 
         // Initialize cache subsystem
         let cache_dir = storage_path.join("cache");
@@ -979,6 +975,17 @@ impl LeIndex {
             let _ = self.load_pdg_from_active_storage();
         }
         Ok(())
+    }
+
+    /// A new search engine carrying the documented `[search]` knobs:
+    /// `neural_weight`, the fragment layer master switch and its fusion weight.
+    pub(crate) fn configured_search_engine() -> SearchEngine {
+        let mut search_engine = SearchEngine::new();
+        let cfg = crate::config::LeIndexConfig::load_cached();
+        search_engine.set_neural_weight(cfg.neural_weight_f32());
+        search_engine.set_fragment_index_enabled(cfg.search.fragment_index_enabled);
+        search_engine.set_fragment_weight(cfg.search.fragment_weight as f32);
+        search_engine
     }
 
     /// Whether this instance already holds what `full` (graph + search engine)

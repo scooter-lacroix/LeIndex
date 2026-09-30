@@ -78,55 +78,16 @@ pub fn save_communities(
          AND quality_name = ?3 AND resolution = ?4",
         params![project_id, algorithm, quality_name, resolution],
     )?;
-    // Clear stale assignments first: nodes filtered from the current projection
-    // (for example external markers and doc sections) must not retain a prior
-    // generation's community id.
-    tx.execute(
-        "UPDATE intel_nodes SET community_id = NULL WHERE project_id = ?1",
-        params![project_id],
+    apply_assignments(&tx, project_id, assignments)?;
+    insert_labels(
+        &tx,
+        project_id,
+        algorithm,
+        quality_name,
+        resolution,
+        quality_score,
+        labels,
     )?;
-
-    // Node assignments: single UPDATE per community id (batched by grouping in
-    // Rust, one statement per distinct community — never per node).
-    let mut by_community: std::collections::HashMap<i64, Vec<i64>> =
-        std::collections::HashMap::new();
-    for &(node_db_id, community) in assignments {
-        by_community.entry(community).or_default().push(node_db_id);
-    }
-    for (community, node_ids) in &by_community {
-        let placeholders = (0..node_ids.len())
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("UPDATE intel_nodes SET community_id = ?1 WHERE id IN ({placeholders})");
-        let mut bind: Vec<rusqlite::types::Value> = Vec::with_capacity(1 + node_ids.len());
-        bind.push(rusqlite::types::Value::Integer(*community));
-        for id in node_ids {
-            bind.push(rusqlite::types::Value::Integer(*id));
-        }
-        tx.execute(&sql, rusqlite::params_from_iter(bind.iter()))?;
-    }
-
-    // Community metadata rows.
-    for &(community, node_count, label) in labels {
-        tx.execute(
-            "INSERT INTO intel_communities \
-             (project_id, community, algorithm, quality_name, resolution, node_count, \
-              quality_score, label, computed_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                project_id,
-                community,
-                algorithm,
-                quality_name,
-                resolution,
-                node_count,
-                quality_score,
-                label,
-                chrono::Utc::now().timestamp(),
-            ],
-        )?;
-    }
 
     // Timing metric (singleton row).
     tx.execute(
@@ -135,6 +96,83 @@ pub fn save_communities(
     )?;
 
     tx.commit()
+}
+
+/// Bring `intel_nodes.community_id` to exactly `assignments` ((node db id,
+/// community)), writing only the rows that differ.
+///
+/// Nodes filtered out of the current projection (external markers, doc
+/// sections) must not keep a previous run's community, so persisted ids absent
+/// from `assignments` are cleared. Rewriting every row through one dynamic
+/// statement per community (thousands of them, most singletons) cost ~0.5 s per
+/// index; a diff through two prepared statements writes nothing when the
+/// communities did not change.
+fn apply_assignments(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &str,
+    assignments: &[(i64, i64)],
+) -> rusqlite::Result<()> {
+    let mut existing: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, community_id FROM intel_nodes \
+             WHERE project_id = ?1 AND community_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (id, community) = row?;
+            existing.insert(id, community);
+        }
+    }
+    let desired: std::collections::HashMap<i64, i64> = assignments.iter().copied().collect();
+
+    let mut clear =
+        tx.prepare_cached("UPDATE intel_nodes SET community_id = NULL WHERE id = ?1")?;
+    for id in existing.keys().filter(|id| !desired.contains_key(id)) {
+        clear.execute(params![id])?;
+    }
+    let mut set = tx.prepare_cached("UPDATE intel_nodes SET community_id = ?1 WHERE id = ?2")?;
+    for (id, community) in &desired {
+        if existing.get(id) != Some(community) {
+            set.execute(params![community, id])?;
+        }
+    }
+    Ok(())
+}
+
+/// Insert the community metadata rows through one prepared statement.
+fn insert_labels(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &str,
+    algorithm: &str,
+    quality_name: &str,
+    resolution: f64,
+    quality_score: f64,
+    labels: &[(i64, usize, &str)],
+) -> rusqlite::Result<()> {
+    let computed_at = chrono::Utc::now().timestamp();
+    let mut insert = tx.prepare_cached(
+        "INSERT INTO intel_communities \
+         (project_id, community, algorithm, quality_name, resolution, node_count, \
+          quality_score, label, computed_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    for &(community, node_count, label) in labels {
+        insert.execute(params![
+            project_id,
+            community,
+            algorithm,
+            quality_name,
+            resolution,
+            node_count,
+            quality_score,
+            label,
+            computed_at,
+        ])?;
+    }
+    Ok(())
 }
 
 /// String-keyed variant used by the indexing pipeline: resolves node db ids
@@ -176,47 +214,16 @@ pub fn save_communities_by_node_id(
          AND quality_name = ?3 AND resolution = ?4",
         params![project_id, algorithm, quality_name, resolution],
     )?;
-    tx.execute(
-        "UPDATE intel_nodes SET community_id = NULL WHERE project_id = ?1",
-        params![project_id],
+    apply_assignments(&tx, project_id, &id_pairs)?;
+    insert_labels(
+        &tx,
+        project_id,
+        algorithm,
+        quality_name,
+        resolution,
+        quality_score,
+        &i64_labels,
     )?;
-    let mut by_community: std::collections::HashMap<i64, Vec<i64>> =
-        std::collections::HashMap::new();
-    for &(node_db_id, community) in &id_pairs {
-        by_community.entry(community).or_default().push(node_db_id);
-    }
-    for (community, node_ids) in &by_community {
-        let placeholders = (0..node_ids.len())
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("UPDATE intel_nodes SET community_id = ?1 WHERE id IN ({placeholders})");
-        let mut bind: Vec<rusqlite::types::Value> = Vec::with_capacity(1 + node_ids.len());
-        bind.push(rusqlite::types::Value::Integer(*community));
-        for id in node_ids {
-            bind.push(rusqlite::types::Value::Integer(*id));
-        }
-        tx.execute(&sql, rusqlite::params_from_iter(bind.iter()))?;
-    }
-    for &(community, node_count, label) in &i64_labels {
-        tx.execute(
-            "INSERT INTO intel_communities \
-             (project_id, community, algorithm, quality_name, resolution, node_count, \
-              quality_score, label, computed_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                project_id,
-                community,
-                algorithm,
-                quality_name,
-                resolution,
-                node_count,
-                quality_score,
-                label,
-                chrono::Utc::now().timestamp(),
-            ],
-        )?;
-    }
     tx.execute(
         "UPDATE cache_telemetry SET community_recompute_ms = ?1 WHERE id = 1",
         params![recompute_ms],

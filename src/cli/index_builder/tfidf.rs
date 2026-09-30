@@ -42,6 +42,12 @@ pub struct TfIdfEmbedder {
     pub(crate) pdg_edges: usize,
     /// PDG fingerprint captured when persisted for staleness checks
     pub(crate) pdg_fingerprint: String,
+    /// word -> embedding slots, built on first use. Embedding a node then
+    /// probes this once per distinct token (~50) instead of once per
+    /// vocabulary entry (768). The vocabulary is fixed once the embedder is
+    /// built, so the cache never goes stale.
+    #[serde(skip)]
+    pub(crate) slots: std::sync::OnceLock<HashMap<String, Vec<u32>>>,
 }
 
 impl TfIdfEmbedder {
@@ -74,6 +80,7 @@ impl TfIdfEmbedder {
                 pdg_nodes: 0,
                 pdg_edges: 0,
                 pdg_fingerprint: String::new(),
+                slots: Default::default(),
             };
         }
 
@@ -148,6 +155,7 @@ impl TfIdfEmbedder {
             pdg_nodes: 0,
             pdg_edges: 0,
             pdg_fingerprint: String::new(),
+            slots: Default::default(),
         }
     }
 
@@ -171,15 +179,26 @@ impl TfIdfEmbedder {
             *tf_map.entry(tok.as_str()).or_insert(0.0) += 1.0;
         }
 
-        // Compute TF-IDF in lockstep over the output vector so a mismatched
-        // persisted vocabulary/dimension can't index out of bounds.
-        for (slot, (word, idf_val)) in vec.iter_mut().zip(self.vocab.iter().zip(self.idf.iter())) {
-            if let Some(&count) = tf_map.get(word.as_str()) {
-                *slot = (count / total) * idf_val;
+        let slots = self.slots.get_or_init(|| {
+            let mut slots: HashMap<String, Vec<u32>> = HashMap::with_capacity(self.vocab.len());
+            for (slot, word) in self
+                .vocab
+                .iter()
+                .enumerate()
+                .take(self.dimension.min(self.idf.len()))
+            {
+                slots.entry(word.clone()).or_default().push(slot as u32);
+            }
+            slots
+        });
+        for (word, count) in &tf_map {
+            if let Some(dims) = slots.get(*word) {
+                for &slot in dims {
+                    vec[slot as usize] = (count / total) * self.idf[slot as usize];
+                }
             }
         }
 
-        // L2 normalize
         let magnitude: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
         if magnitude > 1e-9 {
             for v in &mut vec {
@@ -208,9 +227,23 @@ impl TfIdfEmbedder {
             *tf_map.entry(tok.as_str()).or_insert(0.0) += 1.0;
         }
 
-        for (slot, (word, idf_val)) in vec.iter_mut().zip(self.vocab.iter().zip(self.idf.iter())) {
-            if let Some(&count) = tf_map.get(word.as_str()) {
-                *slot = (count / total) * idf_val;
+        let slots = self.slots.get_or_init(|| {
+            let mut slots: HashMap<String, Vec<u32>> = HashMap::with_capacity(self.vocab.len());
+            for (slot, word) in self
+                .vocab
+                .iter()
+                .enumerate()
+                .take(self.dimension.min(self.idf.len()))
+            {
+                slots.entry(word.clone()).or_default().push(slot as u32);
+            }
+            slots
+        });
+        for (word, count) in &tf_map {
+            if let Some(dims) = slots.get(*word) {
+                for &slot in dims {
+                    vec[slot as usize] = (count / total) * self.idf[slot as usize];
+                }
             }
         }
 
@@ -256,6 +289,7 @@ impl TfIdfEmbedder {
             pdg_nodes: state.pdg_nodes,
             pdg_edges: state.pdg_edges,
             pdg_fingerprint: state.pdg_fingerprint,
+            slots: Default::default(),
         })
     }
 
