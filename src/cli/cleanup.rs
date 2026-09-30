@@ -296,7 +296,7 @@ pub fn artifact_age(dir: &Path) -> SystemTime {
 
 /// Run startup garbage collection — removes artifacts older than the default
 /// threshold. This is meant to be called early in the CLI startup path
-/// (`Cli::run`). Safe because [`is_locked`] probes the project's cross-process
+/// (`Cli::run`). Safe because `is_locked` probes the project's cross-process
 /// write lock (Codex P2): a directory a live writer is using is never removed.
 /// Readers do not take the write lock, so a reader-only sibling using a stale
 /// (>7-day) temp index is not protected — an inherent limitation of the
@@ -608,7 +608,7 @@ static AT_EXIT_PATHS: std::sync::OnceLock<std::sync::Mutex<Vec<PathBuf>>> =
 
 /// Register a temp storage directory for best-effort removal on clean exit.
 ///
-/// The cleanup is lock-aware (see [`is_locked`]) so an active temp-backed
+/// The cleanup is lock-aware (see `is_locked`) so an active temp-backed
 /// index used by another process is never removed. If the process is killed
 /// with SIGKILL, artifacts remain until the next startup GC pass
 /// ([`startup_gc`]).
@@ -656,7 +656,7 @@ pub fn register_at_exit_cleanup(storage_path: PathBuf) {
 ///
 /// Called from the CLI exit path (`Cli::run`, next to the memory-report
 /// flush) so clean process exits do not leave temp-fallback databases behind.
-/// Each path is guarded by [`is_locked`] (Codex P2): a directory whose
+/// Each path is guarded by `is_locked` (Codex P2): a directory whose
 /// `index.lock` is held by a live **writer** is skipped (readers do not take
 /// the write lock, so a reader-only sibling using a stale temp index is not
 /// protected — an inherent limitation of the advisory write lock, unchanged
@@ -706,7 +706,7 @@ pub fn best_effort_cleanup(path: &Path) {
 /// This is the backing implementation for `leindex retention --report`
 /// (WS4 Task 9, WS10 Task 6). It resolves the project's storage root
 /// (`.leindex/`, or the `LEINDEX_HOME`/XDG/tmp fallbacks via
-/// [`resolve_existing_storage_path`]), opens the CAS store, and scans
+/// `resolve_existing_storage_path`), opens the CAS store, and scans
 /// `generations/` and `jobs/` to report the generation count, CAS bytes,
 /// job bytes, dedup ratio, and GC candidates.
 ///
@@ -780,7 +780,7 @@ pub fn retention_report_cli(project: Option<&Path>) -> anyhow::Result<RetentionR
 /// Prunes generations outside the retained window (the current generation
 /// plus its `max_generations - 1` immediate predecessors), GCs orphaned CAS
 /// blobs on CAS stores, and byte-caps completed jobs. Works on both store
-/// layouts: CAS-backed stores run [`retain_after_publish`]; legacy
+/// layouts: CAS-backed stores run `retain_after_publish`; legacy
 /// full-copy stores (no `cas/`) run the no-CAS directory prune, which is
 /// safe because legacy generations are self-contained. With `dry_run`
 /// nothing is deleted.
@@ -943,7 +943,7 @@ impl std::fmt::Display for ProjectCleanupReport {
 ///
 /// This is the heart of `leindex cleanup --store` (Task 7). It performs:
 ///
-/// 1. **Generation retention** (WS4 [`retain_after_publish`]): removes stale
+/// 1. **Generation retention** (WS4 `retain_after_publish`): removes stale
 ///    generations (not current/previous/leased), CAS GC of orphaned blobs
 ///    (refcount 0, not pinned by any retained manifest), and job pruning.
 /// 2. **Abandoned staging removal**: deletes leftover `.partial` files in

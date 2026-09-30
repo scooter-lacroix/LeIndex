@@ -15,7 +15,7 @@ const DEFAULT_LIMIT: usize = 50;
 const DEFAULT_PER_FILE: usize = 20;
 const DEFAULT_TIMEOUT_MS: usize = 20_000;
 
-/// Handler for LeIndex [Find] — index-accelerated, unbounded text and symbol
+/// Handler for LeIndex \[Find\] — index-accelerated, unbounded text and symbol
 /// search across the project and any other path on the machine.
 #[derive(Clone)]
 pub struct FindHandler;

@@ -39,7 +39,7 @@ pub struct LeIndexConfig {
     pub mcp: McpConfig,
 }
 
-/// Neural embeddings configuration ([neural] section).
+/// Neural embeddings configuration (\[neural\] section).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NeuralConfig {
     /// Whether neural embeddings are enabled.
@@ -70,7 +70,7 @@ pub struct NeuralConfig {
     pub model_name: String,
 }
 
-/// Search behavior configuration ([search] section).
+/// Search behavior configuration (\[search\] section).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SearchConfig {
     /// Search mode: "hybrid", "text", or "neural".
@@ -139,7 +139,7 @@ pub fn query_type_for_mode(search_mode: &str) -> Option<crate::search::ranking::
     }
 }
 
-/// Indexing pipeline configuration ([indexing] section).
+/// Indexing pipeline configuration (\[indexing\] section).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IndexingConfig {
     /// Batch size for embedding generation.
@@ -151,7 +151,7 @@ pub struct IndexingConfig {
     pub max_files: u64,
 }
 
-/// MCP server lifecycle configuration ([mcp] section).
+/// MCP server lifecycle configuration (\[mcp\] section).
 ///
 /// Memory-pressure remediation (1.11.0): MCP servers spawned by AI agents were
 /// accumulating (8+ instances, 2.4 GiB RSS each) because the process had no

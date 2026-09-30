@@ -101,7 +101,7 @@ pub struct Manifest {
     /// Recomputed on read and compared against this stored value.
     pub search_fingerprint: [u8; 32],
     /// Layer-kind to CAS blob hash mapping. A valid manifest has exactly
-    /// [`ALL_LAYER_KINDS.len()`] entries, one per layer.
+    /// `ALL_LAYER_KINDS.len()` entries, one per layer.
     pub layers: HashMap<LayerKind, [u8; 32]>,
 }
 

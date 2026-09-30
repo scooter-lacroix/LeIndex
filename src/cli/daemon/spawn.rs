@@ -1,6 +1,6 @@
 //! Daemon spawn helper (spec §4.1).
 //!
-//! When the shim wins the startup race ([`StartupOutcome::Won`]), it must
+//! When the shim wins the startup race (`StartupOutcome::Won`), it must
 //! spawn `leindexd` as a background child process, wait for the socket file to
 //! appear (bounded timeout), and then re-resolve the endpoint sidecar so it
 //! can connect and begin forwarding.
@@ -42,7 +42,7 @@ pub async fn spawn_bounded_socket_wait(socket_path: &Path, timeout: Duration) ->
 /// # Errors
 ///
 /// - If the `leindexd` binary cannot be found or spawned.
-/// - If the socket file does not appear within [`SOCKET_WAIT_TIMEOUT`].
+/// - If the socket file does not appear within `SOCKET_WAIT_TIMEOUT`.
 /// - If the endpoint sidecar cannot be read after the socket appears.
 pub async fn spawn_and_wait(run_dir: &Path) -> Result<DaemonEndpoint> {
     // Derive the socket path from the run-dir. The daemon's default socket

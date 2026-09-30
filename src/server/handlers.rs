@@ -43,8 +43,8 @@ pub struct SearchQuery {
 ///
 /// Uses `Arc<Mutex<Storage>>` because `rusqlite::Connection` is not `Send + Sync`.
 /// Note: AppState fields are documented for their purposes:
-///   - `storage`: Arc<Mutex<Storage>> provides thread-safe storage access requiring mutex lock
-///   - `config`: Arc<ServerConfig> provides immutable server configuration
+///   - `storage`: `Arc<Mutex<Storage>>` provides thread-safe storage access requiring mutex lock
+///   - `config`: `Arc<ServerConfig>` provides immutable server configuration
 ///     Handlers must lock the mutex before accessing storage.
 #[derive(Clone)]
 pub struct AppState {
@@ -64,7 +64,7 @@ impl AppState {
         }
     }
 
-    /// Create AppState from an existing Arc<Mutex<Storage>>
+    /// Create AppState from an existing `Arc<Mutex<Storage>>`
     pub fn new_from_arc(storage: Arc<Mutex<Storage>>, config: ServerConfig) -> Self {
         Self {
             storage,

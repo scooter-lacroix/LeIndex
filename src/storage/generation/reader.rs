@@ -728,7 +728,7 @@ impl NeuralReader {
 // TfidfReader: sparse TF-IDF triples
 // ===========================================================================
 
-/// Record returned by [`TfidfReader::entry`].
+/// Record returned by `TfidfReader::entry`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TfidfEntry {
     /// Document ID.

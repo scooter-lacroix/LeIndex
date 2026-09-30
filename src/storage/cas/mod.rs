@@ -2,7 +2,7 @@
 //!
 //! Blobs are blake3-addressed and written via a staging-then-rename dance to
 //! guarantee crash safety and deduplication at the storage layer. See
-//! [`blob`] for the on-disk frame format and [`refs`] for refcount storage.
+//! `blob` for the on-disk frame format and `refs` for refcount storage.
 //!
 //! # Layout
 //!

@@ -3,7 +3,7 @@
 //! The standard library's default SipHash is DoS-resistant, which buys nothing
 //! for maps keyed by node ids, symbol names or trigrams derived from the user's
 //! own source tree, while costing a large share of index build and graph
-//! hydration time. [`FastHasher`] consumes eight bytes per step with a 128-bit
+//! hydration time. `FastHasher` consumes eight bytes per step with a 128-bit
 //! folded multiply (the "mum" primitive used by wyhash/foldhash), so strings
 //! are hashed a word at a time and both the high bits (used by hashbrown's
 //! control bytes) and low bits (used for bucket selection) are well mixed.

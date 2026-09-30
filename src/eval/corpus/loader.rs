@@ -9,7 +9,7 @@ use std::path::Path;
 
 /// Load and verify the default built-in corpus.
 ///
-/// This builds the corpus from the hardcoded [`data::build_default_corpus`]
+/// This builds the corpus from the hardcoded `data::build_default_corpus`
 /// data, then runs both verification checks (category coverage and split
 /// integrity). Returns an error if verification fails.
 pub fn load_and_verify_corpus() -> Result<Corpus, CorpusVerificationError> {

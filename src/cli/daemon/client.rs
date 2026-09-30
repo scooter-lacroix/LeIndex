@@ -9,15 +9,15 @@
 //!
 //! Failure never strands the user: any problem before the first byte is
 //! forwarded (no `leindexd` binary, spawn failure, a daemon of another
-//! version with other clients attached) makes [`run`] return
-//! [`Outcome::Fallback`], and the caller runs the ordinary inline server.
+//! version with other clients attached) makes `run` return
+//! `Outcome::Fallback`, and the caller runs the ordinary inline server.
 //!
 //! Lifecycle
 //! 1. `connect(run/leindexd.sock)`. Success is the common, ~50 µs, path.
 //! 2. Otherwise start `leindexd` detached (`setsid`) and poll the socket. Any
 //!    number of shims may do this at once; `leindexd` takes an exclusive
 //!    `flock` and the losers exit, so exactly one daemon wins.
-//! 3. Exchange hello/ack (see [`super::proto`]). A daemon older than its own
+//! 3. Exchange hello/ack (see `super::proto`). A daemon older than its own
 //!    binary on disk, or of another version, is replaced when nobody else is
 //!    attached.
 

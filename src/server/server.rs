@@ -22,7 +22,7 @@ pub struct LeIndexServer {
     /// Server configuration
     config: ServerConfig,
 
-    /// Storage layer wrapped in Arc<Mutex> for thread safety
+    /// Storage layer wrapped in `Arc<Mutex>` for thread safety
     storage: Arc<Mutex<Storage>>,
 }
 
@@ -145,7 +145,7 @@ impl LeIndexServer {
     ///
     /// # Returns
     ///
-    /// Reference to Arc<Mutex<Storage>>
+    /// Reference to `Arc<Mutex<Storage>>`
     #[must_use]
     pub fn storage(&self) -> Arc<Mutex<Storage>> {
         Arc::clone(&self.storage)

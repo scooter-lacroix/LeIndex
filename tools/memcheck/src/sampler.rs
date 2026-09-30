@@ -134,7 +134,7 @@ fn sample_gpu_cuda() -> Option<GpuSample> {
 /// Reads VmRSS from `/proc/<pid>/status` (primary), then PSS from
 /// `smaps_rollup`, and mapped-file / anonymous breakdown from full `smaps`.
 /// The `smaps` read is the most expensive part; callers that need faster
-/// sampling can use [`sample_fast`] instead.
+/// sampling can use `sample_fast` instead.
 ///
 /// If `worker_name` is `Some`, also discovers and samples any child process
 /// with that name (VAL-CPHASE-034).
@@ -274,7 +274,7 @@ fn read_proc_comm(pid: u32) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Read VmRSS from /proc/<pid>/status.
+/// Read VmRSS from /proc/`<pid>`/status.
 fn read_vm_rss(pid: u32) -> anyhow::Result<u64> {
     let path = PathBuf::from(format!("/proc/{}/status", pid));
     let content = std::fs::read_to_string(&path)

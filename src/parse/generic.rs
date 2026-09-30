@@ -10,7 +10,7 @@
 //!
 //! Adding a language to Tier-0 is exactly three lines: a grammar dep in
 //! `Cargo.toml`, a `languages::<name>` module in `traits.rs`, and a row in
-//! [`GENERIC_LANGUAGE_TABLE`] plus the registry arm in `languages.rs`.
+//! `GENERIC_LANGUAGE_TABLE` plus the registry arm in `languages.rs`.
 
 use crate::parse::traits::{
     Block, CodeIntelligence, ComplexityMetrics, Edge, Error, Graph, Result, SignatureInfo,

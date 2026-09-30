@@ -161,7 +161,7 @@ pub fn blob_format_identity() -> (&'static [u8], u8) {
 /// Checks (in order):
 /// 1. Magic bytes are `LIDX-GEN1`.
 /// 2. Manifest version is supported (rejects 0 and > [`MANIFEST_VERSION`]).
-/// 3. All five required [`LayerKind`]s are present.
+/// 3. All five required `LayerKind`s are present.
 ///
 /// Does **not** recompute graph/search fingerprints (that requires loading
 /// layer data). Use [`validate_manifest_fingerprints`] for that.

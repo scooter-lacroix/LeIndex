@@ -623,7 +623,7 @@ impl ProjectRegistry {
     /// pre-write `false` cached result.
     ///
     /// `path` **must** be an already-canonicalized project path (e.g.
-    /// the return value of [`ProjectHandle::project_path`]). The cache
+    /// the return value of `ProjectHandle::project_path`). The cache
     /// key is built from [`LeIndex::project_path`], which is
     /// canonicalized at construction time. Every built-in caller
     /// passes `guard.project_path().to_path_buf()`, which satisfies
@@ -1383,7 +1383,7 @@ impl ProjectRegistry {
         self.projects.read().await.get(path).cloned()
     }
 
-    /// Acquire a [`GenerationLease`] for the currently-published generation of
+    /// Acquire a `GenerationLease` for the currently-published generation of
     /// `project`.
     ///
     /// Reads the `CURRENT` file to find the current generation number, loads

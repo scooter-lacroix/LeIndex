@@ -16,7 +16,7 @@ use super::corpus::CorpusCase;
 /// `retrieved` is the list of retrieved item identifiers (e.g., symbol names
 /// or file paths), in rank order. `relevant` is the set of correct items.
 ///
-/// Recall@k = |retrieved[:k] ∩ relevant| / |relevant|
+/// Recall@k = |retrieved\[:k\] ∩ relevant| / |relevant|
 ///
 /// If `relevant` is empty, returns 0.0 (no relevant items to recall).
 pub fn recall_at_k(retrieved: &[String], relevant: &[String], k: usize) -> f64 {

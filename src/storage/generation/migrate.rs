@@ -18,18 +18,18 @@
 //!
 //! - **Db** — the legacy SQLite catalog, VACUUM-normalized into a canonical
 //!   byte form (same engine as `db_layer`; byte-deterministic for dedup).
-//! - **Tfidf** — a structurally valid, *empty* [`LIDX-TFD1`] payload. The
+//! - **Tfidf** — a structurally valid, *empty* `LIDX-TFD1` payload. The
 //!   legacy `tfidf_embedder.bin` stores only vocabulary + IDF (needed to
 //!   compute query embeddings), not the sparse document×term matrix the
 //!   TF-IDF layer encodes. The dense document vectors are preserved verbatim
 //!   in the Neural layer; sparse-doc reconstruction is deferred to the
 //!   read-path wiring task.
 //! - **Neural** — a real conversion of the legacy mmap embedding file
-//!   (`embeddings.bin`, `LIEE` frame) into a [`LIDX-NRL1`] payload that
+//!   (`embeddings.bin`, `LIEE` frame) into a `LIDX-NRL1` payload that
 //!   preserves the full `count × dim` f32 matrix.
 //! - **Pdg** — reconstructed from the legacy catalog's `intel_nodes` /
-//!   `intel_edges` tables into [`LIDX-PDG1`].
-//! - **Symbols** — reconstructed from `intel_nodes` into [`LIDX-SYM1`].
+//!   `intel_edges` tables into `LIDX-PDG1`.
+//! - **Symbols** — reconstructed from `intel_nodes` into `LIDX-SYM1`.
 //!
 //! ## Crash safety / idempotency
 //!

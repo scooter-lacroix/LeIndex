@@ -1,11 +1,11 @@
 //! Native text search: a mmap'd trigram index (the technique behind Zoekt and
 //! Google Code Search) with live verification, in-process and dependency-light.
 //!
-//! * [`index`] — the on-disk index and its reader,
-//! * [`trigram`] — case-folded trigram extraction,
-//! * [`plan`] — regex → required-trigram formula → candidate files,
-//! * [`glob`] — include/exclude filtering,
-//! * [`engine`] — inventory, freshness, scanning and result windowing.
+//! * `index` — the on-disk index and its reader,
+//! * `trigram` — case-folded trigram extraction,
+//! * `plan` — regex → required-trigram formula → candidate files,
+//! * `glob` — include/exclude filtering,
+//! * `engine` — inventory, freshness, scanning and result windowing.
 //!
 //! Anything the index has not seen (files edited since, new files, whole
 //! directories outside the workspace) is scanned live, so callers never need

@@ -42,11 +42,11 @@ struct Args {
     #[arg(long)]
     update_baseline: bool,
 
-    /// Path to the baselines directory (default: <workspace>/docs/memory/baselines).
+    /// Path to the baselines directory (default: `<workspace>`/docs/memory/baselines).
     #[arg(long)]
     baselines_dir: Option<PathBuf>,
 
-    /// Path to the budget file (default: <workspace>/docs/memory/budgets/current.json).
+    /// Path to the budget file (default: `<workspace>`/docs/memory/budgets/current.json).
     #[arg(long)]
     budget_path: Option<PathBuf>,
 

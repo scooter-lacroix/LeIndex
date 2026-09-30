@@ -107,9 +107,9 @@ pub struct Int8QuantizedVectorMetadata {
     pub scale: f32,
     /// Bias (zero-point) for quantization/dequantization
     pub bias: f32,
-    /// Sum of original vector values: Σx[i]
+    /// Sum of original vector values: Σx\[i\]
     pub sum: f32,
-    /// Sum of squared original vector values: Σx[i]²
+    /// Sum of squared original vector values: Σx\[i\]²
     pub squared_sum: f32,
     /// Padding to ensure 32-byte alignment (16 bytes)
     /// Padding to ensure 32-byte alignment (16 bytes)

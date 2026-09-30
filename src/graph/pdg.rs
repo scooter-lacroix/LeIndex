@@ -1171,17 +1171,17 @@ pub struct ProgramDependenceGraph {
     /// Used for O(1) lookup of nodes by their fully qualified identifier.
     pub(crate) symbol_index: HashMap<String, NodeId>,
 
-    /// Maps file_path → Vec<NodeId>
+    /// Maps file_path → `Vec<NodeId>`
     ///
     /// Used to quickly find all nodes defined in a specific file.
     pub(crate) file_index: HashMap<String, Vec<NodeId>>,
 
-    /// Maps node.name (exact) → Vec<NodeId>
+    /// Maps node.name (exact) → `Vec<NodeId>`
     ///
     /// Used for finding nodes by their human-readable name.
     pub(crate) name_index: HashMap<String, Vec<NodeId>>,
 
-    /// Maps lowercase node.name → Vec<NodeId>
+    /// Maps lowercase node.name → `Vec<NodeId>`
     ///
     /// Enables O(1) case-insensitive lookups without scanning the entire graph.
     /// This eliminates the O(n) scan that would otherwise be needed for

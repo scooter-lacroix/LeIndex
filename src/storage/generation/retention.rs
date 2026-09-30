@@ -8,7 +8,7 @@
 //! Only **current + previous + leased** generations survive:
 //! - **Current**: the generation pointed to by `CURRENT`.
 //! - **Previous**: the immediately preceding generation (if any).
-//! - **Leased**: any generation with at least one live [`GenerationLease`]
+//! - **Leased**: any generation with at least one live `GenerationLease`
 //!   (refcount > 0 on any of its layer blobs).
 //!
 //! All other generation directories are deleted entirely.
