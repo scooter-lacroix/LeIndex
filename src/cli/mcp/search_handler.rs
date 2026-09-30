@@ -167,7 +167,7 @@ impl SearchHandler {
 
     /// Returns the human-readable display title for this tool
     pub fn title(&self) -> &str {
-        "leindex_explore mode=search"
+        "LeIndex [Search]"
     }
 
     /// Returns the description of this RPC method

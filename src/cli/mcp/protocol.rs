@@ -882,7 +882,7 @@ mod tests {
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "leindex_explore mode=search",
+                "name": "LeIndex [Search]",
                 "arguments": {"query": "test"}
             }
         }"#;
@@ -890,7 +890,7 @@ mod tests {
         let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
         let tool_call = req.extract_tool_call().unwrap();
 
-        assert_eq!(tool_call.name, "leindex_explore mode=search");
+        assert_eq!(tool_call.name, "LeIndex [Search]");
         assert_eq!(tool_call.arguments["query"], "test");
     }
 
