@@ -985,7 +985,7 @@ pub async fn handle_tool_call(
 /// Handle a tool call with a transport timestamp captured at message receipt.
 /// What a tool needs resident before its handler runs (see
 /// [`ProjectRegistry::ensure_hydrated`]).
-fn hydration_for_tool(canonical_name: &str) -> Hydration {
+pub(crate) fn hydration_for_tool(canonical_name: &str) -> Hydration {
     match canonical_name {
         "leindex_search" | "leindex_deep_analyze" | "leindex_context" => Hydration::Full,
         "leindex_symbol_lookup"

@@ -842,6 +842,10 @@ pub(super) async fn execute_tool_handler(
 ) -> AnyhowResult<Value> {
     let handler = find_tool_handler(name).ok_or_else(|| tool_not_found(name))?;
     let registry = build_tool_registry(project)?;
+    let level = crate::cli::mcp::server::hydration_for_tool(&normalize_tool_name(name));
+    registry
+        .ensure_hydrated(args.get("project_path").and_then(Value::as_str), level)
+        .await;
     handler
         .execute(&registry, args)
         .await
@@ -865,14 +869,11 @@ fn build_tool_registry(project: Option<PathBuf>) -> AnyhowResult<Arc<ProjectRegi
         canonical
     };
 
-    let mut leindex =
+    let leindex =
         LeIndex::new(&project_root).context("Failed to create LeIndex instance for tool run")?;
-    let _ = leindex.load_from_storage();
-    // One-shot mode starves every `try_get_loaded` enrichment (read-file
-    // symbol maps, text-search owning symbols, grep-catalog relations)
-    // unless the pre-loaded project carries its PDG — load it up front.
-    let _ = leindex.ensure_pdg_loaded();
-
+    // Nothing is loaded up front: `execute_tool_handler` loads exactly what the
+    // requested tool needs (see `hydration_for_tool`), so `find` and reads pay
+    // nothing and graph tools skip the search engine.
     let registry = Arc::new(ProjectRegistry::with_initial_project(
         DEFAULT_MAX_PROJECTS,
         leindex,

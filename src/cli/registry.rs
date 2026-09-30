@@ -456,12 +456,24 @@ impl ProjectRegistry {
             Hydration::Graph => false,
             Hydration::Full => true,
         };
-        if self.is_one_shot() {
-            return false;
-        }
         let Ok(handle) = self.get_or_load(project_path).await else {
             return false;
         };
+        if self.is_one_shot() {
+            // A one-shot process has no other caller to keep responsive, so
+            // load in place -- but only what this tool needs: eagerly loading
+            // the graph and search engine cost ~350 ms even for `find`.
+            let mut idx = handle.write().await;
+            if idx.is_hydrated(full) || !idx.is_indexed() {
+                return idx.is_hydrated(full);
+            }
+            let loaded = if full {
+                idx.ensure_analysis_context_loaded()
+            } else {
+                idx.ensure_pdg_loaded_graph_only()
+            };
+            return loaded.is_ok() && idx.is_hydrated(full);
+        }
         let (root, indexed) = {
             let idx = handle.read().await;
             if idx.is_hydrated(full) {
