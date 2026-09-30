@@ -16,7 +16,8 @@ jobs:
   api-docs:
     name: Generate API Documentation
     runs-on: ubuntu-latest
-    permissions: contents: read
+    permissions:
+      contents: read
     concurrency:
       group: docs-pages
       cancel-in-progress: false
@@ -54,9 +55,15 @@ jobs:
   deploy:
     name: Deploy to GitHub Pages
     runs-on: ubuntu-latest
-    permissions: contents: read, pages: write, id-token: write
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     # Only run on master branch (not PRs)
+    if: github.event_name == 'push'
     needs: api-docs
+    environment:
+      name: github-pages
     concurrency:
       group: docs-pages
       cancel-in-progress: false
