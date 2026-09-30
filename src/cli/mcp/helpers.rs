@@ -445,23 +445,6 @@ pub(crate) fn get_direct_callees(
     )
 }
 
-/// Simple glob matching for include/exclude patterns.
-pub(crate) fn glob_match(path: &str, pattern: &str) -> bool {
-    if pattern.starts_with("*.") {
-        let ext = &pattern[1..];
-        path.ends_with(ext)
-    } else if pattern.contains('*') {
-        let parts: Vec<&str> = pattern.split('*').collect();
-        if parts.len() == 2 {
-            path.contains(parts[0]) && path.ends_with(parts[1])
-        } else {
-            path.contains(pattern)
-        }
-    } else {
-        path.contains(pattern)
-    }
-}
-
 fn edit_change_type(item: &Value, index: usize) -> Result<&str, JsonRpcError> {
     item.get("type")
         .and_then(Value::as_str)

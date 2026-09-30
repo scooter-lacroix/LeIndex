@@ -294,66 +294,6 @@ fn test_trim_read_symbol_caps_callers() {
 }
 
 #[test]
-fn test_trim_grep_symbols_drops_byte_range() {
-    let input = v(r#"{
-            "results": [
-                {
-                    "name": "main",
-                    "type": "function",
-                    "file": "src/main.rs",
-                    "byte_range": [0, 200],
-                    "complexity": 3,
-                    "language": "rust",
-                    "caller_count": 10,
-                    "callers": [{"name": "a"}, {"name": "b"}, {"name": "c"}, {"name": "d"}, {"name": "e"}, {"name": "f"}, {"name": "g"}],
-                    "callees": [{"name": "x"}]
-                }
-            ],
-            "total_matches": 1,
-            "shown": 1,
-            "offset": 0,
-            "mode": "code"
-        }"#);
-    let t = trim_grep_symbols(&input);
-    let r = &t["results"][0];
-    assert!(r.get("byte_range").is_none());
-    assert!(r.get("language").is_none());
-    assert_eq!(r["callers"].as_array().unwrap().len(), 5);
-    assert_eq!(r["callee_count"], Value::Null); // not present in input
-    // caller_count (kept) reflects blast radius even when callers list is capped
-    assert_eq!(r["caller_count"], 10);
-}
-
-#[test]
-fn test_trim_text_search_preserves_context_windows() {
-    let input = v(r#"{
-            "count": 1,
-            "total_matched": 1,
-            "has_more": false,
-            "offset": 0,
-            "results": [
-                {
-                    "file": "src/foo.rs",
-                    "line": 42,
-                    "content": "let x = 1;",
-                    "before": ["fn main() {", "  let y = 2;"],
-                    "after": ["  let z = 3;", "}"],
-                    "in_symbol": "main",
-                    "symbol_type": "function"
-                }
-            ]
-        }"#);
-    let t = trim_text_search(&input);
-    let r = &t["results"][0];
-    // before/after context windows are now preserved so the LLM
-    // can understand match context without a follow-up read_file.
-    assert!(r.get("before").is_some());
-    assert!(r.get("after").is_some());
-    assert_eq!(r["file"], "src/foo.rs");
-    assert_eq!(r["line"], 42);
-}
-
-#[test]
 fn test_trim_deep_analyze_caps_results() {
     let results: Vec<Value> = (0..15)
         .map(|i| {

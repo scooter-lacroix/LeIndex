@@ -115,6 +115,8 @@ pub mod registry;
 /// D-2 idle-engine eviction (sibling of `registry` so the Large-File gate
 /// keeps breathing room — see `registry.rs` head count).
 mod registry_evict;
+/// Text-index lifecycle (locate, load, build) for the `find` search.
+pub mod textindex;
 /// File watcher for auto-reindex.
 #[cfg(feature = "mcp-server")]
 pub mod watcher;

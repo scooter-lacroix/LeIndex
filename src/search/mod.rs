@@ -20,6 +20,8 @@ pub mod ranking;
 pub mod search;
 /// Semantic analysis and embedding generation.
 pub mod semantic;
+/// Native trigram text search (Zoekt-style index, live verification).
+pub mod textsearch;
 /// Vector storage and indexing.
 pub mod vector;
 

@@ -150,6 +150,8 @@ search = [
     "parse",
     "graph",
     "dep:regex",
+    "dep:regex-syntax",
+    "dep:memchr",
     "dep:hnsw_rs",
     "dep:lru",
     "dep:bytemuck",
@@ -367,6 +369,10 @@ rusqlite_migration = { version = "1.0.0", optional = true }
 
 # Search feature dependencies
 regex = { version = "1.10", optional = true }
+# Text-search planner (regex -> required trigrams) and line scanning; both are
+# already in the dependency graph via `regex`.
+regex-syntax = { version = "0.8", optional = true }
+memchr = { version = "2", optional = true }
 hnsw_rs = { version = "0.3", optional = true }
 lru = { version = "0.18", optional = true }
 bytemuck = { version = "1.15", optional = true }
@@ -492,11 +498,6 @@ name = "edit_preview_bench"
 path = "benches/edit_preview_bench.rs"
 harness = false
 required-features = ["edit"]
-
-[[bench]]
-name = "text_search_bench"
-path = "benches/text_search_bench.rs"
-harness = false
 
 [[bench]]
 name = "mcp_tool_latency"

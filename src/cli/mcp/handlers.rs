@@ -11,9 +11,9 @@ pub use super::diagnostics_handler::DiagnosticsHandler;
 pub use super::edit_apply_handler::EditApplyHandler;
 pub use super::edit_preview_handler::EditPreviewHandler;
 pub use super::file_summary_handler::FileSummaryHandler;
+pub use super::find_handler::FindHandler;
 pub use super::git_diff_handler::GitDiffHandler;
 pub use super::git_status_handler::GitStatusHandler;
-pub use super::grep_symbols_handler::GrepSymbolsHandler;
 pub use super::impact_analysis_handler::ImpactAnalysisHandler;
 pub use super::index_handler::IndexHandler;
 pub use super::phase_handler::{PhaseAnalysisAliasHandler, PhaseAnalysisHandler};
@@ -23,7 +23,6 @@ pub use super::read_symbol_handler::ReadSymbolHandler;
 pub use super::rename_symbol_handler::RenameSymbolHandler;
 pub use super::search_handler::SearchHandler;
 pub use super::symbol_lookup_handler::SymbolLookupHandler;
-pub use super::text_search_handler::TextSearchHandler;
 pub use super::write_handler::WriteHandler;
 
 // ── Tool surface definition ──────────────────────────────────────────────
@@ -54,8 +53,8 @@ dispatch_handler! {
     SymbolLookup        => SymbolLookupHandler,
     /// Handler for project structure mapping
     ProjectMap          => ProjectMapHandler,
-    /// Handler for symbol grep
-    GrepSymbols         => GrepSymbolsHandler,
+    /// Handler for index-accelerated text and symbol search
+    Find                => FindHandler,
     /// Handler for reading symbol source
     ReadSymbol          => ReadSymbolHandler,
     /// Handler for atomic file write
@@ -68,8 +67,6 @@ dispatch_handler! {
     RenameSymbol        => RenameSymbolHandler,
     /// Handler for impact analysis
     ImpactAnalysis      => ImpactAnalysisHandler,
-    /// Handler for PDG-aware text search
-    TextSearch           => TextSearchHandler,
     /// Handler for file reading
     ReadFile            => ReadFileHandler,
     /// Handler for git status
@@ -95,7 +92,7 @@ mod tests {
         assert_eq!(FileSummaryHandler.name(), "leindex_file_summary");
         assert_eq!(SymbolLookupHandler.name(), "leindex_symbol_lookup");
         assert_eq!(ProjectMapHandler.name(), "leindex_project_map");
-        assert_eq!(GrepSymbolsHandler.name(), "leindex_grep_symbols");
+        assert_eq!(FindHandler.name(), "leindex_find");
         assert_eq!(ReadSymbolHandler.name(), "leindex_read_symbol");
         assert_eq!(WriteHandler.name(), "leindex_write");
         // Phase D handlers
@@ -118,7 +115,7 @@ mod tests {
         assert_eq!(FileSummaryHandler.title(), "LeIndex [File Summary]");
         assert_eq!(SymbolLookupHandler.title(), "LeIndex [Symbol Lookup]");
         assert_eq!(ProjectMapHandler.title(), "LeIndex [Project Map]");
-        assert_eq!(GrepSymbolsHandler.title(), "LeIndex [Grep Symbols]");
+        assert_eq!(FindHandler.title(), "LeIndex [Find]");
         assert_eq!(ReadSymbolHandler.title(), "LeIndex [Read Symbol]");
         assert_eq!(WriteHandler.title(), "LeIndex [Write]");
         // Phase D handlers
@@ -153,7 +150,7 @@ mod tests {
             FileSummaryHandler.argument_schema(),
             SymbolLookupHandler.argument_schema(),
             ProjectMapHandler.argument_schema(),
-            GrepSymbolsHandler.argument_schema(),
+            FindHandler.argument_schema(),
             ReadSymbolHandler.argument_schema(),
             WriteHandler.argument_schema(),
             EditPreviewHandler.argument_schema(),

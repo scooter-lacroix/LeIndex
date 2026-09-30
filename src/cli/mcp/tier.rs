@@ -103,7 +103,13 @@ fn scalar(value: &Value) -> Option<String> {
 /// Collect headline scalars and array sizes from `object`, one level deep
 /// (plus a `summary`/`stats` sub-object, where handlers put their totals).
 fn headlines(object: &Map<String, Value>, prefix: &str, out: &mut Vec<String>) {
-    for (key, value) in object {
+    // Totals and paging state first, so a cap never drops the headline numbers.
+    let priority = |key: &str| {
+        !(key.starts_with("total") || key == "count" || key == "returned" || key == "has_more")
+    };
+    let mut entries: Vec<(&String, &Value)> = object.iter().collect();
+    entries.sort_by_key(|(key, _)| priority(key));
+    for (key, value) in entries {
         if out.len() >= MAX_HEADLINES {
             return;
         }
@@ -217,6 +223,19 @@ mod tests {
         assert!(!card.contains('?'), "no placeholder glyphs: {card}");
         assert!(!card.contains("noise"), "{card}");
         assert!(card.lines().count() <= 4);
+    }
+
+    #[test]
+    fn test_identity_card_leads_with_totals_even_when_keys_sort_late() {
+        let value = json!({
+            "a1": 1, "a2": 2, "a3": 3, "a4": 4, "a5": 5, "a6": 6, "a7": 7, "a8": 8, "a9": 9,
+            "total_matches": 42, "has_more": true,
+        });
+        let card = identity_card("t", &value);
+        assert!(
+            card.contains("total_matches=42") && card.contains("has_more=true"),
+            "{card}"
+        );
     }
 
     #[test]

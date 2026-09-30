@@ -6,7 +6,7 @@
 // is selected with a discriminator argument and every other argument is
 // forwarded unchanged to the per-feature handler:
 //
-//   leindex_explore  (mode)    search | symbol_lookup | grep | text | read_file | read_symbol
+//   leindex_explore  (mode)    search | symbol_lookup | find | read_file | read_symbol
 //                              | project_map | file_summary | context
 //   leindex_analyze  (mode)    deep | impact | diagnostics | git_status | git_diff
 //   leindex_edit     (action)  apply | preview | rename | write        (action REQUIRED)
@@ -89,7 +89,7 @@ pub static GROUPS: [GroupSpec; 4] = [
     GroupSpec {
         name: "leindex_explore",
         title: "LeIndex [Explore]",
-        description: "Find and read code. mode: search (by meaning, default), symbol_lookup (callers/callees), grep (symbols, falls back to text), text (literal/regex), read_file, read_symbol, project_map, file_summary, context.",
+        description: "Find and read code. mode: search (by meaning, default), find (exact text/regex/symbol names, anywhere on disk), symbol_lookup (callers/callees), read_file, read_symbol, project_map, file_summary, context.",
         discriminator: "mode",
         default_branch: Some("search"),
         branches: &[
@@ -106,16 +106,17 @@ pub static GROUPS: [GroupSpec; 4] = [
                 "Definition with callers, callees and dependencies",
             ),
             branch(
-                "grep",
-                "leindex_grep_symbols",
-                &["grep_symbols", "symbols"],
-                "Structural symbol grep; falls back to text search when no symbol matches",
-            ),
-            branch(
-                "text",
-                "leindex_text_search",
-                &["text_search"],
-                "Literal or regex text search with owning-symbol spans",
+                "find",
+                "leindex_find",
+                &[
+                    "grep",
+                    "text",
+                    "text_search",
+                    "grep_symbols",
+                    "symbols",
+                    "rg",
+                ],
+                "Exact text/regex or symbol-name search: indexed for speed, live for correctness, any path on disk",
             ),
             branch(
                 "read_file",
@@ -386,7 +387,7 @@ pub fn suggest_unknown_tool(name: &str) -> JsonRpcError {
 /// the remaining arguments are forwarded verbatim.
 pub fn resolve_call(name: &str, args: Value) -> Result<(String, Value), JsonRpcError> {
     let Some(group) = group_by_name(name) else {
-        return Ok((name.to_string(), args));
+        return Ok(redirect_retired_tool(name, args));
     };
     let mut args = args;
     let requested = take_discriminator(group, &mut args);
@@ -424,7 +425,33 @@ pub fn resolve_call(name: &str, args: Value) -> Result<(String, Value), JsonRpcE
             ),
         )
     })?;
+    apply_alias_defaults(spec, &wanted, &mut args);
     Ok((spec.tool.to_string(), args))
+}
+
+/// `grep`-style spellings mean "find symbols named X, else the text": the
+/// `auto` target of `leindex_find`. Explicit `target` always wins.
+fn apply_alias_defaults(spec: &BranchSpec, wanted: &str, args: &mut Value) {
+    if spec.tool == "leindex_find" && matches!(wanted, "grep" | "grep_symbols" | "symbols") {
+        if let Some(object) = args.as_object_mut() {
+            object.entry("target").or_insert_with(|| json!("auto"));
+        }
+    }
+}
+
+/// `leindex_grep_symbols` and `leindex_text_search` were folded into
+/// `leindex_find`; direct calls by those names keep working.
+fn redirect_retired_tool(name: &str, mut args: Value) -> (String, Value) {
+    match super::output::normalize_tool_name(name).as_str() {
+        "leindex_text_search" | "text_search" => ("leindex_find".to_string(), args),
+        "leindex_grep_symbols" | "grep_symbols" => {
+            if let Some(object) = args.as_object_mut() {
+                object.entry("target").or_insert_with(|| json!("auto"));
+            }
+            ("leindex_find".to_string(), args)
+        }
+        _ => (name.to_string(), args),
+    }
 }
 
 /// Remove and return the discriminator from `args`.
@@ -631,7 +658,7 @@ pub fn group_schema_flat(group: &GroupSpec, handlers: &[ToolHandler]) -> Value {
             "type": "string",
             "enum": group.branches.iter().map(|spec| spec.branch).collect::<Vec<_>>(),
             "description": format!(
-                "Select the granular handler branch; branch arguments are forwarded unchanged. {}Args per branch (* = required): {}",
+                "Branch selector; other args are forwarded to it. {}Args per branch (* required): {}",
                 match group.default_branch {
                     Some(default) => format!("Defaults to '{default}'. "),
                     None => "Required. ".to_string(),
@@ -938,8 +965,8 @@ mod tests {
             json!({"mode": "grep", "pattern": "todo"}),
         )
         .unwrap();
-        assert_eq!(tool, "leindex_grep_symbols");
-        assert_eq!(args, json!({"pattern": "todo"}));
+        assert_eq!(tool, "leindex_find");
+        assert_eq!(args, json!({"pattern": "todo", "target": "auto"}));
         let (tool, _) = resolve_call("leindex_analyze", json!({"mode": "git_diff"})).unwrap();
         assert_eq!(tool, "leindex_git_diff");
     }
@@ -954,10 +981,22 @@ mod tests {
         ] {
             assert!(group_by_name(name).is_some(), "{name}");
         }
-        for spelling in ["text_search", "text-search", "leindex_text_search", "TEXT"] {
+        // Every historical spelling of a text/symbol search lands on `find`.
+        for spelling in [
+            "find",
+            "grep",
+            "text",
+            "text_search",
+            "text-search",
+            "leindex_text_search",
+            "grep_symbols",
+            "leindex_grep_symbols",
+            "symbols",
+            "TEXT",
+        ] {
             let (tool, _) =
                 resolve_call("explore", json!({"mode": spelling, "query": "q"})).unwrap();
-            assert_eq!(tool, "leindex_text_search", "spelling {spelling}");
+            assert_eq!(tool, "leindex_find", "spelling {spelling}");
         }
     }
 
@@ -1006,6 +1045,29 @@ mod tests {
     }
 
     #[test]
+    fn test_retired_search_tools_redirect_to_find() {
+        let (tool, args) = resolve_call("leindex_text_search", json!({"query": "x"})).unwrap();
+        assert_eq!(
+            (tool.as_str(), &args),
+            ("leindex_find", &json!({"query": "x"}))
+        );
+        let (tool, args) = resolve_call("leindex.grep-symbols", json!({"pattern": "x"})).unwrap();
+        assert_eq!(tool, "leindex_find");
+        assert_eq!(args["target"], "auto");
+        // grep-style aliases search symbol names first; text/find do not.
+        let (_, args) = resolve_call("explore", json!({"mode": "grep", "pattern": "x"})).unwrap();
+        assert_eq!(args["target"], "auto");
+        let (_, args) = resolve_call("explore", json!({"mode": "text", "pattern": "x"})).unwrap();
+        assert!(args.get("target").is_none());
+        let (_, args) = resolve_call(
+            "explore",
+            json!({"mode": "grep", "pattern": "x", "target": "text"}),
+        )
+        .unwrap();
+        assert_eq!(args["target"], "text", "an explicit target wins");
+    }
+
+    #[test]
     fn test_legacy_and_dotted_names_pass_through() {
         for name in [
             "leindex_edit_apply",
@@ -1037,7 +1099,8 @@ mod tests {
             "query",
             "project_path",
             "top_k",
-            "is_regex",
+            "regex",
+            "paths",
             "tier",
             "file_path",
         ] {

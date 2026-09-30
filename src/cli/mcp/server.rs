@@ -1051,6 +1051,14 @@ async fn handle_tool_call_timed(
 
     match handler_result {
         Ok(mut value) => {
+            // A tool that just changed files under a project must not leave
+            // the text search believing they are unchanged.
+            if matches!(
+                call_name.as_str(),
+                "leindex_write" | "leindex_edit_apply" | "leindex_rename_symbol"
+            ) {
+                crate::search::textsearch::invalidate_freshness(std::path::Path::new("/"));
+            }
             if let Some((server, session_id)) = advisory {
                 server.apply_freshness_advisory(
                     session_id,

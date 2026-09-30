@@ -34,8 +34,6 @@ pub fn trim_llm_payload(name: &str, data: &Value) -> Value {
         "leindex_git_status" | "git_status" => trim_git_status(data),
         "leindex_read_file" | "read_file" => trim_read_file(data),
         "leindex_read_symbol" | "read_symbol" => trim_read_symbol(data),
-        "leindex_grep_symbols" | "grep_symbols" => trim_grep_symbols(data),
-        "leindex_text_search" | "text_search" => trim_text_search(data),
         "leindex_deep_analyze" | "deep_analyze" => trim_deep_analyze(data),
         "leindex_write" | "write" => trim_write(data),
         "leindex_index" | "index" => trim_index(data),
@@ -592,106 +590,6 @@ fn trim_read_symbol(data: &Value) -> Value {
     Value::Object(out)
 }
 
-fn trim_grep_symbols(data: &Value) -> Value {
-    // Per-entry: drop byte_range, language; cap callers/callees at 5;
-    // keep the count fields so the LLM still sees blast radius.
-    let arr = data
-        .get("results")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let trimmed: Vec<Value> = arr
-        .into_iter()
-        .map(|r| {
-            let mut obj = serde_json::Map::new();
-            for k in ["name", "type", "file", "complexity", "caller_count"] {
-                if let Some(v) = r.get(k) {
-                    obj.insert(k.to_string(), v.clone());
-                }
-            }
-            obj.insert("callers".to_string(), take_n_for_key(&r, "callers", 5));
-            obj.insert("callees".to_string(), take_n_for_key(&r, "callees", 5));
-            // `source` is opt-in already; pass through if present.
-            if let Some(src) = r.get("source") {
-                obj.insert("source".to_string(), src.clone());
-            }
-            if let Some(score) = r.get("score") {
-                obj.insert("score".to_string(), score.clone());
-            }
-            Value::Object(obj)
-        })
-        .collect();
-    let mut out = serde_json::Map::new();
-    out.insert("results".to_string(), Value::Array(trimmed));
-    if let Some(v) = data.get("total_matches") {
-        out.insert("total_matches".to_string(), v.clone());
-    }
-    if let Some(v) = data.get("shown") {
-        out.insert("shown".to_string(), v.clone());
-    }
-    if let Some(v) = data.get("offset") {
-        out.insert("offset".to_string(), v.clone());
-    }
-    if let Some(v) = data.get("mode") {
-        out.insert("mode".to_string(), v.clone());
-    }
-    if let Some(v) = data.get("truncated") {
-        out.insert("truncated".to_string(), v.clone());
-    }
-    Value::Object(out)
-}
-
-fn trim_text_search(data: &Value) -> Value {
-    // Keep before/after context windows when present — the caller
-    // explicitly requested context via context_lines and the handler
-    // already caps at 10 lines per side. Dropping them silently would
-    // make the tool useless for the "understand match context" use case.
-    let arr = data
-        .get("results")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let trimmed: Vec<Value> = arr
-        .into_iter()
-        .map(|r| {
-            let mut obj = serde_json::Map::new();
-            for k in [
-                "file",
-                "line",
-                "content",
-                "before",
-                "after",
-                "in_symbol",
-                "symbol_type",
-            ] {
-                if let Some(v) = r.get(k) {
-                    obj.insert(k.to_string(), v.clone());
-                }
-            }
-            Value::Object(obj)
-        })
-        .collect();
-    let mut out = serde_json::Map::new();
-    out.insert(
-        "count".to_string(),
-        data.get("count").cloned().unwrap_or(Value::Null),
-    );
-    out.insert(
-        "total_matched".to_string(),
-        data.get("total_matched").cloned().unwrap_or(Value::Null),
-    );
-    out.insert(
-        "has_more".to_string(),
-        data.get("has_more").cloned().unwrap_or(Value::Null),
-    );
-    out.insert(
-        "offset".to_string(),
-        data.get("offset").cloned().unwrap_or(Value::Null),
-    );
-    out.insert("results".to_string(), Value::Array(trimmed));
-    Value::Object(out)
-}
-
 fn trim_deep_analyze(data: &Value) -> Value {
     // Keep the pre-built `context` (already token-budgeted). The
     // results array mirrors a search hit — drop verbose per-result
@@ -937,16 +835,6 @@ fn take_n(v: &Value, n: usize) -> Value {
     match v.as_array() {
         Some(arr) => Value::Array(arr.iter().take(n).cloned().collect()),
         None => Value::Array(Vec::new()),
-    }
-}
-
-/// Look up a key in an object and return the first `n` items of its
-/// array value (or the original value if it's not an array).
-fn take_n_for_key(obj: &Value, key: &str, n: usize) -> Value {
-    match obj.get(key) {
-        Some(v) if v.is_array() => take_n(v, n),
-        Some(v) => v.clone(),
-        None => Value::Null,
     }
 }
 

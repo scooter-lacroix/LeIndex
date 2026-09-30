@@ -494,7 +494,7 @@ mod tests {
     fn test_phase_c_handler_schemas() {
         // All Phase C schemas should be valid JSON objects with required fields
         use super::super::file_summary_handler::FileSummaryHandler;
-        use super::super::grep_symbols_handler::GrepSymbolsHandler;
+        use super::super::find_handler::FindHandler;
         use super::super::project_map_handler::ProjectMapHandler;
         use super::super::read_symbol_handler::ReadSymbolHandler;
         use super::super::symbol_lookup_handler::SymbolLookupHandler;
@@ -504,7 +504,7 @@ mod tests {
             // SymbolLookupHandler has no required fields (symbol or symbols accepted)
             (SymbolLookupHandler.argument_schema(), vec![]),
             (ProjectMapHandler.argument_schema(), vec![]),
-            (GrepSymbolsHandler.argument_schema(), vec!["pattern"]),
+            (FindHandler.argument_schema(), vec!["pattern"]),
             (ReadSymbolHandler.argument_schema(), vec!["symbol"]),
         ];
 

@@ -6,7 +6,7 @@
 
 use leindex::cli::ProjectRegistry;
 use leindex::cli::mcp::handlers::all_tool_handlers;
-use leindex::cli::mcp::handlers::{FileSummaryHandler, GrepSymbolsHandler, ReadSymbolHandler};
+use leindex::cli::mcp::handlers::{FileSummaryHandler, FindHandler, ReadSymbolHandler};
 use leindex::cli::mcp::protocol::JsonRpcRequest;
 use leindex::cli::mcp::request_meta::{
     NEURAL_REQUESTS, PDG_LOADS, PROJECT_HYDRATIONS, PhaseTimings, WorkBudget,
@@ -407,29 +407,32 @@ async fn test_canonical_path_read_symbol_uses_the_same_catalog_key() {
 }
 
 #[tokio::test]
-async fn test_default_project_exact_catalog_grep_does_not_hydrate() {
+async fn test_default_project_symbol_find_does_not_hydrate() {
     let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     let registry = Arc::new(ProjectRegistry::new(2));
     registry.set_default_path(project).await;
     reset_path_counters();
 
-    let response = GrepSymbolsHandler
+    let response = FindHandler
         .execute(
             &registry,
             json!({
                 "pattern": "Askpass",
-                "mode": "exact",
-                "type_filter": "class",
+                "target": "symbols",
+                "kind": "class",
                 "scope": "src",
-                "max_results": 1,
+                "limit": 1,
                 "offset": 0,
             }),
         )
         .await
-        .expect("default project exact catalog grep response");
+        .expect("default project symbol find response");
 
-    assert_eq!(response["results"][0]["name"], "Askpass");
+    assert_eq!(response["symbols"][0]["name"], "Askpass");
+    assert_eq!(response["symbols"][0]["kind"], "class");
+    assert_eq!(response["symbols"][0]["file"], "src/lib.rs");
+    assert_eq!(response["symbols"][0]["line"], 1);
     assert_eq!(PROJECT_HYDRATIONS.load(Ordering::Relaxed), 0);
     assert_eq!(PDG_LOADS.load(Ordering::Relaxed), 0);
     assert_eq!(NEURAL_REQUESTS.load(Ordering::Relaxed), 0);
@@ -616,7 +619,7 @@ async fn test_stale_catalog_file_summary_does_not_attach_stale_pdg_relations() {
 }
 
 #[tokio::test]
-async fn test_exact_grep_catalog_miss_uses_live_parser_without_hydration() {
+async fn test_find_sees_edits_made_after_indexing_without_hydration() {
     let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     fs::write(
@@ -625,18 +628,18 @@ async fn test_exact_grep_catalog_miss_uses_live_parser_without_hydration() {
     )
     .expect("make catalog source stale");
     reset_path_counters();
-    let response = GrepSymbolsHandler
+    let response = FindHandler
         .execute(
             &Arc::new(ProjectRegistry::new(2)),
             json!({
                 "project_path": project,
                 "pattern": "live_marker",
-                "mode": "exact",
             }),
         )
         .await
-        .expect("live exact grep response");
-    assert_eq!(response["results"][0]["name"], "live_marker");
+        .expect("live find response");
+    assert_eq!(response["files"][0]["file"], "src/lib.rs");
+    assert_eq!(response["files"][0]["hits"][0]["line"], 2);
     assert_eq!(PROJECT_HYDRATIONS.load(Ordering::Relaxed), 0);
     assert_eq!(PDG_LOADS.load(Ordering::Relaxed), 0);
     assert_eq!(NEURAL_REQUESTS.load(Ordering::Relaxed), 0);

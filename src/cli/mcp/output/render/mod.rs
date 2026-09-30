@@ -1981,6 +1981,7 @@ fn render_tool_output_inner(
 
     let rendered = match normalized.as_str() {
         "leindex_search" | "search" => render_search(data, query, color),
+        "leindex_find" | "find" => render_find(data),
         "leindex_context" | "context" => render_context(data, node_id, color),
         "leindex_diagnostics" | "diagnostics" => render_diagnostics(data, color),
         "leindex_project_map" | "project_map" => render_project_map(data, color),
@@ -2272,3 +2273,132 @@ impl Default for FileSummaryFormatter {
 // =============================================================================
 // Tests
 // =============================================================================
+
+// =============================================================================
+// leindex_find — compact, token-lean text
+// =============================================================================
+
+/// Render a `leindex_find` result. Hits are grouped by file and, inside a file,
+/// by enclosing symbol, so a symbol name is paid for once rather than per line.
+fn render_find(data: &Value) -> String {
+    use std::fmt::Write as _;
+    let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+    let num = |v: &Value, key: &str| v.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let mut out = String::new();
+
+    if data.get("is_git_repo").is_some() {
+        return render_default(data, false);
+    }
+    let pattern = text(data, "pattern");
+    if data["target"] == "symbols" {
+        let total = num(data, "total_symbols");
+        let _ = writeln!(out, "{total} symbol(s) named like \"{pattern}\"");
+        for symbol in data["symbols"].as_array().into_iter().flatten() {
+            let line = num(symbol, "line");
+            let _ = writeln!(
+                out,
+                "  {} {} — {}{}{}",
+                text(symbol, "kind"),
+                text(symbol, "name"),
+                text(symbol, "file"),
+                if line > 0 {
+                    format!(":{line}")
+                } else {
+                    String::new()
+                },
+                if symbol["stale"] == true {
+                    " (file changed since indexing)"
+                } else {
+                    ""
+                },
+            );
+        }
+        if let Some(note) = data.get("note").and_then(Value::as_str) {
+            let _ = writeln!(out, "{note}");
+        }
+        if data["has_more"] == true {
+            let _ = writeln!(out, "… more: offset={}", num(data, "next_offset"));
+        }
+        return out;
+    }
+
+    let stats = &data["stats"];
+    let indexed = data["roots"]
+        .as_array()
+        .is_some_and(|roots| roots.iter().all(|r| r["indexed"] == true));
+    let _ = writeln!(
+        out,
+        "{} match(es) in {} file(s) for \"{}\" · {}ms{}",
+        num(data, "total_matches"),
+        num(data, "total_files"),
+        pattern,
+        num(stats, "millis"),
+        if indexed { " · indexed" } else { "" },
+    );
+    if let Some(fallback) = data.get("fallback").and_then(Value::as_str) {
+        let _ = writeln!(out, "({fallback})");
+    }
+    match text(data, "output").as_str() {
+        "count" => {}
+        "files" => {
+            for file in data["files"].as_array().into_iter().flatten() {
+                let _ = writeln!(out, "  {} ({})", text(file, "file"), num(file, "matches"));
+            }
+        }
+        "symbols" => {
+            for symbol in data["symbols"].as_array().into_iter().flatten() {
+                let _ = writeln!(
+                    out,
+                    "  {} {} — {} ({})",
+                    text(symbol, "kind"),
+                    text(symbol, "name"),
+                    text(symbol, "file"),
+                    num(symbol, "matches"),
+                );
+            }
+        }
+        _ => {
+            for file in data["files"].as_array().into_iter().flatten() {
+                let shown = file["hits"].as_array().map_or(0, Vec::len) as u64;
+                let total = num(file, "matches");
+                let _ = writeln!(
+                    out,
+                    "{}{}",
+                    text(file, "file"),
+                    if total > shown {
+                        format!(" ({shown} of {total} shown)")
+                    } else {
+                        String::new()
+                    },
+                );
+                let mut current: Option<String> = None;
+                for hit in file["hits"].as_array().into_iter().flatten() {
+                    let symbol = hit
+                        .get("symbol")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if symbol != current {
+                        if let Some(name) = &symbol {
+                            let _ = writeln!(out, " {} ({})", name, text(hit, "kind"));
+                        }
+                        current = symbol;
+                    }
+                    for line in hit["before"].as_array().into_iter().flatten() {
+                        let _ = writeln!(out, "   | {}", line.as_str().unwrap_or(""));
+                    }
+                    let _ = writeln!(out, "  {}: {}", num(hit, "line"), text(hit, "text"));
+                    for line in hit["after"].as_array().into_iter().flatten() {
+                        let _ = writeln!(out, "   | {}", line.as_str().unwrap_or(""));
+                    }
+                }
+            }
+        }
+    }
+    if data["has_more"] == true {
+        let _ = writeln!(out, "… more results: offset={}", num(data, "next_offset"));
+    }
+    if let Some(note) = data.get("note").and_then(Value::as_str) {
+        let _ = writeln!(out, "{note}");
+    }
+    out
+}
