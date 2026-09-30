@@ -14,6 +14,8 @@ What it contains:
 - `references/tool-selection.md`: replacement map for `Read`, `Grep`, `Glob`, `rg`, `find`, `ls`, `cat`, and related workflows.
 - `references/tool-schemas.md`: per-tool JSON schemas (the `oneOf` form) exported from the live CLI surface with `leindex tools schema <tool>`. Regenerate it whenever a tool argument changes.
 
+Agents can check cache effectiveness with `leindex_analyze mode=diagnostics`: the `engram` block reports hits, misses, entries and limits of the opt-in query-embedding phrase-book (`LEINDEX_FEATURE_ENGRAM=1`), and the index-time embed-cache counters. Counters are per process.
+
 ## Claude Code
 
 Use both the shared skill and the hook.

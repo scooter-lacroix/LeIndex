@@ -327,6 +327,9 @@ export LEINDEX_HOME=/custom/leindex
 # Custom log level
 export RUST_LOG=debug
 
+# Opt in to the Engram query-embedding phrase-book (docs/MCP.md)
+export LEINDEX_FEATURE_ENGRAM=1
+
 # Custom memory budget
 export LEINDEX_MEMORY_MB=4096
 ```

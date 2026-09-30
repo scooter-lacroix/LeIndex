@@ -45,6 +45,10 @@ pub use tfidf::*;
 #[path = "index_builder_test.rs"]
 mod test;
 
+#[cfg(test)]
+#[path = "index_builder_hybrid_test.rs"]
+mod hybrid_test;
+
 // ============================================================================
 // TF-IDF EMBEDDING SYSTEM
 // ============================================================================

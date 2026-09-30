@@ -70,6 +70,13 @@ could mean degradation, `signature_scope` on incremental counts).
   merges its exact definitions and relationships into the PDG — upgrading
   heuristic edges to confidence 1.0 and marking precision-confirmed symbols.
   Missing indexers degrade silently to the tree-sitter tier.
+- **Engram query phrase-book** (opt-in: `LEINDEX_FEATURE_ENGRAM=1`): a persistent,
+  content-addressed table of neural query embeddings under `~/.leindex/engram/`.
+  A repeated query is served without waking the embedder (no worker spawn, no
+  network round trip); keys include the embedder identity, so a changed model
+  never serves stale vectors. Bounded (20,000 rows / 256 MiB, LRU) and reported in
+  `leindex_analyze mode=diagnostics`. Query embeddings only; index-time neural
+  reuse is the existing global embed cache.
 
 The retrieval quality claims are gated by a deterministic benchmark —
 internal fixtures plus a vendored subset of the CoSQA (ACL 2021)
@@ -191,7 +198,8 @@ directly. Zed, Cursor, VS Code, and Claude Code configuration snippets are in
 `~/.leindex`), `LEINDEX_PORT` (HTTP server, default 47500), `ORT_DYLIB_PATH`
 (ONNX Runtime override). Memory rails — `LEINDEX_WORKER_MAX_RSS_MB` (default
 10240), `LEINDEX_WORKER_MIN_AVAILABLE_MB` (default 2048),
-`LEINDEX_REGISTRY_MAX_HEAP_MB` (default 1536) — plus the escape hatches
+`LEINDEX_REGISTRY_MAX_HEAP_MB` (default 1536), the Engram bounds
+`LEINDEX_ENGRAM_MAX_ENTRIES` (20000) and `LEINDEX_ENGRAM_MAX_MB` (256) — plus the escape hatches
 `LEINDEX_CLI_SHUTDOWN_DAEMON`, `LEINDEX_ALLOW_MULTIPLE_EMBED_DAEMONS`, and
 the `LEINDEX_FEATURE_*` rollout kills documented in
 [`docs/NEURAL_SETUP.md`](https://github.com/scooter-lacroix/LeIndex/blob/master/docs/NEURAL_SETUP.md).

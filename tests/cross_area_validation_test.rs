@@ -36,6 +36,30 @@ fn read_file(rel: &str) -> String {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
+/// Read a Rust module as a whole: `rel` plus every file of its child-module
+/// directory (`foo.rs` -> `foo/*.rs`). These tests assert that behaviour exists
+/// in a module, not which file of that module holds it, so they must survive a
+/// module being split into child files.
+fn read_module(rel: &str) -> String {
+    let mut text = read_file(rel);
+    let dir = repo_root().join(rel.trim_end_matches(".rs"));
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut files: Vec<_> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .collect();
+        files.sort();
+        for file in files {
+            text.push('\n');
+            text.push_str(
+                &std::fs::read_to_string(&file)
+                    .unwrap_or_else(|e| panic!("failed to read {}: {e}", file.display())),
+            );
+        }
+    }
+    text
+}
+
 // ============================================================================
 // VAL-CROSS-007 / VAL-CROSS-016:
 // No-ORT TF-IDF fallback works with a clear, consistent, actionable notice.
@@ -51,7 +75,7 @@ mod no_ort_fallback_notice {
     /// gracefully.
     #[test]
     fn worker_runtime_emits_actionable_notice_when_ort_missing() {
-        let src = read_file("src/embed/runtime.rs");
+        let src = read_module("src/embed/runtime.rs");
 
         // Locate the InitResult::NotFound branch (where the worker emits the
         // notice). The surrounding code MUST log an error naming the searched

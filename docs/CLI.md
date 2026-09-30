@@ -648,6 +648,10 @@ leindex dashboard --port 3001
 | `LEINDEX_PORT` | 47500 | Override default port for `serve` command |
 | `LEINDEX_DASHBOARD_DIR` | `~/.leindex/dashboard` | Override dashboard asset directory |
 | `RUST_LOG` | info | Logging level (debug, trace, warn, error) |
+| `LEINDEX_FEATURE_ENGRAM` | off | Enable the Engram query-embedding phrase-book (see [MCP.md](MCP.md#engram-query-embedding-phrase-book)) |
+| `LEINDEX_ENGRAM_DIR` | `~/.leindex/engram` | Engram table location (`$LEINDEX_HOME/engram` when `LEINDEX_HOME` is set) |
+| `LEINDEX_ENGRAM_MAX_ENTRIES` | 20000 | Engram row limit (LRU eviction) |
+| `LEINDEX_ENGRAM_MAX_MB` | 256 | Engram size limit in MiB (LRU eviction) |
 
 ### Using Environment Variables
 

@@ -343,6 +343,24 @@ Poll by calling `leindex_index` again with the same project and
 `failed`. A failed attempt leaves the last published generation available and
 reports `last_error`; it is never replaced by a detached, timed-out build.
 
+**Engram counters.** The response also carries an `engram` object (also under
+`leindex_analyze mode=diagnostics`), reporting the query phrase-book described in
+[Engram](#engram-query-embedding-phrase-book) plus the index-time embed cache:
+
+```json
+"engram": {
+  "enabled": true, "open": true, "root": "/home/user/.leindex/engram",
+  "format_version": 1,
+  "hits": 12, "memory_hits": 9, "misses": 3, "puts": 3, "evictions": 0, "corrupt_rows": 0,
+  "entries": 41, "bytes": 168960, "max_entries": 20000, "max_bytes": 268435456,
+  "embed_cache": { "hits": 0, "misses": 0 }
+}
+```
+
+Counters are per process (for the daemon: since it started); `entries` and
+`bytes` are read from disk. With the flag off, `enabled` is `false` and the
+counters are zero.
+
 ---
 
 ### `leindex_search`
@@ -1825,6 +1843,36 @@ Choose your budget based on the task:
 - Responses include a `truncated` flag when the budget was exhausted
 - Higher budgets don't slow down the query — they only increase response size
 
+### Engram (query embedding phrase-book)
+
+Opt-in (`LEINDEX_FEATURE_ENGRAM=1`, default off). A neural query embedding is a
+pure function of the embedder and the exact query text, so it does not depend on
+the project, the index or any generation. Engram stores those vectors in a
+persistent, content-addressed table and serves a repeated query without waking
+the embedder (no worker spawn, no model digest, no network round trip).
+
+- **Key:** `blake3(embedder identity, dimension, exact query text)`. The identity
+  for the local ONNX embedder is model name + dimension + size and modification
+  time of the resolved model and tokenizer files; for a remote provider it is
+  provider + model + endpoint + dimension (never credentials). Replacing the
+  model produces a different key, so stale vectors are never served. If the
+  identity cannot be established the phrase-book is bypassed.
+- **Storage:** `~/.leindex/engram/` (`$LEINDEX_HOME/engram`, or
+  `$LEINDEX_ENGRAM_DIR`), user-level and shared by every project and branch. One
+  immutable row per entry (`<2 hex>/<64 hex>.vec`), written by staging + atomic
+  rename, verified against a blake3 checksum on every read; a corrupt or
+  truncated row is deleted and counted as a miss. A small in-process front serves
+  hot repeats without touching the disk.
+- **Bounds:** 20,000 rows / 256 MiB by default (`LEINDEX_ENGRAM_MAX_ENTRIES`,
+  `LEINDEX_ENGRAM_MAX_MB`); least recently used rows are evicted down to 90% of
+  either limit. Only real embedder output is stored, never a TF-IDF fallback.
+- **Scope:** query embeddings only. Index-time neural embeddings are reused by the
+  existing global embed cache (`LEINDEX_FEATURE_GLOBAL_EMBED_CACHE`, on by
+  default); ranked results are served by the existing result cache. Neither is
+  duplicated here, and the TF-IDF signal is unaffected.
+- **Determinism:** search results are unchanged; a cached vector is byte-identical
+  to the one the embedder produced.
+
 ### Diagnostics and Health Monitoring
 
 The `leindex_diagnostics` tool returns enriched health information:
@@ -1940,5 +1988,5 @@ Or via the health endpoint:
 
 ```bash
 curl http://localhost:3000/health
-# {"status":"ok","service":"leindex","version":"1.9.5"}
+# {"status":"ok","service":"leindex","version":"2.0.0"}
 ```
