@@ -645,14 +645,18 @@ mod tests {
         child.kill().ok();
         child.wait().ok();
 
-        // After killing, a re-scan should return total == 0 (or the child
-        // has been reaped by the OS).
+        // After killing, OUR child must be gone from the process table.
+        // Asserting a global total==0 races with sibling tests' transient
+        // children (chrono_now's `date`, git probes) under parallel test
+        // threads, so scope the assertion to the child we spawned.
         std::thread::sleep(std::time::Duration::from_millis(100));
+        let child_pid = child.id();
+        let child_gone = !std::path::Path::new(&format!("/proc/{child_pid}")).exists();
         let tree_after = count_descendants(std::process::id()).unwrap();
-        assert_eq!(
-            tree_after.total, 0,
-            "after killing the child, total should be 0, got {}",
-            tree_after.total
+        assert!(
+            child_gone && !tree_after.by_name.contains_key("sleep"),
+            "after killing the child (pid {child_pid}), it must no longer be a descendant: {:?}",
+            tree_after.by_name
         );
     }
 
