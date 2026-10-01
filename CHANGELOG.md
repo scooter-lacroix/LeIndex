@@ -7,6 +7,24 @@ All notable changes to the LeIndex project are documented in this file.
 Reconstruction and continuation of the tool layer after the local working tree
 was lost; everything below is on `v2.0.0` and covered by tests.
 
+### Default model: fine-tuned int4 Qwen3 embedder from a pinned public repo
+
+- `leindex setup` now provisions the code fine-tune
+  [ScooterLacroix/qwen3-embed-0.6b-int4-code](https://huggingface.co/ScooterLacroix/qwen3-embed-0.6b-int4-code)
+  (revision-pinned at `2228b18e`) instead of the upstream export. The download
+  set is the complete external-data pair — graph shell
+  (`qwen3-embed-0.6b-dynamic-uint8.onnx`, ~859 KiB) plus weights sibling
+  (`.onnx_data`, ~316 MiB) plus tokenizer — installed flat so external data
+  resolves; the repo hosts no `config.json` and none is required.
+- Presence/verification treat the shell + weights as ONE installable unit: a
+  shell without its `.onnx_data` (the classic half-copied install) or vice
+  versa is incomplete, the size floor applies to the pair, and tampering with
+  either file fails checksum verification.
+- Combined with the KV-cache input fix (the export declares 56
+  `past_key_values.*` inputs the worker now feeds), a fresh `setup --neural`
+  downloads, installs, and passes a real 1024-dim embedding smoke test against
+  this model.
+
 ### Four tools instead of twenty
 
 - `tools/list` advertises `leindex_explore` (`mode`), `leindex_analyze` (`mode`),

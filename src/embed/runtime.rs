@@ -82,8 +82,12 @@ mod rerank;
 
 #[cfg(feature = "onnx")]
 fn extract_output_tensor_f32(value: &ort::value::DynValue) -> Result<Vec<f32>, String> {
-    // Quantization parameters for the electroglyph/Qwen3-Embedding-0.6B-onnx-uint8
-    // model. The model applies QuantizeLinear with these constants to its
+    // Quantization parameters carried over from the upstream
+    // electroglyph/Qwen3-Embedding-0.6B-onnx-uint8 export. The default model
+    // (ScooterLacroix/qwen3-embed-0.6b-int4-code fine-tune) emits a plain f32
+    // last_hidden_state and never hits this branch; the constants stay for
+    // outputs from the upstream export. The model applies
+    // QuantizeLinear with these constants to its
     // L2-normalized sentence_embedding output. Dequantization formula:
     //   float_value = (uint8_value - zero_point) * scale
     const UINT8_DEQUANT_SCALE: f32 = 0.002_745_098;

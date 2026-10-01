@@ -42,6 +42,12 @@ pub const MODEL_ONNX_FILENAME: &str = "qwen3-embed-0.6b.onnx";
 /// Dynamic-batch ONNX export used by CPU, CUDA, and MIGraphX providers.
 pub const DYNAMIC_MODEL_ONNX_FILENAME: &str = "qwen3-embed-0.6b-dynamic-uint8.onnx";
 
+/// External-weights sibling of [`DYNAMIC_MODEL_ONNX_FILENAME`]. The default
+/// model ships as a graph shell + external-data pair; the shell is useless
+/// without this file sitting next to it (the ONNX loader resolves external
+/// data by relative filename).
+pub const DYNAMIC_MODEL_DATA_FILENAME: &str = "qwen3-embed-0.6b-dynamic-uint8.onnx_data";
+
 /// File listing within the bundled checksum manifest. The trailing
 /// `(local_filename, remote_subpath)` pairs let the local layout (flat
 /// `~/.leindex/models/qwen3-embed-0.6b.onnx`) diverge from the HuggingFace

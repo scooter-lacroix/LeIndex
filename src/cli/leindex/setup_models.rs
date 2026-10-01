@@ -7,13 +7,21 @@ fn next_model_install_id() -> u64 {
     MODEL_INSTALL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
 }
 
-pub(super) const QWEN3_ONNX_REPOSITORY: &str = "electroglyph/Qwen3-Embedding-0.6B-onnx-uint8";
-pub(super) const QWEN3_ONNX_REVISION: &str = "1596611504ff0d92a24cb3ed7403a9f5d5f9a13c";
-pub(super) const QWEN3_REMOTE_MODEL: &str = "dynamic_uint8.onnx";
+pub(super) const QWEN3_ONNX_REPOSITORY: &str = "ScooterLacroix/qwen3-embed-0.6b-int4-code";
+/// Pinned commit of the fine-tuned int4 model repo. Pinning keeps every
+/// install byte-identical (the repo also hosts research artifacts and an
+/// alternative `variants/` build we do not want by accident).
+pub(super) const QWEN3_ONNX_REVISION: &str = "2228b18ed8edce562fcfe88fa99fcf29aba2fef0";
+/// Remote paths are under `onnx/` in the repo; `hf download` preserves the
+/// subdirectory in the staging dir, so the install step flattens
+/// `onnx/<name>` → `<model_dir>/<name>` (external weights must sit next to
+/// the graph shell).
+pub(super) const QWEN3_REMOTE_MODEL: &str = "onnx/qwen3-embed-0.6b-dynamic-uint8.onnx";
+pub(super) const QWEN3_REMOTE_DATA: &str = "onnx/qwen3-embed-0.6b-dynamic-uint8.onnx_data";
 pub(super) const QWEN3_LOCAL_MODEL: &str =
     crate::cli::leindex::model_download::DYNAMIC_MODEL_ONNX_FILENAME;
 pub(super) const QWEN3_MODEL_FILES: &[&str] =
-    &[QWEN3_REMOTE_MODEL, "tokenizer.json", "config.json"];
+    &[QWEN3_REMOTE_MODEL, QWEN3_REMOTE_DATA, "onnx/tokenizer.json"];
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ModelDownloadProfile {
@@ -82,16 +90,25 @@ pub(super) fn model_assets_present(model_dir: &Path, model_filename: &str) -> bo
 }
 
 pub(super) fn dynamic_model_assets_present(model_dir: &Path) -> bool {
-    const MIN_MODEL_BYTES: u64 = 100 * 1024 * 1024;
+    use crate::cli::leindex::model_download::{
+        DYNAMIC_MODEL_DATA_FILENAME, DYNAMIC_MODEL_ONNX_FILENAME,
+    };
 
-    let model = model_dir.join(crate::cli::leindex::model_download::DYNAMIC_MODEL_ONNX_FILENAME);
-    if std::fs::metadata(model)
-        .map(|metadata| metadata.len() < MIN_MODEL_BYTES)
-        .unwrap_or(true)
-    {
+    // The model ships as a graph shell (~859 KiB) + external-weights sibling
+    // (~316 MiB). The size floor applies to the PAIR: a shell without its
+    // .onnx_data is the classic half-copied install (the loader fails to
+    // resolve external data), and a lone .onnx_data is a deleted shell.
+    const MIN_PAIR_BYTES: u64 = 100 * 1024 * 1024;
+    let shell = std::fs::metadata(model_dir.join(DYNAMIC_MODEL_ONNX_FILENAME))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let data = std::fs::metadata(model_dir.join(DYNAMIC_MODEL_DATA_FILENAME))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if shell == 0 || data == 0 || shell + data < MIN_PAIR_BYTES {
         return false;
     }
-    ["tokenizer.json", "config.json"].iter().all(|file| {
+    ["tokenizer.json"].iter().all(|file| {
         std::fs::metadata(model_dir.join(file))
             .map(|metadata| metadata.len() > 0)
             .unwrap_or(false)
@@ -149,12 +166,19 @@ pub(super) fn model_checksum_status_for_name(model_name: &str) -> ModelChecksumS
     };
 
     if model_filename == DYNAMIC_MODEL_ONNX_FILENAME && status == ModelChecksumStatus::Ok {
-        let metadata_verified = ["tokenizer.json", "config.json"].iter().all(|file| {
-            matches!(
-                check_file_against_manifest(&model_dir.join(file), &manifest),
-                Ok(CheckResult::Verified)
-            )
-        });
+        use crate::cli::leindex::model_download::DYNAMIC_MODEL_DATA_FILENAME;
+        // The installable unit is the shell + external-weights pair + tokenizer
+        // (the fine-tuned repo hosts no config.json; none is required at
+        // runtime — the tokenizer carries the vocabulary).
+        let metadata_verified =
+            [DYNAMIC_MODEL_DATA_FILENAME, "tokenizer.json"]
+                .iter()
+                .all(|file| {
+                    matches!(
+                        check_file_against_manifest(&model_dir.join(file), &manifest),
+                        Ok(CheckResult::Verified)
+                    )
+                });
         if !metadata_verified {
             return ModelChecksumStatus::Unknown;
         }
@@ -248,14 +272,20 @@ pub(super) fn profile_assets_verified(model_dir: &Path, profile: ModelDownloadPr
         return false;
     }
     let manifest = parse_checksums(&contents);
-    [profile.local_model, "tokenizer.json", "config.json"]
-        .iter()
-        .all(|file| {
-            matches!(
-                check_file_against_manifest(&model_dir.join(file), &manifest),
-                Ok(CheckResult::Verified)
-            )
-        })
+    // Installable unit: graph shell + external-weights sibling + tokenizer.
+    // The fine-tuned repo hosts no config.json, so none is verified here.
+    [
+        profile.local_model,
+        crate::cli::leindex::model_download::DYNAMIC_MODEL_DATA_FILENAME,
+        "tokenizer.json",
+    ]
+    .iter()
+    .all(|file| {
+        matches!(
+            check_file_against_manifest(&model_dir.join(file), &manifest),
+            Ok(CheckResult::Verified)
+        )
+    })
 }
 
 pub(super) fn install_downloaded_model_file(src: &Path, dst: &Path) -> Result<(), SetupError> {
@@ -346,7 +376,13 @@ pub(super) fn generate_profile_checksum_manifest(
     use crate::cli::leindex::model_download::sha256_of_file;
 
     let mut manifest = format!("# source: {}@{}\n", profile.repository, profile.revision);
-    for file in [profile.local_model, "tokenizer.json", "config.json"] {
+    // The fine-tuned model repo hosts no config.json; the manifest covers the
+    // graph shell, its external-weights sibling, and the tokenizer.
+    for file in [
+        profile.local_model,
+        crate::cli::leindex::model_download::DYNAMIC_MODEL_DATA_FILENAME,
+        "tokenizer.json",
+    ] {
         let path = model_dir.join(file);
         let hash = sha256_of_file(&path)
             .map_err(|e| SetupError::Io(format!("Cannot checksum {}: {}", path.display(), e)))?;
@@ -417,14 +453,26 @@ pub(super) fn ensure_hugging_face_model_present(
 
     // Install within a closure so the staging dir is cleaned on every path
     // (success or install failure) before the error, if any, propagates.
+    // `hf download` preserves the repo's `onnx/` subdirectory inside the
+    // staging dir, so the SOURCE keeps its remote path. Only the DESTINATION
+    // is flattened to the model-dir layout (external weights MUST land as a
+    // sibling of the graph shell).
     let install_result = (|| -> Result<(), SetupError> {
+        let local_name = |remote: &str| -> PathBuf {
+            PathBuf::from(remote.rsplit('/').next().unwrap_or(remote))
+        };
         install_downloaded_model_file(
             &staging.join(profile.remote_model),
-            &model_dir.join(profile.local_model),
+            &model_dir.join(local_name(profile.remote_model)),
         )?;
-        for file in ["tokenizer.json", "config.json"] {
-            install_downloaded_model_file(&staging.join(file), &model_dir.join(file))?;
-        }
+        install_downloaded_model_file(
+            &staging.join(QWEN3_REMOTE_DATA),
+            &model_dir.join(local_name(QWEN3_REMOTE_DATA)),
+        )?;
+        install_downloaded_model_file(
+            &staging.join("onnx/tokenizer.json"),
+            &model_dir.join("tokenizer.json"),
+        )?;
         Ok(())
     })();
     let _ = std::fs::remove_dir_all(&staging);
