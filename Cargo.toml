@@ -246,7 +246,15 @@ bounded-scheduler = [
 
 # Turso/libsql remote storage support (opt-in, off by default)
 # Use with: cargo build --features "full turso"
-turso = ["dep:libsql", "dep:rusqlite_migration"]
+#
+# The `libsql` driver crate was removed as an (unused) dependency: no module
+# referenced its API — `src/storage/turso_config.rs` models Turso configuration
+# and stores through the crate's own `rusqlite`-backed `Storage`. Keeping the
+# dependency pulled libsql -> tonic 0.11 -> hyper 0.14 -> h2 0.3.x, whose only
+# patched line is h2 >= 0.4.16 (RUSTSEC-2026-0258), into every
+# `--all-features` dependency scan even though no code could reach it.
+# Re-add the driver together with the first real Turso connection implementation.
+turso = ["dep:rusqlite_migration"]
 
 # Neural embeddings with ONNX Runtime and tokenizers.
 # Opt-in feature: cargo build --features onnx (also installs the worker binary).
@@ -364,7 +372,7 @@ flate2 = { version = "1.1", optional = true, default-features = true }
 
 # Storage feature dependencies
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
-libsql = { version = "0.5.0", optional = true }
+# NOTE: `libsql` is intentionally absent — see the `turso` feature comment above.
 rusqlite_migration = { version = "1.0.0", optional = true }
 
 # Search feature dependencies
