@@ -5,7 +5,7 @@ use super::helpers::{
     validate_file_within_project, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
-use crate::cli::registry::ProjectRegistry;
+use crate::cli::registry::{ProjectHandle, ProjectRegistry};
 use crate::edit::{ResolvedEditChange, atomic_write_with_expected_async};
 use crate::validation::validation_to_json;
 use serde_json::Value;
@@ -72,6 +72,123 @@ async fn ensure_write_succeeded(
         "Edit rejected: file content changed on disk since preview was generated. \
         Please call LeIndex [Edit Preview] again (tool: leindex.edit-preview).",
     ))
+}
+
+/// Wrap a preview payload in the explicit dry-run envelope. Delegating raw made
+/// the apply renderer read the preview-shaped payload (no `success` field) as
+/// "Edit apply failed" with no detail — a dry-run that reports failure without a
+/// reason is worse than none (N-09).
+fn dry_run_envelope(preview: Value) -> Value {
+    let mut envelope = serde_json::json!({
+        "success": true,
+        "dry_run": true,
+        "changes_applied": 0,
+        "message": "Dry run: no changes written. See `preview` for the diff and validation.",
+    });
+    if let (Some(obj), Some(preview_obj)) = (envelope.as_object_mut(), preview.as_object()) {
+        for (key, value) in preview_obj {
+            if key == "content" || key == "isError" {
+                continue;
+            }
+            obj.insert(key.clone(), value.clone());
+        }
+    }
+    envelope
+}
+
+/// Resolve the request's file path and project handle in one step.
+async fn resolve_request_target(
+    registry: &Arc<ProjectRegistry>,
+    args: &Value,
+) -> Result<(String, Option<String>, ProjectHandle), JsonRpcError> {
+    let (file_path, project_path_arg, provided_token) = apply_request_args(args)?;
+    let handle = registry.get_or_create(project_path_arg.as_deref()).await?;
+    Ok((file_path, provided_token, handle))
+}
+
+/// Best-effort PDG load. Applying a plain text edit must never be blocked by a
+/// degraded/unavailable index: the atomic write + expected-content guard is the
+/// safety net, and impact/validation simply report as unavailable when no PDG
+/// can be loaded.
+async fn load_pdg_best_effort(handle: &ProjectHandle) -> bool {
+    let mut guard = handle.write().await;
+    match guard.ensure_pdg_loaded_graph_only() {
+        Ok(()) => guard.pdg().is_some(),
+        Err(error) => {
+            tracing::warn!(
+                project = %guard.project_path().display(),
+                "PDG unavailable for edit-apply; continuing without PDG impact analysis: {error}"
+            );
+            false
+        }
+    }
+}
+
+/// Resolve the target file against the project root and read the storage path.
+async fn resolve_paths(
+    handle: &ProjectHandle,
+    file_path: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), JsonRpcError> {
+    let guard = handle.read().await;
+    let canonical = validate_file_within_project(file_path, guard.project_path())?;
+    Ok((canonical, guard.storage_path().to_path_buf()))
+}
+
+/// Wrap a response in the live project metadata.
+async fn wrap_with_current_meta(handle: &ProjectHandle, response: Value) -> Value {
+    let guard = handle.read().await;
+    wrap_with_meta(response, &guard)
+}
+
+/// Flag a response that was produced without a loaded PDG: the edit is durable,
+/// but impact analysis and validation were unavailable for it.
+fn annotate_degraded_pdg(response: &mut Value) {
+    let Some(object) = response.as_object_mut() else {
+        return;
+    };
+    object.insert("pdg_status".to_string(), serde_json::json!("not_loaded"));
+    object.insert(
+        "warning".to_string(),
+        serde_json::json!(
+            "Index unavailable — edit applied with file-level safety only \
+            (no PDG impact analysis or validation). Reindex (LeIndex [Index] with \
+            force_reindex=true) to restore full editing safeguards."
+        ),
+    );
+}
+
+/// Index maintenance AFTER the response value exists. One-shot CLI processes run
+/// it inline (the process exits once the response is printed, so a spawned task
+/// would be killed mid-write); the long-running MCP server/daemon spawns it so
+/// the caller's latency is exactly the edit, never the reindex.
+async fn refresh_index_after_edit(registry: &Arc<ProjectRegistry>, handle: &ProjectHandle) {
+    if registry.is_one_shot() {
+        let mut guard = handle.write().await;
+        if let Err(e) = guard.incremental_reindex_from_watcher() {
+            tracing::warn!("Failed to refresh index after edit-apply: {}", e);
+        }
+        return;
+    }
+    let registry = Arc::clone(registry);
+    let handle = Arc::clone(handle);
+    tokio::spawn(async move {
+        // Serialized behind the project write lock: concurrent
+        // edit-applies queue their refreshes instead of racing.
+        let mut guard = handle.write().await;
+        let root = guard.project_path().to_path_buf();
+        if let Err(e) = guard.incremental_reindex_from_watcher() {
+            tracing::warn!(
+                project = %root.display(),
+                "Background refresh after edit-apply failed: {e}"
+            );
+        }
+        drop(guard);
+        registry.invalidate_stale_cache(&root).await;
+        tracing::debug!(
+            project = %root.display(),
+            "Background refresh after edit-apply complete"
+        );
+    });
 }
 
 fn validate_edit(
@@ -259,57 +376,20 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
         let dry_run = extract_bool(&args, "dry_run", false);
 
         if dry_run {
-            // Delegate to preview, but wrap the preview payload in an
-            // explicit dry-run envelope. Delegating raw made the apply
-            // renderer read the preview-shaped payload (no `success` field)
-            // as "Edit apply failed" with no detail — a dry-run that
-            // reports failure without a reason is worse than none (N-09).
+            // Delegate to preview, but wrap the preview payload in an explicit
+            // dry-run envelope (see `dry_run_envelope`).
             let preview = EditPreviewHandler.execute(registry, args).await?;
-            let mut envelope = serde_json::json!({
-                "success": true,
-                "dry_run": true,
-                "changes_applied": 0,
-                "message": "Dry run: no changes written. See `preview` for the diff and validation.",
-            });
-            if let (Some(obj), Some(preview_obj)) = (envelope.as_object_mut(), preview.as_object())
-            {
-                for (key, value) in preview_obj {
-                    if key == "content" || key == "isError" {
-                        continue;
-                    }
-                    obj.insert(key.clone(), value.clone());
-                }
-            }
-            return Ok(envelope);
+            return Ok(dry_run_envelope(preview));
         }
 
-        let (file_path, project_path_arg, provided_token) = apply_request_args(&args)?;
-        let handle = registry.get_or_create(project_path_arg.as_deref()).await?;
+        let (file_path, provided_token, handle) = resolve_request_target(registry, &args).await?;
 
-        // 0. Best-effort PDG load. Applying a plain text edit must never be
-        // blocked by a degraded/unavailable index: the atomic write + expected-
-        // content guard is the safety net, and impact/validation simply report
-        // as unavailable when no PDG can be loaded.
-        let pdg_loaded = {
-            let mut guard = handle.write().await;
-            match guard.ensure_pdg_loaded_graph_only() {
-                Ok(()) => guard.pdg().is_some(),
-                Err(error) => {
-                    tracing::warn!(
-                        project = %guard.project_path().display(),
-                        "PDG unavailable for edit-apply; continuing without PDG impact analysis: {error}"
-                    );
-                    false
-                }
-            }
-        };
+        // 0. Best-effort PDG load: applying a plain text edit must never be
+        // blocked by a degraded/unavailable index.
+        let pdg_loaded = load_pdg_best_effort(&handle).await;
 
         // 1. Resolve path and check cache (avoid awaiting while holding lock)
-        let (canonical_path, storage_path) = {
-            let guard = handle.read().await;
-            let canonical = validate_file_within_project(&file_path, guard.project_path())?;
-            (canonical, guard.storage_path().to_path_buf())
-        };
+        let (canonical_path, storage_path) = resolve_paths(&handle, &file_path).await?;
 
         let cached_entry = GLOBAL_EDIT_CACHE.get(&storage_path, &canonical_path).await;
 
@@ -328,15 +408,12 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
             GLOBAL_EDIT_CACHE
                 .clear(&storage_path, &canonical_path)
                 .await;
-            let guard = handle.read().await;
-            return Ok(wrap_with_meta(
-                serde_json::json!({
-                    "success": true,
-                    "changes_applied": 0,
-                    "message": "No changes to apply (content identical)"
-                }),
-                &guard,
-            ));
+            let response = serde_json::json!({
+                "success": true,
+                "changes_applied": 0,
+                "message": "No changes to apply (content identical)"
+            });
+            return Ok(wrap_with_current_meta(&handle, response).await);
         }
 
         let validation_json = {
@@ -392,55 +469,15 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
             validation_json,
         );
         if !pdg_loaded {
-            if let Some(obj) = response.as_object_mut() {
-                obj.insert("pdg_status".to_string(), serde_json::json!("not_loaded"));
-                obj.insert(
-                    "warning".to_string(),
-                    serde_json::json!(
-                        "Index unavailable — edit applied with file-level safety only \
-                        (no PDG impact analysis or validation). Reindex (LeIndex [Index] with \
-                        force_reindex=true) to restore full editing safeguards."
-                    ),
-                );
-            }
+            annotate_degraded_pdg(&mut response);
         }
 
-        let guard = handle.read().await;
-        let response = wrap_with_meta(response, &guard);
-        drop(guard);
+        let response = wrap_with_current_meta(&handle, response).await;
 
-        // 7. Index maintenance AFTER the response value exists. One-shot
-        // CLI processes run it inline (the process exits once the response
-        // is printed, so a spawned task would be killed mid-write); the
-        // long-running MCP server/daemon spawns it so the caller's latency
-        // is exactly the edit, never the reindex.
-        if registry.is_one_shot() {
-            let mut guard = handle.write().await;
-            if let Err(e) = guard.incremental_reindex_from_watcher() {
-                tracing::warn!("Failed to refresh index after edit-apply: {}", e);
-            }
-        } else {
-            let registry = Arc::clone(registry);
-            let handle = Arc::clone(&handle);
-            tokio::spawn(async move {
-                // Serialized behind the project write lock: concurrent
-                // edit-applies queue their refreshes instead of racing.
-                let mut guard = handle.write().await;
-                let root = guard.project_path().to_path_buf();
-                if let Err(e) = guard.incremental_reindex_from_watcher() {
-                    tracing::warn!(
-                        project = %root.display(),
-                        "Background refresh after edit-apply failed: {e}"
-                    );
-                }
-                drop(guard);
-                registry.invalidate_stale_cache(&root).await;
-                tracing::debug!(
-                    project = %root.display(),
-                    "Background refresh after edit-apply complete"
-                );
-            });
-        }
+        // 7. Index maintenance AFTER the response value exists: the caller
+        // receives the response now, and the refresh never rides on its
+        // latency (see `refresh_index_after_edit`).
+        refresh_index_after_edit(registry, &handle).await;
 
         Ok(response)
     }

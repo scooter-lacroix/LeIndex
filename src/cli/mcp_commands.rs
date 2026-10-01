@@ -17,88 +17,113 @@ pub(super) async fn cmd_tools_impl(
     project: Option<PathBuf>,
 ) -> AnyhowResult<()> {
     match command {
-        ToolCommands::List { verbose } => {
-            print!("{}", crate::cli::mcp::grouped::cli_tools_table(verbose));
-            println!(
-                "\nRun `leindex tools inspect <tool>` for arguments, or `leindex tools run <tool> --set mode=<branch> ...`."
-            );
-            Ok(())
-        }
-        ToolCommands::Inspect { name } => {
-            if let Some(group) = crate::cli::mcp::grouped::group_by_name(&name) {
-                println!(
-                    "{}\n{}\n",
-                    group.title,
-                    crate::cli::mcp::grouped::full_description(group)
-                );
-                println!("Schema:");
-                print_json_value(&crate::cli::mcp::grouped::group_schema_oneof(
-                    group,
-                    &all_tool_handlers(),
-                ))?;
-                return Ok(());
-            }
-            let handler = find_tool_handler(&name).ok_or_else(|| tool_not_found(&name))?;
-            print_tool_help(&handler);
-            Ok(())
-        }
-        ToolCommands::Schema { name } => {
-            if let Some(group) = crate::cli::mcp::grouped::group_by_name(&name) {
-                print_json_value(&crate::cli::mcp::grouped::group_schema_oneof(
-                    group,
-                    &all_tool_handlers(),
-                ))?;
-                return Ok(());
-            }
-            let handler = find_tool_handler(&name).ok_or_else(|| tool_not_found(&name))?;
-            print_json_value(&handler.argument_schema())?;
-            Ok(())
-        }
+        ToolCommands::List { verbose } => tools_list(verbose),
+        ToolCommands::Inspect { name } => tools_inspect(&name),
+        ToolCommands::Schema { name } => tools_schema(&name),
         ToolCommands::Run {
             name,
             args_json,
             set,
-        } => {
-            let parsed_args = parse_tool_args_json(&args_json)?;
-            let mut args = merge_tool_args(parsed_args.clone(), &set, project.as_ref())?;
-            // One-shot CLI mode: hydration happens inside this process
-            // (~1-2 s), which the 250 ms resident-server default budget can
-            // never cover — every enrichment silently downgraded to empty.
-            // Raise the default when the caller didn't choose one.
-            if !args
-                .as_object()
-                .is_some_and(|object| object.contains_key("max_latency_ms"))
-            {
-                if let Some(object) = args.as_object_mut() {
-                    object.insert("max_latency_ms".to_string(), serde_json::json!(5000));
-                }
-            }
-            // The four public tools pick their operation with `action`
-            // (`--set action=text`); resolve to the underlying tool so the
-            // CLI renders exactly what the MCP transport does.
-            let (name, args) = crate::cli::mcp::grouped::resolve_call(&name, args)
-                .map_err(|error| anyhow::anyhow!("{}", error))?;
-            let mut parsed_args = parsed_args;
-            if let Some(object) = parsed_args.as_object_mut() {
-                object.remove("action");
-            }
-            let value = execute_tool_handler(&name, args, project).await?;
-
-            // Use the unified renderer — same path used by the MCP transport
-            // so CLI and LLM-visible payloads stay in lock-step. The
-            // freshness footer goes to stderr so stdout remains parseable
-            // JSON for tools that emit raw JSON.
-            let (formatted, footer) =
-                crate::cli::mcp::output::render_tool_output_split(&name, &value, &parsed_args);
-
-            println!("{}", formatted);
-            if let Some(footer) = footer {
-                eprintln!("{}", footer);
-            }
-            Ok(())
-        }
+        } => tools_run(&name, &args_json, &set, project).await,
     }
 }
+
+/// `tools list` — the router table plus a pointer to inspect/run.
+fn tools_list(verbose: bool) -> AnyhowResult<()> {
+    print!("{}", crate::cli::mcp::grouped::cli_tools_table(verbose));
+    println!(
+        "\nRun `leindex tools inspect <tool>` for arguments, or `leindex tools run <tool> --set mode=<branch> ...`."
+    );
+    Ok(())
+}
+
+/// Resolve a branch handler by name, or fail with the standard not-found error.
+fn resolve_tool(name: &str) -> AnyhowResult<ToolHandler> {
+    find_tool_handler(name).ok_or_else(|| tool_not_found(name))
+}
+
+/// `tools inspect` — for a router: title, description and the oneOf schema of
+/// its branches; for a branch: the handler's argument help.
+fn tools_inspect(name: &str) -> AnyhowResult<()> {
+    if let Some(group) = crate::cli::mcp::grouped::group_by_name(name) {
+        println!(
+            "{}\n{}\n",
+            group.title,
+            crate::cli::mcp::grouped::full_description(group)
+        );
+        println!("Schema:");
+        return print_json_value(&crate::cli::mcp::grouped::group_schema_oneof(
+            group,
+            &all_tool_handlers(),
+        ));
+    }
+    print_tool_help(&resolve_tool(name)?);
+    Ok(())
+}
+
+/// `tools schema` — the raw JSON argument schema (routers print their oneOf form).
+fn tools_schema(name: &str) -> AnyhowResult<()> {
+    if let Some(group) = crate::cli::mcp::grouped::group_by_name(name) {
+        return print_json_value(&crate::cli::mcp::grouped::group_schema_oneof(
+            group,
+            &all_tool_handlers(),
+        ));
+    }
+    print_json_value(&resolve_tool(name)?.argument_schema())
+}
+
+/// Raise `max_latency_ms` to the one-shot default when the caller left it unset.
+///
+/// One-shot CLI mode: hydration happens inside this process (~1-2 s), which the
+/// 250 ms resident-server default budget can never cover — every enrichment
+/// silently downgraded to empty. No-op for non-object args.
+fn apply_default_latency_budget(args: &mut Value) {
+    let Some(object) = args.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("max_latency_ms") {
+        return;
+    }
+    object.insert("max_latency_ms".to_string(), serde_json::json!(5000));
+}
+
+/// Print a tool result through the unified renderer — same path used by the MCP
+/// transport so CLI and LLM-visible payloads stay in lock-step. The freshness
+/// footer goes to stderr so stdout remains parseable JSON for tools that emit
+/// raw JSON.
+fn emit_rendered_tool_output(name: &str, value: &Value, parsed_args: &Value) -> AnyhowResult<()> {
+    let (formatted, footer) =
+        crate::cli::mcp::output::render_tool_output_split(name, value, parsed_args);
+    println!("{}", formatted);
+    if let Some(footer) = footer {
+        eprintln!("{}", footer);
+    }
+    Ok(())
+}
+
+/// `tools run` — execute one tool and emit its rendered output.
+async fn tools_run(
+    name: &str,
+    args_json: &str,
+    set: &[String],
+    project: Option<PathBuf>,
+) -> AnyhowResult<()> {
+    let parsed_args = parse_tool_args_json(args_json)?;
+    let mut args = merge_tool_args(parsed_args.clone(), set, project.as_ref())?;
+    apply_default_latency_budget(&mut args);
+    // The four public tools pick their operation with `action`
+    // (`--set action=text`); resolve to the underlying tool so the
+    // CLI renders exactly what the MCP transport does.
+    let (name, args) = crate::cli::mcp::grouped::resolve_call(name, args)
+        .map_err(|error| anyhow::anyhow!("{}", error))?;
+    let mut parsed_args = parsed_args;
+    if let Some(object) = parsed_args.as_object_mut() {
+        object.remove("action");
+    }
+    let value = execute_tool_handler(&name, args, project).await?;
+    emit_rendered_tool_output(&name, &value, &parsed_args)
+}
+
 /// MCP stdio command implementation - Run MCP server in stdio mode
 /// This mode allows AI tools to start LeIndex as a subprocess for automatic integration
 ///

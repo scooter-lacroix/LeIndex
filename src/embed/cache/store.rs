@@ -46,7 +46,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -346,6 +346,15 @@ impl ModelIndex {
     }
 }
 
+/// A candidate row for byte-budget eviction: its path plus the mtime/size
+/// needed for LRU ordering and reclaimed-byte accounting.
+#[derive(Clone)]
+struct EvictionCandidate {
+    path: PathBuf,
+    mtime: SystemTime,
+    size: u64,
+}
+
 /// User-level content-addressed global embedding cache.
 ///
 /// The cache stores embedding vectors in fixed-layout mmap-friendly row files
@@ -520,13 +529,38 @@ impl GlobalEmbeddingCache {
         }
 
         // Byte-budget enforcement: evict unreferenced rows if over budget.
-        if self.config.max_bytes > 0 {
-            let current = self.total_bytes()?;
-            if current + entry_size > self.config.max_bytes {
-                self.evict_unreferenced(current + entry_size - self.config.max_bytes)?;
-            }
-        }
+        self.enforce_byte_budget(entry_size)?;
 
+        self.publish_row(&final_path, &row_bytes)?;
+
+        // Record model digest for model_identity reporting in cache_stats().
+        let fingerprint_hex = hex_encode(&fingerprint);
+        let model_digest_hex = hex_encode(&key.model_digest);
+        self.model_index.insert(&fingerprint_hex, &model_digest_hex);
+        let _ = self.persist_model_index();
+
+        Ok(())
+    }
+
+    /// Enforce the cache byte budget before a new row of `entry_size` bytes
+    /// is written: evict oldest unreferenced rows until the projected total
+    /// fits within `max_bytes` (spec section 10.3). A limit of `0` means
+    /// unlimited and is a no-op.
+    fn enforce_byte_budget(&mut self, entry_size: u64) -> Result<(), CacheError> {
+        if self.config.max_bytes == 0 {
+            return Ok(());
+        }
+        let current = self.total_bytes()?;
+        if current + entry_size > self.config.max_bytes {
+            self.evict_unreferenced(current + entry_size - self.config.max_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Atomically publish a prepared row: staging write + `sync_all` + rename.
+    /// Cleans up the staging file when the rename is lost to a concurrent
+    /// writer or fails outright.
+    fn publish_row(&self, final_path: &Path, row_bytes: &[u8]) -> Result<(), CacheError> {
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -535,13 +569,13 @@ impl GlobalEmbeddingCache {
         let staging_path = final_path.with_extension("partial");
         {
             let file = fs::File::create(&staging_path)?;
-            let mut writer = std::io::BufWriter::new(file);
-            writer.write_all(&row_bytes)?;
+            let mut writer = BufWriter::new(file);
+            writer.write_all(row_bytes)?;
             writer.flush()?;
             writer.get_ref().sync_all()?;
         }
 
-        match fs::rename(&staging_path, &final_path) {
+        match fs::rename(&staging_path, final_path) {
             Ok(()) => {}
             Err(_) if final_path.exists() => {
                 let _ = fs::remove_file(&staging_path);
@@ -551,13 +585,6 @@ impl GlobalEmbeddingCache {
                 return Err(CacheError::Io(e));
             }
         }
-
-        // Record model digest for model_identity reporting in cache_stats().
-        let fingerprint_hex = hex_encode(&fingerprint);
-        let model_digest_hex = hex_encode(&key.model_digest);
-        self.model_index.insert(&fingerprint_hex, &model_digest_hex);
-        let _ = self.persist_model_index();
-
         Ok(())
     }
 
@@ -594,8 +621,85 @@ impl GlobalEmbeddingCache {
             return Ok(0);
         }
         // Encode up front, deduping by fingerprint and against existing rows.
+        let (encoded, skipped_oversized) = self.encode_batch_entries(entries);
+        if skipped_oversized > 0 {
+            self.telemetry
+                .record_entry_rejection(skipped_oversized * 1024);
+        }
+        if encoded.is_empty() {
+            return Ok(0);
+        }
+
+        // Byte-budget enforcement once for the whole batch.
+        let batch_bytes: u64 = encoded.iter().map(|(_, bytes, _)| bytes.len() as u64).sum();
+        self.enforce_byte_budget(batch_bytes)?;
+
+        let written = self.write_batch_rows(&encoded)?;
+
+        // Metadata + telemetry once per batch.
+        for (fingerprint, _, model_digest) in &encoded {
+            let fingerprint_hex = hex_encode(fingerprint);
+            let model_digest_hex = hex_encode(model_digest);
+            self.model_index.insert(&fingerprint_hex, &model_digest_hex);
+        }
+        let _ = self.persist_model_index();
+
+        Ok(written)
+    }
+
+    /// Write all prepared rows as staging + rename (deliberately WITHOUT the
+    /// per-row `sync_all` of [`put`]), creating each shard directory once.
+    /// Returns the number of rows published.
+    fn write_batch_rows(
+        &mut self,
+        encoded: &[([u8; 32], Vec<u8>, [u8; 32])],
+    ) -> Result<usize, CacheError> {
+        let mut created_dirs: HashSet<PathBuf> = HashSet::new();
+        let mut written = 0usize;
+        for (fingerprint, row_bytes, _) in encoded {
+            let final_path = self.row_path(fingerprint);
+            if let Some(parent) = final_path.parent() {
+                if created_dirs.insert(parent.to_path_buf()) {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+            let staging_path = final_path.with_extension("partial");
+            {
+                let file = fs::File::create(&staging_path)?;
+                let mut writer = BufWriter::new(file);
+                writer.write_all(row_bytes)?;
+                writer.flush()?;
+                // Deliberately NO sync_all: see the method doc.
+            }
+            match fs::rename(&staging_path, &final_path) {
+                Ok(()) => {
+                    written += 1;
+                }
+                Err(_) if final_path.exists() => {
+                    let _ = fs::remove_file(&staging_path);
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&staging_path);
+                    return Err(CacheError::Io(e));
+                }
+            }
+        }
+        Ok(written)
+    }
+
+    /// Encode, dedup, and size-check a batch before any bytes hit the disk.
+    ///
+    /// Returns one encoded row per new fingerprint — rows already on disk and
+    /// duplicates within the batch are skipped, as are dimension-mismatched
+    /// or empty vectors — plus the number of entries rejected for exceeding
+    /// `max_entry_bytes`. The batch path never persists source text (privacy,
+    /// spec §10.1).
+    fn encode_batch_entries(
+        &self,
+        entries: &[(CacheKey, Vec<f32>)],
+    ) -> (Vec<([u8; 32], Vec<u8>, [u8; 32])>, u64) {
         let mut encoded: Vec<([u8; 32], Vec<u8>, [u8; 32])> = Vec::with_capacity(entries.len());
-        let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
         let mut skipped_oversized = 0u64;
         for (key, vector) in entries {
             let dim = key.output_dimensions as usize;
@@ -617,64 +721,7 @@ impl GlobalEmbeddingCache {
             }
             encoded.push((fingerprint, row_bytes, key.model_digest));
         }
-        if skipped_oversized > 0 {
-            self.telemetry
-                .record_entry_rejection(skipped_oversized * 1024);
-        }
-        if encoded.is_empty() {
-            return Ok(0);
-        }
-
-        // Byte-budget enforcement once for the whole batch.
-        if self.config.max_bytes > 0 {
-            let batch_bytes: u64 = encoded.iter().map(|(_, bytes, _)| bytes.len() as u64).sum();
-            let current = self.total_bytes()?;
-            if current + batch_bytes > self.config.max_bytes {
-                self.evict_unreferenced(current + batch_bytes - self.config.max_bytes)?;
-            }
-        }
-
-        let mut created_dirs: std::collections::HashSet<std::path::PathBuf> =
-            std::collections::HashSet::new();
-        let mut written = 0usize;
-        for (fingerprint, row_bytes, _) in &encoded {
-            let final_path = self.row_path(fingerprint);
-            if let Some(parent) = final_path.parent() {
-                if created_dirs.insert(parent.to_path_buf()) {
-                    fs::create_dir_all(parent)?;
-                }
-            }
-            let staging_path = final_path.with_extension("partial");
-            {
-                let file = fs::File::create(&staging_path)?;
-                let mut writer = std::io::BufWriter::new(file);
-                writer.write_all(row_bytes)?;
-                writer.flush()?;
-                // Deliberately NO sync_all: see the method doc.
-            }
-            match fs::rename(&staging_path, &final_path) {
-                Ok(()) => {
-                    written += 1;
-                }
-                Err(_) if final_path.exists() => {
-                    let _ = fs::remove_file(&staging_path);
-                }
-                Err(e) => {
-                    let _ = fs::remove_file(&staging_path);
-                    return Err(CacheError::Io(e));
-                }
-            }
-        }
-
-        // Metadata + telemetry once per batch.
-        for (fingerprint, _, model_digest) in &encoded {
-            let fingerprint_hex = hex_encode(fingerprint);
-            let model_digest_hex = hex_encode(model_digest);
-            self.model_index.insert(&fingerprint_hex, &model_digest_hex);
-        }
-        let _ = self.persist_model_index();
-
-        Ok(written)
+        (encoded, skipped_oversized)
     }
 
     /// Add a project-generation reference for a fingerprint.
@@ -737,57 +784,66 @@ impl GlobalEmbeddingCache {
             if !entry.file_type()?.is_dir() {
                 continue;
             }
-            for sub_entry in fs::read_dir(entry.path())? {
-                let sub_entry = sub_entry?;
-                let path = sub_entry.path();
-
-                // Skip staging files.
-                if path.extension().is_some_and(|ext| ext == "partial") {
-                    continue;
-                }
-                if !path.is_file() {
-                    continue;
-                }
-
-                // Parse fingerprint from the filename.
-                let filename = sub_entry.file_name().to_string_lossy().to_string();
-                let Some(fingerprint) = hex_decode(&filename) else {
-                    continue;
-                };
-
-                let is_live = self.refs.is_referenced(&fingerprint);
-                if is_live {
-                    report.rows_retained += 1;
-                } else {
-                    let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    let _ = fs::remove_file(&path);
-                    report.reclaimed_bytes += size;
-                    report.rows_removed += 1;
-                    self.telemetry.record_eviction(size);
-                }
+            for path in row_file_paths(fs::read_dir(entry.path())?)? {
+                self.gc_row(&path, &mut report);
             }
         }
 
         // Persist updated refs (remove entries that referred to deleted rows).
-        let tracked: Vec<String> = self.refs.refs.keys().cloned().collect();
-        let mut still_existing = HashSet::new();
-        for hex in &tracked {
-            if let Some(fp) = hex_decode(hex) {
-                if self.row_path(&fp).exists() {
-                    still_existing.insert(hex.clone());
-                }
-            }
-        }
-        self.refs.refs.retain(|k, _| still_existing.contains(k));
+        let still_existing = self.retain_existing_refs();
 
         // Prune model_index entries for deleted rows.
         self.model_index.retain_existing(&still_existing);
 
+        self.persist_compaction_sidecars()?;
+
+        Ok(report)
+    }
+
+    /// Persist refs, telemetry, and the model index after a compaction pass.
+    fn persist_compaction_sidecars(&self) -> Result<(), CacheError> {
         self.persist_refs()?;
         self.persist_telemetry()?;
         self.persist_model_index()?;
+        Ok(())
+    }
 
-        Ok(report)
+    /// Account for one candidate row during compaction: rows with live
+    /// project references are retained, all others are removed, with the
+    /// reclaimed size credited to `report` and telemetry.
+    fn gc_row(&mut self, path: &Path, report: &mut CacheCompactionReport) {
+        let Some(filename) = path.file_name() else {
+            return;
+        };
+        // The filename is the fingerprint hex.
+        let Some(fingerprint) = hex_decode(&filename.to_string_lossy()) else {
+            return;
+        };
+        if self.refs.is_referenced(&fingerprint) {
+            report.rows_retained += 1;
+            return;
+        }
+        let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let _ = fs::remove_file(path);
+        report.reclaimed_bytes += size;
+        report.rows_removed += 1;
+        self.telemetry.record_eviction(size);
+    }
+
+    /// Drop refcount entries whose row file no longer exists on disk and
+    /// return the set of fingerprint hex values that are still present.
+    fn retain_existing_refs(&mut self) -> HashSet<String> {
+        let tracked: Vec<String> = self.refs.refs.keys().cloned().collect();
+        let mut still_existing = HashSet::new();
+        for hex in tracked {
+            if let Some(fp) = hex_decode(&hex) {
+                if self.row_path(&fp).exists() {
+                    still_existing.insert(hex);
+                }
+            }
+        }
+        self.refs.refs.retain(|k, _| still_existing.contains(k));
+        still_existing
     }
 
     /// Persist the project refs to disk.
@@ -883,48 +939,60 @@ impl GlobalEmbeddingCache {
             return Ok(());
         }
 
-        // Collect all unreferenced rows with their mtime and size.
-        #[derive(Clone)]
-        struct RowInfo {
-            path: PathBuf,
-            mtime: SystemTime,
-            size: u64,
-        }
+        let candidates = self.eviction_candidates(&rows_dir)?;
+        self.evict_rows_until(candidates, bytes_needed);
 
-        let mut candidates: Vec<RowInfo> = Vec::new();
+        // Persist updated telemetry.
+        self.persist_telemetry()?;
+        Ok(())
+    }
 
-        for entry in fs::read_dir(&rows_dir)? {
+    /// Collect all unreferenced rows with their mtime and size, sorted
+    /// oldest-first (LRU eviction order).
+    fn eviction_candidates(&self, rows_dir: &Path) -> Result<Vec<EvictionCandidate>, CacheError> {
+        let mut candidates: Vec<EvictionCandidate> = Vec::new();
+        for entry in fs::read_dir(rows_dir)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
             }
-            for sub_entry in fs::read_dir(entry.path())? {
-                let sub_entry = sub_entry?;
-                let path = sub_entry.path();
-                if path.extension().is_some_and(|ext| ext == "partial") || !path.is_file() {
-                    continue;
-                }
-                let filename = sub_entry.file_name().to_string_lossy().to_string();
-                let Some(fingerprint) = hex_decode(&filename) else {
-                    continue;
-                };
-                // Only evict rows with no project references.
-                if self.refs.is_referenced(&fingerprint) {
-                    continue;
-                }
-                let meta = match fs::metadata(&path) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                let size = meta.len();
-                candidates.push(RowInfo { path, mtime, size });
+            for path in row_file_paths(fs::read_dir(entry.path())?)? {
+                self.push_eviction_candidate(&path, &mut candidates);
             }
         }
-
         // Sort oldest-first (LRU eviction).
         candidates.sort_by_key(|a| a.mtime);
+        Ok(candidates)
+    }
 
+    /// Add `path` to `candidates` if it is a row file with no live project
+    /// references (i.e. it may be evicted).
+    fn push_eviction_candidate(&self, path: &Path, candidates: &mut Vec<EvictionCandidate>) {
+        let Some(filename) = path.file_name() else {
+            return;
+        };
+        let Some(fingerprint) = hex_decode(&filename.to_string_lossy()) else {
+            return;
+        };
+        // Only evict rows with no project references.
+        if self.refs.is_referenced(&fingerprint) {
+            return;
+        }
+        let Ok(meta) = fs::metadata(path) else {
+            return;
+        };
+        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let size = meta.len();
+        candidates.push(EvictionCandidate {
+            path: path.to_path_buf(),
+            mtime,
+            size,
+        });
+    }
+
+    /// Remove oldest rows first until at least `bytes_needed` have been
+    /// reclaimed or the candidate list is exhausted.
+    fn evict_rows_until(&mut self, candidates: Vec<EvictionCandidate>, bytes_needed: u64) {
         let mut reclaimed = 0u64;
         for row in candidates {
             if reclaimed >= bytes_needed {
@@ -938,10 +1006,6 @@ impl GlobalEmbeddingCache {
                 Err(_) => continue,
             }
         }
-
-        // Persist updated telemetry.
-        self.persist_telemetry()?;
-        Ok(())
     }
 
     /// Generate a comprehensive cache stats report for `leindex retention --report`
@@ -996,6 +1060,25 @@ impl GlobalEmbeddingCache {
         }
         Ok(total)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Row-scan helper shared by compaction and eviction
+// ---------------------------------------------------------------------------
+
+/// Collect the real row files (skipping `.partial` staging files) from a
+/// row-shard directory, propagating directory-read errors to the caller.
+fn row_file_paths(shard: fs::ReadDir) -> Result<Vec<PathBuf>, CacheError> {
+    let mut paths = Vec::new();
+    for sub_entry in shard {
+        let sub_entry = sub_entry?;
+        let path = sub_entry.path();
+        if path.extension().is_some_and(|ext| ext == "partial") || !path.is_file() {
+            continue;
+        }
+        paths.push(path);
+    }
+    Ok(paths)
 }
 
 // ---------------------------------------------------------------------------

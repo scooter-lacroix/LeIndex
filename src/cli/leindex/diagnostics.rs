@@ -5,6 +5,82 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 
 impl LeIndex {
+    fn determine_embedding_model(&self) -> String {
+        match &self.embedder {
+            None => "unknown".to_string(),
+            Some(crate::cli::index_builder::HybridEmbedder::TfIdfOnly(_)) => {
+                "tfidf_only".to_string()
+            }
+            #[cfg(feature = "onnx")]
+            Some(crate::cli::index_builder::HybridEmbedder::HybridLocal { .. }) => {
+                "onnx_hybrid".to_string()
+            }
+            #[cfg(feature = "remote-embeddings")]
+            Some(crate::cli::index_builder::HybridEmbedder::HybridRemote { .. }) => {
+                "remote_hybrid".to_string()
+            }
+        }
+    }
+
+    fn determine_index_health(&self, search_index_nodes: usize) -> String {
+        let health = crate::cli::index_freshness::load_health(&self.storage_path);
+        if search_index_nodes == 0 {
+            "empty".to_string()
+        } else if health.as_ref().is_some_and(|health| {
+            matches!(
+                health.status,
+                super::ComponentStatus::Stale
+                    | super::ComponentStatus::Partial
+                    | super::ComponentStatus::Failed
+            )
+        }) {
+            "stale".to_string()
+        } else {
+            "healthy".to_string()
+        }
+    }
+
+    fn collect_precision_diagnostics(&self) -> (usize, Vec<String>) {
+        let mut precision_languages = std::collections::BTreeSet::new();
+        // Resident PDG is authoritative; the lightweight one-shot path (no
+        // hydration) falls back to the persisted marker column, mirroring how
+        // search_index_nodes falls back to persisted stats above.
+        let precision_nodes = match self.pdg.as_ref() {
+            Some(pdg) => {
+                for node_id in &pdg.precision_symbols {
+                    if let Some(node) = pdg.find_by_id(node_id).and_then(|id| pdg.get_node(id)) {
+                        precision_languages.insert(node.language.to_ascii_lowercase());
+                    }
+                }
+                pdg.precision_symbols.len()
+            }
+            None => {
+                let conn = self.storage.conn();
+                let nodes: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM intel_nodes WHERE project_id = ?1 AND precision = 1",
+                        rusqlite::params![self.project_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT DISTINCT language FROM intel_nodes \
+                     WHERE project_id = ?1 AND precision = 1",
+                ) {
+                    if let Ok(languages) = stmt
+                        .query_map(rusqlite::params![self.project_id], |row| {
+                            row.get::<_, String>(0)
+                        })
+                    {
+                        precision_languages.extend(languages.flatten());
+                    }
+                }
+                nodes as usize
+            }
+        };
+        (precision_nodes, precision_languages.into_iter().collect())
+    }
+
     /// Get diagnostics about the indexed project
     ///
     /// # Returns
@@ -54,21 +130,7 @@ impl LeIndex {
 
         // Read persisted health rather than rescanning/hash-stat'ing every
         // source file. The MCP handler adds a live Git delta separately.
-        let health = crate::cli::index_freshness::load_health(&self.storage_path);
-        let index_health = if search_index_nodes == 0 {
-            "empty".to_string()
-        } else if health.as_ref().is_some_and(|health| {
-            matches!(
-                health.status,
-                super::ComponentStatus::Stale
-                    | super::ComponentStatus::Partial
-                    | super::ComponentStatus::Failed
-            )
-        }) {
-            "stale".to_string()
-        } else {
-            "healthy".to_string()
-        };
+        let index_health = self.determine_index_health(search_index_nodes);
 
         let cache_temperature = if memory_stats.cache_hits == 0 {
             "cold".to_string()
@@ -79,60 +141,11 @@ impl LeIndex {
         };
 
         // Determine embedding model status from the embedder variant.
-        let embedding_model = match &self.embedder {
-            None => "unknown".to_string(),
-            Some(crate::cli::index_builder::HybridEmbedder::TfIdfOnly(_)) => {
-                "tfidf_only".to_string()
-            }
-            #[cfg(feature = "onnx")]
-            Some(crate::cli::index_builder::HybridEmbedder::HybridLocal { .. }) => {
-                "onnx_hybrid".to_string()
-            }
-            #[cfg(feature = "remote-embeddings")]
-            Some(crate::cli::index_builder::HybridEmbedder::HybridRemote { .. }) => {
-                "remote_hybrid".to_string()
-            }
-        };
+        let embedding_model = self.determine_embedding_model();
 
         let precision_enabled = cfg!(feature = "precision")
             && crate::feature_flags::FeatureFlag::PrecisionIngest.is_enabled();
-        let mut precision_languages = std::collections::BTreeSet::new();
-        // Resident PDG is authoritative; the lightweight one-shot path (no
-        // hydration) falls back to the persisted marker column, mirroring how
-        // search_index_nodes falls back to persisted stats above.
-        let precision_nodes = match self.pdg.as_ref() {
-            Some(pdg) => {
-                for node_id in &pdg.precision_symbols {
-                    if let Some(node) = pdg.find_by_id(node_id).and_then(|id| pdg.get_node(id)) {
-                        precision_languages.insert(node.language.to_ascii_lowercase());
-                    }
-                }
-                pdg.precision_symbols.len()
-            }
-            None => {
-                let conn = self.storage.conn();
-                let nodes: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM intel_nodes WHERE project_id = ?1 AND precision = 1",
-                        rusqlite::params![self.project_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-                if let Ok(mut stmt) = conn.prepare(
-                    "SELECT DISTINCT language FROM intel_nodes \
-                     WHERE project_id = ?1 AND precision = 1",
-                ) {
-                    if let Ok(languages) = stmt
-                        .query_map(rusqlite::params![self.project_id], |row| {
-                            row.get::<_, String>(0)
-                        })
-                    {
-                        precision_languages.extend(languages.flatten());
-                    }
-                }
-                nodes as usize
-            }
-        };
+        let (precision_nodes, precision_languages) = self.collect_precision_diagnostics();
 
         Ok(super::Diagnostics {
             project_path: self.project_path.display().to_string(),

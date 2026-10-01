@@ -3,69 +3,108 @@ use super::*;
 pub(super) fn render_project_map(data: &Value, color: bool) -> String {
     let mut out = header("Project Structure", color);
     out.push('\n');
+    out.push_str(&project_map_body(data, color));
+    out.push_str(&project_map_stats(data, color));
+    out.push_str(&project_map_scope_line(data, color));
+    out.push_str(&project_map_legend(data, color));
+    out
+}
+
+/// Render the structure body: community groups, the handler's tree, a
+/// single-root tree, or a flat ranked file list — whichever shape the
+/// handler emitted first.
+fn project_map_body(data: &Value, color: bool) -> String {
     if data.get("group_by").and_then(|v| v.as_str()) == Some("community") {
-        out.push_str(&render_community_groups(data, color));
-    } else if let Some(tree) = data.get("tree").and_then(|v| v.as_array()) {
-        out.push_str(&render_tree(tree, color));
-    } else if let Some(roots) = data.get("root").map(|v| vec![v.clone()]) {
-        out.push_str(&render_tree(&roots, color));
-    } else if let Some(files) = data.get("files").and_then(|v| v.as_array()) {
-        let tree = build_tree_from_files(files);
-        if tree.is_empty() {
-            // No directory info is available in the file entries (the
-            // handler ships basenames, not full paths), so render a flat
-            // ranked list rather than fabricating fake directories.
-            out.push_str(&render_flat_files(files, color));
-        } else {
-            out.push_str(&render_tree(&tree, color));
-        }
+        return render_community_groups(data, color);
     }
-    if let Some(stats) = data.get("stats") {
+    if let Some(tree) = data.get("tree").and_then(|v| v.as_array()) {
+        return render_tree(tree, color);
+    }
+    if let Some(roots) = data.get("root").map(|v| vec![v.clone()]) {
+        return render_tree(&roots, color);
+    }
+    if let Some(files) = data.get("files").and_then(|v| v.as_array()) {
+        return project_map_files_body(files, color);
+    }
+    String::new()
+}
+
+/// Render the `files` array shape. `build_tree_from_files` returns an
+/// empty Vec when no directory info is available in the file entries (the
+/// handler ships basenames, not full paths), so render a flat ranked list
+/// rather than fabricating fake directories.
+fn project_map_files_body(files: &[Value], color: bool) -> String {
+    let tree = build_tree_from_files(files);
+    if tree.is_empty() {
+        return render_flat_files(files, color);
+    }
+    render_tree(&tree, color)
+}
+
+/// Render the optional `stats` block (files, symbols, avg complexity, LOC).
+fn project_map_stats(data: &Value, color: bool) -> String {
+    let Some(stats) = data.get("stats") else {
+        return String::new();
+    };
+    let mut out = String::from("\n");
+    if let Some(v) = stats.get("total_files").and_then(|v| v.as_u64()) {
+        out.push_str(&field("Files", &v.to_string(), color));
+    }
+    if let Some(v) = stats.get("total_symbols").and_then(|v| v.as_u64()) {
+        out.push_str(&field("Symbols", &v.to_string(), color));
+    }
+    if let Some(v) = stats.get("avg_complexity").and_then(|v| v.as_f64()) {
+        out.push_str(&field("Avg complexity", &format!("{:.1}", v), color));
+    }
+    if let Some(v) = stats.get("total_loc").and_then(|v| v.as_u64()) {
+        out.push_str(&field("Lines of code", &v.to_string(), color));
+    }
+    out
+}
+
+/// Render the handler's top-level `total_files_in_scope` count (it is not
+/// under "stats"). Only a positive count is shown.
+fn project_map_scope_line(data: &Value, color: bool) -> String {
+    let Some(count) = data
+        .get("total_files_in_scope")
+        .and_then(|v| v.as_u64())
+        .filter(|count| *count > 0)
+    else {
+        return String::new();
+    };
+    let mut out = String::new();
+    if data.get("stats").is_none() {
         out.push('\n');
-        if let Some(v) = stats.get("total_files").and_then(|v| v.as_u64()) {
-            out.push_str(&field("Files", &v.to_string(), color));
-        }
-        if let Some(v) = stats.get("total_symbols").and_then(|v| v.as_u64()) {
-            out.push_str(&field("Symbols", &v.to_string(), color));
-        }
-        if let Some(v) = stats.get("avg_complexity").and_then(|v| v.as_f64()) {
-            out.push_str(&field("Avg complexity", &format!("{:.1}", v), color));
-        }
-        if let Some(v) = stats.get("total_loc").and_then(|v| v.as_u64()) {
-            out.push_str(&field("Lines of code", &v.to_string(), color));
-        }
     }
-    // Also show total_files_in_scope from the handler output
-    // (the handler puts this at top level, not under "stats")
+    // N-14: state the count basis — "Files in scope" counts source files
+    // under the scoped path, which is deliberately different from the
+    // indexed-file total shown by diagnostics (skip lists, exclusions,
+    // and scoping all apply).
+    out.push_str(&field(
+        "Files in scope",
+        &format!("{} (source files under the scoped path)", count),
+        color,
+    ));
+    out
+}
+
+/// N-14: one legend line for the bracket annotations — `[out→in]` is
+/// outgoing→incoming dependency counts and `[N symbols]` is the file's
+/// indexed symbol count. Previously nowhere documented. Shown whenever
+/// any bracket annotation can appear (scoped count, tree, or root).
+fn project_map_legend(data: &Value, color: bool) -> String {
     let scoped = data
         .get("total_files_in_scope")
         .and_then(|v| v.as_u64())
         .is_some_and(|count| count > 0);
-    if let Some(v) = data.get("total_files_in_scope").and_then(|v| v.as_u64()) {
-        if data.get("stats").is_none() {
-            out.push('\n');
-        }
-        // N-14: state the count basis — "Files in scope" counts source files
-        // under the scoped path, which is deliberately different from the
-        // indexed-file total shown by diagnostics (skip lists, exclusions,
-        // and scoping all apply).
-        out.push_str(&field(
-            "Files in scope",
-            &format!("{} (source files under the scoped path)", v),
-            color,
-        ));
-    }
-    // N-14: one legend line for the bracket annotations — `[out→in]` is
-    // outgoing→incoming dependency counts and `[N symbols]` is the file's
-    // indexed symbol count. Previously nowhere documented.
     if scoped || data.get("tree").is_some() || data.get("root").is_some() {
-        out.push_str(&format!(
+        return format!(
             "\n  {}Legend: [N symbols] = indexed symbol count; [out→in] = outgoing→incoming dependencies{}\n",
             if color { DIM } else { "" },
             if color { RESET } else { "" },
-        ));
+        );
     }
-    out
+    String::new()
 }
 
 pub(super) fn render_community_groups(data: &Value, color: bool) -> String {
@@ -73,84 +112,111 @@ pub(super) fn render_community_groups(data: &Value, color: bool) -> String {
         return "  (no community assignments)\n".to_string();
     };
     if communities.is_empty() {
-        let note = data
-            .get("note")
-            .and_then(|v| v.as_str())
-            .map(|value| format!(" — {value}"))
-            .unwrap_or_default();
-        return format!("  (no communities{note})\n");
+        return community_groups_empty_note(data);
     }
 
-    let mut out = String::new();
-    out.push_str(&format!(
+    let mut out = format!(
         "  {}Community groups ({}):{}\n",
         if color { BOLD } else { "" },
         communities.len(),
         if color { RESET } else { "" },
-    ));
+    );
     for community in communities {
-        let id = community
-            .get("community")
-            .and_then(|v| v.as_i64())
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "?".to_string());
-        let label = community
-            .get("label")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unlabeled");
-        let file_count = community
-            .get("file_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        out.push_str(&format!(
-            "\n    {}Community {}{} — {} ({} files){}\n",
-            if color { LIGHT_MAGENTA } else { "" },
-            id,
-            if color { RESET } else { "" },
-            label,
-            file_count,
-            if color { RESET } else { "" },
-        ));
-        if let Some(files) = community.get("files").and_then(|v| v.as_array()) {
-            for file in files {
-                let path = file
-                    .get("relative_path")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| file.get("path").and_then(|v| v.as_str()))
-                    .unwrap_or("?");
-                let symbols = file
-                    .get("symbol_count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                out.push_str(&format!(
-                    "      {}•{} {}{}{}  [{} symbols]\n",
-                    if color { LIGHT_YELLOW } else { "" },
-                    if color { RESET } else { "" },
-                    if color { LIGHT_YELLOW } else { "" },
-                    path,
-                    if color { RESET } else { "" },
-                    symbols,
-                ));
-            }
+        out.push_str(&community_section(community, color));
+    }
+    out.push_str(&ungrouped_files_section(data, color));
+    out
+}
+
+/// Render the empty-communities line, appending the handler's `note`
+/// (e.g. why community detection was skipped) when present.
+fn community_groups_empty_note(data: &Value) -> String {
+    let note = data
+        .get("note")
+        .and_then(|v| v.as_str())
+        .map(|value| format!(" — {value}"))
+        .unwrap_or_default();
+    format!("  (no communities{note})\n")
+}
+
+/// Render one community: its header line (id, label, file count) followed
+/// by the member file list.
+fn community_section(community: &Value, color: bool) -> String {
+    let id = community
+        .get("community")
+        .and_then(|v| v.as_i64())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let label = community
+        .get("label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unlabeled");
+    let file_count = community
+        .get("file_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let mut out = format!(
+        "\n    {}Community {}{} — {} ({} files){}\n",
+        if color { LIGHT_MAGENTA } else { "" },
+        id,
+        if color { RESET } else { "" },
+        label,
+        file_count,
+        if color { RESET } else { "" },
+    );
+    if let Some(files) = community.get("files").and_then(|v| v.as_array()) {
+        for file in files {
+            out.push_str(&community_file_line(file, color));
         }
     }
-    if let Some(files) = data.get("ungrouped_files").and_then(|v| v.as_array()) {
-        if !files.is_empty() {
-            out.push_str(&format!(
-                "\n    {}Ungrouped ({} files):{}\n",
-                if color { BOLD } else { "" },
-                files.len(),
-                if color { RESET } else { "" },
-            ));
-            for file in files {
-                let path = file
-                    .get("relative_path")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| file.get("path").and_then(|v| v.as_str()))
-                    .unwrap_or("?");
-                out.push_str(&format!("      • {path}\n"));
-            }
-        }
+    out
+}
+
+/// Render one community member file: `• <path>  [N symbols]`.
+fn community_file_line(file: &Value, color: bool) -> String {
+    let path = file
+        .get("relative_path")
+        .and_then(|v| v.as_str())
+        .or_else(|| file.get("path").and_then(|v| v.as_str()))
+        .unwrap_or("?");
+    let symbols = file
+        .get("symbol_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    format!(
+        "      {}•{} {}{}{}  [{} symbols]\n",
+        if color { LIGHT_YELLOW } else { "" },
+        if color { RESET } else { "" },
+        if color { LIGHT_YELLOW } else { "" },
+        path,
+        if color { RESET } else { "" },
+        symbols,
+    )
+}
+
+/// Render the `ungrouped_files` tail block: a header with the file count
+/// followed by one bullet per path. Emits nothing when the array is
+/// absent or empty.
+fn ungrouped_files_section(data: &Value, color: bool) -> String {
+    let Some(files) = data.get("ungrouped_files").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if files.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "\n    {}Ungrouped ({} files):{}\n",
+        if color { BOLD } else { "" },
+        files.len(),
+        if color { RESET } else { "" },
+    );
+    for file in files {
+        let path = file
+            .get("relative_path")
+            .and_then(|v| v.as_str())
+            .or_else(|| file.get("path").and_then(|v| v.as_str()))
+            .unwrap_or("?");
+        out.push_str(&format!("      • {path}\n"));
     }
     out
 }

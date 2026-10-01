@@ -4,7 +4,7 @@ use super::helpers::{
 };
 use super::protocol::JsonRpcError;
 use crate::cli::live_project::LiveProject;
-use crate::cli::registry::ProjectRegistry;
+use crate::cli::registry::{ProjectHandle, ProjectRegistry};
 use crate::graph::pdg::ProgramDependenceGraph;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -319,6 +319,111 @@ fn build_pdg_enrichment(
     (symbol_map, context)
 }
 
+/// Language of a path, from its extension (case-insensitive), or `text`.
+/// Unknown extensions report the extension itself, matching
+/// [`detect_language`].
+fn language_for(file_path: &str) -> String {
+    Path::new(file_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            let lowered = extension.to_ascii_lowercase();
+            detect_language(&lowered).to_string()
+        })
+        .unwrap_or_else(|| "text".to_string())
+}
+
+/// An explicit symbol-map request must not silently degrade: a handle can lack
+/// a resident PDG (fresh one-shot process, or an auto-index swapped in a new
+/// LeIndex whose graph was dropped at completion). Load it on demand in that
+/// case (audit #7: the flag was a no-op).
+async fn ensure_symbol_map_pdg(
+    handle: Option<ProjectHandle>,
+    wanted: bool,
+) -> Option<ProjectHandle> {
+    match handle {
+        Some(handle) if wanted => {
+            let mut guard = handle.write().await;
+            if guard.pdg().is_none() {
+                // The symbol map lists graph nodes only; the full engine
+                // load here added ~1s to every cold read with a map.
+                let _ = guard.ensure_pdg_loaded_graph_only();
+            }
+            drop(guard);
+            Some(handle)
+        }
+        other => other,
+    }
+}
+
+/// The resident PDG, cloned for the blocking enrichment task.
+async fn pdg_snapshot(handle: Option<&ProjectHandle>) -> Option<ProgramDependenceGraph> {
+    if let Some(handle) = handle {
+        let guard = handle.read().await;
+        guard.pdg().cloned()
+    } else {
+        None
+    }
+}
+
+/// Build the PDG enrichment (symbol map plus compact context) off the runtime.
+///
+/// Takes the resident PDG snapshot exactly once and reports whether it was
+/// available, so the caller can label the retrieval status without re-cloning.
+async fn pdg_enrichment(
+    handle: Option<&ProjectHandle>,
+    file_path: &str,
+    resolved_file_path: &Path,
+    content: &str,
+    start_line: usize,
+    end_line: usize,
+    total_lines: usize,
+    include_symbol_map: bool,
+) -> Result<(Vec<Value>, Option<Value>, &'static str), JsonRpcError> {
+    let Some(pdg) = pdg_snapshot(handle).await else {
+        return Ok((Vec::new(), None, "not_loaded"));
+    };
+    let enrichment_file_path = resolved_file_path.to_string_lossy().to_string();
+    let content = content.to_string();
+    let file_path_label = file_path.to_string();
+    let enrichment = tokio::task::spawn_blocking(move || {
+        build_pdg_enrichment(
+            &pdg,
+            &enrichment_file_path,
+            &content,
+            start_line,
+            end_line,
+            total_lines,
+            include_symbol_map,
+        )
+    })
+    .await
+    .map_err(|e| {
+        JsonRpcError::internal_error(format!(
+            "Failed to build PDG enrichment for '{}': {}",
+            file_path_label, e
+        ))
+    })?;
+    let (symbol_map, context) = enrichment;
+    Ok((symbol_map, context, "fresh"))
+}
+
+/// Attach the freshness badge from the resident handle when there is one, else
+/// the live-only badge for a project with no loaded index.
+async fn wrap_read_result(
+    result: Value,
+    handle: Option<&ProjectHandle>,
+    project_root: &Path,
+) -> Value {
+    match handle {
+        Some(handle) => {
+            let guard = handle.read().await;
+            wrap_with_meta(result, &guard)
+        }
+        None => wrap_live_with_meta(result, project_root),
+    }
+}
+
 #[allow(missing_docs)]
 impl ReadFileHandler {
     pub fn name(&self) -> &str {
@@ -396,66 +501,20 @@ Works for any text file including configs and docs."
         let (content, total_lines, end_line, content_str) =
             read_visible_content(&resolved_file_path, &args, start_line, max_lines).await?;
 
-        // Detect language from extension (case-insensitive)
-        let ext_lower = Path::new(&file_path)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(|extension| extension.to_ascii_lowercase());
-        let language = ext_lower.as_deref().map(detect_language).unwrap_or("text");
+        let language = language_for(&file_path);
 
-        // An explicit symbol-map request must not silently degrade: a handle
-        // can lack a resident PDG (fresh one-shot process, or an auto-index
-        // swapped in a new LeIndex whose graph was dropped at completion).
-        // Load it on demand in that case (audit #7: the flag was a no-op).
-        let maybe_handle = match maybe_handle {
-            Some(handle) if include_symbol_map => {
-                let mut guard = handle.write().await;
-                if guard.pdg().is_none() {
-                    // The symbol map lists graph nodes only; the full engine
-                    // load here added ~1s to every cold read with a map.
-                    let _ = guard.ensure_pdg_loaded_graph_only();
-                }
-                drop(guard);
-                Some(handle)
-            }
-            other => other,
-        };
-
-        let pdg_snapshot = if let Some(ref handle) = maybe_handle {
-            let guard = handle.read().await;
-            guard.pdg().cloned()
-        } else {
-            None
-        };
-
-        let pdg_status = if pdg_snapshot.is_some() {
-            "fresh"
-        } else {
-            "not_loaded"
-        };
-        let enrichment_file_path = resolved_file_path.to_string_lossy().to_string();
-        let (symbol_map, context) = if let Some(pdg) = pdg_snapshot {
-            tokio::task::spawn_blocking(move || {
-                build_pdg_enrichment(
-                    &pdg,
-                    &enrichment_file_path,
-                    &content,
-                    start_line,
-                    end_line,
-                    total_lines,
-                    include_symbol_map,
-                )
-            })
-            .await
-            .map_err(|e| {
-                JsonRpcError::internal_error(format!(
-                    "Failed to build PDG enrichment for '{}': {}",
-                    file_path, e
-                ))
-            })?
-        } else {
-            (Vec::new(), None)
-        };
+        let maybe_handle = ensure_symbol_map_pdg(maybe_handle, include_symbol_map).await;
+        let (symbol_map, context, pdg_status) = pdg_enrichment(
+            maybe_handle.as_ref(),
+            &file_path,
+            &resolved_file_path,
+            &content,
+            start_line,
+            end_line,
+            total_lines,
+            include_symbol_map,
+        )
+        .await?;
 
         let mut result = serde_json::json!({
             "file_path": file_path,
@@ -483,12 +542,7 @@ Works for any text file including configs and docs."
         }
 
         // Add staleness warning only if we have an indexed project
-        if let Some(ref handle) = maybe_handle {
-            let guard = handle.read().await;
-            result = wrap_with_meta(result, &guard);
-        } else {
-            result = wrap_live_with_meta(result, &project_root);
-        }
+        result = wrap_read_result(result, maybe_handle.as_ref(), &project_root).await;
 
         Ok(result)
     }

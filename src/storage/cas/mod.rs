@@ -174,21 +174,10 @@ impl CasStore {
                 continue;
             }
             if entry.file_type()?.is_dir() {
-                for sub_entry in fs::read_dir(entry.path())? {
-                    let sub_entry = sub_entry?;
-                    if sub_entry.file_type()?.is_file() {
-                        count += 1;
-                    }
-                }
-            }
-
-            // Also count top-level files whose names look like blob hashes
-            // (legacy / flat layout tolerance).
-            if entry.file_type()?.is_file()
-                && !refs::REFS_AUX_FILES.contains(&name.as_ref())
-                && !name.ends_with(".tmp")
-                && name.len() == 64
-            {
+                count += count_shard_blobs(&entry.path())?;
+            } else if is_flat_layout_blob(&name) {
+                // Top-level files whose names look like blob hashes
+                // (legacy / flat layout tolerance).
                 count += 1;
             }
         }
@@ -300,6 +289,24 @@ impl CasStore {
         }
         Ok(out)
     }
+}
+
+/// Count blob files one level deep inside a shard directory. Every regular
+/// file counts; nested directories are not traversed.
+fn count_shard_blobs(shard: &Path) -> Result<usize> {
+    let mut count = 0;
+    for sub_entry in fs::read_dir(shard)? {
+        if sub_entry?.file_type()?.is_file() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Legacy flat-layout tolerance: a top-level file counts as a blob when its
+/// name looks like a 64-character hash and it is not an aux/temp file.
+fn is_flat_layout_blob(name: &str) -> bool {
+    !refs::REFS_AUX_FILES.contains(&name) && !name.ends_with(".tmp") && name.len() == 64
 }
 
 #[cfg(test)]

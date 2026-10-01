@@ -3,7 +3,8 @@ use super::protocol::JsonRpcError;
 use crate::cli::live_project::LiveProject;
 use crate::cli::registry::ProjectRegistry;
 use crate::search::textsearch::{
-    CaseMode, FileFilter, Query, RootSpec, SearchOptions, SearchOutput, search, search_symbols,
+    CaseMode, Compiled, FileFilter, Query, RootSpec, SearchOptions, SearchOutput, search,
+    search_symbols,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -151,174 +152,265 @@ impl FindHandler {
         registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
-        let pattern = first(&args, &["pattern", "query"])
-            .and_then(Value::as_str)
-            .filter(|p| !p.is_empty())
-            .ok_or_else(|| {
-                JsonRpcError::invalid_params_with_suggestion(
-                    "Missing required argument: pattern",
-                    "Add \"pattern\": \"<text or regex>\"; set regex=true for a regular expression",
-                )
-            })?
-            .to_string();
-        let query = Query {
-            pattern: pattern.clone(),
-            regex: extract_bool(&args, "regex", extract_bool(&args, "is_regex", false)),
-            case: case_mode(&args),
-            word: extract_bool(&args, "word", false),
-        };
-        let compiled = query.compile().map_err(JsonRpcError::invalid_params)?;
+        let found = find_pattern(&args)?;
+        let output_mode = output_mode_arg(&args)?;
+        let window = find_window(&args)?;
 
         let target_symbols = args.get("target").and_then(Value::as_str) == Some("symbols");
-        let output_mode = args
-            .get("output")
-            .and_then(Value::as_str)
-            .unwrap_or("matches")
-            .to_ascii_lowercase();
-        if !["matches", "files", "count", "symbols"].contains(&output_mode.as_str()) {
-            return Err(JsonRpcError::invalid_params_with_suggestion(
-                format!("Unknown output '{output_mode}'"),
-                "Use output: matches | files | count | symbols",
-            ));
-        }
-        let limit_arg = extract_usize(
-            &args,
-            if args.get("limit").is_some() {
-                "limit"
-            } else {
-                "max_results"
-            },
-            DEFAULT_LIMIT,
-        )?;
-        let limit = (limit_arg > 0).then_some(limit_arg);
-        let offset = extract_usize(&args, "offset", 0)?;
-        let timeout_ms = extract_usize(&args, "timeout_ms", DEFAULT_TIMEOUT_MS)?;
-        let context = extract_usize(
-            &args,
-            if args.get("context_lines").is_some() {
-                "context_lines"
-            } else {
-                "include_context_lines"
-            },
-            0,
-        )?
-        .min(10);
-        let per_file = extract_usize(
-            &args,
-            if args.get("per_file_cap").is_some() {
-                "per_file_cap"
-            } else {
-                "max_per_file"
-            },
-            DEFAULT_PER_FILE,
-        )?;
-        let max_line_chars = extract_usize(&args, "max_line_chars", 200)?.clamp(20, 2000);
 
         // ── Roots ────────────────────────────────────────────────────────
-        let include = strings(&args, &["include_globs", "include"]);
-        let exclude = strings(&args, &["exclude_globs", "exclude"]);
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let paths = strings(&args, &["paths", "path"]);
-
-        let project_raw = match args.get("project_path").and_then(Value::as_str) {
-            Some(path) => Some(expand_home(path)),
-            None => registry.default_project_path().await.ok(),
-        };
-        let project = project_raw.as_deref().and_then(project_ref);
-        if project.is_none() && paths.is_empty() {
-            return Err(JsonRpcError::invalid_params_with_suggestion(
-                "No project to search",
-                "Pass project_path, or paths: [\"/any/directory\"] to search without a project",
-            ));
-        }
-
-        let project_for_blocking = project
-            .as_ref()
-            .map(|p| (p.root.clone(), p.storage.clone(), p.active_storage.clone()));
-        let (specs, primary) = tokio::task::spawn_blocking(move || {
-            let project = project_for_blocking.map(|(root, storage, active_storage)| ProjectRef {
-                root,
-                storage,
-                active_storage,
-            });
-            build_roots(
-                project.as_ref(),
-                &paths,
-                scope.as_deref(),
-                &include,
-                &exclude,
-            )
-        })
-        .await
-        .map_err(|e| JsonRpcError::internal_error(format!("find setup failed: {e}")))??;
+        let (specs, primary) = find_roots(registry, &args).await?;
 
         // ── Symbol definitions ───────────────────────────────────────────
         if target_symbols {
-            let kinds = strings(&args, &["kind", "type_filter"])
-                .into_iter()
-                .filter(|k| !k.eq_ignore_ascii_case("all"))
-                .collect::<Vec<_>>();
-            let lowered = pattern.to_ascii_lowercase();
-            let (hits, total) = tokio::task::spawn_blocking(move || {
-                search_symbols(&specs, &compiled, &lowered, &kinds, offset, limit)
-            })
-            .await
-            .map_err(|e| JsonRpcError::internal_error(format!("find failed: {e}")))?;
-            let returned = hits.len();
-            return Ok(json!({
-                "pattern": pattern,
-                "target": "symbols",
-                "total_symbols": total,
-                "returned": returned,
-                "offset": offset,
-                "has_more": offset + returned < total,
-                "next_offset": (offset + returned < total).then_some(offset + returned),
-                "symbols": hits.iter().map(|h| json!({
-                    "name": h.name,
-                    "kind": h.kind,
-                    "file": display_path(&primary, h.root, &h.rel),
-                    "line": h.line,
-                    "end_line": h.end_line,
-                    "exact": h.rank == 0,
-                    "stale": h.stale,
-                })).collect::<Vec<_>>(),
-                "note": if primary.iter().all(|r| !r.indexed) {
-                    Some("Symbol search needs an index: run leindex_manage action=index")
-                } else { None },
-                "source_freshness": "live",
-            }));
+            return symbols_result(&args, found, specs, &primary, window.offset, window.limit)
+                .await;
         }
 
         // ── Text ─────────────────────────────────────────────────────────
-        let collect_hits = output_mode == "matches";
-        let windowed = matches!(output_mode.as_str(), "matches");
+        let windowed = output_mode == "matches";
+        let (engine_offset, engine_limit) =
+            paging_for_window(windowed, window.offset, window.limit);
         let options = SearchOptions {
-            offset: if windowed { offset } else { 0 },
-            limit: if windowed { limit } else { None },
-            per_file_cap: per_file,
-            context,
-            max_line_chars,
-            deadline: (timeout_ms > 0)
-                .then(|| Instant::now() + Duration::from_millis(timeout_ms as u64)),
-            collect_hits,
+            offset: engine_offset,
+            limit: engine_limit,
+            per_file_cap: window.per_file,
+            context: window.context,
+            max_line_chars: window.max_line_chars,
+            deadline: search_deadline(window.timeout_ms),
+            collect_hits: windowed,
             want_symbols: extract_bool(&args, "symbols", true),
         };
+        let compiled = found.compiled;
         let result: SearchOutput =
             tokio::task::spawn_blocking(move || search(&specs, &compiled, &options))
                 .await
                 .map_err(|e| JsonRpcError::internal_error(format!("find failed: {e}")))?;
 
         Ok(shape_text_result(
-            &pattern,
+            &found.text,
             &output_mode,
             &primary,
             result,
-            offset,
-            limit,
+            window.offset,
+            window.limit,
         ))
+    }
+}
+
+/// The pattern a LeIndex \[Find\] call searches for, with its matcher compiled.
+struct FindPattern {
+    /// Pattern text, echoed back in the response.
+    text: String,
+    /// Compiled matcher handed to the search engine.
+    compiled: Compiled,
+}
+
+/// The paging and windowing knobs of a LeIndex \[Find\] call.
+struct FindWindow {
+    /// Hits per page; `None` means all of them.
+    limit: Option<usize>,
+    /// Hits to skip.
+    offset: usize,
+    /// Context lines shown per match, capped at 10.
+    context: usize,
+    /// Shown matches per file; 0 disables the cap.
+    per_file: usize,
+    /// Longest line shown, clamped to 20..=2000.
+    max_line_chars: usize,
+    /// Scan budget; 0 disables the deadline.
+    timeout_ms: usize,
+}
+
+/// The primary argument name when the caller supplied it, else the legacy
+/// spelling kept for compatibility with the pre-\[Find\] text search.
+fn preferred_key(args: &Value, primary: &'static str, legacy: &'static str) -> &'static str {
+    if args.get(primary).is_some() {
+        primary
+    } else {
+        legacy
+    }
+}
+
+/// Extract the required pattern and compile its matcher.
+fn find_pattern(args: &Value) -> Result<FindPattern, JsonRpcError> {
+    let text = first(args, &["pattern", "query"])
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params_with_suggestion(
+                "Missing required argument: pattern",
+                "Add \"pattern\": \"<text or regex>\"; set regex=true for a regular expression",
+            )
+        })?
+        .to_string();
+    let query = Query {
+        pattern: text.clone(),
+        regex: extract_bool(args, "regex", extract_bool(args, "is_regex", false)),
+        case: case_mode(args),
+        word: extract_bool(args, "word", false),
+    };
+    let compiled = query.compile().map_err(JsonRpcError::invalid_params)?;
+    Ok(FindPattern { text, compiled })
+}
+
+/// The output mode, validated against the shapes a \[Find\] call renders.
+fn output_mode_arg(args: &Value) -> Result<String, JsonRpcError> {
+    let mode = args
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or("matches")
+        .to_ascii_lowercase();
+    if ["matches", "files", "count", "symbols"].contains(&mode.as_str()) {
+        return Ok(mode);
+    }
+    Err(JsonRpcError::invalid_params_with_suggestion(
+        format!("Unknown output '{mode}'"),
+        "Use output: matches | files | count | symbols",
+    ))
+}
+
+/// Paging and windowing arguments for a \[Find\] call.
+fn find_window(args: &Value) -> Result<FindWindow, JsonRpcError> {
+    let raw_limit = extract_usize(
+        args,
+        preferred_key(args, "limit", "max_results"),
+        DEFAULT_LIMIT,
+    )?;
+    let offset = extract_usize(args, "offset", 0)?;
+    let timeout_ms = extract_usize(args, "timeout_ms", DEFAULT_TIMEOUT_MS)?;
+    let context = extract_usize(
+        args,
+        preferred_key(args, "context_lines", "include_context_lines"),
+        0,
+    )?
+    .min(10);
+    let per_file = extract_usize(
+        args,
+        preferred_key(args, "per_file_cap", "max_per_file"),
+        DEFAULT_PER_FILE,
+    )?;
+    let max_line_chars = extract_usize(args, "max_line_chars", 200)?.clamp(20, 2000);
+    Ok(FindWindow {
+        limit: (raw_limit > 0).then_some(raw_limit),
+        offset,
+        context,
+        per_file,
+        max_line_chars,
+        timeout_ms,
+    })
+}
+
+/// Resolve the roots to search, off the async runtime.
+///
+/// Returns the engine specs plus the per-root summaries the response still
+/// needs once the specs have moved into the blocking scan.
+async fn find_roots(
+    registry: &Arc<ProjectRegistry>,
+    args: &Value,
+) -> Result<(Vec<RootSpec>, Vec<PrimaryRoot>), JsonRpcError> {
+    let include = strings(args, &["include_globs", "include"]);
+    let exclude = strings(args, &["exclude_globs", "exclude"]);
+    let scope = args
+        .get("scope")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let paths = strings(args, &["paths", "path"]);
+
+    let project_raw = match args.get("project_path").and_then(Value::as_str) {
+        Some(path) => Some(expand_home(path)),
+        None => registry.default_project_path().await.ok(),
+    };
+    let project = project_raw.as_deref().and_then(project_ref);
+    if project.is_none() && paths.is_empty() {
+        return Err(JsonRpcError::invalid_params_with_suggestion(
+            "No project to search",
+            "Pass project_path, or paths: [\"/any/directory\"] to search without a project",
+        ));
+    }
+
+    let project_for_blocking = project
+        .as_ref()
+        .map(|p| (p.root.clone(), p.storage.clone(), p.active_storage.clone()));
+    tokio::task::spawn_blocking(move || {
+        let project = project_for_blocking.map(|(root, storage, active_storage)| ProjectRef {
+            root,
+            storage,
+            active_storage,
+        });
+        build_roots(
+            project.as_ref(),
+            &paths,
+            scope.as_deref(),
+            &include,
+            &exclude,
+        )
+    })
+    .await
+    .map_err(|e| JsonRpcError::internal_error(format!("find setup failed: {e}")))?
+}
+
+/// Search the index for symbol definitions instead of text.
+async fn symbols_result(
+    args: &Value,
+    pattern: FindPattern,
+    specs: Vec<RootSpec>,
+    primary: &[PrimaryRoot],
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<Value, JsonRpcError> {
+    let FindPattern { text, compiled } = pattern;
+    let kinds = strings(args, &["kind", "type_filter"])
+        .into_iter()
+        .filter(|k| !k.eq_ignore_ascii_case("all"))
+        .collect::<Vec<_>>();
+    let lowered = text.to_ascii_lowercase();
+    let (hits, total) = tokio::task::spawn_blocking(move || {
+        search_symbols(&specs, &compiled, &lowered, &kinds, offset, limit)
+    })
+    .await
+    .map_err(|e| JsonRpcError::internal_error(format!("find failed: {e}")))?;
+    let returned = hits.len();
+    Ok(json!({
+        "pattern": text,
+        "target": "symbols",
+        "total_symbols": total,
+        "returned": returned,
+        "offset": offset,
+        "has_more": offset + returned < total,
+        "next_offset": (offset + returned < total).then_some(offset + returned),
+        "symbols": hits.iter().map(|h| json!({
+            "name": h.name,
+            "kind": h.kind,
+            "file": display_path(primary, h.root, &h.rel),
+            "line": h.line,
+            "end_line": h.end_line,
+            "exact": h.rank == 0,
+            "stale": h.stale,
+        })).collect::<Vec<_>>(),
+        "note": if primary.iter().all(|r| !r.indexed) {
+            Some("Symbol search needs an index: run leindex_manage action=index")
+        } else { None },
+        "source_freshness": "live",
+    }))
+}
+
+/// Only `matches` pages the hit list in the engine; the summarising modes ask
+/// for everything and window their own rows afterwards.
+fn paging_for_window(
+    windowed: bool,
+    offset: usize,
+    limit: Option<usize>,
+) -> (usize, Option<usize>) {
+    if windowed { (offset, limit) } else { (0, None) }
+}
+
+/// The scan deadline, or `None` when the caller set no time budget.
+fn search_deadline(timeout_ms: usize) -> Option<Instant> {
+    if timeout_ms > 0 {
+        Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
+    } else {
+        None
     }
 }
 

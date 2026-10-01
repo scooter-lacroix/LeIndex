@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tracing::debug;
@@ -141,6 +141,99 @@ fn oversize_response() -> String {
     .unwrap_or_default()
 }
 
+/// Queue a response for the writer, when the message produced one
+/// (notifications produce none).
+fn send_response(
+    out: &mpsc::UnboundedSender<(String, bool)>,
+    response: Option<String>,
+    framed: bool,
+) {
+    if let Some(response) = response {
+        let _ = out.send((response, framed));
+    }
+}
+
+/// Drain the outbound response queue into the socket until the peer goes away.
+async fn drive_writer<W>(mut write_half: W, mut out_rx: mpsc::UnboundedReceiver<(String, bool)>)
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    while let Some((response, framed)) = out_rx.recv().await {
+        if !write_socket_frame(&mut write_half, &response, framed).await {
+            break;
+        }
+    }
+}
+
+/// How the connection loop should treat the client's first frame.
+enum HelloOutcome {
+    /// Not a hello: handle it as an ordinary request.
+    NotHello,
+    /// A hello from a compatible client: the ack is sent, keep serving.
+    Handled,
+    /// A hello from an incompatible client: hang up.
+    Incompatible,
+}
+
+/// Handle the client's first frame as the shim hello when it is one: reply with
+/// the ack, start warming the client's project at once and record its cwd as
+/// the connection default.
+fn handle_hello_frame(
+    payload: &str,
+    out_tx: &mpsc::UnboundedSender<(String, bool)>,
+    default_project: &mut Option<String>,
+) -> HelloOutcome {
+    let Some(hello) = proto::parse_hello(payload) else {
+        return HelloOutcome::NotHello;
+    };
+    let compatible = hello.wire == WIRE_VERSION;
+    let ack = Ack {
+        wire: WIRE_VERSION,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        pid: std::process::id(),
+        started_ms: daemon_started_ms(),
+        clients: attached_clients().load(Ordering::Acquire),
+        ok: compatible,
+        error: (!compatible).then(|| {
+            format!(
+                "wire v{} client cannot talk to wire v{} daemon",
+                hello.wire, WIRE_VERSION
+            )
+        }),
+    };
+    // The ack is a bare line, never Content-Length framed.
+    let _ = out_tx.send((proto::ack_line(&ack).trim_end().to_string(), false));
+    if !compatible {
+        return HelloOutcome::Incompatible;
+    }
+    if let Some(cwd) = hello.cwd.filter(|cwd| !cwd.is_empty()) {
+        if let Some(state) = SERVER_STATE.get() {
+            state.spawn_prewarm_at(Some(std::path::PathBuf::from(&cwd)));
+        }
+        *default_project = Some(cwd);
+    }
+    HelloOutcome::Handled
+}
+
+/// Fill in `project_path` for a tool call that omitted it, using the cwd the
+/// client announced in its hello.
+fn apply_default_project(payload: &mut String, default_project: Option<&str>) {
+    let Some(cwd) = default_project else {
+        return;
+    };
+    if let Some(patched) = proto::with_default_project(payload, cwd) {
+        *payload = patched;
+    }
+}
+
+/// Answer everything already accepted before hanging up.
+async fn drain_calls(calls: &mut JoinSet<()>) {
+    let drain = async { while calls.join_next().await.is_some() {} };
+    if tokio::time::timeout(DRAIN_TIMEOUT, drain).await.is_err() {
+        calls.abort_all();
+    }
+}
+
 /// Serve one client until it hangs up.
 pub(super) async fn serve(
     stream: tokio::net::UnixStream,
@@ -153,17 +246,11 @@ pub(super) async fn serve(
 
     debug!("Daemon connection accepted (session {session_id})");
     let _attached = Attached::new(idle_clock.clone());
-    let (read_half, mut write_half) = stream.into_split();
+    let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<(String, bool)>();
-    let writer = tokio::spawn(async move {
-        while let Some((response, framed)) = out_rx.recv().await {
-            if !write_socket_frame(&mut write_half, &response, framed).await {
-                break;
-            }
-        }
-    });
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<(String, bool)>();
+    let writer = tokio::spawn(drive_writer(write_half, out_rx));
 
     let limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_CALLS));
     let mut calls: JoinSet<()> = JoinSet::new();
@@ -190,43 +277,15 @@ pub(super) async fn serve(
 
         if first_frame {
             first_frame = false;
-            if let Some(hello) = proto::parse_hello(&payload) {
-                let compatible = hello.wire == WIRE_VERSION;
-                let ack = Ack {
-                    wire: WIRE_VERSION,
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    pid: std::process::id(),
-                    started_ms: daemon_started_ms(),
-                    clients: attached_clients().load(Ordering::Acquire),
-                    ok: compatible,
-                    error: (!compatible).then(|| {
-                        format!(
-                            "wire v{} client cannot talk to wire v{} daemon",
-                            hello.wire, WIRE_VERSION
-                        )
-                    }),
-                };
-                // The ack is a bare line, never Content-Length framed.
-                let _ = out_tx.send((proto::ack_line(&ack).trim_end().to_string(), false));
-                if !compatible {
-                    break;
-                }
-                if let Some(cwd) = hello.cwd.filter(|cwd| !cwd.is_empty()) {
-                    if let Some(state) = SERVER_STATE.get() {
-                        state.spawn_prewarm_at(Some(std::path::PathBuf::from(&cwd)));
-                    }
-                    default_project = Some(cwd);
-                }
-                continue;
+            match handle_hello_frame(&payload, &out_tx, &mut default_project) {
+                HelloOutcome::Handled => continue,
+                HelloOutcome::Incompatible => break,
+                HelloOutcome::NotHello => {}
             }
         }
 
         idle_clock.touch();
-        if let Some(cwd) = default_project.as_deref() {
-            if let Some(patched) = proto::with_default_project(&payload, cwd) {
-                payload = patched;
-            }
-        }
+        apply_default_project(&mut payload, default_project.as_deref());
 
         let is_tool_call = payload.contains("\"tools/call\"");
         let respond_framed = framed;
@@ -241,25 +300,19 @@ pub(super) async fn serve(
             let clock = idle_clock.clone();
             calls.spawn(async move {
                 let _permit = permit;
-                if let Some(response) =
-                    handle_socket_message(&payload, &session, &handshakes, &complete).await
-                {
-                    let _ = out.send((response, respond_framed));
-                }
+                let response =
+                    handle_socket_message(&payload, &session, &handshakes, &complete).await;
+                send_response(&out, response, respond_framed);
                 clock.touch();
             });
-        } else if let Some(response) =
-            handle_socket_message(&payload, &session, &handshakes, &complete).await
-        {
-            let _ = out.send((response, respond_framed));
+        } else {
+            let response = handle_socket_message(&payload, &session, &handshakes, &complete).await;
+            send_response(&out, response, respond_framed);
         }
     }
 
     // Answer everything already accepted before hanging up.
-    let drain = async { while calls.join_next().await.is_some() {} };
-    if tokio::time::timeout(DRAIN_TIMEOUT, drain).await.is_err() {
-        calls.abort_all();
-    }
+    drain_calls(&mut calls).await;
     drop(out_tx);
     let _ = writer.await;
     session_handshakes.remove(session_id.as_str());

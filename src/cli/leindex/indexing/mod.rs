@@ -460,22 +460,35 @@ impl LeIndex {
         check_memory_cap(&mut cap_guard)?;
         let lexical = self.run_lexical(&job, &pdg)?;
 
+        self.run_and_publish_neural(&job, &lexical)?;
+        self.finalize_indexing()?;
+        Ok(self.stats.clone())
+    }
+
+    fn run_and_publish_neural(
+        &mut self,
+        job: &JobPaths,
+        lexical: &LexicalCheckpoint,
+    ) -> Result<()> {
         // Publish the core (lexical-only) generation as a crash-recovery
         // checkpoint.  If the process dies during neural, the resumed run
         // can skip straight to the neural phase using this snapshot.
-        let _core = self.publish_generation(&job, None)?;
+        let _core = self.publish_generation(job, None)?;
         // The text index only needs the core generation's symbols, so it builds
         // beside the neural phase instead of after it.
         let text_index_job = self.spawn_text_index_refresh();
 
-        let neural = self.run_neural(&job, &lexical);
+        let neural = self.run_neural(job, lexical);
         // Never leave the builder running past this run, even on failure.
         if text_index_job.join().is_err() {
             warn!("Text index build panicked (search will scan live)");
         }
         let neural = neural?;
-        let _enhanced = self.publish_generation(&job, Some(&neural))?;
+        let _enhanced = self.publish_generation(job, Some(&neural))?;
+        Ok(())
+    }
 
+    fn finalize_indexing(&mut self) -> Result<()> {
         let state = self
             .pipeline
             .take()
@@ -498,7 +511,7 @@ impl LeIndex {
                 .to_string(),
         );
         self.retain_published_generations();
-        Ok(self.stats.clone())
+        Ok(())
     }
 
     /// Bound the store's disk use after a successful publish: keep the current
@@ -921,6 +934,58 @@ impl LeIndex {
         })
     }
 
+    fn prepare_pdg_for_building(
+        &mut self,
+        state: &mut IndexPipelineState,
+    ) -> Result<(
+        crate::graph::pdg::ProgramDependenceGraph,
+        Vec<crate::parse::parallel::ParsingResult>,
+    )> {
+        progress_stderr("Indexing: building PDG...");
+        if !state.unchanged_files.is_empty() && self.pdg.is_none() && state.pdg.is_none() {
+            self.load_pdg_from_storage().context(
+                "Failed to load existing PDG for incremental reindex. Please reindex with --force if corruption persists.",
+            )?;
+        }
+        let resumed_pdg_loaded = state.resumed_pdg.is_some() && state.pdg.is_some();
+        let pdg = if resumed_pdg_loaded {
+            state.pdg.take().unwrap_or_default()
+        } else {
+            state
+                .pdg
+                .take()
+                .or_else(|| self.take_owned_pdg())
+                .unwrap_or_default()
+        };
+        let parsing_results = if resumed_pdg_loaded {
+            Vec::new()
+        } else {
+            std::mem::take(&mut state.parsing_results)
+        };
+        Ok((pdg, parsing_results))
+    }
+
+    fn finalize_pdg(
+        &mut self,
+        pdg: &mut crate::graph::pdg::ProgramDependenceGraph,
+        state: &mut IndexPipelineState,
+        all_signatures: &[(String, crate::parse::traits::SignatureInfo)],
+    ) {
+        // Resume-proof FileSummary pass: covers files loaded from storage on
+        // resume (the merge_pdgs loop above only fires for freshly-parsed files).
+        pdg.ensure_file_summary_nodes();
+        if !all_signatures.is_empty() {
+            crate::graph::resolve_cross_file_call_edges_for_files(pdg, all_signatures);
+            crate::graph::resolve_cross_file_flow_edges_for_files(pdg, all_signatures);
+        }
+        self.annotate_external_dependencies(state, pdg);
+        add_submodule_summary_nodes(pdg, &self.project_path);
+        index_builder::normalize_external_nodes(pdg);
+        // Precision must be merged before checkpoint counts and fingerprints are
+        // captured; otherwise resumable artifacts describe a different graph.
+        self.run_precision_ingest(pdg);
+    }
+
     pub(crate) fn run_pdg(
         &mut self,
         _job: &JobPaths,
@@ -935,27 +1000,8 @@ impl LeIndex {
             .as_ref()
             .context("PDG phase missing checkpoint store")?
             .clone();
-        progress_stderr("Indexing: building PDG...");
-        if !state.unchanged_files.is_empty() && self.pdg.is_none() && state.pdg.is_none() {
-            self.load_pdg_from_storage().context(
-                "Failed to load existing PDG for incremental reindex. Please reindex with --force if corruption persists.",
-            )?;
-        }
-        let resumed_pdg_loaded = state.resumed_pdg.is_some() && state.pdg.is_some();
-        let mut pdg = if resumed_pdg_loaded {
-            state.pdg.take().unwrap_or_default()
-        } else {
-            state
-                .pdg
-                .take()
-                .or_else(|| self.take_owned_pdg())
-                .unwrap_or_default()
-        };
-        let parsing_results = if resumed_pdg_loaded {
-            Vec::new()
-        } else {
-            std::mem::take(&mut state.parsing_results)
-        };
+
+        let (mut pdg, parsing_results) = self.prepare_pdg_for_building(&mut state)?;
         let parse_stats = pdg_parse_stats(&parsing_results);
         // Route PDG construction: the streaming fragment/segment pipeline
         // (SP4) is the default; `LEINDEX_FEATURE_STREAMING_PDG=0` reverts to
@@ -970,25 +1016,8 @@ impl LeIndex {
             }
         );
         self.apply_pdg_file_changes(&state, &mut pdg, parsing_results, use_streaming)?;
-        // Resume-proof FileSummary pass: covers files loaded from storage on
-        // resume (the merge_pdgs loop above only fires for freshly-parsed files).
-        pdg.ensure_file_summary_nodes();
-        if !parse_stats.all_signatures.is_empty() {
-            crate::graph::resolve_cross_file_call_edges_for_files(
-                &mut pdg,
-                &parse_stats.all_signatures,
-            );
-            crate::graph::resolve_cross_file_flow_edges_for_files(
-                &mut pdg,
-                &parse_stats.all_signatures,
-            );
-        }
-        self.annotate_external_dependencies(&mut state, &mut pdg);
-        add_submodule_summary_nodes(&mut pdg, &self.project_path);
-        index_builder::normalize_external_nodes(&mut pdg);
-        // Precision must be merged before checkpoint counts and fingerprints are
-        // captured; otherwise resumable artifacts describe a different graph.
-        self.run_precision_ingest(&mut pdg);
+        self.finalize_pdg(&mut pdg, &mut state, &parse_stats.all_signatures);
+
         let pdg_node_count = pdg.node_count();
         let pdg_edge_count = pdg.edge_count();
         let pdg_checkpoint = checkpoint_store.write_pdg(parsed.scan_hash.clone(), &pdg)?;

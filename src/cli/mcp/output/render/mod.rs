@@ -584,21 +584,41 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
     if let Some(v) = data.get("embedding_model").and_then(|v| v.as_str()) {
         out.push_str(&field("Embedding model", v, color));
     }
-    if let Some(engram) = data.get("engram") {
-        let enabled = engram.get("enabled").and_then(|v| v.as_bool()) == Some(true);
-        let summary = if enabled {
-            let count = |key: &str| engram.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
-            format!(
-                "on ({} hits / {} misses, {} entries)",
-                count("hits"),
-                count("misses"),
-                count("entries")
-            )
-        } else {
-            "off (LEINDEX_FEATURE_ENGRAM=1 to enable)".to_string()
-        };
-        out.push_str(&field("Engram", &summary, color));
-    }
+    out.push_str(&render_diagnostics_engram(data, color));
+    out.push_str(&render_diagnostics_precision(data, color));
+    out.push_str(&render_diagnostics_provider(data, color));
+    out.push_str(&render_diagnostics_health(data, color));
+    out.push_str(&render_diagnostics_issues(data, color));
+    out
+}
+
+/// Render the `engram` cache status line: hit/miss/entry counts when the
+/// feature is enabled, an off-note pointing at the feature flag otherwise.
+/// Emits nothing when the handler did not report the field.
+fn render_diagnostics_engram(data: &Value, color: bool) -> String {
+    let Some(engram) = data.get("engram") else {
+        return String::new();
+    };
+    let enabled = engram.get("enabled").and_then(|v| v.as_bool()) == Some(true);
+    let summary = if enabled {
+        let count = |key: &str| engram.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+        format!(
+            "on ({} hits / {} misses, {} entries)",
+            count("hits"),
+            count("misses"),
+            count("entries")
+        )
+    } else {
+        "off (LEINDEX_FEATURE_ENGRAM=1 to enable)".to_string()
+    };
+    field("Engram", &summary, color)
+}
+
+/// Render the SCIP-precision block: enabled flag, node count, and the
+/// comma-joined language list (the language line is omitted when the
+/// list is empty).
+fn render_diagnostics_precision(data: &Value, color: bool) -> String {
+    let mut out = String::new();
     if let Some(enabled) = data.get("precision_enabled").and_then(|v| v.as_bool()) {
         let status = if enabled { "enabled" } else { "disabled" };
         out.push_str(&field("SCIP precision", status, color));
@@ -616,8 +636,13 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
             out.push_str(&field("Precision languages", &names, color));
         }
     }
-    // VAL-CROSS-015 / VAL-ORT-022: surface resolved ORT library info so support
-    // engineers can debug any install surface identically via `leindex diagnostics`.
+    out
+}
+
+// VAL-CROSS-015 / VAL-ORT-022: surface resolved ORT library info so support
+// engineers can debug any install surface identically via `leindex diagnostics`.
+fn render_diagnostics_provider(data: &Value, color: bool) -> String {
+    let mut out = String::new();
     if let Some(v) = data.get("ort_version").and_then(|v| v.as_str()) {
         out.push_str(&field("ORT version", v, color));
     }
@@ -645,8 +670,6 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
             }
         }
     }
-    out.push_str(&render_diagnostics_health(data, color));
-    out.push_str(&render_diagnostics_issues(data, color));
     out
 }
 
@@ -759,40 +782,50 @@ fn render_read_file(data: &Value, color: bool) -> String {
     // read range; the handler builds them and the trimmer keeps them, but
     // this renderer silently dropped the field — the parameter looked like a
     // no-op (N-08). Render a compact map when present.
-    if let Some(symbols) = data.get("symbol_map").and_then(|v| v.as_array()) {
-        if !symbols.is_empty() {
-            out.push_str(&format!(
-                "\n  {}Symbols in range ({}):{}\n",
-                if color { DIM } else { "" },
-                symbols.len(),
-                if color { RESET } else { "" },
-            ));
-            for symbol in symbols.iter().take(20) {
-                let name = symbol.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                let typ = symbol.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                let line_start = symbol.get("line_start").and_then(|v| v.as_u64());
-                let line_end = symbol.get("line_end").and_then(|v| v.as_u64());
-                let location = match (line_start, line_end) {
-                    (Some(s), Some(e)) => format!(":{s}-{e}"),
-                    (Some(s), None) => format!(":{s}"),
-                    _ => String::new(),
-                };
-                out.push_str(&format!(
-                    "    {}{}{} {}{}{}{}\n",
-                    if color { LIGHT_CYAN } else { "" },
-                    name,
-                    if color { RESET } else { "" },
-                    if color { DIM } else { "" },
-                    if typ.is_empty() {
-                        String::new()
-                    } else {
-                        format!("[{typ}]")
-                    },
-                    location,
-                    if color { RESET } else { "" },
-                ));
-            }
-        }
+    out.push_str(&render_read_file_symbol_map(data, color));
+    out
+}
+
+/// Render the compact per-symbol map requested by `include_symbol_map`:
+/// up to 20 symbols with optional `[type]` tag and `:start-end` line
+/// range. Emits nothing when the map is absent or empty.
+fn render_read_file_symbol_map(data: &Value, color: bool) -> String {
+    let Some(symbols) = data.get("symbol_map").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if symbols.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "\n  {}Symbols in range ({}):{}\n",
+        if color { DIM } else { "" },
+        symbols.len(),
+        if color { RESET } else { "" },
+    );
+    for symbol in symbols.iter().take(20) {
+        let name = symbol.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let typ = symbol.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let line_start = symbol.get("line_start").and_then(|v| v.as_u64());
+        let line_end = symbol.get("line_end").and_then(|v| v.as_u64());
+        let location = match (line_start, line_end) {
+            (Some(s), Some(e)) => format!(":{s}-{e}"),
+            (Some(s), None) => format!(":{s}"),
+            _ => String::new(),
+        };
+        out.push_str(&format!(
+            "    {}{}{} {}{}{}{}\n",
+            if color { LIGHT_CYAN } else { "" },
+            name,
+            if color { RESET } else { "" },
+            if color { DIM } else { "" },
+            if typ.is_empty() {
+                String::new()
+            } else {
+                format!("[{typ}]")
+            },
+            location,
+            if color { RESET } else { "" },
+        ));
     }
     out
 }
@@ -1036,27 +1069,7 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
         .get("success")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let changes_applied = data
-        .get("changes_applied")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let (status_label, status_color) = if !success {
-        ("Edit apply failed", if color { LIGHT_RED } else { "" })
-    } else if data.get("dry_run").and_then(|v| v.as_bool()) == Some(true) {
-        // A dry run always reports zero applied changes by design; labeling
-        // it "No-op (content identical)" misdescribes a real preview.
-        (
-            "Dry run (no changes written)",
-            if color { LIGHT_YELLOW } else { "" },
-        )
-    } else if changes_applied == 0 {
-        (
-            "No-op (content identical)",
-            if color { LIGHT_YELLOW } else { "" },
-        )
-    } else {
-        ("Applied", if color { LIGHT_GREEN } else { "" })
-    };
+    let (status_label, status_color) = edit_apply_status(success, data, color);
     out.push_str(&format!(
         "{}{}{}\n",
         status_color,
@@ -1090,6 +1103,33 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
             .map_or_else(String::new, |region| render_edit_region(region, color)),
     );
     out
+}
+
+/// Pick the first status line of the edit-apply render: failure, dry-run
+/// preview, no-op, or successful apply. A dry run always reports zero
+/// applied changes by design; labeling it "No-op (content identical)"
+/// misdescribes a real preview.
+fn edit_apply_status(success: bool, data: &Value, color: bool) -> (&'static str, &'static str) {
+    if !success {
+        ("Edit apply failed", if color { LIGHT_RED } else { "" })
+    } else if data.get("dry_run").and_then(|v| v.as_bool()) == Some(true) {
+        (
+            "Dry run (no changes written)",
+            if color { LIGHT_YELLOW } else { "" },
+        )
+    } else if data
+        .get("changes_applied")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        == 0
+    {
+        (
+            "No-op (content identical)",
+            if color { LIGHT_YELLOW } else { "" },
+        )
+    } else {
+        ("Applied", if color { LIGHT_GREEN } else { "" })
+    }
 }
 
 // =============================================================================
@@ -1442,50 +1482,87 @@ impl Default for FileSummaryFormatter {
 // leindex_find — compact, token-lean text
 // =============================================================================
 
+/// String accessor for `leindex_find` payloads: `""` when the field is
+/// missing or not a string.
+fn find_text(v: &Value, key: &str) -> String {
+    v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// Numeric accessor for `leindex_find` payloads: `0` when the field is
+/// missing or not a number.
+fn find_num(v: &Value, key: &str) -> u64 {
+    v.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
 /// Render a `leindex_find` result. Hits are grouped by file and, inside a file,
 /// by enclosing symbol, so a symbol name is paid for once rather than per line.
 fn render_find(data: &Value) -> String {
     use std::fmt::Write as _;
-    let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).unwrap_or("").to_string();
-    let num = |v: &Value, key: &str| v.get(key).and_then(Value::as_u64).unwrap_or(0);
-    let mut out = String::new();
 
     if data.get("is_git_repo").is_some() {
         return render_default(data, false);
     }
-    let pattern = text(data, "pattern");
+    let pattern = find_text(data, "pattern");
     if data["target"] == "symbols" {
-        let total = num(data, "total_symbols");
-        let _ = writeln!(out, "{total} symbol(s) named like \"{pattern}\"");
-        for symbol in data["symbols"].as_array().into_iter().flatten() {
-            let line = num(symbol, "line");
-            let _ = writeln!(
-                out,
-                "  {} {} — {}{}{}",
-                text(symbol, "kind"),
-                text(symbol, "name"),
-                text(symbol, "file"),
-                if line > 0 {
-                    format!(":{line}")
-                } else {
-                    String::new()
-                },
-                if symbol["stale"] == true {
-                    " (file changed since indexing)"
-                } else {
-                    ""
-                },
-            );
-        }
-        if let Some(note) = data.get("note").and_then(Value::as_str) {
-            let _ = writeln!(out, "{note}");
-        }
-        if data["has_more"] == true {
-            let _ = writeln!(out, "… more: offset={}", num(data, "next_offset"));
-        }
-        return out;
+        return render_find_symbols(data, &pattern);
     }
 
+    let mut out = String::new();
+    render_find_summary(&mut out, data, &pattern);
+    render_find_output_section(&mut out, data);
+    if data["has_more"] == true {
+        let _ = writeln!(
+            out,
+            "… more results: offset={}",
+            find_num(data, "next_offset")
+        );
+    }
+    if let Some(note) = data.get("note").and_then(Value::as_str) {
+        let _ = writeln!(out, "{note}");
+    }
+    out
+}
+
+/// Render `target=symbols` results: one line per matching symbol with
+/// optional line anchor and stale-file annotation.
+fn render_find_symbols(data: &Value, pattern: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let total = find_num(data, "total_symbols");
+    let _ = writeln!(out, "{total} symbol(s) named like \"{pattern}\"");
+    for symbol in data["symbols"].as_array().into_iter().flatten() {
+        let line = find_num(symbol, "line");
+        let _ = writeln!(
+            out,
+            "  {} {} — {}{}{}",
+            find_text(symbol, "kind"),
+            find_text(symbol, "name"),
+            find_text(symbol, "file"),
+            if line > 0 {
+                format!(":{line}")
+            } else {
+                String::new()
+            },
+            if symbol["stale"] == true {
+                " (file changed since indexing)"
+            } else {
+                ""
+            },
+        );
+    }
+    if data["has_more"] == true {
+        let _ = writeln!(out, "… more: offset={}", find_num(data, "next_offset"));
+    }
+    if let Some(note) = data.get("note").and_then(Value::as_str) {
+        let _ = writeln!(out, "{note}");
+    }
+    out
+}
+
+/// Render the match-count summary line (with indexed-state suffix) and the
+/// optional search-fallback note.
+fn render_find_summary(out: &mut String, data: &Value, pattern: &str) {
+    use std::fmt::Write as _;
     let stats = &data["stats"];
     let indexed = data["roots"]
         .as_array()
@@ -1493,76 +1570,105 @@ fn render_find(data: &Value) -> String {
     let _ = writeln!(
         out,
         "{} match(es) in {} file(s) for \"{}\" · {}ms{}",
-        num(data, "total_matches"),
-        num(data, "total_files"),
+        find_num(data, "total_matches"),
+        find_num(data, "total_files"),
         pattern,
-        num(stats, "millis"),
+        find_num(stats, "millis"),
         if indexed { " · indexed" } else { "" },
     );
     if let Some(fallback) = data.get("fallback").and_then(Value::as_str) {
         let _ = writeln!(out, "({fallback})");
     }
-    match text(data, "output").as_str() {
+}
+
+/// Dispatch on the requested `output` mode: bare counts, file list,
+/// symbol list, or full content hits.
+fn render_find_output_section(out: &mut String, data: &Value) {
+    match find_text(data, "output").as_str() {
         "count" => {}
-        "files" => {
-            for file in data["files"].as_array().into_iter().flatten() {
-                let _ = writeln!(out, "  {} ({})", text(file, "file"), num(file, "matches"));
-            }
-        }
-        "symbols" => {
-            for symbol in data["symbols"].as_array().into_iter().flatten() {
-                let _ = writeln!(
-                    out,
-                    "  {} {} — {} ({})",
-                    text(symbol, "kind"),
-                    text(symbol, "name"),
-                    text(symbol, "file"),
-                    num(symbol, "matches"),
-                );
-            }
-        }
-        _ => {
-            for file in data["files"].as_array().into_iter().flatten() {
-                let shown = file["hits"].as_array().map_or(0, Vec::len) as u64;
-                let total = num(file, "matches");
-                let _ = writeln!(
-                    out,
-                    "{}{}",
-                    text(file, "file"),
-                    if total > shown {
-                        format!(" ({shown} of {total} shown)")
-                    } else {
-                        String::new()
-                    },
-                );
-                let mut current: Option<String> = None;
-                for hit in file["hits"].as_array().into_iter().flatten() {
-                    let symbol = hit
-                        .get("symbol")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    if symbol != current {
-                        if let Some(name) = &symbol {
-                            let _ = writeln!(out, " {} ({})", name, text(hit, "kind"));
-                        }
-                        current = symbol;
-                    }
-                    for line in hit["before"].as_array().into_iter().flatten() {
-                        let _ = writeln!(out, "   | {}", line.as_str().unwrap_or(""));
-                    }
-                    let _ = writeln!(out, "  {}: {}", num(hit, "line"), text(hit, "text"));
-                    for line in hit["after"].as_array().into_iter().flatten() {
-                        let _ = writeln!(out, "   | {}", line.as_str().unwrap_or(""));
-                    }
-                }
-            }
+        "files" => render_find_files_output(out, data),
+        "symbols" => render_find_symbol_matches(out, data),
+        _ => render_find_content_hits(out, data),
+    }
+}
+
+/// `output=files`: one line per matching file.
+fn render_find_files_output(out: &mut String, data: &Value) {
+    use std::fmt::Write as _;
+    for file in data["files"].as_array().into_iter().flatten() {
+        let _ = writeln!(
+            out,
+            "  {} ({})",
+            find_text(file, "file"),
+            find_num(file, "matches")
+        );
+    }
+}
+
+/// `output=symbols`: one line per matching symbol with its match count.
+fn render_find_symbol_matches(out: &mut String, data: &Value) {
+    use std::fmt::Write as _;
+    for symbol in data["symbols"].as_array().into_iter().flatten() {
+        let _ = writeln!(
+            out,
+            "  {} {} — {} ({})",
+            find_text(symbol, "kind"),
+            find_text(symbol, "name"),
+            find_text(symbol, "file"),
+            find_num(symbol, "matches"),
+        );
+    }
+}
+
+/// Default content mode: per-file hit blocks, hits grouped under their
+/// enclosing symbol so a symbol name is printed once.
+fn render_find_content_hits(out: &mut String, data: &Value) {
+    use std::fmt::Write as _;
+    for file in data["files"].as_array().into_iter().flatten() {
+        let shown = file["hits"].as_array().map_or(0, Vec::len) as u64;
+        let total = find_num(file, "matches");
+        let _ = writeln!(
+            out,
+            "{}{}",
+            find_text(file, "file"),
+            if total > shown {
+                format!(" ({shown} of {total} shown)")
+            } else {
+                String::new()
+            },
+        );
+        let mut current: Option<String> = None;
+        for hit in file["hits"].as_array().into_iter().flatten() {
+            render_find_hit(out, &mut current, hit);
         }
     }
-    if data["has_more"] == true {
-        let _ = writeln!(out, "… more results: offset={}", num(data, "next_offset"));
+}
+
+/// Render a single content hit: the enclosing-symbol header (when the
+/// symbol changes), the `before` context lines, the match line, and the
+/// `after` context lines.
+fn render_find_hit(out: &mut String, current: &mut Option<String>, hit: &Value) {
+    use std::fmt::Write as _;
+    let symbol = hit
+        .get("symbol")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if symbol != *current {
+        if let Some(name) = &symbol {
+            let _ = writeln!(out, " {} ({})", name, find_text(hit, "kind"));
+        }
+        *current = symbol;
     }
-    if let Some(note) = data.get("note").and_then(Value::as_str) {
-        let _ = writeln!(out, "{note}");
+    for line in hit["before"].as_array().into_iter().flatten() {
+        let _ = writeln!(out, "   | {}", line.as_str().unwrap_or(""));
     }
-    out
+    let _ = writeln!(
+        out,
+        "  {}: {}",
+        find_num(hit, "line"),
+        find_text(hit, "text")
+    );
+    for line in hit["after"].as_array().into_iter().flatten() {
+        let _ = writeln!(out, "   | {}", line.as_str().unwrap_or(""));
+    }
 }

@@ -1427,32 +1427,13 @@ impl WorkerRuntime {
         // Probe while holding the cache lock, then release it before inference.
         if let Some(cache_arc) = &self.cache {
             let mut cache = cache_arc.lock().unwrap_or_else(|p| p.into_inner());
-            match cache.probe(cache_keys) {
-                Ok(probe_result) => {
-                    let hit_count = probe_result.hits.len();
-                    for (idx, vector) in probe_result.hits {
-                        if idx < n && vector.len() == expected_dim {
-                            let start = idx * expected_dim;
-                            vectors[start..start + expected_dim].copy_from_slice(&vector);
-                            filled[idx] = true;
-                        } else {
-                            tracing::warn!(
-                                index = idx,
-                                cached_dim = vector.len(),
-                                expected_dim,
-                                "ignoring malformed embedding cache row"
-                            );
-                        }
-                    }
-                    tracing::debug!(
-                        total = n,
-                        hits = hit_count,
-                        misses = filled.iter().filter(|&&is_filled| !is_filled).count(),
-                        "cache probe complete"
-                    );
-                }
-                Err(e) => tracing::warn!(error = %e, "cache probe failed; embedding all texts"),
-            }
+            self.apply_probe_hits(
+                &mut cache,
+                cache_keys,
+                expected_dim,
+                &mut vectors,
+                &mut filled,
+            );
         }
 
         let miss_indices: Vec<usize> = filled
@@ -1496,14 +1477,14 @@ impl WorkerRuntime {
         // Write misses after inference; never hold the cache mutex across ORT.
         if let Some(cache_arc) = &self.cache {
             let mut cache = cache_arc.lock().unwrap_or_else(|p| p.into_inner());
-            for (miss_row, &miss_idx) in miss_indices.iter().enumerate() {
-                let start = miss_row * expected_dim;
-                let vec_slice = &miss_vectors[start..start + expected_dim];
-                let source_text = texts.get(miss_idx).map(String::as_str);
-                if let Err(e) = cache.put(&cache_keys[miss_idx], vec_slice, source_text) {
-                    tracing::warn!(error = %e, "failed to write embedding to cache");
-                }
-            }
+            self.put_miss_vectors(
+                &mut cache,
+                texts,
+                cache_keys,
+                &miss_indices,
+                &miss_vectors,
+                expected_dim,
+            );
         }
 
         debug_assert!(filled.into_iter().all(|value| value));
@@ -1511,6 +1492,67 @@ impl WorkerRuntime {
             kind: ErrorKind::Inference,
             message,
         })
+    }
+
+    /// Copy probed cache hits into `vectors`, marking filled rows in `filled`.
+    /// Malformed rows (out-of-range index or wrong dimension) are logged and
+    /// dropped so the affected text is re-embedded as a miss.
+    fn apply_probe_hits(
+        &self,
+        cache: &mut crate::embed::cache::store::GlobalEmbeddingCache,
+        cache_keys: &[crate::embed::cache::CacheKey],
+        expected_dim: usize,
+        vectors: &mut [f32],
+        filled: &mut [bool],
+    ) {
+        match cache.probe(cache_keys) {
+            Ok(probe_result) => {
+                let hit_count = probe_result.hits.len();
+                for (idx, vector) in probe_result.hits {
+                    if idx < filled.len() && vector.len() == expected_dim {
+                        let start = idx * expected_dim;
+                        vectors[start..start + expected_dim].copy_from_slice(&vector);
+                        filled[idx] = true;
+                    } else {
+                        tracing::warn!(
+                            index = idx,
+                            cached_dim = vector.len(),
+                            expected_dim,
+                            "ignoring malformed embedding cache row"
+                        );
+                    }
+                }
+                tracing::debug!(
+                    total = filled.len(),
+                    hits = hit_count,
+                    misses = filled.iter().filter(|&&is_filled| !is_filled).count(),
+                    "cache probe complete"
+                );
+            }
+            Err(e) => tracing::warn!(error = %e, "cache probe failed; embedding all texts"),
+        }
+    }
+
+    /// Write the freshly embedded miss vectors back to the cache, row by row.
+    /// Write failures are logged and otherwise ignored: the cache is
+    /// rebuildable, so a dropped write only costs a future miss.
+    fn put_miss_vectors(
+        &self,
+        cache: &mut crate::embed::cache::store::GlobalEmbeddingCache,
+        texts: &[String],
+        cache_keys: &[crate::embed::cache::CacheKey],
+        miss_indices: &[usize],
+        miss_vectors: &[f32],
+        expected_dim: usize,
+    ) {
+        for (miss_row, &miss_idx) in miss_indices.iter().enumerate() {
+            let start = miss_row * expected_dim;
+            let vec_slice = &miss_vectors[start..start + expected_dim];
+            let source_text = texts.get(miss_idx).map(String::as_str);
+            if let Err(e) = cache.put(&cache_keys[miss_idx], vec_slice, source_text) {
+                tracing::warn!(error = %e, "failed to write embedding to cache");
+            }
+        }
     }
 
     /// Embed texts using ONNX inference (or zero vectors if ONNX is not enabled).
