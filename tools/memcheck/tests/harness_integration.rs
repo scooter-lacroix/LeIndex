@@ -71,20 +71,6 @@ fn memcheck_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// Helper: check if a phase is a worker-gated phase whose placeholder report
-/// (produced when the embed worker binary is unavailable) carries `u64::MAX`
-/// sentinel RSS values. Such phases must be skipped when checking RSS bounds
-/// to avoid assertion failures on sentinel values.
-///
-/// Worker-gated phases: `embed_idle`, `embed_active`, `embed_teardown`,
-/// `worker_ort_threads`. When `sample_count == 0`, the worker binary was not
-/// available and `placeholder_report()` injected `u64::MAX` for
-/// `rss_max_kib` and `combined_rss_max_kib`.
-fn is_unsampled_worker_gated(phase_name: &str, sample_count: u64) -> bool {
-    let is_worker_gated = phase_name.starts_with("embed_") || phase_name == "worker_ort_threads";
-    is_worker_gated && sample_count == 0
-}
-
 /// Helper: run the memcheck binary and return (exit_code, stdout, stderr).
 fn run_memcheck(fixture: &str, extra_args: &[&str]) -> (bool, String, String) {
     let _lock = memcheck_lock();
@@ -334,30 +320,26 @@ fn test_val_measure_003_per_phase_schema_has_required_metrics() {
             );
         }
 
-        // sample_count should be positive unless this is a worker-gated
-        // phase with no samples (worker binary not available → placeholder).
+        // sample_count must be positive: every canonical phase runs and is
+        // sampled, including the worker-active ones (worker-missing shows up
+        // as worker_note diagnostics, never as unsampled placeholders).
         let phase_name = phase.get("phase").unwrap().as_str().unwrap_or("");
         let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
-        if !is_unsampled_worker_gated(phase_name, sample_count) {
-            assert!(
-                sample_count > 0,
-                "phase {} ('{}') should have at least 1 sample",
-                i,
-                phase_name
-            );
-        }
+        assert!(
+            sample_count > 0,
+            "phase {} ('{}') should have at least 1 sample",
+            i,
+            phase_name
+        );
 
-        // duration_ms should be positive unless this is a worker-gated
-        // placeholder phase (0 duration when unsampled).
+        // duration_ms should be positive for every sampled phase.
         let duration = phase.get("duration_ms").unwrap().as_u64().unwrap();
-        if !is_unsampled_worker_gated(phase_name, sample_count) {
-            assert!(
-                duration > 0,
-                "phase {} ('{}') should have positive duration",
-                i,
-                phase_name
-            );
-        }
+        assert!(
+            duration > 0,
+            "phase {} ('{}') should have positive duration",
+            i,
+            phase_name
+        );
     }
 }
 
@@ -416,13 +398,6 @@ fn test_val_measure_005_linux_rss_is_primary_metric() {
     for phase in phases {
         let phase_name = phase.get("phase").unwrap().as_str().unwrap();
         let rss_max = phase.get("rss_max_kib").unwrap().as_u64().unwrap();
-        let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
-
-        // Skip worker-gated phases that had no samples (worker binary not
-        // available → placeholder reports carry u64::MAX sentinels).
-        if is_unsampled_worker_gated(phase_name, sample_count) {
-            continue;
-        }
 
         // RSS should be positive for all sampled phases
         assert!(
@@ -462,11 +437,6 @@ fn test_val_measure_006_mapped_file_and_anon_captured() {
     for phase in phases {
         let phase_name = phase.get("phase").unwrap().as_str().unwrap();
         let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
-
-        // Skip worker-gated placeholder phases (unsampled → u64::MAX sentinels).
-        if is_unsampled_worker_gated(phase_name, sample_count) {
-            continue;
-        }
 
         let mapped = phase.get("mapped_file_kib").unwrap().as_u64().unwrap();
         let anon = phase.get("anon_kib").unwrap().as_u64().unwrap();
@@ -577,19 +547,12 @@ fn test_idle_phases_have_reasonable_duration() {
     let phases = report.get("phases").unwrap().as_array().unwrap();
 
     // Idle phases should have duration >= 3 seconds (IDLE_DWELL)
-    // Worker-active idle phases (embed_idle, embed_teardown) may have 0 duration
-    // if the worker binary is not available.
     for phase in phases {
         let name = phase.get("phase").unwrap().as_str().unwrap();
-        let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
         if name.starts_with("idle_")
             || name == "mcp_idle_proliferation"
             || (name.starts_with("embed_") && name != "embed_active")
         {
-            // Skip unsampled worker-gated phases (worker binary not available)
-            if is_unsampled_worker_gated(name, sample_count) {
-                continue;
-            }
             let duration = phase.get("duration_ms").unwrap().as_u64().unwrap();
             assert!(
                 duration >= 2500,
@@ -703,6 +666,36 @@ fn test_stale_artifacts_phase_removes_dead_sidecars() {
             path.display()
         );
     }
+}
+
+// ─── Worker token parity guard ───────────────────────────────────────────
+
+/// The duplicated argv-token literal in `tools/memcheck/src/sampler.rs`
+/// (`WORKER_CMDLINE_TOKEN`). `tools/memcheck` is a binary-only crate, so the
+/// constant cannot be imported; this test compares source text instead.
+#[test]
+fn test_worker_cmdline_token_matches_authoritative_source() {
+    const HARNESS_WORKER_CMDLINE_TOKEN: &str = "--internal-embed-worker";
+
+    let worker_main = std::fs::read_to_string(workspace_root().join("src/embed/worker_main.rs"))
+        .unwrap_or_else(|e| panic!("failed to read src/embed/worker_main.rs (read-only): {e}"));
+    assert!(
+        worker_main.contains("INTERNAL_WORKER_TOKEN: &str = \"--internal-embed-worker\";"),
+        "src/embed/worker_main.rs no longer declares INTERNAL_WORKER_TOKEN — \
+         update sampler.rs::WORKER_CMDLINE_TOKEN and this test together"
+    );
+
+    let sampler_src =
+        std::fs::read_to_string(workspace_root().join("tools/memcheck/src/sampler.rs"))
+            .expect("failed to read tools/memcheck/src/sampler.rs");
+    assert!(
+        sampler_src.contains(&format!(
+            "WORKER_CMDLINE_TOKEN: &str = \"{HARNESS_WORKER_CMDLINE_TOKEN}\";"
+        )),
+        "tools/memcheck/src/sampler.rs WORKER_CMDLINE_TOKEN drifted from \
+         \"{HARNESS_WORKER_CMDLINE_TOKEN}\" — keep it in sync with \
+         src/embed/worker_main.rs INTERNAL_WORKER_TOKEN"
+    );
 }
 
 // ─── T8 step-3: worker ORT-threads cap ≤ no-cap (opt-in, expensive) ─────

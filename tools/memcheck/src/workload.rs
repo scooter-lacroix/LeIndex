@@ -79,9 +79,6 @@ pub const CANONICAL_PHASES: &[&str] = &[
     "full_index_run3",
 ];
 
-/// The worker binary name used for child-process detection.
-const WORKER_BINARY_NAME: &str = "leindex-embed";
-
 /// Concurrent idle MCP servers launched by the `mcp_idle_proliferation` phase.
 const PROLIFERATION_COUNT: usize = 3;
 
@@ -103,9 +100,11 @@ pub struct WorkloadConfig {
     pub fixture: PathBuf,
     pub sample_interval: Duration,
     pub verbose: bool,
-    /// Path to the leindex-embed worker binary (for worker-active phases).
-    /// If None, worker-active phases are skipped.
-    pub worker_binary: Option<PathBuf>,
+    /// Whether the measured binary can spawn an embed worker, from the
+    /// `<binary> --internal-embed-worker --version` capability probe in
+    /// `main.rs`. Worker-active phases run regardless; this only controls
+    /// whether a missing worker process produces a diagnostic.
+    pub worker_capable: bool,
     /// Directory for heap-profile snapshots (smaps). If None, profiles are
     /// stored in a temp dir that is cleaned up after the run.
     pub heap_profile_dir: Option<PathBuf>,
@@ -213,66 +212,31 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
     kill_child(child);
 
     // ── Worker-active phases (VAL-CPHASE-036) ───────────────────────────
-    // These phases exercise the worker lifecycle. They require the
-    // leindex-embed binary to be available alongside the main binary.
-    let worker_available = config
-        .worker_binary
-        .as_ref()
-        .map(|p| p.exists())
-        .unwrap_or(false);
+    // These phases ALWAYS run so every canonical phase carries real samples
+    // (VAL-MEASURE-002). When the binary is worker-capable but no worker
+    // process appears in a phase that triggers embedding, that is recorded
+    // as a diagnostic (`annotate_worker_report`), never a u64::MAX sentinel.
 
-    if worker_available {
-        // ── Phase 7: embed_idle ─────────────────────────────────────────
-        // Launch MCP process and let it sit idle (no worker spawned yet).
-        let (child, report) = run_idle_phase(config, "embed_idle", IDLE_DWELL, false)?;
-        reports.push(report);
-        kill_child(child);
+    // ── Phase 7: embed_idle ─────────────────────────────────────────
+    // Launch MCP process and let it sit idle (no worker spawned yet).
+    let (child, report) = run_idle_phase(config, "embed_idle", IDLE_DWELL, false)?;
+    reports.push(report);
+    kill_child(child);
 
-        // ── Phase 8: embed_active ───────────────────────────────────────
-        // Launch MCP process, trigger a search that would use ONNX embeddings
-        // (which spawns the worker), and sample both main + worker RSS.
-        let (child, report) = run_embed_active_phase(config)?;
-        reports.push(report);
-        kill_child(child);
+    // ── Phase 8: embed_active ───────────────────────────────────────
+    // Launch MCP process, trigger a search that would use ONNX embeddings
+    // (which spawns the worker), and sample both main + worker RSS.
+    let (child, mut report) = run_embed_active_phase(config)?;
+    annotate_worker_report(config, &mut report);
+    reports.push(report);
+    kill_child(child);
 
-        // ── Phase 9: embed_teardown ─────────────────────────────────────
-        // Launch MCP process after the worker has been torn down. This verifies
-        // that the worker process is cleaned up and doesn't leak RSS.
-        let (child, report) = run_idle_phase(config, "embed_teardown", IDLE_DWELL, true)?;
-        reports.push(report);
-        kill_child(child);
-    } else {
-        if config.verbose {
-            eprintln!(
-                "memcheck: skipping worker-active phases ({} not found)",
-                config
-                    .worker_binary
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "worker binary path not set".to_string())
-            );
-        }
-        // Still add placeholder phases so the report has the right phase count.
-        // Use u64::MAX sentinel values so the budget gate fails these phases
-        // (they were not actually measured). A zero-valued report would pass
-        // trivially since 0 < any threshold. Only the three `embed_*` phases
-        // are inserted here: `worker_ort_threads` gets its placeholder at the
-        // same canonical position as the real run (after mcp_idle_proliferation,
-        // before stale_artifacts) so report order matches CANONICAL_PHASES on
-        // both paths (VAL-MEASURE-002).
-        eprintln!(
-            "memcheck: WARNING: worker-active phases skipped ({} not found) — \
-             placeholder reports will fail the budget gate",
-            config
-                .worker_binary
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "worker binary path not set".to_string())
-        );
-        for phase_name in &["embed_idle", "embed_active", "embed_teardown"] {
-            reports.push(placeholder_report(phase_name));
-        }
-    }
+    // ── Phase 9: embed_teardown ─────────────────────────────────────
+    // Launch MCP process after the worker has been torn down. This verifies
+    // that the worker process is cleaned up and doesn't leak RSS.
+    let (child, report) = run_idle_phase(config, "embed_teardown", IDLE_DWELL, true)?;
+    reports.push(report);
+    kill_child(child);
 
     // ── Phase 10: mcp_idle_proliferation ────────────────────────────────
     // Spawn PROLIFERATION_COUNT concurrent idle MCP servers and measure their
@@ -283,16 +247,12 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
     reports.push(report);
 
     // ── Phase 11: worker_ort_threads ────────────────────────────────────
-    // Worker-gated: real run or placeholder at the SAME canonical position on
-    // both paths (after mcp_idle_proliferation, before stale_artifacts), so
-    // report order always matches CANONICAL_PHASES (VAL-MEASURE-002).
-    if worker_available {
-        let (child, report) = run_worker_ort_threads_phase(config)?;
-        reports.push(report);
-        kill_child(child);
-    } else {
-        reports.push(placeholder_report("worker_ort_threads"));
-    }
+    // Worker-active trigger under LEINDEX_WORKER_ORT_THREADS=1 (T5/D3).
+    // Always runs (real samples in every canonical phase, VAL-MEASURE-002).
+    let (child, mut report) = run_worker_ort_threads_phase(config)?;
+    annotate_worker_report(config, &mut report);
+    reports.push(report);
+    kill_child(child);
 
     // ── Phase 12: stale_artifacts ───────────────────────────────────────
     // Seed dead-pid run-dir sidecars, run `leindex cleanup --stale-daemons`,
@@ -352,25 +312,26 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
     Ok(reports)
 }
 
-/// Placeholder report for a worker-gated phase that could not run because the
-/// worker binary is missing. `u64::MAX` sentinels make the budget gate fail
-/// these phases loudly (they were not actually measured); a zero-valued report
-/// would pass trivially since 0 < any threshold.
-fn placeholder_report(phase_name: &str) -> PhaseReport {
-    PhaseReport {
-        phase: phase_name.to_string(),
-        rss_min_kib: 0,
-        rss_max_kib: u64::MAX,
-        rss_p95_kib: 0,
-        mapped_file_kib: 0,
-        anon_kib: 0,
-        sample_count: 0,
-        duration_ms: 0,
-        worker_rss_max_kib: 0,
-        combined_rss_max_kib: u64::MAX,
-        gpu_vram_mib: None,
-        descendants: crate::sampler::DescendantTree::default(),
+/// Annotate a worker-active phase report when the binary is worker-capable
+/// but no worker process was observed.
+///
+/// Prints a diagnostic naming the phase and the likely cause (missing ONNX
+/// runtime library or model), and records it in `report.worker_note`. This
+/// is NOT a hard failure: `diff.rs` gates purely on measured RSS numbers, so
+/// a run where the worker failed to spawn still reports real main-process
+/// RSS (worker_rss_max_kib = 0, combined = main max) instead of a
+/// `u64::MAX` sentinel.
+fn annotate_worker_report(config: &WorkloadConfig, report: &mut PhaseReport) {
+    if !config.worker_capable || report.worker_rss_max_kib > 0 {
+        return;
     }
+    let note = format!(
+        "no embed worker process observed during '{}' despite the binary being \
+         worker-capable; likely cause: missing ONNX runtime library or model",
+        report.phase
+    );
+    eprintln!("memcheck: WARNING: {note}");
+    report.worker_note = Some(note);
 }
 
 // ─── Phase implementations ──────────────────────────────────────────────
@@ -395,13 +356,8 @@ fn run_idle_phase(
     // Give the process time to initialise before sampling.
     std::thread::sleep(STARTUP_GRACE);
 
-    let worker_name = if track_worker {
-        Some(WORKER_BINARY_NAME)
-    } else {
-        None
-    };
     let report =
-        sample_pid_for_duration(pid, phase_name, dwell, config.sample_interval, worker_name)?;
+        sample_pid_for_duration(pid, phase_name, dwell, config.sample_interval, track_worker)?;
 
     if config.verbose {
         eprintln!(
@@ -512,13 +468,7 @@ fn run_worker_active_phase(
 
     // Sample the MCP process (and its worker child) for the dwell period.
     // stdin_pipe is still in scope so the child process stays alive.
-    let report = sample_pid_for_duration(
-        pid,
-        phase_name,
-        dwell,
-        config.sample_interval,
-        Some(WORKER_BINARY_NAME),
-    )?;
+    let report = sample_pid_for_duration(pid, phase_name, dwell, config.sample_interval, true)?;
 
     // Read the search response now that sampling is complete. The background
     // reader reports EOF/transport errors through the channel; no elapsed-time
@@ -674,7 +624,7 @@ fn sample_pids_for_duration(
         let mut anon = 0u64;
         let mut all_ok = true;
         for &pid in pids {
-            match sampler::sample(pid, None) {
+            match sampler::sample(pid, false) {
                 Ok(s) => {
                     combined += s.rss_kib;
                     mapped += s.mapped_file_kib;
@@ -853,7 +803,7 @@ fn run_command_phase(
         // commands.  The outer `done` flag is checked between samples.
         let fast_interval = Duration::from_millis(10);
         while !done_clone.load(Ordering::Relaxed) {
-            if let Ok(s) = sampler::sample(pid, None) {
+            if let Ok(s) = sampler::sample(pid, false) {
                 samples.push(s);
             }
             std::thread::sleep(fast_interval);
@@ -875,11 +825,11 @@ fn run_command_phase(
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
 
-    // Clean up any leindex-embed daemon the command spawned. Command phases
+    // Clean up any embed worker the command spawned. Command phases
     // invoke one-shot CLI subcommands (index, search, reindex) that may start
-    // a persistent ONNX worker daemon. Without this cleanup, the daemon
+    // a persistent ONNX worker. Without this cleanup, the worker
     // survives the command's exit and leaks as an orphan process.
-    let worker_pids = find_worker_pids(pid, WORKER_BINARY_NAME);
+    let worker_pids = find_worker_pids(pid);
     if !worker_pids.is_empty() && config.verbose {
         eprintln!(
             "memcheck: phase '{}' cleaning up {} orphaned worker process(es)",
@@ -941,7 +891,13 @@ fn launch_mcp_process_with_env(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("LEINDEX_EMBED_DAEMON", "0");
+        .env("LEINDEX_EMBED_DAEMON", "0")
+        // Force the INLINE server: the stdio daemon shim
+        // (`FeatureFlag::DaemonClient` in `src/feature_flags.rs`) is ON by
+        // default and would forward `leindex mcp --stdio` to a user's
+        // `leindexd`; the harness would then sample a byte-copying shim
+        // instead of the real server.
+        .env("LEINDEX_FEATURE_DAEMON_CLIENT", "0");
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -966,7 +922,7 @@ fn launch_mcp_process_with_env(
 /// is somehow unavailable (e.g., non-Linux platforms or older kernels).
 fn kill_child(mut child: Child) {
     let pid = child.id();
-    let worker_pids = find_worker_pids(pid, WORKER_BINARY_NAME);
+    let worker_pids = find_worker_pids(pid);
 
     let _ = child.kill();
     let _ = child.wait();
@@ -1050,9 +1006,14 @@ fn cleanup_command_phase_workers(worker_pids: &[u32]) {
     }
 }
 
-/// Scan `/proc` for worker processes matching `worker_name` whose PPID is
-/// `parent_pid`.
-fn find_worker_pids(parent_pid: u32, worker_name: &str) -> Vec<u32> {
+/// Scan `/proc` for worker processes whose PPID is `parent_pid`.
+///
+/// A worker is a process whose NUL-separated `/proc/<pid>/cmdline` contains
+/// the hidden argv token (`sampler::WORKER_CMDLINE_TOKEN`; source of truth:
+/// `src/embed/worker_main.rs` `INTERNAL_WORKER_TOKEN`). Since v2.0.0 the
+/// worker is the same `leindex` executable re-executed with that token, so
+/// comm-based matching cannot distinguish worker from parent.
+fn find_worker_pids(parent_pid: u32) -> Vec<u32> {
     let mut found = Vec::new();
 
     let proc_dir = match std::fs::read_dir("/proc") {
@@ -1076,18 +1037,12 @@ fn find_worker_pids(parent_pid: u32, worker_name: &str) -> Vec<u32> {
             continue;
         }
 
-        // Read the process name and ppid.
-        let comm = match read_proc_comm(candidate_pid) {
-            Some(c) => c,
-            None => continue,
-        };
-
-        // comm is truncated to 15 chars on Linux, so use starts_with.
-        if comm != worker_name && !comm.starts_with(worker_name) {
+        if !sampler::is_worker_process(candidate_pid) {
             continue;
         }
 
-        // Only workers directly owned by the measured process are eligible.
+        // Only workers directly owned by the measured process are eligible;
+        // a worker belonging to another LeIndex session must never be killed.
         let ppid = read_proc_ppid(candidate_pid);
         if ppid == parent_pid {
             found.push(candidate_pid);
@@ -1095,14 +1050,6 @@ fn find_worker_pids(parent_pid: u32, worker_name: &str) -> Vec<u32> {
     }
 
     found
-}
-
-/// Read the process name from `/proc/<pid>/comm`.
-fn read_proc_comm(pid: u32) -> Option<String> {
-    let path = format!("/proc/{}/comm", pid);
-    std::fs::read_to_string(&path)
-        .ok()
-        .map(|s| s.trim().to_string())
 }
 
 /// Read the parent PID from `/proc/<pid>/stat`.
@@ -1131,20 +1078,20 @@ fn read_proc_ppid(pid: u32) -> u32 {
 
 /// Sample a PID for a fixed duration, collecting full memory samples.
 ///
-/// When `worker_name` is `Some`, also samples any child worker process
-/// matching that name (VAL-CPHASE-034).
+/// When `track_worker` is true, also samples any direct child running in
+/// worker mode (VAL-CPHASE-034).
 fn sample_pid_for_duration(
     pid: u32,
     phase_name: &str,
     dwell: Duration,
     sample_interval: Duration,
-    worker_name: Option<&str>,
+    track_worker: bool,
 ) -> Result<PhaseReport> {
     let start = Instant::now();
     let mut samples = Vec::new();
 
     while start.elapsed() < dwell {
-        if let Ok(s) = sampler::sample(pid, worker_name) {
+        if let Ok(s) = sampler::sample(pid, track_worker) {
             samples.push(s);
         }
         std::thread::sleep(sample_interval);
@@ -1180,6 +1127,7 @@ fn build_phase_report(
             duration_ms: duration.as_millis() as u64,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 0,
+            worker_note: None,
             gpu_vram_mib: None,
             descendants: crate::sampler::DescendantTree::default(),
         };
@@ -1224,6 +1172,7 @@ fn build_phase_report(
         duration_ms: duration.as_millis() as u64,
         worker_rss_max_kib: worker_rss_max,
         combined_rss_max_kib: combined_rss_max,
+        worker_note: None,
         gpu_vram_mib,
         descendants: sampler::DescendantTree::default(),
     }
@@ -1448,7 +1397,7 @@ fn run_contention_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
 
     // Reap orphaned workers.
     for &pid in &pids {
-        let workers = find_worker_pids(pid, WORKER_BINARY_NAME);
+        let workers = find_worker_pids(pid);
         cleanup_command_phase_workers(&workers);
     }
 
@@ -1831,18 +1780,7 @@ mod tests {
     // ── Worker-reaping cleanup tests ───────────────────────────────────
     //
     // These tests exercise the helper functions used by `kill_child` to
-    // scan /proc for orphaned `leindex-embed` workers after a phase ends.
-
-    #[test]
-    fn test_read_proc_comm_for_self() {
-        let pid = std::process::id();
-        let comm = read_proc_comm(pid);
-        assert!(comm.is_some(), "should be able to read comm for self");
-        let comm = comm.unwrap();
-        assert!(!comm.is_empty());
-        // The memcheck test binary's comm should not match the worker name.
-        assert_ne!(comm, WORKER_BINARY_NAME);
-    }
+    // scan /proc for orphaned embed workers after a phase ends.
 
     #[test]
     fn test_read_proc_ppid_for_self() {
@@ -1860,16 +1798,11 @@ mod tests {
     }
 
     #[test]
-    fn test_read_proc_comm_missing_pid() {
-        let comm = read_proc_comm(u32::MAX);
-        assert!(comm.is_none(), "missing pid should return None");
-    }
-
-    #[test]
     fn test_find_worker_pids_finds_no_workers_for_self() {
-        // The memcheck test process should not have any leindex-embed children.
+        // The memcheck test process should not have any embed-worker children
+        // (a worker is only ever a `leindex` child carrying the argv token).
         let pid = std::process::id();
-        let workers = find_worker_pids(pid, WORKER_BINARY_NAME);
+        let workers = find_worker_pids(pid);
         assert!(
             workers.is_empty(),
             "expected no worker children for test process, found {:?}",

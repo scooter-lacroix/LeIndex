@@ -4,9 +4,9 @@
 //! Secondary: PSS from `smaps_rollup`; mapped-file vs anonymous from `smaps`
 //! when available (VAL-MEASURE-006).
 //!
-//! Worker-aware sampling (VAL-CPHASE-034): when a worker process name is
-//! provided, the sampler also discovers and samples any child process
-//! matching that name, returning combined RSS in the sample.
+//! Worker-aware sampling (VAL-CPHASE-034): workers are identified by the hidden
+//! argv token and sampled only when they are direct children of the measured
+//! process.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -129,22 +129,16 @@ fn sample_gpu_cuda() -> Option<GpuSample> {
     })
 }
 
-/// Read a single memory sample for the given PID.
-///
-/// Reads VmRSS from `/proc/<pid>/status` (primary), then PSS from
-/// `smaps_rollup`, and mapped-file / anonymous breakdown from full `smaps`.
-/// The `smaps` read is the most expensive part; callers that need faster
-/// sampling can use `sample_fast` instead.
-///
-/// If `worker_name` is `Some`, also discovers and samples any child process
-/// with that name (VAL-CPHASE-034).
-pub fn sample(pid: u32, worker_name: Option<&str>) -> anyhow::Result<MemorySample> {
+/// If worker tracking is enabled, also discovers a direct child running in
+/// worker mode (VAL-CPHASE-034).
+pub fn sample(pid: u32, track_worker: bool) -> anyhow::Result<MemorySample> {
     let rss = read_vm_rss(pid)?;
     let (mapped, anon, pss) = read_smaps_breakdown(pid);
 
-    let worker_rss = match worker_name {
-        Some(name) => find_child_worker_rss(pid, name),
-        None => 0,
+    let worker_rss = if track_worker {
+        find_child_worker_rss(pid)
+    } else {
+        0
     };
 
     // GPU sampling is global (not per-pid), but cheap enough to inline.
@@ -162,33 +156,39 @@ pub fn sample(pid: u32, worker_name: Option<&str>) -> anyhow::Result<MemorySampl
 
 /// Fast sample (VmRSS only) — used by high-frequency sampling tests.
 #[cfg(test)]
-fn sample_fast(pid: u32, worker_name: Option<&str>) -> anyhow::Result<MemorySample> {
+fn sample_fast(pid: u32) -> anyhow::Result<MemorySample> {
     let rss = read_vm_rss(pid)?;
-    let worker_rss = match worker_name {
-        Some(name) => find_child_worker_rss(pid, name),
-        None => 0,
-    };
     Ok(MemorySample {
         rss_kib: rss,
         mapped_file_kib: 0,
         anon_kib: 0,
         pss_kib: 0,
-        worker_rss_kib: worker_rss,
+        worker_rss_kib: 0,
         gpu: GpuSample::default(),
     })
 }
 
-/// Find the RSS of a child process matching the given name.
+/// Source of truth: `src/embed/worker_main.rs` (`INTERNAL_WORKER_TOKEN`).
+pub const WORKER_CMDLINE_TOKEN: &str = "--internal-embed-worker";
+
+/// Whether `/proc/<pid>/cmdline` contains the worker token as an argument.
+pub fn is_worker_process(pid: u32) -> bool {
+    let path = format!("/proc/{pid}/cmdline");
+    let Ok(cmdline) = std::fs::read(&path) else {
+        return false;
+    };
+    cmdline
+        .split(|byte| *byte == 0)
+        .any(|argument| argument == WORKER_CMDLINE_TOKEN.as_bytes())
+}
+
+/// Find the RSS of a direct child running in worker mode.
 ///
-/// Scans `/proc/<pid>/task/<tid>/children` to discover child PIDs,
-/// then checks `/proc/<child_pid>/comm` for a matching process name.
-/// Returns the RSS of the first matching child, or 0 if none found.
-///
-/// VAL-CPHASE-034: The memcheck harness detects the worker process once
-/// embedding begins and records it separately from the main daemon.
-fn find_child_worker_rss(parent_pid: u32, worker_name: &str) -> u64 {
-    // Strategy: scan /proc for processes whose ppid matches our pid
-    // and whose comm matches the worker name.
+/// Scans `/proc` for direct children whose NUL-separated argv contains the
+/// hidden worker token. Returns the RSS of the first matching child, or 0.
+/// Ownership is checked independently of the process name because the worker
+/// re-executes the same binary as its parent.
+fn find_child_worker_rss(parent_pid: u32) -> u64 {
     let proc_dir = match std::fs::read_dir("/proc") {
         Ok(d) => d,
         Err(_) => return 0,
@@ -196,42 +196,21 @@ fn find_child_worker_rss(parent_pid: u32, worker_name: &str) -> u64 {
 
     for entry in proc_dir.flatten() {
         let name = entry.file_name();
-        let name_str = match name.to_str() {
-            Some(s) => s,
-            None => continue,
+        let Some(name_str) = name.to_str() else {
+            continue;
         };
-
-        // Skip non-numeric entries
-        let child_pid: u32 = match name_str.parse() {
-            Ok(p) => p,
-            Err(_) => continue,
+        let Ok(child_pid) = name_str.parse::<u32>() else {
+            continue;
         };
-
-        // Skip our own pid
-        if child_pid == parent_pid {
+        if child_pid == parent_pid || !is_child_of(child_pid, parent_pid) {
             continue;
         }
-
-        // Check if this process is a child of our target
-        if !is_child_of(child_pid, parent_pid) {
-            continue;
-        }
-
-        // Check the process name
-        let comm = match read_proc_comm(child_pid) {
-            Some(c) => c,
-            None => continue,
-        };
-
-        // Match: the worker binary name (without path) should match
-        // "leindex-embed" — comm may be truncated to 15 chars on Linux
-        if comm == worker_name || comm.starts_with(worker_name) {
-            if let Ok(rss) = read_vm_rss(child_pid) {
-                return rss;
-            }
+        if is_worker_process(child_pid)
+            && let Ok(rss) = read_vm_rss(child_pid)
+        {
+            return rss;
         }
     }
-
     0
 }
 
@@ -264,14 +243,6 @@ fn is_child_of(child_pid: u32, parent_pid: u32) -> bool {
     }
 
     false
-}
-
-/// Read the process name from `/proc/<pid>/comm`.
-fn read_proc_comm(pid: u32) -> Option<String> {
-    let path = format!("/proc/{}/comm", pid);
-    std::fs::read_to_string(&path)
-        .ok()
-        .map(|s| s.trim().to_string())
 }
 
 /// Read VmRSS from /proc/`<pid>`/status.
@@ -525,7 +496,7 @@ mod tests {
     #[test]
     fn test_sample_current_process() {
         let pid = std::process::id();
-        let sample = sample(pid, None);
+        let sample = sample(pid, false);
         assert!(sample.is_ok(), "should be able to sample current process");
         let s = sample.unwrap();
         assert!(s.rss_kib > 0, "RSS should be positive");
@@ -535,7 +506,7 @@ mod tests {
     #[test]
     fn test_sample_fast_current_process() {
         let pid = std::process::id();
-        let s = sample_fast(pid, None).expect("fast sample should work");
+        let s = sample_fast(pid).expect("fast sample should work");
         assert!(s.rss_kib > 0, "RSS should be positive");
         // Fast sample does not populate mapped/anon/pss
         assert_eq!(s.mapped_file_kib, 0);
@@ -591,7 +562,7 @@ mod tests {
     #[test]
     fn test_find_child_worker_rss_no_worker() {
         let pid = std::process::id();
-        let rss = find_child_worker_rss(pid, "leindex-embed");
+        let rss = find_child_worker_rss(pid);
         assert_eq!(rss, 0, "no worker child expected for memcheck process");
     }
 
@@ -600,18 +571,6 @@ mod tests {
         let pid = std::process::id();
         // Our own process is not a child of itself
         assert!(!is_child_of(pid, pid));
-    }
-
-    #[test]
-    fn test_read_proc_comm() {
-        let pid = std::process::id();
-        let comm = read_proc_comm(pid);
-        assert!(
-            comm.is_some(),
-            "should be able to read comm for current process"
-        );
-        // The process name should be non-empty
-        assert!(!comm.unwrap().is_empty());
     }
 
     #[test]

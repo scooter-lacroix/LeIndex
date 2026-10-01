@@ -1,12 +1,19 @@
 {
-  "phase": "index",
-  "rss_min_kib": 556,
-  "rss_max_kib": 26688,
-  "rss_p95_kib": 23640,
-  "mapped_file_kib": 14184,
-  "anon_kib": 12608,
-  "sample_count": 1779,
-  "duration_ms": 19609,
-  "worker_rss_max_kib": 0,
-  "combined_rss_max_kib": 26688
+ "phase": "index",
+ "rss_min_kib": 528,
+ "rss_max_kib": 30460,
+ "rss_p95_kib": 30308,
+ "mapped_file_kib": 17852,
+ "anon_kib": 12608,
+ "sample_count": 158,
+ "duration_ms": 13767,
+ "worker_rss_max_kib": 0,
+ "combined_rss_max_kib": 30460,
+ "gpu_vram_mib": 575,
+ "descendants": {
+  "total": 0,
+  "by_name": {},
+  "combined_rss_kib": 0
+ },
+ "rebaselined_note": "v2.0.0 rebaseline (2026-09-30, single-binary embed worker): harness now detects the worker by the --internal-embed-worker argv token (comm-based detection retired with the leindex-embed binary) and all 21 canonical phases run with real samples (u64::MAX placeholder sentinels removed). Baselines refreshed on the v2.0.0 release binary; budget ceilings in docs/memory/budgets/current.json unchanged."
 }
