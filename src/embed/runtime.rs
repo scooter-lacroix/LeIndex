@@ -73,6 +73,9 @@ pub use crate::embed::runtime_env::{
 
 mod onnx_session;
 
+mod past_key_values;
+pub(crate) use past_key_values::KvInput;
+
 mod onnx_embed;
 
 mod rerank;
@@ -470,6 +473,12 @@ pub struct WorkerRuntime {
     #[cfg(feature = "onnx")]
     input_names: Arc<OnceLock<(bool, bool)>>,
 
+    /// Declared `past_key_values.*` KV-cache inputs (empty for BERT/GTE-style
+    /// models). Cached once per runtime; feeds zero-length caches on the
+    /// fresh-pass inference path.
+    #[cfg(feature = "onnx")]
+    kv_inputs: Arc<OnceLock<Vec<KvInput>>>,
+
     /// Tokenizer for text preprocessing. Only available with `onnx` feature.
     #[cfg(feature = "onnx")]
     tokenizer: Option<Arc<tokenizers::Tokenizer>>,
@@ -747,6 +756,8 @@ impl WorkerRuntime {
             #[cfg(feature = "onnx")]
             input_names: Arc::new(OnceLock::new()),
             #[cfg(feature = "onnx")]
+            kv_inputs: Arc::new(OnceLock::new()),
+            #[cfg(feature = "onnx")]
             rerank_session: Arc::new(Mutex::new(None)),
             #[cfg(feature = "onnx")]
             rerank_tokenizer: Arc::new(Mutex::new(None)),
@@ -807,6 +818,18 @@ impl WorkerRuntime {
     #[doc(hidden)]
     pub fn bench_model_name(&self) -> &str {
         &self.config.model_name
+    }
+
+    /// Detect the model's declared KV-cache inputs through the same code path
+    /// the embed inference uses. Doc-hidden test/bench accessor.
+    #[cfg(feature = "onnx")]
+    #[doc(hidden)]
+    pub fn bench_detect_kv_inputs(&self) -> Vec<KvInput> {
+        let Some(session) = &self.session else {
+            return Vec::new();
+        };
+        let guard = session.lock().unwrap_or_else(|e| e.into_inner());
+        past_key_values::detect_kv_inputs(&guard)
     }
 
     #[cfg(feature = "onnx")]

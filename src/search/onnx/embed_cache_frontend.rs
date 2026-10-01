@@ -319,7 +319,21 @@ mod tests {
 
     #[test]
     fn test_counters_start_at_zero() {
-        assert_eq!(counters(), (0, 0));
+        // HITS/MISSES are process-global atomics that any concurrent embed-path
+        // test may legitimately increment (probe_texts runs in other lib tests
+        // and on dev machines the feature flag can be on by default), so
+        // asserting an absolute zero here is order-dependent. Assert the real
+        // invariant instead: counters only ever move via cache probes, and a
+        // bypassed probe (empty texts / zero dim) must not touch them.
+        let (hits_before, misses_before) = counters();
+        assert!(probe_texts("model", 8, &[] as &[String]).is_none());
+        assert!(probe_texts("model", 0, &["text".to_string()]).is_none());
+        let (hits_after, misses_after) = counters();
+        assert_eq!(
+            (hits_before, misses_before),
+            (hits_after, misses_after),
+            "bypassed probes must not change the cache counters"
+        );
     }
 
     #[test]

@@ -282,31 +282,18 @@ impl WorkerRuntime {
         let mut guard = session
             .lock()
             .map_err(|error| format!("session lock: {}", error))?;
-        let uses_position_ids = guard
-            .inputs()
-            .iter()
-            .any(|input| input.name() == "position_ids");
-        let uses_token_type_ids = guard
-            .inputs()
-            .iter()
-            .any(|input| input.name() == "token_type_ids");
-        let result = match (uses_position_ids, uses_token_type_ids) {
-            (true, true) => guard.run(ort::inputs! {
-                "input_ids" => input_ids, "attention_mask" => attention_mask,
-                "position_ids" => position_ids, "token_type_ids" => token_type_ids,
-            }),
-            (true, false) => guard.run(ort::inputs! {
-                "input_ids" => input_ids, "attention_mask" => attention_mask,
-                "position_ids" => position_ids,
-            }),
-            (false, true) => guard.run(ort::inputs! {
-                "input_ids" => input_ids, "attention_mask" => attention_mask,
-                "token_type_ids" => token_type_ids,
-            }),
-            (false, false) => guard.run(ort::inputs! {
-                "input_ids" => input_ids, "attention_mask" => attention_mask,
-            }),
-        };
+        // Decoder-style exports (the default qwen3-embed model) declare
+        // `past_key_values.*` cache inputs that must be fed even for a smoke
+        // pass; zero-length caches are the correct fresh-pass feed.
+        let input_list = super::onnx_embed::assemble_probe_input_list(
+            &guard,
+            input_ids,
+            attention_mask,
+            position_ids,
+            token_type_ids,
+            batch_size,
+        )?;
+        let result = guard.run(input_list);
         result
             .map(|_| ())
             .map_err(|error| format!("MIGraphX probe inference: {}", error))

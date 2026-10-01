@@ -318,19 +318,22 @@ impl WorkerRuntime {
             .inputs()
             .iter()
             .any(|input| input.name() == "position_ids");
-        let outputs = if uses_position_ids {
-            session_guard.run(ort::inputs! {
-                "input_ids" => input_ids_tensor,
-                "attention_mask" => attention_mask_tensor,
-                "position_ids" => position_ids_tensor,
-            })
-        } else {
-            session_guard.run(ort::inputs! {
-                "input_ids" => input_ids_tensor,
-                "attention_mask" => attention_mask_tensor,
-            })
+        // Decoder-style reranker exports declare `past_key_values.*` cache
+        // inputs that must be fed; zero-length caches are the fresh-pass feed.
+        let kv_inputs = self
+            .kv_inputs
+            .get_or_init(|| super::past_key_values::detect_kv_inputs(&session_guard));
+        let kv_tensors = super::past_key_values::zero_length_kv_tensors(kv_inputs, batch_size)?;
+        let mut input_list: Vec<(String, ort::session::SessionInputValue<'_>)> = Vec::new();
+        input_list.push(("input_ids".to_string(), input_ids_tensor.into()));
+        input_list.push(("attention_mask".to_string(), attention_mask_tensor.into()));
+        if uses_position_ids {
+            input_list.push(("position_ids".to_string(), position_ids_tensor.into()));
         }
-        .map_err(|e| WorkerError {
+        for (name, tensor) in kv_tensors {
+            input_list.push((name, tensor.into()));
+        }
+        let outputs = session_guard.run(input_list).map_err(|e| WorkerError {
             kind: ErrorKind::Inference,
             message: format!("ONNX rerank inference failed: {}", e),
         })?;

@@ -331,43 +331,18 @@ impl WorkerRuntime {
             message: format!("failed to lock ONNX session: {}", e),
         })?;
 
-        let (uses_position_ids, uses_token_type_ids) = *self.input_names.get_or_init(|| {
-            (
-                session_guard
-                    .inputs()
-                    .iter()
-                    .any(|input| input.name() == "position_ids"),
-                session_guard
-                    .inputs()
-                    .iter()
-                    .any(|input| input.name() == "token_type_ids"),
-            )
-        });
-        // Feed only the inputs the model declares; extras would be rejected.
-        // Arms are mutually exclusive, so each tensor moves on exactly one path.
-        let outputs = match (uses_position_ids, uses_token_type_ids) {
-            (true, true) => session_guard.run(ort::inputs! {
-                "input_ids" => input_ids_tensor,
-                "attention_mask" => attention_mask_tensor,
-                "position_ids" => position_ids_tensor,
-                "token_type_ids" => token_type_ids_tensor,
-            }),
-            (true, false) => session_guard.run(ort::inputs! {
-                "input_ids" => input_ids_tensor,
-                "attention_mask" => attention_mask_tensor,
-                "position_ids" => position_ids_tensor,
-            }),
-            (false, true) => session_guard.run(ort::inputs! {
-                "input_ids" => input_ids_tensor,
-                "attention_mask" => attention_mask_tensor,
-                "token_type_ids" => token_type_ids_tensor,
-            }),
-            (false, false) => session_guard.run(ort::inputs! {
-                "input_ids" => input_ids_tensor,
-                "attention_mask" => attention_mask_tensor,
-            }),
-        }
-        .map_err(|e| WorkerError {
+        let input_list = assemble_embed_input_list(
+            self,
+            &session_guard,
+            EmbedInputTensors {
+                input_ids_tensor,
+                attention_mask_tensor,
+                position_ids_tensor,
+                token_type_ids_tensor,
+            },
+            batch_size,
+        )?;
+        let outputs = session_guard.run(input_list).map_err(|e| WorkerError {
             kind: ErrorKind::Inference,
             message: format!("ONNX inference failed: {}", e),
         })?;
@@ -535,4 +510,107 @@ impl WorkerRuntime {
 
         Ok(EmbedResponse::new(pooled, batch_size, expected_dim))
     }
+}
+
+/// Owned input tensors for one embed sub-batch, consumed by
+/// [`assemble_embed_input_list`].
+#[cfg(feature = "onnx")]
+struct EmbedInputTensors {
+    input_ids_tensor: ort::value::Tensor<i64>,
+    attention_mask_tensor: ort::value::Tensor<i64>,
+    position_ids_tensor: ort::value::Tensor<i64>,
+    token_type_ids_tensor: ort::value::Tensor<i64>,
+}
+
+/// Assemble the session input list for one embed sub-batch: the standard
+/// ids/mask pair, the optional position/token-type inputs the model declares,
+/// and the zero-length KV caches decoder-style exports require. Extracted
+/// from `run_onnx_embed_sub_batch_inner` to keep its branch count under the
+/// complexity gate.
+#[cfg(feature = "onnx")]
+fn assemble_embed_input_list(
+    runtime: &WorkerRuntime,
+    session_guard: &Session,
+    tensors: EmbedInputTensors,
+    batch_size: usize,
+) -> Result<Vec<(String, ort::session::SessionInputValue<'static>)>, WorkerError> {
+    // Feed exactly the inputs the model declares. Decoder-style exports
+    // (the default qwen3-embed model) additionally declare
+    // `past_key_values.*` cache inputs that MUST be fed — a zero-length
+    // cache per input is the correct fresh-pass feed. BERT/GTE-style
+    // models declare none and this loop appends nothing.
+    let (uses_position_ids, uses_token_type_ids) = *runtime
+        .input_names
+        .get_or_init(|| session_input_flags(session_guard));
+    let kv_inputs = runtime
+        .kv_inputs
+        .get_or_init(|| super::past_key_values::detect_kv_inputs(session_guard));
+    let mut input_list: Vec<(String, ort::session::SessionInputValue<'static>)> = Vec::new();
+    input_list.push(("input_ids".to_string(), tensors.input_ids_tensor.into()));
+    input_list.push((
+        "attention_mask".to_string(),
+        tensors.attention_mask_tensor.into(),
+    ));
+    if uses_position_ids {
+        input_list.push((
+            "position_ids".to_string(),
+            tensors.position_ids_tensor.into(),
+        ));
+    }
+    if uses_token_type_ids {
+        input_list.push((
+            "token_type_ids".to_string(),
+            tensors.token_type_ids_tensor.into(),
+        ));
+    }
+    for (name, tensor) in super::past_key_values::zero_length_kv_tensors(kv_inputs, batch_size)? {
+        input_list.push((name, tensor.into()));
+    }
+    Ok(input_list)
+}
+
+/// Which optional inputs the session declares.
+#[cfg(feature = "onnx")]
+fn session_input_flags(session_guard: &Session) -> (bool, bool) {
+    (
+        session_guard
+            .inputs()
+            .iter()
+            .any(|input| input.name() == "position_ids"),
+        session_guard
+            .inputs()
+            .iter()
+            .any(|input| input.name() == "token_type_ids"),
+    )
+}
+
+/// Assemble the MIGraphX probe smoke-inference input list (no
+/// `WorkerRuntime` state — the probe runs in a bare child process).
+/// Shares the KV-feeding contract with [`assemble_embed_input_list`].
+#[cfg(feature = "onnx")]
+pub(super) fn assemble_probe_input_list(
+    session_guard: &Session,
+    input_ids: ort::value::Tensor<i64>,
+    attention_mask: ort::value::Tensor<i64>,
+    position_ids: ort::value::Tensor<i64>,
+    token_type_ids: ort::value::Tensor<i64>,
+    batch_size: usize,
+) -> Result<Vec<(String, ort::session::SessionInputValue<'static>)>, String> {
+    let (uses_position_ids, uses_token_type_ids) = session_input_flags(session_guard);
+    let kv_inputs = super::past_key_values::detect_kv_inputs(session_guard);
+    let kv_tensors = super::past_key_values::zero_length_kv_tensors(&kv_inputs, batch_size)
+        .map_err(|e| format!("probe KV tensors: {}", e.message))?;
+    let mut input_list: Vec<(String, ort::session::SessionInputValue<'static>)> = Vec::new();
+    input_list.push(("input_ids".to_string(), input_ids.into()));
+    input_list.push(("attention_mask".to_string(), attention_mask.into()));
+    if uses_position_ids {
+        input_list.push(("position_ids".to_string(), position_ids.into()));
+    }
+    if uses_token_type_ids {
+        input_list.push(("token_type_ids".to_string(), token_type_ids.into()));
+    }
+    for (name, tensor) in kv_tensors {
+        input_list.push((name, tensor.into()));
+    }
+    Ok(input_list)
 }
