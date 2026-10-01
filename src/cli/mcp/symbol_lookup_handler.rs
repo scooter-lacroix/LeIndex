@@ -256,37 +256,20 @@ For the exact source implementation use LeIndex [Read Symbol]."
         let node = pdg
             .get_node(node_id)
             .ok_or_else(|| JsonRpcError::internal_error("PDG node disappeared after lookup"))?;
-        let mut partial = budget.elapsed(started);
 
-        // Callees (direct)
-        let (callees, callees_truncated) = if include_callees && !partial {
-            summarize_nodes(pdg, get_direct_callees(pdg, node_id))
-        } else {
-            (Vec::new(), false)
-        };
-        partial |= budget.elapsed(started);
+        let relations = collect_relations(
+            pdg,
+            node_id,
+            depth,
+            include_callers,
+            include_callees,
+            started,
+            budget,
+        );
+        let partial = relations.partial;
 
-        // Callers (direct)
-        let (callers, callers_truncated) = if include_callers && !partial {
-            summarize_nodes(pdg, get_direct_callers(pdg, node_id))
-        } else {
-            (Vec::new(), false)
-        };
-        partial |= budget.elapsed(started);
-
-        // Forward impact (depth-bounded transitive dependents)
-        let forward = if partial {
-            Vec::new()
-        } else {
-            pdg.forward_impact(
-                node_id,
-                &crate::graph::pdg::TraversalConfig {
-                    max_depth: Some(depth),
-                    ..crate::graph::pdg::TraversalConfig::for_impact_analysis()
-                },
-            )
-        };
-        let affected_files: std::collections::HashSet<&str> = forward
+        let affected_files: std::collections::HashSet<&str> = relations
+            .forward
             .iter()
             .filter_map(|&nid| pdg.get_node(nid).map(|n| n.file_path.as_ref()))
             .collect();
@@ -294,14 +277,16 @@ For the exact source implementation use LeIndex [Read Symbol]."
             // Direction label: the audit flagged 351-vs-9 confusion against
             // impact-analysis; this figure is forward (dependents) reach.
             "direction": "forward (symbols that depend on this one)",
-            "affected_symbols": forward.len(),
+            "affected_symbols": relations.forward.len(),
             "affected_files": affected_files.len()
         });
 
-        partial |= budget.elapsed(started);
-        let relations_empty = callers.is_empty() && callees.is_empty() && forward.is_empty();
-        let impact_note =
-            impact_degradation_note(relations_empty, index_stale, graph_has_call_edges, partial);
+        let impact_note = impact_degradation_note(
+            relations_are_empty(&relations),
+            index_stale,
+            graph_has_call_edges,
+            partial,
+        );
         let mut result = serde_json::json!({
             "symbol": node.name,
             "type": node_type_str(&node.node_type),
@@ -309,10 +294,10 @@ For the exact source implementation use LeIndex [Read Symbol]."
             "byte_range": node.byte_range,
             "complexity": node.complexity,
             "language": node.language,
-            "callers": callers,
-            "callees": callees,
-            "callers_truncated": callers_truncated,
-            "callees_truncated": callees_truncated,
+            "callers": relations.callers,
+            "callees": relations.callees,
+            "callers_truncated": relations.callers_truncated,
+            "callees_truncated": relations.callees_truncated,
             "impact_radius": impact_radius,
             "pdg_status": if partial { "partial" } else { "fresh" },
             "index_freshness": index_freshness,
@@ -323,12 +308,7 @@ For the exact source implementation use LeIndex [Read Symbol]."
         }
 
         if include_source && !partial {
-            if let Some(src) =
-                read_source_snippet_resolved(&node.file_path, node.byte_range, Some(project_root))
-            {
-                let truncated: String = src.chars().take(char_budget / 2).collect();
-                result["source"] = Value::String(truncated);
-            }
+            attach_source(&mut result, node, project_root, char_budget);
         }
 
         Ok(result)
@@ -461,6 +441,96 @@ fn find_fuzzy_node(
         }
     }
     best
+}
+
+/// Structural relations collected for one symbol lookup, plus the sticky
+/// latency-budget flag observed while collecting them.
+struct SymbolRelations {
+    callers: Vec<Value>,
+    callers_truncated: bool,
+    callees: Vec<Value>,
+    callees_truncated: bool,
+    forward: Vec<crate::graph::pdg::NodeId>,
+    /// Once the budget is exhausted every later relation step is skipped and
+    /// the result is reported as partial.
+    partial: bool,
+}
+
+/// Collect a symbol's direct callees, direct callers and depth-bounded forward
+/// impact, each only while the latency budget still allows work. The flag is
+/// re-evaluated between steps and ORs forward, so a step that runs long
+/// suppresses the steps after it.
+fn collect_relations(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    node_id: crate::graph::pdg::NodeId,
+    depth: usize,
+    include_callers: bool,
+    include_callees: bool,
+    started: Instant,
+    budget: WorkBudget,
+) -> SymbolRelations {
+    let mut partial = budget.elapsed(started);
+
+    // Callees (direct)
+    let (callees, callees_truncated) = if include_callees && !partial {
+        summarize_nodes(pdg, get_direct_callees(pdg, node_id))
+    } else {
+        (Vec::new(), false)
+    };
+    partial |= budget.elapsed(started);
+
+    // Callers (direct)
+    let (callers, callers_truncated) = if include_callers && !partial {
+        summarize_nodes(pdg, get_direct_callers(pdg, node_id))
+    } else {
+        (Vec::new(), false)
+    };
+    partial |= budget.elapsed(started);
+
+    // Forward impact (depth-bounded transitive dependents)
+    let forward = if partial {
+        Vec::new()
+    } else {
+        pdg.forward_impact(
+            node_id,
+            &crate::graph::pdg::TraversalConfig {
+                max_depth: Some(depth),
+                ..crate::graph::pdg::TraversalConfig::for_impact_analysis()
+            },
+        )
+    };
+    partial |= budget.elapsed(started);
+
+    SymbolRelations {
+        callers,
+        callers_truncated,
+        callees,
+        callees_truncated,
+        forward,
+        partial,
+    }
+}
+
+/// No relations at all — the case where a zero impact figure must be disclosed
+/// as a data-availability statement rather than a fact.
+fn relations_are_empty(relations: &SymbolRelations) -> bool {
+    relations.callers.is_empty() && relations.callees.is_empty() && relations.forward.is_empty()
+}
+
+/// Attach the source snippet for a resolved node, truncated to half the char
+/// budget (the other half is reserved for the structural payload).
+fn attach_source(
+    result: &mut Value,
+    node: &crate::graph::pdg::Node,
+    project_root: &std::path::Path,
+    char_budget: usize,
+) {
+    if let Some(src) =
+        read_source_snippet_resolved(&node.file_path, node.byte_range, Some(project_root))
+    {
+        let truncated: String = src.chars().take(char_budget / 2).collect();
+        result["source"] = Value::String(truncated);
+    }
 }
 
 fn summarize_nodes(

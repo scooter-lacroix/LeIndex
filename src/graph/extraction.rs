@@ -1187,24 +1187,16 @@ fn extract_call_edges_for_nodes(
     extract_call_edges_and_externals(signatures, node_ids).0
 }
 
-/// Extract call edges plus the set of distinct external call targets made by
-/// each caller. External targets (`String::truncate`, `Vec::push`, …) are
-/// deliberately NOT resolved to project symbols (N-03); the caller links
-/// them to one shared External node per distinct target so relationship
-/// renders can show `String.truncate [external]` instead of guessing a
-/// project namesake (N-03/N-04).
-#[allow(clippy::type_complexity)]
-fn extract_call_edges_and_externals(
+struct SymbolResolutionMaps {
+    exact_map: HashMap<String, Vec<crate::graph::pdg::NodeId>>,
+    last_map: HashMap<String, Vec<crate::graph::pdg::NodeId>>,
+    suffix_map: HashMap<String, Vec<crate::graph::pdg::NodeId>>,
+}
+
+fn build_symbol_resolution_maps(
     signatures: &[SignatureInfo],
     node_ids: &LocalNodeIds,
-) -> (
-    Vec<(crate::graph::pdg::NodeId, crate::graph::pdg::NodeId)>,
-    Vec<(crate::graph::pdg::NodeId, String)>,
-) {
-    let mut edges = Vec::new();
-    let mut external_calls = Vec::new();
-    let mut seen = HashSet::default();
-    let mut seen_external = HashSet::default();
+) -> SymbolResolutionMaps {
     let mut exact_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::default();
     let mut last_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::default();
     let mut suffix_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::default();
@@ -1228,6 +1220,95 @@ fn extract_call_edges_and_externals(
         }
     }
 
+    SymbolResolutionMaps {
+        exact_map,
+        last_map,
+        suffix_map,
+    }
+}
+
+struct CallCollector {
+    edges: Vec<(crate::graph::pdg::NodeId, crate::graph::pdg::NodeId)>,
+    external_calls: Vec<(crate::graph::pdg::NodeId, String)>,
+    seen: HashSet<(crate::graph::pdg::NodeId, crate::graph::pdg::NodeId)>,
+    seen_external: HashSet<(crate::graph::pdg::NodeId, String)>,
+}
+
+impl CallCollector {
+    fn new() -> Self {
+        Self {
+            edges: Vec::new(),
+            external_calls: Vec::new(),
+            seen: HashSet::default(),
+            seen_external: HashSet::default(),
+        }
+    }
+
+    fn record_external(&mut self, caller_id: crate::graph::pdg::NodeId, call_target: &str) {
+        let normalized = normalize_symbol(call_target);
+        if self.seen_external.insert((caller_id, normalized.clone())) {
+            self.external_calls.push((caller_id, normalized));
+        }
+    }
+
+    fn record_edge(
+        &mut self,
+        caller_id: crate::graph::pdg::NodeId,
+        target_id: crate::graph::pdg::NodeId,
+    ) {
+        if caller_id != target_id && self.seen.insert((caller_id, target_id)) {
+            self.edges.push((caller_id, target_id));
+        }
+    }
+}
+
+fn resolve_call_target(
+    caller_id: crate::graph::pdg::NodeId,
+    call_target: &str,
+    alias_map: &HashMap<String, String>,
+    caller_ns: Option<&str>,
+    maps: &SymbolResolutionMaps,
+    node_ids: &LocalNodeIds,
+    collector: &mut CallCollector,
+) {
+    if is_external_call_target(call_target) {
+        // External call: record one marker per distinct target
+        // for this caller; never resolve it into project nodes.
+        collector.record_external(caller_id, call_target);
+        return;
+    }
+    let candidates = ordered_resolution_candidates(call_target, alias_map, caller_ns);
+
+    for target_id in local_call_targets(
+        &candidates,
+        &maps.exact_map,
+        &maps.last_map,
+        &maps.suffix_map,
+    ) {
+        collector.record_edge(caller_id, target_id);
+    }
+
+    if let Some(target_id) = type_node_target(call_target, node_ids, &maps.last_map) {
+        collector.record_edge(caller_id, target_id);
+    }
+}
+
+/// A resolved call edge: (caller node, callee node).
+type CallEdge = (crate::graph::pdg::NodeId, crate::graph::pdg::NodeId);
+
+/// Extract call edges plus the set of distinct external call targets made by
+/// each caller. External targets (`String::truncate`, `Vec::push`, …) are
+/// deliberately NOT resolved to project symbols (N-03); the caller links
+/// them to one shared External node per distinct target so relationship
+/// renders can show `String.truncate [external]` instead of guessing a
+/// project namesake (N-03/N-04).
+fn extract_call_edges_and_externals(
+    signatures: &[SignatureInfo],
+    node_ids: &LocalNodeIds,
+) -> (Vec<CallEdge>, Vec<(crate::graph::pdg::NodeId, String)>) {
+    let maps = build_symbol_resolution_maps(signatures, node_ids);
+    let mut collector = CallCollector::new();
+
     for signature in signatures {
         let Some(caller_ids) = node_ids.get(&signature.qualified_name) else {
             continue;
@@ -1237,35 +1318,20 @@ fn extract_call_edges_and_externals(
 
         for &caller_id in caller_ids {
             for call_target in &signature.calls {
-                if is_external_call_target(call_target) {
-                    // External call: record one marker per distinct target
-                    // for this caller; never resolve it into project nodes.
-                    let normalized = normalize_symbol(call_target);
-                    if seen_external.insert((caller_id, normalized.clone())) {
-                        external_calls.push((caller_id, normalized));
-                    }
-                    continue;
-                }
-                let candidates =
-                    ordered_resolution_candidates(call_target, &alias_map, caller_ns.as_deref());
-
-                for target_id in local_call_targets(&candidates, &exact_map, &last_map, &suffix_map)
-                {
-                    if caller_id != target_id && seen.insert((caller_id, target_id)) {
-                        edges.push((caller_id, target_id));
-                    }
-                }
-
-                if let Some(target_id) = type_node_target(call_target, node_ids, &last_map) {
-                    if caller_id != target_id && seen.insert((caller_id, target_id)) {
-                        edges.push((caller_id, target_id));
-                    }
-                }
+                resolve_call_target(
+                    caller_id,
+                    call_target,
+                    &alias_map,
+                    caller_ns.as_deref(),
+                    &maps,
+                    node_ids,
+                    &mut collector,
+                );
             }
         }
     }
 
-    (edges, external_calls)
+    (collector.edges, collector.external_calls)
 }
 
 fn add_local_flow_fact_edge(

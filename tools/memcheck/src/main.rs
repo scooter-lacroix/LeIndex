@@ -13,7 +13,7 @@ mod workload;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Memcheck harness for LeIndex memory measurement.
 #[derive(Parser, Debug)]
@@ -89,6 +89,13 @@ fn main() -> Result<()> {
         );
     }
 
+    // Canonicalize: phases launch children with a different working directory
+    // (temp dir, fixture dir), and a relative `--binary` path would be
+    // resolved against the CHILD's cwd, where it does not exist.
+    let binary = binary
+        .canonicalize()
+        .with_context(|| format!("failed to resolve binary path {}", binary.display()))?;
+
     let baselines_dir = args
         .baselines_dir
         .unwrap_or_else(|| workspace_root.join("docs/memory/baselines"));
@@ -137,13 +144,23 @@ fn main() -> Result<()> {
         }
     }
 
+    let worker_capable = std::process::Command::new(&binary)
+        .args([sampler::WORKER_CMDLINE_TOKEN, "--version"])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .starts_with("leindex-embed ")
+        });
+
     let isolated_fixture = workload::copy_fixture_source(&fixture)?;
     let config = workload::WorkloadConfig {
         binary,
         fixture: isolated_fixture.path().to_path_buf(),
         sample_interval: std::time::Duration::from_millis(args.sample_interval_ms),
         verbose: args.verbose,
-        worker_binary: resolve_worker_binary(args.binary.as_deref(), &workspace_root),
+        worker_capable,
         heap_profile_dir: None,
     };
 
@@ -215,56 +232,6 @@ fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Resolve the `leindex-embed` worker binary path for the worker-active phases.
-///
-/// Probe order (first existing candidate wins):
-/// 1. `LEINDEX_WORKER_BINARY` env override (explicit, e.g. a custom install dir)
-/// 2. Alongside the user-specified main binary (`--binary`): `leindex-embed`
-///    (and `leindex-embed.exe` on Windows)
-/// 3. `target/release/leindex-embed` (canonical release layout)
-/// 4. `target/debug/leindex-embed` (debug layout — `cargo test --workspace`
-///    builds the worker bin in debug, so CI/harness runs without a release
-///    worker still get real worker-active phases instead of u64::MAX sentinels)
-///
-/// Falls back to the canonical release path when nothing exists so the
-/// workload's "worker not found" warning + loud-failure budget gate still
-/// behave as designed (a genuinely-missing worker must fail loudly, not pass
-/// trivially).
-fn resolve_worker_binary(main_binary: Option<&Path>, workspace_root: &Path) -> Option<PathBuf> {
-    if let Ok(env_path) = std::env::var("LEINDEX_WORKER_BINARY") {
-        let candidate = PathBuf::from(env_path);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    if let Some(main) = main_binary {
-        let dir = main.parent().unwrap_or(Path::new("."));
-        for name in ["leindex-embed", "leindex-embed.exe"] {
-            let candidate = dir.join(name);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    let release = workspace_root
-        .join("target")
-        .join("release")
-        .join("leindex-embed");
-    if release.exists() {
-        return Some(release);
-    }
-    let debug = workspace_root
-        .join("target")
-        .join("debug")
-        .join("leindex-embed");
-    if debug.exists() {
-        return Some(debug);
-    }
-    // No worker found anywhere: keep the canonical release path so the
-    // workload's existence check drives the loud-failure path.
-    Some(release)
 }
 
 /// Get a simple timestamp string.

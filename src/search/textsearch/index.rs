@@ -280,6 +280,98 @@ fn u64_at(data: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(data.get(at..at + 8)?.try_into().ok()?))
 }
 
+struct ParsedHeader {
+    file_count: u32,
+    tri_count: u32,
+    has_symbols: bool,
+    off_files: usize,
+    off_paths: usize,
+    off_syms: usize,
+    off_names: usize,
+    off_tri: usize,
+    off_post: usize,
+}
+
+fn parse_offsets(data: &[u8]) -> io::Result<[usize; 7]> {
+    let mut offsets = [0usize; 7];
+    for (i, slot) in offsets.iter_mut().enumerate() {
+        *slot = u64_at(data, 32 + i * 8).ok_or_else(|| bad("truncated"))? as usize;
+    }
+    Ok(offsets)
+}
+
+fn validate_bounds(
+    data: &[u8],
+    offsets: &[usize; 7],
+    file_count: u32,
+    tri_count: u32,
+) -> io::Result<()> {
+    let [
+        off_files,
+        off_paths,
+        off_syms,
+        off_names,
+        off_tri,
+        off_post,
+        total_len,
+    ] = *offsets;
+    if total_len != data.len() || &data[data.len() - 8..] != TRAILER {
+        return Err(bad("length or trailer mismatch"));
+    }
+    if [off_files, off_paths, off_syms, off_names, off_tri, off_post]
+        .iter()
+        .any(|o| *o > data.len())
+        || off_files + file_count as usize * FILE_ENTRY > data.len()
+        || off_tri + tri_count as usize * TRI_ENTRY > data.len()
+    {
+        return Err(bad("section out of bounds"));
+    }
+    Ok(())
+}
+
+fn parse_header(data: &[u8]) -> io::Result<ParsedHeader> {
+    if data.len() < HEADER_LEN + TRAILER.len() || &data[..8] != MAGIC {
+        return Err(bad("bad magic"));
+    }
+    if u32_at(data, 8) != Some(VERSION) {
+        return Err(bad("unsupported version"));
+    }
+    let has_symbols = u32_at(data, 12).ok_or_else(|| bad("truncated"))? & 1 == 1;
+    let file_count = u32_at(data, 16).ok_or_else(|| bad("truncated"))?;
+    let tri_count = u32_at(data, 20).ok_or_else(|| bad("truncated"))?;
+    let offsets = parse_offsets(data)?;
+    validate_bounds(data, &offsets, file_count, tri_count)?;
+    let [
+        off_files,
+        off_paths,
+        off_syms,
+        off_names,
+        off_tri,
+        off_post,
+        _,
+    ] = offsets;
+    Ok(ParsedHeader {
+        file_count,
+        tri_count,
+        has_symbols,
+        off_files,
+        off_paths,
+        off_syms,
+        off_names,
+        off_tri,
+        off_post,
+    })
+}
+
+fn build_path_index(index: &TextIndex, file_count: u32) -> io::Result<HashMap<String, u32>> {
+    let mut by_path = HashMap::with_capacity(file_count as usize);
+    for id in 0..file_count {
+        let meta = index.file(id).ok_or_else(|| bad("bad file entry"))?;
+        by_path.insert(meta.path.to_string(), id);
+    }
+    Ok(by_path)
+}
+
 impl TextIndex {
     /// Map and validate `path`.
     pub fn open(path: &Path) -> io::Result<Self> {
@@ -287,59 +379,21 @@ impl TextIndex {
         // SAFETY: the index is only ever replaced by an atomic rename of a new
         // file; the mapped inode is never modified in place.
         let map = unsafe { Mmap::map(&file)? };
-        let data = &map[..];
-        if data.len() < HEADER_LEN + TRAILER.len() || &data[..8] != MAGIC {
-            return Err(bad("bad magic"));
-        }
-        if u32_at(data, 8) != Some(VERSION) {
-            return Err(bad("unsupported version"));
-        }
-        let has_symbols = u32_at(data, 12).ok_or_else(|| bad("truncated"))? & 1 == 1;
-        let file_count = u32_at(data, 16).ok_or_else(|| bad("truncated"))?;
-        let tri_count = u32_at(data, 20).ok_or_else(|| bad("truncated"))?;
-        let mut offsets = [0usize; 7];
-        for (i, slot) in offsets.iter_mut().enumerate() {
-            *slot = u64_at(data, 32 + i * 8).ok_or_else(|| bad("truncated"))? as usize;
-        }
-        let [
-            off_files,
-            off_paths,
-            off_syms,
-            off_names,
-            off_tri,
-            off_post,
-            total_len,
-        ] = offsets;
-        if total_len != data.len() || &data[data.len() - 8..] != TRAILER {
-            return Err(bad("length or trailer mismatch"));
-        }
-        if [off_files, off_paths, off_syms, off_names, off_tri, off_post]
-            .iter()
-            .any(|o| *o > data.len())
-            || off_files + file_count as usize * FILE_ENTRY > data.len()
-            || off_tri + tri_count as usize * TRI_ENTRY > data.len()
-        {
-            return Err(bad("section out of bounds"));
-        }
+        let parsed = parse_header(&map)?;
         let mut index = Self {
             map,
-            file_count,
-            tri_count,
-            has_symbols,
-            off_files,
-            off_paths,
-            off_syms,
-            off_names,
-            off_tri,
-            off_post,
+            file_count: parsed.file_count,
+            tri_count: parsed.tri_count,
+            has_symbols: parsed.has_symbols,
+            off_files: parsed.off_files,
+            off_paths: parsed.off_paths,
+            off_syms: parsed.off_syms,
+            off_names: parsed.off_names,
+            off_tri: parsed.off_tri,
+            off_post: parsed.off_post,
             by_path: HashMap::new(),
         };
-        let mut by_path = HashMap::with_capacity(file_count as usize);
-        for id in 0..file_count {
-            let meta = index.file(id).ok_or_else(|| bad("bad file entry"))?;
-            by_path.insert(meta.path.to_string(), id);
-        }
-        index.by_path = by_path;
+        index.by_path = build_path_index(&index, parsed.file_count)?;
         Ok(index)
     }
 

@@ -966,7 +966,6 @@ pub fn cleanup_project_store(
 ) -> anyhow::Result<ProjectCleanupReport> {
     use crate::storage::cas::CasStore;
     use crate::storage::generation::GENERATIONS_DIR;
-    use crate::storage::generation::retention::{RetentionConfig, retain_after_publish};
 
     let cas_dir = storage_root.join("cas");
     let gens_dir = storage_root.join(GENERATIONS_DIR);
@@ -978,22 +977,8 @@ pub fn cleanup_project_store(
     // Generation-directory pruning is safe without CAS — no shared blobs —
     // so run the no-CAS variant and keep only the CAS-specific phases
     // (staging sweep, blob GC) for stores that actually have a CAS.
-    if !storage_root.exists() || (!cas_dir.exists() && !gens_dir.exists()) {
-        #[cfg(feature = "onnx")]
-        {
-            return Ok(ProjectCleanupReport {
-                generations: crate::storage::generation::GenerationRetentionReport::default(),
-                cache: compact_embed_cache(dry_run),
-                ..Default::default()
-            });
-        }
-        #[cfg(not(feature = "onnx"))]
-        {
-            return Ok(ProjectCleanupReport {
-                generations: crate::storage::generation::GenerationRetentionReport::default(),
-                ..Default::default()
-            });
-        }
+    if let Some(report) = empty_store_cleanup_report(storage_root, &cas_dir, &gens_dir, dry_run) {
+        return Ok(report);
     }
 
     let mut cas = if cas_dir.exists() {
@@ -1005,54 +990,10 @@ pub fn cleanup_project_store(
     };
 
     // Phase 1: Generation retention + CAS GC + job pruning (WS4).
-    let cfg = RetentionConfig::default();
-    let gen_report = if let Some(cas) = cas.as_mut() {
-        if dry_run {
-            // Read-only report for dry-run mode.
-            crate::storage::generation::retention::retention_report(cas, &gens_dir, &jobs_dir)
-                .map_err(|e| anyhow::anyhow!("retention report failed: {e}"))?
-        } else {
-            retain_after_publish(cas, &gens_dir, &jobs_dir, &cfg)
-                .map_err(|e| anyhow::anyhow!("retention sweep failed: {e}"))?
-        }
-    } else {
-        crate::storage::generation::retention::retain_generations_no_cas(
-            &gens_dir,
-            &jobs_dir,
-            cfg.max_generations,
-            dry_run,
-        )
-        .map_err(|e| anyhow::anyhow!("legacy retention sweep failed: {e}"))?
-    };
-
-    let mut staging_files_removed = 0usize;
+    let gen_report = run_generation_retention(cas.as_mut(), &gens_dir, &jobs_dir, dry_run)?;
 
     // Phase 2: Remove abandoned staging files (crash recovery).
-    let staging_dir = cas_dir.join(".staging");
-    if staging_dir.exists() {
-        if let Ok(entries) = fs::read_dir(&staging_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "partial") {
-                    if !dry_run {
-                        if let Err(e) = fs::remove_file(&path) {
-                            if e.kind() != std::io::ErrorKind::NotFound {
-                                warn!(
-                                    "cleanup: failed to remove staging file {}: {}",
-                                    path.display(),
-                                    e
-                                );
-                            }
-                        } else {
-                            staging_files_removed += 1;
-                        }
-                    } else {
-                        staging_files_removed += 1;
-                    }
-                }
-            }
-        }
-    }
+    let staging_files_removed = remove_abandoned_staging_files(&cas_dir.join(".staging"), dry_run);
 
     // Phase 3: Embedding-cache compaction (WS10).
     #[cfg(feature = "onnx")]
@@ -1066,6 +1007,100 @@ pub fn cleanup_project_store(
     };
 
     Ok(report)
+}
+
+/// Cleanup report for a project store with nothing generation-related to
+/// clean: a missing store root, or a store with neither `cas/` nor
+/// `generations/` directories.
+fn empty_store_cleanup_report(
+    storage_root: &Path,
+    cas_dir: &Path,
+    gens_dir: &Path,
+    dry_run: bool,
+) -> Option<ProjectCleanupReport> {
+    if !storage_root.exists() || (!cas_dir.exists() && !gens_dir.exists()) {
+        #[cfg(feature = "onnx")]
+        {
+            return Some(ProjectCleanupReport {
+                generations: crate::storage::generation::GenerationRetentionReport::default(),
+                cache: compact_embed_cache(dry_run),
+                ..Default::default()
+            });
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            let _ = dry_run;
+            return Some(ProjectCleanupReport {
+                generations: crate::storage::generation::GenerationRetentionReport::default(),
+                ..Default::default()
+            });
+        }
+    }
+    None
+}
+
+/// Phase 1 of [`cleanup_project_store`]: generation retention, CAS GC, and
+/// job pruning (WS4). Stores without a CAS get the no-CAS retention variant.
+fn run_generation_retention(
+    cas: Option<&mut crate::storage::cas::CasStore>,
+    gens_dir: &Path,
+    jobs_dir: &Path,
+    dry_run: bool,
+) -> anyhow::Result<crate::storage::generation::GenerationRetentionReport> {
+    use crate::storage::generation::retention::{RetentionConfig, retain_after_publish};
+
+    let cfg = RetentionConfig::default();
+    if let Some(cas) = cas {
+        if dry_run {
+            // Read-only report for dry-run mode.
+            crate::storage::generation::retention::retention_report(cas, gens_dir, jobs_dir)
+                .map_err(|e| anyhow::anyhow!("retention report failed: {e}"))
+        } else {
+            retain_after_publish(cas, gens_dir, jobs_dir, &cfg)
+                .map_err(|e| anyhow::anyhow!("retention sweep failed: {e}"))
+        }
+    } else {
+        crate::storage::generation::retention::retain_generations_no_cas(
+            gens_dir,
+            jobs_dir,
+            cfg.max_generations,
+            dry_run,
+        )
+        .map_err(|e| anyhow::anyhow!("legacy retention sweep failed: {e}"))
+    }
+}
+
+/// Phase 2 of [`cleanup_project_store`]: remove abandoned `.partial` staging
+/// files in `cas/.staging/` left over from crashed writes. Returns the number
+/// removed (or, on `dry_run`, the number that would be).
+fn remove_abandoned_staging_files(staging_dir: &Path, dry_run: bool) -> usize {
+    if !staging_dir.exists() {
+        return 0;
+    }
+    let mut removed = 0usize;
+    if let Ok(entries) = fs::read_dir(staging_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "partial") {
+                if !dry_run {
+                    if let Err(e) = fs::remove_file(&path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            warn!(
+                                "cleanup: failed to remove staging file {}: {}",
+                                path.display(),
+                                e
+                            );
+                        }
+                    } else {
+                        removed += 1;
+                    }
+                } else {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    removed
 }
 
 /// Compact the user-level global embedding cache (WS10 Task 6).

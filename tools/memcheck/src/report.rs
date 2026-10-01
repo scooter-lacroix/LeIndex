@@ -38,6 +38,12 @@ pub struct PhaseReport {
     /// (VAL-CPHASE-035). Equal to rss_max_kib when no worker is active.
     #[serde(default)]
     pub combined_rss_max_kib: u64,
+    /// Diagnostic recorded when the binary is worker-capable but no worker
+    /// process was observed in a worker-active phase (e.g. missing ONNX
+    /// runtime library or model). Not a gate failure; `None` (and omitted
+    /// from JSON) in every other case so existing baseline files keep parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_note: Option<String>,
     /// Peak GPU VRAM used in MiB during this phase (§14 item 8).
     /// `None` when no GPU is detected (headless CI).
     #[serde(default)]
@@ -106,6 +112,7 @@ mod tests {
             duration_ms: 1000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 200,
+            worker_note: None,
             gpu_vram_mib: None,
             descendants: crate::sampler::DescendantTree::default(),
         }
@@ -124,6 +131,7 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 200000,
+            worker_note: None,
             gpu_vram_mib: None,
             descendants: crate::sampler::DescendantTree::default(),
         };
@@ -160,6 +168,7 @@ mod tests {
             duration_ms: 2000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 80000,
+            worker_note: None,
             gpu_vram_mib: None,
             descendants: crate::sampler::DescendantTree::default(),
         };

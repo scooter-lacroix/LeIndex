@@ -439,6 +439,7 @@ mod tests {
                     duration_ms: 3000,
                     worker_rss_max_kib: 0,
                     combined_rss_max_kib: *rss,
+                    worker_note: None,
                     gpu_vram_mib: None,
                     descendants: crate::sampler::DescendantTree::default(),
                 })
@@ -481,6 +482,7 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            worker_note: None,
             gpu_vram_mib: None,
             descendants: crate::sampler::DescendantTree::default(),
         };
@@ -499,6 +501,7 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 700000,
+            worker_note: None,
             gpu_vram_mib: None,
             descendants: crate::sampler::DescendantTree::default(),
         };
@@ -544,6 +547,7 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            worker_note: None,
             gpu_vram_mib: None,
             descendants: crate::sampler::DescendantTree::default(),
         };
@@ -626,6 +630,7 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            worker_note: None,
             gpu_vram_mib: None,
             descendants: crate::sampler::DescendantTree::default(),
         };
@@ -660,6 +665,7 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            worker_note: None,
             gpu_vram_mib: None,
             descendants: crate::sampler::DescendantTree::default(),
         };
@@ -692,6 +698,7 @@ mod tests {
                 duration_ms: 3000,
                 worker_rss_max_kib: 0,
                 combined_rss_max_kib: 200000 + i as u64 * 10000,
+                worker_note: None,
                 gpu_vram_mib: None,
                 descendants: crate::sampler::DescendantTree::default(),
             })
@@ -729,6 +736,7 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            worker_note: None,
             gpu_vram_mib: None,
             descendants: crate::sampler::DescendantTree::default(),
         };
@@ -764,6 +772,7 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            worker_note: None,
             gpu_vram_mib: None,
             descendants: crate::sampler::DescendantTree::default(),
         };

@@ -395,6 +395,80 @@ impl LeIndex {
         self.analyze_internal(query, token_budget, false)
     }
 
+    fn lookup_cached_analysis(
+        &mut self,
+        query: &str,
+        cache_key: &str,
+        start_time: std::time::Instant,
+    ) -> Result<Option<super::AnalysisResult>> {
+        let neural_search_requested = self.neural_search_should_be_attempted();
+        let Some(CacheEntry::Analysis {
+            serialized_data, ..
+        }) = self
+            .cache
+            .cache_spiller
+            .store_mut()
+            .get_or_load(cache_key)?
+        else {
+            return Ok(None);
+        };
+
+        // New entries carry a one-bit provenance marker so a cached
+        // hybrid analysis can be reused without starting another
+        // model request, while an old/raw TF-IDF-only entry cannot
+        // suppress a configured neural attempt.
+        if let Ok((cached_with_neural, mut cached)) =
+            bincode::deserialize::<(bool, super::AnalysisResult)>(&serialized_data)
+        {
+            if cached_with_neural || !neural_search_requested {
+                cached.processing_time_ms = start_time.elapsed().as_millis() as u64;
+                debug!("Analysis cache hit for '{}'", query);
+                return Ok(Some(cached));
+            }
+        } else if !neural_search_requested {
+            // Preserve compatibility with entries written before the
+            // provenance marker was introduced.
+            if let Ok(mut cached) = bincode::deserialize::<super::AnalysisResult>(&serialized_data)
+            {
+                cached.processing_time_ms = start_time.elapsed().as_millis() as u64;
+                debug!("Analysis cache hit for '{}'", query);
+                return Ok(Some(cached));
+            }
+        }
+        Ok(None)
+    }
+
+    fn cache_analysis_result(
+        &mut self,
+        query: &str,
+        cache_key: &str,
+        analysis: &super::AnalysisResult,
+    ) {
+        let cached_with_neural = self
+            .embedder
+            .as_ref()
+            .is_some_and(|embedder| embedder.neural_status() == "ready");
+        if let Ok(serialized) = bincode::serialize(&(cached_with_neural, analysis)) {
+            let entry = CacheEntry::Analysis {
+                query: query.to_string(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                serialized_data: serialized,
+            };
+            if self
+                .cache
+                .cache_spiller
+                .store_mut()
+                .insert(cache_key.to_string(), entry)
+                .is_ok()
+            {
+                let _ = self.cache.cache_spiller.store_mut().persist_key(cache_key);
+            }
+        }
+    }
+
     fn analyze_internal(
         &mut self,
         query: &str,
@@ -404,39 +478,11 @@ impl LeIndex {
         let start_time = std::time::Instant::now();
 
         let analysis_cache_key = self.analysis_cache_key_for(query, token_budget);
-        let neural_search_requested = self.neural_search_should_be_attempted();
         if cache_results {
-            if let Some(CacheEntry::Analysis {
-                serialized_data, ..
-            }) = self
-                .cache
-                .cache_spiller
-                .store_mut()
-                .get_or_load(&analysis_cache_key)?
+            if let Some(cached) =
+                self.lookup_cached_analysis(query, &analysis_cache_key, start_time)?
             {
-                // New entries carry a one-bit provenance marker so a cached
-                // hybrid analysis can be reused without starting another
-                // model request, while an old/raw TF-IDF-only entry cannot
-                // suppress a configured neural attempt.
-                if let Ok((cached_with_neural, mut cached)) =
-                    bincode::deserialize::<(bool, super::AnalysisResult)>(&serialized_data)
-                {
-                    if cached_with_neural || !neural_search_requested {
-                        cached.processing_time_ms = start_time.elapsed().as_millis() as u64;
-                        debug!("Analysis cache hit for '{}'", query);
-                        return Ok(cached);
-                    }
-                } else if !neural_search_requested {
-                    // Preserve compatibility with entries written before the
-                    // provenance marker was introduced.
-                    if let Ok(mut cached) =
-                        bincode::deserialize::<super::AnalysisResult>(&serialized_data)
-                    {
-                        cached.processing_time_ms = start_time.elapsed().as_millis() as u64;
-                        debug!("Analysis cache hit for '{}'", query);
-                        return Ok(cached);
-                    }
-                }
+                return Ok(cached);
             }
         }
 
@@ -477,33 +523,7 @@ impl LeIndex {
         };
 
         if cache_results {
-            let cached_with_neural = self
-                .embedder
-                .as_ref()
-                .is_some_and(|embedder| embedder.neural_status() == "ready");
-            if let Ok(serialized) = bincode::serialize(&(cached_with_neural, &analysis)) {
-                let entry = CacheEntry::Analysis {
-                    query: query.to_string(),
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                    serialized_data: serialized,
-                };
-                if self
-                    .cache
-                    .cache_spiller
-                    .store_mut()
-                    .insert(analysis_cache_key.clone(), entry)
-                    .is_ok()
-                {
-                    let _ = self
-                        .cache
-                        .cache_spiller
-                        .store_mut()
-                        .persist_key(&analysis_cache_key);
-                }
-            }
+            self.cache_analysis_result(query, &analysis_cache_key, &analysis);
         }
 
         Ok(analysis)

@@ -205,17 +205,9 @@ pub enum MigrationError {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Migrate a legacy full-copy `.leindex/` store in place to the CAS-backed
-/// generation layout (WS4 Task 10 / VAL-MIGRATE-001..005).
-///
-/// Idempotent and crash-safe: a no-op when the store is already migrated, and
-/// a crash at any point resumes from the last `CURRENT` swap. The destructive
-/// cleanup runs only after the store is durably migrated.
-pub fn migrate_legacy_store(
-    storage_root: &Path,
-    cfg: &MigrationConfig,
-) -> Result<MigrationReport, MigrationError> {
-    let mut report = MigrationReport {
+/// The pre-migration report: legacy-layout detection plus zeroed counters.
+fn empty_migration_report(storage_root: &Path) -> MigrationReport {
+    MigrationReport {
         detected_legacy: is_legacy_full_copy_layout(storage_root),
         migrated: false,
         current_generation: None,
@@ -234,7 +226,106 @@ pub fn migrate_legacy_store(
         total_bytes_after: 0,
         blob_hashes: Vec::new(),
         warnings: Vec::new(),
-    };
+    }
+}
+
+/// The legacy generations to convert (current + existing previous) and the
+/// previous generation, if it exists.
+fn retained_legacy_generations(
+    storage_root: &Path,
+) -> Result<(Vec<u64>, Option<u64>), MigrationError> {
+    let current = read_current_generation(storage_root)
+        .ok_or_else(|| MigrationError::Legacy("legacy CURRENT points to no generation".into()))?;
+    let previous = current
+        .checked_sub(1)
+        .filter(|p| legacy_generation_dir_exists(storage_root, *p));
+    let retained: Vec<u64> = [previous, Some(current)].into_iter().flatten().collect();
+    if retained.is_empty() {
+        return Err(MigrationError::Legacy(format!(
+            "no retained generations found near current {current}"
+        )));
+    }
+    Ok((retained, previous))
+}
+
+/// Emit the one-time migration warning (irreversible rewrite) and record it
+/// in the report.
+fn warn_and_record_backup_advice(
+    storage_root: &Path,
+    retained: &[u64],
+    current: u64,
+    previous: Option<u64>,
+    report: &mut MigrationReport,
+) {
+    let msg = format!(
+        "one-time legacy→CAS store migration: converting {} generation(s) \
+         (current={}, previous={:?}) at {}; this irreversibly rewrites the \
+         store footprint. Back up `.leindex/` before proceeding if the \
+         content must be preserved verbatim.",
+        retained.len(),
+        current,
+        previous,
+        storage_root.display()
+    );
+    tracing::warn!("{}", msg);
+    report.warnings.push(msg);
+}
+
+/// Convert every retained generation and publish it: manifest-only for the
+/// previous generation, full `CURRENT` swap for the current one — the swap
+/// happens last so the store is fully migrated at the commit point.
+fn migrate_retained_generations(
+    writer: &mut GenerationWriter,
+    storage_root: &Path,
+    retained: &[u64],
+    current: u64,
+    report: &mut MigrationReport,
+) -> Result<(), MigrationError> {
+    for g in retained {
+        convert_generation(writer, storage_root, *g)?;
+        if *g == current {
+            // Swap CURRENT last: the store is now fully migrated.
+            writer.publish(current)?;
+            report.migrated = true;
+        } else {
+            writer.publish_manifest_only(*g)?;
+        }
+        report.generations_converted += 1;
+    }
+    Ok(())
+}
+
+/// Record the current manifest's layer hashes (dedup audit); a store without
+/// a readable manifest simply contributes none.
+fn record_current_manifest_hashes(storage_root: &Path, current: u64, report: &mut MigrationReport) {
+    if let Ok(manifest) = read_generation_manifest(storage_root, current) {
+        for hash in manifest.layer_hashes() {
+            report.blob_hashes.push(hash_to_hex(&hash));
+        }
+    }
+}
+
+/// Store stats now that CAS is populated.
+fn record_cas_stats(
+    cas: &Arc<Mutex<CasStore>>,
+    report: &mut MigrationReport,
+) -> Result<(), MigrationError> {
+    report.cas_blob_count = cas.lock().expect("cas lock").blob_count()?;
+    report.cas_bytes = compute_cas_bytes(&cas.lock().expect("cas lock"));
+    Ok(())
+}
+
+/// Migrate a legacy full-copy `.leindex/` store in place to the CAS-backed
+/// generation layout (WS4 Task 10 / VAL-MIGRATE-001..005).
+///
+/// Idempotent and crash-safe: a no-op when the store is already migrated, and
+/// a crash at any point resumes from the last `CURRENT` swap. The destructive
+/// cleanup runs only after the store is durably migrated.
+pub fn migrate_legacy_store(
+    storage_root: &Path,
+    cfg: &MigrationConfig,
+) -> Result<MigrationReport, MigrationError> {
+    let mut report = empty_migration_report(storage_root);
 
     // Idempotency / crash-resume: a store that is not in the legacy layout but
     // already migrated (CURRENT → manifest) still runs the destructive cleanup
@@ -247,61 +338,26 @@ pub fn migrate_legacy_store(
         return Ok(report);
     }
 
-    let current = read_current_generation(storage_root)
-        .ok_or_else(|| MigrationError::Legacy("legacy CURRENT points to no generation".into()))?;
-    let previous = current
-        .checked_sub(1)
-        .filter(|p| legacy_generation_dir_exists(storage_root, *p));
-    let retained: Vec<u64> = [previous, Some(current)].into_iter().flatten().collect();
-    if retained.is_empty() {
-        return Err(MigrationError::Legacy(format!(
-            "no retained generations found near current {current}"
-        )));
-    }
+    let (retained, previous) = retained_legacy_generations(storage_root)?;
+    let current = *retained.last().expect("retained generations are non-empty");
 
     if cfg.emit_backup_warning {
-        let msg = format!(
-            "one-time legacy→CAS store migration: converting {} generation(s) \
-             (current={}, previous={:?}) at {}; this irreversibly rewrites the \
-             store footprint. Back up `.leindex/` before proceeding if the \
-             content must be preserved verbatim.",
-            retained.len(),
-            current,
-            previous,
-            storage_root.display()
-        );
-        tracing::warn!("{}", msg);
-        report.warnings.push(msg);
+        warn_and_record_backup_advice(storage_root, &retained, current, previous, &mut report);
     }
 
     let cas_root = storage_root.join("cas");
     let cas = Arc::new(Mutex::new(CasStore::open(&cas_root)?));
 
     let mut writer = GenerationWriter::new(storage_root, cas.clone());
-    for g in &retained {
-        convert_generation(&mut writer, storage_root, *g)?;
-        if *g == current {
-            // Swap CURRENT last: the store is now fully migrated.
-            writer.publish(current)?;
-            report.migrated = true;
-        } else {
-            writer.publish_manifest_only(*g)?;
-        }
-        report.generations_converted += 1;
-    }
+    migrate_retained_generations(&mut writer, storage_root, &retained, current, &mut report)?;
     report.current_generation = Some(current);
     report.previous_generation = previous;
 
     // Record layer hashes for the current manifest (dedup audit).
-    if let Ok(manifest) = read_generation_manifest(storage_root, current) {
-        for hash in manifest.layer_hashes() {
-            report.blob_hashes.push(hash_to_hex(&hash));
-        }
-    }
+    record_current_manifest_hashes(storage_root, current, &mut report);
 
     // Store stats now that CAS is populated.
-    report.cas_blob_count = cas.lock().expect("cas lock").blob_count()?;
-    report.cas_bytes = compute_cas_bytes(&cas.lock().expect("cas lock"));
+    record_cas_stats(&cas, &mut report)?;
 
     report.total_bytes_after = dir_total_bytes(storage_root);
 
@@ -524,63 +580,69 @@ pub(crate) fn encode_empty_neural() -> Vec<u8> {
     payload
 }
 
-/// Reconstruct a [`LIDX-PDG1`] layer from the legacy catalog's `intel_nodes`
-/// and `intel_edges` tables.
-pub(crate) fn encode_pdg_layer(conn: &Connection) -> Result<Vec<u8>, MigrationError> {
-    let mut interner = StringInterner::new();
-
+/// Encode the legacy `intel_nodes` table into the LIDX-PDG1 node section,
+/// interning symbol/file strings as they are encountered.
+fn encode_pdg_nodes(
+    conn: &Connection,
+    interner: &mut StringInterner,
+) -> Result<Vec<u8>, MigrationError> {
     let mut nodes: Vec<u8> = Vec::new();
-    {
-        let mut q = conn.prepare(
-            "SELECT id, symbol_name, node_type, file_path \
-             FROM intel_nodes ORDER BY id",
-        )?;
-        let rows = q.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        for row in rows {
-            let (db_id, symbol_name, node_type, file_path) = row?;
-            let node_id = u32::try_from(db_id)
-                .map_err(|_| MigrationError::Payload("node id exceeds u32".into()))?;
-            let node_type = legacy_node_type_code(&node_type);
-            let file_path_id = interner.intern(&file_path);
-            let sym_name_id = interner.intern(&symbol_name);
-            nodes.extend_from_slice(&node_id.to_le_bytes());
-            nodes.extend_from_slice(&node_type.to_le_bytes());
-            nodes.extend_from_slice(&file_path_id.to_le_bytes());
-            nodes.extend_from_slice(&0u32.to_le_bytes()); // start_line (legacy stores bytes, not lines)
-            nodes.extend_from_slice(&0u32.to_le_bytes()); // end_line
-            nodes.extend_from_slice(&sym_name_id.to_le_bytes());
-        }
+    let mut q = conn.prepare(
+        "SELECT id, symbol_name, node_type, file_path \
+         FROM intel_nodes ORDER BY id",
+    )?;
+    let rows = q.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (db_id, symbol_name, node_type, file_path) = row?;
+        let node_id = u32::try_from(db_id)
+            .map_err(|_| MigrationError::Payload("node id exceeds u32".into()))?;
+        let node_type = legacy_node_type_code(&node_type);
+        let file_path_id = interner.intern(&file_path);
+        let sym_name_id = interner.intern(&symbol_name);
+        nodes.extend_from_slice(&node_id.to_le_bytes());
+        nodes.extend_from_slice(&node_type.to_le_bytes());
+        nodes.extend_from_slice(&file_path_id.to_le_bytes());
+        nodes.extend_from_slice(&0u32.to_le_bytes()); // start_line (legacy stores bytes, not lines)
+        nodes.extend_from_slice(&0u32.to_le_bytes()); // end_line
+        nodes.extend_from_slice(&sym_name_id.to_le_bytes());
     }
+    Ok(nodes)
+}
 
+/// Encode the legacy `intel_edges` table into the LIDX-PDG1 edge section.
+fn encode_pdg_edges(conn: &Connection) -> Result<Vec<u8>, MigrationError> {
     let mut edges: Vec<u8> = Vec::new();
-    {
-        let mut q = conn.prepare("SELECT caller_id, callee_id, edge_type FROM intel_edges")?;
-        let rows = q.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (caller, callee, edge_type) = row?;
-            let src = u32::try_from(caller)
-                .map_err(|_| MigrationError::Payload("caller id exceeds u32".into()))?;
-            let dst = u32::try_from(callee)
-                .map_err(|_| MigrationError::Payload("callee id exceeds u32".into()))?;
-            edges.extend_from_slice(&src.to_le_bytes());
-            edges.extend_from_slice(&dst.to_le_bytes());
-            edges.extend_from_slice(&legacy_edge_type_code(&edge_type).to_le_bytes());
-        }
+    let mut q = conn.prepare("SELECT caller_id, callee_id, edge_type FROM intel_edges")?;
+    let rows = q.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (caller, callee, edge_type) = row?;
+        let src = u32::try_from(caller)
+            .map_err(|_| MigrationError::Payload("caller id exceeds u32".into()))?;
+        let dst = u32::try_from(callee)
+            .map_err(|_| MigrationError::Payload("callee id exceeds u32".into()))?;
+        edges.extend_from_slice(&src.to_le_bytes());
+        edges.extend_from_slice(&dst.to_le_bytes());
+        edges.extend_from_slice(&legacy_edge_type_code(&edge_type).to_le_bytes());
     }
+    Ok(edges)
+}
 
+/// Assemble the LIDX-PDG1 payload: magic + version header over the
+/// nodes/edges/string-table sections, content-hashed for the manifest.
+fn pdg1_payload(nodes: &[u8], edges: &[u8], interner: StringInterner) -> Vec<u8> {
     let (string_table, string_bytes) = interner.into_bytes();
     let num_nodes = nodes.len() / PDG_NODE_LEN;
     let num_edges = edges.len() / PDG_EDGE_LEN;
@@ -589,8 +651,8 @@ pub(crate) fn encode_pdg_layer(conn: &Connection) -> Result<Vec<u8>, MigrationEr
 
     let mut data =
         Vec::with_capacity(nodes.len() + edges.len() + string_table.len() + string_bytes.len());
-    data.extend_from_slice(&nodes);
-    data.extend_from_slice(&edges);
+    data.extend_from_slice(nodes);
+    data.extend_from_slice(edges);
     data.extend_from_slice(&string_table);
     data.extend_from_slice(&string_bytes);
     let content_hash = crate::storage::cas::blob::blob_hash(&data);
@@ -605,7 +667,16 @@ pub(crate) fn encode_pdg_layer(conn: &Connection) -> Result<Vec<u8>, MigrationEr
     payload.extend_from_slice(&(strings_bytes_len as u32).to_le_bytes());
     payload.extend_from_slice(&content_hash);
     payload.extend_from_slice(&data);
-    Ok(payload)
+    payload
+}
+
+/// Reconstruct a [`LIDX-PDG1`] layer from the legacy catalog's `intel_nodes`
+/// and `intel_edges` tables.
+pub(crate) fn encode_pdg_layer(conn: &Connection) -> Result<Vec<u8>, MigrationError> {
+    let mut interner = StringInterner::new();
+    let nodes = encode_pdg_nodes(conn, &mut interner)?;
+    let edges = encode_pdg_edges(conn)?;
+    Ok(pdg1_payload(&nodes, &edges, interner))
 }
 
 /// Reconstruct a [`LIDX-SYM1`] layer from the legacy catalog's `intel_nodes`.
@@ -693,6 +764,92 @@ const LEGACY_TOP_LEVEL_ARTIFACTS: &[&str] = &[
     "tfidf_embedder.bin",
 ];
 
+/// Delete every non-retained generation directory under `generations/`
+/// (numeric subdirectories outside `retained`); best-effort per directory.
+fn delete_non_retained_generations(
+    storage_root: &Path,
+    retained: &[u64],
+    report: &mut MigrationReport,
+) -> Result<(), MigrationError> {
+    let gens_dir = storage_root.join(GENERATIONS_DIR);
+    if !gens_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&gens_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name_str = entry.file_name().to_string_lossy().into_owned();
+        let Ok(num) = name_str.parse::<u64>() else {
+            continue;
+        };
+        if retained.contains(&num) {
+            continue;
+        }
+        if fs::remove_dir_all(entry.path()).is_ok() {
+            report.generations_deleted += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Delete one redundant legacy artifact, crediting its size to the report.
+fn remove_legacy_artifact(path: &Path, report: &mut MigrationReport) {
+    if !path.is_file() {
+        return;
+    }
+    let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if fs::remove_file(path).is_ok() {
+        report.artifact_bytes_reclaimed += size;
+    }
+}
+
+/// Delete the redundant legacy full-copy files inside the retained
+/// generations, plus stale manifest partials.
+fn delete_retained_generation_artifacts(
+    storage_root: &Path,
+    retained: &[u64],
+    report: &mut MigrationReport,
+) {
+    for g in retained {
+        let gen_dir = generation_dir(storage_root, *g);
+        for artifact in LEGACY_GEN_ARTIFACTS {
+            remove_legacy_artifact(&gen_dir.join(artifact), report);
+        }
+        let _ = fs::remove_file(gen_dir.join("manifest.partial"));
+    }
+}
+
+/// Delete the top-level legacy full-copy artifacts (fully captured in CAS).
+fn delete_top_level_artifacts(storage_root: &Path, report: &mut MigrationReport) {
+    for artifact in LEGACY_TOP_LEVEL_ARTIFACTS {
+        remove_legacy_artifact(&storage_root.join(artifact), report);
+    }
+}
+
+/// CAS GC: remove blobs not referenced by any retained manifest (they are
+/// unreachable once the retained generations are live). Pins are the current
+/// + previous manifest layer hashes.
+fn garbage_collect_unpinned_blobs(
+    storage_root: &Path,
+    retained: &[u64],
+    report: &mut MigrationReport,
+) -> Result<(), MigrationError> {
+    let cas_root = storage_root.join("cas");
+    if !cas_root.is_dir() {
+        return Ok(());
+    }
+    let mut store = CasStore::open(&cas_root)?;
+    let pinned = retained_manifest_pins(storage_root, retained);
+    let gc = store.gc_with_pins(&pinned)?;
+    report.cas_reclaimed_bytes += gc.reclaimed_bytes;
+    report.cas_blob_count = store.blob_count()?;
+    report.cas_bytes = compute_cas_bytes(&store);
+    store.persist()?;
+    Ok(())
+}
+
 /// Perform the post-commit destructive sweep. Safe to run after the store is
 /// migrated; idempotent.
 fn cleanup_migrated_store(
@@ -710,51 +867,13 @@ fn cleanup_migrated_store(
         .collect::<Vec<_>>();
 
     // 1. Delete non-retained generation directories.
-    let gens_dir = storage_root.join(GENERATIONS_DIR);
-    if gens_dir.is_dir() {
-        for entry in fs::read_dir(&gens_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let name_str = entry.file_name().to_string_lossy().into_owned();
-            let Ok(num) = name_str.parse::<u64>() else {
-                continue;
-            };
-            if retained.contains(&num) {
-                continue;
-            }
-            if fs::remove_dir_all(entry.path()).is_ok() {
-                report.generations_deleted += 1;
-            }
-        }
-    }
+    delete_non_retained_generations(storage_root, &retained, report)?;
 
     // 2. Delete redundant legacy full-copy files inside retained generations.
-    for g in &retained {
-        let gen_dir = generation_dir(storage_root, *g);
-        for artifact in LEGACY_GEN_ARTIFACTS {
-            let p = gen_dir.join(artifact);
-            if p.is_file() {
-                let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                if fs::remove_file(&p).is_ok() {
-                    report.artifact_bytes_reclaimed += size;
-                }
-            }
-        }
-        let _ = fs::remove_file(gen_dir.join("manifest.partial"));
-    }
+    delete_retained_generation_artifacts(storage_root, &retained, report);
 
     // 3. Delete redundant top-level legacy full-copy artifacts.
-    for artifact in LEGACY_TOP_LEVEL_ARTIFACTS {
-        let p = storage_root.join(artifact);
-        if p.is_file() {
-            let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-            if fs::remove_file(&p).is_ok() {
-                report.artifact_bytes_reclaimed += size;
-            }
-        }
-    }
+    delete_top_level_artifacts(storage_root, report);
 
     // 4. Prune jobs: completed jobs immediately, then byte-cap oldest-first.
     let jobs_dir = storage_root.join("jobs");
@@ -763,16 +882,7 @@ fn cleanup_migrated_store(
     // 5. CAS GC: remove blobs not referenced by any retained manifest (they
     //    are unreachable once the retained generations are live). Pins are the
     //    current + previous manifest layer hashes.
-    let cas_root = storage_root.join("cas");
-    if cas_root.is_dir() {
-        let mut store = CasStore::open(&cas_root)?;
-        let pinned = retained_manifest_pins(storage_root, &retained);
-        let gc = store.gc_with_pins(&pinned)?;
-        report.cas_reclaimed_bytes += gc.reclaimed_bytes;
-        report.cas_blob_count = store.blob_count()?;
-        report.cas_bytes = compute_cas_bytes(&store);
-        store.persist()?;
-    }
+    garbage_collect_unpinned_blobs(storage_root, &retained, report)?;
 
     Ok(())
 }

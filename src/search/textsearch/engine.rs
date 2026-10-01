@@ -660,26 +660,73 @@ fn context_lines(
     (before, after)
 }
 
+fn read_scan_file(path: &Path) -> Option<Vec<u8>> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_SCAN_FILE_BYTES {
+        return None;
+    }
+    let data = std::fs::read(path).ok()?;
+    if looks_binary(&data) {
+        return None;
+    }
+    Some(data)
+}
+
+fn resolve_symbol_index<'a>(
+    index: Option<&'a TextIndex>,
+    candidate: &Candidate,
+    options: &SearchOptions,
+) -> Option<(&'a TextIndex, u32)> {
+    match (index, candidate.id, candidate.dirty) {
+        (Some(index), Some(id), false) if options.want_symbols && index.has_symbols() => {
+            Some((index, id))
+        }
+        _ => None,
+    }
+}
+
+fn build_hit(
+    data: &[u8],
+    start: usize,
+    line_start: usize,
+    line_no: u32,
+    options: &SearchOptions,
+    symbol: Option<(String, &'static str)>,
+) -> Hit {
+    let line_end = memchr::memchr(b'\n', &data[start..]).map_or(data.len(), |p| start + p);
+    let (before, after) = if options.context > 0 {
+        context_lines(
+            data,
+            line_start,
+            line_end,
+            options.context,
+            options.max_line_chars,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    Hit {
+        line: line_no,
+        col: (start - line_start + 1) as u32,
+        text: clip_line(
+            &data[line_start..line_end],
+            start - line_start,
+            options.max_line_chars,
+        ),
+        before,
+        after,
+        symbol,
+    }
+}
+
 fn scan_file(
     candidate: &Candidate,
     compiled: &Compiled,
     options: &SearchOptions,
     index: Option<&TextIndex>,
 ) -> Option<FileResult> {
-    let meta = std::fs::metadata(&candidate.abs).ok()?;
-    if !meta.is_file() || meta.len() > MAX_SCAN_FILE_BYTES {
-        return None;
-    }
-    let data = std::fs::read(&candidate.abs).ok()?;
-    if looks_binary(&data) {
-        return None;
-    }
-    let symbol_index = match (index, candidate.id, candidate.dirty) {
-        (Some(index), Some(id), false) if options.want_symbols && index.has_symbols() => {
-            Some((index, id))
-        }
-        _ => None,
-    };
+    let data = read_scan_file(&candidate.abs)?;
+    let symbol_index = resolve_symbol_index(index, candidate, options);
     let mut result = FileResult {
         rel: candidate.rel.clone(),
         symbols_stale: options.want_symbols && candidate.dirty && candidate.id.is_some(),
@@ -709,30 +756,9 @@ fn scan_file(
         if !reportable {
             continue;
         }
-        let line_end = memchr::memchr(b'\n', &data[start..]).map_or(data.len(), |p| start + p);
-        let (before, after) = if options.context > 0 {
-            context_lines(
-                &data,
-                line_start,
-                line_end,
-                options.context,
-                options.max_line_chars,
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        result.hits.push(Hit {
-            line: line_no,
-            col: (start - line_start + 1) as u32,
-            text: clip_line(
-                &data[line_start..line_end],
-                start - line_start,
-                options.max_line_chars,
-            ),
-            before,
-            after,
-            symbol,
-        });
+        result.hits.push(build_hit(
+            &data, start, line_start, line_no, options, symbol,
+        ));
     }
     if result.match_lines == 0 {
         return None;
@@ -742,6 +768,42 @@ fn scan_file(
         .map(|((name, kind), count)| (name, kind, count))
         .collect();
     Some(result)
+}
+
+fn window_file_hits(
+    file: &mut FileResult,
+    seen_hits: &mut usize,
+    offset: usize,
+    window_end: Option<usize>,
+) {
+    let mut windowed = Vec::with_capacity(file.hits.len());
+    for hit in file.hits.drain(..) {
+        let position = *seen_hits;
+        *seen_hits += 1;
+        if position >= offset && window_end.is_none_or(|end| position < end) {
+            windowed.push(hit);
+        }
+    }
+    file.hits = windowed;
+}
+
+fn ingest_scanned_files(
+    scanned: Vec<Option<FileResult>>,
+    root_out: &mut RootOutput,
+    output: &mut SearchOutput,
+    options: &SearchOptions,
+    seen_hits: &mut usize,
+    window_end: Option<usize>,
+) {
+    for mut file in scanned.into_iter().flatten() {
+        output.stats.files_matched += 1;
+        output.stats.match_lines += file.match_lines;
+        window_file_hits(&mut file, seen_hits, options.offset, window_end);
+        output.returned += file.hits.len();
+        if !options.collect_hits || !file.hits.is_empty() {
+            root_out.files.push(file);
+        }
+    }
 }
 
 /// Run `query` over `roots`.
@@ -779,26 +841,14 @@ pub fn search(roots: &[RootSpec], compiled: &Compiled, options: &SearchOptions) 
                     .collect()
             });
             output.stats.scanned += chunk.len();
-            for mut file in scanned.into_iter().flatten() {
-                output.stats.files_matched += 1;
-                output.stats.match_lines += file.match_lines;
-                // Window the reported hits by offset/limit.
-                let mut windowed = Vec::with_capacity(file.hits.len());
-                for hit in file.hits.drain(..) {
-                    let position = seen_hits;
-                    seen_hits += 1;
-                    if position >= options.offset && window_end.is_none_or(|end| position < end) {
-                        windowed.push(hit);
-                    }
-                }
-                // Hits past the per-file cap still occupy no positions.
-                file.hits = windowed;
-                output.returned += file.hits.len();
-                let keep = !options.collect_hits || !file.hits.is_empty();
-                if keep {
-                    root_out.files.push(file);
-                }
-            }
+            ingest_scanned_files(
+                scanned,
+                &mut root_out,
+                &mut output,
+                options,
+                &mut seen_hits,
+                window_end,
+            );
             if options.collect_hits && window_end.is_some_and(|end| seen_hits > end) {
                 output.has_more = true;
                 output.complete = false;

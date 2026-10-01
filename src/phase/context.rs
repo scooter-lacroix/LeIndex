@@ -224,17 +224,12 @@ impl PhaseExecutionContext {
         let source_bytes_map = source_bytes_from_results(&self.root, &self.parse_results);
 
         let mut pdg = ProgramDependenceGraph::new();
-        for (file_path, (language, signatures)) in &self.signatures_by_file {
-            // Use source_bytes from ParsingResult when available, fall back to disk read
-            let source_bytes_fallback = source_bytes_for_file(&self.root, file_path);
-            let source_bytes = source_bytes_map
-                .get(file_path)
-                .map(|s| s.as_slice())
-                .unwrap_or_else(|| source_bytes_fallback.as_slice());
-            let file_pdg =
-                extract_pdg_from_signatures(signatures.clone(), source_bytes, file_path, language);
-            merge_pdgs(&mut pdg, &file_pdg);
-        }
+        merge_file_fragments(
+            &self.root,
+            &self.signatures_by_file,
+            &source_bytes_map,
+            &mut pdg,
+        );
         self.pdg = pdg;
 
         self.run_precision_ingest();
@@ -244,16 +239,7 @@ impl PhaseExecutionContext {
         self.compute_and_persist_communities()
             .context("failed persisting communities for phase analysis")?;
 
-        let inventory_hashes = freshness
-            .file_inventory
-            .iter()
-            .map(|(path, hash)| {
-                (
-                    normalize_file_key(&self.root, &path.display().to_string()),
-                    hash.clone(),
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        let inventory_hashes = inventory_hash_map(&self.root, &freshness.file_inventory);
 
         for file_path in self.signatures_by_file.keys() {
             let normalized = normalize_file_key(&self.root, file_path);
@@ -275,121 +261,133 @@ impl PhaseExecutionContext {
     fn refresh_persisted_graph(&mut self, freshness: &FreshnessState) -> Result<()> {
         let mut pdg = load_pdg(&self.storage, &self.project_id)
             .context("failed loading cached PDG for incremental phase run")?;
-        #[cfg(feature = "community")]
-        if let Err(error) = crate::storage::community_store::load_community_memberships(
-            &self.storage,
-            &self.project_id,
-            &mut pdg,
-        ) {
-            warn!(%error, "Phase context: failed to hydrate community memberships");
-        }
+        self.hydrate_community_memberships(&mut pdg);
 
-        // Collect all file keys that need deletion (from deleted files + changed
-        // files) so we can batch them in a single transaction.
+        // Collect all file keys that need deletion (from deleted files +
+        // changed files) so we can batch them in a single transaction.
         let mut files_to_delete: Vec<String> = Vec::new();
-
         for path in &freshness.deleted_files {
-            for key in equivalent_file_keys(&self.root, path) {
-                pdg.remove_file(&key);
-                files_to_delete.push(key);
-            }
+            remove_file_fragments(&self.root, path, &mut pdg, &mut files_to_delete);
         }
 
-        let parse_paths = freshness.changed_files.clone();
-        if !parse_paths.is_empty() {
-            self.parse_results = ParallelParser::new().parse_files(parse_paths);
-            self.signatures_by_file = signatures_from_results(&self.root, &self.parse_results);
-            let source_bytes_map = source_bytes_from_results(&self.root, &self.parse_results);
-
-            let inventory_hashes = freshness
-                .file_inventory
-                .iter()
-                .map(|(path, hash)| {
-                    (
-                        normalize_file_key(&self.root, &path.display().to_string()),
-                        hash.clone(),
-                    )
-                })
-                .collect::<HashMap<_, _>>();
+        if !freshness.changed_files.is_empty() {
+            let source_bytes_map = self.parse_changed_files(freshness);
+            let inventory_hashes = inventory_hash_map(&self.root, &freshness.file_inventory);
 
             // Collect changed file keys for batch deletion.
             for file_path in self.signatures_by_file.keys() {
-                for key in equivalent_file_keys(&self.root, file_path) {
-                    pdg.remove_file(&key);
-                    files_to_delete.push(key);
-                }
+                remove_file_fragments(&self.root, file_path, &mut pdg, &mut files_to_delete);
             }
 
             // Batch-delete all stale file data and update indexed_files in a
             // single transaction to avoid N x fsync overhead.
-            let mut file_updates: Vec<(String, String)> = Vec::new();
-            for file_path in self.signatures_by_file.keys() {
-                let normalized = normalize_file_key(&self.root, file_path);
-                if let Some(hash) = inventory_hashes.get(&normalized) {
-                    file_updates.push((normalized.clone(), hash.clone()));
-                }
-            }
-
-            if !files_to_delete.is_empty() || !file_updates.is_empty() {
-                let tx = self.storage.conn_mut().transaction()?;
-                if !files_to_delete.is_empty() {
-                    if let Err(e) = delete_files_data_tx(&tx, &self.project_id, &files_to_delete) {
-                        warn!(
-                            "Phase context: failed to batch-delete file data for {} files: {}",
-                            files_to_delete.len(),
-                            e
-                        );
-                    }
-                }
-                if !file_updates.is_empty() {
-                    if let Err(e) = update_indexed_files_tx(&tx, &self.project_id, &file_updates) {
-                        warn!(
-                            "Phase context: failed to batch-update {} indexed file records: {}",
-                            file_updates.len(),
-                            e
-                        );
-                    }
-                }
-                if let Err(e) = tx.commit() {
-                    warn!("Phase context: failed to commit batch transaction: {}", e);
-                }
-            }
+            let file_updates =
+                changed_file_updates(&self.root, &self.signatures_by_file, &inventory_hashes);
+            self.persist_stale_file_updates(&files_to_delete, &file_updates);
 
             // Build new PDG fragments from parsed results.
-            for (file_path, (language, signatures)) in &self.signatures_by_file {
-                // Use source_bytes from ParsingResult when available, fall back to disk read
-                let source_bytes_fallback = source_bytes_for_file(&self.root, file_path);
-                let source_bytes = source_bytes_map
-                    .get(file_path)
-                    .map(|s| s.as_slice())
-                    .unwrap_or_else(|| source_bytes_fallback.as_slice());
-                let file_pdg = extract_pdg_from_signatures(
-                    signatures.clone(),
-                    source_bytes,
-                    file_path,
-                    language,
-                );
-                merge_pdgs(&mut pdg, &file_pdg);
-            }
+            merge_file_fragments(
+                &self.root,
+                &self.signatures_by_file,
+                &source_bytes_map,
+                &mut pdg,
+            );
         }
 
         let graph_changed =
             !freshness.deleted_files.is_empty() || !self.signatures_by_file.is_empty();
+        self.persist_refreshed_graph(&mut pdg, freshness, graph_changed)?;
+        Ok(())
+    }
+
+    /// Hydrate persisted community memberships into a loaded PDG. Failures
+    /// are non-fatal: analysis proceeds without community data.
+    fn hydrate_community_memberships(&self, pdg: &mut ProgramDependenceGraph) {
+        #[cfg(feature = "community")]
+        if let Err(error) = crate::storage::community_store::load_community_memberships(
+            &self.storage,
+            &self.project_id,
+            pdg,
+        ) {
+            warn!(%error, "Phase context: failed to hydrate community memberships");
+        }
+        #[cfg(not(feature = "community"))]
+        let _ = pdg;
+    }
+
+    /// Parse the changed files detected by freshness and store the parse
+    /// results and per-file signatures on the context. Returns the parsed
+    /// source bytes keyed by normalized file path.
+    fn parse_changed_files(&mut self, freshness: &FreshnessState) -> HashMap<String, Vec<u8>> {
+        self.parse_results = ParallelParser::new().parse_files(freshness.changed_files.clone());
+        self.signatures_by_file = signatures_from_results(&self.root, &self.parse_results);
+        source_bytes_from_results(&self.root, &self.parse_results)
+    }
+
+    /// Batch-delete stale file data and update indexed-file records in a
+    /// single transaction to avoid N x fsync overhead. Individual statement
+    /// failures are logged and skipped; the rest of the transaction commits.
+    fn persist_stale_file_updates(
+        &mut self,
+        files_to_delete: &[String],
+        file_updates: &[(String, String)],
+    ) {
+        if files_to_delete.is_empty() && file_updates.is_empty() {
+            return;
+        }
+        let tx = match self.storage.conn_mut().transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                warn!("Phase context: failed to commit batch transaction: {}", e);
+                return;
+            }
+        };
+        if !files_to_delete.is_empty() {
+            if let Err(e) = delete_files_data_tx(&tx, &self.project_id, files_to_delete) {
+                warn!(
+                    "Phase context: failed to batch-delete file data for {} files: {}",
+                    files_to_delete.len(),
+                    e
+                );
+            }
+        }
+        if !file_updates.is_empty() {
+            if let Err(e) = update_indexed_files_tx(&tx, &self.project_id, file_updates) {
+                warn!(
+                    "Phase context: failed to batch-update {} indexed file records: {}",
+                    file_updates.len(),
+                    e
+                );
+            }
+        }
+        if let Err(e) = tx.commit() {
+            warn!("Phase context: failed to commit batch transaction: {}", e);
+        }
+    }
+
+    /// Persist the refreshed PDG (running precision ingest when applicable),
+    /// then install it as the analysis graph.
+    fn persist_refreshed_graph(
+        &mut self,
+        pdg: &mut ProgramDependenceGraph,
+        freshness: &FreshnessState,
+        graph_changed: bool,
+    ) -> Result<()> {
         if graph_changed {
-            self.run_precision_ingest_for(&mut pdg);
-            save_pdg(&mut self.storage, &self.project_id, &pdg)
+            self.run_precision_ingest_for(pdg);
+            save_pdg(&mut self.storage, &self.project_id, pdg)
                 .context("failed saving refreshed PDG")?;
-        } else if Self::should_run_precision_ingest(&pdg, freshness) {
+        } else if Self::should_run_precision_ingest(pdg, freshness) {
             // A persisted Tier-0 graph can predate precision ingest (or have
             // no matched markers yet). Allow that opt-in pass to run even when
             // freshness reports no source delta, then persist its markers.
-            self.run_precision_ingest_for(&mut pdg);
-            save_pdg(&mut self.storage, &self.project_id, &pdg)
+            self.run_precision_ingest_for(pdg);
+            save_pdg(&mut self.storage, &self.project_id, pdg)
                 .context("failed saving precision-enriched PDG")?;
         }
 
-        relink_for_analysis(&mut pdg);
-        self.pdg = pdg;
+        relink_for_analysis(pdg);
+        self.pdg = std::mem::take(pdg);
         if graph_changed {
             self.compute_and_persist_communities()?;
         }
@@ -446,6 +444,76 @@ fn source_bytes_from_results(root: &Path, results: &[ParsingResult]) -> HashMap<
             Some((file, result.source_bytes.clone().unwrap_or_default()))
         })
         .collect()
+}
+
+/// Inventory hashes keyed by normalized file path.
+fn inventory_hash_map(
+    root: &Path,
+    file_inventory: &[(PathBuf, String)],
+) -> HashMap<String, String> {
+    file_inventory
+        .iter()
+        .map(|(path, hash)| {
+            (
+                normalize_file_key(root, &path.display().to_string()),
+                hash.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Remove a file's old fragment from the PDG and record every equivalent
+/// key for it in `files_to_delete` (the keys are sorted by
+/// [`equivalent_file_keys`], so removal order is deterministic).
+fn remove_file_fragments(
+    root: &Path,
+    file: &str,
+    pdg: &mut ProgramDependenceGraph,
+    files_to_delete: &mut Vec<String>,
+) {
+    for key in equivalent_file_keys(root, file) {
+        pdg.remove_file(&key);
+        files_to_delete.push(key);
+    }
+}
+
+/// Indexed-file record updates `(path, hash)` for every parsed file that the
+/// current inventory has a hash for.
+fn changed_file_updates(
+    root: &Path,
+    signatures_by_file: &HashMap<String, (String, Vec<SignatureInfo>)>,
+    inventory_hashes: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut file_updates: Vec<(String, String)> = Vec::new();
+    for file_path in signatures_by_file.keys() {
+        let normalized = normalize_file_key(root, file_path);
+        if let Some(hash) = inventory_hashes.get(&normalized) {
+            file_updates.push((normalized.clone(), hash.clone()));
+        }
+    }
+    file_updates
+}
+
+/// Build per-file PDG fragments from the parsed signatures and merge them
+/// into `pdg`. Uses source bytes captured at parse time when available,
+/// falling back to a disk read.
+fn merge_file_fragments(
+    root: &Path,
+    signatures_by_file: &HashMap<String, (String, Vec<SignatureInfo>)>,
+    source_bytes_map: &HashMap<String, Vec<u8>>,
+    pdg: &mut ProgramDependenceGraph,
+) {
+    for (file_path, (language, signatures)) in signatures_by_file {
+        // Use source_bytes from ParsingResult when available, fall back to disk read
+        let source_bytes_fallback = source_bytes_for_file(root, file_path);
+        let source_bytes = source_bytes_map
+            .get(file_path)
+            .map(|s| s.as_slice())
+            .unwrap_or_else(|| source_bytes_fallback.as_slice());
+        let file_pdg =
+            extract_pdg_from_signatures(signatures.clone(), source_bytes, file_path, language);
+        merge_pdgs(pdg, &file_pdg);
+    }
 }
 
 fn project_id(root: &Path) -> String {

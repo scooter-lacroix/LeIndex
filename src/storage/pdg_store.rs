@@ -361,17 +361,80 @@ fn node_content_hash(
     hasher.finalize().to_hex().to_string()
 }
 
-fn save_nodes(
+/// Persisted state of one `intel_nodes` row: `(db_id, content_hash, precision)`.
+type ExistingNodeRow = (i64, String, bool);
+
+/// Pre-query existing rows for the project so an unchanged node reuses its db
+/// id and issues no write (C1). A legacy row whose content_hash was computed
+/// as blake3(node_id) under the old scheme reads as changed once and is
+/// rewritten under the new scheme on the first save.
+fn load_existing_node_rows(
     tx: &rusqlite::Transaction<'_>,
     project_id: &str,
-    pdg: &ProgramDependenceGraph,
-) -> Result<(NodeRowMap, Vec<String>, RowIdSet)> {
-    // Pre-query existing rows for the project so an unchanged node reuses its
-    // db id and issues no write (C1). A legacy row whose content_hash was
-    // computed as blake3(node_id) under the old scheme reads as changed once
-    // and is rewritten under the new scheme on the first save.
-    let existing = load_existing_nodes(tx, project_id)?;
+) -> Result<HashMap<String, ExistingNodeRow>> {
+    let mut existing: HashMap<String, ExistingNodeRow> = HashMap::new();
+    let mut stmt = tx.prepare(
+        "SELECT id, node_id, content_hash, precision FROM intel_nodes WHERE project_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![project_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i32>(3)? != 0,
+        ))
+    })?;
+    for row in rows {
+        let (db_id, node_id, content_hash, precision) = row?;
+        existing.insert(node_id, (db_id, content_hash, precision));
+    }
+    Ok(existing)
+}
 
+/// Build the `NodeRecord` to persist for one PDG node, including the freshly
+/// computed content hash (C3: one hash per node, reused for the column and
+/// the skip check).
+fn changed_node_record(
+    pdg_node: &PDGNode,
+    project_id: &str,
+    qualified_name: String,
+    content_hash: String,
+    graph_precision: bool,
+) -> NodeRecord {
+    // Note: Embeddings are externalized to EmbeddingStore, not stored here.
+    NodeRecord {
+        id: None,
+        project_id: project_id.to_string(),
+        file_path: pdg_node.file_path.to_string(),
+        node_id: pdg_node.id.clone(),
+        symbol_name: pdg_node.name.clone(),
+        qualified_name,
+        language: pdg_node.language.clone(),
+        node_type: convert_node_type(&pdg_node.node_type),
+        signature: None, // Could be populated from node content
+        complexity: Some(pdg_node.complexity as i32),
+        content_hash,
+        embedding: None, // Embeddings externalized to EmbeddingStore
+        byte_range_start: Some(pdg_node.byte_range.0 as i64),
+        byte_range_end: Some(pdg_node.byte_range.1 as i64),
+        embedding_format: Some(0),
+        precision: graph_precision,
+    }
+}
+
+/// Collect the db ids of every row currently persisted for the project.
+fn persisted_node_row_ids(existing: &HashMap<String, ExistingNodeRow>) -> RowIdSet {
+    existing.values().map(|(db_id, _, _)| *db_id).collect()
+}
+
+/// Diff the graph's nodes against the persisted rows (C1/C3): unchanged nodes
+/// map straight to their db id, new/changed ones are queued for upsert. Also
+/// returns the stale ids (rows in the DB absent from the new PDG).
+fn diff_nodes_against_persisted_rows(
+    pdg: &ProgramDependenceGraph,
+    project_id: &str,
+    existing: &HashMap<String, ExistingNodeRow>,
+) -> Result<(NodeRowMap, Vec<(usize, NodeRecord)>, Vec<String>)> {
     let node_indices: Vec<NodeId> = pdg.node_indices().collect();
     let mut node_id_map =
         NodeRowMap::with_capacity_and_hasher(node_indices.len(), Default::default());
@@ -388,7 +451,6 @@ fn save_nodes(
             .next_back()
             .unwrap_or(&pdg_node.id)
             .to_string();
-        // C3: one hash per node, reused for the column and the skip check.
         let content_hash = node_content_hash(
             &pdg_node.file_path,
             &pdg_node.name,
@@ -408,25 +470,13 @@ fn save_nodes(
             }
         }
 
-        // Note: Embeddings are externalized to EmbeddingStore, not stored here.
-        let record = NodeRecord {
-            id: None,
-            project_id: project_id.to_string(),
-            file_path: pdg_node.file_path.to_string(),
-            node_id: pdg_node.id.clone(),
-            symbol_name: pdg_node.name.clone(),
+        let record = changed_node_record(
+            pdg_node,
+            project_id,
             qualified_name,
-            language: pdg_node.language.clone(),
-            node_type: convert_node_type(&pdg_node.node_type),
-            signature: None, // Could be populated from node content
-            complexity: Some(pdg_node.complexity as i32),
             content_hash,
-            embedding: None, // Embeddings externalized to EmbeddingStore
-            byte_range_start: Some(pdg_node.byte_range.0 as i64),
-            byte_range_end: Some(pdg_node.byte_range.1 as i64),
-            embedding_format: Some(0),
-            precision: graph_precision,
-        };
+            graph_precision,
+        );
         to_upsert.push((pos, record));
     }
 
@@ -442,61 +492,60 @@ fn save_nodes(
         .cloned()
         .collect();
 
-    // Upsert only new/changed nodes in batches. `RETURNING id` emits rows in
-    // the same order as the VALUES tuples, so the returned db ids map 1:1 onto
-    // the chunk's (pos, record) pairs. The invariant that makes this mapping
-    // sound is that the statement returns EXACTLY one row per input tuple.
-    //
-    // A previous `DO UPDATE ... WHERE content_hash != excluded.content_hash`
-    // guard violated that invariant: when a chunk contains duplicate
-    // `node_id`s (the graph legitimately holds same-named symbols from
-    // different files), the second tuple's guard evaluated false, suppressed
-    // the UPDATE, and `RETURNING` returned fewer rows than the chunk. The
-    // `zip` below then silently dropped the tail nodes from `node_id_map`,
-    // so their edges referenced non-existent rows and the whole persist
-    // failed with `EdgeNodeMissing`. Unchanged rows are already filtered out
-    // by the Rust-side content_hash comparison above, so the guard was both
-    // redundant and harmful; it is removed here.
-    for chunk in to_upsert.chunks(PDG_INSERT_BATCH_SIZE) {
-        upsert_node_chunk(tx, chunk, &node_indices, &mut node_id_map)?;
-    }
+    Ok((node_id_map, to_upsert, stale_node_ids))
+}
 
-    let project_rows: RowIdSet = existing.values().map(|(db_id, _, _)| *db_id).collect();
+fn save_nodes(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &str,
+    pdg: &ProgramDependenceGraph,
+) -> Result<(NodeRowMap, Vec<String>, RowIdSet)> {
+    let existing = load_existing_node_rows(tx, project_id)?;
+    let (mut node_id_map, to_upsert, stale_node_ids) =
+        diff_nodes_against_persisted_rows(pdg, project_id, &existing)?;
+    upsert_changed_nodes(tx, &node_indices(pdg), &mut node_id_map, &to_upsert)?;
+    let project_rows = persisted_node_row_ids(&existing);
     Ok((node_id_map, stale_node_ids, project_rows))
 }
 
-/// Existing rows of a project keyed by node id: `(db id, content hash, precision)`.
-///
-/// Lets an unchanged node reuse its db id and issue no write (C1). A legacy row
-/// whose content_hash was computed as blake3(node_id) under the old scheme
-/// reads as changed once and is rewritten under the new scheme on the first
-/// save.
-fn load_existing_nodes(
-    tx: &rusqlite::Transaction<'_>,
-    project_id: &str,
-) -> Result<HashMap<String, (i64, String, bool)>> {
-    let mut existing: HashMap<String, (i64, String, bool)> = HashMap::new();
-    let mut stmt = tx.prepare(
-        "SELECT id, node_id, content_hash, precision FROM intel_nodes WHERE project_id = ?1",
-    )?;
-    let rows = stmt.query_map(params![project_id], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i32>(3)? != 0,
-        ))
-    })?;
-    for row in rows {
-        let (db_id, node_id, content_hash, precision) = row?;
-        existing.insert(node_id, (db_id, content_hash, precision));
-    }
-    Ok(existing)
+/// Node indices in the same order `diff_nodes_against_persisted_rows`
+/// collected them, so `(pos, _)` chunk pairs resolve back to graph nodes.
+fn node_indices(pdg: &ProgramDependenceGraph) -> Vec<NodeId> {
+    pdg.node_indices().collect()
 }
 
-/// Bind parameters of one node row, in the column order of the upsert.
-fn node_row_params(record: &NodeRecord, now: i64) -> [Value; 17] {
-    [
+/// SQL text for one batched node upsert: `values_clause` rows of 17 anonymous
+/// placeholders, each row aligned positionally with [`node_record_sql_params`].
+fn node_upsert_sql(values_clause: &str) -> String {
+    format!(
+        "INSERT INTO intel_nodes \
+         (project_id, file_path, node_id, symbol_name, qualified_name, \
+          language, node_type, signature, complexity, content_hash, embedding, \
+          byte_range_start, byte_range_end, created_at, updated_at, embedding_format, precision) \
+         VALUES {values_clause} \
+         ON CONFLICT(project_id, node_id) DO UPDATE SET \
+           file_path = excluded.file_path, \
+           symbol_name = excluded.symbol_name, \
+           qualified_name = excluded.qualified_name, \
+           language = excluded.language, \
+           node_type = excluded.node_type, \
+           signature = excluded.signature, \
+           complexity = excluded.complexity, \
+           content_hash = excluded.content_hash, \
+           embedding = excluded.embedding, \
+           byte_range_start = excluded.byte_range_start, \
+           byte_range_end = excluded.byte_range_end, \
+           embedding_format = excluded.embedding_format, \
+           precision = excluded.precision, \
+           updated_at = excluded.updated_at \
+         RETURNING id"
+    )
+}
+
+/// Bind one node record's upsert parameters, positionally aligned with the
+/// statement built by [`node_upsert_sql`].
+fn node_record_sql_params(record: &NodeRecord, now: i64) -> Vec<Value> {
+    vec![
         record.project_id.clone().into(),
         record.file_path.clone().into(),
         record.node_id.clone().into(),
@@ -537,70 +586,68 @@ fn node_row_params(record: &NodeRecord, now: i64) -> [Value; 17] {
     ]
 }
 
-/// Upsert one batch of changed nodes and record the returned db ids in
-/// `node_id_map` (see the `RETURNING` ordering note in [`save_nodes`]).
-fn upsert_node_chunk(
+/// Whether `RETURNING id` produced exactly one db id per VALUES tuple. The
+/// statement must return EXACTLY one row per tuple; if that ever regresses
+/// (e.g. a future conditional guard), fail loudly rather than silently
+/// dropping nodes from the map and corrupting edge references.
+fn returned_row_count_mismatch(ids: &[i64], tuple_count: usize) -> bool {
+    ids.len() != tuple_count
+}
+
+/// Upsert only new/changed nodes in batches. `RETURNING id` emits rows in
+/// the same order as the VALUES tuples, so the returned db ids map 1:1 onto
+/// the chunk's (pos, record) pairs. The invariant that makes this mapping
+/// sound is that the statement returns EXACTLY one row per input tuple.
+///
+/// A previous `DO UPDATE ... WHERE content_hash != excluded.content_hash`
+/// guard violated that invariant: when a chunk contains duplicate
+/// `node_id`s (the graph legitimately holds same-named symbols from
+/// different files), the second tuple's guard evaluated false, suppressed
+/// the UPDATE, and `RETURNING` returned fewer rows than the chunk. The
+/// `zip` below then silently dropped the tail nodes from `node_id_map`,
+/// so their edges referenced non-existent rows and the whole persist
+/// failed with `EdgeNodeMissing`. Unchanged rows are already filtered out
+/// by the Rust-side content_hash comparison, so the guard was both
+/// redundant and harmful; it is removed here.
+fn upsert_changed_nodes(
     tx: &rusqlite::Transaction<'_>,
-    chunk: &[(usize, NodeRecord)],
     node_indices: &[NodeId],
     node_id_map: &mut NodeRowMap,
+    to_upsert: &[(usize, NodeRecord)],
 ) -> Result<()> {
-    let n = chunk.len();
+    for chunk in to_upsert.chunks(PDG_INSERT_BATCH_SIZE) {
+        let n = chunk.len();
 
-    // Each row carries its own set of 17 anonymous `?` placeholders, bound
-    // positionally so they align with `params` below.
-    let values_clause = (0..n)
-        .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "INSERT INTO intel_nodes \
-         (project_id, file_path, node_id, symbol_name, qualified_name, \
-          language, node_type, signature, complexity, content_hash, embedding, \
-          byte_range_start, byte_range_end, created_at, updated_at, embedding_format, precision) \
-         VALUES {values_clause} \
-         ON CONFLICT(project_id, node_id) DO UPDATE SET \
-           file_path = excluded.file_path, \
-           symbol_name = excluded.symbol_name, \
-           qualified_name = excluded.qualified_name, \
-           language = excluded.language, \
-           node_type = excluded.node_type, \
-           signature = excluded.signature, \
-           complexity = excluded.complexity, \
-           content_hash = excluded.content_hash, \
-           embedding = excluded.embedding, \
-           byte_range_start = excluded.byte_range_start, \
-           byte_range_end = excluded.byte_range_end, \
-           embedding_format = excluded.embedding_format, \
-           precision = excluded.precision, \
-           updated_at = excluded.updated_at \
-         RETURNING id"
-    );
+        // Each row carries its own set of 17 anonymous `?` placeholders, bound
+        // positionally so they align with `params` below.
+        let values_clause = (0..n)
+            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = node_upsert_sql(&values_clause);
 
-    let now = chrono::Utc::now().timestamp();
-    let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(n * 17);
-    for (_, record) in chunk {
-        params.extend(node_row_params(record, now));
-    }
+        let now = chrono::Utc::now().timestamp();
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(n * 17);
+        for (_, record) in chunk {
+            params.extend(node_record_sql_params(record, now));
+        }
 
-    let mut stmt = tx.prepare(&sql)?;
-    let ids: Vec<i64> = stmt
-        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            row.get::<_, i64>(0)
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    // The statement now returns exactly one row per tuple. If this ever
-    // regresses (e.g. a future conditional guard), fail loudly rather than
-    // silently dropping nodes from the map and corrupting edge references.
-    if ids.len() != chunk.len() {
-        return Err(PdgStoreError::Serialization(format!(
-            "node upsert returned {} ids for {} tuples; refusing to save a partial node map",
-            ids.len(),
-            chunk.len(),
-        )));
-    }
-    for (&(pos, _), db_id) in chunk.iter().zip(ids) {
-        node_id_map.insert(node_indices[pos], db_id);
+        let mut stmt = tx.prepare(&sql)?;
+        let ids: Vec<i64> = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                row.get::<_, i64>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if returned_row_count_mismatch(&ids, chunk.len()) {
+            return Err(PdgStoreError::Serialization(format!(
+                "node upsert returned {} ids for {} tuples; refusing to save a partial node map",
+                ids.len(),
+                chunk.len(),
+            )));
+        }
+        for (&(pos, _), db_id) in chunk.iter().zip(ids) {
+            node_id_map.insert(node_indices[pos], db_id);
+        }
     }
     Ok(())
 }
@@ -615,80 +662,22 @@ type EdgeMeta = Option<String>;
 type EdgeMap =
     HashMap<EdgeKey, EdgeMeta, std::hash::BuildHasherDefault<crate::fast_hash::FastHasher>>;
 
-/// Persist edges by DIFFING against the rows already stored for the project,
-/// mirroring the node content-hash skip: an edge whose (caller, callee, type)
-/// row already exists with identical metadata JSON issues no write at all.
-///
-/// This replaces the previous unconditional delete-all + reinsert, which
-/// rewrote every edge row (110K+ on large projects) on every save, including
-/// one-file incremental deltas where nothing changed.
-///
-/// Semantics preserved from the old implementation:
-/// - duplicate parallel edges with the same PK collapse last-wins (the desired
-///   map's `insert` overwrites, matching "later INSERT wins" upsert order);
-/// - rows whose caller node belongs to another project are never touched (the
-///   existing-rows query filters by caller-side project membership, exactly
-///   like the old bulk DELETE did).
-fn save_edges(
-    tx: &rusqlite::Transaction<'_>,
-    project_id: &str,
-    project_rows: &RowIdSet,
-    node_id_map: &NodeRowMap,
-    pdg: &ProgramDependenceGraph,
-) -> Result<EdgeSaveStats> {
-    let (existing, unknown_type) = load_existing_edges(tx, project_rows)?;
-    let desired = build_desired_edges(pdg, node_id_map)?;
-
-    // Stale = persisted rows absent from the desired set (includes every edge
-    // of a removed node, since those keys cannot be produced from the current
-    // node_id_map).
-    let mut stale: Vec<(i64, i64, String)> = existing
-        .keys()
-        .filter(|key| !desired.contains_key(key))
-        .map(|&(caller, callee, kind)| (caller, callee, kind.to_string()))
-        .collect();
-    let existing_total = existing.len() + unknown_type.len();
-    stale.extend(unknown_type);
-
-    let mut stats = EdgeSaveStats::default();
-
-    // When most of the table churns (major refactor / different content), the
-    // single subquery DELETE beats thousands of parameterized OR clauses and
-    // every desired edge becomes a fresh insert — i.e. the old full-rebuild
-    // path. Otherwise delete exactly the stale rows via their primary key.
-    let bulk = existing_total >= 64 && stale.len() * 2 > existing_total;
-    delete_stale_edges(tx, project_id, &stale, bulk, &mut stats)?;
-
-    // After a bulk delete every desired edge is a fresh insert; otherwise only
-    // new rows and rows whose metadata JSON changed are written (the upsert's
-    // DO UPDATE arm covers changed metadata).
-    let mut to_write: Vec<(i64, i64, &'static str, &EdgeMeta)> = Vec::new();
-    for (key, metadata) in &desired {
-        let unchanged = !bulk && existing.get(key).is_some_and(|stored| stored == metadata);
-        if !unchanged {
-            to_write.push((key.0, key.1, key.2, metadata));
-        }
-    }
-    insert_edges(tx, &to_write, &mut stats)?;
-
-    Ok(stats)
-}
-
-/// Rows already stored for the project, plus rows whose edge type this build
-/// does not know (never desired, so always stale).
-///
+/// Every persisted edge row for the project (caller-side membership checked
+/// in memory), keyed like the old bulk DELETE: `(caller, callee, type)`.
 /// One sequential read (no WAL growth) instead of a full-table rewrite. NULL
 /// metadata (legacy rows) reads as the empty string, which never equals
 /// serialized JSON, so such rows are rewritten once and converge.
-fn load_existing_edges(
+///
+/// A sequential scan of the table with an in-memory membership test is ~4x
+/// faster than the equivalent `caller_id IN (SELECT ...)` semi-join, which
+/// probed the primary-key index once per node.
+fn load_existing_edge_rows(
     tx: &rusqlite::Transaction<'_>,
     project_rows: &RowIdSet,
 ) -> Result<(EdgeMap, Vec<(i64, i64, String)>)> {
     let mut existing = EdgeMap::default();
+    // Rows whose type this build does not know: never desired, so always stale.
     let mut unknown_type: Vec<(i64, i64, String)> = Vec::new();
-    // A sequential scan of the table with an in-memory membership test is
-    // ~4x faster than the equivalent `caller_id IN (SELECT ...)` semi-join,
-    // which probed the primary-key index once per node.
     let mut stmt =
         tx.prepare("SELECT caller_id, callee_id, edge_type, metadata FROM intel_edges")?;
     let mut rows = stmt.query([])?;
@@ -721,25 +710,45 @@ fn load_existing_edges(
     Ok((existing, unknown_type))
 }
 
-/// Serialized metadata of an edge, or `None` for the all-null literal.
-fn edge_metadata_json(pdg_edge: &PDGEdge) -> Result<EdgeMeta> {
-    let metadata = convert_edge_metadata(&pdg_edge.metadata);
-    let all_null = metadata.call_count.is_none()
+/// Serialize an edge's metadata the way it is stored and diffed: an edge with
+/// every field `None` stores `None` (recognized on load without parsing),
+/// everything else its JSON form.
+fn edge_metadata_json(metadata: &StorageEdgeMetadata) -> Result<EdgeMeta> {
+    if metadata.call_count.is_none()
         && metadata.variable_name.is_none()
         && metadata.confidence.is_none()
         && metadata.channel.is_none()
-        && metadata.position.is_none();
-    if all_null {
-        return Ok(None);
+        && metadata.position.is_none()
+    {
+        Ok(None)
+    } else {
+        Ok(Some(serde_json::to_string(metadata).map_err(|e| {
+            PdgStoreError::Serialization(e.to_string())
+        })?))
     }
-    serde_json::to_string(&metadata)
-        .map(Some)
-        .map_err(|e| PdgStoreError::Serialization(e.to_string()))
 }
 
-/// The edge set the graph currently holds, keyed like the stored rows.
-/// Duplicate parallel edges with the same key collapse last-wins.
-fn build_desired_edges(pdg: &ProgramDependenceGraph, node_id_map: &NodeRowMap) -> Result<EdgeMap> {
+/// Row id of one edge endpoint; a missing endpoint is an error reporting the
+/// edge's (caller, callee) graph indices, whichever end is missing.
+fn edge_endpoint_row_id(
+    node_id_map: &NodeRowMap,
+    source: &NodeId,
+    target: &NodeId,
+    endpoint: &NodeId,
+) -> Result<i64> {
+    node_id_map
+        .get(endpoint)
+        .copied()
+        .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
+            caller: source.index() as i64,
+            callee: target.index() as i64,
+        })
+}
+
+/// Every edge of the graph, decoded into the desired persisted-row map. Rows
+/// whose caller or callee has no persisted row are an error (the node save
+/// guarantees every graph node one).
+fn desired_edge_map(pdg: &ProgramDependenceGraph, node_id_map: &NodeRowMap) -> Result<EdgeMap> {
     let mut desired = EdgeMap::with_capacity_and_hasher(pdg.edge_count(), Default::default());
     for edge_idx in pdg.edge_indices() {
         let (source, target) = pdg
@@ -748,31 +757,38 @@ fn build_desired_edges(pdg: &ProgramDependenceGraph, node_id_map: &NodeRowMap) -
         let pdg_edge = pdg
             .get_edge(edge_idx)
             .ok_or_else(|| PdgStoreError::Serialization("Missing edge data".to_string()))?;
-        let endpoint_row = |node| {
-            node_id_map
-                .get(&node)
-                .copied()
-                .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
-                    caller: source.index() as i64,
-                    callee: target.index() as i64,
-                })
-        };
-        let caller_id = endpoint_row(source)?;
-        let callee_id = endpoint_row(target)?;
+        let caller_id = edge_endpoint_row_id(node_id_map, &source, &target, &source)?;
+        let callee_id = edge_endpoint_row_id(node_id_map, &source, &target, &target)?;
+        let metadata = convert_edge_metadata(&pdg_edge.metadata);
         desired.insert(
             (
                 caller_id,
                 callee_id,
                 convert_edge_type(&pdg_edge.edge_type).as_str(),
             ),
-            edge_metadata_json(pdg_edge)?,
+            edge_metadata_json(&metadata)?,
         );
     }
     Ok(desired)
 }
 
-/// Delete the stale rows: one subquery DELETE when `bulk`, otherwise exactly
-/// the stale rows via their primary key.
+/// Whether the edge diff churns enough of the table to switch to the bulk
+/// path (major refactor / different content): the single subquery DELETE then
+/// beats thousands of parameterized deletes and every desired edge becomes a
+/// fresh insert — i.e. the old full-rebuild path.
+fn is_bulk_delete(existing_total: usize, stale_len: usize) -> bool {
+    existing_total >= 64 && stale_len * 2 > existing_total
+}
+
+/// Delete exactly the stale rows: the bulk subquery DELETE when `bulk`, else
+/// row-value deletes over a VALUES table keyed by the (caller_id, callee_id,
+/// edge_type) primary key.
+///
+/// The row-value IN is flat (no expression-tree depth growth — a chain of
+/// ORs nests left-associatively and blows SQLITE_LIMIT_EXPR_DEPTH=1000 at
+/// ~1000 rows), and the planner can use the (caller_id, callee_id, edge_type)
+/// PK index for the probe. 3 bound params per row; 1000 rows = 3000 params,
+/// well under SQLITE_MAX_VARIABLE_NUMBER (32766).
 fn delete_stale_edges(
     tx: &rusqlite::Transaction<'_>,
     project_id: &str,
@@ -781,6 +797,7 @@ fn delete_stale_edges(
     stats: &mut EdgeSaveStats,
 ) -> Result<()> {
     if stale.is_empty() {
+        // Nothing to delete.
         return Ok(());
     }
     if bulk {
@@ -791,12 +808,6 @@ fn delete_stale_edges(
         stats.deleted = stale.len();
         return Ok(());
     }
-    // Row-value IN over a VALUES table: flat (no expression-tree depth
-    // growth — a chain of ORs nests left-associatively and blows
-    // SQLITE_LIMIT_EXPR_DEPTH=1000 at ~1000 rows), and the planner can
-    // use the (caller_id, callee_id, edge_type) PK index for the probe.
-    // 3 bound params per row; 1000 rows = 3000 params, well under
-    // SQLITE_MAX_VARIABLE_NUMBER (32766).
     const EDGE_DELETE_CHUNK: usize = 1000;
     for chunk in stale.chunks(EDGE_DELETE_CHUNK) {
         let values = (0..chunk.len())
@@ -818,8 +829,27 @@ fn delete_stale_edges(
     Ok(())
 }
 
-/// Batch inserts into multi-row statements, mirroring the node batching.
-fn insert_edges(
+/// Rows to write after the delete phase: after a bulk delete every desired
+/// edge is a fresh insert; otherwise only new rows and rows whose metadata
+/// JSON changed (the upsert's DO UPDATE arm covers changed metadata).
+fn plan_edge_writes<'a>(
+    desired: &'a EdgeMap,
+    existing: &EdgeMap,
+    bulk: bool,
+) -> Vec<(i64, i64, &'static str, &'a EdgeMeta)> {
+    let mut to_write: Vec<(i64, i64, &'static str, &EdgeMeta)> = Vec::new();
+    for (key, metadata) in desired {
+        let unchanged = !bulk && existing.get(key).is_some_and(|stored| stored == metadata);
+        if !unchanged {
+            to_write.push((key.0, key.1, key.2, metadata));
+        }
+    }
+    to_write
+}
+
+/// Write the planned rows in batched multi-row upserts, mirroring the node
+/// batching.
+fn write_edge_rows(
     tx: &rusqlite::Transaction<'_>,
     to_write: &[(i64, i64, &'static str, &EdgeMeta)],
     stats: &mut EdgeSaveStats,
@@ -848,6 +878,52 @@ fn insert_edges(
         stats.written += n;
     }
     Ok(())
+}
+
+/// Persist edges by DIFFING against the rows already stored for the project,
+/// mirroring the node content-hash skip: an edge whose (caller, callee, type)
+/// row already exists with identical metadata JSON issues no write at all.
+///
+/// This replaces the previous unconditional delete-all + reinsert, which
+/// rewrote every edge row (110K+ on large projects) on every save, including
+/// one-file incremental deltas where nothing changed.
+///
+/// Semantics preserved from the old implementation:
+/// - duplicate parallel edges with the same PK collapse last-wins (the desired
+///   map's `insert` overwrites, matching "later INSERT wins" upsert order);
+/// - rows whose caller node belongs to another project are never touched (the
+///   existing-rows query filters by caller-side project membership, exactly
+///   like the old bulk DELETE did).
+fn save_edges(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &str,
+    project_rows: &RowIdSet,
+    node_id_map: &NodeRowMap,
+    pdg: &ProgramDependenceGraph,
+) -> Result<EdgeSaveStats> {
+    let (existing, unknown_type) = load_existing_edge_rows(tx, project_rows)?;
+    let desired = desired_edge_map(pdg, node_id_map)?;
+
+    // Stale = persisted rows absent from the desired set (includes every edge
+    // of a removed node, since those keys cannot be produced from the current
+    // node_id_map).
+    let mut stale: Vec<(i64, i64, String)> = existing
+        .keys()
+        .filter(|key| !desired.contains_key(key))
+        .map(|&(caller, callee, kind)| (caller, callee, kind.to_string()))
+        .collect();
+    let existing_total = existing.len() + unknown_type.len();
+    stale.extend(unknown_type);
+
+    let mut stats = EdgeSaveStats::default();
+
+    let bulk = is_bulk_delete(existing_total, stale.len());
+    delete_stale_edges(tx, project_id, &stale, bulk, &mut stats)?;
+
+    let to_write = plan_edge_writes(&desired, &existing, bulk);
+    write_edge_rows(tx, &to_write, &mut stats)?;
+
+    Ok(stats)
 }
 
 /// Save trigram index within an existing transaction.
@@ -975,41 +1051,30 @@ type NodeRowMap = HashMap<NodeId, i64, std::hash::BuildHasherDefault<crate::fast
 type RowIdSet =
     std::collections::HashSet<i64, std::hash::BuildHasherDefault<crate::fast_hash::FastHasher>>;
 
-fn load_nodes(
-    storage: &Storage,
-    project_id: &str,
-    pdg: &mut ProgramDependenceGraph,
-) -> Result<RowIdMap> {
-    // Only the columns a graph node needs: `qualified_name`, `content_hash`,
-    // `embedding` and `embedding_format` are not part of a `PDGNode`, and rows
-    // are streamed straight into the graph rather than collected first.
-    let mut nodes_stmt = storage.conn().prepare(
-        "SELECT id, file_path, node_id, symbol_name, language, node_type, complexity, byte_range_start, byte_range_end, precision
-         FROM intel_nodes WHERE project_id = ?1",
-    )?;
-    let mut rows = nodes_stmt.query(params![project_id])?;
-    // Pre-size every per-node map: rehash-and-grow while streaming ~30k rows
-    // showed up in hydration profiles.
-    let node_count = count_project_nodes(storage, project_id);
-    let mut db_id_to_node_id = RowIdMap::with_capacity_and_hasher(node_count, Default::default());
-    pdg.reserve_nodes(node_count);
-    // One `Arc<str>` per file, shared by all of its nodes.
-    let mut files: crate::fast_hash::FastMap<String, Arc<str>> = Default::default();
-
-    while let Some(row) = rows.next()? {
-        let (db_id, pdg_node, precision) = node_from_row(row, &mut files)?;
-        let stable_id = (precision != 0).then(|| pdg_node.id.clone());
-        let node_id = pdg.add_node_without_trigrams(pdg_node);
-        if let Some(stable_id) = stable_id {
-            pdg.mark_precision_symbol(stable_id);
-        }
-        db_id_to_node_id.insert(db_id, node_id);
-    }
-
-    Ok(db_id_to_node_id)
+/// Decode the `intel_nodes` row columns that can fail to deserialize
+/// (`file_path`, `node_type`); the remaining columns are plain typed gets.
+fn decode_node_row_strings<'a>(row: &'a rusqlite::Row<'_>) -> Result<(&'a str, &'a str)> {
+    let file_path = row
+        .get_ref(1)?
+        .as_str()
+        .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
+    let node_type_str = row
+        .get_ref(5)?
+        .as_str()
+        .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
+    Ok((file_path, node_type_str))
 }
 
-/// Number of node rows stored for the project (0 when the count is unavailable).
+/// Parse a persisted `node_type` string into the storage enum.
+fn parse_storage_node_type(node_type_str: &str) -> Result<StorageNodeType> {
+    StorageNodeType::from_str_name(node_type_str).ok_or_else(|| {
+        PdgStoreError::Deserialization(format!("Invalid node type: {}", node_type_str))
+    })
+}
+
+/// Count the rows the hydration query will stream, so every per-node map can
+/// be pre-sized (rehash-and-grow while streaming ~30k rows showed up in
+/// hydration profiles).
 fn count_project_nodes(storage: &Storage, project_id: &str) -> usize {
     storage
         .conn()
@@ -1022,39 +1087,26 @@ fn count_project_nodes(storage: &Storage, project_id: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// One shared `Arc<str>` per distinct file path.
-fn shared_file_path(
+/// One `Arc<str>` per file, shared by all of its nodes.
+fn shared_file_arc(
     files: &mut crate::fast_hash::FastMap<String, Arc<str>>,
-    path: &str,
+    file_path: &str,
 ) -> Arc<str> {
-    match files.get(path) {
-        Some(shared) => Arc::clone(shared),
-        None => {
-            let shared: Arc<str> = Arc::from(path);
-            files.insert(path.to_string(), Arc::clone(&shared));
-            shared
-        }
+    if let Some(shared) = files.get(file_path) {
+        return Arc::clone(shared);
     }
+    let shared: Arc<str> = Arc::from(file_path);
+    files.insert(file_path.to_string(), Arc::clone(&shared));
+    shared
 }
 
-/// Decode one `intel_nodes` row into `(db id, graph node, precision flag)`.
-fn node_from_row(
+/// Decode one `intel_nodes` row into a graph node, alongside whether the row
+/// carries a precision (stable) symbol id.
+fn decode_pdg_node(
     row: &rusqlite::Row<'_>,
-    files: &mut crate::fast_hash::FastMap<String, Arc<str>>,
-) -> Result<(i64, PDGNode, i32)> {
-    let db_id: i64 = row.get(0)?;
-    let file_path = row
-        .get_ref(1)?
-        .as_str()
-        .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
-    let node_type_str = row
-        .get_ref(5)?
-        .as_str()
-        .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
-    let node_type = StorageNodeType::from_str_name(node_type_str).ok_or_else(|| {
-        PdgStoreError::Deserialization(format!("Invalid node type: {}", node_type_str))
-    })?;
-    let file_path = shared_file_path(files, file_path);
+    node_type: StorageNodeType,
+    file_path: Arc<str>,
+) -> Result<(PDGNode, bool)> {
     let start: Option<i64> = row.get(7)?;
     let end: Option<i64> = row.get(8)?;
     let complexity: Option<i32> = row.get(6)?;
@@ -1068,7 +1120,48 @@ fn node_from_row(
         complexity: complexity.unwrap_or(0) as u32,
         language: row.get(4)?,
     };
-    Ok((db_id, pdg_node, precision))
+    let is_precision = precision != 0;
+    Ok((pdg_node, is_precision))
+}
+
+fn load_nodes(
+    storage: &Storage,
+    project_id: &str,
+    pdg: &mut ProgramDependenceGraph,
+) -> Result<RowIdMap> {
+    // Only the columns a graph node needs: `qualified_name`, `content_hash`,
+    // `embedding` and `embedding_format` are not part of a `PDGNode`, and rows
+    // are streamed straight into the graph rather than collected first.
+    let mut nodes_stmt = storage.conn().prepare(
+        "SELECT id, file_path, node_id, symbol_name, language, node_type, complexity, byte_range_start, byte_range_end, precision
+         FROM intel_nodes WHERE project_id = ?1",
+    )?;
+    let mut rows = nodes_stmt.query(params![project_id])?;
+    let node_count = count_project_nodes(storage, project_id);
+    let mut db_id_to_node_id = RowIdMap::with_capacity_and_hasher(node_count, Default::default());
+    pdg.reserve_nodes(node_count);
+    // One `Arc<str>` per file, shared by all of its nodes.
+    let mut files: crate::fast_hash::FastMap<String, Arc<str>> = Default::default();
+
+    while let Some(row) = rows.next()? {
+        let db_id: i64 = row.get(0)?;
+        let (file_path, node_type_str) = decode_node_row_strings(row)?;
+        let node_type = parse_storage_node_type(node_type_str)?;
+        let file_path: Arc<str> = shared_file_arc(&mut files, file_path);
+        let (pdg_node, precision) = decode_pdg_node(row, node_type, file_path)?;
+        let stable_id = if precision {
+            Some(pdg_node.id.clone())
+        } else {
+            None
+        };
+        let node_id = pdg.add_node_without_trigrams(pdg_node);
+        if let Some(stable_id) = stable_id {
+            pdg.mark_precision_symbol(stable_id);
+        }
+        db_id_to_node_id.insert(db_id, node_id);
+    }
+
+    Ok(db_id_to_node_id)
 }
 
 /// What an edge with no metadata serializes to (`StorageEdgeMetadata` with every

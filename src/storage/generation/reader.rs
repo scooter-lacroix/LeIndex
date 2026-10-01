@@ -245,6 +245,41 @@ fn require_magic(bytes: &[u8], expected: &[u8; 9]) -> Result<(), ReaderError> {
     Ok(())
 }
 
+/// Validate the neural data region: geometric consistency (count * dim *
+/// element_size must fit in the payload) and the embedded blake3 content_hash
+/// over the data bytes.
+fn validate_neural_data_region(payload: &[u8], header: &NeuralHeader) -> Result<(), ReaderError> {
+    let data_offset_in_payload = NEURAL_HEADER_LEN;
+    let element_size = header.dtype.element_size();
+    let expected = header
+        .count
+        .checked_mul(header.dim)
+        .and_then(|n| n.checked_mul(element_size))
+        .ok_or_else(|| ReaderError::BadHeader("count * dim * element_size overflow".to_string()))?;
+    let available = payload
+        .len()
+        .checked_sub(data_offset_in_payload)
+        .ok_or_else(|| ReaderError::BadHeader("data offset exceeds payload".to_string()))?;
+    if available < expected {
+        return Err(ReaderError::BadHeader(format!(
+            "neural payload short: have {} bytes of data, need {}",
+            available, expected
+        )));
+    }
+
+    // Verify the embedded content_hash (blake3 of the data region).
+    let mut stored_hash = [0u8; 32];
+    stored_hash.copy_from_slice(&payload[33..65]);
+    let computed =
+        blob::blob_hash(&payload[data_offset_in_payload..data_offset_in_payload + expected]);
+    if stored_hash != computed {
+        return Err(ReaderError::BadHeader(
+            "neural content_hash does not match data".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 // ===========================================================================
 // NeuralReader: f32 + INT8 SIMD dot-product
 // ===========================================================================
@@ -312,27 +347,21 @@ impl<'a> VectorView<'a> {
     }
 }
 
-/// A zero-copy reader over a neural layer CAS blob.
-#[derive(Debug)]
-pub struct NeuralReader {
-    blob: BlobMmap,
+/// Validated contents of the `LIDX-NRL1` header (magic and geometry checks
+/// already applied by [`NeuralHeader::parse`]).
+struct NeuralHeader {
     count: usize,
     dim: usize,
     dtype: NeuralDtype,
     scale: f32,
     zero_point: f32,
-    /// Offset, from the start of the CAS payload, where the vectors data
-    /// begins (i.e. immediately after the neural header).
-    data_offset_in_payload: usize,
 }
 
-impl NeuralReader {
-    /// Open a neural layer blob at `path`.
-    pub fn open(path: &Path) -> Result<Self, ReaderError> {
-        let blob = BlobMmap::open(path)?;
-        let payload = blob.payload();
-        require_magic(payload, NEURAL_MAGIC)?;
-
+impl NeuralHeader {
+    /// Parse and validate the fixed neural header at the start of `payload`.
+    /// The caller must have verified the magic bytes and the minimum length
+    /// is re-checked here.
+    fn parse(payload: &[u8]) -> Result<Self, ReaderError> {
         if payload.len() < NEURAL_HEADER_LEN {
             return Err(ReaderError::BadHeader(format!(
                 "neural payload truncated: {} < {}",
@@ -359,45 +388,48 @@ impl NeuralReader {
         }
         let scale = read_f32_le(payload, 25)?;
         let zero_point = read_f32_le(payload, 29)?;
-
-        let data_offset_in_payload = NEURAL_HEADER_LEN;
-        let element_size = dtype.element_size();
-        let expected = count
-            .checked_mul(dim)
-            .and_then(|n| n.checked_mul(element_size))
-            .ok_or_else(|| {
-                ReaderError::BadHeader("count * dim * element_size overflow".to_string())
-            })?;
-        let available = payload
-            .len()
-            .checked_sub(data_offset_in_payload)
-            .ok_or_else(|| ReaderError::BadHeader("data offset exceeds payload".to_string()))?;
-        if available < expected {
-            return Err(ReaderError::BadHeader(format!(
-                "neural payload short: have {} bytes of data, need {}",
-                available, expected
-            )));
-        }
-
-        // Verify the embedded content_hash (blake3 of the data region).
-        let mut stored_hash = [0u8; 32];
-        stored_hash.copy_from_slice(&payload[33..65]);
-        let computed =
-            blob::blob_hash(&payload[data_offset_in_payload..data_offset_in_payload + expected]);
-        if stored_hash != computed {
-            return Err(ReaderError::BadHeader(
-                "neural content_hash does not match data".to_string(),
-            ));
-        }
-
-        Ok(NeuralReader {
-            blob,
+        Ok(NeuralHeader {
             count,
             dim,
             dtype,
             scale,
             zero_point,
-            data_offset_in_payload,
+        })
+    }
+}
+
+/// A zero-copy reader over a neural layer CAS blob.
+#[derive(Debug)]
+pub struct NeuralReader {
+    blob: BlobMmap,
+    count: usize,
+    dim: usize,
+    dtype: NeuralDtype,
+    scale: f32,
+    zero_point: f32,
+    /// Offset, from the start of the CAS payload, where the vectors data
+    /// begins (i.e. immediately after the neural header).
+    data_offset_in_payload: usize,
+}
+
+impl NeuralReader {
+    /// Open a neural layer blob at `path`.
+    pub fn open(path: &Path) -> Result<Self, ReaderError> {
+        let blob = BlobMmap::open(path)?;
+        let payload = blob.payload();
+        require_magic(payload, NEURAL_MAGIC)?;
+
+        let header = NeuralHeader::parse(payload)?;
+        validate_neural_data_region(payload, &header)?;
+
+        Ok(NeuralReader {
+            blob,
+            count: header.count,
+            dim: header.dim,
+            dtype: header.dtype,
+            scale: header.scale,
+            zero_point: header.zero_point,
+            data_offset_in_payload: NEURAL_HEADER_LEN,
         })
     }
 

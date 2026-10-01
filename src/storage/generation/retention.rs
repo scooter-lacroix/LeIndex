@@ -108,12 +108,15 @@ pub struct GenerationRetentionReport {
     pub gc_candidates: Vec<String>,
 }
 
-impl std::fmt::Display for GenerationRetentionReport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl GenerationRetentionReport {
+    fn write_generation_summary(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Retention Report:")?;
         writeln!(f, "  Generations:")?;
         writeln!(f, "    retained: {}", self.generations_retained)?;
-        writeln!(f, "    removed:  {}", self.generations_removed)?;
+        writeln!(f, "    removed:  {}", self.generations_removed)
+    }
+
+    fn write_cas_summary(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "  CAS:")?;
         writeln!(f, "    blob count:    {}", self.cas_blob_count)?;
         writeln!(f, "    total bytes:   {}", self.cas_bytes)?;
@@ -123,13 +126,23 @@ impl std::fmt::Display for GenerationRetentionReport {
             self.cas.reclaimed_bytes, self.cas.blobs_removed
         )?;
         writeln!(f, "    dedup ratio:   {:.2}", self.dedup_ratio)?;
-        writeln!(f, "    GC candidates: {}", self.gc_candidates.len())?;
+        writeln!(f, "    GC candidates: {}", self.gc_candidates.len())
+    }
+
+    fn write_job_summary(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "  Jobs:")?;
         writeln!(f, "    remaining:     {} bytes", self.job_bytes_remaining)?;
         writeln!(f, "    completed del: {}", self.jobs_completed_deleted)?;
         writeln!(f, "    byte-capped:   {}", self.jobs_byte_capped)?;
-        writeln!(f, "    reclaimed:     {} bytes", self.job_bytes_reclaimed)?;
-        Ok(())
+        writeln!(f, "    reclaimed:     {} bytes", self.job_bytes_reclaimed)
+    }
+}
+
+impl std::fmt::Display for GenerationRetentionReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.write_generation_summary(f)?;
+        self.write_cas_summary(f)?;
+        self.write_job_summary(f)
     }
 }
 
@@ -149,6 +162,78 @@ pub enum RetentionError {
     /// Manifest error reading generation manifests.
     #[error("manifest error: {0}")]
     Manifest(#[from] super::manifest::ManifestError),
+}
+
+// ---------------------------------------------------------------------------
+// Generation directory scan helpers
+// ---------------------------------------------------------------------------
+
+/// Collect the generation numbers of the directories under `gens_dir`,
+/// sorted ascending. Entries that are not directories or whose names are
+/// not plain digits are ignored; a missing `gens_dir` yields an empty list.
+fn read_generation_numbers(gens_dir: &Path) -> Result<Vec<u64>, RetentionError> {
+    let mut gen_numbers: Vec<u64> = Vec::new();
+    if gens_dir.exists() {
+        for entry in fs::read_dir(gens_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if let Ok(num) = entry.file_name().to_string_lossy().parse::<u64>() {
+                gen_numbers.push(num);
+            }
+        }
+    }
+    gen_numbers.sort_unstable();
+    Ok(gen_numbers)
+}
+
+/// Load a generation's manifest, or `None` when it is missing or unparsable —
+/// retention is best-effort and never fails on a single bad manifest.
+fn generation_manifest(gen_dir: &Path) -> Option<Manifest> {
+    let bytes = fs::read(gen_dir.join(MANIFEST_FILE)).ok()?;
+    Manifest::from_bytes(&bytes).ok()
+}
+
+/// Anchor of the retention window: the generation pointed to by `CURRENT`
+/// when it exists on disk, otherwise the newest generation. `gen_numbers`
+/// must be non-empty and sorted.
+fn window_anchor(gen_numbers: &[u64], current_gen: Option<u64>) -> u64 {
+    current_gen
+        .filter(|g| gen_numbers.contains(g))
+        .unwrap_or_else(|| gen_numbers[gen_numbers.len() - 1])
+}
+
+/// Generations inside the retention window: the anchor plus its
+/// `keep_count - 1` immediate predecessors (default 2 = current + previous).
+/// When the anchor itself is missing from `gen_numbers` (stale `CURRENT` over
+/// a partially cleaned store), the newest `keep_count` generations are kept
+/// as a conservative fallback.
+fn retention_window(gen_numbers: &[u64], anchor: u64, keep_count: usize) -> HashSet<u64> {
+    if let Some(idx) = gen_numbers.iter().position(|g| *g == anchor) {
+        let start = idx.saturating_sub(keep_count - 1);
+        gen_numbers[start..=idx].iter().copied().collect()
+    } else {
+        let start = gen_numbers.len().saturating_sub(keep_count);
+        gen_numbers[start..].iter().copied().collect()
+    }
+}
+
+/// Remove a generation directory, treating an already-missing directory as
+/// success (best-effort sweep). Failures other than `NotFound` are logged
+/// and swallowed. Returns `true` when the directory was removed.
+///
+/// `label` distinguishes the CAS layout ("generation") from the legacy
+/// full-copy layout ("legacy generation") in log output.
+fn remove_generation_dir(gen_dir: &Path, label: &str, gen_num: u64) -> bool {
+    match fs::remove_dir_all(gen_dir) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            warn!("retention: failed to remove {} {}: {}", label, gen_num, e);
+            false
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -253,61 +338,18 @@ pub fn retention_report(
 ) -> Result<GenerationRetentionReport, RetentionError> {
     let mut report = GenerationRetentionReport::default();
 
-    // Count generations and compute pinned hashes.
-    let mut pinned_hashes: HashSet<[u8; 32]> = HashSet::new();
-    let mut total_layer_refs = 0usize;
-    let mut unique_layer_hashes: HashSet<[u8; 32]> = HashSet::new();
-
-    if gens_dir.exists() {
-        let mut gen_numbers: Vec<u64> = Vec::new();
-        for entry in fs::read_dir(gens_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if let Ok(num) = name_str.parse::<u64>() {
-                gen_numbers.push(num);
-            }
-        }
-        gen_numbers.sort_unstable();
-        report.generation_count = gen_numbers.len();
-        report.generations_retained = gen_numbers.len();
-
-        for gen_num in &gen_numbers {
-            let manifest_path = gens_dir.join(gen_num.to_string()).join(MANIFEST_FILE);
-            if let Ok(bytes) = fs::read(&manifest_path) {
-                if let Ok(manifest) = Manifest::from_bytes(&bytes) {
-                    let hashes = manifest.layer_hashes();
-                    total_layer_refs += hashes.len();
-                    for hash in &hashes {
-                        unique_layer_hashes.insert(*hash);
-                        // Check if blob is leased (refcount > 0) or just
-                        // referenced by a manifest
-                        let rc = store.refcount(hash);
-                        if rc > 0 {
-                            pinned_hashes.insert(*hash);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Count generations and collect the layer hashes their manifests reference.
+    let gen_numbers = read_generation_numbers(gens_dir)?;
+    report.generation_count = gen_numbers.len();
+    report.generations_retained = gen_numbers.len();
+    let (total_layer_refs, unique_layer_hashes) = count_manifest_layers(gens_dir, &gen_numbers);
 
     // CAS stats
     report.cas_blob_count = store.blob_count()?;
     report.cas_bytes = compute_cas_bytes(store)?;
 
     // GC candidates: refcount 0 blobs not in any manifest
-    let manifest_hashes = &unique_layer_hashes;
-    let stored = store.stored_hashes()?;
-    for hash in &stored {
-        let rc = store.refcount(hash);
-        if rc == 0 && !manifest_hashes.contains(hash) {
-            report.gc_candidates.push(hash_to_hex(hash));
-        }
-    }
+    report.gc_candidates = unmanaged_blob_hashes(store, &unique_layer_hashes)?;
 
     // Dedup ratio
     if total_layer_refs > 0 {
@@ -318,6 +360,40 @@ pub fn retention_report(
     report.job_bytes_remaining = dir_total_bytes(jobs_dir);
 
     Ok(report)
+}
+
+/// Layer references across the given generations' manifests:
+/// `(total_references, unique_hashes)`. Missing or unparsable manifests are
+/// skipped (best-effort scan).
+fn count_manifest_layers(gens_dir: &Path, gen_numbers: &[u64]) -> (usize, HashSet<[u8; 32]>) {
+    let mut total_layer_refs = 0usize;
+    let mut unique_layer_hashes: HashSet<[u8; 32]> = HashSet::new();
+    for gen_num in gen_numbers {
+        if let Some(manifest) = generation_manifest(&gens_dir.join(gen_num.to_string())) {
+            let hashes = manifest.layer_hashes();
+            total_layer_refs += hashes.len();
+            for hash in &hashes {
+                unique_layer_hashes.insert(*hash);
+            }
+        }
+    }
+    (total_layer_refs, unique_layer_hashes)
+}
+
+/// Stored CAS blob hashes with refcount 0 that no manifest references —
+/// the GC candidate set for the read-only report.
+fn unmanaged_blob_hashes(
+    store: &CasStore,
+    manifest_hashes: &HashSet<[u8; 32]>,
+) -> Result<Vec<String>, RetentionError> {
+    let stored = store.stored_hashes()?;
+    let mut candidates = Vec::new();
+    for hash in &stored {
+        if store.refcount(hash) == 0 && !manifest_hashes.contains(hash) {
+            candidates.push(hash_to_hex(hash));
+        }
+    }
+    Ok(candidates)
 }
 
 // ---------------------------------------------------------------------------
@@ -338,25 +414,7 @@ fn prune_generations(
     current_gen: Option<u64>,
     max_generations: usize,
 ) -> Result<(usize, usize, Vec<[u8; 32]>), RetentionError> {
-    if !gens_dir.exists() {
-        return Ok((0, 0, Vec::new()));
-    }
-
-    // Collect all generation numbers.
-    let mut gen_numbers: Vec<u64> = Vec::new();
-    for entry in fs::read_dir(gens_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if let Ok(num) = name_str.parse::<u64>() {
-            gen_numbers.push(num);
-        }
-    }
-    gen_numbers.sort_unstable();
-
+    let gen_numbers = read_generation_numbers(gens_dir)?;
     if gen_numbers.is_empty() {
         return Ok((0, 0, Vec::new()));
     }
@@ -365,59 +423,14 @@ fn prune_generations(
     // one pointed to by `CURRENT`; when the pointer is missing (e.g. first
     // publish, or a partially-written store) fall back to the newest
     // generation on disk.
-    let current_gen = current_gen
-        .filter(|g| gen_numbers.contains(g))
-        .unwrap_or_else(|| gen_numbers[gen_numbers.len() - 1]);
-    let mut retained_gens: HashSet<u64> = HashSet::new();
-
-    // Retain the current generation plus its `max_generations - 1`
-    // immediate predecessors (default 2 = current + previous).
-    let keep_count = max_generations.max(1);
-    if let Some(idx) = gen_numbers.iter().position(|g| *g == current_gen) {
-        let start = idx.saturating_sub(keep_count - 1);
-        for &g in &gen_numbers[start..=idx] {
-            retained_gens.insert(g);
-        }
-    } else {
-        // `CURRENT` points at a missing directory (partial cleanup); keep
-        // the newest `max_generations` as a conservative fallback.
-        let start = gen_numbers.len().saturating_sub(keep_count);
-        for &g in &gen_numbers[start..] {
-            retained_gens.insert(g);
-        }
-    }
+    let current_gen = window_anchor(&gen_numbers, current_gen);
+    let mut retained_gens = retention_window(&gen_numbers, current_gen, max_generations.max(1));
 
     // Check each generation for leased status (any layer blob with refcount > 0).
-    for gen_num in &gen_numbers {
-        if retained_gens.contains(gen_num) {
-            continue;
-        }
-        let manifest_path = gens_dir.join(gen_num.to_string()).join(MANIFEST_FILE);
-        if let Ok(bytes) = fs::read(&manifest_path) {
-            if let Ok(manifest) = Manifest::from_bytes(&bytes) {
-                let hashes = manifest.layer_hashes();
-                let any_leased = hashes.iter().any(|h| store.refcount(h) > 0);
-                if any_leased {
-                    retained_gens.insert(*gen_num);
-                }
-            }
-        }
-    }
+    retain_leased_generations(store, gens_dir, &gen_numbers, &mut retained_gens);
 
     // Collect pinned hashes from retained manifests.
-    let mut pinned_hashes: Vec<[u8; 32]> = Vec::new();
-    for gen_num in &retained_gens {
-        let manifest_path = gens_dir.join(gen_num.to_string()).join(MANIFEST_FILE);
-        if let Ok(bytes) = fs::read(&manifest_path) {
-            if let Ok(manifest) = Manifest::from_bytes(&bytes) {
-                for hash in manifest.layer_hashes() {
-                    if !pinned_hashes.contains(&hash) {
-                        pinned_hashes.push(hash);
-                    }
-                }
-            }
-        }
-    }
+    let pinned_hashes = collect_pinned_hashes(gens_dir, &retained_gens);
 
     // Delete non-retained generations.
     let mut removed = 0;
@@ -429,17 +442,50 @@ fn prune_generations(
                 "retention: removing generation {} (not current/prev/leased)",
                 gen_num
             );
-            if let Err(e) = fs::remove_dir_all(&gen_dir) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    warn!("retention: failed to remove generation {}: {}", gen_num, e);
-                }
-            } else {
+            if remove_generation_dir(&gen_dir, "generation", *gen_num) {
                 removed += 1;
             }
         }
     }
 
     Ok((retained_count, removed, pinned_hashes))
+}
+
+/// Retain every generation outside the window that is still leased
+/// (at least one layer blob with refcount > 0).
+fn retain_leased_generations(
+    store: &CasStore,
+    gens_dir: &Path,
+    gen_numbers: &[u64],
+    retained: &mut HashSet<u64>,
+) {
+    for gen_num in gen_numbers {
+        if retained.contains(gen_num) {
+            continue;
+        }
+        if let Some(manifest) = generation_manifest(&gens_dir.join(gen_num.to_string())) {
+            let hashes = manifest.layer_hashes();
+            let any_leased = hashes.iter().any(|h| store.refcount(h) > 0);
+            if any_leased {
+                retained.insert(*gen_num);
+            }
+        }
+    }
+}
+
+/// Blob hashes referenced by the retained manifests, deduplicated.
+fn collect_pinned_hashes(gens_dir: &Path, retained: &HashSet<u64>) -> Vec<[u8; 32]> {
+    let mut pinned_hashes: Vec<[u8; 32]> = Vec::new();
+    for gen_num in retained {
+        if let Some(manifest) = generation_manifest(&gens_dir.join(gen_num.to_string())) {
+            for hash in manifest.layer_hashes() {
+                if !pinned_hashes.contains(&hash) {
+                    pinned_hashes.push(hash);
+                }
+            }
+        }
+    }
+    pinned_hashes
 }
 
 /// Prune a legacy (pre-CAS, full-copy) generation store.
@@ -470,19 +516,7 @@ pub fn retain_generations_no_cas(
     let mut report = GenerationRetentionReport::default();
     let current_gen = read_current_generation_from_gens_dir(gens_dir);
 
-    let mut gen_numbers: Vec<u64> = Vec::new();
-    if gens_dir.exists() {
-        for entry in fs::read_dir(gens_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            if let Ok(num) = entry.file_name().to_string_lossy().parse::<u64>() {
-                gen_numbers.push(num);
-            }
-        }
-    }
-    gen_numbers.sort_unstable();
+    let gen_numbers = read_generation_numbers(gens_dir)?;
     report.generation_count = gen_numbers.len();
 
     if gen_numbers.is_empty() {
@@ -492,13 +526,9 @@ pub fn retain_generations_no_cas(
 
     // Anchor the retention window at CURRENT; fall back to the newest
     // generation when the pointer is missing or dangling.
-    let current = current_gen
-        .filter(|g| gen_numbers.contains(g))
-        .unwrap_or_else(|| gen_numbers[gen_numbers.len() - 1]);
+    let current = window_anchor(&gen_numbers, current_gen);
     let keep_count = max_generations.max(1);
-    let idx = gen_numbers.iter().position(|g| *g == current).unwrap_or(0);
-    let start = idx.saturating_sub(keep_count - 1);
-    let retained: HashSet<u64> = gen_numbers[start..=idx].iter().copied().collect();
+    let retained = retention_window(&gen_numbers, current, keep_count);
 
     for gen_num in &gen_numbers {
         if retained.contains(gen_num) {
@@ -513,15 +543,8 @@ pub fn retain_generations_no_cas(
             "retention: removing legacy generation {} (outside the {}-generation window)",
             gen_num, keep_count
         );
-        match fs::remove_dir_all(&gen_dir) {
-            Ok(()) => report.generations_removed += 1,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                warn!(
-                    "retention: failed to remove legacy generation {}: {}",
-                    gen_num, e
-                );
-            }
+        if remove_generation_dir(&gen_dir, "legacy generation", *gen_num) {
+            report.generations_removed += 1;
         }
     }
     report.generations_retained = retained.len();
@@ -555,52 +578,75 @@ fn prune_jobs(
         return Ok((0, 0, 0));
     }
 
-    let mut completed_deleted = 0;
-    let mut byte_capped = 0;
-    let mut bytes_reclaimed: u64 = 0;
-
     // Phase 1: Delete completed jobs whose generation is the current/published gen.
     // A job directory contains a `generation` file or the directory name encodes
     // the generation number. We look for jobs whose generation matches current_gen.
-    if let Some(cur_gen) = current_gen {
-        let job_entries: Vec<PathBuf> = fs::read_dir(jobs_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .map(|e| e.path())
-            .collect();
-
-        for job_dir in &job_entries {
-            // Check if this job produced the current generation.
-            if job_produced_generation(job_dir, cur_gen) && job_is_completed(job_dir) {
-                let size = dir_total_bytes(job_dir);
-                if let Err(e) = fs::remove_dir_all(job_dir) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        warn!(
-                            "retention: failed to remove completed job {}: {}",
-                            job_dir.display(),
-                            e
-                        );
-                    }
-                } else {
-                    debug!(
-                        "retention: deleted completed job {} (gen {} published)",
-                        job_dir.display(),
-                        cur_gen
-                    );
-                    completed_deleted += 1;
-                    bytes_reclaimed += size;
-                }
-            }
-        }
-    }
+    let (completed_deleted, mut bytes_reclaimed) = match current_gen {
+        Some(cur_gen) => delete_completed_jobs_for_current_gen(jobs_dir, cur_gen)?,
+        None => (0, 0),
+    };
 
     // Phase 2: Enforce byte cap on remaining completed jobs (oldest-first).
     let total_job_bytes = dir_total_bytes(jobs_dir);
     if total_job_bytes <= job_bytes_max {
-        return Ok((completed_deleted, byte_capped, bytes_reclaimed));
+        return Ok((completed_deleted, 0, bytes_reclaimed));
     }
 
-    // Collect remaining completed jobs sorted by mtime (oldest first).
+    let completed_jobs = completed_jobs_oldest_first(jobs_dir)?;
+    let (byte_capped, reclaimed) =
+        enforce_job_byte_cap(&completed_jobs, total_job_bytes, job_bytes_max);
+    bytes_reclaimed += reclaimed;
+
+    Ok((completed_deleted, byte_capped, bytes_reclaimed))
+}
+
+/// Delete completed jobs that produced `current_gen` (zero resume value once
+/// the generation is published). Returns the number of jobs deleted and the
+/// bytes they occupied.
+fn delete_completed_jobs_for_current_gen(
+    jobs_dir: &Path,
+    current_gen: u64,
+) -> Result<(usize, u64), RetentionError> {
+    let job_entries: Vec<PathBuf> = fs::read_dir(jobs_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect();
+
+    let mut completed_deleted = 0;
+    let mut bytes_reclaimed: u64 = 0;
+    for job_dir in &job_entries {
+        // Check if this job produced the current generation.
+        if job_produced_generation(job_dir, current_gen) && job_is_completed(job_dir) {
+            let size = dir_total_bytes(job_dir);
+            if let Err(e) = fs::remove_dir_all(job_dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        "retention: failed to remove completed job {}: {}",
+                        job_dir.display(),
+                        e
+                    );
+                }
+            } else {
+                debug!(
+                    "retention: deleted completed job {} (gen {} published)",
+                    job_dir.display(),
+                    current_gen
+                );
+                completed_deleted += 1;
+                bytes_reclaimed += size;
+            }
+        }
+    }
+    Ok((completed_deleted, bytes_reclaimed))
+}
+
+/// Remaining completed jobs under `jobs_dir` as `(mtime, path, size)`, sorted
+/// oldest first. In-progress jobs are excluded — they are never deleted to
+/// meet the cap (they have checkpoint resume value).
+fn completed_jobs_oldest_first(
+    jobs_dir: &Path,
+) -> Result<Vec<(std::time::SystemTime, PathBuf, u64)>, RetentionError> {
     let mut completed_jobs: Vec<(std::time::SystemTime, PathBuf, u64)> = Vec::new();
     for entry in fs::read_dir(jobs_dir)? {
         let entry = entry?;
@@ -626,9 +672,20 @@ fn prune_jobs(
 
     // Sort oldest first.
     completed_jobs.sort_by_key(|(mtime, _, _)| *mtime);
+    Ok(completed_jobs)
+}
 
+/// Delete oldest completed jobs until the total is at or below the cap.
+/// Returns `(deleted_count, bytes_reclaimed)`.
+fn enforce_job_byte_cap(
+    completed_jobs: &[(std::time::SystemTime, PathBuf, u64)],
+    total_job_bytes: u64,
+    job_bytes_max: u64,
+) -> (usize, u64) {
+    let mut byte_capped = 0;
+    let mut bytes_reclaimed: u64 = 0;
     let mut current_bytes = total_job_bytes;
-    for (_mtime, path, size) in &completed_jobs {
+    for (_mtime, path, size) in completed_jobs {
         if current_bytes <= job_bytes_max {
             break;
         }
@@ -651,8 +708,7 @@ fn prune_jobs(
             current_bytes = current_bytes.saturating_sub(*size);
         }
     }
-
-    Ok((completed_deleted, byte_capped, bytes_reclaimed))
+    (byte_capped, bytes_reclaimed)
 }
 
 /// Read the current generation number from the gens_dir's parent (which

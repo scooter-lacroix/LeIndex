@@ -1154,6 +1154,24 @@ fn index_nodes_with_embedder_inner(
     });
 
     // A+ logging: run-total stats at info! level (invisible under default WARN).
+    log_indexing_admission_stats(
+        pruned_count,
+        shed_count,
+        hoisted_count,
+        external_skipped_count,
+        total_admitted,
+    );
+
+    Ok((embedder, content_cache))
+}
+
+fn log_indexing_admission_stats(
+    pruned_count: usize,
+    shed_count: usize,
+    hoisted_count: usize,
+    external_skipped_count: usize,
+    total_admitted: usize,
+) {
     if pruned_count > 0 || shed_count > 0 || hoisted_count > 0 || external_skipped_count > 0 {
         info!(
             pruned = pruned_count,
@@ -1175,8 +1193,6 @@ fn index_nodes_with_embedder_inner(
             "indexing completed with pruning/shedding — some nodes were filtered"
         );
     }
-
-    Ok((embedder, content_cache))
 }
 
 /// A6: cap the text sent to the neural worker so a single node's content can

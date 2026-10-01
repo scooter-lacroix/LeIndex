@@ -507,19 +507,7 @@ impl ProjectRegistry {
             return false;
         };
         if self.is_one_shot() {
-            // A one-shot process has no other caller to keep responsive, so
-            // load in place -- but only what this tool needs: eagerly loading
-            // the graph and search engine cost ~350 ms even for `find`.
-            let mut idx = handle.write().await;
-            if idx.is_hydrated(full) || !idx.is_indexed() {
-                return idx.is_hydrated(full);
-            }
-            let loaded = if full {
-                idx.ensure_analysis_context_loaded()
-            } else {
-                idx.ensure_pdg_loaded_graph_only()
-            };
-            return loaded.is_ok() && idx.is_hydrated(full);
+            return Self::ensure_hydrated_in_place(&handle, full).await;
         }
         let (root, indexed) = {
             let idx = handle.read().await;
@@ -568,6 +556,22 @@ impl ProjectRegistry {
         }
         handle.write().await.adopt_hydration(sibling, full);
         handle.read().await.is_hydrated(full)
+    }
+
+    async fn ensure_hydrated_in_place(handle: &ProjectHandle, full: bool) -> bool {
+        // A one-shot process has no other caller to keep responsive, so load
+        // in place -- but only what this tool needs: eagerly loading the graph
+        // and search engine cost ~350 ms even for `find`.
+        let mut idx = handle.write().await;
+        if idx.is_hydrated(full) || !idx.is_indexed() {
+            return idx.is_hydrated(full);
+        }
+        let loaded = if full {
+            idx.ensure_analysis_context_loaded()
+        } else {
+            idx.ensure_pdg_loaded_graph_only()
+        };
+        loaded.is_ok() && idx.is_hydrated(full)
     }
 
     /// Create a registry pre-loaded with one project (the initial startup project).
@@ -1171,6 +1175,15 @@ impl ProjectRegistry {
         Ok(handle)
     }
 
+    async fn cached_index_stats(handle: &ProjectHandle) -> Option<IndexStats> {
+        let idx = handle.read().await;
+        if idx.is_indexed() && !idx.is_stale_fast() {
+            Some(idx.get_stats().clone())
+        } else {
+            None
+        }
+    }
+
     /// Build a fresh index for the project behind `handle`, then swap it in.
     ///
     /// Uses a per-project slot lock so concurrent index requests coalesce.
@@ -1193,16 +1206,7 @@ impl ProjectRegistry {
         let _slot_guard = slot.lock().await;
 
         if !force_reindex {
-            let cached = {
-                let idx = handle.read().await;
-                if idx.is_indexed() && !idx.is_stale_fast() {
-                    Some(idx.get_stats().clone())
-                } else {
-                    None
-                }
-            };
-
-            if let Some(stats) = cached {
+            if let Some(stats) = Self::cached_index_stats(handle).await {
                 return Ok(stats);
             }
         }

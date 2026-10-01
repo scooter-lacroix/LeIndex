@@ -278,6 +278,94 @@ pub fn ingest_file_from_root(
     }
 }
 
+fn push_symbol_relationships(
+    symbol_name: &str,
+    relationships: &[types::Relationship],
+    out: &mut Vec<RelationshipFact>,
+) {
+    if symbol_name.is_empty() {
+        return;
+    }
+    for relationship in relationships {
+        if relationship.symbol.is_empty() {
+            continue;
+        }
+        if relationship.is_implementation {
+            out.push(RelationshipFact {
+                source: symbol_name.to_string(),
+                target: relationship.symbol.clone(),
+                kind: "inheritance".to_string(),
+            });
+        }
+        if relationship.is_type_definition {
+            out.push(RelationshipFact {
+                source: symbol_name.to_string(),
+                target: relationship.symbol.clone(),
+                kind: "type_of".to_string(),
+            });
+        }
+        if relationship.is_reference {
+            out.push(RelationshipFact {
+                source: symbol_name.to_string(),
+                target: relationship.symbol.clone(),
+                kind: "call".to_string(),
+            });
+        }
+    }
+}
+
+fn process_document_symbol(
+    symbol: &types::SymbolInformation,
+    document: &types::Document,
+    source_text: Option<&str>,
+    encoding: Option<PositionEncoding>,
+    facts: &mut CompactScipFacts,
+) {
+    let signature = symbol
+        .signature_documentation
+        .as_ref()
+        .map(|value| value.text.clone())
+        .filter(|value| !value.is_empty());
+    let range = document
+        .occurrences
+        .iter()
+        .find(|occurrence| occurrence.symbol == symbol.symbol && is_definition(occurrence))
+        .and_then(|occurrence| range_from_occurrence(occurrence, source_text?, encoding?));
+    if range.is_none() {
+        facts.definitions_without_range += 1;
+    }
+    facts.definitions.push(DefinitionFact {
+        symbol: symbol.symbol.clone(),
+        file_path: document.relative_path.clone(),
+        byte_range: range,
+        qualified_name: if symbol.display_name.is_empty() {
+            symbol.symbol.clone()
+        } else {
+            symbol.display_name.clone()
+        },
+        signature,
+    });
+    push_symbol_relationships(
+        &symbol.symbol,
+        &symbol.relationships,
+        &mut facts.relationships,
+    );
+}
+
+fn count_unmatched_occurrences(
+    occurrences: &[types::Occurrence],
+    known_symbols: &HashSet<&str>,
+) -> usize {
+    occurrences
+        .iter()
+        .filter(|occurrence| {
+            !occurrence.symbol.is_empty()
+                && !is_definition(occurrence)
+                && !known_symbols.contains(occurrence.symbol.as_str())
+        })
+        .count()
+}
+
 fn project_index(index: &types::Index, project_root: Option<&Path>) -> CompactScipFacts {
     let mut facts = CompactScipFacts::default();
     let known_symbols: HashSet<&str> = index
@@ -294,69 +382,10 @@ fn project_index(index: &types::Index, project_root: Option<&Path>) -> CompactSc
         let source_text = source_text.as_deref();
         let encoding = document.position_encoding.enum_value().ok();
         for symbol in &document.symbols {
-            let signature = symbol
-                .signature_documentation
-                .as_ref()
-                .map(|value| value.text.clone())
-                .filter(|value| !value.is_empty());
-            let range = document
-                .occurrences
-                .iter()
-                .find(|occurrence| occurrence.symbol == symbol.symbol && is_definition(occurrence))
-                .and_then(|occurrence| range_from_occurrence(occurrence, source_text?, encoding?));
-            if range.is_none() {
-                facts.definitions_without_range += 1;
-            }
-            facts.definitions.push(DefinitionFact {
-                symbol: symbol.symbol.clone(),
-                file_path: document.relative_path.clone(),
-                byte_range: range,
-                qualified_name: if symbol.display_name.is_empty() {
-                    symbol.symbol.clone()
-                } else {
-                    symbol.display_name.clone()
-                },
-                signature,
-            });
-            if symbol.symbol.is_empty() {
-                continue;
-            }
-            for relationship in &symbol.relationships {
-                if relationship.symbol.is_empty() {
-                    continue;
-                }
-                if relationship.is_implementation {
-                    facts.relationships.push(RelationshipFact {
-                        source: symbol.symbol.clone(),
-                        target: relationship.symbol.clone(),
-                        kind: "inheritance".to_string(),
-                    });
-                }
-                if relationship.is_type_definition {
-                    facts.relationships.push(RelationshipFact {
-                        source: symbol.symbol.clone(),
-                        target: relationship.symbol.clone(),
-                        kind: "type_of".to_string(),
-                    });
-                }
-                if relationship.is_reference {
-                    facts.relationships.push(RelationshipFact {
-                        source: symbol.symbol.clone(),
-                        target: relationship.symbol.clone(),
-                        kind: "call".to_string(),
-                    });
-                }
-            }
+            process_document_symbol(symbol, document, source_text, encoding, &mut facts);
         }
-        for occurrence in &document.occurrences {
-            if occurrence.symbol.is_empty()
-                || is_definition(occurrence)
-                || known_symbols.contains(occurrence.symbol.as_str())
-            {
-                continue;
-            }
-            facts.unmatched_references += 1;
-        }
+        facts.unmatched_references +=
+            count_unmatched_occurrences(&document.occurrences, &known_symbols);
     }
     facts.files.sort();
     facts.files.dedup();
