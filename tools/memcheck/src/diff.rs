@@ -91,6 +91,10 @@ pub struct DiffResult {
     pub phases: Vec<PhaseDiff>,
     /// Whether all phases passed.
     pub all_passed: bool,
+    /// The regression rules this diff was computed with (from the budget
+    /// file). Formatting must report the SAME rules the gate applied —
+    /// hard-coding them here once printed "+5%" details under a +10% rule.
+    pub rules: RegressionRules,
 }
 
 /// Load the budget file from the canonical path.
@@ -228,6 +232,7 @@ pub fn diff_report(
     DiffResult {
         phases: phase_diffs,
         all_passed,
+        rules: budget.regression_rules.clone(),
     }
 }
 
@@ -239,7 +244,7 @@ pub fn format_diff(diff: &DiffResult) -> String {
     let mut lines = Vec::new();
 
     lines.push("═══ Memcheck Phase Diff ═══".to_string());
-    let rules = diff_phases_rules(diff);
+    let rules = &diff.rules;
     lines.push(format!(
         "{:<15} {:>12} {:>12} {:>12} {:>12} {:>8}",
         "Phase",
@@ -280,9 +285,7 @@ pub fn format_diff(diff: &DiffResult) -> String {
             if let (Some(bl), Some(_thr)) = (pd.baseline_kib, pd.baseline_threshold_kib) {
                 lines.push(format!(
                     "  ⚠ MAIN RSS baseline regression: {} KiB > baseline({} KiB) + {}%",
-                    pd.measured_kib,
-                    bl,
-                    diff_phases_rules(diff).baseline_tolerance_pct
+                    pd.measured_kib, bl, diff.rules.baseline_tolerance_pct
                 ));
             }
         }
@@ -290,9 +293,7 @@ pub fn format_diff(diff: &DiffResult) -> String {
             if let (Some(ce), Some(_thr)) = (pd.ceiling_kib, pd.ceiling_threshold_kib) {
                 lines.push(format!(
                     "  ⚠ MAIN RSS ceiling regression: {} KiB > ceiling({} KiB) + {}%",
-                    pd.measured_kib,
-                    ce,
-                    diff_phases_rules(diff).ceiling_tolerance_pct
+                    pd.measured_kib, ce, diff.rules.ceiling_tolerance_pct
                 ));
             }
         }
@@ -302,9 +303,7 @@ pub fn format_diff(diff: &DiffResult) -> String {
             {
                 lines.push(format!(
                     "  ⚠ COMBINED RSS ceiling regression: {} KiB > combined ceiling({} KiB) + {}%",
-                    pd.combined_measured_kib,
-                    ce,
-                    diff_phases_rules(diff).ceiling_tolerance_pct
+                    pd.combined_measured_kib, ce, diff.rules.ceiling_tolerance_pct
                 ));
             }
         }
@@ -365,16 +364,6 @@ fn extract_fixture_name(fixture_path: &str) -> &str {
 /// Apply a percentage increase to a value.
 fn apply_pct(value: u64, pct: u64) -> u64 {
     value + (value * pct / 100)
-}
-
-/// Helper to get regression rules from a diff result (for formatting).
-fn diff_phases_rules(_diff: &DiffResult) -> RegressionRules {
-    // We don't store the rules in DiffResult; return defaults for formatting.
-    // The actual rules come from the budget file.
-    RegressionRules {
-        baseline_tolerance_pct: 5,
-        ceiling_tolerance_pct: 10,
-    }
 }
 
 /// Find the workspace root by walking up from a starting directory.

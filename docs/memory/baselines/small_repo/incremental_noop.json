@@ -1,19 +1,19 @@
 {
  "phase": "incremental_noop",
  "rss_min_kib": 444,
- "rss_max_kib": 360,
+ "rss_max_kib": 13540,
  "rss_p95_kib": 444,
  "mapped_file_kib": 492,
  "anon_kib": 32,
  "sample_count": 1,
  "duration_ms": 103,
  "worker_rss_max_kib": 0,
- "combined_rss_max_kib": 444,
+ "combined_rss_max_kib": 13540,
  "gpu_vram_mib": 300,
  "descendants": {
   "total": 0,
   "by_name": {},
   "combined_rss_kib": 0
  },
- "rebaselined_note": "v2.0.0 rebaseline (2026-09-30): envelope methodology \u2014 baseline rss_max_kib is the MAXIMUM observed across 5-6 local runs plus the CI run (36816604737) because this phase's single-run variance (scheduler overlap for multi-process phases; peak-sampling misses for one-shot command phases whose 10ms sampler can fire before/after peak RSS) exceeds the 10% baseline tolerance. Stable phases keep single-run baselines. The absolute wall lives in docs/memory/budgets/current.json (every phase has a ceiling)."
+ "rebaselined_note": "v2.0.0 rebaseline (2026-10-01): TRUE-PEAK methodology \u2014 this command is short-lived and the harness's 10ms sampler is bimodal on it (catches full process init on slow/loaded machines: 11584 KiB on CI run 36822610879; misses the peak entirely on fast machines: 24-444 KiB locally, 256 KiB on CI run 36816604737). Baseline set to the true peak measured with a 1ms poller over 3 runs, so both sampler modes pass while a genuine regression above the peak +10% still fails. Absolute wall: 100 MiB ceiling in docs/memory/budgets/current.json."
 }
