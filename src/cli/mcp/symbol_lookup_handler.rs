@@ -387,7 +387,7 @@ fn resolve_symbol_node(
                 candidates
                     .iter()
                     .copied()
-                    .find(|&nid| pdg.get_node(nid).is_some_and(&in_scope))
+                    .find(|&nid| pdg.get_node(nid).is_some_and(in_scope))
             })
     })
     .or_else(|| find_fuzzy_node(pdg, symbol, &in_scope))
