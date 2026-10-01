@@ -632,9 +632,7 @@ async function installFromBundle(release) {
     }
 
     const binaryName = getBinaryName();
-    const workerName = getWorkerBinaryName();
     const srcBinary = path.join(bundleDir, 'bin', binaryName);
-    const srcWorker = path.join(bundleDir, 'bin', workerName);
 
     if (fs.existsSync(srcBinary)) {
       copyRegularBundledFile(srcBinary, path.join(BIN_DIR, binaryName), 'binary');
@@ -646,27 +644,22 @@ async function installFromBundle(release) {
       throw new Error(`Main binary not found in bundle: bin/${binaryName}`);
     }
 
-    if (srcWorker && srcWorker !== srcMain && fs.existsSync(srcWorker)) {
-      copyRegularBundledFile(srcWorker, path.join(BIN_DIR, workerName), 'worker binary');
-      if (process.platform !== 'win32') {
-        fs.chmodSync(path.join(BIN_DIR, workerName), 0o755);
+    // The ONNX embed worker is built into the main binary (hidden re-exec
+    // token), so there is no separate worker to install.
+    console.log('   ✓ Worker mode built into the main binary (no separate worker)');
+
+    // `leindex` launches the per-user daemon as a sibling executable, so
+    // `leindexd` must land next to it. The daemon is Unix-only: Windows bundles
+    // do not carry it, and a missing one just means the client serves inline.
+    if (process.platform !== 'win32') {
+      const srcDaemon = path.join(bundleDir, 'bin', 'leindexd');
+      if (fs.existsSync(srcDaemon)) {
+        copyRegularBundledFile(srcDaemon, path.join(BIN_DIR, 'leindexd'), 'daemon binary');
+        fs.chmodSync(path.join(BIN_DIR, 'leindexd'), 0o755);
+        console.log('   ✓ Daemon binary installed');
+      } else {
+        console.log('   ⚠ leindexd not found in bundle; the shared daemon is unavailable');
       }
-      console.log('   ✓ Worker binary installed');
-    } else if (srcWorker === srcMain) {
-      console.log('   ✓ Worker mode built into the main binary (no separate worker)');
-    } else {
-      // Worker binary check: single-binary bundles have none (worker
-      // missing, neural (ONNX) search is unavailable — there is NO
-      // in-process ONNX fallback (the client delegates all inference to
-      // the worker process). TF-IDF search still works. Recover with:
-      //   npm install (re-fetch the bundle)  |  cargo install leindex --features onnx
-      //   |  leindex setup --neural after obtaining the worker.
-      throw new Error(
-        `Worker binary not found in bundle at bin/${workerName}. ` +
-          'Neural search is unavailable until it is installed. ' +
-          'Re-run `npm install`, or run `cargo install leindex --features onnx` ' +
-          'to build both binaries from source, then `leindex setup --neural`.'
-      );
     }
 
     // VAL-NPM-002: Install bundled ORT shared libraries under `lib/`.

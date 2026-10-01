@@ -28,6 +28,7 @@ set -euo pipefail
 readonly SCRIPT_VERSION="2.0.0"
 readonly PROJECT_NAME="LeIndex"
 readonly PROJECT_SLUG="leindex"
+readonly DAEMON_SLUG="leindexd"
 readonly MIN_RUST_MAJOR=1
 readonly MIN_RUST_MINOR=75
 readonly REPO_URL="https://github.com/scooter-lacroix/LeIndex"
@@ -546,6 +547,23 @@ install_rust() {
 # INSTALLATION
 # ============================================================================
 
+# Install the `leindexd` daemon beside the `leindex` client (Unix only; the
+# daemon is not supported on Windows). A missing daemon is not fatal: the
+# client falls back to an inline server, so only warn.
+install_daemon_binary() {
+    local source_path="$1"
+    local target_path="${INSTALL_BIN_DIR}/${DAEMON_SLUG}"
+    if [[ ! -f "$source_path" ]]; then
+        log_warn "Daemon binary not found at $source_path; the shared daemon is unavailable and leindex will serve inline"
+        return 0
+    fi
+    if cp "$source_path" "$target_path" && chmod +x "$target_path"; then
+        log_success "Daemon installed to: $target_path"
+    else
+        log_warn "Failed to install daemon to $target_path"
+    fi
+}
+
 install_leindex() {
     print_step 5 8 "Building LeIndex"
 
@@ -674,8 +692,9 @@ install_leindex() {
     # (load-dynamic) produces a binary that can use CPU, CUDA, or MIGraphX
     # ORT at runtime depending on which library is discovered.
     log_info "Building LeIndex..."
-    # One published crate (leindex) builds BOTH binaries (leindex and
-    # with the onnx feature compiles the worker [[bin]] target too.
+    # One published crate (leindex) builds both binaries: `leindex` (which also
+    # hosts the ONNX embed worker behind a hidden re-exec token) and `leindexd`,
+    # the per-user daemon the client launches from its own directory.
     if cargo build --release -p leindex --features leindex/onnx 2>&1 | tee -a "$INSTALL_LOG"; then
         log_success "Build completed successfully"
     else
@@ -711,15 +730,9 @@ install_leindex() {
         exit 1
     fi
 
-    # Install ONNX worker binary
-    if [[ -f "$worker_binary" ]]; then
-        if cp "$worker_binary" "$worker_install_path" && chmod +x "$worker_install_path"; then
-            log_success "Worker binary installed to: $worker_install_path"
-        else
-            log_warn "Failed to install worker binary to $worker_install_path"
-        fi
-    else
-    fi
+    # Install the daemon next to the client: `leindex` finds `leindexd` as a
+    # sibling executable, and falls back to an inline server without it.
+    install_daemon_binary "target/release/${DAEMON_SLUG}"
 
     # Install bundled ORT runtime libraries (from release bundle lib/
     # or a local lib/ directory). When building from source with
@@ -814,6 +827,7 @@ try_install_from_release_bundle() {
     #
     # The bundle layout (produced by .github/workflows/release.yml) is:
     #   leindex-<version>-<platform>/
+    #   ├── bin/   (leindex, leindexd)
     #   ├── lib/   (ORT runtime libraries for zero-setup neural search)
     #   └── INSTALL.txt
     #
@@ -924,13 +938,7 @@ try_install_from_release_bundle() {
         return 1
     fi
 
-    if [[ -f "$worker_bin" ]]; then
-        if cp "$worker_bin" "$worker_install_path" && chmod +x "$worker_install_path"; then
-            log_success "Worker binary installed to: $worker_install_path"
-        else
-            log_warn "Failed to install worker binary from bundle"
-        fi
-    fi
+    install_daemon_binary "${bundle_dir}/bin/${DAEMON_SLUG}"
 
     # Install bundled ORT libraries. Models are provisioned by `leindex setup`.
     install_ort_libraries "$bundle_dir"

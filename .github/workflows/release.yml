@@ -363,7 +363,7 @@ jobs:
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             STRIP="aarch64-linux-gnu-strip"
           fi
-          $STRIP target/${{ matrix.target }}/release/leindex
+          $STRIP target/${{ matrix.target }}/release/leindex target/${{ matrix.target }}/release/leindexd
 
       # ── Verify binaries: no NEEDED libonnxruntime, no $ORIGIN rpath ──
       # VAL-RELEASE-012/013: with load-dynamic, the produced binaries
@@ -378,7 +378,7 @@ jobs:
         run: |
           set -e
           BIN_DIR="target/${{ matrix.target }}/release"
-          for bin in leindex; do
+          for bin in leindex leindexd; do
             echo "Inspecting $BIN_DIR/$bin ..."
             if [[ "$RUNNER_OS" == "macOS" ]]; then
               LOAD_DEPS=$(otool -L "$BIN_DIR/$bin")
@@ -431,8 +431,13 @@ jobs:
           BUNDLE_DIR="leindex-${VERSION}-${{ matrix.asset_name }}"
           mkdir -p "$BUNDLE_DIR/bin" "$BUNDLE_DIR/lib"
 
-          # Copy both binaries
+          # Copy both binaries. `leindex` launches the per-user daemon as a
+          # sibling executable, so `leindexd` must ship beside it. The daemon
+          # is Unix-only; Windows bundles carry the client alone.
           cp "target/${{ matrix.target }}/release/leindex${EXT}" "$BUNDLE_DIR/bin/leindex${EXT}"
+          if [[ "$RUNNER_OS" != "Windows" ]]; then
+            cp "target/${{ matrix.target }}/release/leindexd" "$BUNDLE_DIR/bin/leindexd"
+          fi
 
           # ── Copy ORT runtime libraries into lib/ ──
           # VAL-RELEASE-005/011: ORT is extracted from the pip wheel (above)
