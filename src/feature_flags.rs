@@ -71,22 +71,42 @@ pub enum FeatureFlag {
     /// behind the DRR queues and admission gate instead of one unstepped
     /// `spawn_blocking` call. Default OFF = legacy spawn_blocking + error-at-cap
     /// indexing path.
+    ///
+    /// **Status:** declared but not yet consumed by `index_project_inner`; the
+    /// flag currently has no effect. Tracked in
+    /// <https://github.com/scooter-lacroix/LeIndex/issues/86>.
     BoundedScheduler,
     /// Enable the streaming scan stage (WS6-9 Task 1): scan walks files lazily,
     /// hashing via a fixed 64KiB buffer, writing metadata records to CAS-staged
     /// scan blob without retaining source bodies.
+    ///
+    /// **Status:** declared but not yet consumed by `index_project_inner`; the
+    /// flag currently has no effect. Tracked in
+    /// <https://github.com/scooter-lacroix/LeIndex/issues/86>.
     StreamingScan,
     /// Enable the streaming parse stage (WS6-9 Task 2): bounded parse chunks
     /// with per-file persist and syntax-tree drop before the next file.
+    ///
+    /// **Status:** declared but not yet consumed by `index_project_inner`; the
+    /// flag currently has no effect. Tracked in
+    /// <https://github.com/scooter-lacroix/LeIndex/issues/86>.
     StreamingParse,
     /// Enable the compact PDG persistence stage (WS6-9 Task 3): per-file graph
     /// fragments to CAS adjacency without whole-PDG clone.
     StreamingPdg,
     /// Enable the streaming TF-IDF stage (WS6-9 Task 4): two-pass external-
     /// memory TF-IDF with direct CAS-staged row writes.
+    ///
+    /// **Status:** declared but not yet consumed by `index_project_inner`; the
+    /// flag currently has no effect. Tracked in
+    /// <https://github.com/scooter-lacroix/LeIndex/issues/86>.
     StreamingTfidf,
     /// Enable the streaming neural enrichment stage (WS6-9 Task 6):
     /// NeuralRowWriter replaces Vec accumulation, direct staged writes.
+    ///
+    /// **Status:** declared but not yet consumed by `index_project_inner`; the
+    /// flag currently has no effect. Tracked in
+    /// <https://github.com/scooter-lacroix/LeIndex/issues/86>.
     StreamingNeural,
     /// Enable the global content-addressed embedding cache (WS10 Task 1-2).
     /// The cache stores embedding vectors at user-level (e.g.

@@ -272,6 +272,10 @@ pub fn retain_after_publish(
 ) -> Result<GenerationRetentionReport, RetentionError> {
     let mut report = GenerationRetentionReport::default();
 
+    // Leases taken by other handles and processes since this store opened must
+    // be visible before anything is deleted on the strength of a refcount.
+    store.reload()?;
+
     // The current generation is the one pointed to by `CURRENT`. It is the
     // anchor for both generation pruning and the completed-job sweep.
     let current_gen = read_current_generation_from_gens_dir(gens_dir);
@@ -451,8 +455,14 @@ fn prune_generations(
     Ok((retained_count, removed, pinned_hashes))
 }
 
-/// Retain every generation outside the window that is still leased
-/// (at least one layer blob with refcount > 0).
+/// Retain every generation outside the window that is still leased.
+///
+/// A lease pins *every* layer blob of its manifest, so a leased generation has
+/// all of its layers above refcount 0. Requiring all of them (rather than any
+/// one) keeps a generation that merely shares an unchanged layer with a leased
+/// neighbour from being mistaken for a leased generation: with an "any" test a
+/// long-lived lease on the current generation pinned every older generation
+/// that reused one stable layer, defeating the current-plus-previous bound.
 fn retain_leased_generations(
     store: &CasStore,
     gens_dir: &Path,
@@ -465,8 +475,8 @@ fn retain_leased_generations(
         }
         if let Some(manifest) = generation_manifest(&gens_dir.join(gen_num.to_string())) {
             let hashes = manifest.layer_hashes();
-            let any_leased = hashes.iter().any(|h| store.refcount(h) > 0);
-            if any_leased {
+            let fully_leased = !hashes.is_empty() && hashes.iter().all(|h| store.refcount(h) > 0);
+            if fully_leased {
                 retained.insert(*gen_num);
             }
         }

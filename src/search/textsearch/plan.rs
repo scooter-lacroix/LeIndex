@@ -42,9 +42,11 @@ pub fn plan(pattern: &str, case_insensitive: bool) -> Result<Expr, String> {
 }
 
 /// Byte a small class stands for once ASCII case is folded, if it is
-/// unambiguous. `(?i)k` also matches U+212A (Kelvin) and `(?i)s` U+017F; the
-/// index folds ASCII only, so those two are accepted as the ASCII letter (a
-/// file that spells a word only with them would be missed by the pre-filter).
+/// unambiguous. `(?i)k` also matches U+212A (Kelvin) and `(?i)s` U+017F, but
+/// the index folds ASCII only, so a file spelling a word with those characters
+/// carries no trigram for the ASCII letter. Such a class therefore yields no
+/// requirement (`None`): the neighbouring literals still constrain the search,
+/// and the verifier regex stays the single source of truth for matching.
 fn class_byte(class: &Class) -> Option<u8> {
     let mut found: Option<u8> = None;
     let mut fold = |byte: u8| -> bool {
@@ -73,7 +75,6 @@ fn class_byte(class: &Class) -> Option<u8> {
                                 return None;
                             }
                         }
-                        Some('\u{212A}') | Some('\u{17F}') => {}
                         _ => return None,
                     }
                 }
@@ -376,6 +377,48 @@ mod tests {
             "absent trigram => no candidates"
         );
         assert_eq!(get(".*", false), None);
+    }
+
+    #[test]
+    fn test_unicode_folds_of_ascii_letters_are_never_required_as_ascii() {
+        // `(?i)k` and `(?i)s` also match U+212A (Kelvin sign) and U+017F (long
+        // s), which the ASCII-only trigram index cannot see. The pre-filter must
+        // not demand the ASCII letter, or files using those characters vanish.
+        let kelvin = "\u{212A}elvin";
+        let long_s = "\u{17F}ervice";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("i.bin");
+        let texts = [kelvin, "Kelvin", long_s, "service", "unrelated"];
+        let files: Vec<FileInput> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| FileInput {
+                rel_path: format!("f{i}.txt"),
+                size: t.len() as u64,
+                mtime_ns: 0,
+                flags: 0,
+                trigrams: tris(t.as_bytes()),
+                symbols: vec![],
+            })
+            .collect();
+        write_index(&path, &files, false).unwrap();
+        let index = TextIndex::open(&path).unwrap();
+        for (pattern, expect) in [("kelvin", [0u32, 1]), ("service", [2, 3])] {
+            let re = regex::Regex::new(&format!("(?i){pattern}")).unwrap();
+            let candidate = candidates(&index, &plan(pattern, true).unwrap());
+            for id in expect {
+                assert!(
+                    re.is_match(texts[id as usize]),
+                    "premise: regex must match {:?}",
+                    texts[id as usize]
+                );
+                assert!(
+                    candidate.as_ref().is_none_or(|c| c.contains(&id)),
+                    "(?i){pattern} dropped file {id} ({:?})",
+                    texts[id as usize]
+                );
+            }
+        }
     }
 
     #[test]

@@ -208,6 +208,40 @@ fn test_retention_current_prev_leased() {
 }
 
 #[test]
+fn test_retention_shared_layer_does_not_make_an_old_generation_leased() {
+    let env = TestEnv::new();
+
+    // Generations 1..=4 have unique layers; generation 5 (current) is leased
+    // and reuses ONE layer (the db blob) of generation 2.
+    let _h1 = env.make_generation(1);
+    let h2 = env.make_generation(2);
+    let _h3 = env.make_generation(3);
+    let _h4 = env.make_generation(4);
+    let mut h5 = env.make_generation(5);
+    h5[0] = h2[0];
+    env.make_generation_with_hashes(5, &h5);
+    env.write_current(5);
+
+    let mut store = make_store(&env.root);
+    for hash in &h5 {
+        store.incr(hash); // a live lease on generation 5
+    }
+    store.persist().unwrap();
+
+    let cfg = RetentionConfig::default();
+    retain_after_publish(&mut store, &env.gens_dir, &env.jobs_dir, &cfg).unwrap();
+
+    assert!(env.gens_dir.join("5").exists(), "current gen 5 must exist");
+    assert!(env.gens_dir.join("4").exists(), "previous gen 4 must exist");
+    assert!(
+        !env.gens_dir.join("2").exists(),
+        "gen 2 only shares one blob with leased gen 5; it is not itself leased"
+    );
+    assert!(!env.gens_dir.join("1").exists());
+    assert!(!env.gens_dir.join("3").exists());
+}
+
+#[test]
 fn test_retention_no_lease_only_two() {
     let env = TestEnv::new();
 

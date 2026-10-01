@@ -209,8 +209,18 @@ impl CasStore {
     }
 
     /// Persist the refcount sidecar to disk.
+    ///
+    /// Merges this handle's changes into the shared sidecar under a lock, so
+    /// overlapping handles (threads or processes) never overwrite each other.
     pub fn persist(&self) -> Result<()> {
         self.refs.persist()
+    }
+
+    /// Refresh refcounts from disk so leases taken through other handles or
+    /// processes since this one opened are visible. Callers about to delete
+    /// data (retention, GC) call this first.
+    pub fn reload(&self) -> Result<()> {
+        self.refs.reload()
     }
 
     /// Garbage-collect blobs with refcount 0 that are not in `pinned_hashes`.
@@ -220,6 +230,8 @@ impl CasStore {
     /// empty set or use [`gc`](Self::gc).
     pub fn gc_with_pins(&mut self, pinned_hashes: &HashSet<[u8; 32]>) -> Result<RetentionReport> {
         let mut report = RetentionReport::default();
+        // See leases taken through other handles since this one opened.
+        self.refs.reload()?;
         // Walk all blobs on disk so that we catch both blobs that were
         // decr'd to 0 AND blobs that were `put` but never `incr`'d.
         let candidates = self.stored_hashes()?;

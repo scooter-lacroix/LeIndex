@@ -218,3 +218,188 @@ fn test_refcount_reopen_corrupt_sidecar() {
     let store = JsonSidecarStore::open(dir.path()).expect("open");
     assert_eq!(store.tracked_hashes().len(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Overlapping handles and crashed owners
+// ---------------------------------------------------------------------------
+
+fn sidecar_count(dir: &std::path::Path, hash: &[u8; 32]) -> u64 {
+    super::read_counts(&dir.join(REFS_SIDECAR))
+        .get(hash)
+        .copied()
+        .unwrap_or(0)
+}
+
+#[test]
+fn test_refcount_overlapping_handles_do_not_lose_updates() {
+    // Lease A persists 1, lease B (opened before that persist) persists its own
+    // increment, then A drops first. Whole-map replacement used to write A's
+    // stale view (0) here while B was still live, and B later wrote 1 after
+    // both were gone.
+    let dir = tempdir().expect("tempdir");
+    let h = blob_hash(b"overlapping leases");
+
+    let mut a = JsonSidecarStore::open(dir.path()).unwrap();
+    let mut b = JsonSidecarStore::open(dir.path()).unwrap();
+
+    a.incr(&h);
+    a.persist().unwrap();
+    b.incr(&h);
+    b.persist().unwrap();
+    assert_eq!(sidecar_count(dir.path(), &h), 2, "both leases are recorded");
+
+    a.decr(&h).unwrap();
+    a.persist().unwrap();
+    assert_eq!(
+        sidecar_count(dir.path(), &h),
+        1,
+        "A releasing must leave B's lease in place"
+    );
+
+    b.decr(&h).unwrap();
+    b.persist().unwrap();
+    assert_eq!(
+        sidecar_count(dir.path(), &h),
+        0,
+        "no phantom lease once both are released"
+    );
+}
+
+#[test]
+fn test_refcount_concurrent_persists_from_many_handles_sum_exactly() {
+    let dir = tempdir().expect("tempdir");
+    let h = blob_hash(b"concurrent leases");
+    let root = dir.path().to_path_buf();
+
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let mut store = JsonSidecarStore::open(&root).unwrap();
+                for _ in 0..25 {
+                    store.incr(&h);
+                    store.persist().unwrap();
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+
+    assert_eq!(sidecar_count(dir.path(), &h), 200);
+}
+
+#[test]
+fn test_refcount_reload_sees_other_handles_leases() {
+    let dir = tempdir().expect("tempdir");
+    let h = blob_hash(b"reload sees leases");
+
+    let observer = JsonSidecarStore::open(dir.path()).unwrap();
+    let mut leaser = JsonSidecarStore::open(dir.path()).unwrap();
+    leaser.incr(&h);
+    leaser.persist().unwrap();
+
+    assert_eq!(observer.refcount(&h), 0, "stale until reloaded");
+    observer.reload().unwrap();
+    assert_eq!(observer.refcount(&h), 1);
+}
+
+#[test]
+fn test_refcount_reload_keeps_unpersisted_local_changes() {
+    let dir = tempdir().expect("tempdir");
+    let h = blob_hash(b"reload keeps local");
+
+    let mut other = JsonSidecarStore::open(dir.path()).unwrap();
+    let mut local = JsonSidecarStore::open(dir.path()).unwrap();
+    other.incr(&h);
+    other.persist().unwrap();
+    local.incr(&h);
+    local.reload().unwrap();
+    assert_eq!(local.refcount(&h), 2, "other's persisted + local pending");
+}
+
+/// A pid that is guaranteed not to be running: a child that has been reaped.
+#[cfg(unix)]
+fn dead_pid() -> u32 {
+    let mut child = std::process::Command::new("true").spawn().expect("spawn");
+    let pid = child.id();
+    child.wait().expect("wait");
+    pid
+}
+
+#[cfg(unix)]
+#[test]
+fn test_refcount_counts_of_a_crashed_owner_are_reclaimed_on_open() {
+    // A process that persisted a lease and was then killed leaves positive
+    // counts behind. Without owner metadata they pinned blobs forever.
+    let dir = tempdir().expect("tempdir");
+    let h = blob_hash(b"crashed owner");
+    let survivor = blob_hash(b"live owner");
+
+    // A live handle in this process holds one count on each hash.
+    let mut live = JsonSidecarStore::open(dir.path()).unwrap();
+    live.incr(&survivor);
+    live.persist().unwrap();
+
+    // The crashed owner held two counts on `h` and one on `survivor`.
+    let pid = dead_pid();
+    let owners = dir.path().join(REFS_OWNERS_DIR);
+    fs::create_dir_all(&owners).unwrap();
+    let mut ledger = HashMap::new();
+    ledger.insert(h, 2u64);
+    ledger.insert(survivor, 1u64);
+    let ledger_path = owners.join(format!("{pid}.1.0.json"));
+    super::write_counts_atomic(&ledger_path, &ledger).unwrap();
+    let mut counts = super::read_counts(&dir.path().join(REFS_SIDECAR));
+    *counts.entry(h).or_insert(0) += 2;
+    *counts.entry(survivor).or_insert(0) += 1;
+    super::write_counts_atomic(&dir.path().join(REFS_SIDECAR), &counts).unwrap();
+    assert_eq!(sidecar_count(dir.path(), &h), 2);
+    assert_eq!(sidecar_count(dir.path(), &survivor), 2);
+
+    let reopened = JsonSidecarStore::open(dir.path()).unwrap();
+    assert_eq!(reopened.refcount(&h), 0, "crashed owner's counts reclaimed");
+    assert_eq!(
+        reopened.refcount(&survivor),
+        1,
+        "only the dead owner's share is reclaimed; the live lease stays"
+    );
+    assert!(!ledger_path.exists(), "dead owner's ledger is removed");
+    assert_eq!(sidecar_count(dir.path(), &h), 0, "reclaim is persisted");
+}
+
+#[test]
+fn test_refcount_released_leases_leave_no_owner_ledger() {
+    let dir = tempdir().expect("tempdir");
+    let h = blob_hash(b"ledger cleanup");
+    let mut store = JsonSidecarStore::open(dir.path()).unwrap();
+    store.incr(&h);
+    store.persist().unwrap();
+    let ledgers = || {
+        fs::read_dir(dir.path().join(REFS_OWNERS_DIR))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    };
+    assert_eq!(ledgers(), 1);
+    store.decr(&h).unwrap();
+    store.persist().unwrap();
+    assert_eq!(ledgers(), 0, "a handle holding nothing keeps no ledger");
+}
+
+#[test]
+fn test_refcount_remove_keeps_entry_another_handle_still_counts() {
+    let dir = tempdir().expect("tempdir");
+    let h = blob_hash(b"remove vs lease");
+
+    let mut gc = JsonSidecarStore::open(dir.path()).unwrap();
+    let mut reader = JsonSidecarStore::open(dir.path()).unwrap();
+    reader.incr(&h);
+    reader.persist().unwrap();
+
+    // GC (stale view: count 0) drops the entry; the merge must not discard the
+    // reader's live count.
+    gc.remove(&h);
+    gc.persist().unwrap();
+    assert_eq!(sidecar_count(dir.path(), &h), 1);
+}

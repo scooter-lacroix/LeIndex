@@ -1076,12 +1076,14 @@ fn compute_cas_bytes(store: &CasStore) -> u64 {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name == "refs.json" || name == ".staging" {
+            if name == ".staging"
+                || crate::storage::cas::refs::REFS_AUX_FILES.contains(&name.as_ref())
+            {
                 continue;
             }
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
                 total += dir_total_bytes(&entry.path());
-            } else if entry.file_type().is_ok_and(|t| t.is_file()) && name != "refs.json" {
+            } else if entry.file_type().is_ok_and(|t| t.is_file()) {
                 if let Ok(meta) = entry.metadata() {
                     total += meta.len();
                 }

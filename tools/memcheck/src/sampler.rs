@@ -420,6 +420,31 @@ pub struct DescendantTree {
 
 use std::collections::HashMap;
 
+/// System page size in KiB (`/proc/<pid>/stat` reports RSS in pages).
+fn page_size_kib() -> u64 {
+    // SAFETY: `sysconf` has no preconditions and touches no Rust state.
+    let bytes = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if bytes > 0 { (bytes as u64) / 1024 } else { 4 }
+}
+
+/// Parse one `/proc/<pid>/stat` line into `(ppid, comm, rss_kib)`.
+///
+/// `comm` may itself contain spaces and parentheses, so everything is located
+/// relative to the *last* `)`. The fields after it start at field 3 (`state`);
+/// `rss` is field 24 — index 21 of that remainder — and is counted in pages.
+fn parse_proc_stat(content: &str, page_kib: u64) -> Option<(u32, String, u64)> {
+    let close_paren = content.rfind(')')?;
+    let comm = content[..close_paren]
+        .split_once('(')
+        .map(|(_, name)| name.to_string())
+        .unwrap_or_default();
+    // fields[0] = state (field 3), fields[1] = ppid (field 4), ..., fields[21] = rss (field 24).
+    let fields: Vec<&str> = content[close_paren + 1..].split_whitespace().collect();
+    let ppid: u32 = fields.get(1)?.parse().ok()?;
+    let rss_pages: u64 = fields.get(21).and_then(|s| s.parse().ok()).unwrap_or(0);
+    Some((ppid, comm, rss_pages * page_kib))
+}
+
 /// Count all descendant processes of `root_pid` via BFS over `/proc/*/stat`.
 ///
 /// Walks the process tree starting from `root_pid`, visiting every process
@@ -430,6 +455,7 @@ use std::collections::HashMap;
 pub fn count_descendants(root_pid: u32) -> std::io::Result<DescendantTree> {
     // Build a map of pid → (ppid, name, rss_kib) for all live processes.
     let mut all_procs: Vec<(u32, u32, String, u64)> = Vec::new();
+    let page_kib = page_size_kib();
     let proc_dir = std::fs::read_dir("/proc")?;
     for entry in proc_dir.flatten() {
         let name = entry.file_name();
@@ -441,30 +467,14 @@ pub fn count_descendants(root_pid: u32) -> std::io::Result<DescendantTree> {
             Ok(p) => p,
             Err(_) => continue,
         };
-        // Read ppid and name from /proc/<pid>/stat
+        // Read ppid, name and RSS from /proc/<pid>/stat
         let stat_path = format!("/proc/{}/stat", pid);
         let Ok(content) = std::fs::read_to_string(&stat_path) else {
             continue;
         };
-        let Some(close_paren) = content.rfind(')') else {
+        let Some((ppid, comm, rss_kib)) = parse_proc_stat(&content, page_kib) else {
             continue;
         };
-        let comm_raw = &content[..close_paren];
-        // Extract comm between first '(' and last ')'
-        let comm = comm_raw
-            .split_once('(')
-            .map(|(_, name)| name.to_string())
-            .unwrap_or_default();
-        let rest = &content[close_paren + 1..];
-        let mut fields = rest.split_whitespace();
-        fields.next(); // state
-        let ppid: u32 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        // RSS is field 24 in /proc/<pid>/stat
-        let rss_kib: u64 = fields
-            .nth(21) // field 24 (0-indexed: state=1, ppid=2, ..., rss=24 -> skip 4-23 = 20 fields, then next is 24)
-            .unwrap_or("0")
-            .parse()
-            .unwrap_or(0);
         all_procs.push((pid, ppid, comm, rss_kib));
     }
 
@@ -672,6 +682,30 @@ mod tests {
             tree.total,
             tree.by_name
         );
+    }
+
+    #[test]
+    fn test_parse_proc_stat_reads_rss_field_in_kib() {
+        // Field 24 (rss) = 777 pages; field 26 (startcode) is a large address
+        // that the old off-by-two index returned instead. comm contains a
+        // space and parentheses to prove parsing anchors on the last ')'.
+        let line = "4242 (my (odd) proc) S 100 4242 4242 0 -1 4194560 \
+            1 2 3 4 5 6 7 8 20 0 1 0 999 1000000 777 18446744073709551615 \
+            4194304 4198400 140730000000000 0 0 0 0 0 0 0 0 0 17 0 0 0 0";
+        let (ppid, comm, rss_kib) = parse_proc_stat(line, 4).unwrap();
+        assert_eq!(ppid, 100);
+        assert_eq!(comm, "my (odd) proc");
+        assert_eq!(
+            rss_kib,
+            777 * 4,
+            "rss must be field 24, scaled pages -> KiB"
+        );
+    }
+
+    #[test]
+    fn test_parse_proc_stat_rejects_truncated_line() {
+        assert!(parse_proc_stat("1 (x)", 4).is_none());
+        assert!(parse_proc_stat("garbage", 4).is_none());
     }
 
     #[test]
