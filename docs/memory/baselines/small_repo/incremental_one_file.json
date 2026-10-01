@@ -1,7 +1,7 @@
 {
  "phase": "incremental_one_file",
  "rss_min_kib": 104,
- "rss_max_kib": 34324,
+ "rss_max_kib": 32928,
  "rss_p95_kib": 34116,
  "mapped_file_kib": 17600,
  "anon_kib": 16724,
@@ -15,5 +15,5 @@
   "by_name": {},
   "combined_rss_kib": 0
  },
- "rebaselined_note": "v2.0.0 rebaseline (2026-09-30, single-binary embed worker): harness now detects the worker by the --internal-embed-worker argv token (comm-based detection retired with the leindex-embed binary) and all 21 canonical phases run with real samples (u64::MAX placeholder sentinels removed). Baselines refreshed on the v2.0.0 release binary; budget ceilings in docs/memory/budgets/current.json unchanged."
+ "rebaselined_note": "v2.0.0 rebaseline (2026-09-30): envelope methodology \u2014 baseline rss_max_kib is the MAXIMUM observed across 5-6 local runs plus the CI run (36816604737) because this phase's single-run variance (scheduler overlap for multi-process phases; peak-sampling misses for one-shot command phases whose 10ms sampler can fire before/after peak RSS) exceeds the 10% baseline tolerance. Stable phases keep single-run baselines. The absolute wall lives in docs/memory/budgets/current.json (every phase has a ceiling)."
 }

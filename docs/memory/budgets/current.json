@@ -65,6 +65,51 @@
    "rss_max_kib": 102400,
    "description": "T8 step-3: RSS of the `leindex cleanup --stale-daemons` sweep command against seeded dead-pid sidecars (100 MiB ceiling; measured value is a few MB). Removal of every seeded sidecar is asserted in-phase and in harness_integration.rs::test_stale_artifacts_phase_removes_dead_sidecars.",
    "combined_rss_max_kib": null
+  },
+  "contention_3c_2p": {
+   "rss_max_kib": 102400,
+   "description": "§14 Baseline Protocol: combined RSS of 3 MCP clients over 2 projects. Ceiling = 10x the single-idle-server 100 MiB wall — this is a multi-process aggregate, and its single-run variance is scheduler-bound (observed 23-34 MiB across environments); the regression signal is the phase baseline, not this wall.",
+   "combined_rss_max_kib": null
+  },
+  "incremental_noop": {
+   "rss_max_kib": 102400,
+   "description": "§14: `leindex index` with no file changes (fast no-op path). Same 100 MiB command wall; measured value is a few hundred KiB on fast machines.",
+   "combined_rss_max_kib": null
+  },
+  "incremental_one_file": {
+   "rss_max_kib": 307200,
+   "description": "§14: add 1 source file then re-index. Full indexing command; same 300 MiB wall as `index`.",
+   "combined_rss_max_kib": null
+  },
+  "incremental_burst": {
+   "rss_max_kib": 307200,
+   "description": "§14: add 10 files at once then re-index. Full indexing command; same 300 MiB wall as `index`.",
+   "combined_rss_max_kib": null
+  },
+  "incremental_delete": {
+   "rss_max_kib": 307200,
+   "description": "§14: remove a file then re-index. Full indexing command; same 300 MiB wall as `index`.",
+   "combined_rss_max_kib": null
+  },
+  "query_suite_cold": {
+   "rss_max_kib": 184320,
+   "description": "§14: fixed query suite, cache cold. Same 180 MiB wall as `query`.",
+   "combined_rss_max_kib": null
+  },
+  "query_suite_warm": {
+   "rss_max_kib": 184320,
+   "description": "§14: fixed query suite, cache warm. Same 180 MiB wall as `query`.",
+   "combined_rss_max_kib": null
+  },
+  "full_index_run2": {
+   "rss_max_kib": 307200,
+   "description": "§14: second full index run (3x RSS stability check). Same 300 MiB wall as `index`.",
+   "combined_rss_max_kib": null
+  },
+  "full_index_run3": {
+   "rss_max_kib": 307200,
+   "description": "§14: third full index run (3x RSS stability check). Same 300 MiB wall as `index`.",
+   "combined_rss_max_kib": null
   }
  }
 }

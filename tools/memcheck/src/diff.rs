@@ -239,9 +239,15 @@ pub fn format_diff(diff: &DiffResult) -> String {
     let mut lines = Vec::new();
 
     lines.push("═══ Memcheck Phase Diff ═══".to_string());
+    let rules = diff_phases_rules(diff);
     lines.push(format!(
         "{:<15} {:>12} {:>12} {:>12} {:>12} {:>8}",
-        "Phase", "Main RSS", "Baseline+5%", "Ceiling+10%", "Combined", "Status"
+        "Phase",
+        "Main RSS",
+        format!("Baseline+{}%", rules.baseline_tolerance_pct),
+        format!("Ceiling+{}%", rules.ceiling_tolerance_pct),
+        "Combined",
+        "Status"
     ));
     lines.push("─".repeat(80));
 
