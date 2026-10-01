@@ -155,6 +155,12 @@ impl RemoteEmbeddingConfig {
 }
 
 /// Trait for remote embedding providers
+// `async_trait` (0.1.91) unconditionally stamps a bare `#[must_use]` on every
+// generated trait method whose return type is `Pin<Box<dyn Future>>`, which is
+// already `#[must_use]`; clippy 1.99's `double_must_use` flags that expansion.
+// The duplicate is emitted by the macro, not by this declaration, so it is
+// allowed here at the single trait that triggers it.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait RemoteEmbeddingProvider: Send + Sync {
     /// Generate embeddings for a single text

@@ -35,6 +35,28 @@ use crate::embed::runtime::{RuntimeConfig, WorkerRuntime, low_memory_refusal};
 /// against pathological bursts, not a throughput limiter.
 const MAX_SOCKET_CLIENT_THREADS: usize = 16;
 
+/// Atomically claims one client slot if fewer than `max` are in use.
+///
+/// A compare-exchange loop rather than `fetch_update`/`try_update`: the former
+/// is deprecated on current toolchains and the latter post-dates our MSRV.
+fn try_acquire_client_slot(active: &AtomicUsize, max: usize) -> bool {
+    let mut current = active.load(Ordering::Relaxed);
+    loop {
+        if current >= max {
+            return false;
+        }
+        match active.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// Configured socket-client concurrency cap, from
 /// `LEINDEX_WORKER_MAX_SOCKET_CLIENTS` (default [`MAX_SOCKET_CLIENT_THREADS`]).
 fn max_socket_clients() -> usize {
@@ -402,12 +424,7 @@ fn run_socket_accept_loop(
                 }
                 // Bound concurrency: when every slot is in use, drop the excess
                 // connection — the daemon's client observes EOF and re-requests.
-                if active_clients
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                        (n < max_clients).then_some(n + 1)
-                    })
-                    .is_err()
-                {
+                if !try_acquire_client_slot(&active_clients, max_clients) {
                     tracing::warn!(
                         max_clients,
                         "worker socket client concurrency cap reached; dropping connection"
