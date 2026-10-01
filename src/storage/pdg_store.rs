@@ -370,24 +370,7 @@ fn save_nodes(
     // db id and issues no write (C1). A legacy row whose content_hash was
     // computed as blake3(node_id) under the old scheme reads as changed once
     // and is rewritten under the new scheme on the first save.
-    let mut existing: HashMap<String, (i64, String, bool)> = HashMap::new();
-    {
-        let mut stmt = tx.prepare(
-            "SELECT id, node_id, content_hash, precision FROM intel_nodes WHERE project_id = ?1",
-        )?;
-        let rows = stmt.query_map(params![project_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i32>(3)? != 0,
-            ))
-        })?;
-        for row in rows {
-            let (db_id, node_id, content_hash, precision) = row?;
-            existing.insert(node_id, (db_id, content_hash, precision));
-        }
-    }
+    let existing = load_existing_nodes(tx, project_id)?;
 
     let node_indices: Vec<NodeId> = pdg.node_indices().collect();
     let mut node_id_map =
@@ -475,115 +458,151 @@ fn save_nodes(
     // by the Rust-side content_hash comparison above, so the guard was both
     // redundant and harmful; it is removed here.
     for chunk in to_upsert.chunks(PDG_INSERT_BATCH_SIZE) {
-        let n = chunk.len();
-
-        // Each row carries its own set of 17 anonymous `?` placeholders, bound
-        // positionally so they align with `params` below.
-        let values_clause = (0..n)
-            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO intel_nodes \
-             (project_id, file_path, node_id, symbol_name, qualified_name, \
-              language, node_type, signature, complexity, content_hash, embedding, \
-              byte_range_start, byte_range_end, created_at, updated_at, embedding_format, precision) \
-             VALUES {values_clause} \
-             ON CONFLICT(project_id, node_id) DO UPDATE SET \
-               file_path = excluded.file_path, \
-               symbol_name = excluded.symbol_name, \
-               qualified_name = excluded.qualified_name, \
-               language = excluded.language, \
-               node_type = excluded.node_type, \
-               signature = excluded.signature, \
-               complexity = excluded.complexity, \
-               content_hash = excluded.content_hash, \
-               embedding = excluded.embedding, \
-               byte_range_start = excluded.byte_range_start, \
-               byte_range_end = excluded.byte_range_end, \
-               embedding_format = excluded.embedding_format, \
-               precision = excluded.precision, \
-               updated_at = excluded.updated_at \
-             RETURNING id"
-        );
-
-        let now = chrono::Utc::now().timestamp();
-        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(n * 17);
-        for (_, record) in chunk {
-            params.push(record.project_id.clone().into());
-            params.push(record.file_path.clone().into());
-            params.push(record.node_id.clone().into());
-            params.push(record.symbol_name.clone().into());
-            params.push(record.qualified_name.clone().into());
-            params.push(record.language.clone().into());
-            params.push(record.node_type.as_str().to_string().into());
-            params.push(
-                record
-                    .signature
-                    .clone()
-                    .map(Value::Text)
-                    .unwrap_or(Value::Null),
-            );
-            params.push(
-                record
-                    .complexity
-                    .map(|c| Value::Integer(c.into()))
-                    .unwrap_or(Value::Null),
-            );
-            params.push(record.content_hash.clone().into());
-            params.push(
-                record
-                    .embedding
-                    .clone()
-                    .map(Value::Blob)
-                    .unwrap_or(Value::Null),
-            );
-            params.push(
-                record
-                    .byte_range_start
-                    .map(Value::Integer)
-                    .unwrap_or(Value::Null),
-            );
-            params.push(
-                record
-                    .byte_range_end
-                    .map(Value::Integer)
-                    .unwrap_or(Value::Null),
-            );
-            params.push(Value::Integer(now));
-            params.push(Value::Integer(now));
-            params.push(
-                record
-                    .embedding_format
-                    .map(|f| Value::Integer(f.into()))
-                    .unwrap_or(Value::Null),
-            );
-            params.push(Value::Integer(record.precision as i64));
-        }
-
-        let mut stmt = tx.prepare(&sql)?;
-        let ids: Vec<i64> = stmt
-            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                row.get::<_, i64>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        // The statement now returns exactly one row per tuple. If this ever
-        // regresses (e.g. a future conditional guard), fail loudly rather than
-        // silently dropping nodes from the map and corrupting edge references.
-        if ids.len() != chunk.len() {
-            return Err(PdgStoreError::Serialization(format!(
-                "node upsert returned {} ids for {} tuples; refusing to save a partial node map",
-                ids.len(),
-                chunk.len(),
-            )));
-        }
-        for (&(pos, _), db_id) in chunk.iter().zip(ids) {
-            node_id_map.insert(node_indices[pos], db_id);
-        }
+        upsert_node_chunk(tx, chunk, &node_indices, &mut node_id_map)?;
     }
 
     let project_rows: RowIdSet = existing.values().map(|(db_id, _, _)| *db_id).collect();
     Ok((node_id_map, stale_node_ids, project_rows))
+}
+
+/// Existing rows of a project keyed by node id: `(db id, content hash, precision)`.
+///
+/// Lets an unchanged node reuse its db id and issue no write (C1). A legacy row
+/// whose content_hash was computed as blake3(node_id) under the old scheme
+/// reads as changed once and is rewritten under the new scheme on the first
+/// save.
+fn load_existing_nodes(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &str,
+) -> Result<HashMap<String, (i64, String, bool)>> {
+    let mut existing: HashMap<String, (i64, String, bool)> = HashMap::new();
+    let mut stmt = tx.prepare(
+        "SELECT id, node_id, content_hash, precision FROM intel_nodes WHERE project_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![project_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i32>(3)? != 0,
+        ))
+    })?;
+    for row in rows {
+        let (db_id, node_id, content_hash, precision) = row?;
+        existing.insert(node_id, (db_id, content_hash, precision));
+    }
+    Ok(existing)
+}
+
+/// Bind parameters of one node row, in the column order of the upsert.
+fn node_row_params(record: &NodeRecord, now: i64) -> [Value; 17] {
+    [
+        record.project_id.clone().into(),
+        record.file_path.clone().into(),
+        record.node_id.clone().into(),
+        record.symbol_name.clone().into(),
+        record.qualified_name.clone().into(),
+        record.language.clone().into(),
+        record.node_type.as_str().to_string().into(),
+        record
+            .signature
+            .clone()
+            .map(Value::Text)
+            .unwrap_or(Value::Null),
+        record
+            .complexity
+            .map(|c| Value::Integer(c.into()))
+            .unwrap_or(Value::Null),
+        record.content_hash.clone().into(),
+        record
+            .embedding
+            .clone()
+            .map(Value::Blob)
+            .unwrap_or(Value::Null),
+        record
+            .byte_range_start
+            .map(Value::Integer)
+            .unwrap_or(Value::Null),
+        record
+            .byte_range_end
+            .map(Value::Integer)
+            .unwrap_or(Value::Null),
+        Value::Integer(now),
+        Value::Integer(now),
+        record
+            .embedding_format
+            .map(|f| Value::Integer(f.into()))
+            .unwrap_or(Value::Null),
+        Value::Integer(record.precision as i64),
+    ]
+}
+
+/// Upsert one batch of changed nodes and record the returned db ids in
+/// `node_id_map` (see the `RETURNING` ordering note in [`save_nodes`]).
+fn upsert_node_chunk(
+    tx: &rusqlite::Transaction<'_>,
+    chunk: &[(usize, NodeRecord)],
+    node_indices: &[NodeId],
+    node_id_map: &mut NodeRowMap,
+) -> Result<()> {
+    let n = chunk.len();
+
+    // Each row carries its own set of 17 anonymous `?` placeholders, bound
+    // positionally so they align with `params` below.
+    let values_clause = (0..n)
+        .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "INSERT INTO intel_nodes \
+         (project_id, file_path, node_id, symbol_name, qualified_name, \
+          language, node_type, signature, complexity, content_hash, embedding, \
+          byte_range_start, byte_range_end, created_at, updated_at, embedding_format, precision) \
+         VALUES {values_clause} \
+         ON CONFLICT(project_id, node_id) DO UPDATE SET \
+           file_path = excluded.file_path, \
+           symbol_name = excluded.symbol_name, \
+           qualified_name = excluded.qualified_name, \
+           language = excluded.language, \
+           node_type = excluded.node_type, \
+           signature = excluded.signature, \
+           complexity = excluded.complexity, \
+           content_hash = excluded.content_hash, \
+           embedding = excluded.embedding, \
+           byte_range_start = excluded.byte_range_start, \
+           byte_range_end = excluded.byte_range_end, \
+           embedding_format = excluded.embedding_format, \
+           precision = excluded.precision, \
+           updated_at = excluded.updated_at \
+         RETURNING id"
+    );
+
+    let now = chrono::Utc::now().timestamp();
+    let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(n * 17);
+    for (_, record) in chunk {
+        params.extend(node_row_params(record, now));
+    }
+
+    let mut stmt = tx.prepare(&sql)?;
+    let ids: Vec<i64> = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            row.get::<_, i64>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // The statement now returns exactly one row per tuple. If this ever
+    // regresses (e.g. a future conditional guard), fail loudly rather than
+    // silently dropping nodes from the map and corrupting edge references.
+    if ids.len() != chunk.len() {
+        return Err(PdgStoreError::Serialization(format!(
+            "node upsert returned {} ids for {} tuples; refusing to save a partial node map",
+            ids.len(),
+            chunk.len(),
+        )));
+    }
+    for (&(pos, _), db_id) in chunk.iter().zip(ids) {
+        node_id_map.insert(node_indices[pos], db_id);
+    }
+    Ok(())
 }
 
 /// Persisted-row identity of an edge: the `intel_edges` primary key.
@@ -617,93 +636,8 @@ fn save_edges(
     node_id_map: &NodeRowMap,
     pdg: &ProgramDependenceGraph,
 ) -> Result<EdgeSaveStats> {
-    // Existing rows for the project: one sequential read (no WAL growth)
-    // instead of a full-table rewrite. NULL metadata (legacy rows) reads as
-    // the empty string, which never equals serialized JSON, so such rows are
-    // rewritten once and converge.
-    let mut existing = EdgeMap::default();
-    // Rows whose type this build does not know: never desired, so always stale.
-    let mut unknown_type: Vec<(i64, i64, String)> = Vec::new();
-    {
-        // A sequential scan of the table with an in-memory membership test is
-        // ~4x faster than the equivalent `caller_id IN (SELECT ...)` semi-join,
-        // which probed the primary-key index once per node.
-        let mut stmt =
-            tx.prepare("SELECT caller_id, callee_id, edge_type, metadata FROM intel_edges")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let caller: i64 = row.get(0)?;
-            if !project_rows.contains(&caller) {
-                continue;
-            }
-            let callee: i64 = row.get(1)?;
-            let edge_type = row
-                .get_ref(2)?
-                .as_str()
-                .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
-            let metadata: EdgeMeta = match row.get_ref(3)? {
-                rusqlite::types::ValueRef::Text(bytes) if bytes == EMPTY_EDGE_METADATA_JSON => None,
-                rusqlite::types::ValueRef::Text(bytes) => {
-                    Some(String::from_utf8_lossy(bytes).into_owned())
-                }
-                // NULL (legacy rows) reads as a value that never equals real
-                // JSON, so such rows are rewritten once and converge.
-                _ => Some(String::new()),
-            };
-            match StorageEdgeType::from_str_name(edge_type) {
-                Some(kind) => {
-                    existing.insert((caller, callee, kind.as_str()), metadata);
-                }
-                None => unknown_type.push((caller, callee, edge_type.to_string())),
-            }
-        }
-    }
-
-    let mut desired = EdgeMap::with_capacity_and_hasher(pdg.edge_count(), Default::default());
-    for edge_idx in pdg.edge_indices() {
-        let (source, target) = pdg
-            .edge_endpoints(edge_idx)
-            .ok_or_else(|| PdgStoreError::Serialization("Edge has no endpoints".to_string()))?;
-        let pdg_edge = pdg
-            .get_edge(edge_idx)
-            .ok_or_else(|| PdgStoreError::Serialization("Missing edge data".to_string()))?;
-        let caller_id =
-            *node_id_map
-                .get(&source)
-                .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
-                    caller: source.index() as i64,
-                    callee: target.index() as i64,
-                })?;
-        let callee_id =
-            *node_id_map
-                .get(&target)
-                .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
-                    caller: source.index() as i64,
-                    callee: target.index() as i64,
-                })?;
-        let metadata = convert_edge_metadata(&pdg_edge.metadata);
-        let metadata_json: EdgeMeta = if metadata.call_count.is_none()
-            && metadata.variable_name.is_none()
-            && metadata.confidence.is_none()
-            && metadata.channel.is_none()
-            && metadata.position.is_none()
-        {
-            None
-        } else {
-            Some(
-                serde_json::to_string(&metadata)
-                    .map_err(|e| PdgStoreError::Serialization(e.to_string()))?,
-            )
-        };
-        desired.insert(
-            (
-                caller_id,
-                callee_id,
-                convert_edge_type(&pdg_edge.edge_type).as_str(),
-            ),
-            metadata_json,
-        );
-    }
+    let (existing, unknown_type) = load_existing_edges(tx, project_rows)?;
+    let desired = build_desired_edges(pdg, node_id_map)?;
 
     // Stale = persisted rows absent from the desired set (includes every edge
     // of a removed node, since those keys cannot be produced from the current
@@ -723,40 +657,7 @@ fn save_edges(
     // every desired edge becomes a fresh insert — i.e. the old full-rebuild
     // path. Otherwise delete exactly the stale rows via their primary key.
     let bulk = existing_total >= 64 && stale.len() * 2 > existing_total;
-    if stale.is_empty() {
-        // Nothing to delete.
-    } else if bulk {
-        tx.execute(
-            "DELETE FROM intel_edges WHERE caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1)",
-            params![project_id],
-        )?;
-        stats.deleted = stale.len();
-    } else {
-        // Row-value IN over a VALUES table: flat (no expression-tree depth
-        // growth — a chain of ORs nests left-associatively and blows
-        // SQLITE_LIMIT_EXPR_DEPTH=1000 at ~1000 rows), and the planner can
-        // use the (caller_id, callee_id, edge_type) PK index for the probe.
-        // 3 bound params per row; 1000 rows = 3000 params, well under
-        // SQLITE_MAX_VARIABLE_NUMBER (32766).
-        const EDGE_DELETE_CHUNK: usize = 1000;
-        for chunk in stale.chunks(EDGE_DELETE_CHUNK) {
-            let values = (0..chunk.len())
-                .map(|_| "(?,?,?)")
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "DELETE FROM intel_edges WHERE (caller_id, callee_id, edge_type) IN (VALUES {values})"
-            );
-            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 3);
-            for (caller, callee, edge_type) in chunk {
-                params.push(Value::Integer(*caller));
-                params.push(Value::Integer(*callee));
-                params.push(Value::Text(edge_type.clone()));
-            }
-            tx.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
-            stats.deleted += chunk.len();
-        }
-    }
+    delete_stale_edges(tx, project_id, &stale, bulk, &mut stats)?;
 
     // After a bulk delete every desired edge is a fresh insert; otherwise only
     // new rows and rows whose metadata JSON changed are written (the upsert's
@@ -768,8 +669,161 @@ fn save_edges(
             to_write.push((key.0, key.1, key.2, metadata));
         }
     }
+    insert_edges(tx, &to_write, &mut stats)?;
 
-    // Batch inserts into multi-row statements, mirroring the node batching.
+    Ok(stats)
+}
+
+/// Rows already stored for the project, plus rows whose edge type this build
+/// does not know (never desired, so always stale).
+///
+/// One sequential read (no WAL growth) instead of a full-table rewrite. NULL
+/// metadata (legacy rows) reads as the empty string, which never equals
+/// serialized JSON, so such rows are rewritten once and converge.
+fn load_existing_edges(
+    tx: &rusqlite::Transaction<'_>,
+    project_rows: &RowIdSet,
+) -> Result<(EdgeMap, Vec<(i64, i64, String)>)> {
+    let mut existing = EdgeMap::default();
+    let mut unknown_type: Vec<(i64, i64, String)> = Vec::new();
+    // A sequential scan of the table with an in-memory membership test is
+    // ~4x faster than the equivalent `caller_id IN (SELECT ...)` semi-join,
+    // which probed the primary-key index once per node.
+    let mut stmt =
+        tx.prepare("SELECT caller_id, callee_id, edge_type, metadata FROM intel_edges")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let caller: i64 = row.get(0)?;
+        if !project_rows.contains(&caller) {
+            continue;
+        }
+        let callee: i64 = row.get(1)?;
+        let edge_type = row
+            .get_ref(2)?
+            .as_str()
+            .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
+        let metadata: EdgeMeta = match row.get_ref(3)? {
+            rusqlite::types::ValueRef::Text(bytes) if bytes == EMPTY_EDGE_METADATA_JSON => None,
+            rusqlite::types::ValueRef::Text(bytes) => {
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            }
+            // NULL (legacy rows) reads as a value that never equals real
+            // JSON, so such rows are rewritten once and converge.
+            _ => Some(String::new()),
+        };
+        match StorageEdgeType::from_str_name(edge_type) {
+            Some(kind) => {
+                existing.insert((caller, callee, kind.as_str()), metadata);
+            }
+            None => unknown_type.push((caller, callee, edge_type.to_string())),
+        }
+    }
+    Ok((existing, unknown_type))
+}
+
+/// Serialized metadata of an edge, or `None` for the all-null literal.
+fn edge_metadata_json(pdg_edge: &PDGEdge) -> Result<EdgeMeta> {
+    let metadata = convert_edge_metadata(&pdg_edge.metadata);
+    let all_null = metadata.call_count.is_none()
+        && metadata.variable_name.is_none()
+        && metadata.confidence.is_none()
+        && metadata.channel.is_none()
+        && metadata.position.is_none();
+    if all_null {
+        return Ok(None);
+    }
+    serde_json::to_string(&metadata)
+        .map(Some)
+        .map_err(|e| PdgStoreError::Serialization(e.to_string()))
+}
+
+/// The edge set the graph currently holds, keyed like the stored rows.
+/// Duplicate parallel edges with the same key collapse last-wins.
+fn build_desired_edges(pdg: &ProgramDependenceGraph, node_id_map: &NodeRowMap) -> Result<EdgeMap> {
+    let mut desired = EdgeMap::with_capacity_and_hasher(pdg.edge_count(), Default::default());
+    for edge_idx in pdg.edge_indices() {
+        let (source, target) = pdg
+            .edge_endpoints(edge_idx)
+            .ok_or_else(|| PdgStoreError::Serialization("Edge has no endpoints".to_string()))?;
+        let pdg_edge = pdg
+            .get_edge(edge_idx)
+            .ok_or_else(|| PdgStoreError::Serialization("Missing edge data".to_string()))?;
+        let endpoint_row = |node| {
+            node_id_map
+                .get(&node)
+                .copied()
+                .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
+                    caller: source.index() as i64,
+                    callee: target.index() as i64,
+                })
+        };
+        let caller_id = endpoint_row(source)?;
+        let callee_id = endpoint_row(target)?;
+        desired.insert(
+            (
+                caller_id,
+                callee_id,
+                convert_edge_type(&pdg_edge.edge_type).as_str(),
+            ),
+            edge_metadata_json(pdg_edge)?,
+        );
+    }
+    Ok(desired)
+}
+
+/// Delete the stale rows: one subquery DELETE when `bulk`, otherwise exactly
+/// the stale rows via their primary key.
+fn delete_stale_edges(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &str,
+    stale: &[(i64, i64, String)],
+    bulk: bool,
+    stats: &mut EdgeSaveStats,
+) -> Result<()> {
+    if stale.is_empty() {
+        return Ok(());
+    }
+    if bulk {
+        tx.execute(
+            "DELETE FROM intel_edges WHERE caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1)",
+            params![project_id],
+        )?;
+        stats.deleted = stale.len();
+        return Ok(());
+    }
+    // Row-value IN over a VALUES table: flat (no expression-tree depth
+    // growth — a chain of ORs nests left-associatively and blows
+    // SQLITE_LIMIT_EXPR_DEPTH=1000 at ~1000 rows), and the planner can
+    // use the (caller_id, callee_id, edge_type) PK index for the probe.
+    // 3 bound params per row; 1000 rows = 3000 params, well under
+    // SQLITE_MAX_VARIABLE_NUMBER (32766).
+    const EDGE_DELETE_CHUNK: usize = 1000;
+    for chunk in stale.chunks(EDGE_DELETE_CHUNK) {
+        let values = (0..chunk.len())
+            .map(|_| "(?,?,?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "DELETE FROM intel_edges WHERE (caller_id, callee_id, edge_type) IN (VALUES {values})"
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 3);
+        for (caller, callee, edge_type) in chunk {
+            params.push(Value::Integer(*caller));
+            params.push(Value::Integer(*callee));
+            params.push(Value::Text(edge_type.clone()));
+        }
+        tx.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+        stats.deleted += chunk.len();
+    }
+    Ok(())
+}
+
+/// Batch inserts into multi-row statements, mirroring the node batching.
+fn insert_edges(
+    tx: &rusqlite::Transaction<'_>,
+    to_write: &[(i64, i64, &'static str, &EdgeMeta)],
+    stats: &mut EdgeSaveStats,
+) -> Result<()> {
     for chunk in to_write.chunks(PDG_INSERT_BATCH_SIZE) {
         let n = chunk.len();
         let values_clause = (0..n).map(|_| "(?,?,?,?)").collect::<Vec<_>>().join(", ");
@@ -793,8 +847,7 @@ fn save_edges(
         tx.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         stats.written += n;
     }
-
-    Ok(stats)
+    Ok(())
 }
 
 /// Save trigram index within an existing transaction.
@@ -937,59 +990,15 @@ fn load_nodes(
     let mut rows = nodes_stmt.query(params![project_id])?;
     // Pre-size every per-node map: rehash-and-grow while streaming ~30k rows
     // showed up in hydration profiles.
-    let node_count: usize = storage
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) FROM intel_nodes WHERE project_id = ?1",
-            params![project_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|count| count.max(0) as usize)
-        .unwrap_or(0);
+    let node_count = count_project_nodes(storage, project_id);
     let mut db_id_to_node_id = RowIdMap::with_capacity_and_hasher(node_count, Default::default());
     pdg.reserve_nodes(node_count);
     // One `Arc<str>` per file, shared by all of its nodes.
     let mut files: crate::fast_hash::FastMap<String, Arc<str>> = Default::default();
 
     while let Some(row) = rows.next()? {
-        let db_id: i64 = row.get(0)?;
-        let file_path = row
-            .get_ref(1)?
-            .as_str()
-            .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
-        let node_type_str = row
-            .get_ref(5)?
-            .as_str()
-            .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
-        let node_type = StorageNodeType::from_str_name(node_type_str).ok_or_else(|| {
-            PdgStoreError::Deserialization(format!("Invalid node type: {}", node_type_str))
-        })?;
-        let file_path: Arc<str> = match files.get(file_path) {
-            Some(shared) => Arc::clone(shared),
-            None => {
-                let shared: Arc<str> = Arc::from(file_path);
-                files.insert(file_path.to_string(), Arc::clone(&shared));
-                shared
-            }
-        };
-        let start: Option<i64> = row.get(7)?;
-        let end: Option<i64> = row.get(8)?;
-        let complexity: Option<i32> = row.get(6)?;
-        let precision: i32 = row.get(9)?;
-        let pdg_node = PDGNode {
-            id: row.get(2)?,
-            node_type: convert_storage_node_type(&node_type),
-            name: row.get(3)?,
-            file_path,
-            byte_range: (start.unwrap_or(0) as usize, end.unwrap_or(0) as usize),
-            complexity: complexity.unwrap_or(0) as u32,
-            language: row.get(4)?,
-        };
-        let stable_id = if precision != 0 {
-            Some(pdg_node.id.clone())
-        } else {
-            None
-        };
+        let (db_id, pdg_node, precision) = node_from_row(row, &mut files)?;
+        let stable_id = (precision != 0).then(|| pdg_node.id.clone());
         let node_id = pdg.add_node_without_trigrams(pdg_node);
         if let Some(stable_id) = stable_id {
             pdg.mark_precision_symbol(stable_id);
@@ -998,6 +1007,68 @@ fn load_nodes(
     }
 
     Ok(db_id_to_node_id)
+}
+
+/// Number of node rows stored for the project (0 when the count is unavailable).
+fn count_project_nodes(storage: &Storage, project_id: &str) -> usize {
+    storage
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM intel_nodes WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as usize)
+        .unwrap_or(0)
+}
+
+/// One shared `Arc<str>` per distinct file path.
+fn shared_file_path(
+    files: &mut crate::fast_hash::FastMap<String, Arc<str>>,
+    path: &str,
+) -> Arc<str> {
+    match files.get(path) {
+        Some(shared) => Arc::clone(shared),
+        None => {
+            let shared: Arc<str> = Arc::from(path);
+            files.insert(path.to_string(), Arc::clone(&shared));
+            shared
+        }
+    }
+}
+
+/// Decode one `intel_nodes` row into `(db id, graph node, precision flag)`.
+fn node_from_row(
+    row: &rusqlite::Row<'_>,
+    files: &mut crate::fast_hash::FastMap<String, Arc<str>>,
+) -> Result<(i64, PDGNode, i32)> {
+    let db_id: i64 = row.get(0)?;
+    let file_path = row
+        .get_ref(1)?
+        .as_str()
+        .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
+    let node_type_str = row
+        .get_ref(5)?
+        .as_str()
+        .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
+    let node_type = StorageNodeType::from_str_name(node_type_str).ok_or_else(|| {
+        PdgStoreError::Deserialization(format!("Invalid node type: {}", node_type_str))
+    })?;
+    let file_path = shared_file_path(files, file_path);
+    let start: Option<i64> = row.get(7)?;
+    let end: Option<i64> = row.get(8)?;
+    let complexity: Option<i32> = row.get(6)?;
+    let precision: i32 = row.get(9)?;
+    let pdg_node = PDGNode {
+        id: row.get(2)?,
+        node_type: convert_storage_node_type(&node_type),
+        name: row.get(3)?,
+        file_path,
+        byte_range: (start.unwrap_or(0) as usize, end.unwrap_or(0) as usize),
+        complexity: complexity.unwrap_or(0) as u32,
+        language: row.get(4)?,
+    };
+    Ok((db_id, pdg_node, precision))
 }
 
 /// What an edge with no metadata serializes to (`StorageEdgeMetadata` with every
