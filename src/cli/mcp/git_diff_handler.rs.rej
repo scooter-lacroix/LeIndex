@@ -1,0 +1,32 @@
+diff a/src/cli/mcp/git_diff_handler.rs b/src/cli/mcp/git_diff_handler.rs	(rejected hunks)
+@@ -238,20 +238,25 @@ fn parse_hunks(patch: &str) -> BTreeMap<String, Vec<(usize, usize)>> {
+             };
+             if let (Ok(start), Ok(hit_count)) = (start, hit_count) {
+                 // A pure deletion (count 0) sits between lines: attribute it to
+-                // the line where the removal happened.
++                // the line where the removal happened. Saturating arithmetic:
++                // the counts come straight from (possibly crafted) patch text
++                // via a custom diff driver or textconv, and `start + count - 1`
++                // on usize::MAX overflowed — a panic in debug builds and a
++                // whole-file range in release.
+                 let start = start.max(1);
+                 let end = if hit_count == 0 {
+                     start
+                 } else {
+-                    start + hit_count - 1
++                    start.saturating_add(hit_count.saturating_sub(1))
+                 };
+                 hunks.entry(file.clone()).or_default().push((start, end));
+                 // Enter the hunk body with the remaining (non-context) side
+                 // counts so body lines cannot be parsed as headers. The -U0
+                 // form has no context lines; `count` lines are `-`, `hit_count`
+-                // are `+`.
+-                body_old = count;
+-                body_new = hit_count;
++                // are `+`. Bounded the same way so a crafted count cannot pin
++                // the parser inside a "body" forever.
++                body_old = count.min(u32::MAX as usize);
++                body_new = hit_count.min(u32::MAX as usize);
+             }
+         }
+     }

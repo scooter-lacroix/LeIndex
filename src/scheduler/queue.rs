@@ -345,35 +345,9 @@ impl<P: Send + Clone> DrrQueue<P> {
         let step = match entry.job.step(budget) {
             Ok(step) => step,
             Err(error) => {
-                // Defer-don't-error (anti-cheat §2.1 #10): a failed step is
-                // retried with exponential backoff, never silently dropped,
-                // and the error is surfaced. After MAX_CONSECUTIVE_FAILURES
-                // the job becomes terminally failed so it stops consuming
-                // the step budget and `is_done` unblocks pollers.
-                entry.consecutive_failures += 1;
-                let message = format!("{error:#}");
-                if entry.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    tracing::warn!(
-                        job = job_id,
-                        class = ?class,
-                        attempts = entry.consecutive_failures,
-                        "scheduler job failed terminally: {message}"
-                    );
-                    self.failures.insert(job_id, message);
-                    self.ager.note_served(class);
-                    return None;
+                if self.defer_failed_step(&mut entry, error) {
+                    self.queues.get_mut(&key)?.entries.push_back(entry);
                 }
-                let backoff =
-                    MAX_RETRY_BACKOFF_TICKS.min(1u64 << entry.consecutive_failures.min(7));
-                entry.retry_not_before_tick = self.tick_count + backoff;
-                tracing::debug!(
-                    job = job_id,
-                    class = ?class,
-                    attempt = entry.consecutive_failures,
-                    retry_in_ticks = backoff,
-                    "scheduler step failed; backing off: {message}"
-                );
-                self.queues.get_mut(&key)?.entries.push_back(entry);
                 return None;
             }
         };
@@ -417,6 +391,42 @@ impl<P: Send + Clone> DrrQueue<P> {
                 })
             }
         }
+    }
+
+    /// Defer-don't-error (anti-cheat §2.1 #10) handling for a failed step:
+    /// retry with exponential backoff, never silently drop, and surface the
+    /// error. After [`MAX_CONSECUTIVE_FAILURES`] the job becomes terminally
+    /// failed so it stops consuming the step budget and `is_done` unblocks
+    /// pollers.
+    ///
+    /// Returns whether the entry should be re-queued (at the back) for a
+    /// later retry; `false` means it failed terminally and is dropped.
+    fn defer_failed_step(&mut self, entry: &mut DrrEntry<P>, error: anyhow::Error) -> bool {
+        let job_id = entry.id;
+        let class = entry.key.class;
+        entry.consecutive_failures += 1;
+        let message = format!("{error:#}");
+        if entry.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            tracing::warn!(
+                job = job_id,
+                class = ?class,
+                attempts = entry.consecutive_failures,
+                "scheduler job failed terminally: {message}"
+            );
+            self.failures.insert(job_id, message);
+            self.ager.note_served(class);
+            return false;
+        }
+        let backoff = MAX_RETRY_BACKOFF_TICKS.min(1u64 << entry.consecutive_failures.min(7));
+        entry.retry_not_before_tick = self.tick_count + backoff;
+        tracing::debug!(
+            job = job_id,
+            class = ?class,
+            attempt = entry.consecutive_failures,
+            retry_in_ticks = backoff,
+            "scheduler step failed; backing off: {message}"
+        );
+        true
     }
 }
 

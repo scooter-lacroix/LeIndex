@@ -157,15 +157,22 @@ pub fn detect_communities(pdg: &ProgramDependenceGraph) -> (HashMap<NodeId, u32>
 }
 
 /// Human-scannable label for a community: the longest common directory
-/// prefix of its member files, falling back to the dominant file's parent.
+/// prefix of its member files, falling back to the alphabetically first
+/// member's stem.
+///
+/// The paths are sorted first: membership arrives in randomized HashMap
+/// iteration order, and the fallback used to take whichever file happened
+/// to be first — the same community persisted as `a` or `b` across
+/// otherwise identical runs.
 pub fn community_label(pdg: &ProgramDependenceGraph, members: &[NodeId]) -> String {
-    let paths: Vec<&str> = members
+    let mut paths: Vec<&str> = members
         .iter()
         .filter_map(|&node_id| pdg.get_node(node_id).map(|node| node.file_path.as_ref()))
         .collect();
     if paths.is_empty() {
         return "community".to_string();
     }
+    paths.sort_unstable();
     let first = paths[0];
     let mut prefix_len = first.rfind('/').map(|idx| idx + 1).unwrap_or(0);
     for path in &paths[1..] {
@@ -174,7 +181,15 @@ pub fn community_label(pdg: &ProgramDependenceGraph, members: &[NodeId]) -> Stri
             .zip(path.bytes())
             .take_while(|(a, b)| a == b)
             .count();
-        let bounded = common.min(prefix_len);
+        // The byte-wise common length can end in the MIDDLE of a multi-byte
+        // UTF-8 character (two distinct characters sharing a lead byte, e.g.
+        // `src/é/a.rs` and `src/ê/b.rs`): retreat to a character boundary
+        // before slicing, or `first[..bounded]` panics and takes the whole
+        // indexing run down with it.
+        let mut bounded = common.min(prefix_len);
+        while bounded > 0 && !first.is_char_boundary(bounded) {
+            bounded -= 1;
+        }
         // Snap to a directory boundary.
         prefix_len = first[..bounded].rfind('/').map(|idx| idx + 1).unwrap_or(0);
         if prefix_len == 0 {
@@ -184,7 +199,7 @@ pub fn community_label(pdg: &ProgramDependenceGraph, members: &[NodeId]) -> Stri
     if prefix_len > 0 {
         first[..prefix_len].trim_end_matches('/').to_string()
     } else {
-        // No shared prefix: name by the dominant file's stem.
+        // No shared prefix: name by the alphabetically first member's stem.
         first
             .rsplit('/')
             .next()
@@ -301,5 +316,42 @@ mod tests {
             .filter_map(|id| pdg.find_by_id(id))
             .collect();
         assert_eq!(community_label(&pdg, &members), "src/alpha");
+    }
+
+    #[test]
+    fn test_label_does_not_panic_on_partial_utf8_common_prefix() {
+        // é and ê share their UTF-8 lead byte, so the byte-wise common
+        // prefix ends mid-character: slicing there used to panic.
+        let mut pdg = ProgramDependenceGraph::new();
+        add_function(&mut pdg, "a", "src/\u{e9}/a.rs"); // src/é/a.rs
+        add_function(&mut pdg, "b", "src/\u{ea}/b.rs"); // src/ê/b.rs
+        let members: Vec<NodeId> = ["a", "b"]
+            .iter()
+            .filter_map(|id| pdg.find_by_id(id))
+            .collect();
+        let label = community_label(&pdg, &members);
+        assert_eq!(
+            label, "src",
+            "prefix retreats to the shared character boundary"
+        );
+    }
+
+    #[test]
+    fn test_label_fallback_is_order_independent() {
+        // No shared directory prefix: the label must not depend on the
+        // (randomized) membership iteration order.
+        let build = |members: Vec<&str>| -> String {
+            let mut pdg = ProgramDependenceGraph::new();
+            add_function(&mut pdg, "a", "src/a.rs");
+            add_function(&mut pdg, "b", "tests/b.rs");
+            let member_ids: Vec<NodeId> =
+                members.iter().filter_map(|id| pdg.find_by_id(id)).collect();
+            community_label(&pdg, &member_ids)
+        };
+        assert_eq!(
+            build(vec!["a", "b"]),
+            build(vec!["b", "a"]),
+            "identical communities must label identically across runs"
+        );
     }
 }

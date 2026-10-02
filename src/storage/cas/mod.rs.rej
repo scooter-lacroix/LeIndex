@@ -1,0 +1,35 @@
+diff a/src/storage/cas/mod.rs b/src/storage/cas/mod.rs	(rejected hunks)
+@@ -283,7 +283,7 @@ impl CasStore {
+ 
+         let mut reclaimed_bytes = 0u64;
+         let mut blobs_removed = 0usize;
+-        let removed = self.refs.collect_zero_refcount(&candidates, &mut |hash| {
++        let swept = self.refs.collect_zero_refcount(&candidates, &mut |hash| {
+             let path = self.blob_path(hash);
+             let size = match fs::metadata(&path) {
+                 Ok(meta) => meta.len(),
+@@ -298,7 +298,23 @@ impl CasStore {
+             reclaimed_bytes += size;
+             blobs_removed += 1;
+             Ok(())
+-        })?;
++        });
++        let removed = match swept {
++            Ok(removed) => removed,
++            Err(error) => {
++                // The sweep aborted part-way but the already-unlinked blobs
++                // are gone and their sidecar entries were persisted (see
++                // `collect_zero_refcount`). Surface the partial accounting
++                // before propagating so operators know what was reclaimed.
++                tracing::warn!(
++                    %error,
++                    blobs_removed,
++                    reclaimed_bytes,
++                    "GC sweep failed part-way; the already-swept blobs above were reclaimed"
++                );
++                return Err(error);
++            }
++        };
+         report.reclaimed_bytes += reclaimed_bytes;
+         report.blobs_removed += blobs_removed;
+         debug_assert_eq!(removed.len(), report.blobs_removed);

@@ -434,12 +434,18 @@ impl LeIndex {
         // process: if that process publishes a fresh index while we wait for
         // the lock, this run returns immediately instead of queueing a
         // redundant full index behind it.
+        self.last_index_coalesced = false;
         let Some(_write_lock) = self.acquire_write_lock_coalescing(force)? else {
             info!(
                 "Skipping index for {}: another process published a fresh index \
                  while this writer waited for the project write lock",
                 self.project_id
             );
+            // Flag it so the registry keeps the resident instance (which may
+            // hold a hydrated core this never-loaded temp lacks) and
+            // refreshes it from the peer's published generation instead of
+            // installing an un-hydrated replacement.
+            self.last_index_coalesced = true;
             return Ok(self.stats.clone());
         };
         let start_time = Instant::now();

@@ -734,6 +734,20 @@ fn scan_file(
     };
     let mut tallies: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
     let (mut line_no, mut counted_to, mut last_line_start) = (1u32, 0usize, usize::MAX);
+    // Collect enough hits per file to cover the requested global window:
+    // the per-file cap shapes a page, but it must not drop matches the
+    // window still needs. Capping collection at per_file_cap BEFORE the
+    // global offset/limit is applied stranded every match past the cap (a
+    // 30-match file with cap 20 returned 20 hits with has_more=false, and
+    // no later offset could reach the remaining 10).
+    let collect_bound = match (options.collect_hits, options.limit) {
+        (false, _) => 0,
+        (true, Some(limit)) => options
+            .offset
+            .saturating_add(limit)
+            .max(options.per_file_cap),
+        (true, None) => options.offset.saturating_add(options.per_file_cap),
+    };
     for found in compiled.regex.find_iter(&data) {
         let start = found.start();
         let line_start = memchr::memrchr(b'\n', &data[..start]).map_or(0, |p| p + 1);
@@ -751,8 +765,8 @@ fn scan_file(
         if let Some(symbol) = &symbol {
             *tallies.entry(symbol.clone()).or_default() += 1;
         }
-        let reportable = options.collect_hits
-            && (options.per_file_cap == 0 || result.hits.len() < options.per_file_cap);
+        let reportable =
+            options.collect_hits && (collect_bound == 0 || result.hits.len() < collect_bound);
         if !reportable {
             continue;
         }
@@ -1246,6 +1260,46 @@ mod tests {
         );
         assert_eq!(out.roots[0].files[0].hits.len(), 5);
         assert_eq!(out.roots[0].files[0].match_lines, 100);
+    }
+
+    #[test]
+    fn test_pagination_reaches_matches_beyond_the_per_file_cap() {
+        // A single file with more matches than per_file_cap: the old code
+        // capped collection BEFORE the global window, so the first page
+        // reported has_more=false and no later offset could reach the
+        // stranded matches.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "big.txt", &"needle\n".repeat(30));
+        let compiled = q("needle").compile().unwrap();
+
+        let first = search(
+            &[spec(dir.path(), None)],
+            &compiled,
+            &SearchOptions {
+                per_file_cap: 20,
+                limit: Some(10),
+                ..Default::default()
+            },
+        );
+        assert_eq!(first.returned, 10, "first page returns the window");
+        assert!(first.has_more);
+
+        let third = search(
+            &[spec(dir.path(), None)],
+            &compiled,
+            &SearchOptions {
+                per_file_cap: 20,
+                limit: Some(10),
+                offset: 20,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            third.returned, 10,
+            "offset 20 must still reach the matches past the per-file cap"
+        );
+        assert!(!third.has_more, "all 30 matches accounted for");
+        assert_eq!(third.roots[0].files[0].match_lines, 30);
     }
 
     #[test]

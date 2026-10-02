@@ -44,10 +44,9 @@ const ACK_WAIT: Duration = Duration::from_secs(3);
 /// startup-lock race (typically to the outgoing daemon's still-held lock
 /// during a replacement) exits immediately, and the connect loop must be
 /// able to try again instead of polling a socket that will never answer.
+/// The overall budget is the connect deadline, not an attempt count: a
+/// slow-to-bind daemon (cold cache, loaded host) gets the full window.
 const SPAWN_RETRY_COOLDOWN: Duration = Duration::from_secs(1);
-
-/// Maximum daemon spawn attempts before falling back to the inline server.
-const MAX_SPAWN_ATTEMPTS: usize = 3;
 
 /// Result of trying to serve this process through the daemon.
 #[derive(Debug)]
@@ -121,7 +120,6 @@ pub fn run(project: Option<PathBuf>) -> Outcome {
         .map(|path| path.to_string_lossy().into_owned());
 
     let mut replaced = false;
-    let mut spawn_attempts = 0usize;
     let mut next_spawn_allowed = Instant::now();
     let deadline = Instant::now() + SPAWN_WAIT + ACK_WAIT;
     loop {
@@ -146,31 +144,26 @@ pub fn run(project: Option<PathBuf>) -> Outcome {
                     // The replacement may lose the startup-lock race to the
                     // outgoing daemon's still-held lock and exit without
                     // ever binding; allow a fresh spawn attempt.
-                    spawn_attempts = 0;
                     next_spawn_allowed = Instant::now() + SPAWN_RETRY_COOLDOWN;
                     continue;
                 }
                 return Outcome::Done(forward(stream));
             }
             Err(error) => {
-                if Instant::now() >= deadline {
+                let now = Instant::now();
+                if now >= deadline {
                     return Outcome::Fallback(format!("daemon unavailable: {error}"));
                 }
-                // Spawn (and re-spawn after a failed attempt) with a
-                // cooldown: latching "spawned" on the fork alone never
-                // retried a daemon that died during startup, silently
-                // burning the whole wait budget and falling back inline.
-                if Instant::now() >= next_spawn_allowed {
-                    if spawn_attempts >= MAX_SPAWN_ATTEMPTS {
-                        return Outcome::Fallback(format!(
-                            "daemon did not come up after {spawn_attempts} attempts: {error}"
-                        ));
-                    }
+                // Spawn (and re-spawn) under the remaining deadline budget
+                // with a cooldown between forks: latching "spawned" on the
+                // fork alone never retried a daemon that died during
+                // startup, and a fixed attempt count gave up with most of
+                // the budget unspent — orphaning a slow-to-bind daemon that
+                // then raced the inline fallback to the same project. The
+                // deadline, not the attempt count, decides when to stop.
+                if now >= next_spawn_allowed {
                     match spawn_daemon(&socket) {
-                        Ok(()) => {
-                            spawn_attempts += 1;
-                            next_spawn_allowed = Instant::now() + SPAWN_RETRY_COOLDOWN;
-                        }
+                        Ok(()) => next_spawn_allowed = now + SPAWN_RETRY_COOLDOWN,
                         Err(reason) => return Outcome::Fallback(reason),
                     }
                 }
@@ -305,6 +298,11 @@ fn replace(stream: &UnixStream, socket: &Path, pid: u32) {
 }
 
 /// Whether `pid` really is the daemon on the other end of `stream`.
+///
+/// Verified with a kernel-provided peer credential where the platform has
+/// one (SO_PEERCRED on Linux, LOCAL_PEERCRED on macOS — both primary
+/// release targets), plus — where `/proc` exists — the target's executable
+/// must be `leindexd` (guards a pid recycled between ack and kill).
 fn pid_is_the_connected_daemon(stream: &UnixStream, pid: u32) -> bool {
     // 1. Kernel credential check: the peer that answered us must BE that pid
     //    (SO_PEERCRED; `UnixStream::peer_cred` is not stable in std yet).
@@ -332,6 +330,40 @@ fn pid_is_the_connected_daemon(stream: &UnixStream, pid: u32) -> bool {
             return false;
         }
     }
+    // macOS: LOCAL_PEERCRED's xucred carries the peer's uid (the libc crate
+    // does not yet mirror the kernel's pid extension, so pid-exact matching
+    // is not available there). Requiring the peer to run as OUR effective
+    // uid still ties the connection to this user — combined with the 0700
+    // run directory, no other account can be the listener — and a liveness
+    // probe guards a pid recycled between ack and kill. Without any check
+    // here, a stale daemon could never be replaced on a primary release
+    // platform and every session silently fell back to an inline server
+    // (the double-index-per-editor problem the shim exists to prevent).
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let mut cred: libc::xucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+        // SAFETY: `getsockopt` on a valid, owned fd with a correctly sized
+        // out-buffer; it writes only into `cred`. LOCAL_PEERCRED is a
+        // socket-level (SOL_LOCAL = 0) option on macOS.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                0,
+                libc::LOCAL_PEERCRED,
+                &mut cred as *mut libc::xucred as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 || cred.cr_uid != libc::geteuid() {
+            return false;
+        }
+        // SAFETY: signal 0 only probes for existence.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+            return false;
+        }
+    }
     // 2. The target must be running the leindexd binary (guards a pid
     //    recycled between ack and kill).
     #[cfg(target_os = "linux")]
@@ -339,22 +371,31 @@ fn pid_is_the_connected_daemon(stream: &UnixStream, pid: u32) -> bool {
         let exe = std::fs::read_link(format!("/proc/{pid}/exe"));
         match exe {
             Ok(path) => {
-                let is_leindexd = path
+                let mut name = path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name == "leindexd" || name.starts_with("leindexd"));
-                if !is_leindexd {
+                    .unwrap_or_default()
+                    .to_string();
+                // `cargo install` / rustup upgrade by renaming over the
+                // binary: the running daemon's /proc/<pid>/exe then reads
+                // "leindexd (deleted)". Strip that suffix, and require an
+                // exact match — a `starts_with` prefix also accepted
+                // unrelated executables like "leindexd-malware".
+                if let Some(stripped) = name.strip_suffix(" (deleted)") {
+                    name = stripped.to_string();
+                }
+                if name != "leindexd" {
                     return false;
                 }
             }
             Err(_) => return false,
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        // No portable peer-credential or /proc probe on this platform: the
-        // pid cannot be verified, so never signal it (the connect deadline
-        // in the caller falls back to the inline server instead).
+        // No portable peer-credential probe on this platform: the pid cannot
+        // be verified, so never signal it (the connect deadline in the
+        // caller falls back to the inline server instead).
         let _ = (stream, pid);
         return false;
     }

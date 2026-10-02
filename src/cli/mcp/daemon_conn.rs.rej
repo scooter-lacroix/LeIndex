@@ -1,0 +1,103 @@
+diff a/src/cli/mcp/daemon_conn.rs b/src/cli/mcp/daemon_conn.rs	(rejected hunks)
+@@ -29,6 +29,15 @@ use crate::cli::daemon::proto::{self, Ack, WIRE_VERSION};
+ /// Upper bound on tool calls executing at once on one connection.
+ const MAX_CONCURRENT_CALLS: usize = 64;
+ 
++/// Upper bound on responses queued for the socket writer. Bounded on
++/// purpose: a client that keeps submitting requests but stops reading
++/// responses would otherwise park the writer while this queue accepted
++/// every completed result without limit, growing the shared daemon's
++/// memory until it died for every attached editor. Once the queue is full,
++/// senders park (and the read loop with them), pushing backpressure onto
++/// the client through TCP flow control.
++const MAX_QUEUED_RESPONSES: usize = 32;
++
+ /// Longest single frame accepted (matches the stdio transport).
+ const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
+ 
+@@ -142,19 +151,17 @@ fn oversize_response() -> String {
+ }
+ 
+ /// Queue a response for the writer, when the message produced one
+-/// (notifications produce none).
+-fn send_response(
+-    out: &mpsc::UnboundedSender<(String, bool)>,
+-    response: Option<String>,
+-    framed: bool,
+-) {
++/// (notifications produce none). Awaiting the bounded send is the
++/// backpressure point: it parks until the writer has drained enough of the
++/// queue, instead of buffering without limit.
++async fn send_response(out: mpsc::Sender<(String, bool)>, response: Option<String>, framed: bool) {
+     if let Some(response) = response {
+-        let _ = out.send((response, framed));
++        let _ = out.send((response, framed)).await;
+     }
+ }
+ 
+ /// Drain the outbound response queue into the socket until the peer goes away.
+-async fn drive_writer<W>(mut write_half: W, mut out_rx: mpsc::UnboundedReceiver<(String, bool)>)
++async fn drive_writer<W>(mut write_half: W, mut out_rx: mpsc::Receiver<(String, bool)>)
+ where
+     W: AsyncWrite + Unpin + Send + 'static,
+ {
+@@ -180,7 +187,7 @@ enum HelloOutcome {
+ /// the connection default.
+ fn handle_hello_frame(
+     payload: &str,
+-    out_tx: &mpsc::UnboundedSender<(String, bool)>,
++    out_tx: &mpsc::Sender<(String, bool)>,
+     default_project: &mut Option<String>,
+ ) -> HelloOutcome {
+     let Some(hello) = proto::parse_hello(payload) else {
+@@ -201,8 +208,15 @@ fn handle_hello_frame(
+             )
+         }),
+     };
+-    // The ack is a bare line, never Content-Length framed.
+-    let _ = out_tx.send((proto::ack_line(&ack).trim_end().to_string(), false));
++    // The ack is a bare line, never Content-Length framed. try_send: this
++    // is a sync helper and the queue is at its freshest here — a full queue
++    // before the ack means the client already is not reading; hang up.
++    if out_tx
++        .try_send((proto::ack_line(&ack).trim_end().to_string(), false))
++        .is_err()
++    {
++        return HelloOutcome::Incompatible;
++    }
+     if !compatible {
+         return HelloOutcome::Incompatible;
+     }
+@@ -261,7 +275,7 @@ pub(super) async fn serve(
+     let (read_half, write_half) = stream.into_split();
+     let mut reader = BufReader::new(read_half);
+ 
+-    let (out_tx, out_rx) = mpsc::unbounded_channel::<(String, bool)>();
++    let (out_tx, out_rx) = mpsc::channel::<(String, bool)>(MAX_QUEUED_RESPONSES);
+     let writer = tokio::spawn(drive_writer(write_half, out_rx));
+ 
+     let limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_CALLS));
+@@ -279,7 +293,7 @@ pub(super) async fn serve(
+         let (mut payload, framed) = match frame {
+             Frame::Message { payload, framed } => (payload, framed),
+             Frame::Fatal { response } => {
+-                let _ = out_tx.send((response, false));
++                let _ = out_tx.send((response, false)).await;
+                 break;
+             }
+         };
+@@ -314,12 +328,12 @@ pub(super) async fn serve(
+                 let _permit = permit;
+                 let response =
+                     handle_socket_message(&payload, &session, &handshakes, &complete).await;
+-                send_response(&out, response, respond_framed);
++                send_response(out, response, respond_framed).await;
+                 clock.touch();
+             });
+         } else {
+             let response = handle_socket_message(&payload, &session, &handshakes, &complete).await;
+-            send_response(&out, response, respond_framed);
++            send_response(out_tx.clone(), response, respond_framed).await;
+         }
+     }
+ 

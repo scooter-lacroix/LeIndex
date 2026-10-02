@@ -97,7 +97,18 @@ impl GenerationLease {
             }
             s.record_generation_hold(manifest.generation);
             // Persist refcounts so they survive a crash while the lease is held.
-            s.persist().map_err(LeaseError::Persist)?;
+            if let Err(persist_error) = s.persist() {
+                // Nothing was durably recorded, and unpersisted deltas are
+                // folded into this handle's visible counts and held
+                // generations — without this rollback they would pin the
+                // blobs and the generation for the rest of the process (no
+                // GenerationLease exists, so Drop never releases them).
+                s.release_generation_hold(manifest.generation);
+                for hash in &hashes {
+                    let _ = s.decr(hash);
+                }
+                return Err(LeaseError::Persist(persist_error));
+            }
         }
         Ok(GenerationLease {
             store,

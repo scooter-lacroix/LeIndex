@@ -227,12 +227,20 @@ pub fn write_index(path: &Path, files: &[FileInput], has_symbols: bool) -> io::R
     static BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp{}.{}", std::process::id(), seq));
-    {
-        let mut file = File::create(&tmp)?;
-        file.write_all(&body)?;
-        file.sync_all()?;
+    // The temp is removed on every failure path: with unique names a failed
+    // build used to leave a full-size orphan index behind (nothing sweeps
+    // `index.tmp*`), one multi-megabyte file per interrupted build.
+    if let Err(error) = write_index_tmp(&tmp, &body).and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
     }
-    std::fs::rename(&tmp, path)
+    Ok(())
+}
+
+fn write_index_tmp(tmp: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    let mut file = File::create(tmp)?;
+    file.write_all(body)?;
+    file.sync_all()
 }
 
 /// A file's entry in a loaded index.

@@ -152,7 +152,15 @@ impl FindHandler {
         registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
-        let found = find_pattern(&args)?;
+        // Regex compilation (regex-automata's meta builder) is stack-hungry,
+        // and this handler sits on a deep async poll chain: compiling on the
+        // tokio worker's ~2 MiB stack overflowed in debug builds and stays
+        // borderline in release. It is pure CPU work — run it on the
+        // blocking pool, where the search below already runs.
+        let compile_args = args.clone();
+        let found = tokio::task::spawn_blocking(move || find_pattern(&compile_args))
+            .await
+            .map_err(|e| JsonRpcError::internal_error(format!("find failed: {e}")))??;
         let output_mode = output_mode_arg(&args)?;
         let window = find_window(&args)?;
 

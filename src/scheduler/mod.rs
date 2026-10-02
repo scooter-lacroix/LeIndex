@@ -78,7 +78,10 @@ impl<P: Send + Clone> Scheduler<P> {
     ///
     /// Returns the shared result if the job completed. When admission
     /// repeatedly defers the job across many ticks, returns `None` (the job is
-    /// still pending, not failed).
+    /// still pending, not failed). A job that reached the terminal failed
+    /// state also yields `None` here — callers must disambiguate with
+    /// [`failure`](Self::failure) / [`is_failed`](Self::is_failed), which is
+    /// why `is_done` alone is not a success signal.
     pub fn run_until_done(&mut self, id: JobId, budget: WorkBudget) -> Option<&P> {
         // Bound the loop so an eternally-deferred job cannot spin forever; the
         // caller re-invokes this after memory frees up.
@@ -93,9 +96,21 @@ impl<P: Send + Clone> Scheduler<P> {
         None
     }
 
-    /// Whether the job has completed.
+    /// Whether the job has completed (successfully or as a terminal failure).
     pub fn is_done(&self, id: JobId) -> bool {
         self.queue.is_done(id)
+    }
+
+    /// Whether the job ended in the terminal failed state (bounded retries
+    /// exhausted). Check this after [`is_done`](Self::is_done): a failed job
+    /// is "done" but has no result.
+    pub fn is_failed(&self, id: JobId) -> bool {
+        self.queue.failure(id).is_some()
+    }
+
+    /// The terminal failure message for `id`, if the job failed.
+    pub fn failure(&self, id: JobId) -> Option<&str> {
+        self.queue.failure(id)
     }
 
     /// The shared result for a completed job.
@@ -363,5 +378,38 @@ mod test {
             "eviction must have freed memory"
         );
         assert!(sched.is_done(id), "over-cap index completes after eviction");
+    }
+
+    /// A terminally failed job must be distinguishable from a successful
+    /// no-progress job through the facade: `run_until_done` returns `None`
+    /// for both, so `is_failed` / `failure` are the disambiguation.
+    #[test]
+    fn test_scheduler_exposes_terminal_failure() {
+        struct AlwaysFails;
+        impl BoundedJob for AlwaysFails {
+            type Progress = usize;
+            fn step(&mut self, _budget: WorkBudget) -> anyhow::Result<Step<usize>> {
+                Err(anyhow::anyhow!("deterministic failure"))
+            }
+            fn estimated_next_bytes(&self) -> usize {
+                8
+            }
+        }
+
+        let mut sched = Scheduler::<usize>::new();
+        let id: JobId = sched.enqueue(index_key("p"), None, Box::new(AlwaysFails));
+        let mut ticks = 0;
+        while !sched.is_done(id) {
+            ticks += 1;
+            assert!(ticks <= 1000, "job must terminate");
+            let _ = sched.tick(one_item_budget());
+        }
+        assert!(sched.run_until_done(id, one_item_budget()).is_none());
+        assert!(sched.is_failed(id), "terminal failure must be visible");
+        assert!(
+            sched
+                .failure(id)
+                .is_some_and(|m| m.contains("deterministic failure"))
+        );
     }
 }

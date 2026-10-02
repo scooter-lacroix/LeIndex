@@ -104,6 +104,13 @@ pub struct LeIndex {
     /// external rebuilds (another server or a CLI `--force`) and re-hydrate
     /// instead of serving a stale snapshot under a fresh footer (N-13).
     pub(crate) hydrated_generation: std::sync::atomic::AtomicU64,
+
+    /// Whether the most recent `index_project` call was coalesced away (a
+    /// fresh index published by another process while this one waited for
+    /// the project write lock). The registry uses this to keep the resident
+    /// instance — which may hold a hydrated core — instead of installing an
+    /// un-hydrated temp over it.
+    pub(crate) last_index_coalesced: bool,
 }
 
 /// Cross-process exclusive lock guarding writes to a project's storage.
@@ -687,6 +694,7 @@ impl LeIndex {
             pipeline: None,
             generation_snapshot: None,
             hydrated_generation: std::sync::atomic::AtomicU64::new(0),
+            last_index_coalesced: false,
         };
 
         // Restore persisted index stats (if any) so diagnostics can report

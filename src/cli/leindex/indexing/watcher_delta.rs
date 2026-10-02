@@ -118,14 +118,18 @@ impl LeIndex {
         } else {
             parser.parse_files(changed_files)
         };
-        let mut pdg = self.take_owned_pdg().unwrap_or_default();
-        // The graph now exists only in this local. Both fallible steps below
+        // The graph now exists only in this local. The fallible steps below
         // must return it to `self.pdg` on error — a transient failure
         // (SQLite error, disk full) otherwise leaves the engine with no
         // resident PDG, degrading every graph-dependent read tool until a
-        // full reload. The partially-mutated graph is restored as-is: the
-        // per-file deletes already committed inside this call are then
-        // reflected in memory too.
+        // full reload. The restore happens ONLY when a graph was resident:
+        // `unwrap_or_default()` fabricates an empty graph for a
+        // never-hydrated project, and installing THAT would defeat every
+        // `pdg.is_none()` load gate (`ensure_pdg_loaded`,
+        // `reload_pdg_from_cache`, `warm_caches`) — the delta-only merge is
+        // not a valid graph either way.
+        let had_resident_pdg = self.pdg.is_some();
+        let mut pdg = self.take_owned_pdg().unwrap_or_default();
         let applied = self.apply_incremental_pdg_changes(
             &mut pdg,
             &deleted_files,
@@ -135,7 +139,12 @@ impl LeIndex {
         let removed_node_ids = match applied {
             Ok(ids) => ids,
             Err(error) => {
-                self.pdg = Some(std::sync::Arc::new(pdg));
+                if had_resident_pdg {
+                    // The partially-mutated graph, restored as-is: the
+                    // per-file deletes already committed inside this call
+                    // are then reflected in memory too.
+                    self.pdg = Some(std::sync::Arc::new(pdg));
+                }
                 return Err(error);
             }
         };
@@ -189,7 +198,13 @@ impl LeIndex {
                 removed_node_ids,
                 updated_nodes,
             });
-        self.persist_and_publish_watcher_delta(pdg, embedder, source_files_with_hashes, start_time)
+        self.persist_and_publish_watcher_delta(
+            pdg,
+            had_resident_pdg,
+            embedder,
+            source_files_with_hashes,
+            start_time,
+        )
     }
     /// Compute Leiden communities over the completed PDG and persist them in
     /// one batched transaction (roadmap Part IV). Placement: after PDG edge
@@ -255,9 +270,16 @@ impl LeIndex {
     /// Persist the watcher-reindex delta (PDG, embeddings, snapshot, neural) and
     /// publish the new generation with fresh health. Owns all post-merge I/O so
     /// the reindex orchestrator stays a thin pipeline.
+    ///
+    /// `had_resident_pdg` says whether the caller actually took a graph out
+    /// of `self.pdg` (versus fabricating an empty default for a
+    /// never-hydrated project): error paths restore the graph only in the
+    /// former case, because installing an empty or delta-only graph would
+    /// defeat every `pdg.is_none()` load gate.
     pub(super) fn persist_and_publish_watcher_delta(
         &mut self,
         mut pdg: crate::graph::pdg::ProgramDependenceGraph,
+        had_resident_pdg: bool,
         embedder: index_builder::HybridEmbedder,
         source_files_with_hashes: Vec<(PathBuf, String)>,
         start_time: std::time::Instant,
@@ -273,7 +295,9 @@ impl LeIndex {
         if let Err(error) =
             index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)
         {
-            self.pdg = Some(std::sync::Arc::new(pdg));
+            if had_resident_pdg {
+                self.pdg = Some(std::sync::Arc::new(pdg));
+            }
             return Err(error);
         }
         self.compute_and_persist_communities(&mut pdg);
