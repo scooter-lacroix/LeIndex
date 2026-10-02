@@ -333,7 +333,7 @@ impl LeIndex {
                     .as_ref()
                     .context("PDG is resident before neural enrichment")?;
                 progress_stderr(&format!(
-                    "Indexing: neural embedding {} admitted nodes (content cache may skip most)...",
+                    "Indexing: neural embedding {} admitted nodes...",
                     state.admitted_node_ids.len()
                 ));
                 let (cache_hits_before, _) = neural_cache_counters();
@@ -341,7 +341,6 @@ impl LeIndex {
                     pdg,
                     neural_embedder,
                     &state.admitted_node_ids,
-                    &state.enriched_content_cache,
                 );
                 let (cache_hits_after, cache_misses) = neural_cache_counters();
                 progress_stderr(&format!(

@@ -1196,15 +1196,12 @@ impl LeIndex {
             .ok_or_else(|| anyhow::anyhow!("No PDG available for vector rebuild"))?;
 
         let batch_size = self.indexing_batch_size();
-        self.embedder = Some(
-            index_builder::index_nodes(
-                &pdg,
-                &mut self.search_engine,
-                &mut self.cache.file_stats_cache,
-                batch_size,
-            )?
-            .0,
-        );
+        self.embedder = Some(index_builder::index_nodes(
+            &pdg,
+            &mut self.search_engine,
+            &mut self.cache.file_stats_cache,
+            batch_size,
+        )?);
         let indexed_count = self.search_engine.node_count();
 
         self.pdg = Some(std::sync::Arc::new(pdg));

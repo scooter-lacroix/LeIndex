@@ -422,3 +422,48 @@ fn test_leindex_home_dir_relative_env_ignored() {
     unsafe { std::env::remove_var("LEINDEX_HOME") };
     unsafe { std::env::remove_var("HOME") };
 }
+
+#[test]
+fn test_content_digest_changes_when_content_swapped_within_forged_metadata() {
+    // The Engram identity must be content-based: a same-named model whose
+    // files keep their size AND mtime across a swap (metadata-preserving
+    // copy, reproducible artifact) must not reuse the old digest. On Unix
+    // the memo guard includes ctime, which userspace cannot forge — the
+    // rewrite itself changes it.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.bin");
+    std::fs::write(&path, b"AAAA").unwrap();
+    let meta1 = std::fs::metadata(&path).unwrap();
+    let mtime1 = meta1.modified().unwrap();
+    let digest1 = super::content_digest(&path, &meta1).unwrap();
+
+    // Swap the content, then forge size-preserving length and the ORIGINAL
+    // mtime back onto the file.
+    std::fs::write(&path, b"BBBB").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(mtime1)
+        .unwrap();
+    let meta2 = std::fs::metadata(&path).unwrap();
+    assert_eq!(meta1.len(), meta2.len(), "fixture: same length");
+    assert_eq!(mtime1, meta2.modified().unwrap(), "fixture: same mtime");
+
+    let digest2 = super::content_digest(&path, &meta2).unwrap();
+    assert_ne!(
+        digest1, digest2,
+        "a content swap under forged size+mtime must force a re-hash"
+    );
+}
+
+#[test]
+fn test_content_digest_is_stable_while_metadata_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tokenizer.json");
+    std::fs::write(&path, b"{\"vocab\": true}").unwrap();
+    let meta = std::fs::metadata(&path).unwrap();
+    let first = super::content_digest(&path, &meta).unwrap();
+    let second = super::content_digest(&path, &meta).unwrap();
+    assert_eq!(first, second, "memoized digest must be stable per guard");
+}

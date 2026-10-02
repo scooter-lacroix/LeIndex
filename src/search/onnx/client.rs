@@ -23,6 +23,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "cli")]
+use std::collections::HashMap;
+
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -1369,11 +1372,23 @@ impl EmbeddingClient {
     }
 
     /// Cheap, sound identity of the configured neural embedder for the Engram
-    /// query phrase-book: model name, dimension and the size + modification
-    /// time of the exact model and tokenizer files the worker would load
-    /// (two `stat`s, no hashing). Any change to those files yields a different
-    /// identity, so stale vectors are never served. `None` when the model
-    /// cannot be resolved, in which case callers bypass the phrase-book.
+    /// query phrase-book: model name, dimension, and a **content digest** of
+    /// the exact model and tokenizer files the worker would load, guarded by
+    /// their size + mtime (+ ctime/inode on Unix). Any change to those files
+    /// yields a different identity, so stale vectors are never served.
+    ///
+    /// The digest is what makes this sound where a metadata stamp alone is
+    /// not: a same-named model whose files keep their size and mtime across a
+    /// swap (reproducible artifacts, metadata-preserving copies) would
+    /// otherwise produce the same identity while its contents — and therefore
+    /// its embeddings — differ.
+    ///
+    /// Hashing a model file costs hundreds of MB of reads, so each file's
+    /// digest is memoized under its metadata guard and recomputed only when
+    /// the guard changes. On Unix the guard includes ctime and inode, which
+    /// userspace cannot forge: rewriting the file (even preserving size and
+    /// mtime) changes both, forcing a re-hash. `None` when the model cannot
+    /// be resolved or read, in which case callers bypass the phrase-book.
     #[cfg(feature = "cli")]
     pub(crate) fn engram_identity(&self, expected_dim: usize) -> Option<String> {
         let model = std::env::var("LEINDEX_WORKER_MODEL")
@@ -1390,7 +1405,12 @@ impl EmbeddingClient {
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()?
                 .as_nanos();
-            Some(format!("{}:{}", meta.len(), nanos))
+            Some(format!(
+                "{}:{}:{}",
+                meta.len(),
+                nanos,
+                content_digest(path, &meta)?
+            ))
         };
         Some(format!(
             "onnx|{model}|{expected_dim}|{}|{}",
@@ -1897,6 +1917,68 @@ fn flatten_into_response(vectors: Vec<Vec<f32>>, expected_dim: usize) -> EmbedRe
         flat.extend_from_slice(&vector);
     }
     EmbedResponse::new(flat, count, expected_dim)
+}
+
+/// Hex blake3 digest of `path`'s content, memoized under a metadata guard.
+///
+/// The guard is what keeps repeated calls cheap (model files are read once
+/// per guard change, not per query) while staying sound: on Unix it includes
+/// ctime and inode, which userspace cannot preserve across a rewrite — so a
+/// file replaced with a same-size, same-mtime copy forces a re-hash instead
+/// of silently reusing the old digest. On platforms without those fields the
+/// guard is size + mtime and a swap within one guard window is indistinguish
+/// able (the pre-existing metadata-only weakness, now narrowed to a single
+/// process lifetime instead of persisted identity).
+#[cfg(feature = "cli")]
+fn content_digest(path: &Path, meta: &std::fs::Metadata) -> Option<String> {
+    #[cfg(unix)]
+    fn guard(meta: &std::fs::Metadata) -> Option<(u64, u128, u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        Some((
+            meta.len(),
+            meta.modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos(),
+            meta.ctime_nsec() as u64,
+            meta.ino(),
+        ))
+    }
+    #[cfg(not(unix))]
+    fn guard(meta: &std::fs::Metadata) -> Option<(u64, u128, u64, u64)> {
+        Some((
+            meta.len(),
+            meta.modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos(),
+            0,
+            0,
+        ))
+    }
+
+    static DIGESTS: OnceLock<Mutex<HashMap<PathBuf, ((u64, u128, u64, u64), String)>>> =
+        OnceLock::new();
+    let digests = DIGESTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = guard(meta)?;
+
+    let mut digests = digests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((cached_key, digest)) = digests.get(path) {
+        if *cached_key == key {
+            return Some(digest.clone());
+        }
+    }
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    let digest = hasher.finalize().to_hex().to_string();
+    digests.insert(path.to_path_buf(), (key, digest.clone()));
+    Some(digest)
 }
 
 #[cfg(test)]

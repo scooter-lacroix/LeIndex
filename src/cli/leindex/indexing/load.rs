@@ -312,7 +312,6 @@ impl LeIndex {
                     batch_size,
                     Some(tfidf_embedder),
                 )?
-                .0
             } else {
                 info!("Persisted embedder is stale; rebuilding TF-IDF index");
                 index_builder::index_nodes_tfidf_only(
@@ -322,7 +321,6 @@ impl LeIndex {
                     batch_size,
                     None,
                 )?
-                .0
             }
         } else {
             // No persisted embedder; build a fresh vocab.
@@ -333,7 +331,6 @@ impl LeIndex {
                 batch_size,
                 None,
             )?
-            .0
         })
     }
 

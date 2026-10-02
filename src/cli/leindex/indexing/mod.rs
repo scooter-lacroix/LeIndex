@@ -86,9 +86,6 @@ pub(crate) struct IndexPipelineState {
     pub(crate) neural_rows: usize,
     pub(crate) neural_resume_loaded: bool,
     pub(crate) admitted_node_ids: HashSet<String>,
-    /// Cached enriched node content from the DF/indexing pass, reused by the
-    /// neural enrichment pass to avoid recomputing `enriched_node_content`.
-    pub(crate) enriched_content_cache: HashMap<String, String>,
     pub(crate) skip: bool,
 }
 
@@ -147,7 +144,6 @@ impl IndexPipelineState {
             neural_rows: 0,
             neural_resume_loaded: false,
             admitted_node_ids: HashSet::new(),
-            enriched_content_cache: HashMap::new(),
             skip: false,
         }
     }
@@ -1066,7 +1062,7 @@ impl LeIndex {
         &mut self,
         pdg: &crate::graph::pdg::ProgramDependenceGraph,
         resume_valid: bool,
-    ) -> Result<(index_builder::HybridEmbedder, HashMap<String, String>)> {
+    ) -> Result<index_builder::HybridEmbedder> {
         let batch_size = self.indexing_batch_size();
         let persisted = index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
             .ok()
@@ -1075,20 +1071,18 @@ impl LeIndex {
             return match self.load_from_mutable_storage() {
                 Ok(()) => {
                     self.search_engine.clear_neural_embeddings();
-                    Ok((
-                        self.embedder
-                            .as_ref()
-                            .map(|embedder| {
-                                index_builder::HybridEmbedder::tfidf_only(embedder.tfidf().clone())
-                            })
-                            .or_else(|| {
-                                persisted
-                                    .clone()
-                                    .map(index_builder::HybridEmbedder::tfidf_only)
-                            })
-                            .context("resumed lexical checkpoint has no TF-IDF embedder")?,
-                        HashMap::new(),
-                    ))
+                    Ok(self
+                        .embedder
+                        .as_ref()
+                        .map(|embedder| {
+                            index_builder::HybridEmbedder::tfidf_only(embedder.tfidf().clone())
+                        })
+                        .or_else(|| {
+                            persisted
+                                .clone()
+                                .map(index_builder::HybridEmbedder::tfidf_only)
+                        })
+                        .context("resumed lexical checkpoint has no TF-IDF embedder")?)
                 }
                 Err(error) => {
                     warn!(
@@ -1151,11 +1145,10 @@ impl LeIndex {
             .resumed_lexical
             .as_ref()
             .is_some_and(|checkpoint| checkpoint.pdg_hash == pdg_checkpoint.artifact_hash);
-        let (embedder, content_cache) = self.build_lexical_embedder(&pdg, lexical_resume_valid)?;
+        let embedder = self.build_lexical_embedder(&pdg, lexical_resume_valid)?;
         self.embedder = Some(embedder);
         let indexed_count = self.search_engine.node_count();
         state.admitted_node_ids = self.search_engine.live_node_ids().into_iter().collect();
-        state.enriched_content_cache = content_cache;
         self.mark_index_phase(
             super::IndexPhase::Lexical,
             super::ComponentStatus::Initializing,

@@ -877,48 +877,102 @@ fn test_git_scan_max_files_not_consumed_by_excluded_files() {
 // PIPELINE OPTIMIZATION TESTS
 // ============================================================================
 
-/// Test that `index_nodes` returns a content cache populated for every
-/// non-external node, proving `enriched_node_content` is computed exactly
-/// once per node (during the DF pass) and reused by the embedding pass.
+/// Duplicate node IDs (the supported multiple-unqualified-`new` pattern) must
+/// each carry the enriched content of THEIR OWN node: content is recomputed
+/// per node index, never cached or looked up by the non-unique string ID.
+/// The old ID-keyed cache fed the surviving HashMap body to every duplicate,
+/// so one method's index row described a different method's file.
 #[test]
-fn test_enriched_node_content_cached_once_per_node() {
-    let mut pdg = ProgramDependenceGraph::new();
+fn test_duplicate_node_ids_keep_their_own_enriched_content() {
     use crate::graph::pdg::{Node, NodeType};
     use std::sync::Arc;
 
-    for i in 0..5 {
-        pdg.add_node(Node {
-            id: format!("file_{i}.rs:func_{i}"),
-            node_type: NodeType::Function,
-            name: format!("func_{i}"),
-            file_path: Arc::from(format!("file_{i}.rs")),
-            byte_range: (0, 10),
-            complexity: 1,
-            language: "rust".to_string(),
-        });
-    }
+    let temp = tempfile::tempdir().unwrap();
+    let a_rs = temp.path().join("a.rs");
+    let b_rs = temp.path().join("b.rs");
+    // Distinctive tokens per file's body; same symbol name and (duplicate)
+    // node id in both.
+    std::fs::write(&a_rs, "impl A { fn new() -> i32 { wibble_marker() } }\n").unwrap();
+    std::fs::write(&b_rs, "impl B { fn new() -> i32 { wobble_marker() } }\n").unwrap();
 
+    let mut pdg = ProgramDependenceGraph::new();
+    let id = "proj:new";
+    let idx_a = pdg.add_node(Node {
+        id: id.to_string(),
+        node_type: NodeType::Method,
+        name: "new".to_string(),
+        file_path: Arc::from(a_rs.to_string_lossy().as_ref()),
+        byte_range: (8, 40),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+    let idx_b = pdg.add_node(Node {
+        id: id.to_string(),
+        node_type: NodeType::Method,
+        name: "new".to_string(),
+        file_path: Arc::from(b_rs.to_string_lossy().as_ref()),
+        byte_range: (8, 40),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+
+    // Unit level: each duplicate's enriched content names its own body.
+    let connectivity_config = crate::graph::pdg::TraversalConfig {
+        max_depth: Some(1),
+        max_nodes: Some(1000),
+        allowed_edge_types: Some(&[EdgeType::Call, EdgeType::DataDependency]),
+        excluded_node_types: Some(vec![NodeType::External]),
+        min_complexity: None,
+        min_edge_confidence: 0.0,
+    };
+    let file_summary_ctx = FileSummaryContext::from_pdg(&pdg);
+    let mut file_cache = FileReadCache::per_chunk_scratch();
+    let mut content_of = |node_idx| {
+        let node = pdg.get_node(node_idx).unwrap();
+        let bytes = file_cache
+            .get_or_read(std::path::Path::new(&*node.file_path))
+            .unwrap();
+        enriched_node_content(
+            &pdg,
+            node_idx,
+            node,
+            &bytes,
+            &connectivity_config,
+            &file_summary_ctx,
+        )
+    };
+    let content_a = content_of(idx_a);
+    let content_b = content_of(idx_b);
+    assert_ne!(
+        content_a, content_b,
+        "duplicate-ID nodes must enrich to their own bodies"
+    );
+    assert!(content_a.contains("wibble_marker"));
+    assert!(content_b.contains("wobble_marker"));
+
+    // End to end: the row the engine keeps (first duplicate, a.rs) must be
+    // tokenized from a.rs's body. The old ID-keyed cache could hand it
+    // b.rs's body, so "wibble" found nothing.
     let mut cache = None;
     let mut engine = SearchEngine::new();
-    let (embedder, content_cache) = index_nodes(&pdg, &mut engine, &mut cache, 3).unwrap();
-
-    // Every non-external node should have its enriched content in the cache.
-    assert_eq!(
-        content_cache.len(),
-        5,
-        "content cache should have an entry for every indexed node"
+    let _embedder = index_nodes(&pdg, &mut engine, &mut cache, 4).unwrap();
+    let query = crate::search::search::SearchQuery {
+        query: "wibble_marker".to_string(),
+        top_k: 5,
+        token_budget: None,
+        semantic: false,
+        expand_context: false,
+        query_embedding: None,
+        query_neural_embedding: None,
+        threshold: None,
+        query_type: None,
+    };
+    let results = engine.search(query).unwrap();
+    assert!(
+        results.iter().any(|hit| hit.file_path.ends_with("a.rs")),
+        "the surviving duplicate's tokens must come from its own file, got {:?}",
+        results.iter().map(|h| &h.file_path).collect::<Vec<_>>()
     );
-    for i in 0..5 {
-        let node_id = format!("file_{i}.rs:func_{i}");
-        assert!(
-            content_cache.contains_key(&node_id),
-            "content cache missing node {node_id}"
-        );
-    }
-
-    // The embedder should still be valid.
-    let _ = embedder;
-    assert_eq!(engine.node_count(), 5);
 }
 
 /// Test that `collect_source_files_with_hashes` produces identical results
@@ -972,11 +1026,12 @@ fn test_parallel_file_hashing_deterministic() {
     }
 }
 
-/// Test that `build_document_frequencies` returns a content cache whose
-/// entries match what `enriched_node_content` would produce directly,
-/// proving the cache can safely replace redundant recomputation.
+/// `enriched_node_content` must be a pure function of its inputs: the DF
+/// pass, the lexical pass and the neural pass each recompute it (no
+/// cross-phase cache — VAL-STREAM-012), so a hidden dependency on iteration
+/// state or ordering would silently desynchronize the passes.
 #[test]
-fn test_content_cache_matches_direct_enrichment() {
+fn test_enriched_node_content_is_deterministic() {
     use crate::graph::pdg::{Node, NodeType};
     use std::sync::Arc;
 
@@ -1002,33 +1057,27 @@ fn test_content_cache_matches_direct_enrichment() {
     };
     let file_summary_ctx = FileSummaryContext::from_pdg(&pdg);
 
-    let (_df, _total, content_cache) =
-        build_document_frequencies(&pdg, &node_indices, &connectivity_config, &file_summary_ctx);
-
-    let mut file_cache = FileReadCache::per_chunk_scratch();
-
-    // The cache should contain the node.
-    assert_eq!(content_cache.len(), 1);
-    assert!(content_cache.contains_key("test.rs:hello"));
-
-    // Verify the cached content matches a fresh computation.
-    let node_idx = node_indices[0];
-    let node = pdg.get_node(node_idx).unwrap();
-    let file_bytes = file_cache
-        .get_or_read(std::path::Path::new("test.rs"))
-        .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
-    let fresh_content = enriched_node_content(
-        &pdg,
-        node_idx,
-        node,
-        &file_bytes,
-        &connectivity_config,
-        &file_summary_ctx,
-    );
+    let compute = || {
+        let mut file_cache = FileReadCache::per_chunk_scratch();
+        let node_idx = node_indices[0];
+        let node = pdg.get_node(node_idx).unwrap();
+        let file_bytes = file_cache
+            .get_or_read(std::path::Path::new("test.rs"))
+            .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
+        enriched_node_content(
+            &pdg,
+            node_idx,
+            node,
+            &file_bytes,
+            &connectivity_config,
+            &file_summary_ctx,
+        )
+    };
+    let first = compute();
+    let second = compute();
     assert_eq!(
-        content_cache.get("test.rs:hello").unwrap(),
-        &fresh_content,
-        "cached content must match freshly computed enriched_node_content"
+        first, second,
+        "recomputation must be bit-identical: every pass depends on it"
     );
 }
 
@@ -1144,11 +1193,10 @@ fn test_parallel_document_frequencies_match_a_sequential_reference() {
     };
     let ctx = FileSummaryContext::from_pdg(&pdg);
 
-    let (df, total, contents) = build_document_frequencies(&pdg, &node_indices, &config, &ctx);
+    let (df, total) = build_document_frequencies(&pdg, &node_indices, &config, &ctx);
 
     // Sequential reference.
     let mut expected_df: HashMap<String, usize> = HashMap::new();
-    let mut expected_contents: HashMap<String, String> = HashMap::new();
     let mut expected_total = 0;
     let mut cache = FileReadCache::per_chunk_scratch();
     for &idx in &node_indices {
@@ -1163,12 +1211,10 @@ fn test_parallel_document_frequencies_match_a_sequential_reference() {
             *expected_df.entry(token).or_insert(0) += 1;
         }
         expected_total += 1;
-        expected_contents.insert(node.id.clone(), content);
     }
 
     assert_eq!(total, expected_total);
     assert_eq!(df, expected_df);
-    assert_eq!(contents, expected_contents);
     assert_eq!(total, 12 * 40);
 }
 

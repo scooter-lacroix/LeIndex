@@ -785,15 +785,11 @@ fn test_index_nodes_respects_batch_size_and_matches_results() {
 
     let mut file_stats_cache = None;
     let mut engine_small = SearchEngine::new();
-    let embedder_small = index_nodes(&pdg, &mut engine_small, &mut file_stats_cache, 2)
-        .unwrap()
-        .0;
+    let embedder_small = index_nodes(&pdg, &mut engine_small, &mut file_stats_cache, 2).unwrap();
 
     let mut file_stats_cache = None;
     let mut engine_large = SearchEngine::new();
-    let embedder_large = index_nodes(&pdg, &mut engine_large, &mut file_stats_cache, 64)
-        .unwrap()
-        .0;
+    let embedder_large = index_nodes(&pdg, &mut engine_large, &mut file_stats_cache, 64).unwrap();
 
     // Extract TfIdfEmbedder from HybridEmbedder to access internal fields
     let tfidf_small = match embedder_small {
@@ -943,7 +939,7 @@ fn test_index_nodes_accumulates_df_across_passes() {
 
     let mut cache = None;
     let mut engine = SearchEngine::new();
-    let embedder = index_nodes(&pdg, &mut engine, &mut cache, 3).unwrap().0;
+    let embedder = index_nodes(&pdg, &mut engine, &mut cache, 3).unwrap();
 
     // Extract TfIdfEmbedder from HybridEmbedder to access dimension
     let tfidf_embedder = match embedder {
