@@ -516,34 +516,38 @@ impl JsonSidecarStore {
         let _lock = RefsLock::acquire(&self.lock_path)?;
         let mut file = self.read_sidecar_unlocked();
         let mut absorbed = false;
+        let mut skipped = 0usize;
         for entry in fs::read_dir(&self.owners_dir)?.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             let Some(ledger) = name.strip_suffix(".json") else {
                 continue;
             };
-            // Only well-formed owner identities can ever be probed for
-            // liveness; anything else would become a permanent pin. Leave
-            // the directory for manual inspection rather than guessing.
+            // An unrecognized ledger NAME (an editor swap, a backup, a
+            // build with a different key layout) cannot be probed for
+            // liveness — but it is not evidence of live data either, so
+            // SKIP it (leaving the file in place) instead of aborting
+            // absorption for every well-formed sibling. Only a WELL-FORMED
+            // ledger whose CONTENT is unreadable or unparseable aborts:
+            // recording that owner as holding nothing would delete the
+            // only record of live pins.
             let Some((pid, start)) = parse_owner_key(ledger) else {
+                skipped += 1;
                 tracing::warn!(
                     ledger = %entry.path().display(),
-                    "refs.owners: unrecognized ledger identity; skipping legacy-ledger absorption"
+                    "refs.owners: unrecognized ledger name; left in place, not absorbed"
                 );
-                return Ok(());
+                continue;
             };
             if file.owners.contains_key(ledger) {
                 continue;
             }
-            // Distinguish "absent" from "unreadable": a read or parse
-            // failure aborts absorption instead of recording the owner as
-            // holding nothing.
             let data = match fs::read(entry.path()) {
                 Ok(data) => data,
                 Err(error) => {
                     tracing::warn!(
                         ledger = %entry.path().display(),
                         %error,
-                        "refs.owners: unreadable ledger; skipping legacy-ledger absorption"
+                        "refs.owners: unreadable ledger; leaving legacy directory in place"
                     );
                     return Ok(());
                 }
@@ -554,16 +558,21 @@ impl JsonSidecarStore {
                     tracing::warn!(
                         ledger = %entry.path().display(),
                         %error,
-                        "refs.owners: unparseable ledger; skipping legacy-ledger absorption"
+                        "refs.owners: unparseable ledger; leaving legacy directory in place"
                     );
                     return Ok(());
                 }
             };
+            // Normalize keys through the canonical hex form (lowercase,
+            // parse-validated): the dead-owner reclaim matches these keys
+            // against `counts` keys, and a ledger with uppercase or garbage
+            // hex would otherwise stay inflated forever. Unparseable keys
+            // are dropped (they never matched anything).
             let _ = (pid, start);
             file.owners.insert(
                 ledger.to_string(),
                 OwnerHolds {
-                    blobs,
+                    blobs: counts_to_strings(&counts_from_strings(&blobs)),
                     generations: HashMap::new(),
                 },
             );
@@ -572,14 +581,22 @@ impl JsonSidecarStore {
         if absorbed {
             write_sidecar_atomic(&self.sidecar_path, &file)?;
         }
-        let _ = fs::remove_dir_all(&self.owners_dir);
+        // Only remove the directory when everything in it was either
+        // absorbed or explicitly skipped-and-logged; a partial run keeps it.
+        if skipped == 0 {
+            let _ = fs::remove_dir_all(&self.owners_dir);
+        }
         Ok(())
     }
 
     /// Remove leftover `refs.json.tmp.<pid>.<seq>` files whose owning
     /// process is gone (a crash between temp creation and rename orphaned
-    /// them). Temps belonging to a live pid — including ours, which may be
-    /// mid-write on another handle — are left alone.
+    /// them). Unix only: Windows has no liveness probe and no advisory-lock
+    /// mutual exclusion, so another process's temp there may be mid-write —
+    /// deleting it would break its rename. A recycled pid can make a dead
+    /// writer's orphan look live; it lingers (harmless disk) rather than
+    /// risking a live file.
+    #[cfg(unix)]
     fn sweep_orphaned_sidecar_temps(&self) {
         let Some(parent) = self.sidecar_path.parent() else {
             return;
@@ -607,6 +624,7 @@ impl JsonSidecarStore {
 /// Whether `pid` has a running process. A recycled pid can only make a dead
 /// writer's orphan look live (kept, safe) — never the reverse on Linux,
 /// where /proc existence is authoritative.
+#[cfg(unix)]
 fn pid_is_running(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -617,10 +635,6 @@ fn pid_is_running(pid: u32) -> bool {
         // SAFETY: signal 0 only probes for existence.
         let rc = unsafe { libc::kill(pid as i32, 0) };
         rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-    #[cfg(not(unix))]
-    {
-        false
     }
 }
 
@@ -645,6 +659,7 @@ impl RefcountStore for JsonSidecarStore {
             owner_start: start,
         };
         // Best effort: a read-only store must still open.
+        #[cfg(unix)]
         store.sweep_orphaned_sidecar_temps();
         let _ = store.absorb_legacy_owner_ledgers();
         let _ = store.reclaim_if_needed();
@@ -959,9 +974,41 @@ pub enum CasError {
     /// Refcount underflow: `decr` called on a hash whose count is already zero.
     #[error("refcount underflow: cannot decrement zero refcount")]
     RefcountUnderflow,
+    /// A GC sweep aborted part-way. The blobs unlinked before the failure are
+    /// really gone and their sidecar entries were persisted (see
+    /// [`RefcountStore::collect_zero_refcount`]), so `reclaimed_bytes` /
+    /// `blobs_removed` are real accounting callers should credit — not a
+    /// best-effort guess.
+    #[error(
+        "gc sweep failed part-way after removing {blobs_removed} blob(s), {reclaimed_bytes} byte(s): {source}"
+    )]
+    PartialSweep {
+        /// The error that aborted the sweep.
+        source: Box<CasError>,
+        /// Bytes reclaimed by the partial sweep.
+        reclaimed_bytes: u64,
+        /// Blobs removed by the partial sweep.
+        blobs_removed: usize,
+    },
     /// Serialization error writing the refcount sidecar.
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
+}
+
+impl CasError {
+    /// The `(reclaimed_bytes, blobs_removed)` a partially-aborted GC sweep
+    /// reclaimed before failing, for callers that credit the partial
+    /// accounting and continue.
+    pub fn partial_sweep(&self) -> Option<(u64, usize)> {
+        match self {
+            CasError::PartialSweep {
+                reclaimed_bytes,
+                blobs_removed,
+                ..
+            } => Some((*reclaimed_bytes, *blobs_removed)),
+            _ => None,
+        }
+    }
 }
 
 /// Result type for CAS operations.

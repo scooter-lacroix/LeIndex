@@ -539,7 +539,7 @@ impl Storage {
     }
 
     /// Current schema version. Increment when adding migrations.
-    pub const SCHEMA_VERSION: u32 = 4;
+    pub const SCHEMA_VERSION: u32 = 5;
 
     /// Run database migrations based on the stored schema version.
     /// Creates the version tracking table if it doesn't exist.
@@ -584,6 +584,12 @@ impl Storage {
         // become the upsert conflict target, then create the unique index.
         if current < 4 {
             self.migrate_v3_to_v4()?;
+        }
+        // Migration v4 to v5: backfill qualified_name for stores that were
+        // already at v4 while the v3→v4 backfill was still gated behind it —
+        // exactly the population holding the empty sentinel.
+        if current < 5 {
+            self.migrate_v4_to_v5()?;
         }
 
         // Update stored version
@@ -712,6 +718,39 @@ impl Storage {
              UPDATE intel_nodes
                 SET node_id = node_id || ':' || id
               WHERE id NOT IN (SELECT MIN(id) FROM intel_nodes GROUP BY project_id, node_id);",
+        )?;
+        Ok(())
+    }
+
+    /// Migration from v4 to v5: backfill `qualified_name` for stores that
+    /// sat at v4 while the v3→v4 migration was adding the column without
+    /// repairing it. Once that migration (or `ensure_intel_node_columns`)
+    /// has added the column, the presence check in the column repair skips
+    /// it — so every row of an already-v4 store keeps the empty sentinel
+    /// and stays invisible to qualified-name lookups. This migration runs
+    /// the backfill UNCONDITIONALLY on the affected population.
+    fn migrate_v4_to_v5(&mut self) -> SqliteResult<()> {
+        let table_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'intel_nodes')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !table_exists {
+            return Ok(());
+        }
+        // Fresh stores at v3-and-below may predate the column entirely;
+        // initialize_schema creates it with the table and their rows never
+        // carry the sentinel.
+        let has_column = self
+            .intel_node_column_names()?
+            .iter()
+            .any(|column| column == "qualified_name");
+        if !has_column {
+            return Ok(());
+        }
+        self.conn.execute(
+            "UPDATE intel_nodes SET qualified_name = symbol_name WHERE qualified_name = ''",
+            [],
         )?;
         Ok(())
     }
@@ -887,6 +926,57 @@ mod tests {
             "same-named symbols in different files are re-keyed (not deleted) \
              and qualified_name is backfilled even though the migration added \
              the column itself"
+        );
+    }
+
+    #[test]
+    fn test_v4_to_v5_migration_backfills_qualified_name_for_already_v4_stores() {
+        // The population the v5 migration exists for: a store already
+        // recorded at v4 while the v3→v4 migration added the column without
+        // running the backfill. `current < 4` gates meant the repair never
+        // ran on upgrade — these rows kept `qualified_name = ''` forever.
+        let temp_file = NamedTempFile::new().unwrap();
+        {
+            let conn = rusqlite::Connection::open(temp_file.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (key TEXT PRIMARY KEY, version INTEGER NOT NULL);
+                 INSERT INTO schema_version (key, version) VALUES ('schema', 4);
+                 CREATE TABLE intel_nodes (
+                     id INTEGER PRIMARY KEY,
+                     project_id TEXT NOT NULL,
+                     file_path TEXT NOT NULL,
+                     node_id TEXT NOT NULL,
+                     symbol_name TEXT NOT NULL,
+                     qualified_name TEXT DEFAULT '',
+                     node_type TEXT NOT NULL
+                 );
+                 INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, node_type)
+                 VALUES ('proj', 'a.rs', 'a-symbol', 'alpha', '', 'Function'),
+                        ('proj', 'b.rs', 'b-symbol', 'beta', 'kept', 'Function');",
+            )
+            .unwrap();
+        }
+
+        let storage =
+            Storage::open(temp_file.path()).expect("a v4 store must open and backfill, not fail");
+
+        let rows: Vec<(String, String)> = {
+            let mut stmt = storage
+                .conn()
+                .prepare("SELECT symbol_name, qualified_name FROM intel_nodes ORDER BY symbol_name")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                ("alpha".to_string(), "alpha".to_string()),
+                ("beta".to_string(), "kept".to_string()),
+            ],
+            "the empty sentinel is backfilled on upgrade; a real qualified_name is untouched"
         );
     }
 

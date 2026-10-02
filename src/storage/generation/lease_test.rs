@@ -291,6 +291,81 @@ fn test_lease_acquire_persists_refcounts() {
     }
 }
 
+// -------- Fault injection: acquire's persist-failure rollback --------
+
+/// When the sidecar cannot be persisted, `acquire` must roll the
+/// unpersisted deltas back (visible refcounts and generation holds), report
+/// `LeaseError::Persist` instead of handing out a lease, and leave the store
+/// usable. Without rollback the phantom deltas would pin the blobs for the
+/// rest of the process — no lease exists, so Drop never releases them.
+#[test]
+#[cfg(unix)]
+fn test_lease_acquire_persist_failure_rolls_back_deltas_and_reports() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, store, hashes) = setup_store_with_blobs();
+    let manifest =
+        fixture_manifest_with_hashes([hashes[0], hashes[1], hashes[2], hashes[3], hashes[4]]);
+
+    let restore_permissions = |path: &Path| {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    };
+
+    // Blobs exist on disk already; make the CAS root read-only so the
+    // sidecar persist inside acquire fails while the in-memory deltas are
+    // pending.
+    let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(dir.path(), perms).unwrap();
+
+    // If we are running privileged (root ignores the mode bits), the
+    // injection cannot bite and the rollback branch is unreachable — skip
+    // rather than misreport.
+    let probe = dir.path().join(".write-probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        restore_permissions(dir.path());
+        return;
+    }
+
+    let result = GenerationLease::acquire(store.clone(), &manifest);
+    restore_permissions(dir.path());
+
+    // GenerationLease is not Debug, so match instead of formatting the
+    // whole Result.
+    match result {
+        Err(LeaseError::Persist(_)) => {}
+        Err(other) => panic!("expected LeaseError::Persist, got: {other}"),
+        Ok(_) => panic!("acquire unexpectedly succeeded despite the unwritable sidecar"),
+    }
+
+    // The rollback undid the unpersisted incr and the generation hold.
+    {
+        let s = store.lock().unwrap();
+        for h in &hashes {
+            assert_eq!(s.refcount(h), 0, "rollback must undo the unpersisted incr");
+        }
+        assert!(
+            !s.held_generations().contains(&manifest.generation),
+            "rollback must release the generation hold"
+        );
+    }
+
+    // The store is still fully usable: a lease acquires cleanly once the
+    // sidecar is writable again, and drops back to zero.
+    {
+        let lease = GenerationLease::acquire(store.clone(), &manifest).expect("acquire after fix");
+        assert_eq!(lease.generation(), manifest.generation);
+        drop(lease);
+        let s = store.lock().unwrap();
+        for h in &hashes {
+            assert_eq!(s.refcount(h), 0);
+        }
+    }
+}
+
 // -------- Integration: read CURRENT + manifest from disk --------
 
 /// Write a storage-root directory with CURRENT + manifest so the lease-from-disk

@@ -66,6 +66,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::Connection;
 
 use crate::storage::cas::CasStore;
+use crate::storage::cas::RetentionReport;
 use crate::storage::cas::blob::hash_to_hex;
 
 use super::lease::{GENERATIONS_DIR, MANIFEST_FILE, read_current_generation};
@@ -848,7 +849,26 @@ fn garbage_collect_unpinned_blobs(
     }
     let mut store = CasStore::open(&cas_root)?;
     let pinned = retained_manifest_pins(storage_root, retained);
-    let gc = store.gc_with_pins(&pinned)?;
+    let gc = match store.gc_with_pins(&pinned) {
+        Ok(gc) => gc,
+        Err(error) => match error.partial_sweep() {
+            // A mid-sweep failure must not abort the migration: the reclaim
+            // already performed is real, and the remaining candidates are
+            // retried by the next retention sweep.
+            Some((reclaimed_bytes, blobs_removed)) => {
+                tracing::warn!(
+                    reclaimed_bytes,
+                    blobs_removed,
+                    "migration CAS GC failed part-way; crediting the partial reclaim and continuing"
+                );
+                RetentionReport {
+                    reclaimed_bytes,
+                    blobs_removed,
+                }
+            }
+            None => return Err(error.into()),
+        },
+    };
     report.cas_reclaimed_bytes += gc.reclaimed_bytes;
     report.cas_blob_count = store.blob_count()?;
     report.cas_bytes = compute_cas_bytes(&store);

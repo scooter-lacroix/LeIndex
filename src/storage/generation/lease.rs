@@ -105,7 +105,20 @@ impl GenerationLease {
                 // GenerationLease exists, so Drop never releases them).
                 s.release_generation_hold(manifest.generation);
                 for hash in &hashes {
-                    let _ = s.decr(hash);
+                    // A concurrent handle can legitimately take a count to
+                    // zero between our incr above and this decr, which then
+                    // reports RefcountUnderflow. The pending delta is still
+                    // rewound either way, but swallowing the error silently
+                    // would hide a state where the sidecar under-counts a
+                    // blob another live reader holds — exactly what lets GC
+                    // free in-use data. Make it loud.
+                    if let Err(error) = s.decr(hash) {
+                        tracing::warn!(
+                            hash = %crate::storage::cas::blob::hash_to_hex(hash),
+                            %error,
+                            "generation lease rollback: decr underflowed; another handle released this blob concurrently"
+                        );
+                    }
                 }
                 return Err(LeaseError::Persist(persist_error));
             }

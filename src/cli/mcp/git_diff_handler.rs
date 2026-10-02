@@ -179,13 +179,35 @@ fn parse_numstat(bytes: &[u8]) -> BTreeMap<String, (Option<u64>, Option<u64>)> {
     stats
 }
 
+/// Whether a line met while inside a hunk body must resync the parser to
+/// header state instead of being consumed as body.
+///
+/// `@@ ` and `diff --git ` open headers that can never be body content
+/// (valid body lines begin with ' ', '-', '+' or '\\'), so they resync
+/// unconditionally — otherwise a crafted count could swallow the rest of
+/// the patch, silently dropping every remaining hunk and file. A `+++ ` or
+/// `--- ` line is ambiguous (an added line whose content itself starts
+/// with "++ " renders as `+++ …`): those stay body unless the counters are
+/// implausible — claiming more remaining body than the patch has lines
+/// left — which is exactly the crafted-count case.
+fn is_body_resync(line: &str, body_old: usize, body_new: usize, remaining: usize) -> bool {
+    if line.starts_with("@@ ") || line.starts_with("diff --git ") {
+        return true;
+    }
+    let header_like = line.starts_with("+++ ") || line.starts_with("--- ");
+    let implausible = body_old > remaining || body_new > remaining;
+    header_like && implausible
+}
+
 /// New-side line ranges (1-based, inclusive) touched per file, from a
 /// `-U0` unified diff.
 ///
 /// Hunk bodies are tracked: an added line whose *content* begins with `++`
-/// (`+++ …`) or `--` must never be mistaken for a file header. Without the
-/// body state, such a line cleared the current file and silently dropped
-/// every remaining hunk of that file.
+/// (`+++ …`) or `--` must not be mistaken for a file header while the body
+/// counters are plausible. Without the body state, such a line cleared the
+/// current file and silently dropped every remaining hunk of that file;
+/// see [`is_body_resync`] for how a crafted count is prevented from
+/// swinging to the opposite failure mode.
 fn parse_hunks(patch: &str) -> BTreeMap<String, Vec<(usize, usize)>> {
     let mut hunks: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
     let mut current: Option<String> = None;
@@ -194,20 +216,27 @@ fn parse_hunks(patch: &str) -> BTreeMap<String, Vec<(usize, usize)>> {
     // headers are meaningful).
     let mut body_old = 0usize;
     let mut body_new = 0usize;
-    for line in patch.lines() {
+    let lines: Vec<&str> = patch.lines().collect();
+    for (idx, &line) in lines.iter().enumerate() {
+        let remaining = lines.len() - idx - 1;
         if body_old > 0 || body_new > 0 {
-            match line.as_bytes().first() {
-                Some(b'-') => body_old = body_old.saturating_sub(1),
-                Some(b'+') => body_new = body_new.saturating_sub(1),
-                // "\ No newline at end of file" belongs to the previous line.
-                Some(b'\\') => {}
-                // Context line (or anything mangled): consumes both sides.
-                _ => {
-                    body_old = body_old.saturating_sub(1);
-                    body_new = body_new.saturating_sub(1);
+            if is_body_resync(line, body_old, body_new, remaining) {
+                body_old = 0;
+                body_new = 0;
+            } else {
+                match line.as_bytes().first() {
+                    Some(b'-') => body_old = body_old.saturating_sub(1),
+                    Some(b'+') => body_new = body_new.saturating_sub(1),
+                    // "\ No newline at end of file" belongs to the previous line.
+                    Some(b'\\') => {}
+                    // Context line (or anything mangled): consumes both sides.
+                    _ => {
+                        body_old = body_old.saturating_sub(1);
+                        body_new = body_new.saturating_sub(1);
+                    }
                 }
+                continue;
             }
-            continue;
         }
         if let Some(path) = line.strip_prefix("+++ ") {
             current = path
@@ -253,8 +282,9 @@ fn parse_hunks(patch: &str) -> BTreeMap<String, Vec<(usize, usize)>> {
                 // Enter the hunk body with the remaining (non-context) side
                 // counts so body lines cannot be parsed as headers. The -U0
                 // form has no context lines; `count` lines are `-`, `hit_count`
-                // are `+`. Bounded the same way so a crafted count cannot pin
-                // the parser inside a "body" forever.
+                // are `+`. The counts come from possibly crafted text and can
+                // be absurd; the header-resync at the top of the loop is what
+                // keeps a crafted count from swallowing the rest of the patch.
                 body_old = count.min(u32::MAX as usize);
                 body_new = hit_count.min(u32::MAX as usize);
             }
@@ -816,6 +846,55 @@ mod tests {
             vec![(2, usize::MAX)],
             "saturating range instead of a panic"
         );
+    }
+
+    #[test]
+    fn test_parse_hunks_resyncs_after_crafted_count_swallows_body() {
+        // A header declaring 2^32-1 lines on both sides used to leave the
+        // body counters pinned for the rest of the patch: every subsequent
+        // line — the real `+++ b/` and `@@` headers included — was consumed
+        // as body, silently dropping every remaining hunk and file. The
+        // header-resync must let later hunks through.
+        let patch = concat!(
+            "--- a/craft.rs\n",
+            "+++ b/craft.rs\n",
+            "@@ -1 +1,4294967295 @@\n",
+            "+crafted\n",
+            "--- a/real.rs\n",
+            "+++ b/real.rs\n",
+            "@@ -10 +20 @@\n",
+            "-old\n",
+            "+new\n",
+        );
+        let hunks = parse_hunks(patch);
+        assert_eq!(
+            hunks["craft.rs"],
+            vec![(1, u32::MAX as usize)],
+            "the crafted hunk's own saturating range is kept"
+        );
+        assert_eq!(
+            hunks["real.rs"],
+            vec![(20, 20)],
+            "the real hunk after the crafted count must survive"
+        );
+    }
+
+    #[test]
+    fn test_parse_hunks_body_line_looking_like_header_still_consumed_when_counters_allow() {
+        // The inverse case: a body line that LOOKS like a header (a '+'
+        // line whose content starts with "++ ") must be consumed as body
+        // while the counters still have room — otherwise a patch that adds
+        // lines of patch text would resync mid-body.
+        let patch = concat!(
+            "--- a/x.rs\n",
+            "+++ b/x.rs\n",
+            "@@ -1,2 +1,3 @@\n",
+            "+@@ -1 +1 @@\n",
+            "+added\n",
+            " context\n",
+        );
+        let hunks = parse_hunks(patch);
+        assert_eq!(hunks["x.rs"], vec![(1, 3)]);
     }
 
     #[test]

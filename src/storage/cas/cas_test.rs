@@ -413,6 +413,61 @@ fn test_gc_empty_store_noop() {
     assert_eq!(report.reclaimed_bytes, 0);
 }
 
+/// A sweep that fails part-way (one unremovable blob) must surface the
+/// reclaim it already performed: the error carries the partial accounting
+/// (`CasError::PartialSweep`) so callers can credit it instead of dropping
+/// the report wholesale.
+#[test]
+#[cfg(unix)]
+fn test_gc_partial_sweep_error_carries_partial_accounting() {
+    use crate::storage::cas::blob::hash_to_hex;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().expect("tempdir");
+    let mut store = CasStore::open(dir.path()).expect("open");
+
+    let h_a = store.put(b"removable blob").expect("put A");
+    let h_b = store.put(b"blocked blob").expect("put B");
+    store.persist().expect("persist refcounts");
+    let size_a = fs::metadata(store.blob_path(&h_a)).expect("meta A").len();
+    let size_b = fs::metadata(store.blob_path(&h_b)).expect("meta B").len();
+
+    // Both blobs have refcount 0. Make the shard directory holding B
+    // read-only so its unlink fails; whether the sweep walks A or B first
+    // (and whether both share a shard) depends on hash layout, so the
+    // assertions check the accounting against what is actually on disk.
+    let b_shard = dir.path().join(&hash_to_hex(&h_b)[0..2]);
+    let mut perms = fs::metadata(&b_shard).expect("shard B").permissions();
+    perms.set_mode(0o555);
+    fs::set_permissions(&b_shard, perms).unwrap();
+
+    let error = store
+        .gc()
+        .expect_err("gc must fail while a shard is read-only");
+
+    // Restore so tempdir cleanup can remove everything.
+    let mut perms = fs::metadata(&b_shard).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&b_shard, perms).unwrap();
+
+    let (reclaimed_bytes, blobs_removed) = error
+        .partial_sweep()
+        .expect("a blocked unlink must produce partial-sweep accounting");
+    let a_gone = !store.exists(&h_a);
+    let b_gone = !store.exists(&h_b);
+    assert!(!b_gone, "the read-only shard's blob cannot be removed");
+    assert_eq!(
+        blobs_removed,
+        a_gone as usize + b_gone as usize,
+        "accounting must match the blobs actually unlinked"
+    );
+    let expected_bytes = u64::from(a_gone) * size_a + u64::from(b_gone) * size_b;
+    assert_eq!(
+        reclaimed_bytes, expected_bytes,
+        "byte accounting must match the sizes of the unlinked blobs"
+    );
+}
+
 #[test]
 fn test_gc_with_pins_retains_unreferenced_but_pinned_blobs() {
     // Even if refcount == 0, the pin set (e.g. generation hashes in future

@@ -1711,8 +1711,23 @@ pub(crate) fn enrich_neural_embeddings(
         if !pending.is_empty() {
             append_neural_batch(embedder, &pending, &mut rows);
         }
+        dedupe_neural_rows_keep_first(&mut rows);
         rows
     }
+}
+
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+/// Keep the first row per node_id, in place.
+///
+/// `append_nodes` retains the FIRST occurrence of a duplicate node_id
+/// (unqualified names, e.g. two `fn new`), while `update_neural_embeddings`
+/// applies rows last-wins — an undeduped vec would hand the retained node a
+/// later duplicate's neural vector. Rows and lexical nodes both follow
+/// pdg.node_indices() order, so the first row per id is the retained node's
+/// own body.
+fn dedupe_neural_rows_keep_first(rows: &mut Vec<(String, Vec<f32>)>) {
+    let mut seen = HashSet::new();
+    rows.retain(|(node_id, _)| seen.insert(node_id.clone()));
 }
 
 #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]

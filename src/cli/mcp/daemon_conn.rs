@@ -160,13 +160,31 @@ async fn send_response(out: mpsc::Sender<(String, bool)>, response: Option<Strin
     }
 }
 
-/// Drain the outbound response queue into the socket until the peer goes away.
+/// How long one response frame may sit in a stalled socket write before the
+/// connection is torn down. A client that stops reading fills the bounded
+/// response queue and then parks the writer mid-`write_all`; without this
+/// ceiling the read loop parks behind it forever, `_attached` never drops,
+/// and the daemon's idle self-exit is suppressed for the daemon's lifetime.
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Drain the outbound response queue into the socket until the peer goes
+/// away. A write stalled past [`WRITE_STALL_TIMEOUT`] hangs up: the parked
+/// senders then fail, the read loop breaks, and the connection is reclaimed.
 async fn drive_writer<W>(mut write_half: W, mut out_rx: mpsc::Receiver<(String, bool)>)
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     while let Some((response, framed)) = out_rx.recv().await {
-        if !write_socket_frame(&mut write_half, &response, framed).await {
+        let written = tokio::time::timeout(
+            WRITE_STALL_TIMEOUT,
+            write_socket_frame(&mut write_half, &response, framed),
+        )
+        .await
+        .unwrap_or_else(|_stalled| {
+            debug!("daemon socket write stalled past the deadline; hanging up");
+            false
+        });
+        if !written {
             break;
         }
     }
@@ -185,7 +203,11 @@ enum HelloOutcome {
 /// Handle the client's first frame as the shim hello when it is one: reply with
 /// the ack, start warming the client's project at once and record its cwd as
 /// the connection default.
-fn handle_hello_frame(
+///
+/// The ack goes through an awaited send: on the first frame the queue is
+/// provably empty, so the send can only fail because the writer already
+/// exited on a dead socket — in which case the connection is hung up.
+async fn handle_hello_frame(
     payload: &str,
     out_tx: &mpsc::Sender<(String, bool)>,
     default_project: &mut Option<String>,
@@ -208,13 +230,14 @@ fn handle_hello_frame(
             )
         }),
     };
-    // The ack is a bare line, never Content-Length framed. try_send: this
-    // is a sync helper and the queue is at its freshest here — a full queue
-    // before the ack means the client already is not reading; hang up.
+    // The ack is a bare line, never Content-Length framed. A send failure
+    // here means the writer is gone (dead socket), not a full queue.
     if out_tx
-        .try_send((proto::ack_line(&ack).trim_end().to_string(), false))
+        .send((proto::ack_line(&ack).trim_end().to_string(), false))
+        .await
         .is_err()
     {
+        debug!("hello ack could not be queued; writer is gone");
         return HelloOutcome::Incompatible;
     }
     if !compatible {
@@ -303,7 +326,7 @@ pub(super) async fn serve(
 
         if first_frame {
             first_frame = false;
-            match handle_hello_frame(&payload, &out_tx, &mut default_project) {
+            match handle_hello_frame(&payload, &out_tx, &mut default_project).await {
                 HelloOutcome::Handled => continue,
                 HelloOutcome::Incompatible => break,
                 HelloOutcome::NotHello => {}

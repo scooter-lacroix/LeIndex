@@ -414,6 +414,13 @@ impl<P: Send + Clone> DrrQueue<P> {
                 "scheduler job failed terminally: {message}"
             );
             self.failures.insert(job_id, message);
+            // Mirror the other run_front exits: drain one quantum of DRR
+            // credit for this service. The entry is being dropped, so a
+            // quantum left behind is credit nothing can spend and the next
+            // enqueue on this key would inherit it.
+            if let Some(queue) = self.queues.get_mut(&entry.key) {
+                queue.deficit = queue.deficit.saturating_sub(self.quantum);
+            }
             self.ager.note_served(class);
             return false;
         }
@@ -759,5 +766,60 @@ mod test {
             queue.queue_len(&index_key("project-a")) == 0,
             "terminally failed entry leaves the queue"
         );
+    }
+
+    /// The terminal-failure exit must drain one quantum of DRR credit like
+    /// the Yield/Complete exits do: a dropped job produced no outcome, so
+    /// credit left behind is unspendable and would be inherited by the next
+    /// enqueue on the same key.
+    #[test]
+    fn test_terminal_failure_drains_one_quantum_of_deficit() {
+        struct AlwaysFails;
+        impl BoundedJob for AlwaysFails {
+            type Progress = usize;
+            fn step(&mut self, _budget: WorkBudget) -> anyhow::Result<Step<usize>> {
+                Err(anyhow::anyhow!("deterministic failure"))
+            }
+            fn estimated_next_bytes(&self) -> usize {
+                8
+            }
+        }
+
+        let mut queue = DrrQueue::<usize>::new();
+        let key = index_key("project-a");
+        let class = key.class;
+        let id = queue.enqueue(key.clone(), None, Box::new(AlwaysFails));
+
+        // First tick: the step fails and the entry re-enters backoff — no
+        // deficit is drained because no service happened.
+        let _ = queue.tick(one_item_budget());
+        let deficit_after_backoff = queue.queues.get(&key).expect("queue kept").deficit;
+
+        // Fast-forward to the terminal attempt: the next failure is the
+        // (MAX)th consecutive one and the backoff is already served.
+        {
+            let entry = queue
+                .queues
+                .get_mut(&key)
+                .expect("queue kept")
+                .entries
+                .front_mut()
+                .expect("entry still queued");
+            entry.consecutive_failures = MAX_CONSECUTIVE_FAILURES - 1;
+            entry.retry_not_before_tick = 0;
+        }
+
+        // Terminal tick: accrual adds quantum * weight for the queue, the
+        // terminal exit must drain exactly quantum back off.
+        let _ = queue.tick(one_item_budget());
+        assert!(queue.is_done(id), "job reached terminal failure");
+        let weight = queue.ager.effective_weight(class);
+        let expected = deficit_after_backoff + queue.quantum * (weight - 1);
+        assert_eq!(
+            queue.queues.get(&key).expect("queue kept").deficit,
+            expected,
+            "terminal failure must drain exactly one quantum of deficit"
+        );
+        assert_eq!(queue.queue_len(&key), 0, "terminally failed entry dropped");
     }
 }

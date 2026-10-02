@@ -297,7 +297,27 @@ pub fn retain_after_publish(
     for hash in &gc_candidates {
         report.gc_candidates.push(hash_to_hex(hash));
     }
-    report.cas = store.gc_with_pins(&pinned_set)?;
+    report.cas = match store.gc_with_pins(&pinned_set) {
+        Ok(gc) => gc,
+        Err(error) => match error.partial_sweep() {
+            // A mid-sweep failure (one unremovable blob) must not abort the
+            // later retention phases: the reclaim already performed is real,
+            // and the remaining candidates are retried by the next sweep,
+            // which re-derives them from disk.
+            Some((reclaimed_bytes, blobs_removed)) => {
+                warn!(
+                    reclaimed_bytes,
+                    blobs_removed,
+                    "CAS GC failed part-way; crediting the partial reclaim and continuing"
+                );
+                RetentionReport {
+                    reclaimed_bytes,
+                    blobs_removed,
+                }
+            }
+            None => return Err(error.into()),
+        },
+    };
 
     // ---------------------------------------------------------------
     // Phase 3: Job retention

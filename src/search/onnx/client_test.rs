@@ -423,13 +423,19 @@ fn test_leindex_home_dir_relative_env_ignored() {
     unsafe { std::env::remove_var("HOME") };
 }
 
+// `content_digest` backs the Engram identity, which exists only with the
+// `cli` feature (the daemon/query path); these tests follow that gate so the
+// onnx-without-cli compile matrix stays clean.
+#[cfg(all(feature = "cli", unix))]
 #[test]
 fn test_content_digest_changes_when_content_swapped_within_forged_metadata() {
     // The Engram identity must be content-based: a same-named model whose
     // files keep their size AND mtime across a swap (metadata-preserving
     // copy, reproducible artifact) must not reuse the old digest. On Unix
     // the memo guard includes ctime, which userspace cannot forge — the
-    // rewrite itself changes it.
+    // rewrite itself changes it. Unix-only: elsewhere the guard is size +
+    // mtime, so this forged-metadata swap is indistinguishable by design
+    // and the assertion would fail there.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("model.bin");
     std::fs::write(&path, b"AAAA").unwrap();
@@ -457,6 +463,7 @@ fn test_content_digest_changes_when_content_swapped_within_forged_metadata() {
     );
 }
 
+#[cfg(feature = "cli")]
 #[test]
 fn test_content_digest_is_stable_while_metadata_is_unchanged() {
     let dir = tempfile::tempdir().unwrap();
@@ -466,4 +473,37 @@ fn test_content_digest_is_stable_while_metadata_is_unchanged() {
     let first = super::content_digest(&path, &meta).unwrap();
     let second = super::content_digest(&path, &meta).unwrap();
     assert_eq!(first, second, "memoized digest must be stable per guard");
+}
+
+#[cfg(all(feature = "cli", not(unix)))]
+#[test]
+fn test_content_digest_forged_swap_is_a_memo_hit_without_unix_metadata() {
+    // Companion to the Unix forged-swap test, documenting the deliberately
+    // weaker non-Unix guard: without ctime/ino the guard is size + mtime,
+    // so a swap that forges both back is indistinguishable and the memo
+    // serves the previous digest. That is the documented single-process
+    // weakness of the non-Unix guard, not a regression.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.bin");
+    std::fs::write(&path, b"AAAA").unwrap();
+    let meta1 = std::fs::metadata(&path).unwrap();
+    let mtime1 = meta1.modified().unwrap();
+    let digest1 = super::content_digest(&path, &meta1).unwrap();
+
+    std::fs::write(&path, b"BBBB").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(mtime1)
+        .unwrap();
+    let meta2 = std::fs::metadata(&path).unwrap();
+    assert_eq!(meta1.len(), meta2.len(), "fixture: same length");
+    assert_eq!(mtime1, meta2.modified().unwrap(), "fixture: same mtime");
+
+    let digest2 = super::content_digest(&path, &meta2).unwrap();
+    assert_eq!(
+        digest1, digest2,
+        "non-Unix guard is size+mtime: a forged-metadata swap is a memo hit"
+    );
 }

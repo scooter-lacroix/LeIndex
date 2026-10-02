@@ -93,12 +93,27 @@ fn git_inventory(root: &Path) -> Option<Vec<String>> {
     if !output.status.success() {
         return None;
     }
+    let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut files: Vec<String> = output
         .stdout
         .split(|b| *b == 0)
         .filter(|raw| !raw.is_empty())
         .filter_map(|raw| std::str::from_utf8(raw).ok())
         .filter(|rel| !rel.split('/').any(|seg| seg == ".leindex" || seg == ".git"))
+        // A tracked or untracked symlink can point anywhere — including
+        // outside the project (a `leak.txt -> ../secret` in the worktree).
+        // Downstream reads follow links, so admit a symlink only when its
+        // target resolves back inside the root as a regular file.
+        // Non-symlinks keep the zero-cost path.
+        .filter(|rel| {
+            let path = root.join(rel);
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if !meta.is_symlink() => true,
+                Ok(_) => std::fs::canonicalize(&path)
+                    .is_ok_and(|resolved| resolved.starts_with(&canon_root) && resolved.is_file()),
+                Err(_) => false,
+            }
+        })
         .map(str::to_string)
         .collect();
     files.sort_unstable();
@@ -468,6 +483,10 @@ pub struct FileResult {
     pub match_lines: usize,
     /// Reported hits.
     pub hits: Vec<Hit>,
+    /// More matching lines exist than were buffered for the window: a page
+    /// limit cut collection short, so `has_more` must be reported even when
+    /// the global window was not exceeded by the buffered hits alone.
+    pub collected_truncated: bool,
     /// Enclosing-symbol tallies `(name, kind, matching lines)`.
     pub symbols: Vec<(String, &'static str, usize)>,
     /// Symbols were unavailable because the file changed after indexing.
@@ -734,19 +753,18 @@ fn scan_file(
     };
     let mut tallies: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
     let (mut line_no, mut counted_to, mut last_line_start) = (1u32, 0usize, usize::MAX);
-    // Collect enough hits per file to cover the requested global window:
-    // the per-file cap shapes a page, but it must not drop matches the
-    // window still needs. Capping collection at per_file_cap BEFORE the
-    // global offset/limit is applied stranded every match past the cap (a
+    // Collect enough hits per file to cover the requested global window
+    // [offset, offset+limit). The per-file cap is a REPORTING cap applied
+    // after windowing (see `window_file_hits`), never a collection bound:
+    // bounding collection at the cap stranded every match past it (a
     // 30-match file with cap 20 returned 20 hits with has_more=false, and
-    // no later offset could reach the remaining 10).
+    // no later offset could reach the rest), and folding the cap into the
+    // bound as a floor made it unable to cap anything. 0 = unbounded (no
+    // window: every match is wanted).
     let collect_bound = match (options.collect_hits, options.limit) {
         (false, _) => 0,
-        (true, Some(limit)) => options
-            .offset
-            .saturating_add(limit)
-            .max(options.per_file_cap),
-        (true, None) => options.offset.saturating_add(options.per_file_cap),
+        (true, Some(limit)) => options.offset.saturating_add(limit),
+        (true, None) => 0,
     };
     for found in compiled.regex.find_iter(&data) {
         let start = found.start();
@@ -777,6 +795,10 @@ fn scan_file(
     if result.match_lines == 0 {
         return None;
     }
+    // A page limit stopped collection while matches remained: the caller
+    // must report has_more even if the buffered hits alone did not exceed
+    // the window (the defaults' collect_bound == window_end shape).
+    result.collected_truncated = collect_bound > 0 && result.match_lines > result.hits.len();
     result.symbols = tallies
         .into_iter()
         .map(|((name, kind), count)| (name, kind, count))
@@ -789,6 +811,7 @@ fn window_file_hits(
     seen_hits: &mut usize,
     offset: usize,
     window_end: Option<usize>,
+    per_file_cap: usize,
 ) {
     let mut windowed = Vec::with_capacity(file.hits.len());
     for hit in file.hits.drain(..) {
@@ -797,6 +820,13 @@ fn window_file_hits(
         if position >= offset && window_end.is_none_or(|end| position < end) {
             windowed.push(hit);
         }
+    }
+    // The per-file cap is a REPORTING cap: it shapes what a page shows per
+    // file but never limits what is collected (that is the window's job), so
+    // pagination stays complete and one noisy file cannot consume the page.
+    // 0 = uncapped.
+    if per_file_cap > 0 && windowed.len() > per_file_cap {
+        windowed.truncate(per_file_cap);
     }
     file.hits = windowed;
 }
@@ -808,16 +838,25 @@ fn ingest_scanned_files(
     options: &SearchOptions,
     seen_hits: &mut usize,
     window_end: Option<usize>,
-) {
+) -> bool {
+    let mut truncated = false;
     for mut file in scanned.into_iter().flatten() {
         output.stats.files_matched += 1;
         output.stats.match_lines += file.match_lines;
-        window_file_hits(&mut file, seen_hits, options.offset, window_end);
+        truncated |= file.collected_truncated;
+        window_file_hits(
+            &mut file,
+            seen_hits,
+            options.offset,
+            window_end,
+            options.per_file_cap,
+        );
         output.returned += file.hits.len();
         if !options.collect_hits || !file.hits.is_empty() {
             root_out.files.push(file);
         }
     }
+    truncated
 }
 
 /// Run `query` over `roots`.
@@ -855,7 +894,7 @@ pub fn search(roots: &[RootSpec], compiled: &Compiled, options: &SearchOptions) 
                     .collect()
             });
             output.stats.scanned += chunk.len();
-            ingest_scanned_files(
+            let chunk_truncated = ingest_scanned_files(
                 scanned,
                 &mut root_out,
                 &mut output,
@@ -864,6 +903,16 @@ pub fn search(roots: &[RootSpec], compiled: &Compiled, options: &SearchOptions) 
                 window_end,
             );
             if options.collect_hits && window_end.is_some_and(|end| seen_hits > end) {
+                output.has_more = true;
+                output.complete = false;
+                output.roots.push(std::mem::take(&mut root_out));
+                break 'roots;
+            }
+            if chunk_truncated {
+                // A page limit stopped collection while matches remained:
+                // report has_more so the client pages on, even though the
+                // buffered hits alone never exceeded the window (the
+                // defaults' collect_bound == window_end shape).
                 output.has_more = true;
                 output.complete = false;
                 output.roots.push(std::mem::take(&mut root_out));
@@ -1056,6 +1105,58 @@ mod tests {
         );
         assert!(indexed.roots[0].used_index && !live.roots[0].used_index);
         assert!(indexed.stats.candidates <= live.stats.candidates);
+    }
+
+    #[test]
+    fn test_git_symlinks_escaping_the_root_are_never_indexed() {
+        use std::os::unix::fs::symlink;
+        // A tracked symlink pointing outside the project must not become a
+        // search candidate: reads follow links, so its content would leak.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "treasure_token\n").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/lib.rs", "fn parse_config() {}\n");
+        symlink(outside.path().join("secret"), dir.path().join("leak.txt")).unwrap();
+        // A link INSIDE the root to a root file stays searchable.
+        symlink(
+            dir.path().join("src/lib.rs"),
+            dir.path().join("internal_link.rs"),
+        )
+        .unwrap();
+        // git_inventory needs a repository.
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+            .then_some(())
+            .expect("git init");
+
+        let compiled = q("treasure_token").compile().unwrap();
+        let out = search(
+            &[spec(dir.path(), None)],
+            &compiled,
+            &SearchOptions::default(),
+        );
+        assert!(
+            out.returned == 0,
+            "content behind an escaping symlink must never be served"
+        );
+
+        // The in-root link's target is still reachable through the link.
+        let compiled = q("parse_config").compile().unwrap();
+        let out = search(
+            &[spec(dir.path(), None)],
+            &compiled,
+            &SearchOptions::default(),
+        );
+        let rels = paths(&out);
+        assert!(
+            rels.contains(&"src/lib.rs".to_string()),
+            "the real file stays searchable: {rels:?}"
+        );
     }
 
     #[test]
@@ -1300,6 +1401,86 @@ mod tests {
         );
         assert!(!third.has_more, "all 30 matches accounted for");
         assert_eq!(third.roots[0].files[0].match_lines, 30);
+    }
+
+    #[test]
+    fn test_per_file_cap_caps_the_returned_window() {
+        // The documented "shown per file" semantics: with the handler
+        // defaults (limit 50, cap 20), one file with 200 matches must show
+        // 20 hits — not the whole window. The earlier fix made the cap a
+        // collection FLOOR (`.max(per_file_cap)`), so the window was
+        // reported in full and the cap capped nothing.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "big.txt", &"needle\n".repeat(200));
+        let out = search(
+            &[spec(dir.path(), None)],
+            &q("needle").compile().unwrap(),
+            &SearchOptions {
+                per_file_cap: 20,
+                limit: Some(50),
+                ..Default::default()
+            },
+        );
+        assert_eq!(out.returned, 20, "per-file cap shapes the page");
+        assert_eq!(out.roots[0].files[0].hits.len(), 20);
+        assert_eq!(out.roots[0].files[0].match_lines, 200, "all counted");
+    }
+
+    #[test]
+    fn test_page_truncation_reports_has_more_even_when_window_not_exceeded() {
+        // The defaults' shape: limit 50, cap 20, one file with 200 matches.
+        // Buffered hits (50) never EXCEED the window end (50), so the old
+        // seen_hits > window_end check left has_more=false with complete
+        // true and 150 matches unreachable through documented paging.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "big.txt", &"needle\n".repeat(200));
+        let first = search(
+            &[spec(dir.path(), None)],
+            &q("needle").compile().unwrap(),
+            &SearchOptions {
+                per_file_cap: 20,
+                limit: Some(50),
+                ..Default::default()
+            },
+        );
+        assert!(first.has_more, "truncated collection must page on");
+        assert!(!first.complete);
+
+        // The next page reaches the rest.
+        let second = search(
+            &[spec(dir.path(), None)],
+            &q("needle").compile().unwrap(),
+            &SearchOptions {
+                per_file_cap: 20,
+                limit: Some(50),
+                offset: 50,
+                ..Default::default()
+            },
+        );
+        assert_eq!(second.returned, 20, "second page shows the next 20");
+        assert!(second.has_more);
+    }
+
+    #[test]
+    fn test_uncapped_collection_still_collects_everything_with_offset() {
+        // limit: 0 (all) with per_file_cap: 0 (no cap): the old
+        // `.max(per_file_cap)`/offset arm bounded collection at `offset`,
+        // and windowing then discarded those buffered hits — the first
+        // `offset` matches of the first file vanished entirely.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "big.txt", &"needle\n".repeat(30));
+        let out = search(
+            &[spec(dir.path(), None)],
+            &q("needle").compile().unwrap(),
+            &SearchOptions {
+                per_file_cap: 0,
+                limit: None,
+                offset: 20,
+                ..Default::default()
+            },
+        );
+        assert_eq!(out.returned, 10, "all 30 matches exist; window keeps 10");
+        assert_eq!(out.roots[0].files[0].match_lines, 30);
     }
 
     #[test]

@@ -1296,6 +1296,19 @@ impl LeIndex {
         self.load_from_storage_inner_at(false, Some(&active_storage), active)
     }
 
+    /// Re-hydrate from the CURRENT generation even when a generation snapshot
+    /// is already held (which `load_from_active_storage` treats as done).
+    ///
+    /// Used after a coalesced index: another process published a fresh
+    /// generation while this instance waited on the write lock, and a held
+    /// snapshot of the OLD generation would otherwise keep serving stale
+    /// data under a moved CURRENT pointer. Dropping the old snapshot
+    /// releases its lease; the new hydration leases the new generation.
+    pub(crate) fn force_reload_from_active_storage(&mut self) -> Result<()> {
+        self.generation_snapshot = None;
+        self.load_from_active_storage()
+    }
+
     /// WS4 Task 14: wire the read path (PDG + search engine) onto the leased
     /// mmap generation when `LEINDEX_FEATURE_GENERATION_READERS` is enabled
     /// and the project has a current generation.

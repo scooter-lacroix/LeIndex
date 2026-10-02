@@ -1313,8 +1313,12 @@ impl ProjectRegistry {
             }
         };
 
+        // A failed coalesced refresh propagates BEFORE the cleanup writes
+        // below: the stale-cache entry and failure marker must survive so
+        // the auto-index cooldown retries on a later call instead of
+        // reporting a stale resident as success.
         self.install_indexed_instance(handle, temp, &project_path)
-            .await;
+            .await?;
 
         // Invalidate stale-cache entry so get_or_create() won't reuse
         // the pre-indexing staleness result. `project_path` is
@@ -1340,27 +1344,30 @@ impl ProjectRegistry {
     /// instance (which may hold a hydrated core the temp lacks, and whose
     /// `hydrated_generation` powers the N-13 external-rebuild detector) and
     /// refresh it from the generation the peer published instead.
+    /// Install the freshly indexed instance into the resident handle — or,
+    /// for a run coalesced away by a peer process, keep the resident
+    /// instance (which may hold a hydrated core the temp lacks, and whose
+    /// `hydrated_generation` powers the N-13 external-rebuild detector) and
+    /// FORCE-refresh it from the generation the peer published.
+    ///
+    /// The refresh error propagates: `index_handle` only clears the stale
+    /// cache and the failed-attempt marker on success, so a failed refresh
+    /// keeps the auto-index cooldown and retry semantics instead of leaving
+    /// a stale resident reported as success.
     async fn install_indexed_instance(
         &self,
         handle: &ProjectHandle,
         temp: crate::cli::leindex::LeIndex,
         project_path: &Path,
-    ) {
+    ) -> Result<(), JsonRpcError> {
         if !temp.last_index_coalesced {
             let mut idx = handle.write().await;
             *idx = temp;
-            return;
+            return Ok(());
         }
         drop(temp);
-        if let Err(error) = self
-            .refresh_loaded_from_active_generation(project_path)
+        self.force_refresh_loaded_from_active_generation(project_path)
             .await
-        {
-            warn!(
-                project = %project_path.display(),
-                "Coalesced index: resident refresh from the published generation failed: {error}"
-            );
-        }
     }
 
     /// Get/create the per-project indexing slot.
@@ -1490,6 +1497,31 @@ impl ProjectRegistry {
         tokio::task::spawn_blocking(move || {
             let mut index = handle.blocking_write();
             index.load_from_active_storage().map_err(|error| {
+                JsonRpcError::internal_error(format!(
+                    "Failed to hydrate published core generation: {error:#}"
+                ))
+            })
+        })
+        .await
+        .map_err(|error| {
+            JsonRpcError::internal_error(format!("Core hydration task failed: {error}"))
+        })?
+    }
+
+    /// Forced variant used after a coalesced index: re-hydrate from the
+    /// CURRENT generation even when a generation snapshot is already held (a
+    /// plain refresh early-returns on a held snapshot and would leave the
+    /// resident serving the pre-peer generation under a moved CURRENT).
+    async fn force_refresh_loaded_from_active_generation(
+        &self,
+        path: &Path,
+    ) -> Result<(), JsonRpcError> {
+        let Some(handle) = self.try_get_loaded(path).await else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || {
+            let mut index = handle.blocking_write();
+            index.force_reload_from_active_storage().map_err(|error| {
                 JsonRpcError::internal_error(format!(
                     "Failed to hydrate published core generation: {error:#}"
                 ))

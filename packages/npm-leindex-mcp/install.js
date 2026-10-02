@@ -830,10 +830,43 @@ async function install() {
         `   ⚠ Existing LeIndex binary is stale or unreadable: ${existing.version || existing.output}`
       );
       console.log(`   Reinstalling binary for package version ${pkg.version}...`);
-    } else if (!hasDaemon) {
-      console.log('   ⚠ Daemon binary (leindexd) missing; reinstalling release bundle...');
     } else {
-      console.log('   ⚠ Bundled ORT runtime assets missing; reinstalling release bundle...');
+      // Binary is current; the gap is daemon or ORT assets. Before deleting
+      // a working binary, check what the resolved release could actually
+      // install: a legacy bare-binary release ships neither leindexd nor
+      // the ORT bundle, so reinstalling from it recreates the exact same
+      // incomplete state — deleting first would turn every install run
+      // into an endless download loop that keeps "repairing" nothing.
+      const gap = !hasAssets
+        ? 'Bundled ORT runtime assets missing'
+        : 'Daemon binary (leindexd) missing';
+      let resolved = null;
+      let resolveFailed = false;
+      try {
+        resolved = await resolveReleaseConfig(platform, arch);
+      } catch (_) {
+        resolveFailed = true;
+      }
+
+      if (resolved && !resolved.isBundle) {
+        console.log(
+          `   ⚠ ${gap}, but resolved release ${resolved.version} is the legacy bare-binary format and carries neither leindexd nor the ORT bundle.`
+        );
+        console.log('   Keeping the installed binary; reinstalling would recreate the same state.');
+        console.log('   Sessions run inline (no shared daemon) until a bundle-format release is installed.');
+        return;
+      }
+
+      // Release resolution failed (offline, rate limit): leave the working
+      // binary in place and report, rather than gambling it on the cargo
+      // fallback below.
+      if (resolveFailed) {
+        console.log(`   ⚠ ${gap}, and no release could be resolved to repair it (${getRequestedRelease()}).`);
+        console.log('   Keeping the installed binary; fix connectivity or set LEINDEX_BINARY_VERSION and rerun.');
+        return;
+      }
+
+      console.log(`   ⚠ ${gap}; reinstalling release bundle...`);
     }
 
     try { fs.unlinkSync(binaryPath); } catch (_) {}

@@ -1919,20 +1919,26 @@ fn flatten_into_response(vectors: Vec<Vec<f32>>, expected_dim: usize) -> EmbedRe
     EmbedResponse::new(flat, count, expected_dim)
 }
 
+/// Memo key for [`content_digest`]: `(len, mtime_ns, ctime, inode)`. ctime is
+/// the full `seconds << 32 | nanoseconds` value — nanoseconds alone can
+/// repeat across rewrites landing at the same offset within the second.
+#[cfg(feature = "cli")]
+type DigestKey = (u64, u128, u128, u64);
+
 /// Hex blake3 digest of `path`'s content, memoized under a metadata guard.
 ///
 /// The guard is what keeps repeated calls cheap (model files are read once
 /// per guard change, not per query) while staying sound: on Unix it includes
-/// ctime and inode, which userspace cannot preserve across a rewrite — so a
-/// file replaced with a same-size, same-mtime copy forces a re-hash instead
-/// of silently reusing the old digest. On platforms without those fields the
-/// guard is size + mtime and a swap within one guard window is indistinguish
-/// able (the pre-existing metadata-only weakness, now narrowed to a single
-/// process lifetime instead of persisted identity).
+/// the full ctime and inode, which userspace cannot preserve across a
+/// rewrite — so a file replaced with a same-size, same-mtime copy forces a
+/// re-hash instead of silently reusing the old digest. On platforms without
+/// those fields the guard is size + mtime and a swap within one guard window
+/// is indistinguishable (the metadata-only weakness, narrowed to a single
+/// process lifetime).
 #[cfg(feature = "cli")]
 fn content_digest(path: &Path, meta: &std::fs::Metadata) -> Option<String> {
     #[cfg(unix)]
-    fn guard(meta: &std::fs::Metadata) -> Option<(u64, u128, u64, u64)> {
+    fn guard(meta: &std::fs::Metadata) -> Option<DigestKey> {
         use std::os::unix::fs::MetadataExt;
         Some((
             meta.len(),
@@ -1941,12 +1947,12 @@ fn content_digest(path: &Path, meta: &std::fs::Metadata) -> Option<String> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()?
                 .as_nanos(),
-            meta.ctime_nsec() as u64,
+            ((meta.ctime() as u128) << 32) | meta.ctime_nsec() as u128,
             meta.ino(),
         ))
     }
     #[cfg(not(unix))]
-    fn guard(meta: &std::fs::Metadata) -> Option<(u64, u128, u64, u64)> {
+    fn guard(meta: &std::fs::Metadata) -> Option<DigestKey> {
         Some((
             meta.len(),
             meta.modified()
@@ -1959,17 +1965,20 @@ fn content_digest(path: &Path, meta: &std::fs::Metadata) -> Option<String> {
         ))
     }
 
-    static DIGESTS: OnceLock<Mutex<HashMap<PathBuf, ((u64, u128, u64, u64), String)>>> =
-        OnceLock::new();
+    static DIGESTS: OnceLock<Mutex<HashMap<PathBuf, (DigestKey, String)>>> = OnceLock::new();
     let digests = DIGESTS.get_or_init(|| Mutex::new(HashMap::new()));
     let key = guard(meta)?;
 
-    let mut digests = digests
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some((cached_key, digest)) = digests.get(path) {
-        if *cached_key == key {
-            return Some(digest.clone());
+    // Lookup holds the memo lock only for the map probe: hashing a multi-
+    // hundred-MB model file must not serialize concurrent embedder starts.
+    {
+        let digests = digests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((cached_key, digest)) = digests.get(path) {
+            if *cached_key == key {
+                return Some(digest.clone());
+            }
         }
     }
 
@@ -1977,7 +1986,10 @@ fn content_digest(path: &Path, meta: &std::fs::Metadata) -> Option<String> {
     let mut hasher = blake3::Hasher::new();
     std::io::copy(&mut file, &mut hasher).ok()?;
     let digest = hasher.finalize().to_hex().to_string();
-    digests.insert(path.to_path_buf(), (key, digest.clone()));
+    digests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf(), (key, digest.clone()));
     Some(digest)
 }
 

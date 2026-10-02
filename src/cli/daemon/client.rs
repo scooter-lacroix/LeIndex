@@ -161,9 +161,13 @@ pub fn run(project: Option<PathBuf>) -> Outcome {
                 // the budget unspent — orphaning a slow-to-bind daemon that
                 // then raced the inline fallback to the same project. The
                 // deadline, not the attempt count, decides when to stop.
+                // The cooldown is measured from AFTER the fork returns: a
+                // fork of the full daemon binary can cost hundreds of ms on
+                // a loaded host, and pre-fork timing would shrink the
+                // effective gap toward zero.
                 if now >= next_spawn_allowed {
                     match spawn_daemon(&socket) {
-                        Ok(()) => next_spawn_allowed = now + SPAWN_RETRY_COOLDOWN,
+                        Ok(()) => next_spawn_allowed = Instant::now() + SPAWN_RETRY_COOLDOWN,
                         Err(reason) => return Outcome::Fallback(reason),
                     }
                 }
@@ -299,11 +303,21 @@ fn replace(stream: &UnixStream, socket: &Path, pid: u32) {
 
 /// Whether `pid` really is the daemon on the other end of `stream`.
 ///
-/// Verified with a kernel-provided peer credential where the platform has
-/// one (SO_PEERCRED on Linux, LOCAL_PEERCRED on macOS — both primary
-/// release targets), plus — where `/proc` exists — the target's executable
-/// must be `leindexd` (guards a pid recycled between ack and kill).
+/// The pid is an unauthenticated wire value, so it is validated before any
+/// signal is considered: `0` and out-of-`pid_t`-range values are rejected
+/// outright (`kill(0, …)` targets the caller's whole process group — the
+/// editor's — and a wrapping `pid_t` would negate), the kernel-provided peer
+/// credential is matched where the platform has one (SO_PEERCRED on Linux,
+/// LOCAL_PEERCRED + `proc_pidpath` on macOS), and the target's executable is
+/// compared against the resolved `daemon_binary()` — guarding a pid recycled
+/// between ack and kill and honouring `LEINDEXD_BIN` overrides.
 fn pid_is_the_connected_daemon(stream: &UnixStream, pid: u32) -> bool {
+    // 0. Wire-value sanity: pid 0 would signal our whole process group and
+    //    probes as "alive" via kill(pid, 0); anything above i32::MAX wraps
+    //    negative in pid_t.
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
     // 1. Kernel credential check: the peer that answered us must BE that pid
     //    (SO_PEERCRED; `UnixStream::peer_cred` is not stable in std yet).
     #[cfg(target_os = "linux")]
@@ -331,14 +345,12 @@ fn pid_is_the_connected_daemon(stream: &UnixStream, pid: u32) -> bool {
         }
     }
     // macOS: LOCAL_PEERCRED's xucred carries the peer's uid (the libc crate
-    // does not yet mirror the kernel's pid extension, so pid-exact matching
-    // is not available there). Requiring the peer to run as OUR effective
-    // uid still ties the connection to this user — combined with the 0700
-    // run directory, no other account can be the listener — and a liveness
-    // probe guards a pid recycled between ack and kill. Without any check
-    // here, a stale daemon could never be replaced on a primary release
-    // platform and every session silently fell back to an inline server
-    // (the double-index-per-editor problem the shim exists to prevent).
+    // does not mirror the kernel's pid extension, so pid-exact matching is
+    // not available there). Requiring the peer to run as OUR effective uid
+    // ties the connection to this user — combined with the 0700 run
+    // directory, no other account can be the listener — and step 2 below
+    // (`proc_pidpath`) binds the named pid to the exact daemon binary, so a
+    // same-uid peer cannot name an arbitrary process.
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::io::AsRawFd;
@@ -364,32 +376,34 @@ fn pid_is_the_connected_daemon(stream: &UnixStream, pid: u32) -> bool {
             return false;
         }
     }
-    // 2. The target must be running the leindexd binary (guards a pid
-    //    recycled between ack and kill).
+    // 2. The target must be running the exact binary this shim would spawn
+    //    (guards a pid recycled between ack and kill, honours LEINDEXD_BIN).
     #[cfg(target_os = "linux")]
     {
-        let exe = std::fs::read_link(format!("/proc/{pid}/exe"));
-        match exe {
-            Ok(path) => {
-                let mut name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or_default()
-                    .to_string();
-                // `cargo install` / rustup upgrade by renaming over the
-                // binary: the running daemon's /proc/<pid>/exe then reads
-                // "leindexd (deleted)". Strip that suffix, and require an
-                // exact match — a `starts_with` prefix also accepted
-                // unrelated executables like "leindexd-malware".
-                if let Some(stripped) = name.strip_suffix(" (deleted)") {
-                    name = stripped.to_string();
-                }
-                if name != "leindexd" {
-                    return false;
-                }
-            }
-            Err(_) => return false,
+        exe_matches_daemon_binary(
+            std::fs::read_link(format!("/proc/{pid}/exe"))
+                .ok()
+                .as_deref(),
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `proc_pidpath` writes at most `buffer.len()` bytes into a
+        // buffer we own for the pid we are about to signal.
+        let mut buffer = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let len = unsafe {
+            libc::proc_pidpath(
+                pid as libc::c_int,
+                buffer.as_mut_ptr() as *mut libc::c_void,
+                buffer.len() as u32,
+            )
+        };
+        if len <= 0 {
+            return false;
         }
+        let path =
+            std::path::PathBuf::from(String::from_utf8_lossy(&buffer[..len as usize]).into_owned());
+        exe_matches_daemon_binary(Some(path.as_path()))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -399,7 +413,39 @@ fn pid_is_the_connected_daemon(stream: &UnixStream, pid: u32) -> bool {
         let _ = (stream, pid);
         return false;
     }
-    true
+}
+
+/// Whether the running executable `exe` is the daemon binary this shim would
+/// spawn: the resolved `daemon_binary()` when one is configured, else the
+/// plain `leindexd` name. The kernel may report the binary with a
+/// `" (deleted)"` suffix after an upgrade renames over it (`cargo install`,
+/// rustup); that suffix is stripped before comparing.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn exe_matches_daemon_binary(exe: Option<&Path>) -> bool {
+    let Some(exe) = exe else {
+        return false;
+    };
+    let mut exe = exe.to_path_buf();
+    if exe.as_os_str().to_string_lossy().ends_with(" (deleted)") {
+        let stripped = exe.as_os_str().to_string_lossy();
+        exe = PathBuf::from(stripped.trim_end_matches(" (deleted)").to_string());
+    }
+    match daemon_binary() {
+        Some(expected) => {
+            match (
+                std::fs::canonicalize(&exe),
+                std::fs::canonicalize(&expected),
+            ) {
+                (Ok(actual), Ok(expected)) => actual == expected,
+                // Canonicalize fails on the "(deleted)" binary; compare the
+                // raw paths as a fallback.
+                _ => exe == expected,
+            }
+        }
+        // No resolvable daemon binary: an exe literally named leindexd next
+        // to us is still accepted (the pre-override default layout).
+        None => exe.file_name().and_then(|name| name.to_str()) == Some("leindexd"),
+    }
 }
 
 /// Copy stdin to the daemon and the daemon to stdout until either side ends.

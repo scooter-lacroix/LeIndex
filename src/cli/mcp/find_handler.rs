@@ -15,6 +15,12 @@ use std::time::{Duration, Instant};
 const DEFAULT_LIMIT: usize = 50;
 const DEFAULT_PER_FILE: usize = 20;
 const DEFAULT_TIMEOUT_MS: usize = 20_000;
+/// Hard ceiling on a page. `limit` has no schema maximum today, and the
+/// engine buffers `offset + limit` hits per file to keep pagination
+/// complete — an unbounded `limit: 100_000_000` let one request park
+/// hundreds of MB of hits in the shared daemon. Values above the ceiling
+/// are clamped, not rejected.
+const MAX_LIMIT: usize = 10_000;
 
 /// Handler for LeIndex \[Find\] — index-accelerated, unbounded text and symbol
 /// search across the project and any other path on the machine.
@@ -113,7 +119,7 @@ impl FindHandler {
                 "output": { "type": "string", "enum": ["matches", "files", "count", "symbols"], "default": "matches", "description": "matches (default), files, count, or symbols (enclosing symbols by hits)" },
                 "kind": { "type": "string", "description": "target=symbols: function, class, struct, ..." },
                 "context_lines": { "type": "integer", "default": 0, "minimum": 0, "maximum": 10, "description": "Context lines per match" },
-                "limit": { "type": "integer", "default": DEFAULT_LIMIT, "minimum": 0, "description": "Hits per page; 0 = all" },
+                "limit": { "type": "integer", "default": DEFAULT_LIMIT, "minimum": 0, "maximum": MAX_LIMIT, "description": "Hits per page; 0 = all (capped)" },
                 "offset": { "type": "integer", "default": 0, "minimum": 0, "description": "Hits to skip (use next_offset)" },
                 "per_file_cap": { "type": "integer", "default": DEFAULT_PER_FILE, "minimum": 0, "description": "Shown per file (all counted); 0 = no cap" },
                 "max_line_chars": { "type": "integer", "default": 200, "minimum": 20, "maximum": 2000, "description": "Longest line shown" },
@@ -156,9 +162,12 @@ impl FindHandler {
         // and this handler sits on a deep async poll chain: compiling on the
         // tokio worker's ~2 MiB stack overflowed in debug builds and stays
         // borderline in release. It is pure CPU work — run it on the
-        // blocking pool, where the search below already runs.
-        let compile_args = args.clone();
-        let found = tokio::task::spawn_blocking(move || find_pattern(&compile_args))
+        // blocking pool, where the search below already runs. The offload
+        // stays unconditional (the meta builder runs for literals too);
+        // only the small extracted `Query` is moved in, so the common case
+        // pays one handoff and no argument deep-clone.
+        let query = find_query(&args)?;
+        let found = tokio::task::spawn_blocking(move || compile_query(query))
             .await
             .map_err(|e| JsonRpcError::internal_error(format!("find failed: {e}")))??;
         let output_mode = output_mode_arg(&args)?;
@@ -240,8 +249,8 @@ fn preferred_key(args: &Value, primary: &'static str, legacy: &'static str) -> &
     }
 }
 
-/// Extract the required pattern and compile its matcher.
-fn find_pattern(args: &Value) -> Result<FindPattern, JsonRpcError> {
+/// Pull the pattern and its modifiers out of the arguments (cheap, sync).
+fn find_query(args: &Value) -> Result<Query, JsonRpcError> {
     let text = first(args, &["pattern", "query"])
         .and_then(Value::as_str)
         .filter(|p| !p.is_empty())
@@ -252,12 +261,18 @@ fn find_pattern(args: &Value) -> Result<FindPattern, JsonRpcError> {
             )
         })?
         .to_string();
-    let query = Query {
-        pattern: text.clone(),
+    Ok(Query {
+        pattern: text,
         regex: extract_bool(args, "regex", extract_bool(args, "is_regex", false)),
         case: case_mode(args),
         word: extract_bool(args, "word", false),
-    };
+    })
+}
+
+/// Compile the matcher. Only ever called from `spawn_blocking` (see `run`):
+/// the meta builder is stack-hungry even for literals.
+fn compile_query(query: Query) -> Result<FindPattern, JsonRpcError> {
+    let text = query.pattern.clone();
     let compiled = query.compile().map_err(JsonRpcError::invalid_params)?;
     Ok(FindPattern { text, compiled })
 }
@@ -300,7 +315,7 @@ fn find_window(args: &Value) -> Result<FindWindow, JsonRpcError> {
     )?;
     let max_line_chars = extract_usize(args, "max_line_chars", 200)?.clamp(20, 2000);
     Ok(FindWindow {
-        limit: (raw_limit > 0).then_some(raw_limit),
+        limit: (raw_limit > 0).then_some(raw_limit.min(MAX_LIMIT)),
         offset,
         context,
         per_file,

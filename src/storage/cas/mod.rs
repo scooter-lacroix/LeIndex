@@ -304,15 +304,15 @@ impl CasStore {
             Err(error) => {
                 // The sweep aborted part-way but the already-unlinked blobs
                 // are gone and their sidecar entries were persisted (see
-                // `collect_zero_refcount`). Surface the partial accounting
-                // before propagating so operators know what was reclaimed.
-                tracing::warn!(
-                    %error,
-                    blobs_removed,
+                // `collect_zero_refcount`). Attach the real partial
+                // accounting to the error — callers credit it and continue
+                // (or propagate) instead of losing the numbers to a bare
+                // `?`.
+                return Err(CasError::PartialSweep {
+                    source: Box::new(error),
                     reclaimed_bytes,
-                    "GC sweep failed part-way; the already-swept blobs above were reclaimed"
-                );
-                return Err(error);
+                    blobs_removed,
+                });
             }
         };
         report.reclaimed_bytes += reclaimed_bytes;

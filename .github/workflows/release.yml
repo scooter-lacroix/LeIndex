@@ -519,7 +519,7 @@ jobs:
           1. Add this directory to your PATH, or copy bin\leindex.exe into
              a directory that already is. The shared daemon is not shipped
              on Windows; leindex sessions always run in-process.
-FRAG
+          FRAG
           else
             LAYOUT_BINS='    bin/        leindex binary (worker mode: leindex --internal-embed-worker)
             bin/leindexd  shared per-user daemon'
@@ -535,7 +535,7 @@ FRAG
              Without leindexd beside it, every `leindex mcp` session runs
              its own inline server (higher memory per editor/session)
              instead of sharing one daemon per user.
-FRAG
+          FRAG
           fi
           cat > "$BUNDLE_DIR/INSTALL.txt" <<EOF
           LeIndex $VERSION — ${{ matrix.asset_name }}
@@ -551,7 +551,7 @@ FRAG
           QUICK START
           -----------
 
-$(cat "$STEP1_FRAG")
+          $(cat "$STEP1_FRAG")
 
           2. TF-IDF search works immediately. Index a project and search:
 

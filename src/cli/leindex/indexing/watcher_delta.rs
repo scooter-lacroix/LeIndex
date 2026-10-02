@@ -72,6 +72,21 @@ impl LeIndex {
         // `try_acquire_write_lock` in mod.rs and watcher.rs. Do not add a
         // blocking flock here: spawn_blocking cannot be cancelled, so a
         // blocking acquire held by another process would stall the watcher.
+        //
+        // A resident PDG is REQUIRED: the delta is built by merging into the
+        // graph `take_owned_pdg` yields, and `save_pdg` persists exactly the
+        // supplied graph — for a never-hydrated resident that would be a
+        // delta-only graph holding just the changed files, and persisting it
+        // would delete every unchanged file's nodes from the database (and
+        // then install the truncated graph as resident, defeating every
+        // load gate). A project without a resident graph needs a full index,
+        // which the caller's error path escalates to.
+        if self.pdg.is_none() {
+            anyhow::bail!(
+                "incremental reindex requires a resident PDG; none is loaded \
+                 (project not hydrated) — a full index is needed"
+            );
+        }
         let start_time = std::time::Instant::now();
         let indexed_files =
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
