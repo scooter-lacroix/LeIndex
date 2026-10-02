@@ -39,15 +39,94 @@ fn test_put_idempotency() {
     assert_eq!(h1, h2, "same content must hash identically");
     assert_eq!(store.blob_count().unwrap(), 1, "dedup must store once");
 
-    // Staging file cleaned up.
-    let staging = dir
-        .path()
-        .join(STAGING_DIR)
-        .join(format!("{}.partial", hash_to_hex(&h1)));
-    assert!(
-        !staging.exists(),
-        "staging partial must be gone after rename"
+    // Staging file cleaned up (name-agnostic: the staging dir must be empty).
+    let staging_dir = dir.path().join(STAGING_DIR);
+    assert_eq!(
+        fs::read_dir(&staging_dir)
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0),
+        0,
+        "staging partials must be gone after rename"
     );
+}
+
+#[test]
+fn test_staging_paths_are_unique_per_put() {
+    // Two writers putting the same content concurrently must never share a
+    // staging file: a deterministic `<hash>.partial` name let them truncate
+    // each other's in-flight blob.
+    let dir = tempdir().expect("tempdir");
+    let store = CasStore::open(dir.path()).expect("open");
+    let h = blob_hash(b"staging uniqueness");
+    assert_ne!(
+        store.staging_path(&h),
+        store.staging_path(&h),
+        "every put must get a distinct staging path"
+    );
+}
+
+#[test]
+fn test_concurrent_puts_of_same_blob_publish_a_valid_blob() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i & 0xFF) as u8).collect();
+
+    // Concurrent writers of the same content from independent handles.
+    let mut threads = Vec::new();
+    for _ in 0..4 {
+        let root = root.clone();
+        let payload = payload.clone();
+        threads.push(std::thread::spawn(move || {
+            let store = CasStore::open(&root).expect("open");
+            store.put(&payload).expect("put");
+        }));
+    }
+    for thread in threads {
+        thread.join().expect("join");
+    }
+
+    let hash = blob_hash(&payload);
+    let verifier = CasStore::open(&root).expect("open verifier");
+    let recovered = verifier
+        .get(&hash)
+        .expect("blob must validate after concurrent puts");
+    assert_eq!(recovered.as_slice(), payload.as_slice());
+}
+
+#[test]
+fn test_gc_does_not_delete_blob_leased_after_reload() {
+    // The GC handle reloads before sweeping (sees refcount 0), then another
+    // handle acquires a lease and persists it. The sweep must re-read the
+    // fresh count under the refs lock and keep the blob: deleting it would
+    // fail the live reader's snapshot open and erase its just-persisted
+    // lease count.
+    let dir = tempdir().expect("tempdir");
+    let h = {
+        let store = CasStore::open(dir.path()).expect("open");
+        store.put(b"leased between reload and sweep").expect("put")
+    };
+
+    let mut gc = CasStore::open(dir.path()).expect("open gc handle");
+    gc.reload().expect("reload sees refcount 0");
+
+    // The lease lands after the GC handle's reload.
+    let mut reader = CasStore::open(dir.path()).expect("open reader handle");
+    reader.incr(&h);
+    reader.persist().expect("persist lease");
+
+    let report = gc.gc().expect("gc");
+    assert_eq!(report.blobs_removed, 0, "a persisted live lease must win");
+    assert!(gc.exists(&h), "blob must survive the concurrent lease");
+    assert_eq!(gc.refcount(&h), 1, "the lease count must not be erased");
+
+    // Once the lease is released, a fresh sweep reclaims the blob.
+    reader.decr(&h).expect("release lease");
+    reader.persist().expect("persist release");
+    drop(reader);
+    gc.reload().expect("reload");
+    let report = gc.gc().expect("gc after release");
+    assert_eq!(report.blobs_removed, 1);
+    assert!(!gc.exists(&h));
 }
 
 // -------- VAL-CAS-003: hash determinism across stores --------

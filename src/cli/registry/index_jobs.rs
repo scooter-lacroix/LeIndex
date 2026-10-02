@@ -25,7 +25,7 @@ impl ProjectRegistry {
         let next_state_path =
             JobPaths::new(&storage_root, previous_generation.saturating_add(1)).job_status();
         let state = self
-            .select_index_job_state(&canonical, &next_state_path, force_reindex)
+            .select_index_job_state(&canonical, &next_state_path)
             .await;
         self.spawn_owned_index_job(
             &state,
@@ -57,17 +57,27 @@ impl ProjectRegistry {
         })
     }
 
-    /// Select the existing owned job or replace a completed one for an explicit reindex.
+    /// Select the existing owned job or replace a terminal one.
+    ///
+    /// Only a live job is coalesced with (a freshly created state also
+    /// reports `Running` — it is `IndexJobSnapshot`'s default — so the
+    /// insert/spawn race between two concurrent callers still coalesces).
+    /// Returning a terminal `Failed` job made a project that failed to index
+    /// once unindexable for the life of the process — every later
+    /// `auto_index` (always `force_reindex=false`) got the same stale failure
+    /// snapshot back and `spawn_owned_index_job` started nothing. A terminal
+    /// `Complete` job is replaced too: if the caller is asking again, either
+    /// the index went missing (re-run heals) or nothing changed and the
+    /// pipeline's freshness check makes the re-run a fast no-op.
     pub(super) async fn select_index_job_state(
         &self,
         canonical: &Path,
         next_state_path: &Path,
-        force_reindex: bool,
     ) -> Arc<IndexJobState> {
         let mut jobs = self.index_jobs.lock().await;
         if let Some(existing) = jobs.get(canonical).cloned() {
             let current = existing.snapshot().await;
-            if current.status == JobStatus::Running || !force_reindex {
+            if current.status == JobStatus::Running {
                 return existing;
             }
         }

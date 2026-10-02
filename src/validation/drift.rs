@@ -14,6 +14,25 @@ use crate::validation::ValidationError;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Whether two signatures describe the same symbol shape: identical
+/// parameter count with element-wise identical parameter types, identical
+/// return type, and identical method/async flags.
+///
+/// Names are excluded (that is what a rename changes), as are parameter
+/// names and defaults; a parameter TYPE change is an API break and must not
+/// let a rename pairing swallow it.
+fn signatures_shape_compatible(old_sig: &SignatureInfo, new_sig: &SignatureInfo) -> bool {
+    new_sig.parameters.len() == old_sig.parameters.len()
+        && new_sig
+            .parameters
+            .iter()
+            .zip(old_sig.parameters.iter())
+            .all(|(new_param, old_param)| new_param.type_annotation == old_param.type_annotation)
+        && new_sig.return_type == old_sig.return_type
+        && new_sig.is_method == old_sig.is_method
+        && new_sig.is_async == old_sig.is_async
+}
+
 /// Upper bound on memoised signature lists; the cache is cleared when full.
 const SIGNATURE_CACHE_CAP: usize = 256;
 
@@ -353,19 +372,20 @@ impl SemanticDriftAnalyzer {
         // + Added(new) pair, `has_errors()` classified the removal as an
         // error, and the rename tool hard-rejected its own output — apply
         // mode could never succeed. Under a rename edit, pair each removal
-        // with a structurally identical addition (same parameter count,
-        // return type, and method flag — i.e. the same symbol under a new
-        // name) and report the pair as informational `Renamed`. Only
-        // unpaired removals/additions remain as drift errors.
+        // with a structurally identical addition (the same symbol under a
+        // new name) and report the pair as informational `Renamed`.
+        // "Structurally identical" includes the full parameter TYPE list
+        // element-wise: matching on parameter count alone paired a rename
+        // that also changed a parameter type (`fn load(x: u32)` →
+        // `fn load_v2(x: &str)`), swallowing an API-breaking change as
+        // informational. Only unpaired removals/additions remain as drift
+        // errors.
         if change.edit_type == EditType::Rename {
             let mut unpaired_removals: Vec<(&String, &SignatureInfo)> = Vec::new();
             for (old_name, old_sig) in removed.drain(..) {
-                let pair_index = added.iter().position(|(_, new_sig)| {
-                    new_sig.parameters.len() == old_sig.parameters.len()
-                        && new_sig.return_type == old_sig.return_type
-                        && new_sig.is_method == old_sig.is_method
-                        && new_sig.is_async == old_sig.is_async
-                });
+                let pair_index = added
+                    .iter()
+                    .position(|(_, new_sig)| signatures_shape_compatible(old_sig, new_sig));
                 match pair_index {
                     Some(idx) => {
                         let (new_name, new_sig) = added.remove(idx);
@@ -739,6 +759,32 @@ mod rename_pairing_tests {
                 .iter()
                 .any(|item| item.drift_type == DriftType::Removed),
             "an unpaired removal must keep the legacy error semantics"
+        );
+    }
+
+    #[test]
+    fn test_rename_with_parameter_type_change_still_errors() {
+        // Same parameter COUNT, return type and flags, but a changed
+        // parameter TYPE is an API break. Count-only pairing reported this
+        // as an informational Renamed, letting edit_apply write a
+        // signature-changing rename it should have rejected.
+        let original = "pub fn stress_load(x: u32) -> u32 {\n    x + 1\n}\n";
+        let new = "pub fn stress_load_v2(x: &str) -> u32 {\n    1\n}\n";
+        let items = analyzer()
+            .analyze_semantic_drift(&[rename_change(original, new)])
+            .unwrap();
+
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.drift_type == DriftType::Renamed),
+            "a rename that changes a parameter type must not pair as Renamed"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.drift_type == DriftType::Removed),
+            "the removal must keep the legacy error semantics"
         );
     }
 

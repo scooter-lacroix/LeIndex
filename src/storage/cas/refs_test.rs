@@ -224,8 +224,9 @@ fn test_refcount_reopen_corrupt_sidecar() {
 // ---------------------------------------------------------------------------
 
 fn sidecar_count(dir: &std::path::Path, hash: &[u8; 32]) -> u64 {
-    super::read_counts(&dir.join(REFS_SIDECAR))
-        .get(hash)
+    super::read_sidecar(&dir.join(REFS_SIDECAR))
+        .counts
+        .get(&super::hash_to_hex(hash))
         .copied()
         .unwrap_or(0)
 }
@@ -328,6 +329,26 @@ fn dead_pid() -> u32 {
     pid
 }
 
+/// Write a full sidecar (counts + owners) directly, bypassing the store.
+fn write_sidecar(
+    dir: &std::path::Path,
+    counts: HashMap<[u8; 32], u64>,
+    owners: BTreeMap<String, super::OwnerHolds>,
+) {
+    let file = super::SidecarFile {
+        counts: counts
+            .iter()
+            .map(|(hash, count)| (super::hash_to_hex(hash), *count))
+            .collect(),
+        owners,
+    };
+    std::fs::write(
+        dir.join(REFS_SIDECAR),
+        serde_json::to_vec_pretty(&file).unwrap(),
+    )
+    .unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn test_refcount_counts_of_a_crashed_owner_are_reclaimed_on_open() {
@@ -337,24 +358,28 @@ fn test_refcount_counts_of_a_crashed_owner_are_reclaimed_on_open() {
     let h = blob_hash(b"crashed owner");
     let survivor = blob_hash(b"live owner");
 
-    // A live handle in this process holds one count on each hash.
+    // A live handle in this process holds one count on `survivor`.
     let mut live = JsonSidecarStore::open(dir.path()).unwrap();
     live.incr(&survivor);
     live.persist().unwrap();
 
     // The crashed owner held two counts on `h` and one on `survivor`.
     let pid = dead_pid();
-    let owners = dir.path().join(REFS_OWNERS_DIR);
-    fs::create_dir_all(&owners).unwrap();
-    let mut ledger = HashMap::new();
-    ledger.insert(h, 2u64);
-    ledger.insert(survivor, 1u64);
-    let ledger_path = owners.join(format!("{pid}.1.0.json"));
-    super::write_counts_atomic(&ledger_path, &ledger).unwrap();
-    let mut counts = super::read_counts(&dir.path().join(REFS_SIDECAR));
-    *counts.entry(h).or_insert(0) += 2;
-    *counts.entry(survivor).or_insert(0) += 1;
-    super::write_counts_atomic(&dir.path().join(REFS_SIDECAR), &counts).unwrap();
+    let mut file = super::read_sidecar(&dir.path().join(REFS_SIDECAR));
+    let mut holds = super::OwnerHolds::default();
+    holds.blobs.insert(super::hash_to_hex(&h), 2);
+    holds.blobs.insert(super::hash_to_hex(&survivor), 1);
+    file.owners.insert(format!("{pid}.1.0"), holds);
+    *file.counts.entry(super::hash_to_hex(&h)).or_insert(0) += 2;
+    *file
+        .counts
+        .entry(super::hash_to_hex(&survivor))
+        .or_insert(0) += 1;
+    std::fs::write(
+        dir.path().join(REFS_SIDECAR),
+        serde_json::to_vec_pretty(&file).unwrap(),
+    )
+    .unwrap();
     assert_eq!(sidecar_count(dir.path(), &h), 2);
     assert_eq!(sidecar_count(dir.path(), &survivor), 2);
 
@@ -365,26 +390,217 @@ fn test_refcount_counts_of_a_crashed_owner_are_reclaimed_on_open() {
         1,
         "only the dead owner's share is reclaimed; the live lease stays"
     );
-    assert!(!ledger_path.exists(), "dead owner's ledger is removed");
     assert_eq!(sidecar_count(dir.path(), &h), 0, "reclaim is persisted");
+    assert!(
+        !super::read_sidecar(&dir.path().join(REFS_SIDECAR))
+            .owners
+            .contains_key(&format!("{pid}.1.0")),
+        "dead owner's entry is removed"
+    );
 }
 
 #[test]
-fn test_refcount_released_leases_leave_no_owner_ledger() {
+fn test_refcount_released_leases_leave_no_owner_entry() {
     let dir = tempdir().expect("tempdir");
     let h = blob_hash(b"ledger cleanup");
     let mut store = JsonSidecarStore::open(dir.path()).unwrap();
     store.incr(&h);
     store.persist().unwrap();
-    let ledgers = || {
-        fs::read_dir(dir.path().join(REFS_OWNERS_DIR))
-            .map(|entries| entries.count())
-            .unwrap_or(0)
+    let owner_entries = || {
+        super::read_sidecar(&dir.path().join(REFS_SIDECAR))
+            .owners
+            .len()
     };
-    assert_eq!(ledgers(), 1);
+    assert_eq!(owner_entries(), 1);
     store.decr(&h).unwrap();
     store.persist().unwrap();
-    assert_eq!(ledgers(), 0, "a handle holding nothing keeps no ledger");
+    assert_eq!(
+        owner_entries(),
+        0,
+        "a handle holding nothing keeps no owner entry"
+    );
+}
+
+#[test]
+fn test_refcount_release_transitions_count_and_holding_together() {
+    // Two handles each hold one lease on the same blob; A releases. The
+    // shared count (2 -> 1) and A's owner holdings must transition in ONE
+    // atomic sidecar write: with the earlier two-file layout, a crash
+    // between the count write and the ledger write left A's stale holdings
+    // behind, and recovery subtracted them from the already-decremented
+    // count — freeing the blob while B was still reading it. Both live in
+    // one file now, so an observed sidecar can never show the intermediate
+    // state.
+    let dir = tempdir().expect("tempdir");
+    let h = blob_hash(b"atomic release");
+
+    let mut a = JsonSidecarStore::open(dir.path()).unwrap();
+    let mut b = JsonSidecarStore::open(dir.path()).unwrap();
+    a.incr(&h);
+    a.persist().unwrap();
+    b.incr(&h);
+    b.persist().unwrap();
+    assert_eq!(sidecar_count(dir.path(), &h), 2);
+    assert_eq!(
+        super::read_sidecar(&dir.path().join(REFS_SIDECAR))
+            .owners
+            .len(),
+        2
+    );
+
+    a.decr(&h).unwrap();
+    a.persist().unwrap();
+
+    let file = super::read_sidecar(&dir.path().join(REFS_SIDECAR));
+    assert_eq!(
+        file.counts.get(&super::hash_to_hex(&h)).copied(),
+        Some(1),
+        "count is decremented"
+    );
+    assert_eq!(
+        file.owners.len(),
+        1,
+        "and A's holdings are dropped in the same write"
+    );
+
+    // Reopening (recovery) must not subtract anything further.
+    let reopened = JsonSidecarStore::open(dir.path()).unwrap();
+    assert_eq!(
+        reopened.refcount(&h),
+        1,
+        "B's live lease survives A's release and a recovery pass"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_refcount_recycled_own_pid_with_new_start_time_is_reclaimed() {
+    // A restarted process frequently receives its predecessor's pid (in
+    // containers, often pid 1). The predecessor's holdings must be judged by
+    // start time, not by "this pid is mine, so it is alive" — otherwise they
+    // pin blobs and generations forever.
+    let dir = tempdir().expect("tempdir");
+    let h = blob_hash(b"recycled pid");
+    let our_pid = std::process::id();
+    let wrong_start = super::process_start_ticks(our_pid).unwrap_or(0) + 1;
+
+    let mut counts = HashMap::new();
+    counts.insert(h, 1u64);
+    let mut holds = super::OwnerHolds::default();
+    holds.blobs.insert(super::hash_to_hex(&h), 1);
+    let mut owners = BTreeMap::new();
+    owners.insert(format!("{our_pid}.{wrong_start}.0"), holds);
+    write_sidecar(dir.path(), counts, owners);
+
+    let reopened = JsonSidecarStore::open(dir.path()).unwrap();
+    assert_eq!(
+        reopened.refcount(&h),
+        0,
+        "a same-pid owner with a different start time is dead"
+    );
+}
+
+#[test]
+fn test_refcount_legacy_flat_sidecar_is_still_readable() {
+    // Sidecars written before owner tracking moved into refs.json are flat
+    // hex → count maps; they must keep opening.
+    let dir = tempdir().expect("tempdir");
+    let h = blob_hash(b"legacy flat");
+    let flat = format!("{{\"{}\": 3}}", super::hash_to_hex(&h));
+    fs::write(dir.path().join(REFS_SIDECAR), flat).unwrap();
+
+    let store = JsonSidecarStore::open(dir.path()).unwrap();
+    assert_eq!(store.refcount(&h), 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_refcount_legacy_owner_ledger_dir_is_absorbed() {
+    // Intermediate v2.0.0 builds kept per-owner ledgers in refs.owners/.
+    // Opening a store written by one must fold them into the sidecar and
+    // remove the directory, dead owner included.
+    let dir = tempdir().expect("tempdir");
+    let h = blob_hash(b"legacy ledger");
+    let pid = dead_pid();
+
+    let mut store = JsonSidecarStore::open(dir.path()).unwrap();
+    store.incr(&h);
+    store.persist().unwrap();
+
+    let owners = dir.path().join(REFS_OWNERS_DIR);
+    fs::create_dir_all(&owners).unwrap();
+    let mut ledger = HashMap::new();
+    ledger.insert(h, 1u64);
+    super::write_counts_atomic(&owners.join(format!("{pid}.1.0.json")), &ledger).unwrap();
+    // Bump the count for the crashed owner in the sidecar's own format
+    // (writing a flat hex map would destroy the owners map).
+    let mut file = super::read_sidecar(&dir.path().join(REFS_SIDECAR));
+    *file.counts.entry(super::hash_to_hex(&h)).or_insert(0) += 1;
+    std::fs::write(
+        dir.path().join(REFS_SIDECAR),
+        serde_json::to_vec_pretty(&file).unwrap(),
+    )
+    .unwrap();
+
+    let reopened = JsonSidecarStore::open(dir.path()).unwrap();
+    assert!(
+        !owners.exists(),
+        "legacy ledger dir is removed after absorption"
+    );
+    assert_eq!(
+        reopened.refcount(&h),
+        1,
+        "only the live handle's count remains"
+    );
+}
+
+#[test]
+fn test_generation_holds_are_tracked_by_identity_across_handles() {
+    let dir = tempdir().expect("tempdir");
+
+    let mut leaser = JsonSidecarStore::open(dir.path()).unwrap();
+    leaser.record_generation_hold(7);
+    leaser.record_generation_hold(7);
+    leaser.persist().unwrap();
+
+    let observer = JsonSidecarStore::open(dir.path()).unwrap();
+    assert!(
+        observer.held_generations().contains(&7),
+        "a persisted generation hold is visible to a fresh handle"
+    );
+
+    leaser.release_generation_hold(7);
+    leaser.persist().unwrap();
+    assert!(
+        observer.held_generations().contains(&7),
+        "one hold remains after a single release of two"
+    );
+
+    leaser.release_generation_hold(7);
+    leaser.persist().unwrap();
+    assert!(
+        observer.held_generations().is_empty(),
+        "the generation is no longer held once every lease is released"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_generation_hold_of_a_crashed_owner_is_reclaimed() {
+    let dir = tempdir().expect("tempdir");
+    let pid = dead_pid();
+
+    let mut holds = super::OwnerHolds::default();
+    holds.generations.insert("9".to_string(), 1);
+    let mut owners = BTreeMap::new();
+    owners.insert(format!("{pid}.1.0"), holds);
+    write_sidecar(dir.path(), HashMap::new(), owners);
+
+    let reopened = JsonSidecarStore::open(dir.path()).unwrap();
+    assert!(
+        reopened.held_generations().is_empty(),
+        "a crashed owner's generation hold must not pin the generation forever"
+    );
 }
 
 #[test]

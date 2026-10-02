@@ -30,7 +30,7 @@
 //! was deleted after the decision; this module carries only the winner behind
 //! the trait.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -44,8 +44,8 @@ pub const REFS_SIDECAR: &str = "refs.json";
 /// Advisory-lock file serialising sidecar read-modify-write across handles
 /// and processes.
 pub const REFS_LOCK: &str = "refs.lock";
-/// Directory of per-owner ledgers recording which counts each live handle
-/// contributed, so counts left behind by a crashed owner can be reclaimed.
+/// Legacy directory of per-owner ledgers written by intermediate v2.0.0
+/// builds. Absorbed into the sidecar's `owners` map on open and removed.
 pub const REFS_OWNERS_DIR: &str = "refs.owners";
 /// On-disk auxiliary files the CAS blob-count / stored-hash walkers skip.
 pub const REFS_AUX_FILES: &[&str] = &[REFS_SIDECAR, REFS_LOCK, REFS_OWNERS_DIR];
@@ -56,7 +56,7 @@ pub const REFS_AUX_FILES: &[&str] = &[REFS_SIDECAR, REFS_LOCK, REFS_OWNERS_DIR];
 static PERSIST_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic sequence giving every store handle in this process a distinct
-/// owner ledger, so overlapping handles never share (or clobber) a ledger.
+/// owner identity, so overlapping handles never share (or clobber) holdings.
 static OWNER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Interchangeable refcount persistence backend.
@@ -99,6 +99,65 @@ pub trait RefcountStore: Send {
     /// own not-yet-persisted changes on top. Callers about to make a
     /// destructive decision (retention, GC) reload first.
     fn reload(&self) -> Result<()>;
+
+    /// Record that this handle holds one lease on `generation`, so retention
+    /// can identify leased generations directly instead of inferring lease
+    /// state from shared blob refcounts (identical layer sets across
+    /// generations would otherwise all look leased). Durably recorded by the
+    /// next [`persist`](RefcountStore::persist).
+    fn record_generation_hold(&mut self, generation: u64);
+
+    /// Release one lease on `generation` previously recorded by
+    /// [`record_generation_hold`](RefcountStore::record_generation_hold).
+    fn release_generation_hold(&mut self, generation: u64);
+
+    /// Generations currently held by any live owner, including this handle's
+    /// not-yet-persisted holds. Dead owners' holds are reclaimed first.
+    fn held_generations(&self) -> HashSet<u64>;
+
+    /// GC decision point: for each candidate whose **fresh** on-disk
+    /// refcount — re-read under the cross-process `refs` lock, immediately
+    /// before the callback — is zero, invoke `unlink` to remove the blob
+    /// file, then drop the sidecar entry. Returns the hashes removed.
+    ///
+    /// Holding the lock across check-and-unlink closes the window where a
+    /// lease acquired through another handle or process between this store's
+    /// last [`reload`](RefcountStore::reload) and the unlink would have its
+    /// blob deleted and its just-persisted count erased.
+    fn collect_zero_refcount(
+        &self,
+        candidates: &[[u8; 32]],
+        unlink: &mut dyn FnMut(&[u8; 32]) -> std::io::Result<()>,
+    ) -> Result<Vec<[u8; 32]>>;
+}
+
+/// The sidecar file: merged blob counts plus every owner's holdings, written
+/// by a single atomic rename so the two can never disagree after a crash.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct SidecarFile {
+    /// Merged refcounts, hex hash → count.
+    #[serde(default)]
+    counts: HashMap<String, u64>,
+    /// Holdings per live owner, keyed `"<pid>.<start_ticks>.<seq>"`.
+    #[serde(default)]
+    owners: BTreeMap<String, OwnerHolds>,
+}
+
+/// What one owner (store handle) currently pins: blob counts and generation
+/// leases. Dead owners' holdings are subtracted from `counts` and dropped.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct OwnerHolds {
+    #[serde(default)]
+    blobs: HashMap<String, u64>,
+    #[serde(default)]
+    generations: HashMap<String, u64>,
+}
+
+impl OwnerHolds {
+    fn is_empty(&self) -> bool {
+        self.blobs.values().all(|count| *count == 0)
+            && self.generations.values().all(|count| *count == 0)
+    }
 }
 
 /// Refcount storage backed by an in-memory map and a JSON sidecar.
@@ -109,28 +168,38 @@ pub trait RefcountStore: Send {
 ///
 /// Every `CasStore::open` creates an independent handle, and generation leases
 /// open one per reader, so many handles (across threads and processes) share
-/// one `refs.json`. Two rules keep that safe:
+/// one `refs.json`. Three rules keep that safe:
 ///
 /// * **Merge, don't overwrite.** A handle records only its own *deltas*
 ///   (`incr`/`decr`/`remove`). [`persist`](RefcountStore::persist) takes the
 ///   `refs.lock` advisory lock, re-reads the sidecar, applies the deltas on
 ///   top, and writes the result, so one handle's flush can never erase
-///   another's increments (the previous whole-map replacement lost updates
-///   between overlapping leases).
-/// * **Own what you add.** Each handle also records the net counts it holds in
-///   a per-owner ledger (`refs.owners/<pid>.<start>.<seq>.json`). When a
-///   process dies holding counts, the next handle to open or persist sees that
-///   the owner is gone (pid absent, or its start time no longer matches) and
-///   subtracts the dead owner's holdings, instead of leaving the blobs and
-///   generations pinned forever. Owners are assumed to share a PID namespace;
-///   on platforms with no liveness probe nothing is reclaimed.
+///   another's increments.
+/// * **One file, one rename.** Merged counts and the per-owner holdings that
+///   back crash recovery live in the *same* sidecar file and transition in a
+///   single atomic rename. The earlier two-file layout (sidecar + per-owner
+///   ledger) had a crash window between the two writes in which recovery
+///   subtracted a stale ledger from an already-decremented count, freeing a
+///   blob another live reader still used.
+/// * **Own what you add.** Each handle records the net counts and generation
+///   leases it holds in its `owners` entry. When a process dies holding
+///   counts, the next handle to open or persist sees that the owner is gone
+///   (pid absent, or its `/proc` start time no longer matches — the start
+///   time is compared even when the pid is our own, so a pid reused by a
+///   restarted process does not pin forever) and subtracts the dead owner's
+///   holdings. Owners are assumed to share a PID namespace; on platforms
+///   with no liveness probe nothing is reclaimed.
 pub struct JsonSidecarStore {
     state: Mutex<State>,
     sidecar_path: PathBuf,
     lock_path: PathBuf,
     owners_dir: PathBuf,
-    /// Ledger filename for this handle.
+    /// Owner identity of this handle: `"<pid>.<start_ticks>.<seq>"`.
     owner_file: String,
+    /// Own pid and start time; holders with the same pair are this process's
+    /// sibling handles and are always live.
+    owner_pid: u32,
+    owner_start: u64,
 }
 
 /// Mutable per-handle state, behind a lock so `&self` methods can refresh it.
@@ -145,8 +214,12 @@ struct State {
     delta: HashMap<[u8; 32], i64>,
     /// Hashes whose entry should be dropped once their count is zero.
     removed: HashSet<[u8; 32]>,
-    /// Net counts this handle has persisted so far; mirrors its ledger.
+    /// Net blob counts this handle has persisted so far; mirrors its ledger.
     held: HashMap<[u8; 32], u64>,
+    /// Pending generation-lease changes since the last successful persist.
+    gen_delta: HashMap<u64, i64>,
+    /// Net generation leases this handle has persisted so far.
+    held_generations: HashMap<u64, u64>,
 }
 
 impl State {
@@ -157,19 +230,60 @@ impl State {
     }
 }
 
-/// Parse a sidecar/ledger body (hex → count), tolerating corruption.
-fn parse_counts(data: &[u8]) -> HashMap<[u8; 32], u64> {
-    let map: HashMap<String, u64> = serde_json::from_slice(data).unwrap_or_default();
-    map.into_iter()
-        .filter_map(|(hex, count)| hex_to_hash(&hex).map(|h| (h, count)))
+/// Decode a hex → count map, dropping keys that are not valid hashes.
+fn counts_from_strings(map: &HashMap<String, u64>) -> HashMap<[u8; 32], u64> {
+    map.iter()
+        .filter_map(|(hex, count)| hex_to_hash(hex).map(|h| (h, *count)))
         .collect()
 }
 
-/// Read a sidecar/ledger file; absent or unreadable means empty.
+/// Encode a hash → count map as hex → count.
+fn counts_to_strings(counts: &HashMap<[u8; 32], u64>) -> HashMap<String, u64> {
+    counts
+        .iter()
+        .map(|(hash, count)| (hash_to_hex(hash), *count))
+        .collect()
+}
+
+/// Parse a sidecar/ledger body (hex → count), tolerating corruption.
+fn parse_counts(data: &[u8]) -> HashMap<[u8; 32], u64> {
+    let map: HashMap<String, u64> = serde_json::from_slice(data).unwrap_or_default();
+    counts_from_strings(&map)
+}
+
+/// Read a counts-only file (a legacy owner ledger); absent or unreadable
+/// means empty.
 fn read_counts(path: &Path) -> HashMap<[u8; 32], u64> {
     fs::read(path)
         .map(|data| parse_counts(&data))
         .unwrap_or_default()
+}
+
+/// Read the sidecar. Understands both the current format (an object with
+/// `counts` and `owners` fields) and the legacy flat hex → count map written
+/// before owner tracking moved into this file; corrupt content starts empty.
+fn read_sidecar(path: &Path) -> SidecarFile {
+    let data = match fs::read(path) {
+        Ok(data) => data,
+        Err(_) => return SidecarFile::default(),
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&data) {
+        Ok(value) => value,
+        Err(_) => return SidecarFile::default(),
+    };
+    // "counts" is not a valid 64-hex hash, so the two formats are
+    // unambiguous.
+    if value
+        .as_object()
+        .is_some_and(|map| map.contains_key("counts"))
+    {
+        return serde_json::from_value(value).unwrap_or_default();
+    }
+    let counts = parse_counts(&data);
+    SidecarFile {
+        counts: counts_to_strings(&counts),
+        owners: BTreeMap::new(),
+    }
 }
 
 /// Apply a signed `delta` to `count`, clamping at zero.
@@ -181,10 +295,40 @@ fn apply_delta(count: u64, delta: i64) -> u64 {
     }
 }
 
+/// Atomically replace `path` with `file` serialised as JSON.
+fn write_sidecar_atomic(path: &Path, file: &SidecarFile) -> Result<()> {
+    let data = serde_json::to_vec_pretty(file).map_err(CasError::Serde)?;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(CasError::Io)?;
+    }
+    let seq = PERSIST_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), seq));
+    {
+        let file = fs::File::create(&tmp_path).map_err(CasError::Io)?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer
+            .write_all(&data)
+            .and_then(|_| writer.flush())
+            .map_err(CasError::Io)?;
+        fsync_file(writer.get_ref()).map_err(CasError::Io)?;
+    }
+    fs::rename(&tmp_path, path).map_err(CasError::Io)?;
+
+    // Best-effort dir fsync.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = fsync_file(&dir);
+        }
+    }
+    Ok(())
+}
+
 /// Atomically replace `path` with `counts` serialised as hex → count.
+/// Test-facing helper for fixtures that write legacy-format files.
+#[cfg(test)]
 fn write_counts_atomic(path: &Path, counts: &HashMap<[u8; 32], u64>) -> Result<()> {
-    // Serialize hex → count directly to avoid any lifetime pitfalls.
-    let owned: HashMap<String, u64> = counts.iter().map(|(k, v)| (hash_to_hex(k), *v)).collect();
+    let owned = counts_to_strings(counts);
     let data = serde_json::to_vec_pretty(&owned).map_err(CasError::Serde)?;
 
     if let Some(parent) = path.parent() {
@@ -263,11 +407,12 @@ fn process_start_ticks(_pid: u32) -> Option<u64> {
     None
 }
 
-/// Whether the owner `pid` started at `start_ticks` is still running.
+/// Whether the owner `pid` started at `start_ticks` is still running. The
+/// start time is always compared on Linux, including for our own pid: a
+/// restarted process frequently receives a recycled pid (in containers,
+/// often pid 1), and treating that as "alive" would pin its predecessor's
+/// holdings forever.
 fn owner_is_alive(pid: u32, start_ticks: u64) -> bool {
-    if pid == std::process::id() {
-        return true;
-    }
     #[cfg(target_os = "linux")]
     {
         // A missing /proc entry means the process is gone; a different start
@@ -276,7 +421,7 @@ fn owner_is_alive(pid: u32, start_ticks: u64) -> bool {
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        let _ = start_ticks;
+        // No /proc start time; probe existence.
         // SAFETY: signal 0 only probes for existence.
         let rc = unsafe { libc::kill(pid as i32, 0) };
         rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
@@ -289,9 +434,9 @@ fn owner_is_alive(pid: u32, start_ticks: u64) -> bool {
     }
 }
 
-/// Parse `<pid>.<start_ticks>.<seq>.json` into `(pid, start_ticks)`.
-fn parse_owner_file(name: &str) -> Option<(u32, u64)> {
-    let mut parts = name.strip_suffix(".json")?.split('.');
+/// Parse an owner key `<pid>.<start_ticks>.<seq>` into `(pid, start_ticks)`.
+fn parse_owner_key(name: &str) -> Option<(u32, u64)> {
+    let mut parts = name.split('.');
     let pid = parts.next()?.parse().ok()?;
     let start = parts.next()?.parse().ok()?;
     parts.next()?.parse::<u64>().ok()?;
@@ -299,70 +444,100 @@ fn parse_owner_file(name: &str) -> Option<(u32, u64)> {
 }
 
 impl JsonSidecarStore {
-    /// Ledger files whose owner is no longer running.
-    fn dead_owner_ledgers(&self) -> Vec<PathBuf> {
-        let Ok(entries) = fs::read_dir(&self.owners_dir) else {
-            return Vec::new();
-        };
-        entries
-            .flatten()
-            .filter_map(|entry| {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name == self.owner_file {
-                    return None;
-                }
-                let (pid, start) = parse_owner_file(&name)?;
-                (!owner_is_alive(pid, start)).then(|| entry.path())
-            })
-            .collect()
+    /// Whether the sidecar's `owners` entry `key` belongs to a live owner.
+    /// This process's own handles (same pid and start time) are live by
+    /// definition; everything else is probed.
+    fn owner_key_is_live(&self, key: &str) -> bool {
+        if key == self.owner_file {
+            return true;
+        }
+        match parse_owner_key(key) {
+            Some((pid, start)) => {
+                (pid == self.owner_pid && start == self.owner_start) || owner_is_alive(pid, start)
+            }
+            // Unparseable identity: cannot probe, never reclaimed.
+            None => true,
+        }
     }
 
-    /// Subtract every dead owner's holdings from `counts` and delete their
-    /// ledgers. Returns whether any count changed. Caller holds the lock.
-    fn reclaim_dead_owners(&self, counts: &mut HashMap<[u8; 32], u64>) -> bool {
-        let mut changed = false;
-        for ledger in self.dead_owner_ledgers() {
-            for (hash, held) in read_counts(&ledger) {
-                if let Some(count) = counts.get_mut(&hash) {
+    /// Subtract every dead owner's holdings from `counts` and drop their
+    /// entries. Returns whether the file changed. Caller holds the lock.
+    fn reclaim_dead_owners(&self, file: &mut SidecarFile) -> bool {
+        let dead: Vec<String> = file
+            .owners
+            .keys()
+            .filter(|key| !self.owner_key_is_live(key))
+            .cloned()
+            .collect();
+        let mut changed = !dead.is_empty();
+        for key in dead {
+            let Some(holds) = file.owners.remove(&key) else {
+                continue;
+            };
+            for (hex, held) in holds.blobs {
+                if let Some(count) = file.counts.get_mut(&hex) {
                     let reduced = count.saturating_sub(held);
                     changed |= reduced != *count;
                     *count = reduced;
                 }
             }
-            let _ = fs::remove_file(&ledger);
         }
         changed
     }
 
     /// Reclaim abandoned counts from crashed owners, if there are any.
     fn reclaim_if_needed(&self) -> Result<()> {
-        if self.dead_owner_ledgers().is_empty() {
+        if self
+            .read_sidecar_unlocked()
+            .owners
+            .keys()
+            .all(|key| self.owner_key_is_live(key))
+        {
             return Ok(());
         }
         let _lock = RefsLock::acquire(&self.lock_path)?;
-        let mut counts = read_counts(&self.sidecar_path);
-        if self.reclaim_dead_owners(&mut counts) {
-            write_counts_atomic(&self.sidecar_path, &counts)?;
+        let mut file = self.read_sidecar_unlocked();
+        if self.reclaim_dead_owners(&mut file) {
+            write_sidecar_atomic(&self.sidecar_path, &file)?;
         }
         Ok(())
     }
 
-    /// Rewrite (or remove, when it holds nothing) this handle's ledger.
-    fn write_ledger(&self, held: &HashMap<[u8; 32], u64>) -> Result<()> {
-        let path = self.owners_dir.join(&self.owner_file);
-        let positive: HashMap<[u8; 32], u64> = held
-            .iter()
-            .filter(|(_, count)| **count > 0)
-            .map(|(hash, count)| (*hash, *count))
-            .collect();
-        if positive.is_empty() {
-            return match fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(CasError::Io(e)),
+    fn read_sidecar_unlocked(&self) -> SidecarFile {
+        read_sidecar(&self.sidecar_path)
+    }
+
+    /// Absorb the legacy per-owner ledger directory (`refs.owners/`) written
+    /// by intermediate v2.0.0 builds into the sidecar's `owners` map, then
+    /// remove the directory. One-time, idempotent.
+    fn absorb_legacy_owner_ledgers(&self) -> Result<()> {
+        let Ok(entries) = fs::read_dir(&self.owners_dir) else {
+            return Ok(());
+        };
+        let _lock = RefsLock::acquire(&self.lock_path)?;
+        let mut file = self.read_sidecar_unlocked();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(ledger) = name.strip_suffix(".json") else {
+                continue;
             };
+            // Only well-formed owner identities can ever be probed for
+            // liveness; anything else would become a permanent pin.
+            if parse_owner_key(ledger).is_none() {
+                continue;
+            }
+            if file.owners.contains_key(ledger) {
+                continue;
+            }
+            let holds = OwnerHolds {
+                blobs: counts_to_strings(&read_counts(&entry.path())),
+                generations: HashMap::new(),
+            };
+            file.owners.insert(ledger.to_string(), holds);
         }
-        write_counts_atomic(&path, &positive)
+        write_sidecar_atomic(&self.sidecar_path, &file)?;
+        let _ = fs::remove_dir_all(&self.owners_dir);
+        Ok(())
     }
 }
 
@@ -382,11 +557,15 @@ impl RefcountStore for JsonSidecarStore {
             sidecar_path: cas_root.join(REFS_SIDECAR),
             lock_path: cas_root.join(REFS_LOCK),
             owners_dir: cas_root.join(REFS_OWNERS_DIR),
-            owner_file: format!("{pid}.{start}.{seq}.json"),
+            owner_file: format!("{pid}.{start}.{seq}"),
+            owner_pid: pid,
+            owner_start: start,
         };
         // Best effort: a read-only store must still open.
+        let _ = store.absorb_legacy_owner_ledgers();
         let _ = store.reclaim_if_needed();
-        State::lock(&store.state).counts = read_counts(&store.sidecar_path);
+        State::lock(&store.state).counts =
+            counts_from_strings(&store.read_sidecar_unlocked().counts);
         Ok(store)
     }
 
@@ -454,47 +633,78 @@ impl RefcountStore for JsonSidecarStore {
     /// Merge this handle's changes into the shared sidecar atomically.
     ///
     /// Under the `refs.lock` advisory lock: re-read the sidecar, reclaim
-    /// counts held by dead owners, apply this handle's deltas, then write a
-    /// uniquely-named temp sidecar, fsync, and rename it into place. The lock
-    /// serialises overlapping handles (threads or processes) so no update is
-    /// lost; the unique temp name keeps a crash from leaving a torn sidecar.
+    /// counts held by dead owners, apply this handle's deltas, refresh this
+    /// handle's owner entry, then write the whole file — counts *and* owner
+    /// holdings — through one uniquely-named temp file, fsync, and rename.
+    /// The lock serialises overlapping handles (threads or processes) so no
+    /// update is lost; the single rename means a crash can never leave the
+    /// counts and the owner holdings that back recovery disagreeing.
     fn persist(&self) -> Result<()> {
         let _lock = RefsLock::acquire(&self.lock_path)?;
+        let mut file = self.read_sidecar_unlocked();
+        self.reclaim_dead_owners(&mut file);
+
         let mut state = State::lock(&self.state);
-
-        let mut merged = read_counts(&self.sidecar_path);
-        self.reclaim_dead_owners(&mut merged);
-
         let State {
             delta,
             removed,
             held,
+            gen_delta,
+            held_generations,
             ..
         } = &mut *state;
         for (hash, change) in delta.iter() {
-            let entry = merged.entry(*hash).or_insert(0);
+            let entry = file.counts.entry(hash_to_hex(hash)).or_insert(0);
             *entry = apply_delta(*entry, *change);
             let own = held.entry(*hash).or_insert(0);
             *own = apply_delta(*own, *change);
         }
         for hash in removed.iter() {
-            if merged.get(hash).is_none_or(|count| *count == 0) {
-                merged.remove(hash);
+            let hex = hash_to_hex(hash);
+            if file.counts.get(&hex).is_none_or(|count| *count == 0) {
+                file.counts.remove(&hex);
             }
         }
+        for (generation, change) in gen_delta.iter() {
+            let own = held_generations.entry(*generation).or_insert(0);
+            *own = apply_delta(*own, *change);
+        }
 
-        write_counts_atomic(&self.sidecar_path, &merged)?;
-        self.write_ledger(held)?;
+        // Refresh this handle's owner entry: positive holdings only, dropped
+        // entirely when it holds nothing.
+        let holds = OwnerHolds {
+            blobs: counts_to_strings(
+                &held
+                    .iter()
+                    .filter(|(_, count)| **count > 0)
+                    .map(|(hash, count)| (*hash, *count))
+                    .collect(),
+            ),
+            generations: held_generations
+                .iter()
+                .filter(|(_, count)| **count > 0)
+                .map(|(generation, count)| (generation.to_string(), *count))
+                .collect(),
+        };
+        if holds.is_empty() {
+            file.owners.remove(&self.owner_file);
+        } else {
+            file.owners.insert(self.owner_file.clone(), holds);
+        }
+
+        write_sidecar_atomic(&self.sidecar_path, &file)?;
 
         delta.clear();
         removed.clear();
-        state.counts = merged;
+        gen_delta.clear();
+        state.counts = counts_from_strings(&file.counts);
         Ok(())
     }
 
     fn reload(&self) -> Result<()> {
         self.reclaim_if_needed()?;
-        let mut merged = read_counts(&self.sidecar_path);
+        let file = self.read_sidecar_unlocked();
+        let mut merged = counts_from_strings(&file.counts);
         let mut state = State::lock(&self.state);
         for (hash, change) in &state.delta {
             let entry = merged.entry(*hash).or_insert(0);
@@ -507,6 +717,97 @@ impl RefcountStore for JsonSidecarStore {
         }
         state.counts = merged;
         Ok(())
+    }
+
+    fn record_generation_hold(&mut self, generation: u64) {
+        let state = self.state.get_mut().unwrap_or_else(|p| p.into_inner());
+        *state.gen_delta.entry(generation).or_insert(0) += 1;
+    }
+
+    fn release_generation_hold(&mut self, generation: u64) {
+        let state = self.state.get_mut().unwrap_or_else(|p| p.into_inner());
+        // Best-effort release: without a recorded or pending hold there is
+        // nothing to give back.
+        let pending = state.gen_delta.get(&generation).copied().unwrap_or(0);
+        let held = state
+            .held_generations
+            .get(&generation)
+            .copied()
+            .unwrap_or(0);
+        if pending <= 0 && held == 0 {
+            return;
+        }
+        *state.gen_delta.entry(generation).or_insert(0) -= 1;
+    }
+
+    fn held_generations(&self) -> HashSet<u64> {
+        let _ = self.reclaim_if_needed();
+        let file = self.read_sidecar_unlocked();
+        let mut generations: HashSet<u64> = file
+            .owners
+            .iter()
+            .filter(|(key, _)| self.owner_key_is_live(key))
+            .flat_map(|(_, holds)| holds.generations.keys())
+            .filter_map(|generation| generation.parse::<u64>().ok())
+            .collect();
+        // This handle's not-yet-persisted holds are live readers too.
+        let state = State::lock(&self.state);
+        for (generation, change) in &state.gen_delta {
+            let held = apply_delta(
+                state.held_generations.get(generation).copied().unwrap_or(0),
+                *change,
+            );
+            if held > 0 {
+                generations.insert(*generation);
+            }
+        }
+        generations
+    }
+
+    fn collect_zero_refcount(
+        &self,
+        candidates: &[[u8; 32]],
+        unlink: &mut dyn FnMut(&[u8; 32]) -> std::io::Result<()>,
+    ) -> Result<Vec<[u8; 32]>> {
+        // The lock spans the fresh read and every unlink, so a lease persist
+        // from another handle/process either lands before the read (count
+        // visible → blob kept) or after the sweep (blob already gone, its
+        // reader fails to open rather than reading a half-deleted file).
+        let _lock = RefsLock::acquire(&self.lock_path)?;
+        let mut file = self.read_sidecar_unlocked();
+        self.reclaim_dead_owners(&mut file);
+
+        let mut removed = Vec::new();
+        {
+            let mut state = State::lock(&self.state);
+            for hash in candidates {
+                let hex = hash_to_hex(hash);
+                // Effective count = the fresh on-disk value plus THIS
+                // handle's not-yet-persisted changes (an incr without a
+                // persist still has a live reader behind it), and zero when
+                // this handle already removed the entry.
+                let on_disk = file.counts.get(&hex).copied().unwrap_or(0);
+                let pending = state.delta.get(hash).copied().unwrap_or(0);
+                let fresh = if state.removed.contains(hash) {
+                    0
+                } else {
+                    apply_delta(on_disk, pending)
+                };
+                if fresh != 0 {
+                    continue;
+                }
+                unlink(hash).map_err(CasError::Io)?;
+                file.counts.remove(&hex);
+                state.counts.remove(hash);
+                state.removed.insert(*hash);
+                removed.push(*hash);
+            }
+        }
+
+        if !removed.is_empty() {
+            write_sidecar_atomic(&self.sidecar_path, &file)?;
+        }
+        Ok(removed)
     }
 }
 

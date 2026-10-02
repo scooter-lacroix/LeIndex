@@ -429,7 +429,19 @@ impl LeIndex {
         // risk. If startup-write contention is ever observed, extend the lock
         // to a write-mode `Storage::open` (or make `ProjectWriteLock`
         // re-entrant so `new()` can also acquire it without self-deadlock).
-        let _write_lock = self.acquire_write_lock()?;
+        //
+        // Non-forced runs coalesce with a concurrent index in another
+        // process: if that process publishes a fresh index while we wait for
+        // the lock, this run returns immediately instead of queueing a
+        // redundant full index behind it.
+        let Some(_write_lock) = self.acquire_write_lock_coalescing(force)? else {
+            info!(
+                "Skipping index for {}: another process published a fresh index \
+                 while this writer waited for the project write lock",
+                self.project_id
+            );
+            return Ok(self.stats.clone());
+        };
         let start_time = Instant::now();
         let job = JobPaths::new(self.storage_path(), self.checkpoint_generation());
         self.pipeline = Some(IndexPipelineState::new(force, start_time, job.clone()));

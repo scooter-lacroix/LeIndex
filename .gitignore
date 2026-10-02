@@ -192,3 +192,10 @@ jscpd-report/
 
 # Throwaway rewrite scripts
 /rewrite.py
+
+# Machine-local investigation scratch (absolute paths, timestamps — never commit)
+.factory-temp-*.json
+
+# Saved web pages / editor scratch at the repository root (never commit)
+/*.html
+/Text File.txt

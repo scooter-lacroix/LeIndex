@@ -207,10 +207,22 @@ fn handle_hello_frame(
         return HelloOutcome::Incompatible;
     }
     if let Some(cwd) = hello.cwd.filter(|cwd| !cwd.is_empty()) {
-        if let Some(state) = SERVER_STATE.get() {
-            state.spawn_prewarm_at(Some(std::path::PathBuf::from(&cwd)));
+        // Re-validate on the daemon side. The shim canonicalizes and filters
+        // the cwd before sending it, but the wire peer is unauthenticated: a
+        // relative path, `/`, or a nonexistent tree named by a rogue client
+        // must not be prewarmed and injected as the default `project_path`
+        // for every tool call on this connection.
+        let validated = std::path::PathBuf::from(&cwd)
+            .canonicalize()
+            .ok()
+            .filter(|path| proto::is_projectish_cwd(path))
+            .map(|path| path.to_string_lossy().into_owned());
+        if let Some(cwd) = validated {
+            if let Some(state) = SERVER_STATE.get() {
+                state.spawn_prewarm_at(Some(std::path::PathBuf::from(&cwd)));
+            }
+            *default_project = Some(cwd);
         }
-        *default_project = Some(cwd);
     }
     HelloOutcome::Handled
 }

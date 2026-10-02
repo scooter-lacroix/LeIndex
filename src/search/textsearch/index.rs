@@ -220,7 +220,13 @@ pub fn write_index(path: &Path, files: &[FileInput], has_symbols: bool) -> io::R
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    // Unique per build: two concurrent in-process sessions (MCP connections
+    // sharing one daemon) build the same project's index; a pid-only name
+    // made them truncate each other's temp file and publish an interleaved,
+    // permanently-invalid index.
+    static BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp{}.{}", std::process::id(), seq));
     {
         let mut file = File::create(&tmp)?;
         file.write_all(&body)?;
@@ -485,7 +491,11 @@ impl TextIndex {
         else {
             return Vec::new();
         };
-        let mut out = Vec::with_capacity(count as usize);
+        // `count` is an unvalidated header field; a torn index claiming
+        // u32::MAX postings must not turn into a ~17 GiB allocation before
+        // the varint decode (which is bounded by the section bytes anyway).
+        let capacity = (count as usize).min(bytes.len());
+        let mut out = Vec::with_capacity(capacity);
         let (mut pos, mut previous) = (0usize, 0u32);
         while pos < bytes.len() {
             let Some(delta) = read_varint(bytes, &mut pos) else {

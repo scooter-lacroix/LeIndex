@@ -500,3 +500,47 @@ fn test_npm_installer_installs_the_daemon() {
         "npm installer references an undeclared `srcMain`"
     );
 }
+
+/// The worker is not a separate binary anymore (single `leindex` binary,
+/// hidden re-exec worker mode). A worker-name alias equal to the main
+/// binary made the cargo fallback copy `bin/leindex` onto itself (a
+/// possible 0-byte binary after a "successful" install) and never copied
+/// `leindexd`; the dead `hasWorker` reinstall trigger went with it.
+#[test]
+fn test_npm_installer_has_no_self_copying_worker_alias() {
+    let installer = read_repo_file("packages/npm-leindex-mcp/install.js");
+    assert!(
+        !installer.contains("getWorkerBinaryName"),
+        "the retired worker-name alias must not exist"
+    );
+    assert!(
+        !installer.contains("hasWorker"),
+        "hasWorker was permanently true (worker === main binary) and is dead code"
+    );
+    assert!(
+        installer.contains("cargoDaemon"),
+        "the cargo fallback must link the daemon (leindexd) into the package"
+    );
+}
+
+/// The macOS source install must place `leindexd` beside `leindex` and must
+/// not reference the retired `leindex-embed` binary (its build produces
+/// none, so every install printed a false "neural search unavailable"
+/// warning and never installed the daemon). Prose explaining the retirement
+/// is intentionally allowed (same convention as install.sh's guard).
+#[test]
+fn test_install_macos_installs_the_daemon_not_the_retired_worker() {
+    let script = read_repo_file("install_macos.sh");
+    assert!(
+        script.contains("target/release/leindexd"),
+        "macOS source install must install leindexd"
+    );
+    assert!(
+        !script.contains("release/leindex-embed"),
+        "the retired leindex-embed binary must not be installed"
+    );
+    assert!(
+        !script.contains("worker_binary"),
+        "no worker-binary install block may remain"
+    );
+}

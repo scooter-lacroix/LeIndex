@@ -149,16 +149,25 @@ where
                     pending_texts.push(input.text);
                     false
                 } else {
-                    // Text by itself exceeds limit — flush current batch, then
-                    // add this text as a single-item batch
+                    // Text by itself exceeds a batch limit — flush current
+                    // batch, then add this text as a single-item batch
                     if !pending_texts.is_empty() {
                         flush_batch(&pending_ids, &pending_texts, embedder, writer, &mut stats)?;
                         pending_ids.clear();
                         pending_texts.clear();
                         pending_bytes = 0;
                     }
-                    // Single-item batch for oversized text
-                    if input.text.len() <= budget.max_seq_len || budget.max_seq_len == usize::MAX {
+                    // Single-item batch for oversized text. Text longer than
+                    // the embedder's sequence limit cannot be embedded at
+                    // all: skip it, but COUNT the skip — the previous guard
+                    // (`text.len() <= max_seq_len`) only reached this branch
+                    // for texts that were already too long, so every
+                    // oversized input was silently dropped with no row, no
+                    // counter and no error while NeuralStats reported
+                    // success.
+                    if input.text.len() > budget.max_seq_len && budget.max_seq_len != usize::MAX {
+                        stats.rows_skipped += 1;
+                    } else {
                         pending_bytes = input.text.len();
                         pending_ids.push(input.node_id);
                         pending_texts.push(input.text);
@@ -305,6 +314,46 @@ mod test {
         // No single batch exceeded max_texts
         assert_eq!(stats.rows_written, 100);
         assert!(stats.batches >= 20); // 100 / 5 = 20 minimum
+    }
+
+    /// An input longer than `max_seq_len` must be counted as skipped, never
+    /// silently dropped: the oversized branch previously pushed only texts
+    /// that fit, so over-length inputs vanished with no row and no counter
+    /// while NeuralStats reported success.
+    #[test]
+    fn test_oversized_input_is_counted_not_silently_dropped() {
+        let mut inputs = make_inputs(3);
+        inputs.insert(
+            1,
+            NeuralInput {
+                node_id: "huge".to_string(),
+                text: "x".repeat(4096),
+            },
+        );
+        let budget = BatchBudget {
+            max_texts: 2,
+            max_utf8_bytes: usize::MAX,
+            max_estimated_tokens: usize::MAX,
+            max_seq_len: 1024,
+            max_output_vector_bytes: usize::MAX,
+        };
+        let embedder = MockEmbedder::new(16);
+        let mut writer = VecNeuralRowWriter::new();
+        let mut iter = inputs.into_iter().map(Ok);
+        let stats = enrich_neural_streaming(&mut iter, &embedder, &mut writer, &budget).unwrap();
+
+        assert_eq!(
+            stats.rows_written, 3,
+            "the three embeddable inputs are written"
+        );
+        assert_eq!(
+            stats.rows_skipped, 1,
+            "the over-length input is counted as skipped"
+        );
+        assert!(
+            !writer.rows.iter().any(|(id, _)| id == "huge"),
+            "over-length text produces no row"
+        );
     }
 
     /// VAL-STREAM-014: RSS independent of corpus node count.

@@ -509,6 +509,54 @@ impl LeIndex {
         ProjectWriteLock::try_acquire(self.storage_path())
     }
 
+    /// Acquire the cross-process write lock, coalescing with a concurrent
+    /// index in another process instead of queueing a redundant one.
+    ///
+    /// With multiple processes on one project (two MCP instances, MCP + CLI),
+    /// the old blocking flock made the second writer sit in the queue for the
+    /// first's *entire* index and then re-scan the tree itself — two tool
+    /// calls would stall for minutes and finish within a second of each
+    /// other. This variant polls the (cheap) lock while another process
+    /// holds it, and once the lock is acquired re-checks staleness once: if
+    /// the other process published a fresh index while we waited, this
+    /// caller is done — no scan, no parse, no second generation. A forced
+    /// reindex always blocks for the lock and always runs.
+    ///
+    /// Returns `Ok(None)` when the index was coalesced away (the caller
+    /// should treat the project as freshly indexed).
+    fn acquire_write_lock_coalescing(&self, force: bool) -> Result<Option<ProjectWriteLock>> {
+        if force {
+            return self.acquire_write_lock().map(Some);
+        }
+        loop {
+            match self.try_acquire_write_lock()? {
+                Some(guard) => {
+                    // We hold the lock. If another process finished indexing
+                    // while we waited, there is nothing left to do. The
+                    // staleness check is one O(N) stat scan, paid once per
+                    // coalesced run, never per poll. A run is skipped ONLY
+                    // when no incomplete job checkpoint exists either: a
+                    // failed attempt leaves a resumable checkpoint (marked
+                    // "complete" only on success) that the next non-forced
+                    // index is expected to finish publishing.
+                    if !self.is_stale_fast() && self.no_incomplete_job() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(guard));
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(200)),
+            }
+        }
+    }
+
+    /// Whether every indexing job checkpoint is marked complete. An
+    /// incomplete checkpoint means an attempt failed mid-pipeline and the
+    /// next non-forced index must resume it (run_scan's checkpoint-reuse
+    /// path), not treat the project as done.
+    fn no_incomplete_job(&self) -> bool {
+        crate::cli::index_job::latest_incomplete_job(self.storage_path()).is_none()
+    }
+
     /// Create a new LeIndex instance for a project.
     ///
     /// ```ignore

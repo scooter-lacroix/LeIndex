@@ -314,6 +314,72 @@ fn file_summary_context_collects_same_file_symbols_excluding_summary_nodes() {
 }
 
 #[test]
+fn test_persist_search_snapshot_rewrites_on_content_only_token_change() {
+    use crate::search::search::{DEFAULT_EMBEDDING_DIMENSION, NodeInfo, SearchEngine};
+
+    // A comment-only edit inside a function body leaves the node id, byte
+    // range, counts and PDG fingerprint untouched but changes the node's
+    // tokens. The snapshot identity must cover the token dictionary and
+    // per-node token ids, or the rewrite is skipped and cold hydration keeps
+    // serving pre-edit tokens (text search can never match the new content).
+    let temp = tempfile::tempdir().unwrap();
+    let project_path = temp.path();
+    let storage = project_path.join(".leindex");
+    std::fs::create_dir_all(&storage).unwrap();
+
+    let engine_for = |content: &str| {
+        let mut engine = SearchEngine::new();
+        let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+        tfidf_embedding[0] = 1.0;
+        engine.index_nodes(vec![NodeInfo {
+            node_id: "a.rs:alpha".to_string(),
+            file_path: "a.rs".to_string(),
+            symbol_name: "alpha".to_string(),
+            language: "rust".to_string(),
+            content: content.to_string(),
+            byte_range: (0, 25),
+            tfidf_embedding,
+            neural_embedding: None,
+            complexity: 1,
+            signature: None,
+            pre_tokenized: None,
+        }]);
+        engine
+    };
+
+    let snapshot_path = storage.join("search_snapshot.bin");
+    persist_search_snapshot(
+        &engine_for("fn alpha() { let counter_a = 1; }"),
+        project_path,
+        1,
+        0,
+        "fp".to_string(),
+    )
+    .unwrap();
+    let first = std::fs::read(&snapshot_path).unwrap();
+
+    // Content-only change: same node id, byte range, fingerprint arguments.
+    persist_search_snapshot(
+        &engine_for("fn alpha() { let counter_b = 1; }"),
+        project_path,
+        1,
+        0,
+        "fp".to_string(),
+    )
+    .unwrap();
+    let second = std::fs::read(&snapshot_path).unwrap();
+    assert_ne!(
+        first, second,
+        "a token-level content change must rewrite the snapshot even when every \
+         structural identity field is unchanged"
+    );
+
+    // The rewritten snapshot is valid and hydrates.
+    let reloaded = try_load_search_snapshot_from_storage(&storage).unwrap();
+    assert_eq!(reloaded.pdg_fingerprint, "fp");
+}
+
+#[test]
 fn test_persist_search_snapshot_skips_identical_rewrite() {
     use crate::search::search::{DEFAULT_EMBEDDING_DIMENSION, NodeInfo, SearchEngine};
 

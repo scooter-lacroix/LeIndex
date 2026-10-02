@@ -79,13 +79,25 @@ thread_local! {
 /// [`CodeIntelligence::get_signatures_lite`] never read (call lists, flow
 /// facts, docstrings, imports, complexity) return empty values. The flag is
 /// thread-local, so rayon closures must create their own guard.
-pub struct LiteGuard(());
+///
+/// The guard is `!Send`/`!Sync` on purpose: entering and dropping it mutate
+/// the *entering thread's* `LITE_DEPTH`. A unit struct would stay `Send`,
+/// and moving one to another thread (a rayon worker capturing it in a
+/// closure) would decrement the destination thread's depth and leave the
+/// source thread stuck in lite mode — silently dropping calls, docstrings,
+/// imports, flow facts and complexity for every later extraction on it.
+pub struct LiteGuard {
+    /// Makes this type `!Send` and `!Sync` (raw pointers are neither).
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
 
 impl LiteGuard {
     /// Enter signature-only extraction on the current thread.
     pub fn enter() -> Self {
         LITE_DEPTH.with(|d| d.set(d.get() + 1));
-        LiteGuard(())
+        LiteGuard {
+            _thread_bound: std::marker::PhantomData,
+        }
     }
 }
 

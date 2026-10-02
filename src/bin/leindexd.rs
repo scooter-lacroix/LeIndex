@@ -128,6 +128,16 @@ mod imp {
             .ok_or_else(|| anyhow::anyhow!("cannot resolve LeIndex home directory"))?
             .join("run");
         std::fs::create_dir_all(&run_dir)?;
+        // The socket is a capability: only this user may connect or even
+        // reach the lock. `create_dir_all` applies the umask (typically
+        // leaving 0755), and a daemon started directly (documented usage)
+        // never went through the shim's permission hardening, so restrict
+        // here too.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
 
         // The socket defaults to the well-known path the shim connects to.
         let socket_path: PathBuf = parse_arg_value(&args, "--socket")
@@ -182,6 +192,19 @@ mod imp {
             // listening (spec §4.2 post-bind callback pattern).
             let run_dir_clone = run_dir.clone();
             let post_bind = move |bound_socket: &std::path::Path| {
+                // Defense in depth on top of the 0700 run directory: the
+                // bind leaves the socket at `0777 & !umask` (typically
+                // 0755); restrict it to this user.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(e) = std::fs::set_permissions(
+                        bound_socket,
+                        std::fs::Permissions::from_mode(0o600),
+                    ) {
+                        error!("failed to restrict socket {}: {e}", bound_socket.display());
+                    }
+                }
                 let endpoint = DaemonEndpoint::current_process(
                     bound_socket.to_path_buf(),
                     DAEMON_PROTOCOL_VERSION,

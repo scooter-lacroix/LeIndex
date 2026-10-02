@@ -268,11 +268,6 @@ function getBinaryName() {
   return process.platform === 'win32' ? 'leindex.exe' : 'leindex';
 }
 
-function getWorkerBinaryName() {
-  // Single binary (2026-08-20): worker mode is built into leindex itself.
-  return process.platform === 'win32' ? 'leindex.exe' : 'leindex';
-}
-
 function requestResponse(url, options = {}, redirectCount = 0) {
   return new Promise((resolve, reject) => {
     https.get(url, options, (response) => {
@@ -804,19 +799,17 @@ async function install() {
   
   const binaryName = getBinaryName();
   const binaryPath = path.join(BIN_DIR, binaryName);
-  const workerName = getWorkerBinaryName();
-  const workerPath = path.join(BIN_DIR, workerName);
-  
-  // Check if already installed (both main and worker)
+
+  // Check if already installed. The worker is not a separate file anymore
+  // (single binary since 2026-08-20): `binaryPath` IS the worker, so the
+  // reinstall triggers are only a stale/unreadable binary or missing assets.
   if (fs.existsSync(binaryPath)) {
     const existing = existingBinaryMatchesPackage(binaryPath);
-    const hasWorker = fs.existsSync(workerPath);
 
     const hasAssets = bundledAssetsComplete();
 
-    if (existing.ok && hasWorker && hasAssets) {
+    if (existing.ok && hasAssets) {
       console.log(`   ✓ LeIndex already installed: ${existing.output}`);
-      console.log('   ✓ Worker binary present');
       console.log('   ✓ Bundled ORT runtime assets present');
       console.log('\n📦 Installation complete!');
       console.log('   Add this package to your MCP configuration to use LeIndex.');
@@ -828,14 +821,11 @@ async function install() {
         `   ⚠ Existing LeIndex binary is stale or unreadable: ${existing.version || existing.output}`
       );
       console.log(`   Reinstalling binary for package version ${pkg.version}...`);
-    } else if (!hasWorker) {
-      console.log('   ⚠ Worker binary missing; reinstalling bundled worker...');
-    } else if (!hasAssets) {
+    } else {
       console.log('   ⚠ Bundled ORT runtime assets missing; reinstalling release bundle...');
     }
 
     try { fs.unlinkSync(binaryPath); } catch (_) {}
-    try { fs.unlinkSync(workerPath); } catch (_) {}
   }
   
   try {
@@ -883,16 +873,20 @@ async function install() {
           fs.chmodSync(binaryPath, 0o755);
           console.log('   ✓ Main binary linked to package directory');
         }
-        // The worker binary is co-installed by the same cargo install.
-        const cargoWorker = path.join(cargoHome, 'bin', workerName);
-        if (fs.existsSync(cargoWorker)) {
-          fs.copyFileSync(cargoWorker, workerPath);
-          fs.chmodSync(workerPath, 0o755);
-          console.log('   ✓ Worker binary linked to package directory');
-        } else {
-          // No in-process ONNX fallback exists: if the worker is absent,
-          // neural search is unavailable until it is obtained.
-          console.log('   ⚠ leindex binary missing from cargo install; neural search unavailable. Re-run `cargo install leindex --features onnx`.');
+        // The same cargo install also builds `leindexd` (one crate, two
+        // binaries). The daemon is Unix-only, and the shared-daemon
+        // behaviour needs it next to the client, exactly like the bundle
+        // path installs it. The retired worker self-copy (leindex onto
+        // leindex) is gone — worker mode is built into the single binary.
+        if (process.platform !== 'win32') {
+          const cargoDaemon = path.join(cargoHome, 'bin', 'leindexd');
+          if (fs.existsSync(cargoDaemon)) {
+            fs.copyFileSync(cargoDaemon, path.join(BIN_DIR, 'leindexd'));
+            fs.chmodSync(path.join(BIN_DIR, 'leindexd'), 0o755);
+            console.log('   ✓ Daemon binary linked to package directory');
+          } else {
+            console.log('   ⚠ leindexd missing from cargo install; the shared daemon is unavailable (sessions run inline)');
+          }
         }
       } catch (linkErr) {
         console.log('   ⚠ Could not link binary, but cargo install succeeded');

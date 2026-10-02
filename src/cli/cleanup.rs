@@ -784,6 +784,13 @@ pub fn retention_report_cli(project: Option<&Path>) -> anyhow::Result<RetentionR
 /// full-copy stores (no `cas/`) run the no-CAS directory prune, which is
 /// safe because legacy generations are self-contained. With `dry_run`
 /// nothing is deleted.
+///
+/// The sweep holds the project write lock (`index.lock`, flock) so it cannot
+/// interleave with a concurrent publish: without the lock, deleting a
+/// non-retained generation directory between a publisher's
+/// `manifest.partial` write and its `CURRENT` swap would abort the publish
+/// with ENOENT. The post-publish retention call inside indexing already runs
+/// under the same lock.
 pub fn retention_gc_cli(
     project: Option<&Path>,
     max_generations: usize,
@@ -804,6 +811,11 @@ pub fn retention_gc_cli(
 
     let storage_root = crate::cli::leindex::resolve_existing_storage_path(&canonical)
         .unwrap_or_else(|| canonical.join(".leindex"));
+
+    // Serialise against any concurrent writer (indexer / publisher) for the
+    // whole sweep.
+    let _write_guard = crate::cli::leindex::ProjectWriteLock::acquire(&storage_root)
+        .map_err(|e| anyhow::anyhow!("failed to acquire project write lock: {e}"))?;
 
     let cas_dir = storage_root.join("cas");
     let gens_dir = storage_root.join(GENERATIONS_DIR);
@@ -1703,8 +1715,10 @@ mod tests {
     fn test_cleanup_never_removes_leased_generation() {
         let (_dir, root, cas, _layer_data) = build_generation_store_fixture(&[1, 2, 3, 4, 5], 5);
 
-        // Simulate a lease on generation 1 by incrementing refcounts.
-        // First, read gen 1's manifest for its hashes.
+        // Simulate a lease on generation 1 the way `GenerationLease::acquire`
+        // does: blob refcounts for its layers plus the generation hold that
+        // records the lease's identity (leases are tracked per generation,
+        // not inferred from blob counts).
         {
             let manifest_bytes = std::fs::read(root.join("generations/1/manifest")).unwrap();
             let manifest =
@@ -1714,6 +1728,7 @@ mod tests {
             for hash in manifest.layer_hashes() {
                 store.incr(&hash);
             }
+            store.record_generation_hold(1);
             store.persist().unwrap();
         }
 

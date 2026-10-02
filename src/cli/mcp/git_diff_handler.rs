@@ -181,10 +181,34 @@ fn parse_numstat(bytes: &[u8]) -> BTreeMap<String, (Option<u64>, Option<u64>)> {
 
 /// New-side line ranges (1-based, inclusive) touched per file, from a
 /// `-U0` unified diff.
+///
+/// Hunk bodies are tracked: an added line whose *content* begins with `++`
+/// (`+++ …`) or `--` must never be mistaken for a file header. Without the
+/// body state, such a line cleared the current file and silently dropped
+/// every remaining hunk of that file.
 fn parse_hunks(patch: &str) -> BTreeMap<String, Vec<(usize, usize)>> {
     let mut hunks: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
     let mut current: Option<String> = None;
+    // Lines still expected inside the current hunk body (old-side and
+    // new-side counters; both zero = between hunks, where `+++`/`---`
+    // headers are meaningful).
+    let mut body_old = 0usize;
+    let mut body_new = 0usize;
     for line in patch.lines() {
+        if body_old > 0 || body_new > 0 {
+            match line.as_bytes().first() {
+                Some(b'-') => body_old = body_old.saturating_sub(1),
+                Some(b'+') => body_new = body_new.saturating_sub(1),
+                // "\ No newline at end of file" belongs to the previous line.
+                Some(b'\\') => {}
+                // Context line (or anything mangled): consumes both sides.
+                _ => {
+                    body_old = body_old.saturating_sub(1);
+                    body_new = body_new.saturating_sub(1);
+                }
+            }
+            continue;
+        }
         if let Some(path) = line.strip_prefix("+++ ") {
             current = path
                 .strip_prefix("b/")
@@ -196,20 +220,38 @@ fn parse_hunks(patch: &str) -> BTreeMap<String, Vec<(usize, usize)>> {
             let Some(file) = current.as_ref() else {
                 continue;
             };
+            let side = |prefix: char| -> usize {
+                rest.split_whitespace()
+                    .find(|part| part.starts_with(prefix))
+                    .and_then(|part| part[1..].split_once(','))
+                    .and_then(|(_, count)| count.parse::<usize>().ok())
+                    .unwrap_or(1)
+            };
+            let count = side('-');
             let Some(new_side) = rest.split_whitespace().find(|part| part.starts_with('+')) else {
                 continue;
             };
             let spec = new_side.trim_start_matches('+');
-            let (start, count) = match spec.split_once(',') {
+            let (start, hit_count) = match spec.split_once(',') {
                 Some((start, count)) => (start.parse::<usize>(), count.parse::<usize>()),
                 None => (spec.parse::<usize>(), Ok(1)),
             };
-            if let (Ok(start), Ok(count)) = (start, count) {
+            if let (Ok(start), Ok(hit_count)) = (start, hit_count) {
                 // A pure deletion (count 0) sits between lines: attribute it to
                 // the line where the removal happened.
                 let start = start.max(1);
-                let end = if count == 0 { start } else { start + count - 1 };
+                let end = if hit_count == 0 {
+                    start
+                } else {
+                    start + hit_count - 1
+                };
                 hunks.entry(file.clone()).or_default().push((start, end));
+                // Enter the hunk body with the remaining (non-context) side
+                // counts so body lines cannot be parsed as headers. The -U0
+                // form has no context lines; `count` lines are `-`, `hit_count`
+                // are `+`.
+                body_old = count;
+                body_new = hit_count;
             }
         }
     }
@@ -739,6 +781,21 @@ mod tests {
         let hunks = parse_hunks(patch);
         assert_eq!(hunks["x.rs"], vec![(4, 5), (12, 12), (21, 21)]);
         assert!(!hunks.contains_key("gone.rs"));
+    }
+
+    #[test]
+    fn test_parse_hunks_body_lines_are_never_headers() {
+        // An added line whose CONTENT begins with "++ " renders as
+        // "+++ doc comment" in the diff. Without hunk-body tracking that
+        // line was parsed as a file header, cleared the current file, and
+        // silently dropped every remaining hunk of the file.
+        let patch = "--- a/x.rs\n+++ b/x.rs\n@@ -1,0 +2,3 @@\n+first\n+++ doc comment\n+last\n@@ -10 +20 @@\n-old\n+new\n";
+        let hunks = parse_hunks(patch);
+        assert_eq!(
+            hunks["x.rs"],
+            vec![(2, 4), (20, 20)],
+            "the body line must not be treated as a header and the second hunk must survive"
+        );
     }
 
     #[test]

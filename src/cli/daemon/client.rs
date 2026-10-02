@@ -40,6 +40,15 @@ const SPAWN_WAIT: Duration = Duration::from_secs(5);
 /// How long to wait for the ack.
 const ACK_WAIT: Duration = Duration::from_secs(3);
 
+/// Cooldown between daemon spawn attempts: a spawned daemon that loses the
+/// startup-lock race (typically to the outgoing daemon's still-held lock
+/// during a replacement) exits immediately, and the connect loop must be
+/// able to try again instead of polling a socket that will never answer.
+const SPAWN_RETRY_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// Maximum daemon spawn attempts before falling back to the inline server.
+const MAX_SPAWN_ATTEMPTS: usize = 3;
+
 /// Result of trying to serve this process through the daemon.
 #[derive(Debug)]
 pub enum Outcome {
@@ -92,8 +101,17 @@ pub fn run(project: Option<PathBuf>) -> Outcome {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // The socket is a capability: only this user may connect.
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        // The socket is a capability: only this user may connect. If the
+        // directory's permissions cannot be restricted, the daemon we are
+        // about to spawn would bind a world-connectable socket on a
+        // multi-user host — any local user could drive its write tools —
+        // so fail closed and run inline instead.
+        if let Err(error) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+            return Outcome::Fallback(format!(
+                "cannot restrict {} to 0700: {error}",
+                dir.display()
+            ));
+        }
     }
     let socket = dir.join(SOCKET_NAME);
     let cwd = project
@@ -103,7 +121,8 @@ pub fn run(project: Option<PathBuf>) -> Outcome {
         .map(|path| path.to_string_lossy().into_owned());
 
     let mut replaced = false;
-    let mut spawned = false;
+    let mut spawn_attempts = 0usize;
+    let mut next_spawn_allowed = Instant::now();
     let deadline = Instant::now() + SPAWN_WAIT + ACK_WAIT;
     loop {
         match connect_and_greet(&socket, cwd.as_deref()) {
@@ -121,10 +140,14 @@ pub fn run(project: Option<PathBuf>) -> Outcome {
                             ack.version, ack.pid
                         ));
                     }
+                    replace(&stream, &socket, ack.pid);
                     drop(stream);
-                    replace(&socket, ack.pid);
                     replaced = true;
-                    spawned = false;
+                    // The replacement may lose the startup-lock race to the
+                    // outgoing daemon's still-held lock and exit without
+                    // ever binding; allow a fresh spawn attempt.
+                    spawn_attempts = 0;
+                    next_spawn_allowed = Instant::now() + SPAWN_RETRY_COOLDOWN;
                     continue;
                 }
                 return Outcome::Done(forward(stream));
@@ -133,9 +156,21 @@ pub fn run(project: Option<PathBuf>) -> Outcome {
                 if Instant::now() >= deadline {
                     return Outcome::Fallback(format!("daemon unavailable: {error}"));
                 }
-                if !spawned {
+                // Spawn (and re-spawn after a failed attempt) with a
+                // cooldown: latching "spawned" on the fork alone never
+                // retried a daemon that died during startup, silently
+                // burning the whole wait budget and falling back inline.
+                if Instant::now() >= next_spawn_allowed {
+                    if spawn_attempts >= MAX_SPAWN_ATTEMPTS {
+                        return Outcome::Fallback(format!(
+                            "daemon did not come up after {spawn_attempts} attempts: {error}"
+                        ));
+                    }
                     match spawn_daemon(&socket) {
-                        Ok(()) => spawned = true,
+                        Ok(()) => {
+                            spawn_attempts += 1;
+                            next_spawn_allowed = Instant::now() + SPAWN_RETRY_COOLDOWN;
+                        }
                         Err(reason) => return Outcome::Fallback(reason),
                     }
                 }
@@ -242,8 +277,21 @@ fn spawn_daemon(socket: &Path) -> Result<(), String> {
 }
 
 /// Ask a stale daemon to exit and wait until its socket stops answering.
-fn replace(socket: &Path, pid: u32) {
-    // SAFETY: plain signal delivery to a pid we were told by our own daemon.
+///
+/// The pid comes from the ack of whatever process answered the socket — an
+/// unauthenticated wire value. Before signalling, verify it identifies the
+/// process we are actually connected to: the kernel-provided peer
+/// credentials of the connection must match, and (where `/proc` exists) the
+/// target's executable must be the `leindexd` binary. This also covers pid
+/// recycling between the ack and the kill. If either check fails or cannot
+/// be performed, do not signal: the caller's deadline falls back to the
+/// inline server instead of terminating an arbitrary process.
+fn replace(stream: &UnixStream, socket: &Path, pid: u32) {
+    if !pid_is_the_connected_daemon(stream, pid) {
+        return;
+    }
+    // SAFETY: signal delivery to a pid verified above to be the process on
+    // the other end of our own daemon connection.
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGTERM);
     }
@@ -254,6 +302,63 @@ fn replace(socket: &Path, pid: u32) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Whether `pid` really is the daemon on the other end of `stream`.
+fn pid_is_the_connected_daemon(stream: &UnixStream, pid: u32) -> bool {
+    // 1. Kernel credential check: the peer that answered us must BE that pid
+    //    (SO_PEERCRED; `UnixStream::peer_cred` is not stable in std yet).
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `getsockopt` on a valid, owned fd with a correctly sized
+        // out-buffer; it writes only into `cred`.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut libc::ucred as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 || cred.pid != pid as libc::pid_t {
+            return false;
+        }
+    }
+    // 2. The target must be running the leindexd binary (guards a pid
+    //    recycled between ack and kill).
+    #[cfg(target_os = "linux")]
+    {
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe"));
+        match exe {
+            Ok(path) => {
+                let is_leindexd = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == "leindexd" || name.starts_with("leindexd"));
+                if !is_leindexd {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // No portable peer-credential or /proc probe on this platform: the
+        // pid cannot be verified, so never signal it (the connect deadline
+        // in the caller falls back to the inline server instead).
+        let _ = (stream, pid);
+        return false;
+    }
+    true
 }
 
 /// Copy stdin to the daemon and the daemon to stdout until either side ends.

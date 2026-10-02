@@ -626,6 +626,11 @@ impl Storage {
     }
 
     /// Migration from v2 to v3: bounded catalog point-lookup indexes.
+    ///
+    /// Runs before `initialize_schema`, so the `qualified_name` column (added
+    /// to ancient stores by `ensure_intel_node_columns`) may not exist yet;
+    /// the index is skipped in that case — `initialize_query_indexes`
+    /// recreates it after the column repair.
     fn migrate_v2_to_v3(&mut self) -> SqliteResult<()> {
         let table_exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'intel_nodes')",
@@ -633,6 +638,10 @@ impl Storage {
             |row| row.get(0),
         )?;
         if !table_exists {
+            return Ok(());
+        }
+        let columns = self.intel_node_column_names()?;
+        if !columns.iter().any(|c| c == "qualified_name") {
             return Ok(());
         }
         self.conn.execute(
@@ -649,14 +658,21 @@ impl Storage {
     /// Migration from v3 to v4: unique (project_id, node_id) for the save_pdg
     /// upsert conflict target.
     ///
-    /// Legacy rows predate the natural node key and may carry a `node_id` that
-    /// defaults to `symbol_name`, which repeats across files (e.g. two `init`
-    /// functions). `ON CONFLICT(project_id, node_id)` requires a UNIQUE index,
-    /// so duplicate keys must be collapsed first: keep the lowest `id` per
-    /// `(project_id, node_id)` and drop the rest together with any edges that
-    /// referenced them. The unique index itself is created by
-    /// `initialize_query_indexes` (also covers fresh databases), so this
-    /// migration only has to make the table safe for it.
+    /// Legacy rows predate the natural node key: `node_id` is either absent
+    /// or backfilled from `symbol_name`, which repeats across files (e.g. two
+    /// `init` functions). `ON CONFLICT(project_id, node_id)` requires a
+    /// UNIQUE index, so duplicate keys must be resolved first. Rather than
+    /// deleting the "duplicate" rows — which are genuinely distinct symbols
+    /// (same name, different file) carrying real index data and edges — every
+    /// non-minimal row of a duplicate group is **re-keyed** to the natural
+    /// `<file_path>:<qualified_name>` form (with a final `:id` disambiguator
+    /// for any residual collision, e.g. a true duplicate write). No row and
+    /// no edge is lost; re-keyed rows are simply rewritten with their natural
+    /// key at the next re-index of their file.
+    ///
+    /// This migration runs before `initialize_schema`, so it must be
+    /// self-sufficient: the `node_id` / `qualified_name` columns are added
+    /// here if the legacy table predates them.
     fn migrate_v3_to_v4(&mut self) -> SqliteResult<()> {
         let table_exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'intel_nodes')",
@@ -666,18 +682,29 @@ impl Storage {
         if !table_exists {
             return Ok(());
         }
+        let columns = self.intel_node_column_names()?;
+        for (name, addition) in [
+            (
+                "node_id",
+                "ALTER TABLE intel_nodes ADD COLUMN node_id TEXT DEFAULT ''",
+            ),
+            (
+                "qualified_name",
+                "ALTER TABLE intel_nodes ADD COLUMN qualified_name TEXT DEFAULT ''",
+            ),
+        ] {
+            if !columns.iter().any(|column| column == name) {
+                self.conn.execute(addition, [])?;
+            }
+        }
         self.conn.execute_batch(
-            "DELETE FROM intel_edges
-             WHERE caller_id IN (
-                 SELECT id FROM intel_nodes
-                 WHERE id NOT IN (SELECT MIN(id) FROM intel_nodes GROUP BY project_id, node_id)
-             )
-                OR callee_id IN (
-                 SELECT id FROM intel_nodes
-                 WHERE id NOT IN (SELECT MIN(id) FROM intel_nodes GROUP BY project_id, node_id)
-             );
-             DELETE FROM intel_nodes
-             WHERE id NOT IN (SELECT MIN(id) FROM intel_nodes GROUP BY project_id, node_id);",
+            "UPDATE intel_nodes SET node_id = symbol_name WHERE node_id = '';
+             UPDATE intel_nodes
+                SET node_id = file_path || ':' || COALESCE(NULLIF(qualified_name, ''), symbol_name)
+              WHERE id NOT IN (SELECT MIN(id) FROM intel_nodes GROUP BY project_id, node_id);
+             UPDATE intel_nodes
+                SET node_id = node_id || ':' || id
+              WHERE id NOT IN (SELECT MIN(id) FROM intel_nodes GROUP BY project_id, node_id);",
         )?;
         Ok(())
     }
@@ -729,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v3_to_v4_migration_dedupes_duplicate_node_ids() {
+    fn test_v3_to_v4_migration_rekeys_duplicate_node_ids_without_deleting() {
         let temp_file = NamedTempFile::new().unwrap();
 
         // Simulate a legacy v3 database: open (creates v4 schema), then drop the
@@ -756,9 +783,12 @@ mod tests {
             storage.close().expect("WAL checkpoint on close");
         }
 
-        // Re-open: the v3 -> v4 migration dedupes (keeps the lowest id per
-        // (project_id, node_id)) and initialize_query_indexes recreates the
-        // unique index the upsert depends on.
+        // Re-open: the v3 -> v4 migration re-keys duplicate (project_id,
+        // node_id) rows to the natural `<file_path>:<qualified_name>` form —
+        // the two 'dup' rows are genuinely distinct symbols in different
+        // files, so deleting either would lose real index data — and
+        // initialize_query_indexes recreates the unique index the upsert
+        // depends on.
         let storage = Storage::open(temp_file.path()).unwrap();
 
         let rows: Vec<(i64, String, String)> = {
@@ -773,10 +803,15 @@ mod tests {
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap()
         };
-        // 'dup' collapsed to the lowest-id row (a.rs / f1) plus the 'uniq' row.
-        assert_eq!(rows.len(), 2, "duplicate node_id rows must be deduped");
+        // All three rows survive; only the duplicate row in b.rs is re-keyed.
+        assert_eq!(rows.len(), 3, "duplicate node_id rows must not be deleted");
         assert_eq!(rows[0], (1, "dup".to_string(), "f1".to_string()));
-        assert_eq!(rows[1], (3, "uniq".to_string(), "f3".to_string()));
+        assert_eq!(
+            rows[1],
+            (2, "b.rs:dup".to_string(), "f2".to_string()),
+            "the duplicate is re-keyed to its natural file-qualified key"
+        );
+        assert_eq!(rows[2], (3, "uniq".to_string(), "f3".to_string()));
 
         let idx_count: i64 = storage
             .conn()
@@ -789,6 +824,54 @@ mod tests {
         assert_eq!(
             idx_count, 1,
             "unique (project_id, node_id) index must exist"
+        );
+    }
+
+    #[test]
+    fn test_v3_to_v4_migration_opens_a_store_predating_node_id_and_edges() {
+        // A v3 store may predate both the `node_id` column and the
+        // `intel_edges` table. Migrations run before initialize_schema, so
+        // the v3 -> v4 migration must add what it needs itself instead of
+        // failing to open the store outright.
+        let temp_file = NamedTempFile::new().unwrap();
+        {
+            let conn = rusqlite::Connection::open(temp_file.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (key TEXT PRIMARY KEY, version INTEGER NOT NULL);
+                 INSERT INTO schema_version (key, version) VALUES ('schema', 3);
+                 CREATE TABLE intel_nodes (
+                     id INTEGER PRIMARY KEY,
+                     project_id TEXT NOT NULL,
+                     file_path TEXT NOT NULL,
+                     symbol_name TEXT NOT NULL,
+                     node_type TEXT NOT NULL
+                 );
+                 INSERT INTO intel_nodes (project_id, file_path, symbol_name, node_type)
+                 VALUES ('proj', 'a.rs', 'init', 'Function'), ('proj', 'b.rs', 'init', 'Function');",
+            )
+            .unwrap();
+        }
+
+        let storage = Storage::open(temp_file.path())
+            .expect("an ancient v3 store must open and self-repair, not fail");
+
+        let node_ids: Vec<(String, String)> = {
+            let mut stmt = storage
+                .conn()
+                .prepare("SELECT file_path, node_id FROM intel_nodes ORDER BY file_path")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            node_ids,
+            vec![
+                ("a.rs".to_string(), "init".to_string()),
+                ("b.rs".to_string(), "b.rs:init".to_string()),
+            ],
+            "same-named symbols in different files are re-keyed, not deleted"
         );
     }
 

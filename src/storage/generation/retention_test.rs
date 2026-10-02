@@ -175,12 +175,14 @@ fn test_retention_current_prev_leased() {
     // Set CURRENT = 5
     env.write_current(5);
 
-    // Create a lease on gen 2 (so refcount > 0 for its blobs).
+    // Create a lease on gen 2 (blob refcounts plus the generation hold that
+    // records the lease's identity).
     let mut store = make_store(&env.root);
     {
         for hash in &h2 {
             store.incr(hash);
         }
+        store.record_generation_hold(2);
         store.persist().unwrap();
     }
 
@@ -226,6 +228,7 @@ fn test_retention_shared_layer_does_not_make_an_old_generation_leased() {
     for hash in &h5 {
         store.incr(hash); // a live lease on generation 5
     }
+    store.record_generation_hold(5);
     store.persist().unwrap();
 
     let cfg = RetentionConfig::default();
@@ -239,6 +242,45 @@ fn test_retention_shared_layer_does_not_make_an_old_generation_leased() {
     );
     assert!(!env.gens_dir.join("1").exists());
     assert!(!env.gens_dir.join("3").exists());
+}
+
+#[test]
+fn test_retention_identical_layer_set_does_not_make_an_old_generation_leased() {
+    // A forced / no-content-change republish produces a generation whose
+    // layer set is IDENTICAL to an older one. With lease state inferred from
+    // blob refcounts, every layer of the old generation is above zero (the
+    // lease on the current one pins them all), so the old look-alike
+    // generation was retained forever, defeating the current-plus-previous
+    // bound. Leases are tracked by generation identity, so only the
+    // generation actually leased is retained.
+    let env = TestEnv::new();
+
+    let h1 = env.make_generation(1);
+    let h2 = env.make_generation(2);
+    let h3 = env.make_generation(3);
+    let h4 = env.make_generation(4);
+    // Generation 5: identical layers to generation 2 (nothing changed).
+    env.make_generation_with_hashes(5, &h2);
+    env.write_current(5);
+    let _ = (h1, h3, h4);
+
+    let mut store = make_store(&env.root);
+    for hash in &h2 {
+        store.incr(hash); // a live lease on generation 5 pins all of h2
+    }
+    store.record_generation_hold(5);
+    store.persist().unwrap();
+
+    let cfg = RetentionConfig::default();
+    let report = retain_after_publish(&mut store, &env.gens_dir, &env.jobs_dir, &cfg).unwrap();
+
+    assert!(env.gens_dir.join("5").exists(), "current gen 5 must exist");
+    assert!(env.gens_dir.join("4").exists(), "previous gen 4 must exist");
+    assert!(
+        !env.gens_dir.join("2").exists(),
+        "gen 2 shares every layer with leased gen 5 but is not itself leased"
+    );
+    assert_eq!(report.generations_retained, 2);
 }
 
 #[test]

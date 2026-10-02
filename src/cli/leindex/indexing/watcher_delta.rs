@@ -119,12 +119,26 @@ impl LeIndex {
             parser.parse_files(changed_files)
         };
         let mut pdg = self.take_owned_pdg().unwrap_or_default();
-        let removed_node_ids = self.apply_incremental_pdg_changes(
+        // The graph now exists only in this local. Both fallible steps below
+        // must return it to `self.pdg` on error — a transient failure
+        // (SQLite error, disk full) otherwise leaves the engine with no
+        // resident PDG, degrading every graph-dependent read tool until a
+        // full reload. The partially-mutated graph is restored as-is: the
+        // per-file deletes already committed inside this call are then
+        // reflected in memory too.
+        let applied = self.apply_incremental_pdg_changes(
             &mut pdg,
             &deleted_files,
             parsing_results,
             &source_file_hashes,
-        )?;
+        );
+        let removed_node_ids = match applied {
+            Ok(ids) => ids,
+            Err(error) => {
+                self.pdg = Some(std::sync::Arc::new(pdg));
+                return Err(error);
+            }
+        };
 
         // Resume-proof FileSummary pass: covers ALL files (the incremental merge
         // loop only touched changed files; existing files keep/refresh summaries).
@@ -252,8 +266,16 @@ impl LeIndex {
         // indexer pass (minutes with rust-analyzer) would block the project
         // write lock every time a file is saved. Markers for changed files
         // drop until the next explicit index, which re-merges precision.
-        // Persist the updated PDG to storage so changes survive restart
-        index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)?;
+        // Persist the updated PDG to storage so changes survive restart. On
+        // failure the graph is returned to `self.pdg` (it was taken out by
+        // the caller) so the engine keeps serving graph reads from the
+        // in-memory state it had.
+        if let Err(error) =
+            index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)
+        {
+            self.pdg = Some(std::sync::Arc::new(pdg));
+            return Err(error);
+        }
         self.compute_and_persist_communities(&mut pdg);
 
         // Snapshot/embedder freshness must describe the graph as the DB

@@ -48,6 +48,12 @@ pub struct GpuSample {
 ///
 /// Returns `GpuSample::default()` (all None) on headless boxes where neither
 /// tool exists. Never panics.
+///
+/// Each call forks an external binary costing hundreds of milliseconds to
+/// seconds on GPU hosts. The per-tick sampler runs in a ~10 ms loop, so it
+/// must use [`cached_gpu_sample`]; calling this directly per tick degraded
+/// the loop to roughly one sample per GPU probe, under-reporting peak RSS
+/// (the metric the Memory Budget job gates on) and stretching every phase.
 pub fn sample_gpu() -> GpuSample {
     // Try ROCm first (AMD/ROCm/MIGraphX).
     if let Some(sample) = sample_gpu_rocm() {
@@ -59,6 +65,28 @@ pub fn sample_gpu() -> GpuSample {
     }
     // Headless: nothing found.
     GpuSample::default()
+}
+
+/// How long a GPU probe result is reused before the probes fork again.
+const GPU_SAMPLE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`sample_gpu`] behind a TTL cache: the per-sample path stays RSS-only in
+/// practice, with the GPU probed at most once per TTL window.
+pub fn cached_gpu_sample() -> GpuSample {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, GpuSample)>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((sampled_at, sample)) = guard.as_ref() {
+        if sampled_at.elapsed() < GPU_SAMPLE_TTL {
+            return sample.clone();
+        }
+    }
+    let fresh = sample_gpu();
+    *guard = Some((std::time::Instant::now(), fresh.clone()));
+    fresh
 }
 
 /// Parse VRAM from `rocm-smi --showmeminfo vram --json`.
@@ -141,8 +169,10 @@ pub fn sample(pid: u32, track_worker: bool) -> anyhow::Result<MemorySample> {
         0
     };
 
-    // GPU sampling is global (not per-pid), but cheap enough to inline.
-    let gpu = sample_gpu();
+    // GPU sampling is global (not per-pid). TTL-cached: forking
+    // rocm-smi/nvidia-smi on every tick under-reported peak RSS and slowed
+    // every phase on GPU hosts.
+    let gpu = cached_gpu_sample();
 
     Ok(MemorySample {
         rss_kib: rss,

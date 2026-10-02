@@ -77,11 +77,17 @@ pub struct GenerationLease {
 
 impl GenerationLease {
     /// Acquire a lease on `manifest`, incrementing the refcount of every
-    /// layer blob hash in the CAS store.
+    /// layer blob hash in the CAS store and recording a hold on the
+    /// generation itself.
     ///
     /// Returns a [`GenerationLease`] whose `Drop` impl will decrement the
-    /// same refcounts. If any refcount increment fails the error is returned
-    /// and no refcounts are modified.
+    /// same refcounts and release the generation hold. If any refcount
+    /// increment fails the error is returned and no refcounts are modified.
+    ///
+    /// The generation hold lets retention identify leased generations by
+    /// identity: blob refcounts alone cannot distinguish a leased generation
+    /// from a historical one that happens to share its entire (unchanged)
+    /// layer set.
     pub fn acquire(store: Arc<Mutex<CasStore>>, manifest: &Manifest) -> Result<Self, LeaseError> {
         let hashes = manifest.layer_hashes();
         {
@@ -89,6 +95,7 @@ impl GenerationLease {
             for hash in &hashes {
                 s.incr(hash);
             }
+            s.record_generation_hold(manifest.generation);
             // Persist refcounts so they survive a crash while the lease is held.
             s.persist().map_err(LeaseError::Persist)?;
         }
@@ -123,6 +130,7 @@ impl Drop for GenerationLease {
             for hash in &self.hashes {
                 let _ = store.decr(hash);
             }
+            store.release_generation_hold(self.manifest.generation);
             let _ = store.persist();
         }
     }

@@ -81,7 +81,22 @@ pub struct DrrEntry<P> {
     waiters: usize,
     /// Last progress the job reported; used as the shared result on completion.
     last_progress: Option<P>,
+    /// Consecutive failed steps without an intervening success (reset on
+    /// progress).
+    consecutive_failures: usize,
+    /// Earliest tick at which this entry may be retried after a failure
+    /// (exponential backoff in ticks).
+    retry_not_before_tick: u64,
 }
+
+/// Consecutive failed steps after which a job is moved to the terminal
+/// failed state instead of being retried again. A deterministic failure
+/// (unreadable input, poisoned checkpoint) would otherwise burn the entire
+/// step budget with zero progress and keep every poller waiting forever.
+const MAX_CONSECUTIVE_FAILURES: usize = 8;
+
+/// Longest backoff between retries, in ticks.
+const MAX_RETRY_BACKOFF_TICKS: u64 = 128;
 
 /// Outcome of a single scheduler tick (one step of one job).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,11 +131,17 @@ pub struct DrrQueue<P> {
     /// job reported progress before completing (`None` for jobs that completed
     /// in a single step without ever yielding).
     results: HashMap<JobId, Option<P>>,
+    /// Terminally failed jobs, keyed by job id, with the last step error.
+    /// Recorded after [`MAX_CONSECUTIVE_FAILURES`] consecutive failed steps;
+    /// `is_done` reports them as done so pollers cannot block forever.
+    failures: HashMap<JobId, String>,
     /// Completed coalescable jobs, keyed by target (so a duplicate arriving
     /// after completion returns the shared result without new work).
     completed_by_target: HashMap<TargetRef, JobId>,
     /// Deficit added per tick per unit of weight.
     quantum: u64,
+    /// Monotonic tick counter driving retry backoff.
+    tick_count: u64,
     /// Admission gate consulted before running gated classes.
     admit: Box<dyn Fn(WorkClass, usize) -> Admission + Send + Sync>,
 }
@@ -142,8 +163,10 @@ impl<P: Send + Clone> DrrQueue<P> {
             ager,
             next_job_id: 0,
             results: HashMap::new(),
+            failures: HashMap::new(),
             completed_by_target: HashMap::new(),
             quantum: 1,
+            tick_count: 0,
             admit: Box::new(admit),
         }
     }
@@ -192,6 +215,8 @@ impl<P: Send + Clone> DrrQueue<P> {
             job,
             waiters: 1,
             last_progress: None,
+            consecutive_failures: 0,
+            retry_not_before_tick: 0,
         });
         id
     }
@@ -201,9 +226,15 @@ impl<P: Send + Clone> DrrQueue<P> {
         self.queues.get(key).map_or(0, |q| q.entries.len())
     }
 
-    /// Whether the job with `id` has completed.
+    /// Whether the job with `id` has completed (successfully or as a
+    /// terminal failure).
     pub fn is_done(&self, id: JobId) -> bool {
-        self.results.contains_key(&id)
+        self.results.contains_key(&id) || self.failures.contains_key(&id)
+    }
+
+    /// The terminal failure message for `id`, if the job failed.
+    pub fn failure(&self, id: JobId) -> Option<&str> {
+        self.failures.get(&id).map(String::as_str)
     }
 
     /// The shared result for `id`, if completed and the job reported progress.
@@ -244,6 +275,7 @@ impl<P: Send + Clone> DrrQueue<P> {
     /// Returns `None` when no job is ready (all queues empty or the selected
     /// work was deferred by admission).
     pub fn tick(&mut self, budget: WorkBudget) -> Option<TickOutcome<P>> {
+        self.tick_count += 1;
         self.ager.advance();
 
         // Accrue deficit for every queue proportional to effective weight.
@@ -301,21 +333,55 @@ impl<P: Send + Clone> DrrQueue<P> {
     fn run_front(&mut self, key: QueueKey, budget: WorkBudget) -> Option<TickOutcome<P>> {
         let queue = self.queues.get_mut(&key)?;
         let mut entry = queue.entries.pop_front()?;
+        // Backoff: an entry that recently failed waits out its deferral at
+        // the BACK of the queue, so entries behind it are served instead of
+        // starving behind a hot retry loop.
+        if self.tick_count < entry.retry_not_before_tick {
+            self.queues.get_mut(&key)?.entries.push_back(entry);
+            return None;
+        }
         let job_id = entry.id;
         let class = entry.key.class;
         let step = match entry.job.step(budget) {
             Ok(step) => step,
-            Err(_) => {
-                // A failed step is held for retry, never dropped (defer-don't-
-                // error, anti-cheat §2.1 #10). Return None so the scheduler
-                // treats this tick as having produced no progress.
-                self.queues.get_mut(&key)?.entries.push_front(entry);
+            Err(error) => {
+                // Defer-don't-error (anti-cheat §2.1 #10): a failed step is
+                // retried with exponential backoff, never silently dropped,
+                // and the error is surfaced. After MAX_CONSECUTIVE_FAILURES
+                // the job becomes terminally failed so it stops consuming
+                // the step budget and `is_done` unblocks pollers.
+                entry.consecutive_failures += 1;
+                let message = format!("{error:#}");
+                if entry.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    tracing::warn!(
+                        job = job_id,
+                        class = ?class,
+                        attempts = entry.consecutive_failures,
+                        "scheduler job failed terminally: {message}"
+                    );
+                    self.failures.insert(job_id, message);
+                    self.ager.note_served(class);
+                    return None;
+                }
+                let backoff =
+                    MAX_RETRY_BACKOFF_TICKS.min(1u64 << entry.consecutive_failures.min(7));
+                entry.retry_not_before_tick = self.tick_count + backoff;
+                tracing::debug!(
+                    job = job_id,
+                    class = ?class,
+                    attempt = entry.consecutive_failures,
+                    retry_in_ticks = backoff,
+                    "scheduler step failed; backing off: {message}"
+                );
+                self.queues.get_mut(&key)?.entries.push_back(entry);
                 return None;
             }
         };
         match step {
             Step::Yield(progress) => {
                 entry.last_progress = Some(progress.clone());
+                entry.consecutive_failures = 0;
+                entry.retry_not_before_tick = 0;
                 // Requeue the entry for a future tick.
                 self.queues.get_mut(&key)?.entries.push_front(entry);
                 self.queues.get_mut(&key)?.deficit = self
@@ -627,6 +693,61 @@ mod test {
         assert!(
             queue.is_done(maint),
             "maintenance job completed once selected"
+        );
+    }
+
+    /// A job whose every step fails deterministically must reach a terminal
+    /// failed state after bounded retries (with backoff between attempts) —
+    /// not loop forever burning the step budget while pollers wait on
+    /// `is_done`.
+    #[test]
+    fn test_failing_job_reaches_terminal_failure_after_bounded_retries() {
+        struct AlwaysFails {
+            attempts: Arc<AtomicUsize>,
+        }
+        impl BoundedJob for AlwaysFails {
+            type Progress = usize;
+            fn step(&mut self, _budget: WorkBudget) -> anyhow::Result<Step<usize>> {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("deterministic failure"))
+            }
+            fn estimated_next_bytes(&self) -> usize {
+                8
+            }
+        }
+
+        let mut queue = DrrQueue::<usize>::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let id = queue.enqueue(
+            index_key("project-a"),
+            None,
+            Box::new(AlwaysFails {
+                attempts: attempts.clone(),
+            }),
+        );
+
+        // Exponential backoff spaces the 8 attempts across up to ~255 ticks;
+        // a cap well above that proves termination.
+        let mut ticks = 0;
+        while !queue.is_done(id) {
+            ticks += 1;
+            assert!(ticks <= 1000, "job must terminate within 1000 ticks");
+            let _ = queue.tick(one_item_budget());
+        }
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            MAX_CONSECUTIVE_FAILURES,
+            "exactly the retry cap worth of attempts, not one per tick"
+        );
+        assert!(
+            queue
+                .failure(id)
+                .is_some_and(|m| m.contains("deterministic failure"))
+        );
+        assert!(
+            queue.queue_len(&index_key("project-a")) == 0,
+            "terminally failed entry leaves the queue"
         );
     }
 }

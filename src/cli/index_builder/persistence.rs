@@ -136,25 +136,24 @@ pub(crate) fn persist_search_snapshot(
     }
 
     let path = search_snapshot_path(project_path);
-    // Identity sidecar: `SearchSnapshot` carries no timestamps — it is a pure
-    // function of (PDG content, indexed node set, fragment layer). When every
-    // identity field matches what is already on disk, the ~11MB bincode
-    // rewrite is byte-equivalent and can be skipped. This matters on no-op
-    // re-saves and watcher loops that previously rewrote the full snapshot on
-    // every pass.
+    // Identity sidecar. `SearchSnapshot` carries no timestamps — it is a pure
+    // function of (PDG content, indexed node set, token dictionary, fragment
+    // layer). The identity is a blake3 of the serialized snapshot itself, so
+    // EVERY content-bearing field is covered: the earlier multi-field
+    // identity omitted the per-node `token_ids` and the token dictionary,
+    // and a comment-only edit inside a function body left every one of those
+    // fields unchanged (same ids, byte ranges, counts, fingerprint), so the
+    // rewrite was skipped and cold hydration kept serving the pre-edit
+    // tokens until an unrelated structural change bumped the fingerprint.
+    // When the identity matches what is already on disk, the ~11MB rewrite
+    // is byte-equivalent and can be skipped. Serializing in memory to hash
+    // is far cheaper than the write + fsync it avoids, and the serialized
+    // bytes are reused for the write itself.
     let sidecar_path = project_path
         .join(".leindex")
         .join("search_snapshot.identity");
-    let identity = format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-        snapshot.version,
-        snapshot.pdg_nodes,
-        snapshot.pdg_edges,
-        snapshot.pdg_fingerprint,
-        snapshot.indexed_nodes,
-        snapshot.fragment_root_hash.as_deref().unwrap_or(""),
-        snapshot.fragment_rows,
-    );
+    let bytes = bincode::serialize(&snapshot).context("Failed to serialize search snapshot")?;
+    let identity = format!("v2:{}\n", blake3::hash(&bytes));
     if path.is_file()
         && std::fs::read_to_string(&sidecar_path).ok().as_deref() == Some(identity.as_str())
     {
@@ -173,10 +172,9 @@ pub(crate) fn persist_search_snapshot(
         })?;
     }
 
-    let bytes = bincode::serialize(&snapshot).context("Failed to serialize search snapshot")?;
-    std::fs::write(&path, bytes)
+    std::fs::write(&path, &bytes)
         .with_context(|| format!("Failed to write search snapshot: {}", path.display()))?;
-    std::fs::write(&sidecar_path, identity).with_context(|| {
+    std::fs::write(&sidecar_path, &identity).with_context(|| {
         format!(
             "Failed to write search snapshot identity sidecar: {}",
             sidecar_path.display()

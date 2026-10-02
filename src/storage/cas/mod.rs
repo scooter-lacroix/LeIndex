@@ -24,6 +24,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use blob::{encode_blob, extract_payload, fsync_file, hash_to_hex, validate_blob};
 use refs::{JsonSidecarStore, RefcountStore, Result};
@@ -33,6 +34,11 @@ pub use refs::{CasError, RetentionReport};
 
 /// Directory holding staging partial files.
 const STAGING_DIR: &str = ".staging";
+
+/// Monotonic sequence making every staging path unique per `put` call, so
+/// concurrent writers of the same blob never truncate each other's in-flight
+/// file.
+static PUT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Content-addressed blob store with refcount and garbage collection.
 pub struct CasStore {
@@ -75,10 +81,18 @@ impl CasStore {
         self.prefix_dir(hash).join(&hex)
     }
 
-    /// Staging partial path: `<root>/.staging/<hash>.partial`.
+    /// Staging partial path: `<root>/.staging/<hash>.<pid>.<seq>.partial`.
+    ///
+    /// The pid/seq suffix makes the name unique per writer and per `put`
+    /// call: a deterministic `<hash>.partial` name let two concurrent writers
+    /// of the same blob truncate each other's file mid-write, publishing a
+    /// short/growing blob to readers.
     fn staging_path(&self, hash: &[u8; 32]) -> PathBuf {
         let hex = hash_to_hex(hash);
-        self.root.join(STAGING_DIR).join(format!("{hex}.partial"))
+        let seq = PUT_SEQ.fetch_add(1, Ordering::Relaxed);
+        self.root
+            .join(STAGING_DIR)
+            .join(format!("{hex}.{}.{}.partial", std::process::id(), seq))
     }
 
     /// Store `payload` in the CAS.
@@ -223,42 +237,71 @@ impl CasStore {
         self.refs.reload()
     }
 
+    /// Record that this store handle holds one lease on `generation` (see
+    /// [`GenerationLease`](crate::storage::generation::GenerationLease)), so
+    /// retention identifies leased generations by identity instead of
+    /// inferring lease state from shared blob refcounts. Durably recorded by
+    /// the next [`persist`](Self::persist).
+    pub fn record_generation_hold(&mut self, generation: u64) {
+        self.refs.record_generation_hold(generation)
+    }
+
+    /// Release one generation lease recorded via
+    /// [`record_generation_hold`](Self::record_generation_hold).
+    pub fn release_generation_hold(&mut self, generation: u64) {
+        self.refs.release_generation_hold(generation)
+    }
+
+    /// Generations currently held by any live owner (including this handle's
+    /// not-yet-persisted holds); dead owners' holds are reclaimed first.
+    pub fn held_generations(&self) -> HashSet<u64> {
+        self.refs.held_generations()
+    }
+
     /// Garbage-collect blobs with refcount 0 that are not in `pinned_hashes`.
     ///
     /// `pinned_hashes` is the set of blob hashes referenced by retained
     /// generation manifests. When no manifests exist yet (Tasks 1-2), pass an
     /// empty set or use [`gc`](Self::gc).
+    ///
+    /// Each blob is unlinked only after its refcount is re-read from disk
+    /// under the cross-process `refs` lock, so a lease acquired and persisted
+    /// by another handle or process since this store's last
+    /// [`reload`](Self::reload) is honoured instead of deleted from under the
+    /// live reader.
     pub fn gc_with_pins(&mut self, pinned_hashes: &HashSet<[u8; 32]>) -> Result<RetentionReport> {
         let mut report = RetentionReport::default();
         // See leases taken through other handles since this one opened.
         self.refs.reload()?;
         // Walk all blobs on disk so that we catch both blobs that were
         // decr'd to 0 AND blobs that were `put` but never `incr`'d.
-        let candidates = self.stored_hashes()?;
+        let candidates: Vec<[u8; 32]> = self
+            .stored_hashes()?
+            .into_iter()
+            .filter(|hash| !pinned_hashes.contains(hash))
+            .collect();
 
-        for hash in candidates {
-            let refcount = self.refs.refcount(&hash);
-            if refcount != 0 {
-                continue;
-            }
-            if pinned_hashes.contains(&hash) {
-                continue;
-            }
-            let path = self.blob_path(&hash);
+        let mut reclaimed_bytes = 0u64;
+        let mut blobs_removed = 0usize;
+        let removed = self.refs.collect_zero_refcount(&candidates, &mut |hash| {
+            let path = self.blob_path(hash);
             let size = match fs::metadata(&path) {
                 Ok(meta) => meta.len(),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-                Err(e) => return Err(CasError::Io(e)),
+                Err(e) => return Err(e),
             };
             if let Err(e) = fs::remove_file(&path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(CasError::Io(e));
+                    return Err(e);
                 }
             }
-            report.reclaimed_bytes += size;
-            report.blobs_removed += 1;
-            self.refs.remove(&hash);
-        }
+            reclaimed_bytes += size;
+            blobs_removed += 1;
+            Ok(())
+        })?;
+        report.reclaimed_bytes += reclaimed_bytes;
+        report.blobs_removed += blobs_removed;
+        debug_assert_eq!(removed.len(), report.blobs_removed);
 
         // Persist the cleaned-up refcount map so the blobs stay gone after a
         // restart.

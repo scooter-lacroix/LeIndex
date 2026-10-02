@@ -445,6 +445,12 @@ struct NormalizedDb {
 /// Copy `src` (replaying any WAL) into a temp dir and checkpoint it, so
 /// subsequent VACUUM / reads see a single consistent snapshot without mutating
 /// the source. Returns the checkpointed copy path.
+///
+/// A `-wal` sidecar that exists but cannot be copied is a hard error, not a
+/// skip: opening the copy without it silently rolls back to the pre-WAL
+/// state, and the destructive sweep later deletes both `leindex.db` and its
+/// WAL from the retained generation — every WAL-only transaction would be
+/// lost with no surfaced failure.
 fn copy_and_checkpoint(src: &Path) -> Result<NormalizedDb, MigrationError> {
     let tmp = tempfile::tempdir()?;
     let copy = tmp.path().join("catalog.db");
@@ -452,7 +458,7 @@ fn copy_and_checkpoint(src: &Path) -> Result<NormalizedDb, MigrationError> {
     for sidecar in ["-wal", "-shm"] {
         let s = src.with_extension(format!("db{}", sidecar));
         if s.is_file() {
-            let _ = fs::copy(&s, tmp.path().join(format!("catalog.db{}", sidecar)));
+            fs::copy(&s, tmp.path().join(format!("catalog.db{}", sidecar)))?;
         }
     }
     // Open read-write so a trailing WAL is replayed, then checkpoint it away.
@@ -904,8 +910,11 @@ fn retained_manifest_pins(
     pins
 }
 
-/// Delete completed jobs immediately, then byte-cap the remaining jobs
-/// oldest-first to meet the job cap and the total footprint goal.
+/// Delete completed jobs immediately (zero resume value). In-progress jobs
+/// are never deleted — they hold checkpoint resume value and may belong to a
+/// concurrently running index — so when they alone exceed the effective job
+/// cap (job cap, or the footprint-goal headroom), a warning is recorded
+/// instead of destroying their checkpoints.
 fn prune_jobs(jobs_dir: &Path, cfg: &MigrationConfig, report: &mut MigrationReport) {
     if !jobs_dir.is_dir() {
         return;
@@ -943,22 +952,26 @@ fn prune_jobs(jobs_dir: &Path, cfg: &MigrationConfig, report: &mut MigrationRepo
     }
 
     // Phase 2: byte-cap the remaining (in-progress) jobs oldest-first.
+    //
+    // In-progress jobs are excluded, matching the retention sweep: they hold
+    // checkpoint resume value, and this cleanup also runs from `LeIndex::new`
+    // on already-migrated stores, where it could otherwise destroy the
+    // checkpoints of a job that is indexing concurrently in another process.
+    // The footprint goal is simply reported as unmet while they remain.
     let job_cap = effective_job_cap(cfg, report);
-    report.job_bytes_remaining = dir_total_bytes(jobs_dir);
-
-    // Oldest first = smallest generation number first.
-    remaining.sort_by_key(|(g, _, _)| *g);
-    for (_gen, path, size) in remaining {
-        let current_total = dir_total_bytes(jobs_dir);
-        if current_total <= job_cap {
-            break;
-        }
-        if fs::remove_dir_all(&path).is_ok() {
-            report.jobs_byte_capped += 1;
-            report.job_bytes_reclaimed += size;
+    if dir_total_bytes(jobs_dir) > job_cap {
+        let in_progress_bytes: u64 = remaining.iter().map(|(_, _, size)| *size).sum();
+        if in_progress_bytes > job_cap {
+            let msg = format!(
+                "jobs directory exceeds the {job_cap}-byte cap but {} bytes of \
+                 in-progress jobs remain (checkpoint resume value); skipping \
+                 their deletion",
+                in_progress_bytes
+            );
+            tracing::warn!("{}", msg);
+            report.warnings.push(msg);
         }
     }
-
     report.job_bytes_remaining = dir_total_bytes(jobs_dir);
 }
 

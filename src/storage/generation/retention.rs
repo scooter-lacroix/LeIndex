@@ -8,8 +8,9 @@
 //! Only **current + previous + leased** generations survive:
 //! - **Current**: the generation pointed to by `CURRENT`.
 //! - **Previous**: the immediately preceding generation (if any).
-//! - **Leased**: any generation with at least one live `GenerationLease`
-//!   (refcount > 0 on any of its layer blobs).
+//! - **Leased**: any generation with at least one live `GenerationLease`,
+//!   tracked by generation identity in the CAS refcount sidecar (not
+//!   inferred from blob refcounts, which are shared across generations).
 //!
 //! All other generation directories are deleted entirely.
 //!
@@ -409,7 +410,8 @@ fn unmanaged_blob_hashes(
 /// `current_gen` is the generation pointed to by `CURRENT` (if the pointer
 /// exists). It anchors the retention window: the current generation plus its
 /// `max_generations - 1` immediate predecessors are always retained, as are
-/// any generations with at least one leased (refcount > 0) layer blob.
+/// any generations with a live generation lease (tracked by identity; see
+/// [`retain_leased_generations`]).
 ///
 /// Returns `(retained_count, removed_count, pinned_hashes)`.
 fn prune_generations(
@@ -430,17 +432,21 @@ fn prune_generations(
     let current_gen = window_anchor(&gen_numbers, current_gen);
     let mut retained_gens = retention_window(&gen_numbers, current_gen, max_generations.max(1));
 
-    // Check each generation for leased status (any layer blob with refcount > 0).
-    retain_leased_generations(store, gens_dir, &gen_numbers, &mut retained_gens);
+    // Check each generation for a live lease (tracked by generation
+    // identity; see `retain_leased_generations`).
+    retain_leased_generations(store, &gen_numbers, &mut retained_gens);
 
     // Collect pinned hashes from retained manifests.
     let pinned_hashes = collect_pinned_hashes(gens_dir, &retained_gens);
 
-    // Delete non-retained generations.
+    // Delete non-retained generations. Leases are re-checked here: one taken
+    // (and persisted) after the window was computed must still win, so the
+    // directory removal itself cannot race a fresh reader.
+    let leased_now = store.held_generations();
     let mut removed = 0;
     let retained_count = retained_gens.len();
     for gen_num in &gen_numbers {
-        if !retained_gens.contains(gen_num) {
+        if !retained_gens.contains(gen_num) && !leased_now.contains(gen_num) {
             let gen_dir = gens_dir.join(gen_num.to_string());
             debug!(
                 "retention: removing generation {} (not current/prev/leased)",
@@ -457,28 +463,18 @@ fn prune_generations(
 
 /// Retain every generation outside the window that is still leased.
 ///
-/// A lease pins *every* layer blob of its manifest, so a leased generation has
-/// all of its layers above refcount 0. Requiring all of them (rather than any
-/// one) keeps a generation that merely shares an unchanged layer with a leased
-/// neighbour from being mistaken for a leased generation: with an "any" test a
-/// long-lived lease on the current generation pinned every older generation
-/// that reused one stable layer, defeating the current-plus-previous bound.
-fn retain_leased_generations(
-    store: &CasStore,
-    gens_dir: &Path,
-    gen_numbers: &[u64],
-    retained: &mut HashSet<u64>,
-) {
+/// Lease state is tracked by generation identity (recorded by
+/// [`GenerationLease::acquire`](super::GenerationLease::acquire) alongside
+/// the blob refcounts), not inferred from blob counts: a leased generation
+/// and a historical one that shares its entire — unchanged — layer set have
+/// identical blob refcounts, so any count-based test either pins every
+/// look-alike generation forever (defeating the current-plus-previous bound)
+/// or frees a genuinely leased one.
+fn retain_leased_generations(store: &CasStore, gen_numbers: &[u64], retained: &mut HashSet<u64>) {
+    let leased = store.held_generations();
     for gen_num in gen_numbers {
-        if retained.contains(gen_num) {
-            continue;
-        }
-        if let Some(manifest) = generation_manifest(&gens_dir.join(gen_num.to_string())) {
-            let hashes = manifest.layer_hashes();
-            let fully_leased = !hashes.is_empty() && hashes.iter().all(|h| store.refcount(h) > 0);
-            if fully_leased {
-                retained.insert(*gen_num);
-            }
+        if !retained.contains(gen_num) && leased.contains(gen_num) {
+            retained.insert(*gen_num);
         }
     }
 }

@@ -24,6 +24,13 @@ pub(super) async fn cmd_cleanup_impl(
         let storage_root = crate::cli::leindex::resolve_existing_storage_path(&canonical)
             .unwrap_or_else(|| canonical.join(".leindex"));
         println!("Cleaning: {}\n", storage_root.display());
+        // Hold the project write lock for the sweep so it cannot interleave
+        // with a concurrent publish (deleting a generation directory between
+        // a publisher's manifest.partial write and its CURRENT swap would
+        // abort the publish). Programmatic callers of
+        // `cleanup_project_store` manage their own locking.
+        let _write_guard = crate::cli::leindex::ProjectWriteLock::acquire(&storage_root)
+            .map_err(|e| anyhow::anyhow!("failed to acquire project write lock: {e}"))?;
         let report = crate::cli::cleanup::cleanup_project_store(&storage_root, dry_run)?;
         println!("{}", report);
         return Ok(());

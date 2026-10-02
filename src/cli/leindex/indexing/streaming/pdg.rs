@@ -4,7 +4,7 @@
 //! batches, writes node/edge segments + interned symbol table to CAS. No
 //! whole-PDG clone during merge (spec §6.3, VAL-STREAM-004).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -122,8 +122,9 @@ pub struct PdgStats {
 
 /// Merge per-file fragments into a compact CAS-ready segment.
 ///
-/// Cross-file edges are resolved in bounded batches against the interned
-/// symbol table. No whole-PDG clone is performed during merge (VAL-STREAM-004).
+/// Cross-file edges are resolved in a second pass against the full interned
+/// node-id set, so resolution cannot depend on fragment iteration order. No
+/// whole-PDG clone is performed during merge (VAL-STREAM-004).
 ///
 /// Each fragment is consumed by value (moved into the segment), and the
 /// symbol table is built incrementally — there is no intermediate `PDG::clone()`.
@@ -134,21 +135,25 @@ pub fn merge_fragments_to_segment(fragments: Vec<PdgFragment>) -> (PdgSegment, P
         symbol_table: Vec::new(),
     };
     let mut stats = PdgStats::default();
-    let mut symbol_index: HashMap<String, usize> = HashMap::new();
+    // Node ids (`{file_path}:{qualified_name}` / `external::{target}`) — the
+    // same namespace cross-file edge targets live in. The previous key
+    // (`{name}:{file_path}`) could never match an edge target, so every
+    // cross-file edge fell into the O(N) scan below, which only saw the
+    // fragments merged so far and permanently dropped forward references.
+    let mut node_ids: HashSet<String> = HashSet::new();
+    let mut deferred_cross: Vec<PdgEdgeRecord> = Vec::new();
 
     for fragment in fragments {
         stats.fragments += 1;
 
         // Index nodes: build symbol table entries
         for node in &fragment.nodes {
-            let key = format!("{}:{}", node.name, node.file_path);
-            if !symbol_index.contains_key(&key) {
+            if node_ids.insert(node.id.clone()) {
                 let interned = InternedSymbol {
                     name: node.name.clone(),
                     file_path: node.file_path.clone(),
                     node_id: node.id.clone(),
                 };
-                symbol_index.insert(key.clone(), segment.symbol_table.len());
                 segment.symbol_table.push(interned);
             }
         }
@@ -159,16 +164,18 @@ pub fn merge_fragments_to_segment(fragments: Vec<PdgFragment>) -> (PdgSegment, P
         // Move intra-file edges
         segment.edges.extend(fragment.intra_edges);
 
-        // Resolve cross-file edges in bounded batches
-        for edge in fragment.cross_file_refs {
-            if symbol_index.contains_key(&edge.target)
-                || segment.nodes.iter().any(|n| n.id == edge.target)
-            {
-                segment.edges.push(edge);
-                stats.cross_file_resolved += 1;
-            } else {
-                stats.cross_file_unresolved += 1;
-            }
+        // Defer cross-file resolution until every fragment's nodes are known.
+        deferred_cross.extend(fragment.cross_file_refs);
+    }
+
+    // Second pass: resolve against the complete node-id set. Order no longer
+    // decides which cross-file edges survive.
+    for edge in deferred_cross {
+        if node_ids.contains(&edge.target) {
+            segment.edges.push(edge);
+            stats.cross_file_resolved += 1;
+        } else {
+            stats.cross_file_unresolved += 1;
         }
     }
 
@@ -428,8 +435,65 @@ mod test {
         assert_eq!(stats.fragments, 5);
         // Symbol table has unique entries per (name, file_path)
         assert_eq!(segment.symbol_table.len(), 5);
-        // Cross-file edges resolved against symbol table
-        assert!(stats.cross_file_resolved > 0);
+        // Cross-file edges resolved against the full node-id set: four of
+        // these target fragments that merge LATER in the iteration, which
+        // the old single-pass resolution dropped as unresolved.
+        assert_eq!(stats.cross_file_resolved, 5);
+        assert_eq!(stats.cross_file_unresolved, 0);
+        assert_eq!(segment.edges.len(), 5);
+    }
+
+    /// Cross-file resolution must not depend on fragment order: every edge
+    /// targets a node id that exists somewhere in the merge, so *all* of
+    /// them resolve regardless of which file is merged first. The previous
+    /// keyed lookup used a `{name}:{file_path}` namespace that never matched
+    /// an edge target, and the fallback scan only saw fragments merged so
+    /// far — forward references were permanently dropped.
+    #[test]
+    fn test_cross_file_resolution_is_order_independent() {
+        let make_fragment = |file: &str, target: &str| PdgFragment {
+            nodes: vec![PdgNodeRecord {
+                id: format!("{file}:func"),
+                node_type: "function".into(),
+                name: "func".into(),
+                file_path: file.to_string(),
+                byte_start: 0,
+                byte_end: 100,
+                complexity: 1,
+                language: "rust".into(),
+            }],
+            intra_edges: vec![],
+            cross_file_refs: vec![PdgEdgeRecord {
+                source: format!("{file}:func"),
+                target: target.to_string(),
+                edge_type: "call".into(),
+                confidence: Some(80),
+                call_count: None,
+                variable_name: None,
+                channel: None,
+                position: None,
+            }],
+        };
+
+        // Caller in a.rs targets a node defined in z.rs (a "forward"
+        // reference across the merge order), and vice versa.
+        let fragments = vec![
+            make_fragment("a.rs", "z.rs:func"),
+            make_fragment("z.rs", "a.rs:func"),
+        ];
+        let (segment, stats) = merge_fragments_to_segment(fragments);
+        assert_eq!(stats.cross_file_resolved, 2, "both directions resolve");
+        assert_eq!(stats.cross_file_unresolved, 0);
+        assert_eq!(segment.edges.len(), 2);
+
+        // Reversed merge order: identical outcome.
+        let fragments = vec![
+            make_fragment("z.rs", "a.rs:func"),
+            make_fragment("a.rs", "z.rs:func"),
+        ];
+        let (_, stats) = merge_fragments_to_segment(fragments);
+        assert_eq!(stats.cross_file_resolved, 2);
+        assert_eq!(stats.cross_file_unresolved, 0);
     }
 
     #[test]

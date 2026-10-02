@@ -1272,7 +1272,12 @@ fn run_contention_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("LEINDEX_HOME", home_str)
-            .env("LEINDEX_EMBED_DAEMON", "0");
+            .env("LEINDEX_EMBED_DAEMON", "0")
+            // Measure three full MCP servers contending, not three byte-copy
+            // shims to per-home daemons: the daemon client now defaults ON,
+            // and without this override the contention scenario is never
+            // exercised (matches every other MCP launch in this harness).
+            .env("LEINDEX_FEATURE_DAEMON_CLIENT", "0");
         let child = cmd
             .spawn()
             .with_context(|| format!("contention_3c_2p: failed to spawn client {i}"))?;

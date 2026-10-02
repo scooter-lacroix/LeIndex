@@ -513,16 +513,24 @@ jobs:
           (TF-IDF) search over your source tree. This bundle contains:
 
             bin/        leindex binary (worker mode: leindex --internal-embed-worker)
+            bin/leindexd  shared per-user daemon (Unix bundles only; see below)
             lib/        ONNX Runtime shared libraries (loaded dynamically)
             INSTALL.txt this file
 
           QUICK START
           -----------
 
-          1. Add this directory to your PATH (or copy bin/leindex and
-             worker mode is built into leindex):
+          1. Add this directory to your PATH. Copy BOTH binaries —
+             bin/leindex AND bin/leindexd — together into the same
+             directory (e.g. ~/.cargo/bin); leindex looks for leindexd
+             next to itself:
 
-               export PATH="$PWD/$BUNDLE_DIR/bin:\$PATH"
+               cp bin/leindex bin/leindexd ~/.cargo/bin/
+               export PATH="$HOME/.cargo/bin:\$PATH"
+
+             Without leindexd beside it, every `leindex mcp` session runs
+             its own inline server (higher memory per editor/session)
+             instead of sharing one daemon per user.
 
           2. TF-IDF search works immediately. Index a project and search:
 
@@ -1024,7 +1032,7 @@ jobs:
           echo "- **npm**: Binary wrapper with GH Release download (optional — needs NPM_TOKEN)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "### Bundle topology" >> "$GITHUB_STEP_SUMMARY"
-          echo "Each platform archive includes \`leindex\` (single binary; ONNX worker via the hidden re-exec mode) and ONNX Runtime libraries. Models are provisioned by \`leindex setup\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "Each platform archive includes \`leindex\` (ONNX worker via the hidden re-exec mode), \`leindexd\` (Unix only — the shared per-user daemon; copy it next to \`leindex\`), and ONNX Runtime libraries. Models are provisioned by \`leindex setup\`." >> "$GITHUB_STEP_SUMMARY"
 
   # ── Update version badge ─────────────────────────────────────────────
   badge:
