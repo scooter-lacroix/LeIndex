@@ -199,3 +199,6 @@ jscpd-report/
 # Saved web pages / editor scratch at the repository root (never commit)
 /*.html
 /Text File.txt
+
+# Rejected-patch scratch from git apply --reject (never commit)
+*.rej
