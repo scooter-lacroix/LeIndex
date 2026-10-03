@@ -665,7 +665,7 @@ impl GlobalEmbeddingCache {
                     fs::create_dir_all(parent)?;
                 }
             }
-            let staging_path = staging_path_for(final_path);
+            let staging_path = staging_path_for(&final_path);
             {
                 let file = fs::File::create(&staging_path)?;
                 let mut writer = BufWriter::new(file);
