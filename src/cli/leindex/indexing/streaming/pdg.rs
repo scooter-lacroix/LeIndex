@@ -146,8 +146,13 @@ pub fn merge_fragments_to_segment(fragments: Vec<PdgFragment>) -> (PdgSegment, P
     for fragment in fragments {
         stats.fragments += 1;
 
-        // Index nodes: build symbol table entries
-        for node in &fragment.nodes {
+        // Move nodes into segment (no clone), one record per node id:
+        // per-file fragments each create their own `external::{target}`
+        // placeholder, so concatenating them would leave the segment (and
+        // every graph materialized from it) with duplicate ids that
+        // `save_pdg` collapses onto a single row. First occurrence wins;
+        // edges resolve by id and stay attached to it.
+        for node in fragment.nodes {
             if node_ids.insert(node.id.clone()) {
                 let interned = InternedSymbol {
                     name: node.name.clone(),
@@ -155,11 +160,9 @@ pub fn merge_fragments_to_segment(fragments: Vec<PdgFragment>) -> (PdgSegment, P
                     node_id: node.id.clone(),
                 };
                 segment.symbol_table.push(interned);
+                segment.nodes.push(node);
             }
         }
-
-        // Move nodes into segment (no clone)
-        segment.nodes.extend(fragment.nodes);
 
         // Move intra-file edges
         segment.edges.extend(fragment.intra_edges);
@@ -350,13 +353,29 @@ pub fn pdg_from_segment(segment: &PdgSegment) -> ProgramDependenceGraph {
     // Nodes of one file share a single path allocation.
     let mut file_paths: HashMap<&str, std::sync::Arc<str>> = HashMap::new();
     for record in &segment.nodes {
+        // One node per id: per-file fragments each create their own
+        // `external::{target}` placeholder, so the merged segment carries
+        // duplicates that would otherwise all upsert onto the single
+        // `intel_nodes` row `(project_id, node_id)` and collapse on reload.
+        // Keep the first occurrence and let edges resolve to it by id.
+        if node_ids.contains_key(&record.id) {
+            continue;
+        }
         let node_type = node_type_from_str(&record.node_type).unwrap_or(PDGNodeType::External);
-        let file_path = match file_paths.get(record.file_path.as_str()) {
-            Some(shared) => std::sync::Arc::clone(shared),
-            None => {
-                let shared: std::sync::Arc<str> = std::sync::Arc::from(record.file_path.as_str());
-                file_paths.insert(record.file_path.as_str(), std::sync::Arc::clone(&shared));
-                shared
+        // Shared external placeholders are graph-level vocabulary, not file
+        // content: canonicalize their path so per-file removal never deletes
+        // a node other files' edges still point at (mirrors `merge_pdgs`).
+        let file_path = if node_type == PDGNodeType::External {
+            crate::cli::index_builder::EXTERNAL_NODE_FILE_PATH.clone()
+        } else {
+            match file_paths.get(record.file_path.as_str()) {
+                Some(shared) => std::sync::Arc::clone(shared),
+                None => {
+                    let shared: std::sync::Arc<str> =
+                        std::sync::Arc::from(record.file_path.as_str());
+                    file_paths.insert(record.file_path.as_str(), std::sync::Arc::clone(&shared));
+                    shared
+                }
             }
         };
         let node = PDGNode {
@@ -494,6 +513,70 @@ mod test {
         let (_, stats) = merge_fragments_to_segment(fragments);
         assert_eq!(stats.cross_file_resolved, 2);
         assert_eq!(stats.cross_file_unresolved, 0);
+    }
+
+    /// Per-file fragments each create their own `external::{target}`
+    /// placeholder; the merged segment must keep exactly one record per node
+    /// id (first wins) so the materialized graph cannot carry duplicate ids
+    /// that `save_pdg` would collapse onto a single `(project_id, node_id)`
+    /// row. Edges from every duplicate-holder must survive, resolved to the
+    /// one shared node.
+    #[test]
+    fn test_merge_dedupes_external_placeholders_by_node_id() {
+        let make_fragment = |file: &str| PdgFragment {
+            nodes: vec![
+                PdgNodeRecord {
+                    id: format!("{file}:main"),
+                    node_type: "function".into(),
+                    name: "main".into(),
+                    file_path: file.to_string(),
+                    byte_start: 0,
+                    byte_end: 100,
+                    complexity: 1,
+                    language: "rust".into(),
+                },
+                PdgNodeRecord {
+                    id: "external::String".to_string(),
+                    node_type: "external".into(),
+                    name: "String".into(),
+                    file_path: file.to_string(),
+                    byte_start: 0,
+                    byte_end: 0,
+                    complexity: 0,
+                    language: "external".into(),
+                },
+            ],
+            intra_edges: vec![PdgEdgeRecord {
+                source: format!("{file}:main"),
+                target: "external::String".to_string(),
+                edge_type: "call".into(),
+                confidence: None,
+                call_count: None,
+                variable_name: None,
+                channel: None,
+                position: None,
+            }],
+            cross_file_refs: vec![],
+        };
+
+        let fragments = vec![make_fragment("a.rs"), make_fragment("b.rs")];
+        let (segment, stats) = merge_fragments_to_segment(fragments);
+
+        assert_eq!(segment.nodes.len(), 3, "two callers + one shared external");
+        assert_eq!(segment.symbol_table.len(), 3);
+        assert_eq!(stats.node_count, 3);
+        assert_eq!(segment.edges.len(), 2, "both callers' edges survive");
+
+        let pdg = pdg_from_segment(&segment);
+        assert_eq!(pdg.node_count(), 3);
+        let external = pdg
+            .find_by_id("external::String")
+            .expect("shared external materialized once");
+        assert_eq!(
+            pdg.get_node(external).unwrap().file_path.as_ref(),
+            "<external>",
+            "shared placeholder is not owned by any file"
+        );
     }
 
     #[test]

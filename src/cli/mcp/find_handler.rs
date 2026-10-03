@@ -121,7 +121,7 @@ impl FindHandler {
                 "context_lines": { "type": "integer", "default": 0, "minimum": 0, "maximum": 10, "description": "Context lines per match" },
                 "limit": { "type": "integer", "default": DEFAULT_LIMIT, "minimum": 0, "maximum": MAX_LIMIT, "description": "Hits per page; 0 = all (capped)" },
                 "offset": { "type": "integer", "default": 0, "minimum": 0, "description": "Hits to skip (use next_offset)" },
-                "per_file_cap": { "type": "integer", "default": DEFAULT_PER_FILE, "minimum": 0, "description": "Shown per file (all counted); 0 = no cap" },
+                "per_file_cap": { "type": "integer", "default": DEFAULT_PER_FILE, "minimum": 0, "description": "Hits shown per file; matches past the cap stay counted but appear on no page; 0 = no cap" },
                 "max_line_chars": { "type": "integer", "default": 200, "minimum": 20, "maximum": 2000, "description": "Longest line shown" },
                 "timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": 0, "description": "Time budget; partial results + has_more. 0 = none" },
                 "project_path": { "type": "string", "description": "Project directory; omit to use the current project" }

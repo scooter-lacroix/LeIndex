@@ -927,7 +927,7 @@ How it works, and why it is fast and always correct:
 | `kind` | — | With `target=symbols`: `function`, `class`, `struct`, … |
 | `context_lines` | `0` | Lines of context (max 10) |
 | `limit` / `offset` | `50` / `0` | Paging; `limit=0` returns everything |
-| `per_file_cap` | `20` | Shown per file (all are counted) |
+| `per_file_cap` | `20` | Hits shown per file; matches past the cap stay counted but appear on no page; `0` = no cap |
 | `max_line_chars` | `200` | Long lines are windowed around the match |
 | `timeout_ms` | `20000` | Time budget; `0` = none |
 

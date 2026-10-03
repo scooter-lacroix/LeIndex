@@ -898,11 +898,25 @@ pub(crate) fn collect_source_files_with_hashes(
         .collect()
 }
 
+/// Canonical file path for external placeholder nodes. Real file paths would
+/// tie a shared placeholder to whichever file's extraction pass created it,
+/// letting a per-file `remove_file`/`delete_file_data` delete a node other
+/// files' edges still point at.
+pub(crate) static EXTERNAL_NODE_FILE_PATH: std::sync::LazyLock<std::sync::Arc<str>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::from("<external>"));
+
 /// Merge a source PDG into a target PDG.
 ///
-/// Assumes source and target have disjoint node sets (e.g., merging a
-/// per-file PDG into the global index). Does not deduplicate by symbol
-/// name to preserve overloaded methods that share the same qualified name.
+/// The merged target holds at most one node per node id: a source node whose
+/// id already exists in the target is not re-added — its edges are remapped
+/// onto the existing node. Per-file extraction legitimately produces
+/// duplicate ids for its external placeholders (`external::{target}` is
+/// created once per file pass), and concatenating them gave the graph
+/// several nodes sharing one id; `save_pdg` then keys every copy onto the
+/// single `intel_nodes` row `(project_id, node_id)` and a reload collapses
+/// them. Exact-id dedup preserves overloaded methods that share a qualified
+/// name: their ids differ (file-prefixed, or `@start..end`-suffixed within
+/// a file by the extraction's duplicate guard).
 pub(crate) fn merge_pdgs(target: &mut ProgramDependenceGraph, source: ProgramDependenceGraph) {
     let mut id_map: std::collections::HashMap<
         petgraph::graph::NodeIndex,
@@ -914,8 +928,16 @@ pub(crate) fn merge_pdgs(target: &mut ProgramDependenceGraph, source: ProgramDep
     // (with vacant slots filtered out), avoiding a per-element `clone()`.
     let (nodes_iter, edges_iter) = source.graph.into_nodes_edges_iters();
 
-    for node in nodes_iter {
-        let new_idx = target.add_node(node.weight);
+    for mut node in nodes_iter {
+        if node.weight.node_type == NodeType::External {
+            node.weight.file_path = std::sync::Arc::clone(&EXTERNAL_NODE_FILE_PATH);
+        }
+        let new_idx = match target.find_by_id(&node.weight.id) {
+            // Duplicate id (per-file external placeholder): fold onto the
+            // existing node; the moved weight is dropped.
+            Some(existing_idx) => existing_idx,
+            None => target.add_node(node.weight),
+        };
         id_map.insert(node.index, new_idx);
     }
 

@@ -428,7 +428,13 @@ pub struct SearchOptions {
     pub offset: usize,
     /// Hits to return (`None` = all).
     pub limit: Option<usize>,
-    /// Reported hits per file (`0` = unlimited); further matches are counted.
+    /// Hits shown per file (`0` = unlimited); further matches are counted.
+    ///
+    /// The cap defines each file's contribution to the pagination stream:
+    /// `offset`/`has_more` account only for a file's first `per_file_cap`
+    /// hits, so pages tile the capped stream exactly once. Matches beyond
+    /// the cap never appear on any page (they stay counted in
+    /// `match_lines`); set `0` to page through every match.
     pub per_file_cap: usize,
     /// Context lines around each hit.
     pub context: usize,
@@ -484,8 +490,9 @@ pub struct FileResult {
     /// Reported hits.
     pub hits: Vec<Hit>,
     /// More matching lines exist than were buffered for the window: a page
-    /// limit cut collection short, so `has_more` must be reported even when
-    /// the global window was not exceeded by the buffered hits alone.
+    /// limit cut collection short while the file's capped stream still has
+    /// hits beyond it, so `has_more` must be reported even when the global
+    /// window was not exceeded by the buffered hits alone.
     pub collected_truncated: bool,
     /// Enclosing-symbol tallies `(name, kind, matching lines)`.
     pub symbols: Vec<(String, &'static str, usize)>,
@@ -754,13 +761,12 @@ fn scan_file(
     let mut tallies: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
     let (mut line_no, mut counted_to, mut last_line_start) = (1u32, 0usize, usize::MAX);
     // Collect enough hits per file to cover the requested global window
-    // [offset, offset+limit). The per-file cap is a REPORTING cap applied
-    // after windowing (see `window_file_hits`), never a collection bound:
-    // bounding collection at the cap stranded every match past it (a
-    // 30-match file with cap 20 returned 20 hits with has_more=false, and
-    // no later offset could reach the rest), and folding the cap into the
-    // bound as a floor made it unable to cap anything. 0 = unbounded (no
-    // window: every match is wanted).
+    // [offset, offset+limit). The per-file cap shapes the pagination stream
+    // (see `window_file_hits`) but must never bound COLLECTION below the
+    // window: a file whose capped stream is shorter than the window must
+    // still contribute everything it has, and a file whose stream runs past
+    // the window needs its tail buffered so later offsets can reach it.
+    // 0 = unbounded (no window: every match is wanted).
     let collect_bound = match (options.collect_hits, options.limit) {
         (false, _) => 0,
         (true, Some(limit)) => options.offset.saturating_add(limit),
@@ -797,8 +803,15 @@ fn scan_file(
     }
     // A page limit stopped collection while matches remained: the caller
     // must report has_more even if the buffered hits alone did not exceed
-    // the window (the defaults' collect_bound == window_end shape).
-    result.collected_truncated = collect_bound > 0 && result.match_lines > result.hits.len();
+    // the window (the defaults' collect_bound == window_end shape) — but
+    // only when the file's CAPPED stream actually extends past the
+    // collected prefix. A cap at or below the collected count already
+    // bounds the stream inside it (those hits are all buffered), so
+    // flagging there sent clients paging into empty pages forever (a
+    // 200-match file with cap 20 fully shown must not claim has_more).
+    result.collected_truncated = collect_bound > 0
+        && result.match_lines > result.hits.len()
+        && (options.per_file_cap == 0 || options.per_file_cap > result.hits.len());
     result.symbols = tallies
         .into_iter()
         .map(|((name, kind), count)| (name, kind, count))
@@ -813,6 +826,20 @@ fn window_file_hits(
     window_end: Option<usize>,
     per_file_cap: usize,
 ) {
+    // The per-file cap DEFINES this file's contribution to the pagination
+    // stream: only its first `per_file_cap` hits exist for offset/has_more
+    // accounting, so `offset` indexes the same capped stream on every page
+    // and nothing shown on one page reappears on another. Truncating AFTER
+    // the window walk instead (the previous behavior) dropped hits that
+    // `seen_hits` had already counted: the offset space then described hits
+    // no page would ever show, and a page whose buffer filled the window
+    // exactly (two 25-match files, limit 50, cap 20) reported has_more=false
+    // with ten matches reachable on no offset at all. Cap-dropped matches
+    // remain intentional (documented "shown per file, all counted":
+    // `match_lines` and the symbol tallies still report them). 0 = uncapped.
+    if per_file_cap > 0 && file.hits.len() > per_file_cap {
+        file.hits.truncate(per_file_cap);
+    }
     let mut windowed = Vec::with_capacity(file.hits.len());
     for hit in file.hits.drain(..) {
         let position = *seen_hits;
@@ -820,13 +847,6 @@ fn window_file_hits(
         if position >= offset && window_end.is_none_or(|end| position < end) {
             windowed.push(hit);
         }
-    }
-    // The per-file cap is a REPORTING cap: it shapes what a page shows per
-    // file but never limits what is collected (that is the window's job), so
-    // pagination stays complete and one noisy file cannot consume the page.
-    // 0 = uncapped.
-    if per_file_cap > 0 && windowed.len() > per_file_cap {
-        windowed.truncate(per_file_cap);
     }
     file.hits = windowed;
 }
@@ -1364,11 +1384,11 @@ mod tests {
     }
 
     #[test]
-    fn test_pagination_reaches_matches_beyond_the_per_file_cap() {
-        // A single file with more matches than per_file_cap: the old code
-        // capped collection BEFORE the global window, so the first page
-        // reported has_more=false and no later offset could reach the
-        // stranded matches.
+    fn test_capped_stream_paginates_completely() {
+        // The cap defines the pagination stream: a 30-match file with cap 20
+        // pages through its first 20 hits and stops; the 10 beyond the cap
+        // stay counted (match_lines) but appear on no page, and no page
+        // claims has_more once the capped stream is exhausted.
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "big.txt", &"needle\n".repeat(30));
         let compiled = q("needle").compile().unwrap();
@@ -1383,7 +1403,24 @@ mod tests {
             },
         );
         assert_eq!(first.returned, 10, "first page returns the window");
-        assert!(first.has_more);
+        assert!(first.has_more, "the capped stream (20) exceeds the page");
+
+        let second = search(
+            &[spec(dir.path(), None)],
+            &compiled,
+            &SearchOptions {
+                per_file_cap: 20,
+                limit: Some(10),
+                offset: 10,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            second.returned, 10,
+            "second page shows the rest of the stream"
+        );
+        assert!(!second.has_more, "capped stream fully shown");
+        assert_eq!(second.roots[0].files[0].match_lines, 30, "all counted");
 
         let third = search(
             &[spec(dir.path(), None)],
@@ -1395,12 +1432,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(
-            third.returned, 10,
-            "offset 20 must still reach the matches past the per-file cap"
-        );
-        assert!(!third.has_more, "all 30 matches accounted for");
-        assert_eq!(third.roots[0].files[0].match_lines, 30);
+        assert_eq!(third.returned, 0, "stream ends at the cap");
+        assert!(!third.has_more, "paging terminates cleanly");
     }
 
     #[test]
@@ -1424,21 +1457,89 @@ mod tests {
         assert_eq!(out.returned, 20, "per-file cap shapes the page");
         assert_eq!(out.roots[0].files[0].hits.len(), 20);
         assert_eq!(out.roots[0].files[0].match_lines, 200, "all counted");
+        assert!(
+            !out.has_more,
+            "the capped stream is fully shown; no page churn"
+        );
+        assert!(out.complete);
+    }
+
+    #[test]
+    fn test_capped_matches_across_files_never_strand_a_page() {
+        // The reported multi-file shape (defaults in the MCP handler: limit
+        // 50, cap 20): two files with 25 matches each buffer all 50 hits, so
+        // neither `collected_truncated` nor `seen_hits > window_end` fired
+        // and 10 matches were reachable on no offset. With the cap defining
+        // the stream, the page shows the full capped stream (2 x 20) and
+        // reports has_more honestly; paging with a smaller limit tiles the
+        // stream exactly once, with no duplicates and no gaps.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.txt", &"needle\n".repeat(25));
+        write(dir.path(), "b.txt", &"needle\n".repeat(25));
+        let compiled = q("needle").compile().unwrap();
+
+        let page = search(
+            &[spec(dir.path(), None)],
+            &compiled,
+            &SearchOptions {
+                per_file_cap: 20,
+                limit: Some(50),
+                ..Default::default()
+            },
+        );
+        assert_eq!(page.returned, 40, "both files contribute their capped 20");
+        assert!(!page.has_more, "capped stream (40) fits the page");
+        assert_eq!(page.stats.match_lines, 50, "all matches counted");
+
+        // Same corpus, smaller pages: the capped stream tiles exactly once.
+        let mut seen: Vec<(String, u32)> = Vec::new();
+        let mut offset = 0;
+        loop {
+            let out = search(
+                &[spec(dir.path(), None)],
+                &compiled,
+                &SearchOptions {
+                    per_file_cap: 20,
+                    limit: Some(15),
+                    offset,
+                    ..Default::default()
+                },
+            );
+            for root in &out.roots {
+                for file in &root.files {
+                    for hit in &file.hits {
+                        seen.push((file.rel.clone(), hit.line));
+                    }
+                }
+            }
+            if !out.has_more {
+                assert_eq!(out.returned + offset, 40, "pages tile the capped stream");
+                break;
+            }
+            offset += out.returned;
+            assert!(offset < 40, "paging must terminate");
+        }
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), seen.len(), "no hit appears on two pages");
+        assert_eq!(seen.len(), 40, "every capped-stream hit is delivered");
     }
 
     #[test]
     fn test_page_truncation_reports_has_more_even_when_window_not_exceeded() {
-        // The defaults' shape: limit 50, cap 20, one file with 200 matches.
-        // Buffered hits (50) never EXCEED the window end (50), so the old
-        // seen_hits > window_end check left has_more=false with complete
-        // true and 150 matches unreachable through documented paging.
+        // The window-not-exceeded shape: limit 50, cap 100, one file with
+        // 200 matches. Buffered hits (50) never EXCEED the window end (50),
+        // so the seen_hits > window_end check alone would leave has_more=false
+        // — but the capped stream (100) runs past the collected prefix (50),
+        // so collected_truncated must page the client on.
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "big.txt", &"needle\n".repeat(200));
         let first = search(
             &[spec(dir.path(), None)],
             &q("needle").compile().unwrap(),
             &SearchOptions {
-                per_file_cap: 20,
+                per_file_cap: 100,
                 limit: Some(50),
                 ..Default::default()
             },
@@ -1446,19 +1547,19 @@ mod tests {
         assert!(first.has_more, "truncated collection must page on");
         assert!(!first.complete);
 
-        // The next page reaches the rest.
+        // The next page reaches the rest of the capped stream.
         let second = search(
             &[spec(dir.path(), None)],
             &q("needle").compile().unwrap(),
             &SearchOptions {
-                per_file_cap: 20,
+                per_file_cap: 100,
                 limit: Some(50),
                 offset: 50,
                 ..Default::default()
             },
         );
-        assert_eq!(second.returned, 20, "second page shows the next 20");
-        assert!(second.has_more);
+        assert_eq!(second.returned, 50, "second page shows the next 50");
+        assert!(!second.has_more, "capped stream (100) fully shown");
     }
 
     #[test]

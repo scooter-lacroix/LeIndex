@@ -95,6 +95,185 @@ fn test_merge_pdgs_empty_source_is_noop() {
     assert_eq!(target.edge_count(), 0);
 }
 
+/// Per-file extraction gives every file pass its own `external::{target}`
+/// placeholder, so merged graphs used to carry several nodes sharing one id.
+/// `save_pdg` keys them all onto the single `(project_id, node_id)` row and
+/// a reload collapses them. The merge must fold duplicates onto one node and
+/// remap every edge endpoint onto it.
+#[test]
+fn test_merge_pdgs_dedupes_duplicate_node_ids_and_remaps_edges() {
+    use crate::graph::pdg::{Edge, EdgeMetadata, EdgeType, Node, NodeType};
+    use std::sync::Arc;
+
+    fn caller(id: &str, file: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            node_type: NodeType::Function,
+            name: "main".to_string(),
+            file_path: Arc::from(file),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "rust".to_string(),
+        }
+    }
+
+    fn external_node(file: &str) -> Node {
+        Node {
+            id: "external::String".to_string(),
+            node_type: NodeType::External,
+            name: "String".to_string(),
+            file_path: Arc::from(file),
+            byte_range: (0, 0),
+            complexity: 0,
+            language: "external".to_string(),
+        }
+    }
+
+    fn call_edge() -> crate::graph::pdg::Edge {
+        Edge {
+            edge_type: EdgeType::Call,
+            metadata: EdgeMetadata {
+                call_count: None,
+                variable_name: None,
+                confidence: None,
+                channel: None,
+                position: None,
+            },
+        }
+    }
+
+    // Two file passes, each with a caller and its own `external::String`.
+    let mut target = ProgramDependenceGraph::new();
+    for file in ["a.rs", "b.rs"] {
+        let mut source = ProgramDependenceGraph::new();
+        let caller_idx = source.add_node(caller(&format!("{file}:main"), file));
+        let external_idx = source.add_node(external_node(file));
+        source.add_edge(caller_idx, external_idx, call_edge());
+        merge_pdgs(&mut target, source);
+    }
+
+    assert_eq!(target.node_count(), 3, "two callers + one shared external");
+
+    let external = target
+        .find_by_id("external::String")
+        .expect("shared external survives the merges");
+    assert_eq!(
+        target.get_node(external).unwrap().file_path.as_ref(),
+        "<external>",
+        "shared placeholder is not owned by any file"
+    );
+
+    let inbound_calls = target
+        .edge_indices()
+        .filter(|idx| {
+            target
+                .get_edge(*idx)
+                .is_some_and(|edge| edge.edge_type == EdgeType::Call)
+                && target
+                    .edge_endpoints(*idx)
+                    .is_some_and(|(_, to)| to == external)
+        })
+        .count();
+    assert_eq!(
+        inbound_calls, 2,
+        "both callers' edges point at the shared node"
+    );
+}
+
+/// A shared external placeholder is graph-level vocabulary, not file content:
+/// removing the file whose extraction pass happened to create it must not
+/// delete the node or the other files' edges pointing at it.
+#[test]
+fn test_remove_file_keeps_shared_external_placeholders() {
+    use crate::graph::pdg::{Edge, EdgeMetadata, EdgeType, Node, NodeType};
+    use std::sync::Arc;
+
+    let mut target = ProgramDependenceGraph::new();
+    let mut source = ProgramDependenceGraph::new();
+    let a_main = source.add_node(Node {
+        id: "a.rs:main".to_string(),
+        node_type: NodeType::Function,
+        name: "main".to_string(),
+        file_path: Arc::from("a.rs"),
+        byte_range: (0, 10),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+    let external_idx = source.add_node(Node {
+        id: "external::String".to_string(),
+        node_type: NodeType::External,
+        name: "String".to_string(),
+        file_path: Arc::from("a.rs"),
+        byte_range: (0, 0),
+        complexity: 0,
+        language: "external".to_string(),
+    });
+    source.add_edge(
+        a_main,
+        external_idx,
+        Edge {
+            edge_type: EdgeType::Call,
+            metadata: EdgeMetadata {
+                call_count: None,
+                variable_name: None,
+                confidence: None,
+                channel: None,
+                position: None,
+            },
+        },
+    );
+    merge_pdgs(&mut target, source);
+
+    let mut later = ProgramDependenceGraph::new();
+    later.add_node(Node {
+        id: "b.rs:main".to_string(),
+        node_type: NodeType::Function,
+        name: "main".to_string(),
+        file_path: Arc::from("b.rs"),
+        byte_range: (0, 10),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+    merge_pdgs(&mut target, later);
+
+    // Attach b.rs:main's call to the shared external, then drop file a.rs.
+    let external = target
+        .find_by_id("external::String")
+        .expect("shared external exists");
+    let b_idx = target.find_by_id("b.rs:main").expect("b.rs:main exists");
+    target.add_edge(
+        b_idx,
+        external,
+        Edge {
+            edge_type: EdgeType::Call,
+            metadata: EdgeMetadata {
+                call_count: None,
+                variable_name: None,
+                confidence: None,
+                channel: None,
+                position: None,
+            },
+        },
+    );
+    target.remove_file("a.rs");
+
+    let external_after = target
+        .find_by_id("external::String")
+        .expect("shared external survives a.rs removal");
+    assert_eq!(external_after, external);
+    let b_call_survives = target.edge_indices().any(|idx| {
+        target.edge_endpoints(idx) == Some((b_idx, external_after))
+            && target
+                .get_edge(idx)
+                .is_some_and(|edge| edge.edge_type == EdgeType::Call)
+    });
+    assert!(
+        b_call_survives,
+        "b.rs's edge to the shared external survives"
+    );
+    assert_eq!(target.node_count(), 2, "b.rs:main + the shared external");
+}
+
 #[test]
 fn test_tokenize_code_camel_case() {
     let toks = tokenize_code("getUserName");

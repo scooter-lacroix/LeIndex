@@ -470,6 +470,77 @@ fn test_save_pdg_duplicate_node_id_keeps_all_edges_referencable() {
 }
 
 #[test]
+fn test_shared_external_placeholder_round_trips_losslessly() {
+    // The shape `merge_pdgs` produces after exact-id dedup: two callers and
+    // ONE shared `external::` placeholder per target (the pre-dedup graph
+    // held one placeholder per file, and every copy upserted onto the single
+    // (project_id, node_id) row, conflating their columns and collapsing
+    // node_id_map entries on every subsequent save). The deduped graph must
+    // persist and reload with node and edge counts intact, and its save must
+    // be a no-op on the second pass (stable content hashes, no flapping).
+    let temp_file = NamedTempFile::new().unwrap();
+    let mut storage = Storage::open(temp_file.path()).unwrap();
+
+    let mut pdg = ProgramDependenceGraph::new();
+    let a_main = pdg.add_node(PDGNode {
+        id: "a.rs:main".to_string(),
+        node_type: PDGNodeType::Function,
+        name: "main".to_string(),
+        file_path: Arc::from("a.rs"),
+        byte_range: (0, 10),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+    let b_main = pdg.add_node(PDGNode {
+        id: "b.rs:main".to_string(),
+        node_type: PDGNodeType::Function,
+        name: "main".to_string(),
+        file_path: Arc::from("b.rs"),
+        byte_range: (0, 10),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+    let shared = pdg.add_node(PDGNode {
+        id: "external::String".to_string(),
+        node_type: PDGNodeType::External,
+        name: "String".to_string(),
+        file_path: Arc::from("<external>"),
+        byte_range: (0, 0),
+        complexity: 0,
+        language: "external".to_string(),
+    });
+    pdg.add_edge(
+        a_main,
+        shared,
+        PDGEdge {
+            edge_type: PDGEdgeType::Call,
+            metadata: PDGEdgeMetadata::empty(),
+        },
+    );
+    pdg.add_edge(
+        b_main,
+        shared,
+        PDGEdge {
+            edge_type: PDGEdgeType::Call,
+            metadata: PDGEdgeMetadata::empty(),
+        },
+    );
+
+    save_pdg(&mut storage, "shared_external_proj", &pdg).unwrap();
+    let loaded = load_pdg(&storage, "shared_external_proj").unwrap();
+    assert_eq!(loaded.node_count(), 3, "3 graph nodes -> 3 rows -> 3 nodes");
+    assert_eq!(loaded.edge_count(), 2, "both calls to the shared external");
+    assert!(loaded.find_by_id("external::String").is_some());
+
+    // Re-saving the same graph must converge: every node diffs unchanged
+    // against the first pass, so counts stay stable.
+    save_pdg(&mut storage, "shared_external_proj", &pdg).unwrap();
+    let reloaded = load_pdg(&storage, "shared_external_proj").unwrap();
+    assert_eq!(reloaded.node_count(), 3);
+    assert_eq!(reloaded.edge_count(), 2);
+}
+
+#[test]
 fn test_legacy_schema_missing_timestamp_columns_repaired() {
     // Simulate a database created before intel_nodes had created_at/
     // updated_at columns. `CREATE TABLE IF NOT EXISTS` never repairs an
