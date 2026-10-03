@@ -655,6 +655,15 @@ fn shape_text_result(
         }
         _ => {}
     }
+    if let Some(note) = result_note(&result) {
+        value["note"] = json!(note);
+    }
+    value
+}
+
+/// Trailing hint for a matches payload: why a complete-looking response may
+/// still be incomplete. `None` when neither signal applies.
+fn result_note(result: &SearchOutput) -> Option<String> {
     let mut note = String::new();
     if !result.complete && !result.has_more {
         note.push_str("Stopped at the time budget; raise timeout_ms or narrow the search");
@@ -669,10 +678,7 @@ fn shape_text_result(
             result.cap_withheld
         ));
     }
-    if !note.is_empty() {
-        value["note"] = json!(note);
-    }
-    value
+    (!note.is_empty()).then_some(note)
 }
 
 #[cfg(test)]

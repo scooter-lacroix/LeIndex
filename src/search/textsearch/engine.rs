@@ -754,6 +754,41 @@ fn build_hit(
     }
 }
 
+/// Whether an index-seeded candidate may still be read: its path was
+/// recorded at inventory time and may have been re-pointed since, and a
+/// tracked regular file swapped for a symlink (at the leaf or via a parent
+/// component) would be followed into content outside the root. Fresh-walk
+/// candidates cannot escape (the walk does not follow links) and explicit
+/// file roots are caller-requested paths, so only index-seeded candidates
+/// are revalidated.
+fn index_candidate_contained(
+    candidate: &Candidate,
+    root_canonical: Option<&std::path::Path>,
+) -> bool {
+    match (candidate.id, root_canonical) {
+        (Some(_), Some(root)) => {
+            std::fs::canonicalize(&candidate.abs).is_ok_and(|resolved| resolved.starts_with(root))
+        }
+        _ => true,
+    }
+}
+
+/// How many hits a file may buffer for the requested global window
+/// [offset, offset+limit): `offset + limit` when bounded, 0 (everything)
+/// when `limit` is `None` or this is count-only. The per-file cap shapes
+/// the pagination stream (see `window_file_hits`) but must never bound
+/// COLLECTION below the window: a file whose capped stream is shorter than
+/// the window must still contribute everything it has, and a file whose
+/// stream runs past the window needs its tail buffered so later offsets
+/// can reach it.
+fn page_collect_bound(options: &SearchOptions) -> usize {
+    match (options.collect_hits, options.limit) {
+        (false, _) => 0,
+        (true, Some(limit)) => options.offset.saturating_add(limit),
+        (true, None) => 0,
+    }
+}
+
 fn scan_file(
     candidate: &Candidate,
     compiled: &Compiled,
@@ -761,20 +796,8 @@ fn scan_file(
     index: Option<&TextIndex>,
     root_canonical: Option<&std::path::Path>,
 ) -> Option<FileResult> {
-    // An indexed candidate's path was recorded at inventory time and may have
-    // been re-pointed since: a tracked regular file swapped for a symlink (at
-    // the leaf or via a parent component) would be followed into content
-    // outside the root. Fresh-walk candidates cannot escape (the walk does
-    // not follow links) and explicit file roots are caller-requested paths,
-    // so only index-seeded candidates are revalidated.
-    if candidate.id.is_some() {
-        if let Some(root) = root_canonical {
-            let inside = std::fs::canonicalize(&candidate.abs)
-                .is_ok_and(|resolved| resolved.starts_with(root));
-            if !inside {
-                return None;
-            }
-        }
+    if !index_candidate_contained(candidate, root_canonical) {
+        return None;
     }
     let data = read_scan_file(&candidate.abs)?;
     let symbol_index = resolve_symbol_index(index, candidate, options);
@@ -785,18 +808,7 @@ fn scan_file(
     };
     let mut tallies: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
     let (mut line_no, mut counted_to, mut last_line_start) = (1u32, 0usize, usize::MAX);
-    // Collect enough hits per file to cover the requested global window
-    // [offset, offset+limit). The per-file cap shapes the pagination stream
-    // (see `window_file_hits`) but must never bound COLLECTION below the
-    // window: a file whose capped stream is shorter than the window must
-    // still contribute everything it has, and a file whose stream runs past
-    // the window needs its tail buffered so later offsets can reach it.
-    // 0 = unbounded (no window: every match is wanted).
-    let collect_bound = match (options.collect_hits, options.limit) {
-        (false, _) => 0,
-        (true, Some(limit)) => options.offset.saturating_add(limit),
-        (true, None) => 0,
-    };
+    let collect_bound = page_collect_bound(options);
     for found in compiled.regex.find_iter(&data) {
         let start = found.start();
         let line_start = memchr::memrchr(b'\n', &data[..start]).map_or(0, |p| p + 1);
