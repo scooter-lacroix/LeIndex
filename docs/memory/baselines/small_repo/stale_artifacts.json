@@ -1,13 +1,19 @@
 {
  "phase": "stale_artifacts",
- "rss_min_kib": 404,
- "rss_max_kib": 404,
- "rss_p95_kib": 404,
- "mapped_file_kib": 488,
- "anon_kib": 36,
+ "rss_min_kib": 380,
+ "rss_max_kib": 8584,
+ "rss_p95_kib": 380,
+ "mapped_file_kib": 528,
+ "anon_kib": 32,
  "sample_count": 1,
- "duration_ms": 13,
+ "duration_ms": 83,
  "worker_rss_max_kib": 0,
- "combined_rss_max_kib": 404,
- "rebaselined_note": "T8 step-3: NEW phase. `leindex cleanup --stale-daemons` sweep RSS measured 360-444 KiB (2026-08-03); all 3 seeded dead-pid sidecars removed in-phase (loud failure if any survives) and in harness_integration.rs::test_stale_artifacts_phase_removes_dead_sidecars."
+ "combined_rss_max_kib": 8584,
+ "gpu_vram_mib": 300,
+ "descendants": {
+  "total": 0,
+  "by_name": {},
+  "combined_rss_kib": 0
+ },
+ "rebaselined_note": "v2.0.0 rebaseline (2026-10-01): TRUE-PEAK methodology \u2014 this command is short-lived and the harness's 10ms sampler is bimodal on it (catches full process init on slow/loaded machines: 11584 KiB on CI run 36822610879; misses the peak entirely on fast machines: 24-444 KiB locally, 256 KiB on CI run 36816604737). Baseline set to the true peak measured with a 1ms poller over 3 runs, so both sampler modes pass while a genuine regression above the peak +10% still fails. Absolute wall: 100 MiB ceiling in docs/memory/budgets/current.json."
 }

@@ -1,0 +1,19 @@
+{
+ "phase": "query_suite_warm",
+ "rss_min_kib": 172,
+ "rss_max_kib": 17184,
+ "rss_p95_kib": 16900,
+ "mapped_file_kib": 14688,
+ "anon_kib": 2432,
+ "sample_count": 93,
+ "duration_ms": 8522,
+ "worker_rss_max_kib": 0,
+ "combined_rss_max_kib": 17184,
+ "gpu_vram_mib": 575,
+ "descendants": {
+  "total": 0,
+  "by_name": {},
+  "combined_rss_kib": 0
+ },
+ "rebaselined_note": "v2.0.0 rebaseline (2026-09-30): envelope methodology \u2014 baseline rss_max_kib is the MAXIMUM observed across 5-6 local runs plus the CI run (36816604737) because this phase's single-run variance (scheduler overlap for multi-process phases; peak-sampling misses for one-shot command phases whose 10ms sampler can fire before/after peak RSS) exceeds the 10% baseline tolerance. Stable phases keep single-run baselines. The absolute wall lives in docs/memory/budgets/current.json (every phase has a ceiling)."
+}

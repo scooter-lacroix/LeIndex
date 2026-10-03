@@ -78,9 +78,9 @@ thread_local! {
 pub struct AdcQueryContext {
     /// The f32 query vector
     pub query: Vec<f32>,
-    /// Sum of query values: Σq[i]
+    /// Sum of query values: Σq\[i\]
     pub sum: f32,
-    /// Sum of squared query values: Σq[i]²
+    /// Sum of squared query values: Σq\[i\]²
     pub norm_sq: f32,
     /// Distance metric to use
     pub metric: AdcDistanceMetric,
@@ -213,7 +213,7 @@ impl Distance<Int8QuantizedVector> for AdcDistanceMetric {
     }
 }
 
-/// Wrapper struct that implements Distance<Int8QuantizedVector> with ADC
+/// Wrapper struct that implements `Distance<Int8QuantizedVector>` with ADC
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Int8AdcDistance {
     /// The distance metric to use

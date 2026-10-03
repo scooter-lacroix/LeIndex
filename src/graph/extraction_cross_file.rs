@@ -51,11 +51,11 @@ struct CrossFileCallIndexes {
 
 fn build_cross_file_call_indexes(pdg: &ProgramDependenceGraph) -> CrossFileCallIndexes {
     let mut indexes = CrossFileCallIndexes {
-        qname_to_node: HashMap::new(),
-        qname_file_to_node: HashMap::new(),
-        exact_map: HashMap::new(),
-        last_map: HashMap::new(),
-        suffix_map: HashMap::new(),
+        qname_to_node: HashMap::default(),
+        qname_file_to_node: HashMap::default(),
+        exact_map: HashMap::default(),
+        last_map: HashMap::default(),
+        suffix_map: HashMap::default(),
     };
 
     for nid in pdg.node_indices() {
@@ -486,8 +486,8 @@ pub fn resolve_cross_file_flow_edges_for_files(
 ) {
     use crate::graph::pdg::{EdgeType, NodeId};
 
-    let mut by_qname: HashMap<String, Vec<NodeId>> = HashMap::new();
-    let mut by_file_qname: HashMap<(String, String), Vec<NodeId>> = HashMap::new();
+    let mut by_qname: HashMap<String, Vec<NodeId>> = HashMap::default();
+    let mut by_file_qname: HashMap<(String, String), Vec<NodeId>> = HashMap::default();
 
     for nid in pdg.node_indices() {
         let Some(node) = pdg.get_node(nid) else {

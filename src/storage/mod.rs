@@ -7,14 +7,21 @@
 
 /// Storage analytics and metrics.
 pub mod analytics;
+/// Content-addressed blob store (CAS) and refcount/GC infrastructure
+/// (WS4 Tasks 1-2). See BENCHMARKS.md Section 9 for digested CAS decisions.
+pub mod cas;
 /// Bounded read-only catalog queries for exact MCP reads.
 pub mod catalog;
 /// Cross-project reference resolution and graph merging.
 pub mod cross_project;
 /// Storage and retrieval of graph edges.
 pub mod edges;
+/// Immutable mmap generation store: manifest format, leases, readers, writers
+/// (WS4 Tasks 3+). See BENCHMARKS.md Sections 2 and 9 for digested outcomes.
+pub mod generation;
 /// Global symbol table for cross-project indexing.
 pub mod global_symbols;
+
 /// Storage and retrieval of code nodes.
 pub mod nodes;
 /// Persistent storage for Program Dependence Graphs.
@@ -27,14 +34,24 @@ pub mod project_metadata;
 pub mod salsa;
 /// Database schema and connection management.
 pub mod schema;
+
+#[cfg(feature = "community")]
+pub mod community_store;
 /// Configuration for Turso and hybrid storage backends.
 #[cfg(feature = "turso")]
 pub mod turso_config;
 
 pub use analytics::Analytics;
+/// CAS (content-addressed blob store) types.
+pub use cas::{CasError as CasStoreError, CasStore, RetentionReport};
 pub use catalog::{CatalogReader, CatalogSymbol};
 pub use cross_project::{CrossProjectResolver, MergeError, ResolutionError, ResolvedSymbol};
 pub use edges::{EdgeRecord, EdgeStore};
+pub use generation::{
+    ALL_LAYER_KINDS, GenerationLease, GenerationWriter, LayerKind, LeaseError, Manifest,
+    ManifestError, ModelIdentity, NeuralDtype, NeuralReader, PdgEdge, PdgNode, PdgReader,
+    ReaderError, SymbolEntry, SymbolReader, TfidfEntry, TfidfReader, VectorView, WriterError,
+};
 pub use global_symbols::{
     DepType, ExternalRef, GlobalSymbol, GlobalSymbolError, GlobalSymbolId, GlobalSymbolTable,
     ProjectDep, RefType, SymbolType,

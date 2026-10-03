@@ -9,12 +9,16 @@
 
 #![warn(missing_docs)]
 
+use crate::fast_hash::{FastMap as HashMap, FastSet as HashSet};
 use crate::graph::pdg::{Edge, EdgeMetadata, EdgeType, Node, NodeType, ProgramDependenceGraph};
 use crate::parse::prelude::{FlowChannel, FlowFact, ImportInfo, SignatureInfo};
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+
+mod import_edges;
+pub use import_edges::extract_import_paths_from_source;
+use import_edges::*;
 
 type LocalNodeIds = HashMap<String, Vec<crate::graph::pdg::NodeId>>;
 
@@ -30,9 +34,9 @@ pub fn extract_pdg_from_signatures(
     language: &str,
 ) -> ProgramDependenceGraph {
     let mut pdg = ProgramDependenceGraph::new();
-    let mut node_ids: HashMap<String, crate::graph::pdg::NodeId> = HashMap::new();
-    let mut local_node_ids = LocalNodeIds::new();
-    let mut seen_qnames = HashSet::new();
+    let mut node_ids: HashMap<String, crate::graph::pdg::NodeId> = HashMap::default();
+    let mut local_node_ids = LocalNodeIds::default();
+    let mut seen_qnames = HashSet::default();
     let duplicate_qnames: HashSet<&str> = signatures
         .iter()
         .filter_map(|sig| {
@@ -43,6 +47,25 @@ pub fn extract_pdg_from_signatures(
 
     // Phase 1a: Create function/method nodes
     for sig in &signatures {
+        // Import-marker signatures (`return_type == "use"`) exist so callers
+        // can discover a file's imports from the parser API; they are NOT
+        // code symbols. Creating PDG nodes for them indexed every `use`
+        // path segment as a searchable "function" — `Arc`, `Lazy`, `*` and
+        // bare module names — polluting search ranking, grep output, and
+        // git-status enrichment. They carry no calls, parameters, or
+        // imports, so no edge phase references their node ids; skipping
+        // them here is safe and simply never materializes the noise.
+        if sig.return_type.as_deref() == Some("use") {
+            continue;
+        }
+        // Defensive name guard: a symbol with a blank or glob-star name is
+        // never a navigable definition (observed from macro-generated and
+        // re-export extractions across parsers); indexing it produces
+        // blank bullets in enrichment output and unaddressable nodes.
+        let trimmed_name = sig.name.trim();
+        if trimmed_name.is_empty() || trimmed_name == "*" {
+            continue;
+        }
         let mut node = signature_to_node(sig, file_path, language);
         if duplicate_qnames.contains(sig.qualified_name.as_str()) {
             node.id = format!(
@@ -81,9 +104,28 @@ pub fn extract_pdg_from_signatures(
     let inheritance = extract_inheritance_edges(&signatures, &node_ids);
     pdg.add_inheritance_edges(inheritance);
 
-    // Phase 4: Explicit call edges from parser
-    let call_edges = extract_call_edges_for_nodes(&signatures, &local_node_ids);
+    // Phase 4: Explicit call edges from parser, plus one shared External
+    // node per distinct std/external call target so relationship renders can
+    // show `String.truncate [external]` instead of guessing a project
+    // namesake (N-03).
+    let (call_edges, external_calls) =
+        extract_call_edges_and_externals(&signatures, &local_node_ids);
     pdg.add_call_edges(call_edges);
+    for (caller_id, external_target) in external_calls {
+        let external_id = format!("external::{}", external_target);
+        let target_id = pdg.find_by_id(&external_id).unwrap_or_else(|| {
+            pdg.add_node(Node {
+                id: external_id,
+                node_type: NodeType::External,
+                name: external_target,
+                file_path: std::sync::Arc::from(file_path),
+                byte_range: (0, 0),
+                complexity: 0,
+                language: "external".to_string(),
+            })
+        });
+        pdg.add_call_edges(vec![(caller_id, target_id)]);
+    }
 
     // Phase 4b: source-level value/state/command channels. These edges are
     // intentionally bounded and additive; ordinary call extraction remains
@@ -116,7 +158,7 @@ fn infer_class_nodes_and_containment(
     file_path: &str,
     language: &str,
 ) -> Vec<(crate::graph::pdg::NodeId, crate::graph::pdg::NodeId)> {
-    let mut class_methods: HashMap<String, HashSet<crate::graph::pdg::NodeId>> = HashMap::new();
+    let mut class_methods: HashMap<String, HashSet<crate::graph::pdg::NodeId>> = HashMap::default();
 
     for sig in signatures {
         if !sig.is_method {
@@ -355,7 +397,7 @@ fn extract_data_flow_edges_for_nodes(
 ) -> Vec<DataFlowEdge> {
     let indexes = build_data_flow_indexes(signatures);
     let mut edges = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
 
     add_return_to_parameter_edges(&indexes, node_ids, &mut edges, &mut seen);
     add_shared_return_call_edges(&indexes, node_ids, &mut edges, &mut seen);
@@ -366,10 +408,10 @@ fn extract_data_flow_edges_for_nodes(
 
 fn build_data_flow_indexes(signatures: &[SignatureInfo]) -> DataFlowIndexes<'_> {
     let mut indexes = DataFlowIndexes {
-        producers: HashMap::new(),
-        consumers: HashMap::new(),
-        call_set: HashMap::new(),
-        by_normalized_name: HashMap::new(),
+        producers: HashMap::default(),
+        consumers: HashMap::default(),
+        call_set: HashMap::default(),
+        by_normalized_name: HashMap::default(),
     };
 
     for sig in signatures {
@@ -684,7 +726,7 @@ impl InheritanceEvidence {
 }
 
 fn group_methods_by_class(signatures: &[SignatureInfo]) -> HashMap<String, Vec<&SignatureInfo>> {
-    let mut class_methods: HashMap<String, Vec<&SignatureInfo>> = HashMap::new();
+    let mut class_methods: HashMap<String, Vec<&SignatureInfo>> = HashMap::default();
 
     for sig in signatures {
         if !sig.is_method {
@@ -1019,19 +1061,34 @@ fn local_call_targets(
         let normalized = normalize_symbol(candidate);
         let segments: Vec<&str> = normalized.split('.').filter(|s| !s.is_empty()).collect();
 
+        // Exact qualified-name matches are always trusted (multiple ids can
+        // legitimately exist for the same qualified name across files).
         if let Some(ids) = exact_map.get(&normalized) {
             targets.extend(ids);
         }
+        // Fuzzy fallbacks (bare last segment, 2-3 segment suffix) resolve to
+        // a project namesake in ANOTHER file. When the same short name is
+        // defined in several files — the common case for utility names like
+        // `truncate` — linking the call to ALL of them merged every
+        // namesake's relationships into one conflation blob (N-04), and a
+        // std/external call (`String::truncate`) linked to whichever
+        // project namesake shared the method name (N-03). These fallbacks
+        // now only fire when the name is UNAMBIGUOUS project-wide; an
+        // ambiguous short name resolves to none of the namesakes.
         if let Some(last) = segments.last() {
             if let Some(ids) = last_map.get(*last) {
-                targets.extend(ids);
+                if ids.len() == 1 {
+                    targets.extend(ids);
+                }
             }
         }
         for len in 2..=3_usize.min(segments.len()) {
             let start = segments.len() - len;
             let suffix = segments[start..].join(".");
             if let Some(ids) = suffix_map.get(&suffix) {
-                targets.extend(ids);
+                if ids.len() == 1 {
+                    targets.extend(ids);
+                }
             }
         }
     }
@@ -1039,6 +1096,38 @@ fn local_call_targets(
     targets.sort_unstable();
     targets.dedup();
     targets
+}
+
+/// Call targets that are standard-library/external and must never resolve to
+/// project namesakes (N-03): explicit `std`/`core`/`alloc` namespaces plus
+/// the common Rust prelude/container types whose methods (`String::truncate`,
+/// `Vec::push`, `Option::unwrap`, …) routinely collide with short project
+/// symbol names.
+fn is_external_call_target(call_target: &str) -> bool {
+    let normalized = normalize_symbol(call_target);
+    let first = normalized.split('.').next().unwrap_or("");
+    matches!(
+        first,
+        "std"
+            | "core"
+            | "alloc"
+            | "String"
+            | "str"
+            | "Vec"
+            | "Option"
+            | "Result"
+            | "Box"
+            | "Arc"
+            | "Rc"
+            | "Cell"
+            | "RefCell"
+            | "HashMap"
+            | "BTreeMap"
+            | "HashSet"
+            | "BTreeSet"
+    ) || call_target.starts_with("std::")
+        || call_target.starts_with("core::")
+        || call_target.starts_with("alloc::")
 }
 
 fn type_node_target(
@@ -1095,11 +1184,22 @@ fn extract_call_edges_for_nodes(
     signatures: &[SignatureInfo],
     node_ids: &LocalNodeIds,
 ) -> Vec<(crate::graph::pdg::NodeId, crate::graph::pdg::NodeId)> {
-    let mut edges = Vec::new();
-    let mut seen = HashSet::new();
-    let mut exact_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::new();
-    let mut last_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::new();
-    let mut suffix_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::new();
+    extract_call_edges_and_externals(signatures, node_ids).0
+}
+
+struct SymbolResolutionMaps {
+    exact_map: HashMap<String, Vec<crate::graph::pdg::NodeId>>,
+    last_map: HashMap<String, Vec<crate::graph::pdg::NodeId>>,
+    suffix_map: HashMap<String, Vec<crate::graph::pdg::NodeId>>,
+}
+
+fn build_symbol_resolution_maps(
+    signatures: &[SignatureInfo],
+    node_ids: &LocalNodeIds,
+) -> SymbolResolutionMaps {
+    let mut exact_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::default();
+    let mut last_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::default();
+    let mut suffix_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::default();
 
     for signature in signatures {
         if let Some(ids) = node_ids.get(&signature.qualified_name) {
@@ -1120,6 +1220,95 @@ fn extract_call_edges_for_nodes(
         }
     }
 
+    SymbolResolutionMaps {
+        exact_map,
+        last_map,
+        suffix_map,
+    }
+}
+
+struct CallCollector {
+    edges: Vec<(crate::graph::pdg::NodeId, crate::graph::pdg::NodeId)>,
+    external_calls: Vec<(crate::graph::pdg::NodeId, String)>,
+    seen: HashSet<(crate::graph::pdg::NodeId, crate::graph::pdg::NodeId)>,
+    seen_external: HashSet<(crate::graph::pdg::NodeId, String)>,
+}
+
+impl CallCollector {
+    fn new() -> Self {
+        Self {
+            edges: Vec::new(),
+            external_calls: Vec::new(),
+            seen: HashSet::default(),
+            seen_external: HashSet::default(),
+        }
+    }
+
+    fn record_external(&mut self, caller_id: crate::graph::pdg::NodeId, call_target: &str) {
+        let normalized = normalize_symbol(call_target);
+        if self.seen_external.insert((caller_id, normalized.clone())) {
+            self.external_calls.push((caller_id, normalized));
+        }
+    }
+
+    fn record_edge(
+        &mut self,
+        caller_id: crate::graph::pdg::NodeId,
+        target_id: crate::graph::pdg::NodeId,
+    ) {
+        if caller_id != target_id && self.seen.insert((caller_id, target_id)) {
+            self.edges.push((caller_id, target_id));
+        }
+    }
+}
+
+fn resolve_call_target(
+    caller_id: crate::graph::pdg::NodeId,
+    call_target: &str,
+    alias_map: &HashMap<String, String>,
+    caller_ns: Option<&str>,
+    maps: &SymbolResolutionMaps,
+    node_ids: &LocalNodeIds,
+    collector: &mut CallCollector,
+) {
+    if is_external_call_target(call_target) {
+        // External call: record one marker per distinct target
+        // for this caller; never resolve it into project nodes.
+        collector.record_external(caller_id, call_target);
+        return;
+    }
+    let candidates = ordered_resolution_candidates(call_target, alias_map, caller_ns);
+
+    for target_id in local_call_targets(
+        &candidates,
+        &maps.exact_map,
+        &maps.last_map,
+        &maps.suffix_map,
+    ) {
+        collector.record_edge(caller_id, target_id);
+    }
+
+    if let Some(target_id) = type_node_target(call_target, node_ids, &maps.last_map) {
+        collector.record_edge(caller_id, target_id);
+    }
+}
+
+/// A resolved call edge: (caller node, callee node).
+type CallEdge = (crate::graph::pdg::NodeId, crate::graph::pdg::NodeId);
+
+/// Extract call edges plus the set of distinct external call targets made by
+/// each caller. External targets (`String::truncate`, `Vec::push`, …) are
+/// deliberately NOT resolved to project symbols (N-03); the caller links
+/// them to one shared External node per distinct target so relationship
+/// renders can show `String.truncate [external]` instead of guessing a
+/// project namesake (N-03/N-04).
+fn extract_call_edges_and_externals(
+    signatures: &[SignatureInfo],
+    node_ids: &LocalNodeIds,
+) -> (Vec<CallEdge>, Vec<(crate::graph::pdg::NodeId, String)>) {
+    let maps = build_symbol_resolution_maps(signatures, node_ids);
+    let mut collector = CallCollector::new();
+
     for signature in signatures {
         let Some(caller_ids) = node_ids.get(&signature.qualified_name) else {
             continue;
@@ -1129,26 +1318,20 @@ fn extract_call_edges_for_nodes(
 
         for &caller_id in caller_ids {
             for call_target in &signature.calls {
-                let candidates =
-                    ordered_resolution_candidates(call_target, &alias_map, caller_ns.as_deref());
-
-                for target_id in local_call_targets(&candidates, &exact_map, &last_map, &suffix_map)
-                {
-                    if caller_id != target_id && seen.insert((caller_id, target_id)) {
-                        edges.push((caller_id, target_id));
-                    }
-                }
-
-                if let Some(target_id) = type_node_target(call_target, node_ids, &last_map) {
-                    if caller_id != target_id && seen.insert((caller_id, target_id)) {
-                        edges.push((caller_id, target_id));
-                    }
-                }
+                resolve_call_target(
+                    caller_id,
+                    call_target,
+                    &alias_map,
+                    caller_ns.as_deref(),
+                    &maps,
+                    node_ids,
+                    &mut collector,
+                );
             }
         }
     }
 
-    edges
+    (collector.edges, collector.external_calls)
 }
 
 fn add_local_flow_fact_edge(
@@ -1190,8 +1373,8 @@ fn extract_flow_edges(
     node_ids: &HashMap<String, crate::graph::pdg::NodeId>,
     pdg: &mut ProgramDependenceGraph,
 ) {
-    let mut by_normalized: HashMap<String, crate::graph::pdg::NodeId> = HashMap::new();
-    let mut by_last: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::new();
+    let mut by_normalized: HashMap<String, crate::graph::pdg::NodeId> = HashMap::default();
+    let mut by_last: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::default();
     for sig in signatures {
         if let Some(&id) = node_ids.get(&sig.qualified_name) {
             by_normalized.insert(normalize_symbol(&sig.qualified_name), id);
@@ -1201,7 +1384,7 @@ fn extract_flow_edges(
         }
     }
 
-    let mut external: HashMap<String, crate::graph::pdg::NodeId> = HashMap::new();
+    let mut external: HashMap<String, crate::graph::pdg::NodeId> = HashMap::default();
     for sig in signatures {
         let Some(&caller_id) = node_ids.get(&sig.qualified_name) else {
             continue;
@@ -1353,7 +1536,7 @@ fn qualified_name_from_node(node: &Node) -> Option<&str> {
 }
 
 fn import_alias_map(imports: &[ImportInfo]) -> HashMap<String, String> {
-    let mut alias_map = HashMap::new();
+    let mut alias_map = HashMap::default();
     for import in imports {
         let alias = import.alias.clone().or_else(|| {
             import
@@ -1369,518 +1552,6 @@ fn import_alias_map(imports: &[ImportInfo]) -> HashMap<String, String> {
         }
     }
     alias_map
-}
-
-// ---------------------------------------------------------------------------
-// Phase 5: Import edge extraction with robust multi-line parsing
-//
-// The original line-by-line parser misses:
-//   - Python:     from x import (
-//    a,
-//    b
-//)
-//   - Rust:       use x::{
-//    A,
-//    B
-//};
-//   - TypeScript: import {
-//    A,
-//    B
-//} from 'x';
-//   - Go:         import (
-//    "pkg"
-//    "pkg2"
-//)
-//   - Java:       import x.y.z; (straightforward but needs robustness)
-//   - C#:         using X.Y.Z;
-//   - Ruby:       require / require_relative
-//   - PHP:        use X\Y\Z;
-//   - Lua:        require('x')
-//   - Scala:      import x.y.{A, B}
-//   - C/C++:      #include <x> / #include "x"
-//
-// Strategy: strip comments, collapse the entire source to a single string,
-// then apply per-language regex patterns with DOTALL semantics.
-// All patterns are compiled once and cached as statics.
-// ---------------------------------------------------------------------------
-
-/// Extracts import paths from source code for multiple programming languages.
-///
-/// This function parses source code to identify import statements across
-/// 12+ programming languages. It handles:
-///
-/// - **Rust**: `use`, `extern crate`, and multi-line imports
-/// - **JavaScript/TypeScript**: `import` and `require()` statements
-/// - **Go**: `import` blocks with single and multi-line formats
-/// - **Python**: `import` and `from ... import` statements
-/// - **Java**: `import` statements
-/// - **C/C++**: `#include` directives
-/// - **C#**: `using` statements
-/// - **PHP**: `require`, `include`, `require_once`, `include_once`
-/// - **Ruby**: `require` and `require_relative`
-/// - **Swift**: `import` statements
-/// - **Kotlin**: `import` statements
-/// - **Dart**: `import` and `export` statements
-///
-/// The function strips block comments before parsing to avoid false positives.
-///
-/// # Arguments
-///
-/// * `source_code` - The source code as a byte slice
-/// * `language` - The programming language identifier (e.g., "rust", "python")
-///
-/// # Returns
-///
-/// A HashSet of unique import paths/modules found in the source code.
-pub fn extract_import_paths_from_source(source_code: &[u8], language: &str) -> HashSet<String> {
-    let Ok(source) = std::str::from_utf8(source_code) else {
-        return HashSet::new();
-    };
-    let lang = language.to_ascii_lowercase();
-    let source = strip_block_comments(&lang, source);
-
-    match lang.as_str() {
-        "python" | "py" => extract_python_imports(&source),
-        "javascript" | "js" | "typescript" | "ts" | "jsx" | "tsx" => extract_js_ts_imports(&source),
-        "rust" | "rs" => extract_rust_imports(&source),
-        "go" | "golang" => extract_go_imports(&source),
-        "java" => extract_java_imports(&source),
-        "csharp" | "cs" | "c#" => extract_csharp_imports(&source),
-        "ruby" | "rb" => extract_ruby_imports(&source),
-        "php" => extract_php_imports(&source),
-        "lua" => extract_lua_imports(&source),
-        "scala" => extract_scala_imports(&source),
-        "c" | "cpp" | "c++" | "cxx" | "cc" | "h" | "hpp" => extract_c_imports(&source),
-        _ => HashSet::new(),
-    }
-}
-
-fn strip_block_comments(lang: &str, source: &str) -> String {
-    match lang {
-        "python" | "py" | "ruby" | "rb" => source.to_string(), // no block comments to strip before imports
-        _ => {
-            // Strip /* ... */ style block comments
-            let mut result = String::with_capacity(source.len());
-            let mut chars = source.chars().peekable();
-            while let Some(c) = chars.next() {
-                if c == '/' && chars.peek() == Some(&'*') {
-                    chars.next(); // consume '*'
-                    // Skip until */
-                    loop {
-                        match chars.next() {
-                            Some('*') if chars.peek() == Some(&'/') => {
-                                chars.next();
-                                break;
-                            }
-                            None => break,
-                            _ => {}
-                        }
-                    }
-                    result.push(' '); // preserve whitespace for line counting
-                } else {
-                    result.push(c);
-                }
-            }
-            result
-        }
-    }
-}
-
-fn extract_python_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
-
-    // `import x, y, z` (simple)
-    let re_import = Regex::new(r"(?m)^import\s+([\w,\s.]+)").unwrap();
-    for cap in re_import.captures_iter(source) {
-        for name in cap[1].split(',') {
-            let trimmed = name.split_whitespace().next().unwrap_or("").trim();
-            if !trimmed.is_empty() {
-                imports.insert(trimmed.to_string());
-            }
-        }
-    }
-
-    // `from x import (...)` — multi-line via DOTALL
-    // First capture the module name, then the import list
-    let re_from =
-        Regex::new(r"(?s)from\s+([\w.]+)\s+import\s+(?:\(([^)]+)\)|(\w[\w\s,*]*))").unwrap();
-    for cap in re_from.captures_iter(source) {
-        let module = cap[1].trim();
-        imports.insert(module.to_string());
-        // Also insert fully qualified names for the imported symbols
-        let names_str = cap.get(2).or(cap.get(3)).map(|m| m.as_str()).unwrap_or("");
-        for name in names_str.split(',') {
-            let sym = name
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .trim_matches('*');
-            if !sym.is_empty() && sym != "*" {
-                imports.insert(format!("{}.{}", module, sym));
-            }
-        }
-    }
-
-    imports
-}
-
-fn extract_js_ts_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
-
-    // import { A, B } from 'x' — multi-line
-    let re_named =
-        Regex::new(r#"(?s)import\s+(?:type\s+)?\{[^}]*\}\s+from\s+['"]([^'"]+)['"]"#).unwrap();
-    for cap in re_named.captures_iter(source) {
-        imports.insert(cap[1].trim().to_string());
-    }
-
-    // import x from 'y'  / import * as x from 'y'
-    let re_default =
-        Regex::new(r#"import\s+(?:type\s+)?(?:\*\s+as\s+\w+|\w+)\s+from\s+['"]([^'"]+)['"]"#)
-            .unwrap();
-    for cap in re_default.captures_iter(source) {
-        imports.insert(cap[1].trim().to_string());
-    }
-
-    // require('x')
-    let re_require = Regex::new(r#"require\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap();
-    for cap in re_require.captures_iter(source) {
-        imports.insert(cap[1].trim().to_string());
-    }
-
-    // export { } from 'x'
-    let re_export = Regex::new(r#"export\s+(?:\*|\{[^}]*\})\s+from\s+['"]([^'"]+)['"]"#).unwrap();
-    for cap in re_export.captures_iter(source) {
-        imports.insert(cap[1].trim().to_string());
-    }
-
-    imports
-}
-
-fn extract_rust_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
-
-    // `use x::y::{A, B, C};` — multi-line via collapse
-    // Collapse the entire source to handle multi-line use statements
-    let collapsed = collapse_multiline(source, "use ", ';');
-    for stmt in &collapsed {
-        let use_stmt = stmt.trim_start_matches("use ").trim_end_matches(';').trim();
-        expand_rust_use(use_stmt, &mut imports);
-    }
-
-    imports
-}
-
-fn expand_rust_use(stmt: &str, out: &mut HashSet<String>) {
-    // Handle: a::b::{C, D, E} and a::b::{c::{D}, e}
-    if let Some(brace_start) = stmt.find('{') {
-        let base = stmt[..brace_start]
-            .trim()
-            .trim_end_matches("::")
-            .replace("::", ".");
-        let inner = stmt[brace_start + 1..]
-            .trim_end_matches('}')
-            .trim_end_matches(';');
-        // Recursively handle nested braces
-        for item in split_respecting_braces(inner) {
-            let item = item.trim();
-            if item == "self" {
-                out.insert(base.clone());
-                continue;
-            }
-            if item.contains('{') {
-                expand_rust_use(&format!("{}::{}", base.replace('.', "::"), item), out);
-            } else {
-                let full = format!("{}.{}", base, item.replace("::", "."));
-                out.insert(full);
-            }
-        }
-    } else {
-        out.insert(stmt.replace("::", ".").trim_matches('.').to_string());
-    }
-}
-
-fn split_respecting_braces(s: &str) -> Vec<&str> {
-    let mut result = Vec::new();
-    let mut depth = 0i32;
-    let mut last = 0;
-    for (i, c) in s.char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => depth -= 1,
-            ',' if depth == 0 => {
-                result.push(s[last..i].trim());
-                last = i + 1;
-            }
-            _ => {}
-        }
-    }
-    let tail = s[last..].trim();
-    if !tail.is_empty() {
-        result.push(tail);
-    }
-    result
-}
-
-fn collapse_multiline(source: &str, prefix: &str, terminator: char) -> Vec<String> {
-    let mut results = Vec::new();
-    let mut in_stmt = false;
-    let mut current = String::new();
-
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("//") {
-            continue;
-        }
-
-        if !in_stmt && trimmed.starts_with(prefix) {
-            in_stmt = true;
-            current = trimmed.to_string();
-        } else if in_stmt {
-            current.push(' ');
-            current.push_str(trimmed);
-        }
-
-        if in_stmt {
-            if let Some(end) = current.find(terminator) {
-                results.push(current[..=end].to_string());
-                in_stmt = false;
-                current = String::new();
-            }
-        }
-    }
-
-    results
-}
-
-fn extract_go_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
-
-    // Single: import "pkg"
-    let re_single = Regex::new(r#"import\s+["']([^"']+)["']"#).unwrap();
-    for cap in re_single.captures_iter(source) {
-        imports.insert(cap[1].trim().to_string());
-    }
-
-    // Block: import ( "a" "b" ) — multi-line
-    let re_block = Regex::new(r#"(?s)import\s*\(([^)]+)\)"#).unwrap();
-    let re_path = Regex::new(r#"["']([^"']+)["']"#).unwrap();
-    for cap in re_block.captures_iter(source) {
-        let inner = &cap[1];
-        for p in re_path.captures_iter(inner) {
-            imports.insert(p[1].trim().to_string());
-        }
-    }
-
-    imports
-}
-
-fn extract_java_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
-    let re = Regex::new(r"(?m)^import(?:\s+static)?\s+([\w.*]+)\s*;").unwrap();
-    for cap in re.captures_iter(source) {
-        imports.insert(cap[1].trim().to_string());
-    }
-    imports
-}
-
-fn extract_csharp_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
-    // `using X.Y.Z;` and `using static X.Y.Z;`
-    let re = Regex::new(r"(?m)^using(?:\s+static)?\s+([\w.]+)\s*;").unwrap();
-    for cap in re.captures_iter(source) {
-        imports.insert(cap[1].trim().to_string());
-    }
-    imports
-}
-
-fn extract_ruby_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
-    let re = Regex::new(r#"(?:require|require_relative|load)\s*['"]([^'"]+)['"]"#).unwrap();
-    for cap in re.captures_iter(source) {
-        imports.insert(cap[1].trim().to_string());
-    }
-    imports
-}
-
-fn extract_php_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
-    // use X\Y\Z; and use X\Y\Z as Alias;
-    let re = Regex::new(r"(?m)^use\s+([\w\\]+)(?:\s+as\s+\w+)?\s*;").unwrap();
-    for cap in re.captures_iter(source) {
-        let path = cap[1].trim().replace('\\', ".");
-        imports.insert(path);
-    }
-    // require/include
-    let re_require =
-        Regex::new(r#"(?:require|include)(?:_once)?\s*\(?['"]([^'"]+)['"]\)?"#).unwrap();
-    for cap in re_require.captures_iter(source) {
-        imports.insert(cap[1].trim().to_string());
-    }
-    imports
-}
-
-fn extract_lua_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
-    let re = Regex::new(r#"require\s*\(?['"]([^'"]+)['"]\)?"#).unwrap();
-    for cap in re.captures_iter(source) {
-        imports.insert(cap[1].replace('.', "/").trim().to_string());
-    }
-    imports
-}
-
-fn extract_scala_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
-    let re = Regex::new(r"(?m)^\s*import\s+([^\n]+)$").unwrap();
-    let selector_re = Regex::new(r"^([\w.]+)(?:\.\{([^}]+)\}|\.(\w+|\*))?$").unwrap();
-
-    for cap in re.captures_iter(source) {
-        let stmt = cap[1].trim();
-        if let Some(sel) = selector_re.captures(stmt) {
-            let base = &sel[1];
-            if let Some(names) = sel.get(2) {
-                for name in names.as_str().split(',') {
-                    let n = name.trim();
-                    if n != "_" && !n.is_empty() {
-                        imports.insert(format!("{}.{}", base, n));
-                    }
-                }
-            } else if let Some(single) = sel.get(3) {
-                imports.insert(format!("{}.{}", base, single.as_str()));
-            } else {
-                imports.insert(base.to_string());
-            }
-        }
-    }
-
-    imports
-}
-
-fn extract_c_imports(source: &str) -> HashSet<String> {
-    let mut imports = HashSet::new();
-    // #include <x> and #include "x"
-    let re = Regex::new(r#"#include\s*[<"']([^>"']+)[>"']"#).unwrap();
-    for cap in re.captures_iter(source) {
-        imports.insert(cap[1].trim().to_string());
-    }
-    imports
-}
-
-// ---------------------------------------------------------------------------
-// Import edge wiring (unchanged logic)
-// ---------------------------------------------------------------------------
-
-fn extract_import_edges(
-    signatures: &[SignatureInfo],
-    node_ids: &HashMap<String, crate::graph::pdg::NodeId>,
-    pdg: &mut ProgramDependenceGraph,
-    file_path: &str,
-    language: &str,
-    source_code: &[u8],
-) -> Vec<(crate::graph::pdg::NodeId, crate::graph::pdg::NodeId)> {
-    let mut edges = Vec::new();
-    let mut seen: HashSet<(crate::graph::pdg::NodeId, crate::graph::pdg::NodeId)> = HashSet::new();
-
-    let mut unique_paths: HashSet<String> = signatures
-        .iter()
-        .flat_map(|sig| sig.imports.iter().map(|imp| imp.path.clone()))
-        .collect();
-    unique_paths.extend(extract_import_paths_from_source(source_code, language));
-
-    if unique_paths.is_empty() {
-        return edges;
-    }
-
-    let module_sym = format!("{}:__module__", file_path);
-    let importer_nid = pdg.find_by_symbol(&module_sym).unwrap_or_else(|| {
-        pdg.add_node(Node {
-            id: module_sym,
-            node_type: NodeType::Module,
-            name: "__module__".to_string(),
-            file_path: Arc::from(file_path),
-            byte_range: (0, 0),
-            complexity: 1,
-            language: language.to_string(),
-        })
-    });
-
-    let mut symbol_map: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::new();
-    for sig in signatures {
-        if let Some(&nid) = node_ids.get(&sig.qualified_name) {
-            let norm = normalize_symbol(&sig.qualified_name);
-            symbol_map.entry(norm.clone()).or_default().push(nid);
-            if let Some(last) = norm.split('.').next_back() {
-                symbol_map.entry(last.to_string()).or_default().push(nid);
-            }
-        }
-    }
-
-    let mut external_nodes: HashMap<String, crate::graph::pdg::NodeId> = HashMap::new();
-
-    for path in unique_paths {
-        let targets = resolve_import_targets(&path, &symbol_map);
-        let targets = if targets.is_empty() {
-            let eid = *external_nodes.entry(path.clone()).or_insert_with(|| {
-                pdg.add_node(Node {
-                    id: format!("{}:__external__:{}", file_path, path),
-                    node_type: NodeType::External,
-                    name: path.clone(),
-                    file_path: Arc::from(file_path),
-                    byte_range: (0, 0),
-                    complexity: 1,
-                    language: "external".to_string(),
-                })
-            });
-            vec![eid]
-        } else {
-            targets
-        };
-
-        for target in targets {
-            if target == importer_nid {
-                continue;
-            }
-            if seen.insert((importer_nid, target)) {
-                edges.push((importer_nid, target));
-            }
-        }
-    }
-
-    edges
-}
-
-fn resolve_import_targets(
-    import_path: &str,
-    symbol_map: &HashMap<String, Vec<crate::graph::pdg::NodeId>>,
-) -> Vec<crate::graph::pdg::NodeId> {
-    let normalized = normalize_symbol(import_path);
-    let mut targets: Vec<crate::graph::pdg::NodeId> = Vec::new();
-
-    if let Some(ids) = symbol_map.get(&normalized) {
-        targets.extend(ids);
-    }
-
-    let parts: Vec<&str> = normalized.split('.').collect();
-    for len in 2..=3_usize.min(parts.len()) {
-        let start = parts.len() - len;
-        let key = parts[start..].join(".");
-        if let Some(ids) = symbol_map.get(&key) {
-            targets.extend(ids);
-        }
-    }
-
-    if targets.is_empty() {
-        if let Some(last) = normalized.split('.').next_back() {
-            if let Some(ids) = symbol_map.get(last) {
-                targets.extend(ids);
-            }
-        }
-    }
-
-    targets.sort_by_key(|id| id.index());
-    targets.dedup();
-    targets
 }
 
 // ---------------------------------------------------------------------------
@@ -1914,14 +1585,31 @@ fn resolve_import_targets(
 /// - `module/function` → `module.function`
 pub fn normalize_symbol(raw: &str) -> String {
     let trimmed = raw.split('(').next().unwrap_or(raw).trim();
-    trimmed
-        .replace("?.", ".")
-        .replace("::", ".")
-        .replace("->", ".")
-        .replace(['\\', '/', ':'], ".")
-        .replace("..", ".")
-        .trim_matches('.')
-        .to_string()
+    // One pass instead of five chained `replace` calls (five allocations and
+    // five scans per call, on a function that runs for every call target and
+    // every comparison during cross-file resolution -- about a tenth of all
+    // indexing CPU). The rewrites are applied left to right exactly as the
+    // chain did: `?.`, `::` and `->` become `.`, then each remaining `\`, `/`
+    // and `:` becomes `.`.
+    let mut out = String::with_capacity(trimmed.len());
+    let mut chars = trimmed.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match (ch, chars.peek().copied()) {
+            ('?', Some('.')) | (':', Some(':')) | ('-', Some('>')) => {
+                chars.next();
+                out.push('.');
+            }
+            ('\\' | '/' | ':', _) => out.push('.'),
+            _ => out.push(ch),
+        }
+    }
+    // `replace("..", ".")` runs once (not to a fixed point): `...` becomes `..`.
+    let collapsed = if out.contains("..") {
+        out.replace("..", ".")
+    } else {
+        out
+    };
+    collapsed.trim_matches('.').to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1930,6 +1618,7 @@ pub fn normalize_symbol(raw: &str) -> String {
 
 fn signature_to_node(sig: &SignatureInfo, file_path: &str, language: &str) -> Node {
     let node_type = match sig.return_type.as_deref() {
+        Some("doc_section") => NodeType::DocSection,
         Some("module") => NodeType::Module,
         Some("enum_variant") => NodeType::Variable,
         Some("enum") | Some("trait") => NodeType::Class,
@@ -1960,3 +1649,80 @@ fn signature_to_node(sig: &SignatureInfo, file_path: &str, language: &str) -> No
 #[cfg(test)]
 #[path = "extraction_test.rs"]
 mod tests;
+
+#[cfg(test)]
+mod normalize_symbol_test {
+    use super::normalize_symbol;
+
+    /// The original chained-`replace` implementation, kept as the reference.
+    fn reference(raw: &str) -> String {
+        let trimmed = raw.split('(').next().unwrap_or(raw).trim();
+        trimmed
+            .replace("?.", ".")
+            .replace("::", ".")
+            .replace("->", ".")
+            .replace(['\\', '/', ':'], ".")
+            .replace("..", ".")
+            .trim_matches('.')
+            .to_string()
+    }
+
+    #[test]
+    fn test_normalize_symbol_matches_the_replace_chain_on_edge_cases() {
+        for case in [
+            "",
+            ".",
+            "..",
+            "...",
+            "a::b",
+            "a:::b",
+            "a::::b",
+            "a:b",
+            "a->b",
+            "a-->b",
+            "a?.b",
+            "a?::b",
+            "a??.b",
+            "std::io::Read",
+            "obj?.property",
+            "module/function",
+            "a\\b/c:d",
+            "::a::",
+            "->x->",
+            "x(y)::z",
+            "  pad::name  ",
+            "a.b..c...d",
+            "é::ü->ñ",
+            "?",
+            "-",
+            "-:>",
+            "a?.?.b",
+            "path/to/file.rs:Type::method",
+        ] {
+            assert_eq!(normalize_symbol(case), reference(case), "input {case:?}");
+        }
+    }
+
+    #[test]
+    fn test_normalize_symbol_matches_the_replace_chain_on_generated_strings() {
+        // Deterministic pseudo-random strings over the characters that matter.
+        let alphabet: Vec<char> = "ab.:/\\-?>( _é".chars().collect();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..20_000 {
+            let mut input = String::new();
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let mut bits = state;
+            for _ in 0..(bits % 11) {
+                bits = bits.rotate_left(7) ^ 0x9E37_79B9;
+                input.push(alphabet[(bits as usize) % alphabet.len()]);
+            }
+            assert_eq!(
+                normalize_symbol(&input),
+                reference(&input),
+                "input {input:?}"
+            );
+        }
+    }
+}

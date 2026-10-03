@@ -14,7 +14,7 @@ pub struct ProjectMapHandler;
 #[allow(missing_docs)]
 impl ProjectMapHandler {
     pub fn name(&self) -> &str {
-        "leindex.project-map"
+        "leindex_project_map"
     }
 
     pub fn title(&self) -> &str {
@@ -34,6 +34,12 @@ scoping to subdirectories, sorting, and pagination."
                 "path": {
                     "type": "string",
                     "description": "Subdirectory to scope to (default: project root)"
+                },
+                "group_by": {
+                    "type": "string",
+                    "enum": ["tree", "community"],
+                    "description": "Grouping mode: tree (default, flat file list) or community (Leiden communities — module boundaries the codebase itself may not have named)",
+                    "default": "tree"
                 },
                 "project_path": {
                     "type": "string",
@@ -96,6 +102,11 @@ scoping to subdirectories, sorting, and pagination."
         let depth = extract_usize(&args, "depth", 3)?.min(10);
         let token_budget = extract_usize(&args, "token_budget", 2000)?;
         let include_symbols = extract_bool(&args, "include_symbols", false);
+        let group_by = args
+            .get("group_by")
+            .and_then(Value::as_str)
+            .unwrap_or("tree")
+            .to_string();
         let offset = extract_usize(&args, "offset", 0)?;
         let limit = args
             .get("limit")
@@ -107,8 +118,10 @@ scoping to subdirectories, sorting, and pagination."
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
 
+        // Graph-only hydration: this tool never queries the search engine,
+        // so skip snapshot/embedding-mmap restoration (~1s per cold call).
         guard
-            .ensure_pdg_loaded()
+            .ensure_pdg_loaded_graph_only()
             .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
 
         if guard.pdg().is_none() {
@@ -142,11 +155,25 @@ scoping to subdirectories, sorting, and pagination."
             &mut files,
             &sort_by,
             focus.as_deref(),
-            include_symbols,
+            include_symbols || focus.is_some(),
         );
 
         let (total_before_pagination, truncated_files) =
             Self::paginate_and_truncate(files, offset, limit, token_budget);
+
+        if group_by == "community" {
+            return Ok(wrap_with_meta(
+                self.community_grouped_response(
+                    &guard,
+                    &truncated_files,
+                    total_before_pagination,
+                    &project_root.display().to_string(),
+                    &scope_path.display().to_string(),
+                    offset,
+                ),
+                &guard,
+            ));
+        }
 
         Ok(wrap_with_meta(
             serde_json::json!({
@@ -160,6 +187,115 @@ scoping to subdirectories, sorting, and pagination."
             }),
             &guard,
         ))
+    }
+
+    /// Grouped-by-community response: reads persisted Leiden labels and
+    /// buckets the (already paginated) file entries by each file's community
+    /// (from intel_nodes.community_id). Zero query-time computation — the
+    /// persisted assignment is the source of truth.
+    #[cfg(feature = "community")]
+    fn community_grouped_response(
+        &self,
+        guard: &crate::cli::leindex::LeIndex,
+        files: &[Value],
+        total: usize,
+        project_root: &str,
+        scope: &str,
+        offset: usize,
+    ) -> Value {
+        let labels = crate::storage::community_store::load_community_labels(
+            &guard.storage,
+            guard.project_id(),
+            crate::graph::community::COMMUNITY_ALGORITHM,
+            crate::graph::community::COMMUNITY_QUALITY,
+            crate::graph::community::COMMUNITY_RESOLUTION,
+        )
+        .unwrap_or_default();
+
+        // Map community_id -> (label) for rendering.
+        use std::collections::HashMap;
+        let label_by_community: HashMap<i64, String> = labels
+            .iter()
+            .map(|(community, _, label)| (*community, label.clone()))
+            .collect();
+
+        // Fetch file -> community assignments from the persisted nodes.
+        let mut file_community: HashMap<String, i64> = HashMap::new();
+        let conn = guard.storage.conn();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT DISTINCT file_path, community_id FROM intel_nodes \
+             WHERE project_id = ?1 AND community_id IS NOT NULL",
+        ) {
+            if let Ok(rows) = stmt.query_map([guard.project_id()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            }) {
+                for row in rows.flatten() {
+                    file_community.insert(row.0, row.1);
+                }
+            }
+        }
+
+        let mut groups: HashMap<i64, Vec<&Value>> = HashMap::new();
+        let mut ungrouped: Vec<&Value> = Vec::new();
+        for file in files {
+            let path = file.get("path").and_then(Value::as_str).unwrap_or("");
+            match file_community.get(path) {
+                Some(&community) => groups.entry(community).or_default().push(file),
+                None => ungrouped.push(file),
+            }
+        }
+
+        let mut communities: Vec<Value> = groups
+            .into_iter()
+            .map(|(community, files)| {
+                serde_json::json!({
+                    "community": community,
+                    "label": label_by_community
+                        .get(&community)
+                        .cloned()
+                        .unwrap_or_else(|| format!("community {community}")),
+                    "file_count": files.len(),
+                    "files": files,
+                })
+            })
+            .collect();
+        communities
+            .sort_by_key(|entry| entry.get("file_count").and_then(Value::as_u64).unwrap_or(0));
+        communities.reverse();
+
+        serde_json::json!({
+            "project_root": project_root,
+            "scope": scope,
+            "group_by": "community",
+            "total_files_in_scope": total,
+            "offset": offset,
+            "count": files.len(),
+            "communities": communities,
+            "ungrouped_files": ungrouped,
+        })
+    }
+
+    #[cfg(not(feature = "community"))]
+    fn community_grouped_response(
+        &self,
+        _guard: &crate::cli::leindex::LeIndex,
+        files: &[Value],
+        total: usize,
+        project_root: &str,
+        scope: &str,
+        offset: usize,
+    ) -> Value {
+        serde_json::json!({
+            "project_root": project_root,
+            "scope": scope,
+            "group_by": "community",
+            "total_files_in_scope": total,
+            "offset": offset,
+            "count": files.len(),
+            "communities": [],
+            "ungrouped_files": files,
+            "note": "community feature not compiled into this build",
+        })
     }
 
     fn scope_paths(

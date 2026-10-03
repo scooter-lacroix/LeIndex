@@ -1,13 +1,44 @@
 //! Semantic drift detection for signature changes and API breakage
 
-use crate::edit::ResolvedEditChange;
+use crate::edit::{EditType, ResolvedEditChange};
 use crate::graph::ProgramDependenceGraph;
 use crate::graph::pdg::NodeType;
+use crate::parse::go::GoParser;
+use crate::parse::java::JavaParser;
+use crate::parse::javascript::{JavaScriptParser, TypeScriptParser};
+use crate::parse::python::PythonParser;
+use crate::parse::rust::RustParser;
 use crate::parse::traits::{CodeIntelligence, SignatureInfo};
 use crate::validation::Location;
 use crate::validation::ValidationError;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Whether two signatures describe the same symbol shape: identical
+/// parameter count with element-wise identical parameter types, identical
+/// return type, and identical method/async flags.
+///
+/// Names are excluded (that is what a rename changes), as are parameter
+/// names and defaults; a parameter TYPE change is an API break and must not
+/// let a rename pairing swallow it.
+fn signatures_shape_compatible(old_sig: &SignatureInfo, new_sig: &SignatureInfo) -> bool {
+    new_sig.parameters.len() == old_sig.parameters.len()
+        && new_sig
+            .parameters
+            .iter()
+            .zip(old_sig.parameters.iter())
+            .all(|(new_param, old_param)| new_param.type_annotation == old_param.type_annotation)
+        && new_sig.return_type == old_sig.return_type
+        && new_sig.is_method == old_sig.is_method
+        && new_sig.is_async == old_sig.is_async
+}
+
+/// Upper bound on memoised signature lists; the cache is cleared when full.
+const SIGNATURE_CACHE_CAP: usize = 256;
+
+static SIGNATURE_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<[u8; 32], Arc<Vec<SignatureInfo>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Type of semantic drift detected
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +53,11 @@ pub enum DriftType {
     Removed,
     /// Symbol was added
     Added,
+    /// Symbol was renamed (old name removed, new name added, body
+    /// otherwise structurally identical). Informational: a rename edit is
+    /// remove+add by name *by definition*, so paired removal/addition under
+    /// an `EditType::Rename` is the expected outcome, not drift.
+    Renamed,
 }
 
 /// A semantic drift item
@@ -116,6 +152,16 @@ impl DriftItem {
         }
     }
 
+    /// Informational drift item for a paired rename (no error).
+    pub fn renamed(old_name: String, new_name: String, location: Location) -> Self {
+        Self {
+            impact_description: format!("Symbol '{}' renamed to '{}'", old_name, new_name),
+            symbol_name: new_name,
+            drift_type: DriftType::Renamed,
+            location,
+        }
+    }
+
     /// Check if this is a breaking change
     pub fn is_breaking(&self) -> bool {
         matches!(
@@ -192,84 +238,108 @@ impl SemanticDriftAnalyzer {
         &self,
         changes: &[ResolvedEditChange],
     ) -> Result<Vec<DriftItem>, ValidationError> {
+        use rayon::prelude::*;
+
+        // Each change parses two documents (before and after); a rename touches
+        // several files. The parses are independent, so they run across cores:
+        // this was 40% of a rename preview when done one after another.
+        let per_change: Vec<Result<Vec<DriftItem>, ValidationError>> = changes
+            .par_iter()
+            .map(|change| {
+                let (original, new) = rayon::join(
+                    || self.extract_signatures(change, &change.original_content),
+                    || self.extract_signatures(change, &change.new_content),
+                );
+                // Compare signatures to detect drift
+                self.compare_signatures(change, &original?, &new?)
+            })
+            .collect();
+
         let mut drift_items = Vec::new();
-
-        for change in changes {
-            // Extract signatures from original content
-            let original_sigs = self.extract_signatures(change, &change.original_content)?;
-
-            // Extract signatures from new content
-            let new_sigs = self.extract_signatures(change, &change.new_content)?;
-
-            // Compare signatures to detect drift
-            drift_items.extend(self.compare_signatures(change, &original_sigs, &new_sigs)?);
+        for items in per_change {
+            drift_items.extend(items?);
         }
-
         Ok(drift_items)
     }
 
-    /// Extract signatures from content
+    /// Extract signatures from content, memoised by (language, content hash).
+    ///
+    /// The original file does not change between successive previews of the
+    /// same edit, so repeat calls skip the parse entirely. Lite extraction is a
+    /// pure function of `(language, bytes)`, which makes the key sound.
     fn extract_signatures(
         &self,
         change: &ResolvedEditChange,
         content: &str,
-    ) -> Result<Vec<SignatureInfo>, ValidationError> {
+    ) -> Result<Arc<Vec<SignatureInfo>>, ValidationError> {
         if content.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Arc::new(Vec::new()));
         }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(change.infer_language().as_bytes());
+        hasher.update(&[0]);
+        hasher.update(content.as_bytes());
+        let key: [u8; 32] = *hasher.finalize().as_bytes();
 
+        if let Some(hit) = SIGNATURE_CACHE
+            .lock()
+            .ok()
+            .and_then(|c| c.get(&key).cloned())
+        {
+            return Ok(hit);
+        }
+        let sigs = Arc::new(self.extract_signatures_uncached(change, content)?);
+        if let Ok(mut cache) = SIGNATURE_CACHE.lock() {
+            if cache.len() >= SIGNATURE_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(key, Arc::clone(&sigs));
+        }
+        Ok(sigs)
+    }
+
+    fn extract_signatures_uncached(
+        &self,
+        change: &ResolvedEditChange,
+        content: &str,
+    ) -> Result<Vec<SignatureInfo>, ValidationError> {
         let lang = change.infer_language();
         let source = content.as_bytes();
+        let mut ts_parser = tree_sitter::Parser::new();
 
-        // Get the appropriate parser for this language
-        match lang {
-            "python" => {
-                use crate::parse::python::PythonParser;
-                let parser = PythonParser::new();
-                parser
-                    .get_signatures(source)
-                    .map_err(|e| ValidationError::Parse(format!("Failed to parse Python: {}", e)))
-            }
-            "javascript" => {
-                use crate::parse::javascript::JavaScriptParser;
-                let parser = JavaScriptParser::new();
-                parser.get_signatures(source).map_err(|e| {
-                    ValidationError::Parse(format!("Failed to parse JavaScript: {}", e))
-                })
-            }
-            "typescript" => {
-                use crate::parse::javascript::TypeScriptParser;
-                let parser = TypeScriptParser::new();
-                parser.get_signatures(source).map_err(|e| {
-                    ValidationError::Parse(format!("Failed to parse TypeScript: {}", e))
-                })
-            }
-            "rust" => {
-                use crate::parse::rust::RustParser;
-                let parser = RustParser::new();
-                parser
-                    .get_signatures(source)
-                    .map_err(|e| ValidationError::Parse(format!("Failed to parse Rust: {}", e)))
-            }
-            "go" => {
-                use crate::parse::go::GoParser;
-                let parser = GoParser::new();
-                parser
-                    .get_signatures(source)
-                    .map_err(|e| ValidationError::Parse(format!("Failed to parse Go: {}", e)))
-            }
-            "java" => {
-                use crate::parse::java::JavaParser;
-                let parser = JavaParser::new();
-                parser
-                    .get_signatures(source)
-                    .map_err(|e| ValidationError::Parse(format!("Failed to parse Java: {}", e)))
-            }
-            _ => {
-                // For unsupported languages, return empty
-                Ok(Vec::new())
-            }
-        }
+        // Drift reads only header fields, so use signature-only extraction
+        // (no calls, flow facts, docstrings, imports or complexity). The
+        // lite flag is thread-local and `get_signatures_lite` sets it on the
+        // calling thread, which is the rayon worker running this closure.
+        let (label, result) = match lang {
+            "python" => (
+                "Python",
+                PythonParser::new().get_signatures_lite(source, &mut ts_parser),
+            ),
+            "javascript" => (
+                "JavaScript",
+                JavaScriptParser::new().get_signatures_lite(source, &mut ts_parser),
+            ),
+            "typescript" => (
+                "TypeScript",
+                TypeScriptParser::new().get_signatures_lite(source, &mut ts_parser),
+            ),
+            "rust" => (
+                "Rust",
+                RustParser::new().get_signatures_lite(source, &mut ts_parser),
+            ),
+            "go" => (
+                "Go",
+                GoParser::new().get_signatures_lite(source, &mut ts_parser),
+            ),
+            "java" => (
+                "Java",
+                JavaParser::new().get_signatures_lite(source, &mut ts_parser),
+            ),
+            // For unsupported languages, return empty
+            _ => return Ok(Vec::new()),
+        };
+        result.map_err(|e| ValidationError::Parse(format!("Failed to parse {}: {}", label, e)))
     }
 
     /// Compare signatures to detect drift
@@ -285,22 +355,64 @@ impl SemanticDriftAnalyzer {
 
         let new_map: HashMap<_, _> = new.iter().map(|sig| (&sig.name, sig)).collect();
 
-        // Check for removed symbols
-        for name in original_map.keys() {
-            if !new_map.contains_key(name) {
-                // Find location in original content
-                let location =
-                    self.find_signature_location(change, original_map.get(name).unwrap());
-                drift_items.push(DriftItem::removed(name.to_string(), location));
+        // Collect removals and additions by name.
+        let mut removed: Vec<(&String, &SignatureInfo)> = original_map
+            .keys()
+            .filter(|name| !new_map.contains_key(*name))
+            .map(|name| (*name, *original_map.get(*name).unwrap()))
+            .collect();
+        let mut added: Vec<(&String, &SignatureInfo)> = new_map
+            .keys()
+            .filter(|name| !original_map.contains_key(*name))
+            .map(|name| (*name, *new_map.get(*name).unwrap()))
+            .collect();
+
+        // A rename edit is remove+add by name BY DEFINITION: before this
+        // pairing, every `EditType::Rename` change produced a Removed(old)
+        // + Added(new) pair, `has_errors()` classified the removal as an
+        // error, and the rename tool hard-rejected its own output — apply
+        // mode could never succeed. Under a rename edit, pair each removal
+        // with a structurally identical addition (the same symbol under a
+        // new name) and report the pair as informational `Renamed`.
+        // "Structurally identical" includes the full parameter TYPE list
+        // element-wise: matching on parameter count alone paired a rename
+        // that also changed a parameter type (`fn load(x: u32)` →
+        // `fn load_v2(x: &str)`), swallowing an API-breaking change as
+        // informational. Only unpaired removals/additions remain as drift
+        // errors.
+        if change.edit_type == EditType::Rename {
+            let mut unpaired_removals: Vec<(&String, &SignatureInfo)> = Vec::new();
+            for (old_name, old_sig) in removed.drain(..) {
+                let pair_index = added
+                    .iter()
+                    .position(|(_, new_sig)| signatures_shape_compatible(old_sig, new_sig));
+                match pair_index {
+                    Some(idx) => {
+                        let (new_name, new_sig) = added.remove(idx);
+                        let location = self.find_signature_location(change, new_sig);
+                        drift_items.push(DriftItem::renamed(
+                            old_name.to_string(),
+                            new_name.to_string(),
+                            location,
+                        ));
+                    }
+                    None => unpaired_removals.push((old_name, old_sig)),
+                }
             }
+            // Anything still unpaired below keeps the legacy error semantics.
+            removed = unpaired_removals;
+        }
+
+        // Check for removed symbols
+        for (name, sig) in removed {
+            let location = self.find_signature_location(change, sig);
+            drift_items.push(DriftItem::removed(name.to_string(), location));
         }
 
         // Check for added symbols
-        for name in new_map.keys() {
-            if !original_map.contains_key(name) {
-                let location = self.find_signature_location(change, new_map.get(name).unwrap());
-                drift_items.push(DriftItem::added(name.to_string(), location));
-            }
+        for (name, sig) in added {
+            let location = self.find_signature_location(change, sig);
+            drift_items.push(DriftItem::added(name.to_string(), location));
         }
 
         // Check for modified symbols
@@ -357,6 +469,17 @@ impl SemanticDriftAnalyzer {
                 location,
                 &format!("{:?}", original.visibility),
                 &format!("{:?}", new.visibility),
+            )));
+        }
+
+        // Check for async changes: sync <-> async changes how callers must
+        // invoke the symbol, so it is a real signature change.
+        if original.is_async != new.is_async {
+            return Ok(Some(DriftItem::signature_changed(
+                new.name.clone(),
+                location,
+                if original.is_async { "async" } else { "sync" },
+                if new.is_async { "async" } else { "sync" },
             )));
         }
 
@@ -570,5 +693,169 @@ mod tests {
         let location = analyzer.find_signature_location(&change, &sig);
         assert_eq!(location.line, 1);
         assert_eq!(location.column, 1);
+    }
+}
+
+#[cfg(test)]
+mod rename_pairing_tests {
+    use super::*;
+    use crate::edit::{EditType, ResolvedEditChange};
+    use std::path::PathBuf;
+
+    fn analyzer() -> SemanticDriftAnalyzer {
+        SemanticDriftAnalyzer::new(std::sync::Arc::new(ProgramDependenceGraph::new()))
+    }
+
+    fn rename_change(original: &str, new: &str) -> ResolvedEditChange {
+        ResolvedEditChange::new(
+            PathBuf::from("fixture.rs"),
+            original.to_string(),
+            new.to_string(),
+        )
+        .with_edit_type(EditType::Rename)
+    }
+
+    #[test]
+    fn test_rename_pairs_removed_and_added_instead_of_erroring() {
+        // N-00 regression: a rename edit is remove+add by name by
+        // definition. Before the pairing fix, this produced Removed(old) +
+        // Added(new), `has_errors()` classified the removal as an error, and
+        // rename-symbol apply mode hard-rejected every rename.
+        let original = "pub fn stress_alpha(x: u32) -> u32 {\n    x + 1\n}\n";
+        let new = "pub fn stress_alpha_prime(x: u32) -> u32 {\n    x + 1\n}\n";
+        let items = analyzer()
+            .analyze_semantic_drift(&[rename_change(original, new)])
+            .unwrap();
+
+        assert!(
+            items
+                .iter()
+                .any(|item| item.drift_type == DriftType::Renamed),
+            "a structurally identical rename must be reported as Renamed, got {:?}",
+            items.iter().map(|i| &i.drift_type).collect::<Vec<_>>()
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.drift_type == DriftType::Removed),
+            "paired removal must not surface as a Removed drift error"
+        );
+    }
+
+    #[test]
+    fn test_rename_with_structural_change_still_errors() {
+        // A rename that ALSO changes the signature (extra parameter) is a
+        // rename + signature change; the pairing must refuse to pair it and
+        // keep the legacy Removed error so callers cannot silently change
+        // signatures under the rename flag.
+        let original = "pub fn stress_alpha(x: u32) -> u32 {\n    x + 1\n}\n";
+        let new = "pub fn stress_alpha_prime(x: u32, y: u32) -> u32 {\n    x + y\n}\n";
+        let items = analyzer()
+            .analyze_semantic_drift(&[rename_change(original, new)])
+            .unwrap();
+
+        assert!(
+            items
+                .iter()
+                .any(|item| item.drift_type == DriftType::Removed),
+            "an unpaired removal must keep the legacy error semantics"
+        );
+    }
+
+    #[test]
+    fn test_rename_with_parameter_type_change_still_errors() {
+        // Same parameter COUNT, return type and flags, but a changed
+        // parameter TYPE is an API break. Count-only pairing reported this
+        // as an informational Renamed, letting edit_apply write a
+        // signature-changing rename it should have rejected.
+        let original = "pub fn stress_load(x: u32) -> u32 {\n    x + 1\n}\n";
+        let new = "pub fn stress_load_v2(x: &str) -> u32 {\n    1\n}\n";
+        let items = analyzer()
+            .analyze_semantic_drift(&[rename_change(original, new)])
+            .unwrap();
+
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.drift_type == DriftType::Renamed),
+            "a rename that changes a parameter type must not pair as Renamed"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.drift_type == DriftType::Removed),
+            "the removal must keep the legacy error semantics"
+        );
+    }
+
+    #[test]
+    fn test_replace_edit_still_reports_removals() {
+        // Non-rename edits must be completely unaffected.
+        let original = "pub fn stress_alpha(x: u32) -> u32 {\n    x + 1\n}\n";
+        let new = "pub fn something_else(x: u32) -> u32 {\n    x + 1\n}\n";
+        let change = ResolvedEditChange::new(
+            PathBuf::from("fixture.rs"),
+            original.to_string(),
+            new.to_string(),
+        );
+        let items = analyzer().analyze_semantic_drift(&[change]).unwrap();
+
+        assert!(
+            items
+                .iter()
+                .any(|item| item.drift_type == DriftType::Removed)
+        );
+    }
+}
+
+#[cfg(test)]
+mod async_drift_tests {
+    use super::*;
+    use crate::edit::ResolvedEditChange;
+    use std::path::PathBuf;
+
+    fn drift(path: &str, original: &str, new: &str) -> Vec<DriftItem> {
+        let analyzer =
+            SemanticDriftAnalyzer::new(std::sync::Arc::new(ProgramDependenceGraph::new()));
+        let change =
+            ResolvedEditChange::new(PathBuf::from(path), original.to_string(), new.to_string());
+        analyzer.analyze_semantic_drift(&[change]).unwrap()
+    }
+
+    #[test]
+    fn test_sync_to_async_is_signature_drift() {
+        let items = drift(
+            "fixture.rs",
+            "pub fn load(x: u32) -> u32 {\n    x\n}\n",
+            "pub async fn load(x: u32) -> u32 {\n    x\n}\n",
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| i.symbol_name == "load" && i.drift_type == DriftType::SignatureChanged),
+            "sync -> async must be reported as SignatureChanged, got {:?}",
+            items.iter().map(|i| &i.drift_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_async_to_sync_is_signature_drift_python() {
+        let items = drift(
+            "fixture.py",
+            "async def load(x):\n    return x\n",
+            "def load(x):\n    return x\n",
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| i.symbol_name == "load" && i.drift_type == DriftType::SignatureChanged),
+            "async -> sync must be reported as SignatureChanged"
+        );
+    }
+
+    #[test]
+    fn test_unchanged_async_reports_no_drift() {
+        let src = "pub async fn load(x: u32) -> u32 {\n    x\n}\n";
+        assert!(drift("fixture.rs", src, src).is_empty());
     }
 }

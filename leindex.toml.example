@@ -34,8 +34,9 @@ execution_provider = "auto"
 model_dir = "~/.leindex/models"
 
 # Model stem to load from model_dir. The "-dynamic" suffix enables dynamic batch
-# /sequence shapes (more flexible, longer MIGraphX cold compile).
-model_name = "qwen3-embed-0.6b-dynamic"
+# /sequence shapes (more flexible, longer MIGraphX cold compile). The "-uint8"
+# variant uses a quantized model with uint8 dequantization for lower memory.
+model_name = "qwen3-embed-0.6b-dynamic-uint8"
 
 # ── Search ──────────────────────────────────────────────────────────────────
 [search]
@@ -78,3 +79,11 @@ idle_timeout_secs = 1800
 # Unload a loaded project engine from the ProjectRegistry after this many
 # seconds idle (0 = keep loaded once touched). Reloaded on the next tool call.
 engine_max_idle_secs = 600
+# What the MCP server loads in the background right after the client connects,
+# for the default project when it is already indexed (it never builds an index):
+#   "full"  the dependency graph, then the search engine   (default)
+#   "graph" the dependency graph only
+#   "off"   nothing; everything loads on first use
+# Hides the one-time cold-load cost of the first semantic query behind the
+# model's think-time. The engine is still unloaded after engine_max_idle_secs.
+prewarm = "full"

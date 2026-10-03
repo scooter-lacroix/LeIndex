@@ -63,11 +63,16 @@ pub(crate) async fn cmd_phase_impl(
         include_docs,
         docs_mode: parsed_docs_mode,
         hotspot_keywords: PhaseOptions::default().hotspot_keywords,
+        universe: Default::default(),
     };
 
-    let report = tokio::task::spawn_blocking(move || run_phase_analysis(options, selection))
-        .await
-        .context("Phase task failed")??;
+    let report = tokio::task::spawn_blocking(move || {
+        let mut options = options;
+        crate::cli::mcp::phase_handler::attach_index_universe(&mut options);
+        run_phase_analysis(options, selection)
+    })
+    .await
+    .context("Phase task failed")??;
 
     println!("{}", report.formatted_output);
     Ok(())

@@ -250,6 +250,9 @@ impl CodeIntelligence for JavaParser {
 }
 
 fn extract_java_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut imports = Vec::new();
 
     fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
@@ -374,6 +377,9 @@ fn extract_constructor_signature(
 
 /// Extract function calls from a Java node
 fn extract_java_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut calls = Vec::new();
 
     fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {
@@ -489,6 +495,9 @@ fn extract_visibility(node: &tree_sitter::Node<'_>, source: &[u8]) -> Visibility
 
 /// Extract docstring from a node
 fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     // Look for javadoc comments before the node
     let prev_sibling = node.prev_sibling();
 

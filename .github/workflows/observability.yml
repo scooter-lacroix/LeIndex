@@ -22,6 +22,7 @@ jobs:
     name: Record Deployment
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}

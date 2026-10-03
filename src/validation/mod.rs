@@ -182,8 +182,19 @@ impl LogicValidator {
     pub fn validate_changes(&self, changes: &[ResolvedEditChange]) -> Result<ValidationResult> {
         let mut result = ValidationResult::new();
 
-        // Syntax validation
-        for syntax_error in self.syntax_validator.validate_syntax(changes)? {
+        // Syntax validation and semantic drift both parse the edited files and
+        // touch nothing shared, so they run side by side. Results are still
+        // assembled (and errors reported) in the original order.
+        let drift_analyzer = &self.drift_analyzer;
+        let (syntax, drift) = std::thread::scope(|scope| {
+            let drifting = scope.spawn(|| drift_analyzer.analyze_semantic_drift(changes));
+            let syntax = self.syntax_validator.validate_syntax(changes);
+            let drift = drifting
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (syntax, drift)
+        });
+        for syntax_error in syntax? {
             result.add_syntax_error(syntax_error);
         }
 
@@ -193,7 +204,7 @@ impl LogicValidator {
         }
 
         // Semantic drift detection
-        for drift_item in self.drift_analyzer.analyze_semantic_drift(changes)? {
+        for drift_item in drift? {
             result.add_semantic_drift(drift_item);
         }
 

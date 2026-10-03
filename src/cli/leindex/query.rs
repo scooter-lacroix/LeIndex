@@ -77,6 +77,7 @@ impl LeIndex {
                         crate::graph::pdg::NodeType::Variable => "variable".to_string(),
                         crate::graph::pdg::NodeType::Module => "module".to_string(),
                         crate::graph::pdg::NodeType::External => "external".to_string(),
+                        crate::graph::pdg::NodeType::DocSection => "doc_section".to_string(),
                         crate::graph::pdg::NodeType::FileSummary => "file_summary".to_string(),
                     });
 
@@ -394,6 +395,80 @@ impl LeIndex {
         self.analyze_internal(query, token_budget, false)
     }
 
+    fn lookup_cached_analysis(
+        &mut self,
+        query: &str,
+        cache_key: &str,
+        start_time: std::time::Instant,
+    ) -> Result<Option<super::AnalysisResult>> {
+        let neural_search_requested = self.neural_search_should_be_attempted();
+        let Some(CacheEntry::Analysis {
+            serialized_data, ..
+        }) = self
+            .cache
+            .cache_spiller
+            .store_mut()
+            .get_or_load(cache_key)?
+        else {
+            return Ok(None);
+        };
+
+        // New entries carry a one-bit provenance marker so a cached
+        // hybrid analysis can be reused without starting another
+        // model request, while an old/raw TF-IDF-only entry cannot
+        // suppress a configured neural attempt.
+        if let Ok((cached_with_neural, mut cached)) =
+            bincode::deserialize::<(bool, super::AnalysisResult)>(&serialized_data)
+        {
+            if cached_with_neural || !neural_search_requested {
+                cached.processing_time_ms = start_time.elapsed().as_millis() as u64;
+                debug!("Analysis cache hit for '{}'", query);
+                return Ok(Some(cached));
+            }
+        } else if !neural_search_requested {
+            // Preserve compatibility with entries written before the
+            // provenance marker was introduced.
+            if let Ok(mut cached) = bincode::deserialize::<super::AnalysisResult>(&serialized_data)
+            {
+                cached.processing_time_ms = start_time.elapsed().as_millis() as u64;
+                debug!("Analysis cache hit for '{}'", query);
+                return Ok(Some(cached));
+            }
+        }
+        Ok(None)
+    }
+
+    fn cache_analysis_result(
+        &mut self,
+        query: &str,
+        cache_key: &str,
+        analysis: &super::AnalysisResult,
+    ) {
+        let cached_with_neural = self
+            .embedder
+            .as_ref()
+            .is_some_and(|embedder| embedder.neural_status() == "ready");
+        if let Ok(serialized) = bincode::serialize(&(cached_with_neural, analysis)) {
+            let entry = CacheEntry::Analysis {
+                query: query.to_string(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                serialized_data: serialized,
+            };
+            if self
+                .cache
+                .cache_spiller
+                .store_mut()
+                .insert(cache_key.to_string(), entry)
+                .is_ok()
+            {
+                let _ = self.cache.cache_spiller.store_mut().persist_key(cache_key);
+            }
+        }
+    }
+
     fn analyze_internal(
         &mut self,
         query: &str,
@@ -403,39 +478,11 @@ impl LeIndex {
         let start_time = std::time::Instant::now();
 
         let analysis_cache_key = self.analysis_cache_key_for(query, token_budget);
-        let neural_search_requested = self.neural_search_should_be_attempted();
         if cache_results {
-            if let Some(CacheEntry::Analysis {
-                serialized_data, ..
-            }) = self
-                .cache
-                .cache_spiller
-                .store_mut()
-                .get_or_load(&analysis_cache_key)?
+            if let Some(cached) =
+                self.lookup_cached_analysis(query, &analysis_cache_key, start_time)?
             {
-                // New entries carry a one-bit provenance marker so a cached
-                // hybrid analysis can be reused without starting another
-                // model request, while an old/raw TF-IDF-only entry cannot
-                // suppress a configured neural attempt.
-                if let Ok((cached_with_neural, mut cached)) =
-                    bincode::deserialize::<(bool, super::AnalysisResult)>(&serialized_data)
-                {
-                    if cached_with_neural || !neural_search_requested {
-                        cached.processing_time_ms = start_time.elapsed().as_millis() as u64;
-                        debug!("Analysis cache hit for '{}'", query);
-                        return Ok(cached);
-                    }
-                } else if !neural_search_requested {
-                    // Preserve compatibility with entries written before the
-                    // provenance marker was introduced.
-                    if let Ok(mut cached) =
-                        bincode::deserialize::<super::AnalysisResult>(&serialized_data)
-                    {
-                        cached.processing_time_ms = start_time.elapsed().as_millis() as u64;
-                        debug!("Analysis cache hit for '{}'", query);
-                        return Ok(cached);
-                    }
-                }
+                return Ok(cached);
             }
         }
 
@@ -453,6 +500,18 @@ impl LeIndex {
             String::from("/* No PDG available for context expansion */")
         };
 
+        // Per-result context snippets for the top hits: the serialized
+        // SearchResult carries a `context` field that rendered "null" on
+        // every result in the CLI audit, even though the top-level expansion
+        // existed. Fill the first few with a bounded opening snippet so the
+        // field is honest without duplicating the full expansion.
+        let mut results = results;
+        for result in results.iter_mut().take(3) {
+            if result.context.is_none() {
+                result.context = self.opening_snippet(&result.file_path, result.byte_range);
+            }
+        }
+
         // Estimate tokens used (rough approximation: 4 chars per token)
         let tokens_used = context.len() / 4;
         let analysis = super::AnalysisResult {
@@ -464,33 +523,7 @@ impl LeIndex {
         };
 
         if cache_results {
-            let cached_with_neural = self
-                .embedder
-                .as_ref()
-                .is_some_and(|embedder| embedder.neural_status() == "ready");
-            if let Ok(serialized) = bincode::serialize(&(cached_with_neural, &analysis)) {
-                let entry = CacheEntry::Analysis {
-                    query: query.to_string(),
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                    serialized_data: serialized,
-                };
-                if self
-                    .cache
-                    .cache_spiller
-                    .store_mut()
-                    .insert(analysis_cache_key.clone(), entry)
-                    .is_ok()
-                {
-                    let _ = self
-                        .cache
-                        .cache_spiller
-                        .store_mut()
-                        .persist_key(&analysis_cache_key);
-                }
-            }
+            self.cache_analysis_result(query, &analysis_cache_key, &analysis);
         }
 
         Ok(analysis)
@@ -560,7 +593,7 @@ impl LeIndex {
                 // degenerate empty result that confuses the caller.
                 return Err(anyhow::anyhow!(
                     "Node '{}' not found in the project index. \
-                    Use LeIndex [Search] or LeIndex [Grep Symbols] to find valid node IDs. \
+                    Use leindex_explore mode=search or leindex_explore mode=find target=symbols to find valid node IDs. \
                     The index uses short symbol names (e.g., 'handle_tool_call', not 'server.rs:handle_tool_call').",
                     node_id
                 ));
@@ -580,6 +613,17 @@ impl LeIndex {
         } else {
             None
         };
+
+        // The tool's contract promises callers/callees/data-dependency
+        // sections beside the source expansion — assemble them from the
+        // resolved node's DIRECT edges (Call edges for calls, DataDependency
+        // edges for data) so they are always present regardless of how the
+        // gravity traversal orders the source snippets. Bounded lists; the
+        // sections go FIRST so a token-budget truncation of the snippets
+        // cannot hide the graph relations (the audit's #4: relations never
+        // appeared at all).
+        let relation_sections = self.node_relation_sections(pdg, &result_node_id);
+        let relation_tokens = relation_sections.len() / 4;
 
         let results = vec![SearchResult {
             rank: 1,
@@ -601,6 +645,12 @@ impl LeIndex {
 
         let context = self.expand_context(pdg, &results, token_budget)?;
         let tokens_used = context.len() / 4;
+        let context = if relation_sections.is_empty() {
+            context
+        } else {
+            format!("{relation_sections}\n{context}")
+        };
+        let tokens_used = tokens_used + relation_tokens;
 
         Ok(super::AnalysisResult {
             query: format!("Context for node {}", node_id),
@@ -609,6 +659,100 @@ impl LeIndex {
             tokens_used,
             processing_time_ms: start_time.elapsed().as_millis() as u64,
         })
+    }
+
+    /// First ~3 lines of a symbol's source (bounded), used to fill the
+    /// per-result `context` field so it never renders as a bare null.
+    fn opening_snippet(&self, file_path: &str, byte_range: (usize, usize)) -> Option<String> {
+        let abs_path = self.resolve_indexed_file_path(file_path);
+        let content = std::fs::read(&abs_path).ok()?;
+        let start = byte_range.0.min(content.len());
+        let end = byte_range.1.min(content.len());
+        if end <= start {
+            return None;
+        }
+        let text = std::str::from_utf8(&content[start..end]).ok()?;
+        let snippet: String = text.lines().take(3).collect::<Vec<_>>().join("\n");
+        (!snippet.is_empty()).then_some(snippet)
+    }
+
+    /// Bounded callers/callees/data-dependency summary for one node, rendered
+    /// as comment sections. Empty when the node has no graph relations.
+    fn node_relation_sections(&self, pdg: &ProgramDependenceGraph, node_id: &str) -> String {
+        use crate::graph::pdg::EdgeType;
+        let Some(nid) = pdg.find_by_symbol(node_id) else {
+            return String::new();
+        };
+        let describe = |target: crate::graph::pdg::NodeId| -> String {
+            pdg.get_node(target)
+                .map(|node| {
+                    format!(
+                        "{} [{}] ({})",
+                        node.name,
+                        node.file_path,
+                        match node.node_type {
+                            crate::graph::pdg::NodeType::External => "external",
+                            _ => "project",
+                        }
+                    )
+                })
+                .unwrap_or_else(|| "<missing>".to_string())
+        };
+
+        let callers: Vec<String> = pdg
+            .neighbors_by_edge_type(nid, EdgeType::Call, petgraph::Direction::Incoming)
+            .into_iter()
+            .take(12)
+            .map(&describe)
+            .collect();
+        let callees: Vec<String> = pdg
+            .neighbors_by_edge_type(nid, EdgeType::Call, petgraph::Direction::Outgoing)
+            .into_iter()
+            .take(12)
+            .map(&describe)
+            .collect();
+        let data_deps: Vec<String> = pdg
+            .neighbors_by_edge_type(nid, EdgeType::DataDependency, petgraph::Direction::Outgoing)
+            .into_iter()
+            .take(12)
+            .map(&describe)
+            .collect();
+
+        let mut sections = String::new();
+        if !callers.is_empty() {
+            sections.push_str(&format!(
+                "/* Callers (direct, {}): */\n{}\n",
+                callers.len(),
+                callers
+                    .iter()
+                    .map(|line| format!("//   ← {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        if !callees.is_empty() {
+            sections.push_str(&format!(
+                "/* Callees (direct, {}): */\n{}\n",
+                callees.len(),
+                callees
+                    .iter()
+                    .map(|line| format!("//   → {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        if !data_deps.is_empty() {
+            sections.push_str(&format!(
+                "/* Data dependencies (direct, {}): */\n{}\n",
+                data_deps.len(),
+                data_deps
+                    .iter()
+                    .map(|line| format!("//   ⇄ {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        sections
     }
 
     /// Generate an embedding for a query string.
@@ -637,8 +781,28 @@ impl LeIndex {
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
     pub fn generate_query_neural_embedding(&self, query: &str) -> Option<Vec<f32>> {
         let emb = self.embedder.as_ref()?;
+        // Engram phrase-book: a repeat query is answered from the persistent
+        // table without waking the embedder (no worker spawn, no model
+        // digest, no network). Only real embedder output is ever stored.
+        let engram = crate::search::engram::Engram::global().and_then(|engram| {
+            let dim = emb.neural_dimension()?;
+            let identity = emb.engram_identity()?;
+            Some((engram, identity, dim))
+        });
+        if let Some((engram, identity, dim)) = &engram {
+            if let Some(hit) = engram.get(identity, query, *dim) {
+                return Some(hit);
+            }
+        }
         match emb.embed_neural_blocking(query) {
-            Some(Ok(embedding)) => Some(embedding),
+            Some(Ok(embedding)) => {
+                if let Some((engram, identity, dim)) = &engram {
+                    if embedding.len() == *dim {
+                        engram.put(identity, query, &embedding);
+                    }
+                }
+                Some(embedding)
+            }
             Some(Err(error)) => {
                 debug!("Neural query embedding failed ({error}); using TF-IDF fallback");
                 None
@@ -837,7 +1001,19 @@ impl LeIndex {
 
         let mut context = String::from("/* Context Expansion via Gravity Traversal */\n");
 
+        // N-06: the traversal config carried `max_tokens` but this assembly
+        // loop appended every expanded node's full source regardless, so
+        // deep-analyze routinely overran its token_budget (3,700/3,000
+        // observed) with no indication. Enforce the budget during assembly
+        // (4 chars ≈ 1 token, matching the tokens_used estimate) and mark
+        // truncation so the caller knows the context was cut.
+        let char_budget = token_budget.saturating_mul(4);
+        let mut truncated = false;
         for node_id in expanded_node_ids {
+            if context.len() >= char_budget {
+                truncated = true;
+                break;
+            }
             if let Some(node) = pdg.get_node(node_id) {
                 context.push_str(&format!("\n// Symbol: {}\n", node.name));
                 context.push_str(&format!("// File: {}\n", node.file_path));
@@ -876,6 +1052,9 @@ impl LeIndex {
                     ));
                 }
             }
+        }
+        if truncated {
+            context.push_str("\n/* [context truncated at the requested token budget] */\n");
         }
 
         Ok(context)

@@ -83,6 +83,10 @@ pub mod cleanup;
 pub mod cli;
 /// Configuration for projects, languages, and storage.
 pub mod config;
+/// User-scoped daemon: endpoint discovery, startup lock, handshake
+/// (spec §4.1, §4.2). Not feature-gated: the types are referenced from both
+/// the inline server path and the daemon-client path.
+pub mod daemon;
 /// Error types and error handling logic.
 pub mod errors;
 /// Live Git porcelain-v2 status operations.
@@ -111,6 +115,8 @@ pub mod registry;
 /// D-2 idle-engine eviction (sibling of `registry` so the Large-File gate
 /// keeps breathing room — see `registry.rs` head count).
 mod registry_evict;
+/// Text-index lifecycle (locate, load, build) for the `find` search.
+pub mod textindex;
 /// File watcher for auto-reindex.
 #[cfg(feature = "mcp-server")]
 pub mod watcher;

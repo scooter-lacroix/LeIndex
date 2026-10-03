@@ -68,7 +68,7 @@ fn memcheck_lock() -> std::sync::MutexGuard<'static, ()> {
     MEMCHECK_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("memcheck test lock poisoned")
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Helper: run the memcheck binary and return (exit_code, stdout, stderr).
@@ -158,9 +158,9 @@ fn test_val_measure_001_canonical_multi_phase_report() {
         .expect("report should have 'phases' field");
     let phases_arr = phases.as_array().expect("'phases' should be an array");
 
-    // Should have exactly 12 canonical phases (6 original + 3 worker-active
-    // + 3 memory-pressure phases)
-    assert_eq!(phases_arr.len(), 12, "should have 12 canonical phases");
+    // Should have exactly 21 canonical phases (6 original + 3 worker-active
+    // + 3 memory-pressure phases + 9 §14 baseline protocol extensions)
+    assert_eq!(phases_arr.len(), 21, "should have 21 canonical phases");
 
     // Phase names should match canonical order
     let expected = [
@@ -176,6 +176,15 @@ fn test_val_measure_001_canonical_multi_phase_report() {
         "mcp_idle_proliferation",
         "worker_ort_threads",
         "stale_artifacts",
+        "contention_3c_2p",
+        "incremental_noop",
+        "incremental_one_file",
+        "incremental_burst",
+        "incremental_delete",
+        "query_suite_cold",
+        "query_suite_warm",
+        "full_index_run2",
+        "full_index_run3",
     ];
     for (i, expected_name) in expected.iter().enumerate() {
         let phase_name = phases_arr[i]
@@ -225,6 +234,15 @@ fn test_val_measure_002_phase_order_is_canonical() {
         "mcp_idle_proliferation",
         "worker_ort_threads",
         "stale_artifacts",
+        "contention_3c_2p",
+        "incremental_noop",
+        "incremental_one_file",
+        "incremental_burst",
+        "incremental_delete",
+        "query_suite_cold",
+        "query_suite_warm",
+        "full_index_run2",
+        "full_index_run3",
     ];
 
     // No missing phases
@@ -302,30 +320,26 @@ fn test_val_measure_003_per_phase_schema_has_required_metrics() {
             );
         }
 
-        // sample_count should be positive for the non-worker-gated phases.
-        // Worker-gated phases (embed_*, worker_ort_threads) may have 0 samples
-        // if the worker binary is not available (placeholder reports).
+        // sample_count must be positive: every canonical phase runs and is
+        // sampled, including the worker-active ones (worker-missing shows up
+        // as worker_note diagnostics, never as unsampled placeholders).
         let phase_name = phase.get("phase").unwrap().as_str().unwrap_or("");
         let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
-        if !phase_name.starts_with("embed_") && phase_name != "worker_ort_threads" {
-            assert!(
-                sample_count > 0,
-                "phase {} ('{}') should have at least 1 sample",
-                i,
-                phase_name
-            );
-        }
+        assert!(
+            sample_count > 0,
+            "phase {} ('{}') should have at least 1 sample",
+            i,
+            phase_name
+        );
 
-        // duration_ms should be positive for the non-worker-gated phases
+        // duration_ms should be positive for every sampled phase.
         let duration = phase.get("duration_ms").unwrap().as_u64().unwrap();
-        if !phase_name.starts_with("embed_") && phase_name != "worker_ort_threads" {
-            assert!(
-                duration > 0,
-                "phase {} ('{}') should have positive duration",
-                i,
-                phase_name
-            );
-        }
+        assert!(
+            duration > 0,
+            "phase {} ('{}') should have positive duration",
+            i,
+            phase_name
+        );
     }
 }
 
@@ -384,15 +398,6 @@ fn test_val_measure_005_linux_rss_is_primary_metric() {
     for phase in phases {
         let phase_name = phase.get("phase").unwrap().as_str().unwrap();
         let rss_max = phase.get("rss_max_kib").unwrap().as_u64().unwrap();
-        let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
-
-        // Skip worker-gated phases that had no samples (worker binary not
-        // available → placeholder reports carry u64::MAX sentinels).
-        if (phase_name.starts_with("embed_") || phase_name == "worker_ort_threads")
-            && sample_count == 0
-        {
-            continue;
-        }
 
         // RSS should be positive for all sampled phases
         assert!(
@@ -431,12 +436,13 @@ fn test_val_measure_006_mapped_file_and_anon_captured() {
 
     for phase in phases {
         let phase_name = phase.get("phase").unwrap().as_str().unwrap();
+        let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
+
         let mapped = phase.get("mapped_file_kib").unwrap().as_u64().unwrap();
         let anon = phase.get("anon_kib").unwrap().as_u64().unwrap();
 
         // On Linux, at least one of mapped_file or anon should be populated
         // for phases that actually sampled the process.
-        let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
         if sample_count > 0 {
             // On Linux, we expect at least one of these to be non-zero
             // (the process has both file-backed and anonymous mappings).
@@ -541,19 +547,12 @@ fn test_idle_phases_have_reasonable_duration() {
     let phases = report.get("phases").unwrap().as_array().unwrap();
 
     // Idle phases should have duration >= 3 seconds (IDLE_DWELL)
-    // Worker-active idle phases (embed_idle, embed_teardown) may have 0 duration
-    // if the worker binary is not available.
     for phase in phases {
         let name = phase.get("phase").unwrap().as_str().unwrap();
-        let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
         if name.starts_with("idle_")
             || name == "mcp_idle_proliferation"
             || (name.starts_with("embed_") && name != "embed_active")
         {
-            // Skip phases with no samples (worker binary not available)
-            if name.starts_with("embed_") && sample_count == 0 {
-                continue;
-            }
             let duration = phase.get("duration_ms").unwrap().as_u64().unwrap();
             assert!(
                 duration >= 2500,
@@ -667,6 +666,36 @@ fn test_stale_artifacts_phase_removes_dead_sidecars() {
             path.display()
         );
     }
+}
+
+// ─── Worker token parity guard ───────────────────────────────────────────
+
+/// The duplicated argv-token literal in `tools/memcheck/src/sampler.rs`
+/// (`WORKER_CMDLINE_TOKEN`). `tools/memcheck` is a binary-only crate, so the
+/// constant cannot be imported; this test compares source text instead.
+#[test]
+fn test_worker_cmdline_token_matches_authoritative_source() {
+    const HARNESS_WORKER_CMDLINE_TOKEN: &str = "--internal-embed-worker";
+
+    let worker_main = std::fs::read_to_string(workspace_root().join("src/embed/worker_main.rs"))
+        .unwrap_or_else(|e| panic!("failed to read src/embed/worker_main.rs (read-only): {e}"));
+    assert!(
+        worker_main.contains("INTERNAL_WORKER_TOKEN: &str = \"--internal-embed-worker\";"),
+        "src/embed/worker_main.rs no longer declares INTERNAL_WORKER_TOKEN — \
+         update sampler.rs::WORKER_CMDLINE_TOKEN and this test together"
+    );
+
+    let sampler_src =
+        std::fs::read_to_string(workspace_root().join("tools/memcheck/src/sampler.rs"))
+            .expect("failed to read tools/memcheck/src/sampler.rs");
+    assert!(
+        sampler_src.contains(&format!(
+            "WORKER_CMDLINE_TOKEN: &str = \"{HARNESS_WORKER_CMDLINE_TOKEN}\";"
+        )),
+        "tools/memcheck/src/sampler.rs WORKER_CMDLINE_TOKEN drifted from \
+         \"{HARNESS_WORKER_CMDLINE_TOKEN}\" — keep it in sync with \
+         src/embed/worker_main.rs INTERNAL_WORKER_TOKEN"
+    );
 }
 
 // ─── T8 step-3: worker ORT-threads cap ≤ no-cap (opt-in, expensive) ─────

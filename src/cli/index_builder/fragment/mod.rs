@@ -225,8 +225,9 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         std::fs::remove_file(path)?;
     }
     std::fs::rename(&next, path)?;
-    #[cfg(unix)]
-    std::fs::File::open(parent)?.sync_all()?;
+    // Directory sync omitted: the file-level fsync + rename is sufficient for
+    // data durability of a rebuildable index artifact. The directory sync only
+    // guarantees rename atomicity across power loss, which is not critical here.
     Ok(())
 }
 

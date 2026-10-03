@@ -559,7 +559,7 @@ Add to `~/.claude/settings.json` or project-local `.claude/settings.json`:
 ```
 
 Optional guidance pack:
-- Shared skill: `integrations/skills/leindex-toolkit/`
+- Shared skill: `integrations/skills/leindex-code-intelligence/`
 - Reminder hook example: `integrations/claude-code/settings.example.json`
 
 #### Cursor Integration
@@ -584,9 +584,9 @@ Every MCP tool is also runnable from the CLI:
 
 ```bash
 leindex tools list
-leindex tools help leindex_project_map
-leindex tools schema leindex_rename_symbol
-leindex tools run leindex_project_map --args '{"path":"src","depth":2}'
+leindex tools inspect leindex_explore
+leindex tools schema leindex_edit
+leindex tools run leindex_explore --set mode=project_map --set path=src --set depth=2
 ```
 
 #### Output (to stderr)
@@ -648,6 +648,10 @@ leindex dashboard --port 3001
 | `LEINDEX_PORT` | 47500 | Override default port for `serve` command |
 | `LEINDEX_DASHBOARD_DIR` | `~/.leindex/dashboard` | Override dashboard asset directory |
 | `RUST_LOG` | info | Logging level (debug, trace, warn, error) |
+| `LEINDEX_FEATURE_ENGRAM` | off | Enable the Engram query-embedding phrase-book (see [MCP.md](MCP.md#engram-query-embedding-phrase-book)) |
+| `LEINDEX_ENGRAM_DIR` | `~/.leindex/engram` | Engram table location (`$LEINDEX_HOME/engram` when `LEINDEX_HOME` is set) |
+| `LEINDEX_ENGRAM_MAX_ENTRIES` | 20000 | Engram row limit (LRU eviction) |
+| `LEINDEX_ENGRAM_MAX_MB` | 256 | Engram size limit in MiB (LRU eviction) |
 
 ### Using Environment Variables
 

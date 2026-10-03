@@ -81,6 +81,7 @@ fn node_type_to_str(node_type: &NodeType) -> &'static str {
         NodeType::Variable => "variable",
         NodeType::Module => "module",
         NodeType::External => "external",
+        NodeType::DocSection => "doc_section",
         NodeType::FileSummary => "file_summary",
     }
 }

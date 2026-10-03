@@ -4,6 +4,7 @@ use crate::edit::ResolvedEditChange;
 use crate::graph::ProgramDependenceGraph;
 use crate::graph::pdg::{NodeId, NodeType, TraversalConfig};
 use crate::validation::ValidationError;
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -155,23 +156,23 @@ impl ImpactAnalyzer {
             let nodes_in_file = self.pdg.nodes_in_file(&file_path);
 
             // For each node, calculate forward and backward impact
-            let mut affected = HashSet::new();
-
-            for node_id in &nodes_in_file {
-                // Forward impact (nodes that depend on this)
-                let forward = self
-                    .pdg
-                    .forward_impact(*node_id, &TraversalConfig::for_impact_analysis());
-                affected.extend(forward);
-
-                // Backward impact (nodes this depends on)
-                let backward = self
-                    .pdg
-                    .backward_impact(*node_id, &TraversalConfig::for_impact_analysis());
-                affected.extend(backward);
-
-                affected.insert(*node_id);
-            }
+            // Each node's forward/backward traversal is independent and
+            // read-only, so they fan out across cores; the union is order
+            // independent.
+            let config = TraversalConfig::for_impact_analysis();
+            let pdg = &self.pdg;
+            let affected: HashSet<_> = nodes_in_file
+                .par_iter()
+                .fold(HashSet::new, |mut acc, node_id| {
+                    acc.extend(pdg.forward_impact(*node_id, &config));
+                    acc.extend(pdg.backward_impact(*node_id, &config));
+                    acc.insert(*node_id);
+                    acc
+                })
+                .reduce(HashSet::new, |mut left, right| {
+                    left.extend(right);
+                    left
+                });
 
             total_affected_nodes += affected.len();
 

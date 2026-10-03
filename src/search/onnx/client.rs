@@ -23,6 +23,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "cli")]
+use std::collections::HashMap;
+
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -37,10 +40,11 @@ use crate::embed::protocol::{
 
 #[path = "client_config.rs"]
 mod client_config;
+pub(crate) use client_config::terminate_superseded_daemons;
 use client_config::*;
 pub use client_config::{
-    ClientError, EmbedResult, EmbeddingClient, WorkerAvailability, migraphx_cache_path,
-    prune_stale_migraphx_profiles,
+    ClientError, EmbedResult, EmbeddingClient, WorkerAvailability, daemon_active_provider,
+    migraphx_cache_path, prune_stale_migraphx_profiles,
 };
 
 /// Classify a `std::io::Error` as one that indicates the worker process has
@@ -49,6 +53,48 @@ pub use client_config::{
 /// VAL-DEADWORKER-001: When the worker process dies, `read_exact` on the
 /// `UnixStream` returns one of these error kinds. This is a deterministic
 /// transport-level signal, not an arbitrary wall-clock timeout.
+/// ROCm/MIGraphX library directories that must be on the worker's loader
+/// path for the MIGraphX execution provider to load.
+///
+/// ORT's `libonnxruntime_providers_migraphx.so` links against
+/// `libmigraphx*.so` variant libraries that ROCm installs under
+/// `<rocm>/lib/migraphx/lib` — a directory the dynamic loader does not
+/// search by default. When the worker is spawned without that directory on
+/// `LD_LIBRARY_PATH`, provider registration fails with
+/// "libmigraphx_tf.so.<ver>: cannot open shared object file" and the worker
+/// silently falls back to CPU inference (100-1000x slower than GPU).
+/// Returning the existing dirs here lets the spawn path prepend them so
+/// provider loading matches a working shell setup. The MIGraphX compile
+/// probe child inherits the worker environment and benefits identically.
+fn migraphx_loader_dirs() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for key in ["ROCM_PATH", "HIP_PATH"] {
+        if let Ok(value) = std::env::var(key) {
+            if !value.is_empty() {
+                let root = PathBuf::from(value);
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+        }
+    }
+    let default_rocm = PathBuf::from("/opt/rocm");
+    if !roots.contains(&default_rocm) {
+        roots.push(default_rocm);
+    }
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        for sub in ["lib/migraphx/lib", "lib"] {
+            let dir = root.join(sub);
+            if dir.is_dir() && !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
+}
+
 fn is_worker_dead_io_error(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
@@ -402,6 +448,34 @@ impl EmbeddingClient {
         if matches!(
             configured_provider,
             Some("migraphx" | "rocm" | "auto") | None
+        ) {
+            // Prepend ROCm's MIGraphX provider-library directories to the
+            // child's loader path. See `migraphx_loader_dirs` for why this
+            // is required for the MIGraphX EP to load at all on standard
+            // ROCm installs. Missing dirs are a no-op; existing entries are
+            // preserved (prepended, deduplicated).
+            let dirs = migraphx_loader_dirs();
+            if !dirs.is_empty() {
+                let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+                let have: Vec<&str> = existing.split(':').filter(|s| !s.is_empty()).collect();
+                let missing: Vec<String> = dirs
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .filter(|dir| !have.contains(&dir.as_str()))
+                    .collect();
+                if !missing.is_empty() {
+                    let combined = if existing.is_empty() {
+                        missing.join(":")
+                    } else {
+                        format!("{}:{}", missing.join(":"), existing)
+                    };
+                    cmd.env("LD_LIBRARY_PATH", combined);
+                }
+            }
+        }
+        if matches!(
+            configured_provider,
+            Some("migraphx" | "rocm" | "auto") | None
         ) && std::env::var_os("ORT_MIGRAPHX_MODEL_CACHE_PATH").is_none()
         {
             if let Some(cache_path) = migraphx_model_cache_path(config_env.model_name.as_deref()) {
@@ -416,23 +490,12 @@ impl EmbeddingClient {
                 }
             }
         }
-        // VAL-SETUP-020/VAL-ORT-006: When ORT_DYLIB_PATH is not already in the
-        // ambient environment, propagate the path recorded in
-        // `~/.leindex/config/leindex.toml` so the worker reliably loads the
-        // ORT build chosen during `leindex setup`. This keeps the discovery
-        // chain consistent across both the interactive setup flow (which
-        // installs ORT via pip and remembers the discovered `.so`) and the
-        // plain-spawn path used by searches.
-        // An empty value is treated as unset so the config fallback fires.
-        let ort_dylib_unset = match std::env::var_os("ORT_DYLIB_PATH") {
-            None => true,
-            Some(v) => v.is_empty(),
-        };
-        if ort_dylib_unset {
-            if let Some(path) = &config_env.ort_dylib_path {
-                cmd.env("ORT_DYLIB_PATH", path);
-            }
-        }
+        // ORT_DYLIB_PATH is an explicit user override only. Do not promote the
+        // persisted `neural.ort_dylib_path` hint into this highest-priority env
+        // var: setup records a versioned pip soname that may disappear on an
+        // upgrade. The worker reads the same config and intelligently resolves a
+        // stale path to a sibling version before continuing through bundled,
+        // pip, system, and bare-loader fallbacks.
     }
 
     fn spawn_pipe_worker(
@@ -443,6 +506,7 @@ impl EmbeddingClient {
     ) -> Result<WorkerHandle, ClientError> {
         let mut cmd = Command::new(worker_path);
         Self::configure_worker_command(&mut cmd, config_env, configured_provider);
+        cmd.arg(crate::embed::worker_main::INTERNAL_WORKER_TOKEN);
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -513,6 +577,14 @@ impl EmbeddingClient {
             return Ok(Some(handle));
         }
 
+        // Single-daemon enforcement (RAM safety): before bringing a NEW
+        // daemon online, terminate live daemons whose descriptor differs
+        // from this one. The stress-test OOM post-mortem found two
+        // concurrently-resident embed daemons (one per config descriptor,
+        // total_vm ~15 GiB each) exhausting a shared cgroup. Newest config
+        // wins; opt out with LEINDEX_ALLOW_MULTIPLE_EMBED_DAEMONS=1.
+        terminate_superseded_daemons(&socket_path);
+
         Self::spawn_locked_daemon(worker_path, config_env, configured_provider, socket_path)
             .map(Some)
     }
@@ -538,6 +610,7 @@ impl EmbeddingClient {
         }
         let stderr = Self::daemon_stderr();
         let mut child = cmd
+            .arg(crate::embed::worker_main::INTERNAL_WORKER_TOKEN)
             .arg("--socket")
             .arg(&socket_path)
             .stdin(Stdio::null())
@@ -1158,8 +1231,74 @@ impl EmbeddingClient {
     /// VAL-CPHASE-016: The returned `EmbedResult::Success` contains a flat
     /// row-major `EmbedResponse` that can be written directly into destination
     /// storage without creating a nested `Vec<Vec<f32>>` heap mirror.
-    pub fn embed_with_fallback(&self, texts: &[String], expected_dim: usize) -> EmbedResult {
-        let batch_id = Self::next_batch_id();
+    pub fn embed_with_fallback<S: AsRef<str>>(
+        &self,
+        texts: &[S],
+        expected_dim: usize,
+    ) -> EmbedResult {
+        // Client-side embed cache (WS10 completion): probe the shared
+        // content-addressed store FIRST. Hits are applied without touching
+        // the worker — an all-hit batch never spawns the multi-GiB embed
+        // daemon. Only misses reach the embed path, and their fresh vectors
+        // are stored back under the same keys the worker would have used.
+        // A cache that is unavailable (flag off, open failure, model
+        // mismatch) returns None and the flow is exactly the pre-cache path.
+        if let Some(outcome) = self.probe_embed_cache(texts, expected_dim) {
+            if outcome.miss_positions.is_empty() {
+                tracing::debug!(
+                    hits = outcome.hits.len(),
+                    "embed cache: all hits; worker not required"
+                );
+                let vectors = ordered_vectors(&outcome.hits, &outcome.miss_positions, &[]);
+                return EmbedResult::Success(flatten_into_response(vectors, expected_dim));
+            }
+            let miss_texts: Vec<&str> = outcome
+                .miss_positions
+                .iter()
+                .map(|&position| texts[position].as_ref())
+                .collect();
+            let miss_result =
+                self.embed_with_retry(Self::next_batch_id(), &miss_texts, expected_dim);
+            match miss_result {
+                EmbedResult::Success(response) => {
+                    let miss_vectors = response.into_vectors();
+                    super::embed_cache_frontend::store_misses(&outcome, &miss_vectors);
+                    let vectors =
+                        ordered_vectors(&outcome.hits, &outcome.miss_positions, &miss_vectors);
+                    EmbedResult::Success(flatten_into_response(vectors, expected_dim))
+                }
+                // Miss-path failure degrades the whole batch, matching the
+                // uncached contract (rare: worker unavailable).
+                EmbedResult::Fallback { batch_id, error } => {
+                    EmbedResult::Fallback { batch_id, error }
+                }
+            }
+        } else {
+            self.embed_with_retry(Self::next_batch_id(), texts, expected_dim)
+        }
+    }
+
+    /// The pre-cache retry-once embed machinery, unchanged.
+    fn embed_with_retry<S: AsRef<str>>(
+        &self,
+        batch_id: BatchId,
+        texts: &[S],
+        expected_dim: usize,
+    ) -> EmbedResult {
+        // CPU-fallback quality gate, applied at the moment of cost: a GPU
+        // provider was requested but the (resident) worker reports CPU. The
+        // old eager check in `cpu_fallback_reason` spawned the daemon on
+        // every index start, which the embed cache made pure waste.
+        if let Some(reason) = self.cpu_fallback_reason() {
+            tracing::warn!("{}", reason);
+            return EmbedResult::Fallback {
+                batch_id,
+                error: ClientError::Worker(crate::embed::protocol::WorkerError {
+                    kind: crate::embed::protocol::ErrorKind::OnnxRuntime,
+                    message: reason,
+                }),
+            };
+        }
 
         // Attempt 1: initial try
         match self.embed_attempt(batch_id, texts, expected_dim) {
@@ -1232,11 +1371,88 @@ impl EmbeddingClient {
         }
     }
 
-    /// Single attempt to send an embed request to the worker.
-    fn embed_attempt(
+    /// Cheap, sound identity of the configured neural embedder for the Engram
+    /// query phrase-book: model name, dimension, and a **content digest** of
+    /// the exact model and tokenizer files the worker would load, guarded by
+    /// their size + mtime (+ ctime/inode on Unix). Any change to those files
+    /// yields a different identity, so stale vectors are never served.
+    ///
+    /// The digest is what makes this sound where a metadata stamp alone is
+    /// not: a same-named model whose files keep their size and mtime across a
+    /// swap (reproducible artifacts, metadata-preserving copies) would
+    /// otherwise produce the same identity while its contents — and therefore
+    /// its embeddings — differ.
+    ///
+    /// Hashing a model file costs hundreds of MB of reads, so each file's
+    /// digest is memoized under its metadata guard and recomputed only when
+    /// the guard changes. On Unix the guard includes ctime and inode, which
+    /// userspace cannot forge: rewriting the file (even preserving size and
+    /// mtime) changes both, forcing a re-hash. `None` when the model cannot
+    /// be resolved or read, in which case callers bypass the phrase-book.
+    #[cfg(feature = "cli")]
+    pub(crate) fn engram_identity(&self, expected_dim: usize) -> Option<String> {
+        let model = std::env::var("LEINDEX_WORKER_MODEL")
+            .ok()
+            .or_else(|| self.cached_config().model_name.clone())?;
+        let model_path = crate::embed::model_path::ModelResolver::resolve(&model).ok()?;
+        let tokenizer_path =
+            crate::embed::model_path::ModelResolver::resolve_tokenizer(&model).ok()?;
+        let stamp = |path: &std::path::Path| -> Option<String> {
+            let meta = std::fs::metadata(path).ok()?;
+            let nanos = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            Some(format!(
+                "{}:{}:{}",
+                meta.len(),
+                nanos,
+                content_digest(path, &meta)?
+            ))
+        };
+        Some(format!(
+            "onnx|{model}|{expected_dim}|{}|{}",
+            stamp(&model_path)?,
+            stamp(&tokenizer_path)?
+        ))
+    }
+
+    /// Probe the client-side embed cache for `texts` under the model this
+    /// client is configured for (env override first, then leindex.toml — the
+    /// same precedence `availability()` uses for the daemon descriptor).
+    /// Returns None when the cache is unavailable; never fails the call.
+    fn probe_embed_cache<S: AsRef<str>>(
+        &self,
+        texts: &[S],
+        expected_dim: usize,
+    ) -> Option<super::embed_cache_frontend::CacheProbeOutcome> {
+        if texts.is_empty() {
+            return None;
+        }
+        let model = std::env::var("LEINDEX_WORKER_MODEL")
+            .ok()
+            .or_else(|| self.cached_config().model_name.clone())?;
+        super::embed_cache_frontend::probe_texts(&model, expected_dim, texts)
+    }
+
+    /// Send an embed request to the worker, sharding oversized inputs.
+    ///
+    /// VAL-FRAME-001: Batching many full contents into a single IPC frame can
+    /// exceed the worker's incoming-frame guard (32 MiB default), deterministically
+    /// killing the worker. This method estimates the serialized frame size and
+    /// splits the texts into sub-chunks that each fit within
+    /// `MAX_REQUEST_FRAME_BUDGET`, sending them sequentially and concatenating
+    /// the flat row-major vectors in input order.
+    ///
+    /// Retry semantics are preserved: `embed_with_fallback` calls this both for
+    /// its first attempt and its retry, so an oversized batch is never re-sent
+    /// as one oversized frame.
+    fn embed_attempt<S: AsRef<str>>(
         &self,
         batch_id: BatchId,
-        texts: &[String],
+        texts: &[S],
         expected_dim: usize,
     ) -> Result<EmbedResponse, ClientError> {
         #[cfg(feature = "cli")]
@@ -1246,40 +1462,59 @@ impl EmbeddingClient {
         let result = (|| {
             self.ensure_worker_ready()?;
 
-            let request = EmbedRequest {
-                texts: texts.to_vec(),
-                expected_dim,
-            };
-
-            let frame = protocol::embed_request_frame(batch_id, request)
-                .map_err(|e| ClientError::Ipc(e.to_string()))?;
-
-            let response_frame = self.send_and_receive(frame)?;
-
-            match response_frame.header.msg_type {
-                MsgType::EmbedResponse => {
-                    let response: Response = response_frame
-                        .decode_payload()
-                        .map_err(|e| ClientError::Ipc(e.to_string()))?;
-                    match response {
-                        Response::Embed(embed_resp) => Ok(embed_resp),
-                        _ => Err(ClientError::Protocol("expected Embed response".to_string())),
-                    }
-                }
-                MsgType::Error => {
-                    let response: Response = response_frame
-                        .decode_payload()
-                        .map_err(|e| ClientError::Ipc(e.to_string()))?;
-                    match response {
-                        Response::Error(err) => Err(ClientError::Worker(err)),
-                        _ => Err(ClientError::Protocol("expected Error response".to_string())),
-                    }
-                }
-                other => Err(ClientError::Protocol(format!(
-                    "unexpected response type: {:?}",
-                    other
-                ))),
+            let total_estimate = embed_request_frame_estimate(texts);
+            if total_estimate <= MAX_REQUEST_FRAME_BUDGET {
+                // Fast path: a single frame fits the budget, send it directly.
+                let response = self.embed_attempt_shard(batch_id, texts, expected_dim)?;
+                return Ok(response);
             }
+
+            tracing::info!(
+                batch_id = %batch_id,
+                texts = texts.len(),
+                estimated_bytes = total_estimate,
+                budget = MAX_REQUEST_FRAME_BUDGET,
+                "embed request exceeds frame budget; sharding into sub-requests"
+            );
+
+            // Shard: greedily pack texts into sub-chunks that each fit the budget.
+            let mut shards: Vec<Vec<String>> = Vec::new();
+            let mut current: Vec<String> = Vec::new();
+            let mut current_estimate: usize = 0;
+            for text in texts {
+                let text_estimate = text.as_ref().len() + 32;
+                if !current.is_empty()
+                    && current_estimate + text_estimate > MAX_REQUEST_FRAME_BUDGET
+                {
+                    shards.push(std::mem::take(&mut current));
+                    current_estimate = 0;
+                }
+                current_estimate += text_estimate;
+                current.push(text.as_ref().to_string());
+            }
+            if !current.is_empty() {
+                shards.push(current);
+            }
+
+            // Send each shard in order and concatenate the flat vectors.
+            let mut all_vectors: Vec<f32> = Vec::new();
+            let mut shard_count: usize = 0;
+            for shard in shards {
+                shard_count += 1;
+                let shard_response =
+                    self.embed_attempt_shard(Self::next_batch_id(), &shard, expected_dim)?;
+                for vector in shard_response.into_vectors() {
+                    all_vectors.extend_from_slice(&vector);
+                }
+            }
+            tracing::info!(
+                batch_id = %batch_id,
+                shard_count,
+                total_texts = texts.len(),
+                "embed request sharded successfully"
+            );
+
+            Ok(EmbedResponse::new(all_vectors, texts.len(), expected_dim))
         })();
         let neural_ms = neural_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         tracing::debug!(
@@ -1292,21 +1527,22 @@ impl EmbeddingClient {
         result
     }
 
-    /// Send an embed request to the worker and return the response.
+    /// Send a single embed request frame (one shard) to the worker.
     ///
-    /// This is the simple API that returns an error on failure rather than
-    /// falling back. For retry-once fallback semantics, use `embed_with_fallback`.
-    pub fn embed(
+    /// Assumes `texts` is already sized to fit `MAX_REQUEST_FRAME_BUDGET` — call
+    /// via `embed_attempt` which shards, or directly for known-small batches.
+    fn embed_attempt_shard<S: AsRef<str>>(
         &self,
-        texts: &[String],
+        batch_id: BatchId,
+        texts: &[S],
         expected_dim: usize,
     ) -> Result<EmbedResponse, ClientError> {
         self.ensure_worker_ready()?;
 
-        let batch_id = Self::next_batch_id();
         let request = EmbedRequest {
-            texts: texts.to_vec(),
+            texts: texts.iter().map(|t| t.as_ref().to_string()).collect(),
             expected_dim,
+            cache_keys: vec![],
         };
 
         let frame = protocol::embed_request_frame(batch_id, request)
@@ -1338,6 +1574,119 @@ impl EmbeddingClient {
                 other
             ))),
         }
+    }
+
+    /// Send an embed request to the worker and return the response.
+    ///
+    /// This is the simple API that returns an error on failure rather than
+    /// falling back. For retry-once fallback semantics, use `embed_with_fallback`.
+    pub fn embed(
+        &self,
+        texts: &[String],
+        expected_dim: usize,
+    ) -> Result<EmbedResponse, ClientError> {
+        self.ensure_worker_ready()?;
+
+        let batch_id = Self::next_batch_id();
+        let request = EmbedRequest {
+            texts: texts.to_vec(),
+            expected_dim,
+            cache_keys: vec![],
+        };
+        let frame = protocol::embed_request_frame(batch_id, request)
+            .map_err(|e| ClientError::Ipc(e.to_string()))?;
+
+        let response_frame = self.send_and_receive(frame)?;
+
+        match response_frame.header.msg_type {
+            MsgType::EmbedResponse => {
+                let response: Response = response_frame
+                    .decode_payload()
+                    .map_err(|e| ClientError::Ipc(e.to_string()))?;
+                match response {
+                    Response::Embed(embed_resp) => Ok(embed_resp),
+                    _ => Err(ClientError::Protocol("expected Embed response".to_string())),
+                }
+            }
+            MsgType::Error => {
+                let response: Response = response_frame
+                    .decode_payload()
+                    .map_err(|e| ClientError::Ipc(e.to_string()))?;
+                match response {
+                    Response::Error(err) => Err(ClientError::Worker(err)),
+                    _ => Err(ClientError::Protocol("expected Error response".to_string())),
+                }
+            }
+            other => Err(ClientError::Protocol(format!(
+                "unexpected response type: {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// Send a batch-scoped Cancel request over a daemon socket.
+    ///
+    /// Socket mode uses a separate connection so the cancel frame can reach the
+    /// worker while another client connection is performing synchronous embed
+    /// inference. Pipe mode cannot safely dispatch a second frame while its
+    /// single worker loop is synchronously handling Embed.
+    #[cfg(unix)]
+    pub fn cancel_batch(
+        &self,
+        batch_id: BatchId,
+        reason: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        if !self.use_daemon {
+            return Err(ClientError::Ipc(
+                "pipe-mode cancellation is unavailable while embed is synchronous".to_string(),
+            ));
+        }
+        let config = self.cached_config();
+        let provider = std::env::var("LEINDEX_WORKER_EXECUTION_PROVIDER")
+            .ok()
+            .or(config.execution_provider.clone());
+        let model = std::env::var("LEINDEX_WORKER_MODEL")
+            .ok()
+            .or(config.model_name.clone());
+        let socket_path = daemon_socket_path(provider.as_deref(), model.as_deref())
+            .ok_or_else(|| ClientError::Ipc("worker daemon socket path unavailable".to_string()))?;
+        let mut stream = UnixStream::connect(socket_path).map_err(|error| {
+            ClientError::Ipc(format!("failed to connect cancel socket: {}", error))
+        })?;
+        let frame = protocol::cancel_request_frame(
+            batch_id,
+            protocol::CancelRequest {
+                reason: reason.into(),
+            },
+        )
+        .map_err(|error| ClientError::Ipc(error.to_string()))?;
+        let wire = frame
+            .encode_wire()
+            .map_err(|error| ClientError::Ipc(error.to_string()))?;
+        stream
+            .write_all(&wire)
+            .and_then(|_| stream.flush())
+            .map_err(|error| ClientError::Ipc(format!("failed to send cancel: {}", error)))?;
+        let response_bytes = read_frame(&mut stream)?;
+        let response = Frame::from_wire_bytes(&response_bytes)
+            .map_err(|error| ClientError::Ipc(error.to_string()))?;
+        if response.header.batch_id != batch_id || response.header.msg_type != MsgType::Cancel {
+            return Err(ClientError::Protocol(
+                "unexpected cancel response frame".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub fn cancel_batch(
+        &self,
+        _batch_id: BatchId,
+        _reason: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        Err(ClientError::Ipc(
+            "socket-mode cancellation requires Unix IPC".to_string(),
+        ))
     }
 
     /// Send a rerank request to the worker and return the response.
@@ -1536,418 +1885,114 @@ impl Drop for EmbeddingClient {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::embed::protocol::ErrorKind;
-
-    /// TEMP verification: spawn the REAL leindex-embed worker (pipe mode) and run
-    /// one embed through the production EmbeddingClient. On a cold MIGraphX cache
-    /// this JIT-compiles (~300 s) and the native ORT cache writes a `.mxr`; on a
-    /// warm cache it loads the `.mxr` (~10 s). Run: `cargo test -p leindex
-    /// --features onnx real_pipe_embed -- --ignored --nocapture`.
-    #[test]
-    #[ignore = "spawns real leindex-embed worker + ~300s MIGraphX JIT compile"]
-    fn real_pipe_embed_seeds_migraphx_cache() {
-        let cache = migraphx_cache_path("qwen3-embed-0.6b");
-        eprintln!("cache dir: {}", cache.display());
-        let start = std::time::Instant::now();
-        let client = EmbeddingClient::new_pipe();
-        let response = client
-            .embed(&["hello world".to_string()], 1024)
-            .expect("pipe embed failed");
-        eprintln!(
-            "embed count={} elapsed={:?}",
-            response.count,
-            start.elapsed()
-        );
-        assert!(response.count > 0, "embed returned no vectors");
+/// Reassemble per-text vectors in ORIGINAL request order: cached hits at
+/// their positions, freshly computed miss vectors in miss order.
+fn ordered_vectors(
+    hits: &std::collections::HashMap<usize, Vec<f32>>,
+    miss_positions: &[usize],
+    miss_vectors: &[Vec<f32>],
+) -> Vec<Vec<f32>> {
+    let total = hits.len() + miss_positions.len();
+    let mut ordered = Vec::with_capacity(total);
+    let mut next_miss = 0usize;
+    for position in 0..total {
+        if let Some(vector) = hits.get(&position) {
+            ordered.push(vector.clone());
+        } else if let Some(vector) = miss_vectors.get(next_miss) {
+            ordered.push(vector.clone());
+            next_miss += 1;
+        }
+        // Positions beyond both sources cannot occur: every position is
+        // either a hit or a miss by construction.
     }
+    ordered
+}
 
-    #[test]
-    fn test_client_creation() {
-        let _client = EmbeddingClient::new();
+/// Flatten per-text vectors into the row-major `EmbedResponse` the callers
+/// of `embed_with_fallback` expect.
+fn flatten_into_response(vectors: Vec<Vec<f32>>, expected_dim: usize) -> EmbedResponse {
+    let count = vectors.len();
+    let mut flat = Vec::with_capacity(count * expected_dim);
+    for vector in vectors {
+        flat.extend_from_slice(&vector);
     }
+    EmbedResponse::new(flat, count, expected_dim)
+}
 
-    #[test]
-    fn availability_uses_pipe_startup_report_without_spawning() {
-        let client = EmbeddingClient::new_pipe();
-        assert!(matches!(client.availability(), WorkerAvailability::Absent));
-        *client.last_startup_report.lock().unwrap() =
-            Some("startup_report provider=cpu status=available".to_string());
-        assert!(matches!(client.availability(), WorkerAvailability::Ready));
-    }
+/// Memo key for [`content_digest`]: `(len, mtime_ns, ctime, inode)`. ctime is
+/// the full `seconds << 32 | nanoseconds` value — nanoseconds alone can
+/// repeat across rewrites landing at the same offset within the second.
+#[cfg(feature = "cli")]
+type DigestKey = (u64, u128, u128, u64);
 
-    #[test]
-    fn test_client_debug_impl() {
-        let client = EmbeddingClient::new();
-        let debug_str = format!("{:?}", client);
-        assert!(debug_str.contains("EmbeddingClient"));
-    }
-
-    #[test]
-    fn test_client_clone_shares_worker() {
-        let client = EmbeddingClient::new();
-        let cloned = client.clone();
-        // Clone shares the worker handle via Arc, not a new empty client
-        let _ = format!("{:?}", cloned);
-    }
-
-    #[test]
-    fn test_parse_startup_report_provider_from_plain_line() {
-        let line = "startup_report provider=migraphx status=available model=qwen3-embed-0.6b";
-        assert_eq!(
-            parse_startup_report_provider(line).as_deref(),
-            Some("migraphx")
-        );
-    }
-
-    #[test]
-    fn test_parse_startup_report_provider_from_tracing_line() {
-        let line = "2026-06-30T01:02:03Z INFO startup_report provider=cpu status=unavailable (fallback: no GPU)";
-        assert_eq!(parse_startup_report_provider(line).as_deref(), Some("cpu"));
-    }
-
-    #[test]
-    fn test_client_reports_last_startup_provider() {
-        let client = EmbeddingClient::new();
-        *client.last_startup_report.lock().unwrap() =
-            Some("startup_report provider=cuda status=available".to_string());
-
-        assert_eq!(client.active_execution_provider().as_deref(), Some("cuda"));
-    }
-
-    #[test]
-    fn test_wait_for_active_provider_observes_stderr_update() {
-        let client = EmbeddingClient::new_pipe();
-        let report = Arc::clone(&client.last_startup_report);
-        let updater = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(20));
-            *report.lock().unwrap() =
-                Some("startup_report provider=migraphx status=available".to_string());
-        });
-
-        assert_eq!(
-            client
-                .wait_for_active_execution_provider(Duration::from_secs(1))
-                .as_deref(),
-            Some("migraphx")
-        );
-        updater.join().unwrap();
-    }
-
+/// Hex blake3 digest of `path`'s content, memoized under a metadata guard.
+///
+/// The guard is what keeps repeated calls cheap (model files are read once
+/// per guard change, not per query) while staying sound: on Unix it includes
+/// the full ctime and inode, which userspace cannot preserve across a
+/// rewrite — so a file replaced with a same-size, same-mtime copy forces a
+/// re-hash instead of silently reusing the old digest. On platforms without
+/// those fields the guard is size + mtime and a swap within one guard window
+/// is indistinguishable (the metadata-only weakness, narrowed to a single
+/// process lifetime).
+#[cfg(feature = "cli")]
+fn content_digest(path: &Path, meta: &std::fs::Metadata) -> Option<String> {
     #[cfg(unix)]
-    #[test]
-    fn daemon_spawn_lock_serializes_contenders() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("worker.lock");
-        let first = DaemonSpawnLock::acquire(&path, Duration::from_secs(1)).unwrap();
-        assert!(matches!(
-            DaemonSpawnLock::acquire(&path, Duration::from_millis(20)),
-            Err(ClientError::Timeout)
-        ));
-        drop(first);
-        DaemonSpawnLock::acquire(&path, Duration::from_secs(1)).unwrap();
+    fn guard(meta: &std::fs::Metadata) -> Option<DigestKey> {
+        use std::os::unix::fs::MetadataExt;
+        Some((
+            meta.len(),
+            meta.modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos(),
+            ((meta.ctime() as u128) << 32) | meta.ctime_nsec() as u128,
+            meta.ino(),
+        ))
+    }
+    #[cfg(not(unix))]
+    fn guard(meta: &std::fs::Metadata) -> Option<DigestKey> {
+        Some((
+            meta.len(),
+            meta.modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos(),
+            0,
+            0,
+        ))
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn persistent_shutdown_unblocks_and_joins_reader() {
-        let (client_stream, _server_stream) = UnixStream::pair().unwrap();
-        let mut handle = EmbeddingClient::socket_worker_handle(client_stream, None, None).unwrap();
-        let (tx, _rx) = mpsc::channel();
-        handle
-            .read_request_tx
-            .send(ReadRequest::Read { tx })
-            .unwrap();
-        thread::sleep(Duration::from_millis(10));
+    static DIGESTS: OnceLock<Mutex<HashMap<PathBuf, (DigestKey, String)>>> = OnceLock::new();
+    let digests = DIGESTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = guard(meta)?;
 
-        EmbeddingClient::shutdown_worker_handle(&mut handle, false);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn persistent_client_does_not_delete_daemon_socket() {
-        let temp = tempfile::tempdir().unwrap();
-        let socket_path = temp.path().join("daemon.sock");
-        std::fs::write(&socket_path, b"owned by daemon").unwrap();
-        let (client_stream, _server_stream) = UnixStream::pair().unwrap();
-        let mut handle =
-            EmbeddingClient::socket_worker_handle(client_stream, None, Some(socket_path.clone()))
-                .unwrap();
-
-        EmbeddingClient::shutdown_worker_handle(&mut handle, true);
-        assert!(socket_path.exists());
-    }
-
-    #[test]
-    fn stderr_mirror_exits_after_reported_io_error() {
-        struct FailingReader;
-        impl Read for FailingReader {
-            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("synthetic stderr failure"))
+    // Lookup holds the memo lock only for the map probe: hashing a multi-
+    // hundred-MB model file must not serialize concurrent embedder starts.
+    {
+        let digests = digests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((cached_key, digest)) = digests.get(path) {
+            if *cached_key == key {
+                return Some(digest.clone());
             }
         }
-
-        let report = Arc::new(Mutex::new(None));
-        EmbeddingClient::spawn_stderr_thread(FailingReader, report)
-            .join()
-            .unwrap();
     }
 
-    #[test]
-    fn test_client_error_display() {
-        let err = ClientError::SpawnFailed("not found".to_string());
-        assert!(err.to_string().contains("not found"));
-
-        let worker_err = WorkerError {
-            kind: ErrorKind::ModelNotFound,
-            message: "missing model".to_string(),
-        };
-        let err = ClientError::Worker(worker_err);
-        assert!(err.to_string().contains("missing model"));
-    }
-
-    #[test]
-    fn test_embed_result_success() {
-        let response = EmbedResponse::new(vec![1.0, 2.0, 3.0, 4.0], 1, 4);
-        let result = EmbedResult::Success(response);
-        assert!(result.is_success());
-        assert!(!result.is_fallback());
-        assert!(result.into_success().is_some());
-    }
-
-    #[test]
-    fn test_embed_result_fallback() {
-        let error = ClientError::Worker(WorkerError {
-            kind: ErrorKind::Inference,
-            message: "worker crashed".to_string(),
-        });
-        let result = EmbedResult::Fallback {
-            batch_id: BatchId::new(42),
-            error,
-        };
-        assert!(!result.is_success());
-        assert!(result.is_fallback());
-        assert!(result.into_success().is_none());
-    }
-
-    #[test]
-    fn test_batch_id_monotonic() {
-        let id1 = EmbeddingClient::next_batch_id();
-        let id2 = EmbeddingClient::next_batch_id();
-        assert!(
-            id2.0 > id1.0,
-            "batch IDs should be monotonically increasing"
-        );
-    }
-
-    // ── VAL-SETUP-020/VAL-ORT-006: config-driven ORT_DYLIB_PATH injection ──
-
-    // Use a process-shared lock so env-mutating tests serialize within the module.
-    use std::sync::Mutex;
-    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn test_read_ort_dylib_path_from_config_returns_value() {
-        let _g = TEST_ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("LEINDEX_HOME", tmp.path()) };
-        unsafe { std::env::remove_var("LEINDEX_ONNX_INFERENCE_BATCH_SIZE") };
-        unsafe { std::env::remove_var("LEINDEX_ONNX_SEQUENCE_LEN") };
-
-        let cfg_dir = tmp.path().join("config");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(
-            cfg_dir.join("leindex.toml"),
-            "[neural]\nenabled = true\nexecution_provider = \"cpu\"\nort_dylib_path = \"/opt/onnxruntime/libonnxruntime.so\"\nort_version = \"1.25.0\"\nmodel_dir = \"/models\"\n",
-        )
-        .unwrap();
-
-        let parsed = read_ort_dylib_path_from_config();
-        assert_eq!(
-            parsed.as_deref(),
-            Some("/opt/onnxruntime/libonnxruntime.so")
-        );
-        assert_eq!(
-            read_execution_provider_from_config().as_deref(),
-            Some("cpu")
-        );
-
-        unsafe { std::env::remove_var("LEINDEX_HOME") };
-    }
-
-    #[test]
-    fn test_read_execution_provider_from_config_skips_auto() {
-        let _g = TEST_ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("LEINDEX_HOME", tmp.path()) };
-
-        let cfg_dir = tmp.path().join("config");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(
-            cfg_dir.join("leindex.toml"),
-            "[neural]\nenabled = true\nexecution_provider = \"auto\"\n",
-        )
-        .unwrap();
-        assert_eq!(read_execution_provider_from_config(), None);
-
-        std::fs::write(
-            cfg_dir.join("leindex.toml"),
-            "[neural]\nenabled = true\nexecution_provider = \"migraphx\"\n",
-        )
-        .unwrap();
-        assert_eq!(
-            read_execution_provider_from_config().as_deref(),
-            Some("migraphx")
-        );
-
-        unsafe { std::env::remove_var("LEINDEX_HOME") };
-    }
-
-    #[test]
-    fn test_read_worker_model_name_from_config_returns_value() {
-        let _g = TEST_ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("LEINDEX_HOME", tmp.path()) };
-
-        let cfg_dir = tmp.path().join("config");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(
-            cfg_dir.join("leindex.toml"),
-            "[neural]\nenabled = true\nmodel_name = \"qwen3-embed-0.6b-dynamic\"\n",
-        )
-        .unwrap();
-
-        assert_eq!(
-            read_worker_model_name_from_config().as_deref(),
-            Some("qwen3-embed-0.6b-dynamic")
-        );
-
-        unsafe { std::env::remove_var("LEINDEX_HOME") };
-    }
-
-    #[test]
-    fn test_migraphx_model_cache_path_uses_leindex_home() {
-        let _g = TEST_ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("LEINDEX_HOME", tmp.path()) };
-        unsafe { std::env::remove_var("LEINDEX_ONNX_INFERENCE_BATCH_SIZE") };
-        unsafe { std::env::remove_var("LEINDEX_ONNX_SEQUENCE_LEN") };
-        let expected = tmp
-            .path()
-            .join("cache")
-            .join("migraphx")
-            .join("qwen3-embed-0_6b-dynamic")
-            .join("b8-s128");
-
-        assert_eq!(
-            migraphx_model_cache_path(Some("qwen3-embed-0.6b-dynamic")).as_deref(),
-            Some(expected.as_path())
-        );
-
-        unsafe { std::env::remove_var("LEINDEX_HOME") };
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn test_daemon_socket_path_includes_inference_shape() {
-        let _g = TEST_ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("LEINDEX_HOME", tmp.path()) };
-        unsafe { std::env::remove_var("LEINDEX_ONNX_INFERENCE_BATCH_SIZE") };
-        unsafe { std::env::remove_var("LEINDEX_ONNX_SEQUENCE_LEN") };
-
-        let socket =
-            daemon_socket_path(Some("migraphx"), Some("qwen3-embed-0.6b-dynamic")).unwrap();
-        let filename = socket.file_name().and_then(|name| name.to_str()).unwrap();
-        assert!(filename.starts_with("leindex-embed-"));
-        assert!(filename.ends_with(".sock"));
-        assert!(socket.to_string_lossy().len() <= 100);
-
-        unsafe { std::env::remove_var("LEINDEX_HOME") };
-    }
-
-    #[test]
-    fn test_read_ort_dylib_path_from_config_returns_none_when_absent() {
-        let _g = TEST_ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("LEINDEX_HOME", tmp.path()) };
-
-        // No config file at all.
-        assert_eq!(read_ort_dylib_path_from_config(), None);
-
-        // Config exists but lacks ort_dylib_path.
-        let cfg_dir = tmp.path().join("config");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(
-            cfg_dir.join("leindex.toml"),
-            "[neural]\nenabled = true\nmodel_dir = \"/models\"\n",
-        )
-        .unwrap();
-        assert_eq!(read_ort_dylib_path_from_config(), None);
-
-        unsafe { std::env::remove_var("LEINDEX_HOME") };
-    }
-
-    #[test]
-    fn test_read_ort_dylib_path_from_config_handles_single_quotes() {
-        let _g = TEST_ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("LEINDEX_HOME", tmp.path()) };
-
-        let cfg_dir = tmp.path().join("config");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(
-            cfg_dir.join("leindex.toml"),
-            "[neural]\nort_dylib_path = '/quote/ort.so'\n",
-        )
-        .unwrap();
-
-        assert_eq!(
-            read_ort_dylib_path_from_config().as_deref(),
-            Some("/quote/ort.so")
-        );
-
-        unsafe { std::env::remove_var("LEINDEX_HOME") };
-    }
-
-    #[test]
-    fn test_leindex_home_dir_prefers_env_override() {
-        let _g = TEST_ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("LEINDEX_HOME", "/custom/leindex/home") };
-        assert_eq!(
-            leindex_home_dir(),
-            Some(std::path::PathBuf::from("/custom/leindex/home"))
-        );
-        unsafe { std::env::remove_var("LEINDEX_HOME") };
-    }
-
-    #[test]
-    fn test_leindex_home_dir_falls_back_to_home() {
-        let _g = TEST_ENV_LOCK.lock().unwrap();
-        unsafe { std::env::remove_var("LEINDEX_HOME") };
-        unsafe { std::env::set_var("HOME", "/home/testuser") };
-        let home = leindex_home_dir();
-        assert_eq!(
-            home,
-            Some(std::path::PathBuf::from("/home/testuser/.leindex"))
-        );
-        unsafe { std::env::remove_var("HOME") };
-    }
-
-    #[test]
-    fn test_leindex_home_dir_relative_env_ignored() {
-        let _g = TEST_ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("LEINDEX_HOME", "relative/path") };
-        unsafe { std::env::set_var("HOME", "/home/fallback") };
-        // Should fall back to HOME-based path, not use relative.
-        let home = leindex_home_dir();
-        assert_eq!(
-            home,
-            Some(std::path::PathBuf::from("/home/fallback/.leindex"))
-        );
-        unsafe { std::env::remove_var("LEINDEX_HOME") };
-        unsafe { std::env::remove_var("HOME") };
-    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    let digest = hasher.finalize().to_hex().to_string();
+    digests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf(), (key, digest.clone()));
+    Some(digest)
 }
+
+#[cfg(test)]
+#[path = "client_test.rs"]
+mod tests;

@@ -3,7 +3,7 @@
 // *L'Index* (The Index) - Unified API that brings together all LeIndex crates
 
 mod diagnostics;
-mod indexing;
+pub(crate) mod indexing;
 pub(crate) mod model_download;
 mod query;
 pub(crate) mod setup;
@@ -11,6 +11,10 @@ mod types;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "generation_read_test.rs"]
+mod generation_read_tests;
 
 // Re-export public types for external callers
 pub use types::{
@@ -30,7 +34,7 @@ use crate::storage::{UniqueProjectId, schema::Storage};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Find existing index storage without creating a directory or opening SQLite.
 pub(crate) fn resolve_existing_storage_path(project_path: &Path) -> Option<PathBuf> {
@@ -64,7 +68,10 @@ pub struct LeIndex {
     pub(crate) search_engine: SearchEngine,
 
     /// Program Dependence Graph
-    pub(crate) pdg: Option<ProgramDependenceGraph>,
+    /// Shared, copy-on-write: a validator (or any reader) can hold the graph
+    /// without cloning it, and writers use [`Self::take_owned_pdg`], which only
+    /// copies if a reader is still alive.
+    pub(crate) pdg: Option<std::sync::Arc<ProgramDependenceGraph>>,
 
     /// Cache subsystem (spiller, project scan, file stats)
     pub(crate) cache: crate::cli::index_cache::IndexCache,
@@ -80,6 +87,30 @@ pub struct LeIndex {
 
     /// Ephemeral state shared by the explicit indexing phases.
     pub(crate) pipeline: Option<indexing::IndexPipelineState>,
+
+    /// Live generation read path (WS4 Task 14): when
+    /// `LEINDEX_FEATURE_GENERATION_READERS` is enabled and the project has a
+    /// current generation, this holds the leased snapshot that the
+    /// search/symbol/deep-analyze read path reads from. Holding the snapshot
+    /// keeps the generation's CAS blobs pinned (via `GenerationLease`) for the
+    /// lifetime of this process, so reads never touch the writer Mutex and
+    /// never race a concurrent publish.
+    pub(crate) generation_snapshot: Option<crate::storage::generation::GenerationSnapshot>,
+
+    /// The generation this process's in-memory PDG/search state was loaded
+    /// from (set at hydration and at each successful publish; 0 = never
+    /// hydrated). Atomic because publish paths hold `&self`. The registry
+    /// compares it against the persisted `CURRENT` pointer to detect
+    /// external rebuilds (another server or a CLI `--force`) and re-hydrate
+    /// instead of serving a stale snapshot under a fresh footer (N-13).
+    pub(crate) hydrated_generation: std::sync::atomic::AtomicU64,
+
+    /// Whether the most recent `index_project` call was coalesced away (a
+    /// fresh index published by another process while this one waited for
+    /// the project write lock). The registry uses this to keep the resident
+    /// instance — which may hold a hydrated core — instead of installing an
+    /// un-hydrated temp over it.
+    pub(crate) last_index_coalesced: bool,
 }
 
 /// Cross-process exclusive lock guarding writes to a project's storage.
@@ -392,6 +423,15 @@ impl LeIndex {
     }
 
     /// Open storage with retry and exponential backoff.
+    ///
+    /// Each `Storage::open` attempt itself waits out SQLite's 5s busy_timeout
+    /// (schema init takes write locks), so the retry budget must outlast a
+    /// competing writer's WHOLE indexing run, not just one transaction: an
+    /// external `leindex index --force` holds intermittent write locks for
+    /// tens of seconds on large projects (stress-test measured ~31s on this
+    /// repo with the legacy full-rewrite save). 6 attempts ≈ 6×5s busy
+    /// windows + capped backoff ≈ 36s worst case, which covers the rebuild
+    /// while remaining bounded.
     fn open_storage_with_retry(db_path: &Path, max_retries: u32) -> Result<Storage> {
         let mut attempt = 0;
         loop {
@@ -399,7 +439,10 @@ impl LeIndex {
                 Ok(s) => return Ok(s),
                 Err(e) if attempt < max_retries => {
                     attempt += 1;
-                    let delay = std::time::Duration::from_millis(100 * 2u64.pow(attempt));
+                    // Cap the backoff so late attempts do not stack multi-second
+                    // sleeps on top of the multi-second busy windows.
+                    let delay_ms = (100 * 2u64.saturating_pow(attempt)).min(2_000);
+                    let delay = std::time::Duration::from_millis(delay_ms);
                     warn!(
                         "Storage open attempt {}/{} failed: {}. Retrying in {:?}",
                         attempt, max_retries, e, delay
@@ -413,8 +456,10 @@ impl LeIndex {
                     // contention case is tagged `[transient:lock-contention]` so
                     // the registry layer can avoid permanently bricking a
                     // generation on a transient storm (see
-                    // `is_transient_storage_open_failure`). A genuine failure
-                    // still bricks, correctly.
+                    // `is_transient_storage_open_failure`) and the MCP layer can
+                    // render honest "retry shortly" remediation instead of
+                    // telling the user to delete a perfectly valid database. A
+                    // genuine failure still bricks, correctly.
                     let lower = e.to_string().to_lowercase();
                     // Whitelist the exact SQLite transient-lock messages
                     // (SQLITE_BUSY/LOCKED from rusqlite) rather than a loose
@@ -425,13 +470,15 @@ impl LeIndex {
                     // transient storm.
                     let is_lock_contention = lower.contains("database is locked")
                         || lower.contains("database table is locked")
-                        || lower.contains("could not obtain a lock");
+                        || lower.contains("could not obtain a lock")
+                        || lower.contains("database is busy");
                     return Err(e).with_context(|| {
                         if is_lock_contention {
                             format!(
                                 "Failed to open storage at {} after {} attempts \
                                  [transient:lock-contention]. Another leindex process \
-                                 likely holds the database; retry once it completes.",
+                                 is writing the database; the data is intact — retry \
+                                 once it completes. Do NOT delete the database.",
                                 db_path.display(),
                                 max_retries,
                             )
@@ -469,6 +516,54 @@ impl LeIndex {
         ProjectWriteLock::try_acquire(self.storage_path())
     }
 
+    /// Acquire the cross-process write lock, coalescing with a concurrent
+    /// index in another process instead of queueing a redundant one.
+    ///
+    /// With multiple processes on one project (two MCP instances, MCP + CLI),
+    /// the old blocking flock made the second writer sit in the queue for the
+    /// first's *entire* index and then re-scan the tree itself — two tool
+    /// calls would stall for minutes and finish within a second of each
+    /// other. This variant polls the (cheap) lock while another process
+    /// holds it, and once the lock is acquired re-checks staleness once: if
+    /// the other process published a fresh index while we waited, this
+    /// caller is done — no scan, no parse, no second generation. A forced
+    /// reindex always blocks for the lock and always runs.
+    ///
+    /// Returns `Ok(None)` when the index was coalesced away (the caller
+    /// should treat the project as freshly indexed).
+    fn acquire_write_lock_coalescing(&self, force: bool) -> Result<Option<ProjectWriteLock>> {
+        if force {
+            return self.acquire_write_lock().map(Some);
+        }
+        loop {
+            match self.try_acquire_write_lock()? {
+                Some(guard) => {
+                    // We hold the lock. If another process finished indexing
+                    // while we waited, there is nothing left to do. The
+                    // staleness check is one O(N) stat scan, paid once per
+                    // coalesced run, never per poll. A run is skipped ONLY
+                    // when no incomplete job checkpoint exists either: a
+                    // failed attempt leaves a resumable checkpoint (marked
+                    // "complete" only on success) that the next non-forced
+                    // index is expected to finish publishing.
+                    if !self.is_stale_fast() && self.no_incomplete_job() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(guard));
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(200)),
+            }
+        }
+    }
+
+    /// Whether every indexing job checkpoint is marked complete. An
+    /// incomplete checkpoint means an attempt failed mid-pipeline and the
+    /// next non-forced index must resume it (run_scan's checkpoint-reuse
+    /// path), not treat the project as done.
+    fn no_incomplete_job(&self) -> bool {
+        crate::cli::index_job::latest_incomplete_job(self.storage_path()).is_none()
+    }
+
     /// Create a new LeIndex instance for a project.
     ///
     /// ```ignore
@@ -495,8 +590,48 @@ impl LeIndex {
         // Register at-exit cleanup for temp-based storage
         crate::cli::cleanup::register_at_exit_cleanup(storage_path.clone());
 
+        // WS4 Task 10: one-time legacy → CAS generation-store migration on the
+        // first-run path. Flag-gated (destructive sweep; ships behind a backup
+        // warning). Runs before `open_storage_with_retry` so a migrated store
+        // opens a fresh catalog; the search data lives in the CAS generation
+        // store. Idempotent: no-op for stores already migrated; a failed
+        // migration never blocks opening the project (the legacy layout still
+        // serves).
+        if crate::feature_flags::FeatureFlag::GenerationMigration.is_enabled() {
+            let migrate_cfg = crate::storage::generation::migrate::MigrationConfig::default();
+            match crate::storage::generation::migrate::migrate_legacy_store(
+                &storage_path,
+                &migrate_cfg,
+            ) {
+                Ok(report) if report.migrated || !report.was_noop() => {
+                    info!(
+                        storage = %storage_path.display(),
+                        before = report.total_bytes_before,
+                        after = report.total_bytes_after,
+                        generations = report.generations_converted,
+                        jobs_deleted = report.jobs_completed_deleted + report.jobs_byte_capped,
+                        cas_blobs = report.cas_blob_count,
+                        "Legacy store migration complete"
+                    );
+                }
+                Ok(_) => {
+                    debug!(
+                        storage = %storage_path.display(),
+                        "No legacy store migration needed"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        storage = %storage_path.display(),
+                        error = %e,
+                        "Legacy store migration failed; continuing with existing layout"
+                    );
+                }
+            }
+        }
+
         let db_path = storage_path.join("leindex.db");
-        let storage = Self::open_storage_with_retry(&db_path, 3)?;
+        let storage = Self::open_storage_with_retry(&db_path, 6)?;
 
         // Generate unique project ID with conflict resolution
         // Load existing projects with same base name
@@ -520,11 +655,7 @@ impl LeIndex {
         // Initialize search engine, configured with the documented `[search]`
         // knobs: `neural_weight` (previously dead config) plus the fragment
         // layer master switch + fusion weight. VAL-CONFIG.
-        let mut search_engine = SearchEngine::new();
-        let cfg = crate::config::LeIndexConfig::load_cached();
-        search_engine.set_neural_weight(cfg.neural_weight_f32());
-        search_engine.set_fragment_index_enabled(cfg.search.fragment_index_enabled);
-        search_engine.set_fragment_weight(cfg.search.fragment_weight as f32);
+        let search_engine = Self::configured_search_engine();
 
         // Initialize cache subsystem
         let cache_dir = storage_path.join("cache");
@@ -548,6 +679,7 @@ impl LeIndex {
                 successful_parses: 0,
                 failed_parses: 0,
                 total_signatures: 0,
+                signature_scope: "full".to_string(),
                 pdg_nodes: 0,
                 pdg_edges: 0,
                 indexed_nodes: 0,
@@ -560,6 +692,9 @@ impl LeIndex {
             },
             embedder: None,
             pipeline: None,
+            generation_snapshot: None,
+            hydrated_generation: std::sync::atomic::AtomicU64::new(0),
+            last_index_coalesced: false,
         };
 
         // Restore persisted index stats (if any) so diagnostics can report
@@ -577,10 +712,9 @@ impl LeIndex {
     fn collect_source_files_with_hashes(
         &mut self,
         refresh: bool,
-        file_cache: Option<&mut index_builder::FileReadCache>,
     ) -> Result<Vec<(PathBuf, String)>> {
         let scan = self.get_project_scan(refresh)?;
-        index_builder::collect_source_files_with_hashes(&scan, file_cache)
+        index_builder::collect_source_files_with_hashes(&scan)
     }
 
     fn collect_source_file_paths(&mut self, refresh: bool) -> Result<Vec<PathBuf>> {
@@ -794,7 +928,18 @@ impl LeIndex {
     /// Get the PDG, if the project has been indexed.
     #[inline]
     pub fn pdg(&self) -> Option<&ProgramDependenceGraph> {
-        self.pdg.as_ref()
+        self.pdg.as_deref()
+    }
+
+    /// Take the graph out as an owned value for mutation.
+    ///
+    /// Unshared (the normal case) it is unwrapped without copying; if a
+    /// validator still holds it, it is cloned so that reader keeps a consistent
+    /// snapshot.
+    pub(crate) fn take_owned_pdg(&mut self) -> Option<ProgramDependenceGraph> {
+        self.pdg.take().map(|shared| {
+            std::sync::Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone())
+        })
     }
 
     /// Create a LogicValidator for this project's PDG and storage.
@@ -815,7 +960,7 @@ impl LeIndex {
         let storage = crate::storage::schema::Storage::open(&db_path).ok()?;
 
         Some(crate::validation::LogicValidator::new(
-            std::sync::Arc::new(pdg.clone()),
+            std::sync::Arc::clone(pdg),
             // Storage wraps rusqlite::Connection which is not Sync;
             // Arc is required by the LogicValidator interface for shared ownership.
             #[allow(clippy::arc_with_non_send_sync)]
@@ -826,6 +971,18 @@ impl LeIndex {
     /// Ensure the PDG is loaded from storage (deferred load on first use).
     pub fn ensure_pdg_loaded(&mut self) -> Result<()> {
         if self.pdg.is_none() {
+            // WS4 Task 14: when the generation-read path is enabled, load the
+            // PDG (and search engine) from the leased mmap generation instead.
+            match self.try_hydrate_from_generation() {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        "Generation read path unavailable ({}); falling back to legacy load",
+                        e
+                    );
+                }
+            }
             let has_content = self.active_has_indexed_files();
             if has_content {
                 crate::cli::mcp::request_meta::PDG_LOADS
@@ -845,14 +1002,107 @@ impl LeIndex {
         Ok(())
     }
 
+    /// Ensure ONLY the PDG is loaded — never the search engine.
+    ///
+    /// Graph-only tools (read-symbol relations, symbol-lookup, project-map)
+    /// traverse the graph but never query TF-IDF/neural vectors; hydrating
+    /// the snapshot + embedding mmaps + index structures for them was ~1s of
+    /// pure added latency per cold call. Falls back to the plain DB
+    /// `load_pdg_from_active_storage` when the generation-read path is unavailable
+    /// (legacy layout); it reads the published generation, never the mutable root.
+    pub fn ensure_pdg_loaded_graph_only(&mut self) -> Result<()> {
+        if self.pdg.is_some() {
+            return Ok(());
+        }
+        match self.try_hydrate_generation_pdg_only() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    "Generation read path unavailable ({}); falling back to legacy PDG-only load",
+                    e
+                );
+            }
+        }
+        let has_content = self.active_has_indexed_files();
+        if has_content {
+            // An empty/unindexed graph surfaces as pdg=None here; callers
+            // already report "not loaded" semantics for that.
+            let _ = self.load_pdg_from_active_storage();
+        }
+        Ok(())
+    }
+
+    /// A new search engine carrying the documented `[search]` knobs:
+    /// `neural_weight`, the fragment layer master switch and its fusion weight.
+    pub(crate) fn configured_search_engine() -> SearchEngine {
+        let mut search_engine = SearchEngine::new();
+        let cfg = crate::config::LeIndexConfig::load_cached();
+        search_engine.set_neural_weight(cfg.neural_weight_f32());
+        search_engine.set_fragment_index_enabled(cfg.search.fragment_index_enabled);
+        search_engine.set_fragment_weight(cfg.search.fragment_weight as f32);
+        search_engine
+    }
+
+    /// Whether this instance already holds what `full` (graph + search engine)
+    /// or graph-only tools need.
+    pub(crate) fn is_hydrated(&self, full: bool) -> bool {
+        self.pdg.is_some() && (!full || !self.search_engine.is_empty())
+    }
+
+    /// Take over hydrated state built off-lock by `other` (a sibling instance
+    /// of the same project).
+    ///
+    /// Building the graph and search engine takes up to a second; doing it on
+    /// the instance that lives behind the per-project lock stalls every other
+    /// call for that long. Callers build a detached instance instead and swap
+    /// its state in here, which is a handful of pointer moves. Returns `false`
+    /// (leaving `self` untouched) when `self` was hydrated in the meantime or
+    /// `other` did not produce what was asked for.
+    pub(crate) fn adopt_hydration(&mut self, mut other: LeIndex, full: bool) -> bool {
+        if self.is_hydrated(full) || !other.is_hydrated(full) {
+            return false;
+        }
+        self.pdg = other.pdg.take();
+        self.stats.pdg_nodes = other.stats.pdg_nodes;
+        self.stats.pdg_edges = other.stats.pdg_edges;
+        self.generation_snapshot = other.generation_snapshot.take();
+        self.hydrated_generation.store(
+            other
+                .hydrated_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            std::sync::atomic::Ordering::Release,
+        );
+        if full {
+            self.search_engine = std::mem::take(&mut other.search_engine);
+            self.embedder = other.embedder.take();
+            self.stats = other.stats.clone();
+            self.cache.file_stats_cache = other.cache.file_stats_cache.take();
+        }
+        true
+    }
+
     /// Ensure the searchable context is ready for deep analysis / context tools.
     ///
     /// This loads the PDG if needed and performs a focused refresh when the
     /// in-memory search index is empty but indexed files already exist.
     pub fn ensure_analysis_context_loaded(&mut self) -> Result<()> {
+        // WS4 Task 14: prefer the generation read path when enabled. It
+        // hydrates both the PDG and the search engine in one shot, so the
+        // legacy load only runs when the flag is off or no generation exists.
+        match self.try_hydrate_from_generation() {
+            Ok(true) if self.pdg.is_some() && !self.search_engine.is_empty() => return Ok(()),
+            Ok(true) | Ok(false) => {}
+            Err(e) => warn!(
+                "Generation read path unavailable ({}); falling back to legacy load",
+                e
+            ),
+        }
         self.ensure_pdg_loaded()?;
         if self.search_engine.is_empty() && self.active_has_indexed_files() {
-            self.load_from_storage()?;
+            // The graph may already be resident (graph-only tool, prewarm):
+            // hydrate just the engine on top of it rather than reloading both.
+            self.hydrate_search_engine_from_loaded_pdg()?;
         }
         Ok(())
     }
@@ -884,7 +1134,11 @@ impl LeIndex {
     /// Check if the project has been indexed.
     #[inline]
     pub fn is_indexed(&self) -> bool {
-        self.search_engine.node_count() > 0
+        // Persisted-stats truth, NOT the resident search engine: hydration
+        // is lazy (graph-only tools never populate the engine), and keying
+        // this on the engine would make every lazily-loaded project look
+        // unindexed and trigger pointless auto-reindexes.
+        self.stats.indexed_nodes > 0
     }
 
     /// Close the LeIndex and ensure WAL is checkpointed.
@@ -938,8 +1192,7 @@ impl LeIndex {
     /// Reload vector index from PDG.
     pub fn reload_vector_from_pdg(&mut self) -> Result<usize> {
         let pdg = self
-            .pdg
-            .take()
+            .take_owned_pdg()
             .ok_or_else(|| anyhow::anyhow!("No PDG available for vector rebuild"))?;
 
         let batch_size = self.indexing_batch_size();
@@ -951,7 +1204,7 @@ impl LeIndex {
         )?);
         let indexed_count = self.search_engine.node_count();
 
-        self.pdg = Some(pdg);
+        self.pdg = Some(std::sync::Arc::new(pdg));
         self.build_file_stats_cache();
 
         info!("Rebuilt vector index from PDG: {} nodes", indexed_count);

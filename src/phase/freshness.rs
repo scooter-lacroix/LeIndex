@@ -55,6 +55,11 @@ pub fn compute_freshness(
     let deleted_files = indexed_by_normalized
         .iter()
         .filter(|(normalized, _)| !current_set.contains(*normalized))
+        // Absent from this run's inventory is not the same as deleted: the
+        // inventory is limited to the languages, focus and file cap of the
+        // run, while the store also holds files the indexer tracks that the
+        // run never looks at. Only a file that is really gone counts.
+        .filter(|(normalized, _)| !root.join(normalized).exists())
         .map(|(_, (original_key, _))| original_key.clone())
         .collect::<Vec<_>>();
 
@@ -122,5 +127,27 @@ mod tests {
         let freshness = compute_freshness(root, vec![(file, hash)], &indexed).expect("freshness");
         assert!(freshness.changed_files.is_empty());
         assert!(freshness.deleted_files.is_empty());
+    }
+
+    #[test]
+    fn test_freshness_only_counts_really_removed_files_as_deleted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("docs")).expect("mkdir");
+        let kept = root.join("src/lib.rs");
+        std::fs::create_dir_all(kept.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&kept, "pub fn x(){}\n").expect("write");
+        // Tracked by the store but outside this run's inventory (e.g. a doc the
+        // phase language list never collects): still on disk, so not deleted.
+        std::fs::write(root.join("docs/guide.md"), "# guide\n").expect("write");
+
+        let hash = blake3::hash(b"pub fn x(){}\n").to_hex().to_string();
+        let mut indexed = HashMap::new();
+        indexed.insert("src/lib.rs".to_string(), hash.clone());
+        indexed.insert("docs/guide.md".to_string(), "h".to_string());
+        indexed.insert("src/gone.rs".to_string(), "h".to_string());
+
+        let freshness = compute_freshness(root, vec![(kept, hash)], &indexed).expect("freshness");
+        assert_eq!(freshness.deleted_files, vec!["src/gone.rs".to_string()]);
     }
 }

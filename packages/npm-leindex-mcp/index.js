@@ -15,7 +15,9 @@ const fs = require('fs');
 const BIN_DIR = path.join(__dirname, 'bin');
 const LIB_DIR = path.join(__dirname, 'lib');
 const binaryName = process.platform === 'win32' ? 'leindex.exe' : 'leindex';
-const workerBinaryName = process.platform === 'win32' ? 'leindex-embed.exe' : 'leindex-embed';
+// Single binary (2026-08-20): worker mode is built into leindex; the worker
+// path aliases the main binary for any residual consumers.
+const workerBinaryName = binaryName;
 const binaryPath = path.join(BIN_DIR, binaryName);
 const workerBinaryPath = path.join(BIN_DIR, workerBinaryName);
 

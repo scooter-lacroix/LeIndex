@@ -41,7 +41,7 @@ Add to your Claude Code MCP configuration:
 ```
 
 Optional guidance pack:
-- Shared skill: `integrations/skills/leindex-toolkit/`
+- Shared skill: `integrations/skills/leindex-code-intelligence/`
 - Reminder hook example: `integrations/claude-code/settings.example.json`
 
 ### Cursor
@@ -80,123 +80,81 @@ Add to Windsurf MCP configuration:
 
 ## Available MCP Tools
 
-### leindex_index
+LeIndex advertises **four** tools. A discriminator argument (`mode` for explore
+and analyze, `action` for edit and manage) picks the operation and every other
+argument is forwarded to it, which keeps the tool list small enough for every
+client below and leaves the model one decision per call. `tools/list` returns a
+flat union schema by default (some LLM APIs reject a top-level `oneOf`);
+`LEINDEX_MCP_SCHEMA=oneof` switches to per-branch `oneOf` schemas, and
+`leindex tools schema <tool>` prints that form. The per-branch argument
+reference is the `leindex://tools/guide` resource.
 
-Index a project for code search.
+| Tool | Discriminator | Operations |
+|------|---------------|------------|
+| `leindex_explore` | `mode` | `search` (by meaning), `find` (exact text / regex / symbol names, any path), `symbol_lookup`, `read_file`, `read_symbol`, `project_map`, `file_summary`, `context` |
+| `leindex_analyze` | `mode` | `deep`, `impact`, `diagnostics`, `git_status`, `git_diff` |
+| `leindex_edit` | `action` (required) | `preview`, `apply`, `rename`, `write` |
+| `leindex_manage` | `action` | `index`, `phase` |
 
-**Parameters:**
-- `project_path` (string, required): Path to the project directory
-- `config` (object, optional): Override configuration options
+Every tool accepts `tier` (`l0` identity card, `l1` overview, `l2` full).
+The original per-operation names (`leindex_search`, `leindex_deep_analyze`, ...)
+remain callable but are not advertised; `LEINDEX_MCP_LEGACY_TOOLS=1` advertises
+them.
 
-**Example:**
+### leindex_explore
+
+**Common parameters:** `mode`, `project_path` (optional), `tier`.
+
+- `mode=search`: `query` (required), `top_k`, `offset`, `scope`, `search_mode`.
+- `mode=find`: `pattern` (required), `regex`, `word`, `case`, `target`
+  (`text` | `symbols` | `auto`), `output` (`matches` | `files` | `count` |
+  `symbols`), `scope`, `paths` (extra files or directories anywhere on disk; no
+  index needed), `include_globs`, `exclude_globs`, `context_lines`, `limit`
+  (`0` = unbounded), `offset`, `per_file_cap`, `timeout_ms`.
+- `mode=symbol_lookup`: `symbol` or `symbols`, `depth`, `include_source`.
+- `mode=read_file`: `file_path` (required), `start_line`, `end_line`, `include_symbol_map`.
+- `mode=read_symbol`: `symbol` (required), `file_path`.
+- `mode=project_map`: `path`, `depth`, `focus`, `group_by`, `sort_by`, `limit`.
+- `mode=file_summary`: `file_path` (required).
+- `mode=context`: `node_id` (required), `token_budget`.
+
 ```json
-{
-  "project_path": "/home/user/my-project",
-  "config": {
-    "memory": {
-      "total_budget_mb": 2048
-    }
-  }
-}
+{ "name": "leindex_explore", "arguments": { "mode": "find", "pattern": "handle_request", "output": "files" } }
 ```
 
-**Returns:** Indexing status and statistics
+### leindex_analyze
 
----
+- `mode=deep`: `query` (required), `token_budget`.
+- `mode=impact`: `symbol` (required), `change_type`, `depth`.
+- `mode=diagnostics`: index health, sizes, cache and memory statistics.
+- `mode=git_status`: repository state enriched with structural impact.
+- `mode=git_diff`: `ref`, `range`, `staged`, `scope`, `stat_only`,
+  `include_patch`; changed hunks mapped to symbols, callers and affected files.
 
-### leindex_search
+### leindex_edit
 
-Perform semantic code search.
+`action` is required (an ambiguous call must not guess at a mutation).
 
-**Parameters:**
-- `query` (string, required): Search query
-- `project_path` (string, optional): Limit search to specific project
-- `file_patterns` (array, optional): Filter by file patterns (e.g., `["*.py"]`)
-- `exclude_patterns` (array, optional): Exclude file patterns
-- `limit` (integer, optional): Maximum results (default: 10)
+- `action=preview`: `file_path`, `old_text`, `new_text` (or `changes`); returns a `preview_token`.
+- `action=apply`: same arguments, or `preview_token`; `dry_run`.
+- `action=rename`: `old_name`, `new_name`, `scope`, `preview_only` (default `true`).
+- `action=write`: `file_path`, `content`.
 
-**Example:**
-```json
-{
-  "query": "database connection handling",
-  "file_patterns": ["*.rs", "*.toml"],
-  "limit": 20
-}
-```
+### leindex_manage
 
-**Returns:** Search results with file paths, line numbers, and relevance scores
-
----
-
-### leindex_deep_analyze
-
-Perform deep code analysis with PDG (Program Dependence Graph).
-
-**Parameters:**
-- `file_path` (string, required): Path to the file to analyze
-- `symbol_name` (string, optional): Specific symbol/function to analyze
-
-**Example:**
-```json
-{
-  "file_path": "/home/user/project/src/main.rs",
-  "symbol_name": "process_request"
-}
-```
-
-**Returns:** Analysis results including:
-- Function dependencies
-- Data flow information
-- Control flow graph
-- Related symbols
-
----
-
-### leindex_context
-
-Expand context around a code location.
-
-**Parameters:**
-- `file_path` (string, required): Path to the file
-- `line_number` (integer, required): Line number
-- `context_lines` (integer, optional): Number of context lines (default: 10)
-
-**Example:**
-```json
-{
-  "file_path": "/home/user/project/src/lib.rs",
-  "line_number": 42,
-  "context_lines": 20
-}
-```
-
-**Returns:** Context window with surrounding code
-
----
-
-### leindex_diagnostics
-
-Get system health and diagnostic information.
-
-**Parameters:** None
-
-**Returns:** System status including:
-- LeIndex version
-- Memory usage
-- Indexed projects
-- Parser status
-- Performance metrics
+- `action=index`: `project_path` (required), `force_reindex`, `wait`. Returns a pollable job unless `wait=true`.
+- `action=phase`: 5-phase architecture analysis: `phase`, `mode`, `path`, `include_docs`.
 
 ---
 
 ## Tool Compatibility Matrix
 
-| AI Tool | leindex_index | leindex_search | leindex_deep_analyze | leindex_context | leindex_diagnostics |
-|---------|---------------|----------------|----------------------|-----------------|---------------------|
-| **Claude Code** | ✅ Verified | ✅ Verified | ✅ Verified | ✅ Verified | ✅ Verified |
-| **Cursor** | ✅ Verified | ✅ Verified | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending |
-| **Windsurf** | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending |
-| **Cline** | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending |
+| AI Tool | leindex_explore | leindex_analyze | leindex_edit | leindex_manage |
+|---------|-----------------|-----------------|--------------|----------------|
+| **Claude Code** | ✅ Verified | ✅ Verified | ✅ Verified | ✅ Verified |
+| **Cursor** | ✅ Verified | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending |
+| **Windsurf** | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending |
+| **Cline** | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending |
 
 **Legend:**
 - ✅ Verified - Tested and confirmed working
@@ -212,64 +170,61 @@ Get system health and diagnostic information.
 
 ```json
 {
-  "tool": "leindex_search",
-  "arguments": {
-    "query": "authenticate user token validation",
-    "file_patterns": ["*.rs"]
-  }
+  "name": "leindex_explore",
+  "arguments": { "mode": "search", "query": "authenticate user token validation", "scope": "src" }
 }
 ```
 
-### 2. Analyze Function Dependencies
+### 2. Find Every Use of a Name
 
-**Scenario:** Understand what a function depends on
+**Scenario:** List the files that mention `validate_token`, then read the hits
 
 ```json
 {
-  "tool": "leindex_deep_analyze",
-  "arguments": {
-    "file_path": "/project/src/auth.rs",
-    "symbol_name": "validate_token"
-  }
+  "name": "leindex_explore",
+  "arguments": { "mode": "find", "pattern": "validate_token", "word": true, "output": "files" }
 }
 ```
 
-### 3. Get Context for a Bug
+To search a directory that is not part of the project, add `"paths": ["/other/dir"]`; no index is built.
 
-**Scenario:** Get surrounding code for a line number
+### 3. Analyze a Function's Dependencies
+
+**Scenario:** Understand what a function depends on and what depends on it
 
 ```json
 {
-  "tool": "leindex_context",
-  "arguments": {
-    "file_path": "/project/src/database.rs",
-    "line_number": 156,
-    "context_lines": 30
-  }
+  "name": "leindex_analyze",
+  "arguments": { "mode": "deep", "query": "validate_token" }
 }
 ```
 
-### 4. Index New Project
-
-**Scenario:** Index a project for AI assistant
+### 4. Check the Blast Radius of a Change
 
 ```json
 {
-  "tool": "leindex_index",
-  "arguments": {
-    "project_path": "/home/user/new-project"
-  }
+  "name": "leindex_analyze",
+  "arguments": { "mode": "impact", "symbol": "validate_token" }
 }
 ```
 
-### 5. Check System Health
+### 5. Index a Project
 
-**Scenario:** Verify LeIndex is working
+**Scenario:** Force a refresh (first use indexes automatically)
 
 ```json
 {
-  "tool": "leindex_diagnostics",
-  "arguments": {}
+  "name": "leindex_manage",
+  "arguments": { "action": "index", "project_path": "/home/user/new-project", "force_reindex": true }
+}
+```
+
+### 6. Check System Health
+
+```json
+{
+  "name": "leindex_analyze",
+  "arguments": { "mode": "diagnostics" }
 }
 ```
 
@@ -372,6 +327,9 @@ export LEINDEX_HOME=/custom/leindex
 # Custom log level
 export RUST_LOG=debug
 
+# Opt in to the Engram query-embedding phrase-book (docs/MCP.md)
+export LEINDEX_FEATURE_ENGRAM=1
+
 # Custom memory budget
 export LEINDEX_MEMORY_MB=4096
 ```
@@ -382,13 +340,13 @@ export LEINDEX_MEMORY_MB=4096
 
 The MCP tool names have changed:
 
-| Python v2.0.2 | Rust v0.1.0 | Notes |
-|---------------|-------------|-------|
-| `manage_project` | `leindex_index` | Same functionality |
-| `search_content` | `leindex_search` | Same functionality |
-| `get_diagnostics` | `leindex_diagnostics` | Same functionality |
-| N/A | `leindex_deep_analyze` | **NEW** - PDG analysis |
-| N/A | `leindex_context` | **NEW** - Context expansion |
+| Python v2.0.2 | Rust v2.0 | Notes |
+|---------------|-----------|-------|
+| `manage_project` | `leindex_manage` `action=index` | Same functionality |
+| `search_content` | `leindex_explore` `mode=search` / `mode=find` | Semantic search; exact text and regex via `find` |
+| `get_diagnostics` | `leindex_analyze` `mode=diagnostics` | Same functionality |
+| N/A | `leindex_analyze` `mode=deep` | **NEW** - PDG analysis |
+| N/A | `leindex_explore` `mode=context` | **NEW** - Context expansion |
 
 **Configuration:** No changes needed - binary name is still `leindex`
 

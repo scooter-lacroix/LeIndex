@@ -168,6 +168,59 @@ fn run_reindex(handle: ProjectHandle) -> ReindexOutcome {
     }));
     match reindex_result {
         Ok(Ok(_)) => ReindexOutcome::Completed,
+        Ok(Err(e)) if e.is::<crate::cli::leindex::indexing::watcher_delta::NotHydratedError>() => {
+            // No resident PDG: the incremental path can never succeed for
+            // this state, so retrying it on every tick would loop forever.
+            // Escalate ONCE, under the project write guard we still hold, to
+            // the full index — the path that hydrates the resident graph —
+            // and only report failure if that also errors.
+            warn!("Auto-reindex skipped ({}); escalating to a full index", e);
+            // Release the cross-process flock first: `index_project` acquires
+            // the same `index.lock` through a freshly opened descriptor, and
+            // flock(2) locks live on the open file description — a second
+            // descriptor's blocking acquisition never completes while this
+            // task holds one, which would park this spawn_blocking (and the
+            // project write guard with it) forever.
+            drop(_flock);
+            // A blocking acquire with a peer mid-index would park this
+            // spawn_blocking for the peer's whole run (and with it the
+            // watcher's `reindex_active` flag), so probe first: a peer that
+            // holds the lock is publishing a fresh index that makes the
+            // escalation redundant — skip, and the next debounce tick sees
+            // the hydrated state. The probe-then-escalate window is not
+            // airtight (a peer can grab the lock between the probe and
+            // `index_project`'s own acquire); in that residual race the
+            // escalation blocks for the peer's run — bounded, rare, and the
+            // same behavior a forced index documents.
+            match idx.try_acquire_write_lock() {
+                Ok(Some(_probe)) => {}
+                Ok(None) => {
+                    warn!(
+                        "Full-index escalation skipped: another process is indexing this project"
+                    );
+                    return ReindexOutcome::Skipped;
+                }
+                Err(e) => return ReindexOutcome::Failed(format!("write-lock probe: {e}")),
+            }
+            let full_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| idx.index_project(true)));
+            match full_result {
+                Ok(Ok(_)) => ReindexOutcome::Completed,
+                Ok(Err(full_err)) => {
+                    warn!("Full-index escalation failed: {}", full_err);
+                    ReindexOutcome::Failed(full_err.to_string())
+                }
+                Err(panic_payload) => {
+                    let msg = panic_payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_string());
+                    warn!("Full-index escalation panicked: {}", msg);
+                    ReindexOutcome::Failed(format!("panic: {}", msg))
+                }
+            }
+        }
         Ok(Err(e)) => {
             warn!("Auto-reindex failed: {}", e);
             ReindexOutcome::Failed(e.to_string())

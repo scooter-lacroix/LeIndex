@@ -6,7 +6,7 @@
 use super::handlers::{ToolHandler, all_tool_handlers};
 use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use super::request_meta::{collect_request_timings, elapsed_ms};
-use crate::cli::registry::ProjectRegistry;
+use crate::cli::registry::{Hydration, ProjectRegistry};
 use anyhow::Context;
 use axum::{
     Router,
@@ -31,20 +31,6 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
-
-#[cfg(unix)]
-const SOCKET_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-#[cfg(unix)]
-const INITIAL_SOCKET_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
-#[cfg(unix)]
-fn socket_read_timeout(first_frame: bool) -> std::time::Duration {
-    if first_frame {
-        INITIAL_SOCKET_READ_TIMEOUT
-    } else {
-        SOCKET_READ_TIMEOUT
-    }
-}
 
 /// Global server state — multi-project registry.
 ///
@@ -740,6 +726,7 @@ pub async fn index_with_progress(
 fn handle_initialize(server: &McpServer) -> (Value, Option<String>) {
     // Generate a session ID for HTTP transport
     let session_id = generate_session_id();
+    server._registry.spawn_prewarm();
 
     // Store in per-session map with eviction logic
     {
@@ -982,6 +969,25 @@ pub async fn handle_tool_call(
 }
 
 /// Handle a tool call with a transport timestamp captured at message receipt.
+/// What a tool needs resident before its handler runs (see
+/// [`ProjectRegistry::ensure_hydrated`]).
+pub(crate) fn hydration_for_tool(canonical_name: &str) -> Hydration {
+    match canonical_name {
+        "leindex_search" | "leindex_deep_analyze" | "leindex_context" => Hydration::Full,
+        "leindex_symbol_lookup"
+        | "leindex_project_map"
+        | "leindex_read_symbol"
+        | "leindex_impact_analysis"
+        | "leindex_edit_preview"
+        | "leindex_edit_apply"
+        | "leindex_rename_symbol"
+        | "leindex_git_status"
+        | "leindex_git_diff"
+        | "leindex_phase_analysis" => Hydration::Graph,
+        _ => Hydration::None,
+    }
+}
+
 async fn handle_tool_call_timed(
     registry: &Arc<ProjectRegistry>,
     handlers: &[ToolHandler],
@@ -993,15 +999,52 @@ async fn handle_tool_call_timed(
     let tool_call = req.extract_tool_call()?;
     debug!("Tool call: name={}", tool_call.name);
 
-    let handler = handlers
+    // Tool names are canonicalized to underscore form (`leindex_edit_apply`).
+    // Historical dotted/dashed spellings (`leindex.edit-apply`) resolve to
+    // the same handler: several MCP client implementations mishandle dots in
+    // tool names, and this dispatch was previously the one place that
+    // bypassed the shared normalizer (so legacy configs keep working).
+    //
+    // The four public tools (`leindex_index|search|analyze|edit`) select their
+    // underlying handler with `action`; resolve that first so rendering and
+    // trimming below are keyed by the real tool.
+    let (resolved_name, mut resolved_args) =
+        match crate::cli::mcp::grouped::resolve_call(&tool_call.name, tool_call.arguments) {
+            Ok(resolved) => resolved,
+            Err(error) => return Ok(tool_error_result(&error, None)),
+        };
+    let tier = match crate::cli::mcp::tier::Tier::take_from(&mut resolved_args) {
+        Ok(tier) => tier,
+        Err(error) => return Ok(tool_error_result(&error, None)),
+    };
+    let canonical_name = crate::cli::mcp::output::normalize_tool_name(&resolved_name);
+    let tool_call = super::protocol::ToolCallParams {
+        name: resolved_name,
+        arguments: resolved_args,
+    };
+    let Some(handler) = handlers
         .iter()
-        .find(|h| h.name() == tool_call.name)
-        .ok_or_else(|| JsonRpcError::method_not_found(tool_call.name.clone()))?;
+        .find(|h| crate::cli::mcp::output::normalize_tool_name(h.name()) == canonical_name)
+    else {
+        return Ok(tool_error_result(
+            &crate::cli::mcp::grouped::suggest_unknown_tool(&tool_call.name),
+            None,
+        ));
+    };
 
     // Clone arguments before moving them into execute (we need them
     // for render_tool_output_plain which needs the original args).
     let call_args = tool_call.arguments.clone();
-    let call_name = tool_call.name.clone();
+    let call_name = canonical_name;
+
+    // Load the graph / search engine off the project lock so this call (and
+    // every other one queued behind it) is not frozen while it builds.
+    registry
+        .ensure_hydrated(
+            call_args.get("project_path").and_then(Value::as_str),
+            hydration_for_tool(&call_name),
+        )
+        .await;
 
     // Execute the tool and wrap the result in standard MCP content format
     let (handler_result, mut timings) =
@@ -1023,6 +1066,14 @@ async fn handle_tool_call_timed(
 
     match handler_result {
         Ok(mut value) => {
+            // A tool that just changed files under a project must not leave
+            // the text search believing they are unchanged.
+            if matches!(
+                call_name.as_str(),
+                "leindex_write" | "leindex_edit_apply" | "leindex_rename_symbol"
+            ) {
+                crate::search::textsearch::invalidate_freshness(std::path::Path::new("/"));
+            }
             if let Some((server, session_id)) = advisory {
                 server.apply_freshness_advisory(
                     session_id,
@@ -1040,14 +1091,27 @@ async fn handle_tool_call_timed(
             // The CLI surface uses `render_tool_output` (colored); the
             // MCP transport uses the same render functions but without
             // ANSI codes so the LLM sees clean text.
-            let rendered =
-                crate::cli::mcp::output::render_tool_output_plain(&call_name, &trimmed, &call_args);
-            let is_substantive = rendered.trim().lines().count() > 1 || rendered.trim().len() > 80;
-            let payload = if is_substantive {
-                rendered
-            } else {
-                serde_json::to_string_pretty(&trimmed)
-                    .unwrap_or_else(|_| "Error serializing result".to_string())
+            let payload = match tier {
+                // Identity card: a few lines regardless of result size.
+                crate::cli::mcp::tier::Tier::L0 => {
+                    crate::cli::mcp::tier::identity_card(&call_name, &trimmed)
+                }
+                // Full detail: the complete, untrimmed handler result.
+                crate::cli::mcp::tier::Tier::L2 => serde_json::to_string_pretty(&value)
+                    .unwrap_or_else(|_| "Error serializing result".to_string()),
+                crate::cli::mcp::tier::Tier::L1 => {
+                    let rendered = crate::cli::mcp::output::render_tool_output_plain(
+                        &call_name, &trimmed, &call_args,
+                    );
+                    let is_substantive =
+                        rendered.trim().lines().count() > 1 || rendered.trim().len() > 80;
+                    if is_substantive {
+                        rendered
+                    } else {
+                        serde_json::to_string_pretty(&trimmed)
+                            .unwrap_or_else(|_| "Error serializing result".to_string())
+                    }
+                }
             };
             Ok(serde_json::json!({
                 "content": [
@@ -1067,7 +1131,7 @@ async fn handle_tool_call_timed(
                 "content": [
                     {
                         "type": "text",
-                        "text": format!("Error: {}", e)
+                        "text": format!("Error: {}", e.message_with_hint())
                     }
                 ],
                 "isError": true,
@@ -1077,20 +1141,30 @@ async fn handle_tool_call_timed(
     }
 }
 
-/// List tools as JSON
-pub fn list_tools_json(handlers: &[ToolHandler]) -> Value {
-    let tools: Vec<_> = handlers
-        .iter()
-        .map(|handler| {
-            serde_json::json!({
-                "name": handler.name(),
-                "description": handler.description(),
-                "inputSchema": handler.argument_schema()
-            })
-        })
-        .collect();
+/// A tool-level failure as MCP content (`isError: true`), with the remediation
+/// hint inlined: models read `content`, not JSON-RPC `error.data`.
+fn tool_error_result(
+    error: &JsonRpcError,
+    timings: Option<&super::request_meta::PhaseTimings>,
+) -> Value {
+    let mut result = serde_json::json!({
+        "content": [{ "type": "text", "text": format!("Error: {}", error.message_with_hint()) }],
+        "isError": true,
+    });
+    if let Some(timings) = timings {
+        result["_meta"] = serde_json::json!({ "timings": timings });
+    }
+    result
+}
 
-    serde_json::json!({ "tools": tools })
+/// List the public tool surface as JSON.
+///
+/// Four grouped tools are advertised (`leindex_index`, `leindex_search`,
+/// `leindex_analyze`, `leindex_edit`), each selecting its operation with an
+/// `action` argument. The individual per-operation tools remain callable by
+/// name; set `LEINDEX_MCP_LEGACY_TOOLS=1` to advertise them too.
+pub fn list_tools_json(handlers: &[ToolHandler]) -> Value {
+    serde_json::json!({ "tools": crate::cli::mcp::grouped::public_tools_json(handlers) })
 }
 
 /// List tools handler
@@ -1210,11 +1284,18 @@ impl McpServer {
     /// `idle_clock` tracks process-level activity for the D-1 idle self-exit;
     /// `idle_timeout` is the quiet window after which the process exits 0
     /// (`None` = disabled via `--mcp-idle-timeout-secs 0`).
+    ///
+    /// `post_bind` is invoked after the socket is successfully bound but
+    /// before the accept loop begins. The daemon binary (`leindexd`) uses
+    /// this to publish the endpoint sidecar so clients discover the daemon
+    /// only after the socket is actually listening (spec §4.2 post-bind
+    /// callback pattern).
     pub async fn run_socket(
         &self,
         socket_path: &std::path::Path,
         idle_clock: ProcessIdleClock,
         idle_timeout: Option<std::time::Duration>,
+        post_bind: Option<&(dyn Fn(&std::path::Path) + Send + Sync)>,
     ) -> anyhow::Result<()> {
         use tokio::net::UnixListener;
 
@@ -1239,6 +1320,16 @@ impl McpServer {
             "MCP server listening on Unix socket: {}",
             socket_path.display()
         );
+
+        if let Some(registry) = SERVER_STATE.get() {
+            registry.disable_default_prewarm();
+        }
+
+        // Post-bind callback: the daemon writes its endpoint sidecar here so
+        // clients discover it only after the socket is actually live.
+        if let Some(cb) = post_bind {
+            cb(socket_path);
+        }
 
         // D-1/D-2 (memory-pressure remediation): a per-second tick enforces the
         // process-level idle self-exit; a 60-second sweep evicts loaded project
@@ -1283,7 +1374,10 @@ impl McpServer {
                     }
                 }
                 _ = idle_ticker.tick() => {
-                    if idle_exit_due(idle_clock.idle_duration(), idle_timeout) {
+                    // Attached clients keep the daemon alive however quiet they are.
+                    if daemon_conn::attached_clients().load(Ordering::Acquire) == 0
+                        && idle_exit_due(idle_clock.idle_duration(), idle_timeout)
+                    {
                         info!(
                             "MCP socket server idle for {idle_timeout:?}; exiting (D-1 memory-pressure idle exit)"
                         );
@@ -1334,144 +1428,12 @@ async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 #[cfg(unix)]
-#[derive(Debug)]
-enum SocketFrame {
-    Message {
-        payload: String,
-        content_length: bool,
-    },
-    Error {
-        response: String,
-        content_length: bool,
-    },
-}
-
-#[cfg(unix)]
-async fn read_socket_frame<R>(
-    reader: &mut R,
-    session_id: &str,
-    first_frame: bool,
-) -> Option<SocketFrame>
-where
-    R: tokio::io::AsyncBufRead + tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-    const MAX_LINE_LENGTH: usize = 10_240;
-    const MAX_PAYLOAD_SIZE: usize = 10_485_760;
-    let line_timeout = socket_read_timeout(first_frame);
-
-    let line = match tokio::time::timeout(line_timeout, read_bounded_line(reader, MAX_PAYLOAD_SIZE))
-        .await
-    {
-        Ok(Ok(Some(line))) => line,
-        Ok(Ok(None)) => return None,
-        Ok(Err(error)) => {
-            debug!(
-                "Socket read error / line too long (session {}): {}",
-                session_id, error
-            );
-            let error_response = JsonRpcResponse::error(
-                serde_json::Value::Null,
-                JsonRpcError::new(-32600, "request payload exceeds maximum size"),
-            );
-            return serde_json::to_string(&error_response).ok().map(|response| {
-                SocketFrame::Error {
-                    response,
-                    content_length: false,
-                }
-            });
-        }
-        Err(_) => {
-            debug!("Socket read timed out (session {})", session_id);
-            return None;
-        }
-    };
-
-    let line_trim = line.trim_end();
-    if line_trim.is_empty() {
-        return Some(SocketFrame::Message {
-            payload: String::new(),
-            content_length: false,
-        });
-    }
-    if !line_trim
-        .to_ascii_lowercase()
-        .starts_with("content-length:")
-    {
-        return Some(SocketFrame::Message {
-            payload: line_trim.to_string(),
-            content_length: false,
-        });
-    }
-
-    let len_str = line_trim.split(':').nth(1).unwrap_or("").trim();
-    let length = match len_str.parse::<usize>() {
-        Ok(length) => length,
-        Err(error) => {
-            debug!("Invalid Content-Length header: {}", error);
-            let response = JsonRpcResponse::error(
-                serde_json::Value::Null,
-                JsonRpcError::new(-32600, "invalid Content-Length header"),
-            );
-            return serde_json::to_string(&response)
-                .ok()
-                .map(|response| SocketFrame::Error {
-                    response,
-                    content_length: false,
-                });
-        }
-    };
-    if length > MAX_PAYLOAD_SIZE {
-        debug!(
-            "Payload too large (session {}): {} bytes",
-            session_id, length
-        );
-        let response = JsonRpcResponse::error(
-            serde_json::Value::Null,
-            JsonRpcError::new(-32600, "request payload exceeds maximum size"),
-        );
-        return serde_json::to_string(&response)
-            .ok()
-            .map(|response| SocketFrame::Error {
-                response,
-                content_length: true,
-            });
-    }
-
-    loop {
-        let header = match tokio::time::timeout(
-            SOCKET_READ_TIMEOUT,
-            read_bounded_line(reader, MAX_LINE_LENGTH),
-        )
-        .await
-        {
-            Ok(Ok(Some(header))) => header,
-            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return None,
-        };
-        if header.trim().is_empty() {
-            break;
-        }
-    }
-
-    let mut buffer = vec![0u8; length];
-    match tokio::time::timeout(SOCKET_READ_TIMEOUT, reader.read_exact(&mut buffer)).await {
-        Ok(Ok(_)) => Some(SocketFrame::Message {
-            payload: String::from_utf8_lossy(&buffer).into_owned(),
-            content_length: true,
-        }),
-        Ok(Err(error)) => {
-            debug!("Failed to read JSON payload: {}", error);
-            None
-        }
-        Err(_) => {
-            debug!("Socket payload read timed out (session {})", session_id);
-            None
-        }
-    }
-}
-
-#[cfg(unix)]
-async fn write_socket_frame<W>(writer: &mut W, response: &str, content_length: bool) -> bool
+async fn write_socket_frame<W>(
+    writer: &mut W,
+    response: &str,
+    content_length: bool,
+    stall_timeout: std::time::Duration,
+) -> bool
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -1481,7 +1443,29 @@ where
     } else {
         format!("{}\n", response)
     };
-    writer.write_all(message.as_bytes()).await.is_ok() && writer.flush().await.is_ok()
+    // Write in bounded chunks with a per-chunk deadline: the timeout bounds
+    // the time since the last PROGRESS, not the total wall time of the
+    // frame. A slow-but-reading client draining a multi-MB response keeps
+    // resetting the deadline with every completed chunk and stays
+    // connected; a peer that stopped reading parks on a chunk write until
+    // the deadline fires. One total-frame deadline instead would hang up on
+    // legitimate large responses after exactly `stall_timeout` regardless
+    // of progress.
+    const CHUNK_BYTES: usize = 64 * 1024;
+    let bytes = message.as_bytes();
+    for chunk in bytes.chunks(CHUNK_BYTES.max(1)) {
+        let write = async {
+            writer.write_all(chunk).await?;
+            writer.flush().await
+        };
+        match tokio::time::timeout(stall_timeout, write).await {
+            Ok(Ok(())) => {}
+            // Socket error, or the peer stopped reading and the chunk write
+            // outlived the idle deadline: either way, hang up.
+            Ok(Err(_)) | Err(_) => return false,
+        }
+    }
+    true
 }
 
 #[cfg(unix)]
@@ -1492,53 +1476,14 @@ async fn handle_socket_connection(
     handshake_complete: Arc<AtomicBool>,
     idle_clock: ProcessIdleClock,
 ) {
-    use tokio::io::BufReader;
-
-    debug!("Accepted Unix socket connection (session: {})", session_id);
-    idle_clock.touch();
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-
-    let mut first_frame = true;
-    loop {
-        let Some(frame) = read_socket_frame(&mut reader, &session_id, first_frame).await else {
-            break;
-        };
-        first_frame = false;
-        let (json_payload, content_length) = match frame {
-            SocketFrame::Message {
-                payload,
-                content_length,
-            } => (payload, content_length),
-            SocketFrame::Error {
-                response,
-                content_length,
-            } => {
-                let _ = write_socket_frame(&mut writer, &response, content_length).await;
-                break;
-            }
-        };
-        if json_payload.is_empty() {
-            continue;
-        }
-        idle_clock.touch();
-        let Some(response) = handle_socket_message(
-            &json_payload,
-            &session_id,
-            &session_handshakes,
-            &handshake_complete,
-        )
-        .await
-        else {
-            continue;
-        };
-        if !write_socket_frame(&mut writer, &response, content_length).await {
-            break;
-        }
-    }
-
-    session_handshakes.remove(session_id.as_str());
-    debug!("Socket connection closed (session: {})", session_id);
+    daemon_conn::serve(
+        stream,
+        session_id,
+        session_handshakes,
+        handshake_complete,
+        idle_clock,
+    )
+    .await;
 }
 
 /// Handle a single JSON-RPC message received over a Unix socket connection.
@@ -1626,6 +1571,7 @@ async fn handle_socket_message(
                     // Mark session as handshaked
                     handshake_complete.store(true, Ordering::SeqCst);
                     session_handshakes.insert(Arc::<str>::from(session_id), (true, Instant::now()));
+                    state.spawn_prewarm();
 
                     let result = serde_json::json!({
                         "protocolVersion": "2024-11-05",
@@ -1693,6 +1639,10 @@ mod tests;
 
 #[path = "prompts_resources.rs"]
 mod prompts_resources;
+
+#[cfg(unix)]
+#[path = "daemon_conn.rs"]
+mod daemon_conn;
 pub use prompts_resources::{
     Prompt, PromptArgument, PromptContent, PromptMessage, Resource, ResourceContent, get_prompt,
     get_prompts, get_resource, get_resources, handle_prompt_get, handle_resource_read,

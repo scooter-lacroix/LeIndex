@@ -7,7 +7,8 @@ use crate::phase::pdg_utils::merge_pdgs;
 use crate::phase::utils::{collect_files, hash_inventory};
 use crate::storage::{
     pdg_store::{
-        delete_file_data, get_indexed_files, load_pdg, pdg_exists, save_pdg, update_indexed_file,
+        delete_files_data_tx, get_indexed_files, load_pdg, pdg_exists, save_pdg,
+        update_indexed_file, update_indexed_files_tx,
     },
     schema::Storage,
 };
@@ -43,6 +44,17 @@ pub struct PhaseExecutionContext {
     pub docs_summary: Option<DocsSummary>,
     /// Freshness generation hash.
     pub generation_hash: String,
+
+    /// Graph refresh that has not run yet. A run whose phases are all cached
+    /// never needs the graph, so loading it (~0.3 s, plus community and
+    /// storage work) waits for the first cache miss; see [`Self::ensure_graph`].
+    pub(crate) pending_graph: Option<PendingGraph>,
+}
+
+/// Inputs for the deferred graph load/refresh.
+pub(crate) struct PendingGraph {
+    options: PhaseOptions,
+    freshness: FreshnessState,
 }
 
 impl PhaseExecutionContext {
@@ -77,15 +89,117 @@ impl PhaseExecutionContext {
             pdg: ProgramDependenceGraph::new(),
             docs_summary: None,
             generation_hash: freshness.generation_hash.clone(),
+            pending_graph: Some(PendingGraph {
+                options: options.clone(),
+                freshness,
+            }),
         };
-
-        context.load_or_refresh_graph(options, &freshness)?;
 
         if options.include_docs {
             context.docs_summary = Some(analyze_docs(&collected.docs_files)?);
         }
 
         Ok(context)
+    }
+
+    /// Load or refresh the graph if that has not happened yet. Phases call this
+    /// before computing anything; a cached phase result never does.
+    pub fn ensure_graph(&mut self) -> Result<()> {
+        if let Some(PendingGraph { options, freshness }) = self.pending_graph.take() {
+            self.load_or_refresh_graph(&options, &freshness)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "community")]
+    fn compute_and_persist_communities(&mut self) -> Result<()> {
+        if !crate::feature_flags::FeatureFlag::CommunityDetection.is_enabled() {
+            return Ok(());
+        }
+        let stats = crate::storage::community_store::compute_and_persist(
+            &mut self.storage,
+            &self.project_id,
+            &mut self.pdg,
+        )
+        .context("community persistence failed")?;
+        tracing::info!(
+            communities = stats.community_count,
+            quality = stats.quality,
+            recompute_ms = stats.recompute_ms,
+            "community detection complete"
+        );
+        Ok(())
+    }
+
+    #[cfg(not(feature = "community"))]
+    fn compute_and_persist_communities(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "precision")]
+    fn run_precision_ingest(&mut self) {
+        if !crate::feature_flags::FeatureFlag::PrecisionIngest.is_enabled() {
+            return;
+        }
+        let report = crate::intel::run_precision_ingest(&mut self.pdg, &self.root);
+        if report.definitions_seen > 0 || report.relationships_seen > 0 {
+            tracing::info!(
+                definitions_seen = report.definitions_seen,
+                definitions_matched = report.definitions_matched,
+                relationships_upgraded = report.relationships_upgraded,
+                relationships_added = report.relationships_added,
+                "SCIP precision ingest complete"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "precision"))]
+    fn run_precision_ingest(&mut self) {}
+
+    #[cfg(feature = "precision")]
+    fn run_precision_ingest_for(&self, pdg: &mut ProgramDependenceGraph) {
+        if !crate::feature_flags::FeatureFlag::PrecisionIngest.is_enabled() {
+            return;
+        }
+        let report = crate::intel::run_precision_ingest(pdg, &self.root);
+        if report.definitions_seen > 0 || report.relationships_seen > 0 {
+            tracing::info!(
+                definitions_seen = report.definitions_seen,
+                definitions_matched = report.definitions_matched,
+                relationships_upgraded = report.relationships_upgraded,
+                relationships_added = report.relationships_added,
+                "SCIP precision ingest complete"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "precision"))]
+    fn run_precision_ingest_for(&self, _pdg: &mut ProgramDependenceGraph) {}
+
+    fn should_run_precision_ingest(
+        pdg: &ProgramDependenceGraph,
+        freshness: &FreshnessState,
+    ) -> bool {
+        #[cfg(feature = "precision")]
+        {
+            if !crate::feature_flags::FeatureFlag::PrecisionIngest.is_enabled()
+                || !freshness.changed_files.is_empty()
+                || !freshness.deleted_files.is_empty()
+            {
+                return false;
+            }
+
+            // The no-change path still needs one precision pass for legacy or
+            // Tier-0-only persisted graphs. Once SCIP has confirmed at least
+            // one canonical node, the marker set is the cheap durable guard
+            // that prevents launching an external indexer on every request.
+            pdg.precision_symbols.is_empty()
+        }
+        #[cfg(not(feature = "precision"))]
+        {
+            let _ = (pdg, freshness);
+            false
+        }
     }
 
     fn load_or_refresh_graph(
@@ -110,36 +224,22 @@ impl PhaseExecutionContext {
         let source_bytes_map = source_bytes_from_results(&self.root, &self.parse_results);
 
         let mut pdg = ProgramDependenceGraph::new();
-        for (file_path, (language, signatures)) in &self.signatures_by_file {
-            // Use source_bytes from ParsingResult when available, fall back to disk read
-            let source_bytes_fallback = source_bytes_for_file(&self.root, file_path);
-            let source_bytes = source_bytes_map
-                .get(file_path)
-                .map(|s| s.as_slice())
-                .unwrap_or_else(|| source_bytes_fallback.as_slice());
-            let file_pdg =
-                extract_pdg_from_signatures(signatures.clone(), source_bytes, file_path, language);
-            merge_pdgs(&mut pdg, &file_pdg);
-        }
-        crate::phase::pdg_utils::relink_external_import_edges(
+        merge_file_fragments(
+            &self.root,
+            &self.signatures_by_file,
+            &source_bytes_map,
             &mut pdg,
-            &crate::phase::pdg_utils::RelinkConfig::default(),
         );
         self.pdg = pdg;
 
+        self.run_precision_ingest();
         save_pdg(&mut self.storage, &self.project_id, &self.pdg)
             .context("failed saving full PDG for phase analysis")?;
+        relink_for_analysis(&mut self.pdg);
+        self.compute_and_persist_communities()
+            .context("failed persisting communities for phase analysis")?;
 
-        let inventory_hashes = freshness
-            .file_inventory
-            .iter()
-            .map(|(path, hash)| {
-                (
-                    normalize_file_key(&self.root, &path.display().to_string()),
-                    hash.clone(),
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        let inventory_hashes = inventory_hash_map(&self.root, &freshness.file_inventory);
 
         for file_path in self.signatures_by_file.keys() {
             let normalized = normalize_file_key(&self.root, file_path);
@@ -161,88 +261,153 @@ impl PhaseExecutionContext {
     fn refresh_persisted_graph(&mut self, freshness: &FreshnessState) -> Result<()> {
         let mut pdg = load_pdg(&self.storage, &self.project_id)
             .context("failed loading cached PDG for incremental phase run")?;
+        self.hydrate_community_memberships(&mut pdg);
 
+        // Collect all file keys that need deletion (from deleted files +
+        // changed files) so we can batch them in a single transaction.
+        let mut files_to_delete: Vec<String> = Vec::new();
         for path in &freshness.deleted_files {
-            for key in equivalent_file_keys(&self.root, path) {
-                pdg.remove_file(&key);
-                if let Err(e) = delete_file_data(&mut self.storage, &self.project_id, &key) {
-                    warn!(
-                        "Phase context: failed to delete file data for '{}' (deleted file): {}",
-                        key, e
-                    );
-                }
-            }
+            remove_file_fragments(&self.root, path, &mut pdg, &mut files_to_delete);
         }
 
-        let parse_paths = freshness.changed_files.clone();
-        if !parse_paths.is_empty() {
-            self.parse_results = ParallelParser::new().parse_files(parse_paths);
-            self.signatures_by_file = signatures_from_results(&self.root, &self.parse_results);
-            let source_bytes_map = source_bytes_from_results(&self.root, &self.parse_results);
+        if !freshness.changed_files.is_empty() {
+            let source_bytes_map = self.parse_changed_files(freshness);
+            let inventory_hashes = inventory_hash_map(&self.root, &freshness.file_inventory);
 
-            let inventory_hashes = freshness
-                .file_inventory
-                .iter()
-                .map(|(path, hash)| {
-                    (
-                        normalize_file_key(&self.root, &path.display().to_string()),
-                        hash.clone(),
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-
-            for (file_path, (language, signatures)) in &self.signatures_by_file {
-                // Parse succeeded: now safe to replace stale file graph/state.
-                for key in equivalent_file_keys(&self.root, file_path) {
-                    pdg.remove_file(&key);
-                    if let Err(e) = delete_file_data(&mut self.storage, &self.project_id, &key) {
-                        warn!(
-                            "Phase context: failed to delete file data for '{}' (changed file): {}",
-                            key, e
-                        );
-                    }
-                }
-
-                // Use source_bytes from ParsingResult when available, fall back to disk read
-                let source_bytes_fallback = source_bytes_for_file(&self.root, file_path);
-                let source_bytes = source_bytes_map
-                    .get(file_path)
-                    .map(|s| s.as_slice())
-                    .unwrap_or_else(|| source_bytes_fallback.as_slice());
-                let file_pdg = extract_pdg_from_signatures(
-                    signatures.clone(),
-                    source_bytes,
-                    file_path,
-                    language,
-                );
-                merge_pdgs(&mut pdg, &file_pdg);
-
-                let normalized = normalize_file_key(&self.root, file_path);
-                if let Some(hash) = inventory_hashes.get(&normalized) {
-                    if let Err(e) =
-                        update_indexed_file(&mut self.storage, &self.project_id, &normalized, hash)
-                    {
-                        warn!(
-                            "Phase context: failed to update indexed file record for '{}' (incremental): {}",
-                            normalized, e
-                        );
-                    }
-                }
+            // Collect changed file keys for batch deletion.
+            for file_path in self.signatures_by_file.keys() {
+                remove_file_fragments(&self.root, file_path, &mut pdg, &mut files_to_delete);
             }
-        }
 
-        if !freshness.deleted_files.is_empty() || !self.signatures_by_file.is_empty() {
-            crate::phase::pdg_utils::relink_external_import_edges(
+            // Batch-delete all stale file data and update indexed_files in a
+            // single transaction to avoid N x fsync overhead.
+            let file_updates =
+                changed_file_updates(&self.root, &self.signatures_by_file, &inventory_hashes);
+            self.persist_stale_file_updates(&files_to_delete, &file_updates);
+
+            // Build new PDG fragments from parsed results.
+            merge_file_fragments(
+                &self.root,
+                &self.signatures_by_file,
+                &source_bytes_map,
                 &mut pdg,
-                &crate::phase::pdg_utils::RelinkConfig::default(),
             );
-            save_pdg(&mut self.storage, &self.project_id, &pdg)
-                .context("failed saving refreshed PDG")?;
         }
 
-        self.pdg = pdg;
+        let graph_changed =
+            !freshness.deleted_files.is_empty() || !self.signatures_by_file.is_empty();
+        self.persist_refreshed_graph(&mut pdg, freshness, graph_changed)?;
         Ok(())
     }
+
+    /// Hydrate persisted community memberships into a loaded PDG. Failures
+    /// are non-fatal: analysis proceeds without community data.
+    fn hydrate_community_memberships(&self, pdg: &mut ProgramDependenceGraph) {
+        #[cfg(feature = "community")]
+        if let Err(error) = crate::storage::community_store::load_community_memberships(
+            &self.storage,
+            &self.project_id,
+            pdg,
+        ) {
+            warn!(%error, "Phase context: failed to hydrate community memberships");
+        }
+        #[cfg(not(feature = "community"))]
+        let _ = pdg;
+    }
+
+    /// Parse the changed files detected by freshness and store the parse
+    /// results and per-file signatures on the context. Returns the parsed
+    /// source bytes keyed by normalized file path.
+    fn parse_changed_files(&mut self, freshness: &FreshnessState) -> HashMap<String, Vec<u8>> {
+        self.parse_results = ParallelParser::new().parse_files(freshness.changed_files.clone());
+        self.signatures_by_file = signatures_from_results(&self.root, &self.parse_results);
+        source_bytes_from_results(&self.root, &self.parse_results)
+    }
+
+    /// Batch-delete stale file data and update indexed-file records in a
+    /// single transaction to avoid N x fsync overhead. Individual statement
+    /// failures are logged and skipped; the rest of the transaction commits.
+    fn persist_stale_file_updates(
+        &mut self,
+        files_to_delete: &[String],
+        file_updates: &[(String, String)],
+    ) {
+        if files_to_delete.is_empty() && file_updates.is_empty() {
+            return;
+        }
+        let tx = match self.storage.conn_mut().transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                warn!("Phase context: failed to commit batch transaction: {}", e);
+                return;
+            }
+        };
+        if !files_to_delete.is_empty() {
+            if let Err(e) = delete_files_data_tx(&tx, &self.project_id, files_to_delete) {
+                warn!(
+                    "Phase context: failed to batch-delete file data for {} files: {}",
+                    files_to_delete.len(),
+                    e
+                );
+            }
+        }
+        if !file_updates.is_empty() {
+            if let Err(e) = update_indexed_files_tx(&tx, &self.project_id, file_updates) {
+                warn!(
+                    "Phase context: failed to batch-update {} indexed file records: {}",
+                    file_updates.len(),
+                    e
+                );
+            }
+        }
+        if let Err(e) = tx.commit() {
+            warn!("Phase context: failed to commit batch transaction: {}", e);
+        }
+    }
+
+    /// Persist the refreshed PDG (running precision ingest when applicable),
+    /// then install it as the analysis graph.
+    fn persist_refreshed_graph(
+        &mut self,
+        pdg: &mut ProgramDependenceGraph,
+        freshness: &FreshnessState,
+        graph_changed: bool,
+    ) -> Result<()> {
+        if graph_changed {
+            self.run_precision_ingest_for(pdg);
+            save_pdg(&mut self.storage, &self.project_id, pdg)
+                .context("failed saving refreshed PDG")?;
+        } else if Self::should_run_precision_ingest(pdg, freshness) {
+            // A persisted Tier-0 graph can predate precision ingest (or have
+            // no matched markers yet). Allow that opt-in pass to run even when
+            // freshness reports no source delta, then persist its markers.
+            self.run_precision_ingest_for(pdg);
+            save_pdg(&mut self.storage, &self.project_id, pdg)
+                .context("failed saving precision-enriched PDG")?;
+        }
+
+        relink_for_analysis(pdg);
+        self.pdg = std::mem::take(pdg);
+        if graph_changed {
+            self.compute_and_persist_communities()?;
+        }
+        Ok(())
+    }
+}
+
+/// Resolve import edges to internal symbols for the analysis, in memory only.
+///
+/// The persisted graph is shared with the indexer, which keeps unresolved
+/// imports as external placeholder nodes. Saving the resolved form made the
+/// two writers trade thousands of nodes on every alternating run (a phase call
+/// after an index spent ~15 s deleting ~4,000 external nodes, and the next
+/// index re-created them). The analysis sees the resolved graph; storage keeps
+/// the form the indexer wrote.
+fn relink_for_analysis(pdg: &mut ProgramDependenceGraph) {
+    crate::phase::pdg_utils::relink_external_import_edges(
+        pdg,
+        &crate::phase::pdg_utils::RelinkConfig::default(),
+    );
 }
 
 fn signatures_from_results(
@@ -279,6 +444,76 @@ fn source_bytes_from_results(root: &Path, results: &[ParsingResult]) -> HashMap<
             Some((file, result.source_bytes.clone().unwrap_or_default()))
         })
         .collect()
+}
+
+/// Inventory hashes keyed by normalized file path.
+fn inventory_hash_map(
+    root: &Path,
+    file_inventory: &[(PathBuf, String)],
+) -> HashMap<String, String> {
+    file_inventory
+        .iter()
+        .map(|(path, hash)| {
+            (
+                normalize_file_key(root, &path.display().to_string()),
+                hash.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Remove a file's old fragment from the PDG and record every equivalent
+/// key for it in `files_to_delete` (the keys are sorted by
+/// [`equivalent_file_keys`], so removal order is deterministic).
+fn remove_file_fragments(
+    root: &Path,
+    file: &str,
+    pdg: &mut ProgramDependenceGraph,
+    files_to_delete: &mut Vec<String>,
+) {
+    for key in equivalent_file_keys(root, file) {
+        pdg.remove_file(&key);
+        files_to_delete.push(key);
+    }
+}
+
+/// Indexed-file record updates `(path, hash)` for every parsed file that the
+/// current inventory has a hash for.
+fn changed_file_updates(
+    root: &Path,
+    signatures_by_file: &HashMap<String, (String, Vec<SignatureInfo>)>,
+    inventory_hashes: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut file_updates: Vec<(String, String)> = Vec::new();
+    for file_path in signatures_by_file.keys() {
+        let normalized = normalize_file_key(root, file_path);
+        if let Some(hash) = inventory_hashes.get(&normalized) {
+            file_updates.push((normalized.clone(), hash.clone()));
+        }
+    }
+    file_updates
+}
+
+/// Build per-file PDG fragments from the parsed signatures and merge them
+/// into `pdg`. Uses source bytes captured at parse time when available,
+/// falling back to a disk read.
+fn merge_file_fragments(
+    root: &Path,
+    signatures_by_file: &HashMap<String, (String, Vec<SignatureInfo>)>,
+    source_bytes_map: &HashMap<String, Vec<u8>>,
+    pdg: &mut ProgramDependenceGraph,
+) {
+    for (file_path, (language, signatures)) in signatures_by_file {
+        // Use source_bytes from ParsingResult when available, fall back to disk read
+        let source_bytes_fallback = source_bytes_for_file(root, file_path);
+        let source_bytes = source_bytes_map
+            .get(file_path)
+            .map(|s| s.as_slice())
+            .unwrap_or_else(|| source_bytes_fallback.as_slice());
+        let file_pdg =
+            extract_pdg_from_signatures(signatures.clone(), source_bytes, file_path, language);
+        merge_pdgs(pdg, &file_pdg);
+    }
 }
 
 fn project_id(root: &Path) -> String {
@@ -481,6 +716,7 @@ mod tests {
             pdg: ProgramDependenceGraph::new(),
             docs_summary: None,
             generation_hash: "gen".to_string(),
+            pending_graph: None,
         };
 
         let freshness = FreshnessState {
@@ -530,6 +766,7 @@ mod tests {
             pdg: ProgramDependenceGraph::new(),
             docs_summary: None,
             generation_hash: "initial".to_string(),
+            pending_graph: None,
         };
         let initial_freshness = FreshnessState {
             generation_hash: "initial".to_string(),
@@ -579,5 +816,175 @@ mod tests {
                 .map(String::as_str),
             Some("changed-hash")
         );
+    }
+
+    #[cfg(feature = "precision")]
+    #[test]
+    fn test_no_change_precision_trigger_is_gated_by_flag_and_markers() {
+        let freshness = FreshnessState::default();
+        let mut marked = ProgramDependenceGraph::new();
+        marked.mark_precision_symbol("src/main.py:main");
+
+        crate::feature_flags::with_flag_override(
+            crate::feature_flags::FeatureFlag::PrecisionIngest,
+            true,
+            || {
+                assert!(PhaseExecutionContext::should_run_precision_ingest(
+                    &ProgramDependenceGraph::new(),
+                    &freshness
+                ));
+                assert!(!PhaseExecutionContext::should_run_precision_ingest(
+                    &marked, &freshness
+                ));
+            },
+        );
+        crate::feature_flags::with_flag_override(
+            crate::feature_flags::FeatureFlag::PrecisionIngest,
+            false,
+            || {
+                assert!(!PhaseExecutionContext::should_run_precision_ingest(
+                    &ProgramDependenceGraph::new(),
+                    &freshness
+                ));
+            },
+        );
+    }
+
+    #[cfg(all(feature = "precision", unix))]
+    #[test]
+    fn test_no_change_persisted_refresh_runs_precision_ingest() {
+        use protobuf::Message;
+        use scip::types::{self, PositionEncoding, SymbolRole};
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let source = root.join("src/main.py");
+        std::fs::create_dir_all(source.parent().expect("source parent")).expect("mkdir");
+        std::fs::write(&source, "def main():\n    pass\n").expect("write source");
+
+        let mut index = types::Index::new();
+        let mut document = types::Document::new();
+        document.relative_path = "src/main.py".to_string();
+        document.text = "def main():\n    pass\n".to_string();
+        document.position_encoding =
+            protobuf::EnumOrUnknown::new(PositionEncoding::UTF8CodeUnitOffsetFromLineStart);
+        let mut symbol = types::SymbolInformation::new();
+        symbol.symbol = "python test src/main.py/main".to_string();
+        symbol.display_name = "main".to_string();
+        let mut occurrence = types::Occurrence::new();
+        occurrence.symbol = symbol.symbol.clone();
+        occurrence.symbol_roles = SymbolRole::Definition as i32;
+        occurrence.range = vec![0, 4, 0, 8];
+        document.occurrences.push(occurrence);
+        document.symbols.push(symbol);
+        index.documents.push(document);
+        std::fs::write(
+            root.join(".scip-fixture"),
+            index.write_to_bytes().expect("encode SCIP fixture"),
+        )
+        .expect("write SCIP fixture");
+
+        let indexer_dir = tempfile::tempdir().expect("indexer tempdir");
+        let indexer = indexer_dir.path().join("scip-python-fixture.sh");
+        std::fs::write(&indexer, "#!/bin/sh\ncp \"$1/.scip-fixture\" \"$2\"\n")
+            .expect("write indexer fixture");
+        let mut permissions = std::fs::metadata(&indexer)
+            .expect("indexer metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&indexer, permissions).expect("chmod indexer fixture");
+
+        let storage = open_storage(&root).expect("open storage");
+        let project_id = project_id(&root);
+        let mut persisted = ProgramDependenceGraph::new();
+        persisted.add_node(crate::graph::pdg::Node {
+            id: "src/main.py:main".to_string(),
+            node_type: crate::graph::pdg::NodeType::Function,
+            name: "main".to_string(),
+            file_path: Arc::from("src/main.py"),
+            byte_range: (4, 8),
+            complexity: 1,
+            language: "python".to_string(),
+        });
+        let mut storage = storage;
+        save_pdg(&mut storage, &project_id, &persisted).expect("save Tier-0 graph");
+        update_indexed_file(&mut storage, &project_id, "src/main.py", "hash")
+            .expect("save indexed file");
+
+        let mut context = PhaseExecutionContext {
+            root: root.clone(),
+            project_id: project_id.clone(),
+            storage,
+            file_inventory: vec![(source.clone(), "hash".to_string())],
+            changed_files: Vec::new(),
+            deleted_files: Vec::new(),
+            parse_results: Vec::new(),
+            signatures_by_file: HashMap::new(),
+            pdg: ProgramDependenceGraph::new(),
+            docs_summary: None,
+            generation_hash: "same".to_string(),
+            pending_graph: None,
+        };
+        let freshness = FreshnessState {
+            generation_hash: "same".to_string(),
+            file_inventory: vec![(source, "hash".to_string())],
+            changed_files: Vec::new(),
+            deleted_files: Vec::new(),
+        };
+
+        let _flag_guard = crate::feature_flags::lock_flag_tests();
+        crate::feature_flags::set_flag_override_for_test(
+            crate::feature_flags::FeatureFlag::PrecisionIngest,
+            true,
+        );
+        unsafe {
+            std::env::set_var("LEINDEX_SCIP_PYTHON_BIN", &indexer);
+            std::env::set_var("LEINDEX_SCIP_MIN_AVAILABLE_MB", "0");
+            std::env::set_var("LEINDEX_SCIP_TIMEOUT_SECS", "1");
+        }
+        let refresh = context.refresh_persisted_graph(&freshness);
+        unsafe {
+            std::env::remove_var("LEINDEX_SCIP_PYTHON_BIN");
+            std::env::remove_var("LEINDEX_SCIP_MIN_AVAILABLE_MB");
+            std::env::remove_var("LEINDEX_SCIP_TIMEOUT_SECS");
+        }
+        crate::feature_flags::clear_flag_overrides_for_test();
+        refresh.expect("no-change precision refresh");
+
+        assert!(context.pdg.is_precision_symbol("src/main.py:main"));
+        let loaded = load_pdg(&context.storage, &project_id).expect("reload persisted graph");
+        assert!(loaded.is_precision_symbol("src/main.py:main"));
+    }
+    #[test]
+    fn test_prepare_defers_graph_until_first_use() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn alpha() {}\npub fn beta() { alpha() }\n",
+        )
+        .expect("write");
+        let options = PhaseOptions {
+            root: dir.path().to_path_buf(),
+            ..PhaseOptions::default()
+        };
+        let mut context = PhaseExecutionContext::prepare(&options).expect("prepare");
+        assert!(context.pending_graph.is_some());
+        assert_eq!(
+            context.pdg.node_count(),
+            0,
+            "an all-cached run must not pay for the graph"
+        );
+        assert!(
+            !context.file_inventory.is_empty(),
+            "freshness is still computed"
+        );
+
+        context.ensure_graph().expect("ensure graph");
+        assert!(context.pending_graph.is_none());
+        assert!(context.pdg.node_count() > 0);
+        context.ensure_graph().expect("second call is a no-op");
     }
 }

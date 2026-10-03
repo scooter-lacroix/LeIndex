@@ -26,6 +26,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tracing::{info, warn};
 
+mod storage_cleanup;
+use storage_cleanup::*;
+
 const POST_INSTALL_SKIP_ENV: &str = "LEINDEX_SKIP_POST_INSTALL_HOOK";
 const POST_INSTALL_STAR_MARKER: &str = ".github-starred";
 const POST_INSTALL_VERSION_MARKER: &str = ".post-install-version";
@@ -246,6 +249,73 @@ pub enum Commands {
         /// too-old worker/MCP lock, pid, sock, status, start files)
         #[arg(long = "stale-daemons")]
         stale_daemons: bool,
+
+        /// Clean the project's `.leindex/` generation store (Task 7):
+        /// removes orphaned CAS blobs (refcount 0), stale generations
+        /// (not current/previous/leased), abandoned staging, and runs
+        /// embed-cache compaction. NEVER touches leased/current/rollback
+        /// generations (VAL-ROLLOUT-010).
+        #[arg(long = "store")]
+        store: bool,
+    },
+
+    /// Report generation-store retention state (WS4 Task 9)
+    ///
+    /// Prints the read-only retention report for the project's generation
+    /// store: generation count, CAS bytes, job bytes, dedup ratio, and GC
+    /// candidates. Nothing is deleted. Use `--project` (or run inside the
+    /// project directory) to select the project.
+    #[command(visible_alias = "leindex_retention")]
+    Retention {
+        /// Print the retention report (generation count, CAS bytes, job
+        /// bytes, dedup ratio, GC candidates). Read-only; deletes nothing.
+        #[arg(long = "report")]
+        report: bool,
+
+        /// Run the retention sweep: prune generations outside the retained
+        /// window (current + its `--max-generations - 1` predecessors),
+        /// GC orphaned CAS blobs (CAS stores), and byte-cap completed jobs.
+        /// Safe for both CAS and legacy full-copy stores; the current
+        /// generation is never removed.
+        #[arg(long = "gc")]
+        gc: bool,
+
+        /// Number of generations to retain when running `--gc`
+        /// (default 3: current + two rollback points).
+        #[arg(long = "max-generations", default_value_t = 3)]
+        max_generations: usize,
+
+        /// With `--gc`: report what would be removed without deleting.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+
+    /// One-time legacy → CAS generation-store migration (WS4 Task 10)
+    ///
+    /// Converts a legacy full-copy `.leindex/` store to the content-addressed
+    /// generation layout: the current + previous generations become manifests
+    /// referencing deduplicated CAS blobs, `CURRENT` is swapped atomically
+    /// last, stale generations and completed jobs are removed, and the jobs
+    /// directory is byte-bounded. Idempotent and crash-safe; a second run is a
+    /// no-op. This is a destructive sweep — back up `.leindex/` first.
+    #[command(visible_alias = "leindex_storage_migrate")]
+    Storage {
+        /// Run the migration now.
+        #[arg(long = "migrate")]
+        migrate: bool,
+
+        /// Print the migration state (legacy layout detected? already
+        /// migrated?) without changing anything.
+        #[arg(long = "status")]
+        status: bool,
+
+        /// Job-byte cap for the sweep (default: 128 MiB).
+        #[arg(long = "job-bytes-max", value_name = "BYTES")]
+        job_bytes_max: Option<u64>,
+
+        /// Total `.leindex/` footprint goal in MiB (default: 200).
+        #[arg(long = "footprint-mib", value_name = "MIB")]
+        footprint_mib: Option<u64>,
     },
 
     /// Configure neural search: install ORT, set up models, and write config
@@ -286,18 +356,23 @@ pub enum Commands {
 /// Subcommands for inspecting and executing MCP tools from the CLI.
 #[derive(Subcommand, Debug)]
 pub enum ToolCommands {
-    /// List every MCP/CLI tool name and description
-    List,
+    /// List the MCP tools (the four routers and their branches)
+    List {
+        /// Include descriptions and a one-line summary per branch
+        #[arg(long)]
+        verbose: bool,
+    },
 
     /// Show comprehensive help for a tool
-    Help {
-        /// Tool name (for example: leindex_project_map, project_map, or project-map)
+    #[command(alias = "help")]
+    Inspect {
+        /// Tool name (for example: leindex_explore, explore, or leindex-explore)
         name: String,
     },
 
-    /// Print the JSON argument schema for a tool
+    /// Print the JSON argument schema for a tool (routers print their oneOf form)
     Schema {
-        /// Tool name (for example: leindex_project_map, project_map, or project-map)
+        /// Tool name (for example: leindex_explore, explore, or leindex-explore)
         name: String,
     },
 
@@ -429,7 +504,37 @@ impl Cli {
                 max_age_days,
                 dry_run,
                 stale_daemons,
-            } => cmd_cleanup_impl(max_age_days, dry_run, stale_daemons).await,
+                store,
+            } => {
+                cmd_cleanup_impl(max_age_days, dry_run, stale_daemons, store, global_project).await
+            }
+            Commands::Retention {
+                report,
+                gc,
+                max_generations,
+                dry_run,
+            } => cmd_retention_impl(report, gc, max_generations, dry_run, global_project).await,
+            Commands::Storage {
+                migrate,
+                status,
+                job_bytes_max,
+                footprint_mib,
+            } => {
+                if status {
+                    cmd_storage_status_impl(global_project).await?;
+                } else if migrate {
+                    cmd_storage_migrate_impl(global_project, job_bytes_max, footprint_mib).await?;
+                } else {
+                    println!(
+                        "LeIndex Storage\n\n\
+                         Use `leindex storage --status` to inspect the generation-store\n\
+                         layout (legacy vs. migrated) and `leindex storage --migrate` to\n\
+                         run the one-time legacy→CAS migration sweep. The sweep is\n\
+                         destructive: back up `.leindex/` first."
+                    );
+                }
+                Ok(())
+            }
             Commands::Setup {
                 neural,
                 no_neural,
@@ -737,15 +842,18 @@ async fn cmd_index_impl(
     // (VAL-INDEX-005). If not indexed at all, fall through to full index.
 
     let max_memory_bytes = max_memory.map(|mb| mb * 1024 * 1024);
+    let index_started = std::time::Instant::now();
     let stats = tokio::task::spawn_blocking(move || {
         let result = leindex.index_project_with_memory_cap(force, max_memory_bytes);
-        // Force-shutdown any persistent ONNX daemon spawned during indexing.
-        // CLI commands are short-lived: the daemon has no reason to persist
-        // beyond the process lifetime. Without this, the daemon survives as
-        // an orphan, living until its idle timeout (up to 10 minutes).
-        // This runs regardless of success or failure to ensure cleanup in
-        // all exit paths.
-        leindex.shutdown_daemon();
+        // Keep the embed daemon WARM after indexing by default: the next
+        // index or search in the same working burst reuses the loaded model
+        // instead of paying a ~26 s cold start. The daemon still exits on its
+        // own idle timeout, and the worker's RSS cap bounds its residency.
+        // Set LEINDEX_CLI_SHUTDOWN_DAEMON=1 to restore the old
+        // shutdown-after-run behavior.
+        if std::env::var_os("LEINDEX_CLI_SHUTDOWN_DAEMON").is_some() {
+            leindex.shutdown_daemon();
+        }
         result
     })
     .await
@@ -754,10 +862,23 @@ async fn cmd_index_impl(
 
     // Print results
     println!("\n✓ Indexing complete!");
+    println!(
+        "  Wall time: {}s (core pipeline: {}ms; the remainder is neural embedding and publication)",
+        index_started.elapsed().as_secs_f32(),
+        stats.indexing_time_ms
+    );
     println!("  Files parsed: {}", stats.files_parsed);
     println!("  Successful: {}", stats.successful_parses);
     println!("  Failed: {}", stats.failed_parses);
-    println!("  Signatures: {}", stats.total_signatures);
+    println!(
+        "  Signatures: {}{}",
+        stats.total_signatures,
+        if stats.signature_scope == "delta" {
+            " (changed files only; project total unchanged since last full index)"
+        } else {
+            ""
+        }
+    );
     println!("  PDG nodes: {}", stats.pdg_nodes);
     println!("  PDG edges: {}", stats.pdg_edges);
     println!("  Indexed nodes: {}", stats.indexed_nodes);
@@ -793,8 +914,11 @@ async fn cmd_search_impl(
         .search(&query, top_k, None)
         .context("Search failed")?;
 
-    // Force-shutdown any persistent ONNX daemon spawned during search.
-    leindex.shutdown_daemon();
+    // Keep the embed daemon warm for follow-up calls (same policy as index:
+    // LEINDEX_CLI_SHUTDOWN_DAEMON=1 restores shutdown-after-run).
+    if std::env::var_os("LEINDEX_CLI_SHUTDOWN_DAEMON").is_some() {
+        leindex.shutdown_daemon();
+    }
 
     if results.is_empty() {
         println!("No results found for: {}", query);
@@ -862,8 +986,11 @@ async fn cmd_analyze_impl(
         .analyze(&query, token_budget)
         .context("Analysis failed")?;
 
-    // Force-shutdown any persistent ONNX daemon spawned during analysis.
-    leindex.shutdown_daemon();
+    // Keep the embed daemon warm for follow-up calls (same policy as index:
+    // LEINDEX_CLI_SHUTDOWN_DAEMON=1 restores shutdown-after-run).
+    if std::env::var_os("LEINDEX_CLI_SHUTDOWN_DAEMON").is_some() {
+        leindex.shutdown_daemon();
+    }
 
     // Print results with nice formatting
     let output = format_analysis_output(&query, &result);
@@ -871,6 +998,17 @@ async fn cmd_analyze_impl(
 
     Ok(())
 }
+
+/// Maximum number of characters of code context shown in analysis output.
+///
+/// Named display budget (not a magic number) so results and context share a
+/// clear, expandable allocation. Kept well above the previous hard-coded 300
+/// chars so users can actually see the surrounding code (VAL-OUT-004).
+const CONTEXT_BUDGET: usize = 2000;
+
+/// Compile-time guarantee the context display budget never drops below the
+/// required floor (VAL-OUT-004).
+const _: () = assert!(CONTEXT_BUDGET >= 1000);
 
 fn format_analysis_output(query: &str, result: &crate::cli::leindex::AnalysisResult) -> String {
     use crate::cli::mcp::output::{BOLD, DIM, LIGHT_CYAN, RESET};
@@ -895,11 +1033,48 @@ fn format_analysis_output(query: &str, result: &crate::cli::leindex::AnalysisRes
         BOLD, RESET, result.processing_time_ms
     ));
 
+    // Results section comes before the Context section (VAL-OUT-005). Each
+    // entry shows rank, file path, symbol name, symbol type + line number when
+    // available, and the overall relevance score (VAL-OUT-001/002/003).
+    out.push('\n');
+    if result.results.is_empty() {
+        out.push_str(&format!("  {}No results found\n", DIM));
+    } else {
+        out.push_str(&format!(
+            "  {}Results:{} ({} entries)\n",
+            BOLD,
+            RESET,
+            result.results.len()
+        ));
+        for r in &result.results {
+            out.push_str(&format!(
+                "  {}  {:>2}.{} {}{}{}  {}{}{}",
+                BOLD, r.rank, RESET, LIGHT_CYAN, r.file_path, RESET, BOLD, r.symbol_name, RESET
+            ));
+            match (&r.symbol_type, r.line_number) {
+                (Some(t), Some(l)) => {
+                    out.push_str(&format!("  {}({}, line {}){}", DIM, t, l, RESET));
+                }
+                (Some(t), None) => {
+                    out.push_str(&format!("  {}({}){}", DIM, t, RESET));
+                }
+                (None, Some(l)) => {
+                    out.push_str(&format!("  {}(line {}){}", DIM, l, RESET));
+                }
+                (None, None) => {}
+            }
+            out.push_str(&format!(
+                "  {}score: {:.3}{}\n",
+                DIM, r.score.overall, RESET
+            ));
+        }
+    }
+
     if let Some(context) = &result.context {
         out.push('\n');
         out.push_str(&format!("  {}{}{}\n", BOLD, "Context:", RESET));
         let context_str: &str = context.as_str();
-        let truncated = crate::cli::mcp::output::truncate_chars(context_str, 300);
+        let truncated = crate::cli::mcp::output::truncate_chars(context_str, CONTEXT_BUDGET);
         out.push_str(&format!("  {}{}{}", DIM, truncated, RESET));
     }
 
@@ -1023,7 +1198,7 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     if stale {
         issues.push(serde_json::json!({
             "severity": "warning",
-            "message": "Index may be stale. Call LeIndex [Index] with force_reindex=true for fresh results.",
+            "message": "Index may be stale. Call leindex_manage action=index with force_reindex=true for fresh results.",
         }));
     }
 
@@ -1053,7 +1228,8 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     // command must NOT load ORT itself (the leindex-embed worker does), so we
     // walk the chain via `discover_path_only()` and fall back to the config
     // file when no candidate exists on disk.
-    let (ort_path, ort_version, execution_provider) = collect_ort_diagnostics();
+    let (ort_path, ort_version, execution_provider, execution_provider_active) =
+        collect_ort_diagnostics();
 
     // Convert to JSON for formatter
     let diag_json = serde_json::json!({
@@ -1065,9 +1241,13 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         "freshness": health,
         "last_indexed_secs_ago": last_indexed_secs_ago,
         "embedding_model": embedding_model,
+        "precision_enabled": diag.precision_enabled,
+        "precision_nodes": diag.precision_nodes,
+        "precision_languages": diag.precision_languages,
         "ort_path": ort_path,
         "ort_version": ort_version,
         "execution_provider": execution_provider,
+        "execution_provider_active": execution_provider_active,
         "issues": issues,
     });
 
@@ -1086,7 +1266,7 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 /// VAL-CROSS-015 / VAL-ORT-022: surfaces the same ORT info shape on every
 /// install surface (cargo, npm, PyPI, GitHub Release bundle) so support
 /// engineers can debug identically. Returns a `(ort_path, ort_version,
-/// execution_provider)` triple where:
+/// execution_provider, active_provider)` tuple where:
 ///
 ///   * `ort_path` is the resolved ORT dylib path the discovery chain would
 ///     load right now, falling back to the path recorded in the user's config
@@ -1097,42 +1277,91 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 ///   * `execution_provider` is the configured provider string ("cpu",
 ///     "cuda", "migraphx", or "auto"). Defaults to "auto" when no config
 ///     exists, matching the setup command's default.
+///   * `active_provider` is the provider the embed worker ACTUALLY
+///     activated, probed live from the daemon's health socket. `None` when
+///     no worker is running or it has not reported a provider yet. When it
+///     differs from the configured value the worker fell back (e.g.
+///     migraphx requested, cpu active) — the single most important signal
+///     for "why is neural search slow".
 ///
 /// This function does NOT call `ort::init_from()` and therefore does NOT
 /// load ORT into the main daemon process. That keeps the diagnostics command
 /// cheap and side-effect-free; the leindex-embed worker performs its own
 /// discovery at spawn time.
-pub(crate) fn collect_ort_diagnostics() -> (Option<String>, Option<String>, String) {
+///
+/// The expensive static parts (dylib discovery walk, version lookup) are
+/// cached per process: a live version query spawns Python and imports
+/// onnxruntime (~110–130 ms), which single-handedly blew the 100 ms
+/// diagnostics budget on every call. The config-recorded version
+/// (VAL-SETUP-020) is preferred; a live query runs only when the config
+/// lacks a version, and its result is cached for the process lifetime.
+/// The ACTIVE provider probe stays per-call (bounded ≤50 ms) so a CPU
+/// fallback is reported promptly.
+pub(crate) fn collect_ort_diagnostics() -> (Option<String>, Option<String>, String, Option<String>)
+{
     use crate::cli::leindex::setup;
+    use std::sync::Mutex;
 
-    // ort_path: prefer the live discovery chain, fall back to configured path.
-    #[cfg(feature = "onnx")]
-    let live_path = crate::embed::ort_discovery::discover_path_only()
-        .map(|outcome| outcome.path.display().to_string());
-    #[cfg(not(feature = "onnx"))]
-    let live_path: Option<String> = None;
+    static CACHED: std::sync::OnceLock<Mutex<Option<(Option<String>, Option<String>)>>> =
+        std::sync::OnceLock::new();
 
-    let config_path = crate::config::LeIndexConfig::load()
-        .ok()
-        .and_then(|c| c.neural.ort_dylib_path);
+    let (ort_path, ort_version) = {
+        let cache = CACHED.get_or_init(|| Mutex::new(None));
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = guard.clone() {
+            cached
+        } else {
+            // ort_path: prefer the live discovery chain, fall back to configured path.
+            #[cfg(feature = "onnx")]
+            let live_path = crate::embed::ort_discovery::discover_path_only()
+                .map(|outcome| outcome.path.display().to_string());
+            #[cfg(not(feature = "onnx"))]
+            let live_path: Option<String> = None;
 
-    let ort_path = live_path.or(config_path);
+            let config_path = crate::config::LeIndexConfig::load()
+                .ok()
+                .and_then(|c| c.neural.ort_dylib_path);
+            let ort_path = live_path.or(config_path);
 
-    // ort_version: prefer the live-detected version, fall back to the recorded one.
-    let live_version = setup::get_ort_version();
-    let recorded_version = crate::config::LeIndexConfig::load()
-        .ok()
-        .and_then(|c| c.neural.ort_version);
-    let ort_version = live_version.or(recorded_version);
+            // ort_version: prefer the version recorded in the config
+            // (VAL-SETUP-020 exists exactly so re-querying pip is
+            // unnecessary); fall back to a live Python query only when the
+            // config has none, and cache that result for the process.
+            let recorded_version = crate::config::LeIndexConfig::load()
+                .ok()
+                .and_then(|c| c.neural.ort_version);
+            let ort_version = match recorded_version {
+                Some(version) => Some(version),
+                None => setup::get_ort_version(),
+            };
+
+            let value = (ort_path, ort_version);
+            *guard = Some(value.clone());
+            value
+        }
+    };
 
     // execution_provider: from config, default to "auto" when unset.
-    let execution_provider = crate::config::LeIndexConfig::load()
-        .ok()
-        .map(|c| c.neural.execution_provider)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "auto".to_string());
+    let execution_provider = crate::config::LeIndexConfig::load_cached()
+        .neural
+        .execution_provider
+        .clone();
+    let execution_provider = if execution_provider.is_empty() {
+        "auto".to_string()
+    } else {
+        execution_provider
+    };
 
-    (ort_path, ort_version, execution_provider)
+    // active_provider: live-probe the embed daemon for what actually loaded.
+    #[cfg(feature = "onnx")]
+    let active_provider =
+        crate::search::onnx::daemon_active_provider().map(|(provider, _phase)| provider);
+    #[cfg(not(feature = "onnx"))]
+    let active_provider: Option<String> = None;
+
+    (ort_path, ort_version, execution_provider, active_provider)
 }
 
 /// Serve command implementation - Start MCP server
@@ -1447,7 +1676,8 @@ fn should_auto_warmup(
     }
 
     // Auto-warm only when the MIGraphX cache is cold (does not exist yet).
-    let cache_path = crate::search::onnx::client::migraphx_cache_path("qwen3-embed-0.6b-dynamic");
+    let cache_path =
+        crate::search::onnx::client::migraphx_cache_path("qwen3-embed-0.6b-dynamic-uint8");
     !cache_path.exists()
 }
 
@@ -1472,129 +1702,6 @@ fn check_neutral_conflicts(
     Ok(())
 }
 
-/// Cleanup command implementation — remove stale LeIndex temp artifacts
-/// and/or sweep stale daemon sidecars (memory-pressure T7).
-async fn cmd_cleanup_impl(
-    max_age_days: u64,
-    dry_run: bool,
-    stale_daemons: bool,
-) -> AnyhowResult<()> {
-    use crate::cli::cleanup::{run_gc, sweep_stale_daemon_artifacts};
-    use std::time::Duration;
-
-    let max_age = Duration::from_secs(max_age_days * 24 * 3600);
-
-    if stale_daemons {
-        let label = if dry_run { " (dry run)\n" } else { "\n" };
-        println!("LeIndex Cleanup — stale daemon sidecars{}", label);
-        println!(
-            "Sweeping ~/.leindex/run/ for dead-pid or >{} day(s) old worker/MCP sidecars...\n",
-            max_age_days
-        );
-        let report = sweep_stale_daemon_artifacts(max_age, dry_run);
-        println!("{}", report);
-        return Ok(());
-    }
-
-    if dry_run {
-        // In dry-run mode we scan but do not remove
-        println!("LeIndex Cleanup (dry run)\n");
-        println!(
-            "Scanning for artifacts older than {} day(s)...\n",
-            max_age_days
-        );
-
-        let report = run_gc_dry_run(max_age);
-        println!("{}", report);
-    } else {
-        println!("LeIndex Cleanup\n");
-        println!("Removing artifacts older than {} day(s)...\n", max_age_days);
-
-        let report = run_gc(max_age);
-        println!("{}", report);
-    }
-
-    Ok(())
-}
-
-/// Dry-run GC: scan and report without removing anything.
-fn run_gc_dry_run(max_age: std::time::Duration) -> crate::cli::cleanup::GcReport {
-    use crate::cli::cleanup::artifact_scan_roots;
-    use std::time::SystemTime;
-    use tracing::debug;
-
-    let mut report = crate::cli::cleanup::GcReport::default();
-    let cutoff = SystemTime::now() - max_age;
-
-    for root in artifact_scan_roots() {
-        if !root.exists() {
-            continue;
-        }
-
-        if root
-            .file_name()
-            .map(|n| n.to_string_lossy().starts_with("lephase-"))
-            .unwrap_or(false)
-        {
-            count_artifact(&root, &cutoff, &mut report);
-            continue;
-        }
-
-        let entries = match std::fs::read_dir(&root) {
-            Ok(e) => e,
-            Err(err) => {
-                debug!("Cannot read {}: {}", root.display(), err);
-                continue;
-            }
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            if path.file_name().map(|n| n == ".leindex").unwrap_or(false) {
-                continue;
-            }
-            count_artifact(&path, &cutoff, &mut report);
-        }
-    }
-
-    report
-}
-
-fn count_artifact(
-    dir: &std::path::Path,
-    cutoff: &std::time::SystemTime,
-    report: &mut crate::cli::cleanup::GcReport,
-) {
-    use crate::cli::cleanup::{
-        artifact_age, dir_size, is_leindex_artifact, is_leindex_artifact_by_pattern,
-    };
-    use tracing::debug;
-
-    if !is_leindex_artifact(dir) && !is_leindex_artifact_by_pattern(dir) {
-        return;
-    }
-
-    report.scanned += 1;
-
-    let age = artifact_age(dir);
-    if age >= *cutoff {
-        debug!("Artifact {} is not stale yet", dir.display());
-        return;
-    }
-
-    let size = dir_size(dir);
-    debug!(
-        "Would remove stale artifact: {} ({:.2} MB)",
-        dir.display(),
-        size as f64 / 1024.0 / 1024.0
-    );
-    report.removed += 1;
-    report.bytes_freed += size;
-}
-
 /// Main entry point for the CLI
 pub async fn main() -> AnyhowResult<()> {
     match Cli::try_parse() {
@@ -1612,312 +1719,5 @@ pub async fn main() -> AnyhowResult<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_cli_parsing() {
-        let cli = Cli::try_parse_from(["leindex", "index", "/path/to/project"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Index { .. })));
-    }
-
-    #[test]
-    fn test_mcp_command_parsing() {
-        let cli = Cli::try_parse_from(["leindex", "mcp"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Mcp { .. })));
-    }
-
-    #[test]
-    fn test_stdio_flag_parsing() {
-        let cli = Cli::try_parse_from(["leindex", "--stdio"]).unwrap();
-        assert!(cli.stdio);
-    }
-
-    #[test]
-    fn test_search_command() {
-        let cli = Cli::try_parse_from(["leindex", "search", "test query"]).unwrap();
-        match cli.command {
-            Some(Commands::Search { query, top_k, .. }) => {
-                assert_eq!(query, "test query");
-                assert_eq!(top_k, 10);
-            }
-            _ => panic!("Expected Search command"),
-        }
-    }
-
-    #[test]
-    fn test_phase_command_parsing() {
-        let cli =
-            Cli::try_parse_from(["leindex", "phase", "--phase", "2", "--mode", "ultra"]).unwrap();
-        match cli.command {
-            Some(Commands::Phase {
-                phase, all, mode, ..
-            }) => {
-                assert_eq!(phase, Some(2));
-                assert!(!all);
-                assert_eq!(mode, "ultra");
-            }
-            _ => panic!("Expected Phase command"),
-        }
-    }
-
-    #[test]
-    fn test_dashboard_command_parsing() {
-        let cli = Cli::try_parse_from(["leindex", "dashboard"]).unwrap();
-        match cli.command {
-            Some(Commands::Dashboard { port, prod }) => {
-                assert_eq!(port, 5173);
-                assert!(!prod);
-            }
-            _ => panic!("Expected Dashboard command"),
-        }
-    }
-
-    #[test]
-    fn test_dashboard_command_with_port() {
-        let cli = Cli::try_parse_from(["leindex", "dashboard", "--port", "3000"]).unwrap();
-        match cli.command {
-            Some(Commands::Dashboard { port, prod }) => {
-                assert_eq!(port, 3000);
-                assert!(!prod);
-            }
-            _ => panic!("Expected Dashboard command"),
-        }
-    }
-
-    #[test]
-    fn test_dashboard_command_prod() {
-        let cli = Cli::try_parse_from(["leindex", "dashboard", "--prod"]).unwrap();
-        match cli.command {
-            Some(Commands::Dashboard { port, prod }) => {
-                assert_eq!(port, 5173);
-                assert!(prod);
-            }
-            _ => panic!("Expected Dashboard command"),
-        }
-    }
-
-    #[test]
-    fn test_tools_help_command_parsing() {
-        let cli = Cli::try_parse_from(["leindex", "tools", "help", "project_map"]).unwrap();
-        match cli.command {
-            Some(Commands::Tools {
-                command: ToolCommands::Help { name },
-            }) => assert_eq!(name, "project_map"),
-            _ => panic!("Expected tools help command"),
-        }
-    }
-
-    #[test]
-    fn test_tools_run_command_parsing() {
-        let cli = Cli::try_parse_from([
-            "leindex",
-            "tools",
-            "run",
-            "project_map",
-            "--args",
-            "{\"depth\":1}",
-            "--set",
-            "include_symbols=true",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Some(Commands::Tools {
-                command:
-                    ToolCommands::Run {
-                        name,
-                        args_json,
-                        set,
-                    },
-            }) => {
-                assert_eq!(name, "project_map");
-                assert_eq!(args_json, "{\"depth\":1}");
-                assert_eq!(set, vec!["include_symbols=true"]);
-            }
-            _ => panic!("Expected tools run command"),
-        }
-    }
-
-    #[test]
-    fn test_find_tool_handler_accepts_short_and_full_names() {
-        assert!(find_tool_handler("LeIndex [Project Map]").is_some());
-        assert!(find_tool_handler("project_map").is_some());
-        assert!(find_tool_handler("project-map").is_some());
-    }
-
-    #[test]
-    fn test_cleanup_command_parsing() {
-        let cli = Cli::try_parse_from(["leindex", "cleanup"]).unwrap();
-        match cli.command {
-            Some(Commands::Cleanup {
-                max_age_days,
-                dry_run,
-                stale_daemons,
-            }) => {
-                assert_eq!(max_age_days, 7);
-                assert!(!dry_run);
-                assert!(!stale_daemons);
-            }
-            _ => panic!("Expected Cleanup command"),
-        }
-    }
-
-    #[test]
-    fn test_cleanup_command_with_flags() {
-        let cli = Cli::try_parse_from([
-            "leindex",
-            "cleanup",
-            "--max-age-days",
-            "14",
-            "--dry-run",
-            "--stale-daemons",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Commands::Cleanup {
-                max_age_days,
-                dry_run,
-                stale_daemons,
-            }) => {
-                assert_eq!(max_age_days, 14);
-                assert!(dry_run);
-                assert!(stale_daemons);
-            }
-            _ => panic!("Expected Cleanup command"),
-        }
-    }
-
-    #[test]
-    fn test_memory_report_flag_parsing() {
-        // VAL-MEASURE-020: --memory-report is an opt-in CLI surface
-        let cli = Cli::try_parse_from([
-            "leindex",
-            "--memory-report",
-            "/tmp/mem-report.json",
-            "index",
-            "/tmp/project",
-        ])
-        .unwrap();
-        assert_eq!(
-            cli.memory_report,
-            Some(PathBuf::from("/tmp/mem-report.json"))
-        );
-        assert!(matches!(cli.command, Some(Commands::Index { .. })));
-    }
-
-    #[test]
-    fn test_memory_report_flag_absent_by_default() {
-        let cli = Cli::try_parse_from(["leindex", "index", "/tmp/project"]).unwrap();
-        assert!(cli.memory_report.is_none());
-    }
-
-    #[test]
-    fn test_setup_command_parsing() {
-        // VAL-SETUP-001: setup command is registered
-        let cli = Cli::try_parse_from(["leindex", "setup", "--neural", "--cpu"]).unwrap();
-        match cli.command {
-            Some(Commands::Setup {
-                neural,
-                no_neural,
-                cpu,
-                gpu,
-                check,
-                warmup: _,
-            }) => {
-                assert!(neural);
-                assert!(!no_neural);
-                assert!(cpu);
-                assert!(gpu.is_none());
-                assert!(!check);
-            }
-            _ => panic!("Expected Setup command"),
-        }
-    }
-
-    #[test]
-    fn test_setup_command_gpu_amd() {
-        let cli = Cli::try_parse_from(["leindex", "setup", "--neural", "--gpu", "amd"]).unwrap();
-        match cli.command {
-            Some(Commands::Setup {
-                neural, cpu, gpu, ..
-            }) => {
-                assert!(neural);
-                assert!(!cpu);
-                assert_eq!(gpu.as_deref(), Some("amd"));
-            }
-            _ => panic!("Expected Setup command"),
-        }
-    }
-
-    #[test]
-    fn test_setup_command_gpu_nvidia() {
-        let cli = Cli::try_parse_from(["leindex", "setup", "--neural", "--gpu", "nvidia"]).unwrap();
-        match cli.command {
-            Some(Commands::Setup {
-                neural, cpu, gpu, ..
-            }) => {
-                assert!(neural);
-                assert!(!cpu);
-                assert_eq!(gpu.as_deref(), Some("nvidia"));
-            }
-            _ => panic!("Expected Setup command"),
-        }
-    }
-
-    #[test]
-    fn test_setup_command_no_neural() {
-        // VAL-SETUP-013: --no-neural flag
-        let cli = Cli::try_parse_from(["leindex", "setup", "--no-neural"]).unwrap();
-        match cli.command {
-            Some(Commands::Setup {
-                neural,
-                no_neural,
-                cpu,
-                gpu,
-                check,
-                warmup: _,
-            }) => {
-                assert!(!neural);
-                assert!(no_neural);
-                assert!(!cpu);
-                assert!(gpu.is_none());
-                assert!(!check);
-            }
-            _ => panic!("Expected Setup command"),
-        }
-    }
-
-    #[test]
-    fn test_setup_command_check() {
-        // VAL-SETUP-014: --check flag
-        let cli = Cli::try_parse_from(["leindex", "setup", "--check"]).unwrap();
-        match cli.command {
-            Some(Commands::Setup { check, .. }) => assert!(check),
-            _ => panic!("Expected Setup command"),
-        }
-    }
-
-    #[test]
-    fn test_setup_command_neural_gpu_conflict_rejected() {
-        // VAL-SETUP-015: conflicting flags produce error
-        let result = Cli::try_parse_from(["leindex", "setup", "--neural", "--cpu", "--gpu", "amd"]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_setup_command_neural_no_neural_conflict_rejected() {
-        // VAL-SETUP-015: --neural + --no-neural is a conflict
-        let result = Cli::try_parse_from(["leindex", "setup", "--neural", "--no-neural"]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_setup_help_is_valid() {
-        // VAL-SETUP-001: leindex setup --help exits 0
-        let result = Cli::try_parse_from(["leindex", "setup", "--help"]);
-        assert!(result.is_err()); // clap exits with error for --help
-        let err = result.unwrap_err();
-        assert!(matches!(err.kind(), ErrorKind::DisplayHelp));
-    }
-}
+#[path = "cli_test.rs"]
+mod tests;

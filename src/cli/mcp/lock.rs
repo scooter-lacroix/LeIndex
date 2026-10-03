@@ -17,7 +17,7 @@
 //!
 //! **Platform scope:** the ownership liveness check is Linux-only (it reads
 //! `/proc/<pid>/stat` for process start time). On macOS/Windows the lock is a
-//! documented **advisory no-op** — [`McpProjectLock::try_acquire`] returns
+//! documented **advisory no-op** — `McpProjectLock::try_acquire` returns
 //! `NotAvailable` *before any file is written*, so the half-written sidecar
 //! that a failed start-time write would otherwise leave can never be produced.
 //! The dup-instance advisory warning therefore only fires on Linux; the real

@@ -14,7 +14,7 @@ pub struct ContextHandler;
 impl ContextHandler {
     /// Returns the name of this MCP tool (MCP-compliant: ASCII letters, digits, underscore, hyphen, dot only)
     pub fn name(&self) -> &str {
-        "leindex.context"
+        "leindex_context"
     }
 
     /// Returns the human-readable display title for this tool

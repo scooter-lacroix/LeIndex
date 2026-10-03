@@ -42,7 +42,7 @@ Models are never included in GitHub Release archives, crates.io, npm, or PyPI
 artifacts. `leindex setup` owns model provisioning.
 
 The 1.9.5 profile downloads
-[Qwen3 Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) from
+[Qwen3 Embedding (LeIndex code fine-tune, int4)](https://huggingface.co/ScooterLacroix/qwen3-embed-0.6b-int4-code) from
 Hugging Face via Hugging Face CLI:
 
 - `model.onnx`, installed as `qwen3-embed-0.6b-dynamic.onnx`
@@ -114,7 +114,7 @@ performance. They are opt-in so the default path remains reproducible.
 ## Runtime Behavior
 
 On Unix, LeIndex connects to a local socket whose identity includes the model,
-provider, batch size, and sequence length. The resident `leindex-embed` process retains the ONNX session,
+provider, batch size, and sequence length. The resident embed-worker process (a `leindex --internal-embed-worker` re-exec; named `leindex-embed` in process listings) retains the ONNX session,
 GPU allocations, and compiled cache across short-lived CLI commands and MCP
 calls. It exits after ten minutes without a client. Non-Unix and setup smoke
 paths use direct worker IPC with a one-minute idle limit.

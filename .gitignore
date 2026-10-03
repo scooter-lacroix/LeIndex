@@ -173,6 +173,9 @@ docs/planning/
 docs/review/
 docs/optimization/
 
+# Test-generated memcheck baseline scaffolding (regenerates on each test run)
+docs/baselines/
+
 # Personal runtime config, DB backups, and logs (never commit user paths)
 # The live config lives at ~/.leindex/config/leindex.toml (outside the repo);
 # leindex.toml.example is the committed template. These guard dev artifacts that
@@ -189,3 +192,13 @@ jscpd-report/
 
 # Throwaway rewrite scripts
 /rewrite.py
+
+# Machine-local investigation scratch (absolute paths, timestamps — never commit)
+.factory-temp-*.json
+
+# Saved web pages / editor scratch at the repository root (never commit)
+/*.html
+/Text File.txt
+
+# Rejected-patch scratch from git apply --reject (never commit)
+*.rej

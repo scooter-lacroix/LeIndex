@@ -1,9 +1,16 @@
-// Memory Cap — RSS monitoring and hard limit enforcement for indexing.
+// Memory Cap — RSS monitoring for admission (WS5 §5.3).
 //
 // Provides:
 // - `current_rss_mb()`: reads current RSS via /proc/self/status (Linux) or sysinfo fallback
-// - `MemoryCapGuard`: periodic checker that warns at 90% and errors at 100% of a cap
+// - `MemoryCapGuard`: periodic RSS observer that logs pressure; over-cap reports
+//   `CapStatus::OverCap` (a deferral signal) rather than aborting work
 // - `apply_hard_limit()`: sets RLIMIT_AS as a hard ceiling (Linux-only)
+//
+// VAL-SCHED-015: the bail-at-cap error path is REMOVED from the indexing hot
+// loop. A memory cap prevents overlapping peaks; it never converts valid work
+// into errors. The global admission controller (`scheduler::admission`) owns
+// capacity decisions and defers/reduces instead of erroring; this guard only
+// observes RSS and reports the pressure signal.
 
 use anyhow::{Result, bail};
 use tracing::{info, warn};
@@ -99,12 +106,25 @@ pub fn apply_hard_limit(mb: u64) -> Result<()> {
     Ok(())
 }
 
-/// Periodic memory cap checker.
+/// Outcome of a memory-cap observation.
+///
+/// The guard never errors (VAL-SCHED-015): every observation resolves to one
+/// of these two states, and over-cap pressure is surfaced as a deferral signal
+/// for the admission gate rather than a fatal indexing error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapStatus {
+    /// RSS is below the cap (or within the warning band).
+    Ok,
+    /// RSS exceeds the cap: heavy work should defer until memory frees up.
+    OverCap,
+}
+
+/// Periodic memory cap observer.
 ///
 /// Call `check()` at regular intervals during indexing (e.g., after each batch
-/// of nodes). It will:
-/// - Log a warning when RSS exceeds 90% of the cap
-/// - Return an error when RSS exceeds 100% of the cap
+/// of nodes). It logs a warning when RSS exceeds 90% of the cap and reports
+/// `CapStatus::OverCap` (a deferral signal) when RSS exceeds 100% of the cap.
+/// It never aborts indexing — deferral, not erroring (§5.3, VAL-SCHED-015).
 pub struct MemoryCapGuard {
     /// Soft cap in megabytes
     cap_mb: u64,
@@ -135,31 +155,33 @@ impl MemoryCapGuard {
 
     /// Check current RSS against the cap.
     ///
-    /// Returns `Ok(())` if under the cap, logs a warning at 90%,
-    /// and returns an error if the cap is exceeded.
-    ///
-    /// The check is throttled to only run every `check_interval` calls
-    /// to avoid excessive `/proc` reads.
-    pub fn check(&mut self) -> Result<()> {
+    /// Returns `CapStatus::Ok` when under the cap, logs a warning at 90%, and
+    /// returns `CapStatus::OverCap` (a deferral signal, never an error) when
+    /// the cap is exceeded. The check is throttled to only run every
+    /// `check_interval` calls to avoid excessive `/proc` reads.
+    pub fn check(&mut self) -> CapStatus {
         self.check_counter += 1;
         if self.check_counter % self.check_interval != 0 {
-            return Ok(());
+            return CapStatus::Ok;
         }
-
         self.check_now()
     }
 
     /// Force an immediate RSS check regardless of the counter.
-    pub fn check_now(&mut self) -> Result<()> {
+    ///
+    /// Never returns an error. Over-cap pressure is reported as
+    /// `CapStatus::OverCap` and logged as a deferral signal; the admission
+    /// controller owns the actual guard/reduce/defer decision (§5.3).
+    pub fn check_now(&mut self) -> CapStatus {
         match current_rss_mb() {
             Ok(rss) => {
                 if rss > self.cap_mb {
-                    bail!(
-                        "Memory cap exceeded: RSS is {} MB, cap is {} MB. \
-                         Indexing stopped gracefully. Increase --max-memory or index a smaller project.",
-                        rss,
-                        self.cap_mb
+                    warn!(
+                        "Memory pressure: RSS is {} MB, cap is {} MB — DEFERRING heavy work \
+                         (admission gate owns capacity; no indexing task is errored)",
+                        rss, self.cap_mb
                     );
+                    return CapStatus::OverCap;
                 }
                 if rss > self.warn_threshold_mb && !self.warned {
                     warn!(
@@ -170,12 +192,12 @@ impl MemoryCapGuard {
                     );
                     self.warned = true;
                 }
-                Ok(())
+                CapStatus::Ok
             }
             Err(e) => {
                 // If we can't read RSS, just log and continue — don't block indexing
                 warn!("Could not read RSS for memory cap check: {}", e);
-                Ok(())
+                CapStatus::Ok
             }
         }
     }
@@ -203,7 +225,7 @@ mod tests {
         // Use a very high cap so it never triggers
         let mut guard = MemoryCapGuard::new(1_000_000);
         guard.check_interval = 1; // check every call
-        guard.check().expect("should not error when under cap");
+        assert_eq!(guard.check(), CapStatus::Ok);
     }
 
     #[test]
@@ -212,24 +234,46 @@ mod tests {
         guard.check_interval = 1000;
         // First 999 calls should be no-ops
         for _ in 0..999 {
-            guard.check().expect("should not error");
+            assert_eq!(guard.check(), CapStatus::Ok);
         }
         // The 1000th call should actually check RSS
-        guard.check().expect("should not error");
+        assert_eq!(guard.check(), CapStatus::Ok);
     }
 
     #[test]
-    fn test_memory_cap_guard_over_cap() {
-        // Use a tiny cap (1 MB) that should always be exceeded
+    fn test_memory_cap_guard_over_cap_defers_not_errors() {
+        // Use a tiny cap (1 MB) that should always be exceeded. Over-cap
+        // pressure reports `OverCap` (a deferral signal) and NEVER an error —
+        // VAL-SCHED-015 / §5.3: a cap prevents peaks, not valid-work failures.
         let mut guard = MemoryCapGuard::new(1);
         guard.check_interval = 1;
-        let result = guard.check();
-        assert!(result.is_err(), "should error when RSS exceeds cap");
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("Memory cap exceeded"),
-            "error should mention cap exceeded: {}",
-            err_msg
+        let status = guard.check();
+        assert_eq!(
+            status,
+            CapStatus::OverCap,
+            "exceeding the cap must defer (OverCap), never error"
         );
+    }
+
+    /// VAL-SCHED-015: indexing with a cap set artificially low defers
+    /// (reports OverCap) across many hot-loop checks and NEVER returns an
+    /// error. This is the contract the indexing loop relies on.
+    #[test]
+    fn test_no_error_at_cap() {
+        let mut guard = MemoryCapGuard::new(1);
+        guard.check_interval = 1;
+        // Simulate the hot-loop checking RSS after each phase boundary.
+        let mut over_cap_signal_seen = false;
+        for _ in 0..50 {
+            match guard.check() {
+                CapStatus::Ok => {}
+                CapStatus::OverCap => over_cap_signal_seen = true,
+            }
+        }
+        assert!(
+            over_cap_signal_seen,
+            "a 1 MB cap must trigger the deferral (OverCap) signal at least once"
+        );
+        // The guard API is total: it never produced an Err for any observation.
     }
 }

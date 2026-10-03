@@ -69,6 +69,50 @@ pub fn find_node_by_id<'tree>(
     None
 }
 
+thread_local! {
+    static LITE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard that switches the current thread into signature-only extraction.
+///
+/// While alive, parser leaf helpers that compute data callers of
+/// [`CodeIntelligence::get_signatures_lite`] never read (call lists, flow
+/// facts, docstrings, imports, complexity) return empty values. The flag is
+/// thread-local, so rayon closures must create their own guard.
+///
+/// The guard is `!Send`/`!Sync` on purpose: entering and dropping it mutate
+/// the *entering thread's* `LITE_DEPTH`. A unit struct would stay `Send`,
+/// and moving one to another thread (a rayon worker capturing it in a
+/// closure) would decrement the destination thread's depth and leave the
+/// source thread stuck in lite mode — silently dropping calls, docstrings,
+/// imports, flow facts and complexity for every later extraction on it.
+pub struct LiteGuard {
+    /// Makes this type `!Send` and `!Sync` (raw pointers are neither).
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+impl LiteGuard {
+    /// Enter signature-only extraction on the current thread.
+    pub fn enter() -> Self {
+        LITE_DEPTH.with(|d| d.set(d.get() + 1));
+        LiteGuard {
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for LiteGuard {
+    fn drop(&mut self) {
+        LITE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// True when the current thread is inside a [`LiteGuard`] scope.
+#[inline]
+pub fn lite() -> bool {
+    LITE_DEPTH.with(|d| d.get() > 0)
+}
+
 /// Compute cyclomatic-complexity metrics for a node and its descendants.
 ///
 /// The skeleton (nesting depth, line floor, token/child count, recursion) is
@@ -337,6 +381,23 @@ pub trait CodeIntelligence {
         // Default implementation delegates to get_signatures
         // Implementations should override this to provide pooling benefits
         self.get_signatures(source)
+    }
+
+    /// Extract only the signature header fields (`name`, `qualified_name`,
+    /// `parameters`, `return_type`, `visibility`, `is_async`, `is_method`,
+    /// `byte_range`).
+    ///
+    /// `calls`, `flow_facts`, `docstring`, `imports` and `cyclomatic_complexity`
+    /// are left empty. Header fields are identical to the full extraction, so
+    /// correctness never depends on a parser opting in: the default enters a
+    /// [`LiteGuard`] and delegates to [`Self::get_signatures_with_parser`].
+    fn get_signatures_lite(
+        &self,
+        source: &[u8],
+        parser: &mut tree_sitter::Parser,
+    ) -> Result<Vec<SignatureInfo>> {
+        let _guard = LiteGuard::enter();
+        self.get_signatures_with_parser(source, parser)
     }
 
     /// Compute control flow graph for a node
@@ -610,54 +671,174 @@ pub mod languages {
         }
     }
 
-    /// Swift language implementation (disabled due to tree-sitter version conflicts)
-    // #[cfg(feature = "parse")]
-    // pub mod swift {
-    //     use super::{LanguageConfig, Language};
-    //     use once_cell::sync::Lazy;
-    //
-    //     pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
-    //         name: "Swift".to_string(),
-    //         extensions: vec!["swift".to_string()],
-    //         queries: LanguageConfig::default_queries(),
-    //     });
-    //
-    //     pub fn language() -> Language {
-    //         tree_sitter_swift::LANGUAGE.into()
-    //     }
-    // }
-    /// Kotlin language implementation (disabled due to tree-sitter version conflicts)
-    // #[cfg(feature = "parse")]
-    // pub mod kotlin {
-    //     use super::{LanguageConfig, Language};
-    //     use once_cell::sync::Lazy;
-    //
-    //     pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
-    //         name: "Kotlin".to_string(),
-    //         extensions: vec!["kt".to_string(), "kts".to_string()],
-    //         queries: LanguageConfig::default_queries(),
-    //     });
-    //
-    //     pub fn language() -> Language {
-    //         unsafe { std::mem::transmute(tree_sitter_kotlin::language()) }
-    //     }
-    // }
-    /// Dart language implementation (disabled due to tree-sitter version conflicts)
-    // #[cfg(feature = "parse")]
-    // pub mod dart {
-    //     use super::{LanguageConfig, Language};
-    //     use once_cell::sync::Lazy;
-    //
-    //     pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
-    //         name: "Dart".to_string(),
-    //         extensions: vec!["dart".to_string()],
-    //         queries: LanguageConfig::default_queries(),
-    //     });
-    //
-    //     pub fn language() -> Language {
-    //         tree_sitter_dart::LANGUAGE.into()
-    //     }
-    // }
+    /// Define a Tier-0 language module: CONFIG + tree-sitter loader.
+    ///
+    /// One line per language keeps the 100+ breadth goal maintainable; the
+    /// bespoke parsers (kotlin/swift/dart) and the generic Tier-0 parser
+    /// (`parse::generic`) consume these through `language_by_name`.
+    macro_rules! tier0_language {
+        ($modname:ident, $display:expr, $exts:expr, $loader:expr) => {
+            /// Tier-0 language module (see the table in `parse::generic`).
+            pub mod $modname {
+                use super::{Language, LanguageConfig};
+                use once_cell::sync::Lazy;
+
+                /// Language configuration.
+                pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
+                    name: $display.to_string(),
+                    extensions: $exts.iter().map(|e| e.to_string()).collect(),
+                    queries: LanguageConfig::default_queries(),
+                });
+
+                /// Get the tree-sitter language.
+                pub fn language() -> Language {
+                    $loader.into()
+                }
+            }
+        };
+    }
+
+    tier0_language!(swift, "Swift", ["swift"], tree_sitter_swift::LANGUAGE);
+    tier0_language!(
+        kotlin,
+        "Kotlin",
+        ["kt", "kts"],
+        tree_sitter_kotlin_ng::LANGUAGE
+    );
+    tier0_language!(dart, "Dart", ["dart"], tree_sitter_dart::LANGUAGE);
+    tier0_language!(html, "HTML", ["html", "htm"], tree_sitter_html::LANGUAGE);
+    tier0_language!(css, "CSS", ["css"], tree_sitter_css::LANGUAGE);
+    tier0_language!(scss, "SCSS", ["scss"], tree_sitter_scss::language());
+    tier0_language!(yaml, "YAML", ["yaml", "yml"], tree_sitter_yaml::LANGUAGE);
+    tier0_language!(cmake, "CMake", ["cmake"], tree_sitter_cmake::LANGUAGE);
+    tier0_language!(
+        elixir,
+        "Elixir",
+        ["ex", "exs"],
+        tree_sitter_elixir::LANGUAGE
+    );
+    tier0_language!(
+        erlang,
+        "Erlang",
+        ["erl", "hrl"],
+        tree_sitter_erlang::LANGUAGE
+    );
+    tier0_language!(haskell, "Haskell", ["hs"], tree_sitter_haskell::LANGUAGE);
+    tier0_language!(perl, "Perl", ["pl", "pm"], tree_sitter_perl::LANGUAGE);
+    tier0_language!(r, "R", ["r", "R"], tree_sitter_r::LANGUAGE);
+    tier0_language!(zig, "Zig", ["zig"], tree_sitter_zig::LANGUAGE);
+    tier0_language!(
+        graphql,
+        "GraphQL",
+        ["graphql", "gql"],
+        tree_sitter_graphql::LANGUAGE
+    );
+    tier0_language!(
+        hcl,
+        "HCL",
+        ["hcl", "tf", "tfvars"],
+        tree_sitter_hcl::LANGUAGE
+    );
+    tier0_language!(
+        make,
+        "Make",
+        ["makefile", "mak", "mk"],
+        tree_sitter_make::LANGUAGE
+    );
+    tier0_language!(elisp, "Emacs Lisp", ["el"], tree_sitter_elisp::LANGUAGE);
+    tier0_language!(julia, "Julia", ["jl"], tree_sitter_julia::LANGUAGE);
+    tier0_language!(d, "D", ["d", "di"], tree_sitter_d::LANGUAGE);
+    tier0_language!(
+        glsl,
+        "GLSL",
+        ["glsl", "vert", "frag", "comp"],
+        tree_sitter_glsl::LANGUAGE_GLSL
+    );
+    tier0_language!(
+        embedded_template,
+        "Embedded Template",
+        ["ejs", "erb", "liquid"],
+        tree_sitter_embedded_template::LANGUAGE
+    );
+    // Docs tier: pulldown-cmark/regex parsers — no tree-sitter grammar. The
+    // language() stand-ins exist only for LanguageId completeness; the
+    // pipeline dispatches by language NAME to DocParser, which ignores the
+    // tree-sitter handle entirely.
+    tier0_language!(
+        markdown,
+        "Markdown",
+        ["md", "markdown"],
+        tree_sitter_json::LANGUAGE
+    );
+    tier0_language!(rst, "reStructuredText", ["rst"], tree_sitter_json::LANGUAGE);
+    tier0_language!(
+        adoc,
+        "AsciiDoc",
+        ["adoc", "asciidoc"],
+        tree_sitter_json::LANGUAGE
+    );
+    tier0_language!(plaintext, "Plain Text", ["txt"], tree_sitter_json::LANGUAGE);
+
+    /// Resolve a tree-sitter language by registry name (used by the generic
+    /// Tier-0 parser). Panics on unknown names — callers pass table-driven
+    /// names that are compile-time verified by the registry test.
+    pub fn language_by_name(name: &str) -> Language {
+        match name {
+            "swift" => swift::language(),
+            "kotlin" => kotlin::language(),
+            "dart" => dart::language(),
+            "html" => html::language(),
+            "css" => css::language(),
+            "scss" => scss::language(),
+            "yaml" => yaml::language(),
+            "cmake" => cmake::language(),
+            "elixir" => elixir::language(),
+            "erlang" => erlang::language(),
+            "haskell" => haskell::language(),
+            "perl" => perl::language(),
+            "r" => r::language(),
+            "zig" => zig::language(),
+            "graphql" => graphql::language(),
+            "hcl" => hcl::language(),
+            "make" => make::language(),
+            "elisp" => elisp::language(),
+            "julia" => julia::language(),
+            "d" => d::language(),
+            "glsl" => glsl::language(),
+            "embedded_template" => embedded_template::language(),
+            _ => panic!("language_by_name: unknown language {name}"),
+        }
+    }
+
+    /// Whether `name` has a Tier-0 language module (registry test helper).
+    pub fn language_by_name_is_registered(name: &str) -> bool {
+        matches!(
+            name,
+            "swift"
+                | "kotlin"
+                | "dart"
+                | "html"
+                | "css"
+                | "scss"
+                | "yaml"
+                | "cmake"
+                | "elixir"
+                | "erlang"
+                | "haskell"
+                | "perl"
+                | "r"
+                | "zig"
+                | "graphql"
+                | "hcl"
+                | "make"
+                | "elisp"
+                | "julia"
+                | "d"
+                | "glsl"
+                | "embedded_template"
+        )
+    }
+
     /// Lua language support.
     pub mod lua {
         use super::{Language, LanguageConfig};

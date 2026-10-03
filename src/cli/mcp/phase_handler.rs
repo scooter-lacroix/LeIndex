@@ -1,4 +1,4 @@
-use super::helpers::{extract_bool, extract_usize, phase_analysis_schema, wrap_with_meta};
+use super::helpers::{extract_bool, extract_usize, phase_analysis_schema, wrap_live_with_meta};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use crate::phase::{DocsMode, FormatMode, PhaseOptions, PhaseSelection, run_phase_analysis};
@@ -13,7 +13,7 @@ pub struct PhaseAnalysisHandler;
 impl PhaseAnalysisHandler {
     /// Returns the name of this MCP tool (MCP-compliant: leindex.phase-analysis)
     pub fn name(&self) -> &str {
-        "leindex.phase-analysis"
+        "leindex_phase_analysis"
     }
 
     /// Returns the human-readable display title for this tool
@@ -282,6 +282,7 @@ fn phase_request(args: &Value, project_root: &Path) -> Result<PhaseRequest, Json
         include_docs,
         docs_mode,
         hotspot_keywords: PhaseOptions::default().hotspot_keywords,
+        universe: Default::default(),
     };
     Ok(PhaseRequest {
         selection,
@@ -290,22 +291,45 @@ fn phase_request(args: &Value, project_root: &Path) -> Result<PhaseRequest, Json
     })
 }
 
+/// Keep a phase run inside the file set the index tracks for the same root.
+///
+/// The phase store is the index store, so a run that saw a different set of
+/// files (dotfiles, ignored paths, other languages) re-parsed and rewrote the
+/// difference on every call and the indexer then undid it: the shared graph
+/// flip-flopped and a phase call after an index took ~60 s.
+pub(crate) fn attach_index_universe(options: &mut PhaseOptions) {
+    if !options.focus_files.is_empty() {
+        return;
+    }
+    if let Ok(scan) = crate::cli::index_builder::scan_project_files(&options.root) {
+        options.universe = Arc::new(scan.source_paths);
+    }
+}
+
 async fn execute_phase_analysis(
     registry: &Arc<ProjectRegistry>,
     args: Value,
 ) -> Result<Value, JsonRpcError> {
     let project_path = args.get("project_path").and_then(Value::as_str);
-    let handle = registry.get_or_create(project_path).await?;
-    let base_project_root = handle.read().await.project_path().to_path_buf();
+    // The phase pipeline brings its own incremental analysis and cache, so it
+    // needs only to know *where* the project is. Going through `get_or_create`
+    // here also started an index / background refresh — a second writer on the
+    // same SQLite file the phase run opens, so a phase call on a project with
+    // any changed file spent tens of seconds waiting on busy-timeouts for a
+    // reindex it never needed.
+    let base_project_root = registry.resolve_project_root(project_path).await?;
     let request = phase_request(&args, &base_project_root)?;
 
     let file_symbols_json = if let Some(file_path) = request.single_file_target.as_deref() {
+        // Single-file enrichment reads the graph: load it (graph only, no
+        // index, no refresh) on demand.
+        let handle = registry.get_or_load(project_path).await?;
         let file_path = file_path.to_path_buf();
-        let handle = handle.clone();
         tokio::task::spawn_blocking(move || {
             let content = std::fs::read_to_string(&file_path).unwrap_or_default();
-            let reader = handle.blocking_read();
-            reader
+            let mut index = handle.blocking_write();
+            let _ = index.ensure_pdg_loaded_graph_only();
+            index
                 .pdg()
                 .map(|pdg| file_symbols(pdg, &file_path, &content))
         })
@@ -317,19 +341,21 @@ async fn execute_phase_analysis(
         None
     };
 
-    let report =
-        tokio::task::spawn_blocking(move || run_phase_analysis(request.options, request.selection))
-            .await
-            .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))?
-            .map_err(|e| JsonRpcError::internal_error(format!("Phase analysis failed: {}", e)))?;
+    let report = tokio::task::spawn_blocking(move || {
+        let mut options = request.options;
+        attach_index_universe(&mut options);
+        run_phase_analysis(options, request.selection)
+    })
+    .await
+    .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))?
+    .map_err(|e| JsonRpcError::internal_error(format!("Phase analysis failed: {}", e)))?;
 
     let report_value = enrich_report(
         serde_json::to_value(report)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?,
         file_symbols_json,
     );
-    let index_for_meta = handle.read().await;
-    Ok(wrap_with_meta(report_value, &index_for_meta))
+    Ok(wrap_live_with_meta(report_value, &base_project_root))
 }
 
 #[cfg(test)]
@@ -421,7 +447,7 @@ mod tests {
     #[test]
     fn test_handler_names() {
         let primary = PhaseAnalysisHandler;
-        assert_eq!(primary.name(), "leindex.phase-analysis");
+        assert_eq!(primary.name(), "leindex_phase_analysis");
         assert_eq!(primary.title(), "LeIndex [Phase Analysis]");
 
         let alias = PhaseAnalysisAliasHandler;
@@ -494,7 +520,7 @@ mod tests {
     fn test_phase_c_handler_schemas() {
         // All Phase C schemas should be valid JSON objects with required fields
         use super::super::file_summary_handler::FileSummaryHandler;
-        use super::super::grep_symbols_handler::GrepSymbolsHandler;
+        use super::super::find_handler::FindHandler;
         use super::super::project_map_handler::ProjectMapHandler;
         use super::super::read_symbol_handler::ReadSymbolHandler;
         use super::super::symbol_lookup_handler::SymbolLookupHandler;
@@ -504,7 +530,7 @@ mod tests {
             // SymbolLookupHandler has no required fields (symbol or symbols accepted)
             (SymbolLookupHandler.argument_schema(), vec![]),
             (ProjectMapHandler.argument_schema(), vec![]),
-            (GrepSymbolsHandler.argument_schema(), vec!["pattern"]),
+            (FindHandler.argument_schema(), vec!["pattern"]),
             (ReadSymbolHandler.argument_schema(), vec!["symbol"]),
         ];
 

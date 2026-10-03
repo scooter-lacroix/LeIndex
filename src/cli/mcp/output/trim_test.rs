@@ -78,6 +78,28 @@ fn test_trim_symbol_lookup_keeps_actual_fields() {
 }
 
 #[test]
+fn test_trim_symbol_lookup_keeps_degradation_fields() {
+    // N-15: the honest-degradation fields must survive trimming so the LLM
+    // sees WHY a zero-impact figure is not authoritative.
+    let input = v(r#"{
+            "symbol": "orphan_fn",
+            "type": "function",
+            "file": "src/orphan.rs",
+            "callers": [],
+            "callees": [],
+            "impact_radius": {"affected_symbols": 0, "affected_files": 0},
+            "pdg_status": "fresh",
+            "index_freshness": "stale",
+            "impact_note": "the index is stale relative to the worktree; the zero impact figure may reflect missing data — re-index for authoritative impact"
+        }"#);
+    let t = trim_symbol_lookup(&input);
+    assert_eq!(t["index_freshness"], "stale");
+    assert_eq!(t["pdg_status"], "fresh");
+    let note = t["impact_note"].as_str().unwrap();
+    assert!(note.contains("stale"), "note: {note}");
+}
+
+#[test]
 fn test_trim_search_drops_verbose_fields() {
     let input = v(r#"{
             "results": [
@@ -212,6 +234,27 @@ fn test_trim_edit_keeps_apply_result_fields() {
 }
 
 #[test]
+fn test_trim_edit_keeps_dry_run_flag() {
+    // Regression (audit N-09): the handler wraps dry-run responses with
+    // success=true, changes_applied=0, dry_run=true — but the trim dropped
+    // `dry_run`, so the renderer's dry-run branch was dead and every dry run
+    // rendered as "No-op (content identical)".
+    let input = v(r#"{
+            "success": true,
+            "dry_run": true,
+            "changes_applied": 0,
+            "file_path": "src/foo.rs",
+            "message": "Dry run: no changes written. See `preview` for the diff and validation.",
+            "diff_text": "--- a/src/foo.rs\n+++ b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new\n"
+        }"#);
+    let t = trim_edit(&input);
+    assert_eq!(
+        t["dry_run"], true,
+        "trim must preserve dry_run for the renderer"
+    );
+}
+
+#[test]
 fn test_trim_read_symbol_caps_callers() {
     let callers: Vec<Value> = (0..20)
         .map(|i| serde_json::json!({"name": format!("c{}", i), "file": "a.rs", "line": i}))
@@ -248,66 +291,6 @@ fn test_trim_read_symbol_caps_callers() {
     // Callers capped at 5
     assert_eq!(t["callers"].as_array().unwrap().len(), 5);
     assert_eq!(t["callers_more"], true);
-}
-
-#[test]
-fn test_trim_grep_symbols_drops_byte_range() {
-    let input = v(r#"{
-            "results": [
-                {
-                    "name": "main",
-                    "type": "function",
-                    "file": "src/main.rs",
-                    "byte_range": [0, 200],
-                    "complexity": 3,
-                    "language": "rust",
-                    "caller_count": 10,
-                    "callers": [{"name": "a"}, {"name": "b"}, {"name": "c"}, {"name": "d"}, {"name": "e"}, {"name": "f"}, {"name": "g"}],
-                    "callees": [{"name": "x"}]
-                }
-            ],
-            "total_matches": 1,
-            "shown": 1,
-            "offset": 0,
-            "mode": "code"
-        }"#);
-    let t = trim_grep_symbols(&input);
-    let r = &t["results"][0];
-    assert!(r.get("byte_range").is_none());
-    assert!(r.get("language").is_none());
-    assert_eq!(r["callers"].as_array().unwrap().len(), 5);
-    assert_eq!(r["callee_count"], Value::Null); // not present in input
-    // caller_count (kept) reflects blast radius even when callers list is capped
-    assert_eq!(r["caller_count"], 10);
-}
-
-#[test]
-fn test_trim_text_search_preserves_context_windows() {
-    let input = v(r#"{
-            "count": 1,
-            "total_matched": 1,
-            "has_more": false,
-            "offset": 0,
-            "results": [
-                {
-                    "file": "src/foo.rs",
-                    "line": 42,
-                    "content": "let x = 1;",
-                    "before": ["fn main() {", "  let y = 2;"],
-                    "after": ["  let z = 3;", "}"],
-                    "in_symbol": "main",
-                    "symbol_type": "function"
-                }
-            ]
-        }"#);
-    let t = trim_text_search(&input);
-    let r = &t["results"][0];
-    // before/after context windows are now preserved so the LLM
-    // can understand match context without a follow-up read_file.
-    assert!(r.get("before").is_some());
-    assert!(r.get("after").is_some());
-    assert_eq!(r["file"], "src/foo.rs");
-    assert_eq!(r["line"], 42);
 }
 
 #[test]
@@ -1087,7 +1070,12 @@ fn test_trim_impact_borrows_impact_array() {
             "transitive_affected_symbols": ["callee_x", "callee_y", "callee_z"],
             "transitive_affected_files": 2,
             "transitive_callers": 5,
-            "summary": "Changing 'Foo::bar' directly affects 3 symbols in 2 files (risk: medium)"
+            "summary": "Changing 'Foo::bar' directly affects 3 symbols in 2 files (risk: medium)",
+            "community_breakdown": {
+                "same_community": 4,
+                "crossing": 1,
+                "boundaries": [{"from": 3, "to": 9, "symbols": 1}]
+            }
         }"#);
     let t = trim_impact(&input);
     // Top-level: all handler fields are preserved.
@@ -1110,6 +1098,9 @@ fn test_trim_impact_borrows_impact_array() {
     assert_eq!(affected[0], "callee_x");
     // summary string preserved
     assert!(t["summary"].as_str().unwrap().contains("3 symbols"));
+    assert_eq!(t["community_breakdown"]["same_community"], 4);
+    assert_eq!(t["community_breakdown"]["crossing"], 1);
+    assert_eq!(t["community_breakdown"]["boundaries"][0]["to"], 9);
 }
 
 #[test]

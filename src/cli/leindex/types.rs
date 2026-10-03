@@ -97,6 +97,13 @@ pub(crate) const SOURCE_FILE_EXTENSIONS: &[&str] = &[
     // Systems languages
     "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Scripting & other
     "cs", "rb", "php", "lua", "scala", "sc", "sh", "bash", "json",
+    // Tier-0 breadth wave (2026-08-20) — must stay in lockstep with
+    // docs/LANGUAGES.md and the parser registry
+    "swift", "kt", "kts", "dart", "html", "htm", "css", "scss", "yaml", "yml", "cmake", "ex", "exs",
+    "erl", "hrl", "hs", "pl", "pm", "r", "zig", "graphql", "gql", "hcl", "tf", "tfvars", "el",
+    "jl", "d", "di", "glsl", "vert", "frag", "comp", "ejs", "erb", "liquid",
+    // Docs tier: markdown/rest/asciidoc/plain-text heading sections
+    "md", "markdown", "rst", "adoc", "asciidoc", "txt",
 ];
 
 // Directories to always skip during source collection
@@ -175,6 +182,13 @@ pub struct FileStats {
     pub incoming_deps: usize,
 }
 
+/// Serde default for [`IndexStats::signature_scope`] — legacy persisted stats
+/// predate the field and are treated as full-run counts (their historical
+/// meaning).
+fn default_signature_scope() -> String {
+    "full".to_string()
+}
+
 /// Statistics from indexing operations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexStats {
@@ -192,6 +206,15 @@ pub struct IndexStats {
 
     /// Total number of code signatures extracted across all files
     pub total_signatures: usize,
+
+    /// Scope of `total_signatures`: `"full"` when the whole project was
+    /// parsed this run; `"delta"` when only changed files were (incremental
+    /// reindex), in which case the count covers JUST the files parsed this
+    /// run — the project-wide total is unchanged since the last full index.
+    /// Previously an incremental run reported e.g. `2` with no scope marker
+    /// and readers mistook it for the project total collapsing.
+    #[serde(default = "default_signature_scope")]
+    pub signature_scope: String,
 
     /// Number of PDG nodes recorded at indexing time (persisted to storage).
     /// This is a snapshot from the last `index_project` run and may differ
@@ -332,6 +355,15 @@ pub struct Diagnostics {
     /// Embedding model status: "tfidf_only", "onnx_hybrid", "remote_hybrid", or "unknown"
     #[serde(default)]
     pub embedding_model: String,
+    /// Whether the SCIP precision feature is compiled and enabled at runtime.
+    #[serde(default)]
+    pub precision_enabled: bool,
+    /// Number of canonical PDG nodes confirmed by SCIP precision ingest.
+    #[serde(default)]
+    pub precision_nodes: usize,
+    /// Languages represented by SCIP-confirmed canonical nodes.
+    #[serde(default)]
+    pub precision_languages: Vec<String>,
 }
 
 /// Coverage report of indexed vs source files.

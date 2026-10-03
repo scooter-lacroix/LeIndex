@@ -153,6 +153,151 @@ fn retrieval_meta(
     })
 }
 
+/// Query, paging and budget parameters for one \[search\] call.
+struct SearchParams {
+    /// The caller's query, echoed back when nothing matched.
+    query: String,
+    /// The query as the retriever sees it: task context appended when given.
+    effective_query: String,
+    /// Result window size.
+    top_k: usize,
+    /// Results to skip.
+    offset: usize,
+    /// Enrichment budget for this call.
+    budget: WorkBudget,
+    /// True when a task context was supplied (selects the ephemeral search).
+    has_task_context: bool,
+    /// Scoring mode, defaulting to `code`.
+    search_mode: String,
+}
+
+/// Read the query and its paging/budget knobs.
+fn parse_search_params(args: &Value) -> Result<SearchParams, JsonRpcError> {
+    let query = extract_string(args, "query")?;
+    let top_k = extract_usize(args, "top_k", 10)?;
+    let offset = extract_usize(args, "offset", 0)?;
+    let search_mode = args
+        .get("search_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("code")
+        .to_string();
+    let task_context = args
+        .get("task_context")
+        .and_then(Value::as_str)
+        .map(|context| context.chars().take(2000).collect::<String>());
+    let budget = WorkBudget {
+        max_latency_ms: extract_usize(args, "max_latency_ms", 500)?.min(60000) as u64,
+        allow_partial: extract_bool(args, "allow_partial", true),
+    };
+    let effective_query = task_context.as_deref().map_or_else(
+        || query.clone(),
+        |context| format!("{}\nTask context: {}", query, context),
+    );
+    Ok(SearchParams {
+        has_task_context: task_context.is_some(),
+        query,
+        effective_query,
+        top_k,
+        offset,
+        budget,
+        search_mode,
+    })
+}
+
+/// Project handles hydrate lazily (graph-only tools never build the TF-IDF
+/// engine), so a cold MCP session reaches here with an empty engine even for
+/// an indexed project. The one-shot CLI pre-loads everything, which is why
+/// `leindex search` worked while the MCP tool reported "Project not indexed".
+fn load_search_context(index: &mut crate::cli::leindex::LeIndex) -> Result<(), JsonRpcError> {
+    index
+        .ensure_analysis_context_loaded()
+        .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load search context: {e}")))
+}
+
+/// A project with no loaded engine cannot answer a semantic query.
+fn ensure_searchable(index: &crate::cli::leindex::LeIndex) -> Result<(), JsonRpcError> {
+    if index.search_engine().is_empty() {
+        return Err(JsonRpcError::project_not_indexed(
+            index.project_path().display().to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The empty-result response: an actionable suggestion plus retrieval meta.
+fn empty_search_payload(
+    query: &str,
+    index: &mut crate::cli::leindex::LeIndex,
+    offset: usize,
+    route: crate::search::query_route::QueryRoute,
+    route_name: &str,
+    budget: &WorkBudget,
+    started: Instant,
+) -> Value {
+    let indexed_files = index.source_file_paths().map(|p| p.len()).unwrap_or(0);
+    wrap_with_meta(
+        serde_json::json!({
+            "results": [],
+            "offset": offset,
+            "count": 0,
+            "has_more": false,
+            "suggestion": format!(
+                "No semantic matches found for '{}'. The project contains {} indexed files. \
+                Try: rephrase query, use different keywords, or try leindex_explore mode=find target=symbols for exact symbol names.",
+                query,
+                indexed_files
+            ),
+            "retrieval": retrieval_meta(index, route, route_name, budget, started)
+        }),
+        index,
+    )
+}
+
+/// Low-signal detection (F-07): expose the top composite score so agents can
+/// judge confidence, and flag results whose best match is weak. The floor is
+/// deliberately conservative (0.25): TF-IDF gives partial credit for a single
+/// shared token, so a garbage query with one common word can still score ~0.7
+/// — those are not flaggable without risking false negatives on legitimate
+/// short queries, but `top_score` makes the judgment possible at the consumer.
+fn low_signal_json(page: &[crate::search::search::SearchResult]) -> Value {
+    let top_score = page
+        .iter()
+        .map(|result| result.score.overall)
+        .fold(0.0_f32, f32::max);
+    if !page.is_empty() && top_score < 0.25 {
+        serde_json::json!({
+            "low_signal": true,
+            "top_score": top_score,
+            "suggestion": "Top match scores below the confidence floor; results may be coincidental token overlap. Rephrase with more specific terms or use leindex_explore mode=find target=symbols for exact names.",
+        })
+    } else {
+        serde_json::json!({ "top_score": top_score })
+    }
+}
+
+/// Bimodal-latency marker: the first neural call after a server or daemon
+/// start pays the ~15–20 s model load; every later call is milliseconds.
+/// Without this hint agents timeout-and-retry on the first call of every
+/// session (session-5 §5.1). Also merges the low-signal fields.
+fn annotate_search_payload(payload: &mut Value, low_signal_json: &Value, started: Instant) {
+    if started.elapsed().as_millis() > 5000 {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("cold_start".to_string(), serde_json::json!(true));
+            obj.insert(
+                "note".to_string(),
+                serde_json::json!(
+                    "This call included a one-time neural model load; subsequent searches are milliseconds"
+                ),
+            );
+        }
+    }
+    if let (Some(obj), Some(target)) = (payload.as_object_mut(), low_signal_json.as_object()) {
+        for (key, value) in target {
+            obj.insert(key.clone(), value.clone());
+        }
+    }
+}
+
 /// Handler for LeIndex [search
 ///
 /// Performs semantic search on the indexed code.
@@ -162,7 +307,7 @@ pub struct SearchHandler;
 impl SearchHandler {
     /// Returns the name of this MCP tool (MCP-compliant: ASCII letters, digits, underscore, hyphen, dot only)
     pub fn name(&self) -> &str {
-        "leindex.search"
+        "leindex_search"
     }
 
     /// Returns the human-readable display title for this tool
@@ -245,28 +390,10 @@ to auto-switch/auto-index projects."
         registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
-        let query = extract_string(&args, "query")?;
-        let top_k = extract_usize(&args, "top_k", 10)?;
-        let offset = extract_usize(&args, "offset", 0)?;
-        let search_mode = args
-            .get("search_mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("code");
-        let task_context = args
-            .get("task_context")
-            .and_then(Value::as_str)
-            .map(|context| context.chars().take(2000).collect::<String>());
-        let budget = WorkBudget {
-            max_latency_ms: extract_usize(&args, "max_latency_ms", 500)?.min(60000) as u64,
-            allow_partial: extract_bool(&args, "allow_partial", true),
-        };
+        let params = parse_search_params(&args)?;
         let started = Instant::now();
-        let effective_query = task_context.as_deref().map_or_else(
-            || query.clone(),
-            |context| format!("{}\nTask context: {}", query, context),
-        );
-
-        let (route, route_name, query_type) = classify_search(&effective_query, search_mode);
+        let (route, route_name, query_type) =
+            classify_search(&params.effective_query, &params.search_mode);
 
         let project_path = args.get("project_path").and_then(|v| v.as_str());
         let handle = registry.get_or_create(project_path).await?;
@@ -274,58 +401,53 @@ to auto-switch/auto-index projects."
 
         let scope = resolve_scope(&args, guard.project_path())?;
 
-        if guard.search_engine().is_empty() {
-            return Err(JsonRpcError::project_not_indexed(
-                guard.project_path().display().to_string(),
-            ));
-        }
+        load_search_context(&mut guard)?;
+        ensure_searchable(&guard)?;
 
         let project_root = guard.project_path().to_path_buf();
         let filtered = scoped_search(
             &mut guard,
-            &effective_query,
-            top_k,
-            offset,
+            &params.effective_query,
+            params.top_k,
+            params.offset,
             query_type,
-            task_context.is_some(),
+            params.has_task_context,
             scope.as_deref(),
             &project_root,
         )?;
 
         let total_filtered = filtered.len();
-        let page: Vec<_> = filtered.into_iter().skip(offset).take(top_k).collect();
+        let page: Vec<_> = filtered
+            .into_iter()
+            .skip(params.offset)
+            .take(params.top_k)
+            .collect();
         let total_returned = page.len();
 
+        let low_signal_json = low_signal_json(&page);
+
         if total_filtered == 0 {
-            return Ok(wrap_with_meta(
-                serde_json::json!({
-                    "results": [],
-                    "offset": offset,
-                    "count": 0,
-                    "has_more": false,
-                    "suggestion": format!(
-                        "No semantic matches found for '{}'. The project contains {} indexed files. \
-                        Try: rephrase query, use different keywords, or try LeIndex [Grep Symbols] for exact symbol names.",
-                        query,
-                        guard.source_file_paths().map(|p| p.len()).unwrap_or(0)
-                    ),
-                    "retrieval": retrieval_meta(&guard, route, route_name, &budget, started)
-                }),
-                &guard,
+            return Ok(empty_search_payload(
+                &params.query,
+                &mut guard,
+                params.offset,
+                route,
+                route_name,
+                &params.budget,
+                started,
             ));
         }
 
-        Ok(wrap_with_meta(
-            serde_json::json!({
-                "results": serde_json::to_value(&page).map_err(|e|
-                    JsonRpcError::internal_error(format!("Serialization error: {}", e)))?,
-                "offset": offset,
-                "count": total_returned,
-                "has_more": offset + total_returned < total_filtered,
-                "retrieval": retrieval_meta(&guard, route, route_name, &budget, started)
-            }),
-            &guard,
-        ))
+        let mut payload = serde_json::json!({
+            "results": serde_json::to_value(&page).map_err(|e|
+                JsonRpcError::internal_error(format!("Serialization error: {}", e)))?,
+            "offset": params.offset,
+            "count": total_returned,
+            "has_more": params.offset + total_returned < total_filtered,
+            "retrieval": retrieval_meta(&guard, route, route_name, &params.budget, started)
+        });
+        annotate_search_payload(&mut payload, &low_signal_json, started);
+        Ok(wrap_with_meta(payload, &guard))
     }
 }
 

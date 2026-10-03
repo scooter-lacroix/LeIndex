@@ -2,7 +2,7 @@
 
 This module is the implementation behind the ``leindex`` and ``leindex-setup``
 console scripts declared in ``pyproject.toml``. The wrapper ensures the Rust
-``leindex`` binary (and its ``leindex-embed`` worker sibling) is installed via
+single ``leindex`` binary (worker mode built in) is installed via
 ``cargo install``, then forwards CLI execution to the real binary while
 relaying signals and exit codes.
 
@@ -17,7 +17,7 @@ Design notes (see ``validation-contract.md`` Area: PYPI):
   ``leindex-setup`` console script that always runs the setup wizard.
 * VAL-PYPI-007: signals (SIGINT/SIGTERM) propagate to the child and the
   child's real exit code is returned (no KeyboardInterrupt traceback).
-* VAL-PYPI-008: the worker binary (``leindex-embed``) is bootstrapped in the
+* VAL-PYPI-008 (superseded): the worker is built into the main binary
   same pass so neural search is functional after setup.
 * VAL-PYPI-011: a missing ``cargo`` is handled with actionable guidance and a
   non-zero exit instead of a hang or silent failure.
@@ -57,10 +57,8 @@ INSTALL_ONLY_FLAG = "--bootstrap-install-only"
 INSTALL_FEATURES = "onnx"
 
 # Main binary package name on crates.io. `cargo install leindex --features onnx`
-# builds BOTH the `leindex` main binary and the `leindex-embed` worker binary
-# (the worker is a [[bin]] target of this crate), so no separate worker-package
-# install is needed — the former standalone `leindex-embed` crates.io package
-# was removed when the embed subcrate was folded into the main crate.
+# builds the single `leindex` binary with the ONNX worker mode built in
+# (hidden re-exec token), so no separate worker-package install is needed.
 MAIN_PACKAGE = "leindex"
 
 
@@ -167,7 +165,9 @@ def resolve_target() -> InstallTarget:
     cargo_bin = cargo_home / "bin"
     cargo_binary = cargo_bin / binary_name("cargo")
     leindex_binary = cargo_bin / binary_name("leindex")
-    embed_binary = cargo_bin / binary_name("leindex-embed")
+    # Single binary: no separate worker path (kept None-compatible for
+    # InstallTarget consumers that still reference the field).
+    embed_binary = cargo_bin / binary_name("leindex")
     return InstallTarget(
         cargo_home=cargo_home,
         cargo_bin=cargo_bin,
@@ -202,9 +202,8 @@ def ensure_leindex_installed(*, interactive: bool) -> tuple[Path, bool]:
         return target.leindex_binary, False
 
     cargo_binary = ensure_cargo_available(target, interactive=interactive)
-    # install_leindex (cargo install leindex --features onnx) builds BOTH the
-    # main `leindex` and the `leindex-embed` worker bin (a [[bin]] target of this
-    # crate), so the worker is present without a separate install.
+    # install_leindex (cargo install leindex --features onnx) builds the single
+    # binary with worker mode built in (hidden re-exec token).
     install_leindex(cargo_binary, wanted_version)
 
     installed_version = read_installed_version(target.leindex_binary)
@@ -221,39 +220,12 @@ def ensure_leindex_installed(*, interactive: bool) -> tuple[Path, bool]:
 
 
 def ensure_worker_present(target: InstallTarget, *, interactive: bool) -> None:
-    """Best-effort install of a missing worker binary alongside a current main binary.
-
-    Only triggers when the main binary is present at the wanted version but the
-    worker is absent. Failures are reported on stderr and do NOT abort the run:
-    the worker is only needed for neural search, which ``leindex setup`` handles
-    end-to-end and reports clearly when ORT/worker are unavailable.
+    """Single-binary no-op (2026-08-20): the ONNX worker is reached via the
+    hidden ``leindex --internal-embed-worker`` re-exec, so a separate worker
+    binary no longer exists. Kept as a stub for call-site compatibility.
     """
-    if target.embed_binary.is_file():
-        return
-
-    cargo = shutil.which("cargo") or (
-        str(target.cargo_binary) if target.cargo_binary.is_file() else None
-    )
-    if not cargo:
-        # No cargo available; defer to setup which will surface actionable
-        # guidance. Returning keeps TF-IDF search working immediately.
-        return
-
-    try:
-        # The worker is a [[bin]] of the main crate, so reinstalling the main
-        # package with onnx (re)builds it. (Formerly a separate leindex-embed
-        # package install, which no longer exists post-embed-merge.)
-        install_leindex(Path(cargo), desired_version())
-    except BootstrapError as error:
-        print(
-            f"Warning: could not install the leindex-embed worker: {error}",
-            file=sys.stderr,
-        )
-        print(
-            "Neural search will be unavailable until the worker is installed "
-            "(`leindex setup` can retry).",
-            file=sys.stderr,
-        )
+    _ = target, interactive
+    return
 
 
 def ensure_cargo_available(target: InstallTarget, *, interactive: bool) -> Path:

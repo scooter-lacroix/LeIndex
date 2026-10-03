@@ -8,13 +8,21 @@
 //   - `add_edge` returns `EdgeId` directly (was misleadingly Option<EdgeId>)
 //   - All public traversal methods take `TraversalConfig` — callers must be explicit
 
+use crate::fast_hash::{FastMap as HashMap, FastSet as HashSet};
+use bincode::Options;
 use petgraph::stable_graph::StableGraph;
 use petgraph::visit::EdgeRef;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use crate::graph::trigram::TrigramIndex;
+
+mod lookup;
+
+mod edges_traversal_serde;
 
 /// A unique identifier for a node in the Program Dependence Graph.
 ///
@@ -34,6 +42,14 @@ pub type EdgeId = petgraph::stable_graph::EdgeIndex;
 // ---------------------------------------------------------------------------
 // Core data types
 // ---------------------------------------------------------------------------
+
+/// Canonical `file_path` for external placeholder nodes. Real file paths
+/// would tie a shared placeholder to whichever file's extraction pass
+/// created it, letting a per-file `remove_file`/`delete_file_data` delete a
+/// node other files' edges still point at. The graph layer, the storage
+/// loader, and both indexing build routes canonicalize to this value so
+/// externals are graph-level vocabulary, never file content.
+pub const EXTERNAL_NODE_FILE_PATH: &str = "<external>";
 
 /// A node in the Program Dependence Graph representing a code entity.
 ///
@@ -124,6 +140,9 @@ pub enum NodeType {
     /// Imported/referenced symbol not defined in this project
     External,
 
+    /// A documentation heading section (markdown/rst/adoc/txt docs tier).
+    DocSection,
+
     /// Synthetic per-file summary node (conceptual-recall fix). Embeds the
     /// file's leading doc comment + the names of its top-level items as a
     /// single retrievable unit, so a conceptual NL query can match a file by
@@ -134,7 +153,7 @@ pub enum NodeType {
 /// Edge types — now includes Containment for structural (non-semantic) relationships.
 ///
 /// Filtering guidance for callers:
-///   - Call + DataDependency + Inheritance = semantic graph (use for impact analysis)
+///   - Call + DataDependency + Inheritance + TypeOf = semantic graph (use for impact analysis)
 ///   - Containment = structural graph (use for hierarchy display, not reachability)
 ///   - Import = module-level dependency graph
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -158,6 +177,11 @@ pub enum EdgeType {
     Environment,
     /// Bytes or a value passed to command standard input.
     Stdin,
+    /// A precise type-of relationship confirmed by SCIP.
+    ///
+    /// Kept at the end of the enum to preserve bincode discriminants for the
+    /// pre-TypeOf edge variants.
+    TypeOf,
 }
 
 /// An edge in the Program Dependence Graph representing a relationship between nodes.
@@ -284,8 +308,8 @@ impl EdgeMetadata {
 /// | Use case                    | max_depth | max_nodes | allowed_edge_types              |
 /// |-----------------------------|-----------|-----------|----------------------------------|
 /// | LLM context window (tight)  | 3         | 50        | Call, DataDependency             |
-/// | LLM context window (broad)  | 5         | 150       | Call, DataDependency, Inheritance|
-/// | Impact analysis (full)      | None      | 500       | Call, DataDependency, Inheritance|
+/// | LLM context window (broad)  | 5         | 150       | Call, DataDependency, Inheritance, TypeOf|
+/// | Impact analysis (full)      | None      | 500       | Call, DataDependency, Inheritance, TypeOf|
 /// | Module dependency map       | 10        | 1000      | Import                           |
 /// | Class hierarchy display     | 8         | 200       | Inheritance, Containment         |
 #[derive(Debug, Clone)]
@@ -327,7 +351,8 @@ impl TraversalConfig {
         }
     }
 
-    /// Broad semantic analysis — includes inheritance, moderate limits.
+    /// Broad semantic analysis — includes inheritance and precise type edges,
+    /// with moderate limits.
     pub fn for_semantic_analysis() -> Self {
         Self {
             max_depth: Some(5),
@@ -336,6 +361,7 @@ impl TraversalConfig {
                 EdgeType::Call,
                 EdgeType::DataDependency,
                 EdgeType::Inheritance,
+                EdgeType::TypeOf,
                 EdgeType::StateTransition,
                 EdgeType::CommandArgument,
                 EdgeType::Environment,
@@ -347,7 +373,8 @@ impl TraversalConfig {
         }
     }
 
-    /// Full impact analysis — all semantic edges, hard node cap.
+    /// Full impact analysis — all semantic edges, including precise type
+    /// relationships, with a hard node cap.
     pub fn for_impact_analysis() -> Self {
         Self {
             max_depth: None,
@@ -356,6 +383,7 @@ impl TraversalConfig {
                 EdgeType::Call,
                 EdgeType::DataDependency,
                 EdgeType::Inheritance,
+                EdgeType::TypeOf,
                 EdgeType::StateTransition,
                 EdgeType::CommandArgument,
                 EdgeType::Environment,
@@ -504,16 +532,382 @@ struct SerializablePDG {
     /// Keyed by node.id string, value is the embedding vector.
     #[serde(default)]
     embeddings: HashMap<String, Vec<f32>>,
+    /// Stable node identifiers confirmed by SCIP precision ingest.
+    ///
+    /// This is the final field so older bincode payloads can be retried with a
+    /// legacy schema when they do not contain precision markers.
+    #[serde(default)]
+    precision_symbols: HashSet<String>,
 }
 
-impl SerializablePDG {
-    fn from_pdg(pdg: &ProgramDependenceGraph) -> Self {
+/// The bincode schema written before precision markers were added.
+///
+/// `serde(default)` does not make a missing trailing field backward-compatible
+/// for bincode, so `deserialize()` explicitly retries this schema for existing
+/// graph fixtures and caches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializablePDGWithoutPrecision {
+    nodes: Vec<SerializableNode>,
+    edges: Vec<SerializableEdge>,
+    symbol_index: HashMap<String, u32>,
+    file_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_lower_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    embeddings: HashMap<String, Vec<f32>>,
+}
+
+/// The bincode schema from before embeddings were externalized.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializablePDGWithoutEmbeddings {
+    nodes: Vec<SerializableNode>,
+    edges: Vec<SerializableEdge>,
+    symbol_index: HashMap<String, u32>,
+    file_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_lower_index: HashMap<String, Vec<u32>>,
+}
+
+/// The pre-name-lower-index form of the post-embedding schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializablePDGWithoutEmbeddingsAndNameLower {
+    nodes: Vec<SerializableNode>,
+    edges: Vec<SerializableEdge>,
+    symbol_index: HashMap<String, u32>,
+    file_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_index: HashMap<String, Vec<u32>>,
+}
+
+/// Edge metadata used by artifacts written before flow-channel fields existed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyEdgeMetadata {
+    call_count: Option<usize>,
+    variable_name: Option<String>,
+    confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum LegacyEdgeType {
+    Call,
+    DataDependency,
+    Inheritance,
+    Import,
+    Containment,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyEdge {
+    edge_type: LegacyEdgeType,
+    metadata: LegacyEdgeMetadata,
+}
+
+/// Node schema from the period when embeddings were stored inline on nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyNode {
+    id: String,
+    node_type: NodeType,
+    name: String,
+    file_path: String,
+    byte_range: (usize, usize),
+    complexity: u32,
+    language: String,
+    embedding: Option<Vec<f32>>,
+}
+
+/// Node schema immediately before embeddings were externalized.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyNodeWithoutEmbedding {
+    id: String,
+    node_type: NodeType,
+    name: String,
+    file_path: String,
+    byte_range: (usize, usize),
+    complexity: u32,
+    language: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySerializableNode<N> {
+    index: u32,
+    node: N,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySerializableEdge {
+    source: u32,
+    target: u32,
+    edge: LegacyEdge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializablePDGWithInlineEmbeddings {
+    nodes: Vec<LegacySerializableNode<LegacyNode>>,
+    edges: Vec<LegacySerializableEdge>,
+    symbol_index: HashMap<String, u32>,
+    file_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_lower_index: HashMap<String, Vec<u32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializablePDGWithoutInlineEmbeddings {
+    nodes: Vec<LegacySerializableNode<LegacyNodeWithoutEmbedding>>,
+    edges: Vec<LegacySerializableEdge>,
+    symbol_index: HashMap<String, u32>,
+    file_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_lower_index: HashMap<String, Vec<u32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializablePDGWithInlineEmbeddingsWithoutNameLower {
+    nodes: Vec<LegacySerializableNode<LegacyNode>>,
+    edges: Vec<LegacySerializableEdge>,
+    symbol_index: HashMap<String, u32>,
+    file_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_index: HashMap<String, Vec<u32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializablePDGWithoutInlineEmbeddingsAndNameLower {
+    nodes: Vec<LegacySerializableNode<LegacyNodeWithoutEmbedding>>,
+    edges: Vec<LegacySerializableEdge>,
+    symbol_index: HashMap<String, u32>,
+    file_index: HashMap<String, Vec<u32>>,
+    #[serde(default)]
+    name_index: HashMap<String, Vec<u32>>,
+}
+
+fn convert_legacy_edge(edge: &LegacyEdge) -> Edge {
+    Edge {
+        edge_type: match edge.edge_type {
+            LegacyEdgeType::Call => EdgeType::Call,
+            LegacyEdgeType::DataDependency => EdgeType::DataDependency,
+            LegacyEdgeType::Inheritance => EdgeType::Inheritance,
+            LegacyEdgeType::Import => EdgeType::Import,
+            LegacyEdgeType::Containment => EdgeType::Containment,
+        },
+        metadata: EdgeMetadata {
+            call_count: edge.metadata.call_count,
+            variable_name: edge.metadata.variable_name.clone(),
+            confidence: edge.metadata.confidence,
+            channel: None,
+            position: None,
+        },
+    }
+}
+
+fn convert_legacy_node(node: &LegacyNode) -> Node {
+    Node {
+        id: node.id.clone(),
+        node_type: node.node_type.clone(),
+        name: node.name.clone(),
+        file_path: Arc::from(node.file_path.as_str()),
+        byte_range: node.byte_range,
+        complexity: node.complexity,
+        language: node.language.clone(),
+    }
+}
+
+fn convert_legacy_node_without_embedding(node: &LegacyNodeWithoutEmbedding) -> Node {
+    Node {
+        id: node.id.clone(),
+        node_type: node.node_type.clone(),
+        name: node.name.clone(),
+        file_path: Arc::from(node.file_path.as_str()),
+        byte_range: node.byte_range,
+        complexity: node.complexity,
+        language: node.language.clone(),
+    }
+}
+
+fn convert_legacy_edges(edges: &[LegacySerializableEdge]) -> Vec<SerializableEdge> {
+    edges
+        .iter()
+        .map(|serialized| SerializableEdge {
+            source: serialized.source,
+            target: serialized.target,
+            edge: convert_legacy_edge(&serialized.edge),
+        })
+        .collect()
+}
+
+impl SerializablePDGWithInlineEmbeddings {
+    fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|serialized| SerializableNode {
+                index: serialized.index,
+                node: convert_legacy_node(&serialized.node),
+            })
+            .collect();
+        let embeddings = self
+            .nodes
+            .iter()
+            .filter_map(|serialized| {
+                serialized
+                    .node
+                    .embedding
+                    .clone()
+                    .map(|embedding| (serialized.node.id.clone(), embedding))
+            })
+            .collect();
+        SerializablePDG {
+            nodes,
+            edges: convert_legacy_edges(&self.edges),
+            symbol_index: self.symbol_index.clone(),
+            file_index: self.file_index.clone(),
+            name_index: self.name_index.clone(),
+            name_lower_index: self.name_lower_index.clone(),
+            embeddings,
+            precision_symbols: HashSet::default(),
+        }
+        .to_pdg()
+    }
+}
+
+impl SerializablePDGWithoutInlineEmbeddings {
+    fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDG {
+            nodes: self
+                .nodes
+                .iter()
+                .map(|serialized| SerializableNode {
+                    index: serialized.index,
+                    node: convert_legacy_node_without_embedding(&serialized.node),
+                })
+                .collect(),
+            edges: convert_legacy_edges(&self.edges),
+            symbol_index: self.symbol_index.clone(),
+            file_index: self.file_index.clone(),
+            name_index: self.name_index.clone(),
+            name_lower_index: self.name_lower_index.clone(),
+            embeddings: HashMap::default(),
+            precision_symbols: HashSet::default(),
+        }
+        .to_pdg()
+    }
+}
+
+impl SerializablePDGWithInlineEmbeddingsWithoutNameLower {
+    fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|serialized| SerializableNode {
+                index: serialized.index,
+                node: convert_legacy_node(&serialized.node),
+            })
+            .collect();
+        let embeddings = self
+            .nodes
+            .iter()
+            .filter_map(|serialized| {
+                serialized
+                    .node
+                    .embedding
+                    .clone()
+                    .map(|embedding| (serialized.node.id.clone(), embedding))
+            })
+            .collect();
+        SerializablePDG {
+            nodes,
+            edges: convert_legacy_edges(&self.edges),
+            symbol_index: self.symbol_index.clone(),
+            file_index: self.file_index.clone(),
+            name_index: self.name_index.clone(),
+            name_lower_index: HashMap::default(),
+            embeddings,
+            precision_symbols: HashSet::default(),
+        }
+        .to_pdg()
+    }
+}
+
+impl SerializablePDGWithoutInlineEmbeddingsAndNameLower {
+    fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDG {
+            nodes: self
+                .nodes
+                .iter()
+                .map(|serialized| SerializableNode {
+                    index: serialized.index,
+                    node: convert_legacy_node_without_embedding(&serialized.node),
+                })
+                .collect(),
+            edges: convert_legacy_edges(&self.edges),
+            symbol_index: self.symbol_index.clone(),
+            file_index: self.file_index.clone(),
+            name_index: self.name_index.clone(),
+            name_lower_index: HashMap::default(),
+            embeddings: HashMap::default(),
+            precision_symbols: HashSet::default(),
+        }
+        .to_pdg()
+    }
+}
+// ---------------------------------------------------------------------------
+// Borrowed serialization shim
+// ---------------------------------------------------------------------------
+//
+// `SerializablePDG::from_pdg` used to deep-clone every node and edge (`Clone`)
+// into the serialization buffer, doubling peak memory for large PDGs. The
+// borrowed shim below serializes directly from the live graph — node/edge/key
+// maps are referenced rather than cloned — while producing byte-for-byte the
+// same shape `bincode::deserialize::<SerializablePDG>` expects on the read
+// side. Its fields mirror `SerializablePDG` in declaration order so bincode's
+// positional encoding lines up exactly.
+
+/// A node reference used only for serialization (no deep clone of the weight).
+#[derive(Serialize)]
+struct SerializableNodeRef<'a> {
+    index: u32,
+    node: &'a Node,
+}
+
+/// An edge reference used only for serialization (no deep clone of the weight).
+#[derive(Serialize)]
+struct SerializableEdgeRef<'a> {
+    source: u32,
+    target: u32,
+    edge: &'a Edge,
+}
+
+/// Borrowed variant of [`SerializablePDG`] used for clone-free serialization.
+#[derive(Serialize)]
+struct SerializablePDGRef<'a> {
+    nodes: Vec<SerializableNodeRef<'a>>,
+    edges: Vec<SerializableEdgeRef<'a>>,
+    symbol_index: HashMap<&'a str, u32>,
+    file_index: HashMap<&'a str, Vec<u32>>,
+    name_index: HashMap<&'a str, Vec<u32>>,
+    name_lower_index: HashMap<&'a str, Vec<u32>>,
+    embeddings: HashMap<&'a str, &'a Vec<f32>>,
+    precision_symbols: &'a HashSet<String>,
+}
+
+impl SerializablePDGRef<'_> {
+    /// Build a borrowed serialization shim directly from graph references,
+    /// avoiding the per-node/per-edge `clone()` that `SerializablePDG::from_pdg`
+    /// performed.
+    fn from_pdg(pdg: &ProgramDependenceGraph) -> SerializablePDGRef<'_> {
         let nodes = pdg
             .graph
             .node_indices()
-            .map(|idx| SerializableNode {
+            .map(|idx| SerializableNodeRef {
                 index: idx.index() as u32,
-                node: pdg.graph[idx].clone(),
+                node: &pdg.graph[idx],
             })
             .collect();
 
@@ -525,10 +919,10 @@ impl SerializablePDG {
                     .graph
                     .edge_endpoints(eidx)
                     .expect("Edge endpoints must exist");
-                SerializableEdge {
+                SerializableEdgeRef {
                     source: source.index() as u32,
                     target: target.index() as u32,
-                    edge: pdg.graph[eidx].clone(),
+                    edge: &pdg.graph[eidx],
                 }
             })
             .collect();
@@ -536,41 +930,100 @@ impl SerializablePDG {
         let symbol_index = pdg
             .symbol_index
             .iter()
-            .map(|(k, v)| (k.clone(), v.index() as u32))
+            .map(|(k, v)| (k.as_str(), v.index() as u32))
             .collect();
         let file_index = pdg
             .file_index
             .iter()
-            .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
+            .map(|(k, v)| (k.as_str(), v.iter().map(|id| id.index() as u32).collect()))
             .collect();
         let name_index = pdg
             .name_index
             .iter()
-            .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
+            .map(|(k, v)| (k.as_str(), v.iter().map(|id| id.index() as u32).collect()))
             .collect();
         let name_lower_index = pdg
             .name_lower_index
             .iter()
-            .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
+            .map(|(k, v)| (k.as_str(), v.iter().map(|id| id.index() as u32).collect()))
             .collect();
 
-        Self {
+        let embeddings = pdg
+            .embedding_store
+            .embeddings
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+
+        SerializablePDGRef {
             nodes,
             edges,
             symbol_index,
             file_index,
             name_index,
             name_lower_index,
-            embeddings: pdg.embedding_store.embeddings.clone(),
+            embeddings,
+            precision_symbols: &pdg.precision_symbols,
         }
     }
+}
 
+impl SerializablePDGWithoutPrecision {
+    fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDG {
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+            symbol_index: self.symbol_index.clone(),
+            file_index: self.file_index.clone(),
+            name_index: self.name_index.clone(),
+            name_lower_index: self.name_lower_index.clone(),
+            embeddings: self.embeddings.clone(),
+            precision_symbols: HashSet::default(),
+        }
+        .to_pdg()
+    }
+}
+
+impl SerializablePDGWithoutEmbeddings {
+    fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDG {
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+            symbol_index: self.symbol_index.clone(),
+            file_index: self.file_index.clone(),
+            name_index: self.name_index.clone(),
+            name_lower_index: self.name_lower_index.clone(),
+            embeddings: HashMap::default(),
+            precision_symbols: HashSet::default(),
+        }
+        .to_pdg()
+    }
+}
+
+impl SerializablePDGWithoutEmbeddingsAndNameLower {
+    fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDG {
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+            symbol_index: self.symbol_index.clone(),
+            file_index: self.file_index.clone(),
+            name_index: self.name_index.clone(),
+            name_lower_index: HashMap::default(),
+            embeddings: HashMap::default(),
+            precision_symbols: HashSet::default(),
+        }
+        .to_pdg()
+    }
+}
+
+impl SerializablePDG {
     fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
         let mut pdg = ProgramDependenceGraph::new();
         let index_map = self.restore_nodes(&mut pdg);
         self.restore_indexes(&mut pdg, &index_map);
         self.restore_edges(&mut pdg, &index_map)?;
         self.restore_embeddings(&mut pdg);
+        self.restore_precision_symbols(&mut pdg);
         Self::rebuild_name_file_index(&mut pdg);
 
         if pdg.trigram_index.is_empty() {
@@ -606,6 +1059,7 @@ impl SerializablePDG {
         source: &HashMap<String, u32>,
         index_map: &HashMap<u32, NodeId>,
     ) {
+        destination.reserve(source.len());
         for (symbol, old_index) in source {
             if let Some(&node_id) = index_map.get(old_index) {
                 destination.insert(symbol.clone(), node_id);
@@ -618,6 +1072,7 @@ impl SerializablePDG {
         source: &HashMap<String, Vec<u32>>,
         index_map: &HashMap<u32, NodeId>,
     ) {
+        destination.reserve(source.len());
         for (name, old_indices) in source {
             let node_ids: Vec<NodeId> = old_indices
                 .iter()
@@ -630,6 +1085,9 @@ impl SerializablePDG {
     }
 
     fn rebuild_name_indexes(pdg: &mut ProgramDependenceGraph) {
+        let node_count = pdg.graph.node_count();
+        pdg.name_index.reserve(node_count);
+        pdg.name_lower_index.reserve(node_count);
         for node_id in pdg.graph.node_indices() {
             if let Some(node) = pdg.graph.node_weight(node_id) {
                 pdg.name_index
@@ -666,6 +1124,16 @@ impl SerializablePDG {
         for (node_id, embedding) in &self.embeddings {
             pdg.embedding_store.insert(node_id, embedding.clone());
         }
+    }
+
+    fn restore_precision_symbols(&self, pdg: &mut ProgramDependenceGraph) {
+        let restored = self
+            .precision_symbols
+            .iter()
+            .filter(|symbol| pdg.find_by_symbol(symbol).is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        pdg.precision_symbols.extend(restored);
     }
 
     fn rebuild_name_file_index(pdg: &mut ProgramDependenceGraph) {
@@ -711,17 +1179,17 @@ pub struct ProgramDependenceGraph {
     /// Used for O(1) lookup of nodes by their fully qualified identifier.
     pub(crate) symbol_index: HashMap<String, NodeId>,
 
-    /// Maps file_path → Vec<NodeId>
+    /// Maps file_path → `Vec<NodeId>`
     ///
     /// Used to quickly find all nodes defined in a specific file.
     pub(crate) file_index: HashMap<String, Vec<NodeId>>,
 
-    /// Maps node.name (exact) → Vec<NodeId>
+    /// Maps node.name (exact) → `Vec<NodeId>`
     ///
     /// Used for finding nodes by their human-readable name.
     pub(crate) name_index: HashMap<String, Vec<NodeId>>,
 
-    /// Maps lowercase node.name → Vec<NodeId>
+    /// Maps lowercase node.name → `Vec<NodeId>`
     ///
     /// Enables O(1) case-insensitive lookups without scanning the entire graph.
     /// This eliminates the O(n) scan that would otherwise be needed for
@@ -735,20 +1203,23 @@ pub struct ProgramDependenceGraph {
     /// ~300MB; this optional store is populated on demand.
     pub embedding_store: EmbeddingStore,
 
+    /// Leiden community per node (roadmap Part IV), populated post-
+    /// construction by `graph::community::detect_communities`.
+    #[cfg(feature = "community")]
+    pub communities: HashMap<NodeId, u32>,
+
+    /// Stable node IDs confirmed by SCIP precision ingest.
+    ///
+    /// Strings are used instead of transient `NodeId` values so the marker
+    /// remains meaningful across graph reloads and generation rebuilds.
+    pub precision_symbols: HashSet<String>,
+
     /// O(1) lookup by (name, file_path) pair.
     ///
     /// Used by `find_by_name_in_file()` when a file hint is provided,
     /// replacing the linear scan through `name_index` candidates.
     /// Populated during `add_node()`, cleaned up in `remove_node()`.
     name_file_index: HashMap<(String, String), NodeId>,
-
-    /// Reusable scratch buffer for BFS neighbor collection.
-    ///
-    /// Avoids allocating a new `Vec<NodeId>` on every BFS level iteration.
-    /// Cleared at the start of each level, reused across traversals.
-    /// Wrapped in `Mutex` because the PDG is shared across threads
-    /// (e.g., via `Arc<ProgramDependenceGraph>` in validation handlers).
-    bfs_scratch: Mutex<Vec<NodeId>>,
 
     /// Trigram index for accelerating fuzzy node lookups.
     ///
@@ -757,6 +1228,33 @@ pub struct ProgramDependenceGraph {
     /// Built lazily on first fuzzy search, or eagerly during indexing.
     /// Persisted alongside the PDG in SQLite.
     trigram_index: TrigramIndex,
+
+    /// Process-unique revision of the node set. Assigned when the graph is
+    /// created and replaced with a fresh value on every node mutation, so two
+    /// graphs (or two states of one graph) never share a revision unless one is
+    /// an unmodified clone of the other.
+    revision: u64,
+
+    /// Lower-cased distinct names/paths, memoised against `revision`.
+    name_corpus: Mutex<Option<(u64, Arc<NameCorpus>)>>,
+}
+
+static NEXT_PDG_REVISION: AtomicU64 = AtomicU64::new(1);
+
+fn next_revision() -> u64 {
+    NEXT_PDG_REVISION.fetch_add(1, AtomicOrdering::Relaxed)
+}
+
+/// Distinct lower-cased node names and file paths of a PDG.
+///
+/// Import validation probes these with `contains` instead of lower-casing every
+/// node per import. Built once per PDG revision and shared via `Arc`.
+#[derive(Debug, Default)]
+pub struct NameCorpus {
+    /// Distinct lower-cased node names.
+    pub names: Vec<String>,
+    /// Distinct lower-cased node file paths.
+    pub files: Vec<String>,
 }
 
 impl Clone for ProgramDependenceGraph {
@@ -768,9 +1266,18 @@ impl Clone for ProgramDependenceGraph {
             name_index: self.name_index.clone(),
             name_lower_index: self.name_lower_index.clone(),
             embedding_store: self.embedding_store.clone(),
+            #[cfg(feature = "community")]
+            communities: self.communities.clone(),
+            precision_symbols: self.precision_symbols.clone(),
             name_file_index: self.name_file_index.clone(),
-            bfs_scratch: Mutex::new(Vec::new()),
             trigram_index: self.trigram_index.clone(),
+            revision: self.revision,
+            name_corpus: Mutex::new(
+                self.name_corpus
+                    .lock()
+                    .ok()
+                    .and_then(|cached| cached.clone()),
+            ),
         }
     }
 }
@@ -780,15 +1287,55 @@ impl ProgramDependenceGraph {
     pub fn new() -> Self {
         Self {
             graph: StableGraph::new(),
-            symbol_index: HashMap::new(),
-            file_index: HashMap::new(),
-            name_index: HashMap::new(),
-            name_lower_index: HashMap::new(),
+            symbol_index: HashMap::default(),
+            file_index: HashMap::default(),
+            name_index: HashMap::default(),
+            name_lower_index: HashMap::default(),
             embedding_store: EmbeddingStore::new(),
-            name_file_index: HashMap::new(),
-            bfs_scratch: Mutex::new(Vec::new()),
+            #[cfg(feature = "community")]
+            communities: HashMap::default(),
+            precision_symbols: HashSet::default(),
+            name_file_index: HashMap::default(),
             trigram_index: TrigramIndex::new(),
+            revision: next_revision(),
+            name_corpus: Mutex::new(None),
         }
+    }
+
+    /// Revision of the node set; changes whenever nodes are added, removed or
+    /// mutated. Suitable as a cache key for data derived from node contents.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn touch(&mut self) {
+        self.revision = next_revision();
+    }
+
+    /// Distinct lower-cased node names and file paths, built once per
+    /// [`revision`](Self::revision) and shared by every caller.
+    pub fn name_corpus(&self) -> Arc<NameCorpus> {
+        let mut cached = match self.name_corpus.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some((revision, corpus)) = cached.as_ref() {
+            if *revision == self.revision {
+                return Arc::clone(corpus);
+            }
+        }
+        let mut names: HashSet<String> = HashSet::default();
+        let mut files: HashSet<String> = HashSet::default();
+        for node in self.graph.node_weights() {
+            names.insert(node.name.to_lowercase());
+            files.insert(node.file_path.to_lowercase());
+        }
+        let corpus = Arc::new(NameCorpus {
+            names: names.into_iter().collect(),
+            files: files.into_iter().collect(),
+        });
+        *cached = Some((self.revision, Arc::clone(&corpus)));
+        corpus
     }
 
     // -----------------------------------------------------------------------
@@ -816,8 +1363,8 @@ impl ProgramDependenceGraph {
     /// (conceptual-recall fix.)
     pub fn ensure_file_summary_nodes(&mut self) {
         use std::collections::{HashMap, HashSet};
-        let mut file_lang: HashMap<String, String> = HashMap::new();
-        let mut have_summary: HashSet<String> = HashSet::new();
+        let mut file_lang: HashMap<String, String> = HashMap::default();
+        let mut have_summary: HashSet<String> = HashSet::default();
         for ni in self.node_indices() {
             if let Some(n) = self.get_node(ni) {
                 let fp = n.file_path.to_string();
@@ -837,27 +1384,66 @@ impl ProgramDependenceGraph {
 
     /// Add a node to the graph, returning its stable `NodeId`.
     pub fn add_node(&mut self, node: Node) -> NodeId {
-        let id = self.graph.add_node(node.clone());
-        self.symbol_index.insert(node.id.clone(), id);
-        self.file_index
-            .entry(node.file_path.to_string())
-            .or_default()
-            .push(id);
-        self.name_index
-            .entry(node.name.clone())
-            .or_default()
-            .push(id);
-        self.name_lower_index
-            .entry(node.name.to_lowercase())
-            .or_default()
-            .push(id);
-        self.name_file_index
-            .insert((node.name.clone(), node.file_path.to_string()), id);
-
+        let name = node.name.clone();
+        let node_id_str = node.id.clone();
+        let file_path = Arc::clone(&node.file_path);
+        let id = self.add_node_without_trigrams(node);
         // Update trigram index incrementally
         self.trigram_index
-            .add_node(id, &node.name, &node.id, &node.file_path);
+            .add_node(id, &name, &node_id_str, &file_path);
+        id
+    }
 
+    /// Pre-size the node graph and per-node lookup indexes for `additional`
+    /// upcoming insertions (bulk loads know the count up front).
+    pub fn reserve_nodes(&mut self, additional: usize) {
+        self.graph.reserve_nodes(additional);
+        self.symbol_index.reserve(additional);
+        self.name_index.reserve(additional);
+        self.name_lower_index.reserve(additional);
+        self.name_file_index.reserve(additional);
+    }
+
+    /// Add a node to the graph and every lookup index *except* the trigram
+    /// index.
+    ///
+    /// Bulk loading uses this: the trigram index costs ~300 posting inserts
+    /// per node, and a persisted copy replaces it wholesale afterwards
+    /// ([`set_trigram_index`](Self::set_trigram_index)), so building it
+    /// incrementally was pure waste (~250 ms per cold start on a 28k-node
+    /// graph). Callers must install or [rebuild](Self::rebuild_trigram_index)
+    /// the trigram index when done.
+    pub fn add_node_without_trigrams(&mut self, node: Node) -> NodeId {
+        let symbol = node.id.clone();
+        let name = node.name.clone();
+        let lower = name.to_lowercase();
+        let file_path = Arc::clone(&node.file_path);
+        let id = self.graph.add_node(node);
+        self.touch();
+
+        self.symbol_index.insert(symbol, id);
+        // Look up by &str first: most nodes share a file / name with an earlier
+        // one, and `entry(key.to_string())` would allocate on every call.
+        match self.file_index.get_mut(&*file_path) {
+            Some(nodes) => nodes.push(id),
+            None => {
+                self.file_index.insert(file_path.to_string(), vec![id]);
+            }
+        }
+        match self.name_index.get_mut(name.as_str()) {
+            Some(nodes) => nodes.push(id),
+            None => {
+                self.name_index.insert(name.clone(), vec![id]);
+            }
+        }
+        match self.name_lower_index.get_mut(lower.as_str()) {
+            Some(nodes) => nodes.push(id),
+            None => {
+                self.name_lower_index.insert(lower, vec![id]);
+            }
+        }
+        self.name_file_index
+            .insert((name, file_path.to_string()), id);
         id
     }
 
@@ -888,7 +1474,9 @@ impl ProgramDependenceGraph {
     /// The removed node if it existed, or None if not found.
     pub fn remove_node(&mut self, node_id: NodeId) -> Option<Node> {
         if let Some(node) = self.graph.remove_node(node_id) {
+            self.touch();
             self.symbol_index.remove(&node.id);
+            self.precision_symbols.remove(&node.id);
             self.embedding_store.remove(&node.id);
             let remove_file_entry = if let Some(v) = self.file_index.get_mut(&*node.file_path) {
                 v.retain(|&id| id != node_id);
@@ -990,12 +1578,67 @@ impl ProgramDependenceGraph {
     ///
     /// An optional mutable reference to the node if it exists.
     pub fn get_node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        self.touch();
         self.graph.node_weight_mut(id)
+    }
+
+    /// Move a node to a different `file_path`, maintaining every index the
+    /// mutation affects (`file_index`, `name_file_index`, the trigram
+    /// index).
+    ///
+    /// A bare weight write (`get_node_mut(...).file_path = ...`, or through
+    /// `node_weights_mut`) leaves `file_index["<old>"]` holding this NodeId:
+    /// `remove_file` for the old file would then reap the node under its old
+    /// identity, and a later `remove_node` — looking it up under the NEW
+    /// path, which it was never inserted under — would leave a dangling
+    /// entry that petgraph slot recycling can alias onto an unrelated node.
+    /// Returns `false` when the node does not exist or already carries the
+    /// path.
+    pub fn repath_node(&mut self, node_id: NodeId, new_path: &str) -> bool {
+        let (name, node_id_str, old_path) = {
+            let Some(node) = self.graph.node_weight_mut(node_id) else {
+                return false;
+            };
+            if node.file_path.as_ref() == new_path {
+                return false;
+            }
+            let name = node.name.clone();
+            let node_id_str = node.id.clone();
+            let old_path = std::sync::Arc::clone(&node.file_path);
+            node.file_path = std::sync::Arc::from(new_path);
+            (name, node_id_str, old_path)
+        };
+        self.touch();
+        // file_index: leave the old entry, join the new one.
+        if let Some(ids) = self.file_index.get_mut(&*old_path) {
+            ids.retain(|&id| id != node_id);
+            if ids.is_empty() {
+                self.file_index.remove(&*old_path);
+            }
+        }
+        match self.file_index.get_mut(new_path) {
+            Some(ids) => ids.push(node_id),
+            None => {
+                self.file_index.insert(new_path.to_string(), vec![node_id]);
+            }
+        }
+        // (name, file_path) lookup key moves with the path.
+        self.name_file_index
+            .remove(&(name.clone(), old_path.to_string()));
+        self.name_file_index
+            .insert((name.clone(), new_path.to_string()), node_id);
+        // The trigram index indexes the path's trigrams for fuzzy lookup.
+        self.trigram_index
+            .remove_node(node_id, &name, &node_id_str, &old_path);
+        self.trigram_index
+            .add_node(node_id, &name, &node_id_str, new_path);
+        true
     }
 
     /// Returns a mutable slice of all node weights.
     /// Used for bulk node mutations (e.g., external node normalization).
     pub fn node_weights_mut(&mut self) -> impl Iterator<Item = &mut Node> {
+        self.touch();
         self.graph.node_weights_mut()
     }
 
@@ -1003,13 +1646,28 @@ impl ProgramDependenceGraph {
     ///
     /// # Arguments
     ///
-    /// * `id` - The ID of the edge to retrieve
+    /// * `id` - The ID of the edge
     ///
     /// # Returns
     ///
     /// An optional reference to the edge if it exists.
     pub fn get_edge(&self, id: EdgeId) -> Option<&Edge> {
         self.graph.edge_weight(id)
+    }
+
+    /// Retrieves a mutable edge reference for metadata upgrades.
+    pub fn get_edge_mut(&mut self, id: EdgeId) -> Option<&mut Edge> {
+        self.graph.edge_weight_mut(id)
+    }
+
+    /// Mark a stable node identifier as confirmed by SCIP.
+    pub fn mark_precision_symbol(&mut self, node_id: impl Into<String>) {
+        self.precision_symbols.insert(node_id.into());
+    }
+
+    /// Return whether a stable node identifier has SCIP confirmation.
+    pub fn is_precision_symbol(&self, node_id: &str) -> bool {
+        self.precision_symbols.contains(node_id)
     }
 
     /// Returns the total number of nodes in the graph.
@@ -1082,6 +1740,33 @@ impl ProgramDependenceGraph {
             .collect()
     }
 
+    /// Nodes reached from `node_id` through edges of a specific type in the
+    /// given direction, deduplicated.
+    ///
+    /// "Callers"/"callees" semantics: relationship renders must report CALL
+    /// edges, not every edge type — data-flow heuristics (every function
+    /// taking/returning `String` connected to every other) and containment
+    /// (an impl block "calling" its own methods) previously leaked into
+    /// caller lists, conflating unrelated same-typed symbols (N-04).
+    pub fn neighbors_by_edge_type(
+        &self,
+        node_id: NodeId,
+        edge_type: EdgeType,
+        direction: petgraph::Direction,
+    ) -> Vec<NodeId> {
+        use petgraph::visit::EdgeRef;
+        let mut seen = HashSet::default();
+        self.graph
+            .edges_directed(node_id, direction)
+            .filter(|edge| edge.weight().edge_type == edge_type)
+            .map(|edge| match direction {
+                petgraph::Direction::Outgoing => edge.target(),
+                petgraph::Direction::Incoming => edge.source(),
+            })
+            .filter(|id| seen.insert(*id))
+            .collect()
+    }
+
     /// Returns the count of incoming predecessor nodes.
     ///
     /// # Arguments
@@ -1096,152 +1781,6 @@ impl ProgramDependenceGraph {
         self.graph
             .neighbors_directed(node_id, Direction::Incoming)
             .count()
-    }
-
-    // -----------------------------------------------------------------------
-    // Lookup (all O(1) or O(k) where k = results count)
-    // -----------------------------------------------------------------------
-
-    /// Finds a node by its fully qualified symbol ID.
-    ///
-    /// This performs an O(1) lookup using the symbol_index.
-    ///
-    /// # Arguments
-    ///
-    /// * `symbol` - The fully qualified symbol identifier
-    ///
-    /// # Returns
-    ///
-    /// An optional NodeId if the symbol exists in the graph.
-    pub fn find_by_symbol(&self, symbol: &str) -> Option<NodeId> {
-        self.symbol_index.get(symbol).copied()
-    }
-
-    /// Finds a node by its ID string (alias for find_by_symbol).
-    ///
-    /// # Arguments
-    ///
-    /// * `node_id` - The node identifier string
-    ///
-    /// # Returns
-    ///
-    /// An optional NodeId if the node exists in the graph.
-    pub fn find_by_id(&self, node_id: &str) -> Option<NodeId> {
-        self.symbol_index.get(node_id).copied()
-    }
-
-    /// Returns all nodes defined in a specific file.
-    ///
-    /// This performs an O(1) lookup using the file_index.
-    ///
-    /// # Arguments
-    ///
-    /// * `file_path` - The path of the file to query
-    ///
-    /// # Returns
-    ///
-    /// A vector of NodeIds for all nodes in the file (empty if file not found).
-    pub fn nodes_in_file(&self, file_path: &str) -> Vec<NodeId> {
-        self.file_index.get(file_path).cloned().unwrap_or_default()
-    }
-
-    /// Finds the first node with the given name (exact match).
-    ///
-    /// This performs an O(1) lookup using the name_index.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The symbol name to search for
-    ///
-    /// # Returns
-    ///
-    /// An optional NodeId if at least one node with this name exists.
-    pub fn find_by_name(&self, name: &str) -> Option<NodeId> {
-        self.name_index
-            .get(name)
-            .and_then(|ids| ids.first().copied())
-    }
-
-    /// Finds all nodes with the given name (exact match).
-    ///
-    /// This performs an O(1) lookup using the name_index.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The symbol name to search for
-    ///
-    /// # Returns
-    ///
-    /// A vector of all NodeIds with this name (empty if none found).
-    pub fn find_all_by_name(&self, name: &str) -> Vec<NodeId> {
-        self.name_index.get(name).cloned().unwrap_or_default()
-    }
-
-    /// Find by name with optional file hint.
-    /// All lookups are index-backed — no O(n) scans.
-    pub fn find_by_name_in_file(&self, name: &str, file_hint: Option<&str>) -> Option<NodeId> {
-        if let Some(file_path) = file_hint {
-            if let Some(&node_id) = self
-                .name_file_index
-                .get(&(name.to_string(), file_path.to_string()))
-            {
-                return Some(node_id);
-            }
-        }
-
-        if let Some(node_id) = self
-            .name_index
-            .get(name)
-            .and_then(|candidates| self.select_name_candidate(candidates, file_hint))
-        {
-            return Some(node_id);
-        }
-
-        let name_lower = name.to_lowercase();
-        self.name_lower_index
-            .get(&name_lower)
-            .and_then(|candidates| self.select_name_candidate(candidates, file_hint))
-            .or_else(|| self.find_substring_name_match(&name_lower, file_hint))
-    }
-
-    fn select_name_candidate(
-        &self,
-        candidates: &[NodeId],
-        file_hint: Option<&str>,
-    ) -> Option<NodeId> {
-        if let Some(file_path) = file_hint {
-            if let Some(node_id) = candidates.iter().copied().find(|node_id| {
-                self.get_node(*node_id)
-                    .is_some_and(|node| node.file_path.as_ref() == file_path)
-            }) {
-                return Some(node_id);
-            }
-        }
-        candidates.first().copied()
-    }
-
-    fn find_substring_name_match(
-        &self,
-        name_lower: &str,
-        file_hint: Option<&str>,
-    ) -> Option<NodeId> {
-        match file_hint {
-            Some(file_path) => self
-                .nodes_in_file(file_path)
-                .into_iter()
-                .find(|node_id| self.node_contains_name(*node_id, name_lower)),
-            None => self
-                .graph
-                .node_indices()
-                .find(|node_id| self.node_contains_name(*node_id, name_lower)),
-        }
-    }
-
-    fn node_contains_name(&self, node_id: NodeId, name_lower: &str) -> bool {
-        self.graph.node_weight(node_id).is_some_and(|node| {
-            node.name.to_lowercase().contains(name_lower)
-                || node.id.to_lowercase().contains(name_lower)
-        })
     }
 
     // -----------------------------------------------------------------------
@@ -1268,414 +1807,81 @@ impl ProgramDependenceGraph {
     pub fn set_trigram_index(&mut self, index: TrigramIndex) {
         self.trigram_index = index;
     }
+}
 
-    // -----------------------------------------------------------------------
-    // Bulk edge helpers
-    // -----------------------------------------------------------------------
-
-    /// Adds multiple call edges to the graph in batch.
-    ///
-    /// # Arguments
-    ///
-    /// * `calls` - A vector of (caller, callee) node ID pairs
-    pub fn add_call_edges(&mut self, calls: Vec<(NodeId, NodeId)>) {
-        for (from, to) in calls {
-            self.add_edge(
-                from,
-                to,
-                Edge {
-                    edge_type: EdgeType::Call,
-                    metadata: EdgeMetadata::empty(),
-                },
-            );
+fn deserialize_schema<T>(data: &[u8], errors: &mut Vec<String>) -> Option<ProgramDependenceGraph>
+where
+    T: DeserializeOwned,
+    T: IntoPdg,
+{
+    match bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize::<T>(data)
+    {
+        Ok(serialized) => match serialized.to_pdg() {
+            Ok(pdg) => Some(pdg),
+            Err(error) => {
+                errors.push(error);
+                None
+            }
+        },
+        Err(error) => {
+            errors.push(error.to_string());
+            None
         }
     }
+}
 
-    /// Adds multiple data flow edges to the graph in batch.
-    ///
-    /// # Arguments
-    ///
-    /// * `flows` - A vector of (source, target, variable_name, confidence) tuples
-    pub fn add_data_flow_edges(&mut self, flows: Vec<(NodeId, NodeId, String, f32)>) {
-        for (from, to, var_name, confidence) in flows {
-            self.add_edge(
-                from,
-                to,
-                Edge {
-                    edge_type: EdgeType::DataDependency,
-                    metadata: EdgeMetadata {
-                        call_count: None,
-                        variable_name: Some(var_name),
-                        confidence: Some(confidence),
-                        channel: None,
-                        position: None,
-                    },
-                },
-            );
-        }
+trait IntoPdg {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String>;
+}
+
+impl IntoPdg for SerializablePDG {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDG::to_pdg(&self)
     }
+}
 
-    /// Adds multiple inheritance edges to the graph in batch.
-    ///
-    /// # Arguments
-    ///
-    /// * `edges` - A vector of (child, parent, confidence) tuples
-    pub fn add_inheritance_edges(&mut self, edges: Vec<(NodeId, NodeId, f32)>) {
-        for (child, parent, confidence) in edges {
-            self.add_edge(
-                child,
-                parent,
-                Edge {
-                    edge_type: EdgeType::Inheritance,
-                    metadata: EdgeMetadata::with_confidence(confidence),
-                },
-            );
-        }
+impl IntoPdg for SerializablePDGWithoutPrecision {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDGWithoutPrecision::to_pdg(&self)
     }
+}
 
-    /// Adds multiple containment edges to the graph in batch.
-    ///
-    /// Containment edges represent structural relationships (e.g., class contains methods)
-    /// and should NOT be included in semantic traversals.
-    ///
-    /// # Arguments
-    ///
-    /// * `edges` - A vector of (container, contained) node ID pairs
-    pub fn add_containment_edges(&mut self, edges: Vec<(NodeId, NodeId)>) {
-        for (container, contained) in edges {
-            self.add_edge(
-                container,
-                contained,
-                Edge {
-                    edge_type: EdgeType::Containment,
-                    metadata: EdgeMetadata::empty(),
-                },
-            );
-        }
+impl IntoPdg for SerializablePDGWithoutEmbeddings {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDGWithoutEmbeddings::to_pdg(&self)
     }
+}
 
-    /// Adds multiple import edges to the graph in batch.
-    ///
-    /// # Arguments
-    ///
-    /// * `imports` - A vector of (importer, imported) node ID pairs
-    pub fn add_import_edges(&mut self, imports: Vec<(NodeId, NodeId)>) {
-        for (importer, imported) in imports {
-            self.add_edge(
-                importer,
-                imported,
-                Edge {
-                    edge_type: EdgeType::Import,
-                    metadata: EdgeMetadata::empty(),
-                },
-            );
-        }
+impl IntoPdg for SerializablePDGWithoutEmbeddingsAndNameLower {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDGWithoutEmbeddingsAndNameLower::to_pdg(&self)
     }
+}
 
-    // -----------------------------------------------------------------------
-    // Embedding accessors
-    // -----------------------------------------------------------------------
-
-    /// Stores an embedding for a specific node.
-    ///
-    /// The embedding is stored in the external `EmbeddingStore`, keeping it
-    /// separate from the graph structure to reduce memory usage.
-    ///
-    /// # Arguments
-    ///
-    /// * `node_id` - The string identifier of the node (matches `Node.id`)
-    /// * `embedding` - The vector embedding (typically 1536 dimensions)
-    pub fn set_embedding(&mut self, node_id: &str, embedding: Vec<f32>) {
-        self.embedding_store.insert(node_id, embedding);
+impl IntoPdg for SerializablePDGWithInlineEmbeddings {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDGWithInlineEmbeddings::to_pdg(&self)
     }
+}
 
-    /// Retrieves the embedding for a node.
-    ///
-    /// # Arguments
-    ///
-    /// * `node_id` - The string identifier of the node
-    ///
-    /// # Returns
-    ///
-    /// An optional reference to the embedding vector if it exists.
-    pub fn get_embedding(&self, node_id: &str) -> Option<&Vec<f32>> {
-        self.embedding_store.get(node_id)
+impl IntoPdg for SerializablePDGWithoutInlineEmbeddings {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDGWithoutInlineEmbeddings::to_pdg(&self)
     }
+}
 
-    /// Returns the number of embeddings stored in the embedding store.
-    pub fn embedding_count(&self) -> usize {
-        self.embedding_store.len()
+impl IntoPdg for SerializablePDGWithInlineEmbeddingsWithoutNameLower {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDGWithInlineEmbeddingsWithoutNameLower::to_pdg(&self)
     }
+}
 
-    // -----------------------------------------------------------------------
-    // Traversal — all methods require explicit TraversalConfig
-    // -----------------------------------------------------------------------
-
-    /// Forward impact: nodes reachable FROM `start` following outgoing edges.
-    pub fn forward_impact(&self, start: NodeId, config: &TraversalConfig) -> Vec<NodeId> {
-        self.bfs_directed(start, config, Direction::Forward)
-    }
-
-    /// Forward impact from many roots using one visited set.
-    pub fn forward_impact_multi_source(
-        &self,
-        starts: &HashSet<NodeId>,
-        config: &TraversalConfig,
-    ) -> Vec<NodeId> {
-        let mut visited = starts.clone();
-        let mut ordered_starts = starts.iter().copied().collect::<Vec<_>>();
-        ordered_starts.sort_by_key(|id| id.index());
-        let mut queue: VecDeque<(NodeId, usize)> =
-            ordered_starts.into_iter().map(|id| (id, 0)).collect();
-        let mut result = Vec::new();
-
-        while let Some((current, depth)) = queue.pop_front() {
-            if let Some(max_nodes) = config.max_nodes {
-                if result.len() >= max_nodes {
-                    break;
-                }
-            }
-            if !starts.contains(&current)
-                && self
-                    .graph
-                    .node_weight(current)
-                    .is_some_and(|node| config.node_should_collect(node))
-            {
-                result.push(current);
-            }
-            if config.max_depth.is_some_and(|max_depth| depth >= max_depth) {
-                continue;
-            }
-
-            let mut scratch = self.bfs_scratch.lock().unwrap();
-            scratch.clear();
-            scratch.extend(
-                self.graph
-                    .edges(current)
-                    .filter(|edge| config.edge_allowed(edge.weight()))
-                    .map(|edge| edge.target()),
-            );
-            for &neighbor in scratch.iter() {
-                if visited.insert(neighbor) {
-                    queue.push_back((neighbor, depth + 1));
-                }
-            }
-        }
-        result
-    }
-
-    /// Backward impact: nodes that can reach `start` following incoming edges.
-    pub fn backward_impact(&self, start: NodeId, config: &TraversalConfig) -> Vec<NodeId> {
-        self.bfs_directed(start, config, Direction::Backward)
-    }
-
-    /// Bidirectional impact: nodes reachable in either direction.
-    /// Useful for finding all nodes "related to" a given node.
-    pub fn bidirectional_impact(&self, start: NodeId, config: &TraversalConfig) -> Vec<NodeId> {
-        let forward = self.bfs_directed(start, config, Direction::Forward);
-        let backward = self.bfs_directed(start, config, Direction::Backward);
-        let mut combined: HashSet<NodeId> = forward.into_iter().collect();
-        combined.extend(backward);
-        combined.remove(&start);
-        combined.into_iter().collect()
-    }
-
-    fn bfs_directed(&self, start: NodeId, config: &TraversalConfig, dir: Direction) -> Vec<NodeId> {
-        let mut visited: HashSet<NodeId> = HashSet::new();
-        let mut queue: VecDeque<(NodeId, usize)> = VecDeque::new();
-        let mut result: Vec<NodeId> = Vec::new();
-
-        visited.insert(start);
-        queue.push_back((start, 0));
-
-        while let Some((current, depth)) = queue.pop_front() {
-            if let Some(max_n) = config.max_nodes {
-                if result.len() >= max_n {
-                    break;
-                }
-            }
-
-            if current != start {
-                if let Some(node) = self.graph.node_weight(current) {
-                    if config.node_should_collect(node) {
-                        result.push(current);
-                    }
-                }
-            }
-
-            if let Some(max_d) = config.max_depth {
-                if depth >= max_d {
-                    continue;
-                }
-            }
-
-            // Reuse the scratch buffer instead of allocating a new Vec per level.
-            let mut scratch = self.bfs_scratch.lock().unwrap();
-            scratch.clear();
-            match dir {
-                Direction::Forward => {
-                    // Outgoing edges — filter by edge type
-                    scratch.extend(
-                        self.graph
-                            .edges(current)
-                            .filter(|e| config.edge_allowed(e.weight()))
-                            .map(|e| e.target()),
-                    );
-                }
-                Direction::Backward => {
-                    use petgraph::Direction as PD;
-                    scratch.extend(
-                        self.graph
-                            .edges_directed(current, PD::Incoming)
-                            .filter(|e| config.edge_allowed(e.weight()))
-                            .map(|e| e.source()),
-                    );
-                }
-            }
-
-            for &neighbor in scratch.iter() {
-                if visited.insert(neighbor) {
-                    queue.push_back((neighbor, depth + 1));
-                }
-            }
-            // scratch (MutexGuard) dropped here → lock released
-        }
-
-        result
-    }
-
-    // -----------------------------------------------------------------------
-    // Serialization
-    // -----------------------------------------------------------------------
-
-    /// Serializes the PDG to a binary format.
-    ///
-    /// Uses bincode for efficient serialization. The serialized format includes
-    /// all nodes, edges, and indexes.
-    ///
-    /// # Returns
-    ///
-    /// A Result containing the serialized bytes, or an error message if serialization fails.
-    pub fn serialize(&self) -> Result<Vec<u8>, String> {
-        bincode::serialize(&SerializablePDG::from_pdg(self))
-            .map_err(|e| format!("Serialize failed: {}", e))
-    }
-
-    /// Deserializes a PDG from binary data.
-    ///
-    /// Restores a ProgramDependenceGraph from bytes previously serialized with `serialize()`.
-    ///
-    /// # Arguments
-    ///
-    /// * `data` - The binary data to deserialize
-    ///
-    /// # Returns
-    ///
-    /// A Result containing the deserialized PDG, or an error message if deserialization fails.
-    pub fn deserialize(data: &[u8]) -> Result<Self, String> {
-        bincode::deserialize::<SerializablePDG>(data)
-            .map_err(|e| format!("Deserialize failed: {}", e))
-            .and_then(|s| s.to_pdg())
-    }
-
-    // Legacy API aliases for backward compatibility during migration
-
-    /// Gets nodes reachable from the given node (forward impact).
-    ///
-    /// # Deprecated
-    ///
-    /// Since 2.0.0: Use `forward_impact` with `TraversalConfig` instead.
-    /// This method uses a default configuration that may not be appropriate
-    /// for all use cases.
-    #[deprecated(
-        since = "2.0.0",
-        note = "Use forward_impact with TraversalConfig instead"
-    )]
-    pub fn get_forward_impact(&self, node_id: NodeId) -> Vec<NodeId> {
-        self.forward_impact(node_id, &TraversalConfig::for_impact_analysis())
-    }
-
-    /// Gets nodes that can reach the given node (backward impact).
-    ///
-    /// # Deprecated
-    ///
-    /// Since 2.0.0: Use `backward_impact` with `TraversalConfig` instead.
-    /// This method uses a default configuration that may not be appropriate
-    /// for all use cases.
-    #[deprecated(
-        since = "2.0.0",
-        note = "Use backward_impact with TraversalConfig instead"
-    )]
-    pub fn get_backward_impact(&self, node_id: NodeId) -> Vec<NodeId> {
-        self.backward_impact(node_id, &TraversalConfig::for_impact_analysis())
-    }
-
-    /// Gets nodes reachable from the given node with a depth bound.
-    ///
-    /// # Deprecated
-    ///
-    /// Since 2.0.0: Use `forward_impact` with `TraversalConfig` instead.
-    /// The `TraversalConfig` provides more flexible control over traversal
-    /// bounds and filtering.
-    #[deprecated(
-        since = "2.0.0",
-        note = "Use forward_impact with TraversalConfig instead"
-    )]
-    pub fn get_forward_impact_bounded(&self, start: NodeId, max_depth: usize) -> Vec<NodeId> {
-        let config = TraversalConfig {
-            max_depth: Some(max_depth),
-            max_nodes: Some(500),
-            allowed_edge_types: Some(&[
-                EdgeType::Call,
-                EdgeType::DataDependency,
-                EdgeType::Inheritance,
-            ]),
-            excluded_node_types: None,
-            min_complexity: None,
-            min_edge_confidence: 0.0,
-        };
-        self.forward_impact(start, &config)
-    }
-
-    /// Gets nodes that can reach the given node with a depth bound.
-    ///
-    /// # Deprecated
-    ///
-    /// Since 2.0.0: Use `backward_impact` with `TraversalConfig` instead.
-    /// The `TraversalConfig` provides more flexible control over traversal
-    /// bounds and filtering.
-    #[deprecated(
-        since = "2.0.0",
-        note = "Use backward_impact with TraversalConfig instead"
-    )]
-    pub fn get_backward_impact_bounded(&self, start: NodeId, max_depth: usize) -> Vec<NodeId> {
-        let config = TraversalConfig {
-            max_depth: Some(max_depth),
-            max_nodes: Some(500),
-            allowed_edge_types: Some(&[
-                EdgeType::Call,
-                EdgeType::DataDependency,
-                EdgeType::Inheritance,
-            ]),
-            excluded_node_types: None,
-            min_complexity: None,
-            min_edge_confidence: 0.0,
-        };
-        self.backward_impact(start, &config)
-    }
-
-    /// Adds call graph edges (legacy alias - use add_call_edges).
-    ///
-    /// # Deprecated
-    ///
-    /// This method is provided for backward compatibility. New code should use
-    /// `add_call_edges` instead.
-    ///
-    /// # Arguments
-    ///
-    /// * `calls` - A vector of (caller, callee) node ID pairs
-    pub fn add_call_graph_edges(&mut self, calls: Vec<(NodeId, NodeId)>) {
-        self.add_call_edges(calls);
+impl IntoPdg for SerializablePDGWithoutInlineEmbeddingsAndNameLower {
+    fn to_pdg(self) -> Result<ProgramDependenceGraph, String> {
+        SerializablePDGWithoutInlineEmbeddingsAndNameLower::to_pdg(&self)
     }
 }
 

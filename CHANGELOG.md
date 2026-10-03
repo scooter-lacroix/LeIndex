@@ -2,6 +2,505 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [2.0.0] - 2026-09-30 - Four tools, native text search, millisecond cold starts
+
+Reconstruction and continuation of the tool layer after the local working tree
+was lost; everything below is on `v2.0.0` and covered by tests.
+
+### Default model: fine-tuned int4 Qwen3 embedder from a pinned public repo
+
+- `leindex setup` now provisions the code fine-tune
+  [ScooterLacroix/qwen3-embed-0.6b-int4-code](https://huggingface.co/ScooterLacroix/qwen3-embed-0.6b-int4-code)
+  (revision-pinned at `2228b18e`) instead of the upstream export. The download
+  set is the complete external-data pair — graph shell
+  (`qwen3-embed-0.6b-dynamic-uint8.onnx`, ~859 KiB) plus weights sibling
+  (`.onnx_data`, ~316 MiB) plus tokenizer — installed flat so external data
+  resolves; the repo hosts no `config.json` and none is required.
+- Presence/verification treat the shell + weights as ONE installable unit: a
+  shell without its `.onnx_data` (the classic half-copied install) or vice
+  versa is incomplete, the size floor applies to the pair, and tampering with
+  either file fails checksum verification.
+- Combined with the KV-cache input fix (the export declares 56
+  `past_key_values.*` inputs the worker now feeds), a fresh `setup --neural`
+  downloads, installs, and passes a real 1024-dim embedding smoke test against
+  this model.
+
+### Four tools instead of twenty
+
+- `tools/list` advertises `leindex_explore` (`mode`), `leindex_analyze` (`mode`),
+  `leindex_edit` (`action`, required — an ambiguous call must not guess at a
+  mutation) and `leindex_manage` (`action`). The operation is a discriminator
+  argument; all other arguments are forwarded unchanged to the existing handler.
+  The advertised listing is well under half the size of the old one and is
+  guarded by a size test.
+- Every router accepts `tier` (`l0` identity card, `l1` overview, `l2` full),
+  points at the `leindex://tools/guide` resource for per-branch arguments, and
+  answers unknown tools/branches with a "did you mean" hint as an `isError`
+  result. `leindex://docs/q` is a one-screen cheat sheet.
+- The original tool names (dotted/dashed spellings included) stay callable but are
+  not advertised. `LEINDEX_MCP_LEGACY_TOOLS=1` advertises them;
+  `LEINDEX_MCP_SCHEMA=oneof` switches `tools/list` to `oneOf` + `discriminator`
+  schemas (the form `leindex tools schema` prints).
+- `leindex tools list [--verbose]`, `tools inspect`, `tools schema`, `tools run`.
+- New `leindex_analyze mode=git_diff`: working tree / staged / commit / range,
+  changed hunks mapped to PDG symbols, callers and affected files.
+
+### Native text search replaces grep and text_search
+
+- New `leindex_explore mode=find` (`leindex_find`): an in-process, memory-mapped
+  trigram index (the technique behind Zoekt) with regex→trigram query planning.
+  About 1 ms per search on a 700-file repository (was ~980 ms for the previous
+  text search); the index is 2.4 MB and builds in ~150 ms during indexing.
+- Always correct: hits are read from the live file; files edited, added or never
+  indexed are detected and scanned directly. Any directory or file on the
+  machine can be searched with `paths` — a live parallel scan, no index, no side
+  effects. Hits carry their enclosing symbol from the index (no PDG load).
+- Unbounded but paged (`limit=0`, `offset`, `next_offset`), smart-case, whole
+  word, include/exclude globs, context lines, `output` = matches | files | count
+  | symbols, `target=symbols` for definitions by name (exact first).
+- `leindex_grep_symbols` and `leindex_text_search` are removed; calls by those
+  names, and the `grep`/`text` modes, redirect to `find`. The grep tool's
+  semantic mode is gone (`mode=search` covers it).
+
+### MCP hangs fixed (MCP hung while the one-shot CLI was fine)
+
+- Semantic search reported "Project not indexed" on every cold MCP session: the
+  need-based hydration change stopped loading the search engine and search never
+  hydrated it. The CLI pre-loads everything, which hid it.
+- The stdio loop handled requests serially: one slow call (a cold auto-index
+  measured at 10 s) blocked `ping` and everything queued behind it. Requests now
+  run concurrently behind a dedicated writer thread, with panic-safe replies,
+  bounded concurrency, drain-on-EOF, and idle-exit suppressed while calls run.
+- First-use auto-indexing inside a tool call held the request for the whole
+  index. In a server it now starts/joins the owned background job and waits at
+  most `LEINDEX_AUTO_INDEX_WAIT_MS` (default 5000).
+- stdio now answers `prompts/*` and `resources/*` like HTTP and socket.
+
+### Cold-start performance
+
+| Cold first call | before | after | after + prewarm |
+|---|---:|---:|---:|
+| `explore search` | 3.6 s | 1.3 s | ~30 ms |
+| `explore context` | 2.7 s | 1.2 s | ~30 ms |
+| `analyze deep` | 3.3 s | 1.4 s | ~130 ms |
+| `explore symbol_lookup` | 754 ms | 212 ms | ~20 ms |
+| `explore project_map` | 876 ms | 351 ms | ~15 ms |
+| `analyze impact` | 817 ms | 225 ms | ~20 ms |
+| full forced index (this repo) | 14.2 s | 9.8 s | — |
+
+- Search engine restore 1.39 s → ~0.15 s (interned `Arc<str>` tokens and node
+  ids, staged postings, fast hasher). PDG load 710 ms → ~165 ms (bulk load without
+  the throw-away incremental trigram build, streamed rows and only needed columns,
+  no edge self-join, no JSON parse for empty edge metadata). PDG fingerprint is
+  hashed in parallel. TF-IDF document-frequency pass runs in parallel.
+- Background pre-warm after `initialize` (`[mcp] prewarm = "full" | "graph" | "off"`,
+  default `full`): the default project's graph, then its search engine, load while
+  the model is still thinking. Only already-indexed projects; never builds an
+  index or creates storage.
+- Opportunistic staleness refreshes run on a small, low-priority thread pool
+  (at most half the cores, capped at two, nice +10 on Linux) so background work a
+  caller did not ask for no longer competes with the foreground call.
+- `leindex_manage action=phase` no longer creates a project or starts a competing
+  refresh (41–78 s before, ~7 s cold and <1 s warm now); the validator shares the
+  graph copy-on-write instead of deep-cloning it per request.
+- Off-lock hydration: the graph and search engine are built on a detached copy
+  and swapped in, so calls that need neither (`read_file`, `git_status`, `find`)
+  no longer wait behind the background pre-warm. Tools declare what they need
+  (`Hydration::{None, Graph, Full}`) and the router loads it before the handler
+  takes the project lock.
+- Search snapshot v2: an integer-addressed inverted index (token dictionary +
+  sorted postings, `search/search/token_index.rs`) replaces the two hash-of-hash
+  string maps. Engine restore 750 ms → ~125 ms, snapshot 25 MB → 15 MB, far less
+  resident memory. Existing v1 snapshots are ignored and rebuilt: run
+  `leindex index --force` once (or any reindex) to write the new format.
+- Indexing: TF-IDF pass 2 (enrichment, tokenization, vectors) runs across cores
+  with admission and hoisting applied in node order (identical output); the text
+  index builds beside the neural phase. Forced index of this repository
+  14.2 s → 6.7 s.
+- Storage: superseded generations were never removed unless someone ran
+  `leindex retention --gc`, so every index left another full copy behind (this
+  repository: 13 generations + 460 MB of job scratch = 2.5 GB for 20 MB of
+  source). A successful index now keeps the current generation and its rollback
+  predecessor and caps completed job artifacts: 2.5 GB → ~550 MB, and it stays
+  there.
+- One-shot CLI: `leindex tools run` no longer loads the whole graph and search
+  engine up front. Each tool loads what it needs, like the MCP server:
+  `find` 420 ms → 19 ms, `read_file` → 18 ms, graph tools ~230 ms, search/deep
+  ~400 ms (they need the engine).
+- Indexing: file-summary enrichment no longer UTF-8-validates the whole file for
+  every symbol (quadratic in symbols per file); a full rebuild adopts the built
+  graph instead of re-inserting it into an empty one; nodes of a file share one
+  path allocation; the persisted-graph loader probes row ids with a cheap hasher.
+- Daemon architecture (wire v2), on by default. `leindex mcp` is now a
+  synchronous, `std`-only shim that runs before the async runtime exists and
+  copies bytes to one per-user `leindexd`, so any number of editors share one
+  loaded graph and search engine per project. The daemon single-winner lock is
+  a kernel `flock` (no stale-pid heuristics); the connection opens with a hello
+  carrying the client's cwd, which starts warming that project immediately and
+  supplies `project_path` for calls that omit it; tool calls run concurrently
+  per connection (the socket loop used to be serial, the same hang the stdio
+  transport had); idle connections are no longer dropped after 30 s; the daemon
+  idles out only when no client is attached (default 15 min); stale daemons are
+  replaced, or bypassed when other clients are attached. See `docs/MCP.md`.
+  Previously the daemon path was compiled out of default builds, so every
+  session ran a full 150 MB inline server.
+- Engine pass (measured with callgrind on a symbol-bearing build):
+  - `ProgramDependenceGraph` kept its BFS scratch buffer in a `Mutex` shared by
+    every traversal, so the two parallel indexing passes (two traversals per
+    symbol, all cores) serialized on one lock. Local buffer: TF-IDF pass 1
+    1.8 s → 0.8 s.
+  - `normalize_symbol` (run for every call target and comparison in cross-file
+    resolution) chained five `replace` calls: one pass now, ~10% of indexing CPU
+    saved; proven identical to the old chain on 20,000 generated strings.
+  - `preceding_doc_context` decoded the whole file prefix for every symbol;
+    it now walks back a line at a time (identical output, tested against the old
+    code).
+  - The graph trigram index serialized in hash-map order, so its bytes (and
+    content hash) differed on every save and the blob was rewritten each time.
+    Now deterministic, on a fast hasher.
+  - `save_pdg` diff: sequential edge scan + in-memory membership instead of a
+    semi-join, no per-edge allocations, fast hashers ; community persistence writes only changed assignments through
+    prepared statements (0.64 s → 0.41 s); pass 2 hands finished batches to a
+    dedicated appender thread and no longer hashes content for a neural cache
+    that is off; TF-IDF embedding probes a word→slot map (~50 probes per node,
+    not 768).
+  - Loading: the search snapshot is decoded and restored on a second thread
+    while the graph is read, and edge rows are decoded on a third over their own
+    read-only connection. Cold `search` 440 ms → ~300 ms; pre-warm loads both
+    together.
+  - Rename/edit validation parses the before/after of every changed file (and
+    the syntax pass) in parallel, and impact analysis fans its per-symbol
+    traversals out across cores (same per-symbol caps, same result set).
+  - Signature-only extraction. Drift reads only `name`, `parameters`,
+    `return_type`, `visibility`, `is_method` and `byte_range`, but ran the full
+    parse path (calls, flow facts, complexity, docstrings, imports). A
+    thread-local `LiteGuard` and `CodeIntelligence::get_signatures_lite` (the
+    default delegates to `get_signatures_with_parser` under the guard, so a
+    parser never has to opt in) gate the expensive leaf helpers in all 17
+    parsers. Equivalence tests assert the header fields are identical between
+    lite and full output for every language fixture. Drift memoises signatures
+    by (language, blake3 of content) and now also treats a sync↔async change as
+    a signature change (`is_async` was extracted but never compared).
+    `docstring` remains parse-only: it is not persisted on `Node`.
+  - One shared, seedless `FastHasher` (`src/fast_hash.rs`: 8 bytes per step,
+    folded 128-bit multiply, final avalanche) replaces SipHash in the PDG
+    indexes, extraction maps, traversal sets, trigram postings and the row-id
+    maps of the graph loader, and the two bespoke hashers are gone. Tests cover
+    determinism, prefix/padding collisions, avalanche (~50% of output bits flip
+    per input bit), bucket uniformity of the low bits and of hashbrown's top 7
+    bits, and that bincode output is byte-identical to a std map (existing
+    snapshots still load). Loader maps are pre-sized from a row count.
+  - The import-check name corpus moved from a per-validator `OnceLock` (rebuilt
+    by every per-request validator) onto the PDG, memoised against a
+    process-unique node revision that changes on every node add, remove or
+    mutation; clones share it until they diverge.
+  - Measured on this repository against the start of this pass (`8ce59b5`),
+    release build, deterministic whole-process instruction counts (callgrind,
+    one-shot CLI): rename preview −13.9%, symbol lookup −9.0%, impact −9.0%,
+    search −4.3%. Warm session (daemon), median of 20 calls, two alternating
+    rounds: rename preview 47.5 / 176.6 ms → 25.1 / 22.8 ms, deep 12.9 / 16.9 →
+    9.2 / 8.0 ms, symbol lookup 24.0 / 21.2 → 11.2 / 11.5 ms, search
+    14.1 / 14.6 → 10.6 / 8.9 ms; the `find` (grep) branch is unchanged (~12 ms).
+    Cold one-shot wall time is flat within run-to-run noise (interleaved
+    symbol lookup 208 vs 211 ms) apart from rename preview (252 → 203 ms):
+    process start, SQLite and git dominate it.
+  - Forced full index of this repository: 14 s → ~6–7 s (fresh clone, release
+    build: 7.2 s at the start of this pass, 6.9 s now).
+  - Error and welcome text now names the four routers
+    (`leindex_manage action=index`) instead of retired tool names.
+- Agent skill: `integrations/skills/leindex-toolkit` is now
+  `integrations/skills/leindex-code-intelligence`, rewritten for the four tools;
+  the Claude Code hook, `MCP_COMPATIBILITY.md`, `docs/CLI.md`, `docs/AGENT_GUIDANCE.md`
+  and the pi skill use the router names.
+- Phase analysis: a run whose phases are all cached no longer loads the graph
+  (warm ~500 ms → ~17 ms), and the file inventory is hashed in parallel.
+
+### Added
+
+- **Engram** (opt-in, `LEINDEX_FEATURE_ENGRAM=1`): a persistent,
+  content-addressed phrase-book of neural query embeddings under
+  `~/.leindex/engram/`. A repeated query is served without waking the embedder
+  (no worker spawn, no model digest, no network round trip). Keys are
+  `blake3(embedder identity, dimension, exact query text)`; the identity is the
+  model name, dimension and size + mtime of the resolved model and tokenizer
+  files (local ONNX) or provider/model/endpoint/dimension without credentials
+  (remote), so a replaced model never serves stale vectors, and an unknown
+  identity bypasses the table. Rows are immutable, written by staging + atomic
+  rename and verified against a blake3 checksum on read (a corrupt row is
+  deleted and counted as a miss); the table is bounded (20,000 rows / 256 MiB,
+  `LEINDEX_ENGRAM_MAX_ENTRIES`, `LEINDEX_ENGRAM_MAX_MB`) with LRU eviction and a
+  small in-process front. Only real embedder output is stored. Hit/miss/entry
+  counters appear under `engram` in `leindex_analyze mode=diagnostics`. Scope:
+  query embeddings only. Index-time neural vectors are already reused by the
+  global embed cache, and ranked results by the existing result cache.
+
+### Fixed
+
+- **A warm session paid +130–240 ms on every fourth graph-tool call, for ever.**
+  The registry re-launches a background incremental scan whenever
+  `is_stale_fast()` is true and drops its stale cache when that scan ends. Three
+  things kept the answer true after a scan that found nothing to do: (1) the
+  "No changes detected" path recorded a stale `tree_oid`, so a commit that
+  touched nothing indexed left the index flagged as tree-drifted; (2) it did not
+  advance the `leindex.db` reference time, so a new non-indexed file in a source
+  directory kept the directory-mtime sentinel firing; (3) the nested-manifest
+  walker did not apply the scanner's own `tests/fixtures/**` exclusion, so any
+  repository with a fixture `Cargo.toml` or `package.json` was permanently
+  "stale". Each request then ran `git status`, `git ls-files` ×2,
+  `git rev-parse` and a hash pass beside the foreground call. All three are
+  fixed (a clean scan now acknowledges the tree and the directory time; the
+  walker shares the scanner's exclusion). Four regression tests fail without the
+  change and a fifth checks that a real source edit is still detected. While the
+  loop was active, warm p90 for graph tools on this repository was 141–217 ms;
+  it is now 9–13 ms, and steady-state calls dropped from ~12 ms to ~7 ms because
+  nothing contends with them.
+- Quality Gates feature matrix: `--no-default-features --features minimal` and
+  `--features onnx` did not compile (`migration` needs `storage`;
+  `eval::{agent_tasks,external_suite}` need `cli`; one bench, two examples and
+  one test lacked `required-features`/`cfg` guards), plus dead-code and
+  `unused_mut` warnings in those configurations. All four configurations now
+  pass `cargo check --all-targets`.
+- Eleven source files exceeded the 2000-line Large File gate (largest 3023).
+  They are split into child modules and `*_test.rs` files by pure code motion;
+  a test that scraped `src/embed/runtime.rs` now reads the whole module.
+- Phase analysis and the indexer shared one store but disagreed about which
+  files exist and what an import is. The phase run saw dotfiles, ignored paths
+  and a different language list, treated every indexed doc as "deleted", and
+  saved its resolved-import form of the graph, so a phase call after an index
+  re-parsed and rewrote ~100 files and deleted ~4,000 external nodes (62 s), and
+  the next index undid it. That flip-flop is also what left the shared graph
+  without its docs and made every server start refresh the index. Phase now
+  collects exactly the indexer's file set, counts only files that are really
+  gone as deleted, and resolves imports in memory without persisting that form
+  (index → phase 62 s → 3 s).
+- Graph-only hydration read the mutable index root while its search artifacts came
+  from the published generation. After any refresh that wrote the root and did not
+  publish (a failure, a concurrent run) the two never agreed, so every server start
+  rebuilt the search index and never persisted it (~1–2 s on the first calls,
+  forever). It now reads the published generation like every other path; covered
+  by a regression test.
+- Error hints named retired tools (`LeIndex [Grep Symbols]`); they now name the
+  `leindex_explore` branches.
+- `grep_symbols`' `mode` argument collided with the router selector and clobbered
+  it in merged schemas; it is now `grep_mode` (bare `mode` still honoured on direct
+  calls), and the merge can no longer overwrite reserved keys.
+- Test flake with a 5-test cascade: a fixed wall-clock bound flaked under load and,
+  panicking while holding `FLAG_TEST_LOCK`, poisoned it for unrelated tests. The
+  lock is poison-tolerant, overrides reset on unwind, and timing bounds scale with
+  a measured baseline.
+
+## [2.0.0] - 2026-08-06 - Resource Architecture Transformation
+
+**LeIndex 2.0.0** is a ground-up resource architecture rebuild that collapses the
+v1.9.x per-harness heavyweight process model (10 to 20 GiB RSS observed in
+production, 2.5 GiB `.leindex/` on a 419-file repo) into a single user-scoped
+daemon + tiny stdio shims + shared embed worker, with content-addressed immutable
+mmap generations, a streaming bounded indexing pipeline, a fair admission
+scheduler that defers instead of erroring, and a measured model profile that fits
+a 1 GiB aggregate RAM budget. Every claim below is backed by the shipped
+[`BENCHMARKS.md`](BENCHMARKS.md).
+
+### Headline numbers
+
+| Metric | v1.9.5 | v2.0.0 |
+|---|---:|---:|
+| This repo `.leindex/` footprint | 2.9 GiB | 190 MiB |
+| Aggregate steady-state RAM target | >= 10 GiB observed | <= 1 GiB |
+| Embed model host RSS | 1.19 GiB (FP16 Qwen3) | 255 MiB (INT8 CodeRankEmbed 137M) |
+| Reranker memory | 1.19 GiB | 0 (removed after ablation) |
+| Indexing RSS delta across phases | corpus-proportional | 0.06 MiB (flat) |
+
+### Architecture
+
+- **Single user-scoped `leindexd` daemon**: one process owns the project
+  registry, scheduler, generation leases, and one IPC channel to the shared
+  embed worker. No eager project or model load at startup; idle exit after a
+  configurable timeout. The daemon serves the same `all_tool_handlers()` tool
+  set as the legacy inline server (byte-identical tool parity, VAL-DAEMON-005).
+- **Tiny stdio MCP shims** (`daemon-client` feature): 5 to 15 MiB RSS each,
+  holding zero SQLite, zero PDG, zero model runtime, zero Tokio worker pool.
+  They forward MCP/JSON-RPC frames byte-faithfully to the daemon over a Unix
+  socket (VAL-SHIM-001, VAL-SHIM-003). Three concurrent agent harnesses that
+  previously cost 3x heavyweight processes now cost 3x ~8 MiB shims.
+- **`leindex-embed` shared worker**: one resident model runtime with
+  token/byte-budgeted batching, a global content-addressed embedding cache
+  (`~/.leindex/cache/embeddings/`), crash isolation with single retry, and
+  digest-aware dedup so a model upgrade creates a new namespace with no
+  accidental mixed vectors (VAL-CACHE-001, VAL-CACHE-002, VAL-CACHE-013).
+- **Content-addressed immutable generations (CAS)**: generation layers (Db,
+  Tfidf, Neural, Pdg, Symbols) are blake3-hashed blobs under
+  `.leindex/cas/<2-hex>/<blake3>/`, referenced by `LIDX-GEN1` manifests. Two
+  no-op reindexes produce byte-identical DB CAS hashes after VACUUM-normalize,
+  eliminating the v1.9.x duplication defect where adjacent generations held
+  identical `leindex.db` copies (VAL-CAS-019). Readers mmap blobs zero-copy
+  via `GenerationLease` and never touch the writer `Mutex` (VAL-LEASE-005,
+  VAL-EQUIV-003).
+- **Streaming bounded indexing pipeline**: every stage (scan, parse, PDG,
+  TF-IDF, neural) now processes one bounded chunk in and one bounded chunk out.
+  The legacy `FileReadCache` (100 to 200 entry LRU retaining source bodies
+  across phases) is reduced to a per-chunk scratch buffer of capacity 1. Neural
+  enrichment streams directly to CAS-staged rows instead of accumulating
+  `Vec<(String, Vec<f32>)>` for the entire corpus (VAL-STREAM-006,
+  VAL-STREAM-011, VAL-STREAM-012). RSS is now structurally independent of
+  corpus size.
+- **Fair bounded scheduler + admission controller**: `WorkBudget` bounds each
+  `BoundedJob::step()`, DRR scheduling with class weights prioritizes reads
+  over indexing (VAL-SCHED-004, VAL-SCHED-005), same-project duplicate index
+  requests coalesce (VAL-SCHED-006), and the admission controller returns only
+  `Admit` / `Defer` / `Reduce`, never `Err`. The v1.9.x `MemoryCapGuard`
+  bail-at-cap error path is removed from the indexing hot loop: valid repos
+  that previously failed on memory pressure now defer and eventually complete
+  (VAL-SCHED-008, VAL-SCHED-010, VAL-SCHED-015).
+
+### Footprint reduction
+
+- **CAS dedup collapses generation storage**: 6 full-copy generation
+  directories (730 MiB) become 2 CAS-backed manifests (current + previous
+  only). The CAS never stores two copies of byte-identical content.
+- **Retention policy**: current + previous + leased only; completed jobs are
+  deleted immediately on publication; jobs capped at 128 MiB per project
+  (VAL-CAS-RET-001..003). The v1.9.x 2 GiB / 115-job accumulation collapses to
+  the cap.
+- **Sparse TF-IDF**: dense f32 document-term matrix replaced with CSR sparse
+  storage. On this repo: 23.1 MiB dense to 1.3 MiB sparse (94.32% reduction),
+  top-10 query ranking identical (decision recorded in BENCHMARKS.md Section
+  9).
+- **Symbol string interning**: repeated `symbol_name` and `file_path` strings
+  across PDG nodes are interned into an mmap'd table. On this repo: 77.9% of
+  the PDG blob size was duplicated strings, well above the 20% gate.
+- **INT8 neural read-path**: SIMD dot-product over INT8-quantized vectors
+  matches dequantize-then-f32-dot within 1e-4 relative epsilon and is at least
+  1.5x faster than f32 (VAL-READER-002, VAL-READER-003). Production-ready at
+  both 384 and 1024 dimensions.
+
+### Model bake-off
+
+- **Winner: CodeRankEmbed 137M INT8.** Selected through LeIndex's full
+  fused-retrieval evaluation (TF-IDF + PDG + dense + fragment + reranker
+  ablation), not public MTEB scores (anti-cheat charter item 13). MRR@10 =
+  1.0000, within the predeclared gate band of the FP16 baseline. Host RSS
+  ~135 MiB (model + ONNX session), fits the 350 MiB worker allocation with
+  ~195 MiB reserve.
+- **Reranker decision: REMOVE.** The no-reranker configuration produces
+  MRR@10 = 1.0000, identical to the Qwen3 reranker baseline. The reranker
+  does not earn its 1.19 GiB second-model allocation. Saves 1.19 GiB.
+- **Anti-cheat compliance (VAL-EVAL-010)**: if no candidate had fit the budget
+  at acceptable quality, a CONFLICT REPORT would have been filed instead of
+  relaxing gates or manufacturing a metric. The winner genuinely fits.
+
+### Rollout
+
+- All v2.0.0 architectural changes ship behind `LEINDEX_FEATURE_*` flags and
+  are flipped to default-on only after all 24 verification scenarios pass and
+  every section 16 acceptance gate is evidenced (VAL-ROLLOUT-012).
+- The 10-phase rollout (spec section 12.3) preserves an independently runnable
+  rollback point at every phase. During the fallback window (phase 9), legacy
+  paths remain reachable via `LEINDEX_LEGACY=1`. Legacy code paths are removed
+  only after the fallback window completes with zero rollback requests
+  (VAL-ROLLOUT-013, VAL-ROLLOUT-014).
+- One-shot artifact migration converts legacy full-copy generations to CAS
+  format on first run, atomically swapping `CURRENT` last. Idempotent and
+  crash-safe (VAL-MIGRATE-001..006). Running migration twice is a confirmed
+  no-op.
+- Cleanup never touches leased, current, or rollback generations
+  (VAL-ROLLOUT-010).
+
+### Memory cap: defer, do not error
+
+The single most user-visible behavioral change: indexing a valid repo under
+memory pressure no longer returns an error. The admission controller evicts
+idle project caches first, then defers the work, then readmits when memory
+frees up. The job eventually completes. This eliminates a class of v1.9.x
+failures where large repos could not be indexed at all under `--max-memory`.
+
+### Evidence
+
+Every claim in this entry is backed by [`BENCHMARKS.md`](BENCHMARKS.md), which
+digests the pre-v1.9.0 anchor (immutable v1.9.5 "before" picture) against the
+post-v2.0.0 baseline ("after" picture) using the same corpora and methodology.
+The anti-cheat charter (spec section 2.1) is preserved: no retrieval behavior
+disabled, skipped, shrunk, staled, offloaded, or hidden; mmap pages counted
+in ledgers; defer, not error; report, not manufacture.
+
+### Version parity
+
+Cargo.toml, installer scripts (`install.sh`, `install_macos.sh`), npm package
+metadata (`packages/npm-leindex-mcp/package.json`), PyPI package metadata
+(`packages/pypi-leindex/pyproject.toml`, `packages/pypi-leindex/src/leindex/__init__.py`),
+root workspace `package.json`, dashboard `package.json`, and the pi
+integration `package.json` are all aligned at `2.0.0`.
+
+---
+
+## [2.0.0-postinstall] - 2026-08-07 - Post-install fixes
+
+Five fixes applied after the initial v2.0.0 release, addressing neural search
+correctness, PDG storage performance, directory exclusion gaps, log flooding,
+and analysis output usability. Commits fa24b963 through cb336753 on the v2.0.0
+branch.
+
+### Fixed
+
+- **ONNX embed batching (CRITICAL)**: A missing `else` branch in the embed
+  batch loop caused CPU and CUDA providers to skip all sub-batches after the
+  first, making neural search silently fall back to TF-IDF. Every sub-batch is
+  now processed correctly. Fixed-batch providers (MIGraphX/ROCm) now receive
+  padding and trim to satisfy their fixed input shape requirement.
+- **Directory exclusion gaps**: Added `packages/` to `SKIP_DIRS`. Added
+  hidden-directory and `SKIP_DIRS` post-filtering to the git scan path, which
+  previously only filtered the non-git scan path. Hidden directories and
+  skip-listed dirs are now excluded regardless of scan mode.
+- **Log flooding**: Downgraded the duplicate `node_id` WARN message to DEBUG.
+  Daemon and worker now default to WARN log level (was INFO). Added
+  `RUST_LOG`/`EnvFilter` support to the daemon. Downgraded per-file read INFO
+  to DEBUG to eliminate per-file log noise during indexing.
+
+### Changed
+
+- **PDG storage performance**: Batched SQLite INSERTs (500 per statement) for
+  `save_nodes` and `save_edges`, reducing round-trips by ~500x for large PDGs.
+  `SerializablePDG` serialization is now clone-free via a borrowed-reference
+  shim. `merge_pdgs` uses move semantics to avoid unnecessary allocations. The
+  streaming PDG path now routes through `build_fragment_from_parsed` directly,
+  eliminating an intermediate allocation.
+- **Analysis output**: `format_analysis_output` now prints each search result
+  with file path, symbol name, type, line number, and score. Context budget
+  increased from 300 to 2000 characters. Results appear before the context
+  section. Empty result sets display "No results found" instead of a blank
+  output.
+
+---
+
+## [2.0.0-perf] - 2026-08-07 - Performance and ONNX shape fixes
+
+Three fixes applied after the post-install round, addressing ONNX batch shape
+correctness for non-dynamic models, SQLite storage throughput, and pipeline
+CPU utilization. Commits ce8ab3f8 through 5cdb39e4 on the v2.0.0 branch.
+
+### Fixed
+
+- **ONNX batch shape for non-dynamic models (CRITICAL)**: Non-dynamic models
+  (e.g. MIGraphX/ROCm) were incorrectly forced to `batch_size=8`, causing
+  shape mismatch warnings and silent TF-IDF fallback on AMD GPU providers. The
+  `-dynamic` suffix is now checked before applying the MIGraphX batch size
+  override. Non-dynamic models correctly use `batch_size=1`; dynamic models
+  retain their fixed-batch padding path.
+
+### Changed
+
+- **Storage performance**: SQLite `PRAGMA synchronous` set to `NORMAL` (was
+  `FULL`), improving write throughput with negligible durability risk on local
+  SSDs. Per-file operations (node/edge saves, fragment writes) are now wrapped
+  in batch transactions instead of individual auto-commits, reducing fsync
+  round-trips. Removed a redundant double fsync in the fragment write path.
+- **Pipeline performance**: `enriched_node_content` is now computed once per
+  node and cached (was recomputed three times per node across PDG construction,
+  hashing, and embedding). PDG construction and file hashing are parallelized
+  with rayon, utilizing all available CPU cores for the CPU-bound parsing and
+  blake3 hashing stages.
+
+---
+
 ## [Unreleased] - Release-pipeline fix + consolidated dependency updates
 
 - **Release pipeline fix**: repaired the `VAL-PYPI-008` validation test, which

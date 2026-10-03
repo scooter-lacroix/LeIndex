@@ -363,8 +363,7 @@ jobs:
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             STRIP="aarch64-linux-gnu-strip"
           fi
-          $STRIP target/${{ matrix.target }}/release/leindex
-          $STRIP target/${{ matrix.target }}/release/leindex-embed
+          $STRIP target/${{ matrix.target }}/release/leindex target/${{ matrix.target }}/release/leindexd
 
       # ── Verify binaries: no NEEDED libonnxruntime, no $ORIGIN rpath ──
       # VAL-RELEASE-012/013: with load-dynamic, the produced binaries
@@ -379,7 +378,7 @@ jobs:
         run: |
           set -e
           BIN_DIR="target/${{ matrix.target }}/release"
-          for bin in leindex leindex-embed; do
+          for bin in leindex leindexd; do
             echo "Inspecting $BIN_DIR/$bin ..."
             if [[ "$RUNNER_OS" == "macOS" ]]; then
               LOAD_DEPS=$(otool -L "$BIN_DIR/$bin")
@@ -432,9 +431,13 @@ jobs:
           BUNDLE_DIR="leindex-${VERSION}-${{ matrix.asset_name }}"
           mkdir -p "$BUNDLE_DIR/bin" "$BUNDLE_DIR/lib"
 
-          # Copy both binaries
+          # Copy both binaries. `leindex` launches the per-user daemon as a
+          # sibling executable, so `leindexd` must ship beside it. The daemon
+          # is Unix-only; Windows bundles carry the client alone.
           cp "target/${{ matrix.target }}/release/leindex${EXT}" "$BUNDLE_DIR/bin/leindex${EXT}"
-          cp "target/${{ matrix.target }}/release/leindex-embed${EXT}" "$BUNDLE_DIR/bin/leindex-embed${EXT}"
+          if [[ "$RUNNER_OS" != "Windows" ]]; then
+            cp "target/${{ matrix.target }}/release/leindexd" "$BUNDLE_DIR/bin/leindexd"
+          fi
 
           # ── Copy ORT runtime libraries into lib/ ──
           # VAL-RELEASE-005/011: ORT is extracted from the pip wheel (above)
@@ -502,6 +505,38 @@ jobs:
           # explaining the layout, the install.sh path, the leindex setup
           # command, and the ORT discovery chain so a user who extracts
           # the archive directly can get to a working install.
+          #
+          # The quick start and bin/ layout are platform-specific: Windows
+          # bundles ship only leindex.exe (no daemon, no POSIX cp). The
+          # fragments are written with QUOTED heredocs so `$HOME` reaches
+          # the reader literally instead of being expanded on the runner,
+          # then spliced into the main (unquoted, $VERSION-expanding)
+          # document via $(cat ...).
+          STEP1_FRAG="$RUNNER_TEMP/install-step1.txt"
+          if [ "${{ matrix.asset_name }}" = "windows-x86_64" ]; then
+            LAYOUT_BINS="    bin/        leindex.exe (worker mode: leindex --internal-embed-worker)"
+            cat > "$STEP1_FRAG" <<'FRAG'
+          1. Add this directory to your PATH, or copy bin\leindex.exe into
+             a directory that already is. The shared daemon is not shipped
+             on Windows; leindex sessions always run in-process.
+          FRAG
+          else
+            LAYOUT_BINS='    bin/        leindex binary (worker mode: leindex --internal-embed-worker)
+            bin/leindexd  shared per-user daemon'
+            cat > "$STEP1_FRAG" <<'FRAG'
+          1. Add this directory to your PATH. Copy BOTH binaries —
+             bin/leindex AND bin/leindexd — together into the same
+             directory (e.g. ~/.cargo/bin); leindex looks for leindexd
+             next to itself:
+
+               cp bin/leindex bin/leindexd ~/.cargo/bin/
+               export PATH="$HOME/.cargo/bin:$PATH"
+
+             Without leindexd beside it, every `leindex mcp` session runs
+             its own inline server (higher memory per editor/session)
+             instead of sharing one daemon per user.
+          FRAG
+          fi
           cat > "$BUNDLE_DIR/INSTALL.txt" <<EOF
           LeIndex $VERSION — ${{ matrix.asset_name }}
           ==========================================
@@ -509,17 +544,14 @@ jobs:
           LeIndex is a code intelligence tool providing semantic and lexical
           (TF-IDF) search over your source tree. This bundle contains:
 
-            bin/        leindex and leindex-embed binaries
+          $LAYOUT_BINS
             lib/        ONNX Runtime shared libraries (loaded dynamically)
             INSTALL.txt this file
 
           QUICK START
           -----------
 
-          1. Add this directory to your PATH (or copy bin/leindex and
-             bin/leindex-embed to ~/.cargo/bin/):
-
-               export PATH="$PWD/$BUNDLE_DIR/bin:\$PATH"
+          $(cat "$STEP1_FRAG")
 
           2. TF-IDF search works immediately. Index a project and search:
 
@@ -1021,7 +1053,7 @@ jobs:
           echo "- **npm**: Binary wrapper with GH Release download (optional — needs NPM_TOKEN)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "### Bundle topology" >> "$GITHUB_STEP_SUMMARY"
-          echo "Each platform archive includes \`leindex\`, \`leindex-embed\` (ONNX worker), and ONNX Runtime libraries. Models are provisioned by \`leindex setup\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "Each platform archive includes \`leindex\` (ONNX worker via the hidden re-exec mode), \`leindexd\` (Unix only — the shared per-user daemon; copy it next to \`leindex\`), and ONNX Runtime libraries. Models are provisioned by \`leindex setup\`." >> "$GITHUB_STEP_SUMMARY"
 
   # ── Update version badge ─────────────────────────────────────────────
   badge:

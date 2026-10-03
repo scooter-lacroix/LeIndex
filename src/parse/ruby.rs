@@ -170,6 +170,9 @@ impl CodeIntelligence for RubyParser {
 }
 
 fn extract_ruby_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut imports = Vec::new();
 
     fn add_import(imports: &mut Vec<ImportInfo>, path: &str) {
@@ -252,6 +255,9 @@ fn extract_method_signature(
 }
 
 fn extract_ruby_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut calls = Vec::new();
 
     fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {

@@ -3,13 +3,12 @@
 //! main pipeline module to keep it under the line-count gate.
 
 use super::IndexPipelineState;
-use crate::cli::index_builder;
 use crate::cli::index_job::{
     CheckpointStore, FileFingerprint, LexicalCheckpoint, ParseCheckpoint, PdgCheckpoint,
     ScanCheckpoint,
 };
-use crate::cli::memory_cap::MemoryCapGuard;
-use anyhow::{Context, Result, bail};
+use crate::cli::memory_cap::{CapStatus, MemoryCapGuard};
+use anyhow::{Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::warn;
@@ -127,6 +126,18 @@ pub(super) fn progress_stderr(msg: &str) {
     }
 }
 
+/// Cumulative (hits, misses) of the client-side embed cache for this
+/// process — surfaces cache effectiveness in neural-phase progress lines.
+#[cfg(feature = "onnx")]
+pub(super) fn neural_cache_counters() -> (u64, u64) {
+    crate::search::onnx::embed_cache_frontend::counters()
+}
+
+#[cfg(not(feature = "onnx"))]
+pub(super) fn neural_cache_counters() -> (u64, u64) {
+    (0, 0)
+}
+
 /// Clear the progress line on stderr (when terminal).
 pub(super) fn progress_clear() {
     use std::io::{IsTerminal, Write};
@@ -138,9 +149,22 @@ pub(super) fn progress_clear() {
     }
 }
 
+/// Observe RSS against the memory cap at an indexing phase boundary.
+///
+/// VAL-SCHED-015: this is NOT an error path anymore. Over-cap RSS reports
+/// `CapStatus::OverCap` (a deferral signal already logged by the guard) and
+/// indexing continues; capacity decisions belong to the global admission
+/// controller (`scheduler::admission`), which defers/reduces instead of
+/// erroring. A cap prevents overlapping peaks — never valid-work failures.
 pub(super) fn check_memory_cap(cap_guard: &mut Option<&mut MemoryCapGuard>) -> Result<()> {
     if let Some(guard) = cap_guard.as_mut() {
-        guard.check_now()?;
+        match guard.check_now() {
+            CapStatus::Ok => {}
+            CapStatus::OverCap => {
+                // Deferral signal: the guard has already logged the pressure.
+                // The phase continues; heavy work is gated by admission.
+            }
+        }
     }
     Ok(())
 }
@@ -278,7 +302,6 @@ pub(super) fn parse_plan(state: &IndexPipelineState) -> ParsePlan {
 pub(super) fn reuse_parse_results(
     resumed_scan: bool,
     resumed_parse: Option<&ParseCheckpoint>,
-    cache: Option<&mut index_builder::FileReadCache>,
     store: &CheckpointStore,
     source_file_hashes: &HashMap<String, String>,
     files_to_parse: &mut Vec<PathBuf>,
@@ -286,7 +309,6 @@ pub(super) fn reuse_parse_results(
     if !resumed_scan {
         return Ok(Vec::new());
     }
-    let cache = cache.context("parse phase missing shared file cache")?;
     let Some(parse_checkpoint) = resumed_parse else {
         return Ok(Vec::new());
     };
@@ -312,8 +334,9 @@ pub(super) fn reuse_parse_results(
                 continue;
             }
         };
-        let source_bytes = match cache.get_or_read(path) {
-            Ok(bytes) => bytes.as_ref().clone(),
+        // Re-read the file per chunk (VAL-STREAM-012: no cross-phase cache).
+        let source_bytes = match crate::cli::index_builder::read_file_once(path) {
+            Ok(bytes) => bytes.1.as_ref().clone(),
             Err(error) => {
                 warn!(
                     "Unable to reuse source bytes for '{}': {}; reparsing",

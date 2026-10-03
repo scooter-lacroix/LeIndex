@@ -35,6 +35,28 @@ use crate::embed::runtime::{RuntimeConfig, WorkerRuntime, low_memory_refusal};
 /// against pathological bursts, not a throughput limiter.
 const MAX_SOCKET_CLIENT_THREADS: usize = 16;
 
+/// Atomically claims one client slot if fewer than `max` are in use.
+///
+/// A compare-exchange loop rather than `fetch_update`/`try_update`: the former
+/// is deprecated on current toolchains and the latter post-dates our MSRV.
+fn try_acquire_client_slot(active: &AtomicUsize, max: usize) -> bool {
+    let mut current = active.load(Ordering::Relaxed);
+    loop {
+        if current >= max {
+            return false;
+        }
+        match active.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// Configured socket-client concurrency cap, from
 /// `LEINDEX_WORKER_MAX_SOCKET_CLIENTS` (default [`MAX_SOCKET_CLIENT_THREADS`]).
 fn max_socket_clients() -> usize {
@@ -72,18 +94,57 @@ impl Drop for SocketClientSlotGuard {
 /// release version (matching `leindex --version`) and exits 0 so install
 /// verification scripts can confirm both binaries are present and correct.
 pub fn run() -> ! {
-    // Handle --version / -V before any heavy initialization.
+    run_from(std::env::args().collect())
+}
+
+/// True when this process was invoked with the hidden single-binary worker
+/// token at argv[1]. Token-only by design: an env-var trigger would leak
+/// into persistent shells/CI and silently turn every `leindex` invocation
+/// into the worker.
+pub fn is_internal_worker_invocation() -> bool {
+    let mut args = std::env::args();
+    let _program = args.next();
+    args.next().is_some_and(|arg| arg == INTERNAL_WORKER_TOKEN)
+}
+
+/// The hidden argv token selecting worker mode inside the single binary.
+pub const INTERNAL_WORKER_TOKEN: &str = "--internal-embed-worker";
+
+/// Entry point for a re-exec'd single-binary worker invocation: the caller
+/// (src/bin/leindex.rs) strips the hidden `--internal-embed-worker` token
+/// before dispatch, so `argv[0]` is the binary and the remaining tokens are
+/// worker arguments exactly as the standalone binary would see them.
+pub fn run_from(argv: Vec<String>) -> ! {
+    // Handle --version / -V before any heavy initialization. Token-position
+    // robust: scan for the flag anywhere (the hidden worker token precedes
+    // it in single-binary mode and argv.len()==2 checks would silently miss
+    // it — the exact bug the original single-binary plan flagged).
     //
     // VAL-CARGO-005: evidence requires `leindex-embed --version` to print
     // the release version. VAL-RELEASE-002 requires the same from the
     // release bundle worker binary. This must run before logging init so
     // the version string is the only stdout output (no tracing noise).
-    let argv: Vec<String> = std::env::args().collect();
-    if argv.len() == 2 && (argv[1] == "--version" || argv[1] == "-V") {
+    if argv.len() >= 2
+        && argv[1..]
+            .iter()
+            .any(|arg| arg == "--version" || arg == "-V")
+    {
         // Use the subcrate version (same as Cargo.toml version, kept in
         // parity with the root crate by AGENTS.md version-parity rule).
         println!("leindex-embed {}", env!("CARGO_PKG_VERSION"));
         process::exit(0);
+    }
+
+    if let Some((model_path, provider_name, ort_threads)) = parse_migraphx_probe_arg(&argv) {
+        let result =
+            WorkerRuntime::run_migraphx_probe_child(&model_path, &provider_name, ort_threads);
+        if let Err(error) = &result {
+            // The parent only observes the exit status; without this line a
+            // probe failure (missing provider lib, compile crash, timeout)
+            // is completely silent and undiagnosable from the daemon log.
+            eprintln!("migraphx probe failed: {error}");
+        }
+        process::exit(if result.is_ok() { 0 } else { 1 });
     }
 
     let socket_path = match parse_socket_arg(&argv) {
@@ -121,6 +182,16 @@ pub fn run() -> ! {
     // their idle timeout fires (up to 10 minutes).
     #[cfg(target_os = "linux")]
     {
+        // Process-name visibility: single-binary re-exec mode runs inside a
+        // `leindex` executable; keep monitoring, `ps`, and the audit trails
+        // seeing the familiar `leindex-embed` name (best-effort — failure
+        // is cosmetic, never fatal).
+        // SAFETY: `prctl(PR_SET_NAME, ptr, 0, 0, 0)` reads a NUL-terminated
+        // name from static storage for the duration of the call.
+        unsafe {
+            let name = b"leindex-embed\0";
+            let _ = libc::prctl(libc::PR_SET_NAME, name.as_ptr() as usize, 0, 0, 0);
+        }
         // SAFETY: `prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0)` is a simple
         // scalar kernel syscall with no pointer arguments. The second
         // argument is the signal number (SIGKILL). The remaining arguments
@@ -168,7 +239,7 @@ pub fn run() -> ! {
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .try_init();
 
@@ -177,7 +248,12 @@ pub fn run() -> ! {
     // Build runtime config from environment
     let mut config = RuntimeConfig::from_env();
     if socket_path.is_some() {
-        config.idle_timeout = Duration::from_secs(600);
+        // Socket daemons hold a multi-GiB model resident for FOLLOW-UP calls
+        // in the same working burst (index → search). 180 s covers that burst
+        // while freeing the memory promptly afterwards; the previous 600 s
+        // retention was a direct contributor to the stress-test OOM (two
+        // idle daemons stacking ~15 GiB total_vm in a shared cgroup).
+        config.idle_timeout = Duration::from_secs(180);
     }
 
     // T6: refuse to load the (multi-GiB) ONNX model when the system is below
@@ -223,6 +299,16 @@ pub fn run() -> ! {
     process::exit(0);
 }
 
+fn parse_migraphx_probe_arg(argv: &[String]) -> Option<(PathBuf, String, usize)> {
+    if argv.get(1).map(String::as_str) != Some("--migraphx-probe") || argv.len() != 5 {
+        return None;
+    }
+    let model_path = PathBuf::from(&argv[2]);
+    let provider_name = argv[3].clone();
+    let ort_threads = argv[4].parse().ok()?;
+    Some((model_path, provider_name, ort_threads))
+}
+
 fn parse_socket_arg(argv: &[String]) -> Result<Option<PathBuf>, &'static str> {
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
@@ -251,6 +337,12 @@ fn run_socket_worker(config: RuntimeConfig, socket_path: PathBuf) -> anyhow::Res
         provider: Some(config.execution_provider.clone()),
         model: config.model_name.clone(),
         error: None,
+        model_digest: None,
+        tokenizer_digest: None,
+        config_digest: None,
+        host_rss_mib: None,
+        gpu_vram_mib: None,
+        provider_compile_cache: None,
     };
     write_worker_pid(&pid_path, process::id())?;
     #[cfg(target_os = "linux")]
@@ -332,12 +424,7 @@ fn run_socket_accept_loop(
                 }
                 // Bound concurrency: when every slot is in use, drop the excess
                 // connection — the daemon's client observes EOF and re-requests.
-                if active_clients
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                        (n < max_clients).then_some(n + 1)
-                    })
-                    .is_err()
-                {
+                if !try_acquire_client_slot(&active_clients, max_clients) {
                     tracing::warn!(
                         max_clients,
                         "worker socket client concurrency cap reached; dropping connection"
@@ -743,6 +830,12 @@ mod tests {
                 provider: Some("cpu".to_string()),
                 model: "test-model".to_string(),
                 error: None,
+                model_digest: None,
+                tokenizer_digest: None,
+                config_digest: None,
+                host_rss_mib: None,
+                gpu_vram_mib: None,
+                provider_compile_cache: None,
             },
             DEFAULT_MAX_FRAME_SIZE,
         ));
@@ -782,6 +875,7 @@ mod tests {
             protocol::EmbedRequest {
                 texts: vec!["test".to_string()],
                 expected_dim: 4,
+                cache_keys: vec![],
             },
         )
         .unwrap();
@@ -803,16 +897,53 @@ mod tests {
 /// protocol/runtime exercise — no socket, no platform gating.
 #[cfg(test)]
 mod worker_entry_tests {
+    use super::{parse_migraphx_probe_arg, parse_socket_arg};
     use crate::embed::protocol::{self, BatchId, EmbedRequest, Frame, MsgType};
     use crate::embed::runtime::{DEFAULT_IDLE_TIMEOUT_SECS, RuntimeConfig, WorkerRuntime};
     use std::io::Cursor;
     use std::time::Duration;
 
     #[test]
+    fn test_parse_migraphx_probe_arg_requires_exact_shape() {
+        let args = vec![
+            "leindex-embed".to_string(),
+            "--migraphx-probe".to_string(),
+            "/tmp/model.onnx".to_string(),
+            "migraphx".to_string(),
+            "4".to_string(),
+        ];
+        let parsed = parse_migraphx_probe_arg(&args).expect("valid probe args");
+        assert_eq!(parsed.0.to_string_lossy(), "/tmp/model.onnx");
+        assert_eq!(parsed.1, "migraphx");
+        assert_eq!(parsed.2, 4);
+    }
+
+    #[test]
+    fn test_parse_migraphx_probe_arg_rejects_invalid_args() {
+        let missing = vec!["worker".to_string(), "--migraphx-probe".to_string()];
+        assert!(parse_migraphx_probe_arg(&missing).is_none());
+        let invalid_threads = vec![
+            "worker".to_string(),
+            "--migraphx-probe".to_string(),
+            "model.onnx".to_string(),
+            "migraphx".to_string(),
+            "not-a-number".to_string(),
+        ];
+        assert!(parse_migraphx_probe_arg(&invalid_threads).is_none());
+    }
+
+    #[test]
+    fn test_parse_socket_arg_remains_independent_of_probe_mode() {
+        let args = vec!["worker".to_string(), "--migraphx-probe".to_string()];
+        assert_eq!(parse_socket_arg(&args), Ok(None));
+    }
+
+    #[test]
     fn test_binary_embed_roundtrip_via_runtime() {
         let request = EmbedRequest {
             texts: vec!["hello".to_string(), "world".to_string()],
             expected_dim: 4,
+            cache_keys: vec![],
         };
         let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
         let wire = frame.encode_wire().unwrap();
@@ -823,11 +954,20 @@ mod worker_entry_tests {
 
     #[test]
     fn test_runtime_handles_embed_request() {
-        let config = RuntimeConfig::default();
+        // Hermetic: a non-resolvable model name makes `init_onnx` return
+        // immediately with no session, so under `--features onnx` this test
+        // never attempts a real model load/compile (which would hang the
+        // suite on hosts that have ORT + a resolvable model).
+        let config = RuntimeConfig {
+            model_name: "__leindex_test_no_model__".to_string(),
+            rerank_model_name: "__leindex_test_no_rerank_model__".to_string(),
+            ..RuntimeConfig::default()
+        };
         let rt = WorkerRuntime::new(config);
         let request = EmbedRequest {
             texts: vec!["test".to_string()],
             expected_dim: 8,
+            cache_keys: vec![],
         };
         let frame = protocol::embed_request_frame(BatchId::new(42), request).unwrap();
         let response_frame = rt.dispatch(&frame);
@@ -838,14 +978,18 @@ mod worker_entry_tests {
 
     #[test]
     fn test_run_loop_single_request() {
+        // Hermetic: as above, never attempt a real model load under onnx.
         let config = RuntimeConfig {
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+            model_name: "__leindex_test_no_model__".to_string(),
+            rerank_model_name: "__leindex_test_no_rerank_model__".to_string(),
             ..RuntimeConfig::default()
         };
         let rt = WorkerRuntime::new(config);
         let request = EmbedRequest {
             texts: vec!["hello".to_string()],
             expected_dim: 4,
+            cache_keys: vec![],
         };
         let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
         let wire = frame.encode_wire().unwrap();

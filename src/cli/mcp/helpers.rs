@@ -77,6 +77,7 @@ pub(crate) fn node_type_str(nt: &crate::graph::pdg::NodeType) -> &'static str {
         crate::graph::pdg::NodeType::Variable => "variable",
         crate::graph::pdg::NodeType::Module => "module",
         crate::graph::pdg::NodeType::External => "external",
+        crate::graph::pdg::NodeType::DocSection => "doc_section",
         crate::graph::pdg::NodeType::FileSummary => "file_summary",
     }
 }
@@ -305,7 +306,7 @@ pub(crate) fn wrap_live_with_meta_dirty(
                             if health.is_none() {
                                 "No indexed generation is loaded; exact live results remain usable."
                             } else {
-                                "Index may be stale; run leindex.index with force_reindex=true to refresh."
+                                "Index may be stale; run leindex_manage action=index with force_reindex=true to refresh."
                             }
                             .to_string(),
                         ),
@@ -316,6 +317,31 @@ pub(crate) fn wrap_live_with_meta_dirty(
                 .entry("_meta".to_string())
                 .or_insert_with(|| Value::Object(serde_json::Map::new()));
             if let Some(meta_obj) = meta.as_object_mut() {
+                // N-11: `status: fresh` means the last index RUN completed —
+                // it says nothing about files changed SINCE. A payload that
+                // simultaneously reports fresh and a nonzero
+                // changed_unindexed_count reads as a contradiction unless
+                // the semantics are stated. Add the one-line clarifier
+                // whenever both appear together.
+                if let Some(freshness_obj) = freshness.as_object_mut() {
+                    let status_is_fresh = freshness_obj
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .is_some_and(|status| status == "fresh");
+                    let changed = freshness_obj
+                        .get("changed_unindexed_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    if status_is_fresh && changed > 0 {
+                        freshness_obj.insert(
+                            "status_note".to_string(),
+                            Value::String(format!(
+                                "fresh = the last index run completed; {} file(s) changed in the worktree since then",
+                                changed
+                            )),
+                        );
+                    }
+                }
                 meta_obj.insert("freshness".to_string(), freshness);
             }
         }
@@ -324,20 +350,31 @@ pub(crate) fn wrap_live_with_meta_dirty(
 }
 
 /// Read a source snippet from disk using the node's byte_range.
-pub(crate) fn read_source_snippet(file_path: &str, byte_range: (usize, usize)) -> Option<String> {
+/// Read a source snippet for a byte range, resolving a (possibly
+/// project-relative) stored file path against the project root first.
+///
+/// PDG nodes store the path exactly as it was indexed. When a project is
+/// indexed through a canonical root the path is absolute and this resolves to
+/// the same file; for relative or remapped paths the live project root is
+/// required to read the source at all (the raw path would be interpreted
+/// against the server's working directory and silently fail).
+pub(crate) fn read_source_snippet_resolved(
+    file_path: &str,
+    byte_range: (usize, usize),
+    project_root: Option<&Path>,
+) -> Option<String> {
     if byte_range.1 <= byte_range.0 {
         return None;
     }
-    let bytes = std::fs::read(file_path).ok()?;
+    let resolved = match project_root {
+        Some(root) if !Path::new(file_path).is_absolute() => root.join(file_path),
+        _ => PathBuf::from(file_path),
+    };
+    let bytes = std::fs::read(&resolved).ok()?;
     if byte_range.0 > bytes.len() || byte_range.1 > bytes.len() {
         return None;
     }
-    let start = byte_range.0;
-    let end = byte_range.1;
-    if start >= end {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&bytes[start..end]).into_owned())
+    Some(String::from_utf8_lossy(&bytes[byte_range.0..byte_range.1]).into_owned())
 }
 
 /// Convert a byte range to a 1-indexed line range.
@@ -377,29 +414,35 @@ pub(crate) fn byte_range_to_line_range(
     (start_line, end_line.max(start_line))
 }
 
-/// Collect the NodeIds of all nodes that have a direct edge pointing *to* `target_id`.
+/// Collect the NodeIds of all nodes that CALL `target_id` — Call edges only.
 pub(crate) fn get_direct_callers(
     pdg: &crate::graph::pdg::ProgramDependenceGraph,
     target_id: crate::graph::pdg::NodeId,
 ) -> Vec<crate::graph::pdg::NodeId> {
-    pdg.predecessors(target_id)
+    // Call-edge semantics (N-04): predecessors of ANY edge type previously
+    // counted as "callers", so data-flow heuristics (every function
+    // taking/returning `String` linked to every other) and containment
+    // (an impl block "calling" its own methods) leaked into caller lists
+    // and conflated unrelated same-typed symbols.
+    pdg.neighbors_by_edge_type(
+        target_id,
+        crate::graph::pdg::EdgeType::Call,
+        petgraph::Direction::Incoming,
+    )
 }
 
-/// Simple glob matching for include/exclude patterns.
-pub(crate) fn glob_match(path: &str, pattern: &str) -> bool {
-    if pattern.starts_with("*.") {
-        let ext = &pattern[1..];
-        path.ends_with(ext)
-    } else if pattern.contains('*') {
-        let parts: Vec<&str> = pattern.split('*').collect();
-        if parts.len() == 2 {
-            path.contains(parts[0]) && path.ends_with(parts[1])
-        } else {
-            path.contains(pattern)
-        }
-    } else {
-        path.contains(pattern)
-    }
+/// Collect the NodeIds of all nodes CALLED BY `source_id` — Call edges only
+/// (see [`get_direct_callers`] for the semantics rationale). Includes
+/// External marker nodes (`String.truncate [external]`, N-03).
+pub(crate) fn get_direct_callees(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    source_id: crate::graph::pdg::NodeId,
+) -> Vec<crate::graph::pdg::NodeId> {
+    pdg.neighbors_by_edge_type(
+        source_id,
+        crate::graph::pdg::EdgeType::Call,
+        petgraph::Direction::Outgoing,
+    )
 }
 
 fn edit_change_type(item: &Value, index: usize) -> Result<&str, JsonRpcError> {
@@ -905,7 +948,7 @@ mod tests {
 
     #[test]
     fn test_read_source_snippet_empty_range() {
-        assert!(read_source_snippet("/nonexistent/path", (0, 0)).is_none());
+        assert!(read_source_snippet_resolved("/nonexistent/path", (0, 0), None).is_none());
     }
 
     #[test]
@@ -914,7 +957,7 @@ mod tests {
         let file = dir.path().join("test.rs");
         std::fs::write(&file, b"pub fn hello() {}").unwrap();
         let path = file.to_str().unwrap();
-        let snippet = read_source_snippet(path, (0, 17));
+        let snippet = read_source_snippet_resolved(path, (0, 17), None);
         assert!(snippet.is_some());
         assert_eq!(snippet.unwrap(), "pub fn hello() {}");
     }
@@ -925,8 +968,8 @@ mod tests {
         let file = dir.path().join("test.rs");
         std::fs::write(&file, b"0123456789").unwrap();
         let path = file.to_str().unwrap();
-        assert!(read_source_snippet(path, (0, 11)).is_none());
-        assert!(read_source_snippet(path, (11, 12)).is_none());
+        assert!(read_source_snippet_resolved(path, (0, 11), None).is_none());
+        assert!(read_source_snippet_resolved(path, (11, 12), None).is_none());
     }
 
     #[test]
@@ -1021,7 +1064,7 @@ mod tests {
         let file = dir.path().join("test.rs");
         std::fs::write(&file, b"0123456789").unwrap();
         let path = file.to_str().unwrap();
-        let snippet = read_source_snippet(path, (2, 5));
+        let snippet = read_source_snippet_resolved(path, (2, 5), None);
         assert_eq!(snippet.unwrap(), "234");
     }
 
@@ -1034,7 +1077,9 @@ mod tests {
 
     #[test]
     fn test_read_source_snippet_nonexistent_file() {
-        assert!(read_source_snippet("/definitely/does/not/exist.rs", (0, 10)).is_none());
+        assert!(
+            read_source_snippet_resolved("/definitely/does/not/exist.rs", (0, 10), None).is_none()
+        );
     }
 
     #[test]

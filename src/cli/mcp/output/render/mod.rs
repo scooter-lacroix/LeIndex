@@ -20,6 +20,12 @@ use super::{
 mod git_status;
 use git_status::render_git_status;
 
+mod symbol_phase;
+use symbol_phase::*;
+
+mod map_impact;
+use map_impact::*;
+
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
@@ -346,6 +352,20 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
     for (idx, r) in arr.iter().enumerate() {
         out.push_str(&render_search_result(r, idx, color));
     }
+    // Low-signal warning (F-07): when the top composite score is below the
+    // confidence floor the handler flags it; make that visible in the text
+    // surface too so agents do not act on coincidental token-overlap hits.
+    if data.get("low_signal").and_then(Value::as_bool) == Some(true) {
+        let score = data
+            .get("top_score")
+            .and_then(Value::as_f64)
+            .map(|s| format!(" ({:.2})", s))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "\n  ⚠ low signal{}: results may be coincidental token overlap; rephrase or use mode=find.\n",
+            score
+        ));
+    }
     out
 }
 
@@ -475,6 +495,15 @@ fn render_diagnostics_health(data: &Value, color: bool) -> String {
             out.push_str(&field(label, &value.to_string(), color));
         }
     }
+    // A delta-scoped signature count covers only the files parsed in the last
+    // (incremental) run — annotate it so it is not read as the project total.
+    if health.get("signature_scope").and_then(Value::as_str) == Some("delta") {
+        out.push_str(&field(
+            "  Signature scope",
+            "delta — count covers only files parsed in the last incremental run",
+            color,
+        ));
+    }
     if let Some(value) = health.get("embedding_model").and_then(|v| v.as_str()) {
         out.push_str(&field("  Embedding model", value, color));
     }
@@ -526,7 +555,18 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
         out.push_str(&field("Symbols", &v.to_string(), color));
     }
     if let Some(v) = data.get("index_size_mb").and_then(|v| v.as_f64()) {
-        out.push_str(&field("Index size", &format!("{:.2} MB", v), color));
+        out.push_str(&field(
+            "Index size (on disk)",
+            &format!("{:.2} MB", v),
+            color,
+        ));
+    }
+    if let Some(v) = data.get("index_heap_estimate_mb").and_then(|v| v.as_f64()) {
+        out.push_str(&field(
+            "Index heap (estimated)",
+            &format!("{:.2} MB", v),
+            color,
+        ));
     }
     if let Some(v) = data.get("memory_rss_mb").and_then(|v| v.as_f64()) {
         out.push_str(&field("Memory RSS", &format!("{:.2} MB", v), color));
@@ -544,8 +584,65 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
     if let Some(v) = data.get("embedding_model").and_then(|v| v.as_str()) {
         out.push_str(&field("Embedding model", v, color));
     }
-    // VAL-CROSS-015 / VAL-ORT-022: surface resolved ORT library info so support
-    // engineers can debug any install surface identically via `leindex diagnostics`.
+    out.push_str(&render_diagnostics_engram(data, color));
+    out.push_str(&render_diagnostics_precision(data, color));
+    out.push_str(&render_diagnostics_provider(data, color));
+    out.push_str(&render_diagnostics_health(data, color));
+    out.push_str(&render_diagnostics_issues(data, color));
+    out
+}
+
+/// Render the `engram` cache status line: hit/miss/entry counts when the
+/// feature is enabled, an off-note pointing at the feature flag otherwise.
+/// Emits nothing when the handler did not report the field.
+fn render_diagnostics_engram(data: &Value, color: bool) -> String {
+    let Some(engram) = data.get("engram") else {
+        return String::new();
+    };
+    let enabled = engram.get("enabled").and_then(|v| v.as_bool()) == Some(true);
+    let summary = if enabled {
+        let count = |key: &str| engram.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+        format!(
+            "on ({} hits / {} misses, {} entries)",
+            count("hits"),
+            count("misses"),
+            count("entries")
+        )
+    } else {
+        "off (LEINDEX_FEATURE_ENGRAM=1 to enable)".to_string()
+    };
+    field("Engram", &summary, color)
+}
+
+/// Render the SCIP-precision block: enabled flag, node count, and the
+/// comma-joined language list (the language line is omitted when the
+/// list is empty).
+fn render_diagnostics_precision(data: &Value, color: bool) -> String {
+    let mut out = String::new();
+    if let Some(enabled) = data.get("precision_enabled").and_then(|v| v.as_bool()) {
+        let status = if enabled { "enabled" } else { "disabled" };
+        out.push_str(&field("SCIP precision", status, color));
+    }
+    if let Some(v) = data.get("precision_nodes").and_then(|v| v.as_u64()) {
+        out.push_str(&field("Precision nodes", &v.to_string(), color));
+    }
+    if let Some(languages) = data.get("precision_languages").and_then(|v| v.as_array()) {
+        let names = languages
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !names.is_empty() {
+            out.push_str(&field("Precision languages", &names, color));
+        }
+    }
+    out
+}
+
+// VAL-CROSS-015 / VAL-ORT-022: surface resolved ORT library info so support
+// engineers can debug any install surface identically via `leindex diagnostics`.
+fn render_diagnostics_provider(data: &Value, color: bool) -> String {
+    let mut out = String::new();
     if let Some(v) = data.get("ort_version").and_then(|v| v.as_str()) {
         out.push_str(&field("ORT version", v, color));
     }
@@ -555,685 +652,24 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
     if let Some(v) = data.get("execution_provider").and_then(|v| v.as_str()) {
         out.push_str(&field("Execution provider", v, color));
     }
-    out.push_str(&render_diagnostics_health(data, color));
-    out.push_str(&render_diagnostics_issues(data, color));
-    out
-}
-
-fn render_project_map(data: &Value, color: bool) -> String {
-    let mut out = header("Project Structure", color);
-    out.push('\n');
-    if let Some(tree) = data.get("tree").and_then(|v| v.as_array()) {
-        out.push_str(&render_tree(tree, color));
-    } else if let Some(roots) = data.get("root").map(|v| vec![v.clone()]) {
-        out.push_str(&render_tree(&roots, color));
-    } else if let Some(files) = data.get("files").and_then(|v| v.as_array()) {
-        let tree = build_tree_from_files(files);
-        if tree.is_empty() {
-            // No directory info is available in the file entries (the
-            // handler ships basenames, not full paths), so render a flat
-            // ranked list rather than fabricating fake directories.
-            out.push_str(&render_flat_files(files, color));
-        } else {
-            out.push_str(&render_tree(&tree, color));
-        }
-    }
-    if let Some(stats) = data.get("stats") {
-        out.push('\n');
-        if let Some(v) = stats.get("total_files").and_then(|v| v.as_u64()) {
-            out.push_str(&field("Files", &v.to_string(), color));
-        }
-        if let Some(v) = stats.get("total_symbols").and_then(|v| v.as_u64()) {
-            out.push_str(&field("Symbols", &v.to_string(), color));
-        }
-        if let Some(v) = stats.get("avg_complexity").and_then(|v| v.as_f64()) {
-            out.push_str(&field("Avg complexity", &format!("{:.1}", v), color));
-        }
-        if let Some(v) = stats.get("total_loc").and_then(|v| v.as_u64()) {
-            out.push_str(&field("Lines of code", &v.to_string(), color));
-        }
-    }
-    // Also show total_files_in_scope from the handler output
-    // (the handler puts this at top level, not under "stats")
-    if let Some(v) = data.get("total_files_in_scope").and_then(|v| v.as_u64()) {
-        if data.get("stats").is_none() {
-            out.push('\n');
-        }
-        out.push_str(&field("Files in scope", &v.to_string(), color));
-    }
-    out
-}
-
-fn render_flat_files(files: &[Value], color: bool) -> String {
-    let mut out = String::new();
-    out.push_str(&format!(
-        "  {}(flat list — files ordered as returned){}\n",
-        if color { DIM } else { "" },
-        if color { RESET } else { "" },
-    ));
-    for (i, f) in files.iter().enumerate() {
-        let path = f
-            .get("path")
-            .and_then(|v| v.as_str())
-            .or_else(|| f.get("relative_path").and_then(|v| v.as_str()))
-            .unwrap_or("?");
-        let syms = f.get("symbol_count").and_then(|v| v.as_u64()).unwrap_or(0);
-        let cx = f
-            .get("total_complexity")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let deps = f
-            .get("incoming_dependencies")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-            + f.get("outgoing_dependencies")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-        // The complexity value is shown as a colour-coded integer
-        // (`cx:{N}`); the human-readable label ("low" / "med" /
-        // "high") was previously computed alongside the colour but
-        // never rendered, so simplify the conditional to just the
-        // colour string. When colour is disabled the colour string
-        // is the empty literal.
-        let cx_color = if color {
-            match cx {
-                0..=20 => LIGHT_GREEN,
-                21..=60 => LIGHT_YELLOW,
-                _ => LIGHT_RED,
-            }
-        } else {
-            ""
-        };
-        out.push_str(&format!(
-            "  {}{:>3}.{} {}{}{}  {}{} sym  cx:{}{}{}  deps:{}\n",
-            if color { BOLD } else { "" },
-            i + 1,
-            if color { RESET } else { "" },
-            if color { LIGHT_YELLOW } else { "" },
-            path,
-            if color { RESET } else { "" },
-            if color { DIM } else { "" },
-            syms,
-            cx_color,
-            cx,
-            if color { RESET } else { "" },
-            deps,
-        ));
-    }
-    out
-}
-
-/// Convert a flat list of `{path, relative_path, symbol_count, ...}`
-/// entries into a nested directory tree suitable for `render_tree`.
-/// Returns an empty Vec if the file entries don't carry directory
-/// information (caller falls back to flat rendering).
-fn build_tree_from_files(files: &[Value]) -> Vec<Value> {
-    use std::collections::BTreeMap;
-
-    // Bail out unless at least one entry has a path with a directory
-    // separator — otherwise we'd fabricate a meaningless single-level
-    // tree from basenames.
-    let any_with_dir = files.iter().any(|f| {
-        f.get("relative_path")
-            .and_then(|v| v.as_str())
-            .or_else(|| f.get("path").and_then(|v| v.as_str()))
-            .map(|p| p.contains('/') || p.contains('\\'))
-            .unwrap_or(false)
-    });
-    if !any_with_dir {
-        return Vec::new();
-    }
-
-    // A `Node` here is a tiny tree of name -> (entry, children).
-    struct Node {
-        entry: Option<Value>,
-        children: BTreeMap<String, Node>,
-    }
-
-    impl Node {
-        fn new() -> Self {
-            Self {
-                entry: None,
-                children: BTreeMap::new(),
-            }
-        }
-        /// Convert a directory node to a `{name, type, children}` JSON
-        /// value. File nodes pass through their entry. Each child is
-        /// converted using its own key as the name so nested directory
-        /// labels stay distinct instead of inheriting the parent's
-        /// segment.
-        fn into_value(self, name: &str) -> Value {
-            let children: Vec<Value> = self
-                .children
-                .into_iter()
-                .map(|(child_name, child)| child.into_value(&child_name))
-                .collect();
-            if let Some(mut entry) = self.entry {
-                if let Some(obj) = entry.as_object_mut() {
-                    if !children.is_empty() {
-                        obj.insert("children".to_string(), Value::Array(children));
-                    }
-                }
-                entry
-            } else {
-                serde_json::json!({
-                    "name": name,
-                    "type": "directory",
-                    "children": children,
-                })
-            }
-        }
-    }
-
-    let mut root = Node::new();
-    for file in files {
-        let rel = file
-            .get("relative_path")
-            .and_then(|v| v.as_str())
-            .or_else(|| file.get("path").and_then(|v| v.as_str()))
-            .unwrap_or("?");
-        // Normalize to forward slashes for stable tree building.
-        let rel = rel.replace('\\', "/");
-        let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
-        let mut node = &mut root;
-        for (i, part) in parts.iter().enumerate() {
-            let key = part.to_string();
-            let is_file = i + 1 == parts.len();
-            let child = node.children.entry(key.clone()).or_insert_with(Node::new);
-            if is_file {
-                let mut entry = file.clone();
-                if let Some(obj) = entry.as_object_mut() {
-                    obj.entry("name".to_string())
-                        .or_insert(Value::String((*part).to_string()));
-                    obj.entry("type".to_string())
-                        .or_insert(Value::String("file".to_string()));
-                }
-                child.entry = Some(entry);
-            }
-            node = child;
-        }
-    }
-
-    // The root is a virtual container with no name of its own — return
-    // its top-level children directly so `render_tree` shows them as
-    // siblings rather than nested under a fabricated "root" node.
-    let mut top: Vec<Value> = Vec::new();
-    for (name, child) in root.children.into_iter() {
-        top.push(child.into_value(&name));
-    }
-    top
-}
-
-fn render_impact_risk(data: &Value, color: bool) -> String {
-    let Some(risk) = data.get("risk_level").and_then(|v| v.as_str()) else {
-        return String::new();
-    };
-    let (icon, risk_color) = if color {
-        match risk.to_lowercase().as_str() {
-            "high" => ("●", LIGHT_RED),
-            "medium" => ("●", LIGHT_YELLOW),
-            "low" => ("●", LIGHT_GREEN),
-            _ => ("○", WHITE),
-        }
-    } else {
-        ("●", "")
-    };
-    format!(
-        "  {}Risk:{} {risk_color}{icon} {risk}{}\n",
-        if color { BOLD } else { "" },
-        if color { RESET } else { "" },
-        if color { RESET } else { "" },
-    )
-}
-
-fn render_impact_list(
-    data: &Value,
-    key: &str,
-    title: &str,
-    arrow: &str,
-    item_color: &str,
-    limit: usize,
-    show_more: bool,
-    color: bool,
-) -> String {
-    let Some(items) = data.get(key).and_then(|v| v.as_array()) else {
-        return String::new();
-    };
-    if items.is_empty() {
-        return String::new();
-    }
-    let (bold, dim, reset, line_color) = if color {
-        (BOLD, DIM, RESET, item_color)
-    } else {
-        ("", "", "", "")
-    };
-    let mut out = format!("\n  {bold}{title} ({}):{reset}\n", items.len());
-    for item in items.iter().take(limit) {
-        let name = item
-            .as_str()
-            .or_else(|| item.get("name").and_then(|v| v.as_str()))
-            .unwrap_or("?");
-        out.push_str(&format!("    {line_color}{arrow} {name}{reset}\n"));
-    }
-    if show_more && items.len() > limit {
-        out.push_str(&format!("    {dim}… {} more{reset}\n", items.len() - limit));
-    }
-    out
-}
-
-fn render_impact_counts(data: &Value, color: bool) -> String {
-    let affected_files = data
-        .get("transitive_affected_files")
-        .and_then(|v| v.as_u64());
-    let transitive_callers = data.get("transitive_callers").and_then(|v| v.as_u64());
-    if affected_files.is_none() && transitive_callers.is_none() {
-        return String::new();
-    }
-
-    let mut out = String::from("\n");
-    if let Some(count) = affected_files {
-        out.push_str(&field("Affected files", &count.to_string(), color));
-    }
-    if let Some(count) = transitive_callers {
-        out.push_str(&field("Transitive callers", &count.to_string(), color));
-    }
-    out
-}
-
-fn render_impact(data: &Value, color: bool) -> String {
-    let mut out = header("Impact Analysis", color);
-    out.push('\n');
-    if let Some(sym) = data.get("symbol").and_then(|v| v.as_str()) {
-        out.push_str(&field("Symbol", sym, color));
-    }
-    if let Some(file) = data.get("file").and_then(|v| v.as_str()) {
-        out.push_str(&field("File", file, color));
-    }
-    if let Some(ct) = data.get("change_type").and_then(|v| v.as_str()) {
-        out.push_str(&field("Change type", ct, color));
-    }
-    out.push_str(&render_impact_risk(data, color));
-
-    out.push_str(&render_impact_list(
-        data,
-        "direct_callers",
-        "Direct callers",
-        "←",
-        LIGHT_CYAN,
-        20,
-        false,
-        color,
-    ));
-
-    out.push_str(&render_impact_list(
-        data,
-        "transitive_affected_symbols",
-        "Transitive affected symbols",
-        "→",
-        LIGHT_YELLOW,
-        30,
-        true,
-        color,
-    ));
-
-    // Summary with numeric counts
-    if let Some(s) = data.get("summary").and_then(|v| v.as_str()) {
-        out.push('\n');
-        out.push_str(&format!(
-            "  {}Summary:{} {}\n",
-            if color { BOLD } else { "" },
-            if color { RESET } else { "" },
-            s,
-        ));
-    }
-
-    out.push_str(&render_impact_counts(data, color));
-
-    out
-}
-
-fn render_symbol_lookup(data: &Value, color: bool) -> String {
-    // `lookup_single_symbol` returns the shape (see
-    // `src/cli/mcp/symbol_lookup_handler.rs::lookup_single_symbol`):
-    //   { symbol, type, file, byte_range, complexity, language,
-    //     callers, callees, impact_radius, [source] }
-    // where each caller/callee entry is { name, file, type } (no
-    // `line` field). Older renderers read `file_path` / `line` /
-    // `symbol_type` / `signature` and end up emitting mostly blanks.
-    //
-    // Batch mode (`lookup_symbols_batch`) returns the wrapper
-    //   { batch: true, count, results: [ ...singleSymbolEntries ] }
-    // The previous renderer silently dropped the wrapper and
-    // emitted a header followed by nothing when `symbol` /
-    // `file` / `type` were absent at the top level. Branch on
-    // `batch:true` and recurse into each entry.
-    if data.get("batch").and_then(|v| v.as_bool()) == Some(true) {
-        let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-        let mut out = header("Symbol Lookup (batch)", color);
-        out.push('\n');
-        out.push_str(&field("Count", &count.to_string(), color));
-        if let Some(arr) = data.get("results").and_then(|v| v.as_array()) {
-            if arr.is_empty() {
-                out.push_str("  (no results)\n");
-                return out;
-            }
-            for (idx, entry) in arr.iter().enumerate() {
-                out.push('\n');
-                out.push_str(&format!(
-                    "  {}{}#{}{} {}\n",
-                    if color { BOLD } else { "" },
-                    if color { DIM } else { "" },
-                    idx + 1,
-                    if color { RESET } else { "" },
-                    entry.get("symbol").and_then(|v| v.as_str()).unwrap_or("?"),
-                ));
-                out.push_str(&render_symbol_lookup_single(entry, color));
-            }
-        }
-        return out;
-    }
-    let mut out = header("Symbol Lookup", color);
-    out.push('\n');
-    out.push_str(&render_symbol_lookup_single(data, color));
-    out
-}
-
-/// Render a single symbol entry (the inner shape returned by
-/// `lookup_single_symbol`). Lifted out of `render_symbol_lookup` so
-/// the batch wrapper can recurse into each entry.
-fn render_symbol_source(data: &Value, color: bool) -> String {
-    let Some(source) = data.get("source").and_then(|v| v.as_str()) else {
-        return String::new();
-    };
-
-    let mut out = String::from("\n");
-    let mut shown = 0usize;
-    for line in source.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        out.push_str(&format!(
-            "      {}{}{}\n",
-            if color { DIM } else { "" },
-            truncate_chars(line, 160),
-            if color { RESET } else { "" },
-        ));
-        shown += 1;
-        if shown >= 12 {
-            break;
-        }
-    }
-    out
-}
-
-fn render_symbol_relationships(
-    data: &Value,
-    key: &str,
-    truncated_key: &str,
-    title: &str,
-    arrow: &str,
-    color: bool,
-) -> String {
-    let Some(entries) = data.get(key).and_then(|v| v.as_array()) else {
-        return String::new();
-    };
-    if entries.is_empty() {
-        return String::new();
-    }
-
-    let mut out = format!("\n  {title}:\n");
-    for entry in entries.iter().take(50) {
-        let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-        let file = entry.get("file").and_then(|v| v.as_str()).unwrap_or("");
-        let typ = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        out.push_str(&format!(
-            "    {arrow} {}{}{} {}{}{}{}\n",
-            if color { LIGHT_CYAN } else { "" },
-            name,
-            if color { RESET } else { "" },
-            if color { DIM } else { "" },
-            file,
-            if typ.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", typ)
-            },
-            if color { RESET } else { "" },
-        ));
-    }
-    if data
-        .get(truncated_key)
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    // The configured provider is a request; the worker reports what actually
+    // loaded. When they differ (e.g. migraphx requested, cpu active after a
+    // provider-library load failure) surface the fallback explicitly instead
+    // of letting the requested value masquerade as the active one.
+    if let Some(active) = data
+        .get("execution_provider_active")
+        .and_then(|v| v.as_str())
     {
-        out.push_str(&format!(
-            "    {}... (showing 50 or more){}\n",
-            if color { DIM } else { "" },
-            if color { RESET } else { "" },
-        ));
-    }
-    out
-}
-
-fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
-    let mut out = String::new();
-    if let Some(sym) = data.get("symbol").and_then(|v| v.as_str()) {
-        out.push_str(&field("Symbol", sym, color));
-    }
-    if let Some(file) = data.get("file").and_then(|v| v.as_str()) {
-        out.push_str(&field("File", file, color));
-    }
-    if let Some(typ) = data.get("type").and_then(|v| v.as_str()) {
-        out.push_str(&field("Type", typ, color));
-    }
-    if let Some(lang) = data.get("language").and_then(|v| v.as_str()) {
-        out.push_str(&field("Language", lang, color));
-    }
-    if let Some(br) = data.get("byte_range").and_then(|v| v.as_array()) {
-        if br.len() == 2 {
-            let start = br[0].as_u64().unwrap_or(0);
-            let end = br[1].as_u64().unwrap_or(0);
-            if end > start {
-                out.push_str(&field("Range", &format!("bytes {}-{}", start, end), color));
+        if let Some(requested) = data.get("execution_provider").and_then(|v| v.as_str()) {
+            if active != requested {
+                out.push_str(&field(
+                    "Provider fallback",
+                    &format!("{requested} requested, {active} ACTIVE"),
+                    color,
+                ));
             }
         }
     }
-    if let Some(cx) = data.get("complexity").and_then(|v| v.as_u64()) {
-        out.push_str(&field("Complexity", &cx.to_string(), color));
-    }
-    if let Some(ir) = data.get("impact_radius").and_then(|v| v.as_object()) {
-        let syms = ir
-            .get("affected_symbols")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let files = ir
-            .get("affected_files")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        out.push_str(&field(
-            "Impact",
-            &format!("{} symbols / {} files", syms, files),
-            color,
-        ));
-    }
-    out.push_str(&render_symbol_source(data, color));
-
-    out.push_str(&render_symbol_relationships(
-        data,
-        "callers",
-        "callers_truncated",
-        "Callers",
-        "→",
-        color,
-    ));
-    out.push_str(&render_symbol_relationships(
-        data,
-        "callees",
-        "callees_truncated",
-        "Callees",
-        "←",
-        color,
-    ));
-    out
-}
-
-fn render_phase_section(data: &Value, phase: u8, color: bool) -> String {
-    let key = format!("phase{phase}");
-    let Some(value) = data.get(&key) else {
-        return String::new();
-    };
-    let (bold, dim, reset) = if color {
-        (BOLD, DIM, RESET)
-    } else {
-        ("", "", "")
-    };
-    match phase {
-        1 => {
-            let files = value
-                .get("total_files")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let signatures = value
-                .get("signatures")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let label = if value
-                .get("cache_hit")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                "cache hit"
-            } else {
-                "parsed"
-            };
-            format!(
-                "\n  {bold}Phase 1:{reset} {files} files, {signatures} signatures ({label}){reset}\n"
-            )
-        }
-        2 => {
-            let internal = value
-                .get("internal_import_edges")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let external = value
-                .get("external_import_edges")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let unresolved = value
-                .get("unresolved_modules")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            format!(
-                "  {bold}Phase 2:{reset} {internal} internal, {external} external, {unresolved} unresolved modules{reset}\n"
-            )
-        }
-        3 => {
-            let entries = value
-                .get("entry_points")
-                .and_then(|v| v.as_array())
-                .map(|items| items.len())
-                .unwrap_or(0);
-            let impacted = value
-                .get("impacted_nodes")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            format!(
-                "  {bold}Phase 3:{reset} {entries} entry points, {impacted} impacted nodes{reset}\n"
-            )
-        }
-        4 => {
-            let hotspots = value
-                .get("hotspots")
-                .and_then(|v| v.as_array())
-                .map(Vec::len)
-                .unwrap_or(0);
-            let mut out = format!("  {bold}Phase 4:{reset} {hotspots} hotspots{reset}\n");
-            if let Some(items) = value.get("hotspots").and_then(|v| v.as_array()) {
-                for (index, hotspot) in items.iter().take(5).enumerate() {
-                    let name = hotspot
-                        .get("node_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?");
-                    let score = hotspot.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let complexity = hotspot
-                        .get("complexity")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    out.push_str(&format!(
-                        "    {}. {name} {dim}(score: {score:.2}, complexity: {complexity}){reset}\n",
-                        index + 1,
-                    ));
-                }
-            }
-            out
-        }
-        5 => {
-            let recommendations = value
-                .get("recommendations")
-                .and_then(|v| v.as_array())
-                .map(Vec::len)
-                .unwrap_or(0);
-            format!("  {bold}Phase 5:{reset} {recommendations} recommendations{reset}\n")
-        }
-        _ => String::new(),
-    }
-}
-
-fn render_phase_formatted(data: &Value, color: bool) -> String {
-    let Some(formatted) = data.get("formatted_output").and_then(|v| v.as_str()) else {
-        return String::new();
-    };
-    if formatted.is_empty() {
-        return String::new();
-    }
-    let (dim, reset) = if color { (DIM, RESET) } else { ("", "") };
-    let mut out = String::from("\n");
-    for line in truncate_chars(formatted, 2000).lines() {
-        out.push_str(&format!("  {dim}{line}{reset}\n"));
-    }
-    out
-}
-
-fn render_phase(data: &Value, color: bool) -> String {
-    let mut out = header("Phase Analysis", color);
-    out.push('\n');
-
-    // Show executed phases
-    if let Some(ep) = data.get("executed_phases").and_then(|v| v.as_array()) {
-        let nums: Vec<String> = ep
-            .iter()
-            .filter_map(|v| v.as_u64().map(|n| n.to_string()))
-            .collect();
-        if !nums.is_empty() {
-            out.push_str(&field("Executed phases", &nums.join(", "), color));
-        }
-    }
-
-    // Show cache hit status
-    if let Some(ch) = data.get("cache_hit").and_then(|v| v.as_bool()) {
-        out.push_str(&field(
-            "Cache hit",
-            if ch { "true" } else { "false" },
-            color,
-        ));
-    }
-
-    // Show generation
-    if let Some(r#gen) = data.get("generation").and_then(|v| v.as_str()) {
-        out.push_str(&field("Generation", r#gen, color));
-    }
-
-    out.push_str(&render_phase_section(data, 1, color));
-
-    out.push_str(&render_phase_section(data, 2, color));
-
-    out.push_str(&render_phase_section(data, 3, color));
-
-    out.push_str(&render_phase_section(data, 4, color));
-
-    out.push_str(&render_phase_section(data, 5, color));
-    out.push_str(&render_phase_formatted(data, color));
-
     out
 }
 
@@ -1340,6 +776,55 @@ fn render_read_file(data: &Value, color: bool) -> String {
             gutter,
             if color { RESET } else { "" },
             line,
+        ));
+    }
+    // `include_symbol_map=true` requests per-symbol PDG annotations for the
+    // read range; the handler builds them and the trimmer keeps them, but
+    // this renderer silently dropped the field — the parameter looked like a
+    // no-op (N-08). Render a compact map when present.
+    out.push_str(&render_read_file_symbol_map(data, color));
+    out
+}
+
+/// Render the compact per-symbol map requested by `include_symbol_map`:
+/// up to 20 symbols with optional `[type]` tag and `:start-end` line
+/// range. Emits nothing when the map is absent or empty.
+fn render_read_file_symbol_map(data: &Value, color: bool) -> String {
+    let Some(symbols) = data.get("symbol_map").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if symbols.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "\n  {}Symbols in range ({}):{}\n",
+        if color { DIM } else { "" },
+        symbols.len(),
+        if color { RESET } else { "" },
+    );
+    for symbol in symbols.iter().take(20) {
+        let name = symbol.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let typ = symbol.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let line_start = symbol.get("line_start").and_then(|v| v.as_u64());
+        let line_end = symbol.get("line_end").and_then(|v| v.as_u64());
+        let location = match (line_start, line_end) {
+            (Some(s), Some(e)) => format!(":{s}-{e}"),
+            (Some(s), None) => format!(":{s}"),
+            _ => String::new(),
+        };
+        out.push_str(&format!(
+            "    {}{}{} {}{}{}{}\n",
+            if color { LIGHT_CYAN } else { "" },
+            name,
+            if color { RESET } else { "" },
+            if color { DIM } else { "" },
+            if typ.is_empty() {
+                String::new()
+            } else {
+                format!("[{typ}]")
+            },
+            location,
+            if color { RESET } else { "" },
         ));
     }
     out
@@ -1584,20 +1069,7 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
         .get("success")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let changes_applied = data
-        .get("changes_applied")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let (status_label, status_color) = if !success {
-        ("Edit apply failed", if color { LIGHT_RED } else { "" })
-    } else if changes_applied == 0 {
-        (
-            "No-op (content identical)",
-            if color { LIGHT_YELLOW } else { "" },
-        )
-    } else {
-        ("Applied", if color { LIGHT_GREEN } else { "" })
-    };
+    let (status_label, status_color) = edit_apply_status(success, data, color);
     out.push_str(&format!(
         "{}{}{}\n",
         status_color,
@@ -1633,6 +1105,33 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
     out
 }
 
+/// Pick the first status line of the edit-apply render: failure, dry-run
+/// preview, no-op, or successful apply. A dry run always reports zero
+/// applied changes by design; labeling it "No-op (content identical)"
+/// misdescribes a real preview.
+fn edit_apply_status(success: bool, data: &Value, color: bool) -> (&'static str, &'static str) {
+    if !success {
+        ("Edit apply failed", if color { LIGHT_RED } else { "" })
+    } else if data.get("dry_run").and_then(|v| v.as_bool()) == Some(true) {
+        (
+            "Dry run (no changes written)",
+            if color { LIGHT_YELLOW } else { "" },
+        )
+    } else if data
+        .get("changes_applied")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        == 0
+    {
+        (
+            "No-op (content identical)",
+            if color { LIGHT_YELLOW } else { "" },
+        )
+    } else {
+        ("Applied", if color { LIGHT_GREEN } else { "" })
+    }
+}
+
 // =============================================================================
 // Central dispatch — single entry point for CLI tool rendering
 // =============================================================================
@@ -1644,6 +1143,21 @@ pub fn render_tool_output(name: &str, data: &Value, args: &Value) -> String {
     render_tool_output_with_color(name, data, args, true)
 }
 
+/// Render a tool's value with the freshness footer split out.
+///
+/// CLI one-shot consumers (`tools run`) print the body to stdout and the
+/// footer to stderr so JSON-emitting tools stay parseable with a plain
+/// `json.load`; the MCP transport concatenates both via
+/// [`render_tool_output`].
+pub fn render_tool_output_split(
+    name: &str,
+    data: &Value,
+    args: &Value,
+) -> (String, Option<String>) {
+    let (rendered, footer) = render_tool_output_inner(name, data, args, true);
+    (rendered, footer)
+}
+
 /// Render a tool's value *without* ANSI color codes. Used by the MCP
 /// transport to produce clean text for the LLM (the CLI uses the
 /// colored `render_tool_output`).
@@ -1652,12 +1166,26 @@ pub fn render_tool_output_plain(name: &str, data: &Value, args: &Value) -> Strin
 }
 
 fn render_tool_output_with_color(name: &str, data: &Value, args: &Value, color: bool) -> String {
+    let (mut rendered, footer) = render_tool_output_inner(name, data, args, color);
+    if let Some(footer) = footer {
+        rendered.push_str(&footer);
+    }
+    rendered
+}
+
+fn render_tool_output_inner(
+    name: &str,
+    data: &Value,
+    args: &Value,
+    color: bool,
+) -> (String, Option<String>) {
     let normalized = normalize_tool_name(name);
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let node_id = args.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
 
-    let mut rendered = match normalized.as_str() {
+    let rendered = match normalized.as_str() {
         "leindex_search" | "search" => render_search(data, query, color),
+        "leindex_find" | "find" => render_find(data),
         "leindex_context" | "context" => render_context(data, node_id, color),
         "leindex_diagnostics" | "diagnostics" => render_diagnostics(data, color),
         "leindex_project_map" | "project_map" => render_project_map(data, color),
@@ -1699,14 +1227,13 @@ fn render_tool_output_with_color(name: &str, data: &Value, args: &Value, color: 
             .get("advisory")
             .and_then(Value::as_str)
             .or_else(|| freshness.get("warning").and_then(Value::as_str));
-        rendered.push_str(&format!(
-            "\nFreshness: status={status}, generation={generation}\n"
-        ));
+        let mut footer = format!("\nFreshness: status={status}, generation={generation}\n");
         if let Some(advisory) = advisory {
-            rendered.push_str(&format!("Advisory: {advisory}\n"));
+            footer.push_str(&format!("Advisory: {advisory}\n"));
         }
+        return (rendered, Some(footer));
     }
-    rendered
+    (rendered, None)
 }
 
 // =============================================================================
@@ -1950,3 +1477,198 @@ impl Default for FileSummaryFormatter {
 // =============================================================================
 // Tests
 // =============================================================================
+
+// =============================================================================
+// leindex_find — compact, token-lean text
+// =============================================================================
+
+/// String accessor for `leindex_find` payloads: `""` when the field is
+/// missing or not a string.
+fn find_text(v: &Value, key: &str) -> String {
+    v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// Numeric accessor for `leindex_find` payloads: `0` when the field is
+/// missing or not a number.
+fn find_num(v: &Value, key: &str) -> u64 {
+    v.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// Render a `leindex_find` result. Hits are grouped by file and, inside a file,
+/// by enclosing symbol, so a symbol name is paid for once rather than per line.
+fn render_find(data: &Value) -> String {
+    use std::fmt::Write as _;
+
+    if data.get("is_git_repo").is_some() {
+        return render_default(data, false);
+    }
+    let pattern = find_text(data, "pattern");
+    if data["target"] == "symbols" {
+        return render_find_symbols(data, &pattern);
+    }
+
+    let mut out = String::new();
+    render_find_summary(&mut out, data, &pattern);
+    render_find_output_section(&mut out, data);
+    if data["has_more"] == true {
+        let _ = writeln!(
+            out,
+            "… more results: offset={}",
+            find_num(data, "next_offset")
+        );
+    }
+    if let Some(note) = data.get("note").and_then(Value::as_str) {
+        let _ = writeln!(out, "{note}");
+    }
+    out
+}
+
+/// Render `target=symbols` results: one line per matching symbol with
+/// optional line anchor and stale-file annotation.
+fn render_find_symbols(data: &Value, pattern: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let total = find_num(data, "total_symbols");
+    let _ = writeln!(out, "{total} symbol(s) named like \"{pattern}\"");
+    for symbol in data["symbols"].as_array().into_iter().flatten() {
+        let line = find_num(symbol, "line");
+        let _ = writeln!(
+            out,
+            "  {} {} — {}{}{}",
+            find_text(symbol, "kind"),
+            find_text(symbol, "name"),
+            find_text(symbol, "file"),
+            if line > 0 {
+                format!(":{line}")
+            } else {
+                String::new()
+            },
+            if symbol["stale"] == true {
+                " (file changed since indexing)"
+            } else {
+                ""
+            },
+        );
+    }
+    if data["has_more"] == true {
+        let _ = writeln!(out, "… more: offset={}", find_num(data, "next_offset"));
+    }
+    if let Some(note) = data.get("note").and_then(Value::as_str) {
+        let _ = writeln!(out, "{note}");
+    }
+    out
+}
+
+/// Render the match-count summary line (with indexed-state suffix) and the
+/// optional search-fallback note.
+fn render_find_summary(out: &mut String, data: &Value, pattern: &str) {
+    use std::fmt::Write as _;
+    let stats = &data["stats"];
+    let indexed = data["roots"]
+        .as_array()
+        .is_some_and(|roots| roots.iter().all(|r| r["indexed"] == true));
+    let _ = writeln!(
+        out,
+        "{} match(es) in {} file(s) for \"{}\" · {}ms{}",
+        find_num(data, "total_matches"),
+        find_num(data, "total_files"),
+        pattern,
+        find_num(stats, "millis"),
+        if indexed { " · indexed" } else { "" },
+    );
+    if let Some(fallback) = data.get("fallback").and_then(Value::as_str) {
+        let _ = writeln!(out, "({fallback})");
+    }
+}
+
+/// Dispatch on the requested `output` mode: bare counts, file list,
+/// symbol list, or full content hits.
+fn render_find_output_section(out: &mut String, data: &Value) {
+    match find_text(data, "output").as_str() {
+        "count" => {}
+        "files" => render_find_files_output(out, data),
+        "symbols" => render_find_symbol_matches(out, data),
+        _ => render_find_content_hits(out, data),
+    }
+}
+
+/// `output=files`: one line per matching file.
+fn render_find_files_output(out: &mut String, data: &Value) {
+    use std::fmt::Write as _;
+    for file in data["files"].as_array().into_iter().flatten() {
+        let _ = writeln!(
+            out,
+            "  {} ({})",
+            find_text(file, "file"),
+            find_num(file, "matches")
+        );
+    }
+}
+
+/// `output=symbols`: one line per matching symbol with its match count.
+fn render_find_symbol_matches(out: &mut String, data: &Value) {
+    use std::fmt::Write as _;
+    for symbol in data["symbols"].as_array().into_iter().flatten() {
+        let _ = writeln!(
+            out,
+            "  {} {} — {} ({})",
+            find_text(symbol, "kind"),
+            find_text(symbol, "name"),
+            find_text(symbol, "file"),
+            find_num(symbol, "matches"),
+        );
+    }
+}
+
+/// Default content mode: per-file hit blocks, hits grouped under their
+/// enclosing symbol so a symbol name is printed once.
+fn render_find_content_hits(out: &mut String, data: &Value) {
+    use std::fmt::Write as _;
+    for file in data["files"].as_array().into_iter().flatten() {
+        let shown = file["hits"].as_array().map_or(0, Vec::len) as u64;
+        let total = find_num(file, "matches");
+        let _ = writeln!(
+            out,
+            "{}{}",
+            find_text(file, "file"),
+            if total > shown {
+                format!(" ({shown} of {total} shown)")
+            } else {
+                String::new()
+            },
+        );
+        let mut current: Option<String> = None;
+        for hit in file["hits"].as_array().into_iter().flatten() {
+            render_find_hit(out, &mut current, hit);
+        }
+    }
+}
+
+/// Render a single content hit: the enclosing-symbol header (when the
+/// symbol changes), the `before` context lines, the match line, and the
+/// `after` context lines.
+fn render_find_hit(out: &mut String, current: &mut Option<String>, hit: &Value) {
+    use std::fmt::Write as _;
+    let symbol = hit
+        .get("symbol")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if symbol != *current {
+        if let Some(name) = &symbol {
+            let _ = writeln!(out, " {} ({})", name, find_text(hit, "kind"));
+        }
+        *current = symbol;
+    }
+    for line in hit["before"].as_array().into_iter().flatten() {
+        let _ = writeln!(out, "   | {}", line.as_str().unwrap_or(""));
+    }
+    let _ = writeln!(
+        out,
+        "  {}: {}",
+        find_num(hit, "line"),
+        find_text(hit, "text")
+    );
+    for line in hit["after"].as_array().into_iter().flatten() {
+        let _ = writeln!(out, "   | {}", line.as_str().unwrap_or(""));
+    }
+}

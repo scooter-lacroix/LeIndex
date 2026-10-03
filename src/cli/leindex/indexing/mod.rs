@@ -9,6 +9,7 @@ use crate::cli::index_job::{
 };
 use crate::cli::memory_cap::MemoryCapGuard;
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -16,10 +17,28 @@ use tracing::{info, warn};
 mod helpers;
 use helpers::*;
 
+pub(crate) mod watcher_delta;
+
+mod neural_publish;
+
 mod load;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+/// Streaming index pipeline modules (WS6-9 Tasks 1-7).
+///
+/// Each stage converts from "materialize the whole corpus" to "stream bounded
+/// chunks" with direct CAS staging. Feature-flagged via
+/// `LEINDEX_FEATURE_STREAMING_*`, default OFF. The legacy pipeline runs
+/// unmodified when flags are disabled.
+///
+/// `#[allow(dead_code)]` marks modules whose public API will be consumed by
+/// the streaming pipeline integration landing in SP4 Task 8-9 (the follow-up
+/// feature that wires these stages behind feature flags into the main
+/// `index_project_inner` loop). Tests exercise every public item today.
+#[allow(dead_code)]
+pub(crate) mod streaming;
 
 /// Runtime state carried between the six explicit indexing phases. It is
 /// present only while `index_project_inner` is executing and is cleared before
@@ -27,11 +46,13 @@ mod tests;
 pub(crate) struct IndexPipelineState {
     pub(crate) force: bool,
     pub(crate) start_time: Instant,
+    /// Wall-clock instant the run began (before the scan). A no-op run
+    /// acknowledges only filesystem changes made before it.
+    pub(crate) started_at: std::time::SystemTime,
     pub(crate) job: JobPaths,
     pub(crate) checkpoint_store: Option<CheckpointStore>,
     pub(crate) indexed_files: HashMap<String, String>,
     pub(crate) old_scan: Option<ProjectFileScan>,
-    pub(crate) shared_file_cache: Option<index_builder::FileReadCache>,
     pub(crate) source_files_with_hashes: Vec<(PathBuf, String)>,
     pub(crate) source_file_hashes: HashMap<String, String>,
     pub(crate) current_file_paths: HashSet<String>,
@@ -85,11 +106,11 @@ impl IndexPipelineState {
         Self {
             force,
             start_time,
+            started_at: std::time::SystemTime::now(),
             job,
             checkpoint_store: None,
             indexed_files: HashMap::new(),
             old_scan: None,
-            shared_file_cache: None,
             source_files_with_hashes: Vec::new(),
             source_file_hashes: HashMap::new(),
             current_file_paths: HashSet::new(),
@@ -256,444 +277,81 @@ impl LeIndex {
 
     fn publish_generation_snapshot(
         &self,
-        generation: u64,
-        health: &super::IndexHealth,
+        requested_generation: u64,
+        health: &mut super::IndexHealth,
         include_neural: bool,
     ) -> Result<PublishedGeneration> {
         let generations = self.storage_path().join("generations");
         std::fs::create_dir_all(&generations)?;
-        let target = generations.join(generation.to_string());
-        if target.exists() {
-            bail!(
-                "generation {} already exists; refusing to overwrite an immutable snapshot",
-                generation
-            );
-        }
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let staging = generations.join(format!(
-            ".staging-{generation}-{}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&staging).with_context(|| {
-            format!("create staging generation directory {}", staging.display())
-        })?;
-        self.prepare_generation_snapshot(&staging, health, include_neural)?;
-        self.promote_generation_snapshot(&staging, &target, &generations, generation)?;
-        Ok(PublishedGeneration {
-            generation,
-            storage_path: target,
-            health: health.clone(),
-        })
-    }
 
-    /// Persist a tiny phase marker so diagnostics and owned MCP jobs can show
-    /// useful progress without touching the resident PDG/search state. The
-    /// marker is advisory until the final atomic snapshot is published.
-    fn mark_index_phase(&self, phase: super::IndexPhase, status: super::ComponentStatus) {
-        let Some(previous) = crate::cli::index_freshness::load_health(self.storage_path()) else {
-            let health = super::IndexHealth {
-                phase,
-                status,
-                ..super::IndexHealth::default()
-            };
-            let _ = crate::cli::index_freshness::save_health(self.storage_path(), &health);
-            return;
-        };
-        let health = super::IndexHealth {
-            generation: previous.generation,
-            phase,
-            status,
-            head_oid: previous.head_oid,
-            tree_oid: previous.tree_oid,
-            indexed_file_count: previous.indexed_file_count,
-            dirty_file_count: previous.dirty_file_count,
-            changed_unindexed_count: previous.changed_unindexed_count,
-            indexed_at_unix_ms: previous.indexed_at_unix_ms,
-            last_failure_phase: previous.last_failure_phase,
-            last_failure: previous.last_failure,
-        };
-        let _ = crate::cli::index_freshness::save_health(self.storage_path(), &health);
-    }
-
-    pub(crate) fn incremental_reindex_from_watcher(&mut self) -> Result<super::IndexStats> {
-        // NOTE: the cross-process write lock is acquired by the WATCHER
-        // (non-blocking, skip-on-busy) before calling this fn — see
-        // `try_acquire_write_lock` in mod.rs and watcher.rs. Do not add a
-        // blocking flock here: spawn_blocking cannot be cancelled, so a
-        // blocking acquire held by another process would stall the watcher.
-        let start_time = std::time::Instant::now();
-        let indexed_files =
-            crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
-                .context("Failed to load indexed files from storage")?;
-
-        // Use a shared file cache so that file reads during hash collection
-        // can be reused later when building NodeInfo content.
-        let mut shared_file_cache = index_builder::FileReadCache::new(100);
-        let source_files_with_hashes =
-            self.collect_source_files_with_hashes(true, Some(&mut shared_file_cache))?;
-        let source_file_hashes: std::collections::HashMap<String, String> =
-            source_files_with_hashes
-                .iter()
-                .map(|(path, hash)| (path.display().to_string(), hash.clone()))
-                .collect();
-        let current_file_paths: HashSet<String> = source_files_with_hashes
-            .iter()
-            .map(|(p, _)| p.display().to_string())
-            .collect();
-
-        let changed_files: Vec<_> = source_files_with_hashes
-            .iter()
-            .filter_map(|(path, hash)| {
-                let path_str = path.display().to_string();
-                if indexed_files.get(&path_str) != Some(hash) {
-                    Some(path.clone())
-                } else {
-                    None
+        // Allocate the generation number under contention. The requested
+        // number is only a hint computed earlier (max+1 at planning time —
+        // a TOCTOU guess): a concurrent writer (a second MCP server, or the
+        // edit-triggered incremental refresh racing the watcher refresh)
+        // may publish the same number between planning and this call.
+        // Previously the loser bailed with "generation N already exists",
+        // which failed the entire index job and left the store
+        // status=failed with a wrecked signature count (N-10). Snapshots
+        // are immutable, but the NUMBER is allocatable: bump past every
+        // number that exists on disk — or that wins the rename race — and
+        // retry.
+        let mut generation = requested_generation;
+        loop {
+            while generations.join(generation.to_string()).exists() {
+                generation += 1;
+            }
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            let staging = generations.join(format!(
+                ".staging-{generation}-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&staging).with_context(|| {
+                format!("create staging generation directory {}", staging.display())
+            })?;
+            // The health record embedded in the snapshot (and later
+            // persisted by the caller) must carry the number actually
+            // published, not the stale planning hint.
+            health.generation = generation;
+            let target = generations.join(generation.to_string());
+            let attempt = self
+                .prepare_generation_snapshot(&staging, health, include_neural)
+                .and_then(|()| {
+                    self.promote_generation_snapshot(&staging, &target, &generations, generation)
+                });
+            if let Err(error) = attempt {
+                let _ = std::fs::remove_dir_all(&staging);
+                // Lost the rename race to a concurrent publisher: the
+                // target appeared between the exists() check and the
+                // atomic rename. Retry on the next free number; anything
+                // else is a real failure.
+                if target.exists() {
+                    generation += 1;
+                    continue;
                 }
-            })
-            .collect();
-        let deleted_files: Vec<String> = indexed_files
-            .keys()
-            .filter(|p| !current_file_paths.contains(*p))
-            .cloned()
-            .collect();
-
-        if changed_files.is_empty() && deleted_files.is_empty() {
-            return Ok(self.stats.clone());
-        }
-
-        let parser = crate::parse::parallel::ParallelParser::new();
-        let parsing_results = if changed_files.is_empty() {
-            Vec::new()
-        } else {
-            parser.parse_files(changed_files)
-        };
-        let mut pdg = self.pdg.take().unwrap_or_default();
-        let removed_node_ids = self.apply_incremental_pdg_changes(
-            &mut pdg,
-            &deleted_files,
-            parsing_results,
-            &source_file_hashes,
-        )?;
-
-        // Resume-proof FileSummary pass: covers ALL files (the incremental merge
-        // loop only touched changed files; existing files keep/refresh summaries).
-        pdg.ensure_file_summary_nodes();
-
-        // Build the set of changed file paths so we only include nodes from
-        // those files in the incremental delta.
-        let changed_file_set: HashSet<String> = source_file_hashes
-            .keys()
-            .filter(|p| {
-                indexed_files.get(*p).map(|s| s.as_str())
-                    != source_file_hashes.get(*p).map(|s| s.as_str())
-            })
-            .cloned()
-            .collect();
-
-        // Load the persisted embedder (built during the last full index) so we
-        // can embed changed-file nodes with the same TF-IDF vocabulary.  Do NOT
-        // call index_nodes_with_embedder() here — that processes ALL nodes and
-        // populates the search engine from scratch (i.e. a full rebuild).
-        let tfidf_embedder = index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| {
-                // No persisted embedder — build a minimal one from the
-                // changed-file node tokens so we can still produce embeddings.
-                tracing::warn!(
-                    "Failed to load persisted TF-IDF embedder for incremental reindex. \
-                    This will result in degraded search quality (zero-vector embeddings) \
-                    for new/modified nodes until a full reindex is performed. \
-                    Consider running a full reindex to restore search quality."
-                );
-                index_builder::TfIdfEmbedder::build_from_tokens(&[])
-            });
-
-        let embedder = index_builder::HybridEmbedder::tfidf_only(tfidf_embedder);
-
-        let updated_nodes = Self::build_changed_node_infos(
-            &pdg,
-            &changed_file_set,
-            &mut shared_file_cache,
-            &embedder,
-        );
-
-        self.search_engine
-            .incremental_reindex(crate::search::search::TextIndexDelta {
-                removed_node_ids,
-                updated_nodes,
-            });
-        self.persist_and_publish_watcher_delta(pdg, embedder, source_files_with_hashes, start_time)
-    }
-    /// Persist the watcher-reindex delta (PDG, embeddings, snapshot, neural) and
-    /// publish the new generation with fresh health. Owns all post-merge I/O so
-    /// the reindex orchestrator stays a thin pipeline.
-    fn persist_and_publish_watcher_delta(
-        &mut self,
-        pdg: crate::graph::pdg::ProgramDependenceGraph,
-        embedder: index_builder::HybridEmbedder,
-        source_files_with_hashes: Vec<(PathBuf, String)>,
-        start_time: std::time::Instant,
-    ) -> Result<super::IndexStats> {
-        // Persist the updated PDG to storage so changes survive restart
-        index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)?;
-
-        self.pdg = Some(pdg);
-        self.embedder = Some(embedder);
-        if let Some(embedder) = &self.embedder {
-            embedder.persist_to_storage(&self.project_path, self.pdg.as_ref().unwrap())?;
-        }
-        self.build_file_stats_cache();
-        self.stats.indexing_time_ms = start_time.elapsed().as_millis() as u64;
-
-        // R10: Persist embeddings to mmap file after watcher incremental reindex
-        index_builder::persist_embeddings_to_mmap(&self.search_engine, &self.project_path)?;
-        // Fragment layer (Task 7): incremental sync before the snapshot
-        // persist. On failure the layer is CLEARED (not just logged) so this
-        // generation can never pair new nodes with stale pre-change fragment
-        // text/byte ranges (Codex wave-4 P2). Node-level ranking stays
-        // authoritative; the fragment layer is simply off for this generation.
-        self.sync_fragment_layer_or_clear();
-        let (pdg_node_count, pdg_edge_count) = self
-            .pdg
-            .as_ref()
-            .map(|pdg| (pdg.node_count(), pdg.edge_count()))
-            .unwrap_or((self.stats.pdg_nodes, self.stats.pdg_edges));
-        index_builder::persist_search_snapshot(
-            &self.search_engine,
-            &self.project_path,
-            pdg_node_count,
-            pdg_edge_count,
-            self.pdg
-                .as_ref()
-                .map(index_builder::pdg_search_fingerprint)
-                .unwrap_or_default(),
-        )?;
-        // Persist neural embeddings separately for fast load_from_storage
-        #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-        {
-            index_builder::persist_neural_embeddings_to_mmap(
-                &self.search_engine,
-                &self.project_path,
-            )?;
-        }
-
-        // Publish the watcher delta before returning. Neural rows are kept
-        // from the previous snapshot when available; full owned index jobs
-        // perform any missing neural enrichment without blocking file-save
-        // latency here.
-        self.update_last_indexed_timestamp()?;
-        self.save_stats_to_storage()?;
-        let generation = self.checkpoint_generation();
-        let git_status = crate::cli::git::status(&self.project_path).ok();
-        let indexed_paths: std::collections::HashSet<PathBuf> = source_files_with_hashes
-            .iter()
-            .map(|(path, _)| path.clone())
-            .collect();
-        let dirty_source_paths = self.dirty_source_paths(git_status.as_ref());
-        let changed_unindexed_count = dirty_source_paths
-            .iter()
-            .filter(|path| !indexed_paths.contains(*path))
-            .count();
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0);
-        let health = super::IndexHealth {
-            generation,
-            phase: super::IndexPhase::Complete,
-            status: super::ComponentStatus::Fresh,
-            head_oid: git_status
-                .as_ref()
-                .and_then(|status| status.head_oid.clone()),
-            tree_oid: git_tree_oid(&self.project_path),
-            indexed_file_count: source_files_with_hashes.len(),
-            dirty_file_count: dirty_source_paths.len(),
-            changed_unindexed_count,
-            indexed_at_unix_ms: Some(now_ms),
-            last_failure_phase: None,
-            last_failure: None,
-        };
-        self.publish_generation_snapshot(generation, &health, true)?;
-        crate::cli::index_freshness::save_health(self.storage_path(), &health)?;
-
-        // Clear search query and analysis caches so stale results are not
-        // served after an incremental reindex (VAL-INDEX-005).
-        index_builder::clear_query_caches(&mut self.cache.cache_spiller, &self.project_id);
-
-        info!(
-            "Watcher incremental reindex completed in {}ms",
-            self.stats.indexing_time_ms
-        );
-        Ok(self.stats.clone())
-    }
-
-    /// Apply deleted-file removals and changed-file re-parsing to the PDG and
-    /// storage during an incremental watcher reindex. Returns the IDs of nodes
-    /// removed from deleted files (for search-engine delta eviction).
-    fn apply_incremental_pdg_changes(
-        &mut self,
-        pdg: &mut crate::graph::pdg::ProgramDependenceGraph,
-        deleted_files: &[String],
-        parsing_results: Vec<crate::parse::parallel::ParsingResult>,
-        source_file_hashes: &HashMap<String, String>,
-    ) -> Result<Vec<String>> {
-        let mut removed_node_ids = Vec::new();
-        for path in deleted_files {
-            removed_node_ids.extend(
-                pdg.node_indices()
-                    .filter_map(|node_idx| pdg.get_node(node_idx))
-                    .filter(|node| node.file_path.as_ref() == path.as_str())
-                    .map(|node| node.id.clone()),
-            );
-            index_builder::remove_file_from_pdg(pdg, path)?;
-            if let Err(e) = crate::storage::pdg_store::delete_file_data(
-                &mut self.storage,
-                &self.project_id,
-                path,
-            ) {
-                warn!(
-                    "Failed to delete file data from storage for '{}' during incremental reindex: {}",
-                    path, e
-                );
+                return Err(error);
             }
-        }
-
-        for result in parsing_results {
-            if !result.is_success() {
-                continue;
-            }
-            let file_path = result.file_path.display().to_string();
-            let language = result.language.as_deref().unwrap_or("unknown");
-            let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
-            index_builder::remove_file_from_pdg(pdg, &file_path)?;
-            let file_pdg = crate::graph::extract_pdg_from_signatures(
-                result.signatures,
-                source_bytes,
-                &file_path,
-                language,
-            );
-            index_builder::merge_pdgs(pdg, file_pdg);
-            if let Some(hash) = source_file_hashes.get(&file_path) {
-                if let Err(e) = crate::storage::pdg_store::update_indexed_file(
-                    &mut self.storage,
-                    &self.project_id,
-                    &file_path,
-                    hash,
-                ) {
-                    warn!(
-                        "Failed to update indexed file record for '{}' during incremental reindex: {}",
-                        file_path, e
-                    );
-                }
-            }
-        }
-        Ok(removed_node_ids)
-    }
-
-    /// Build NodeInfo entries for nodes in changed files, applying the same
-    /// pruning gate and TF-IDF embedding as a full index (restricted to the delta).
-    fn build_changed_node_infos(
-        pdg: &crate::graph::pdg::ProgramDependenceGraph,
-        changed_file_set: &HashSet<String>,
-        file_cache: &mut index_builder::FileReadCache,
-        embedder: &index_builder::HybridEmbedder,
-    ) -> Vec<crate::search::search::NodeInfo> {
-        let connectivity_config = crate::graph::pdg::TraversalConfig {
-            max_depth: Some(1),
-            max_nodes: Some(1000),
-            allowed_edge_types: Some(&[
-                crate::graph::pdg::EdgeType::Call,
-                crate::graph::pdg::EdgeType::DataDependency,
-            ]),
-            excluded_node_types: Some(vec![crate::graph::pdg::NodeType::External]),
-            min_complexity: None,
-            min_edge_confidence: 0.0,
-        };
-        let pruner = crate::search::search::ContentPruner::new();
-        let mut updated_nodes: Vec<crate::search::search::NodeInfo> = Vec::new();
-        let file_summary_ctx = &index_builder::FileSummaryContext::from_pdg(pdg);
-
-        for node_idx in pdg.node_indices() {
-            let Some(node) = pdg.get_node(node_idx) else {
-                continue;
-            };
-            let file_path_str = node.file_path.as_ref();
-            if !changed_file_set.contains(file_path_str) {
-                continue;
-            }
-            let file_bytes = file_cache
-                .get_or_read(std::path::Path::new(file_path_str))
-                .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
-            let node_content = index_builder::enriched_node_content(
-                pdg,
-                node_idx,
-                node,
-                file_bytes.as_ref(),
-                &connectivity_config,
-                file_summary_ctx,
-            );
-            let pruning_decision = pruner.evaluate(&node.file_path, &node_content, &node.name);
-            if pruning_decision != crate::search::search::PruningDecision::Keep {
-                continue;
-            }
-            let tokens = index_builder::tokenize_code(&node_content);
-            let signature =
-                crate::search::search::SearchEngine::extract_signature_from_content(&node_content);
-            let tfidf_embedding = embedder.embed_tfidf(&tokens);
-            updated_nodes.push(crate::search::search::NodeInfo {
-                node_id: node.id.clone(),
-                file_path: node.file_path.to_string(),
-                symbol_name: node.name.clone(),
-                language: node.language.clone(),
-                content: node_content,
-                byte_range: node.byte_range,
-                tfidf_embedding,
-                neural_embedding: None,
-                complexity: node.complexity,
-                signature,
-                pre_tokenized: Some(tokens),
+            self.hydrated_generation
+                .store(generation, std::sync::atomic::Ordering::Release);
+            return Ok(PublishedGeneration {
+                generation,
+                storage_path: target,
+                health: health.clone(),
             });
         }
-        updated_nodes
     }
 
-    /// Collect source-extension dirty paths (modified/staged/untracked/deleted)
-    /// from git status, made absolute and filtered to known source extensions.
-    fn dirty_source_paths(
-        &self,
-        git_status: Option<&crate::cli::git::GitStatus>,
-    ) -> std::collections::HashSet<PathBuf> {
-        let Some(status) = git_status else {
-            return std::collections::HashSet::new();
-        };
-        status
-            .modified
-            .iter()
-            .chain(status.staged.iter())
-            .chain(status.untracked.iter())
-            .chain(status.deleted.iter())
-            .map(|path| {
-                if path.is_absolute() {
-                    path.clone()
-                } else {
-                    self.project_path.join(path)
-                }
-            })
-            .filter(|path| {
-                path.extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| {
-                        super::SOURCE_FILE_EXTENSIONS
-                            .iter()
-                            .any(|known| known.eq_ignore_ascii_case(extension))
-                    })
-            })
-            .collect()
+    /// The generation this process's in-memory index state was hydrated (or
+    /// last published) from — `None` until the first hydration. Compared by
+    /// the registry against the persisted `CURRENT` pointer to detect
+    /// external rebuilds (N-13).
+    pub fn hydrated_generation(&self) -> Option<u64> {
+        let value = self
+            .hydrated_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        (value > 0).then_some(value)
     }
 
     /// Index the project with an optional memory cap.
@@ -702,10 +360,13 @@ impl LeIndex {
     /// memory usage throughout the indexing pipeline. When `max_memory_bytes` is
     /// `Some(bytes)`, a `MemoryCapGuard` is created that:
     /// - Logs a warning when RSS exceeds 90% of the cap
-    /// - Returns an error when RSS exceeds 100% of the cap
+    /// - Reports `OverCap` (a deferral signal) when RSS exceeds 100% of the cap
     ///
-    /// The memory check is performed at key checkpoints during indexing to avoid
-    /// excessive overhead while still catching runaway memory usage.
+    /// VAL-SCHED-015: the cap is an ADMISSION cap, not a hard error. Over-cap
+    /// pressure defers heavy work (and the global admission controller owns the
+    /// actual defer/reduce/evict decision) — indexing is never aborted at the
+    /// cap. The memory check is performed at key checkpoints during indexing to
+    /// avoid excessive overhead while still catching runaway memory usage.
     pub fn index_project_with_memory_cap(
         &mut self,
         force: bool,
@@ -764,7 +425,25 @@ impl LeIndex {
         // risk. If startup-write contention is ever observed, extend the lock
         // to a write-mode `Storage::open` (or make `ProjectWriteLock`
         // re-entrant so `new()` can also acquire it without self-deadlock).
-        let _write_lock = self.acquire_write_lock()?;
+        //
+        // Non-forced runs coalesce with a concurrent index in another
+        // process: if that process publishes a fresh index while we wait for
+        // the lock, this run returns immediately instead of queueing a
+        // redundant full index behind it.
+        self.last_index_coalesced = false;
+        let Some(_write_lock) = self.acquire_write_lock_coalescing(force)? else {
+            info!(
+                "Skipping index for {}: another process published a fresh index \
+                 while this writer waited for the project write lock",
+                self.project_id
+            );
+            // Flag it so the registry keeps the resident instance (which may
+            // hold a hydrated core this never-loaded temp lacks) and
+            // refreshes it from the peer's published generation instead of
+            // installing an un-hydrated replacement.
+            self.last_index_coalesced = true;
+            return Ok(self.stats.clone());
+        };
         let start_time = Instant::now();
         let job = JobPaths::new(self.storage_path(), self.checkpoint_generation());
         self.pipeline = Some(IndexPipelineState::new(force, start_time, job.clone()));
@@ -794,10 +473,36 @@ impl LeIndex {
         let pdg = self.run_pdg(&job, &parsed)?;
         check_memory_cap(&mut cap_guard)?;
         let lexical = self.run_lexical(&job, &pdg)?;
-        let _core = self.publish_generation(&job, None)?;
-        let neural = self.run_neural(&job, &lexical)?;
-        let _enhanced = self.publish_generation(&job, Some(&neural))?;
 
+        self.run_and_publish_neural(&job, &lexical)?;
+        self.finalize_indexing()?;
+        Ok(self.stats.clone())
+    }
+
+    fn run_and_publish_neural(
+        &mut self,
+        job: &JobPaths,
+        lexical: &LexicalCheckpoint,
+    ) -> Result<()> {
+        // Publish the core (lexical-only) generation as a crash-recovery
+        // checkpoint.  If the process dies during neural, the resumed run
+        // can skip straight to the neural phase using this snapshot.
+        let _core = self.publish_generation(job, None)?;
+        // The text index only needs the core generation's symbols, so it builds
+        // beside the neural phase instead of after it.
+        let text_index_job = self.spawn_text_index_refresh();
+
+        let neural = self.run_neural(job, lexical);
+        // Never leave the builder running past this run, even on failure.
+        if text_index_job.join().is_err() {
+            warn!("Text index build panicked (search will scan live)");
+        }
+        let neural = neural?;
+        let _enhanced = self.publish_generation(job, Some(&neural))?;
+        Ok(())
+    }
+
+    fn finalize_indexing(&mut self) -> Result<()> {
         let state = self
             .pipeline
             .take()
@@ -819,7 +524,47 @@ impl LeIndex {
                 .to_hex()
                 .to_string(),
         );
-        Ok(self.stats.clone())
+        self.retain_published_generations();
+        Ok(())
+    }
+
+    /// Bound the store's disk use after a successful publish: keep the current
+    /// generation and its predecessor (the rollback point), drop older
+    /// generations, and cap completed job artifacts.
+    ///
+    /// Nothing ran this automatically -- retention was only reachable through
+    /// `leindex retention --gc` -- so every index run left another full copy
+    /// behind (13 generations and 460 MB of job scratch, 2.5 GB, for a 20 MB
+    /// repository). Best effort: a failure here never fails indexing.
+    fn retain_published_generations(&self) {
+        use crate::storage::generation::retention::{
+            DEFAULT_MAX_GENERATIONS, RetentionConfig, retain_after_publish,
+            retain_generations_no_cas,
+        };
+        let root = self.storage_path();
+        let gens = root.join("generations");
+        let jobs = root.join("jobs");
+        let cas_dir = root.join("cas");
+        let outcome = if cas_dir.exists() {
+            crate::storage::cas::CasStore::open(&cas_dir)
+                .map_err(|error| error.to_string())
+                .and_then(|mut cas| {
+                    retain_after_publish(&mut cas, &gens, &jobs, &RetentionConfig::default())
+                        .map_err(|error| error.to_string())
+                })
+        } else {
+            retain_generations_no_cas(&gens, &jobs, DEFAULT_MAX_GENERATIONS, false)
+                .map_err(|error| error.to_string())
+        };
+        match outcome {
+            Ok(report) if report.generations_removed > 0 => info!(
+                removed = report.generations_removed,
+                retained = report.generations_retained,
+                "Pruned superseded generations"
+            ),
+            Ok(_) => {}
+            Err(error) => warn!("Generation retention failed (store keeps growing): {error}"),
+        }
     }
 
     pub(crate) fn run_scan(&mut self, _job: &JobPaths) -> Result<ScanCheckpoint> {
@@ -832,9 +577,9 @@ impl LeIndex {
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
                 .context("Failed to load indexed files from storage")?;
         let old_scan = self.get_project_scan(false).ok();
-        let mut shared_file_cache = index_builder::FileReadCache::new(200);
-        let source_files_with_hashes =
-            self.collect_source_files_with_hashes(true, Some(&mut shared_file_cache))?;
+        // Hash source files without caching bodies (VAL-STREAM-012: no
+        // cross-phase source-body retention). Each phase re-reads per chunk.
+        let source_files_with_hashes = self.collect_source_files_with_hashes(true)?;
         info!("Found {} source files", source_files_with_hashes.len());
         let scan = scan_checkpoint(&source_files_with_hashes);
         let generation = state.job.generation;
@@ -898,7 +643,6 @@ impl LeIndex {
         );
         state.indexed_files = indexed_files;
         state.old_scan = old_scan;
-        state.shared_file_cache = Some(shared_file_cache);
         state.source_files_with_hashes = source_files_with_hashes;
         state.resumed_scan = resumed_scan;
         state.resumed_parse = resumed_parse;
@@ -1018,7 +762,6 @@ impl LeIndex {
         let resumed_parse_results = reuse_parse_results(
             state.resumed_scan.is_some(),
             state.resumed_parse.as_ref(),
-            state.shared_file_cache.as_mut(),
             checkpoint_store,
             &plan.source_file_hashes,
             &mut plan.files_to_parse,
@@ -1037,6 +780,12 @@ impl LeIndex {
         {
             info!("No changes detected, skipping indexing");
             self.mark_index_phase(super::IndexPhase::Complete, super::ComponentStatus::Fresh);
+            // Content is current, but HEAD may have moved or a directory may
+            // have changed (a commit or new file that touches nothing indexed).
+            // Acknowledge that, otherwise the freshness check keeps reporting
+            // drift and re-launches this scan in the background after every
+            // request, forever.
+            self.record_clean_scan(state.started_at);
             state.skip = true;
             let result = ParseCheckpoint {
                 scan_hash: scan.input_hash.clone(),
@@ -1082,6 +831,7 @@ impl LeIndex {
         state: &IndexPipelineState,
         pdg: &mut crate::graph::pdg::ProgramDependenceGraph,
         parsing_results: Vec<crate::parse::parallel::ParsingResult>,
+        use_streaming: bool,
     ) -> Result<()> {
         for path in &state.deleted_files {
             index_builder::remove_file_from_pdg(pdg, path)?;
@@ -1096,21 +846,17 @@ impl LeIndex {
                 );
             }
         }
-        for result in parsing_results {
-            if !result.is_success() {
-                continue;
-            }
+        let newly_parsed: Vec<crate::parse::parallel::ParsingResult> = parsing_results
+            .into_iter()
+            .filter(|result| result.is_success())
+            .collect();
+        // Drop stale nodes for freshly parsed files *before* the merge, so node
+        // id namespaces (file_path:qualified_name) stay disjoint when the new
+        // graphs are added.
+        let mut changed_file_count = 0usize;
+        for result in &newly_parsed {
             let file_path = result.file_path.display().to_string();
-            let language = result.language.as_deref().unwrap_or("unknown");
-            let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
             index_builder::remove_file_from_pdg(pdg, &file_path)?;
-            let file_pdg = crate::graph::extract_pdg_from_signatures(
-                result.signatures,
-                source_bytes,
-                &file_path,
-                language,
-            );
-            index_builder::merge_pdgs(pdg, file_pdg);
             if let Some(hash) = state.source_file_hashes.get(&file_path) {
                 if let Err(error) = crate::storage::pdg_store::update_indexed_file(
                     &mut self.storage,
@@ -1124,6 +870,25 @@ impl LeIndex {
                     );
                 }
             }
+            changed_file_count += 1;
+        }
+        if !newly_parsed.is_empty() {
+            let (new_pdg, route) = build_changed_file_pdg(newly_parsed, use_streaming);
+            if pdg.node_count() == 0 {
+                // A full rebuild merges into an empty graph: adopt the built
+                // one instead of re-inserting every node and edge (and
+                // rebuilding its trigram index) a second time.
+                *pdg = new_pdg;
+            } else {
+                index_builder::merge_pdgs(pdg, new_pdg);
+            }
+            info!(
+                "PDG: rebuilt {} changed file(s) via {:?} ({} nodes, {} edges)",
+                changed_file_count,
+                route,
+                pdg.node_count(),
+                pdg.edge_count()
+            );
         }
         Ok(())
     }
@@ -1165,6 +930,76 @@ impl LeIndex {
         state.ext_builtin = stats.builtin;
     }
 
+    /// (Re)build the trigram text index used by `leindex_find`, with symbol
+    /// spans read from the generation just published. Best effort: search
+    /// falls back to live scanning, so a failure here never fails indexing.
+    /// Runs on its own thread; join the handle before the run ends.
+    fn spawn_text_index_refresh(&self) -> std::thread::JoinHandle<()> {
+        let root = self.project_path().to_path_buf();
+        let storage = self.storage_path().to_path_buf();
+        let db = crate::cli::live_project::LiveProject::resolve(&root.to_string_lossy())
+            .map(|live| live.active_storage().join("leindex.db"))
+            .ok()
+            .filter(|db| db.is_file());
+        std::thread::spawn(move || {
+            if let Err(error) = crate::cli::textindex::build(&root, &storage, db.as_deref()) {
+                warn!("Text index build failed (search will scan live): {error}");
+            }
+        })
+    }
+
+    fn prepare_pdg_for_building(
+        &mut self,
+        state: &mut IndexPipelineState,
+    ) -> Result<(
+        crate::graph::pdg::ProgramDependenceGraph,
+        Vec<crate::parse::parallel::ParsingResult>,
+    )> {
+        progress_stderr("Indexing: building PDG...");
+        if !state.unchanged_files.is_empty() && self.pdg.is_none() && state.pdg.is_none() {
+            self.load_pdg_from_storage().context(
+                "Failed to load existing PDG for incremental reindex. Please reindex with --force if corruption persists.",
+            )?;
+        }
+        let resumed_pdg_loaded = state.resumed_pdg.is_some() && state.pdg.is_some();
+        let pdg = if resumed_pdg_loaded {
+            state.pdg.take().unwrap_or_default()
+        } else {
+            state
+                .pdg
+                .take()
+                .or_else(|| self.take_owned_pdg())
+                .unwrap_or_default()
+        };
+        let parsing_results = if resumed_pdg_loaded {
+            Vec::new()
+        } else {
+            std::mem::take(&mut state.parsing_results)
+        };
+        Ok((pdg, parsing_results))
+    }
+
+    fn finalize_pdg(
+        &mut self,
+        pdg: &mut crate::graph::pdg::ProgramDependenceGraph,
+        state: &mut IndexPipelineState,
+        all_signatures: &[(String, crate::parse::traits::SignatureInfo)],
+    ) {
+        // Resume-proof FileSummary pass: covers files loaded from storage on
+        // resume (the merge_pdgs loop above only fires for freshly-parsed files).
+        pdg.ensure_file_summary_nodes();
+        if !all_signatures.is_empty() {
+            crate::graph::resolve_cross_file_call_edges_for_files(pdg, all_signatures);
+            crate::graph::resolve_cross_file_flow_edges_for_files(pdg, all_signatures);
+        }
+        self.annotate_external_dependencies(state, pdg);
+        add_submodule_summary_nodes(pdg, &self.project_path);
+        index_builder::normalize_external_nodes(pdg);
+        // Precision must be merged before checkpoint counts and fingerprints are
+        // captured; otherwise resumable artifacts describe a different graph.
+        self.run_precision_ingest(pdg);
+    }
+
     pub(crate) fn run_pdg(
         &mut self,
         _job: &JobPaths,
@@ -1179,45 +1014,24 @@ impl LeIndex {
             .as_ref()
             .context("PDG phase missing checkpoint store")?
             .clone();
-        progress_stderr("Indexing: building PDG...");
-        if !state.unchanged_files.is_empty() && self.pdg.is_none() && state.pdg.is_none() {
-            self.load_pdg_from_storage().context(
-                "Failed to load existing PDG for incremental reindex. Please reindex with --force if corruption persists.",
-            )?;
-        }
-        let resumed_pdg_loaded = state.resumed_pdg.is_some() && state.pdg.is_some();
-        let mut pdg = if resumed_pdg_loaded {
-            state.pdg.take().unwrap_or_default()
-        } else {
-            state
-                .pdg
-                .take()
-                .or_else(|| self.pdg.take())
-                .unwrap_or_default()
-        };
-        let parsing_results = if resumed_pdg_loaded {
-            Vec::new()
-        } else {
-            std::mem::take(&mut state.parsing_results)
-        };
+
+        let (mut pdg, parsing_results) = self.prepare_pdg_for_building(&mut state)?;
         let parse_stats = pdg_parse_stats(&parsing_results);
-        self.apply_pdg_file_changes(&state, &mut pdg, parsing_results)?;
-        // Resume-proof FileSummary pass: covers files loaded from storage on
-        // resume (the merge_pdgs loop above only fires for freshly-parsed files).
-        pdg.ensure_file_summary_nodes();
-        if !parse_stats.all_signatures.is_empty() {
-            crate::graph::resolve_cross_file_call_edges_for_files(
-                &mut pdg,
-                &parse_stats.all_signatures,
-            );
-            crate::graph::resolve_cross_file_flow_edges_for_files(
-                &mut pdg,
-                &parse_stats.all_signatures,
-            );
-        }
-        self.annotate_external_dependencies(&mut state, &mut pdg);
-        add_submodule_summary_nodes(&mut pdg, &self.project_path);
-        index_builder::normalize_external_nodes(&mut pdg);
+        // Route PDG construction: the streaming fragment/segment pipeline
+        // (SP4) is the default; `LEINDEX_FEATURE_STREAMING_PDG=0` reverts to
+        // the legacy per-file extraction + merge loop.
+        let use_streaming = pdg_route_for_current_flag() == PdgBuildRoute::Streaming;
+        info!(
+            "PDG construction: streaming fragment pipeline {}",
+            if use_streaming {
+                "enabled"
+            } else {
+                "disabled (legacy merge)"
+            }
+        );
+        self.apply_pdg_file_changes(&state, &mut pdg, parsing_results, use_streaming)?;
+        self.finalize_pdg(&mut pdg, &mut state, &parse_stats.all_signatures);
+
         let pdg_node_count = pdg.node_count();
         let pdg_edge_count = pdg.edge_count();
         let pdg_checkpoint = checkpoint_store.write_pdg(parsed.scan_hash.clone(), &pdg)?;
@@ -1248,7 +1062,6 @@ impl LeIndex {
         &mut self,
         pdg: &crate::graph::pdg::ProgramDependenceGraph,
         resume_valid: bool,
-        shared_file_cache: Option<index_builder::FileReadCache>,
     ) -> Result<index_builder::HybridEmbedder> {
         let batch_size = self.indexing_batch_size();
         let persisted = index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
@@ -1258,7 +1071,8 @@ impl LeIndex {
             return match self.load_from_mutable_storage() {
                 Ok(()) => {
                     self.search_engine.clear_neural_embeddings();
-                    self.embedder
+                    Ok(self
+                        .embedder
                         .as_ref()
                         .map(|embedder| {
                             index_builder::HybridEmbedder::tfidf_only(embedder.tfidf().clone())
@@ -1268,7 +1082,7 @@ impl LeIndex {
                                 .clone()
                                 .map(index_builder::HybridEmbedder::tfidf_only)
                         })
-                        .context("resumed lexical checkpoint has no TF-IDF embedder")
+                        .context("resumed lexical checkpoint has no TF-IDF embedder")?)
                 }
                 Err(error) => {
                     warn!(
@@ -1280,7 +1094,6 @@ impl LeIndex {
                         &mut self.cache.file_stats_cache,
                         batch_size,
                         persisted.map(index_builder::HybridEmbedder::tfidf_only),
-                        shared_file_cache,
                     )
                 }
             };
@@ -1308,7 +1121,6 @@ impl LeIndex {
             &mut self.cache.file_stats_cache,
             batch_size,
             persisted.map(index_builder::HybridEmbedder::tfidf_only),
-            shared_file_cache,
         )
     }
 
@@ -1321,10 +1133,10 @@ impl LeIndex {
             .pipeline
             .take()
             .context("lexical phase started without pipeline state")?;
-        let pdg = state
+        let mut pdg = state
             .pdg
             .take()
-            .or_else(|| self.pdg.take())
+            .or_else(|| self.take_owned_pdg())
             .context("lexical phase missing resident PDG")?;
         let pdg_node_count = pdg.node_count();
         let pdg_edge_count = pdg.edge_count();
@@ -1333,15 +1145,8 @@ impl LeIndex {
             .resumed_lexical
             .as_ref()
             .is_some_and(|checkpoint| checkpoint.pdg_hash == pdg_checkpoint.artifact_hash);
-        let embedder = self.build_lexical_embedder(
-            &pdg,
-            lexical_resume_valid,
-            state.shared_file_cache.take(),
-        )?;
+        let embedder = self.build_lexical_embedder(&pdg, lexical_resume_valid)?;
         self.embedder = Some(embedder);
-        if let Some(embedder) = &self.embedder {
-            embedder.persist_to_storage(&self.project_path, &pdg)?;
-        }
         let indexed_count = self.search_engine.node_count();
         state.admitted_node_ids = self.search_engine.live_node_ids().into_iter().collect();
         self.mark_index_phase(
@@ -1355,6 +1160,15 @@ impl LeIndex {
             super::ComponentStatus::Initializing,
         );
         index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)?;
+        // Snapshot/embedder freshness identity must describe the graph as the
+        // DB reconstructs it (the in-memory graph may hold duplicate node_ids
+        // the upsert collapses), so compute it from storage AFTER the save.
+        let persisted_identity =
+            index_builder::persisted_search_identity(&self.storage, &self.project_id);
+        if let Some(embedder) = &self.embedder {
+            embedder.persist_to_storage(&self.project_path, &pdg, persisted_identity.clone())?;
+        }
+        self.compute_and_persist_communities(&mut pdg);
         let checkpoint_store = state
             .checkpoint_store
             .as_ref()
@@ -1371,6 +1185,14 @@ impl LeIndex {
             successful_parses: state.successful,
             failed_parses: state.failed,
             total_signatures: state.total_sigs,
+            // An incremental run parses only the changed subset; its signature
+            // count is a delta, not the project total — label it so readers
+            // stop mistaking "2" for a collapse from thousands.
+            signature_scope: if state.files_parsed < state.source_files_with_hashes.len() {
+                "delta".to_string()
+            } else {
+                "full".to_string()
+            },
             pdg_nodes: pdg_node_count,
             pdg_edges: pdg_edge_count,
             indexed_nodes: indexed_count,
@@ -1381,7 +1203,7 @@ impl LeIndex {
             external_deps_total: state.ext_total,
             external_deps_builtin: state.ext_builtin,
         };
-        self.pdg = Some(pdg);
+        self.pdg = Some(std::sync::Arc::new(pdg));
         // A core generation is intentionally lexical/PDG-only. Existing
         // neural rows are reattached only by run_neural after CURRENT moves.
         self.search_engine.clear_neural_embeddings();
@@ -1391,15 +1213,14 @@ impl LeIndex {
         // persist. On failure the layer is CLEARED (not just logged) — see
         // `sync_fragment_layer_or_clear` (Codex wave-4 P2).
         self.sync_fragment_layer_or_clear();
+        let (identity_nodes, identity_edges, identity_fingerprint) =
+            persisted_identity.unwrap_or_else(|| (pdg_node_count, pdg_edge_count, String::new()));
         index_builder::persist_search_snapshot(
             &self.search_engine,
             &self.project_path,
-            pdg_node_count,
-            pdg_edge_count,
-            self.pdg
-                .as_ref()
-                .map(index_builder::pdg_search_fingerprint)
-                .unwrap_or_default(),
+            identity_nodes,
+            identity_edges,
+            identity_fingerprint,
         )?;
         let admitted_node_ids = sorted_admitted_node_ids(&state.admitted_node_ids);
         let lexical_checkpoint = LexicalCheckpoint {
@@ -1416,469 +1237,6 @@ impl LeIndex {
         state.pdg_checkpoint = Some(pdg_checkpoint.clone());
         self.pipeline = Some(state);
         Ok(lexical_checkpoint)
-    }
-
-    #[cfg(feature = "onnx")]
-    fn configured_neural_embedder(&self) -> Result<Option<index_builder::HybridEmbedder>> {
-        let mut embedder = index_builder::HybridEmbedder::hybrid_local(
-            self.embedder
-                .as_ref()
-                .context("core embedder is set before neural enrichment")?
-                .tfidf()
-                .clone(),
-            Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
-        )
-        .ok();
-        if let Some(reason) = embedder
-            .as_ref()
-            .and_then(index_builder::HybridEmbedder::cpu_fallback_reason)
-        {
-            tracing::warn!("{}", reason);
-            embedder = None;
-        }
-        if crate::config::LeIndexConfig::load_cached()
-            .search
-            .search_mode
-            == "text"
-        {
-            embedder = None;
-        }
-        // Feature-flag rollout gate: a deployment can kill neural indexing via
-        // LEINDEX_FEATURE_NEURAL_SEARCH=false even when config enables it.
-        // `is_neural_enabled` ANDs the runtime flag (default-on for this GA
-        // feature) with the config knob, so a disabled config stays disabled.
-        if !crate::feature_flags::is_neural_enabled(
-            crate::config::LeIndexConfig::load_cached().neural.enabled,
-        ) {
-            embedder = None;
-        }
-        Ok(embedder)
-    }
-
-    #[cfg(not(feature = "onnx"))]
-    fn configured_neural_embedder(&self) -> Result<Option<index_builder::HybridEmbedder>> {
-        Ok(None)
-    }
-
-    fn restore_neural_checkpoint(
-        &mut self,
-        checkpoint: Option<&NeuralCheckpoint>,
-        lexical_hash: &str,
-        current_model: &str,
-    ) -> (usize, bool) {
-        let requested = checkpoint.is_some_and(|checkpoint| {
-            checkpoint.lexical_hash == lexical_hash
-                && checkpoint.model == current_model
-                && (checkpoint.rows == 0 || checkpoint.mmap_path.is_file())
-        });
-        let rows = 0;
-        #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-        let mut rows = rows;
-        // loaded stays false until the mmap restore actually yields rows; a
-        // checkpoint with rows==0 means nothing was loaded, not a successful restore.
-        let loaded = false;
-        #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-        let mut loaded = loaded;
-        if requested {
-            #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-            if let Some(neural_mmap) =
-                index_builder::try_load_neural_mmap_embeddings(&self.project_path)
-            {
-                rows = self.search_engine.restore_neural_embeddings(&neural_mmap);
-                loaded = rows > 0;
-            }
-        }
-        (rows, loaded)
-    }
-
-    fn persist_neural_snapshot(
-        &mut self,
-        state: &IndexPipelineState,
-        rows: usize,
-        embedder: Option<index_builder::HybridEmbedder>,
-    ) -> Result<()> {
-        if rows == 0 {
-            return Ok(());
-        }
-        if embedder.is_some() {
-            self.embedder = embedder;
-        }
-        // Fragment layer (Task 7): incremental sync before the snapshot
-        // persist. On failure the layer is CLEARED (not just logged) — see
-        // `sync_fragment_layer_or_clear` (Codex wave-4 P2).
-        self.sync_fragment_layer_or_clear();
-        index_builder::persist_search_snapshot(
-            &self.search_engine,
-            &self.project_path,
-            state.pdg_node_count,
-            state.pdg_edge_count,
-            self.pdg
-                .as_ref()
-                .map(index_builder::pdg_search_fingerprint)
-                .unwrap_or_default(),
-        )
-    }
-
-    /// Persist the neural mmap only when embeddings were freshly produced
-    /// (not resumed) AND there are rows to write — never persist an empty mmap.
-    /// Extracted from run_neural to keep that function's branch count bounded.
-    fn persist_neural_mmap(&self, _neural_resume_loaded: bool, _neural_rows: usize) -> Result<()> {
-        #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-        if !_neural_resume_loaded && _neural_rows > 0 {
-            index_builder::persist_neural_embeddings_to_mmap(
-                &self.search_engine,
-                &self.project_path,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Incremental fragment sync (Task 7): diff the current source files
-    /// against the persisted manifest, re-chunk ONLY changed files via the
-    /// PDG (Tier-2 sub-symbol + Tier-3 orphans), embed ONLY content hashes
-    /// missing from the store (batch-256 IPC), then update the store + root
-    /// under a bumped generation and populate the engine's fragment vector
-    /// index so `persist_search_snapshot` writes real fragment twins.
-    ///
-    /// Feature-off compatible: a no-op when `[search] fragment_index_enabled`
-    /// is false, no PDG is resident, or no neural embedder is configured. A
-    /// mid-build crash is handled by the generation guard in
-    /// `fragment_layer_is_valid` — hydration serves the last complete root
-    /// (i.e. keeps the fragment layer off) rather than a half-synced tree.
-    /// Run the fragment-layer incremental sync, clearing the in-memory
-    /// fragment rows on failure (Codex wave-4 P2).
-    ///
-    /// Every snapshot persist is preceded by a fragment sync; on sync failure
-    /// the engine would otherwise keep the PREVIOUS generation's fragment
-    /// index + owner refs, so a fresh node snapshot could rank/surface a
-    /// changed symbol against deleted (pre-change) fragment content. Clearing
-    /// makes the pre-existing "fragment layer disabled for this generation"
-    /// warning honest and keeps the persisted snapshot fragment-free.
-    /// `set_fragment_embeddings` with empty input drops the index, the owner
-    /// refs, and the result cache in one call.
-    fn sync_fragment_layer_or_clear(&mut self) {
-        if let Err(e) = self.sync_fragment_layer() {
-            warn!(
-                "Fragment layer sync failed (fragment layer disabled for this generation): {e:#}"
-            );
-            self.search_engine.set_fragment_embeddings(Vec::new());
-        }
-    }
-
-    fn sync_fragment_layer(&mut self) -> Result<()> {
-        let cfg = crate::config::LeIndexConfig::load_cached();
-        if !cfg.search.fragment_index_enabled || self.pdg.is_none() {
-            return Ok(());
-        }
-        // The fragment layer only produces rows when a neural embedder is
-        // configured; without one (e.g. text-only builds) it is a no-op.
-        let embedder = self.configured_neural_embedder()?;
-        if embedder.is_none() {
-            return Ok(());
-        }
-        let files = self.collect_source_files_with_hashes(false, None)?;
-        if files.is_empty() {
-            return Ok(());
-        }
-
-        let mut store =
-            index_builder::fragment::FragmentStore::load_from_storage(&self.project_path)?
-                .unwrap_or_default();
-        let max_bytes = cfg.search.fragment_max_bytes as usize;
-        let orphan_enabled = cfg.search.fragment_orphan_enabled;
-        let naive_fallback = cfg.search.fragment_naive_fallback;
-        // Codex P1: persist the model + fragment-knob identity so a model or
-        // knob change while sources are byte-identical forces a fragment
-        // re-sync (mirrors the node-level `NeuralCheckpoint.model` discipline;
-        // without it the source-hash skip would silently serve stale rows).
-        let extraction_identity = index_builder::fragment::sync::FragmentExtractionIdentity::new(
-            &cfg.neural.model_name,
-            max_bytes,
-            orphan_enabled,
-            naive_fallback,
-        );
-
-        // P2-4 (Codex review): detect a missing/corrupt fragment embeddings mmap
-        // BEFORE the sync so unchanged files are NOT skipped. With the mmap gone
-        // but the store+manifest intact, a normal run would embed nothing, install
-        // an empty fragment index, and the snapshot path would remove the mmap
-        // again — permanently disabling fragment retrieval. Recover by forcing a
-        // full re-embed of every content hash.
-        let pre_sync_mmap_rows: std::collections::HashMap<String, Vec<f32>> =
-            index_builder::try_load_fragment_mmap_embeddings_from_storage(
-                &self.project_path.join(".leindex"),
-            )
-            .map(|mmap| mmap.entries().unwrap_or_default().into_iter().collect())
-            .unwrap_or_default();
-        let force_reembed = !store.is_empty() && pre_sync_mmap_rows.is_empty();
-
-        // Scoped so the chunk closure (which borrows `self.pdg`) is dropped
-        // before we mutate `self.search_engine` below.
-        let (summary, new_embeddings) = {
-            let pdg = self.pdg.as_ref().expect("checked above");
-            let mut chunk_fn = |path: &std::path::Path, bytes: &[u8]| {
-                index_builder::fragment::extract::extract_file_fragments(
-                    pdg,
-                    path,
-                    bytes,
-                    max_bytes,
-                    orphan_enabled,
-                    naive_fallback,
-                )
-            };
-            let mut embed_fn = |texts: &[String]| -> Vec<Option<Vec<f32>>> {
-                #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-                {
-                    match &embedder {
-                        Some(embedder) => embedder.embed_neural_batch_blocking(texts),
-                        None => vec![None; texts.len()],
-                    }
-                }
-                #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
-                {
-                    let _ = (&embedder, texts);
-                    vec![None; texts.len()]
-                }
-            };
-            index_builder::fragment::sync::incremental_sync_fragments(
-                &self.project_path,
-                &mut store,
-                &files,
-                &mut chunk_fn,
-                &mut embed_fn,
-                force_reembed,
-                &extraction_identity,
-            )?
-        };
-
-        info!(
-            files_scanned = summary.files_scanned,
-            files_changed = summary.files_changed,
-            fragments_total = summary.fragments_total,
-            embedded = summary.embedded,
-            reused = summary.reused,
-            generation = summary.generation,
-            "Fragment incremental sync complete"
-        ); // Merge freshly embedded rows with reused rows, then populate the
-        // engine's fragment index so the snapshot persist twins write the
-        // complete matrix. EVERY content hash in the store needs an embedding:
-        // prefer this pass's fresh rows, fall back to the previous fragment
-        // mmap (reused hashes are not re-embedded). A hash with neither is
-        // skipped — mirroring the engine's skip-on-None discipline so store
-        // row-count ≡ engine row-count (invariant 8) is preserved.
-        let fresh_rows: std::collections::HashMap<String, Vec<f32>> =
-            new_embeddings.into_iter().collect();
-        let old_rows: std::collections::HashMap<String, Vec<f32>> =
-            index_builder::try_load_fragment_mmap_embeddings_from_storage(
-                &self.project_path.join(".leindex"),
-            )
-            .map(|mmap| mmap.entries().unwrap_or_default().into_iter().collect())
-            .unwrap_or_default();
-        let mut rows: Vec<(String, Vec<f32>)> = Vec::with_capacity(store.len());
-        for hash in store.content_hashes() {
-            if let Some(embedding) = fresh_rows.get(hash).or_else(|| old_rows.get(hash)) {
-                rows.push((hash.to_string(), embedding.clone()));
-            }
-        }
-        self.search_engine.set_fragment_embeddings(rows);
-
-        // Owner refs (invariant 6): content hash → ALL (owner node id, byte
-        // range) refs. A Vec per hash because identical content can live under
-        // N owners — dedup must not collapse multi-owner fragments to the
-        // first (Codex wave-2 item 5).
-        let refs: std::collections::HashMap<String, Vec<(String, (usize, usize))>> = store
-            .content_hashes()
-            .filter_map(|hash| {
-                let owners: Vec<(String, (usize, usize))> = store
-                    .get(hash)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|meta| {
-                        meta.owner
-                            .as_ref()
-                            .map(|owner| (owner.clone(), meta.byte_range))
-                    })
-                    .collect();
-                (!owners.is_empty()).then(|| (hash.to_string(), owners))
-            })
-            .collect();
-        self.search_engine.set_fragment_refs(refs);
-        Ok(())
-    }
-
-    pub(crate) fn run_neural(
-        &mut self,
-        _job: &JobPaths,
-        lexical: &LexicalCheckpoint,
-    ) -> Result<NeuralCheckpoint> {
-        let mut state = self
-            .pipeline
-            .take()
-            .context("neural phase started without pipeline state")?;
-        let lexical_hash = state
-            .lexical_hash
-            .clone()
-            .unwrap_or_else(|| lexical.pdg_hash.clone());
-        let neural_embedder = self.configured_neural_embedder()?;
-        // Cache-key fix: a model swap must NOT silently resume the previous
-        // model's embeddings. The checkpoint stores the embedder model_name that
-        // produced its rows; a mismatch forces a full re-embed.
-        let current_embed_model = crate::config::LeIndexConfig::load_cached()
-            .neural
-            .model_name
-            .clone();
-        let (mut neural_rows, neural_resume_loaded) = self.restore_neural_checkpoint(
-            state.resumed_neural.as_ref(),
-            &lexical_hash,
-            &current_embed_model,
-        );
-        if neural_rows == 0 && !neural_resume_loaded {
-            if let Some(neural_embedder) = neural_embedder.as_ref() {
-                let pdg = self
-                    .pdg
-                    .as_ref()
-                    .context("PDG is resident before neural enrichment")?;
-                let rows = index_builder::enrich_neural_embeddings(
-                    pdg,
-                    neural_embedder,
-                    &mut index_builder::FileReadCache::new(200),
-                    &state.admitted_node_ids,
-                );
-                neural_rows = self.search_engine.update_neural_embeddings(rows);
-            }
-        }
-        self.persist_neural_mmap(neural_resume_loaded, neural_rows)?;
-        self.persist_neural_snapshot(&state, neural_rows, neural_embedder)?;
-        let neural_checkpoint = NeuralCheckpoint {
-            lexical_hash,
-            mmap_path: self.project_path.join(".leindex/neural_embeddings.bin"),
-            rows: neural_rows,
-            provider: if neural_rows == 0 {
-                "unavailable".to_string()
-            } else {
-                std::env::var("LEINDEX_NEURAL_PROVIDER").unwrap_or_else(|_| "onnx".to_string())
-            },
-            model: crate::config::LeIndexConfig::load_cached()
-                .neural
-                .model_name
-                .clone(),
-        };
-        let checkpoint_store = state
-            .checkpoint_store
-            .as_ref()
-            .context("neural phase missing checkpoint store")?;
-        let neural_hash = checkpoint_store.write_neural(&neural_checkpoint)?;
-        self.checkpoint_state(checkpoint_store, "neural", neural_hash);
-        injected_phase_failure("neural")?;
-        state.neural_rows = neural_rows;
-        state.neural_resume_loaded = neural_resume_loaded;
-        state.neural_checkpoint = Some(neural_checkpoint.clone());
-        self.pipeline = Some(state);
-        Ok(neural_checkpoint)
-    }
-
-    pub(crate) fn publish_generation(
-        &mut self,
-        _job: &JobPaths,
-        neural: Option<&NeuralCheckpoint>,
-    ) -> Result<PublishedGeneration> {
-        let mut state = self
-            .pipeline
-            .take()
-            .context("publication started without pipeline state")?;
-        if neural.is_none() {
-            self.update_last_indexed_timestamp()?;
-            self.save_stats_to_storage()?;
-            let generation = self.checkpoint_generation();
-            let git_status = crate::cli::git::status(&self.project_path).ok();
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_millis() as u64)
-                .unwrap_or(0);
-            let indexed_paths: std::collections::HashSet<PathBuf> = state
-                .source_files_with_hashes
-                .iter()
-                .map(|(path, _)| path.clone())
-                .collect();
-            let dirty_source_paths =
-                git_status
-                    .as_ref()
-                    .map_or_else(std::collections::HashSet::new, |status| {
-                        status
-                            .modified
-                            .iter()
-                            .chain(status.staged.iter())
-                            .chain(status.untracked.iter())
-                            .chain(status.deleted.iter())
-                            .map(|path| {
-                                if path.is_absolute() {
-                                    path.clone()
-                                } else {
-                                    self.project_path.join(path)
-                                }
-                            })
-                            .filter(|path| {
-                                path.extension()
-                                    .and_then(|extension| extension.to_str())
-                                    .is_some_and(|extension| {
-                                        super::SOURCE_FILE_EXTENSIONS
-                                            .iter()
-                                            .any(|known| known.eq_ignore_ascii_case(extension))
-                                    })
-                            })
-                            .collect::<std::collections::HashSet<_>>()
-                    });
-            let changed_unindexed_count = dirty_source_paths
-                .iter()
-                .filter(|path| !indexed_paths.contains(*path))
-                .count();
-            let health = super::IndexHealth {
-                generation,
-                phase: super::IndexPhase::Complete,
-                status: super::ComponentStatus::Fresh,
-                head_oid: git_status
-                    .as_ref()
-                    .and_then(|status| status.head_oid.clone()),
-                tree_oid: git_tree_oid(&self.project_path),
-                indexed_file_count: state.source_files_with_hashes.len(),
-                dirty_file_count: dirty_source_paths.len(),
-                changed_unindexed_count,
-                indexed_at_unix_ms: Some(now_ms),
-                last_failure_phase: None,
-                last_failure: None,
-            };
-            let published = self.publish_generation_snapshot(generation, &health, false)?;
-            crate::cli::index_freshness::save_health(self.storage_path(), &health)?;
-            state.core_health = Some(health);
-            injected_phase_failure("lexical")?;
-            self.pipeline = Some(state);
-            return Ok(published);
-        }
-        let core_health = state
-            .core_health
-            .clone()
-            .context("neural publication missing core health")?;
-        let published = if neural.is_some_and(|checkpoint| checkpoint.rows > 0) {
-            let health = super::IndexHealth {
-                generation: core_health.generation.saturating_add(1),
-                ..core_health.clone()
-            };
-            let published = self.publish_generation_snapshot(health.generation, &health, true)?;
-            crate::cli::index_freshness::save_health(self.storage_path(), &health)?;
-            published
-        } else {
-            crate::cli::index_freshness::save_health(self.storage_path(), &core_health)?;
-            PublishedGeneration {
-                generation: core_health.generation,
-                storage_path: self
-                    .storage_path()
-                    .join("generations")
-                    .join(core_health.generation.to_string()),
-                health: core_health,
-            }
-        };
-        self.pipeline = Some(state);
-        Ok(published)
     }
 
     /// Update the last_indexed timestamp in project_metadata
@@ -1913,6 +1271,14 @@ impl LeIndex {
     /// Indexing still writes the mutable root, but normal registry hydration
     /// must never read that in-progress state after a crash or concurrent job.
     pub(crate) fn load_from_active_storage(&mut self) -> Result<()> {
+        // WS4 Task 14: when the `generation-readers` flag is enabled and the
+        // project has a current generation, hydrate the read path from the
+        // leased mmap generation instead of the legacy heap-mirror store. The
+        // lease never touches the writer Mutex, so reads keep working while a
+        // concurrent index/publish is in progress (VAL-EQUIV-002/003).
+        if self.try_hydrate_from_generation()? {
+            return Ok(());
+        }
         let active = self.active_storage_path();
         if active == self.storage_path || !active.join("leindex.db").is_file() {
             return self.load_from_mutable_storage();
@@ -1930,13 +1296,249 @@ impl LeIndex {
         self.load_from_storage_inner_at(false, Some(&active_storage), active)
     }
 
+    /// Re-hydrate from the CURRENT generation even when a generation snapshot
+    /// is already held (which `load_from_active_storage` treats as done).
+    ///
+    /// Used after a coalesced index: another process published a fresh
+    /// generation while this instance waited on the write lock, and a held
+    /// snapshot of the OLD generation would otherwise keep serving stale
+    /// data under a moved CURRENT pointer. Dropping the old snapshot
+    /// releases its lease; the new hydration leases the new generation.
+    pub(crate) fn force_reload_from_active_storage(&mut self) -> Result<()> {
+        self.generation_snapshot = None;
+        self.load_from_active_storage()
+    }
+
+    /// WS4 Task 14: wire the read path (PDG + search engine) onto the leased
+    /// mmap generation when `LEINDEX_FEATURE_GENERATION_READERS` is enabled
+    /// and the project has a current generation.
+    ///
+    /// Returns `Ok(true)` when the read path is served from the generation
+    /// (or was already wired on a previous call), `Ok(false)` when the flag is
+    /// off or no generation exists (the caller falls back to the legacy
+    /// heap-mirror path). The returned snapshot is retained on `self` so its
+    /// [`GenerationLease`] keeps the generation's CAS blobs pinned for the
+    /// lifetime of this process.
+    pub(crate) fn try_hydrate_from_generation(&mut self) -> Result<bool> {
+        self.try_hydrate_from_generation_inner(false)
+    }
+
+    /// Graph-only variant: hydrate the PDG from the leased generation WITHOUT
+    /// restoring the search engine (snapshot + embedding mmaps). Graph-only
+    /// tools (read-symbol, symbol-lookup, project-map) never query the search
+    /// engine, so paying ~1s of artifact restoration per cold call was pure
+    /// added latency.
+    pub(crate) fn try_hydrate_generation_pdg_only(&mut self) -> Result<bool> {
+        if self.pdg.is_some() {
+            return Ok(true);
+        }
+        self.try_hydrate_from_generation_inner(true)
+    }
+
+    fn try_hydrate_from_generation_inner(&mut self, pdg_only: bool) -> Result<bool> {
+        if !crate::feature_flags::FeatureFlag::GenerationReaders.is_enabled() {
+            return Ok(false);
+        }
+        if pdg_only && self.pdg.is_some() {
+            return Ok(true);
+        }
+        if self.generation_snapshot.is_some() {
+            return Ok(true);
+        }
+        let Some(storage_path) =
+            crate::cli::leindex::resolve_existing_storage_path(&self.project_path)
+        else {
+            return Ok(false);
+        };
+        let Some(generation) =
+            crate::storage::generation::lease::read_current_generation(&storage_path)
+        else {
+            return Ok(false);
+        };
+        // Check whether a CAS manifest exists for this generation. Legacy
+        // layouts (pre-migration full-copy) write a CURRENT file but do not
+        // have a manifest. In that case gracefully fall back to the legacy
+        // heap-mirror path instead of erroring.
+        let manifest_path = storage_path
+            .join(crate::storage::generation::lease::GENERATIONS_DIR)
+            .join(generation.to_string())
+            .join(crate::storage::generation::lease::MANIFEST_FILE);
+        if !manifest_path.exists() {
+            return Ok(false);
+        }
+        let snapshot = crate::storage::generation::GenerationSnapshot::open(&storage_path)
+            .with_context(|| {
+                format!(
+                    "Failed to open generation snapshot at {}",
+                    storage_path.display()
+                )
+            })?;
+        let generation_db = crate::storage::schema::Storage::open_readonly(snapshot.db_path())?;
+        // Artifact path points at the snapshot's temp dir, which holds no
+        // search-snapshot/embedder artifacts, so hydration uses the rebuild
+        // path and `persist_artifacts` stays false — the generation read path
+        // never writes legacy artifacts back into the store.
+        let artifact_path = snapshot
+            .db_path()
+            .parent()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| storage_path.clone());
+        self.load_from_storage_inner_at(pdg_only, Some(&generation_db), artifact_path)?;
+        self.hydrated_generation
+            .store(snapshot.generation(), std::sync::atomic::Ordering::Release);
+        self.generation_snapshot = Some(snapshot);
+        info!(
+            project = %self.project_path.display(),
+            "Hydrated read path from leased mmap generation"
+        );
+        Ok(true)
+    }
+
     /// Load PDG from storage without populating the search engine.
     /// Used by index_project() when it will call index_nodes() afterwards.
     pub fn load_pdg_from_storage(&mut self) -> Result<()> {
         self.load_from_storage_inner(true)
     }
 
+    /// Graph-only hydration from the generation selected by `CURRENT`.
+    ///
+    /// Reading the mutable root here would pair a PDG that a concurrent or
+    /// failed index run has since rewritten with the search artifacts of the
+    /// published generation. Those never agree, so every hydration would
+    /// rebuild the search index and never persist the result.
+    pub(crate) fn load_pdg_from_active_storage(&mut self) -> Result<()> {
+        let active = self.active_storage_path();
+        if active == self.storage_path || !active.join("leindex.db").is_file() {
+            return self.load_pdg_from_storage();
+        }
+        let active_storage =
+            crate::storage::schema::Storage::open_readonly(active.join("leindex.db"))
+                .with_context(|| {
+                    format!("Failed to open active generation at {}", active.display())
+                })?;
+        self.load_from_storage_inner_at(true, Some(&active_storage), active)
+    }
+
     fn load_from_storage_inner(&mut self, pdg_only: bool) -> Result<()> {
         self.load_from_storage_inner_at(pdg_only, None, self.storage_path.clone())
     }
+}
+
+/// Which PDG construction route produced a given combined graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PdgBuildRoute {
+    /// Compact streaming fragment/segment pipeline
+    /// (`fragment_from_pdg` + `merge_fragments_to_segment` + `pdg_from_segment`).
+    Streaming,
+    /// Legacy per-file extraction + `merge_pdgs`.
+    Legacy,
+}
+
+/// The construction route selected by the current `StreamingPdg` feature flag.
+///
+/// This is the single dispatch point the indexing phase consults so the flag
+/// cleanly toggles between the streaming fragment pipeline (default) and the
+/// legacy merge loop.
+pub(crate) fn pdg_route_for_current_flag() -> PdgBuildRoute {
+    if crate::feature_flags::FeatureFlag::StreamingPdg.is_enabled() {
+        PdgBuildRoute::Streaming
+    } else {
+        PdgBuildRoute::Legacy
+    }
+}
+
+/// Build a combined PDG for the freshly parsed files using the selected route.
+fn build_changed_file_pdg(
+    parsing_results: Vec<crate::parse::parallel::ParsingResult>,
+    use_streaming: bool,
+) -> (crate::graph::pdg::ProgramDependenceGraph, PdgBuildRoute) {
+    if use_streaming {
+        (
+            build_pdg_streaming(parsing_results),
+            PdgBuildRoute::Streaming,
+        )
+    } else {
+        (build_pdg_legacy(parsing_results), PdgBuildRoute::Legacy)
+    }
+}
+
+/// Legacy route: extract a per-file PDG via `extract_pdg_from_signatures` and
+/// merge each into a combined graph (clone-free `merge_pdgs`).
+fn build_pdg_legacy(
+    parsing_results: Vec<crate::parse::parallel::ParsingResult>,
+) -> crate::graph::pdg::ProgramDependenceGraph {
+    let mut combined = crate::graph::pdg::ProgramDependenceGraph::new();
+    let file_pdgs: Vec<_> = parsing_results
+        .into_par_iter()
+        .filter(|result| result.is_success())
+        .map(|result| {
+            let file_path = result.file_path.display().to_string();
+            let language = result.language.as_deref().unwrap_or("unknown");
+            let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
+            crate::graph::extract_pdg_from_signatures(
+                result.signatures,
+                source_bytes,
+                &file_path,
+                language,
+            )
+        })
+        .collect();
+    for file_pdg in file_pdgs {
+        index_builder::merge_pdgs(&mut combined, file_pdg);
+    }
+    combined
+}
+
+/// Map a `SignatureInfo` to the canonical streaming node-type string (mirrors
+/// the legacy `signature_to_node` mapping so graphs rebuilt from streamed
+/// segments stay type-equivalent to the legacy route).
+/// Streaming route: build a per-file `PdgFragment` from each parsed file
+/// via the real extraction pipeline, merge fragments into a compact
+/// segment, and materialize the combined graph from it.
+/// them into a compact `PdgSegment` via `merge_fragments_to_segment`, then
+/// rebuild the `ProgramDependenceGraph` via `pdg_from_segment`.
+fn build_pdg_streaming(
+    parsing_results: Vec<crate::parse::parallel::ParsingResult>,
+) -> crate::graph::pdg::ProgramDependenceGraph {
+    let fragments: Vec<_> = parsing_results
+        .into_par_iter()
+        .filter(|result| result.is_success())
+        .map(|result| {
+            let file_path = result.file_path.display().to_string();
+            let language = result
+                .language
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
+            // Route through the REAL extraction pipeline
+            // (`extract_pdg_from_signatures` → `fragment_from_pdg`, its
+            // documented production realization) instead of the skeleton
+            // `build_fragment_from_parsed`. The skeleton flattened
+            // signatures to name/kind/bytes, hardcoding complexity 0 and
+            // dropping ALL intra-file call/data edges — which is why the
+            // streaming route's stored graph showed complexity 0 on every
+            // node, empty callee lists, and `forward_impact` returning
+            // nothing. The per-file PDG here is single-file (cheap to
+            // build), so the streaming memory contract (no whole-graph
+            // clone, compact per-file records) is preserved.
+            let file_pdg = crate::graph::extract_pdg_from_signatures(
+                result.signatures,
+                source_bytes,
+                &file_path,
+                &language,
+            );
+            streaming::pdg::fragment_from_pdg(&file_pdg)
+        })
+        .collect();
+    let (segment, stats) = streaming::pdg::merge_fragments_to_segment(fragments);
+    info!(
+        "Streaming PDG merge: {} fragments, {} nodes, {} edges ({} cross-file resolved, {} unresolved, {} duplicate node records dropped)",
+        stats.fragments,
+        stats.node_count,
+        stats.edge_count,
+        stats.cross_file_resolved,
+        stats.cross_file_unresolved,
+        stats.duplicate_nodes_dropped
+    );
+    streaming::pdg::pdg_from_segment(&segment)
 }

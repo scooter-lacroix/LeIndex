@@ -7,12 +7,12 @@
 //!
 //! 1. **Structured types** — `DiffResult`, `DiffHunk`, `DiffLine` capture the
 //!    data shape that the LLM receives (clean JSON, no ANSI).
-//! 2. **Compute** — `compute_diff` and the trim functions in [`trim`] turn
+//! 2. **Compute** — `compute_diff` and the trim functions in `trim` turn
 //!    raw handler output into these structured types.
-//! 3. **Render** — per-tool render functions in [`render`] take a `Value`
+//! 3. **Render** — per-tool render functions in `render` take a `Value`
 //!    and produce a human-readable colored string for the CLI. They share
 //!    the same structured core so MCP and CLI stay in lock-step.
-//! 4. **Dispatch** — `render_tool_output(name, value, args)` (in [`render`])
+//! 4. **Dispatch** — `render_tool_output(name, value, args)` (in `render`)
 //!    is the single entry point used by `leindex tools run` and any other
 //!    CLI surface.
 
@@ -174,7 +174,7 @@ pub use diff::{
 pub use render::{
     DiagnosticsFormatter, FileSummaryFormatter, GitStatusFormatter, ImpactFormatter,
     PhaseFormatter, ProjectMapFormatter, SearchFormatter, SymbolLookupFormatter,
-    render_tool_output, render_tool_output_plain, render_tree,
+    render_tool_output, render_tool_output_plain, render_tool_output_split, render_tree,
 };
 pub use trim::trim_llm_payload;
 

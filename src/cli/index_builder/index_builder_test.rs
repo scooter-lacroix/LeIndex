@@ -1,5 +1,279 @@
 use super::*;
 
+/// VAL-PDG-005/006: `merge_pdgs` consumes the source by value (moving weights,
+/// no per-element clone) and produces a correct merged graph with remapped
+/// edges and intact indexes.
+#[test]
+fn test_merge_pdgs_merges_nodes_edges_and_indexes() {
+    use crate::graph::pdg::{Edge, EdgeMetadata, EdgeType, Node, NodeType};
+    use std::sync::Arc;
+
+    // Target already holds its own node before the merge.
+    let mut target = ProgramDependenceGraph::new();
+    target.add_node(Node {
+        id: "keep.rs:keeper".to_string(),
+        node_type: NodeType::Function,
+        name: "keeper".to_string(),
+        file_path: Arc::from("keep.rs"),
+        byte_range: (0, 5),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+
+    // Source graph must be consumed by value.
+    let mut source = ProgramDependenceGraph::new();
+    let a = source.add_node(Node {
+        id: "a.rs:foo".to_string(),
+        node_type: NodeType::Function,
+        name: "foo".to_string(),
+        file_path: Arc::from("a.rs"),
+        byte_range: (0, 10),
+        complexity: 3,
+        language: "rust".to_string(),
+    });
+    let b = source.add_node(Node {
+        id: "a.rs:bar".to_string(),
+        node_type: NodeType::Class,
+        name: "bar".to_string(),
+        file_path: Arc::from("a.rs"),
+        byte_range: (11, 20),
+        complexity: 0,
+        language: "rust".to_string(),
+    });
+    source.add_edge(
+        a,
+        b,
+        Edge {
+            edge_type: EdgeType::Call,
+            metadata: EdgeMetadata {
+                call_count: Some(2),
+                variable_name: None,
+                confidence: Some(0.9),
+                channel: None,
+                position: None,
+            },
+        },
+    );
+
+    merge_pdgs(&mut target, source);
+
+    // 1 unchanged target node + 2 moved source nodes, with the call edge remapped.
+    assert_eq!(target.node_count(), 3);
+    assert_eq!(target.edge_count(), 1);
+
+    assert!(target.find_by_symbol("keep.rs:keeper").is_some());
+    let foo = target.find_by_symbol("a.rs:foo").expect("foo should merge");
+    let bar = target.find_by_symbol("a.rs:bar").expect("bar should merge");
+    assert_eq!(target.get_node(foo).unwrap().complexity, 3);
+
+    // The single edge must now connect foo -> bar in the target.
+    let call_edges: Vec<_> = target
+        .edge_indices()
+        .filter_map(|idx| {
+            let edge = target.get_edge(idx)?;
+            if edge.edge_type == EdgeType::Call {
+                Some((target.edge_endpoints(idx).unwrap(), edge.metadata.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(call_edges.len(), 1);
+    let ((caller, callee), metadata) = &call_edges[0];
+    assert_eq!(*caller, foo);
+    assert_eq!(*callee, bar);
+    assert_eq!(metadata.call_count, Some(2));
+}
+
+/// Merging a source that is empty is a no-op that leaves the target intact.
+#[test]
+fn test_merge_pdgs_empty_source_is_noop() {
+    let mut target = ProgramDependenceGraph::new();
+    assert_eq!(target.node_count(), 0);
+    merge_pdgs(&mut target, ProgramDependenceGraph::new());
+    assert_eq!(target.node_count(), 0);
+    assert_eq!(target.edge_count(), 0);
+}
+
+/// Per-file extraction gives every file pass its own `external::{target}`
+/// placeholder, so merged graphs used to carry several nodes sharing one id.
+/// `save_pdg` keys them all onto the single `(project_id, node_id)` row and
+/// a reload collapses them. The merge must fold duplicates onto one node and
+/// remap every edge endpoint onto it.
+#[test]
+fn test_merge_pdgs_dedupes_duplicate_node_ids_and_remaps_edges() {
+    use crate::graph::pdg::{Edge, EdgeMetadata, EdgeType, Node, NodeType};
+    use std::sync::Arc;
+
+    fn caller(id: &str, file: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            node_type: NodeType::Function,
+            name: "main".to_string(),
+            file_path: Arc::from(file),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "rust".to_string(),
+        }
+    }
+
+    fn external_node(file: &str) -> Node {
+        Node {
+            id: "external::String".to_string(),
+            node_type: NodeType::External,
+            name: "String".to_string(),
+            file_path: Arc::from(file),
+            byte_range: (0, 0),
+            complexity: 0,
+            language: "external".to_string(),
+        }
+    }
+
+    fn call_edge() -> crate::graph::pdg::Edge {
+        Edge {
+            edge_type: EdgeType::Call,
+            metadata: EdgeMetadata {
+                call_count: None,
+                variable_name: None,
+                confidence: None,
+                channel: None,
+                position: None,
+            },
+        }
+    }
+
+    // Two file passes, each with a caller and its own `external::String`.
+    let mut target = ProgramDependenceGraph::new();
+    for file in ["a.rs", "b.rs"] {
+        let mut source = ProgramDependenceGraph::new();
+        let caller_idx = source.add_node(caller(&format!("{file}:main"), file));
+        let external_idx = source.add_node(external_node(file));
+        source.add_edge(caller_idx, external_idx, call_edge());
+        merge_pdgs(&mut target, source);
+    }
+
+    assert_eq!(target.node_count(), 3, "two callers + one shared external");
+
+    let external = target
+        .find_by_id("external::String")
+        .expect("shared external survives the merges");
+    assert_eq!(
+        target.get_node(external).unwrap().file_path.as_ref(),
+        "<external>",
+        "shared placeholder is not owned by any file"
+    );
+
+    let inbound_calls = target
+        .edge_indices()
+        .filter(|idx| {
+            target
+                .get_edge(*idx)
+                .is_some_and(|edge| edge.edge_type == EdgeType::Call)
+                && target
+                    .edge_endpoints(*idx)
+                    .is_some_and(|(_, to)| to == external)
+        })
+        .count();
+    assert_eq!(
+        inbound_calls, 2,
+        "both callers' edges point at the shared node"
+    );
+}
+
+/// A shared external placeholder is graph-level vocabulary, not file content:
+/// removing the file whose extraction pass happened to create it must not
+/// delete the node or the other files' edges pointing at it.
+#[test]
+fn test_remove_file_keeps_shared_external_placeholders() {
+    use crate::graph::pdg::{Edge, EdgeMetadata, EdgeType, Node, NodeType};
+    use std::sync::Arc;
+
+    let mut target = ProgramDependenceGraph::new();
+    let mut source = ProgramDependenceGraph::new();
+    let a_main = source.add_node(Node {
+        id: "a.rs:main".to_string(),
+        node_type: NodeType::Function,
+        name: "main".to_string(),
+        file_path: Arc::from("a.rs"),
+        byte_range: (0, 10),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+    let external_idx = source.add_node(Node {
+        id: "external::String".to_string(),
+        node_type: NodeType::External,
+        name: "String".to_string(),
+        file_path: Arc::from("a.rs"),
+        byte_range: (0, 0),
+        complexity: 0,
+        language: "external".to_string(),
+    });
+    source.add_edge(
+        a_main,
+        external_idx,
+        Edge {
+            edge_type: EdgeType::Call,
+            metadata: EdgeMetadata {
+                call_count: None,
+                variable_name: None,
+                confidence: None,
+                channel: None,
+                position: None,
+            },
+        },
+    );
+    merge_pdgs(&mut target, source);
+
+    let mut later = ProgramDependenceGraph::new();
+    later.add_node(Node {
+        id: "b.rs:main".to_string(),
+        node_type: NodeType::Function,
+        name: "main".to_string(),
+        file_path: Arc::from("b.rs"),
+        byte_range: (0, 10),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+    merge_pdgs(&mut target, later);
+
+    // Attach b.rs:main's call to the shared external, then drop file a.rs.
+    let external = target
+        .find_by_id("external::String")
+        .expect("shared external exists");
+    let b_idx = target.find_by_id("b.rs:main").expect("b.rs:main exists");
+    target.add_edge(
+        b_idx,
+        external,
+        Edge {
+            edge_type: EdgeType::Call,
+            metadata: EdgeMetadata {
+                call_count: None,
+                variable_name: None,
+                confidence: None,
+                channel: None,
+                position: None,
+            },
+        },
+    );
+    target.remove_file("a.rs");
+
+    let external_after = target
+        .find_by_id("external::String")
+        .expect("shared external survives a.rs removal");
+    assert_eq!(external_after, external);
+    let b_call_survives = target.edge_indices().any(|idx| {
+        target.edge_endpoints(idx) == Some((b_idx, external_after))
+            && target
+                .get_edge(idx)
+                .is_some_and(|edge| edge.edge_type == EdgeType::Call)
+    });
+    assert!(
+        b_call_survives,
+        "b.rs's edge to the shared external survives"
+    );
+    assert_eq!(target.node_count(), 2, "b.rs:main + the shared external");
+}
+
 #[test]
 fn test_tokenize_code_camel_case() {
     let toks = tokenize_code("getUserName");
@@ -869,7 +1143,9 @@ fn test_tfidf_embedder_persist_roundtrip() {
     let docs = vec![("a".to_string(), "fn alpha beta gamma".to_string())];
     let embedder = TfIdfEmbedder::build(&docs);
     let pdg = { crate::graph::pdg::ProgramDependenceGraph::new() };
-    embedder.persist_to_storage(temp.path(), &pdg).unwrap();
+    embedder
+        .persist_to_storage(temp.path(), &pdg, None)
+        .unwrap();
     let loaded = TfIdfEmbedder::load_from_storage(temp.path())
         .unwrap()
         .unwrap();
@@ -988,6 +1264,7 @@ fn cache_key_stats() -> IndexStats {
         successful_parses: 3,
         failed_parses: 0,
         total_signatures: 7,
+        signature_scope: "full".to_string(),
         pdg_nodes: 7,
         pdg_edges: 6,
         indexed_nodes: 7,
@@ -1092,436 +1369,4 @@ fn test_cache_key_legacy_v2_without_fragment_fields_parses() {
         legacy, modern,
         "legacy key must not collide with the fragment-extended key"
     );
-}
-
-// ============================================================================
-// HYBRID EMBEDDING INTEGRATION TESTS
-// ============================================================================
-
-#[test]
-#[cfg(feature = "onnx")]
-fn test_hybrid_embedder_local_creation() {
-    let docs: Vec<(String, String)> =
-        vec![("test".to_string(), "fn test_function() -> bool".to_string())];
-    let tfidf_embedder = TfIdfEmbedder::build(&docs);
-    let result = HybridEmbedder::hybrid_local(tfidf_embedder, None);
-    // May fail if model not found, but tests the API
-    assert!(result.is_ok() || result.is_err());
-}
-
-#[test]
-#[cfg(not(feature = "onnx"))]
-fn test_hybrid_embedder_local_feature_not_enabled() {
-    let docs: Vec<(String, String)> =
-        vec![("test".to_string(), "fn test_function() -> bool".to_string())];
-    let tfidf_embedder = TfIdfEmbedder::build(&docs);
-    // When ONNX feature is not enabled, only TfIdfOnly is available
-    let _ = HybridEmbedder::tfidf_only(tfidf_embedder);
-    // Test passes if we can create a TfIdfOnly embedder
-}
-
-#[test]
-fn test_hybrid_embedder_tfidf_only_default() {
-    let embedder = HybridEmbedder::default();
-    assert!(
-        !embedder.has_neural(),
-        "default embedder should be TF-IDF only"
-    );
-    assert_eq!(
-        embedder.tfidf_dimension(),
-        768,
-        "TF-IDF dimension should be 768"
-    );
-    assert!(
-        embedder.neural_dimension().is_none(),
-        "neural dimension should be None"
-    );
-}
-
-#[test]
-fn test_hybrid_embedder_tfidf_only() {
-    let docs: Vec<(String, String)> = vec![(
-        "auth".to_string(),
-        "fn authenticate_user(token: &str) -> bool".to_string(),
-    )];
-    let tfidf_embedder = TfIdfEmbedder::build(&docs);
-    let embedder = HybridEmbedder::tfidf_only(tfidf_embedder);
-
-    assert!(!embedder.has_neural());
-    assert_eq!(embedder.tfidf_dimension(), 768);
-    assert_eq!(embedder.neural_weight(), 0.0);
-
-    let weights = embedder.scoring_weights();
-    assert_eq!(
-        weights.tfidf, 0.60,
-        "TF-IDF weight should be 0.60 without neural"
-    );
-    assert_eq!(
-        weights.neural, 0.00,
-        "neural weight should be 0.00 without neural"
-    );
-}
-
-#[test]
-#[cfg(feature = "onnx")]
-fn test_hybrid_embedder_local_dimension() {
-    let docs: Vec<(String, String)> =
-        vec![("test".to_string(), "fn test_function() -> bool".to_string())];
-    let tfidf_embedder = TfIdfEmbedder::build(&docs);
-    if let Ok(embedder) = HybridEmbedder::hybrid_local(tfidf_embedder, None) {
-        assert!(
-            embedder.has_neural(),
-            "hybrid local embedder should have neural"
-        );
-        assert_eq!(
-            embedder.tfidf_dimension(),
-            768,
-            "TF-IDF dimension should be 768"
-        );
-        assert!(
-            embedder.neural_dimension().is_some(),
-            "neural dimension should be Some"
-        );
-        assert_eq!(
-            embedder.neural_weight(),
-            0.40,
-            "neural weight should be 0.40"
-        );
-
-        let weights = embedder.scoring_weights();
-        assert_eq!(
-            weights.tfidf, 0.30,
-            "TF-IDF weight should be 0.30 with neural"
-        );
-        assert_eq!(
-            weights.neural, 0.40,
-            "neural weight should be 0.40 with neural"
-        );
-    }
-}
-
-#[test]
-fn test_hybrid_embedder_embed_tfidf() {
-    let docs: Vec<(String, String)> = vec![(
-        "auth".to_string(),
-        "fn authenticate_user(token: &str) -> bool".to_string(),
-    )];
-    let tfidf_embedder = TfIdfEmbedder::build(&docs);
-    let embedder = HybridEmbedder::tfidf_only(tfidf_embedder);
-
-    let tokens = vec![
-        "authenticate".to_string(),
-        "user".to_string(),
-        "token".to_string(),
-    ];
-    let embedding = embedder.embed_tfidf(&tokens);
-
-    assert_eq!(
-        embedding.len(),
-        768,
-        "TF-IDF embedding dimension should be 768"
-    );
-}
-
-#[test]
-#[cfg(feature = "onnx")]
-fn test_hybrid_embedder_embed_neural_local() {
-    let docs: Vec<(String, String)> =
-        vec![("test".to_string(), "fn test_function() -> bool".to_string())];
-    let tfidf_embedder = TfIdfEmbedder::build(&docs);
-    if let Ok(embedder) = HybridEmbedder::hybrid_local(tfidf_embedder, None) {
-        let tokens = vec![
-            "test".to_string(),
-            "code".to_string(),
-            "embedding".to_string(),
-        ];
-        let tfidf_embedding = embedder.embed_tfidf(&tokens);
-
-        assert_eq!(
-            tfidf_embedding.len(),
-            768,
-            "TF-IDF embedding dimension should be 768"
-        );
-
-        // Test neural embedding generation (blocking version for sync test)
-        let text = "test code embedding";
-        if let Some(Ok(neural_embedding)) = embedder.embed_neural_blocking(text) {
-            assert!(
-                !neural_embedding.is_empty(),
-                "neural embedding should have non-zero dimension"
-            );
-            // Real embeddings should have non-zero values
-            let has_nonzero = neural_embedding.iter().any(|&v| v != 0.0);
-            assert!(has_nonzero, "neural embeddings should have non-zero values");
-        }
-    }
-}
-
-#[test]
-#[ignore = "requires the configured auto ONNX model and execution provider"]
-#[cfg(feature = "onnx")]
-fn test_hybrid_embedder_cold_start_uses_neural_by_default() {
-    let docs: Vec<(String, String)> = vec![(
-        "search".to_string(),
-        "fn route_semantic_search(query: &str) -> bool".to_string(),
-    )];
-    let tfidf_embedder = TfIdfEmbedder::build(&docs);
-    let embedder = HybridEmbedder::hybrid_local(tfidf_embedder, None).unwrap();
-    let result = embedder.embed_neural_blocking("route semantic search");
-    let embedding = result
-        .expect("cold hybrid request must attempt the neural worker")
-        .expect("configured auto neural worker must return an embedding");
-
-    assert_eq!(embedding.len(), NEURAL_EMBEDDING_DIMENSION);
-    assert!(embedding.iter().any(|value| *value != 0.0));
-    assert_eq!(embedder.neural_status(), "ready");
-}
-
-#[test]
-fn test_hybrid_scoring_weights() {
-    let weights_with_neural = HybridScoringWeights::default();
-    assert_eq!(weights_with_neural.tfidf, 0.30);
-    assert_eq!(weights_with_neural.neural, 0.40);
-    assert_eq!(weights_with_neural.structural, 0.15);
-    assert_eq!(weights_with_neural.text_match, 0.15);
-    assert!(
-        (weights_with_neural.tfidf
-            + weights_with_neural.neural
-            + weights_with_neural.structural
-            + weights_with_neural.text_match
-            - 1.0)
-            .abs()
-            < 0.001
-    );
-
-    let weights_without_neural = HybridScoringWeights::without_neural();
-    assert_eq!(weights_without_neural.tfidf, 0.60);
-    assert_eq!(weights_without_neural.neural, 0.00);
-    assert_eq!(weights_without_neural.structural, 0.20);
-    assert_eq!(weights_without_neural.text_match, 0.20);
-    assert!(
-        (weights_without_neural.tfidf
-            + weights_without_neural.neural
-            + weights_without_neural.structural
-            + weights_without_neural.text_match
-            - 1.0)
-            .abs()
-            < 0.001
-    );
-}
-
-#[test]
-fn test_hybrid_scoring_weights_normalize() {
-    let mut custom_weights = HybridScoringWeights {
-        tfidf: 0.5,
-        neural: 0.3,
-        structural: 0.1,
-        text_match: 0.1,
-    };
-    custom_weights = custom_weights.normalize();
-    assert!(
-        (custom_weights.tfidf
-            + custom_weights.neural
-            + custom_weights.structural
-            + custom_weights.text_match
-            - 1.0)
-            .abs()
-            < 0.001
-    );
-}
-
-#[test]
-fn test_hybrid_embedder_compare_backends() {
-    let docs: Vec<(String, String)> =
-        vec![("test".to_string(), "fn test_function() -> bool".to_string())];
-
-    let tfidf_embedder = TfIdfEmbedder::build(&docs);
-    let tfidf_only = HybridEmbedder::tfidf_only(tfidf_embedder.clone());
-
-    assert!(!tfidf_only.has_neural());
-    assert_eq!(tfidf_only.tfidf_dimension(), 768);
-    assert!(tfidf_only.neural_dimension().is_none());
-
-    #[cfg(feature = "onnx")]
-    {
-        if let Ok(hybrid_local) = HybridEmbedder::hybrid_local(tfidf_embedder, None) {
-            assert!(hybrid_local.has_neural());
-            assert_eq!(hybrid_local.tfidf_dimension(), 768);
-            assert!(hybrid_local.neural_dimension().is_some());
-        }
-    }
-}
-
-#[test]
-fn file_summary_context_collects_same_file_symbols_excluding_summary_nodes() {
-    use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};
-    use std::sync::Arc;
-
-    let mut pdg = ProgramDependenceGraph::new();
-    let lib: Arc<str> = Arc::from("src/lib.rs");
-    // A FileSummary node must NOT appear in the collected symbol names.
-    pdg.add_node(Node {
-        id: "src/lib.rs".to_string(),
-        node_type: NodeType::FileSummary,
-        name: "src/lib.rs".to_string(),
-        file_path: lib.clone(),
-        byte_range: (0, 0),
-        complexity: 0,
-        language: "rust".to_string(),
-    });
-    for name in ["alpha", "beta", "gamma"] {
-        pdg.add_node(Node {
-            id: format!("src/lib.rs:{name}"),
-            node_type: NodeType::Function,
-            name: name.to_string(),
-            file_path: lib.clone(),
-            byte_range: (0, 10),
-            complexity: 1,
-            language: "rust".to_string(),
-        });
-    }
-    pdg.add_node(Node {
-        id: "src/other.rs:delta".to_string(),
-        node_type: NodeType::Function,
-        name: "delta".to_string(),
-        file_path: Arc::from("src/other.rs"),
-        byte_range: (0, 10),
-        complexity: 1,
-        language: "rust".to_string(),
-    });
-
-    let ctx = FileSummaryContext::from_pdg(&pdg);
-    // Same-file symbols, FileSummary excluded, insertion order preserved.
-    assert_eq!(
-        ctx.file_symbols.get("src/lib.rs"),
-        Some(&vec![
-            "alpha".to_string(),
-            "beta".to_string(),
-            "gamma".to_string()
-        ])
-    );
-    // Different file is bucketed separately.
-    assert_eq!(
-        ctx.file_symbols.get("src/other.rs"),
-        Some(&vec!["delta".to_string()])
-    );
-}
-
-#[test]
-fn test_persist_search_snapshot_writes_fragment_artifacts() {
-    use crate::search::search::{DEFAULT_EMBEDDING_DIMENSION, NodeInfo, SearchEngine};
-    use crate::search::vector::MmapEmbeddingIndex;
-
-    let temp = tempfile::TempDir::new().unwrap();
-    let project_path = temp.path();
-    let storage = project_path.join(".leindex");
-    std::fs::create_dir_all(&storage).unwrap();
-
-    // Build a fragment-enabled engine by hydrating a 2-row fragment index from
-    // persisted-style mmap files (the same path `indexing/load.rs` uses).
-    let mut engine = SearchEngine::new();
-    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
-    tfidf_embedding[0] = 1.0;
-    engine.index_nodes(vec![NodeInfo {
-        node_id: "auth.rs:authenticate_user".to_string(),
-        file_path: "auth.rs".to_string(),
-        symbol_name: "authenticate_user".to_string(),
-        language: "rust".to_string(),
-        content: "pub fn authenticate_user() {}".to_string(),
-        byte_range: (0, 29),
-        tfidf_embedding,
-        neural_embedding: None,
-        complexity: 3,
-        signature: None,
-        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
-    }]);
-    let mut snapshot = engine.search_snapshot(1, 0, "frag".to_string());
-    snapshot.fragment_rows = 2;
-    let tfidf_path = storage.join("tfidf.bin");
-    let frag_path = storage.join("frag.bin");
-    crate::search::vector::write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings())
-        .unwrap();
-    let fragment_embeddings = vec![
-        ("hash_abc".to_string(), vec![0.1f32; 1024]),
-        ("hash_def".to_string(), vec![0.2f32; 1024]),
-    ];
-    crate::search::vector::write_mmap_embeddings(&frag_path, &fragment_embeddings).unwrap();
-    let tfidf_mmap = MmapEmbeddingIndex::open(&tfidf_path).unwrap();
-    let frag_mmap = MmapEmbeddingIndex::open(&frag_path).unwrap();
-    let frag_ids = vec!["hash_abc".to_string(), "hash_def".to_string()];
-    let mut hydrated = SearchEngine::new();
-    hydrated
-        .restore_from_search_snapshot(
-            snapshot,
-            std::sync::Arc::new(tfidf_mmap),
-            None,
-            Some(std::sync::Arc::new(frag_mmap)),
-            Some(&frag_ids),
-        )
-        .unwrap();
-
-    // Persist: must write the fragment mmap + root and stamp the snapshot root.
-    persist_search_snapshot(&hydrated, project_path, 1, 0, "frag".to_string()).unwrap();
-    assert!(storage.join("fragments_embeddings.bin").exists());
-    assert!(storage.join("fragment_root.bin").exists());
-
-    // Reload: the snapshot carries the root hash and passes invariant-8
-    // validation against the persisted artifacts.
-    let reloaded = try_load_search_snapshot_from_storage(&storage).unwrap();
-    assert!(reloaded.fragment_root_hash.is_some());
-    assert_eq!(reloaded.fragment_rows, 2);
-    let mmap = try_load_fragment_mmap_embeddings_from_storage(&storage).unwrap();
-    assert!(fragment_layer_is_valid(
-        reloaded.fragment_root_hash.as_deref(),
-        Some(&mmap),
-        &storage
-    ));
-}
-
-#[test]
-fn test_fragment_layer_is_valid_rejects_stale_root() {
-    use crate::search::vector::MmapEmbeddingIndex;
-
-    let temp = tempfile::TempDir::new().unwrap();
-    let project_path = temp.path();
-    let storage = project_path.join(".leindex");
-
-    let ids = vec!["hash_abc".to_string(), "hash_def".to_string()];
-    fragment::sync::persist_fragment_root_from_ids(project_path, &ids, 0).unwrap();
-
-    let frag_path = storage.join("frag.bin");
-    let embeddings = vec![
-        ("hash_abc".to_string(), vec![0.1f32; 1024]),
-        ("hash_def".to_string(), vec![0.2f32; 1024]),
-    ];
-    crate::search::vector::write_mmap_embeddings(&frag_path, &embeddings).unwrap();
-    let mmap = MmapEmbeddingIndex::open(&frag_path).unwrap();
-
-    // Matching root + row count -> valid.
-    let good_root = fragment::sync::load_fragment_root(&storage)
-        .unwrap()
-        .unwrap()
-        .root_hash;
-    assert!(fragment_layer_is_valid(
-        Some(&good_root),
-        Some(&mmap),
-        &storage
-    ));
-    // Stale root -> invalid.
-    assert!(!fragment_layer_is_valid(
-        Some("stale-hash"),
-        Some(&mmap),
-        &storage
-    ));
-    // Snapshot without a root -> invalid (feature-off semantics).
-    assert!(!fragment_layer_is_valid(None, Some(&mmap), &storage));
-    // Missing mmap -> invalid.
-    assert!(!fragment_layer_is_valid(Some(&good_root), None, &storage));
-    // Missing fragment_root.bin artifact -> invalid.
-    std::fs::remove_file(storage.join("fragment_root.bin")).unwrap();
-    assert!(!fragment_layer_is_valid(
-        Some(&good_root),
-        Some(&mmap),
-        &storage
-    ));
 }

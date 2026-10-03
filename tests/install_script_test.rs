@@ -416,3 +416,131 @@ mod exit_handling {
         );
     }
 }
+
+// ============================================================================
+// Syntax and daemon packaging invariants
+// ============================================================================
+
+/// `install.sh` must be valid bash. An orphaned `else` with an empty body once
+/// shipped after the worker-binary removal and made the universal installer
+/// unusable, which no text-matching test could notice.
+#[test]
+fn test_install_sh_is_syntactically_valid_bash() {
+    let path = repo_root().join("install.sh");
+    let output = match std::process::Command::new("bash")
+        .arg("-n")
+        .arg(&path)
+        .output()
+    {
+        Ok(output) => output,
+        // No bash on this host (e.g. a bare Windows runner): nothing to check.
+        Err(_) => return,
+    };
+    assert!(
+        output.status.success(),
+        "bash -n install.sh failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The single-binary migration retired the separate worker; none of its
+/// variables may survive, because `install.sh` runs under `set -u`.
+#[test]
+fn test_install_sh_has_no_retired_worker_variables() {
+    let script = install_sh();
+    for retired in ["worker_binary", "worker_install_path", "worker_bin"] {
+        assert!(
+            !script.contains(retired),
+            "install.sh still references retired variable `{retired}`"
+        );
+    }
+}
+
+/// `leindex` starts the daemon from a sibling `leindexd`, so both installers
+/// (source build and release bundle) must place it beside the client.
+#[test]
+fn test_install_sh_installs_the_daemon_for_source_and_bundle_paths() {
+    let script = install_sh();
+    assert!(
+        script.contains("install_daemon_binary \"target/release/${DAEMON_SLUG}\""),
+        "source-build path must install leindexd"
+    );
+    assert!(
+        script.contains("install_daemon_binary \"${bundle_dir}/bin/${DAEMON_SLUG}\""),
+        "release-bundle path must install leindexd"
+    );
+}
+
+/// The release archive must carry `leindexd` beside `leindex` on Unix.
+#[test]
+fn test_release_workflow_bundles_the_daemon() {
+    let workflow = read_repo_file(".github/workflows/release.yml");
+    assert!(
+        workflow.contains("\"$BUNDLE_DIR/bin/leindexd\""),
+        "release bundle must copy leindexd into bin/"
+    );
+    assert!(
+        workflow.contains("for bin in leindex leindexd; do"),
+        "the binary verification loop must cover leindexd"
+    );
+}
+
+/// The npm installer copies `leindexd` next to `leindex` and must not touch
+/// identifiers it never declared (an undefined `srcMain` once threw a
+/// ReferenceError for every bundle install).
+#[test]
+fn test_npm_installer_installs_the_daemon() {
+    let installer = read_repo_file("packages/npm-leindex-mcp/install.js");
+    assert!(
+        installer.contains("'leindexd'"),
+        "npm installer must install leindexd"
+    );
+    assert!(
+        !installer.contains("srcMain"),
+        "npm installer references an undeclared `srcMain`"
+    );
+}
+
+/// The worker is not a separate binary anymore (single `leindex` binary,
+/// hidden re-exec worker mode). A worker-name alias equal to the main
+/// binary made the cargo fallback copy `bin/leindex` onto itself (a
+/// possible 0-byte binary after a "successful" install) and never copied
+/// `leindexd`; the dead `hasWorker` reinstall trigger went with it.
+#[test]
+fn test_npm_installer_has_no_self_copying_worker_alias() {
+    let installer = read_repo_file("packages/npm-leindex-mcp/install.js");
+    assert!(
+        !installer.contains("getWorkerBinaryName"),
+        "the retired worker-name alias must not exist"
+    );
+    assert!(
+        !installer.contains("hasWorker"),
+        "hasWorker was permanently true (worker === main binary) and is dead code"
+    );
+    assert!(
+        installer.contains("cargoDaemon"),
+        "the cargo fallback must link the daemon (leindexd) into the package"
+    );
+}
+
+/// The macOS source install must place `leindexd` beside `leindex` and must
+/// not reference the retired `leindex-embed` binary (its build produces
+/// none, so every install printed a false "neural search unavailable"
+/// warning and never installed the daemon). Prose explaining the retirement
+/// is intentionally allowed (same convention as install.sh's guard).
+#[test]
+fn test_install_macos_installs_the_daemon_not_the_retired_worker() {
+    let script = read_repo_file("install_macos.sh");
+    assert!(
+        script.contains("target/release/leindexd"),
+        "macOS source install must install leindexd"
+    );
+    assert!(
+        !script.contains("release/leindex-embed"),
+        "the retired leindex-embed binary must not be installed"
+    );
+    assert!(
+        !script.contains("worker_binary"),
+        "no worker-binary install block may remain"
+    );
+}

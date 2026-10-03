@@ -4,12 +4,12 @@
 //! Secondary: PSS from `smaps_rollup`; mapped-file vs anonymous from `smaps`
 //! when available (VAL-MEASURE-006).
 //!
-//! Worker-aware sampling (VAL-CPHASE-034): when a worker process name is
-//! provided, the sampler also discovers and samples any child process
-//! matching that name, returning combined RSS in the sample.
+//! Worker-aware sampling (VAL-CPHASE-034): workers are identified by the hidden
+//! argv token and sampled only when they are direct children of the measured
+//! process.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A single memory sample, optionally including a worker process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,25 +25,154 @@ pub struct MemorySample {
     /// Worker process RSS in KiB, if a worker was detected (VAL-CPHASE-034).
     /// 0 when no worker is running or worker tracking is not enabled.
     pub worker_rss_kib: u64,
+    /// GPU sample (VRAM utilization), if a GPU was detected (§14 item 8).
+    #[serde(default)]
+    pub gpu: GpuSample,
 }
 
-/// Read a single memory sample for the given PID.
+/// GPU VRAM/utilization sample (§14 item 8, §2.1 GPU memory reporting).
 ///
-/// Reads VmRSS from `/proc/<pid>/status` (primary), then PSS from
-/// `smaps_rollup`, and mapped-file / anonymous breakdown from full `smaps`.
-/// The `smaps` read is the most expensive part; callers that need faster
-/// sampling can use [`sample_fast`] instead.
+/// On a machine with ROCm (`rocm-smi`) or CUDA (`nvidia-smi`), fields are
+/// `Some`. On headless boxes (no GPU tools), all fields are `None`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct GpuSample {
+    /// VRAM used in MiB.
+    pub vram_used_mib: Option<u64>,
+    /// GPU utilization percentage.
+    pub gpu_utilization_pct: Option<u8>,
+    /// Provider: "rocm" | "cuda" | "migraphx".
+    pub provider: Option<String>,
+}
+
+/// Sample GPU VRAM and utilization via rocm-smi or nvidia-smi (first device only).
 ///
-/// If `worker_name` is `Some`, also discovers and samples any child process
-/// with that name (VAL-CPHASE-034).
-pub fn sample(pid: u32, worker_name: Option<&str>) -> anyhow::Result<MemorySample> {
+/// Returns `GpuSample::default()` (all None) on headless boxes where neither
+/// tool exists. Never panics.
+///
+/// Each call forks an external binary costing hundreds of milliseconds to
+/// seconds on GPU hosts. The per-tick sampler runs in a ~10 ms loop, so it
+/// must use [`cached_gpu_sample`]; calling this directly per tick degraded
+/// the loop to roughly one sample per GPU probe, under-reporting peak RSS
+/// (the metric the Memory Budget job gates on) and stretching every phase.
+pub fn sample_gpu() -> GpuSample {
+    // Try ROCm first (AMD/ROCm/MIGraphX).
+    if let Some(sample) = sample_gpu_rocm() {
+        return sample;
+    }
+    // Try CUDA (NVIDIA).
+    if let Some(sample) = sample_gpu_cuda() {
+        return sample;
+    }
+    // Headless: nothing found.
+    GpuSample::default()
+}
+
+/// How long a GPU probe result is reused before the probes fork again.
+const GPU_SAMPLE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`sample_gpu`] behind a TTL cache: the per-sample path stays RSS-only in
+/// practice, with the GPU probed at most once per TTL window.
+pub fn cached_gpu_sample() -> GpuSample {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, GpuSample)>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((sampled_at, sample)) = guard.as_ref() {
+        if sampled_at.elapsed() < GPU_SAMPLE_TTL {
+            return sample.clone();
+        }
+    }
+    let fresh = sample_gpu();
+    *guard = Some((std::time::Instant::now(), fresh.clone()));
+    fresh
+}
+
+/// Parse VRAM from `rocm-smi --showmeminfo vram --json`.
+fn sample_gpu_rocm() -> Option<GpuSample> {
+    let output = std::process::Command::new("rocm-smi")
+        .args(["--showmeminfo", "vram", "--json"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+
+    // rocm-smi --json returns a map keyed by device, e.g. {"card0": {"VRAM Total Used (B)": "1234567"}}
+    // We take the first device.
+    let obj = parsed.as_object()?;
+    let (_dev_name, dev_data) = obj.iter().next()?;
+    let dev = dev_data.as_object()?;
+
+    let vram_used_mib = dev
+        .iter()
+        .find(|(k, _)| k.contains("VRAM") && k.contains("Used"))
+        .and_then(|(_, v)| v.as_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|bytes| bytes / (1024 * 1024));
+
+    // GPU utilization is not directly available from --showmeminfo vram,
+    // but we can try to get it from the general JSON.
+    let gpu_utilization_pct = dev
+        .iter()
+        .find(|(k, _)| k.contains("GPU") && k.contains("Use"))
+        .and_then(|(_, v)| v.as_str())
+        .and_then(|s| s.trim_matches('%').parse::<u8>().ok());
+
+    Some(GpuSample {
+        vram_used_mib,
+        gpu_utilization_pct,
+        provider: Some("rocm".to_string()),
+    })
+}
+
+/// Parse VRAM and utilization from `nvidia-smi` CSV format.
+fn sample_gpu_cuda() -> Option<GpuSample> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.used,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let csv = String::from_utf8_lossy(&output.stdout);
+    let line = csv.lines().next()?;
+    let parts: Vec<&str> = line.trim().split(',').map(|s| s.trim()).collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let vram_used_mib = parts[0].parse::<u64>().ok();
+    let gpu_utilization_pct = parts[1].parse::<u8>().ok();
+
+    Some(GpuSample {
+        vram_used_mib,
+        gpu_utilization_pct,
+        provider: Some("cuda".to_string()),
+    })
+}
+
+/// If worker tracking is enabled, also discovers a direct child running in
+/// worker mode (VAL-CPHASE-034).
+pub fn sample(pid: u32, track_worker: bool) -> anyhow::Result<MemorySample> {
     let rss = read_vm_rss(pid)?;
     let (mapped, anon, pss) = read_smaps_breakdown(pid);
 
-    let worker_rss = match worker_name {
-        Some(name) => find_child_worker_rss(pid, name),
-        None => 0,
+    let worker_rss = if track_worker {
+        find_child_worker_rss(pid)
+    } else {
+        0
     };
+
+    // GPU sampling is global (not per-pid). TTL-cached: forking
+    // rocm-smi/nvidia-smi on every tick under-reported peak RSS and slowed
+    // every phase on GPU hosts.
+    let gpu = cached_gpu_sample();
 
     Ok(MemorySample {
         rss_kib: rss,
@@ -51,37 +180,45 @@ pub fn sample(pid: u32, worker_name: Option<&str>) -> anyhow::Result<MemorySampl
         anon_kib: anon,
         pss_kib: pss,
         worker_rss_kib: worker_rss,
+        gpu,
     })
 }
 
 /// Fast sample (VmRSS only) — used by high-frequency sampling tests.
 #[cfg(test)]
-fn sample_fast(pid: u32, worker_name: Option<&str>) -> anyhow::Result<MemorySample> {
+fn sample_fast(pid: u32) -> anyhow::Result<MemorySample> {
     let rss = read_vm_rss(pid)?;
-    let worker_rss = match worker_name {
-        Some(name) => find_child_worker_rss(pid, name),
-        None => 0,
-    };
     Ok(MemorySample {
         rss_kib: rss,
         mapped_file_kib: 0,
         anon_kib: 0,
         pss_kib: 0,
-        worker_rss_kib: worker_rss,
+        worker_rss_kib: 0,
+        gpu: GpuSample::default(),
     })
 }
 
-/// Find the RSS of a child process matching the given name.
+/// Source of truth: `src/embed/worker_main.rs` (`INTERNAL_WORKER_TOKEN`).
+pub const WORKER_CMDLINE_TOKEN: &str = "--internal-embed-worker";
+
+/// Whether `/proc/<pid>/cmdline` contains the worker token as an argument.
+pub fn is_worker_process(pid: u32) -> bool {
+    let path = format!("/proc/{pid}/cmdline");
+    let Ok(cmdline) = std::fs::read(&path) else {
+        return false;
+    };
+    cmdline
+        .split(|byte| *byte == 0)
+        .any(|argument| argument == WORKER_CMDLINE_TOKEN.as_bytes())
+}
+
+/// Find the RSS of a direct child running in worker mode.
 ///
-/// Scans `/proc/<pid>/task/<tid>/children` to discover child PIDs,
-/// then checks `/proc/<child_pid>/comm` for a matching process name.
-/// Returns the RSS of the first matching child, or 0 if none found.
-///
-/// VAL-CPHASE-034: The memcheck harness detects the worker process once
-/// embedding begins and records it separately from the main daemon.
-fn find_child_worker_rss(parent_pid: u32, worker_name: &str) -> u64 {
-    // Strategy: scan /proc for processes whose ppid matches our pid
-    // and whose comm matches the worker name.
+/// Scans `/proc` for direct children whose NUL-separated argv contains the
+/// hidden worker token. Returns the RSS of the first matching child, or 0.
+/// Ownership is checked independently of the process name because the worker
+/// re-executes the same binary as its parent.
+fn find_child_worker_rss(parent_pid: u32) -> u64 {
     let proc_dir = match std::fs::read_dir("/proc") {
         Ok(d) => d,
         Err(_) => return 0,
@@ -89,42 +226,21 @@ fn find_child_worker_rss(parent_pid: u32, worker_name: &str) -> u64 {
 
     for entry in proc_dir.flatten() {
         let name = entry.file_name();
-        let name_str = match name.to_str() {
-            Some(s) => s,
-            None => continue,
+        let Some(name_str) = name.to_str() else {
+            continue;
         };
-
-        // Skip non-numeric entries
-        let child_pid: u32 = match name_str.parse() {
-            Ok(p) => p,
-            Err(_) => continue,
+        let Ok(child_pid) = name_str.parse::<u32>() else {
+            continue;
         };
-
-        // Skip our own pid
-        if child_pid == parent_pid {
+        if child_pid == parent_pid || !is_child_of(child_pid, parent_pid) {
             continue;
         }
-
-        // Check if this process is a child of our target
-        if !is_child_of(child_pid, parent_pid) {
-            continue;
-        }
-
-        // Check the process name
-        let comm = match read_proc_comm(child_pid) {
-            Some(c) => c,
-            None => continue,
-        };
-
-        // Match: the worker binary name (without path) should match
-        // "leindex-embed" — comm may be truncated to 15 chars on Linux
-        if comm == worker_name || comm.starts_with(worker_name) {
-            if let Ok(rss) = read_vm_rss(child_pid) {
-                return rss;
-            }
+        if is_worker_process(child_pid)
+            && let Ok(rss) = read_vm_rss(child_pid)
+        {
+            return rss;
         }
     }
-
     0
 }
 
@@ -159,15 +275,7 @@ fn is_child_of(child_pid: u32, parent_pid: u32) -> bool {
     false
 }
 
-/// Read the process name from `/proc/<pid>/comm`.
-fn read_proc_comm(pid: u32) -> Option<String> {
-    let path = format!("/proc/{}/comm", pid);
-    std::fs::read_to_string(&path)
-        .ok()
-        .map(|s| s.trim().to_string())
-}
-
-/// Read VmRSS from /proc/<pid>/status.
+/// Read VmRSS from /proc/`<pid>`/status.
 fn read_vm_rss(pid: u32) -> anyhow::Result<u64> {
     let path = PathBuf::from(format!("/proc/{}/status", pid));
     let content = std::fs::read_to_string(&path)
@@ -299,6 +407,128 @@ fn is_vma_header(line: &str) -> bool {
     false
 }
 
+/// Capture a heap-profile snapshot for the given PID at a phase boundary.
+///
+/// On default (glibc) builds, captures `/proc/<pid>/smaps` as a phase-boundary
+/// snapshot — works on all Linux without requiring the memprof build.
+/// The output file is named `<phase>_<boundary>.smaps` and written to `out_dir`.
+///
+/// When `cargo build --features memprof` is used, engineers can set
+/// `MALLOC_CONF=prof:true` and use jemalloc epoch-based dumping for deeper
+/// analysis (see `src/bin/leindex.rs` doc comment).
+///
+/// Returns the path to the written snapshot file.
+pub fn capture_heap_profile(
+    pid: u32,
+    phase: &str,
+    boundary: &str,
+    out_dir: &Path,
+) -> std::io::Result<PathBuf> {
+    let smaps_path = PathBuf::from(format!("/proc/{}/smaps", pid));
+    let content = std::fs::read_to_string(&smaps_path)?;
+
+    let file_name = format!("{}_{}.smaps", phase, boundary);
+    let out_path = out_dir.join(file_name);
+    std::fs::write(&out_path, &content)?;
+
+    Ok(out_path)
+}
+
+/// Descendant process-tree summary (§14 item: "count descendant processes").
+///
+/// Walks `/proc/*/stat` PPID fields in BFS from `root_pid` to discover all
+/// living descendants. Reports total count, per-name counts, and combined RSS.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct DescendantTree {
+    /// Total number of descendant processes (not counting root).
+    pub total: usize,
+    /// Process name → count.
+    pub by_name: HashMap<String, usize>,
+    /// Sum of RSS across all descendants, in KiB.
+    pub combined_rss_kib: u64,
+}
+
+use std::collections::HashMap;
+
+/// System page size in KiB (`/proc/<pid>/stat` reports RSS in pages).
+fn page_size_kib() -> u64 {
+    // SAFETY: `sysconf` has no preconditions and touches no Rust state.
+    let bytes = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if bytes > 0 { (bytes as u64) / 1024 } else { 4 }
+}
+
+/// Parse one `/proc/<pid>/stat` line into `(ppid, comm, rss_kib)`.
+///
+/// `comm` may itself contain spaces and parentheses, so everything is located
+/// relative to the *last* `)`. The fields after it start at field 3 (`state`);
+/// `rss` is field 24 — index 21 of that remainder — and is counted in pages.
+fn parse_proc_stat(content: &str, page_kib: u64) -> Option<(u32, String, u64)> {
+    let close_paren = content.rfind(')')?;
+    let comm = content[..close_paren]
+        .split_once('(')
+        .map(|(_, name)| name.to_string())
+        .unwrap_or_default();
+    // fields[0] = state (field 3), fields[1] = ppid (field 4), ..., fields[21] = rss (field 24).
+    let fields: Vec<&str> = content[close_paren + 1..].split_whitespace().collect();
+    let ppid: u32 = fields.get(1)?.parse().ok()?;
+    let rss_pages: u64 = fields.get(21).and_then(|s| s.parse().ok()).unwrap_or(0);
+    Some((ppid, comm, rss_pages * page_kib))
+}
+
+/// Count all descendant processes of `root_pid` via BFS over `/proc/*/stat`.
+///
+/// Walks the process tree starting from `root_pid`, visiting every process
+/// whose PPID matches a discovered ancestor. Returns a [`DescendantTree`]
+/// summarizing total count, per-name counts, and combined RSS.
+///
+/// `root_pid` itself is NOT counted (only its descendants).
+pub fn count_descendants(root_pid: u32) -> std::io::Result<DescendantTree> {
+    // Build a map of pid → (ppid, name, rss_kib) for all live processes.
+    let mut all_procs: Vec<(u32, u32, String, u64)> = Vec::new();
+    let page_kib = page_size_kib();
+    let proc_dir = std::fs::read_dir("/proc")?;
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let pid: u32 = match name_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Read ppid, name and RSS from /proc/<pid>/stat
+        let stat_path = format!("/proc/{}/stat", pid);
+        let Ok(content) = std::fs::read_to_string(&stat_path) else {
+            continue;
+        };
+        let Some((ppid, comm, rss_kib)) = parse_proc_stat(&content, page_kib) else {
+            continue;
+        };
+        all_procs.push((pid, ppid, comm, rss_kib));
+    }
+
+    // BFS from root_pid
+    let mut tree = DescendantTree::default();
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(root_pid);
+    let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+    while let Some(current_pid) = queue.pop_front() {
+        for &(pid, ppid, ref name, rss) in &all_procs {
+            if ppid == current_pid && !visited.contains(&pid) && pid != root_pid {
+                visited.insert(pid);
+                tree.total += 1;
+                *tree.by_name.entry(name.clone()).or_insert(0) += 1;
+                tree.combined_rss_kib += rss;
+                queue.push_back(pid);
+            }
+        }
+    }
+
+    Ok(tree)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,7 +536,7 @@ mod tests {
     #[test]
     fn test_sample_current_process() {
         let pid = std::process::id();
-        let sample = sample(pid, None);
+        let sample = sample(pid, false);
         assert!(sample.is_ok(), "should be able to sample current process");
         let s = sample.unwrap();
         assert!(s.rss_kib > 0, "RSS should be positive");
@@ -316,7 +546,7 @@ mod tests {
     #[test]
     fn test_sample_fast_current_process() {
         let pid = std::process::id();
-        let s = sample_fast(pid, None).expect("fast sample should work");
+        let s = sample_fast(pid).expect("fast sample should work");
         assert!(s.rss_kib > 0, "RSS should be positive");
         // Fast sample does not populate mapped/anon/pss
         assert_eq!(s.mapped_file_kib, 0);
@@ -372,7 +602,7 @@ mod tests {
     #[test]
     fn test_find_child_worker_rss_no_worker() {
         let pid = std::process::id();
-        let rss = find_child_worker_rss(pid, "leindex-embed");
+        let rss = find_child_worker_rss(pid);
         assert_eq!(rss, 0, "no worker child expected for memcheck process");
     }
 
@@ -384,14 +614,141 @@ mod tests {
     }
 
     #[test]
-    fn test_read_proc_comm() {
-        let pid = std::process::id();
-        let comm = read_proc_comm(pid);
+    fn test_gpu_sample_returns_some_on_amdgpu_or_none_elsewhere() {
+        let s = sample_gpu();
+        // On a box with ROCm: vram_used_mib is Some. On headless CI: all None.
+        // Either is valid; we just assert it doesn't panic and the struct is usable.
+        let _ = s.vram_used_mib;
+        let _ = s.gpu_utilization_pct;
+        let _ = s.provider;
+    }
+
+    #[test]
+    fn test_gpu_sample_is_consistent() {
+        // Two calls should return consistent types (both Some or both None for provider).
+        let s1 = sample_gpu();
+        let s2 = sample_gpu();
+        assert_eq!(s1.provider.is_some(), s2.provider.is_some());
+    }
+
+    #[test]
+    fn test_gpu_sample_default_is_all_none() {
+        let s = GpuSample::default();
+        assert!(s.vram_used_mib.is_none());
+        assert!(s.gpu_utilization_pct.is_none());
+        assert!(s.provider.is_none());
+    }
+
+    #[test]
+    fn test_heap_profile_writes_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = capture_heap_profile(std::process::id(), "test", "before", tmp.path()).unwrap();
+        assert!(p.exists(), "heap profile file should exist");
         assert!(
-            comm.is_some(),
-            "should be able to read comm for current process"
+            p.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("test_before")
         );
-        // The process name should be non-empty
-        assert!(!comm.unwrap().is_empty());
+        let metadata = std::fs::metadata(&p).unwrap();
+        assert!(metadata.len() > 0, "heap profile file should be non-empty");
+    }
+
+    #[test]
+    fn test_heap_profile_missing_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = capture_heap_profile(u32::MAX, "test", "before", tmp.path());
+        assert!(result.is_err(), "missing pid should produce an error");
+    }
+
+    #[test]
+    fn test_count_descendants_includes_spawned_child() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        // Brief wait for /proc to reflect the child
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let tree = count_descendants(std::process::id()).unwrap();
+        assert!(
+            tree.total >= 1,
+            "should find at least 1 descendant (the sleep child), got {}",
+            tree.total
+        );
+        // The child should appear in by_name
+        assert!(
+            tree.by_name.contains_key("sleep") || tree.by_name.values().sum::<usize>() >= 1,
+            "by_name should contain the child process"
+        );
+        child.kill().ok();
+        child.wait().ok();
+
+        // After killing, OUR child must be gone from the process table.
+        // Asserting a global total==0 races with sibling tests' transient
+        // children (chrono_now's `date`, git probes) under parallel test
+        // threads, so scope the assertion to the child we spawned.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let child_pid = child.id();
+        let child_gone = !std::path::Path::new(&format!("/proc/{child_pid}")).exists();
+        let tree_after = count_descendants(std::process::id()).unwrap();
+        assert!(
+            child_gone && !tree_after.by_name.contains_key("sleep"),
+            "after killing the child (pid {child_pid}), it must no longer be a descendant: {:?}",
+            tree_after.by_name
+        );
+    }
+
+    #[test]
+    fn test_count_descendants_no_children() {
+        // The test process might have residual children from other tests
+        // running concurrently (e.g. test_count_descendants_includes_spawned_child
+        // spawns a "sleep"). We only check that total is small (no big tree).
+        let tree = count_descendants(std::process::id()).unwrap();
+        assert!(
+            tree.total < 5,
+            "test process should have very few descendants: {} found: {:?}",
+            tree.total,
+            tree.by_name
+        );
+    }
+
+    #[test]
+    fn test_parse_proc_stat_reads_rss_field_in_kib() {
+        // Field 24 (rss) = 777 pages; field 26 (startcode) is a large address
+        // that the old off-by-two index returned instead. comm contains a
+        // space and parentheses to prove parsing anchors on the last ')'.
+        let line = "4242 (my (odd) proc) S 100 4242 4242 0 -1 4194560 \
+            1 2 3 4 5 6 7 8 20 0 1 0 999 1000000 777 18446744073709551615 \
+            4194304 4198400 140730000000000 0 0 0 0 0 0 0 0 0 17 0 0 0 0";
+        let (ppid, comm, rss_kib) = parse_proc_stat(line, 4).unwrap();
+        assert_eq!(ppid, 100);
+        assert_eq!(comm, "my (odd) proc");
+        assert_eq!(
+            rss_kib,
+            777 * 4,
+            "rss must be field 24, scaled pages -> KiB"
+        );
+    }
+
+    #[test]
+    fn test_parse_proc_stat_rejects_truncated_line() {
+        assert!(parse_proc_stat("1 (x)", 4).is_none());
+        assert!(parse_proc_stat("garbage", 4).is_none());
+    }
+
+    #[test]
+    fn test_descendant_tree_serde_roundtrip() {
+        let mut by_name = HashMap::new();
+        by_name.insert("leindex-embed".to_string(), 1);
+        let tree = DescendantTree {
+            total: 1,
+            by_name,
+            combined_rss_kib: 50000,
+        };
+        let json = serde_json::to_string(&tree).unwrap();
+        let deserialized: DescendantTree = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, tree);
     }
 }

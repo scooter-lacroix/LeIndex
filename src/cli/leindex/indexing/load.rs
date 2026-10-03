@@ -7,6 +7,22 @@ use crate::cli::leindex::LeIndex;
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
+/// What a search snapshot yields before the graph is known.
+struct PreparedEngine {
+    persisted_embedder: Option<index_builder::TfIdfEmbedder>,
+    restored: Option<RestoredEngine>,
+}
+
+/// A search engine restored from a snapshot, with the identity of the graph it
+/// was built for.
+struct RestoredEngine {
+    engine: crate::search::search::SearchEngine,
+    pdg_nodes: usize,
+    pdg_edges: usize,
+    pdg_fingerprint: String,
+    indexed_count: usize,
+}
+
 impl LeIndex {
     pub(crate) fn load_from_storage_inner_at(
         &mut self,
@@ -21,49 +37,99 @@ impl LeIndex {
             self.project_id, pdg_only
         );
 
-        let mut pdg = match storage_override {
-            Some(storage) => crate::storage::pdg_store::load_pdg(storage, &self.project_id),
-            None => crate::storage::pdg_store::load_pdg(&self.storage, &self.project_id),
+        // The search snapshot does not depend on the graph until it is
+        // *validated* against it, so decode and restore it on another thread
+        // while this one reads the graph out of SQLite. The two halves cost
+        // about the same, so a cold search pays for one of them, not both.
+        let (pdg_loaded, prepared) = std::thread::scope(|scope| {
+            let restoring = (!pdg_only).then(|| {
+                let path = artifact_path.clone();
+                scope.spawn(move || Self::load_snapshot_engine(&path))
+            });
+            let pdg = match storage_override {
+                Some(storage) => crate::storage::pdg_store::load_pdg(storage, &self.project_id),
+                None => crate::storage::pdg_store::load_pdg(&self.storage, &self.project_id),
+            };
+            let prepared = restoring.and_then(|handle| handle.join().ok());
+            (pdg, prepared)
+        });
+        let mut pdg = pdg_loaded.context("Failed to load PDG from storage")?;
+        #[cfg(feature = "community")]
+        if let Err(error) = crate::storage::community_store::load_community_memberships(
+            storage_override.unwrap_or(&self.storage),
+            &self.project_id,
+            &mut pdg,
+        ) {
+            warn!(%error, "Failed to hydrate persisted community memberships");
         }
-        .context("Failed to load PDG from storage")?;
-        let persist_artifacts = artifact_path == self.storage_path;
-
-        let pdg_node_count = pdg.node_count();
-        let pdg_edge_count = pdg.edge_count();
-
         info!(
             "Loaded PDG with {} nodes and {} edges",
-            pdg_node_count, pdg_edge_count
+            pdg.node_count(),
+            pdg.edge_count()
         );
 
         index_builder::normalize_external_nodes(&mut pdg);
 
         if pdg_only {
+            let pdg_node_count = pdg.node_count();
+            let pdg_edge_count = pdg.edge_count();
             // Skip search engine population — caller will call index_nodes() later.
             self.embedder = None;
             self.stats.pdg_nodes = pdg_node_count;
             self.stats.pdg_edges = pdg_edge_count;
-            self.pdg = Some(pdg);
+            self.pdg = Some(std::sync::Arc::new(pdg));
             return Ok(());
         }
 
-        let persisted_embedder =
-            index_builder::TfIdfEmbedder::load_from_artifact_path(&artifact_path)
-                .ok()
-                .flatten();
-        let current_pdg_fingerprint = index_builder::pdg_search_fingerprint(&pdg);
+        let prepared = prepared.unwrap_or_else(|| Self::load_snapshot_engine(&artifact_path));
+        self.hydrate_search_after_pdg_with(pdg, artifact_path, prepared)
+    }
 
-        // Fast path: hydrate the search engine from a persisted snapshot when it
-        // matches the current PDG and a fresh TF-IDF mmap/embedder are available.
-        if self.try_hydrate_from_snapshot(
-            &artifact_path,
-            pdg_node_count,
-            pdg_edge_count,
-            &current_pdg_fingerprint,
-            persisted_embedder.as_ref(),
-        ) {
-            self.pdg = Some(pdg);
-            return Ok(());
+    /// Hydrate the search engine on top of a PDG that is *already resident*.
+    ///
+    /// A graph-only load followed by a search used to fall back to a complete
+    /// `load_from_storage`, reading and rebuilding the whole PDG a second time
+    /// just to get the engine. This runs only the engine half. If the graph is
+    /// not loaded yet, it loads everything.
+    pub(crate) fn hydrate_search_engine_from_loaded_pdg(&mut self) -> Result<()> {
+        let Some(pdg) = self.take_owned_pdg() else {
+            return self.load_from_storage();
+        };
+        let artifact_path = self.active_storage_path();
+        let prepared = Self::load_snapshot_engine(&artifact_path);
+        self.hydrate_search_after_pdg_with(pdg, artifact_path, prepared)
+    }
+
+    /// Restore the search engine for `pdg` from a persisted snapshot when it is
+    /// current, otherwise rebuild it, then finalize (neural, stats, `self.pdg`).
+    fn hydrate_search_after_pdg_with(
+        &mut self,
+        pdg: crate::graph::pdg::ProgramDependenceGraph,
+        artifact_path: std::path::PathBuf,
+        prepared: PreparedEngine,
+    ) -> Result<()> {
+        let persist_artifacts = artifact_path == self.storage_path;
+        let pdg_node_count = pdg.node_count();
+        let pdg_edge_count = pdg.edge_count();
+        let current_pdg_fingerprint = index_builder::pdg_search_fingerprint(&pdg);
+        let PreparedEngine {
+            persisted_embedder,
+            restored,
+        } = prepared;
+
+        // Fast path: adopt the restored engine when it matches the current PDG.
+        if let Some(restored) = restored {
+            if self.install_restored_engine(
+                restored,
+                &artifact_path,
+                pdg_node_count,
+                pdg_edge_count,
+                &current_pdg_fingerprint,
+                persisted_embedder.as_ref(),
+            ) {
+                self.pdg = Some(std::sync::Arc::new(pdg));
+                return Ok(());
+            }
         }
 
         // Slow path: rebuild the TF-IDF index from the PDG, then finalize.
@@ -84,37 +150,31 @@ impl LeIndex {
         )
     }
 
-    /// Try to hydrate the search engine from a persisted snapshot. Returns true
-    /// when hydration succeeded (embedder/stats set; caller assigns `self.pdg`
-    /// and returns), false when the snapshot is absent/stale/mismatched and the
-    /// caller must rebuild from the PDG.
-    fn try_hydrate_from_snapshot(
-        &mut self,
-        artifact_path: &std::path::Path,
-        pdg_node_count: usize,
-        pdg_edge_count: usize,
-        current_pdg_fingerprint: &str,
-        persisted_embedder: Option<&index_builder::TfIdfEmbedder>,
-    ) -> bool {
-        let Some(snapshot) = index_builder::try_load_search_snapshot_from_storage(artifact_path)
-        else {
-            return false;
-        };
-        let Some(tfidf_mmap) = index_builder::try_load_mmap_embeddings_from_storage(artifact_path)
-        else {
-            return false;
-        };
-        let Some(tfidf_embedder) = persisted_embedder.cloned() else {
-            return false;
-        };
-        if !(snapshot.pdg_nodes == pdg_node_count
-            && snapshot.pdg_edges == pdg_edge_count
-            && snapshot.pdg_fingerprint == current_pdg_fingerprint
-            && tfidf_embedder.is_fresh(pdg_node_count, pdg_edge_count, current_pdg_fingerprint))
-        {
-            info!("Search snapshot/embedder stale for current PDG; rebuilding search index");
-            return false;
+    /// Read and restore everything a snapshot holds that does not need the
+    /// graph: the TF-IDF embedder, the snapshot, the embedding mmaps and the
+    /// search engine built from them. Pure with respect to `self`, so it can
+    /// run beside the graph load; [`Self::install_restored_engine`] validates
+    /// the result against the graph afterwards.
+    fn load_snapshot_engine(artifact_path: &std::path::Path) -> PreparedEngine {
+        let persisted_embedder =
+            index_builder::TfIdfEmbedder::load_from_artifact_path(artifact_path)
+                .ok()
+                .flatten();
+        let restored =
+            Self::restore_engine_from_snapshot(artifact_path, persisted_embedder.as_ref());
+        PreparedEngine {
+            persisted_embedder,
+            restored,
         }
+    }
+
+    fn restore_engine_from_snapshot(
+        artifact_path: &std::path::Path,
+        persisted_embedder: Option<&index_builder::TfIdfEmbedder>,
+    ) -> Option<RestoredEngine> {
+        let snapshot = index_builder::try_load_search_snapshot_from_storage(artifact_path)?;
+        let tfidf_mmap = index_builder::try_load_mmap_embeddings_from_storage(artifact_path)?;
+        persisted_embedder?;
 
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
         let neural_mmap =
@@ -124,18 +184,20 @@ impl LeIndex {
         let neural_mmap: Option<std::sync::Arc<crate::search::vector::MmapEmbeddingIndex>> = None;
 
         // Fragment layer (Task 5, invariant 8): thread the fragment mmap + id
-        // list into the restore call. The rich fragment store (owner/file/byte
-        // metadata) is wired in Task 7; until fragment_store.bin exists the id
-        // list is empty and the fragment layer stays off (feature-off
-        // compatible). `fragment_layer_is_valid` rejects stale roots, so a
-        // mismatched artifact can never poison the node-level path. Shared with
-        // the slow TF-IDF-fallback rebuild path (Codex wave-6 item 1).
+        // list into the restore call. `fragment_layer_is_valid` rejects stale
+        // roots, so a mismatched artifact can never poison the node-level path.
         let (fragment_mmap, fragment_ids, fragment_store) = Self::load_validated_fragment_layer(
             artifact_path,
             snapshot.fragment_root_hash.as_deref(),
         );
 
-        match self.search_engine.restore_from_search_snapshot(
+        let (pdg_nodes, pdg_edges, pdg_fingerprint) = (
+            snapshot.pdg_nodes,
+            snapshot.pdg_edges,
+            snapshot.pdg_fingerprint.clone(),
+        );
+        let mut engine = Self::configured_search_engine();
+        match engine.restore_from_search_snapshot(
             snapshot,
             std::sync::Arc::new(tfidf_mmap),
             neural_mmap,
@@ -143,61 +205,86 @@ impl LeIndex {
             fragment_ids.as_deref(),
         ) {
             Ok(indexed_count) => {
-                #[cfg(feature = "onnx")]
-                {
-                    match index_builder::HybridEmbedder::hybrid_local(
-                        tfidf_embedder,
-                        Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
-                    ) {
-                        Ok(hybrid) => self.embedder = Some(hybrid),
-                        Err(e) => {
-                            warn!(
-                                "Failed to create hybrid_local embedder for query embedding: {}",
-                                e
-                            );
-                            self.embedder = persisted_embedder
-                                .cloned()
-                                .map(index_builder::HybridEmbedder::tfidf_only);
-                        }
-                    }
-                }
-                #[cfg(not(feature = "onnx"))]
-                {
-                    self.embedder = Some(index_builder::HybridEmbedder::tfidf_only(tfidf_embedder));
-                }
-
                 // Fragment owner mapping (Task 6, invariant 6): content hash →
-                // ALL (owner node id, byte range) refs from the store, used at
-                // query time to map fragment hits back to their Tier-1 owners.
-                // A Vec per hash because identical content can legitimately
-                // live under N owners — dedup must not collapse multi-owner
-                // fragments to the first (Codex wave-2 item 5).
+                // ALL (owner node id, byte range) refs from the store.
                 if let Ok(Some(store)) = &fragment_store {
-                    self.search_engine
-                        .set_fragment_refs(fragment_owner_refs(store));
+                    engine.set_fragment_refs(fragment_owner_refs(store));
                 }
-
-                if let Err(err) = self.load_stats_from_path(artifact_path) {
-                    warn!("Failed to load persisted index stats: {err:#}");
-                }
-                self.stats.pdg_nodes = pdg_node_count;
-                self.stats.pdg_edges = pdg_edge_count;
-                self.stats.indexed_nodes = indexed_count;
-                self.build_file_stats_cache();
-                info!(
-                    "Hydrated search index from snapshot with {} nodes",
-                    indexed_count
-                );
-                true
+                Some(RestoredEngine {
+                    engine,
+                    pdg_nodes,
+                    pdg_edges,
+                    pdg_fingerprint,
+                    indexed_count,
+                })
             }
             Err(err) => {
                 warn!(
                     "Failed to hydrate search index from snapshot; rebuilding from PDG: {}",
                     err
                 );
-                false
+                None
             }
         }
+    }
+
+    /// Adopt a restored engine if it describes exactly this graph. Returns
+    /// false (leaving `self` untouched) when the snapshot or embedder is stale.
+    fn install_restored_engine(
+        &mut self,
+        restored: RestoredEngine,
+        artifact_path: &std::path::Path,
+        pdg_node_count: usize,
+        pdg_edge_count: usize,
+        current_pdg_fingerprint: &str,
+        persisted_embedder: Option<&index_builder::TfIdfEmbedder>,
+    ) -> bool {
+        let Some(tfidf_embedder) = persisted_embedder.cloned() else {
+            return false;
+        };
+        if !(restored.pdg_nodes == pdg_node_count
+            && restored.pdg_edges == pdg_edge_count
+            && restored.pdg_fingerprint == current_pdg_fingerprint
+            && tfidf_embedder.is_fresh(pdg_node_count, pdg_edge_count, current_pdg_fingerprint))
+        {
+            info!("Search snapshot/embedder stale for current PDG; rebuilding search index");
+            return false;
+        }
+        self.search_engine = restored.engine;
+
+        #[cfg(feature = "onnx")]
+        {
+            match index_builder::HybridEmbedder::hybrid_local(
+                tfidf_embedder.clone(),
+                Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
+            ) {
+                Ok(hybrid) => self.embedder = Some(hybrid),
+                Err(e) => {
+                    warn!(
+                        "Failed to create hybrid_local embedder for query embedding: {}",
+                        e
+                    );
+                    self.embedder = Some(index_builder::HybridEmbedder::tfidf_only(tfidf_embedder));
+                }
+            }
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            self.embedder = Some(index_builder::HybridEmbedder::tfidf_only(tfidf_embedder));
+        }
+
+        if let Err(err) = self.load_stats_from_path(artifact_path) {
+            warn!("Failed to load persisted index stats: {err:#}");
+        }
+        self.stats.pdg_nodes = pdg_node_count;
+        self.stats.pdg_edges = pdg_edge_count;
+        self.stats.indexed_nodes = restored.indexed_count;
+        self.build_file_stats_cache();
+        info!(
+            "Hydrated search index from snapshot with {} nodes",
+            restored.indexed_count
+        );
+        true
     }
 
     /// Rebuild the TF-IDF search index from the PDG. Reuses a persisted embedder
@@ -224,7 +311,6 @@ impl LeIndex {
                     &mut self.cache.file_stats_cache,
                     batch_size,
                     Some(tfidf_embedder),
-                    None,
                 )?
             } else {
                 info!("Persisted embedder is stale; rebuilding TF-IDF index");
@@ -233,7 +319,6 @@ impl LeIndex {
                     &mut self.search_engine,
                     &mut self.cache.file_stats_cache,
                     batch_size,
-                    None,
                     None,
                 )?
             }
@@ -244,7 +329,6 @@ impl LeIndex {
                 &mut self.search_engine,
                 &mut self.cache.file_stats_cache,
                 batch_size,
-                None,
                 None,
             )?
         })
@@ -325,8 +409,14 @@ impl LeIndex {
 
         if persist_artifacts {
             if let Some(embedder) = &self.embedder {
+                // The rebuild path only runs when the snapshot identity
+                // mismatched; persist the corrected identity from storage so
+                // the NEXT hydration takes the fast path instead of looping
+                // on the same mismatch.
+                let persisted_identity =
+                    index_builder::persisted_search_identity(&self.storage, &self.project_id);
                 embedder
-                    .persist_to_storage(&self.project_path, &pdg)
+                    .persist_to_storage(&self.project_path, &pdg, persisted_identity)
                     .context("Failed to persist TF-IDF embedder during hydration")?;
             }
         }
@@ -342,7 +432,7 @@ impl LeIndex {
         self.stats.pdg_edges = pdg_edge_count;
         self.stats.indexed_nodes = indexed_count;
 
-        self.pdg = Some(pdg);
+        self.pdg = Some(std::sync::Arc::new(pdg));
         self.build_file_stats_cache();
 
         // R10: Persist embeddings to mmap file for fast read-only access.
@@ -359,6 +449,15 @@ impl LeIndex {
             .context("Failed to persist search snapshot during hydration")?;
         }
         // Persist neural embeddings separately for fast load_from_storage.
+        // Record which generation this in-memory state was loaded from so
+        // the registry can detect external rebuilds (N-13).
+        if let Some(generation) =
+            crate::storage::generation::lease::read_current_generation(&self.storage_path)
+        {
+            self.hydrated_generation
+                .store(generation, std::sync::atomic::Ordering::Release);
+        }
+
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
         {
             if !persist_artifacts {

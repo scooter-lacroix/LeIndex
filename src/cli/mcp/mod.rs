@@ -27,6 +27,8 @@ pub mod lock;
 /// Dispatch macro for `ToolHandler` enum and match-arm generation.
 #[macro_use]
 pub mod macros;
+/// Grouped four-tool public surface (`action`-selected sub-tools).
+pub mod grouped;
 /// Request handlers for MCP tools.
 pub mod handlers;
 /// Shared helpers for MCP request processing.
@@ -37,12 +39,14 @@ pub mod output;
 pub mod protocol;
 /// Request budgets, timing metadata, and causal-path counters.
 pub mod request_meta;
+/// Response detail tiers (`l0` identity card, `l1` overview, `l2` full detail).
+pub mod tier;
 
-/// Handler for LeIndex [Context] — PDG-based context expansion.
+/// Handler for LeIndex \[Context\] — PDG-based context expansion.
 pub mod context_handler;
 /// Handler for LeIndex [Deep Analyze] — deep code analysis.
 pub mod deep_analyze_handler;
-/// Handler for LeIndex [Diagnostics] — project diagnostics.
+/// Handler for LeIndex \[Diagnostics\] — project diagnostics.
 pub mod diagnostics_handler;
 /// Handler for LeIndex [Edit Apply] — atomic code modifications.
 pub mod edit_apply_handler;
@@ -52,13 +56,15 @@ pub mod edit_cache;
 pub mod edit_preview_handler;
 /// Handler for LeIndex [File Summary] — structured file analysis.
 pub mod file_summary_handler;
+/// Handler for LeIndex \[Find\] — index-accelerated text/symbol search.
+pub mod find_handler;
+/// Handler for LeIndex [Git Diff] — PDG-enriched diff.
+pub mod git_diff_handler;
 /// Handler for LeIndex [Git Status] — PDG-aware git status.
 pub mod git_status_handler;
-/// Handler for LeIndex [Grep Symbols] — structurally-aware symbol search.
-pub mod grep_symbols_handler;
 /// Handler for LeIndex [Impact Analysis] — transitive dependency impact.
 pub mod impact_analysis_handler;
-/// Handler for LeIndex [Index] — project indexing.
+/// Handler for LeIndex \[Index\] — project indexing.
 pub mod index_handler;
 /// Handler for LeIndex [Phase Analysis] — multi-phase analysis.
 pub mod phase_handler;
@@ -70,13 +76,11 @@ pub mod read_file_handler;
 pub mod read_symbol_handler;
 /// Handler for LeIndex [Rename Symbol] — cross-file symbol rename.
 pub mod rename_symbol_handler;
-/// Handler for LeIndex [Search] — semantic code search.
+/// Handler for LeIndex \[Search\] — semantic code search.
 pub mod search_handler;
 /// Handler for LeIndex [Symbol Lookup] — full call graph lookup.
 pub mod symbol_lookup_handler;
-/// Handler for LeIndex [Text Search] — raw text/regex search.
-pub mod text_search_handler;
-/// Handler for LeIndex [Write] — atomic file creation with PDG surfacing.
+/// Handler for LeIndex \[Write\] — atomic file creation with PDG surfacing.
 pub mod write_handler;
 
 /// MCP server implementation.
