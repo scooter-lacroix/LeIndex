@@ -1582,6 +1582,59 @@ impl ProgramDependenceGraph {
         self.graph.node_weight_mut(id)
     }
 
+    /// Move a node to a different `file_path`, maintaining every index the
+    /// mutation affects (`file_index`, `name_file_index`, the trigram
+    /// index).
+    ///
+    /// A bare weight write (`get_node_mut(...).file_path = ...`, or through
+    /// `node_weights_mut`) leaves `file_index["<old>"]` holding this NodeId:
+    /// `remove_file` for the old file would then reap the node under its old
+    /// identity, and a later `remove_node` — looking it up under the NEW
+    /// path, which it was never inserted under — would leave a dangling
+    /// entry that petgraph slot recycling can alias onto an unrelated node.
+    /// Returns `false` when the node does not exist or already carries the
+    /// path.
+    pub fn repath_node(&mut self, node_id: NodeId, new_path: &str) -> bool {
+        let (name, node_id_str, old_path) = {
+            let Some(node) = self.graph.node_weight_mut(node_id) else {
+                return false;
+            };
+            if node.file_path.as_ref() == new_path {
+                return false;
+            }
+            let name = node.name.clone();
+            let node_id_str = node.id.clone();
+            let old_path = std::sync::Arc::clone(&node.file_path);
+            node.file_path = std::sync::Arc::from(new_path);
+            (name, node_id_str, old_path)
+        };
+        self.touch();
+        // file_index: leave the old entry, join the new one.
+        if let Some(ids) = self.file_index.get_mut(&*old_path) {
+            ids.retain(|&id| id != node_id);
+            if ids.is_empty() {
+                self.file_index.remove(&*old_path);
+            }
+        }
+        match self.file_index.get_mut(new_path) {
+            Some(ids) => ids.push(node_id),
+            None => {
+                self.file_index.insert(new_path.to_string(), vec![node_id]);
+            }
+        }
+        // (name, file_path) lookup key moves with the path.
+        self.name_file_index
+            .remove(&(name.clone(), old_path.to_string()));
+        self.name_file_index
+            .insert((name.clone(), new_path.to_string()), node_id);
+        // The trigram index indexes the path's trigrams for fuzzy lookup.
+        self.trigram_index
+            .remove_node(node_id, &name, &node_id_str, &old_path);
+        self.trigram_index
+            .add_node(node_id, &name, &node_id_str, new_path);
+        true
+    }
+
     /// Returns a mutable slice of all node weights.
     /// Used for bulk node mutations (e.g., external node normalization).
     pub fn node_weights_mut(&mut self) -> impl Iterator<Item = &mut Node> {

@@ -145,7 +145,24 @@ impl GenerationLease {
                         );
                     }
                 }
-                let _ = s.persist();
+                // The FIRST persist already committed the positive counts and
+                // the hold to the sidecar, so this rollback write MUST land:
+                // if it fails, the on-disk state keeps phantom pins with no
+                // GenerationLease to release them (Drop never runs), and
+                // reclaim_dead_owners cannot repair it while this process
+                // lives. The caller still gets GenerationPruned — the
+                // generation IS gone — but the failure is loud, and the next
+                // successful persist through any handle flushes these
+                // pending rollback deltas.
+                if let Err(error) = s.persist() {
+                    tracing::error!(
+                        generation = manifest.generation,
+                        %error,
+                        "generation lease rollback (pruned): persist FAILED — \
+                         phantom refcounts/hold may remain durably pinned until \
+                         another persist through any handle succeeds"
+                    );
+                }
                 return Err(LeaseError::GenerationPruned {
                     generation: manifest.generation,
                 });

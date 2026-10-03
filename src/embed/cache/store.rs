@@ -1054,7 +1054,11 @@ impl GlobalEmbeddingCache {
                 for sub_entry in fs::read_dir(entry.path())? {
                     let sub_entry = sub_entry?;
                     let path = sub_entry.path();
-                    if path.is_file() && !path.ends_with(".partial") {
+                    // Extension check, NOT `Path::ends_with(".partial")`:
+                    // that is a whole-component comparison and is never true
+                    // for a `x.partial` suffix, which permanently charged
+                    // staging bytes against the budget here.
+                    if path.is_file() && !path.extension().is_some_and(|ext| ext == "partial") {
                         total += fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     }
                 }
@@ -1088,7 +1092,7 @@ fn staging_path_for(final_path: &Path) -> PathBuf {
         .file_name()
         .map(std::ffi::OsString::from)
         .unwrap_or_default();
-    name.push(format!(".partial.{}.{}", std::process::id(), seq));
+    name.push(format!(".{}.{}.partial", std::process::id(), seq));
     final_path.with_file_name(name)
 }
 

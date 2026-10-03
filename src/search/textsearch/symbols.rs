@@ -5,7 +5,7 @@
 //! conversion reads the live file under the same containment rules the
 //! scanner enforces for index-seeded paths.
 
-use super::engine::{Compiled, RootSpec, dirty_files, path_stays_inside};
+use super::engine::{Compiled, MAX_SCAN_FILE_BYTES, RootSpec, dirty_files, path_stays_inside};
 
 /// A symbol whose *name* matched.
 #[derive(Debug, Clone)]
@@ -85,22 +85,45 @@ pub fn search_symbols(
         .skip(offset)
         .take(limit.unwrap_or(usize::MAX))
         .collect();
-    // Byte offsets -> lines, only for the returned window. The read is
-    // seeded from the index (`meta.path`), so it gets the same revalidation
-    // as `scan_file`: a path re-pointed at a symlink outside the root is not
-    // read, and a non-regular entry (e.g. a FIFO substituted since indexing)
-    // is never opened — `fs::read` would block on it with no deadline.
+    convert_window_lines(roots, &mut window);
+    (window, total)
+}
+
+/// Convert the window's byte offsets to line numbers, reading the live files.
+///
+/// The read is seeded from the index (`meta.path`), so it gets the same
+/// revalidation as `scan_file`: a path re-pointed at a symlink outside the
+/// root is not read, a non-regular entry (e.g. a FIFO substituted since
+/// indexing) is never opened — `fs::read` would block on it with no deadline
+/// — and oversized files are refused exactly where the scan refuses them.
+/// Hits sort by (rank, root, rel, line), so a one-entry memo serves every
+/// hit in the same file without re-reading it.
+fn convert_window_lines(roots: &[RootSpec], window: &mut [SymbolHit]) {
     let roots_canonical: Vec<Option<std::path::PathBuf>> = roots
         .iter()
         .map(|s| std::fs::canonicalize(&s.root).ok())
         .collect();
-    for hit in &mut window {
-        let path = roots[hit.root].root.join(&hit.rel);
-        let data = path_stays_inside(&path, roots_canonical[hit.root].as_deref())
-            .then(|| std::fs::metadata(&path).ok())
-            .flatten()
-            .filter(|meta| meta.is_file())
-            .and_then(|_| std::fs::read(&path).ok());
+    let mut memo: Option<(usize, String, std::sync::Arc<[u8]>)> = None;
+    for hit in window.iter_mut() {
+        let memo_hit = memo
+            .as_ref()
+            .is_some_and(|(root, rel, _)| *root == hit.root && rel == &hit.rel);
+        let data: Option<std::sync::Arc<[u8]>> = if memo_hit {
+            memo.as_ref()
+                .map(|(_, _, data)| std::sync::Arc::clone(data))
+        } else {
+            let path = roots[hit.root].root.join(&hit.rel);
+            let data = path_stays_inside(&path, roots_canonical[hit.root].as_deref())
+                .then(|| std::fs::metadata(&path).ok())
+                .flatten()
+                .filter(|meta| meta.is_file() && meta.len() <= MAX_SCAN_FILE_BYTES)
+                .and_then(|_| std::fs::read(&path).ok())
+                .map(Into::into);
+            memo = data
+                .as_ref()
+                .map(|data| (hit.root, hit.rel.clone(), std::sync::Arc::clone(data)));
+            data
+        };
         if let Some(data) = data {
             let (start, end) = (hit.line as usize, hit.end_line as usize);
             let line_of = |at: usize| {
@@ -113,7 +136,6 @@ pub fn search_symbols(
             hit.end_line = 0;
         }
     }
-    (window, total)
 }
 
 #[cfg(test)]

@@ -746,6 +746,16 @@ impl Storage {
     /// exactly inside `open`. A crash mid-backfill resumes on the next open:
     /// the first batch then walks past the already-rewritten prefix once and
     /// the cursor takes over from there.
+    ///
+    /// The cursor is monotonic only within this writer (rowids are recycled
+    /// from freed space, and startup migrations run outside the
+    /// cross-process write lock), so a peer committing a sentinel row at or
+    /// below the cursor mid-sweep would otherwise be skipped permanently
+    /// once the schema version advances. One cursorless verification
+    /// therefore follows every sweep; a non-empty check (however unlikely —
+    /// only a peer that skipped its own migration could write sentinels
+    /// here) logs loudly and runs exactly one more sweep instead of
+    /// silently advancing the version over unrepaired rows.
     fn backfill_column_batched(&mut self, column: &str, fallback: &str) -> SqliteResult<()> {
         if !matches!(
             (column, fallback),
@@ -758,32 +768,54 @@ impl Storage {
             )));
         }
         const BATCH_ROWS: i64 = 10_000;
-        let mut cursor = i64::MIN;
-        loop {
-            // Bounded look-ahead: the rowid predicate lets SQLite seek to the
-            // cursor, and LIMIT stops the scan after BATCH_ROWS matches. The
-            // upper bound is read back so the UPDATE below is an exact
-            // rowid-range rewrite (and the cursor strictly advances).
-            let upper: Option<i64> = self.conn.query_row(
-                &format!(
-                    "SELECT MAX(id) FROM (SELECT id FROM intel_nodes \
-                     WHERE {column} = '' AND id > ?1 ORDER BY id LIMIT {BATCH_ROWS})"
-                ),
-                rusqlite::params![cursor],
+        const MAX_SWEEPS: usize = 2;
+        for sweep in 1..=MAX_SWEEPS {
+            let mut cursor = i64::MIN;
+            loop {
+                // Bounded look-ahead: the rowid predicate lets SQLite seek to
+                // the cursor, and LIMIT stops the scan after BATCH_ROWS
+                // matches. The upper bound is read back so the UPDATE below
+                // is an exact rowid-range rewrite (and the cursor strictly
+                // advances).
+                let upper: Option<i64> = self.conn.query_row(
+                    &format!(
+                        "SELECT MAX(id) FROM (SELECT id FROM intel_nodes \
+                         WHERE {column} = '' AND id > ?1 ORDER BY id LIMIT {BATCH_ROWS})"
+                    ),
+                    rusqlite::params![cursor],
+                    |row| row.get(0),
+                )?;
+                let Some(upper) = upper else {
+                    break;
+                };
+                self.conn.execute(
+                    &format!(
+                        "UPDATE intel_nodes SET {column} = {fallback} \
+                         WHERE {column} = '' AND id > ?1 AND id <= ?2"
+                    ),
+                    rusqlite::params![cursor, upper],
+                )?;
+                cursor = upper;
+            }
+            // Cursorless verification sweep.
+            let remaining: i64 = self.conn.query_row(
+                &format!("SELECT COUNT(*) FROM intel_nodes WHERE {column} = ''"),
+                [],
                 |row| row.get(0),
             )?;
-            let Some(upper) = upper else {
+            if remaining == 0 {
                 return Ok(());
-            };
-            self.conn.execute(
-                &format!(
-                    "UPDATE intel_nodes SET {column} = {fallback} \
-                     WHERE {column} = '' AND id > ?1 AND id <= ?2"
-                ),
-                rusqlite::params![cursor, upper],
-            )?;
-            cursor = upper;
+            }
+            eprintln!(
+                "backfill {column}: {remaining} sentinel row(s) appeared outside cursor sweep \
+                 #{sweep} (concurrent writer at or below the cursor?); re-running the sweep"
+            );
         }
+        eprintln!(
+            "backfill {column}: sentinel rows persist after {MAX_SWEEPS} sweeps; \
+             they stay invisible to qualified-name lookups until the next open"
+        );
+        Ok(())
     }
 
     /// Migration from v4 to v5: backfill `qualified_name` for stores that

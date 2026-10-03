@@ -75,20 +75,30 @@ pub(crate) fn remove_file_from_pdg(
 
 /// Normalize external nodes: ensure any node with `language == "external"`
 /// also has `NodeType::External` — and carries the graph-level external
-/// path. The type flip alone would leave the creating file's path in place,
-/// keeping the node in that file's `file_index` entry: a later
-/// `remove_file`/`delete_file_data` for the file would then delete a shared
-/// placeholder other files' edges point at (the hazard
-/// [`crate::graph::pdg::EXTERNAL_NODE_FILE_PATH`] exists to prevent).
+/// path. The flip goes through [`ProgramDependenceGraph::repath_node`],
+/// NOT a bare weight write: `node_weights_mut` maintains no indexes, so a
+/// weight-level re-path would leave `file_index["<old file>"]` holding the
+/// placeholder's NodeId and `remove_file` for that file would still reap
+/// the shared placeholder (exactly the hazard
+/// [`crate::graph::pdg::EXTERNAL_NODE_FILE_PATH`] exists to prevent), while
+/// the missing `name_file_index`/trigram entries would dangle behind it.
 pub(crate) fn normalize_external_nodes(pdg: &mut ProgramDependenceGraph) {
-    let mut migrated = 0usize;
-    for node in pdg.node_weights_mut() {
-        let is_external = node.language == "external" || node.language.starts_with("external:");
-        if is_external && node.node_type != NodeType::External {
+    let to_migrate: Vec<petgraph::graph::NodeIndex> = pdg
+        .node_indices()
+        .filter(|idx| {
+            let Some(node) = pdg.get_node(*idx) else {
+                return false;
+            };
+            let is_external = node.language == "external" || node.language.starts_with("external:");
+            is_external && node.node_type != NodeType::External
+        })
+        .collect();
+    let migrated = to_migrate.len();
+    for idx in to_migrate {
+        if let Some(node) = pdg.get_node_mut(idx) {
             node.node_type = NodeType::External;
-            node.file_path = std::sync::Arc::from(crate::graph::pdg::EXTERNAL_NODE_FILE_PATH);
-            migrated += 1;
         }
+        pdg.repath_node(idx, crate::graph::pdg::EXTERNAL_NODE_FILE_PATH);
     }
     if migrated > 0 {
         info!(
@@ -116,10 +126,10 @@ mod tests {
     }
 
     /// A node that only becomes external via the language migration (round-8
-    /// Kilo) must also be re-pathed to the graph-level external vocabulary:
-    /// keeping the creating file's path would leave it in that file's
-    /// file_index entry, so a later remove/delete for the file would destroy
-    /// a shared placeholder other files' edges point at.
+    /// Kilo) must also be re-pathed to the graph-level external vocabulary —
+    /// through the index-maintaining repath (round-9 Kilo): a weight-level
+    /// write leaves `file_index["a.rs"]` holding the placeholder, so
+    /// `remove_file("a.rs")` would still reap the shared placeholder.
     #[test]
     fn test_normalize_external_nodes_repaths_migrated_nodes() {
         let mut pdg = ProgramDependenceGraph::new();
@@ -129,6 +139,8 @@ mod tests {
             "ext_thing",
             "external:crate::thing",
         ));
+        // A second, real node of the same file so remove_file has work to do.
+        let real = pdg.add_node(function("a.rs:real", "a.rs", "real", "rust"));
         normalize_external_nodes(&mut pdg);
         let node = pdg.get_node(idx).unwrap();
         assert_eq!(node.node_type, NodeType::External);
@@ -136,6 +148,32 @@ mod tests {
             node.file_path.as_ref(),
             crate::graph::pdg::EXTERNAL_NODE_FILE_PATH,
             "migrated externals leave the per-file namespace"
+        );
+        assert!(
+            !pdg.nodes_in_file("a.rs").contains(&idx),
+            "file_index must drop the migrated placeholder"
+        );
+        assert!(
+            pdg.nodes_in_file(crate::graph::pdg::EXTERNAL_NODE_FILE_PATH)
+                .contains(&idx),
+            "file_index must admit it under the external vocabulary"
+        );
+
+        // The hazard itself: removing the creating file must leave the
+        // shared placeholder standing.
+        pdg.remove_file("a.rs");
+        assert!(
+            pdg.get_node(idx).is_some(),
+            "placeholder survives remove_file"
+        );
+        assert!(pdg.get_node(real).is_none(), "the real node is gone");
+        // And it remains reachable by (name, file) after the move.
+        assert_eq!(
+            pdg.find_by_name_in_file(
+                "ext_thing",
+                Some(crate::graph::pdg::EXTERNAL_NODE_FILE_PATH)
+            ),
+            Some(idx),
         );
     }
 

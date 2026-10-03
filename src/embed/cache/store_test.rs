@@ -1091,5 +1091,8 @@ fn test_staging_path_is_unique_per_call_and_trailing_partial() {
         Some("partial"),
         "extension is exactly 'partial'"
     );
-    assert!(first.contains(&format!(".partial.{}.", std::process::id())));
+    assert!(
+        first.contains(&format!(".{}.", std::process::id())),
+        "pid is part of the unique suffix: {first}"
+    );
 }

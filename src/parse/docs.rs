@@ -68,8 +68,16 @@ impl CodeIntelligence for DocParser {
     fn get_signatures(&self, source: &[u8]) -> Result<Vec<SignatureInfo>> {
         if source.len() > MAX_DOC_FILE_BYTES {
             // Oversized doc: index just the first chunk's headings rather
-            // than dropping the file entirely.
-            let truncated = &source[..source.len().min(MAX_DOC_FILE_BYTES)];
+            // than dropping the file entirely. The cut retreats to a UTF-8
+            // character boundary — slicing mid-codepoint would fail the
+            // from_utf8 conversion below and drop the document after all.
+            let mut end = source.len().min(MAX_DOC_FILE_BYTES);
+            // Retreat past any UTF-8 continuation bytes (0b10xxxxxx) so the
+            // slice ends on a character boundary.
+            while end > 0 && source[end] & 0xC0 == 0x80 {
+                end -= 1;
+            }
+            let truncated = &source[..end];
             return self.get_signatures(truncated);
         }
         let text = std::str::from_utf8(source)
@@ -180,13 +188,24 @@ fn markdown_sections(text: &str) -> Vec<Section> {
     sections
 }
 
+/// Byte offset of the line following `start`: the line's length plus its
+/// real terminator. `str::lines` strips `\r\n` but reports only the line
+/// body, so advancing by `line.len() + 1` drifts one byte per preceding
+/// CRLF and shifts every later section range into the previous line.
+fn next_line_start(text: &str, start: usize) -> usize {
+    match text[start..].find('\n') {
+        Some(nl) => start + nl + 1,
+        None => text.len(),
+    }
+}
+
 /// RST underline headings: `Title\n=====` (and overline forms).
 fn rst_sections(text: &str) -> Vec<Section> {
     let lines: Vec<(usize, &str)> = text
         .lines()
         .scan(0usize, |offset, line| {
             let start = *offset;
-            *offset += line.len() + 1;
+            *offset = next_line_start(text, start);
             Some((start, line))
         })
         .collect();
@@ -233,7 +252,7 @@ fn adoc_sections(text: &str) -> Vec<Section> {
     let mut offset = 0usize;
     for line in text.lines() {
         let start = offset;
-        offset += line.len() + 1;
+        offset = next_line_start(text, offset);
         let trimmed = line.trim_start();
         let level = trimmed.chars().take_while(|&c| c == '=').count();
         if level >= 1 && trimmed.len() > level && trimmed.as_bytes()[level] == b' ' {
@@ -373,5 +392,68 @@ mod tests {
         // Plain flavor returns one section regardless; the guarantee under
         // test is that oversized input does not error.
         assert!(parser.get_signatures(&big).is_ok());
+    }
+
+    /// Oversized docs are truncated at a UTF-8 character boundary (round-9
+    /// Codex P2): a 1 MiB cut landing mid-codepoint used to fail the UTF-8
+    /// conversion and drop the document the truncation existed to save.
+    #[test]
+    fn test_oversized_doc_truncates_at_a_character_boundary() {
+        let parser = DocParser::new(DocFlavor::Markdown);
+        // 'é' is 2 bytes; place one straddling the 1 MiB cut point.
+        let mut body = vec![b'#'; MAX_DOC_FILE_BYTES - 1];
+        body.extend_from_slice("é\n# Tail heading\n".as_bytes());
+        assert!(body.len() > MAX_DOC_FILE_BYTES);
+        assert_eq!(
+            body[MAX_DOC_FILE_BYTES - 1],
+            0xC3,
+            "cut lands mid-codepoint"
+        );
+        let signatures = parser
+            .get_signatures(&body)
+            .expect("truncation must not fail UTF-8 validation");
+        let _ = signatures;
+    }
+
+    /// Section ranges stay byte-exact under CRLF line endings (round-9
+    /// Codex P2): `str::lines` strips \r\n while the offset walk advanced by
+    /// only one byte, shifting every later heading into the previous line.
+    #[test]
+    fn test_rst_and_adoc_section_ranges_survive_crlf() {
+        let rst =
+            "Title One\r\n=====\r\n\r\nintro text\r\n\r\nTitle Two\r\n=====\r\n\r\nbody two\r\n";
+        let sections = rst_sections(rst);
+        assert!(
+            sections.len() >= 2,
+            "both headings detected under CRLF, got {sections:?}"
+        );
+        assert_eq!(sections[0].0, "Title One");
+        assert_eq!(sections[1].0, "Title Two");
+        for (name, (start, end), _) in &sections {
+            assert!(
+                end > start && *end <= rst.len(),
+                "section {name} range ({start},{end}) out of bounds/empty"
+            );
+            let slice = &rst[*start..*end];
+            assert!(
+                slice.contains(name),
+                "section {name} must start at its own title, got: {slice:?}"
+            );
+        }
+
+        let adoc = "= Title One\r\n\r\nintro\r\n\r\n== Title Two\r\n\r\nbody two\r\n";
+        let sections = adoc_sections(adoc);
+        assert!(
+            sections.len() >= 2,
+            "both adoc headings under CRLF: {sections:?}"
+        );
+        for (name, (start, end), _) in &sections {
+            assert!(end > start && *end <= adoc.len());
+            let slice = &adoc[*start..*end];
+            assert!(
+                slice.contains(name),
+                "adoc section {name} must start at its own title, got: {slice:?}"
+            );
+        }
     }
 }

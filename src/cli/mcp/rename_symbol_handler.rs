@@ -222,18 +222,21 @@ fn reference_files(
         }
     }
     // Scope filter: PDG file paths are absolute while the scope argument may
-    // be project-relative. Resolve relative scopes against the project root
-    // and compare component-wise (`Path::starts_with`), so a relative scope
-    // no longer filters out every file (the old string prefix check compared
-    // an absolute path against a relative one and always failed) and
-    // "src/a.rs" cannot accidentally match "src/a.rs.bak".
+    // be project-relative. Resolve relative scopes against the project root,
+    // normalize the join lexically (`.`, `..`), and compare component-wise
+    // (`Path::starts_with`): `Path::join` keeps `.` components, so scope "."
+    // would resolve to `<root>/.`, never prefix-match, and the PDG path
+    // would report a successful zero-file rename. Normalization matches the
+    // live fallback; canonicalize is deliberately NOT used (it also resolves
+    // symlinks, which can diverge from how the inventory spells the files).
     let resolved_scope = scope.map(|s| {
         let path = std::path::Path::new(s);
-        if path.is_absolute() {
+        let joined = if path.is_absolute() {
             path.to_path_buf()
         } else {
             project_root.join(path)
-        }
+        };
+        normalize_lexical(&joined)
     });
     Ok(files
         .into_iter()
@@ -825,5 +828,38 @@ mod tests {
         assert!(props.get("preview_only").is_some());
         assert!(props.get("scope").is_some());
         assert!(props.get("project_path").is_some());
+    }
+
+    /// The PDG-backed scope filter normalizes the joined scope too (round-9
+    /// Kilo): `scope: "."` used to resolve to `<root>/.`, filter out every
+    /// file, and report a successful zero-file rename. reference_files is the
+    /// COMMON path (taken whenever the PDG is available).
+    #[test]
+    fn test_reference_files_normalizes_dot_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn old_name() {}\n").unwrap();
+        let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
+        pdg.add_node(crate::graph::pdg::Node {
+            id: "a.rs:old_name".into(),
+            node_type: crate::graph::pdg::NodeType::Function,
+            name: "old_name".into(),
+            file_path: dir
+                .path()
+                .join("a.rs")
+                .to_string_lossy()
+                .into_owned()
+                .into(),
+            byte_range: (0, 18),
+            complexity: 0,
+            language: "rust".into(),
+        });
+
+        let dot = reference_files(&pdg, "old_name", "brand_new", Some("."), dir.path())
+            .expect("scope '.' must keep every file in scope");
+        assert_eq!(dot.len(), 1, "got: {dot:?}");
+
+        let dot_src = reference_files(&pdg, "old_name", "brand_new", Some("./."), dir.path())
+            .expect("scope './.' must normalize to the root");
+        assert_eq!(dot_src.len(), 1, "got: {dot_src:?}");
     }
 }

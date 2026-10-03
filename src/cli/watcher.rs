@@ -180,10 +180,28 @@ fn run_reindex(handle: ProjectHandle) -> ReindexOutcome {
             // flock(2) locks live on the open file description — a second
             // descriptor's blocking acquisition never completes while this
             // task holds one, which would park this spawn_blocking (and the
-            // project write guard with it) forever. A peer process that grabs
-            // the lock in the gap publishes a fresh index; the forced full
-            // index then runs after it, which is redundant but correct.
+            // project write guard with it) forever.
             drop(_flock);
+            // A blocking acquire with a peer mid-index would park this
+            // spawn_blocking for the peer's whole run (and with it the
+            // watcher's `reindex_active` flag), so probe first: a peer that
+            // holds the lock is publishing a fresh index that makes the
+            // escalation redundant — skip, and the next debounce tick sees
+            // the hydrated state. The probe-then-escalate window is not
+            // airtight (a peer can grab the lock between the probe and
+            // `index_project`'s own acquire); in that residual race the
+            // escalation blocks for the peer's run — bounded, rare, and the
+            // same behavior a forced index documents.
+            match idx.try_acquire_write_lock() {
+                Ok(Some(_probe)) => {}
+                Ok(None) => {
+                    warn!(
+                        "Full-index escalation skipped: another process is indexing this project"
+                    );
+                    return ReindexOutcome::Skipped;
+                }
+                Err(e) => return ReindexOutcome::Failed(format!("write-lock probe: {e}")),
+            }
             let full_result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| idx.index_project(true)));
             match full_result {
