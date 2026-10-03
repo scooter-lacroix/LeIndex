@@ -898,13 +898,6 @@ pub(crate) fn collect_source_files_with_hashes(
         .collect()
 }
 
-/// Canonical file path for external placeholder nodes. Real file paths would
-/// tie a shared placeholder to whichever file's extraction pass created it,
-/// letting a per-file `remove_file`/`delete_file_data` delete a node other
-/// files' edges still point at.
-pub(crate) static EXTERNAL_NODE_FILE_PATH: std::sync::LazyLock<std::sync::Arc<str>> =
-    std::sync::LazyLock::new(|| std::sync::Arc::from("<external>"));
-
 /// Merge a source PDG into a target PDG.
 ///
 /// The merged target holds at most one node per node id: a source node whose
@@ -930,12 +923,25 @@ pub(crate) fn merge_pdgs(target: &mut ProgramDependenceGraph, source: ProgramDep
 
     for mut node in nodes_iter {
         if node.weight.node_type == NodeType::External {
-            node.weight.file_path = std::sync::Arc::clone(&EXTERNAL_NODE_FILE_PATH);
+            node.weight.file_path =
+                std::sync::Arc::from(crate::graph::pdg::EXTERNAL_NODE_FILE_PATH);
         }
         let new_idx = match target.find_by_id(&node.weight.id) {
             // Duplicate id (per-file external placeholder): fold onto the
-            // existing node; the moved weight is dropped.
-            Some(existing_idx) => existing_idx,
+            // existing node; the moved weight is dropped. A non-external
+            // duplicate means a caller merged without removing the file's
+            // old nodes first (a caller-side invariant) — stay visible so a
+            // future id scheme that produces real symbol collisions is
+            // diagnosed, not silently absorbed.
+            Some(existing_idx) => {
+                if node.weight.node_type != NodeType::External {
+                    warn!(
+                        id = %node.weight.id,
+                        "merge_pdgs folded a non-external duplicate node id (first wins)"
+                    );
+                }
+                existing_idx
+            }
             None => target.add_node(node.weight),
         };
         id_map.insert(node.index, new_idx);

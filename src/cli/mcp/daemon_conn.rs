@@ -160,31 +160,36 @@ async fn send_response(out: mpsc::Sender<(String, bool)>, response: Option<Strin
     }
 }
 
-/// How long one response frame may sit in a stalled socket write before the
-/// connection is torn down. A client that stops reading fills the bounded
-/// response queue and then parks the writer mid-`write_all`; without this
-/// ceiling the read loop parks behind it forever, `_attached` never drops,
-/// and the daemon's idle self-exit is suppressed for the daemon's lifetime.
+/// How long a socket write may make NO progress before the connection is
+/// torn down. A client that stops reading fills the bounded response queue
+/// and then parks the writer mid-`write_all`; without this ceiling the read
+/// loop parks behind it forever, `_attached` never drops, and the daemon's
+/// idle self-exit is suppressed for the daemon's lifetime.
+///
+/// This is an IDLE deadline, not a total-frame one: [`write_socket_frame`]
+/// writes in bounded chunks and resets the deadline on every completed
+/// chunk, so a slow-but-reading client draining a multi-MB response stays
+/// connected — only genuine silence (a peer that stopped reading) reaps the
+/// connection.
 const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Drain the outbound response queue into the socket until the peer goes
-/// away. A write stalled past [`WRITE_STALL_TIMEOUT`] hangs up: the parked
-/// senders then fail, the read loop breaks, and the connection is reclaimed.
+/// away. A write that makes no progress for [`WRITE_STALL_TIMEOUT`]
+/// hangs up: the parked senders then fail, the read loop breaks, and the
+/// connection is reclaimed.
 async fn drive_writer<W>(mut write_half: W, mut out_rx: mpsc::Receiver<(String, bool)>)
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     while let Some((response, framed)) = out_rx.recv().await {
-        let written = tokio::time::timeout(
-            WRITE_STALL_TIMEOUT,
-            write_socket_frame(&mut write_half, &response, framed),
-        )
-        .await
-        .unwrap_or_else(|_stalled| {
-            debug!("daemon socket write stalled past the deadline; hanging up");
-            false
-        });
+        // The stall detector lives inside `write_socket_frame` (per-chunk
+        // deadline). A total-frame timeout here would kill a slow-but-alive
+        // client draining a large frame at the 30 s mark even though bytes
+        // were still moving.
+        let written =
+            write_socket_frame(&mut write_half, &response, framed, WRITE_STALL_TIMEOUT).await;
         if !written {
+            debug!("daemon socket write stalled or failed; hanging up");
             break;
         }
     }

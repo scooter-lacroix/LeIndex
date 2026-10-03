@@ -470,6 +470,80 @@ fn test_save_pdg_duplicate_node_id_keeps_all_edges_referencable() {
 }
 
 #[test]
+fn test_delete_file_data_keeps_shared_external_placeholder() {
+    // The shared `external::` row lives under whatever file's extraction
+    // pass created it, so deleting that file must not reap the placeholder
+    // (or the other files' edges to it). Both the node delete and the edge
+    // delete exclude external rows.
+    let temp_file = NamedTempFile::new().unwrap();
+    let mut storage = Storage::open(temp_file.path()).unwrap();
+
+    let mut pdg = ProgramDependenceGraph::new();
+    let a_main = pdg.add_node(PDGNode {
+        id: "a.rs:main".to_string(),
+        node_type: PDGNodeType::Function,
+        name: "main".to_string(),
+        file_path: Arc::from("a.rs"),
+        byte_range: (0, 10),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+    let b_main = pdg.add_node(PDGNode {
+        id: "b.rs:main".to_string(),
+        node_type: PDGNodeType::Function,
+        name: "main".to_string(),
+        file_path: Arc::from("b.rs"),
+        byte_range: (0, 10),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+    let shared = pdg.add_node(PDGNode {
+        id: "external::String".to_string(),
+        node_type: PDGNodeType::External,
+        name: "String".to_string(),
+        file_path: Arc::from("a.rs"),
+        byte_range: (0, 0),
+        complexity: 0,
+        language: "external".to_string(),
+    });
+    pdg.add_edge(
+        a_main,
+        shared,
+        PDGEdge {
+            edge_type: PDGEdgeType::Call,
+            metadata: PDGEdgeMetadata::empty(),
+        },
+    );
+    pdg.add_edge(
+        b_main,
+        shared,
+        PDGEdge {
+            edge_type: PDGEdgeType::Call,
+            metadata: PDGEdgeMetadata::empty(),
+        },
+    );
+    save_pdg(&mut storage, "del_ext_proj", &pdg).unwrap();
+
+    delete_file_data(&mut storage, "del_ext_proj", "a.rs").unwrap();
+
+    let loaded = load_pdg(&storage, "del_ext_proj").unwrap();
+    assert!(
+        loaded.find_by_id("external::String").is_some(),
+        "the shared external survives its creating file's deletion"
+    );
+    assert_eq!(
+        loaded.node_count(),
+        2,
+        "b.rs:main + the shared external (a.rs:main gone)"
+    );
+    assert_eq!(
+        loaded.edge_count(),
+        1,
+        "b.rs's edge to the shared external survives"
+    );
+}
+
+#[test]
 fn test_shared_external_placeholder_round_trips_losslessly() {
     // The shape `merge_pdgs` produces after exact-id dedup: two callers and
     // ONE shared `external::` placeholder per target (the pre-dedup graph

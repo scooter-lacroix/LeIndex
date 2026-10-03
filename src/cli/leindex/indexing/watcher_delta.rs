@@ -1,5 +1,18 @@
 use super::*;
 
+/// Raised by [`LeIndex::incremental_reindex_from_watcher`] when no resident
+/// PDG is loaded. The caller MUST escalate to a full index — a delta-only
+/// save would truncate the stored graph — and both call sites (the watcher
+/// loop and post-edit refreshes) match on this type to run
+/// [`LeIndex::index_project`] instead of retrying the incremental path
+/// forever.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "incremental reindex requires a resident PDG; none is loaded (project not \
+     hydrated) — a full index is needed"
+)]
+pub struct NotHydratedError;
+
 impl LeIndex {
     /// Persist a tiny phase marker so diagnostics and owned MCP jobs can show
     /// useful progress without touching the resident PDG/search state. The
@@ -79,13 +92,11 @@ impl LeIndex {
         // delta-only graph holding just the changed files, and persisting it
         // would delete every unchanged file's nodes from the database (and
         // then install the truncated graph as resident, defeating every
-        // load gate). A project without a resident graph needs a full index,
-        // which the caller's error path escalates to.
+        // load gate). Fail with the typed [`NotHydratedError`] so callers
+        // escalate to a full index once instead of retrying this path on
+        // every tick.
         if self.pdg.is_none() {
-            anyhow::bail!(
-                "incremental reindex requires a resident PDG; none is loaded \
-                 (project not hydrated) — a full index is needed"
-            );
+            return Err(NotHydratedError.into());
         }
         let start_time = std::time::Instant::now();
         let indexed_files =

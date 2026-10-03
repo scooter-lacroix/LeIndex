@@ -1428,7 +1428,12 @@ async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 #[cfg(unix)]
-async fn write_socket_frame<W>(writer: &mut W, response: &str, content_length: bool) -> bool
+async fn write_socket_frame<W>(
+    writer: &mut W,
+    response: &str,
+    content_length: bool,
+    stall_timeout: std::time::Duration,
+) -> bool
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -1438,7 +1443,29 @@ where
     } else {
         format!("{}\n", response)
     };
-    writer.write_all(message.as_bytes()).await.is_ok() && writer.flush().await.is_ok()
+    // Write in bounded chunks with a per-chunk deadline: the timeout bounds
+    // the time since the last PROGRESS, not the total wall time of the
+    // frame. A slow-but-reading client draining a multi-MB response keeps
+    // resetting the deadline with every completed chunk and stays
+    // connected; a peer that stopped reading parks on a chunk write until
+    // the deadline fires. One total-frame deadline instead would hang up on
+    // legitimate large responses after exactly `stall_timeout` regardless
+    // of progress.
+    const CHUNK_BYTES: usize = 64 * 1024;
+    let bytes = message.as_bytes();
+    for chunk in bytes.chunks(CHUNK_BYTES.max(1)) {
+        let write = async {
+            writer.write_all(chunk).await?;
+            writer.flush().await
+        };
+        match tokio::time::timeout(stall_timeout, write).await {
+            Ok(Ok(())) => {}
+            // Socket error, or the peer stopped reading and the chunk write
+            // outlived the idle deadline: either way, hang up.
+            Ok(Err(_)) | Err(_) => return false,
+        }
+    }
+    true
 }
 
 #[cfg(unix)]

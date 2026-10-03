@@ -207,7 +207,15 @@ Find and read code. mode: search (by meaning, default), find (exact text/regex/s
         },
         "limit": {
           "default": 50,
-          "description": "Hits per page; 0 = all",
+          "description": "Hits per page; 0 = ceiling (10000)",
+          "maximum": 10000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "description": "Hits to skip (use next_offset; clamped to the 10000 ceiling)",
+          "maximum": 10000,
           "minimum": 0,
           "type": "integer"
         },
@@ -252,7 +260,7 @@ Find and read code. mode: search (by meaning, default), find (exact text/regex/s
         },
         "per_file_cap": {
           "default": 20,
-          "description": "Shown per file (all counted); 0 = no cap",
+          "description": "Hits shown per file; matches past the cap stay counted but appear on no page; 0 = no cap",
           "minimum": 0,
           "type": "integer"
         },

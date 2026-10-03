@@ -168,6 +168,32 @@ fn run_reindex(handle: ProjectHandle) -> ReindexOutcome {
     }));
     match reindex_result {
         Ok(Ok(_)) => ReindexOutcome::Completed,
+        Ok(Err(e)) if e.is::<crate::cli::leindex::indexing::watcher_delta::NotHydratedError>() => {
+            // No resident PDG: the incremental path can never succeed for
+            // this state, so retrying it on every tick would loop forever.
+            // Escalate ONCE, under the lock we already hold, to the full
+            // index — the path that hydrates the resident graph — and only
+            // report failure if that also errors.
+            warn!("Auto-reindex skipped ({}); escalating to a full index", e);
+            let full_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| idx.index_project(true)));
+            match full_result {
+                Ok(Ok(_)) => ReindexOutcome::Completed,
+                Ok(Err(full_err)) => {
+                    warn!("Full-index escalation failed: {}", full_err);
+                    ReindexOutcome::Failed(full_err.to_string())
+                }
+                Err(panic_payload) => {
+                    let msg = panic_payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_string());
+                    warn!("Full-index escalation panicked: {}", msg);
+                    ReindexOutcome::Failed(format!("panic: {}", msg))
+                }
+            }
+        }
         Ok(Err(e)) => {
             warn!("Auto-reindex failed: {}", e);
             ReindexOutcome::Failed(e.to_string())

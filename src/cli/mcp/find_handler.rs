@@ -119,9 +119,9 @@ impl FindHandler {
                 "output": { "type": "string", "enum": ["matches", "files", "count", "symbols"], "default": "matches", "description": "matches (default), files, count, or symbols (enclosing symbols by hits)" },
                 "kind": { "type": "string", "description": "target=symbols: function, class, struct, ..." },
                 "context_lines": { "type": "integer", "default": 0, "minimum": 0, "maximum": 10, "description": "Context lines per match" },
-                "limit": { "type": "integer", "default": DEFAULT_LIMIT, "minimum": 0, "maximum": MAX_LIMIT, "description": "Hits per page; 0 = all (capped)" },
-                "offset": { "type": "integer", "default": 0, "minimum": 0, "description": "Hits to skip (use next_offset)" },
-                "per_file_cap": { "type": "integer", "default": DEFAULT_PER_FILE, "minimum": 0, "description": "Hits shown per file; matches past the cap stay counted but appear on no page; 0 = no cap" },
+                "limit": { "type": "integer", "default": DEFAULT_LIMIT, "minimum": 0, "maximum": MAX_LIMIT, "description": "Hits per page; 0 = ceiling (10000)" },
+                "offset": { "type": "integer", "default": 0, "minimum": 0, "maximum": MAX_LIMIT, "description": "Hits to skip; clamped to 10000" },
+                "per_file_cap": { "type": "integer", "default": DEFAULT_PER_FILE, "minimum": 0, "description": "Shown per file; past-cap matches appear on no page; 0 = no cap" },
                 "max_line_chars": { "type": "integer", "default": 200, "minimum": 20, "maximum": 2000, "description": "Longest line shown" },
                 "timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": 0, "description": "Time budget; partial results + has_more. 0 = none" },
                 "project_path": { "type": "string", "description": "Project directory; omit to use the current project" }
@@ -315,8 +315,19 @@ fn find_window(args: &Value) -> Result<FindWindow, JsonRpcError> {
     )?;
     let max_line_chars = extract_usize(args, "max_line_chars", 200)?.clamp(20, 2000);
     Ok(FindWindow {
-        limit: (raw_limit > 0).then_some(raw_limit.min(MAX_LIMIT)),
-        offset,
+        // `limit: 0` means "as much as the ceiling allows", NOT unbounded:
+        // a None limit reaches the engine as `collect_bound = 0`, which
+        // collects every match of every file — exactly the daemon-parking
+        // buffering MAX_LIMIT exists to bound. The offset window keeps the
+        // rest reachable. `offset` is clamped for the same reason: the
+        // engine buffers `offset + limit` hits per file, so an unclamped
+        // deep offset re-creates the blow-up (and re-scans from position 0
+        // on every page).
+        limit: Some(match raw_limit {
+            0 => MAX_LIMIT,
+            n => n.min(MAX_LIMIT),
+        }),
+        offset: offset.min(MAX_LIMIT),
         context,
         per_file,
         max_line_chars,
@@ -611,6 +622,9 @@ fn shape_text_result(
             if result.has_more {
                 value["next_offset"] = json!(offset + result.returned);
             }
+            if result.cap_withheld > 0 {
+                value["withheld_by_cap"] = json!(result.cap_withheld);
+            }
             value["files"] = Value::Array(files_json);
         }
         "files" => {
@@ -641,8 +655,22 @@ fn shape_text_result(
         }
         _ => {}
     }
+    let mut note = String::new();
     if !result.complete && !result.has_more {
-        value["note"] = json!("Stopped at the time budget; raise timeout_ms or narrow the search");
+        note.push_str("Stopped at the time budget; raise timeout_ms or narrow the search");
+    }
+    if result.cap_withheld > 0 {
+        if !note.is_empty() {
+            note.push(' ');
+        }
+        note.push_str(&format!(
+            "{} buffered matches sit past per_file_cap and appear on no page; \
+             raise per_file_cap (0 = no cap) to page through every match",
+            result.cap_withheld
+        ));
+    }
+    if !note.is_empty() {
+        value["note"] = json!(note);
     }
     value
 }
@@ -650,6 +678,26 @@ fn shape_text_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_find_window_limit_zero_maps_to_ceiling_not_unbounded() {
+        // `limit: 0` must NOT reach the engine as `None` (unbounded
+        // collection): the ceiling exists precisely to stop one request
+        // from parking every match of every file in the shared daemon.
+        let window = find_window(&serde_json::json!({ "limit": 0 })).unwrap();
+        assert_eq!(window.limit, Some(MAX_LIMIT));
+
+        // Values above the ceiling clamp; the offset clamps for the same
+        // reason (the engine buffers offset + limit hits per file).
+        let window =
+            find_window(&serde_json::json!({ "limit": 500_000, "offset": 90_000_000 })).unwrap();
+        assert_eq!(window.limit, Some(MAX_LIMIT));
+        assert_eq!(window.offset, MAX_LIMIT);
+
+        // A limit of None (absent) keeps the default page, not unbounded.
+        let window = find_window(&serde_json::json!({})).unwrap();
+        assert_eq!(window.limit, Some(DEFAULT_LIMIT));
+    }
 
     fn project() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();

@@ -43,6 +43,14 @@ pub type EdgeId = petgraph::stable_graph::EdgeIndex;
 // Core data types
 // ---------------------------------------------------------------------------
 
+/// Canonical `file_path` for external placeholder nodes. Real file paths
+/// would tie a shared placeholder to whichever file's extraction pass
+/// created it, letting a per-file `remove_file`/`delete_file_data` delete a
+/// node other files' edges still point at. The graph layer, the storage
+/// loader, and both indexing build routes canonicalize to this value so
+/// externals are graph-level vocabulary, never file content.
+pub const EXTERNAL_NODE_FILE_PATH: &str = "<external>";
+
 /// A node in the Program Dependence Graph representing a code entity.
 ///
 /// Each node represents a distinct code element such as a function, class,

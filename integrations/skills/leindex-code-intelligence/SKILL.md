@@ -121,7 +121,10 @@ operation and every other argument is forwarded to it. All accept optional
   on disk, no index needed), `include_globs`, `exclude_globs`, `kind`
   (function|class|struct|... for `target=symbols`), `context_lines`,
   `max_line_chars`, `limit` (per page, `0` = all), `offset` (use the response's
-  `next_offset`), `per_file_cap`, `timeout_ms` (partial results + `has_more`).
+  `next_offset`; `limit=0` = ceiling of 10000), `per_file_cap` (hits shown
+  per file; matches past the cap stay counted but appear on no page — raise
+  it, or set `0`, to page through every match), `timeout_ms` (partial
+  results + `has_more`).
 - `search` — ranked semantic + structural search by meaning. Args: `query`
   (required), `top_k`, `offset`, `scope`, `search_mode`
   (`code`|`prose`|`auto`|`exact`|`semantic`), `task_context`. Repeat queries are

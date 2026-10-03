@@ -3,7 +3,7 @@
 // *L'Index* (The Index) - Unified API that brings together all LeIndex crates
 
 mod diagnostics;
-mod indexing;
+pub(crate) mod indexing;
 pub(crate) mod model_download;
 mod query;
 pub(crate) mod setup;

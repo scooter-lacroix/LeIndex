@@ -1148,7 +1148,19 @@ fn load_nodes(
         let (file_path, node_type_str) = decode_node_row_strings(row)?;
         let node_type = parse_storage_node_type(node_type_str)?;
         let file_path: Arc<str> = shared_file_arc(&mut files, file_path);
-        let (pdg_node, precision) = decode_pdg_node(row, node_type, file_path)?;
+        // Externals are graph-level vocabulary, not file content: rows from
+        // a pre-2.0.0 index still carry the creating file's path, and taking
+        // it verbatim would let `remove_file` delete a shared placeholder
+        // other files' edges point at. Canonicalize here; the next
+        // `save_pdg` rewrites the row (the content hash changes with the
+        // path) so the store converges.
+        let (pdg_node, precision) = {
+            let (mut node, precision) = decode_pdg_node(row, node_type, file_path)?;
+            if node.node_type == PDGNodeType::External {
+                node.file_path = std::sync::Arc::from(crate::graph::pdg::EXTERNAL_NODE_FILE_PATH);
+            }
+            (node, precision)
+        };
         let stable_id = if precision {
             Some(pdg_node.id.clone())
         } else {
@@ -1287,17 +1299,23 @@ pub fn delete_file_data(
     project_id: &str,
     file_path: &str,
 ) -> SqliteResult<()> {
-    // Delete edges where caller or callee belongs to this file
+    // Delete edges where caller or callee belongs to this file. Externals
+    // are excluded from both subqueries: an edge must not be reaped just
+    // because its endpoint is the shared external placeholder this file's
+    // pass happened to create — other files' edges to that same row survive.
     storage.conn().execute(
         "DELETE FROM intel_edges WHERE 
-         caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2) OR
-         callee_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2)",
+         caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2 AND node_type != 'external') OR
+         callee_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2 AND node_type != 'external')",
         params![project_id, file_path],
     )?;
 
-    // Delete nodes for this file
+    // Delete nodes for this file. External placeholders are excluded: they
+    // are shared vocabulary (one row per `external::{target}` id, held by
+    // whatever file's pass created it) and deleting the creator's row would
+    // strand every other file's edges to it.
     storage.conn().execute(
-        "DELETE FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2",
+        "DELETE FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2 AND node_type != 'external'",
         params![project_id, file_path],
     )?;
 
@@ -1316,14 +1334,16 @@ pub fn delete_file_data_tx(
     project_id: &str,
     file_path: &str,
 ) -> SqliteResult<()> {
+    // Externals excluded from both subqueries: see `delete_file_data`.
     tx.execute(
         "DELETE FROM intel_edges WHERE
-         caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2) OR
-         callee_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2)",
+         caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2 AND node_type != 'external') OR
+         callee_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2 AND node_type != 'external')",
         params![project_id, file_path],
     )?;
+    // External placeholders excluded: see `delete_file_data`.
     tx.execute(
-        "DELETE FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2",
+        "DELETE FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2 AND node_type != 'external'",
         params![project_id, file_path],
     )?;
     tx.execute(

@@ -411,6 +411,7 @@ fn test_gc_empty_store_noop() {
     let report = store.gc().expect("gc");
     assert_eq!(report.blobs_removed, 0);
     assert_eq!(report.reclaimed_bytes, 0);
+    assert!(!report.partial, "a clean sweep must not be flagged partial");
 }
 
 /// A sweep that fails part-way (one unremovable blob) must surface the

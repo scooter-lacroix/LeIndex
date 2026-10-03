@@ -864,6 +864,7 @@ fn garbage_collect_unpinned_blobs(
                 RetentionReport {
                     reclaimed_bytes,
                     blobs_removed,
+                    partial: true,
                 }
             }
             None => return Err(error.into()),

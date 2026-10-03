@@ -494,6 +494,10 @@ pub struct FileResult {
     /// hits beyond it, so `has_more` must be reported even when the global
     /// window was not exceeded by the buffered hits alone.
     pub collected_truncated: bool,
+    /// Buffered hits this page dropped because they sat past the file's
+    /// `per_file_cap`. They appear on no page; `match_lines` still counts
+    /// them.
+    pub cap_withheld: usize,
     /// Enclosing-symbol tallies `(name, kind, matching lines)`.
     pub symbols: Vec<(String, &'static str, usize)>,
     /// Symbols were unavailable because the file changed after indexing.
@@ -539,6 +543,11 @@ pub struct SearchOutput {
     pub has_more: bool,
     /// Hits returned.
     pub returned: usize,
+    /// Matches buffered for this page that the per-file cap dropped. A
+    /// non-zero value means the result set is cap-limited, not exhaustive:
+    /// the withheld matches appear on no page (`match_lines` still counts
+    /// them). The client signal for `per_file_cap` semantics.
+    pub cap_withheld: usize,
     /// Totals.
     pub stats: SearchStats,
 }
@@ -750,7 +759,23 @@ fn scan_file(
     compiled: &Compiled,
     options: &SearchOptions,
     index: Option<&TextIndex>,
+    root_canonical: Option<&std::path::Path>,
 ) -> Option<FileResult> {
+    // An indexed candidate's path was recorded at inventory time and may have
+    // been re-pointed since: a tracked regular file swapped for a symlink (at
+    // the leaf or via a parent component) would be followed into content
+    // outside the root. Fresh-walk candidates cannot escape (the walk does
+    // not follow links) and explicit file roots are caller-requested paths,
+    // so only index-seeded candidates are revalidated.
+    if candidate.id.is_some() {
+        if let Some(root) = root_canonical {
+            let inside = std::fs::canonicalize(&candidate.abs)
+                .is_ok_and(|resolved| resolved.starts_with(root));
+            if !inside {
+                return None;
+            }
+        }
+    }
     let data = read_scan_file(&candidate.abs)?;
     let symbol_index = resolve_symbol_index(index, candidate, options);
     let mut result = FileResult {
@@ -838,6 +863,7 @@ fn window_file_hits(
     // remain intentional (documented "shown per file, all counted":
     // `match_lines` and the symbol tallies still report them). 0 = uncapped.
     if per_file_cap > 0 && file.hits.len() > per_file_cap {
+        file.cap_withheld = file.hits.len() - per_file_cap;
         file.hits.truncate(per_file_cap);
     }
     let mut windowed = Vec::with_capacity(file.hits.len());
@@ -871,6 +897,9 @@ fn ingest_scanned_files(
             window_end,
             options.per_file_cap,
         );
+        // Summed after windowing: `window_file_hits` is what sets
+        // `cap_withheld`.
+        output.cap_withheld += file.cap_withheld;
         output.returned += file.hits.len();
         if !options.collect_hits || !file.hits.is_empty() {
             root_out.files.push(file);
@@ -900,6 +929,7 @@ pub fn search(roots: &[RootSpec], compiled: &Compiled, options: &SearchOptions) 
         };
         let candidates = root_candidates(spec, compiled, options.deadline, &mut output.stats);
         output.stats.candidates += candidates.len();
+        let canonical_root = std::fs::canonicalize(&spec.root).ok();
 
         for chunk in candidates.chunks(chunk_size) {
             if options.deadline.is_some_and(|d| Instant::now() >= d) {
@@ -910,7 +940,15 @@ pub fn search(roots: &[RootSpec], compiled: &Compiled, options: &SearchOptions) 
             let scanned: Vec<Option<FileResult>> = pool().install(|| {
                 chunk
                     .par_iter()
-                    .map(|c| scan_file(c, compiled, options, spec.index.as_deref()))
+                    .map(|c| {
+                        scan_file(
+                            c,
+                            compiled,
+                            options,
+                            spec.index.as_deref(),
+                            canonical_root.as_deref(),
+                        )
+                    })
                     .collect()
             });
             output.stats.scanned += chunk.len();
@@ -1125,6 +1163,87 @@ mod tests {
         );
         assert!(indexed.roots[0].used_index && !live.roots[0].used_index);
         assert!(indexed.stats.candidates <= live.stats.candidates);
+    }
+
+    #[test]
+    fn test_stale_index_candidates_cannot_escape_through_symlinks() {
+        use std::os::unix::fs::symlink;
+        // An indexed regular file later replaced by a symlink to outside the
+        // root: the stale index still seeds the path (its trigrams match the
+        // query) and reads follow links, so the external target's content
+        // would surface as hits. The read-time containment check must drop
+        // the candidate instead.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "treasure_token\n").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/lib.rs", "fn parse_config() {}\n");
+        // The swapped file's ORIGINAL content matches the query, so the
+        // stale index genuinely proposes it as a candidate.
+        write(dir.path(), "harmless.txt", "treasure_token\n");
+        let index = built(dir.path());
+
+        std::fs::remove_file(dir.path().join("harmless.txt")).unwrap();
+        symlink(
+            outside.path().join("secret"),
+            dir.path().join("harmless.txt"),
+        )
+        .unwrap();
+
+        let out = search(
+            &[spec(dir.path(), Some(std::sync::Arc::clone(&index)))],
+            &q("treasure_token").compile().unwrap(),
+            &SearchOptions::default(),
+        );
+        assert_eq!(
+            out.returned, 0,
+            "external content must not leak through a re-pointed indexed file"
+        );
+
+        // Untouched indexed content is still served through the same index.
+        let legit = search(
+            &[spec(dir.path(), Some(index))],
+            &q("parse_config").compile().unwrap(),
+            &SearchOptions::default(),
+        );
+        assert!(legit.returned > 0, "legit indexed content stays reachable");
+    }
+
+    #[test]
+    fn test_cap_withheld_reports_dropped_buffered_hits() {
+        // The client-visible signal that a page is cap-limited rather than
+        // exhaustive: hits buffered for the window but dropped by
+        // per_file_cap are counted in `cap_withheld`.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "big.txt", &"needle\n".repeat(200));
+        let out = search(
+            &[spec(dir.path(), None)],
+            &q("needle").compile().unwrap(),
+            &SearchOptions {
+                per_file_cap: 20,
+                limit: Some(50),
+                ..Default::default()
+            },
+        );
+        assert_eq!(out.returned, 20);
+        assert_eq!(
+            out.cap_withheld, 30,
+            "50 buffered minus the 20 the cap keeps"
+        );
+        assert!(!out.has_more, "capped stream exhausted within the page");
+    }
+
+    #[test]
+    fn test_cap_withheld_zero_when_cap_not_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.txt", &"needle\n".repeat(10));
+        let out = search(
+            &[spec(dir.path(), None)],
+            &q("needle").compile().unwrap(),
+            &SearchOptions::default(),
+        );
+        assert_eq!(out.returned, 10);
+        assert_eq!(out.cap_withheld, 0);
     }
 
     #[test]

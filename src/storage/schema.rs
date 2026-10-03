@@ -708,11 +708,18 @@ impl Storage {
         // `ensure_intel_node_columns` see it as present and skip its own
         // repair — without this line every legacy row would keep
         // `qualified_name = ''` forever, invisible to the qualified-name
-        // index and lookups.
+        // index and lookups. The two sentinel backfills run in batches so
+        // each statement commits and releases the write lock instead of
+        // holding it for one multi-million-row rewrite inside `open`; both
+        // predicates shrink monotonically, so a crash mid-backfill resumes
+        // (the stored schema version only advances after all migrations
+        // return). The two dedup statements stay single-shot: batching them
+        // re-evaluates the duplicate predicate against rows their own
+        // earlier batches renamed, which can diverge instead of converging.
+        self.backfill_column_batched("node_id", "symbol_name")?;
+        self.backfill_column_batched("qualified_name", "symbol_name")?;
         self.conn.execute_batch(
-            "UPDATE intel_nodes SET node_id = symbol_name WHERE node_id = '';
-             UPDATE intel_nodes SET qualified_name = symbol_name WHERE qualified_name = '';
-             UPDATE intel_nodes
+            "UPDATE intel_nodes
                 SET node_id = file_path || ':' || COALESCE(NULLIF(qualified_name, ''), symbol_name)
               WHERE id NOT IN (SELECT MIN(id) FROM intel_nodes GROUP BY project_id, node_id);
              UPDATE intel_nodes
@@ -720,6 +727,42 @@ impl Storage {
               WHERE id NOT IN (SELECT MIN(id) FROM intel_nodes GROUP BY project_id, node_id);",
         )?;
         Ok(())
+    }
+
+    /// Rewrite `column = ''` rows to `fallback` in bounded batches.
+    ///
+    /// Each batch is its own implicit transaction, so the SQLite write lock
+    /// is released between batches and other connections can interleave —
+    /// the unbatched single UPDATE held it for the whole rewrite of what is
+    /// the largest table in the store, executed inside [`Storage::open`].
+    /// The predicate shrinks every batch (rewritten rows no longer match),
+    /// so the loop terminates and a crashed backfill resumes on the next
+    /// open.
+    fn backfill_column_batched(&mut self, column: &str, fallback: &str) -> SqliteResult<()> {
+        if !matches!(
+            (column, fallback),
+            ("node_id" | "qualified_name", "symbol_name")
+        ) {
+            // Only the two caller-internal pairs are allowed; keep the SQL
+            // below injection-proof by construction.
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "unsupported backfill pair {column} <- {fallback}"
+            )));
+        }
+        const BATCH_ROWS: i64 = 10_000;
+        loop {
+            let changed = self.conn.execute(
+                &format!(
+                    "UPDATE intel_nodes SET {column} = {fallback} \
+                     WHERE {column} = '' \
+                       AND id IN (SELECT id FROM intel_nodes WHERE {column} = '' LIMIT {BATCH_ROWS})"
+                ),
+                [],
+            )?;
+            if changed == 0 {
+                return Ok(());
+            }
+        }
     }
 
     /// Migration from v4 to v5: backfill `qualified_name` for stores that
@@ -748,11 +791,13 @@ impl Storage {
         if !has_column {
             return Ok(());
         }
-        self.conn.execute(
-            "UPDATE intel_nodes SET qualified_name = symbol_name WHERE qualified_name = ''",
-            [],
-        )?;
-        Ok(())
+        // Batched: this is the population where every row matches the
+        // sentinel, so the unbatched single UPDATE rewrote the whole table
+        // under one write lock inside `open` (the exact shape the migration
+        // guidelines call out). The predicate shrinks each batch and the
+        // schema version only advances after this returns, so a crash
+        // mid-backfill resumes on the next open.
+        self.backfill_column_batched("qualified_name", "symbol_name")
     }
 }
 

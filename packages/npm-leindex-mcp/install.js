@@ -814,6 +814,14 @@ async function install() {
     const hasAssets = bundledAssetsComplete();
     const hasDaemon = !needsDaemon || fs.existsSync(daemonPath);
 
+    // Resolution shared between the repair guard below and the install at
+    // the bottom: one GitHub round-trip for the repair path, and one
+    // authoritative answer for both decisions. Null when the guard never
+    // ran (fresh install, or the binary needed replacing outright) — the
+    // install then resolves for itself, and the fast path pays no resolve.
+    let resolved = null;
+    let resolveFailed = false;
+
     if (existing.ok && hasAssets && hasDaemon) {
       console.log(`   ✓ LeIndex already installed: ${existing.output}`);
       console.log('   ✓ Bundled ORT runtime assets present');
@@ -840,8 +848,6 @@ async function install() {
       const gap = !hasAssets
         ? 'Bundled ORT runtime assets missing'
         : 'Daemon binary (leindexd) missing';
-      let resolved = null;
-      let resolveFailed = false;
       try {
         resolved = await resolveReleaseConfig(platform, arch);
       } catch (_) {
@@ -873,7 +879,9 @@ async function install() {
   }
   
   try {
-    const release = await resolveReleaseConfig(platform, arch);
+    // On the repair path this is the resolution the guard already fetched;
+    // a fresh resolve happens only when the guard never ran.
+    const release = resolved || (await resolveReleaseConfig(platform, arch));
     console.log(`   Resolved version: ${release.version} (${release.isBundle ? 'bundle' : 'legacy binary'})`);
 
     if (release.isBundle) {

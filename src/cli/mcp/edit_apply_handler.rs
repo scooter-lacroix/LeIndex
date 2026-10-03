@@ -162,9 +162,25 @@ fn annotate_degraded_pdg(response: &mut Value) {
 /// would be killed mid-write); the long-running MCP server/daemon spawns it so
 /// the caller's latency is exactly the edit, never the reindex.
 async fn refresh_index_after_edit(registry: &Arc<ProjectRegistry>, handle: &ProjectHandle) {
+    use crate::cli::leindex::indexing::watcher_delta::NotHydratedError;
+
+    // A not-hydrated resident can never take the incremental path — the
+    // guard is a persistent condition, not a transient one — so escalate to
+    // a full index once instead of leaving the project permanently stale.
+    async fn refresh(guard: &mut crate::cli::leindex::LeIndex) -> Result<(), anyhow::Error> {
+        if let Err(e) = guard.incremental_reindex_from_watcher() {
+            if !e.is::<NotHydratedError>() {
+                return Err(e);
+            }
+            tracing::warn!("Index refresh needs a full index ({e}); escalating");
+            guard.index_project(true)?;
+        }
+        Ok(())
+    }
+
     if registry.is_one_shot() {
         let mut guard = handle.write().await;
-        if let Err(e) = guard.incremental_reindex_from_watcher() {
+        if let Err(e) = refresh(&mut guard).await {
             tracing::warn!("Failed to refresh index after edit-apply: {}", e);
         }
         return;
@@ -176,7 +192,7 @@ async fn refresh_index_after_edit(registry: &Arc<ProjectRegistry>, handle: &Proj
         // edit-applies queue their refreshes instead of racing.
         let mut guard = handle.write().await;
         let root = guard.project_path().to_path_buf();
-        if let Err(e) = guard.incremental_reindex_from_watcher() {
+        if let Err(e) = refresh(&mut guard).await {
             tracing::warn!(
                 project = %root.display(),
                 "Background refresh after edit-apply failed: {e}"

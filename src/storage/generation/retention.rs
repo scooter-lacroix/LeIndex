@@ -313,6 +313,7 @@ pub fn retain_after_publish(
                 RetentionReport {
                     reclaimed_bytes,
                     blobs_removed,
+                    partial: true,
                 }
             }
             None => return Err(error.into()),

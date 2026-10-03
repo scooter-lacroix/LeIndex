@@ -59,6 +59,19 @@ async fn live_reference_files(
     let old_name = old_name.to_owned();
     let new_name = new_name.to_owned();
     let scope = scope.map(str::to_owned);
+    // The inventory yields ABSOLUTE paths (source_inventory documents this,
+    // and the walkdir fallback starts at the absolute project root), so a
+    // caller-supplied project-relative scope like "src/" would never prefix-
+    // match and the live fallback would report the symbol as absent. Resolve
+    // relative scopes against the project root, matching the PDG-backed path.
+    let scope = scope.map(|scope| {
+        let scope_path = std::path::Path::new(&scope);
+        if scope_path.is_absolute() {
+            scope
+        } else {
+            project_root.join(scope_path).display().to_string()
+        }
+    });
     tokio::task::spawn_blocking(move || {
         let inventory = match crate::cli::git::source_inventory(&project_root) {
             Ok(paths) => paths,
@@ -522,6 +535,24 @@ mod tests {
             "got: {}",
             err.message
         );
+    }
+
+    #[tokio::test]
+    async fn test_live_reference_files_resolves_relative_scope_against_root() {
+        // The inventory yields absolute paths, so a caller-supplied
+        // project-relative scope ("src/") must be resolved against the
+        // project root — the old comparison never matched and the live
+        // fallback reported every symbol as absent.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn old_name() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn old_name() {}\n").unwrap();
+
+        let files = live_reference_files(dir.path(), "old_name", "new_name", Some("src"))
+            .await
+            .expect("relative scope must resolve against the project root");
+        assert_eq!(files.len(), 1, "only the in-scope file matches");
+        assert!(files[0].ends_with("src/a.rs"), "got: {:?}", files);
     }
 
     #[tokio::test]

@@ -565,8 +565,19 @@ impl GlobalEmbeddingCache {
             fs::create_dir_all(parent)?;
         }
 
-        // Atomic write: temp file -> fsync -> rename.
-        let staging_path = final_path.with_extension("partial");
+        // Atomic write: uniquely-named temp file -> fsync -> rename. The
+        // pid/seq suffix mirrors the CAS staging convention: a deterministic
+        // `<fingerprint>.partial` name let two processes populating the
+        // global cache for the same fingerprint open and truncate the SAME
+        // staging file, so one writer's rename could publish an inode the
+        // other was still appending to — a short or mixed row that the
+        // final-path existence check would then serve forever.
+        static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let staging_path = final_path.with_extension(format!(
+            "partial.{}.{}",
+            std::process::id(),
+            STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         {
             let file = fs::File::create(&staging_path)?;
             let mut writer = BufWriter::new(file);

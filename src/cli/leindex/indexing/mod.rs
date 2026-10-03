@@ -17,7 +17,7 @@ use tracing::{info, warn};
 mod helpers;
 use helpers::*;
 
-mod watcher_delta;
+pub(crate) mod watcher_delta;
 
 mod neural_publish;
 
@@ -1532,12 +1532,13 @@ fn build_pdg_streaming(
         .collect();
     let (segment, stats) = streaming::pdg::merge_fragments_to_segment(fragments);
     info!(
-        "Streaming PDG merge: {} fragments, {} nodes, {} edges ({} cross-file resolved, {} unresolved)",
+        "Streaming PDG merge: {} fragments, {} nodes, {} edges ({} cross-file resolved, {} unresolved, {} duplicate node records dropped)",
         stats.fragments,
         stats.node_count,
         stats.edge_count,
         stats.cross_file_resolved,
-        stats.cross_file_unresolved
+        stats.cross_file_unresolved,
+        stats.duplicate_nodes_dropped
     );
     streaming::pdg::pdg_from_segment(&segment)
 }

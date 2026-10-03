@@ -1021,6 +1021,12 @@ pub struct RetentionReport {
     pub reclaimed_bytes: u64,
     /// Number of blob files removed.
     pub blobs_removed: usize,
+    /// The sweep aborted part-way: the counters above are real partial
+    /// accounting, and candidates not yet swept are retried by the next
+    /// sweep, which re-derives them from disk. A clean sweep reports
+    /// `false` so consumers can distinguish an aborted run from a
+    /// successful one instead of reading a truncated sweep as complete.
+    pub partial: bool,
 }
 
 #[cfg(test)]

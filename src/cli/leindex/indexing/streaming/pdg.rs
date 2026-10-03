@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::graph::pdg::ProgramDependenceGraph;
 use crate::graph::pdg::{
@@ -111,6 +112,11 @@ pub struct PdgStats {
     pub cross_file_resolved: usize,
     /// Number of cross-file edges unresolved (external target not found).
     pub cross_file_unresolved: usize,
+    /// Node records dropped by the one-record-per-id dedup. Legitimate for
+    /// per-file `external::{target}` placeholders; a non-external count
+    /// here means a real id collision was silently absorbed — diagnosable
+    /// instead of invisible.
+    pub duplicate_nodes_dropped: usize,
 }
 
 // `build_fragment_from_parsed` (the original streaming skeleton) was
@@ -161,6 +167,14 @@ pub fn merge_fragments_to_segment(fragments: Vec<PdgFragment>) -> (PdgSegment, P
                 };
                 segment.symbol_table.push(interned);
                 segment.nodes.push(node);
+            } else {
+                stats.duplicate_nodes_dropped += 1;
+                if node.node_type != "external" {
+                    warn!(
+                        id = %node.id,
+                        "segment merge dropped a non-external duplicate node record (first wins)"
+                    );
+                }
             }
         }
 
@@ -365,8 +379,12 @@ pub fn pdg_from_segment(segment: &PdgSegment) -> ProgramDependenceGraph {
         // Shared external placeholders are graph-level vocabulary, not file
         // content: canonicalize their path so per-file removal never deletes
         // a node other files' edges still point at (mirrors `merge_pdgs`).
-        let file_path = if node_type == PDGNodeType::External {
-            crate::cli::index_builder::EXTERNAL_NODE_FILE_PATH.clone()
+        // Keyed on the RAW record string, not the parsed type: the parser
+        // maps any unknown type string to External, and re-pathing a real
+        // file's node to `<external>` would strand it outside `file_index`,
+        // making it unpurgeable by remove_file/delete_file_data.
+        let file_path = if record.node_type == "external" {
+            std::sync::Arc::from(crate::graph::pdg::EXTERNAL_NODE_FILE_PATH)
         } else {
             match file_paths.get(record.file_path.as_str()) {
                 Some(shared) => std::sync::Arc::clone(shared),
@@ -565,6 +583,10 @@ mod test {
         assert_eq!(segment.nodes.len(), 3, "two callers + one shared external");
         assert_eq!(segment.symbol_table.len(), 3);
         assert_eq!(stats.node_count, 3);
+        assert_eq!(
+            stats.duplicate_nodes_dropped, 1,
+            "b.rs's external placeholder folded onto a.rs's"
+        );
         assert_eq!(segment.edges.len(), 2, "both callers' edges survive");
 
         let pdg = pdg_from_segment(&segment);
