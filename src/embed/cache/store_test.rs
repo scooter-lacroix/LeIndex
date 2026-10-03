@@ -1065,3 +1065,31 @@ fn test_model_identity_after_gc() {
     assert_eq!(stats.row_count, 1);
     assert_eq!(stats.model_identity, expected_hex);
 }
+
+// -------- staging naming (round-8 Codex P2 + Kilo WARNING) ----------------
+
+/// Staging names must be unique per writer AND keep the trailing `.partial`:
+/// the uniqueness stops two processes caching the same fingerprint from
+/// sharing one staging inode (one rename publishing the other's half-written
+/// row), and the trailing suffix keeps every name-based staging detector
+/// (`row_file_paths`/gc/eviction, `row_count`, `total_bytes`,
+/// `compute_model_identity`) recognizing them — a staging file must never be
+/// simultaneously invisible as staging and visible as data.
+#[test]
+fn test_staging_path_is_unique_per_call_and_trailing_partial() {
+    let final_path = std::path::Path::new("/cache/rows/ab/0123456789abcdef");
+    let first = staging_path_for(final_path);
+    let second = staging_path_for(final_path);
+    assert_ne!(first, second, "each writer/call gets its own staging name");
+    let first = first.to_string_lossy().into_owned();
+    assert!(
+        first.ends_with(".partial"),
+        "trailing .partial keeps the staging detectors working: {first}"
+    );
+    assert_eq!(
+        first.rsplit('.').next(),
+        Some("partial"),
+        "extension is exactly 'partial'"
+    );
+    assert!(first.contains(&format!(".partial.{}.", std::process::id())));
+}

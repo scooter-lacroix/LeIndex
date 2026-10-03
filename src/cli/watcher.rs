@@ -171,10 +171,19 @@ fn run_reindex(handle: ProjectHandle) -> ReindexOutcome {
         Ok(Err(e)) if e.is::<crate::cli::leindex::indexing::watcher_delta::NotHydratedError>() => {
             // No resident PDG: the incremental path can never succeed for
             // this state, so retrying it on every tick would loop forever.
-            // Escalate ONCE, under the lock we already hold, to the full
-            // index — the path that hydrates the resident graph — and only
-            // report failure if that also errors.
+            // Escalate ONCE, under the project write guard we still hold, to
+            // the full index — the path that hydrates the resident graph —
+            // and only report failure if that also errors.
             warn!("Auto-reindex skipped ({}); escalating to a full index", e);
+            // Release the cross-process flock first: `index_project` acquires
+            // the same `index.lock` through a freshly opened descriptor, and
+            // flock(2) locks live on the open file description — a second
+            // descriptor's blocking acquisition never completes while this
+            // task holds one, which would park this spawn_blocking (and the
+            // project write guard with it) forever. A peer process that grabs
+            // the lock in the gap publishes a fresh index; the forced full
+            // index then runs after it, which is redundant but correct.
+            drop(_flock);
             let full_result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| idx.index_project(true)));
             match full_result {

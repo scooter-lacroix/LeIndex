@@ -122,6 +122,34 @@ impl GenerationLease {
                 }
                 return Err(LeaseError::Persist(persist_error));
             }
+            // Serialization with pruning, part 2: the refcounts above are
+            // durable now, but a retention that snapshotted its lease view
+            // BEFORE this persist may have already unlinked the blobs — the
+            // counts would then read positive while `Snapshot::open` cannot
+            // open its layers. Check existence on the durable side: a
+            // missing blob means the generation was pruned under us and the
+            // caller must retry against the CURRENT pointer it re-reads
+            // (the pruner's refcount re-check under the refs lock protects
+            // every lease persisted BEFORE its GC began; this check covers
+            // the ones that land after). Roll back exactly like the persist
+            // failure above so no phantom pin survives.
+            let pruned = hashes.iter().filter(|hash| !s.exists(hash)).count();
+            if pruned > 0 {
+                s.release_generation_hold(manifest.generation);
+                for hash in &hashes {
+                    if let Err(error) = s.decr(hash) {
+                        tracing::warn!(
+                            hash = %crate::storage::cas::blob::hash_to_hex(hash),
+                            %error,
+                            "generation lease rollback (pruned): decr underflowed"
+                        );
+                    }
+                }
+                let _ = s.persist();
+                return Err(LeaseError::GenerationPruned {
+                    generation: manifest.generation,
+                });
+            }
         }
         Ok(GenerationLease {
             store,
@@ -163,7 +191,7 @@ impl Drop for GenerationLease {
 /// Errors that can occur when acquiring a lease.
 #[derive(Debug, thiserror::Error)]
 pub enum LeaseError {
-    /// Failed to persist refcounts after incrementing.
+    /// Failed to persist lease refcounts after incrementing.
     #[error("failed to persist lease refcounts: {0}")]
     Persist(#[from] crate::storage::cas::CasError),
     /// The manifest is invalid (missing layers, bad version, etc.).
@@ -172,6 +200,17 @@ pub enum LeaseError {
     /// The project does not have a current generation.
     #[error("no current generation for project: {0}")]
     NoCurrentGeneration(String),
+    /// The generation was pruned (and its blobs garbage-collected) while the
+    /// lease was being acquired — the caller's CURRENT read raced a
+    /// retention pass. Retryable: re-read CURRENT and acquire again against
+    /// the freshly published generation.
+    #[error(
+        "generation {generation} was pruned while its lease was being acquired; retry against CURRENT"
+    )]
+    GenerationPruned {
+        /// The generation number that was requested and found pruned.
+        generation: u64,
+    },
     /// I/O error reading the CURRENT or manifest file.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

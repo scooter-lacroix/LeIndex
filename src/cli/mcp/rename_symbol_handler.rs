@@ -45,6 +45,26 @@ fn content_contains_whole_word(content: &str, word: &str) -> bool {
     })
 }
 
+/// Normalize a path lexically: drop `.` components and resolve `..` against
+/// the preceding component. `Path::join` never normalizes, so the joined
+/// scope would otherwise carry components that `Path::starts_with` (also
+/// purely lexical, no filesystem access) can never match.
+fn normalize_lexical(path: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::with_capacity(path.as_os_str().len());
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push(std::path::Component::ParentDir);
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// Find files referencing `old_name` when the PDG is unavailable, using the
 /// live source inventory (git-aware, walkdir fallback). Also detects a rename
 /// conflict against `new_name` across the same inventory so a text-only rename
@@ -63,14 +83,21 @@ async fn live_reference_files(
     // and the walkdir fallback starts at the absolute project root), so a
     // caller-supplied project-relative scope like "src/" would never prefix-
     // match and the live fallback would report the symbol as absent. Resolve
-    // relative scopes against the project root, matching the PDG-backed path.
+    // relative scopes against the project root and normalize the result
+    // lexically: `Path::join` keeps `.`/`..` components and the filter below
+    // compares components (`Path::starts_with`), so a scope of "." or
+    // "./src" would otherwise match nothing and the tool would report a
+    // symbol that exists as absent — with no rename conflict detected.
+    // canonicalize is deliberately NOT used: it also resolves symlinks,
+    // which can diverge from how the inventory spells the same files.
     let scope = scope.map(|scope| {
         let scope_path = std::path::Path::new(&scope);
-        if scope_path.is_absolute() {
-            scope
+        let joined = if scope_path.is_absolute() {
+            scope_path.to_path_buf()
         } else {
-            project_root.join(scope_path).display().to_string()
-        }
+            project_root.join(scope_path)
+        };
+        normalize_lexical(&joined).display().to_string()
     });
     tokio::task::spawn_blocking(move || {
         let inventory = match crate::cli::git::source_inventory(&project_root) {
@@ -93,9 +120,12 @@ async fn live_reference_files(
         let mut files = std::collections::HashSet::new();
         let mut conflicts = std::collections::HashSet::new();
         for path in inventory {
+            // Component-wise containment (deref to `Path::starts_with`), so
+            // scope "src" cannot match "src_backup/x.rs" the way a byte
+            // prefix would.
             if scope
                 .as_deref()
-                .is_some_and(|scope| !path.starts_with(scope))
+                .is_some_and(|scope| !path.starts_with(std::path::Path::new(scope)))
             {
                 continue;
             }
@@ -553,6 +583,44 @@ mod tests {
             .expect("relative scope must resolve against the project root");
         assert_eq!(files.len(), 1, "only the in-scope file matches");
         assert!(files[0].ends_with("src/a.rs"), "got: {:?}", files);
+    }
+
+    #[tokio::test]
+    async fn test_live_reference_files_normalizes_dot_scopes_and_neighbor_prefixes() {
+        // `Path::join` keeps `.` components ("." -> <root>/., "./src" ->
+        // <root>/./src) and `Path::starts_with` compares components, so an
+        // unnormalized scope filtered out EVERY file — a symbol that exists
+        // was reported absent, with no rename conflict detected either
+        // (round-8 Kilo). The natural scopes must work.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn old_name() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn old_name() {}\n").unwrap();
+
+        let files = live_reference_files(dir.path(), "old_name", "new_name", Some("."))
+            .await
+            .expect("scope '.' means the whole project");
+        assert_eq!(files.len(), 2, "both files are in scope, got: {:?}", files);
+
+        let files = live_reference_files(dir.path(), "old_name", "new_name", Some("./src"))
+            .await
+            .expect("scope './src' must normalize to <root>/src");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("src/a.rs"));
+
+        // Component-wise containment: a sibling directory sharing the
+        // scope's name as a byte prefix is NOT in scope.
+        std::fs::create_dir(dir.path().join("src_backup")).unwrap();
+        std::fs::write(dir.path().join("src_backup/x.rs"), "fn old_name() {}\n").unwrap();
+        let files = live_reference_files(dir.path(), "old_name", "new_name", Some("src"))
+            .await
+            .expect("scope 'src'");
+        assert_eq!(
+            files.len(),
+            1,
+            "src_backup must not match scope 'src', got: {:?}",
+            files
+        );
     }
 
     #[tokio::test]

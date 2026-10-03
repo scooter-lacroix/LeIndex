@@ -74,13 +74,19 @@ pub(crate) fn remove_file_from_pdg(
 }
 
 /// Normalize external nodes: ensure any node with `language == "external"`
-/// also has `NodeType::External`.
+/// also has `NodeType::External` — and carries the graph-level external
+/// path. The type flip alone would leave the creating file's path in place,
+/// keeping the node in that file's `file_index` entry: a later
+/// `remove_file`/`delete_file_data` for the file would then delete a shared
+/// placeholder other files' edges point at (the hazard
+/// [`crate::graph::pdg::EXTERNAL_NODE_FILE_PATH`] exists to prevent).
 pub(crate) fn normalize_external_nodes(pdg: &mut ProgramDependenceGraph) {
     let mut migrated = 0usize;
     for node in pdg.node_weights_mut() {
         let is_external = node.language == "external" || node.language.starts_with("external:");
         if is_external && node.node_type != NodeType::External {
             node.node_type = NodeType::External;
+            node.file_path = std::sync::Arc::from(crate::graph::pdg::EXTERNAL_NODE_FILE_PATH);
             migrated += 1;
         }
     }
@@ -89,5 +95,88 @@ pub(crate) fn normalize_external_nodes(pdg: &mut ProgramDependenceGraph) {
             "Normalized {} external nodes to NodeType::External",
             migrated
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::pdg::{Edge, EdgeMetadata, Node};
+
+    fn function(id: &str, file: &str, name: &str, language: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            node_type: NodeType::Function,
+            name: name.to_string(),
+            file_path: std::sync::Arc::from(file),
+            byte_range: (0, 0),
+            complexity: 0,
+            language: language.to_string(),
+        }
+    }
+
+    /// A node that only becomes external via the language migration (round-8
+    /// Kilo) must also be re-pathed to the graph-level external vocabulary:
+    /// keeping the creating file's path would leave it in that file's
+    /// file_index entry, so a later remove/delete for the file would destroy
+    /// a shared placeholder other files' edges point at.
+    #[test]
+    fn test_normalize_external_nodes_repaths_migrated_nodes() {
+        let mut pdg = ProgramDependenceGraph::new();
+        let idx = pdg.add_node(function(
+            "a.rs:ext_thing",
+            "a.rs",
+            "ext_thing",
+            "external:crate::thing",
+        ));
+        normalize_external_nodes(&mut pdg);
+        let node = pdg.get_node(idx).unwrap();
+        assert_eq!(node.node_type, NodeType::External);
+        assert_eq!(
+            node.file_path.as_ref(),
+            crate::graph::pdg::EXTERNAL_NODE_FILE_PATH,
+            "migrated externals leave the per-file namespace"
+        );
+    }
+
+    /// merge_pdgs canonicalizes externals on entry too — the merge path and
+    /// the normalize pass must agree on the file_path convention.
+    #[test]
+    fn test_merge_pdgs_canonicalizes_external_paths() {
+        let mut target = ProgramDependenceGraph::new();
+        let mut source = ProgramDependenceGraph::new();
+        let mut external = function("external::log", "a.rs", "log", "rust");
+        external.node_type = NodeType::External;
+        source.add_node(external);
+        merge_pdgs(&mut target, source);
+        let node = target
+            .node_indices()
+            .find_map(|idx| {
+                let node = target.get_node(idx)?;
+                (node.id == "external::log").then_some(node)
+            })
+            .unwrap();
+        assert_eq!(
+            node.file_path.as_ref(),
+            crate::graph::pdg::EXTERNAL_NODE_FILE_PATH
+        );
+        // And a merged edge survives the fold onto the canonical node.
+        let mut target = ProgramDependenceGraph::new();
+        target.add_node(function("b.rs:caller", "b.rs", "caller", "rust"));
+        let mut source = ProgramDependenceGraph::new();
+        let mut external = function("external::log", "a.rs", "log", "rust");
+        external.node_type = NodeType::External;
+        let ext_idx = source.add_node(external);
+        let caller_idx = source.add_node(function("a.rs:main", "a.rs", "main", "rust"));
+        source.add_edge(
+            caller_idx,
+            ext_idx,
+            Edge {
+                edge_type: crate::graph::pdg::EdgeType::Call,
+                metadata: EdgeMetadata::empty(),
+            },
+        );
+        merge_pdgs(&mut target, source);
+        assert_eq!(target.node_count(), 3);
     }
 }

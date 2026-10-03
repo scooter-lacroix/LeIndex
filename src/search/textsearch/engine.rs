@@ -67,13 +67,61 @@ fn pool() -> &'static rayon::ThreadPool {
     })
 }
 
-fn signature(meta: &std::fs::Metadata) -> (u64, i64) {
+/// The freshness identity recorded at index time and re-read at search time.
+///
+/// Size + mtime alone miss same-size edits that preserve mtime (metadata-
+/// preserving copies, coarse-resolution filesystems): the stale trigram plan
+/// then excludes the edited file and the live-content verifier never reads
+/// it, so results introduced by the edit stay missing until a rebuild. ctime
+/// (inode change time) advances on any content write and ino changes on
+/// replace-by-rename; both are compared whenever the platform provides them
+/// (0 elsewhere, where the check degrades to the old size/mtime behavior).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    /// Size in bytes.
+    pub size: u64,
+    /// Modification time (ns since epoch).
+    pub mtime_ns: i64,
+    /// ctime (unix) or creation time (windows), seconds; 0 if unavailable.
+    pub ctime_secs: i64,
+    /// Inode number (unix); 0 elsewhere.
+    pub ino: u64,
+}
+
+fn identity(meta: &std::fs::Metadata) -> FileIdentity {
     let mtime = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_nanos().min(i64::MAX as u128) as i64);
-    (meta.len(), mtime)
+    let (ctime_secs, ino) = platform_identity(meta);
+    FileIdentity {
+        size: meta.len(),
+        mtime_ns: mtime,
+        ctime_secs,
+        ino,
+    }
+}
+
+#[cfg(unix)]
+fn platform_identity(meta: &std::fs::Metadata) -> (i64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.ctime(), meta.ino())
+}
+
+#[cfg(windows)]
+fn platform_identity(meta: &std::fs::Metadata) -> (i64, u64) {
+    let created = meta
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs().min(i64::MAX as u64) as i64);
+    (created, 0)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_identity(_meta: &std::fs::Metadata) -> (i64, u64) {
+    (0, 0)
 }
 
 // ── Inventory ────────────────────────────────────────────────────────────────
@@ -208,16 +256,18 @@ pub fn build_index(
                 if !meta.is_file() {
                     return None;
                 }
-                let (size, mtime_ns) = signature(&meta);
+                let ident = identity(&meta);
                 let mut input = FileInput {
                     rel_path: rel.clone(),
-                    size,
-                    mtime_ns,
+                    size: ident.size,
+                    mtime_ns: ident.mtime_ns,
+                    ctime_secs: ident.ctime_secs,
+                    ino: ident.ino,
                     flags: 0,
                     trigrams: Vec::new(),
                     symbols: symbols.get(rel).cloned().unwrap_or_default(),
                 };
-                if size > MAX_INDEXED_FILE_BYTES {
+                if ident.size > MAX_INDEXED_FILE_BYTES {
                     input.flags = FLAG_ALWAYS_SCAN;
                     return Some(input);
                 }
@@ -300,7 +350,19 @@ pub fn dirty_files(root: &Path, index: &TextIndex) -> Arc<Vec<String>> {
                     return true;
                 };
                 match std::fs::metadata(root.join(rel.as_str())) {
-                    Ok(meta) => signature(&meta) != (known.size, known.mtime_ns),
+                    // Every recorded field must match: size and mtime can be
+                    // forged by a metadata-preserving copy, so ctime/ino are
+                    // part of the comparison wherever the platform records
+                    // them (0 = not available on either side, a no-op term).
+                    Ok(meta) => {
+                        identity(&meta)
+                            != FileIdentity {
+                                size: known.size,
+                                mtime_ns: known.mtime_ns,
+                                ctime_secs: known.ctime_secs,
+                                ino: known.ino,
+                            }
+                    }
                     Err(_) => false, // deleted: nothing to search
                 }
             })
@@ -372,6 +434,15 @@ fn has_uppercase(pattern: &str, is_regex: bool) -> bool {
         }
     }
     false
+}
+
+impl Compiled {
+    /// Match bytes against the compiled pattern. The `regex` field is
+    /// module-private (`expr` drives the trigram plan), so cross-module
+    /// consumers — symbol search lives in `symbols` — go through here.
+    pub fn is_match(&self, text: &[u8]) -> bool {
+        self.regex.is_match(text)
+    }
 }
 
 impl Query {
@@ -754,6 +825,23 @@ fn build_hit(
     }
 }
 
+/// Whether `path` still resolves inside the canonical `root`.
+///
+/// Index-seeded paths were recorded at inventory time and may have been
+/// re-pointed since; a tracked regular file swapped for a symlink (at the
+/// leaf or via a parent component) would otherwise be followed into content
+/// outside the root. Canonicalization never follows a trailing symlink whose
+/// target is missing, and a resolution that escapes `root` fails the prefix
+/// check — both fail closed.
+pub(super) fn path_stays_inside(
+    path: &std::path::Path,
+    root_canonical: Option<&std::path::Path>,
+) -> bool {
+    root_canonical.is_some_and(|root| {
+        std::fs::canonicalize(path).is_ok_and(|resolved| resolved.starts_with(root))
+    })
+}
+
 /// Whether an index-seeded candidate may still be read: its path was
 /// recorded at inventory time and may have been re-pointed since, and a
 /// tracked regular file swapped for a symlink (at the leaf or via a parent
@@ -766,9 +854,7 @@ fn index_candidate_contained(
     root_canonical: Option<&std::path::Path>,
 ) -> bool {
     match (candidate.id, root_canonical) {
-        (Some(_), Some(root)) => {
-            std::fs::canonicalize(&candidate.abs).is_ok_and(|resolved| resolved.starts_with(root))
-        }
+        (Some(_), Some(root)) => path_stays_inside(&candidate.abs, Some(root)),
         _ => true,
     }
 }
@@ -999,106 +1085,9 @@ pub fn search(roots: &[RootSpec], compiled: &Compiled, options: &SearchOptions) 
     output
 }
 
-// ── Symbol-definition search ─────────────────────────────────────────────────
-
-/// A symbol whose *name* matched.
-#[derive(Debug, Clone)]
-pub struct SymbolHit {
-    /// Root index in the `roots` slice.
-    pub root: usize,
-    /// Root-relative file.
-    pub rel: String,
-    /// Symbol name.
-    pub name: String,
-    /// Kind (`function`, `class`, ...).
-    pub kind: &'static str,
-    /// First line (1-based); `0` when the file could not be read.
-    pub line: u32,
-    /// Last line (1-based).
-    pub end_line: u32,
-    /// The file changed after indexing, so the line numbers may be off.
-    pub stale: bool,
-    /// 0 exact name, 1 prefix, 2 other.
-    pub rank: u8,
-}
-
-/// Find symbol definitions by name across indexed roots. Symbols come from the
-/// index, so this needs no PDG and no parsing; exact matches sort first.
-/// Returns `(window, total)`.
-pub fn search_symbols(
-    roots: &[RootSpec],
-    compiled: &Compiled,
-    pattern_lower: &str,
-    kinds: &[String],
-    offset: usize,
-    limit: Option<usize>,
-) -> (Vec<SymbolHit>, usize) {
-    let mut hits: Vec<SymbolHit> = Vec::new();
-    for (root_id, spec) in roots.iter().enumerate() {
-        let Some(index) = &spec.index else { continue };
-        let dirty_list = dirty_files(&spec.root, index);
-        let dirty: std::collections::HashSet<&str> =
-            dirty_list.iter().map(String::as_str).collect();
-        for id in index.file_ids() {
-            let Some(meta) = index.file(id) else { continue };
-            if !spec.filter.allows(meta.path) {
-                continue;
-            }
-            for (name, kind, start, end) in index.symbols(id) {
-                if !kinds.is_empty() && !kinds.iter().any(|k| k.eq_ignore_ascii_case(kind)) {
-                    continue;
-                }
-                if !compiled.regex.is_match(name.as_bytes()) {
-                    continue;
-                }
-                let lowered = name.to_ascii_lowercase();
-                let rank = if lowered == pattern_lower {
-                    0
-                } else if lowered.starts_with(pattern_lower) {
-                    1
-                } else {
-                    2
-                };
-                hits.push(SymbolHit {
-                    root: root_id,
-                    rel: meta.path.to_string(),
-                    name,
-                    kind,
-                    line: start,
-                    end_line: end,
-                    stale: dirty.contains(meta.path),
-                    rank,
-                });
-            }
-        }
-    }
-    hits.sort_by(|a, b| (a.rank, a.root, &a.rel, a.line).cmp(&(b.rank, b.root, &b.rel, b.line)));
-    let total = hits.len();
-    let mut window: Vec<SymbolHit> = hits
-        .into_iter()
-        .skip(offset)
-        .take(limit.unwrap_or(usize::MAX))
-        .collect();
-    // Byte offsets -> lines, only for the returned window.
-    for hit in &mut window {
-        let path = roots[hit.root].root.join(&hit.rel);
-        if let Ok(data) = std::fs::read(&path) {
-            let (start, end) = (hit.line as usize, hit.end_line as usize);
-            let line_of = |at: usize| {
-                1 + memchr::memchr_iter(b'\n', &data[..at.min(data.len())]).count() as u32
-            };
-            hit.line = line_of(start);
-            hit.end_line = line_of(end.saturating_sub(1).max(start));
-        } else {
-            hit.line = 0;
-            hit.end_line = 0;
-        }
-    }
-    (window, total)
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::symbols::search_symbols;
     use super::*;
     use std::fs;
 
@@ -1897,5 +1886,65 @@ mod tests {
             &SearchOptions::default(),
         );
         assert_eq!(paths(&out), ["huge.txt"]);
+    }
+
+    /// Same-size edits that preserve mtime (metadata-preserving copies,
+    /// coarse-resolution filesystems) were invisible to the old
+    /// (size, mtime) freshness check: the stale trigram plan excluded the
+    /// file and the edit stayed missing forever. Both replacement-sensitive
+    /// terms catch it: an in-place write advances ctime, and a
+    /// replace-by-rename changes the inode.
+    /// Set a file's mtime to an explicit value (ns since epoch), standing in
+    /// for a metadata-preserving copy. ctime cannot be forged — which is the
+    /// detection property under test.
+    #[cfg(unix)]
+    fn force_mtime_ns(path: &std::path::Path, ns: i64) {
+        let ts = libc::timespec {
+            tv_sec: ns.div_euclid(1_000_000_000),
+            tv_nsec: ns.rem_euclid(1_000_000_000),
+        };
+        let times = [ts, ts];
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(rc, 0, "utimensat failed for {}", path.display());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_dirty_files_detects_same_size_mtime_preserving_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "fn alpha() {}\n";
+        write(dir.path(), "a.rs", text);
+        let out = dir.path().join(".leindex/textindex/index.bin");
+        build_index(dir.path(), &out, HashMap::new()).unwrap();
+        let index = TextIndex::open(&out).unwrap();
+        assert!(dirty_files(dir.path(), &index).is_empty());
+
+        // In-place same-length edit with the indexed mtime restored: the
+        // ctime term detects it (utimensat bumps ctime to a later instant;
+        // the pre-sleep guarantees the second differs from the build's).
+        let known = index.file(index.id_of("a.rs").unwrap()).unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(dir.path().join("a.rs"), "fn delta() {}\n").unwrap();
+        force_mtime_ns(&dir.path().join("a.rs"), known.mtime_ns);
+        let dirty = dirty_files(dir.path(), &index);
+        assert!(
+            dirty.contains(&"a.rs".to_string()),
+            "in-place same-size/mtime edit must be dirty, got {dirty:?}"
+        );
+
+        // Replace-by-rename with the mtime preserved: the ino term detects
+        // it even when ctime granularity would not.
+        let index = TextIndex::open(&out).unwrap();
+        let known = index.file(index.id_of("a.rs").unwrap()).unwrap();
+        let staged = dir.path().join("a.rs.staged");
+        std::fs::write(&staged, "fn gamma() {}\n").unwrap();
+        force_mtime_ns(&staged, known.mtime_ns);
+        std::fs::rename(&staged, dir.path().join("a.rs")).unwrap();
+        let dirty = dirty_files(dir.path(), &index);
+        assert!(
+            dirty.contains(&"a.rs".to_string()),
+            "rename-replaced same-size/mtime edit must be dirty, got {dirty:?}"
+        );
     }
 }

@@ -500,3 +500,67 @@ fn test_lease_acquires_from_disk() {
         }
     }
 }
+
+// -------- lease acquisition vs generation pruning (round-8 Codex P1) ------
+
+/// The pruner's GC unlinked this generation's blobs before the reader's
+/// refcount persist landed (the reader's CURRENT read raced a retention
+/// pass). Acquire must refuse with the retryable `GenerationPruned` — not
+/// record positive counts over missing blobs — and roll back every hold so
+/// no phantom pin survives.
+#[test]
+fn test_lease_acquire_reports_generation_pruned_and_rolls_back() {
+    let (_dir, store, hashes) = setup_store_with_blobs();
+    let manifest =
+        fixture_manifest_with_hashes([hashes[0], hashes[1], hashes[2], hashes[3], hashes[4]]);
+
+    // Simulate the race: the blobs are gone from disk before acquire runs.
+    remove_blob_files(_dir.path());
+
+    match GenerationLease::acquire(store.clone(), &manifest) {
+        Err(LeaseError::GenerationPruned { generation }) => {
+            assert_eq!(generation, manifest.generation);
+        }
+        Err(other) => panic!("expected GenerationPruned, got {other}"),
+        Ok(_) => panic!("expected GenerationPruned, the acquisition must not succeed"),
+    }
+
+    // No phantom pin: counts read zero and the generation hold is gone.
+    let s = store.lock().unwrap();
+    for h in &hashes {
+        assert_eq!(s.refcount(h), 0, "rollback must undo every incr");
+    }
+    assert!(
+        !s.held_generations().contains(&manifest.generation),
+        "rollback must release the generation hold"
+    );
+}
+
+/// A lease whose blobs still exist keeps working exactly as before (the new
+/// existence check must not reject valid acquisitions).
+#[test]
+fn test_lease_acquire_still_succeeds_when_blobs_exist() {
+    let (_dir, store, hashes) = setup_store_with_blobs();
+    let manifest =
+        fixture_manifest_with_hashes([hashes[0], hashes[1], hashes[2], hashes[3], hashes[4]]);
+    let lease = GenerationLease::acquire(store.clone(), &manifest).expect("acquire");
+    assert_eq!(lease.generation(), manifest.generation);
+}
+
+/// Delete every stored blob under the CAS root (shard files named as 64 hex
+/// chars), leaving aux/sidecar files alone.
+fn remove_blob_files(root: &Path) {
+    for entry in std::fs::read_dir(root).expect("cas root") {
+        let entry = entry.expect("entry");
+        if !entry.file_type().expect("type").is_dir() {
+            continue;
+        }
+        for blob in std::fs::read_dir(entry.path()).expect("shard") {
+            let blob = blob.expect("blob entry");
+            let name = blob.file_name().to_string_lossy().to_string();
+            if name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                std::fs::remove_file(blob.path()).expect("remove blob");
+            }
+        }
+    }
+}

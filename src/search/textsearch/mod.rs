@@ -15,12 +15,13 @@ pub mod engine;
 pub mod glob;
 pub mod index;
 pub mod plan;
+pub mod symbols;
 pub mod trigram;
 
 pub use engine::{
     BuildStats, CaseMode, Compiled, FileResult, Hit, Query, RootOutput, RootSpec, SearchOptions,
-    SearchOutput, SearchStats, SymbolHit, build_index, invalidate_freshness, list_files, search,
-    search_symbols,
+    SearchOutput, SearchStats, build_index, invalidate_freshness, list_files, search,
 };
 pub use glob::FileFilter;
 pub use index::{SymbolSpan, TextIndex, kind_code};
+pub use symbols::{SymbolHit, search_symbols};

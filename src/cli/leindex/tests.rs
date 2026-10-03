@@ -202,3 +202,27 @@ fn test_diagnostics_serialization() {
     assert_eq!(deserialized.cache_hits, 9);
     assert_eq!(deserialized.spilled_bytes, 30000);
 }
+
+/// The flock behind [`ProjectWriteLock`] is per open-file description, NOT
+/// reentrant: a second descriptor's acquisition fails while the first is
+/// held. This is the premise behind the watcher's escalation path (round-8
+/// Codex P1): `index_project` opens its own descriptor and blocks, so the
+/// watcher MUST drop its guard before escalating or it deadlocks itself and
+/// pins the project write guard forever.
+#[test]
+fn test_project_write_lock_is_not_reentrant_within_a_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let guard = ProjectWriteLock::try_acquire(dir.path())
+        .expect("probe")
+        .expect("first acquisition must succeed on a free lock");
+    let second = ProjectWriteLock::try_acquire(dir.path()).expect("probe");
+    assert!(
+        second.is_none(),
+        "a second descriptor must NOT acquire while the first guard is held"
+    );
+    drop(guard);
+    let again = ProjectWriteLock::try_acquire(dir.path())
+        .expect("probe")
+        .expect("the lock must be free again after the guard drops");
+    drop(again);
+}

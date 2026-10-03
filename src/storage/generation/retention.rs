@@ -454,7 +454,11 @@ fn prune_generations(
     let mut retained_gens = retention_window(&gen_numbers, current_gen, max_generations.max(1));
 
     // Check each generation for a live lease (tracked by generation
-    // identity; see `retain_leased_generations`).
+    // identity; see `retain_leased_generations`). The reload first: a lease
+    // persisted by another handle or process since this store opened must be
+    // visible here, or the window computation would prune a pinned
+    // generation. A reload failure aborts pruning rather than pruning blind.
+    store.reload()?;
     retain_leased_generations(store, &gen_numbers, &mut retained_gens);
 
     // Collect pinned hashes from retained manifests.
@@ -462,7 +466,15 @@ fn prune_generations(
 
     // Delete non-retained generations. Leases are re-checked here: one taken
     // (and persisted) after the window was computed must still win, so the
-    // directory removal itself cannot race a fresh reader.
+    // directory removal itself cannot race a fresh reader whose lease was
+    // already visible. A lease persisted between this snapshot and the
+    // unlinks is still honoured where it matters: the GC that follows
+    // re-reads each blob's refcount under the refs lock before unlinking,
+    // so a reader whose lease landed after this snapshot keeps its blobs —
+    // only its generation DIRECTORY may be removed, and that cannot corrupt
+    // blobs shared with retained generations. The reader-side counterpart
+    // (acquire validates after persisting and retries against fresh
+    // CURRENT) closes the remaining window; see `GenerationLease::acquire`.
     let leased_now = store.held_generations();
     let mut removed = 0;
     let retained_count = retained_gens.len();

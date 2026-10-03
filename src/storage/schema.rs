@@ -710,12 +710,14 @@ impl Storage {
         // `qualified_name = ''` forever, invisible to the qualified-name
         // index and lookups. The two sentinel backfills run in batches so
         // each statement commits and releases the write lock instead of
-        // holding it for one multi-million-row rewrite inside `open`; both
-        // predicates shrink monotonically, so a crash mid-backfill resumes
-        // (the stored schema version only advances after all migrations
-        // return). The two dedup statements stay single-shot: batching them
-        // re-evaluates the duplicate predicate against rows their own
-        // earlier batches renamed, which can diverge instead of converging.
+        // holding it for one multi-million-row rewrite inside `open`; each
+        // batch is a bounded rowid-range scan (see
+        // `backfill_column_batched`), so a crash mid-backfill resumes on the
+        // next open (the stored schema version only advances after all
+        // migrations return). The two dedup statements stay single-shot:
+        // batching them re-evaluates the duplicate predicate against rows
+        // their own earlier batches renamed, which can diverge instead of
+        // converging.
         self.backfill_column_batched("node_id", "symbol_name")?;
         self.backfill_column_batched("qualified_name", "symbol_name")?;
         self.conn.execute_batch(
@@ -735,9 +737,15 @@ impl Storage {
     /// is released between batches and other connections can interleave —
     /// the unbatched single UPDATE held it for the whole rewrite of what is
     /// the largest table in the store, executed inside [`Storage::open`].
-    /// The predicate shrinks every batch (rewritten rows no longer match),
-    /// so the loop terminates and a crashed backfill resumes on the next
-    /// open.
+    /// The loop advances a monotonic `id` (rowid alias) cursor, so every
+    /// batch is a BOUNDED rowid-range scan instead of a full table pass:
+    /// `column = ''` has no index that can serve it (the column indexes lead
+    /// with symbol_name/project_id), and a cursorless batch loop would
+    /// re-scan — and re-skip — every row earlier batches already rewrote,
+    /// making the total O(matching_rows/BATCH * table_size) full scans
+    /// exactly inside `open`. A crash mid-backfill resumes on the next open:
+    /// the first batch then walks past the already-rewritten prefix once and
+    /// the cursor takes over from there.
     fn backfill_column_batched(&mut self, column: &str, fallback: &str) -> SqliteResult<()> {
         if !matches!(
             (column, fallback),
@@ -750,18 +758,31 @@ impl Storage {
             )));
         }
         const BATCH_ROWS: i64 = 10_000;
+        let mut cursor = i64::MIN;
         loop {
-            let changed = self.conn.execute(
+            // Bounded look-ahead: the rowid predicate lets SQLite seek to the
+            // cursor, and LIMIT stops the scan after BATCH_ROWS matches. The
+            // upper bound is read back so the UPDATE below is an exact
+            // rowid-range rewrite (and the cursor strictly advances).
+            let upper: Option<i64> = self.conn.query_row(
+                &format!(
+                    "SELECT MAX(id) FROM (SELECT id FROM intel_nodes \
+                     WHERE {column} = '' AND id > ?1 ORDER BY id LIMIT {BATCH_ROWS})"
+                ),
+                rusqlite::params![cursor],
+                |row| row.get(0),
+            )?;
+            let Some(upper) = upper else {
+                return Ok(());
+            };
+            self.conn.execute(
                 &format!(
                     "UPDATE intel_nodes SET {column} = {fallback} \
-                     WHERE {column} = '' \
-                       AND id IN (SELECT id FROM intel_nodes WHERE {column} = '' LIMIT {BATCH_ROWS})"
+                     WHERE {column} = '' AND id > ?1 AND id <= ?2"
                 ),
-                [],
+                rusqlite::params![cursor, upper],
             )?;
-            if changed == 0 {
-                return Ok(());
-            }
+            cursor = upper;
         }
     }
 
@@ -794,8 +815,8 @@ impl Storage {
         // Batched: this is the population where every row matches the
         // sentinel, so the unbatched single UPDATE rewrote the whole table
         // under one write lock inside `open` (the exact shape the migration
-        // guidelines call out). The predicate shrinks each batch and the
-        // schema version only advances after this returns, so a crash
+        // guidelines call out). Each batch is a bounded rowid-range scan and
+        // the schema version only advances after this returns, so a crash
         // mid-backfill resumes on the next open.
         self.backfill_column_batched("qualified_name", "symbol_name")
     }
@@ -1023,6 +1044,43 @@ mod tests {
             ],
             "the empty sentinel is backfilled on upgrade; a real qualified_name is untouched"
         );
+    }
+
+    /// The cursor-bounded batch loop (round-8 Kilo): a population larger
+    /// than one batch must be rewritten completely across batches — no row
+    /// skipped, no re-scan divergence, termination — which is what the
+    /// monotonic `id` cursor guarantees versus a cursorless
+    /// `WHERE column = ''` loop (a full table pass per batch, since no index
+    /// serves the bare predicate).
+    #[test]
+    fn test_batched_backfill_covers_more_rows_than_one_batch() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+        {
+            let conn = storage.conn_mut();
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, node_type, content_hash, language, created_at, updated_at, precision)
+                     VALUES ('proj', 'f.rs', 'n' || ?1, 's' || ?1, '', 'Function', 'h' || ?1, 'rust', 0, 0, 0)",
+                )
+                .unwrap();
+            // 10_500 rows: more than one BATCH_ROWS slice, fewer than two.
+            for i in 0..10_500 {
+                stmt.execute(rusqlite::params![i]).unwrap();
+            }
+        }
+        storage
+            .backfill_column_batched("qualified_name", "symbol_name")
+            .expect("batched backfill must succeed");
+        let remaining: i64 = storage
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM intel_nodes WHERE qualified_name = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "every sentinel row must be rewritten");
     }
 
     // A+ VAL-APLUS-007: Project writer SQLite connection uses the writer cache cap

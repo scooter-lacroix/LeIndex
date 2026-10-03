@@ -433,6 +433,14 @@ impl LeIndex {
     /// Apply deleted-file removals and changed-file re-parsing to the PDG and
     /// storage during an incremental watcher reindex. Returns the IDs of nodes
     /// removed from deleted files (for search-engine delta eviction).
+    ///
+    /// A re-parsed file's old nodes are removed together with every incident
+    /// edge, while the freshly extracted per-file PDG only carries unresolved
+    /// external placeholders — persisting that merge as-is would silently drop
+    /// every cross-file call/flow relationship involving the edited file until
+    /// the next full reindex. Cross-file edges incident to the file are
+    /// therefore snapshotted before removal (keyed by stable node-id strings)
+    /// and re-attached after the merge (see [`preserve_cross_file_edges`]).
     pub(super) fn apply_incremental_pdg_changes(
         &mut self,
         pdg: &mut crate::graph::pdg::ProgramDependenceGraph,
@@ -468,6 +476,9 @@ impl LeIndex {
             let file_path = result.file_path.display().to_string();
             let language = result.language.as_deref().unwrap_or("unknown");
             let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
+            // Snapshot BEFORE removal: removing the file's nodes deletes every
+            // incident edge, including the cross-file ones this snapshot keeps.
+            let preserved = preserve_cross_file_edges(pdg, &file_path);
             index_builder::remove_file_from_pdg(pdg, &file_path)?;
             let file_pdg = crate::graph::extract_pdg_from_signatures(
                 result.signatures,
@@ -476,6 +487,7 @@ impl LeIndex {
                 language,
             );
             index_builder::merge_pdgs(pdg, file_pdg);
+            restore_cross_file_edges(pdg, preserved);
             if let Some(hash) = source_file_hashes.get(&file_path) {
                 if let Err(e) = crate::storage::pdg_store::update_indexed_file(
                     &mut self.storage,
@@ -492,7 +504,6 @@ impl LeIndex {
         }
         Ok(removed_node_ids)
     }
-
     /// Build NodeInfo entries for nodes in changed files, applying the same
     /// pruning gate and TF-IDF embedding as a full index (restricted to the delta).
     pub(super) fn build_changed_node_infos(
@@ -593,5 +604,247 @@ impl LeIndex {
                     })
             })
             .collect()
+    }
+}
+
+/// A cross-file edge incident to a re-parsed file's nodes, snapshotted before
+/// the file's old nodes (and every incident edge) are removed.
+struct PreservedCrossFileEdge {
+    /// `node.id` string of the endpoint inside the re-parsed file. Ids are
+    /// deterministic per file (`file_path:qualified_name`), so the replacement
+    /// node for a surviving symbol carries the same string after the merge.
+    file_side_id: String,
+    /// `node.id` string of the endpoint in another file — a real definition
+    /// (untouched by this delta) or an external placeholder.
+    other_side_id: String,
+    /// `true` when the edge runs `other_side -> file_side`.
+    incoming: bool,
+    /// The original edge weight (type, call count, confidence, …).
+    edge: crate::graph::pdg::Edge,
+}
+
+/// Snapshot every edge crossing the file boundary of `file_path`.
+///
+/// Edges with both endpoints inside the file are skipped (the re-extraction
+/// recreates them) as are edges touching neither the file nor its nodes.
+/// Both directions are captured: an unchanged caller's edge into the edited
+/// file dies with the edited file's old node, and so does the edited file's
+/// own resolved edge into another file's definition.
+fn preserve_cross_file_edges(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    file_path: &str,
+) -> Vec<PreservedCrossFileEdge> {
+    let file_node_ids: HashSet<String> = pdg
+        .node_indices()
+        .filter_map(|idx| pdg.get_node(idx))
+        .filter(|node| node.file_path.as_ref() == file_path)
+        .map(|node| node.id.to_string())
+        .collect();
+    let mut preserved = Vec::new();
+    for edge_id in pdg.edge_indices() {
+        let Some((from, to)) = pdg.edge_endpoints(edge_id) else {
+            continue;
+        };
+        let (Some(from_node), Some(to_node)) = (pdg.get_node(from), pdg.get_node(to)) else {
+            continue;
+        };
+        let from_in_file = file_node_ids.contains(from_node.id.as_str());
+        let to_in_file = file_node_ids.contains(to_node.id.as_str());
+        if from_in_file == to_in_file {
+            continue;
+        }
+        let Some(edge) = pdg.get_edge(edge_id) else {
+            continue;
+        };
+        preserved.push(if from_in_file {
+            PreservedCrossFileEdge {
+                file_side_id: from_node.id.to_string(),
+                other_side_id: to_node.id.to_string(),
+                incoming: false,
+                edge: edge.clone(),
+            }
+        } else {
+            PreservedCrossFileEdge {
+                file_side_id: to_node.id.to_string(),
+                other_side_id: from_node.id.to_string(),
+                incoming: true,
+                edge: edge.clone(),
+            }
+        });
+    }
+    preserved
+}
+
+/// Re-attach the snapshotted cross-file edges onto the re-merged graph.
+///
+/// An edge is restored only when BOTH endpoints resolve by id string: the
+/// file side must have survived the edit (a renamed/removed symbol's edges
+/// are correctly dropped), and the other side must still exist. An edge the
+/// fresh per-file extraction already recreated (e.g. the file's own call to
+/// an external placeholder) is not duplicated. Returns the restored count.
+fn restore_cross_file_edges(
+    pdg: &mut crate::graph::pdg::ProgramDependenceGraph,
+    preserved: Vec<PreservedCrossFileEdge>,
+) -> usize {
+    use petgraph::visit::EdgeRef;
+    let mut restored = 0usize;
+    for edge in preserved {
+        let (Some(file_side), Some(other_side)) = (
+            pdg.find_by_id(&edge.file_side_id),
+            pdg.find_by_id(&edge.other_side_id),
+        ) else {
+            continue;
+        };
+        let (from, to) = if edge.incoming {
+            (other_side, file_side)
+        } else {
+            (file_side, other_side)
+        };
+        let already_present = pdg.graph.edges(from).any(|reference| {
+            reference.target() == to && reference.weight().edge_type == edge.edge.edge_type
+        });
+        if already_present {
+            continue;
+        }
+        pdg.add_edge(from, to, edge.edge);
+        restored += 1;
+    }
+    restored
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::pdg::{Edge, EdgeMetadata, EdgeType, Node, NodeType};
+
+    fn symbol(id: &str, file: &str, name: &str, node_type: NodeType) -> Node {
+        Node {
+            id: id.to_string(),
+            node_type,
+            name: name.to_string(),
+            file_path: std::sync::Arc::from(file),
+            byte_range: (0, 0),
+            complexity: 0,
+            language: "rust".to_string(),
+        }
+    }
+
+    fn call_edge() -> Edge {
+        Edge {
+            edge_type: EdgeType::Call,
+            metadata: EdgeMetadata::empty(),
+        }
+    }
+
+    fn has_edge(
+        pdg: &crate::graph::pdg::ProgramDependenceGraph,
+        from: crate::graph::pdg::NodeId,
+        to: crate::graph::pdg::NodeId,
+        edge_type: &EdgeType,
+    ) -> bool {
+        use petgraph::visit::EdgeRef;
+        pdg.graph
+            .edges(from)
+            .any(|reference| reference.target() == to && reference.weight().edge_type == *edge_type)
+    }
+
+    /// The watcher-delta contract (Codex P1, round 8): removing a re-parsed
+    /// file's nodes deletes every incident edge, so the cross-file edges must
+    /// be snapshotted before removal and re-attached after the merge — in
+    /// BOTH directions (the file's own resolved calls out, other files' calls
+    /// in) — or impact/dependency queries lose the edited file's
+    /// relationships until a full reindex.
+    #[test]
+    fn test_cross_file_edges_survive_a_watcher_remerge() {
+        let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
+        let caller = pdg.add_node(symbol("a.rs:main", "a.rs", "main", NodeType::Function));
+        let callee = pdg.add_node(symbol("b.rs:helper", "b.rs", "helper", NodeType::Function));
+        let external = pdg.add_node(Node {
+            language: "external".to_string(),
+            node_type: NodeType::External,
+            ..symbol("external::log", "<external>", "log", NodeType::External)
+        });
+        pdg.add_edge(caller, callee, call_edge());
+        pdg.add_edge(caller, external, call_edge());
+        // An intra-file edge: recreated by re-extraction, never snapshotted.
+        let helper2 = pdg.add_node(symbol("a.rs:main2", "a.rs", "main2", NodeType::Function));
+        pdg.add_edge(caller, helper2, call_edge());
+
+        let preserved = preserve_cross_file_edges(&pdg, "a.rs");
+        assert_eq!(preserved.len(), 2, "only cross-file edges are captured");
+        assert!(
+            preserved
+                .iter()
+                .all(|edge| !edge.incoming && edge.file_side_id == "a.rs:main")
+        );
+
+        // Simulate the re-merge: drop the file's old nodes (edges die with
+        // them), re-add the surviving symbol under the same deterministic id.
+        pdg.remove_file("a.rs");
+        assert!(!has_edge(&pdg, callee, caller, &EdgeType::Call));
+        let caller_new = pdg.add_node(symbol("a.rs:main", "a.rs", "main", NodeType::Function));
+
+        let restored = restore_cross_file_edges(&mut pdg, preserved);
+        assert_eq!(restored, 2);
+        assert!(
+            has_edge(&pdg, caller_new, callee, &EdgeType::Call),
+            "the file's resolved call into another file must be restored"
+        );
+        assert!(
+            has_edge(&pdg, caller_new, external, &EdgeType::Call),
+            "the call to the external placeholder must be restored"
+        );
+    }
+
+    /// An edge whose far end disappeared with the edit (the symbol was
+    /// renamed or removed in the other file) is dropped, not re-attached to a
+    /// stale node.
+    #[test]
+    fn test_restore_drops_edges_whose_other_side_vanished() {
+        let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
+        let caller = pdg.add_node(symbol("a.rs:main", "a.rs", "main", NodeType::Function));
+        let callee = pdg.add_node(symbol("b.rs:helper", "b.rs", "helper", NodeType::Function));
+        pdg.add_edge(caller, callee, call_edge());
+
+        let preserved = preserve_cross_file_edges(&pdg, "b.rs");
+        assert_eq!(preserved.len(), 1);
+        assert!(preserved[0].incoming, "b.rs's node is the edge target");
+
+        pdg.remove_file("b.rs");
+        // The replacement b.rs no longer defines `helper` — only a renamed one.
+        let _replacement = pdg.add_node(symbol(
+            "b.rs:renamed",
+            "b.rs",
+            "renamed",
+            NodeType::Function,
+        ));
+        assert_eq!(restore_cross_file_edges(&mut pdg, preserved), 0);
+    }
+
+    /// An edge the fresh per-file extraction already recreated (here: the
+    /// file's own call to an external placeholder) must not be duplicated.
+    #[test]
+    fn test_restore_does_not_duplicate_recreated_edges() {
+        let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
+        let caller = pdg.add_node(symbol("a.rs:main", "a.rs", "main", NodeType::Function));
+        let external = pdg.add_node(Node {
+            language: "external".to_string(),
+            ..symbol("external::log", "<external>", "log", NodeType::External)
+        });
+        pdg.add_edge(caller, external, call_edge());
+
+        let preserved = preserve_cross_file_edges(&pdg, "a.rs");
+        pdg.remove_file("a.rs");
+        let caller_new = pdg.add_node(symbol("a.rs:main", "a.rs", "main", NodeType::Function));
+        // The re-extraction's placeholder edge (merge remaps it onto the
+        // shared external node).
+        pdg.add_edge(caller_new, external, call_edge());
+
+        assert_eq!(restore_cross_file_edges(&mut pdg, preserved), 0);
+        assert_eq!(
+            pdg.graph.edges(caller_new).count(),
+            1,
+            "exactly one caller->external edge remains"
+        );
     }
 }

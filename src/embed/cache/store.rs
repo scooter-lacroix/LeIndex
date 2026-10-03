@@ -565,19 +565,10 @@ impl GlobalEmbeddingCache {
             fs::create_dir_all(parent)?;
         }
 
-        // Atomic write: uniquely-named temp file -> fsync -> rename. The
-        // pid/seq suffix mirrors the CAS staging convention: a deterministic
-        // `<fingerprint>.partial` name let two processes populating the
-        // global cache for the same fingerprint open and truncate the SAME
-        // staging file, so one writer's rename could publish an inode the
-        // other was still appending to — a short or mixed row that the
-        // final-path existence check would then serve forever.
-        static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let staging_path = final_path.with_extension(format!(
-            "partial.{}.{}",
-            std::process::id(),
-            STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        // Atomic write: uniquely-named temp file -> fsync -> rename. See
+        // `staging_path_for` for why the name must be unique per writer AND
+        // still end in `.partial`.
+        let staging_path = staging_path_for(final_path);
         {
             let file = fs::File::create(&staging_path)?;
             let mut writer = BufWriter::new(file);
@@ -674,7 +665,7 @@ impl GlobalEmbeddingCache {
                     fs::create_dir_all(parent)?;
                 }
             }
-            let staging_path = final_path.with_extension("partial");
+            let staging_path = staging_path_for(final_path);
             {
                 let file = fs::File::create(&staging_path)?;
                 let mut writer = BufWriter::new(file);
@@ -1076,6 +1067,30 @@ impl GlobalEmbeddingCache {
 // ---------------------------------------------------------------------------
 // Row-scan helper shared by compaction and eviction
 // ---------------------------------------------------------------------------
+
+/// Unique staging path for `final_path`, following the CAS staging
+/// convention (`<name>.<pid>.<seq>.partial`, see `storage::cas`): the
+/// TRAILING `.partial` keeps every name-based staging detector working
+/// (`row_file_paths` — and through it gc()/eviction — plus `row_count`,
+/// `total_bytes`, `compute_model_identity`), while the pid/seq suffix makes
+/// the name unique per writer. Both halves matter: a deterministic
+/// `<fingerprint>.partial` let two processes populating the cache for the
+/// same fingerprint open and truncate the SAME staging file, so one writer's
+/// rename could publish an inode the other was still appending to — a torn
+/// row that probes treat as a permanent miss; and the intermediate
+/// `<hex>.partial.<pid>.<seq>` spelling (extension = seq) made the same
+/// staging files simultaneously invisible as staging and visible as data,
+/// over-reporting occupancy so byte-budget eviction freed live rows.
+fn staging_path_for(final_path: &Path) -> PathBuf {
+    static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = final_path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_default();
+    name.push(format!(".partial.{}.{}", std::process::id(), seq));
+    final_path.with_file_name(name)
+}
 
 /// Collect the real row files (skipping `.partial` staging files) from a
 /// row-shard directory, propagating directory-read errors to the caller.

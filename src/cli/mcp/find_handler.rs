@@ -120,7 +120,7 @@ impl FindHandler {
                 "kind": { "type": "string", "description": "target=symbols: function, class, struct, ..." },
                 "context_lines": { "type": "integer", "default": 0, "minimum": 0, "maximum": 10, "description": "Context lines per match" },
                 "limit": { "type": "integer", "default": DEFAULT_LIMIT, "minimum": 0, "maximum": MAX_LIMIT, "description": "Hits per page; 0 = ceiling (10000)" },
-                "offset": { "type": "integer", "default": 0, "minimum": 0, "maximum": MAX_LIMIT, "description": "Hits to skip; clamped to 10000" },
+                "offset": { "type": "integer", "default": 0, "minimum": 0, "maximum": MAX_LIMIT, "description": "Hits to skip; clamped to 10000; stream ends there" },
                 "per_file_cap": { "type": "integer", "default": DEFAULT_PER_FILE, "minimum": 0, "description": "Shown per file; past-cap matches appear on no page; 0 = no cap" },
                 "max_line_chars": { "type": "integer", "default": 200, "minimum": 20, "maximum": 2000, "description": "Longest line shown" },
                 "timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": 0, "description": "Time budget; partial results + has_more. 0 = none" },
@@ -405,14 +405,20 @@ async fn symbols_result(
     .await
     .map_err(|e| JsonRpcError::internal_error(format!("find failed: {e}")))?;
     let returned = hits.len();
+    // A page whose continuation would land past the offset ceiling ends the
+    // stream: has_more/next_offset stay honest instead of pointing at an
+    // offset the next request would clamp back to this page's start.
+    let proposed_next = offset + returned;
+    let more = offset + returned < total && !continuation_past_ceiling(proposed_next);
     Ok(json!({
         "pattern": text,
         "target": "symbols",
         "total_symbols": total,
         "returned": returned,
         "offset": offset,
-        "has_more": offset + returned < total,
-        "next_offset": (offset + returned < total).then_some(offset + returned),
+        "has_more": more,
+        "next_offset": more.then_some(proposed_next),
+        "truncated_by_ceiling": (!more && offset + returned < total).then_some(true),
         "symbols": hits.iter().map(|h| json!({
             "name": h.name,
             "kind": h.kind,
@@ -437,6 +443,16 @@ fn paging_for_window(
     limit: Option<usize>,
 ) -> (usize, Option<usize>) {
     if windowed { (offset, limit) } else { (0, None) }
+}
+
+/// Whether a continuation past this page would be unusable: `next_offset`
+/// exceeds the offset ceiling, so the next request would be silently clamped
+/// back and re-serve this page forever. The ceiling therefore ENDS the
+/// stream: the page is still served in full, but `has_more` goes false and
+/// the response says why (same contract shape as `withheld_by_cap` — a cap
+/// must either shape the stream or not exist).
+fn continuation_past_ceiling(next_offset: usize) -> bool {
+    next_offset > MAX_LIMIT
 }
 
 /// The scan deadline, or `None` when the caller set no time budget.
@@ -614,59 +630,105 @@ fn shape_text_result(
             "millis": stats.millis as u64,
         },
     });
+    // Whether the engine's has_more was suppressed because the continuation
+    // would land past the offset ceiling (matches mode only; the summary
+    // modes compute their own in `shape_rows_page`).
+    let ceiling_ended = output_mode == "matches"
+        && result.has_more
+        && continuation_past_ceiling(offset + result.returned);
     match output_mode {
-        "matches" => {
-            value["returned"] = json!(result.returned);
-            value["offset"] = json!(offset);
-            value["has_more"] = json!(result.has_more);
-            if result.has_more {
-                value["next_offset"] = json!(offset + result.returned);
-            }
-            if result.cap_withheld > 0 {
-                value["withheld_by_cap"] = json!(result.cap_withheld);
-            }
-            value["files"] = Value::Array(files_json);
-        }
-        "files" => {
-            let cap = limit.unwrap_or(usize::MAX);
-            let total = file_rows.len();
-            let page: Vec<_> = file_rows.into_iter().skip(offset).take(cap).collect();
-            value["has_more"] = json!(offset + page.len() < total);
-            value["files"] = json!(
-                page.iter()
-                    .map(|(file, matches)| json!({ "file": file, "matches": matches }))
-                    .collect::<Vec<_>>()
-            );
-        }
+        "matches" => shape_matches_page(&mut value, &result, offset, ceiling_ended, files_json),
+        "files" => shape_rows_page(
+            &mut value,
+            file_rows,
+            offset,
+            limit,
+            "files",
+            |(file, matches)| json!({ "file": file, "matches": matches }),
+        ),
         "symbols" => {
             let mut rows: Vec<_> = symbol_totals.into_iter().collect();
             rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            let cap = limit.unwrap_or(usize::MAX);
-            let total = rows.len();
-            let page: Vec<_> = rows.into_iter().skip(offset).take(cap).collect();
-            value["has_more"] = json!(offset + page.len() < total);
-            value["symbols"] = json!(
-                page.iter()
-                    .map(|((name, kind, file), matches)| json!({
-                        "name": name, "kind": kind, "file": file, "matches": matches
-                    }))
-                    .collect::<Vec<_>>()
-            );
+            shape_rows_page(&mut value, rows, offset, limit, "symbols", |entry| {
+                let ((name, kind, file), matches) = entry;
+                json!({ "name": name, "kind": kind, "file": file, "matches": matches })
+            });
         }
         _ => {}
     }
-    if let Some(note) = result_note(&result) {
+    if let Some(note) = result_note(&result, output_mode, ceiling_ended) {
         value["note"] = json!(note);
     }
     value
 }
 
+/// The `matches` response page: hit lists plus the paging/truncation signals.
+fn shape_matches_page(
+    value: &mut Value,
+    result: &SearchOutput,
+    offset: usize,
+    ceiling_ended: bool,
+    files: Vec<Value>,
+) {
+    value["returned"] = json!(result.returned);
+    value["offset"] = json!(offset);
+    value["has_more"] = json!(result.has_more && !ceiling_ended);
+    if result.has_more && !ceiling_ended {
+        value["next_offset"] = json!(offset + result.returned);
+    }
+    if ceiling_ended {
+        value["truncated_by_ceiling"] = json!(true);
+    }
+    if result.cap_withheld > 0 {
+        value["withheld_by_cap"] = json!(result.cap_withheld);
+    }
+    value["files"] = Value::Array(files);
+}
+
+/// A summarised (`files`/`symbols`) response page: window the sorted rows and
+/// attach the same honest paging/truncation signals the hit pages carry.
+fn shape_rows_page<T>(
+    value: &mut Value,
+    rows: Vec<T>,
+    offset: usize,
+    limit: Option<usize>,
+    key: &str,
+    render: impl Fn(&T) -> Value,
+) {
+    let cap = limit.unwrap_or(usize::MAX);
+    let total = rows.len();
+    let page: Vec<_> = rows.into_iter().skip(offset).take(cap).collect();
+    let proposed_next = offset + page.len();
+    let ceiling_ended = proposed_next < total && continuation_past_ceiling(proposed_next);
+    value["has_more"] = json!(proposed_next < total && !ceiling_ended);
+    if ceiling_ended {
+        value["truncated_by_ceiling"] = json!(true);
+    }
+    value[key] = json!(page.iter().map(render).collect::<Vec<_>>());
+}
+
 /// Trailing hint for a matches payload: why a complete-looking response may
-/// still be incomplete. `None` when neither signal applies.
-fn result_note(result: &SearchOutput) -> Option<String> {
+/// still be incomplete. `None` when no signal applies. `ceiling_ended` is
+/// the stream-end computed by the caller (it needs the request offset).
+fn result_note(result: &SearchOutput, output_mode: &str, ceiling_ended: bool) -> Option<String> {
     let mut note = String::new();
-    if !result.complete && !result.has_more {
-        note.push_str("Stopped at the time budget; raise timeout_ms or narrow the search");
+    if output_mode == "matches" {
+        if !result.complete && !result.has_more {
+            note.push_str("Stopped at the time budget; raise timeout_ms or narrow the search");
+        }
+        if ceiling_ended {
+            // The page was served in full, but a continuation past the
+            // offset ceiling is unservable — say so instead of advertising
+            // a next_offset the next request would clamp into a repeat.
+            if !note.is_empty() {
+                note.push(' ');
+            }
+            note.push_str(&format!(
+                "Result stream ends at the {}-hit window ceiling (offset + page); \
+                 narrow the search with scope/include_globs to reach further matches",
+                MAX_LIMIT
+            ));
+        }
     }
     if result.cap_withheld > 0 {
         if !note.is_empty() {
@@ -804,6 +866,48 @@ mod tests {
             files["files"][1],
             json!({"file": "src/lib.rs", "matches": 2})
         );
+    }
+
+    #[test]
+    fn test_continuation_past_ceiling_boundaries() {
+        assert!(!continuation_past_ceiling(MAX_LIMIT));
+        assert!(continuation_past_ceiling(MAX_LIMIT + 1));
+    }
+
+    /// A page whose continuation would land past the offset ceiling must END
+    /// the stream (has_more=false, no next_offset, ceiling note) instead of
+    /// advertising a next_offset the next request would clamp back to this
+    /// page's start — the repeat-forever page (Codex P2, round 8).
+    #[test]
+    fn test_matches_page_at_ceiling_ends_stream_instead_of_repeating() {
+        let more = || SearchOutput {
+            returned: 5,
+            has_more: true,
+            complete: true,
+            ..SearchOutput::default()
+        };
+
+        // Control: a normal page keeps paging.
+        let value = shape_text_result("p", "matches", &[], more(), 10, Some(50));
+        assert_eq!(value["has_more"], true);
+        assert_eq!(value["next_offset"], 15);
+        assert!(value.get("truncated_by_ceiling").is_none());
+
+        // The page starting AT the ceiling: returned hits are served in
+        // full, but the continuation is refused with an explanation.
+        let value = shape_text_result("p", "matches", &[], more(), MAX_LIMIT, Some(50));
+        assert_eq!(value["has_more"], false);
+        assert!(value["next_offset"].is_null());
+        assert_eq!(value["truncated_by_ceiling"], true);
+        let note = value["note"].as_str().unwrap();
+        assert!(note.contains("window ceiling"), "note: {note}");
+
+        // The straddling page (offset + returned crosses the ceiling): same
+        // honest end, no clamped overlap.
+        let value = shape_text_result("p", "matches", &[], more(), MAX_LIMIT - 2, Some(50));
+        assert_eq!(value["has_more"], false);
+        assert!(value["next_offset"].is_null());
+        assert_eq!(value["truncated_by_ceiling"], true);
     }
 
     #[tokio::test]

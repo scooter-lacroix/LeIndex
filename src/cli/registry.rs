@@ -1437,6 +1437,7 @@ impl ProjectRegistry {
         project: &Path,
     ) -> Result<crate::storage::GenerationLease, crate::storage::LeaseError> {
         use crate::storage::GenerationLease;
+        use crate::storage::LeaseError;
         use crate::storage::generation::{read_current_generation, read_generation_manifest};
         use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
@@ -1446,24 +1447,45 @@ impl ProjectRegistry {
             .unwrap_or_else(|| project.join(".leindex"));
 
         let cas_dir = storage_path.join("cas");
-        let generation = read_current_generation(&storage_path).ok_or_else(|| {
-            crate::storage::LeaseError::NoCurrentGeneration(project.display().to_string())
-        })?;
-        let manifest = read_generation_manifest(&storage_path, generation)
-            .map_err(crate::storage::LeaseError::InvalidManifest)?;
 
         // Open (or re-open) the CAS store. Each call opens a fresh handle
         // backed by the same on-disk data. The refcount sidecar is
         // read+merged on open so increments survive across openings.
         let store = StdArc::new(StdMutex::new(
             crate::storage::CasStore::open(&cas_dir).map_err(|e| {
-                crate::storage::LeaseError::Io(std::io::Error::other(format!(
-                    "cas open failed: {e}"
-                )))
+                LeaseError::Io(std::io::Error::other(format!("cas open failed: {e}")))
             })?,
         ));
 
-        GenerationLease::acquire(store, &manifest)
+        // The CURRENT read races retention: `GenerationPruned` from acquire
+        // means this generation's blobs were garbage-collected between our
+        // CURRENT read and the lease's durable refcounts. Re-read CURRENT and
+        // retry against the freshly published generation; a bounded budget
+        // turns the pathological case (a pruner running every attempt) into
+        // a clean error instead of a live-loop.
+        let mut attempts = 0usize;
+        loop {
+            attempts += 1;
+            let generation = read_current_generation(&storage_path)
+                .ok_or_else(|| LeaseError::NoCurrentGeneration(project.display().to_string()))?;
+            let manifest = read_generation_manifest(&storage_path, generation)
+                .map_err(LeaseError::InvalidManifest)?;
+            match GenerationLease::acquire(StdArc::clone(&store), &manifest) {
+                Ok(lease) => return Ok(lease),
+                Err(LeaseError::GenerationPruned { .. }) if attempts < 3 => {
+                    tracing::debug!(
+                        project = %project.display(),
+                        generation,
+                        attempt = attempts,
+                        "generation pruned during lease acquisition; retrying against CURRENT"
+                    );
+                    // Give the publisher a beat so the retry's CURRENT read
+                    // lands after the retention that invalidated this one.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn refresh_resident_core_if_published(&self, path: &Path, resident_generation: &mut u64) {
