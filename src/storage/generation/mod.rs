@@ -10,6 +10,7 @@
 /// DB layer normalisation: copy a live SQLite DB into CAS via VACUUM
 /// (WS4 Task 8). See `db_layer` module docs.
 pub mod db_layer;
+pub mod graph_codec;
 pub mod lease;
 pub mod manifest;
 pub mod migrate;

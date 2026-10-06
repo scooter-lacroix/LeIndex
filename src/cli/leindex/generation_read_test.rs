@@ -14,7 +14,8 @@ use crate::feature_flags::{
 use crate::graph::pdg::ProgramDependenceGraph;
 use crate::storage::cas::CasStore;
 use crate::storage::generation::migrate::{
-    encode_empty_neural, encode_empty_tfidf, encode_pdg_layer, encode_symbols_layer, vacuum_bytes,
+    encode_empty_neural, encode_empty_tfidf, encode_pdg_layer_v2, encode_symbols_layer,
+    vacuum_bytes,
 };
 use crate::storage::generation::{
     GenerationSnapshot, GenerationWriter, LayerKind, read_current_generation,
@@ -69,7 +70,7 @@ fn publish_live_generation(storage_root: &std::path::Path, generation: u64) {
 
     let db_bytes = vacuum_bytes(&db_path).expect("vacuum db");
     let conn = Connection::open(&db_path).expect("open db");
-    let pdg_bytes = encode_pdg_layer(&conn).expect("encode pdg");
+    let pdg_bytes = encode_pdg_layer_v2(&conn).expect("encode pdg");
     let symbols_bytes = encode_symbols_layer(&conn).expect("encode symbols");
     drop(conn);
 
@@ -268,7 +269,7 @@ fn test_no_stall_read_during_index() {
             .stage(LayerKind::Neural, &encode_empty_neural())
             .expect("stage neural");
         let conn = Connection::open(writer_storage.join("leindex.db")).expect("open db");
-        let pdg_bytes = encode_pdg_layer(&conn).expect("encode pdg");
+        let pdg_bytes = encode_pdg_layer_v2(&conn).expect("encode pdg");
         let symbols_bytes = encode_symbols_layer(&conn).expect("encode symbols");
         drop(conn);
         writer.stage(LayerKind::Pdg, &pdg_bytes).expect("stage pdg");

@@ -1670,6 +1670,18 @@ impl ProgramDependenceGraph {
         self.precision_symbols.contains(node_id)
     }
 
+    /// Read access to the full precision-marker set (shared, not cloned).
+    pub fn precision_symbols(&self) -> &HashSet<String> {
+        &self.precision_symbols
+    }
+
+    /// Remove every precision marker whose node id matches `keep` returning
+    /// false. Callers that bulk-revoke markers after file invalidations use
+    /// this instead of cloning the set.
+    pub fn retain_precision_symbols<F: FnMut(&String) -> bool>(&mut self, keep: F) {
+        self.precision_symbols.retain(keep);
+    }
+
     /// Returns the total number of nodes in the graph.
     pub fn node_count(&self) -> usize {
         self.graph.node_count()

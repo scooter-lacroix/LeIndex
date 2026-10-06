@@ -11,7 +11,8 @@
 
 use crate::storage::cas::CasStore;
 use crate::storage::generation::migrate::{
-    encode_empty_neural, encode_empty_tfidf, encode_pdg_layer, encode_symbols_layer, vacuum_bytes,
+    encode_empty_neural, encode_empty_tfidf, encode_pdg_layer_v2, encode_symbols_layer,
+    vacuum_bytes,
 };
 use crate::storage::generation::{
     GenerationSnapshot, GenerationWriter, LayerKind, Manifest, read_generation_manifest,
@@ -27,29 +28,45 @@ use std::sync::{Arc, Mutex};
 fn write_catalog(path: &std::path::Path) {
     let conn = Connection::open(path).expect("open catalog");
     conn.execute_batch(
-        "CREATE TABLE intel_nodes (id INTEGER PRIMARY KEY, symbol_name TEXT, \
-         node_type TEXT, file_path TEXT, byte_start INTEGER, byte_end INTEGER, \
-         complexity INTEGER);\
-         CREATE TABLE intel_edges (caller_id INTEGER, callee_id INTEGER, edge_type TEXT);\
+        "CREATE TABLE intel_nodes (id INTEGER PRIMARY KEY, node_id TEXT, symbol_name TEXT, \
+         language TEXT, node_type TEXT, file_path TEXT, byte_range_start INTEGER, \
+         byte_range_end INTEGER, complexity INTEGER, precision INTEGER);\
+         CREATE TABLE intel_edges (caller_id INTEGER, callee_id INTEGER, edge_type TEXT, \
+         metadata TEXT);\
          CREATE TABLE project_metadata (project_id TEXT, value TEXT);",
     )
     .expect("create tables");
     {
         let mut stmt = conn
-            .prepare("INSERT INTO intel_nodes VALUES (?,?,?,?,?,?,?)")
+            .prepare(
+                "INSERT INTO intel_nodes (id, node_id, symbol_name, language, node_type, \
+                 file_path, byte_range_start, byte_range_end, complexity, precision) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?)",
+            )
             .expect("prepare node insert");
         for (id, name, ntype, fpath) in [
-            (1i64, "alpha", "Function", "/src/a.rs"),
-            (2i64, "alpha", "Function", "/src/a.rs"),
-            (3i64, "beta", "Variable", "/src/b.rs"),
+            (1i64, "alpha", "function", "/src/a.rs"),
+            (2i64, "alpha", "function", "/src/a.rs"),
+            (3i64, "beta", "variable", "/src/b.rs"),
         ] {
-            stmt.execute(rusqlite::params![id, name, ntype, fpath, 0i64, 40i64, 1i64])
-                .expect("insert node");
+            stmt.execute(rusqlite::params![
+                id,
+                format!("{fpath}:{name}"),
+                name,
+                "rust",
+                ntype,
+                fpath,
+                0i64,
+                40i64,
+                1i64,
+                0i64
+            ])
+            .expect("insert node");
         }
     }
     conn.execute(
-        "INSERT INTO intel_edges VALUES (?,?,?)",
-        rusqlite::params![1i64, 3i64, "CALL"],
+        "INSERT INTO intel_edges VALUES (?,?,?,NULL)",
+        rusqlite::params![1i64, 3i64, "call"],
     )
     .expect("insert edge");
     conn.execute(
@@ -73,7 +90,7 @@ fn publish_generation(
 
     let db_bytes = vacuum_bytes(catalog_path).expect("vacuum catalog");
     let conn = Connection::open(catalog_path).expect("open catalog");
-    let pdg_bytes = encode_pdg_layer(&conn).expect("encode pdg");
+    let pdg_bytes = encode_pdg_layer_v2(&conn).expect("encode pdg");
     let symbols_bytes = encode_symbols_layer(&conn).expect("encode symbols");
 
     writer.stage(LayerKind::Db, &db_bytes).expect("stage db");

@@ -18,17 +18,19 @@
 //!
 //! - **Db** — the legacy SQLite catalog, VACUUM-normalized into a canonical
 //!   byte form (same engine as `db_layer`; byte-deterministic for dedup).
-//! - **Tfidf** — a structurally valid, *empty* `LIDX-TFD1` payload. The
-//!   legacy `tfidf_embedder.bin` stores only vocabulary + IDF (needed to
-//!   compute query embeddings), not the sparse document×term matrix the
-//!   TF-IDF layer encodes. The dense document vectors are preserved verbatim
-//!   in the Neural layer; sparse-doc reconstruction is deferred to the
-//!   read-path wiring task.
-//! - **Neural** — a real conversion of the legacy mmap embedding file
-//!   (`embeddings.bin`, `LIEE` frame) into a `LIDX-NRL1` payload that
-//!   preserves the full `count × dim` f32 matrix.
+//! - **Tfidf** — the legacy `embeddings.bin` (`LIEE` frame) holds the dense
+//!   768-d TF-IDF document vectors keyed by `intel_nodes.node_id`. They are
+//!   re-encoded as sparse `(node, term, value)` triples in `LIDX-TFD1` (zeros
+//!   dropped, so the dense vector is exactly recoverable). `doc_id` is the
+//!   catalog integer id, matching the Pdg/Symbols layers.
+//! - **Neural** — the legacy `neural_embeddings.bin` (same `LIEE` frame; only
+//!   present when a neural model ran) becomes a version-2 `LIDX-NRL1` payload
+//!   carrying the f32 rows plus a per-row PDG node-id table. A store with no
+//!   neural file gets the canonical empty payload.
 //! - **Pdg** — reconstructed from the legacy catalog's `intel_nodes` /
-//!   `intel_edges` tables into `LIDX-PDG1`.
+//!   `intel_edges` tables into the **version-2 (lossless)** `LIDX-PDG1`
+//!   payload: graph node ids, symbol names, file paths, languages, types,
+//!   complexity, byte ranges, precision markers and full edge metadata.
 //! - **Symbols** — reconstructed from `intel_nodes` into `LIDX-SYM1`.
 //!
 //! ## Crash safety / idempotency
@@ -58,7 +60,7 @@
 //! explicit `leindex storage migrate` CLI command for sanctioned one-time
 //! runs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -72,9 +74,9 @@ use crate::storage::cas::blob::hash_to_hex;
 use super::lease::{GENERATIONS_DIR, MANIFEST_FILE, read_current_generation};
 use super::manifest::{LayerKind, Manifest};
 use super::reader::{
-    NEURAL_HEADER_LEN, NEURAL_MAGIC, PDG_EDGE_LEN, PDG_HEADER_LEN, PDG_MAGIC, PDG_NODE_LEN,
-    PDG_STRING_OFFSET_LEN, SYMBOL_ENTRY_LEN, SYMBOLS_HEADER_LEN, SYMBOLS_MAGIC, TFIDF_HEADER_LEN,
-    TFIDF_MAGIC,
+    NEURAL_HEADER_LEN, NEURAL_MAGIC, NEURAL_VERSION_WITH_IDS, PDG_EDGE_LEN, PDG_HEADER_LEN,
+    PDG_MAGIC, PDG_NODE_V2_LEN, PDG_STRING_OFFSET_LEN, PDG_V2_NONE, SYMBOL_ENTRY_LEN,
+    SYMBOLS_HEADER_LEN, SYMBOLS_MAGIC, TFIDF_ENTRY_LEN, TFIDF_HEADER_LEN, TFIDF_MAGIC,
 };
 use super::retention::DEFAULT_JOB_BYTES_MAX;
 use super::writer::GenerationWriter;
@@ -417,17 +419,21 @@ fn convert_generation(
     let db_bytes = vacuum_bytes(&db_handle.path)?;
     writer.stage(LayerKind::Db, &db_bytes)?;
 
-    // Neural layer: real conversion of the LIEE mmap embedding matrix.
-    let embeddings_path = gen_dir.join("embeddings.bin");
-    let neural_bytes = encode_neural_layer(&embeddings_path)?;
+    let conn = Connection::open(&db_handle.path)?;
+    let node_ids = load_node_id_map(&conn)?;
+
+    // Tfidf layer: `embeddings.bin` holds the dense TF-IDF document vectors;
+    // re-encode them as sparse (node, term, value) triples.
+    let tfidf_bytes = encode_tfidf_layer(&gen_dir.join("embeddings.bin"), &node_ids)?;
+    writer.stage(LayerKind::Tfidf, &tfidf_bytes)?;
+
+    // Neural layer: `neural_embeddings.bin` (absent when no neural model ran).
+    let neural_bytes = encode_neural_layer(&gen_dir.join("neural_embeddings.bin"), &node_ids)?;
     writer.stage(LayerKind::Neural, &neural_bytes)?;
 
-    // Tfidf layer: structurally valid empty payload (see module docs).
-    writer.stage(LayerKind::Tfidf, &encode_empty_tfidf())?;
-
-    // Pdg + Symbols: reconstructed from the legacy catalog.
-    let conn = Connection::open(&db_handle.path)?;
-    let pdg_bytes = encode_pdg_layer(&conn)?;
+    // Pdg + Symbols: reconstructed from the legacy catalog. The PDG layer is
+    // the lossless version-2 form (see encode_pdg_layer_v2).
+    let pdg_bytes = encode_pdg_layer_v2(&conn)?;
     writer.stage(LayerKind::Pdg, &pdg_bytes)?;
     let symbols_bytes = encode_symbols_layer(&conn)?;
     writer.stage(LayerKind::Symbols, &symbols_bytes)?;
@@ -481,209 +487,418 @@ pub(crate) fn vacuum_bytes(db_path: &Path) -> Result<Vec<u8>, MigrationError> {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     let escaped = out.to_string_lossy().replace('\'', "''");
     conn.execute_batch(&format!("VACUUM INTO '{}';", escaped))?;
-    let bytes = fs::read(&out)?;
     drop(conn);
+    canonicalize_volatile_rows(&out)?;
+    let bytes = fs::read(&out)?;
     Ok(bytes)
 }
 
-/// Convert a legacy `LIEE` mmap embedding file into a [`LIDX-NRL1`] payload
-/// preserving the full f32 matrix.
-pub(crate) fn encode_neural_layer(embeddings_path: &Path) -> Result<Vec<u8>, MigrationError> {
+/// Whether `table` exists (fixtures and legacy catalogs may lack the newer
+/// bookkeeping tables entirely).
+fn table_exists(conn: &Connection, table: &str) -> Result<bool, MigrationError> {
+    let mut stmt =
+        conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?;
+    Ok(stmt.exists([table])?)
+}
+
+/// Whether `table` exists AND carries every column in `columns`. A fixture or
+/// legacy catalog may reuse a table name with an older layout, which must be
+/// left untouched rather than rewritten.
+fn table_has_columns(
+    conn: &Connection,
+    table: &str,
+    columns: &[&str],
+) -> Result<bool, MigrationError> {
+    if !table_exists(conn, table)? {
+        return Ok(false);
+    }
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let present = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(columns
+        .iter()
+        .all(|want| present.iter().any(|have| have == want)))
+}
+
+/// Rewrite `table` with its rows in `ORDER BY <key>` order, in place. VACUUM
+/// alone preserves a b-tree's existing cell order, so two catalogs whose rows
+/// were inserted in different orders stay byte-different even when their
+/// logical contents are identical; rebuilding through a temp table with a
+/// deterministic ORDER BY yields one canonical byte image.
+fn rebuild_table_sorted(
+    conn: &Connection,
+    table: &str,
+    order_by: &str,
+) -> Result<(), MigrationError> {
+    if !table_exists(conn, table)? {
+        return Ok(());
+    }
+    conn.execute_batch(&format!(
+        "CREATE TABLE {table}_canonical AS
+             SELECT * FROM {table} ORDER BY {order_by};
+         DROP TABLE {table};
+         ALTER TABLE {table}_canonical RENAME TO {table};"
+    ))?;
+    Ok(())
+}
+
+/// Zero or collapse the per-run rows that make two catalogs of identical
+/// content compare unequal, so the staged Db layer dedups across generations.
+///
+/// - `project_metadata` grows one row per CLI invocation (the instance counter
+///   disambiguates concurrent opens of the same base name). The staged copy
+///   keeps a single row with the canonical `<base>_<hash>_0` identity, and
+///   every `project_id` reference in the catalog is rewritten to match.
+/// - Telemetry counters, community timestamps and `last_indexed` clocks are
+///   zeroed: they are mutable-root bookkeeping, not reader state.
+/// - Large tables are rebuilt in canonical row order so the byte image does
+///   not depend on the insertion order of the run that produced it.
+///
+/// A final in-place `VACUUM` renormalizes the page layout after the edits.
+pub(crate) fn canonicalize_volatile_rows(db_path: &Path) -> Result<(), MigrationError> {
+    use rusqlite::OptionalExtension;
+
+    let conn = Connection::open(db_path)?;
+    // Collapse the per-invocation project rows to the canonical identity.
+    // Fixtures and legacy catalogs may lack the table entirely.
+    let survivor: Option<(String, String, String, String, String, bool, String)> =
+        if table_has_columns(
+            &conn,
+            "project_metadata",
+            &[
+                "unique_project_id",
+                "base_name",
+                "path_hash",
+                "instance",
+                "canonical_path",
+            ],
+        )? {
+            conn.query_row(
+                "SELECT unique_project_id, base_name, path_hash, canonical_path,
+                    COALESCE(display_name, ''), is_clone, COALESCE(cloned_from, '')
+             FROM project_metadata
+             ORDER BY instance DESC, id DESC
+             LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?
+        } else {
+            None
+        };
+    if let Some((
+        _old_id,
+        base_name,
+        path_hash,
+        canonical_path,
+        display_name,
+        is_clone,
+        cloned_from,
+    )) = survivor
+    {
+        let canonical_id = format!("{base_name}_{path_hash}_0");
+        let stale_ids: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT unique_project_id FROM project_metadata")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        conn.execute("DELETE FROM project_metadata", [])?;
+        conn.execute(
+            "INSERT INTO project_metadata
+                 (id, unique_project_id, base_name, path_hash, instance, canonical_path,
+                  display_name, is_clone, cloned_from, created_at, last_indexed)
+             VALUES (0, ?1, ?2, ?3, 0, ?4, ?5, ?6, ?7,
+                     '1970-01-01 00:00:00', '1970-01-01 00:00:00')",
+            rusqlite::params![
+                canonical_id,
+                base_name,
+                path_hash,
+                canonical_path,
+                display_name,
+                is_clone,
+                cloned_from
+            ],
+        )?;
+        // Rewrite every table that keys rows by the project identity.
+        let tables: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for table in tables {
+            let has_project_id = {
+                let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+                    .iter()
+                    .any(|column| column == "project_id")
+            };
+            if !has_project_id {
+                continue;
+            }
+            for stale in &stale_ids {
+                if stale != &canonical_id {
+                    conn.execute(
+                        &format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"),
+                        rusqlite::params![canonical_id, stale],
+                    )?;
+                }
+            }
+        }
+    }
+    // Every statement below is guarded per table: fixtures and legacy
+    // catalogs may not carry the newer bookkeeping tables.
+    if table_exists(&conn, "cache_telemetry")? {
+        conn.execute_batch(
+            "UPDATE cache_telemetry
+                 SET cache_hits = 0,
+                     cache_misses = 0,
+                     cache_writes = 0,
+                     updated_at = 0,
+                     community_recompute_ms = 0;",
+        )?;
+    }
+    if table_exists(&conn, "intel_communities")? {
+        conn.execute_batch("UPDATE intel_communities SET computed_at = 0;")?;
+    }
+    if table_exists(&conn, "indexed_files")? {
+        conn.execute_batch("UPDATE indexed_files SET last_indexed = 0;")?;
+    }
+    if table_exists(&conn, "sqlite_sequence")? {
+        conn.execute_batch("DELETE FROM sqlite_sequence WHERE name = 'project_metadata';")?;
+    }
+    rebuild_table_sorted(&conn, "indexed_files", "file_path")?;
+    rebuild_table_sorted(
+        &conn,
+        "intel_community_memberships",
+        "project_id, node_id, community",
+    )?;
+    rebuild_table_sorted(
+        &conn,
+        "intel_communities",
+        "community, algorithm, quality_name",
+    )?;
+    // `schema_version` is rewritten via INSERT OR REPLACE each run, so its
+    // rowid drifts (1, 2, ...); rebuilding pins it.
+    rebuild_table_sorted(&conn, "schema_version", "key")?;
+    conn.execute_batch("VACUUM;")?;
+    Ok(())
+}
+
+/// Catalog `intel_nodes.node_id` (the text id legacy embedding files are keyed
+/// by) -> `intel_nodes.id` (the integer id the PDG/Symbols layers use).
+pub(crate) fn load_node_id_map(conn: &Connection) -> Result<HashMap<String, u32>, MigrationError> {
+    let mut q = conn.prepare("SELECT node_id, id FROM intel_nodes")?;
+    let rows = q.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (node_id, db_id) = row?;
+        let db_id = u32::try_from(db_id)
+            .map_err(|_| MigrationError::Payload("node id exceeds u32".into()))?;
+        map.insert(node_id, db_id);
+    }
+    Ok(map)
+}
+
+fn liee_u32(bytes: &[u8], offset: usize) -> Result<usize, MigrationError> {
+    bytes
+        .get(offset..offset + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        .ok_or_else(|| MigrationError::Payload("embeddings file truncated".into()))
+}
+
+/// Parse a legacy `LIEE` file (layout: see `write_mmap_embeddings`) into its
+/// row ids, dimension and raw little-endian f32 matrix bytes. Strict: any
+/// truncation or non-UTF-8 id aborts the migration before anything destructive.
+fn parse_liee(bytes: &[u8]) -> Result<(Vec<&str>, usize, &[u8]), MigrationError> {
+    if bytes.len() < LIEE_HEADER_LEN || bytes[0..4] != LIEE_MAGIC {
+        return Err(MigrationError::Payload(
+            "embeddings file has no LIEE header".into(),
+        ));
+    }
+    let count = liee_u32(bytes, 8)?;
+    let dim = liee_u32(bytes, 12)?;
+    let lengths_start = LIEE_HEADER_LEN + count * 8;
+    let ids_start = lengths_start + count * 4;
+    let mut ids = Vec::with_capacity(count);
+    let mut ids_end = ids_start;
+    for i in 0..count {
+        let off_at = LIEE_HEADER_LEN + i * 8;
+        let offset = bytes
+            .get(off_at..off_at + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().expect("8-byte slice")) as usize)
+            .ok_or_else(|| MigrationError::Payload("embeddings offset table truncated".into()))?;
+        let len = liee_u32(bytes, lengths_start + i * 4)?;
+        let (start, end) = (ids_start + offset, ids_start + offset + len);
+        let raw = bytes
+            .get(start..end)
+            .ok_or_else(|| MigrationError::Payload("embeddings id section truncated".into()))?;
+        ids.push(
+            std::str::from_utf8(raw)
+                .map_err(|_| MigrationError::Payload("embeddings id is not UTF-8".into()))?,
+        );
+        ids_end = ids_end.max(end);
+    }
+    let matrix_offset = (ids_end + 3) & !3;
+    let matrix_len = count
+        .checked_mul(dim)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| MigrationError::Payload("embeddings matrix size overflow".into()))?;
+    let matrix = bytes
+        .get(matrix_offset..matrix_offset + matrix_len)
+        .ok_or_else(|| MigrationError::Payload("embeddings matrix truncated".into()))?;
+    Ok((ids, dim, matrix))
+}
+
+/// Map each LIEE row to its catalog integer id (last row wins on duplicate
+/// ids). Rows whose id is not in the catalog are stale and dropped, loudly.
+fn rows_by_node(
+    ids: &[&str],
+    node_ids: &HashMap<String, u32>,
+    layer: &str,
+) -> BTreeMap<u32, usize> {
+    let mut rows = BTreeMap::new();
+    let mut dropped = 0usize;
+    for (row, id) in ids.iter().enumerate() {
+        match node_ids.get(*id) {
+            Some(&node) => {
+                rows.insert(node, row);
+            }
+            None => dropped += 1,
+        }
+    }
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            layer,
+            "legacy embedding rows not present in the catalog were dropped"
+        );
+    }
+    rows
+}
+
+/// Convert the legacy dense TF-IDF document vectors (`embeddings.bin`, `LIEE`)
+/// into a [`LIDX-TFD1`] payload of sparse `(node, term, value)` triples.
+/// Zero components are omitted, so the dense vector is exactly recoverable;
+/// an all-zero document leaves no entries.
+pub(crate) fn encode_tfidf_layer(
+    embeddings_path: &Path,
+    node_ids: &HashMap<String, u32>,
+) -> Result<Vec<u8>, MigrationError> {
     let bytes = fs::read(embeddings_path).map_err(|_| {
         MigrationError::Legacy(format!(
             "missing embeddings file at {}",
             embeddings_path.display()
         ))
     })?;
-    if bytes.len() < LIEE_HEADER_LEN {
-        return Err(MigrationError::Payload(
-            "embeddings file shorter than LIEE header".into(),
-        ));
-    }
-    if bytes[0..4] != LIEE_MAGIC {
-        return Err(MigrationError::Payload(
-            "embeddings file has no LIEE magic".into(),
-        ));
-    }
-    let node_count = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
-    let dimension = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
-
-    // Recompute the matrix offset exactly as `write_mmap_embeddings` does.
-    let offsets_start = LIEE_HEADER_LEN;
-    let lengths_start = offsets_start + node_count * 8;
-    let ids_start = lengths_start + node_count * 4;
-    let mut ids_len = 0usize;
-    for i in 0..node_count {
-        let base = lengths_start + i * 4;
-        if base + 4 > bytes.len() {
-            return Err(MigrationError::Payload(
-                "embeddings length table truncated".into(),
-            ));
+    let (ids, dim, matrix) = parse_liee(&bytes)?;
+    let rows = rows_by_node(&ids, node_ids, "tfidf");
+    let mut entries: Vec<(u32, u32, f32)> = Vec::new();
+    for (&node, &row) in &rows {
+        let vector = &matrix[row * dim * 4..(row + 1) * dim * 4];
+        for (term, chunk) in vector.chunks_exact(4).enumerate() {
+            let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            if value != 0.0 {
+                entries.push((node, term as u32, value));
+            }
         }
-        ids_len += u32::from_le_bytes([
-            bytes[base],
-            bytes[base + 1],
-            bytes[base + 2],
-            bytes[base + 3],
-        ]) as usize;
     }
-    let ids_end = ids_start + ids_len;
-    let matrix_offset = (ids_end + 3) & !3;
-    let matrix_len = node_count * dimension * 4;
-    let data = bytes
-        .get(matrix_offset..matrix_offset + matrix_len)
-        .ok_or_else(|| MigrationError::Payload("embeddings matrix truncated".into()))?;
+    let num_docs = rows.keys().next_back().map_or(0, |last| last + 1);
+    Ok(encode_tfidf_payload(num_docs, dim as u32, &entries))
+}
 
-    let content_hash = crate::storage::cas::blob::blob_hash(data);
-    let mut payload = Vec::with_capacity(NEURAL_HEADER_LEN + data.len());
+/// Convert the legacy neural embedding file (`neural_embeddings.bin`, `LIEE`)
+/// into a version-2 [`LIDX-NRL1`] payload: f32 rows plus the PDG node id of
+/// each row, sorted by node id. A missing file means no neural model ran, so
+/// the layer is the canonical empty payload.
+pub(crate) fn encode_neural_layer(
+    neural_path: &Path,
+    node_ids: &HashMap<String, u32>,
+) -> Result<Vec<u8>, MigrationError> {
+    if !neural_path.is_file() {
+        return Ok(encode_empty_neural());
+    }
+    let bytes = fs::read(neural_path)?;
+    let (ids, dim, matrix) = parse_liee(&bytes)?;
+    let rows = rows_by_node(&ids, node_ids, "neural");
+    let mut data = Vec::with_capacity(rows.len() * dim * 4);
+    for &row in rows.values() {
+        data.extend_from_slice(&matrix[row * dim * 4..(row + 1) * dim * 4]);
+    }
+    let node_order: Vec<u32> = rows.keys().copied().collect();
+    Ok(encode_neural_payload(&node_order, dim, &data))
+}
+
+/// Assemble a version-2 [`LIDX-NRL1`] F32 payload: `nodes[i]` is the PDG node
+/// id of row `i` of `data` (little-endian f32, `dim` per row). The content
+/// hash covers the id table followed by the data.
+pub(crate) fn encode_neural_payload(nodes: &[u32], dim: usize, data: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(nodes.len() * 4 + data.len());
+    for node in nodes {
+        body.extend_from_slice(&node.to_le_bytes());
+    }
+    body.extend_from_slice(data);
+    let mut payload = Vec::with_capacity(NEURAL_HEADER_LEN + body.len());
     payload.extend_from_slice(NEURAL_MAGIC);
-    payload.push(1); // version
+    payload.push(NEURAL_VERSION_WITH_IDS);
     payload.extend_from_slice(&[0, 0, 0]); // pad
-    payload.extend_from_slice(&(node_count as u32).to_le_bytes());
-    payload.extend_from_slice(&(dimension as u32).to_le_bytes());
+    payload.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&(dim as u32).to_le_bytes());
     payload.extend_from_slice(&0u32.to_le_bytes()); // dtype = F32
     payload.extend_from_slice(&1.0f32.to_le_bytes()); // scale (unused for F32)
     payload.extend_from_slice(&0.0f32.to_le_bytes()); // zero_point (unused for F32)
-    payload.extend_from_slice(&content_hash);
-    payload.push(0); // 4-byte alignment pad for the f32 array
-    payload.extend_from_slice(data);
-    Ok(payload)
+    payload.extend_from_slice(&crate::storage::cas::blob::blob_hash(&body));
+    payload.push(0); // 4-byte alignment pad for the id table / f32 array
+    payload.extend_from_slice(&body);
+    payload
 }
 
-/// Build a structurally valid, empty [`LIDX-TFD1`] payload. The legacy store
-/// does not persist a sparse document×term matrix (only vocabulary + IDF),
-/// so the migration stages an empty sparse layer and preserves the dense
-/// vectors in the Neural layer. See module docs.
-pub(crate) fn encode_empty_tfidf() -> Vec<u8> {
-    let mut payload = Vec::with_capacity(TFIDF_HEADER_LEN);
+/// Assemble a [`LIDX-TFD1`] payload from `(doc, term, value)` triples that
+/// are already sorted by `(doc, term)`.
+pub(crate) fn encode_tfidf_payload(
+    num_docs: u32,
+    num_terms: u32,
+    entries: &[(u32, u32, f32)],
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(entries.len() * TFIDF_ENTRY_LEN);
+    for (doc, term, value) in entries {
+        body.extend_from_slice(&doc.to_le_bytes());
+        body.extend_from_slice(&term.to_le_bytes());
+        body.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut payload = Vec::with_capacity(TFIDF_HEADER_LEN + body.len());
     payload.extend_from_slice(TFIDF_MAGIC);
     payload.push(1); // version
     payload.extend_from_slice(&[0, 0, 0]); // pad
-    payload.extend_from_slice(&0u32.to_le_bytes()); // num_docs
-    payload.extend_from_slice(&0u32.to_le_bytes()); // num_terms
-    payload.extend_from_slice(&0u32.to_le_bytes()); // num_entries
-    let content_hash = crate::storage::cas::blob::blob_hash(&[]);
-    payload.extend_from_slice(&content_hash);
+    payload.extend_from_slice(&num_docs.to_le_bytes());
+    payload.extend_from_slice(&num_terms.to_le_bytes());
+    payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&crate::storage::cas::blob::blob_hash(&body));
+    payload.extend_from_slice(&body);
     payload
 }
 
-/// Build a structurally valid, empty [`LIDX-NRL1`] payload (0 vectors). The
-/// legacy store's neural layer is preserved only when dense vectors exist;
-/// fixtures and the empty store use this canonical empty form.
-#[cfg(test)]
+/// The canonical empty [`LIDX-TFD1`] payload (no documents).
+pub(crate) fn encode_empty_tfidf() -> Vec<u8> {
+    encode_tfidf_payload(0, 0, &[])
+}
+
+/// The canonical empty [`LIDX-NRL1`] payload (no vectors).
 pub(crate) fn encode_empty_neural() -> Vec<u8> {
-    let mut payload = Vec::with_capacity(NEURAL_HEADER_LEN);
-    payload.extend_from_slice(NEURAL_MAGIC);
-    payload.push(1); // version
-    payload.extend_from_slice(&[0, 0, 0]); // pad
-    payload.extend_from_slice(&0u32.to_le_bytes()); // node_count
-    payload.extend_from_slice(&0u32.to_le_bytes()); // dimension
-    payload.extend_from_slice(&0u32.to_le_bytes()); // dtype = F32
-    payload.extend_from_slice(&1.0f32.to_le_bytes()); // scale
-    payload.extend_from_slice(&0.0f32.to_le_bytes()); // zero_point
-    let content_hash = crate::storage::cas::blob::blob_hash(&[]);
-    payload.extend_from_slice(&content_hash);
-    payload.push(0); // alignment pad
-    payload
-}
-
-/// Encode the legacy `intel_nodes` table into the LIDX-PDG1 node section,
-/// interning symbol/file strings as they are encountered.
-fn encode_pdg_nodes(
-    conn: &Connection,
-    interner: &mut StringInterner,
-) -> Result<Vec<u8>, MigrationError> {
-    let mut nodes: Vec<u8> = Vec::new();
-    let mut q = conn.prepare(
-        "SELECT id, symbol_name, node_type, file_path \
-         FROM intel_nodes ORDER BY id",
-    )?;
-    let rows = q.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-    for row in rows {
-        let (db_id, symbol_name, node_type, file_path) = row?;
-        let node_id = u32::try_from(db_id)
-            .map_err(|_| MigrationError::Payload("node id exceeds u32".into()))?;
-        let node_type = legacy_node_type_code(&node_type);
-        let file_path_id = interner.intern(&file_path);
-        let sym_name_id = interner.intern(&symbol_name);
-        nodes.extend_from_slice(&node_id.to_le_bytes());
-        nodes.extend_from_slice(&node_type.to_le_bytes());
-        nodes.extend_from_slice(&file_path_id.to_le_bytes());
-        nodes.extend_from_slice(&0u32.to_le_bytes()); // start_line (legacy stores bytes, not lines)
-        nodes.extend_from_slice(&0u32.to_le_bytes()); // end_line
-        nodes.extend_from_slice(&sym_name_id.to_le_bytes());
-    }
-    Ok(nodes)
-}
-
-/// Encode the legacy `intel_edges` table into the LIDX-PDG1 edge section.
-fn encode_pdg_edges(conn: &Connection) -> Result<Vec<u8>, MigrationError> {
-    let mut edges: Vec<u8> = Vec::new();
-    let mut q = conn.prepare("SELECT caller_id, callee_id, edge_type FROM intel_edges")?;
-    let rows = q.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (caller, callee, edge_type) = row?;
-        let src = u32::try_from(caller)
-            .map_err(|_| MigrationError::Payload("caller id exceeds u32".into()))?;
-        let dst = u32::try_from(callee)
-            .map_err(|_| MigrationError::Payload("callee id exceeds u32".into()))?;
-        edges.extend_from_slice(&src.to_le_bytes());
-        edges.extend_from_slice(&dst.to_le_bytes());
-        edges.extend_from_slice(&legacy_edge_type_code(&edge_type).to_le_bytes());
-    }
-    Ok(edges)
-}
-
-/// Assemble the LIDX-PDG1 payload: magic + version header over the
-/// nodes/edges/string-table sections, content-hashed for the manifest.
-fn pdg1_payload(nodes: &[u8], edges: &[u8], interner: StringInterner) -> Vec<u8> {
-    let (string_table, string_bytes) = interner.into_bytes();
-    let num_nodes = nodes.len() / PDG_NODE_LEN;
-    let num_edges = edges.len() / PDG_EDGE_LEN;
-    let num_strings = string_table.len() / PDG_STRING_OFFSET_LEN;
-    let strings_bytes_len = string_bytes.len();
-
-    let mut data =
-        Vec::with_capacity(nodes.len() + edges.len() + string_table.len() + string_bytes.len());
-    data.extend_from_slice(nodes);
-    data.extend_from_slice(edges);
-    data.extend_from_slice(&string_table);
-    data.extend_from_slice(&string_bytes);
-    let content_hash = crate::storage::cas::blob::blob_hash(&data);
-
-    let mut payload = Vec::with_capacity(PDG_HEADER_LEN + data.len());
-    payload.extend_from_slice(PDG_MAGIC);
-    payload.push(1);
-    payload.extend_from_slice(&[0, 0, 0]);
-    payload.extend_from_slice(&(num_nodes as u32).to_le_bytes());
-    payload.extend_from_slice(&(num_edges as u32).to_le_bytes());
-    payload.extend_from_slice(&(num_strings as u32).to_le_bytes());
-    payload.extend_from_slice(&(strings_bytes_len as u32).to_le_bytes());
-    payload.extend_from_slice(&content_hash);
-    payload.extend_from_slice(&data);
-    payload
-}
-
-/// Reconstruct a [`LIDX-PDG1`] layer from the legacy catalog's `intel_nodes`
-/// and `intel_edges` tables.
-pub(crate) fn encode_pdg_layer(conn: &Connection) -> Result<Vec<u8>, MigrationError> {
-    let mut interner = StringInterner::new();
-    let nodes = encode_pdg_nodes(conn, &mut interner)?;
-    let edges = encode_pdg_edges(conn)?;
-    Ok(pdg1_payload(&nodes, &edges, interner))
+    encode_neural_payload(&[], 0, &[])
 }
 
 /// Reconstruct a [`LIDX-SYM1`] layer from the legacy catalog's `intel_nodes`.
@@ -1143,33 +1358,277 @@ fn legacy_node_type_code(node_type: &str) -> u32 {
     }
 }
 
-/// Deterministic legacy edge `edge_type` string → u32 code.
-fn legacy_edge_type_code(edge_type: &str) -> u32 {
-    match edge_type.to_ascii_lowercase().as_str() {
-        "call" | "calls" => 1,
-        "data" | "dataflow" | "data_flow" => 2,
-        "import" | "imports" | "dependency" => 3,
-        "definition" | "defines" => 4,
-        "inherit" | "inherits" | "extends" | "implements" => 5,
-        // Keep this code aligned with the PDG edge-key encoding. TypeOf was
-        // added after the original migration mapping and must not be erased
-        // as an unknown legacy edge during conversion.
-        "type_of" => 10,
-        _ => 0,
+// ---------------------------------------------------------------------------
+// Version-2 (lossless) PDG layer
+// ---------------------------------------------------------------------------
+
+/// Lossless node-type codes: the storage `NodeType` vocabulary in
+/// declaration order (`src/storage/nodes.rs`). Codes are 1-based so 0 can
+/// never be a valid type (a 0 in a v1 payload means "unknown legacy type").
+/// Unknown types are a hard error — a lossless layer must not erase them.
+pub(crate) fn node_type_code_v2(node_type: &str) -> Result<u32, MigrationError> {
+    Ok(match node_type {
+        "function" => 1,
+        "class" => 2,
+        "method" => 3,
+        "variable" => 4,
+        "module" => 5,
+        "external" => 6,
+        "doc_section" => 7,
+        "file_summary" => 8,
+        other => {
+            return Err(MigrationError::Payload(format!(
+                "unknown node type {other:?}; refusing to encode a lossless layer without it"
+            )));
+        }
+    })
+}
+
+/// Lossless edge-type codes: the storage `EdgeType` vocabulary in declaration
+/// order (`src/storage/edges.rs`), 1-based. See [`node_type_code_v2`].
+pub(super) fn edge_type_code_v2(edge_type: &str) -> Result<u32, MigrationError> {
+    Ok(match edge_type {
+        "call" => 1,
+        "data_dependency" => 2,
+        "inheritance" => 3,
+        "import" => 4,
+        "containment" => 5,
+        "type_of" => 6,
+        "state_transition" => 7,
+        "command_argument" => 8,
+        "environment" => 9,
+        "stdin" => 10,
+        other => {
+            return Err(MigrationError::Payload(format!(
+                "unknown edge type {other:?}; refusing to encode a lossless layer without it"
+            )));
+        }
+    })
+}
+
+/// Decode half of the lossless node-type vocabulary shared with
+/// [`graph_codec`](super::graph_codec). Codes are 1-based; an unknown code is
+/// a hard error so a lossless layer can never silently erase a node kind.
+pub(super) fn node_type_name_v2(code: u32) -> Result<&'static str, MigrationError> {
+    Ok(match code {
+        1 => "function",
+        2 => "class",
+        3 => "method",
+        4 => "variable",
+        5 => "module",
+        6 => "external",
+        7 => "doc_section",
+        8 => "file_summary",
+        other => {
+            return Err(MigrationError::Payload(format!(
+                "unknown node type code {other}; refusing to decode a lossless layer"
+            )));
+        }
+    })
+}
+
+/// Decode half of the lossless edge-type vocabulary shared with
+/// [`graph_codec`](super::graph_codec). Codes are 1-based; an unknown code is
+/// a hard error.
+pub(super) fn edge_type_name_v2(code: u32) -> Result<&'static str, MigrationError> {
+    Ok(match code {
+        1 => "call",
+        2 => "data_dependency",
+        3 => "inheritance",
+        4 => "import",
+        5 => "containment",
+        6 => "type_of",
+        7 => "state_transition",
+        8 => "command_argument",
+        9 => "environment",
+        10 => "stdin",
+        other => {
+            return Err(MigrationError::Payload(format!(
+                "unknown edge type code {other}; refusing to decode a lossless layer"
+            )));
+        }
+    })
+}
+
+/// Reconstruct a version-2 (lossless) [`LIDX-PDG1`] payload from the legacy
+/// catalog. Unlike the v1 encoder, every `ProgramDependenceGraph` field is
+/// preserved: graph node id, symbol name, file path, language, type,
+/// complexity, byte range, precision markers, and full edge metadata. Edge
+/// endpoints reference nodes by their interned graph node id (not the
+/// storage row id, which is a catalog artifact).
+pub(crate) fn encode_pdg_layer_v2(conn: &Connection) -> Result<Vec<u8>, MigrationError> {
+    use crate::storage::edges::EdgeMetadata as StorageEdgeMetadata;
+
+    let mut interner = StringInterner::new();
+    let mut nodes: Vec<u8> = Vec::new();
+    {
+        let mut q = conn.prepare(
+            "SELECT node_id, symbol_name, file_path, language, node_type, \
+             complexity, byte_range_start, byte_range_end, precision \
+             FROM intel_nodes ORDER BY id",
+        )?;
+        let rows = q.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+            ))
+        })?;
+        for row in rows {
+            let (
+                node_id,
+                symbol_name,
+                file_path,
+                language,
+                node_type,
+                complexity,
+                start,
+                end,
+                precision,
+            ) = row?;
+            let type_code = node_type_code_v2(&node_type)?;
+            let complexity = u32::try_from(complexity.unwrap_or(0))
+                .map_err(|_| MigrationError::Payload("node complexity exceeds u32".into()))?;
+            let byte = |value: Option<i64>| {
+                u32::try_from(value.unwrap_or(0))
+                    .map_err(|_| MigrationError::Payload("node byte range exceeds u32".into()))
+            };
+            let flags: u32 = u32::from(precision.unwrap_or(0) != 0);
+            nodes.extend_from_slice(&interner.intern(&node_id).to_le_bytes());
+            nodes.extend_from_slice(&interner.intern(&symbol_name).to_le_bytes());
+            nodes.extend_from_slice(&interner.intern(&file_path).to_le_bytes());
+            nodes.extend_from_slice(&interner.intern(&language).to_le_bytes());
+            nodes.extend_from_slice(&type_code.to_le_bytes());
+            nodes.extend_from_slice(&complexity.to_le_bytes());
+            nodes.extend_from_slice(&byte(start)?.to_le_bytes());
+            nodes.extend_from_slice(&byte(end)?.to_le_bytes());
+            nodes.extend_from_slice(&flags.to_le_bytes());
+        }
     }
+
+    // Resolve each edge's endpoints to the interned graph node ids, then
+    // append the edge records and their metadata records. `intern` is
+    // idempotent, so the second pass over node rows just recovers the ids.
+    let mut row_to_interned: HashMap<i64, u32> = HashMap::new();
+    {
+        let mut q = conn.prepare("SELECT id, node_id FROM intel_nodes")?;
+        let rows = q.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (row_id, node_id) = row?;
+            row_to_interned.insert(row_id, interner.intern(&node_id));
+        }
+    }
+
+    let opt_u32 = |value: Option<u32>| value.unwrap_or(PDG_V2_NONE).to_le_bytes();
+    let mut edges: Vec<u8> = Vec::new();
+    let mut edge_meta: Vec<u8> = Vec::new();
+    {
+        let mut q =
+            conn.prepare("SELECT caller_id, callee_id, edge_type, metadata FROM intel_edges")?;
+        let rows = q.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (caller, callee, edge_type, metadata_json) = row?;
+            let type_code = edge_type_code_v2(&edge_type)?;
+            let src = *row_to_interned.get(&caller).ok_or_else(|| {
+                MigrationError::Payload(format!("edge caller {caller} has no node"))
+            })?;
+            let dst = *row_to_interned.get(&callee).ok_or_else(|| {
+                MigrationError::Payload(format!("edge callee {callee} has no node"))
+            })?;
+            edges.extend_from_slice(&src.to_le_bytes());
+            edges.extend_from_slice(&dst.to_le_bytes());
+            edges.extend_from_slice(&type_code.to_le_bytes());
+
+            let metadata: StorageEdgeMetadata = match metadata_json {
+                Some(json) => serde_json::from_str(&json)
+                    .map_err(|e| MigrationError::Payload(format!("invalid edge metadata: {e}")))?,
+                None => StorageEdgeMetadata {
+                    call_count: None,
+                    variable_name: None,
+                    confidence: None,
+                    channel: None,
+                    position: None,
+                },
+            };
+            let narrow =
+                |value: Option<usize>, field: &str| -> Result<Option<u32>, MigrationError> {
+                    value
+                        .map(u32::try_from)
+                        .transpose()
+                        .map_err(|_| MigrationError::Payload(format!("edge {field} exceeds u32")))
+                };
+            edge_meta.extend_from_slice(&opt_u32(narrow(metadata.call_count, "call_count")?));
+            let variable = metadata
+                .variable_name
+                .as_deref()
+                .map(|s| interner.intern(s));
+            edge_meta.extend_from_slice(&opt_u32(variable));
+            let confidence = metadata
+                .confidence
+                .map(f32::to_bits)
+                .unwrap_or(f32::NAN.to_bits());
+            edge_meta.extend_from_slice(&confidence.to_le_bytes());
+            let channel = metadata.channel.as_deref().map(|s| interner.intern(s));
+            edge_meta.extend_from_slice(&opt_u32(channel));
+            edge_meta.extend_from_slice(&opt_u32(narrow(metadata.position, "position")?));
+        }
+    }
+
+    let (string_table, string_bytes) = interner.into_bytes();
+    let num_nodes = nodes.len() / PDG_NODE_V2_LEN;
+    let num_edges = edges.len() / PDG_EDGE_LEN;
+    let num_strings = string_table.len() / PDG_STRING_OFFSET_LEN;
+    let strings_bytes_len = string_bytes.len();
+
+    let mut data = Vec::with_capacity(
+        nodes.len() + edges.len() + edge_meta.len() + string_table.len() + string_bytes.len(),
+    );
+    data.extend_from_slice(&nodes);
+    data.extend_from_slice(&edges);
+    data.extend_from_slice(&edge_meta);
+    data.extend_from_slice(&string_table);
+    data.extend_from_slice(&string_bytes);
+    let content_hash = crate::storage::cas::blob::blob_hash(&data);
+
+    let mut payload = Vec::with_capacity(PDG_HEADER_LEN + data.len());
+    payload.extend_from_slice(PDG_MAGIC);
+    payload.push(2); // version 2: lossless graph
+    payload.extend_from_slice(&[0, 0, 0]);
+    payload.extend_from_slice(&(num_nodes as u32).to_le_bytes());
+    payload.extend_from_slice(&(num_edges as u32).to_le_bytes());
+    payload.extend_from_slice(&(num_strings as u32).to_le_bytes());
+    payload.extend_from_slice(&(strings_bytes_len as u32).to_le_bytes());
+    payload.extend_from_slice(&content_hash);
+    payload.extend_from_slice(&data);
+    Ok(payload)
 }
 
 /// Interned string table for the PDG/SYMBOLS payloads. Strings are stored once
 /// and referenced by id; the reader locates them via an (offset, length) table
 /// whose offsets are relative to the start of the string bytes region.
-struct StringInterner {
+pub(super) struct StringInterner {
     map: HashMap<String, u32>,
     offsets: Vec<(u32, u32)>,
     bytes: Vec<u8>,
 }
 
 impl StringInterner {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         StringInterner {
             map: HashMap::new(),
             offsets: Vec::new(),
@@ -1177,7 +1636,8 @@ impl StringInterner {
         }
     }
 
-    fn intern(&mut self, s: &str) -> u32 {
+    /// Intern `s`, returning its stable id (idempotent).
+    pub(super) fn intern(&mut self, s: &str) -> u32 {
         if let Some(id) = self.map.get(s) {
             return *id;
         }
@@ -1190,7 +1650,7 @@ impl StringInterner {
     }
 
     /// Produce `(offset_table_bytes, string_bytes)` in reader layout.
-    fn into_bytes(self) -> (Vec<u8>, Vec<u8>) {
+    pub(super) fn into_bytes(self) -> (Vec<u8>, Vec<u8>) {
         let mut table = Vec::with_capacity(self.offsets.len() * PDG_STRING_OFFSET_LEN);
         for (offset, len) in &self.offsets {
             table.extend_from_slice(&offset.to_le_bytes());

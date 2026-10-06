@@ -15,10 +15,10 @@ use crate::storage::cas::CasStore;
 use crate::storage::generation::lease::read_current_generation;
 
 use super::{
-    MigrationConfig, MigrationReport, dir_total_bytes, encode_pdg_layer,
-    is_legacy_full_copy_layout, is_migrated_store, migrate_legacy_store, read_generation_manifest,
+    MigrationConfig, MigrationReport, dir_total_bytes, encode_empty_neural, encode_neural_layer,
+    encode_pdg_layer_v2, encode_tfidf_layer, is_legacy_full_copy_layout, is_migrated_store,
+    migrate_legacy_store, read_generation_manifest,
 };
-use crate::storage::generation::reader::{PDG_HEADER_LEN, PDG_NODE_LEN};
 
 /// Migration config for tests: silent, no crash hook, footprint goal capped.
 fn test_cfg() -> MigrationConfig {
@@ -37,10 +37,15 @@ fn write_catalog(path: &Path, variant: u64) {
     conn.execute_batch(
         "CREATE TABLE intel_nodes (
             id INTEGER PRIMARY KEY,
+            node_id TEXT NOT NULL,
             symbol_name TEXT NOT NULL,
+            language TEXT NOT NULL DEFAULT 'unknown',
             node_type TEXT NOT NULL,
             file_path TEXT NOT NULL,
-            complexity INTEGER DEFAULT 1
+            complexity INTEGER,
+            byte_range_start INTEGER,
+            byte_range_end INTEGER,
+            precision INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE intel_edges (
             caller_id INTEGER NOT NULL,
@@ -52,33 +57,45 @@ fn write_catalog(path: &Path, variant: u64) {
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO intel_nodes (id, symbol_name, node_type, file_path, complexity)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO intel_nodes (id, node_id, symbol_name, language, node_type, file_path, \
+         complexity, byte_range_start, byte_range_end, precision) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             1,
+            format!("node_{variant}_a"),
             format!("fn_variant_{variant}"),
+            "rust",
             "function",
             "/src/a.rs",
-            3
+            3,
+            120,
+            480,
+            variant % 2,
         ],
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO intel_nodes (id, symbol_name, node_type, file_path, complexity)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO intel_nodes (id, node_id, symbol_name, language, node_type, file_path, \
+         complexity, byte_range_start, byte_range_end, precision) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             2,
+            format!("node_{variant}_b"),
             format!("struct_variant_{variant}"),
-            "struct",
+            "rust",
+            "class",
             "/src/b.rs",
-            5
+            5,
+            50,
+            500,
+            0,
         ],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO intel_edges (caller_id, callee_id, edge_type, metadata)
-         VALUES (1, 2, 'call', NULL)",
-        [],
+         VALUES (1, 2, 'call', ?1)",
+        [r#"{"call_count":4,"variable_name":"x","confidence":0.7,"channel":"env","position":2}"#],
     )
     .unwrap();
 }
@@ -124,11 +141,7 @@ fn write_generation_dir(root: &Path, g: u64, shared: bool) {
     fs::create_dir_all(&gd).unwrap();
     write_catalog(&gd.join("leindex.db"), variant);
     write_liee(&gd.join("embeddings.bin"), variant);
-    fs::write(
-        gd.join("neural_embeddings.bin"),
-        format!("neural-v{variant}"),
-    )
-    .unwrap();
+    write_liee(&gd.join("neural_embeddings.bin"), variant);
     fs::write(
         gd.join("search_snapshot.bin"),
         format!("snapshot-v{variant}"),
@@ -195,38 +208,184 @@ fn build_in_progress_jobs(root: &Path, start: u64, count: u64, bytes: u64) {
 }
 
 #[test]
-fn test_legacy_type_of_edge_encoding_preserves_type() {
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "CREATE TABLE intel_nodes (
-            id INTEGER PRIMARY KEY,
-            symbol_name TEXT NOT NULL,
-            node_type TEXT NOT NULL,
-            file_path TEXT NOT NULL
-        );
-        CREATE TABLE intel_edges (
-            caller_id INTEGER NOT NULL,
-            callee_id INTEGER NOT NULL,
-            edge_type TEXT NOT NULL
-        );
-        INSERT INTO intel_nodes VALUES
-            (1, 'value', 'variable', '/src/a.rs'),
-            (2, 'Type', 'class', '/src/a.rs');
-        INSERT INTO intel_edges VALUES (1, 2, 'type_of');",
+fn test_pdg_layer_v2_round_trips_every_catalog_field() {
+    use crate::storage::generation::reader::PdgReader;
+
+    // Build the catalog in-memory, stage the v2 payload as a CAS blob, and
+    // read it back through the zero-copy reader — the same path a hydrated
+    // generation takes.
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("leindex.db");
+    write_catalog(&catalog, 1);
+
+    let conn = Connection::open(&catalog).unwrap();
+    let payload = encode_pdg_layer_v2(&conn).unwrap();
+
+    let blob_path = tmp.path().join("pdg_v2.blob");
+    let frame = crate::storage::cas::blob::encode_blob(&payload);
+    fs::write(&blob_path, &frame).unwrap();
+
+    let reader = PdgReader::open(&blob_path).unwrap();
+    assert_eq!(reader.version(), 2);
+    assert_eq!(reader.num_nodes(), 2);
+    assert_eq!(reader.num_edges(), 1);
+
+    // Node 0: every lossless field, resolved through the string table.
+    let n0 = reader.node_full(0).unwrap();
+    assert_eq!(reader.resolve_string(n0.node_id), Some("node_1_a"));
+    assert_eq!(reader.resolve_string(n0.symbol_name), Some("fn_variant_1"));
+    assert_eq!(reader.resolve_string(n0.file_path), Some("/src/a.rs"));
+    assert_eq!(reader.resolve_string(n0.language), Some("rust"));
+    assert_eq!(n0.node_type, 1, "function");
+    assert_eq!(n0.complexity, 3);
+    assert_eq!((n0.byte_start, n0.byte_end), (120, 480));
+    assert!(n0.precision, "variant 1 => precision = 1 % 2");
+
+    let n1 = reader.node_full(1).unwrap();
+    assert_eq!(reader.resolve_string(n1.node_id), Some("node_1_b"));
+    assert_eq!(n1.node_type, 2, "class");
+    assert!(!n1.precision);
+
+    // The edge: endpoints are the interned node ids, metadata round-trips.
+    let edge = reader.edge(0).unwrap();
+    assert_eq!(
+        (edge.src, edge.dst, edge.edge_type),
+        (n0.node_id, n1.node_id, 1)
+    );
+    let meta = reader.edge_meta(0).unwrap();
+    assert_eq!(meta.call_count, Some(4));
+    assert_eq!(
+        meta.variable_name.and_then(|id| reader.resolve_string(id)),
+        Some("x")
+    );
+    assert_eq!(meta.confidence, Some(0.7));
+    assert_eq!(
+        meta.channel.and_then(|id| reader.resolve_string(id)),
+        Some("env")
+    );
+    assert_eq!(meta.position, Some(2));
+
+    // v1 accessors must refuse a v2 payload rather than return garbage.
+    assert!(reader.node(0).is_err());
+}
+
+#[test]
+fn test_pdg_layer_v2_rejects_unknown_types() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("leindex.db");
+    write_catalog(&catalog, 0);
+    let conn = Connection::open(&catalog).unwrap();
+    conn.execute(
+        "UPDATE intel_nodes SET node_type = 'quantum' WHERE id = 1",
+        [],
     )
     .unwrap();
-
-    let payload = encode_pdg_layer(&conn).unwrap();
-    let edge_offset = PDG_HEADER_LEN + PDG_NODE_LEN * 2;
-    assert_eq!(
-        u32::from_le_bytes(
-            payload[edge_offset + 8..edge_offset + 12]
-                .try_into()
-                .unwrap()
-        ),
-        10,
-        "legacy type_of edges must retain the TypeOf code"
+    let error = encode_pdg_layer_v2(&conn).unwrap_err().to_string();
+    assert!(
+        error.contains("unknown node type"),
+        "expected an unknown-node-type error, got: {error}"
     );
+
+    conn.execute(
+        "UPDATE intel_nodes SET node_type = 'function' WHERE id = 1",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE intel_edges SET edge_type = 'teleport' WHERE caller_id = 1",
+        [],
+    )
+    .unwrap();
+    let error = encode_pdg_layer_v2(&conn).unwrap_err().to_string();
+    assert!(
+        error.contains("unknown edge type"),
+        "expected an unknown-edge-type error, got: {error}"
+    );
+}
+
+#[test]
+fn test_migrated_tfidf_and_neural_layers_carry_real_data() {
+    use crate::storage::generation::reader::{NeuralReader, TfidfReader};
+    use crate::storage::generation::snapshot::GenerationSnapshot;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    build_legacy_store(root, false);
+    migrate_legacy_store(root, &test_cfg()).unwrap();
+
+    // Fixture for variant v: node ids 1 (row 0) and 2 (row 1), dim 8, with
+    // value = v + row * 100 + d. Generation 3 is current.
+    let snapshot = GenerationSnapshot::open(root).unwrap();
+
+    // TF-IDF: sparse triples keyed by catalog id; d == 0 for row 0 is value 3.0
+    // (non-zero), so no component of this fixture is dropped as zero.
+    let tfidf: &TfidfReader = snapshot.tfidf().expect("tfidf layer");
+    assert_eq!(
+        tfidf.num_docs(),
+        3,
+        "doc ids are catalog ids (max id 2) + 1"
+    );
+    assert_eq!(tfidf.num_terms(), 8);
+    assert_eq!(tfidf.num_entries(), 16, "2 docs x 8 non-zero terms");
+    for (node, row) in [(1u32, 0u32), (2, 1)] {
+        for d in 0..8u32 {
+            let expected = 3.0 + row as f32 * 100.0 + d as f32;
+            assert_eq!(
+                tfidf.tf_idf(node, d),
+                Some(expected),
+                "node {node} term {d}"
+            );
+        }
+    }
+
+    // Neural: v2 payload with per-row node ids; vectors match the source.
+    let neural: &NeuralReader = snapshot.neural().expect("neural layer");
+    assert_eq!((neural.count(), neural.dim()), (2, 8));
+    assert_eq!(neural.node_id(0), Some(1));
+    assert_eq!(neural.node_id(1), Some(2));
+    assert_eq!(neural.node_id(2), None);
+    let row1 = neural.vector(1).as_f32_slice().to_vec();
+    let expected: Vec<f32> = (0..8).map(|d| 3.0 + 100.0 + d as f32).collect();
+    assert_eq!(row1, expected);
+}
+
+#[test]
+fn test_tfidf_encoding_drops_zeros_and_maps_ids() {
+    use crate::storage::generation::reader::TFIDF_HEADER_LEN;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("embeddings.bin");
+    // Variant 0, row 0 has d == 0 -> value 0.0 (the zero that must be dropped).
+    write_liee(&path, 0);
+    let ids = std::collections::HashMap::from([
+        ("node_0_a".to_string(), 7u32),
+        ("node_0_b".to_string(), 9u32),
+    ]);
+    let payload = encode_tfidf_layer(&path, &ids).unwrap();
+    let entries = u32::from_le_bytes(payload[21..25].try_into().unwrap());
+    assert_eq!(entries, 15, "one zero component dropped from 16");
+    // First stored entry is node 7, term 1 (term 0 was the dropped zero).
+    let first = &payload[TFIDF_HEADER_LEN..TFIDF_HEADER_LEN + 12];
+    assert_eq!(u32::from_le_bytes(first[0..4].try_into().unwrap()), 7);
+    assert_eq!(u32::from_le_bytes(first[4..8].try_into().unwrap()), 1);
+}
+
+#[test]
+fn test_neural_encoding_missing_file_is_empty_and_corrupt_file_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ids = std::collections::HashMap::new();
+
+    let missing = encode_neural_layer(&tmp.path().join("absent.bin"), &ids).unwrap();
+    assert_eq!(
+        missing,
+        encode_empty_neural(),
+        "no neural model => empty layer"
+    );
+
+    // Junk that is not a LIEE file must abort migration, not be silently staged.
+    let junk = tmp.path().join("neural_embeddings.bin");
+    fs::write(&junk, "neural-v1").unwrap();
+    assert!(encode_neural_layer(&junk, &ids).is_err());
 }
 
 #[test]
