@@ -34,8 +34,11 @@ pub const MANIFEST_VERSION: u16 = 1;
 // LayerKind
 // ---------------------------------------------------------------------------
 
-/// The five layer kinds that make up a complete generation. Each layer is
-/// stored as an independent CAS blob; the manifest records the mapping from
+/// The layer kinds that make up a generation. The five "core" kinds are
+/// required in every manifest (see [`ALL_LAYER_KINDS`]); the optional kinds
+/// carry side artifacts that older manifests predate — readers must treat a
+/// missing optional layer as "absent", not invalid. Each layer is stored as
+/// an independent CAS blob; the manifest records the mapping from
 /// `LayerKind` to blake3 hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -50,9 +53,17 @@ pub enum LayerKind {
     Pdg,
     /// Extracted symbol table layer.
     Symbols,
+    /// Search snapshot (`search_snapshot.bin`) — the heap-mirror search
+    /// engine's persisted state.
+    Search,
+    /// TF-IDF embedder (`tfidf_embedder.bin`) — vocabulary + IDF weights.
+    Embedder,
+    /// Fragment store bundle (`fragment_store.bin`, `fragment_root.bin`,
+    /// `fragment_sync_manifest.bin`, `fragments_embeddings.bin`).
+    Fragments,
 }
 
-/// All known layer kinds in canonical order.
+/// All required layer kinds in canonical order.
 pub const ALL_LAYER_KINDS: [LayerKind; 5] = [
     LayerKind::Db,
     LayerKind::Tfidf,
@@ -60,6 +71,12 @@ pub const ALL_LAYER_KINDS: [LayerKind; 5] = [
     LayerKind::Pdg,
     LayerKind::Symbols,
 ];
+
+/// Optional layer kinds: staged when the underlying artifact exists, absent
+/// from older manifests. [`Manifest::validate_layers`] does not require them,
+/// but [`Manifest::layer_hashes`] includes them so leases/GC cover the blobs.
+pub const OPTIONAL_LAYER_KINDS: [LayerKind; 3] =
+    [LayerKind::Search, LayerKind::Embedder, LayerKind::Fragments];
 
 // ---------------------------------------------------------------------------
 // ModelIdentity
@@ -196,9 +213,11 @@ impl Manifest {
     /// Used by [`GenerationLease`](super::lease::GenerationLease) to increment
     /// and decrement refcounts.
     pub fn layer_hashes(&self) -> Vec<[u8; 32]> {
-        // Return in canonical order for deterministic testing.
+        // Return in canonical order for deterministic testing. Optional
+        // layers are included when present so leases/GC cover their blobs.
         ALL_LAYER_KINDS
             .iter()
+            .chain(OPTIONAL_LAYER_KINDS.iter())
             .filter_map(|k| self.layers.get(k).copied())
             .collect()
     }
@@ -273,6 +292,9 @@ impl fmt::Display for LayerKind {
             LayerKind::Neural => write!(f, "neural"),
             LayerKind::Pdg => write!(f, "pdg"),
             LayerKind::Symbols => write!(f, "symbols"),
+            LayerKind::Search => write!(f, "search"),
+            LayerKind::Embedder => write!(f, "embedder"),
+            LayerKind::Fragments => write!(f, "fragments"),
         }
     }
 }

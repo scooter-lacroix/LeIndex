@@ -44,7 +44,9 @@ use crate::storage::cas::CasStore;
 use crate::storage::cas::blob::fsync_file;
 
 use super::lease::{CURRENT_FILE, GENERATIONS_DIR, MANIFEST_FILE};
-use super::manifest::{ALL_LAYER_KINDS, LayerKind, MANIFEST_VERSION, Manifest, ModelIdentity};
+use super::manifest::{
+    ALL_LAYER_KINDS, LayerKind, MANIFEST_VERSION, Manifest, ModelIdentity, OPTIONAL_LAYER_KINDS,
+};
 
 /// Filename for the temporary manifest file written before atomic rename.
 const MANIFEST_PARTIAL: &str = "manifest.partial";
@@ -413,7 +415,7 @@ impl GenerationWriter {
         let search_fingerprint = compute_search_fingerprint(tfidf_hash, neural_hash);
 
         let mut layers = HashMap::new();
-        for kind in ALL_LAYER_KINDS.iter() {
+        for kind in ALL_LAYER_KINDS.iter().chain(OPTIONAL_LAYER_KINDS.iter()) {
             if let Some(hash) = self.staged.get(kind) {
                 layers.insert(*kind, *hash);
             }
