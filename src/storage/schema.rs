@@ -406,7 +406,14 @@ impl Storage {
     }
 
     fn initialize_community_tables(&self) -> SqliteResult<()> {
-        self.execute_schema_statements(&["CREATE TABLE IF NOT EXISTS intel_communities (
+        let memberships_table_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' \
+             AND name = 'intel_community_memberships')",
+            [],
+            |row| row.get(0),
+        )?;
+        self.execute_schema_statements(&[
+            "CREATE TABLE IF NOT EXISTS intel_communities (
                 id INTEGER PRIMARY KEY,
                 project_id TEXT NOT NULL,
                 community INTEGER NOT NULL,
@@ -417,7 +424,32 @@ impl Storage {
                 quality_score REAL,
                 label TEXT,
                 computed_at INTEGER NOT NULL
-            )"])
+            )",
+            "CREATE TABLE IF NOT EXISTS intel_community_memberships (
+                project_id TEXT NOT NULL,
+                algorithm TEXT NOT NULL,
+                quality_name TEXT NOT NULL,
+                resolution REAL NOT NULL,
+                node_id TEXT NOT NULL,
+                community INTEGER NOT NULL,
+                PRIMARY KEY(project_id, algorithm, quality_name, resolution, node_id)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_community_memberships_identity \
+             ON intel_community_memberships(project_id, algorithm, quality_name, resolution)",
+        ])?;
+        if !memberships_table_exists {
+            // One-time upgrade from the old graph-row membership column. The
+            // table-existence guard prevents stale legacy rows from being
+            // copied back into current derived memberships on every open.
+            self.conn.execute(
+                "INSERT OR IGNORE INTO intel_community_memberships \
+                 (project_id, algorithm, quality_name, resolution, node_id, community) \
+                 SELECT project_id, 'leiden', 'modularity', 1.0, node_id, community_id \
+                 FROM intel_nodes WHERE community_id IS NOT NULL",
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     fn initialize_query_indexes(&self) -> SqliteResult<()> {
@@ -426,7 +458,7 @@ impl Storage {
             "CREATE INDEX IF NOT EXISTS idx_nodes_file ON intel_nodes(file_path)",
             "CREATE INDEX IF NOT EXISTS idx_nodes_symbol ON intel_nodes(symbol_name)",
             "CREATE INDEX IF NOT EXISTS idx_nodes_hash ON intel_nodes(content_hash)",
-            // Natural node key for the save_pdg upsert
+            // Natural node key for the legacy PDG upsert
             // (`ON CONFLICT(project_id, node_id) DO UPDATE`). The v3->v4
             // migration dedupes legacy rows before this index is created.
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_intel_nodes_project_node ON intel_nodes(project_id, node_id)",
@@ -811,11 +843,18 @@ impl Storage {
                  #{sweep} (concurrent writer at or below the cursor?); re-running the sweep"
             );
         }
-        eprintln!(
-            "backfill {column}: sentinel rows persist after {MAX_SWEEPS} sweeps; \
-             they stay invisible to qualified-name lookups until the next open"
-        );
-        Ok(())
+        // Deliberately NOT Ok: returning success here would let run_migrations
+        // record the new schema version, after which neither the backfill
+        // migrations nor ensure_intel_node_columns ever run again — the
+        // remaining rows would stay invisible to qualified-name lookups
+        // forever, not just "until the next open". Failing the migration
+        // fails Storage::open loudly instead; the version does not advance,
+        // so the next open re-runs the backfill from scratch.
+        Err(rusqlite::Error::InvalidParameterName(format!(
+            "backfill {column}: sentinel rows remain after {MAX_SWEEPS} sweeps \
+             (a concurrent writer is committing rows at or below the backfill cursor); \
+             refusing to advance the schema version — retry after the writer settles"
+        )))
     }
 
     /// Migration from v4 to v5: backfill `qualified_name` for stores that
@@ -896,7 +935,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(table_count, 9); // intel_nodes, intel_edges, analysis_cache, cache_telemetry, global_symbols, external_refs, project_deps, project_metadata, intel_communities
+        assert_eq!(table_count, 10); // intel_nodes, intel_edges, analysis_cache, cache_telemetry, global_symbols, external_refs, project_deps, project_metadata, intel_communities, intel_community_memberships
     }
 
     #[test]

@@ -40,8 +40,11 @@ pub enum FeatureFlag {
     ///
     /// When enabled, `leindex mcp --stdio` acts as a thin shim that discovers
     /// (or spawns) the user-scoped `leindexd` daemon and forwards MCP/JSON-RPC
-    /// frames to it over a Unix socket. When disabled (the default), the
-    /// stdio server runs the full inline engine (legacy v1.9.x behaviour).
+    /// frames to it over a Unix socket. When disabled, the stdio server runs
+    /// the full inline engine (legacy v1.9.x behaviour). Default ON since the
+    /// v2.0.0 rollout phase 8 (VAL-ROLLOUT-012); set
+    /// `LEINDEX_FEATURE_DAEMON_CLIENT=false` (or `LEINDEX_LEGACY=1`) to
+    /// revert — the flag doubles as a rollout-KILL.
     ///
     /// This runtime flag works alongside the `daemon-client` Cargo feature:
     /// the Cargo feature compiles the shim code path; this env flag controls
@@ -62,9 +65,12 @@ pub enum FeatureFlag {
     /// When enabled and the project has a current generation, MCP read-path
     /// handlers acquire a [`GenerationLease`](crate::storage::generation::lease::GenerationLease),
     /// drop the legacy heap-mirror structures, and read from the generation's
-    /// content-addressed mmap layers. When disabled (the default), handlers
-    /// keep reading from the legacy heap-mirror path so the two can be
-    /// compared bit-for-bit (VAL-EQUIV-001/002/003).
+    /// content-addressed mmap layers. When disabled, handlers keep reading
+    /// from the legacy heap-mirror path so the two can be compared
+    /// bit-for-bit (VAL-EQUIV-001/002/003). Default ON since the v2.0.0
+    /// rollout phase 8 (VAL-ROLLOUT-012); set
+    /// `LEINDEX_FEATURE_GENERATION_READERS=false` (or `LEINDEX_LEGACY=1`) to
+    /// revert.
     GenerationReaders,
     /// Route indexing through the fair bounded scheduler (WS5): heavy work is
     /// executed as stepped [`BoundedJob`](crate::scheduler::budget::BoundedJob)s
@@ -131,8 +137,10 @@ pub enum FeatureFlag {
     /// Enable the WS11 validated model profile as the production default
     /// (WS11 Task 7). When ON, the embed worker uses the model bake-off
     /// winner (CodeRankEmbed 137M, INT8 quantized, no reranker) instead of
-    /// the legacy FP16 Qwen3 + reranker baseline. Default OFF — legacy
-    /// behavior (FP16 Qwen3) stays active until WS12 rollout phase.
+    /// the legacy FP16 Qwen3 + reranker baseline. Default ON since the
+    /// v2.0.0 rollout phase 8 (VAL-ROLLOUT-012); set
+    /// `LEINDEX_FEATURE_VALIDATED_MODEL=false` (or `LEINDEX_LEGACY=1`) to
+    /// revert to the legacy FP16 Qwen3 behavior.
     ValidatedModel,
     /// Engram: a persistent, content-addressed phrase-book of neural query
     /// embeddings (`~/.leindex/engram/`). Repeat queries skip the embedder
