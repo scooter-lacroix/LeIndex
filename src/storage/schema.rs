@@ -255,10 +255,10 @@ impl Storage {
                 None,
             ),
             (
-                // Content hash column required by save_pdg's unchanged-row
-                // skip and by the idx_nodes_hash index; an ancient table
+                // Content hash column consumed by the legacy read path and
+                // the idx_nodes_hash index; an ancient table
                 // without it cannot even open (CREATE INDEX fails). Empty
-                // hashes mark rows as changed, so the next save rewrites them.
+                // hashes mark rows as changed for legacy rewrite paths.
                 "content_hash",
                 "ALTER TABLE intel_nodes ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
                 None,
@@ -278,15 +278,16 @@ impl Storage {
                 "ALTER TABLE intel_nodes ADD COLUMN embedding_format INTEGER",
                 None,
             ),
-            // Timestamp columns used by the save_pdg upsert (pdg_store.rs).
+            // Timestamp columns written by the legacy PDG upsert (removed
+            // post-flip; the read path still consumes them).
             // Databases created before these columns existed in the CREATE
             // TABLE must be repaired here — `CREATE TABLE IF NOT EXISTS`
-            // never adds columns to an existing table, and the save_pdg
-            // INSERT references them by name, so a legacy schema would fail
-            // every PDG save with "table intel_nodes has no column named
-            // created_at". A default is required because SQLite cannot add
-            // a NOT NULL column without one; 0 marks pre-migration rows and
-            // is corrected on the next save_pdg upsert.
+            // never adds columns to an existing table, and the legacy
+            // INSERT referenced them by name, so an un-repaired legacy
+            // schema would fail every PDG save with "table intel_nodes has
+            // no column named created_at". A default is required because
+            // SQLite cannot add a NOT NULL column without one; 0 marks
+            // pre-migration rows.
             (
                 "created_at",
                 "ALTER TABLE intel_nodes ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
@@ -693,8 +694,8 @@ impl Storage {
         Ok(())
     }
 
-    /// Migration from v3 to v4: unique (project_id, node_id) for the save_pdg
-    /// upsert conflict target.
+    /// Migration from v3 to v4: unique (project_id, node_id) for the legacy
+    /// PDG upsert conflict target.
     ///
     /// Legacy rows predate the natural node key: `node_id` is either absent
     /// or backfilled from `symbol_name`, which repeats across files (e.g. two

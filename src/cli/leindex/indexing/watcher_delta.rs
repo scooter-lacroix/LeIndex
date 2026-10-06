@@ -87,8 +87,8 @@ impl LeIndex {
         // blocking acquire held by another process would stall the watcher.
         //
         // A resident PDG is REQUIRED: the delta is built by merging into the
-        // graph `take_owned_pdg` yields, and `save_pdg` persists exactly the
-        // supplied graph — for a never-hydrated resident that would be a
+        // graph `take_owned_pdg` yields, and the generation publish persists
+        // exactly the supplied graph — for a never-hydrated resident that would be a
         // delta-only graph holding just the changed files, and persisting it
         // would delete every unchanged file's nodes from the database (and
         // then install the truncated graph as resident, defeating every
@@ -224,13 +224,7 @@ impl LeIndex {
                 removed_node_ids,
                 updated_nodes,
             });
-        self.persist_and_publish_watcher_delta(
-            pdg,
-            had_resident_pdg,
-            embedder,
-            source_files_with_hashes,
-            start_time,
-        )
+        self.persist_and_publish_watcher_delta(pdg, embedder, source_files_with_hashes, start_time)
     }
     /// Compute Leiden communities over the completed PDG and persist them in
     /// one batched transaction (roadmap Part IV). Placement: after PDG edge
@@ -293,53 +287,35 @@ impl LeIndex {
     ) {
     }
 
-    /// Persist the watcher-reindex delta (PDG, embeddings, snapshot, neural) and
+    /// Persist the watcher-reindex delta (embeddings, snapshot, neural) and
     /// publish the new generation with fresh health. Owns all post-merge I/O so
     /// the reindex orchestrator stays a thin pipeline.
     ///
-    /// `had_resident_pdg` says whether the caller actually took a graph out
-    /// of `self.pdg` (versus fabricating an empty default for a
-    /// never-hydrated project): error paths restore the graph only in the
-    /// former case, because installing an empty or delta-only graph would
-    /// defeat every `pdg.is_none()` load gate.
+    /// The caller's graph installs into `self.pdg` before the first fallible
+    /// step here (persist_to_storage below), so no error-restore parameter is
+    /// needed: a failure past that point leaves the resident graph in place.
     pub(super) fn persist_and_publish_watcher_delta(
         &mut self,
         mut pdg: crate::graph::pdg::ProgramDependenceGraph,
-        had_resident_pdg: bool,
         embedder: index_builder::HybridEmbedder,
         source_files_with_hashes: Vec<(PathBuf, String)>,
         start_time: std::time::Instant,
     ) -> Result<super::super::IndexStats> {
-        // Precision does NOT run on the watcher/edit-apply path: a full SCIP
-        // indexer pass (minutes with rust-analyzer) would block the project
-        // write lock every time a file is saved. Markers for changed files
-        // drop until the next explicit index, which re-merges precision.
-        // Persist the updated PDG to storage so changes survive restart. On
-        // failure the graph is returned to `self.pdg` (it was taken out by
-        // the caller) so the engine keeps serving graph reads from the
-        // in-memory state it had.
-        if let Err(error) =
-            index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)
-        {
-            if had_resident_pdg {
-                self.pdg = Some(std::sync::Arc::new(pdg));
-            }
-            return Err(error);
-        }
+        // D5: the graph persists only as the Pdg layer of the generation
+        // published at the end of this run — no SQL row writes.
         self.compute_and_persist_communities(&mut pdg);
 
-        // Snapshot/embedder freshness must describe the graph as the DB
-        // reconstructs it (duplicate node_ids collapse on save); otherwise
-        // every later cold hydration takes the full TF-IDF rebuild path.
-        let persisted_identity =
-            index_builder::persisted_search_identity(&self.storage, &self.project_id);
+        // Snapshot/embedder freshness must describe the graph as the
+        // published layer reconstructs it (duplicate node_ids and parallel
+        // edges collapse there).
+        let persisted_identity = index_builder::persisted_search_identity_from_graph(&pdg);
         self.pdg = Some(std::sync::Arc::new(pdg));
         self.embedder = Some(embedder);
         if let Some(embedder) = &self.embedder {
             embedder.persist_to_storage(
                 &self.project_path,
                 self.pdg.as_ref().unwrap(),
-                persisted_identity.clone(),
+                Some(persisted_identity.clone()),
             )?;
         }
         self.build_file_stats_cache();
@@ -353,17 +329,7 @@ impl LeIndex {
         // text/byte ranges (Codex wave-4 P2). Node-level ranking stays
         // authoritative; the fragment layer is simply off for this generation.
         self.sync_fragment_layer_or_clear();
-        let (pdg_node_count, pdg_edge_count, pdg_fingerprint) = persisted_identity
-            .or_else(|| {
-                self.pdg.as_ref().map(|pdg| {
-                    (
-                        pdg.node_count(),
-                        pdg.edge_count(),
-                        index_builder::pdg_search_fingerprint(pdg),
-                    )
-                })
-            })
-            .unwrap_or((self.stats.pdg_nodes, self.stats.pdg_edges, String::new()));
+        let (pdg_node_count, pdg_edge_count, pdg_fingerprint) = persisted_identity;
         index_builder::persist_search_snapshot(
             &self.search_engine,
             &self.project_path,

@@ -15,9 +15,9 @@ use tracing::{info, warn};
 /// onto the existing node. Per-file extraction legitimately produces
 /// duplicate ids for its external placeholders (`external::{target}` is
 /// created once per file pass), and concatenating them gave the graph
-/// several nodes sharing one id; `save_pdg` then keys every copy onto the
-/// single `intel_nodes` row `(project_id, node_id)` and a reload collapses
-/// them. Exact-id dedup preserves overloaded methods that share a qualified
+/// several nodes sharing one id; persisting them through the store's
+/// `(project_id, node_id)` key collapsed every copy onto a single row.
+/// Exact-id dedup preserves overloaded methods that share a qualified
 /// name: their ids differ (file-prefixed, or `@start..end`-suffixed within
 /// a file by the extraction's duplicate guard).
 pub(crate) fn merge_pdgs(target: &mut ProgramDependenceGraph, source: ProgramDependenceGraph) {

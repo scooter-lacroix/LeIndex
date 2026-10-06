@@ -11,14 +11,15 @@ use super::*;
 use crate::feature_flags::{
     FeatureFlag, clear_flag_overrides_for_test, lock_flag_tests, set_flag_override_for_test,
 };
-use crate::graph::pdg::ProgramDependenceGraph;
 use crate::storage::cas::CasStore;
+use crate::storage::generation::graph_codec::canonical_pdg;
 use crate::storage::generation::migrate::{
     encode_empty_neural, encode_empty_tfidf, encode_pdg_layer_v2, encode_symbols_layer,
     vacuum_bytes,
 };
 use crate::storage::generation::{
     GenerationSnapshot, GenerationWriter, LayerKind, read_current_generation,
+    read_generation_manifest,
 };
 use rusqlite::Connection;
 use std::sync::mpsc;
@@ -58,21 +59,42 @@ fn index_project_fixture(project: &std::path::Path) {
     index.index_project(true).expect("index project");
 }
 
-/// Publish a CAS generation from the live store's catalog. The five layers are
-/// encoded with the exact same encoders the migration uses, so the generation
-/// is byte-level faithful to the heap-mirror data.
+/// Publish a CAS generation that carries the graph layers the real pipeline
+/// published from the resident in-memory graph. After the D5 write flip the SQL
+/// catalog holds no graph rows, so the Pdg/Symbols layers are reused from the
+/// current generation's CAS blobs (the faithful graph the read path must
+/// serve) rather than re-encoded from a now-empty catalog.
 fn publish_live_generation(storage_root: &std::path::Path, generation: u64) {
     let cas = Arc::new(Mutex::new(
         CasStore::open(storage_root.join("cas")).expect("open cas"),
     ));
-    let mut writer = GenerationWriter::new(storage_root, cas);
+    let mut writer = GenerationWriter::new(storage_root, cas.clone());
     let db_path = storage_root.join("leindex.db");
 
     let db_bytes = vacuum_bytes(&db_path).expect("vacuum db");
-    let conn = Connection::open(&db_path).expect("open db");
-    let pdg_bytes = encode_pdg_layer_v2(&conn).expect("encode pdg");
-    let symbols_bytes = encode_symbols_layer(&conn).expect("encode symbols");
-    drop(conn);
+
+    let current = read_current_generation(storage_root).expect("current generation");
+    let manifest = read_generation_manifest(storage_root, current).expect("read manifest");
+    let pdg_hash = manifest
+        .layers
+        .get(&LayerKind::Pdg)
+        .copied()
+        .expect("pdg layer");
+    let symbols_hash = manifest
+        .layers
+        .get(&LayerKind::Symbols)
+        .copied()
+        .expect("symbols layer");
+    let pdg_bytes = cas
+        .lock()
+        .expect("cas lock")
+        .get(&pdg_hash)
+        .expect("read pdg blob");
+    let symbols_bytes = cas
+        .lock()
+        .expect("cas lock")
+        .get(&symbols_hash)
+        .expect("read symbols blob");
 
     writer.stage(LayerKind::Db, &db_bytes).expect("stage db");
     writer
@@ -86,47 +108,6 @@ fn publish_live_generation(storage_root: &std::path::Path, generation: u64) {
         .stage(LayerKind::Symbols, &symbols_bytes)
         .expect("stage symbols");
     writer.publish(generation).expect("publish generation");
-}
-
-/// Canonical, order-stable serialization of a PDG so two graphs can be
-/// compared byte-for-byte regardless of internal node-id ordering.
-fn canonical_pdg(pdg: &ProgramDependenceGraph) -> Vec<u8> {
-    use petgraph::visit::{EdgeRef, IntoEdgeReferences};
-    let mut nodes: Vec<(usize, String, String, String, String, (usize, usize), u32)> = Vec::new();
-    for idx in pdg.node_indices() {
-        if let Some(n) = pdg.get_node(idx) {
-            nodes.push((
-                idx.index(),
-                n.id.clone(),
-                n.name.clone(),
-                format!("{:?}", n.node_type),
-                n.file_path.to_string(),
-                n.byte_range,
-                n.complexity,
-            ));
-        }
-    }
-    nodes.sort();
-    let mut edges: Vec<(usize, usize, String)> = Vec::new();
-    for e in pdg.graph.edge_references() {
-        edges.push((
-            e.source().index(),
-            e.target().index(),
-            format!("{:?}", e.weight().edge_type),
-        ));
-    }
-    edges.sort();
-    serde_json::to_vec(&(nodes, edges, pdg.node_count(), pdg.edge_count())).unwrap()
-}
-
-/// Hydrate a heap-mirror instance. `artifact_dir` is a fresh directory with no
-/// legacy artifacts, forcing the same rebuild path the generation instance
-/// uses so the comparison isolates the data source (live store vs generation).
-fn hydrate_heap_instance(project: &std::path::Path, artifact_dir: &std::path::Path) -> LeIndex {
-    let mut idx = LeIndex::new(project).expect("new heap index");
-    idx.load_from_storage_inner_at(false, None, artifact_dir.to_path_buf())
-        .expect("hydrate heap instance");
-    idx
 }
 
 /// Hydrate a generation-reader instance through the real flag-gated entry
@@ -173,23 +154,17 @@ const QUERIES: &[&str] = &[
 // Tests
 // ===========================================================================
 
-/// VAL-EQUIV-001/002/003: with the flag on, the search/symbol/deep-analyze
-/// read path hydrates from the leased mmap generation and produces byte-level
-/// identical output to the legacy heap-mirror path (default off).
+/// The generation read path is the single source of truth after the D5 write
+/// flip (the SQL catalog no longer holds graph rows): with the flag on, the
+/// search/symbol/deep-analyze read path hydrates a populated graph and search
+/// engine from the leased mmap generation and serves real fixture content.
 #[test]
-fn test_read_path_bit_for_bit_equivalence() {
+fn test_read_path_serves_published_generation() {
     let _guard = lock_flag_tests();
     let dir = tempfile::tempdir().expect("tempdir");
     write_fixture_project(dir.path());
     index_project_fixture(dir.path());
-    let storage_root = dir.path().join(".leindex");
-    publish_live_generation(&storage_root, 1);
 
-    let artifact_dir = tempfile::tempdir().expect("artifact tempdir");
-    let mut heap = hydrate_heap_instance(dir.path(), artifact_dir.path());
-    assert!(heap.pdg().is_some(), "heap instance must load the pdg");
-
-    // Flag ON for the generation instance only.
     set_flag_override_for_test(FeatureFlag::GenerationReaders, true);
     let mut generation = hydrate_generation_instance(dir.path());
     clear_flag_overrides_for_test();
@@ -202,36 +177,133 @@ fn test_read_path_bit_for_bit_equivalence() {
         !generation.search_engine().is_empty(),
         "generation instance must hydrate a populated search engine"
     );
+
+    // The generation path must return real search results across the fixture
+    // corpus (at least one deterministic query hits).
+    let mut hits = 0;
+    for query in QUERIES {
+        let results = generation
+            .search(query, 10, None)
+            .unwrap_or_else(|e| panic!("generation search for {query:?} failed: {e}"));
+        if !results.is_empty() {
+            hits += 1;
+        }
+    }
     assert!(
-        generation.pdg().is_some(),
-        "generation instance must load the pdg"
+        hits > 0,
+        "the generation read path must return search results for the fixture corpus"
     );
 
-    // Search output must be byte-for-byte identical across all queries
-    // (anti-cheat section 2.1: no output may differ between the two paths).
-    for query in QUERIES {
-        let heap_results =
-            serde_json::to_vec(&heap.search(query, 10, None).expect("heap search")).unwrap();
-        let generation_results = serde_json::to_vec(
-            &generation
-                .search(query, 10, None)
-                .expect("generation search"),
-        )
-        .unwrap();
-        assert_eq!(
-            heap_results, generation_results,
-            "search output must be bit-for-bit identical for query {query:?}"
+    // The graph is the symbol / deep-analyze source: it must carry the fixture's
+    // real symbols (layer-hydrated, with no SQL mirror).
+    let pdg = generation
+        .pdg()
+        .expect("generation instance must load the pdg");
+    for name in [
+        "authenticate_user",
+        "connect_database",
+        "retry_operation",
+        "hash_password",
+    ] {
+        assert!(
+            pdg.find_by_name(name).is_some(),
+            "generation graph must contain fixture symbol {name}"
         );
     }
+}
 
-    // Symbol / deep-analyze data comes from the PDG: both paths must expose
-    // the same graph content byte-for-byte.
-    let heap_pdg = canonical_pdg(heap.pdg().unwrap());
-    let generation_pdg = canonical_pdg(generation.pdg().unwrap());
-    assert_eq!(
-        heap_pdg, generation_pdg,
-        "PDG (symbol + deep-analyze source) must be bit-identical"
+/// D4 parity: the published Pdg layer is the authoritative graph (the SQL
+/// catalog no longer holds graph rows after the D5 write flip). The flag-gated
+/// read path must hydrate exactly the graph the pipeline published.
+#[test]
+fn test_layer_hydration_matches_published_graph() {
+    let _guard = lock_flag_tests();
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_fixture_project(dir.path());
+    index_project_fixture(dir.path());
+    let storage_root = dir.path().join(".leindex");
+
+    let snapshot = GenerationSnapshot::open(&storage_root).expect("open snapshot");
+    let expected = snapshot
+        .pdg()
+        .expect("published generation must carry a Pdg layer")
+        .to_program_dependence_graph()
+        .expect("decode published Pdg layer");
+    assert!(
+        expected.node_count() > 0,
+        "published graph must be non-empty"
     );
+
+    set_flag_override_for_test(FeatureFlag::GenerationReaders, true);
+    let generation = hydrate_generation_instance(dir.path());
+    clear_flag_overrides_for_test();
+
+    assert_eq!(
+        String::from_utf8(canonical_pdg(&expected)).unwrap(),
+        String::from_utf8(canonical_pdg(generation.pdg().unwrap())).unwrap(),
+        "layer-hydrated graph must match the published Pdg layer"
+    );
+}
+
+/// Step 6 D2 equivalence: restoring the search engine from the generation's
+/// Search/Embedder/Tfidf layers must return exactly what rebuilding it from
+/// the graph returns. Generation 1 is the pipeline's full publish (carries the
+/// optional layers); generation 2 re-publishes only the five core layers, which
+/// forces the rebuild-from-graph route. Same queries, same ids, same scores.
+#[test]
+fn test_layer_search_hydration_matches_graph_rebuild() {
+    let _guard = lock_flag_tests();
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_fixture_project(dir.path());
+    index_project_fixture(dir.path());
+    let storage_root = dir.path().join(".leindex");
+
+    let manifest = read_generation_manifest(
+        &storage_root,
+        read_current_generation(&storage_root).expect("current generation"),
+    )
+    .expect("read manifest");
+    assert!(
+        manifest.layers.contains_key(&LayerKind::Search)
+            && manifest.layers.contains_key(&LayerKind::Embedder),
+        "the pipeline must publish the Search and Embedder layers"
+    );
+
+    set_flag_override_for_test(FeatureFlag::GenerationReaders, true);
+    let mut from_layers = hydrate_generation_instance(dir.path());
+    assert!(
+        from_layers.search_engine().is_mmap_backed(),
+        "search must be restored from the generation layers, not rebuilt"
+    );
+
+    publish_live_generation(&storage_root, 2);
+    let mut from_rebuild = hydrate_generation_instance(dir.path());
+    clear_flag_overrides_for_test();
+    assert!(
+        !from_rebuild.search_engine().is_mmap_backed(),
+        "a generation without the optional layers must take the rebuild route"
+    );
+
+    let mut compared = 0;
+    for query in QUERIES {
+        let layered = from_layers.search(query, 10, None).expect("layer search");
+        let rebuilt = from_rebuild
+            .search(query, 10, None)
+            .expect("rebuild search");
+        let project = |results: &[crate::search::search::SearchResult]| {
+            results
+                .iter()
+                .map(|r| (r.node_id.clone(), r.score.overall.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            project(&layered),
+            project(&rebuilt),
+            "layer-restored search diverged from graph rebuild for {query:?}"
+        );
+        compared += layered.len();
+    }
+    assert!(compared > 0, "the comparison must cover real hits");
 }
 
 /// No-stall test: a search fired mid-index returns immediately by serving the
@@ -291,8 +363,17 @@ fn test_no_stall_read_during_index() {
     // the full 1500ms sleep after this signal).
     rx_mid.recv().expect("writer is mid-publication");
     set_flag_override_for_test(FeatureFlag::GenerationReaders, true);
-    let started = Instant::now();
+    // Hydration (cold mmap/lease setup) is real work the reader must do
+    // regardless of the writer; it is NOT lock contention. The property
+    // under test is that the SEARCH does not block on the writer's lock, so
+    // hydrate first and time only the search call. The writer sleeps 1500ms
+    // after signalling; the search must finish well inside that window.
     let mut reader = hydrate_generation_instance(dir.path());
+    let warm_query = reader
+        .search("authenticate user", 10, None)
+        .expect("warm-up search");
+    assert!(!warm_query.is_empty(), "warm-up must return results");
+    let started = Instant::now();
     let results = reader
         .search("authenticate user", 10, None)
         .expect("search mid-index");

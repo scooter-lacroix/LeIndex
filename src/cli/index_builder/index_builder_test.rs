@@ -97,9 +97,9 @@ fn test_merge_pdgs_empty_source_is_noop() {
 
 /// Per-file extraction gives every file pass its own `external::{target}`
 /// placeholder, so merged graphs used to carry several nodes sharing one id.
-/// `save_pdg` keys them all onto the single `(project_id, node_id)` row and
-/// a reload collapses them. The merge must fold duplicates onto one node and
-/// remap every edge endpoint onto it.
+/// Persisting them keyed every copy onto the single `(project_id, node_id)`
+/// row and a reload collapsed them. The merge must fold duplicates onto one
+/// node and remap every edge endpoint onto it.
 #[test]
 fn test_merge_pdgs_dedupes_duplicate_node_ids_and_remaps_edges() {
     use crate::graph::pdg::{Edge, EdgeMetadata, EdgeType, Node, NodeType};

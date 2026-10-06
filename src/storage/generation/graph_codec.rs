@@ -558,6 +558,13 @@ fn storage_edge_type_to_graph(edge_type: crate::storage::edges::EdgeType) -> Edg
     }
 }
 
+/// The storage-vocabulary string for a graph node type — the exact value the
+/// SQL `intel_nodes.node_type` column held. Shared by the D6 graph-backed
+/// catalog queries so both paths report identical strings.
+pub(crate) fn graph_node_type_str(node_type: &NodeType) -> &'static str {
+    storage_node_type(node_type).as_str()
+}
+
 fn storage_node_type(node_type: &NodeType) -> StorageNodeType {
     match node_type {
         NodeType::Function => StorageNodeType::Function,
@@ -569,6 +576,13 @@ fn storage_node_type(node_type: &NodeType) -> StorageNodeType {
         NodeType::DocSection => StorageNodeType::DocSection,
         NodeType::FileSummary => StorageNodeType::FileSummary,
     }
+}
+
+/// The storage-vocabulary string for a graph edge type — shared by D6 graph
+/// analytics and catalog replacements so the exposed strings match the legacy
+/// `intel_edges.edge_type` values.
+pub(crate) fn graph_edge_type_str(edge_type: &EdgeType) -> &'static str {
+    storage_edge_type(edge_type).as_str()
 }
 
 fn storage_edge_type(edge_type: &EdgeType) -> crate::storage::edges::EdgeType {
@@ -590,3 +604,8 @@ fn storage_edge_type(edge_type: &EdgeType) -> crate::storage::edges::EdgeType {
 #[cfg(test)]
 #[path = "graph_codec_test.rs"]
 mod tests;
+
+// Shared across test modules (e.g. cli/leindex generation read tests) so the
+// canonical-PDG comparison exists exactly once.
+#[cfg(test)]
+pub(crate) use tests::canonical_pdg;

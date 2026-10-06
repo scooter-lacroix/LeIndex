@@ -2,6 +2,7 @@ use super::helpers::{extract_bool, extract_usize, resolve_scope, wrap_with_meta}
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -190,9 +191,8 @@ scoping to subdirectories, sorting, and pagination."
     }
 
     /// Grouped-by-community response: reads persisted Leiden labels and
-    /// buckets the (already paginated) file entries by each file's community
-    /// (from intel_nodes.community_id). Zero query-time computation — the
-    /// persisted assignment is the source of truth.
+    /// buckets the already-paginated file entries using memberships on the
+    /// resident PDG. Labels remain derived metadata in `intel_communities`.
     #[cfg(feature = "community")]
     fn community_grouped_response(
         &self,
@@ -212,25 +212,18 @@ scoping to subdirectories, sorting, and pagination."
         )
         .unwrap_or_default();
 
-        // Map community_id -> (label) for rendering.
-        use std::collections::HashMap;
         let label_by_community: HashMap<i64, String> = labels
             .iter()
             .map(|(community, _, label)| (*community, label.clone()))
             .collect();
 
-        // Fetch file -> community assignments from the persisted nodes.
+        // The resident PDG carries validated derived memberships; aggregate
+        // node memberships to file memberships without graph-table SQL.
         let mut file_community: HashMap<String, i64> = HashMap::new();
-        let conn = guard.storage.conn();
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT DISTINCT file_path, community_id FROM intel_nodes \
-             WHERE project_id = ?1 AND community_id IS NOT NULL",
-        ) {
-            if let Ok(rows) = stmt.query_map([guard.project_id()], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            }) {
-                for row in rows.flatten() {
-                    file_community.insert(row.0, row.1);
+        if let Some(pdg) = guard.pdg() {
+            for (&node_id, &community) in &pdg.communities {
+                if let Some(node) = pdg.get_node(node_id) {
+                    file_community.insert(node.file_path.to_string(), i64::from(community));
                 }
             }
         }

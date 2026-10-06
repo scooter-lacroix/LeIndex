@@ -3,6 +3,7 @@
 use super::LeIndex;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use tracing::warn;
 
 impl LeIndex {
     fn determine_embedding_model(&self) -> String {
@@ -41,44 +42,41 @@ impl LeIndex {
     }
 
     fn collect_precision_diagnostics(&self) -> (usize, Vec<String>) {
-        let mut precision_languages = std::collections::BTreeSet::new();
-        // Resident PDG is authoritative; the lightweight one-shot path (no
-        // hydration) falls back to the persisted marker column, mirroring how
-        // search_index_nodes falls back to persisted stats above.
-        let precision_nodes = match self.pdg.as_ref() {
-            Some(pdg) => {
-                for node_id in &pdg.precision_symbols {
-                    if let Some(node) = pdg.find_by_id(node_id).and_then(|id| pdg.get_node(id)) {
-                        precision_languages.insert(node.language.to_ascii_lowercase());
-                    }
-                }
-                pdg.precision_symbols.len()
-            }
+        // The resident PDG is authoritative; the lightweight one-shot path (no
+        // hydration) decodes the published generation Pdg layer — the sole
+        // graph store after the write flip — instead of reading the now-empty
+        // catalog graph rows.
+        let hydrated;
+        let pdg = match self.pdg.as_ref() {
+            Some(pdg) => pdg,
             None => {
-                let conn = self.storage.conn();
-                let nodes: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM intel_nodes WHERE project_id = ?1 AND precision = 1",
-                        rusqlite::params![self.project_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-                if let Ok(mut stmt) = conn.prepare(
-                    "SELECT DISTINCT language FROM intel_nodes \
-                     WHERE project_id = ?1 AND precision = 1",
-                ) {
-                    if let Ok(languages) = stmt
-                        .query_map(rusqlite::params![self.project_id], |row| {
-                            row.get::<_, String>(0)
-                        })
-                    {
-                        precision_languages.extend(languages.flatten());
+                let snapshot =
+                    crate::storage::generation::GenerationSnapshot::open(&self.storage_path).ok();
+                hydrated = snapshot.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .pdg()
+                        .and_then(|reader| reader.to_program_dependence_graph().ok())
+                });
+                match hydrated.as_ref() {
+                    Some(pdg) => pdg,
+                    None => {
+                        warn!("Precision diagnostics: no resident PDG and no decodable Pdg layer");
+                        return (0, Vec::new());
                     }
                 }
-                nodes as usize
             }
         };
-        (precision_nodes, precision_languages.into_iter().collect())
+
+        let mut precision_languages = std::collections::BTreeSet::new();
+        for node_id in pdg.precision_symbols() {
+            if let Some(node) = pdg.find_by_id(node_id).and_then(|id| pdg.get_node(id)) {
+                precision_languages.insert(node.language.to_ascii_lowercase());
+            }
+        }
+        (
+            pdg.precision_symbols().len(),
+            precision_languages.into_iter().collect(),
+        )
     }
 
     /// Get diagnostics about the indexed project

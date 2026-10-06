@@ -21,6 +21,7 @@ pub(crate) mod watcher_delta;
 
 mod neural_publish;
 
+mod layer_artifacts;
 mod load;
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -149,6 +150,55 @@ impl IndexPipelineState {
     }
 }
 
+/// Save-stage regression gate (step 5 of the graph-layer flip).
+///
+/// The pre-flip save stage (SQLite row-per-edge diff-upsert) measured 869 ms
+/// for 175k edges / 22k nodes; the extrapolated failure mode was minutes at
+/// 1.83M edges. Post-flip the save stage is whole-graph encode + one CAS
+/// blob write per layer (~5 µs/edge measured, release). The gate enforces a
+/// per-edge budget so a regression fails the index run loudly instead of
+/// shipping quietly.
+///
+/// Override: `LEINDEX_SAVE_STAGE_GATE_MS` sets an absolute budget in
+/// milliseconds (slow/loaded machines, CI). `0` disables — benchmarks only.
+fn save_stage_gate(
+    elapsed: std::time::Duration,
+    pdg_edges: usize,
+    staging: &std::path::Path,
+) -> Result<()> {
+    let override_ms = std::env::var("LEINDEX_SAVE_STAGE_GATE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    if override_ms == Some(0) {
+        return Ok(());
+    }
+    let budget_ms = save_stage_budget_ms(pdg_edges, override_ms);
+    let elapsed_ms = elapsed.as_millis() as u64;
+    if elapsed_ms > budget_ms {
+        bail!(
+            "save-stage regression gate: publish took {elapsed_ms} ms for {pdg_edges} edges \
+             (budget {budget_ms} ms; staging {}). If this machine is slow, set \
+             LEINDEX_SAVE_STAGE_GATE_MS=<abs-ms> (0 disables, benchmarks only).",
+            staging.display()
+        );
+    }
+    Ok(())
+}
+
+/// Pure budget computation for [`save_stage_gate`], unit-tested without env
+/// access. 20 µs/edge baseline (~4× headroom over the measured ~5 µs/edge),
+/// a 500 ms floor for tiny graphs, ×10 in debug builds (unoptimized encode).
+fn save_stage_budget_ms(pdg_edges: usize, override_ms: Option<u64>) -> u64 {
+    const US_PER_EDGE: u64 = 20;
+    const FLOOR_MS: u64 = 500;
+    let scale = if cfg!(debug_assertions) { 10 } else { 1 };
+    override_ms.unwrap_or_else(|| {
+        FLOOR_MS
+            .max(pdg_edges as u64 * US_PER_EDGE / 1000)
+            .saturating_mul(scale)
+    })
+}
+
 impl LeIndex {
     fn checkpoint_store(&self, generation: u64) -> CheckpointStore {
         CheckpointStore::new(self.storage_path(), generation)
@@ -183,60 +233,127 @@ impl LeIndex {
         max_generation.max(root_generation).saturating_add(1)
     }
 
-    fn prepare_generation_snapshot(
+    /// Stage every layer of a generation into CAS via [`GenerationWriter`].
+    ///
+    /// The five required layers are always staged (Db from the VACUUMed
+    /// catalog; Pdg/Symbols encoded from the resident in-memory graph; and
+    /// Tfidf/Neural from the mmap embedding files). The optional layers are
+    /// staged when their artifacts exist. Returns the writer with layers
+    /// staged but NOT published — [`Self::promote_generation_snapshot`]
+    /// publishes.
+    fn stage_generation_layers(
         &self,
-        staging: &std::path::Path,
-        health: &super::IndexHealth,
         include_neural: bool,
-    ) -> Result<()> {
-        // WAL is checkpointed before copying the immutable catalog snapshot;
+    ) -> Result<crate::storage::generation::GenerationWriter> {
+        use std::sync::{Arc, Mutex};
+
+        use crate::storage::cas::CasStore;
+        use crate::storage::generation::{
+            GenerationWriter, LayerKind, ModelIdentity, graph_codec, migrate as gen_migrate,
+        };
+
+        // WAL is checkpointed before encoding the immutable catalog snapshot;
         // query readers never observe a half-written generation.
         self.storage
             .conn()
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
             .context("checkpoint SQLite WAL before generation publication")?;
-        let mut copied = HashSet::new();
-        let mut artifact_paths = vec![
-            self.storage_path().join("leindex.db"),
-            self.storage_path().join("index_stats.json"),
-            self.project_path.join(".leindex/search_snapshot.bin"),
-            self.project_path.join(".leindex/embeddings.bin"),
-            self.project_path.join(".leindex/tfidf_embedder.bin"),
-        ];
-        if include_neural {
-            artifact_paths.push(self.project_path.join(".leindex/neural_embeddings.bin"));
+
+        let storage_root = self.storage_path();
+        let artifact_dir = self.project_path.join(".leindex");
+        let cas = Arc::new(Mutex::new(CasStore::open(storage_root.join("cas"))?));
+        let mut writer = GenerationWriter::new(storage_root, cas);
+        writer.set_model_identity(ModelIdentity {
+            name: "tfidf-hybrid".to_string(),
+            digest: String::new(),
+            dimensions: 768,
+        });
+
+        // Db layer: the VACUUM-normalized catalog (byte-deterministic).
+        let db_bytes = gen_migrate::vacuum_bytes(&storage_root.join("leindex.db"))?;
+        writer.stage(LayerKind::Db, &db_bytes)?;
+
+        // Graph layers, encoded losslessly from the resident graph (D3): the
+        // catalog no longer holds graph rows, so the Pdg and Symbols layers
+        // are built from the in-memory PDG via the D1 codec. The layered node
+        // assignment replaces the catalog's integer row ids for the vector
+        // layers below.
+        let pdg = self
+            .pdg
+            .as_ref()
+            .context("generation publication requires a resident PDG")?;
+        let (pdg_bytes, node_ids) = graph_codec::encode_pdg_v2_from_graph(pdg)?;
+        // Vector layers key rows by the same layered assignment.
+        let node_ids = node_ids.as_map();
+        writer.stage(LayerKind::Pdg, &pdg_bytes)?;
+        writer.stage(
+            LayerKind::Symbols,
+            &graph_codec::encode_symbols_layer_from_graph(pdg)?,
+        )?;
+
+        // Vector layers from the mmap embedding files. `embeddings.bin` is
+        // absent on a docs-only index (no code nodes): stage the canonical
+        // empty TF-IDF layer rather than failing the publish.
+        let embeddings_path = artifact_dir.join("embeddings.bin");
+        let tfidf = if embeddings_path.is_file() {
+            gen_migrate::encode_tfidf_layer(&embeddings_path, &node_ids)?
+        } else {
+            gen_migrate::encode_empty_tfidf()
+        };
+        writer.stage(LayerKind::Tfidf, &tfidf)?;
+        let neural_path = artifact_dir.join("neural_embeddings.bin");
+        let neural = if include_neural && neural_path.is_file() {
+            gen_migrate::encode_neural_layer(&neural_path, &node_ids)?
+        } else {
+            gen_migrate::encode_empty_neural()
+        };
+        writer.stage(LayerKind::Neural, &neural)?;
+
+        // Optional layers: staged only when the artifacts exist.
+        if artifact_dir.join("search_snapshot.bin").is_file() {
+            let bytes = std::fs::read(artifact_dir.join("search_snapshot.bin"))?;
+            writer.stage(LayerKind::Search, &bytes)?;
         }
-        // Fragment layer (Task 6, invariant 8): the four fragment artifacts
-        // must be published with each generation or a cold start resolving the
-        // immutable generation would lose the fragment store/mmap and the
-        // indexed fragment layer would silently vanish. Copied only when the
-        // files exist (feature-off leaves nothing extra); validated on load by
-        // `fragment_layer_is_valid` (root hash + mmap row count).
-        for name in [
-            "fragment_store.bin",
-            "fragment_root.bin",
-            "fragment_sync_manifest.bin",
-            "fragments_embeddings.bin",
-        ] {
-            artifact_paths.push(self.project_path.join(".leindex").join(name));
+        if artifact_dir.join("tfidf_embedder.bin").is_file() {
+            let bytes = std::fs::read(artifact_dir.join("tfidf_embedder.bin"))?;
+            writer.stage(LayerKind::Embedder, &bytes)?;
         }
-        for source in artifact_paths {
-            if !source.is_file() || !copied.insert(source.clone()) {
-                continue;
-            }
-            let Some(name) = source.file_name() else {
-                continue;
-            };
-            let destination = staging.join(name);
-            let next = destination.with_extension("next");
-            std::fs::copy(&source, &next).with_context(|| {
+        if let Some(bundle) = gen_migrate::encode_fragment_bundle(&artifact_dir)? {
+            writer.stage(LayerKind::Fragments, &bundle)?;
+        }
+
+        Ok(writer)
+    }
+
+    fn prepare_generation_snapshot(
+        &self,
+        staging: &std::path::Path,
+        health: &super::IndexHealth,
+        _include_neural: bool,
+    ) -> Result<()> {
+        // WAL is checkpointed before the immutable catalog snapshot is
+        // encoded into the Db layer; query readers never observe a
+        // half-written generation.
+        self.storage
+            .conn()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .context("checkpoint SQLite WAL before generation publication")?;
+        // The layer payloads (Db/Tfidf/Neural/Pdg/Symbols plus the optional
+        // Search/Embedder/Fragments) were already staged into CAS by
+        // `stage_generation_layers`; nothing is copied here. A generation
+        // directory carries only KB-scale metadata (health + stats), which
+        // generation reads hydrate directly from the directory.
+        let stats_path = self.storage_path().join("index_stats.json");
+        if stats_path.is_file() {
+            let next = staging.join("index_stats.json.next");
+            std::fs::copy(&stats_path, &next).with_context(|| {
                 format!(
-                    "copy generation artifact {} -> {}",
-                    source.display(),
-                    destination.display()
+                    "copy generation stats {} -> {}",
+                    stats_path.display(),
+                    next.display()
                 )
             })?;
-            std::fs::rename(next, destination)?;
+            std::fs::rename(next, staging.join("index_stats.json"))?;
         }
         crate::cli::index_freshness::save_health(staging, health)?;
         #[cfg(unix)]
@@ -250,6 +367,7 @@ impl LeIndex {
         target: &std::path::Path,
         _generations: &std::path::Path,
         generation: u64,
+        writer: &mut crate::storage::generation::GenerationWriter,
     ) -> Result<()> {
         // Rename the complete directory once. Readers either see no new
         // generation or the fully materialized immutable snapshot.
@@ -262,14 +380,12 @@ impl LeIndex {
         })?;
         #[cfg(unix)]
         std::fs::File::open(_generations)?.sync_all()?;
-        let current = self.storage_path().join("CURRENT");
-        let next = self.storage_path().join("CURRENT.next");
-        let mut current_file = std::fs::File::create(&next)?;
-        use std::io::Write as _;
-        current_file.write_all(format!("{generation}\n").as_bytes())?;
-        current_file.sync_all()?;
-        drop(current_file);
-        std::fs::rename(next, current)?;
+        // The writer's publish is the commit point: manifest first, then the
+        // atomic CURRENT swap LAST (crash-safety per GenerationWriter). The
+        // old inline CURRENT write is gone — a single authority moves it.
+        writer
+            .publish(generation)
+            .context("publish generation manifest + CURRENT via GenerationWriter")?;
         #[cfg(unix)]
         std::fs::File::open(self.storage_path())?.sync_all()?;
         Ok(())
@@ -316,11 +432,30 @@ impl LeIndex {
             // published, not the stale planning hint.
             health.generation = generation;
             let target = generations.join(generation.to_string());
+            // Stage every layer into CAS first (additive, crash-safe), then
+            // materialize the file mirror, rename it into place, and let the
+            // writer commit the manifest + CURRENT. The whole attempt is the
+            // save stage — timed for the regression gate below.
+            let save_started = Instant::now();
             let attempt = self
-                .prepare_generation_snapshot(&staging, health, include_neural)
-                .and_then(|()| {
-                    self.promote_generation_snapshot(&staging, &target, &generations, generation)
+                .stage_generation_layers(include_neural)
+                .and_then(|mut writer| {
+                    self.prepare_generation_snapshot(&staging, health, include_neural)
+                        .and_then(|()| {
+                            self.promote_generation_snapshot(
+                                &staging,
+                                &target,
+                                &generations,
+                                generation,
+                                &mut writer,
+                            )
+                        })
                 });
+            let save_elapsed = save_started.elapsed();
+            if attempt.is_ok() {
+                let pdg_edges = self.pdg.as_ref().map_or(0, |p| p.edge_count());
+                save_stage_gate(save_elapsed, pdg_edges, &staging)?;
+            }
             if let Err(error) = attempt {
                 let _ = std::fs::remove_dir_all(&staging);
                 // Lost the rename race to a concurrent publisher: the
@@ -937,12 +1072,8 @@ impl LeIndex {
     fn spawn_text_index_refresh(&self) -> std::thread::JoinHandle<()> {
         let root = self.project_path().to_path_buf();
         let storage = self.storage_path().to_path_buf();
-        let db = crate::cli::live_project::LiveProject::resolve(&root.to_string_lossy())
-            .map(|live| live.active_storage().join("leindex.db"))
-            .ok()
-            .filter(|db| db.is_file());
         std::thread::spawn(move || {
-            if let Err(error) = crate::cli::textindex::build(&root, &storage, db.as_deref()) {
+            if let Err(error) = crate::cli::textindex::build(&root, &storage) {
                 warn!("Text index build failed (search will scan live): {error}");
             }
         })
@@ -1154,19 +1285,24 @@ impl LeIndex {
             super::ComponentStatus::Initializing,
         );
         info!("Indexed {} nodes for search", indexed_count);
-        progress_stderr("Indexing: saving to storage...");
+        progress_stderr("Indexing: publishing generation...");
         self.mark_index_phase(
             super::IndexPhase::Persist,
             super::ComponentStatus::Initializing,
         );
-        index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)?;
+        // D5: the graph no longer persists as SQL rows. It is published as
+        // the Pdg layer of a CAS generation (stage_generation_layers); the
+        // catalog keeps only `indexed_files` and metadata tables.
         // Snapshot/embedder freshness identity must describe the graph as the
-        // DB reconstructs it (the in-memory graph may hold duplicate node_ids
-        // the upsert collapses), so compute it from storage AFTER the save.
-        let persisted_identity =
-            index_builder::persisted_search_identity(&self.storage, &self.project_id);
+        // published layer reconstructs it (the in-memory graph may hold
+        // duplicate node_ids and parallel edges the layer collapses).
+        let persisted_identity = index_builder::persisted_search_identity_from_graph(&pdg);
         if let Some(embedder) = &self.embedder {
-            embedder.persist_to_storage(&self.project_path, &pdg, persisted_identity.clone())?;
+            embedder.persist_to_storage(
+                &self.project_path,
+                &pdg,
+                Some(persisted_identity.clone()),
+            )?;
         }
         self.compute_and_persist_communities(&mut pdg);
         let checkpoint_store = state
@@ -1213,8 +1349,7 @@ impl LeIndex {
         // persist. On failure the layer is CLEARED (not just logged) — see
         // `sync_fragment_layer_or_clear` (Codex wave-4 P2).
         self.sync_fragment_layer_or_clear();
-        let (identity_nodes, identity_edges, identity_fingerprint) =
-            persisted_identity.unwrap_or_else(|| (pdg_node_count, pdg_edge_count, String::new()));
+        let (identity_nodes, identity_edges, identity_fingerprint) = persisted_identity;
         index_builder::persist_search_snapshot(
             &self.search_engine,
             &self.project_path,
@@ -1293,7 +1428,7 @@ impl LeIndex {
                 .with_context(|| {
                     format!("Failed to open active generation at {}", active.display())
                 })?;
-        self.load_from_storage_inner_at(false, Some(&active_storage), active)
+        self.load_from_storage_inner_at(false, Some(&active_storage), active, None)
     }
 
     /// Re-hydrate from the CURRENT generation even when a generation snapshot
@@ -1374,16 +1509,47 @@ impl LeIndex {
                 )
             })?;
         let generation_db = crate::storage::schema::Storage::open_readonly(snapshot.db_path())?;
-        // Artifact path points at the snapshot's temp dir, which holds no
-        // search-snapshot/embedder artifacts, so hydration uses the rebuild
-        // path and `persist_artifacts` stays false — the generation read path
-        // never writes legacy artifacts back into the store.
+        // Artifact path points at the snapshot's temp dir. The Search /
+        // Embedder / Tfidf / Neural / Fragments layers are materialized there
+        // from CAS (D2) so the SAME decoders and freshness checks as the
+        // mutable-root path restore the engine; if that fails or a layer is
+        // absent, hydration takes the rebuild path. `persist_artifacts` stays
+        // false — the generation read path never writes legacy artifacts back
+        // into the store.
+        if !pdg_only {
+            if let Err(error) = layer_artifacts::materialize_search_artifacts(&snapshot) {
+                warn!(%error, "Search layer materialization failed; rebuilding search from the graph");
+            }
+        }
         let artifact_path = snapshot
             .db_path()
             .parent()
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| storage_path.clone());
-        self.load_from_storage_inner_at(pdg_only, Some(&generation_db), artifact_path)?;
+        // D4: hydrate the graph from the Pdg layer when the leased generation
+        // carries a v2 layer (the only kind this branch publishes). Decode
+        // failure or a missing/v1 layer falls back to the SQL catalog in the
+        // generation's Db layer — pre-migration generations still keep their
+        // graph rows there.
+        let prebuilt_pdg =
+            snapshot
+                .pdg()
+                .and_then(|reader| match reader.to_program_dependence_graph() {
+                    Ok(pdg) => Some(pdg),
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            "Generation Pdg layer decode failed; falling back to the SQL catalog"
+                        );
+                        None
+                    }
+                });
+        self.load_from_storage_inner_at(
+            pdg_only,
+            Some(&generation_db),
+            artifact_path,
+            prebuilt_pdg,
+        )?;
         self.hydrated_generation
             .store(snapshot.generation(), std::sync::atomic::Ordering::Release);
         self.generation_snapshot = Some(snapshot);
@@ -1416,11 +1582,11 @@ impl LeIndex {
                 .with_context(|| {
                     format!("Failed to open active generation at {}", active.display())
                 })?;
-        self.load_from_storage_inner_at(true, Some(&active_storage), active)
+        self.load_from_storage_inner_at(true, Some(&active_storage), active, None)
     }
 
     fn load_from_storage_inner(&mut self, pdg_only: bool) -> Result<()> {
-        self.load_from_storage_inner_at(pdg_only, None, self.storage_path.clone())
+        self.load_from_storage_inner_at(pdg_only, None, self.storage_path.clone(), None)
     }
 }
 

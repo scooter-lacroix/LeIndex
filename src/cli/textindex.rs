@@ -1,5 +1,5 @@
 //! Project text-index lifecycle: locate, load (cached), build, and feed it
-//! symbol spans from the generation catalog — never from a hydrated PDG.
+//! symbol spans decoded from the published generation's Pdg layer.
 
 use crate::search::textsearch::{
     BuildStats, SymbolSpan, TextIndex, build_index, kind_code, list_files,
@@ -53,49 +53,56 @@ pub fn load(storage: &Path) -> Option<Arc<TextIndex>> {
     }
 }
 
-/// Symbol spans per root-relative path, read from the generation's
-/// `intel_nodes` table (read-only, no PDG involved).
-pub fn symbols_from_db(db: &Path, root: &Path) -> HashMap<String, Vec<SymbolSpan>> {
+/// Symbol spans per root-relative path, decoded from the published
+/// generation's Pdg layer — the sole graph store after the write flip (the
+/// catalog no longer carries graph rows). `storage` is the project's storage
+/// root (where `<storage>/generations/<CURRENT>` lives); byte ranges come from
+/// the graph nodes and empty ranges are ignored.
+pub fn symbols_from_generation(storage: &Path, root: &Path) -> HashMap<String, Vec<SymbolSpan>> {
+    let Ok(snapshot) = crate::storage::generation::GenerationSnapshot::open(storage) else {
+        return HashMap::new();
+    };
+    let Some(reader) = snapshot.pdg() else {
+        return HashMap::new();
+    };
+    let Ok(pdg) = reader.to_program_dependence_graph() else {
+        return HashMap::new();
+    };
+    symbols_from_pdg(&pdg, root)
+}
+
+/// Symbol spans (byte ranges) per root-relative path from an in-memory graph.
+fn symbols_from_pdg(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    root: &Path,
+) -> HashMap<String, Vec<SymbolSpan>> {
     let mut out: HashMap<String, Vec<SymbolSpan>> = HashMap::new();
-    let flags =
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let Ok(connection) = rusqlite::Connection::open_with_flags(db, flags) else {
-        return out;
-    };
-    let _ = connection.busy_timeout(std::time::Duration::from_secs(2));
-    let Ok(mut statement) = connection.prepare(
-        "SELECT file_path, symbol_name, node_type, byte_range_start, byte_range_end \
-         FROM intel_nodes WHERE byte_range_end > byte_range_start",
-    ) else {
-        return out;
-    };
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, i64>(4)?,
-        ))
-    });
-    let Ok(rows) = rows else { return out };
-    for (file, name, kind, start, end) in rows.flatten() {
-        let path = Path::new(&file);
+    for index in pdg.node_indices() {
+        let Some(node) = pdg.get_node(index) else {
+            continue;
+        };
+        let (start, end) = node.byte_range;
+        if end <= start {
+            continue;
+        }
+        let path = Path::new(&*node.file_path);
         let rel = path.strip_prefix(root).unwrap_or(path);
         let rel = rel.to_string_lossy().replace('\\', "/");
         out.entry(rel).or_default().push(SymbolSpan {
-            start: start.max(0) as u32,
-            end: end.max(0) as u32,
-            kind: kind_code(&kind),
-            name,
+            start: start as u32,
+            end: end as u32,
+            kind: kind_code(
+                crate::storage::generation::graph_codec::graph_node_type_str(&node.node_type),
+            ),
+            name: node.name.clone(),
         });
     }
     out
 }
 
 /// Build (or rebuild) the index for `root` into `storage`.
-pub fn build(root: &Path, storage: &Path, db: Option<&Path>) -> std::io::Result<BuildStats> {
-    let symbols = db.map(|db| symbols_from_db(db, root)).unwrap_or_default();
+pub fn build(root: &Path, storage: &Path) -> std::io::Result<BuildStats> {
+    let symbols = symbols_from_generation(storage, root);
     let stats = build_index(root, &index_path(storage), symbols)?;
     info!(
         root = %root.display(),
@@ -119,18 +126,16 @@ fn building() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
 /// indexed — no storage directory exists and none is created here — or when it
 /// is too large to index inline, in which case a detached build is started so
 /// later calls are fast.
-pub fn ensure(root: &Path, storage: &Path, active_storage: &Path) -> Option<Arc<TextIndex>> {
+pub fn ensure(root: &Path, storage: &Path) -> Option<Arc<TextIndex>> {
     if let Some(index) = load(storage) {
         return Some(index);
     }
     if !storage.is_dir() {
         return None;
     }
-    let db = active_storage.join("leindex.db");
-    let db = db.is_file().then_some(db);
     let file_count = list_files(root, INLINE_BUILD_MAX_FILES + 1, None).len();
     if file_count <= INLINE_BUILD_MAX_FILES {
-        if let Err(error) = build(root, storage, db.as_deref()) {
+        if let Err(error) = build(root, storage) {
             warn!("Text index build failed for {}: {error}", root.display());
             return None;
         }
@@ -145,7 +150,7 @@ pub fn ensure(root: &Path, storage: &Path, active_storage: &Path) -> Option<Arc<
     }
     let (root, storage) = (root.to_path_buf(), storage.to_path_buf());
     std::thread::spawn(move || {
-        if let Err(error) = build(&root, &storage, db.as_deref()) {
+        if let Err(error) = build(&root, &storage) {
             warn!(
                 "Background text index build failed for {}: {error}",
                 root.display()
@@ -168,7 +173,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn x() {}").unwrap();
         let storage = dir.path().join(".leindex");
-        assert!(ensure(dir.path(), &storage, &storage).is_none());
+        assert!(ensure(dir.path(), &storage).is_none());
         assert!(
             !storage.exists(),
             "searching must not litter an unindexed project"
@@ -181,9 +186,9 @@ mod tests {
         std::fs::write(dir.path().join("a.rs"), "fn alpha_marker() {}").unwrap();
         let storage = dir.path().join(".leindex");
         std::fs::create_dir_all(&storage).unwrap();
-        let first = ensure(dir.path(), &storage, &storage).expect("built inline");
+        let first = ensure(dir.path(), &storage).expect("built inline");
         assert_eq!(first.file_count(), 1);
-        let again = ensure(dir.path(), &storage, &storage).unwrap();
+        let again = ensure(dir.path(), &storage).unwrap();
         assert!(
             Arc::ptr_eq(&first, &again),
             "unchanged file reuses the mapping"
@@ -191,39 +196,45 @@ mod tests {
 
         std::fs::write(dir.path().join("b.rs"), "fn beta_marker() {}").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        build(dir.path(), &storage, None).unwrap();
+        build(dir.path(), &storage).unwrap();
         assert_eq!(load(&storage).unwrap().file_count(), 2);
     }
 
     #[test]
-    fn test_symbols_from_db_tolerates_missing_or_foreign_databases() {
+    fn test_symbols_from_generation_is_empty_without_a_layer() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(symbols_from_db(&dir.path().join("nope.db"), dir.path()).is_empty());
-        let db = dir.path().join("x.db");
-        std::fs::write(&db, b"not sqlite").unwrap();
-        assert!(symbols_from_db(&db, dir.path()).is_empty());
+        // A storage root with no generation store yields no symbol spans.
+        assert!(symbols_from_generation(dir.path(), dir.path()).is_empty());
     }
 
     #[test]
-    fn test_symbols_from_db_reads_intel_nodes_and_relativizes_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("g.db");
-        {
-            let connection = rusqlite::Connection::open(&db).unwrap();
-            connection
-                .execute_batch(
-                    "CREATE TABLE intel_nodes (file_path TEXT, symbol_name TEXT, node_type TEXT, byte_range_start INTEGER, byte_range_end INTEGER);",
-                )
-                .unwrap();
-            let file = dir.path().join("src/a.rs");
-            connection
-                .execute(
-                    "INSERT INTO intel_nodes VALUES (?1, 'alpha', 'Function', 3, 40), (?1, 'skip', 'Function', 0, 0)",
-                    [file.to_string_lossy().as_ref()],
-                )
-                .unwrap();
-        }
-        let symbols = symbols_from_db(&db, dir.path());
+    fn test_symbols_from_pdg_relativizes_paths_and_skips_empty_ranges() {
+        use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};
+        use std::sync::Arc;
+
+        let root = Path::new("/proj");
+        let mut pdg = ProgramDependenceGraph::new();
+        let file: Arc<str> = Arc::from("/proj/src/a.rs");
+        pdg.add_node(Node {
+            id: "fn:alpha".to_string(),
+            node_type: NodeType::Function,
+            name: "alpha".to_string(),
+            file_path: Arc::clone(&file),
+            byte_range: (3, 40),
+            complexity: 1,
+            language: "rust".to_string(),
+        });
+        pdg.add_node(Node {
+            id: "fn:skip".to_string(),
+            node_type: NodeType::Function,
+            name: "skip".to_string(),
+            file_path: file,
+            byte_range: (0, 0),
+            complexity: 1,
+            language: "rust".to_string(),
+        });
+
+        let symbols = symbols_from_pdg(&pdg, root);
         let spans = &symbols["src/a.rs"];
         assert_eq!(spans.len(), 1, "empty ranges are ignored");
         assert_eq!(

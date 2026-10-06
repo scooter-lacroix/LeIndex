@@ -192,6 +192,13 @@ impl GenerationSnapshot {
         &self.db_path
     }
 
+    /// The snapshot-owned temp directory (it holds the decoded `Db` layer and
+    /// is deleted with the snapshot). Hydration materializes the search
+    /// layers here under their legacy file names.
+    pub fn artifact_dir(&self) -> &Path {
+        self._db_tempdir.path()
+    }
+
     /// Neural embedding reader (mmap over the generation's neural blob).
     pub fn neural(&self) -> Option<&NeuralReader> {
         self.neural.as_ref()
@@ -211,6 +218,27 @@ impl GenerationSnapshot {
     pub fn symbols(&self) -> Option<&SymbolReader> {
         self.symbols.as_ref()
     }
+
+    /// The decoded payload of `kind`'s CAS blob, or `None` when the manifest
+    /// does not list the layer (optional layers are absent on older stores).
+    pub fn layer_bytes(&self, kind: LayerKind) -> Result<Option<Vec<u8>>, SnapshotError> {
+        let Some(hash) = self.manifest.layers.get(&kind) else {
+            return Ok(None);
+        };
+        let store = self._cas.lock().expect("cas store mutex poisoned");
+        Ok(Some(store.get(hash)?))
+    }
+}
+
+/// Whether `manifest`'s Neural layer carries vectors, i.e. is not the
+/// canonical empty payload staged when no neural model ran. Decided from the
+/// manifest hash alone — no blob or file is opened.
+pub fn manifest_has_neural_vectors(manifest: &Manifest) -> bool {
+    let empty = crate::storage::cas::blob::blob_hash(&super::migrate::encode_empty_neural());
+    manifest
+        .layers
+        .get(&LayerKind::Neural)
+        .is_some_and(|hash| *hash != empty)
 }
 
 #[cfg(test)]

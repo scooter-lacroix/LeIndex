@@ -155,8 +155,9 @@ pub fn merge_fragments_to_segment(fragments: Vec<PdgFragment>) -> (PdgSegment, P
         // Move nodes into segment (no clone), one record per node id:
         // per-file fragments each create their own `external::{target}`
         // placeholder, so concatenating them would leave the segment (and
-        // every graph materialized from it) with duplicate ids that
-        // `save_pdg` collapses onto a single row. First occurrence wins;
+        // every graph materialized from it) with duplicate ids that the
+        // store's `(project_id, node_id)` key collapses onto a single row.
+        // First occurrence wins;
         // edges resolve by id and stay attached to it.
         for node in fragment.nodes {
             if node_ids.insert(node.id.clone()) {
@@ -536,8 +537,8 @@ mod test {
     /// Per-file fragments each create their own `external::{target}`
     /// placeholder; the merged segment must keep exactly one record per node
     /// id (first wins) so the materialized graph cannot carry duplicate ids
-    /// that `save_pdg` would collapse onto a single `(project_id, node_id)`
-    /// row. Edges from every duplicate-holder must survive, resolved to the
+    /// that the store's `(project_id, node_id)` key would collapse onto a
+    /// single row. Edges from every duplicate-holder must survive, resolved to the
     /// one shared node.
     #[test]
     fn test_merge_dedupes_external_placeholders_by_node_id() {

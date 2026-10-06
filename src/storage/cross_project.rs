@@ -389,7 +389,6 @@ pub enum MergeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::pdg_store::save_pdg;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
 
@@ -399,23 +398,22 @@ mod tests {
         CrossProjectResolver::new(storage)
     }
 
-    fn create_test_pdg(project_id: &str) -> ProgramDependenceGraph {
-        let mut pdg = ProgramDependenceGraph::new();
-
-        // Add a simple node
-        let node_id_str = format!("{}::test_func", project_id);
-        let node = crate::graph::pdg::Node {
-            id: node_id_str,
-            node_type: crate::graph::pdg::NodeType::Function,
-            name: "test_func".to_string(),
-            file_path: Arc::from("src/test.rs"),
-            byte_range: (0, 100),
-            complexity: 5,
-            language: "rust".to_string(),
-        };
-        pdg.add_node(node);
-
-        pdg
+    /// Seed one graph node as a raw SQL row, the way a pre-flip legacy store
+    /// holds it (post-D7 the write path publishes generation layers instead,
+    /// but `load_external_pdg` still reads legacy rows via `load_pdg`).
+    fn seed_legacy_node(
+        storage: &crate::storage::schema::Storage,
+        project_id: &str,
+        node_id: &str,
+    ) {
+        storage
+            .conn()
+            .execute(
+                "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, complexity, content_hash, byte_range_start, byte_range_end, created_at, updated_at)
+                 VALUES (?1, 'src/test.rs', ?2, 'test_func', 'test_func', 'rust', 'function', 5, 'seed-hash', 0, 100, 0, 0)",
+                rusqlite::params![project_id, node_id],
+            )
+            .expect("seed legacy intel_nodes row");
     }
 
     #[test]
@@ -463,11 +461,9 @@ mod tests {
         let mut resolver = CrossProjectResolver::new(storage);
 
         // First load should succeed
-        let pdg = create_test_pdg("test_proj");
         {
-            let temp_file_path = temp_file.path();
-            let mut temp_storage = crate::storage::Storage::open(temp_file_path).unwrap();
-            save_pdg(&mut temp_storage, "test_proj", &pdg).unwrap();
+            let temp_storage = crate::storage::Storage::open(temp_file.path()).unwrap();
+            seed_legacy_node(&temp_storage, "test_proj", "test_proj::test_func");
         }
 
         resolver.load_external_pdg("test_proj").unwrap();
@@ -678,12 +674,9 @@ mod tests {
         let mut resolver = CrossProjectResolver::new(storage);
 
         // Load PDG
-        let pdg = create_test_pdg("test_proj");
         {
-            // Need a mutable storage for save_pdg
-            let temp_file_path = temp_file.path();
-            let mut temp_storage = crate::storage::Storage::open(temp_file_path).unwrap();
-            save_pdg(&mut temp_storage, "test_proj", &pdg).unwrap();
+            let temp_storage = crate::storage::Storage::open(temp_file.path()).unwrap();
+            seed_legacy_node(&temp_storage, "test_proj", "test_proj::test_func");
         }
 
         resolver.load_external_pdg("test_proj").unwrap();
@@ -737,12 +730,9 @@ mod tests {
 
         // Save PDGs
         {
-            let mut temp_storage = crate::storage::Storage::open(temp_file.path()).unwrap();
-            save_pdg(&mut temp_storage, "root_proj", &root_pdg).unwrap();
-        }
-        {
-            let mut temp_storage = crate::storage::Storage::open(temp_file.path()).unwrap();
-            save_pdg(&mut temp_storage, "ext_proj", &ext_pdg).unwrap();
+            let temp_storage = crate::storage::Storage::open(temp_file.path()).unwrap();
+            seed_legacy_node(&temp_storage, "root_proj", "root_func");
+            seed_legacy_node(&temp_storage, "ext_proj", "ext_func");
         }
 
         // Build cross-project PDG - load both PDGs and merge them

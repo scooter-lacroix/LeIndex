@@ -86,7 +86,7 @@ fn project_ref(raw: &Path) -> Option<ProjectRef> {
 }
 
 fn project_index(project: &ProjectRef) -> Option<Arc<crate::search::textsearch::TextIndex>> {
-    crate::cli::textindex::ensure(&project.root, &project.storage, &project.active_storage)
+    crate::cli::textindex::ensure(&project.root, &project.storage)
 }
 
 #[allow(missing_docs)]

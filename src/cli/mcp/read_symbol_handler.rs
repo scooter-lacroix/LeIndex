@@ -73,23 +73,24 @@ impl ReadSymbolHandler {
             .map(|raw| live.file(raw))
             .transpose()
             .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
-        let (file, source_stale) = match catalog_lookup(&live, &symbol, file.as_deref()).await? {
-            CatalogLookup::Fresh { node, bytes } => {
-                let relations = resident_relations(
-                    registry,
-                    &live,
-                    &node,
-                    include_dependencies,
-                    false,
-                    budget,
-                    started,
-                )
-                .await;
-                return symbol_response(node, bytes, token_budget, false, relations, budget);
-            }
-            CatalogLookup::Stale { file } => (Some(file), true),
-            CatalogLookup::Miss => (file, false),
-        };
+        let (file, source_stale) =
+            match catalog_lookup(registry, &live, &symbol, file.as_deref()).await? {
+                CatalogLookup::Fresh { node, bytes } => {
+                    let relations = resident_relations(
+                        registry,
+                        &live,
+                        &node,
+                        include_dependencies,
+                        false,
+                        budget,
+                        started,
+                    )
+                    .await;
+                    return symbol_response(node, bytes, token_budget, false, relations, budget);
+                }
+                CatalogLookup::Stale { file } => (Some(file), true),
+                CatalogLookup::Miss => (file, false),
+            };
 
         let (parsed, node) = match file {
             Some(file) => parse_live_symbol(file, &symbol).await?,
@@ -116,19 +117,49 @@ enum CatalogLookup {
 }
 
 async fn catalog_lookup(
+    registry: &Arc<ProjectRegistry>,
     live: &LiveProject,
     symbol: &str,
     file: Option<&Path>,
 ) -> Result<CatalogLookup, JsonRpcError> {
-    let db_path = live.active_storage().join("leindex.db");
-    if !db_path.is_file() {
-        return Ok(CatalogLookup::Miss);
-    }
-    let Ok(Some(catalog)) = CatalogReader::open(&db_path, live.root()).await else {
-        return Ok(CatalogLookup::Miss);
+    // D6: the resident PDG is the graph store — resolve symbols against it
+    // first; without a resident project, resolve against the published Pdg
+    // layer (the unhydrated fast path); the SQL catalog remains the legacy
+    // fallback for pre-generation stores (and always serves the freshness
+    // check below, since `indexed_files` survives the graph flip).
+    let db_path = live.catalog_db();
+    let mut graph_symbols = match registry.try_get_loaded(live.root()).await {
+        Some(handle) => {
+            let guard = handle.read().await;
+            guard.pdg().map(|pdg| {
+                crate::storage::catalog::graph::find_symbol(pdg, live.root(), symbol, file)
+            })
+        }
+        None => None,
     };
-    let Ok(symbols) = catalog.find_symbol(symbol, file).await else {
-        return Ok(CatalogLookup::Miss);
+    if graph_symbols.as_ref().is_none_or(Vec::is_empty) {
+        let layer_symbols =
+            crate::storage::catalog::layer::find_symbol(live.storage(), live.root(), symbol, file);
+        if !layer_symbols.is_empty() {
+            graph_symbols = Some(layer_symbols);
+        }
+    }
+
+    let catalog = if db_path.is_file() {
+        CatalogReader::open(&db_path, live.root())
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
+    let symbols = match graph_symbols {
+        Some(symbols) => symbols,
+        None => match &catalog {
+            Some(catalog) => catalog.find_symbol(symbol, file).await.unwrap_or_default(),
+            None => Vec::new(),
+        },
     };
     // A symbol can live in several files (overloads, re-exports, shadowing).
     // Pick the best-ranked candidate instead of blindly taking the first row
@@ -140,7 +171,13 @@ async fn catalog_lookup(
         .file(&node.file_path.to_string_lossy())
         .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
     let bytes = read_live_bytes(node.file_path.clone()).await?;
-    if catalog_is_fresh(&catalog, &node.file_path, &bytes).await {
+    let fresh = match &catalog {
+        Some(catalog) => catalog_is_fresh(catalog, &node.file_path, &bytes).await,
+        // No freshness record exists; treat as stale so the caller parses
+        // live instead of trusting an unverifiable graph row.
+        None => false,
+    };
+    if fresh {
         Ok(CatalogLookup::Fresh { node, bytes })
     } else {
         // A stale catalog still supplies a vetted in-root source candidate;

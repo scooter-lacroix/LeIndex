@@ -1212,7 +1212,7 @@ pub struct ProgramDependenceGraph {
     ///
     /// Strings are used instead of transient `NodeId` values so the marker
     /// remains meaningful across graph reloads and generation rebuilds.
-    pub precision_symbols: HashSet<String>,
+    precision_symbols: HashSet<String>,
 
     /// O(1) lookup by (name, file_path) pair.
     ///

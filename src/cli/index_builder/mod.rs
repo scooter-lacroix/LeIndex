@@ -3,7 +3,6 @@
 use crate::cli::memory::{analysis_cache_key, search_cache_key};
 use crate::graph::pdg::{EdgeType, NodeType, ProgramDependenceGraph};
 use crate::search::search::{NodeInfo, SearchEngine};
-use crate::storage::{pdg_store, schema::Storage};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -899,17 +898,6 @@ pub(crate) fn collect_source_files_with_hashes(
         .par_iter()
         .map(|path| Ok((path.clone(), read_file_once(path)?.0)))
         .collect()
-}
-
-/// Save PDG to storage.
-pub(crate) fn save_to_storage(
-    storage: &mut Storage,
-    project_id: &str,
-    pdg: &ProgramDependenceGraph,
-) -> Result<()> {
-    pdg_store::save_pdg(storage, project_id, pdg).context("Failed to save PDG to storage")?;
-    info!("Saved PDG to storage for project: {}", project_id);
-    Ok(())
 }
 
 /// Index nodes from PDG for search.

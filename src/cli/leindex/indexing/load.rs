@@ -29,6 +29,7 @@ impl LeIndex {
         pdg_only: bool,
         storage_override: Option<&crate::storage::schema::Storage>,
         artifact_path: std::path::PathBuf,
+        prebuilt_pdg: Option<crate::graph::pdg::ProgramDependenceGraph>,
     ) -> Result<()> {
         crate::cli::mcp::request_meta::PROJECT_HYDRATIONS
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -46,18 +47,26 @@ impl LeIndex {
                 let path = artifact_path.clone();
                 scope.spawn(move || Self::load_snapshot_engine(&path))
             });
-            let pdg = match storage_override {
-                Some(storage) => crate::storage::pdg_store::load_pdg(storage, &self.project_id),
-                None => crate::storage::pdg_store::load_pdg(&self.storage, &self.project_id),
+            // A prebuilt graph (decoded from the generation's Pdg layer, D4)
+            // replaces the SQL catalog read entirely.
+            let pdg_loaded = match prebuilt_pdg {
+                Some(pdg) => Ok(pdg),
+                None => match storage_override {
+                    Some(storage) => crate::storage::pdg_store::load_pdg(storage, &self.project_id),
+                    None => crate::storage::pdg_store::load_pdg(&self.storage, &self.project_id),
+                },
             };
             let prepared = restoring.and_then(|handle| handle.join().ok());
-            (pdg, prepared)
+            (pdg_loaded, prepared)
         });
         let mut pdg = pdg_loaded.context("Failed to load PDG from storage")?;
         #[cfg(feature = "community")]
         if let Err(error) = crate::storage::community_store::load_community_memberships(
             storage_override.unwrap_or(&self.storage),
             &self.project_id,
+            crate::graph::community::COMMUNITY_ALGORITHM,
+            crate::graph::community::COMMUNITY_QUALITY,
+            crate::graph::community::COMMUNITY_RESOLUTION,
             &mut pdg,
         ) {
             warn!(%error, "Failed to hydrate persisted community memberships");
@@ -410,11 +419,11 @@ impl LeIndex {
         if persist_artifacts {
             if let Some(embedder) = &self.embedder {
                 // The rebuild path only runs when the snapshot identity
-                // mismatched; persist the corrected identity from storage so
-                // the NEXT hydration takes the fast path instead of looping
-                // on the same mismatch.
+                // mismatched; persist the corrected identity (the graph as
+                // the layer reconstructs it) so the NEXT hydration takes the
+                // fast path instead of looping on the same mismatch.
                 let persisted_identity =
-                    index_builder::persisted_search_identity(&self.storage, &self.project_id);
+                    Some(index_builder::persisted_search_identity_from_graph(&pdg));
                 embedder
                     .persist_to_storage(&self.project_path, &pdg, persisted_identity)
                     .context("Failed to persist TF-IDF embedder during hydration")?;

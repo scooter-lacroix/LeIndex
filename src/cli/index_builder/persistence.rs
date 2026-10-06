@@ -63,31 +63,27 @@ fn search_snapshot_path(project_path: &Path) -> PathBuf {
 }
 
 /// The (nodes, edges, fingerprint) identity of a PDG as it will be
-/// RECONSTRUCTED from storage by `load_pdg`.
+/// RECONSTRUCTED from the published Pdg layer.
 ///
 /// Snapshot and embedder freshness metadata must describe the persisted
-/// graph, not the in-memory one: the in-memory graph may legitimately hold
-/// several nodes sharing one `node_id` (external/import duplicates), which
-/// the `(project_id, node_id)` upsert collapses to a single row. Identity
-/// recorded from the in-memory graph can therefore never match a graph
-/// loaded from the DB — every cold hydration would take the full TF-IDF
-/// rebuild path (re-reading every source file) forever. Deriving the
-/// identity with the same `load_pdg` call hydration uses makes save/load
-/// agreement structural instead of coincidental.
-///
-/// Returns `None` when the persisted graph cannot be loaded; callers then
-/// fall back to the in-memory identity (no worse than the previous state).
-pub(crate) fn persisted_search_identity(
-    storage: &crate::storage::schema::Storage,
-    project_id: &str,
-) -> Option<(usize, usize, String)> {
-    let mut pdg = crate::storage::pdg_store::load_pdg(storage, project_id).ok()?;
+/// graph, not the raw in-memory one: the in-memory graph may legitimately
+/// hold several nodes sharing one `node_id` (external/import duplicates) and
+/// parallel same-type edges, which the layer format collapses (last-wins,
+/// matching the legacy SQL upserts). Identity recorded from the uncollapsed
+/// graph can therefore never match a layer-hydrated graph — every cold
+/// hydration would take the full TF-IDF rebuild path forever. Deriving the
+/// identity through the same collapse the layer round-trip applies makes
+/// save/load agreement structural instead of coincidental.
+pub(crate) fn persisted_search_identity_from_graph(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+) -> (usize, usize, String) {
+    let mut collapsed = crate::storage::generation::graph_codec::collapse_for_layer(pdg);
     // Mirror hydration exactly: `load_from_storage_inner_at` normalizes
     // external nodes BEFORE fingerprinting, so the identity must describe
     // the same post-normalization graph or the freshness check fails.
-    super::normalize_external_nodes(&mut pdg);
-    let fingerprint = pdg_search_fingerprint(&pdg);
-    Some((pdg.node_count(), pdg.edge_count(), fingerprint))
+    super::normalize_external_nodes(&mut collapsed);
+    let fingerprint = pdg_search_fingerprint(&collapsed);
+    (collapsed.node_count(), collapsed.edge_count(), fingerprint)
 }
 
 /// Persist search metadata required for fast load_from_storage hydration.

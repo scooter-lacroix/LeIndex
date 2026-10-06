@@ -124,16 +124,65 @@ async fn catalog_file_summary(
     budget: WorkBudget,
     started: Instant,
 ) -> Result<(Option<Value>, bool), JsonRpcError> {
-    let db_path = live.active_storage().join("leindex.db");
-    if !db_path.is_file() {
+    // D6: the resident PDG is the graph store — inventory the file's symbols
+    // against it first; without a resident project, inventory against the
+    // published Pdg layer (the unhydrated fast path); the SQL catalog remains
+    // the legacy fallback (and still serves the freshness record, which
+    // survives the graph flip).
+    let db_path = live.catalog_db();
+    let mut graph = match registry.try_get_loaded(live.root()).await {
+        Some(handle) => {
+            let guard = handle.read().await;
+            guard.pdg().map(|pdg| {
+                (
+                    crate::storage::catalog::graph::symbols_in_file(pdg, live.root(), file),
+                    crate::storage::catalog::graph::count_symbols_in_file(pdg, live.root(), file),
+                )
+            })
+        }
+        None => None,
+    };
+    if graph
+        .as_ref()
+        .map(|(symbols, _)| symbols.is_empty())
+        .unwrap_or(true)
+    {
+        let layer_symbols =
+            crate::storage::catalog::layer::symbols_in_file(live.storage(), live.root(), file);
+        if !layer_symbols.is_empty() {
+            graph = Some((
+                layer_symbols,
+                crate::storage::catalog::layer::count_symbols_in_file(
+                    live.storage(),
+                    live.root(),
+                    file,
+                ),
+            ));
+        }
+    }
+    let (graph_symbols, graph_total) = graph
+        .map(|(symbols, total)| (Some(symbols), Some(total)))
+        .unwrap_or((None, None));
+
+    let catalog = if db_path.is_file() {
+        CatalogReader::open(&db_path, live.root())
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
+    let symbols = match graph_symbols {
+        Some(symbols) => symbols,
+        None => match &catalog {
+            Some(catalog) => catalog.symbols_in_file(file).await.ok().unwrap_or_default(),
+            None => Vec::new(),
+        },
+    };
+    if symbols.is_empty() {
         return Ok((None, false));
     }
-    let Ok(Some(catalog)) = CatalogReader::open(&db_path, live.root()).await else {
-        return Ok((None, false));
-    };
-    let Ok(symbols) = catalog.symbols_in_file(file).await else {
-        return Ok((None, false));
-    };
     // Resolve each symbol's live path; skip (drop) symbols whose lookup fails
     // rather than aborting the whole request. All-stale -> empty -> the caller
     // falls back to live parsing.
@@ -164,14 +213,26 @@ async fn catalog_file_summary(
         return Ok((None, false));
     }
 
-    let catalog_total = catalog.count_symbols_in_file(file).await.ok();
+    let catalog_total = match graph_total {
+        Some(count) => Some(count),
+        None => match &catalog {
+            Some(catalog) => catalog.count_symbols_in_file(file).await.ok(),
+            None => None,
+        },
+    };
     // The row cap compares against ALL rows (externals included), so add the
     // filtered markers back when deciding whether the DEFINITION list was cut.
     let catalog_truncated = catalog_total
         .map(|total| total > symbols.len() + dropped_external)
         .unwrap_or(symbols.len() >= 200);
     let bytes = read_live_bytes(file.to_path_buf()).await?;
-    if !catalog_is_fresh(&catalog, file, &bytes).await {
+    let fresh = match &catalog {
+        Some(catalog) => catalog_is_fresh(catalog, file, &bytes).await,
+        // No freshness record exists to verify against; fall back to live
+        // parsing rather than trusting an unverifiable graph view.
+        None => false,
+    };
+    if !fresh {
         return Ok((None, true));
     }
 

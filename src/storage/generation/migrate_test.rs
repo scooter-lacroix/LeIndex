@@ -15,9 +15,9 @@ use crate::storage::cas::CasStore;
 use crate::storage::generation::lease::read_current_generation;
 
 use super::{
-    MigrationConfig, MigrationReport, dir_total_bytes, encode_empty_neural, encode_neural_layer,
-    encode_pdg_layer_v2, encode_tfidf_layer, is_legacy_full_copy_layout, is_migrated_store,
-    migrate_legacy_store, read_generation_manifest,
+    MigrationConfig, MigrationReport, decode_fragment_bundle, dir_total_bytes, encode_empty_neural,
+    encode_fragment_bundle, encode_neural_layer, encode_pdg_layer_v2, encode_tfidf_layer,
+    is_legacy_full_copy_layout, is_migrated_store, migrate_legacy_store, read_generation_manifest,
 };
 
 /// Migration config for tests: silent, no crash hook, footprint goal capped.
@@ -205,6 +205,33 @@ fn build_in_progress_jobs(root: &Path, start: u64, count: u64, bytes: u64) {
             .set_len(bytes)
             .unwrap();
     }
+}
+
+#[test]
+fn test_fragment_bundle_round_trip_and_absence() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // No fragment artifacts => no bundle (feature-off store).
+    assert!(encode_fragment_bundle(tmp.path()).unwrap().is_none());
+
+    // Two of the four artifacts => a bundle that round-trips exactly.
+    fs::write(tmp.path().join("fragment_store.bin"), b"store-bytes").unwrap();
+    fs::write(tmp.path().join("fragments_embeddings.bin"), [0u8; 64]).unwrap();
+    let bundle = encode_fragment_bundle(tmp.path()).unwrap().expect("bundle");
+    let files = decode_fragment_bundle(&bundle).unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(
+        files[0],
+        ("fragment_store.bin".to_string(), b"store-bytes".to_vec())
+    );
+    assert_eq!(
+        files[1],
+        ("fragments_embeddings.bin".to_string(), vec![0u8; 64])
+    );
+
+    // A truncated bundle must error, not silently drop a file.
+    let truncated = &bundle[..bundle.len() - 10];
+    assert!(decode_fragment_bundle(truncated).is_err());
 }
 
 #[test]

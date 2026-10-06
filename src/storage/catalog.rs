@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::graph::pdg::{Node, ProgramDependenceGraph};
+
 const MAX_CATALOG_ROWS: usize = 200;
 const MAX_POOLED_CATALOG_CONNECTIONS: usize = 16;
 
@@ -31,6 +33,192 @@ pub struct CatalogSymbol {
     pub complexity: u32,
     /// Byte offsets in the source file.
     pub byte_range: (usize, usize),
+}
+
+/// Build the catalog view of one graph node. `qualified_name` is derived the
+/// same way the SQL writer derived it (`node.id.split(':').next_back()` —
+/// see `pdg_store::diff_nodes_against_persisted_rows`), so graph-backed and
+/// SQL-backed reads report identical values.
+fn catalog_symbol_from_node(node: &Node) -> CatalogSymbol {
+    let qualified_name = node.id.rsplit(':').next().unwrap_or(&node.id).to_string();
+    CatalogSymbol {
+        node_id: node.id.clone(),
+        symbol_name: node.name.clone(),
+        qualified_name,
+        file_path: PathBuf::from(node.file_path.to_string()),
+        language: node.language.clone(),
+        node_type: crate::storage::generation::graph_codec::graph_node_type_str(&node.node_type)
+            .to_string(),
+        complexity: node.complexity,
+        byte_range: node.byte_range,
+    }
+}
+
+/// Normalized root-relative form of `file` (absolute, root-relative, or
+/// `..`-laden — handlers resolve live paths while stored nodes and legacy
+/// layers may use either form).
+fn relative_file(root: &Path, file: &Path) -> String {
+    let joined = if file.is_absolute() {
+        file.to_path_buf()
+    } else {
+        root.join(file)
+    };
+    let stripped = joined.strip_prefix(root).unwrap_or(&joined);
+    let mut rel = PathBuf::new();
+    for component in stripped.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                rel.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => rel.push(other.as_os_str()),
+        }
+    }
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+/// Whether `node_path` refers to the filter file. Graph nodes may store
+/// absolute OR root-relative paths (production graphs mix both — see
+/// `textindex::symbols_from_pdg`), so compare normalized root-relative forms.
+fn file_matches(root: &Path, node_path: &str, filter: Option<&str>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let node = Path::new(node_path);
+    let node_rel = node
+        .strip_prefix(root)
+        .unwrap_or(node)
+        .to_string_lossy()
+        .replace('\\', "/");
+    node_rel == filter
+}
+
+/// D6 graph-backed catalog queries: the resident PDG or the published Pdg
+/// layer is the graph store; ordering/cap semantics mirror the SQL
+/// statements they replaced (see each function's doc).
+pub mod graph {
+    use super::*;
+
+    /// Exact-then-case-insensitive symbol lookup over the resident graph.
+    pub fn find_symbol(
+        pdg: &ProgramDependenceGraph,
+        root: &Path,
+        symbol: &str,
+        file: Option<&Path>,
+    ) -> Vec<CatalogSymbol> {
+        let file_str = file.map(|file| relative_file(root, file));
+        let mut matches: Vec<CatalogSymbol> = pdg
+            .node_indices()
+            .filter_map(|index| pdg.get_node(index))
+            .filter(|node| file_matches(root, &node.file_path, file_str.as_deref()))
+            .filter(|node| {
+                let qualified = node.id.rsplit(':').next().unwrap_or(&node.id);
+                node.name == symbol
+                    || qualified == symbol
+                    || node.name.eq_ignore_ascii_case(symbol)
+                    || qualified.eq_ignore_ascii_case(symbol)
+            })
+            .map(catalog_symbol_from_node)
+            .collect();
+        // SQL: ORDER BY CASE WHEN symbol_name = ? OR qualified_name = ? THEN 0
+        // ELSE 1 END, node_id.
+        matches.sort_by(|a, b| {
+            let rank = |candidate: &CatalogSymbol| {
+                if candidate.symbol_name == symbol || candidate.qualified_name == symbol {
+                    0u8
+                } else {
+                    1u8
+                }
+            };
+            rank(a)
+                .cmp(&rank(b))
+                .then_with(|| a.node_id.cmp(&b.node_id))
+        });
+        matches.truncate(MAX_CATALOG_ROWS);
+        matches
+    }
+
+    /// Bounded symbol inventory for one file, ordered by byte range then id.
+    pub fn symbols_in_file(
+        pdg: &ProgramDependenceGraph,
+        root: &Path,
+        file: &Path,
+    ) -> Vec<CatalogSymbol> {
+        let file_str = relative_file(root, file);
+        let mut symbols: Vec<CatalogSymbol> = pdg
+            .node_indices()
+            .filter_map(|index| pdg.get_node(index))
+            .filter(|node| file_matches(root, &node.file_path, Some(&file_str)))
+            .map(catalog_symbol_from_node)
+            .collect();
+        // SQL: ORDER BY byte_range_start, node_id LIMIT 200.
+        symbols.sort_by(|a, b| {
+            a.byte_range
+                .0
+                .cmp(&b.byte_range.0)
+                .then_with(|| a.node_id.cmp(&b.node_id))
+        });
+        symbols.truncate(MAX_CATALOG_ROWS);
+        symbols
+    }
+
+    /// Exact symbol count for one file, no cap.
+    pub fn count_symbols_in_file(pdg: &ProgramDependenceGraph, root: &Path, file: &Path) -> usize {
+        let file_str = relative_file(root, file);
+        pdg.node_indices()
+            .filter_map(|index| pdg.get_node(index))
+            .filter(|node| file_matches(root, &node.file_path, Some(&file_str)))
+            .count()
+    }
+}
+
+/// Layer-backed equivalents of the graph queries (D6): resolve against the
+/// published generation's Pdg layer WITHOUT a resident project — the
+/// unhydrated MCP fast paths. `storage_root` is the project's storage root
+/// (the directory holding `CURRENT`/`generations`/`cas` — NOT a generation
+/// directory; `active_storage()` may point at either). Mirrors
+/// `textindex::symbols_from_generation`; the SQL catalog remains the legacy
+/// fallback in the callers.
+pub mod layer {
+    use super::*;
+
+    /// Decode the published generation's Pdg layer at `storage_root`.
+    /// `None` when no generation/layer exists or the payload is
+    /// corrupt — callers fall back to the legacy SQL catalog.
+    fn layer_graph(storage_root: &Path) -> Option<ProgramDependenceGraph> {
+        let snapshot = crate::storage::generation::GenerationSnapshot::open(storage_root).ok()?;
+        let reader = snapshot.pdg()?;
+        reader.to_program_dependence_graph().ok()
+    }
+
+    /// [`graph::find_symbol`] over the published Pdg layer.
+    pub fn find_symbol(
+        storage_root: &Path,
+        root: &Path,
+        symbol: &str,
+        file: Option<&Path>,
+    ) -> Vec<CatalogSymbol> {
+        let Some(pdg) = layer_graph(storage_root) else {
+            return Vec::new();
+        };
+        super::graph::find_symbol(&pdg, root, symbol, file)
+    }
+
+    /// [`graph::symbols_in_file`] over the published Pdg layer.
+    pub fn symbols_in_file(storage_root: &Path, root: &Path, file: &Path) -> Vec<CatalogSymbol> {
+        let Some(pdg) = layer_graph(storage_root) else {
+            return Vec::new();
+        };
+        super::graph::symbols_in_file(&pdg, root, file)
+    }
+
+    /// [`graph::count_symbols_in_file`] over the published Pdg layer.
+    pub fn count_symbols_in_file(storage_root: &Path, root: &Path, file: &Path) -> usize {
+        let Some(pdg) = layer_graph(storage_root) else {
+            return 0;
+        };
+        super::graph::count_symbols_in_file(&pdg, root, file)
+    }
 }
 
 /// A read-only catalog handle with one serialized SQLite connection reused by
@@ -101,41 +289,6 @@ impl CatalogReader {
         })
         .await
         .context("catalog symbol lookup task failed")?
-    }
-
-    /// Find literal symbol-name matches in deterministic exact-match order.
-    pub async fn find_symbols_matching(&self, pattern: &str) -> Result<Vec<CatalogSymbol>> {
-        let project_ids = self.project_ids.clone();
-        let connection = self.connection.clone();
-        let pattern = pattern.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let conn = connection
-                .lock()
-                .map_err(|_| anyhow::anyhow!("catalog connection poisoned"))?;
-            let mut statement = conn.prepare(
-                "SELECT node_id, symbol_name, qualified_name, file_path, language, node_type, \
-                        COALESCE(complexity, 0), COALESCE(byte_range_start, 0), COALESCE(byte_range_end, 0) \
-                 FROM intel_nodes \
-                 WHERE (project_id = ?1 OR project_id = ?2) \
-                   AND (symbol_name LIKE '%' || ?3 || '%' \
-                        OR qualified_name LIKE '%' || ?3 || '%' \
-                        OR symbol_name LIKE '%' || ?3 || '%' COLLATE NOCASE \
-                        OR qualified_name LIKE '%' || ?3 || '%' COLLATE NOCASE) \
-                 ORDER BY CASE \
-                    WHEN qualified_name = ?3 THEN 0 \
-                    WHEN symbol_name = ?3 THEN 1 \
-                    WHEN qualified_name = ?3 COLLATE NOCASE THEN 2 \
-                    ELSE 3 \
-                 END, node_id \
-                 LIMIT ?4",
-            )?;
-            rows(
-                &mut statement,
-                &[&project_ids[0], &project_ids[1], &pattern, &(MAX_CATALOG_ROWS as i64)],
-            )
-        })
-        .await
-        .context("catalog symbol search task failed")?
     }
 
     /// Return the hash recorded for one canonical source file, if the index

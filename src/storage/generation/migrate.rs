@@ -696,6 +696,110 @@ pub(crate) fn canonicalize_volatile_rows(db_path: &Path) -> Result<(), Migration
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Fragment bundle layer (`LIDX-FRG1`)
+// ---------------------------------------------------------------------------
+
+/// Magic bytes identifying a fragment-bundle layer payload.
+pub(crate) const FRAGMENT_BUNDLE_MAGIC: &[u8; 9] = b"LIDX-FRG1";
+
+/// The fragment artifacts bundled into the optional Fragments layer, in the
+/// order they are encoded.
+pub(crate) const FRAGMENT_BUNDLE_FILES: [&str; 4] = [
+    "fragment_store.bin",
+    "fragment_root.bin",
+    "fragment_sync_manifest.bin",
+    "fragments_embeddings.bin",
+];
+
+/// Bundle the fragment artifacts from `artifact_dir` (`.leindex/`) into one
+/// `LIDX-FRG1` payload: magic, version, file count, then per file a
+/// length-prefixed name and u64-length-prefixed bytes. Integrity comes from
+/// the surrounding CAS blob frame (blake3 over the whole payload).
+///
+/// Returns `Ok(None)` when no fragment artifacts exist (feature off), in
+/// which case the optional layer is simply not staged.
+pub(crate) fn encode_fragment_bundle(
+    artifact_dir: &Path,
+) -> Result<Option<Vec<u8>>, MigrationError> {
+    let mut files: Vec<(&str, Vec<u8>)> = Vec::new();
+    for name in FRAGMENT_BUNDLE_FILES {
+        let path = artifact_dir.join(name);
+        if path.is_file() {
+            files.push((name, fs::read(&path)?));
+        }
+    }
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let mut payload = Vec::new();
+    payload.extend_from_slice(FRAGMENT_BUNDLE_MAGIC);
+    payload.push(1); // version
+    payload.extend_from_slice(&(files.len() as u32).to_le_bytes());
+    for (name, bytes) in &files {
+        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        payload.extend_from_slice(name.as_bytes());
+        payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        payload.extend_from_slice(bytes);
+    }
+    Ok(Some(payload))
+}
+
+/// Split a [`LIDX-FRG1`] payload back into `(name, bytes)` pairs. Errors on
+/// malformed input rather than truncating: a bundle is all-or-nothing.
+///
+/// Cold-start hydration unpacks the Fragments layer with this; the names are
+/// returned as stored, so callers must check them against
+/// [`FRAGMENT_BUNDLE_FILES`] before touching the filesystem.
+pub(crate) fn decode_fragment_bundle(
+    payload: &[u8],
+) -> Result<Vec<(String, Vec<u8>)>, MigrationError> {
+    // Header: magic(9) + version(1) + file count u32(4) = 14 bytes.
+    const HEADER_LEN: usize = FRAGMENT_BUNDLE_MAGIC.len() + 1 + 4;
+    let bad = |what: &str| MigrationError::Payload(format!("fragment bundle {what}"));
+    if payload.len() < HEADER_LEN {
+        return Err(bad("truncated header"));
+    }
+    if &payload[..9] != FRAGMENT_BUNDLE_MAGIC {
+        return Err(bad("magic mismatch"));
+    }
+    let count =
+        u32::from_le_bytes(payload[10..14].try_into().map_err(|_| bad("count read"))?) as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut offset = HEADER_LEN;
+    for _ in 0..count {
+        let name_len = u32::from_le_bytes(
+            payload
+                .get(offset..offset + 4)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| bad("name length truncated"))?,
+        ) as usize;
+        offset += 4;
+        let name = std::str::from_utf8(
+            payload
+                .get(offset..offset + name_len)
+                .ok_or_else(|| bad("name truncated"))?,
+        )
+        .map_err(|_| bad("name not UTF-8"))?
+        .to_string();
+        offset += name_len;
+        let data_len = u64::from_le_bytes(
+            payload
+                .get(offset..offset + 8)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| bad("data length truncated"))?,
+        ) as usize;
+        offset += 8;
+        let data = payload
+            .get(offset..offset + data_len)
+            .ok_or_else(|| bad("data truncated"))?
+            .to_vec();
+        offset += data_len;
+        out.push((name, data));
+    }
+    Ok(out)
+}
+
 /// Catalog `intel_nodes.node_id` (the text id legacy embedding files are keyed
 /// by) -> `intel_nodes.id` (the integer id the PDG/Symbols layers use).
 pub(crate) fn load_node_id_map(conn: &Connection) -> Result<HashMap<String, u32>, MigrationError> {

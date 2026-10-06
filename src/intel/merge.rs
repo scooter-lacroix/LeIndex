@@ -108,7 +108,7 @@ fn relationship_edge_type(kind: &str) -> Option<EdgeType> {
 }
 
 fn clear_precision_markers_for_files(pdg: &mut ProgramDependenceGraph, files: &[String]) {
-    if files.is_empty() || pdg.precision_symbols.is_empty() {
+    if files.is_empty() || pdg.precision_symbols().is_empty() {
         return;
     }
 
@@ -122,8 +122,7 @@ fn clear_precision_markers_for_files(pdg: &mut ProgramDependenceGraph, files: &[
                 .then(|| node.id.clone())
         })
         .collect();
-    pdg.precision_symbols
-        .retain(|node_id| !affected_node_ids.contains(node_id));
+    pdg.retain_precision_symbols(|node_id| !affected_node_ids.contains(node_id));
 }
 
 fn match_definition(pdg: &ProgramDependenceGraph, definition: &DefinitionFact) -> Option<NodeId> {

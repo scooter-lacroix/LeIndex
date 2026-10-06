@@ -1106,13 +1106,8 @@ fn test_enriched_node_content_is_deterministic() {
 }
 
 #[test]
-fn test_persisted_search_identity_matches_load_with_duplicate_node_ids() {
-    use crate::storage::pdg_store::load_pdg;
-    use crate::storage::schema::Storage;
+fn test_persisted_search_identity_matches_layer_with_duplicate_node_ids() {
     use std::sync::Arc;
-
-    let temp = tempfile::tempdir().unwrap();
-    let mut storage = Storage::open(temp.path().join("leindex.db")).unwrap();
 
     let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
     let main = pdg.add_node(crate::graph::pdg::Node {
@@ -1125,7 +1120,7 @@ fn test_persisted_search_identity_matches_load_with_duplicate_node_ids() {
         language: "rust".to_string(),
     });
     // Two nodes sharing one node_id: the external-import duplicate pattern
-    // the (project_id, node_id) upsert collapses to a single DB row.
+    // the layer round-trip collapses last-wins.
     let external_id = "src/a.rs:__external__:serde::Serialize";
     let ext = pdg.add_node(crate::graph::pdg::Node {
         id: external_id.to_string(),
@@ -1147,21 +1142,40 @@ fn test_persisted_search_identity_matches_load_with_duplicate_node_ids() {
     });
     pdg.add_call_edges(vec![(main, ext), (main, ext_dup)]);
 
-    crate::cli::index_builder::save_to_storage(&mut storage, "dup_proj", &pdg).unwrap();
+    let identity = super::persistence::persisted_search_identity_from_graph(&pdg);
 
-    let identity = super::persistence::persisted_search_identity(&storage, "dup_proj")
-        .expect("persisted identity computable after save");
-
-    let loaded = load_pdg(&storage, "dup_proj").unwrap();
-    assert_eq!(identity.0, loaded.node_count(), "nodes must match load");
-    assert_eq!(identity.1, loaded.edge_count(), "edges must match load");
+    // The identity must describe the graph as the Pdg layer round-trip
+    // reconstructs it (decode of encode), including the post-normalization
+    // fingerprint hydration applies.
+    let mut layer_graph = {
+        let (payload, _) =
+            crate::storage::generation::graph_codec::encode_pdg_v2_from_graph(&pdg).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let blob = tmp.path().join("identity.blob");
+        std::fs::write(&blob, crate::storage::cas::blob::encode_blob(&payload)).unwrap();
+        crate::storage::generation::reader::PdgReader::open(&blob)
+            .unwrap()
+            .to_program_dependence_graph()
+            .unwrap()
+    };
+    super::normalize_external_nodes(&mut layer_graph);
+    assert_eq!(
+        identity.0,
+        layer_graph.node_count(),
+        "nodes must match layer"
+    );
+    assert_eq!(
+        identity.1,
+        layer_graph.edge_count(),
+        "edges must match layer"
+    );
     assert_eq!(
         identity.2,
-        super::pdg_search_fingerprint(&loaded),
-        "fingerprint must match the DB-reconstructed graph"
+        super::pdg_search_fingerprint(&layer_graph),
+        "fingerprint must match the layer-reconstructed graph"
     );
 
-    // The in-memory graph genuinely disagrees with its own persisted state —
+    // The in-memory graph genuinely disagrees with its persisted state —
     // the divergence that used to force the slow rebuild path forever.
     assert_ne!(
         identity.0,

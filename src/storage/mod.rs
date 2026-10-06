@@ -57,9 +57,7 @@ pub use global_symbols::{
     ProjectDep, RefType, SymbolType,
 };
 pub use nodes::{NodeRecord, NodeStore};
-pub use pdg_store::{
-    PdgStoreError, Result as PdgStoreResult, delete_pdg, load_pdg, pdg_exists, save_pdg,
-};
+pub use pdg_store::{PdgStoreError, Result as PdgStoreResult, load_pdg, pdg_exists};
 pub use project_id::UniqueProjectId;
 pub use project_metadata::{ProjectMetadata, ProjectMetadataError};
 pub use salsa::{IncrementalCache, NodeHash};

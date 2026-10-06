@@ -40,5 +40,5 @@ pub use retention::{
     DEFAULT_JOB_BYTES_MAX, DEFAULT_MAX_GENERATIONS, GenerationRetentionReport, RetentionConfig,
     RetentionError, retain_after_publish, retention_report,
 };
-pub use snapshot::{GenerationSnapshot, SnapshotError};
+pub use snapshot::{GenerationSnapshot, SnapshotError, manifest_has_neural_vectors};
 pub use writer::{GenerationWriter, WriterError};

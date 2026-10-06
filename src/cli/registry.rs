@@ -457,7 +457,7 @@ impl ProjectRegistry {
             return;
         };
         let has_index = crate::cli::live_project::LiveProject::resolve(&path.to_string_lossy())
-            .is_ok_and(|live| live.active_storage().join("leindex.db").is_file());
+            .is_ok_and(|live| live.catalog_db().is_file());
         if !has_index {
             debug!(project = %path.display(), "Prewarm skipped: project is not indexed");
             return;
@@ -1722,13 +1722,34 @@ fn restore_latest_generation(storage_path: &Path) -> bool {
         .collect::<Vec<_>>();
     generations.sort_unstable_by(|a, b| b.cmp(a));
     for generation in generations {
-        let source = storage_path
+        // A generation's catalog is either its legacy full-copy mirror or the
+        // CAS `Db` layer its manifest names (post-step-6 stores publish
+        // metadata only). Recovery accepts the first source that yields
+        // bytes, so both layouts repair the same way.
+        let mirror = storage_path
             .join("generations")
             .join(generation.to_string())
             .join("leindex.db");
-        if !source.is_file() {
+        let db_bytes = if mirror.is_file() {
+            std::fs::read(&mirror).ok()
+        } else {
+            crate::storage::generation::read_generation_manifest(storage_path, generation)
+                .ok()
+                .and_then(|manifest| {
+                    manifest
+                        .layers
+                        .get(&crate::storage::generation::LayerKind::Db)
+                        .copied()
+                })
+                .and_then(|hash| {
+                    crate::storage::cas::CasStore::open(storage_path.join("cas"))
+                        .ok()
+                        .and_then(|cas| cas.get(&hash).ok())
+                })
+        };
+        let Some(db_bytes) = db_bytes else {
             continue;
-        }
+        };
         let target = storage_path.join("leindex.db");
         if target.is_file() {
             let backup = storage_path.join(format!("leindex.db.corrupt-{generation}"));
@@ -1737,7 +1758,7 @@ fn restore_latest_generation(storage_path: &Path) -> bool {
             }
         }
         let next = storage_path.join("leindex.db.recovery.next");
-        if std::fs::copy(&source, &next).is_err() || std::fs::rename(&next, &target).is_err() {
+        if std::fs::write(&next, &db_bytes).is_err() || std::fs::rename(&next, &target).is_err() {
             let _ = std::fs::remove_file(&next);
             return false;
         }

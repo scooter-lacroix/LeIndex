@@ -80,7 +80,7 @@ impl LeIndex {
 
     pub(super) fn persist_neural_snapshot(
         &mut self,
-        state: &IndexPipelineState,
+        _state: &IndexPipelineState,
         rows: usize,
         embedder: Option<index_builder::HybridEmbedder>,
     ) -> Result<()> {
@@ -94,12 +94,13 @@ impl LeIndex {
         // persist. On failure the layer is CLEARED (not just logged) — see
         // `sync_fragment_layer_or_clear` (Codex wave-4 P2).
         self.sync_fragment_layer_or_clear();
-        // Neural rows attach to an already-persisted graph; re-derive the
-        // identity from storage so hydration's fingerprint check agrees even
-        // when the in-memory graph still holds duplicate node_ids.
+        // Neural rows attach to an already-persisted graph; derive the
+        // identity from the resident graph as the layer reconstructs it
+        // (collapse) so hydration's fingerprint check agrees.
         let (identity_nodes, identity_edges, identity_fingerprint) =
-            index_builder::persisted_search_identity(&self.storage, &self.project_id)
-                .unwrap_or_else(|| (state.pdg_node_count, state.pdg_edge_count, String::new()));
+            index_builder::persisted_search_identity_from_graph(
+                self.pdg.as_ref().expect("PDG resident after lexical"),
+            );
         index_builder::persist_search_snapshot(
             &self.search_engine,
             &self.project_path,

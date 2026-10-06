@@ -198,20 +198,20 @@ fn repo_leindex_mirror() -> RepoFixture {
             "Breadth-first traversal bounded by the explicit TraversalConfig edge-type allowlist and depth/node caps.",
         ),
         symbol(
-            "save_pdg",
-            "src/storage/pdg_store.rs",
-            "function",
-            "pub fn save_pdg(storage: &mut Storage, project_id: &str, pdg: &ProgramDependenceGraph) -> Result<PdgStorageStats>",
-            "Persist the PDG with content-hash no-op detection and edge-level diffs.",
-            "Unchanged nodes issue no write; changed nodes upsert; stale edges delete. Precision markers persist on intel_nodes.",
-        ),
-        symbol(
             "refresh_persisted_graph",
             "src/phase/context.rs",
             "method",
             "fn refresh_persisted_graph(&mut self, freshness: &FreshnessState) -> Result<()>",
             "Incrementally refresh the persisted graph for changed and deleted files.",
             "Re-extracts changed files, relinks external import edges, runs precision ingest, saves, and recomputes communities.",
+        ),
+        symbol(
+            "persist_graph_via_generation",
+            "src/phase/context.rs",
+            "method",
+            "fn persist_graph_via_generation(&mut self, pdg: &ProgramDependenceGraph) -> Result<()>",
+            "Publish the in-memory graph as Pdg+Symbols generation layers through the GenerationWriter.",
+            "Encodes the graph into PDG1 v2 CAS layers and advances the generation pointer; SQL graph rows are no longer written.",
         ),
         symbol(
             "compute_communities",
@@ -810,9 +810,9 @@ pub fn task_suite() -> Vec<AgentTask> {
         task(
             "le-08",
             le,
-            "persist the graph with edge diffs",
+            "persist the graph as a generation layer",
             TaskCategory::CodeSymbol,
-            &["save_pdg"],
+            &["persist_graph_via_generation"],
         ),
         task(
             "le-09",

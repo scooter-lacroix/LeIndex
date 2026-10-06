@@ -7,8 +7,8 @@ use crate::phase::pdg_utils::merge_pdgs;
 use crate::phase::utils::{collect_files, hash_inventory};
 use crate::storage::{
     pdg_store::{
-        delete_files_data_tx, get_indexed_files, load_pdg, pdg_exists, save_pdg,
-        update_indexed_file, update_indexed_files_tx,
+        delete_files_data_tx, get_indexed_files, load_pdg, pdg_exists, update_indexed_file,
+        update_indexed_files_tx,
     },
     schema::Storage,
 };
@@ -193,7 +193,7 @@ impl PhaseExecutionContext {
             // Tier-0-only persisted graphs. Once SCIP has confirmed at least
             // one canonical node, the marker set is the cheap durable guard
             // that prevents launching an external indexer on every request.
-            pdg.precision_symbols.is_empty()
+            pdg.precision_symbols().is_empty()
         }
         #[cfg(not(feature = "precision"))]
         {
@@ -207,7 +207,8 @@ impl PhaseExecutionContext {
         options: &PhaseOptions,
         freshness: &FreshnessState,
     ) -> Result<()> {
-        let has_persisted = pdg_exists(&self.storage, &self.project_id).unwrap_or(false);
+        let has_persisted =
+            Self::persisted_graph_exists(&self.root, &self.storage, &self.project_id);
 
         if options.use_incremental_refresh && has_persisted {
             return self.refresh_persisted_graph(freshness);
@@ -233,8 +234,8 @@ impl PhaseExecutionContext {
         self.pdg = pdg;
 
         self.run_precision_ingest();
-        save_pdg(&mut self.storage, &self.project_id, &self.pdg)
-            .context("failed saving full PDG for phase analysis")?;
+        self.persist_graph_via_generation()
+            .context("failed persisting full PDG for phase analysis")?;
         relink_for_analysis(&mut self.pdg);
         self.compute_and_persist_communities()
             .context("failed persisting communities for phase analysis")?;
@@ -259,7 +260,7 @@ impl PhaseExecutionContext {
     }
 
     fn refresh_persisted_graph(&mut self, freshness: &FreshnessState) -> Result<()> {
-        let mut pdg = load_pdg(&self.storage, &self.project_id)
+        let mut pdg = Self::load_persisted_graph(&self.root, &self.storage, &self.project_id)
             .context("failed loading cached PDG for incremental phase run")?;
         self.hydrate_community_memberships(&mut pdg);
 
@@ -292,11 +293,131 @@ impl PhaseExecutionContext {
                 &source_bytes_map,
                 &mut pdg,
             );
+        } else if !files_to_delete.is_empty() {
+            // Deletions-only run: the publish below removes the graph nodes,
+            // but the `indexed_files` rows are only cleared here. Skipping
+            // the transaction would leave every later freshness pass
+            // rediscovering the same deleted files and re-treating the
+            // graph as changed, forever.
+            self.persist_stale_file_updates(&files_to_delete, &[]);
         }
 
         let graph_changed =
             !freshness.deleted_files.is_empty() || !self.signatures_by_file.is_empty();
         self.persist_refreshed_graph(&mut pdg, freshness, graph_changed)?;
+        Ok(())
+    }
+
+    /// Load a persisted graph: prefer the CURRENT generation's Pdg layer,
+    /// fall back to the legacy SQL catalog for pre-migration stores.
+    fn load_persisted_graph(
+        root: &Path,
+        storage: &Storage,
+        project_id: &str,
+    ) -> Result<ProgramDependenceGraph> {
+        let storage_root = root.join(".leindex");
+        if crate::storage::generation::lease::read_current_generation(&storage_root).is_some() {
+            if let Ok(snapshot) =
+                crate::storage::generation::GenerationSnapshot::open(&storage_root)
+            {
+                if let Some(reader) = snapshot.pdg() {
+                    match reader.to_program_dependence_graph() {
+                        Ok(pdg) => return Ok(pdg),
+                        Err(error) => {
+                            warn!(
+                                %error,
+                                "phase graph: Pdg layer decode failed; using SQL fallback"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        load_pdg(storage, project_id).context("no persisted graph in layer or catalog")
+    }
+
+    /// Whether a persisted graph exists: a CURRENT generation manifest (the
+    /// graph lives in its Pdg layer) or legacy SQL rows.
+    fn persisted_graph_exists(root: &Path, storage: &Storage, project_id: &str) -> bool {
+        let storage_root = root.join(".leindex");
+        let has_generation =
+            crate::storage::generation::lease::read_current_generation(&storage_root)
+                .map(|generation| {
+                    storage_root
+                        .join(crate::storage::generation::lease::GENERATIONS_DIR)
+                        .join(generation.to_string())
+                        .join(crate::storage::generation::lease::MANIFEST_FILE)
+                        .exists()
+                })
+                .unwrap_or(false);
+        has_generation || pdg_exists(storage, project_id).unwrap_or(false)
+    }
+
+    /// Persist the phase graph by publishing a new CAS generation (D5): the
+    /// graph lives in the Pdg layer; the SQL catalog carries only metadata
+    /// and `indexed_files`. The generation's file mirror is refreshed so
+    /// flag-off readers keep working.
+    fn persist_graph_via_generation(&mut self) -> Result<()> {
+        use crate::storage::generation::{
+            GenerationWriter, LayerKind, ModelIdentity, graph_codec, migrate as gen_migrate,
+        };
+
+        let storage_root = self.root.join(".leindex");
+        let db_path = storage_root.join("leindex.db");
+        // WAL checkpoint before vacuum so the layer snapshots committed rows.
+        self.storage
+            .conn()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .context("phase graph: WAL checkpoint before publish")?;
+
+        let cas = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::storage::cas::CasStore::open(storage_root.join("cas"))
+                .context("phase graph: open CAS")?,
+        ));
+        let mut writer = GenerationWriter::new(&storage_root, cas);
+        writer.set_model_identity(ModelIdentity {
+            name: "tfidf-hybrid".to_string(),
+            digest: String::new(),
+            dimensions: 768,
+        });
+
+        // Db layer: the mutable-root catalog (metadata + indexed_files).
+        let db_bytes = gen_migrate::vacuum_bytes(&db_path)
+            .context("phase graph: vacuum catalog for Db layer")?;
+        writer.stage(LayerKind::Db, &db_bytes)?;
+
+        // Graph layers from the in-memory graph (D3 codec).
+        let (pdg_bytes, _) = graph_codec::encode_pdg_v2_from_graph(&self.pdg)?;
+        writer.stage(LayerKind::Pdg, &pdg_bytes)?;
+        let symbols_bytes = graph_codec::encode_symbols_layer_from_graph(&self.pdg)?;
+        writer.stage(LayerKind::Symbols, &symbols_bytes)?;
+
+        // Vector layers: phase runs produce no embeddings; canonical empty
+        // layers keep the 5-layer publish contract.
+        writer.stage(LayerKind::Tfidf, &gen_migrate::encode_empty_tfidf())?;
+        writer.stage(LayerKind::Neural, &gen_migrate::encode_empty_neural())?;
+
+        // Allocate the next generation number (max existing + 1).
+        let next_generation = {
+            let max_existing = std::fs::read_dir(storage_root.join("generations"))
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter_map(|entry| entry.file_name().to_str()?.parse::<u64>().ok())
+                        .max()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            max_existing.saturating_add(1)
+        };
+
+        // The graph lives in the Pdg layer; the generation directory itself
+        // carries only metadata (manifest + CURRENT). Flag-off graph readers
+        // fall back to the SQL catalog exactly as they did for generations
+        // that never carried a mirror, and flag-on readers hydrate the layer.
+        writer
+            .publish(next_generation)
+            .context("phase graph: publish generation")?;
         Ok(())
     }
 
@@ -307,6 +428,9 @@ impl PhaseExecutionContext {
         if let Err(error) = crate::storage::community_store::load_community_memberships(
             &self.storage,
             &self.project_id,
+            crate::graph::community::COMMUNITY_ALGORITHM,
+            crate::graph::community::COMMUNITY_QUALITY,
+            crate::graph::community::COMMUNITY_RESOLUTION,
             pdg,
         ) {
             warn!(%error, "Phase context: failed to hydrate community memberships");
@@ -373,21 +497,21 @@ impl PhaseExecutionContext {
         freshness: &FreshnessState,
         graph_changed: bool,
     ) -> Result<()> {
-        if graph_changed {
-            self.run_precision_ingest_for(pdg);
-            save_pdg(&mut self.storage, &self.project_id, pdg)
-                .context("failed saving refreshed PDG")?;
-        } else if Self::should_run_precision_ingest(pdg, freshness) {
-            // A persisted Tier-0 graph can predate precision ingest (or have
-            // no matched markers yet). Allow that opt-in pass to run even when
-            // freshness reports no source delta, then persist its markers.
-            self.run_precision_ingest_for(pdg);
-            save_pdg(&mut self.storage, &self.project_id, pdg)
-                .context("failed saving precision-enriched PDG")?;
-        }
-
+        // Install the refreshed graph BEFORE persisting: the generation's
+        // Pdg layer is encoded from `self.pdg`, so publishing must see the
+        // enriched graph, not the pre-refresh placeholder.
         relink_for_analysis(pdg);
         self.pdg = std::mem::take(pdg);
+        if graph_changed || Self::should_run_precision_ingest(&self.pdg, freshness) {
+            // A Tier-0 graph can predate precision ingest (or have no
+            // matched markers yet): run the opt-in pass, then persist.
+            let mut enriched = std::mem::take(&mut self.pdg);
+            self.run_precision_ingest_for(&mut enriched);
+            self.pdg = enriched;
+            self.persist_graph_via_generation()
+                .context("failed persisting refreshed PDG")?;
+        }
+
         if graph_changed {
             self.compute_and_persist_communities()?;
         }
@@ -783,7 +907,11 @@ mod tests {
         context
             .load_or_refresh_graph(&full_options, &initial_freshness)
             .expect("initial full refresh");
-        assert!(pdg_exists(&context.storage, &project_id).expect("persisted graph"));
+        assert!(PhaseExecutionContext::persisted_graph_exists(
+            &context.root,
+            &context.storage,
+            &project_id
+        ));
 
         std::fs::write(&file, "pub fn after() {}\n").expect("write changed source");
         let incremental_freshness = FreshnessState {
@@ -909,7 +1037,16 @@ mod tests {
             language: "python".to_string(),
         });
         let mut storage = storage;
-        save_pdg(&mut storage, &project_id, &persisted).expect("save Tier-0 graph");
+        // Seed a Tier-0 graph the way a pre-migration legacy store holds it:
+        // raw SQL rows (the layer path publishes a generation instead).
+        storage
+            .conn()
+            .execute(
+                "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, complexity, content_hash, byte_range_start, byte_range_end, created_at, updated_at)
+                 VALUES (?1, 'src/main.py', 'src/main.py:main', 'main', 'main', 'python', 'function', 1, 'seed-hash', 4, 8, 0, 0)",
+                rusqlite::params![project_id],
+            )
+            .expect("seed Tier-0 graph row");
         update_indexed_file(&mut storage, &project_id, "src/main.py", "hash")
             .expect("save indexed file");
 
@@ -954,8 +1091,15 @@ mod tests {
         refresh.expect("no-change precision refresh");
 
         assert!(context.pdg.is_precision_symbol("src/main.py:main"));
-        let loaded = load_pdg(&context.storage, &project_id).expect("reload persisted graph");
-        assert!(loaded.is_precision_symbol("src/main.py:main"));
+        // Post-D5 the enriched graph persists as the CURRENT generation's
+        // Pdg layer; reload through the layer path and re-check the marker.
+        let reloaded = PhaseExecutionContext::load_persisted_graph(
+            &context.root,
+            &context.storage,
+            &project_id,
+        )
+        .expect("reload persisted graph");
+        assert!(reloaded.is_precision_symbol("src/main.py:main"));
     }
     #[test]
     fn test_prepare_defers_graph_until_first_use() {
@@ -986,5 +1130,60 @@ mod tests {
         assert!(context.pending_graph.is_none());
         assert!(context.pdg.node_count() > 0);
         context.ensure_graph().expect("second call is a no-op");
+    }
+
+    /// Deletions-only incremental runs must persist their `indexed_files`
+    /// deletions (round-10 Codex P2): the batch transaction used to live in
+    /// the changed-files-only branch, so a run that only deleted files left
+    /// the rows in place — every later freshness pass rediscovered the same
+    /// deleted files and re-treated the graph as changed, forever.
+    #[test]
+    fn test_deletions_only_run_persists_indexed_file_removals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        std::fs::write(dir.path().join("src/keep.rs"), "pub fn keep() {}\n").expect("write");
+        let options = PhaseOptions {
+            root: dir.path().to_path_buf(),
+            ..PhaseOptions::default()
+        };
+        let mut context = PhaseExecutionContext::prepare(&options).expect("prepare");
+        let project_id = context.project_id.clone();
+
+        // The previously indexed tree contained src/gone.py; the file is now
+        // deleted from disk and from the inventory. Seed the graph the way a
+        // pre-flip legacy store holds it: raw SQL rows.
+        context
+            .storage
+            .conn()
+            .execute(
+                "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, complexity, content_hash, byte_range_start, byte_range_end, created_at, updated_at)
+                 VALUES (?1, 'src/gone.py', 'src/gone.py:main', 'main', 'main', 'python', 'function', 0, 'seed-hash', 0, 4, 0, 0)",
+                rusqlite::params![project_id],
+            )
+            .expect("seed persisted graph row");
+        crate::storage::pdg_store::update_indexed_file(
+            &mut context.storage,
+            &project_id,
+            "src/gone.py",
+            "old-hash",
+        )
+        .expect("seed indexed file");
+
+        let freshness = FreshnessState {
+            generation_hash: "after-delete".to_string(),
+            file_inventory: Vec::new(),
+            changed_files: Vec::new(),
+            deleted_files: vec!["src/gone.py".to_string()],
+        };
+        context
+            .refresh_persisted_graph(&freshness)
+            .expect("deletions-only refresh");
+
+        let indexed = crate::storage::pdg_store::get_indexed_files(&context.storage, &project_id)
+            .expect("read indexed files");
+        assert!(
+            !indexed.contains_key("src/gone.py"),
+            "the deleted file's indexed_files row must be removed, got: {indexed:?}"
+        );
     }
 }
