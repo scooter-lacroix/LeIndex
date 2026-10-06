@@ -21,6 +21,11 @@
 //! [data: count * dim * sizeof(element)]
 //! ```
 //!
+//! Version 2 inserts a `count * u32` table of PDG node ids between the header
+//! and the data (row `i` belongs to node `ids[i]`); `content_hash` then covers
+//! the id table followed by the data. Version 1 has no id table (rows are
+//! positional). The reader accepts both.
+//!
 //! `dtype = 0` (F32) stores `count * dim` little-endian f32 values. The
 //! `dot(i, query)` operation computes `Σ query[j] * vector_i[j]` directly.
 //!
@@ -76,6 +81,11 @@ pub const SYMBOLS_MAGIC: &[u8; 9] = b"LIDX-SYM1";
 /// so payload offset 66 gives mmap offset 116 = 0 mod 4). This is required so
 /// `&[f32]` views into the mmap can be safely cast from the raw `&[u8]`.
 pub const NEURAL_HEADER_LEN: usize = 9 + 1 + 3 + 4 + 4 + 4 + 4 + 4 + 32 + 1;
+/// Neural payload version with positional rows (no node-id table).
+pub const NEURAL_VERSION_POSITIONAL: u8 = 1;
+/// Neural payload version carrying a `count * u32` PDG node-id table between
+/// the header and the vector data.
+pub const NEURAL_VERSION_WITH_IDS: u8 = 2;
 /// Fixed size of the TF-IDF payload header (in bytes).
 pub const TFIDF_HEADER_LEN: usize = 9 + 1 + 3 + 4 + 4 + 4 + 32;
 /// Fixed size of the PDG payload header (in bytes).
@@ -85,8 +95,17 @@ pub const SYMBOLS_HEADER_LEN: usize = 9 + 1 + 3 + 4 + 4 + 4 + 32;
 
 /// Bytes occupied by a single TF-IDF entry (doc_id, term_id, value).
 pub const TFIDF_ENTRY_LEN: usize = 4 + 4 + 4;
-/// Bytes occupied by a single PDG node (six u32 fields).
+/// Bytes occupied by a single PDG node (version 1: six u32 fields; catalog
+/// row id, positional rows).
 pub const PDG_NODE_LEN: usize = 4 * 6;
+/// Size of a version-2 PDG node record: interned `node_id`, `symbol_name`,
+/// `file_path` and `language` string ids, `node_type`, `complexity`,
+/// `byte_start`, `byte_end`, and a flags word (bit 0 = precision marker).
+pub const PDG_NODE_V2_LEN: usize = 4 * 9;
+/// Size of a version-2 PDG edge-metadata record (see [`PdgEdgeMeta`]).
+pub const PDG_EDGE_META_LEN: usize = 4 * 5;
+/// Sentinel for "absent" in version-2 edge-metadata u32 fields.
+pub const PDG_V2_NONE: u32 = u32::MAX;
 /// Bytes occupied by a single PDG edge.
 pub const PDG_EDGE_LEN: usize = 4 * 3;
 /// Bytes occupied by a single string-table offset record (offset, length).
@@ -249,7 +268,7 @@ fn require_magic(bytes: &[u8], expected: &[u8; 9]) -> Result<(), ReaderError> {
 /// element_size must fit in the payload) and the embedded blake3 content_hash
 /// over the data bytes.
 fn validate_neural_data_region(payload: &[u8], header: &NeuralHeader) -> Result<(), ReaderError> {
-    let data_offset_in_payload = NEURAL_HEADER_LEN;
+    let data_offset_in_payload = header.data_offset();
     let element_size = header.dtype.element_size();
     let expected = header
         .count
@@ -267,11 +286,11 @@ fn validate_neural_data_region(payload: &[u8], header: &NeuralHeader) -> Result<
         )));
     }
 
-    // Verify the embedded content_hash (blake3 of the data region).
+    // Verify the embedded content_hash (blake3 of the id table, if any, then
+    // the data region).
     let mut stored_hash = [0u8; 32];
     stored_hash.copy_from_slice(&payload[33..65]);
-    let computed =
-        blob::blob_hash(&payload[data_offset_in_payload..data_offset_in_payload + expected]);
+    let computed = blob::blob_hash(&payload[NEURAL_HEADER_LEN..data_offset_in_payload + expected]);
     if stored_hash != computed {
         return Err(ReaderError::BadHeader(
             "neural content_hash does not match data".to_string(),
@@ -350,6 +369,7 @@ impl<'a> VectorView<'a> {
 /// Validated contents of the `LIDX-NRL1` header (magic and geometry checks
 /// already applied by [`NeuralHeader::parse`]).
 struct NeuralHeader {
+    version: u8,
     count: usize,
     dim: usize,
     dtype: NeuralDtype,
@@ -370,7 +390,7 @@ impl NeuralHeader {
             )));
         }
         let version = payload[9];
-        if version != 1 {
+        if !matches!(version, NEURAL_VERSION_POSITIONAL | NEURAL_VERSION_WITH_IDS) {
             return Err(ReaderError::BadHeader(format!(
                 "unsupported neural version {}",
                 version
@@ -389,12 +409,24 @@ impl NeuralHeader {
         let scale = read_f32_le(payload, 25)?;
         let zero_point = read_f32_le(payload, 29)?;
         Ok(NeuralHeader {
+            version,
             count,
             dim,
             dtype,
             scale,
             zero_point,
         })
+    }
+
+    fn has_ids(&self) -> bool {
+        self.version == NEURAL_VERSION_WITH_IDS
+    }
+
+    /// Payload offset where the vector data begins (after the optional id
+    /// table).
+    fn data_offset(&self) -> usize {
+        let ids_len = if self.has_ids() { self.count * 4 } else { 0 };
+        NEURAL_HEADER_LEN + ids_len
     }
 }
 
@@ -407,8 +439,10 @@ pub struct NeuralReader {
     dtype: NeuralDtype,
     scale: f32,
     zero_point: f32,
+    /// True for version-2 payloads, which carry a per-row PDG node-id table.
+    has_ids: bool,
     /// Offset, from the start of the CAS payload, where the vectors data
-    /// begins (i.e. immediately after the neural header).
+    /// begins (after the neural header and the optional id table).
     data_offset_in_payload: usize,
 }
 
@@ -429,8 +463,18 @@ impl NeuralReader {
             dtype: header.dtype,
             scale: header.scale,
             zero_point: header.zero_point,
-            data_offset_in_payload: NEURAL_HEADER_LEN,
+            has_ids: header.has_ids(),
+            data_offset_in_payload: header.data_offset(),
         })
+    }
+
+    /// PDG node id that row `i` belongs to. `None` for version-1 payloads
+    /// (positional rows, no id table) or when `i` is out of range.
+    pub fn node_id(&self, i: usize) -> Option<u32> {
+        if !self.has_ids || i >= self.count {
+            return None;
+        }
+        read_u32_le(self.blob.payload(), NEURAL_HEADER_LEN + i * 4).ok()
     }
 
     /// Number of stored vectors.
@@ -926,10 +970,53 @@ pub struct PdgEdge {
     pub edge_type: u32,
 }
 
+/// A version-2 PDG node: every field `ProgramDependenceGraph` needs to
+/// reconstruct the node losslessly. String-bearing fields are ids into the
+/// payload's interned string table (resolve with [`PdgReader::resolve_string`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PdgNodeFull {
+    /// Interned graph node id (e.g. `src/main.rs:func1`).
+    pub node_id: u32,
+    /// Interned display name.
+    pub symbol_name: u32,
+    /// Interned file path.
+    pub file_path: u32,
+    /// Interned language tag.
+    pub language: u32,
+    /// Node kind code (writer-owned mapping).
+    pub node_type: u32,
+    /// Cyclomatic complexity.
+    pub complexity: u32,
+    /// Byte offset of the node's start in `file_path`.
+    pub byte_start: u32,
+    /// Byte offset of the node's end in `file_path`.
+    pub byte_end: u32,
+    /// True when the node carries a SCIP precision (stable-id) marker.
+    pub precision: bool,
+}
+
+/// A version-2 PDG edge's optional metadata. `None` fields were stored as
+/// sentinels ([`PDG_V2_NONE`] / NaN).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PdgEdgeMeta {
+    /// Number of times the call occurs.
+    pub call_count: Option<u32>,
+    /// Variable name for data-dependency edges (interned string id).
+    pub variable_name: Option<u32>,
+    /// Confidence score for inferred edges.
+    pub confidence: Option<f32>,
+    /// Flow channel label (interned string id).
+    pub channel: Option<u32>,
+    /// Argument ordinal.
+    pub position: Option<u32>,
+}
+
 /// Zero-copy reader over a PDG layer blob.
 #[derive(Debug)]
 pub struct PdgReader {
     blob: BlobMmap,
+    /// Payload version (1 = positional catalog rows, 2 = lossless graph).
+    version: u8,
     num_nodes: usize,
     num_edges: usize,
     num_strings: usize,
@@ -938,6 +1025,9 @@ pub struct PdgReader {
     nodes_offset: usize,
     /// Offset, in the payload, where the edge array begins.
     edges_offset: usize,
+    /// Offset, in the payload, where the v2 edge-metadata array begins
+    /// (v1: equal to the string table offset — unused).
+    edge_meta_offset: usize,
     /// Offset, in the payload, where the string-offset table begins.
     string_offsets_offset: usize,
     /// Offset, in the payload, where the raw string bytes begin.
@@ -958,7 +1048,7 @@ impl PdgReader {
             )));
         }
         let version = payload[9];
-        if version != 1 {
+        if !matches!(version, 1 | 2) {
             return Err(ReaderError::BadHeader(format!(
                 "unsupported pdg version {}",
                 version
@@ -970,8 +1060,21 @@ impl PdgReader {
         let strings_bytes_len = read_u32_le(payload, 25)? as usize;
 
         let nodes_offset = PDG_HEADER_LEN;
-        let edges_offset = nodes_offset + num_nodes * PDG_NODE_LEN;
-        let string_offsets_offset = edges_offset + num_edges * PDG_EDGE_LEN;
+        let node_len = if version == 2 {
+            PDG_NODE_V2_LEN
+        } else {
+            PDG_NODE_LEN
+        };
+        let edges_offset = nodes_offset + num_nodes * node_len;
+        let (edge_meta_offset, string_offsets_offset) = if version == 2 {
+            let meta = edges_offset + num_edges * PDG_EDGE_LEN;
+            (meta, meta + num_edges * PDG_EDGE_META_LEN)
+        } else {
+            (
+                edges_offset + num_edges * PDG_EDGE_LEN,
+                edges_offset + num_edges * PDG_EDGE_LEN,
+            )
+        };
         let string_bytes_offset = string_offsets_offset + num_strings * PDG_STRING_OFFSET_LEN;
         let end = string_bytes_offset + strings_bytes_len;
 
@@ -993,15 +1096,22 @@ impl PdgReader {
         }
         Ok(PdgReader {
             blob,
+            version,
             num_nodes,
             num_edges,
             num_strings,
             strings_bytes_len,
             nodes_offset,
             edges_offset,
+            edge_meta_offset,
             string_offsets_offset,
             string_bytes_offset,
         })
+    }
+
+    /// Payload version: 1 (positional catalog rows) or 2 (lossless graph).
+    pub fn version(&self) -> u8 {
+        self.version
     }
 
     /// Total nodes stored in the layer.
@@ -1023,7 +1133,17 @@ impl PdgReader {
 
     /// Return the node at `idx`, no bounds check performed beyond the
     /// inherent integrity validation at open.
+    ///
+    /// Version-1 payloads only: a version-2 payload has a different node
+    /// record layout, and reading it through this accessor would silently
+    /// misparse — refuse instead (use [`node_full`](Self::node_full)).
     pub fn node(&self, idx: usize) -> Result<PdgNode, ReaderError> {
+        if self.version != 1 {
+            return Err(ReaderError::BadHeader(
+                "node() requires a version-1 pdg payload; use node_full() for version 2"
+                    .to_string(),
+            ));
+        }
         if idx >= self.num_nodes {
             return Err(ReaderError::OutOfRange(format!(
                 "pdg node idx {} out of range {}",
@@ -1056,6 +1176,64 @@ impl PdgReader {
             src: read_u32_le(payload, base)?,
             dst: read_u32_le(payload, base + 4)?,
             edge_type: read_u32_le(payload, base + 8)?,
+        })
+    }
+
+    /// Return the lossless version-2 record for node `idx`. Errors on
+    /// version-1 payloads, which do not carry the fields.
+    pub fn node_full(&self, idx: usize) -> Result<PdgNodeFull, ReaderError> {
+        if self.version != 2 {
+            return Err(ReaderError::BadHeader(
+                "node_full requires a version-2 pdg payload".to_string(),
+            ));
+        }
+        if idx >= self.num_nodes {
+            return Err(ReaderError::OutOfRange(format!(
+                "pdg node idx {} out of range {}",
+                idx, self.num_nodes
+            )));
+        }
+        let base = self.nodes_offset + idx * PDG_NODE_V2_LEN;
+        let payload = self.blob.payload();
+        let flags = read_u32_le(payload, base + 32)?;
+        Ok(PdgNodeFull {
+            node_id: read_u32_le(payload, base)?,
+            symbol_name: read_u32_le(payload, base + 4)?,
+            file_path: read_u32_le(payload, base + 8)?,
+            language: read_u32_le(payload, base + 12)?,
+            node_type: read_u32_le(payload, base + 16)?,
+            complexity: read_u32_le(payload, base + 20)?,
+            byte_start: read_u32_le(payload, base + 24)?,
+            byte_end: read_u32_le(payload, base + 28)?,
+            precision: flags & 1 == 1,
+        })
+    }
+
+    /// Return the version-2 metadata for edge `idx`. Errors on version-1
+    /// payloads; returns all-`None` fields when the edge carries none.
+    pub fn edge_meta(&self, idx: usize) -> Result<PdgEdgeMeta, ReaderError> {
+        if self.version != 2 {
+            return Err(ReaderError::BadHeader(
+                "edge_meta requires a version-2 pdg payload".to_string(),
+            ));
+        }
+        if idx >= self.num_edges {
+            return Err(ReaderError::OutOfRange(format!(
+                "pdg edge idx {} out of range {}",
+                idx, self.num_edges
+            )));
+        }
+        let base = self.edge_meta_offset + idx * PDG_EDGE_META_LEN;
+        let payload = self.blob.payload();
+        let opt = |raw: u32| (raw != PDG_V2_NONE).then_some(raw);
+        let confidence_raw = read_u32_le(payload, base + 8)?;
+        let confidence = f32::from_bits(confidence_raw);
+        Ok(PdgEdgeMeta {
+            call_count: opt(read_u32_le(payload, base)?),
+            variable_name: opt(read_u32_le(payload, base + 4)?),
+            confidence: (!confidence.is_nan()).then_some(confidence),
+            channel: opt(read_u32_le(payload, base + 12)?),
+            position: opt(read_u32_le(payload, base + 16)?),
         })
     }
 
