@@ -245,6 +245,19 @@ pub(super) async fn cmd_mcp_stdio_impl(
 /// Upper bound on tool calls executing at once on one stdio connection.
 const MAX_CONCURRENT_STDIO_CALLS: usize = 64;
 
+/// Upper bound on tool calls WAITING for an execution permit. Admission is
+/// bounded in both dimensions: a client that keeps sending while never
+/// reading stdout gets an explicit JSON-RPC busy error past this point
+/// instead of silently accumulating spawned tasks (each holding its request
+/// payload) until the process exhausts memory.
+const MAX_PENDING_STDIO_CALLS: usize = 256;
+
+/// Upper bound on COMPLETED responses queued behind the stdout writer. A
+/// bounded channel turns a client that stops reading stdout into pipe
+/// backpressure (senders park, stdin reads stall) instead of an unbounded
+/// response queue.
+const STDIO_OUTBOUND_CAPACITY: usize = 256;
+
 /// One response queued for the stdout writer.
 struct StdioOutbound {
     response: String,
@@ -256,14 +269,14 @@ struct StdioOutbound {
 /// Owns stdout on a dedicated thread so response writes (a pipe that a slow
 /// client drains lazily) can never park a tokio worker.
 struct StdioWriter {
-    tx: tokio::sync::mpsc::UnboundedSender<StdioOutbound>,
+    tx: tokio::sync::mpsc::Sender<StdioOutbound>,
     thread: std::thread::JoinHandle<()>,
     failed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl StdioWriter {
     fn spawn() -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StdioOutbound>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StdioOutbound>(STDIO_OUTBOUND_CAPACITY);
         let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let failed_flag = Arc::clone(&failed);
         let thread = std::thread::spawn(move || {
@@ -282,7 +295,7 @@ impl StdioWriter {
         Self { tx, thread, failed }
     }
 
-    fn sender(&self) -> tokio::sync::mpsc::UnboundedSender<StdioOutbound> {
+    fn sender(&self) -> tokio::sync::mpsc::Sender<StdioOutbound> {
         self.tx.clone()
     }
 
@@ -304,19 +317,21 @@ impl StdioWriter {
 /// (including `ping`) behind it, which is how a single cold index used to
 /// make the whole MCP server look hung while the one-shot CLI was fine.
 struct StdioDispatcher {
-    out: tokio::sync::mpsc::UnboundedSender<StdioOutbound>,
+    out: tokio::sync::mpsc::Sender<StdioOutbound>,
     calls: std::sync::Mutex<tokio::task::JoinSet<()>>,
     limiter: Arc<tokio::sync::Semaphore>,
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    pending: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl StdioDispatcher {
-    fn new(out: tokio::sync::mpsc::UnboundedSender<StdioOutbound>) -> Self {
+    fn new(out: tokio::sync::mpsc::Sender<StdioOutbound>) -> Self {
         Self {
             out,
             calls: std::sync::Mutex::new(tokio::task::JoinSet::new()),
             limiter: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STDIO_CALLS)),
             in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -336,31 +351,73 @@ impl StdioDispatcher {
         };
         let framed = *framed_responses;
         match tool_call_id(&json) {
-            Some(id) => self.spawn_tool_call(json, id, framed),
+            Some(id) => self.admit_tool_call(json, id, framed).await,
             None => {
                 if let Some((response, recoverable)) = response_for_payload(&json).await {
-                    let _ = self.out.send(StdioOutbound {
-                        response,
-                        framed,
-                        recoverable,
-                    });
+                    // Bounded channel: a client that stopped reading stdout
+                    // parks this send, which stalls stdin reads — pipe
+                    // backpressure instead of an unbounded response queue.
+                    let _ = self
+                        .out
+                        .send(StdioOutbound {
+                            response,
+                            framed,
+                            recoverable,
+                        })
+                        .await;
                 }
             }
         }
         true
     }
 
-    fn spawn_tool_call(&self, json: String, id: Value, framed: bool) {
+    /// Admit one tool call under BOTH bounds: at most
+    /// `MAX_CONCURRENT_STDIO_CALLS` execute, and at most
+    /// `MAX_PENDING_STDIO_CALLS` wait for a permit. Past the pending bound
+    /// the request is refused with a JSON-RPC busy error — visible
+    /// backpressure — instead of accumulating unbounded spawned tasks.
+    async fn admit_tool_call(&self, json: String, id: Value, framed: bool) {
         use std::sync::atomic::Ordering;
+        // A free permit means the task executes without queueing.
+        let permit = self.limiter.clone().try_acquire_owned().ok();
+        if permit.is_none() {
+            let waiting = self.pending.fetch_add(1, Ordering::AcqRel) + 1;
+            if waiting > MAX_PENDING_STDIO_CALLS {
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+                let failure = JsonRpcResponse::error(
+                    id,
+                    JsonRpcError::server_busy(format!(
+                        "too many queued tool calls (limit {MAX_PENDING_STDIO_CALLS}); \
+                         wait for earlier calls to finish"
+                    )),
+                );
+                if let Ok(response) = serde_json::to_string(&failure) {
+                    let _ = self
+                        .out
+                        .send(StdioOutbound {
+                            response,
+                            framed,
+                            recoverable: false,
+                        })
+                        .await;
+                }
+                return;
+            }
+        }
         let out = self.out.clone();
         let limiter = Arc::clone(&self.limiter);
         let in_flight = Arc::clone(&self.in_flight);
+        let pending = Arc::clone(&self.pending);
         in_flight.fetch_add(1, Ordering::AcqRel);
         let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
         // Reap finished tasks so the set does not grow for the whole session.
         while calls.try_join_next().is_some() {}
         calls.spawn(async move {
-            let _permit = limiter.acquire_owned().await.ok();
+            let _permit = match permit {
+                Some(permit) => Some(permit),
+                None => limiter.acquire_owned().await.ok(),
+            };
+            pending.fetch_sub(1, Ordering::AcqRel);
             // A panicking handler must still answer: a request that never
             // gets a response is indistinguishable from a hang to the client.
             let response =
@@ -376,11 +433,13 @@ impl StdioDispatcher {
                     }
                 };
             if let Some(response) = response {
-                let _ = out.send(StdioOutbound {
-                    response,
-                    framed,
-                    recoverable: false,
-                });
+                let _ = out
+                    .send(StdioOutbound {
+                        response,
+                        framed,
+                        recoverable: false,
+                    })
+                    .await;
             }
             in_flight.fetch_sub(1, Ordering::AcqRel);
         });
@@ -1162,5 +1221,68 @@ mod tests {
         let mut output = Vec::new();
         write_stdio_response(&mut output, "{}", framed_responses).unwrap();
         assert_eq!(output, b"Content-Length: 2\r\n\r\n{}");
+    }
+
+    /// Admission is bounded in BOTH dimensions (round-11 Codex P2): past
+    /// `MAX_PENDING_STDIO_CALLS` waiting calls, the request is refused with
+    /// a visible JSON-RPC busy error instead of accumulating unbounded
+    /// spawned tasks. The response channel is bounded for the same reason —
+    /// a client that stops reading stdout gets pipe backpressure, not an
+    /// unbounded response queue.
+    #[tokio::test]
+    async fn test_stdio_admission_refuses_past_the_pending_bound() {
+        use std::sync::atomic::Ordering;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(STDIO_OUTBOUND_CAPACITY);
+        let dispatcher = StdioDispatcher::new(tx);
+
+        // Drain every execution permit so each subsequent call has to queue.
+        let _held: Vec<_> = (0..MAX_CONCURRENT_STDIO_CALLS)
+            .map(|_| {
+                dispatcher
+                    .limiter
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("permit available")
+            })
+            .collect();
+
+        let request = |id: u64| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "leindex_search", "arguments": {} }
+            })
+            .to_string()
+        };
+
+        // Fill the pending queue exactly to the bound: every call is
+        // accepted (spawned, waiting for a permit), none is answered.
+        for id in 0..MAX_PENDING_STDIO_CALLS as u64 {
+            dispatcher
+                .admit_tool_call(request(id), serde_json::json!(id), false)
+                .await;
+        }
+        assert_eq!(
+            dispatcher.pending.load(Ordering::Acquire),
+            MAX_PENDING_STDIO_CALLS,
+            "accepted-but-queued calls are counted against the pending bound"
+        );
+        assert!(rx.try_recv().is_err(), "no queued call produced a response");
+
+        // One past the bound: refused with a busy error, and the pending
+        // count returns to the bound.
+        dispatcher
+            .admit_tool_call(request(99_999), serde_json::json!(99_999i64), false)
+            .await;
+        let busy = rx.try_recv().expect("the refused call gets a busy error");
+        assert!(
+            busy.response.contains("too many queued tool calls"),
+            "response: {}",
+            busy.response
+        );
+        assert_eq!(
+            dispatcher.pending.load(Ordering::Acquire),
+            MAX_PENDING_STDIO_CALLS,
+            "the refusal does not consume a pending slot"
+        );
     }
 }

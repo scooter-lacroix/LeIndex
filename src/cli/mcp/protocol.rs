@@ -381,6 +381,13 @@ impl JsonRpcError {
         Self::new(error_codes::INTERNAL_ERROR, msg)
     }
 
+    /// Create a server-busy error (code -32009): the stdio admission queue
+    /// is full, so the request is refused instead of being queued without
+    /// bound.
+    pub fn server_busy(msg: impl Into<String>) -> Self {
+        Self::new(error_codes::SERVER_BUSY, msg)
+    }
+
     /// Create a project not found error
     pub fn project_not_found(project: String) -> Self {
         Self::with_data(
@@ -681,6 +688,10 @@ pub mod error_codes {
 
     /// Index initialization failed (directory creation, permissions, etc.)
     pub const INIT_FAILED: i32 = -32008;
+
+    /// Server busy: the request was refused because the caller's admission
+    /// queue is full (stdio: too many tool calls waiting to execute).
+    pub const SERVER_BUSY: i32 = -32009;
 
     /// Filesystem error (permissions, disk space, etc.)
     pub const FILESYSTEM_ERROR: i32 = -32009;

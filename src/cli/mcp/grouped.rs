@@ -709,11 +709,17 @@ pub fn group_schema_oneof(group: &GroupSpec, handlers: &[ToolHandler]) -> Value 
             continue;
         };
         let schema = handler.argument_schema();
+        let is_default_branch = group
+            .default_branch
+            .is_some_and(|default| default == spec.branch);
+        let mut discriminator_property =
+            json!({ "const": spec.branch, "description": spec.summary });
+        if is_default_branch {
+            // Document the runtime default on the branch that owns it.
+            discriminator_property["default"] = json!(spec.branch);
+        }
         let mut properties = Map::new();
-        properties.insert(
-            group.discriminator.to_string(),
-            json!({ "const": spec.branch, "description": spec.summary }),
-        );
+        properties.insert(group.discriminator.to_string(), discriminator_property);
         if let Some(own) = schema.get("properties").and_then(Value::as_object) {
             for (key, definition) in own {
                 properties.insert(key.clone(), definition.clone());
@@ -724,6 +730,21 @@ pub fn group_schema_oneof(group: &GroupSpec, handlers: &[ToolHandler]) -> Value 
         let mut required = vec![group.discriminator.to_string()];
         required.extend(required_of(&schema));
         required.dedup();
+        // A PRESENT discriminator pins the object to its own branch (every
+        // non-default variant requires it, so `oneOf` still matches exactly
+        // one); an OMITTED discriminator must also match exactly one variant
+        // — the router's documented default branch — so only that variant
+        // drops it from `required`. Runtime dispatch already accepts the
+        // omission (it routes to `default_branch`); the schema now agrees
+        // instead of rejecting calls the server accepts. Routers without a
+        // default keep the discriminator required in every variant.
+        if is_default_branch {
+            let position = required
+                .iter()
+                .position(|key| key == group.discriminator)
+                .expect("the discriminator was just pushed");
+            required.remove(position);
+        }
         variants.push(json!({
             "type": "object",
             "title": spec.branch,
@@ -1121,13 +1142,61 @@ mod tests {
         assert_eq!(variants.len(), group.branches.len());
         for (variant, spec) in variants.iter().zip(group.branches) {
             assert_eq!(variant["properties"]["mode"]["const"], spec.branch);
+            assert!(variant["properties"].get("project_path").is_some());
+        }
+    }
+
+    /// An OMITTED discriminator must validate against exactly one `oneOf`
+    /// variant — the router's documented default branch — because runtime
+    /// dispatch routes the omission there. Every non-default variant keeps
+    /// the discriminator required (a present value still pins the branch),
+    /// and routers without a default require it everywhere (round-11 Codex
+    /// P2: `leindex_explore({"query":"x"})` used to fail schema validation
+    /// while the server accepted it).
+    #[test]
+    fn test_oneof_schema_omission_matches_only_the_default_branch() {
+        let handlers = all_tool_handlers();
+
+        // A router WITH a default: only the default branch drops the
+        // discriminator from `required`.
+        let group = group_by_name("leindex_explore").unwrap();
+        let default_branch = group.default_branch.expect("explore documents a default");
+        let explore_schema = group_schema_oneof(group, &handlers);
+        let variants = explore_schema["oneOf"].as_array().unwrap().clone();
+        for (variant, spec) in variants.iter().zip(group.branches) {
+            let required = variant["required"].as_array().unwrap();
+            if spec.branch == default_branch {
+                assert_eq!(
+                    variant["properties"]["mode"]["default"],
+                    json!(default_branch),
+                    "the default variant documents the default"
+                );
+                assert!(
+                    !required.contains(&json!("mode")),
+                    "the default variant must accept an omitted discriminator"
+                );
+            } else {
+                assert!(
+                    required.contains(&json!("mode")),
+                    "non-default variants still pin their branch"
+                );
+            }
+        }
+
+        // A router WITHOUT a default: every variant requires the
+        // discriminator.
+        let group = group_by_name("leindex_edit").unwrap();
+        assert!(group.default_branch.is_none());
+        let edit_schema = group_schema_oneof(group, &handlers);
+        let variants = edit_schema["oneOf"].as_array().unwrap();
+        for variant in variants {
             assert!(
                 variant["required"]
                     .as_array()
                     .unwrap()
-                    .contains(&json!("mode"))
+                    .contains(&json!("action")),
+                "no default means no variant accepts an omitted discriminator"
             );
-            assert!(variant["properties"].get("project_path").is_some());
         }
     }
 

@@ -234,11 +234,21 @@ impl PhaseExecutionContext {
         self.pdg = pdg;
 
         self.run_precision_ingest();
-        self.persist_graph_via_generation()
-            .context("failed persisting full PDG for phase analysis")?;
-        relink_for_analysis(&mut self.pdg);
+        // Communities BEFORE the publish: the generation's Db layer is a
+        // vacuum of the mutable catalog, so memberships written after the
+        // snapshot would miss the published generation and generation
+        // readers would hydrate a graph with no (or stale) community data
+        // until another generation was published.
         self.compute_and_persist_communities()
             .context("failed persisting communities for phase analysis")?;
+        self.persist_graph_via_generation()
+            .context("failed persisting full PDG for phase analysis")?;
+        // Analysis-only relink, AFTER persist: the persisted graph must keep
+        // the indexer's form (unresolved imports as external placeholders) —
+        // persisting the relinked form makes phase analysis and indexing
+        // trade graph forms on every alternating run. Only the resident
+        // analysis copy is relinked.
+        relink_for_analysis(&mut self.pdg);
 
         let inventory_hashes = inventory_hash_map(&self.root, &freshness.file_inventory);
 
@@ -357,12 +367,21 @@ impl PhaseExecutionContext {
     /// graph lives in the Pdg layer; the SQL catalog carries only metadata
     /// and `indexed_files`. The generation's file mirror is refreshed so
     /// flag-off readers keep working.
+    ///
+    /// The whole publish — WAL checkpoint, catalog vacuum, layer staging,
+    /// generation allocation, and the `CURRENT` swap — runs under the same
+    /// cross-process write lock the indexer holds: a concurrent indexer
+    /// picking the same "max existing + 1" number would share
+    /// `manifest.partial`/`CURRENT.tmp` with this path, and one writer
+    /// would clobber the other or publish mismatched layers.
     fn persist_graph_via_generation(&mut self) -> Result<()> {
         use crate::storage::generation::{
             GenerationWriter, LayerKind, ModelIdentity, graph_codec, migrate as gen_migrate,
         };
 
         let storage_root = self.root.join(".leindex");
+        let _write_lock = crate::storage::ProjectWriteLock::acquire(&storage_root)
+            .context("phase graph: acquire project write lock")?;
         let db_path = storage_root.join("leindex.db");
         // WAL checkpoint before vacuum so the layer snapshots committed rows.
         self.storage
@@ -392,12 +411,15 @@ impl PhaseExecutionContext {
         let symbols_bytes = graph_codec::encode_symbols_layer_from_graph(&self.pdg)?;
         writer.stage(LayerKind::Symbols, &symbols_bytes)?;
 
-        // Vector layers: phase runs produce no embeddings; canonical empty
-        // layers keep the 5-layer publish contract.
-        writer.stage(LayerKind::Tfidf, &gen_migrate::encode_empty_tfidf())?;
-        writer.stage(LayerKind::Neural, &gen_migrate::encode_empty_neural())?;
+        // Vector + optional layers: see `stage_carried_forward_layers` — a
+        // phase publish re-encodes only the graph/catalog and must not strip
+        // the layers a previous index published.
+        let previous = crate::storage::generation::GenerationSnapshot::open(&storage_root).ok();
+        Self::stage_carried_forward_layers(&mut writer, previous.as_ref())?;
 
-        // Allocate the next generation number (max existing + 1).
+        // Allocate the next generation number (max existing + 1). Under the
+        // write lock above, so a concurrent indexer cannot pick the same
+        // number and race this publish for the staging files.
         let next_generation = {
             let max_existing = std::fs::read_dir(storage_root.join("generations"))
                 .map(|entries| {
@@ -419,6 +441,66 @@ impl PhaseExecutionContext {
             .publish(next_generation)
             .context("phase graph: publish generation")?;
         Ok(())
+    }
+
+    /// Stage the non-graph layers onto `writer`: Tfidf/Neural carried
+    /// forward from the CURRENT generation when it has them (canonical
+    /// empties otherwise — phase runs produce no embeddings), plus the
+    /// optional Search/Embedder/Fragments layers when the current generation
+    /// carries them. Publishing canonical empties — or omitting the optional
+    /// layers — would REPLACE what a previous index published: generation
+    /// hydration reads the published layers, so a phase run after an index
+    /// would silently strip neural/lexical vector data until the next full
+    /// reindex. Vectors for nodes this phase edited are stale by design (the
+    /// next full index re-embeds them), which beats losing every vector
+    /// outright.
+    fn stage_carried_forward_layers(
+        writer: &mut crate::storage::generation::GenerationWriter,
+        previous: Option<&crate::storage::generation::GenerationSnapshot>,
+    ) -> Result<()> {
+        use crate::storage::generation::{LayerKind, migrate as gen_migrate};
+        for kind in [LayerKind::Tfidf, LayerKind::Neural] {
+            match Self::carry_forward_layer(previous, kind) {
+                Some(bytes) => {
+                    writer.stage(kind, &bytes)?;
+                }
+                None => {
+                    let empty = match kind {
+                        LayerKind::Tfidf => gen_migrate::encode_empty_tfidf(),
+                        _ => gen_migrate::encode_empty_neural(),
+                    };
+                    writer.stage(kind, &empty)?;
+                }
+            }
+        }
+        for kind in [LayerKind::Search, LayerKind::Embedder, LayerKind::Fragments] {
+            if let Some(bytes) = Self::carry_forward_layer(previous, kind) {
+                writer.stage(kind, &bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The CURRENT generation's bytes for `kind`, or `None` when there is no
+    /// current generation, the layer is absent, or the read fails (the caller
+    /// falls back to its canonical layer; a failed carry-forward must not
+    /// fail the publish).
+    fn carry_forward_layer(
+        previous: Option<&crate::storage::generation::GenerationSnapshot>,
+        kind: crate::storage::generation::LayerKind,
+    ) -> Option<Vec<u8>> {
+        let snapshot = previous?;
+        match snapshot.layer_bytes(kind) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(
+                    %error,
+                    layer = %kind,
+                    "phase graph: carry-forward read failed; staging the canonical layer"
+                );
+                None
+            }
+        }
     }
 
     /// Hydrate persisted community memberships into a loaded PDG. Failures
@@ -497,10 +579,6 @@ impl PhaseExecutionContext {
         freshness: &FreshnessState,
         graph_changed: bool,
     ) -> Result<()> {
-        // Install the refreshed graph BEFORE persisting: the generation's
-        // Pdg layer is encoded from `self.pdg`, so publishing must see the
-        // enriched graph, not the pre-refresh placeholder.
-        relink_for_analysis(pdg);
         self.pdg = std::mem::take(pdg);
         if graph_changed || Self::should_run_precision_ingest(&self.pdg, freshness) {
             // A Tier-0 graph can predate precision ingest (or have no
@@ -508,13 +586,24 @@ impl PhaseExecutionContext {
             let mut enriched = std::mem::take(&mut self.pdg);
             self.run_precision_ingest_for(&mut enriched);
             self.pdg = enriched;
+            // Communities BEFORE the publish: the Db layer vacuums the
+            // mutable catalog, so memberships written after the snapshot
+            // would miss the published generation.
+            if graph_changed {
+                self.compute_and_persist_communities()
+                    .context("failed persisting communities for phase analysis")?;
+            }
             self.persist_graph_via_generation()
                 .context("failed persisting refreshed PDG")?;
         }
 
-        if graph_changed {
-            self.compute_and_persist_communities()?;
-        }
+        // Analysis-only relink, AFTER persist: the persisted graph keeps the
+        // indexer's form (unresolved imports as external placeholders);
+        // persisting the relinked form made phase analysis and indexing
+        // trade graph forms on every alternating run (the exact ping-pong
+        // `relink_for_analysis`'s contract documents as in-memory-only).
+        // Only the resident analysis copy is relinked.
+        relink_for_analysis(&mut self.pdg);
         Ok(())
     }
 }
@@ -1185,5 +1274,261 @@ mod tests {
             !indexed.contains_key("src/gone.py"),
             "the deleted file's indexed_files row must be removed, got: {indexed:?}"
         );
+    }
+    /// A phase republish must CARRY FORWARD the current generation's vector
+    /// and optional layers (round-11 Codex P1): publishing canonical empty
+    /// Tfidf/Neural layers — and omitting Search/Embedder/Fragments —
+    /// replaced what a previous index published, so a phase run after an
+    /// index silently stripped neural/lexical vector data until the next
+    /// full reindex.
+    #[test]
+    fn test_phase_publish_carries_forward_vector_and_optional_layers() {
+        use crate::storage::generation::{
+            GenerationSnapshot, GenerationWriter, LayerKind, ModelIdentity,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn alpha() {}\n").expect("write");
+        // Incremental refresh OFF: the second publish must take the cold
+        // path (which republishes unconditionally) so the carry-forward is
+        // actually exercised.
+        let options = PhaseOptions {
+            root: dir.path().to_path_buf(),
+            use_incremental_refresh: false,
+            ..PhaseOptions::default()
+        };
+        let mut context = PhaseExecutionContext::prepare(&options).expect("prepare");
+        context.ensure_graph().expect("cold publish");
+        let storage_root = context.root.join(".leindex");
+
+        // A later index publishes real vector layers plus an optional one:
+        // marker bytes stand in for the embeddings the indexer would write
+        // (layers are CAS blobs keyed by content hash, so byte equality is
+        // hash equality).
+        let cas = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::storage::cas::CasStore::open(storage_root.join("cas")).expect("cas"),
+        ));
+        let mut writer = GenerationWriter::new(&storage_root, cas);
+        writer.set_model_identity(ModelIdentity {
+            name: "tfidf-hybrid".to_string(),
+            digest: String::new(),
+            dimensions: 768,
+        });
+        let db_bytes =
+            crate::storage::generation::migrate::vacuum_bytes(&storage_root.join("leindex.db"))
+                .expect("vacuum");
+        writer.stage(LayerKind::Db, &db_bytes).expect("stage db");
+        let (pdg_bytes, _) =
+            crate::storage::generation::graph_codec::encode_pdg_v2_from_graph(&context.pdg)
+                .expect("encode pdg");
+        writer.stage(LayerKind::Pdg, &pdg_bytes).expect("stage pdg");
+        let symbols_bytes =
+            crate::storage::generation::graph_codec::encode_symbols_layer_from_graph(&context.pdg)
+                .expect("encode symbols");
+        writer
+            .stage(LayerKind::Symbols, &symbols_bytes)
+            .expect("stage symbols");
+        // A REAL non-empty Tfidf layer (sparse LIDX-TFD1, encoded by the same
+        // migrator the indexer uses from a synthesized one-row legacy LIEE
+        // file): the snapshot's eager reader validation rejects arbitrary
+        // bytes, which is exactly why the canonical empties are invalid
+        // stand-ins for real layers.
+        let liee_path = dir.path().join("tfidf.bin");
+        std::fs::write(&liee_path, liee_one_row("idx-node-1", &[1.5, 0.0]))
+            .expect("write liee fixture");
+        let tfidf_bytes = crate::storage::generation::migrate::encode_tfidf_layer(
+            &liee_path,
+            &std::collections::HashMap::from([("idx-node-1".to_string(), 1u32)]),
+        )
+        .expect("encode tfidf layer");
+        assert_ne!(
+            tfidf_bytes,
+            crate::storage::generation::migrate::encode_empty_tfidf(),
+            "fixture must be a non-empty layer to be distinguishable from the fallback"
+        );
+        writer
+            .stage(LayerKind::Tfidf, &tfidf_bytes)
+            .expect("stage tfidf");
+        // Neural has no legacy artifact in this fixture: the canonical empty
+        // is what a real index without a neural model publishes.
+        writer
+            .stage(
+                LayerKind::Neural,
+                &crate::storage::generation::migrate::encode_empty_neural(),
+            )
+            .expect("stage neural");
+        // Fragments is optional and NOT eagerly validated by snapshot open —
+        // raw marker bytes stand in for the indexer's fragment bundle.
+        let fragments_marker = b"real-fragments-layer-bytes".to_vec();
+        writer
+            .stage(LayerKind::Fragments, &fragments_marker)
+            .expect("stage fragments");
+        writer.publish(2).expect("publish generation 2");
+
+        // The phase runs again (a no-op refresh still republishes through
+        // ensure_graph's cold path in this harness). The new CURRENT
+        // generation must carry the published layers forward, byte for byte.
+        let mut context = PhaseExecutionContext::prepare(&options).expect("re-prepare");
+        context.ensure_graph().expect("second publish");
+
+        let snapshot = GenerationSnapshot::open(&storage_root).expect("open current");
+        assert_eq!(
+            snapshot
+                .layer_bytes(LayerKind::Tfidf)
+                .expect("tfidf")
+                .as_deref(),
+            Some(tfidf_bytes.as_slice()),
+            "the phase publish must not replace the published Tfidf layer with an empty one"
+        );
+        // Neural had no previous non-empty layer: the canonical empty is the
+        // correct fallback (and proves the fallback arm, not a skip).
+        assert_eq!(
+            snapshot
+                .layer_bytes(LayerKind::Neural)
+                .expect("neural")
+                .as_deref(),
+            Some(crate::storage::generation::migrate::encode_empty_neural().as_slice()),
+            "a phase publish with no previous Neural layer stages the canonical empty"
+        );
+        assert_eq!(
+            snapshot
+                .layer_bytes(LayerKind::Fragments)
+                .expect("fragments")
+                .as_deref(),
+            Some(fragments_marker.as_slice()),
+            "the phase publish must not drop the optional Fragments layer from the manifest"
+        );
+    }
+
+    /// Synthesize a minimal legacy LIEE embeddings file (one row) for the
+    /// Tfidf-layer encoder.
+    fn liee_one_row(id: &str, vector: &[f32]) -> Vec<u8> {
+        let id_bytes = id.as_bytes();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"LIEE");
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&(vector.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(id_bytes);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        for value in vector {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out
+    }
+
+    /// The analysis-only relink must stay OUT of the persisted graph
+    /// (round-11 Codex P1): the refreshed graph is persisted BEFORE the
+    /// relink, so the published Pdg layer keeps the indexer's form
+    /// (unresolved imports as external placeholders) while only the resident
+    /// analysis copy is relinked. Persisting the relinked form made phase
+    /// analysis and indexing trade graph forms on every alternating run.
+    #[test]
+    fn test_refresh_persists_unrelinked_graph_and_relinks_only_the_resident_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn alpha() {}\npub fn beta() { alpha() }\n",
+        )
+        .expect("write");
+        let options = PhaseOptions {
+            root: dir.path().to_path_buf(),
+            ..PhaseOptions::default()
+        };
+        let mut context = PhaseExecutionContext::prepare(&options).expect("prepare");
+        context.ensure_graph().expect("cold publish");
+
+        // Hand-build a refreshed graph in the indexer's form: an import edge
+        // from a real node to an external placeholder whose name matches the
+        // real `beta` definition — exactly the edge relinking replaces (the
+        // placeholder then becomes an orphan and is removed).
+        let mut pdg = ProgramDependenceGraph::new();
+        let caller = pdg.add_node(crate::graph::pdg::Node {
+            id: "src/lib.rs:alpha".to_string(),
+            node_type: crate::graph::pdg::NodeType::Function,
+            name: "alpha".to_string(),
+            file_path: std::sync::Arc::from("src/lib.rs"),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "rust".to_string(),
+        });
+        let beta = pdg.add_node(crate::graph::pdg::Node {
+            id: "src/lib.rs:beta".to_string(),
+            node_type: crate::graph::pdg::NodeType::Function,
+            name: "beta".to_string(),
+            file_path: std::sync::Arc::from("src/lib.rs"),
+            byte_range: (12, 30),
+            complexity: 1,
+            language: "rust".to_string(),
+        });
+        let placeholder = pdg.add_node(crate::graph::pdg::Node {
+            id: "external::beta".to_string(),
+            node_type: crate::graph::pdg::NodeType::External,
+            name: "beta".to_string(),
+            file_path: std::sync::Arc::from("src/lib.rs"),
+            byte_range: (0, 0),
+            complexity: 0,
+            language: "external".to_string(),
+        });
+        pdg.add_edge(
+            caller,
+            placeholder,
+            crate::graph::pdg::Edge {
+                edge_type: crate::graph::pdg::EdgeType::Import,
+                metadata: crate::graph::pdg::EdgeMetadata::empty(),
+            },
+        );
+
+        // Only `graph_changed` matters here (the precision gate is flag-off
+        // in tests); the freshness fields are read by the caller, not this
+        // persistence step.
+        let freshness = FreshnessState {
+            generation_hash: "gen-2".to_string(),
+            file_inventory: Vec::new(),
+            changed_files: Vec::new(),
+            deleted_files: Vec::new(),
+        };
+        context
+            .persist_refreshed_graph(&mut pdg, &freshness, true)
+            .expect("persist refreshed graph");
+
+        // The PUBLISHED graph keeps the indexer's form: the placeholder node
+        // survives. The RESIDENT analysis graph is relinked: the placeholder
+        // is gone and the import edge points at the real definition.
+        let persisted = PhaseExecutionContext::load_persisted_graph(
+            &context.root,
+            &context.storage,
+            &context.project_id,
+        )
+        .expect("reload persisted graph");
+        assert!(
+            persisted.find_by_id("external::beta").is_some(),
+            "the persisted Pdg layer must keep the indexer's external placeholder"
+        );
+        assert!(
+            context.pdg.find_by_id("external::beta").is_none(),
+            "the resident analysis graph is relinked (placeholder gone)"
+        );
+        assert!(
+            has_import_edge(&context.pdg, caller, beta),
+            "the relinked import edge points at the internal definition"
+        );
+    }
+
+    fn has_import_edge(
+        pdg: &ProgramDependenceGraph,
+        from: crate::graph::pdg::NodeId,
+        to: crate::graph::pdg::NodeId,
+    ) -> bool {
+        use petgraph::visit::EdgeRef;
+        pdg.graph.edges(from).any(|reference| {
+            reference.target() == to
+                && reference.weight().edge_type == crate::graph::pdg::EdgeType::Import
+        })
     }
 }

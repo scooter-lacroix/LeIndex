@@ -180,39 +180,15 @@ async fn catalog_file_summary(
             None => Vec::new(),
         },
     };
-    if symbols.is_empty() {
-        return Ok((None, false));
-    }
     // Resolve each symbol's live path; skip (drop) symbols whose lookup fails
     // rather than aborting the whole request. All-stale -> empty -> the caller
-    // falls back to live parsing.
-    //
-    // A file's DEFINITIONS are what a summary should inventory. `external`
-    // rows are import/reference markers (qualified paths like
-    // `crate.cli.index_job.IndexJobSnapshot` from call-target resolution) —
-    // the audit found them dominating the list and drowning the file's own
-    // symbols. Drop them here rather than in the shared catalog query so
-    // other catalog consumers keep their semantics.
-    let mut resolved = Vec::with_capacity(symbols.len());
+    // falls back to live parsing. `external` rows are import/reference
+    // markers (see the summary comment on the resolver below).
     let mut dropped_external = 0usize;
-    for mut symbol in symbols {
-        if symbol.node_type.eq_ignore_ascii_case("external") {
-            dropped_external += 1;
-            continue;
-        }
-        match live.file(&symbol.file_path.to_string_lossy()) {
-            Ok(path) => {
-                symbol.file_path = path;
-                resolved.push(symbol);
-            }
-            Err(_) => continue,
-        }
-    }
-    let symbols = resolved;
+    let symbols = resolve_live_symbol_paths(live, symbols, &mut dropped_external);
     if symbols.is_empty() {
         return Ok((None, false));
     }
-
     let catalog_total = match graph_total {
         Some(count) => Some(count),
         None => match &catalog {
@@ -253,6 +229,35 @@ async fn catalog_file_summary(
         budget,
     )?;
     Ok((Some(response), false))
+}
+
+/// Resolve each symbol's live path and drop the rows a summary must not
+/// carry; returns the resolved definitions and (by out-param) how many
+/// `external` import/reference markers were dropped.
+///
+/// A file's DEFINITIONS are what a summary should inventory. `external`
+/// rows are import/reference markers (qualified paths like
+/// `crate.cli.index_job.IndexJobSnapshot` from call-target resolution) —
+/// the audit found them dominating the list and drowning the file's own
+/// symbols. They are dropped here rather than in the shared catalog query
+/// so other catalog consumers keep their semantics.
+fn resolve_live_symbol_paths(
+    live: &LiveProject,
+    symbols: Vec<crate::storage::catalog::CatalogSymbol>,
+    dropped_external: &mut usize,
+) -> Vec<crate::storage::catalog::CatalogSymbol> {
+    let mut resolved = Vec::with_capacity(symbols.len());
+    for mut symbol in symbols {
+        if symbol.node_type.eq_ignore_ascii_case("external") {
+            *dropped_external += 1;
+            continue;
+        }
+        if let Ok(path) = live.file(&symbol.file_path.to_string_lossy()) {
+            symbol.file_path = path;
+            resolved.push(symbol);
+        }
+    }
+    resolved
 }
 
 fn file_summary_response(

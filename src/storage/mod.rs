@@ -28,6 +28,11 @@ pub mod nodes;
 pub mod pdg_store;
 /// Unique project identification with BLAKE3 path hashing.
 pub mod project_id;
+/// Cross-process exclusive write lock for a project's storage (flock on
+/// `index.lock`), shared by every writer: indexer, watcher, cleanup, and
+/// phase analysis generation publication.
+pub mod project_lock;
+pub(crate) use project_lock::ProjectWriteLock;
 /// Project metadata storage and retrieval.
 pub mod project_metadata;
 /// Salsa-inspired incremental computation and caching.

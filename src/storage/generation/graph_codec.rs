@@ -126,24 +126,7 @@ pub fn encode_pdg_v2_from_graph(
     let mut node_records = Vec::with_capacity(node_ids.len() * PDG_NODE_V2_LEN);
     for id in &node_ids {
         let node = nodes_by_id[id.as_str()];
-        let node_type = storage_node_type(&node.node_type);
-        node_records.extend_from_slice(&interner.intern(&node.id).to_le_bytes());
-        node_records.extend_from_slice(&interner.intern(&node.name).to_le_bytes());
-        node_records.extend_from_slice(&interner.intern(&node.file_path).to_le_bytes());
-        node_records.extend_from_slice(&interner.intern(&node.language).to_le_bytes());
-        node_records.extend_from_slice(&node_type_code_v2(node_type.as_str())?.to_le_bytes());
-        node_records.extend_from_slice(&node.complexity.to_le_bytes());
-        node_records.extend_from_slice(
-            &u32::try_from(node.byte_range.0)
-                .map_err(|_| GraphCodecError::Invalid("node byte start exceeds u32".into()))?
-                .to_le_bytes(),
-        );
-        node_records.extend_from_slice(
-            &u32::try_from(node.byte_range.1)
-                .map_err(|_| GraphCodecError::Invalid("node byte end exceeds u32".into()))?
-                .to_le_bytes(),
-        );
-        node_records.extend_from_slice(&u32::from(pdg.is_precision_symbol(&node.id)).to_le_bytes());
+        append_pdg_v2_node_record(&mut node_records, &mut interner, pdg, node)?;
     }
 
     // Resolve edge endpoints to interned node-id ids and collapse parallel
@@ -151,61 +134,7 @@ pub fn encode_pdg_v2_from_graph(
     // dedups them with last-write-wins on metadata, so the layer must too or
     // a layer-hydrated graph drifts from SQL-hydration semantics. `intern` is
     // idempotent, so re-interning each endpoint's id recovers its assignment.
-    let mut edges_by_key: HashMap<(u32, u32, u32), Vec<u8>> =
-        HashMap::with_capacity(pdg.edge_count());
-    for edge_id in pdg.edge_indices() {
-        let edge = pdg
-            .get_edge(edge_id)
-            .ok_or_else(|| GraphCodecError::Invalid("edge index has no edge".into()))?;
-        let (source, target) = pdg
-            .edge_endpoints(edge_id)
-            .ok_or_else(|| GraphCodecError::Invalid("edge has no endpoints".into()))?;
-        let source = pdg
-            .get_node(source)
-            .ok_or_else(|| GraphCodecError::Invalid("edge source node is missing".into()))?;
-        let target = pdg
-            .get_node(target)
-            .ok_or_else(|| GraphCodecError::Invalid("edge target node is missing".into()))?;
-        // A duplicate-id graph collapsed to one record; both duplicates' edges
-        // survive and point at the surviving record.
-        let source_id = nodes_by_id
-            .get(source.id.as_str())
-            .map(|node| interner.intern(&node.id))
-            .ok_or_else(|| GraphCodecError::Invalid("edge source stable ID is missing".into()))?;
-        let target_id = nodes_by_id
-            .get(target.id.as_str())
-            .map(|node| interner.intern(&node.id))
-            .ok_or_else(|| GraphCodecError::Invalid("edge target stable ID is missing".into()))?;
-        let edge_type = storage_edge_type(&edge.edge_type);
-        let type_code = edge_type_code_v2(edge_type.as_str())?;
-        // Last write wins, matching the SQL upsert.
-        edges_by_key.insert((source_id, target_id, type_code), {
-            let mut metadata = Vec::with_capacity(PDG_EDGE_META_LEN);
-            encode_option_u32(&mut metadata, edge.metadata.call_count, "edge call_count")?;
-            let variable_name = edge
-                .metadata
-                .variable_name
-                .as_deref()
-                .map(|value| interner.intern(value));
-            metadata.extend_from_slice(&variable_name.unwrap_or(PDG_V2_NONE).to_le_bytes());
-            metadata.extend_from_slice(
-                &edge
-                    .metadata
-                    .confidence
-                    .unwrap_or(f32::NAN)
-                    .to_bits()
-                    .to_le_bytes(),
-            );
-            let channel = edge
-                .metadata
-                .channel
-                .as_deref()
-                .map(|value| interner.intern(value));
-            metadata.extend_from_slice(&channel.unwrap_or(PDG_V2_NONE).to_le_bytes());
-            encode_option_u32(&mut metadata, edge.metadata.position, "edge position")?;
-            metadata
-        });
-    }
+    let edges_by_key = build_pdg_v2_edge_map(pdg, &nodes_by_id, &mut interner)?;
     // Deterministic order: sort by interned id triple, then interleave into
     // the edge record and metadata arrays the layout expects.
     let mut edge_keys: Vec<(u32, u32, u32)> = edges_by_key.keys().copied().collect();
@@ -258,6 +187,126 @@ pub fn encode_pdg_v2_from_graph(
             index_by_id,
         },
     ))
+}
+
+/// Append one v2 node record: four interned strings (id, name, file,
+/// language), the storage-vocabulary type code, complexity, byte range, and
+/// the precision flag.
+fn append_pdg_v2_node_record(
+    records: &mut Vec<u8>,
+    interner: &mut StringInterner,
+    pdg: &ProgramDependenceGraph,
+    node: &Node,
+) -> Result<(), GraphCodecError> {
+    let node_type = storage_node_type(&node.node_type);
+    records.extend_from_slice(&interner.intern(&node.id).to_le_bytes());
+    records.extend_from_slice(&interner.intern(&node.name).to_le_bytes());
+    records.extend_from_slice(&interner.intern(&node.file_path).to_le_bytes());
+    records.extend_from_slice(&interner.intern(&node.language).to_le_bytes());
+    records.extend_from_slice(&node_type_code_v2(node_type.as_str())?.to_le_bytes());
+    records.extend_from_slice(&node.complexity.to_le_bytes());
+    records.extend_from_slice(
+        &u32::try_from(node.byte_range.0)
+            .map_err(|_| GraphCodecError::Invalid("node byte start exceeds u32".into()))?
+            .to_le_bytes(),
+    );
+    records.extend_from_slice(
+        &u32::try_from(node.byte_range.1)
+            .map_err(|_| GraphCodecError::Invalid("node byte end exceeds u32".into()))?
+            .to_le_bytes(),
+    );
+    records.extend_from_slice(&u32::from(pdg.is_precision_symbol(&node.id)).to_le_bytes());
+    Ok(())
+}
+
+/// Collapse the graph's edges onto interned `(source, target, type)` keys,
+/// last write winning on metadata (matching the legacy `intel_edges` PRIMARY
+/// KEY upsert, so a layer-hydrated graph cannot drift from SQL hydration).
+fn build_pdg_v2_edge_map(
+    pdg: &ProgramDependenceGraph,
+    nodes_by_id: &HashMap<&str, &Node>,
+    interner: &mut StringInterner,
+) -> Result<HashMap<(u32, u32, u32), Vec<u8>>, GraphCodecError> {
+    let mut edges_by_key: HashMap<(u32, u32, u32), Vec<u8>> =
+        HashMap::with_capacity(pdg.edge_count());
+    for edge_id in pdg.edge_indices() {
+        let edge = pdg
+            .get_edge(edge_id)
+            .ok_or_else(|| GraphCodecError::Invalid("edge index has no edge".into()))?;
+        let (source, target) = edge_endpoint_nodes(pdg, edge_id)?;
+        // A duplicate-id graph collapsed to one record; both duplicates' edges
+        // survive and point at the surviving record.
+        let source_id = intern_endpoint(nodes_by_id, interner, source, "source")?;
+        let target_id = intern_endpoint(nodes_by_id, interner, target, "target")?;
+        let edge_type = storage_edge_type(&edge.edge_type);
+        let type_code = edge_type_code_v2(edge_type.as_str())?;
+        // Last write wins, matching the SQL upsert.
+        let metadata = encode_pdg_v2_edge_metadata(edge, interner)?;
+        edges_by_key.insert((source_id, target_id, type_code), metadata);
+    }
+    Ok(edges_by_key)
+}
+
+/// An edge's two endpoint nodes, with every positional failure named.
+fn edge_endpoint_nodes(
+    pdg: &ProgramDependenceGraph,
+    edge_id: crate::graph::pdg::EdgeId,
+) -> Result<(&Node, &Node), GraphCodecError> {
+    let (source, target) = pdg
+        .edge_endpoints(edge_id)
+        .ok_or_else(|| GraphCodecError::Invalid("edge has no endpoints".into()))?;
+    let source = pdg
+        .get_node(source)
+        .ok_or_else(|| GraphCodecError::Invalid("edge source node is missing".into()))?;
+    let target = pdg
+        .get_node(target)
+        .ok_or_else(|| GraphCodecError::Invalid("edge target node is missing".into()))?;
+    Ok((source, target))
+}
+
+/// Intern an edge endpoint's stable id through the collapsed node table.
+fn intern_endpoint(
+    nodes_by_id: &HashMap<&str, &Node>,
+    interner: &mut StringInterner,
+    node: &Node,
+    role: &str,
+) -> Result<u32, GraphCodecError> {
+    nodes_by_id
+        .get(node.id.as_str())
+        .map(|node| interner.intern(&node.id))
+        .ok_or_else(|| GraphCodecError::Invalid(format!("edge {role} stable ID is missing")))
+}
+
+/// Encode one edge's metadata record: call count, interned variable name,
+/// confidence bits (NaN sentinel), interned channel, position.
+fn encode_pdg_v2_edge_metadata(
+    edge: &crate::graph::pdg::Edge,
+    interner: &mut StringInterner,
+) -> Result<Vec<u8>, GraphCodecError> {
+    let mut metadata = Vec::with_capacity(PDG_EDGE_META_LEN);
+    encode_option_u32(&mut metadata, edge.metadata.call_count, "edge call_count")?;
+    let variable_name = edge
+        .metadata
+        .variable_name
+        .as_deref()
+        .map(|value| interner.intern(value));
+    metadata.extend_from_slice(&variable_name.unwrap_or(PDG_V2_NONE).to_le_bytes());
+    metadata.extend_from_slice(
+        &edge
+            .metadata
+            .confidence
+            .unwrap_or(f32::NAN)
+            .to_bits()
+            .to_le_bytes(),
+    );
+    let channel = edge
+        .metadata
+        .channel
+        .as_deref()
+        .map(|value| interner.intern(value));
+    metadata.extend_from_slice(&channel.unwrap_or(PDG_V2_NONE).to_le_bytes());
+    encode_option_u32(&mut metadata, edge.metadata.position, "edge position")?;
+    Ok(metadata)
 }
 
 /// Encode a `LIDX-SYM1` symbols layer from the in-memory graph.
@@ -349,8 +398,19 @@ impl PdgReader {
         }
         let mut graph = ProgramDependenceGraph::new();
         graph.reserve_nodes(self.num_nodes());
-        // node-id string → petgraph NodeId. Duplicate node-id records in the
-        // payload collapse last-wins, exactly like the SQL upsert did.
+        let node_id_to_graph = self.decode_pdg_v2_nodes(&mut graph)?;
+        self.decode_pdg_v2_edges(&mut graph, &node_id_to_graph)?;
+        Ok(graph)
+    }
+
+    /// Decode the node records: rebuild every `Node` field, mark precision
+    /// symbols, and return the node-id string → petgraph `NodeId` map.
+    /// Duplicate node-id records in the payload collapse last-wins, exactly
+    /// like the SQL upsert did.
+    fn decode_pdg_v2_nodes(
+        &self,
+        graph: &mut ProgramDependenceGraph,
+    ) -> Result<HashMap<String, crate::graph::pdg::NodeId>, GraphCodecError> {
         let mut node_id_to_graph: HashMap<String, crate::graph::pdg::NodeId> = HashMap::new();
         for index in 0..self.num_nodes() {
             let record = self.node_full(index)?;
@@ -373,6 +433,16 @@ impl PdgReader {
             }
             node_id_to_graph.insert(id, graph_node);
         }
+        Ok(node_id_to_graph)
+    }
+
+    /// Decode the edge records and their metadata (sentinels → `None`),
+    /// resolving interned endpoint ids through the node map.
+    fn decode_pdg_v2_edges(
+        &self,
+        graph: &mut ProgramDependenceGraph,
+        node_id_to_graph: &HashMap<String, crate::graph::pdg::NodeId>,
+    ) -> Result<(), GraphCodecError> {
         for index in 0..self.num_edges() {
             let edge = self.edge(index)?;
             let source_id = resolve_interned_node(self, edge.src, index, "source")?;
@@ -412,7 +482,7 @@ impl PdgReader {
             );
         }
         graph.rebuild_trigram_index();
-        Ok(graph)
+        Ok(())
     }
 }
 

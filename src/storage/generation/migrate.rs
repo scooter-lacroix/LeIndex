@@ -557,55 +557,36 @@ fn rebuild_table_sorted(
 ///
 /// A final in-place `VACUUM` renormalizes the page layout after the edits.
 pub(crate) fn canonicalize_volatile_rows(db_path: &Path) -> Result<(), MigrationError> {
-    use rusqlite::OptionalExtension;
-
     let conn = Connection::open(db_path)?;
-    // Collapse the per-invocation project rows to the canonical identity.
-    // Fixtures and legacy catalogs may lack the table entirely.
-    let survivor: Option<(String, String, String, String, String, bool, String)> =
-        if table_has_columns(
-            &conn,
-            "project_metadata",
-            &[
-                "unique_project_id",
-                "base_name",
-                "path_hash",
-                "instance",
-                "canonical_path",
-            ],
-        )? {
-            conn.query_row(
-                "SELECT unique_project_id, base_name, path_hash, canonical_path,
-                    COALESCE(display_name, ''), is_clone, COALESCE(cloned_from, '')
-             FROM project_metadata
-             ORDER BY instance DESC, id DESC
-             LIMIT 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                },
-            )
-            .optional()?
-        } else {
-            None
-        };
-    if let Some((
-        _old_id,
-        base_name,
-        path_hash,
-        canonical_path,
-        display_name,
-        is_clone,
-        cloned_from,
-    )) = survivor
+    collapse_project_identity(&conn)?;
+    zero_volatile_bookkeeping(&conn)?;
+    rebuild_table_sorted(&conn, "indexed_files", "file_path")?;
+    rebuild_table_sorted(
+        &conn,
+        "intel_community_memberships",
+        "project_id, node_id, community",
+    )?;
+    rebuild_table_sorted(
+        &conn,
+        "intel_communities",
+        "community, algorithm, quality_name",
+    )?;
+    // `schema_version` is rewritten via INSERT OR REPLACE each run, so its
+    // rowid drifts (1, 2, ...); rebuilding pins it.
+    rebuild_table_sorted(&conn, "schema_version", "key")?;
+    conn.execute_batch("VACUUM;")?;
+    Ok(())
+}
+
+/// Collapse the per-invocation project rows onto the canonical identity and
+/// re-key every `project_id`-bearing table. Skipped when the catalog lacks
+/// the expected table (fixtures, legacy stores).
+fn collapse_project_identity(conn: &Connection) -> Result<(), MigrationError> {
+    let Some((_old_id, base_name, path_hash, canonical_path, display_name, is_clone, cloned_from)) =
+        canonical_survivor(conn)?
+    else {
+        return Ok(());
+    };
     {
         let canonical_id = format!("{base_name}_{path_hash}_0");
         let stale_ids: Vec<String> = {
@@ -631,35 +612,97 @@ pub(crate) fn canonicalize_volatile_rows(db_path: &Path) -> Result<(), Migration
             ],
         )?;
         // Rewrite every table that keys rows by the project identity.
-        let tables: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rekey_project_tables(conn, &canonical_id, &stale_ids)?;
+    }
+
+    Ok(())
+}
+
+/// Rewrite every table that keys rows by the project identity: rows carrying
+/// a stale per-invocation id move onto the canonical one. Tables without a
+/// `project_id` column are skipped.
+fn rekey_project_tables(
+    conn: &Connection,
+    canonical_id: &str,
+    stale_ids: &[String],
+) -> Result<(), MigrationError> {
+    let tables: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for table in tables {
+        let has_project_id = {
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
             rows.collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .any(|column| column == "project_id")
         };
-        for table in tables {
-            let has_project_id = {
-                let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-                let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-                rows.collect::<Result<Vec<_>, _>>()?
-                    .iter()
-                    .any(|column| column == "project_id")
-            };
-            if !has_project_id {
-                continue;
-            }
-            for stale in &stale_ids {
-                if stale != &canonical_id {
-                    conn.execute(
-                        &format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"),
-                        rusqlite::params![canonical_id, stale],
-                    )?;
-                }
+        if !has_project_id {
+            continue;
+        }
+        for stale in stale_ids {
+            if stale != canonical_id {
+                conn.execute(
+                    &format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"),
+                    rusqlite::params![canonical_id, stale],
+                )?;
             }
         }
     }
-    // Every statement below is guarded per table: fixtures and legacy
-    // catalogs may not carry the newer bookkeeping tables.
-    if table_exists(&conn, "cache_telemetry")? {
+    Ok(())
+}
+
+/// The surviving per-invocation project row (newest instance wins), or
+/// `None` when the catalog has no `project_metadata` table with the expected
+/// columns (fixtures and legacy catalogs may lack it entirely).
+#[allow(clippy::type_complexity)]
+fn canonical_survivor(
+    conn: &Connection,
+) -> Result<Option<(String, String, String, String, String, bool, String)>, MigrationError> {
+    use rusqlite::OptionalExtension;
+
+    if !table_has_columns(
+        conn,
+        "project_metadata",
+        &[
+            "unique_project_id",
+            "base_name",
+            "path_hash",
+            "instance",
+            "canonical_path",
+        ],
+    )? {
+        return Ok(None);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT unique_project_id, base_name, path_hash, canonical_path,
+                    COALESCE(display_name, ''), is_clone, COALESCE(cloned_from, '')
+             FROM project_metadata
+             ORDER BY instance DESC, id DESC
+             LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?)
+}
+
+/// Zero the volatile bookkeeping every statement-guarded table carries.
+/// Fixtures and legacy catalogs may not carry the newer bookkeeping tables.
+fn zero_volatile_bookkeeping(conn: &Connection) -> Result<(), MigrationError> {
+    if table_exists(conn, "cache_telemetry")? {
         conn.execute_batch(
             "UPDATE cache_telemetry
                  SET cache_hits = 0,
@@ -669,30 +712,15 @@ pub(crate) fn canonicalize_volatile_rows(db_path: &Path) -> Result<(), Migration
                      community_recompute_ms = 0;",
         )?;
     }
-    if table_exists(&conn, "intel_communities")? {
+    if table_exists(conn, "intel_communities")? {
         conn.execute_batch("UPDATE intel_communities SET computed_at = 0;")?;
     }
-    if table_exists(&conn, "indexed_files")? {
+    if table_exists(conn, "indexed_files")? {
         conn.execute_batch("UPDATE indexed_files SET last_indexed = 0;")?;
     }
-    if table_exists(&conn, "sqlite_sequence")? {
+    if table_exists(conn, "sqlite_sequence")? {
         conn.execute_batch("DELETE FROM sqlite_sequence WHERE name = 'project_metadata';")?;
     }
-    rebuild_table_sorted(&conn, "indexed_files", "file_path")?;
-    rebuild_table_sorted(
-        &conn,
-        "intel_community_memberships",
-        "project_id, node_id, community",
-    )?;
-    rebuild_table_sorted(
-        &conn,
-        "intel_communities",
-        "community, algorithm, quality_name",
-    )?;
-    // `schema_version` is rewritten via INSERT OR REPLACE each run, so its
-    // rowid drifts (1, 2, ...); rebuilding pins it.
-    rebuild_table_sorted(&conn, "schema_version", "key")?;
-    conn.execute_batch("VACUUM;")?;
     Ok(())
 }
 
@@ -837,6 +865,26 @@ fn parse_liee(bytes: &[u8]) -> Result<(Vec<&str>, usize, &[u8]), MigrationError>
     let dim = liee_u32(bytes, 12)?;
     let lengths_start = LIEE_HEADER_LEN + count * 8;
     let ids_start = lengths_start + count * 4;
+    let (ids, ids_end) = liee_row_ids(bytes, count, lengths_start, ids_start)?;
+    let matrix_offset = (ids_end + 3) & !3;
+    let matrix_len = count
+        .checked_mul(dim)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| MigrationError::Payload("embeddings matrix size overflow".into()))?;
+    let matrix = bytes
+        .get(matrix_offset..matrix_offset + matrix_len)
+        .ok_or_else(|| MigrationError::Payload("embeddings matrix truncated".into()))?;
+    Ok((ids, dim, matrix))
+}
+
+/// Walk the LIEE offset/length tables and borrow each row's UTF-8 id.
+/// Returns the ids and the end offset of the id section.
+fn liee_row_ids(
+    bytes: &[u8],
+    count: usize,
+    lengths_start: usize,
+    ids_start: usize,
+) -> Result<(Vec<&str>, usize), MigrationError> {
     let mut ids = Vec::with_capacity(count);
     let mut ids_end = ids_start;
     for i in 0..count {
@@ -856,15 +904,7 @@ fn parse_liee(bytes: &[u8]) -> Result<(Vec<&str>, usize, &[u8]), MigrationError>
         );
         ids_end = ids_end.max(end);
     }
-    let matrix_offset = (ids_end + 3) & !3;
-    let matrix_len = count
-        .checked_mul(dim)
-        .and_then(|n| n.checked_mul(4))
-        .ok_or_else(|| MigrationError::Payload("embeddings matrix size overflow".into()))?;
-    let matrix = bytes
-        .get(matrix_offset..matrix_offset + matrix_len)
-        .ok_or_else(|| MigrationError::Payload("embeddings matrix truncated".into()))?;
-    Ok((ids, dim, matrix))
+    Ok((ids, ids_end))
 }
 
 /// Map each LIEE row to its catalog integer id (last row wins on duplicate
@@ -1561,137 +1601,13 @@ pub(super) fn edge_type_name_v2(code: u32) -> Result<&'static str, MigrationErro
 /// endpoints reference nodes by their interned graph node id (not the
 /// storage row id, which is a catalog artifact).
 pub(crate) fn encode_pdg_layer_v2(conn: &Connection) -> Result<Vec<u8>, MigrationError> {
-    use crate::storage::edges::EdgeMetadata as StorageEdgeMetadata;
-
     let mut interner = StringInterner::new();
-    let mut nodes: Vec<u8> = Vec::new();
-    {
-        let mut q = conn.prepare(
-            "SELECT node_id, symbol_name, file_path, language, node_type, \
-             complexity, byte_range_start, byte_range_end, precision \
-             FROM intel_nodes ORDER BY id",
-        )?;
-        let rows = q.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, Option<i64>>(6)?,
-                row.get::<_, Option<i64>>(7)?,
-                row.get::<_, Option<i64>>(8)?,
-            ))
-        })?;
-        for row in rows {
-            let (
-                node_id,
-                symbol_name,
-                file_path,
-                language,
-                node_type,
-                complexity,
-                start,
-                end,
-                precision,
-            ) = row?;
-            let type_code = node_type_code_v2(&node_type)?;
-            let complexity = u32::try_from(complexity.unwrap_or(0))
-                .map_err(|_| MigrationError::Payload("node complexity exceeds u32".into()))?;
-            let byte = |value: Option<i64>| {
-                u32::try_from(value.unwrap_or(0))
-                    .map_err(|_| MigrationError::Payload("node byte range exceeds u32".into()))
-            };
-            let flags: u32 = u32::from(precision.unwrap_or(0) != 0);
-            nodes.extend_from_slice(&interner.intern(&node_id).to_le_bytes());
-            nodes.extend_from_slice(&interner.intern(&symbol_name).to_le_bytes());
-            nodes.extend_from_slice(&interner.intern(&file_path).to_le_bytes());
-            nodes.extend_from_slice(&interner.intern(&language).to_le_bytes());
-            nodes.extend_from_slice(&type_code.to_le_bytes());
-            nodes.extend_from_slice(&complexity.to_le_bytes());
-            nodes.extend_from_slice(&byte(start)?.to_le_bytes());
-            nodes.extend_from_slice(&byte(end)?.to_le_bytes());
-            nodes.extend_from_slice(&flags.to_le_bytes());
-        }
-    }
-
+    let nodes = encode_pdg_v2_nodes(conn, &mut interner)?;
     // Resolve each edge's endpoints to the interned graph node ids, then
     // append the edge records and their metadata records. `intern` is
     // idempotent, so the second pass over node rows just recovers the ids.
-    let mut row_to_interned: HashMap<i64, u32> = HashMap::new();
-    {
-        let mut q = conn.prepare("SELECT id, node_id FROM intel_nodes")?;
-        let rows = q.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (row_id, node_id) = row?;
-            row_to_interned.insert(row_id, interner.intern(&node_id));
-        }
-    }
-
-    let opt_u32 = |value: Option<u32>| value.unwrap_or(PDG_V2_NONE).to_le_bytes();
-    let mut edges: Vec<u8> = Vec::new();
-    let mut edge_meta: Vec<u8> = Vec::new();
-    {
-        let mut q =
-            conn.prepare("SELECT caller_id, callee_id, edge_type, metadata FROM intel_edges")?;
-        let rows = q.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-        for row in rows {
-            let (caller, callee, edge_type, metadata_json) = row?;
-            let type_code = edge_type_code_v2(&edge_type)?;
-            let src = *row_to_interned.get(&caller).ok_or_else(|| {
-                MigrationError::Payload(format!("edge caller {caller} has no node"))
-            })?;
-            let dst = *row_to_interned.get(&callee).ok_or_else(|| {
-                MigrationError::Payload(format!("edge callee {callee} has no node"))
-            })?;
-            edges.extend_from_slice(&src.to_le_bytes());
-            edges.extend_from_slice(&dst.to_le_bytes());
-            edges.extend_from_slice(&type_code.to_le_bytes());
-
-            let metadata: StorageEdgeMetadata = match metadata_json {
-                Some(json) => serde_json::from_str(&json)
-                    .map_err(|e| MigrationError::Payload(format!("invalid edge metadata: {e}")))?,
-                None => StorageEdgeMetadata {
-                    call_count: None,
-                    variable_name: None,
-                    confidence: None,
-                    channel: None,
-                    position: None,
-                },
-            };
-            let narrow =
-                |value: Option<usize>, field: &str| -> Result<Option<u32>, MigrationError> {
-                    value
-                        .map(u32::try_from)
-                        .transpose()
-                        .map_err(|_| MigrationError::Payload(format!("edge {field} exceeds u32")))
-                };
-            edge_meta.extend_from_slice(&opt_u32(narrow(metadata.call_count, "call_count")?));
-            let variable = metadata
-                .variable_name
-                .as_deref()
-                .map(|s| interner.intern(s));
-            edge_meta.extend_from_slice(&opt_u32(variable));
-            let confidence = metadata
-                .confidence
-                .map(f32::to_bits)
-                .unwrap_or(f32::NAN.to_bits());
-            edge_meta.extend_from_slice(&confidence.to_le_bytes());
-            let channel = metadata.channel.as_deref().map(|s| interner.intern(s));
-            edge_meta.extend_from_slice(&opt_u32(channel));
-            edge_meta.extend_from_slice(&opt_u32(narrow(metadata.position, "position")?));
-        }
-    }
+    let row_to_interned = build_row_to_interned(conn, &mut interner)?;
+    let (edges, edge_meta) = encode_pdg_v2_edges(conn, &mut interner, &row_to_interned)?;
 
     let (string_table, string_bytes) = interner.into_bytes();
     let num_nodes = nodes.len() / PDG_NODE_V2_LEN;
@@ -1720,6 +1636,169 @@ pub(crate) fn encode_pdg_layer_v2(conn: &Connection) -> Result<Vec<u8>, Migratio
     payload.extend_from_slice(&content_hash);
     payload.extend_from_slice(&data);
     Ok(payload)
+}
+
+/// Encode the node records (`PDG_NODE_V2_LEN` each): five interned strings
+/// (id, symbol, file, language), the storage-vocabulary type code,
+/// complexity, byte range, and the precision flag.
+fn encode_pdg_v2_nodes(
+    conn: &Connection,
+    interner: &mut StringInterner,
+) -> Result<Vec<u8>, MigrationError> {
+    let mut nodes: Vec<u8> = Vec::new();
+    let mut q = conn.prepare(
+        "SELECT node_id, symbol_name, file_path, language, node_type, \
+         complexity, byte_range_start, byte_range_end, precision \
+         FROM intel_nodes ORDER BY id",
+    )?;
+    let rows = q.query_map([], read_pdg_v2_node_row)?;
+    for row in rows {
+        let (
+            node_id,
+            symbol_name,
+            file_path,
+            language,
+            node_type,
+            complexity,
+            start,
+            end,
+            precision,
+        ) = row?;
+        let type_code = node_type_code_v2(&node_type)?;
+        let complexity = u32::try_from(complexity.unwrap_or(0))
+            .map_err(|_| MigrationError::Payload("node complexity exceeds u32".into()))?;
+        let byte = |value: Option<i64>| {
+            u32::try_from(value.unwrap_or(0))
+                .map_err(|_| MigrationError::Payload("node byte range exceeds u32".into()))
+        };
+        let flags: u32 = u32::from(precision.unwrap_or(0) != 0);
+        nodes.extend_from_slice(&interner.intern(&node_id).to_le_bytes());
+        nodes.extend_from_slice(&interner.intern(&symbol_name).to_le_bytes());
+        nodes.extend_from_slice(&interner.intern(&file_path).to_le_bytes());
+        nodes.extend_from_slice(&interner.intern(&language).to_le_bytes());
+        nodes.extend_from_slice(&type_code.to_le_bytes());
+        nodes.extend_from_slice(&complexity.to_le_bytes());
+        nodes.extend_from_slice(&byte(start)?.to_le_bytes());
+        nodes.extend_from_slice(&byte(end)?.to_le_bytes());
+        nodes.extend_from_slice(&flags.to_le_bytes());
+    }
+    Ok(nodes)
+}
+
+/// Read one `intel_nodes` row for the v2 node encoder.
+#[allow(clippy::type_complexity)]
+fn read_pdg_v2_node_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+)> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+    ))
+}
+
+/// Map each catalog row id to its interned graph node id (second pass over
+/// the node rows; `intern` is idempotent, so the ids match the node pass).
+fn build_row_to_interned(
+    conn: &Connection,
+    interner: &mut StringInterner,
+) -> Result<HashMap<i64, u32>, MigrationError> {
+    let mut row_to_interned: HashMap<i64, u32> = HashMap::new();
+    let mut q = conn.prepare("SELECT id, node_id FROM intel_nodes")?;
+    let rows = q.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (row_id, node_id) = row?;
+        row_to_interned.insert(row_id, interner.intern(&node_id));
+    }
+    Ok(row_to_interned)
+}
+/// Encode the edge records (caller, callee, type code) plus their metadata
+/// records (call count, variable, confidence, channel, position; absent
+/// fields use the `PDG_V2_NONE` / NaN sentinels).
+fn encode_pdg_v2_edges(
+    conn: &Connection,
+    interner: &mut StringInterner,
+    row_to_interned: &HashMap<i64, u32>,
+) -> Result<(Vec<u8>, Vec<u8>), MigrationError> {
+    use crate::storage::edges::EdgeMetadata as StorageEdgeMetadata;
+
+    let opt_u32 = |value: Option<u32>| value.unwrap_or(PDG_V2_NONE).to_le_bytes();
+    let mut edges: Vec<u8> = Vec::new();
+    let mut edge_meta: Vec<u8> = Vec::new();
+    let mut q =
+        conn.prepare("SELECT caller_id, callee_id, edge_type, metadata FROM intel_edges")?;
+    let rows = q.query_map([], read_pdg_v2_edge_row)?;
+    for row in rows {
+        let (caller, callee, edge_type, metadata_json) = row?;
+        let type_code = edge_type_code_v2(&edge_type)?;
+        let src = *row_to_interned
+            .get(&caller)
+            .ok_or_else(|| MigrationError::Payload(format!("edge caller {caller} has no node")))?;
+        let dst = *row_to_interned
+            .get(&callee)
+            .ok_or_else(|| MigrationError::Payload(format!("edge callee {callee} has no node")))?;
+        edges.extend_from_slice(&src.to_le_bytes());
+        edges.extend_from_slice(&dst.to_le_bytes());
+        edges.extend_from_slice(&type_code.to_le_bytes());
+
+        let metadata: StorageEdgeMetadata = match metadata_json {
+            Some(json) => serde_json::from_str(&json)
+                .map_err(|e| MigrationError::Payload(format!("invalid edge metadata: {e}")))?,
+            None => StorageEdgeMetadata {
+                call_count: None,
+                variable_name: None,
+                confidence: None,
+                channel: None,
+                position: None,
+            },
+        };
+        let narrow = |value: Option<usize>, field: &str| -> Result<Option<u32>, MigrationError> {
+            value
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| MigrationError::Payload(format!("edge {field} exceeds u32")))
+        };
+        edge_meta.extend_from_slice(&opt_u32(narrow(metadata.call_count, "call_count")?));
+        let variable = metadata
+            .variable_name
+            .as_deref()
+            .map(|s| interner.intern(s));
+        edge_meta.extend_from_slice(&opt_u32(variable));
+        let confidence = metadata
+            .confidence
+            .map(f32::to_bits)
+            .unwrap_or(f32::NAN.to_bits());
+        edge_meta.extend_from_slice(&confidence.to_le_bytes());
+        let channel = metadata.channel.as_deref().map(|s| interner.intern(s));
+        edge_meta.extend_from_slice(&opt_u32(channel));
+        edge_meta.extend_from_slice(&opt_u32(narrow(metadata.position, "position")?));
+    }
+    Ok((edges, edge_meta))
+}
+
+/// Read one `intel_edges` row for the v2 edge encoder.
+fn read_pdg_v2_edge_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(i64, i64, String, Option<String>)> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
 }
 
 /// Interned string table for the PDG/SYMBOLS payloads. Strings are stored once

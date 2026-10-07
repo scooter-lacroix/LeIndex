@@ -291,36 +291,13 @@ impl LeIndex {
             &graph_codec::encode_symbols_layer_from_graph(pdg)?,
         )?;
 
-        // Vector layers from the mmap embedding files. `embeddings.bin` is
-        // absent on a docs-only index (no code nodes): stage the canonical
-        // empty TF-IDF layer rather than failing the publish.
-        let embeddings_path = artifact_dir.join("embeddings.bin");
-        let tfidf = if embeddings_path.is_file() {
-            gen_migrate::encode_tfidf_layer(&embeddings_path, &node_ids)?
-        } else {
-            gen_migrate::encode_empty_tfidf()
-        };
-        writer.stage(LayerKind::Tfidf, &tfidf)?;
-        let neural_path = artifact_dir.join("neural_embeddings.bin");
-        let neural = if include_neural && neural_path.is_file() {
-            gen_migrate::encode_neural_layer(&neural_path, &node_ids)?
-        } else {
-            gen_migrate::encode_empty_neural()
-        };
-        writer.stage(LayerKind::Neural, &neural)?;
+        // Vector layers from the mmap embedding files (`embeddings.bin` is
+        // absent on a docs-only index: the canonical empties keep the
+        // publish contract).
+        stage_vector_layers(&mut writer, &artifact_dir, &node_ids, include_neural)?;
 
         // Optional layers: staged only when the artifacts exist.
-        if artifact_dir.join("search_snapshot.bin").is_file() {
-            let bytes = std::fs::read(artifact_dir.join("search_snapshot.bin"))?;
-            writer.stage(LayerKind::Search, &bytes)?;
-        }
-        if artifact_dir.join("tfidf_embedder.bin").is_file() {
-            let bytes = std::fs::read(artifact_dir.join("tfidf_embedder.bin"))?;
-            writer.stage(LayerKind::Embedder, &bytes)?;
-        }
-        if let Some(bundle) = gen_migrate::encode_fragment_bundle(&artifact_dir)? {
-            writer.stage(LayerKind::Fragments, &bundle)?;
-        }
+        stage_optional_layers(&mut writer, &artifact_dir)?;
 
         Ok(writer)
     }
@@ -1590,6 +1567,56 @@ impl LeIndex {
     }
 }
 
+/// Stage the Tfidf/Neural layers from the mmap embedding files, keyed by the
+/// graph layer's node assignment. `embeddings.bin` is absent on a docs-only
+/// index (no code nodes): the canonical empty TF-IDF layer keeps the publish
+/// contract rather than failing the publish.
+fn stage_vector_layers(
+    writer: &mut crate::storage::generation::GenerationWriter,
+    artifact_dir: &std::path::Path,
+    node_ids: &HashMap<String, u32>,
+    include_neural: bool,
+) -> Result<()> {
+    use crate::storage::generation::{LayerKind, migrate as gen_migrate};
+
+    let embeddings_path = artifact_dir.join("embeddings.bin");
+    let tfidf = if embeddings_path.is_file() {
+        gen_migrate::encode_tfidf_layer(&embeddings_path, node_ids)?
+    } else {
+        gen_migrate::encode_empty_tfidf()
+    };
+    writer.stage(LayerKind::Tfidf, &tfidf)?;
+    let neural_path = artifact_dir.join("neural_embeddings.bin");
+    let neural = if include_neural && neural_path.is_file() {
+        gen_migrate::encode_neural_layer(&neural_path, node_ids)?
+    } else {
+        gen_migrate::encode_empty_neural()
+    };
+    writer.stage(LayerKind::Neural, &neural)?;
+    Ok(())
+}
+
+/// Stage the optional layers (Search, Embedder, Fragments) when their
+/// artifacts exist on disk.
+fn stage_optional_layers(
+    writer: &mut crate::storage::generation::GenerationWriter,
+    artifact_dir: &std::path::Path,
+) -> Result<()> {
+    use crate::storage::generation::{LayerKind, migrate as gen_migrate};
+
+    if artifact_dir.join("search_snapshot.bin").is_file() {
+        let bytes = std::fs::read(artifact_dir.join("search_snapshot.bin"))?;
+        writer.stage(LayerKind::Search, &bytes)?;
+    }
+    if artifact_dir.join("tfidf_embedder.bin").is_file() {
+        let bytes = std::fs::read(artifact_dir.join("tfidf_embedder.bin"))?;
+        writer.stage(LayerKind::Embedder, &bytes)?;
+    }
+    if let Some(bundle) = gen_migrate::encode_fragment_bundle(artifact_dir)? {
+        writer.stage(LayerKind::Fragments, &bundle)?;
+    }
+    Ok(())
+}
 /// Which PDG construction route produced a given combined graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PdgBuildRoute {
