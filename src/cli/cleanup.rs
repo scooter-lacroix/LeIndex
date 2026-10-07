@@ -1136,6 +1136,7 @@ fn compact_embed_cache(dry_run: bool) -> Option<crate::embed::cache::CacheCompac
             reclaimed_bytes: 0,
             rows_removed: 0,
             rows_retained: stats.row_count as u64,
+            staging_files_removed: 0,
         })
     } else {
         cache.gc().ok()

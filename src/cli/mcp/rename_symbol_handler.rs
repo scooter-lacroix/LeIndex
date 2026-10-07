@@ -169,6 +169,54 @@ async fn live_reference_files(
     })?
 }
 
+/// Apply a non-preview rename plan, then invalidate the registry's staleness
+/// cache so the next read tool re-runs `is_stale_fast` instead of reusing a
+/// pre-write `false` cached result. The watcher (when enabled via
+/// `LEINDEX_WATCHER=1`) does this on its own reindex path; this explicit
+/// call covers the watcher-disabled default mode where the 30-second
+/// negative-cache TTL would otherwise silently mask the rename.
+async fn apply_rename_and_invalidate(
+    registry: &Arc<ProjectRegistry>,
+    handle: &crate::cli::registry::ProjectHandle,
+    file_contents: Vec<(String, String, String)>,
+) -> Result<(), JsonRpcError> {
+    tokio::task::spawn_blocking(move || apply_rename_plan(file_contents))
+        .await
+        .map_err(|error| {
+            JsonRpcError::internal_error(format!("Rename apply task failed: {}", error))
+        })?
+        .map_err(JsonRpcError::internal_error)?;
+    let project_root = {
+        let guard = handle.read().await;
+        guard.project_path().to_path_buf()
+    };
+    registry.invalidate_stale_cache(&project_root).await;
+    Ok(())
+}
+
+/// The PDG-based reference set for a rename, or `None` when the PDG cannot
+/// load — the caller falls back to the live whole-word scan and annotates
+/// the response with `pdg_status`/`warning`. Extracted from `execute` to
+/// keep both paths' complexity readable.
+fn pdg_reference_files(
+    index: &mut crate::cli::leindex::LeIndex,
+    old_name: &str,
+    new_name: &str,
+    scope: Option<&str>,
+) -> Result<Option<Vec<String>>, JsonRpcError> {
+    if let Err(error) = index.ensure_pdg_loaded_graph_only() {
+        tracing::warn!(
+            project = %index.project_path().display(),
+            "PDG unavailable for rename; falling back to a live whole-word scan: {error}"
+        );
+        return Ok(None);
+    }
+    let Some(pdg) = index.pdg() else {
+        return Ok(None);
+    };
+    reference_files(pdg, old_name, new_name, scope, index.project_path()).map(Some)
+}
+
 fn reference_files(
     pdg: &crate::graph::pdg::ProgramDependenceGraph,
     old_name: &str,
@@ -238,14 +286,51 @@ fn reference_files(
         };
         normalize_lexical(&joined)
     });
-    Ok(files
+    let pre_filter_count = files.len();
+    let filtered: Vec<String> = files
         .into_iter()
         .filter(|file| {
             resolved_scope
                 .as_ref()
                 .is_none_or(|scope| std::path::Path::new(file).starts_with(scope))
         })
-        .collect())
+        .collect();
+    require_non_empty_reference_set(filtered, pre_filter_count, resolved_scope, old_name)
+}
+
+/// An empty reference set must be an ERROR, not a reported success that wrote
+/// nothing (`{"files_affected": 0, "applied": true}`). With the PDG resident
+/// this is reachable by a scope that prefix-matches no indexed file path — a
+/// typo'd scope, or an absolute scope spelled through a symlink (the project
+/// root is canonicalized, the user's spelling is not reconciled) — matching
+/// the live fallback, which errors on the same condition instead of
+/// returning an empty plan.
+fn require_non_empty_reference_set(
+    filtered: Vec<String>,
+    pre_filter_count: usize,
+    resolved_scope: Option<std::path::PathBuf>,
+    old_name: &str,
+) -> Result<Vec<String>, JsonRpcError> {
+    if !filtered.is_empty() {
+        return Ok(filtered);
+    }
+    if let Some(scope) = resolved_scope {
+        if pre_filter_count > 0 {
+            return Err(JsonRpcError::invalid_params(format!(
+                "Scope '{}' matches none of the {} indexed file(s) that reference '{}'. \
+                 Index paths are absolute and follow the canonical project root — spell \
+                 the scope the way the inventory does (e.g. 'src', not a symlinked path).",
+                scope.display(),
+                pre_filter_count,
+                old_name
+            )));
+        }
+    }
+    Err(JsonRpcError::invalid_params(format!(
+        "Symbol '{}' resolves to no indexed files to rename. \
+         Try leindex_explore mode=find target=symbols to inspect '{}'.",
+        old_name, old_name
+    )))
 }
 
 fn build_rename_plan(
@@ -411,29 +496,19 @@ Grep + multi-file Edit with a single atomic operation."
         let handle = registry.get_or_create(project_path.as_deref()).await?;
         let (filtered_files, pdg_available) = {
             let mut index = handle.write().await;
-            let pdg_available = match index.ensure_pdg_loaded_graph_only() {
-                Ok(()) => index.pdg().is_some(),
-                Err(error) => {
-                    tracing::warn!(
-                        project = %index.project_path().display(),
-                        "PDG unavailable for rename; falling back to a live whole-word scan: {error}"
-                    );
-                    false
-                }
-            };
-            let filtered_files = if pdg_available {
-                reference_files(
-                    index.pdg().unwrap(),
-                    &old_name,
-                    &new_name,
-                    scope.as_deref(),
-                    index.project_path(),
-                )?
-            } else {
-                live_reference_files(index.project_path(), &old_name, &new_name, scope.as_deref())
-                    .await?
-            };
-            (filtered_files, pdg_available)
+            match pdg_reference_files(&mut index, &old_name, &new_name, scope.as_deref())? {
+                Some(files) => (files, true),
+                None => (
+                    live_reference_files(
+                        index.project_path(),
+                        &old_name,
+                        &new_name,
+                        scope.as_deref(),
+                    )
+                    .await?,
+                    false,
+                ),
+            }
         };
         // Release the mutex before spawning blocking I/O.
         // All reference data has been extracted into filtered_files above.
@@ -457,29 +532,7 @@ Grep + multi-file Edit with a single atomic operation."
         };
 
         if !preview_only {
-            tokio::task::spawn_blocking(move || apply_rename_plan(file_contents))
-                .await
-                .map_err(|error| {
-                    JsonRpcError::internal_error(format!("Rename apply task failed: {}", error))
-                })?
-                .map_err(JsonRpcError::internal_error)?;
-
-            // Invalidate the registry's staleness cache so the next
-            // read tool re-runs `is_stale_fast` instead of reusing
-            // a pre-write `false` cached result. The watcher (when
-            // enabled via `LEINDEX_WATCHER=1`) does this on its
-            // own reindex path; this explicit call covers the
-            // watcher-disabled default mode where the 30-second
-            // negative-cache TTL would otherwise silently mask the
-            // rename. Preview-only runs (the default) skip this
-            // — no files were written, so the cache value is
-            // still accurate and re-running `is_stale_fast` on
-            // the next read would be wasted work.
-            let project_root = {
-                let guard = handle.read().await;
-                guard.project_path().to_path_buf()
-            };
-            registry.invalidate_stale_cache(&project_root).await;
+            apply_rename_and_invalidate(registry, &handle, file_contents).await?;
         }
 
         let mut response_data = rename_response(
@@ -527,6 +580,43 @@ mod tests {
         std::fs::write(&file_path, content).expect("write test file");
         let registry = test_registry_for(dir.path());
         (dir, file_path.to_string_lossy().to_string(), registry)
+    }
+
+    /// A scope that prefix-matches no indexed file must be an ERROR, not a
+    /// reported success that wrote nothing (round-10 Kilo): with the PDG
+    /// resident, a typo'd scope — or an absolute scope spelled through a
+    /// symlink, which never prefix-matches the canonicalized root — used to
+    /// yield `{"files_affected": 0, "applied": true}`.
+    #[test]
+    fn test_reference_files_scope_matching_nothing_is_an_error() {
+        let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
+        pdg.add_node(crate::graph::pdg::Node {
+            id: "/proj/src/a.rs:helper".to_string(),
+            node_type: crate::graph::pdg::NodeType::Function,
+            name: "helper".to_string(),
+            file_path: std::sync::Arc::from("/proj/src/a.rs"),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "rust".to_string(),
+        });
+        let root = std::path::Path::new("/proj");
+
+        // The symbol's own file is found without a scope.
+        let files = reference_files(&pdg, "helper", "renamed", None, root).unwrap();
+        assert_eq!(files, vec!["/proj/src/a.rs".to_string()]);
+
+        // A scope matching nothing errors instead of returning an empty plan.
+        let error = reference_files(&pdg, "helper", "renamed", Some("/elsewhere"), root)
+            .expect_err("an empty scope match must not report success");
+        assert!(
+            error.message.contains("matches none"),
+            "message names the scope problem: {}",
+            error.message
+        );
+
+        // A matching scope keeps the file.
+        let files = reference_files(&pdg, "helper", "renamed", Some("/proj/src"), root).unwrap();
+        assert_eq!(files, vec!["/proj/src/a.rs".to_string()]);
     }
 
     #[test]
@@ -750,10 +840,10 @@ mod tests {
     /// the default path no files are written — yet the call still
     /// acquired a read lock and forced the next read to recompute
     /// `is_stale_fast`. The fix moves the invalidation inside the
-    /// `if !preview_only` block. This test verifies the
+    /// `if !preview_only` block (now via the `apply_rename_and_invalidate`
+    /// helper — round-10 lizard-gate extraction). This test verifies the
     /// structural contract by reading the source file (the
-    /// invalidation call is reachable only from inside the
-    /// `if !preview_only { … }` block).
+    /// invalidation call is reachable only through the gated helper).
     #[tokio::test]
     async fn test_rename_preview_only_invalidation_is_gated() {
         // Read the source and confirm the `invalidate_stale_cache`
@@ -767,22 +857,34 @@ mod tests {
         // `test_invalidate_stale_cache_removes_entry` test in
         // `src/cli/registry.rs`.
         let source = include_str!("rename_symbol_handler.rs");
-        let apply_block_start = source
-            .find("if !preview_only {")
-            .expect("if !preview_only block must exist in the handler");
-        let apply_block_open_brace = source[apply_block_start..]
-            .find('{')
-            .map(|i| apply_block_start + i)
-            .expect("if !preview_only block must have an opening brace");
+        // The invalidation lives inside the apply helper...
+        let helper_start = source
+            .find("async fn apply_rename_and_invalidate(")
+            .expect("apply helper must exist in the handler");
         let invalidation_pos = source
             .find("registry.invalidate_stale_cache(&project_root).await")
             .expect("invalidate_stale_cache call must exist in the handler");
         assert!(
-            invalidation_pos > apply_block_open_brace,
-            "invalidate_stale_cache must be inside the if !preview_only block; \
-             apply block opens at byte {} but invalidation is at byte {}",
-            apply_block_open_brace,
+            invalidation_pos > helper_start,
+            "invalidate_stale_cache must live inside the apply helper; \
+             helper starts at byte {} but invalidation is at byte {}",
+            helper_start,
             invalidation_pos
+        );
+        // ...and the helper itself is invoked only from inside the
+        // `if !preview_only` gate, so a preview run can never reach it.
+        let gate_pos = source
+            .find("if !preview_only {")
+            .expect("if !preview_only block must exist in the handler");
+        let call_pos = source
+            .find("apply_rename_and_invalidate(registry")
+            .expect("the apply helper must be called from execute");
+        assert!(
+            call_pos > gate_pos,
+            "the apply helper (and with it the invalidation) must be \
+             gated on !preview_only; gate opens at byte {} but the call is at byte {}",
+            gate_pos,
+            call_pos
         );
     }
 

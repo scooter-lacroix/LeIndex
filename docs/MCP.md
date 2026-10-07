@@ -926,7 +926,7 @@ How it works, and why it is fast and always correct:
 | `output` | `matches` | `matches`, `files` (paths + counts), `count` (totals only), `symbols` (enclosing symbols ranked by hits) |
 | `kind` | — | With `target=symbols`: `function`, `class`, `struct`, … |
 | `context_lines` | `0` | Lines of context (max 10) |
-| `limit` / `offset` | `50` / `0` | Paging; `limit=0` = ceiling (10000); both clamped to 10000; the result stream ends at 10,000 hits — a page reaching it sets `truncated_by_ceiling` and `has_more=false` instead of a repeating `next_offset` |
+| `limit` / `offset` | `50` / `0` | Paging; `limit=0` = ceiling (10000); both clamped to 10000; the result stream ends at 10,000 hits — a page reaching it sets `truncated_by_ceiling` and `has_more=false` instead of a repeating `next_offset` (all output modes, including `target=symbols`, whose pages also set `truncated_by_ceiling` and carry the same ceiling sentence in `note`; a zero-hit page likewise ends the stream) |
 | `per_file_cap` | `20` | Hits shown per file; matches past the cap stay counted but appear on no page; `0` = no cap |
 | `max_line_chars` | `200` | Long lines are windowed around the match |
 | `timeout_ms` | `20000` | Time budget; `0` = none |

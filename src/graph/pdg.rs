@@ -1592,47 +1592,107 @@ impl ProgramDependenceGraph {
     /// identity, and a later `remove_node` — looking it up under the NEW
     /// path, which it was never inserted under — would leave a dangling
     /// entry that petgraph slot recycling can alias onto an unrelated node.
-    /// Returns `false` when the node does not exist or already carries the
-    /// path.
+    /// Re-path a single node, maintaining every index keyed on the file
+    /// path. Thin wrapper over [`Self::repath_nodes_to_file_path`]; see
+    /// there for the contract.
     pub fn repath_node(&mut self, node_id: NodeId, new_path: &str) -> bool {
-        let (name, node_id_str, old_path) = {
-            let Some(node) = self.graph.node_weight_mut(node_id) else {
-                return false;
-            };
-            if node.file_path.as_ref() == new_path {
-                return false;
+        self.repath_nodes_to_file_path(&[node_id], new_path) > 0
+    }
+
+    /// Re-path many nodes onto one file path in a single batched pass,
+    /// maintaining every index keyed on the file path (file_index,
+    /// name_file_index, trigram index).
+    ///
+    /// Batched because the trigram index's per-node removal ends with a
+    /// compaction walk of the ENTIRE trigram keyspace
+    /// (`TrigramIndex::remove_node` → `postings.retain`); removing N nodes
+    /// one `repath_node` at a time pays O(N x keyspace), the batch pays
+    /// O(N x trigrams-per-node + keyspace). The watcher delta path and
+    /// external-node normalization run this under the project write lock.
+    ///
+    /// A node already carrying `new_path` is not re-pathed (idempotent
+    /// re-run) but still gets its forward `file_index` entry repaired —
+    /// a weight-level write (the pre-`repath_node` mutation pattern this
+    /// function exists to replace) could have left the index without the
+    /// node under its current path. The stale backward entry such a write
+    /// leaves behind cannot be reconstructed: the weight no longer knows
+    /// the old path. Returns the number of nodes actually re-pathed (0
+    /// also covers "no such node").
+    pub fn repath_nodes_to_file_path(&mut self, node_ids: &[NodeId], new_path: &str) -> usize {
+        // First pass: mutate the weights, collecting the old identities the
+        // index updates need.
+        let mut moves: Vec<(NodeId, String, String, String)> = Vec::with_capacity(node_ids.len()); // (id, name, id string, old path)
+        for &node_id in node_ids {
+            let already_there = self
+                .graph
+                .node_weight(node_id)
+                .is_some_and(|node| node.file_path.as_ref() == new_path);
+            if already_there {
+                Self::repair_forward_file_entry(&mut self.file_index, node_id, new_path);
+                continue;
             }
+            let Some(node) = self.graph.node_weight_mut(node_id) else {
+                continue;
+            };
             let name = node.name.clone();
             let node_id_str = node.id.clone();
             let old_path = std::sync::Arc::clone(&node.file_path);
             node.file_path = std::sync::Arc::from(new_path);
-            (name, node_id_str, old_path)
-        };
+            moves.push((node_id, name, node_id_str, old_path.to_string()));
+        }
+        if moves.is_empty() {
+            return 0;
+        }
         self.touch();
-        // file_index: leave the old entry, join the new one.
-        if let Some(ids) = self.file_index.get_mut(&*old_path) {
-            ids.retain(|&id| id != node_id);
-            if ids.is_empty() {
-                self.file_index.remove(&*old_path);
+        for (node_id, name, _node_id_str, old_path) in &moves {
+            // file_index: leave the old entry, join the new one.
+            if let Some(ids) = self.file_index.get_mut(old_path.as_str()) {
+                ids.retain(|&id| id != *node_id);
+                if ids.is_empty() {
+                    self.file_index.remove(old_path.as_str());
+                }
             }
+            Self::repair_forward_file_entry(&mut self.file_index, *node_id, new_path);
+            // (name, file_path) lookup key moves with the path. GUARDED: the
+            // insert in `add_node` is last-wins, so when two nodes share
+            // (name, old_path) the surviving key may belong to the sibling —
+            // evicting it unconditionally would silently degrade the
+            // sibling's O(1) `(name, file)` lookup to the name_index +
+            // select_name_candidate fallback.
+            let old_key = (name.clone(), old_path.clone());
+            if self.name_file_index.get(&old_key) == Some(node_id) {
+                self.name_file_index.remove(&old_key);
+            }
+            self.name_file_index
+                .insert((name.clone(), new_path.to_string()), *node_id);
         }
-        match self.file_index.get_mut(new_path) {
-            Some(ids) => ids.push(node_id),
+        // Trigram index: one batched removal (one compaction walk) instead
+        // of one per node, then the per-node re-insert.
+        self.trigram_index.remove_nodes(&moves);
+        for (node_id, name, node_id_str, old_path) in &moves {
+            let _ = old_path;
+            self.trigram_index
+                .add_node(*node_id, name, node_id_str, new_path);
+        }
+        moves.len()
+    }
+
+    /// Ensure `file_index[new_path]` contains `node_id`.
+    fn repair_forward_file_entry(
+        file_index: &mut HashMap<String, Vec<NodeId>>,
+        node_id: NodeId,
+        new_path: &str,
+    ) {
+        match file_index.get_mut(new_path) {
+            Some(ids) => {
+                if !ids.contains(&node_id) {
+                    ids.push(node_id);
+                }
+            }
             None => {
-                self.file_index.insert(new_path.to_string(), vec![node_id]);
+                file_index.insert(new_path.to_string(), vec![node_id]);
             }
         }
-        // (name, file_path) lookup key moves with the path.
-        self.name_file_index
-            .remove(&(name.clone(), old_path.to_string()));
-        self.name_file_index
-            .insert((name.clone(), new_path.to_string()), node_id);
-        // The trigram index indexes the path's trigrams for fuzzy lookup.
-        self.trigram_index
-            .remove_node(node_id, &name, &node_id_str, &old_path);
-        self.trigram_index
-            .add_node(node_id, &name, &node_id_str, new_path);
-        true
     }
 
     /// Returns a mutable slice of all node weights.

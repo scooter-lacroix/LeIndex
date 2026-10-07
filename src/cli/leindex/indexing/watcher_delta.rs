@@ -447,21 +447,25 @@ impl LeIndex {
             let language = result.language.as_deref().unwrap_or("unknown");
             let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
             // Snapshot BEFORE removal: removing the file's nodes deletes every
-            // incident edge, including the cross-file ones this snapshot keeps.
+            // incident edge. Only the INCOMING half is snapshotted — an
+            // unedited caller's edge into the re-parsed file dies with the
+            // old node and nothing else can restore it. Outgoing
+            // relationships are regenerated after the merge, by the same
+            // cross-file resolution a full index runs (see below).
             let preserved = preserve_cross_file_edges(pdg, &file_path);
             index_builder::remove_file_from_pdg(pdg, &file_path)?;
+            // The scoped resolution below needs the call/flow facts of the
+            // re-extracted source; extraction consumes the signatures.
+            let file_signatures = result.signatures.clone();
             let file_pdg = crate::graph::extract_pdg_from_signatures(
                 result.signatures,
                 source_bytes,
                 &file_path,
                 language,
             );
-            // Intersect the outgoing half with what the re-extracted source
-            // actually still calls — while the fresh graph is at hand, before
-            // the merge consumes it.
-            let restorable = restorable_edges(preserved, &file_pdg);
             index_builder::merge_pdgs(pdg, file_pdg);
-            restore_cross_file_edges(pdg, restorable);
+            restore_cross_file_edges(pdg, preserved);
+            resolve_file_cross_file_edges(pdg, &file_path, file_signatures);
             if let Some(hash) = source_file_hashes.get(&file_path) {
                 if let Err(e) = crate::storage::pdg_store::update_indexed_file(
                     &mut self.storage,
@@ -581,8 +585,8 @@ impl LeIndex {
     }
 }
 
-/// A cross-file edge incident to a re-parsed file's nodes, snapshotted before
-/// the file's old nodes (and every incident edge) are removed.
+/// A cross-file edge pointing INTO a re-parsed file, snapshotted before the
+/// file's old nodes (and every incident edge) are removed.
 struct PreservedCrossFileEdge {
     /// `node.id` string of the endpoint inside the re-parsed file. Ids are
     /// deterministic per file (`file_path:qualified_name`), so the replacement
@@ -597,30 +601,27 @@ struct PreservedCrossFileEdge {
     other: crate::graph::pdg::NodeId,
     /// `node.id` string of `other` (the recycled-slot guard above).
     other_side_id: String,
-    /// The other endpoint's symbol name — the fresh-extraction match key for
-    /// outgoing edges.
-    other_name: String,
-    /// Whether the other endpoint is an external placeholder. Outgoing edges
-    /// to externals are left to the fresh extraction (which regenerates one
-    /// per still-existing call); only edges to real definitions are gated
-    /// and restored here.
-    other_is_external: bool,
-    /// `true` when the edge runs `other -> file_side` (an unedited caller's
-    /// edge into the re-parsed file).
-    incoming: bool,
     /// The original edge weight (type, call count, confidence, …).
     edge: crate::graph::pdg::Edge,
 }
 
-/// Snapshot every edge crossing the file boundary of `file_path`.
+/// Snapshot the cross-file edges pointing INTO `file_path` (an unedited
+/// caller's edge into the re-parsed file).
+///
+/// Outgoing relationships are deliberately NOT snapshotted: they are
+/// regenerated after the merge by [`resolve_file_cross_file_edges`] — the
+/// same cross-file resolution a full index runs — which restores exactly the
+/// calls and flows the edited source still makes and none of the removed
+/// ones. Snapshotted-and-gated restoration cannot do that: the per-file
+/// extraction produces no evidence for project callees (its unresolved
+/// non-std calls vanish silently), so no gate on the fresh graph can
+/// distinguish a surviving call from a removed one.
 ///
 /// Edges with both endpoints inside the file are skipped (the re-extraction
 /// recreates them) as are edges touching neither the file nor its nodes.
-/// Both directions are captured: an unchanged caller's edge into the edited
-/// file dies with the edited file's old node, and so does the edited file's
-/// own resolved edge into another file's definition. Node membership comes
-/// from the file index (O(nodes in file)) rather than a full graph scan —
-/// this runs under the project write lock on the file-save path.
+/// Node membership comes from the file index (O(nodes in file)) rather than
+/// a full graph scan — this runs under the project write lock on the
+/// file-save path.
 fn preserve_cross_file_edges(
     pdg: &crate::graph::pdg::ProgramDependenceGraph,
     file_path: &str,
@@ -635,36 +636,15 @@ fn preserve_cross_file_edges(
         };
         let from_in_file = file_nodes.contains(&from);
         let to_in_file = file_nodes.contains(&to);
-        if from_in_file == to_in_file {
+        if from_in_file == to_in_file || from_in_file {
+            // Both endpoints inside the file (re-extracted), or the edge
+            // runs OUT of the re-parsed file (regenerated by resolution).
             continue;
         }
-        let (file_side_id, other, other_side_id, other_name, other_is_external, incoming) =
-            if from_in_file {
-                let Some(node) = pdg.get_node(to) else {
-                    continue;
-                };
-                (
-                    pdg.get_node(from).map(|n| n.id.to_string()),
-                    to,
-                    node.id.to_string(),
-                    node.name.to_string(),
-                    node.node_type == crate::graph::pdg::NodeType::External,
-                    false,
-                )
-            } else {
-                let Some(node) = pdg.get_node(from) else {
-                    continue;
-                };
-                (
-                    pdg.get_node(to).map(|n| n.id.to_string()),
-                    from,
-                    node.id.to_string(),
-                    node.name.to_string(),
-                    node.node_type == crate::graph::pdg::NodeType::External,
-                    true,
-                )
-            };
-        let Some(file_side_id) = file_side_id else {
+        let Some(node) = pdg.get_node(from) else {
+            continue;
+        };
+        let Some(file_side_id) = pdg.get_node(to).map(|n| n.id.to_string()) else {
             continue;
         };
         let Some(edge) = pdg.get_edge(edge_id) else {
@@ -672,79 +652,39 @@ fn preserve_cross_file_edges(
         };
         preserved.push(PreservedCrossFileEdge {
             file_side_id,
-            other,
-            other_side_id,
-            other_name,
-            other_is_external,
-            incoming,
+            other: from,
+            other_side_id: node.id.to_string(),
             edge: edge.clone(),
         });
     }
     preserved
 }
 
-/// Drop the snapshot's outgoing half that the re-extracted source no longer
-/// supports, so the restore cannot resurrect calls the edit removed.
-///
-/// * Incoming edges are kept: the caller was not re-parsed, so its edge into
-///   the edited file genuinely died with the edited file's old node.
-/// * Outgoing edges to EXTERNAL placeholders are dropped: the fresh per-file
-///   extraction regenerates one for every call that still exists (and the
-///   resident placeholder may carry an annotated `<id>@<version>` id that no
-///   longer resolves through `symbol_index` anyway).
-/// * Outgoing edges to REAL definitions in other files are kept only when
-///   the fresh graph still shows that call — i.e. it contains an edge from
-///   the same source node to an external placeholder whose target's trailing
-///   segment names the same definition. The fresh per-file graph is the
-///   authority on what the edited source calls now; resolution against the
-///   definitions is left to the next full reindex, as before.
-fn restorable_edges(
-    preserved: Vec<PreservedCrossFileEdge>,
-    file_pdg: &crate::graph::pdg::ProgramDependenceGraph,
-) -> Vec<PreservedCrossFileEdge> {
-    use petgraph::visit::EdgeRef;
-    preserved
+/// Resolve the re-parsed file's outgoing cross-file edges against the merged
+/// graph — the watcher-delta equivalent of the post-merge
+/// `resolve_cross_file_call_edges_for_files` /
+/// `resolve_cross_file_flow_edges_for_files` passes a full index runs over
+/// every signature at once, scoped to this file because every other file's
+/// relationships are already durable. The per-file extraction resolves calls
+/// against LOCAL symbols only, so without this pass a call into another file
+/// would surface no edge until the next full reindex.
+fn resolve_file_cross_file_edges(
+    pdg: &mut crate::graph::pdg::ProgramDependenceGraph,
+    file_path: &str,
+    signatures: Vec<crate::parse::traits::SignatureInfo>,
+) {
+    let scoped: Vec<(String, crate::parse::traits::SignatureInfo)> = signatures
         .into_iter()
-        .filter(|edge| {
-            if edge.incoming {
-                return true;
-            }
-            if edge.other_is_external {
-                // The fresh extraction regenerates one placeholder edge per
-                // still-existing call — re-attaching the snapshot would
-                // duplicate it.
-                return false;
-            }
-            // Placeholder targets reachable from the same source node in the
-            // fresh extraction.
-            let Some(source) = file_pdg.find_by_id(&edge.file_side_id) else {
-                return false;
-            };
-            file_pdg.graph.edges(source).any(|reference| {
-                let Some(node) = file_pdg.get_node(reference.target()) else {
-                    return false;
-                };
-                node.node_type == crate::graph::pdg::NodeType::External
-                    && placeholder_targets(&node.id, &edge.other_name)
-            })
-        })
-        .collect()
+        .map(|signature| (file_path.to_string(), signature))
+        .collect();
+    crate::graph::resolve_cross_file_call_edges_for_files(pdg, &scoped);
+    crate::graph::resolve_cross_file_flow_edges_for_files(pdg, &scoped);
 }
 
-/// Whether an `external::<target>` placeholder id names `symbol`: the target
-/// is the call-site text, so a bare call shares the name and a qualified
-/// call (`module::name`) ends in `::name`.
-fn placeholder_targets(external_id: &str, symbol: &str) -> bool {
-    let target = external_id
-        .strip_prefix("external::")
-        .unwrap_or(external_id);
-    target == symbol || target.ends_with(&format!("::{symbol}"))
-}
-
-/// Re-attach the filtered cross-file edges onto the re-merged graph.
+/// Re-attach the snapshotted incoming edges onto the re-merged graph.
 ///
 /// The file side must have survived the edit (resolved by its deterministic
-/// id string); the other side is used through its carried `NodeId` — the
+/// id string); the caller side is used through its carried `NodeId` — the
 /// untouched endpoint survives this delta — but only while the node it now
 /// points at still carries the snapshotted id, guarding against petgraph
 /// slot recycling when later files in the same batch re-merge. Returns the
@@ -769,18 +709,13 @@ fn restore_cross_file_edges(
         let Some(other_side) = other_side else {
             continue;
         };
-        let (from, to) = if edge.incoming {
-            (other_side, file_side)
-        } else {
-            (file_side, other_side)
-        };
-        let already_present = pdg.graph.edges(from).any(|reference| {
-            reference.target() == to && reference.weight().edge_type == edge.edge.edge_type
+        let already_present = pdg.graph.edges(other_side).any(|reference| {
+            reference.target() == file_side && reference.weight().edge_type == edge.edge.edge_type
         });
         if already_present {
             continue;
         }
-        pdg.add_edge(from, to, edge.edge);
+        pdg.add_edge(other_side, file_side, edge.edge);
         restored += 1;
     }
     restored
@@ -822,6 +757,27 @@ mod tests {
             .any(|reference| reference.target() == to && reference.weight().edge_type == *edge_type)
     }
 
+    /// Minimal real signature for `extract_pdg_from_signatures`: the node id
+    /// it produces is `format!("{file}:{qualified_name}")`, matching the
+    /// deterministic ids the delta contract relies on.
+    fn signature(name: &str, calls: Vec<&str>) -> crate::parse::traits::SignatureInfo {
+        crate::parse::traits::SignatureInfo {
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            parameters: Vec::new(),
+            return_type: None,
+            visibility: crate::parse::traits::Visibility::Public,
+            is_async: false,
+            is_method: false,
+            docstring: None,
+            calls: calls.into_iter().map(str::to_string).collect(),
+            imports: Vec::new(),
+            byte_range: (0, 0),
+            cyclomatic_complexity: 0,
+            flow_facts: Vec::new(),
+        }
+    }
+
     /// The watcher-delta contract, incoming half (round-8 Codex P1, reworked
     /// in round 9): removing a re-parsed file's nodes deletes every incident
     /// edge, so an unedited caller's edge INTO the file must be snapshotted
@@ -842,8 +798,7 @@ mod tests {
 
         let preserved = preserve_cross_file_edges(&pdg, "a.rs");
         assert_eq!(preserved.len(), 1);
-        assert!(preserved[0].incoming);
-        assert_eq!(preserved[0].other_name, "caller");
+        assert_eq!(preserved[0].other_side_id, "b.rs:caller");
 
         pdg.remove_file("a.rs");
         assert!(
@@ -864,156 +819,171 @@ mod tests {
         );
     }
 
-    /// The outgoing half: an edge from the edited file to a real definition
-    /// in another file is restored ONLY when the re-extracted source still
-    /// makes that call — evidenced by an external placeholder edge from the
-    /// same source node whose target names the callee. Without the evidence
-    /// the edge must NOT be resurrected (it was the old graph's stale truth,
-    /// not the edited source's).
+    /// The outgoing half (round-10 Kilo CRITICAL): the edited file's cross-
+    /// file call into another file's definition must SURVIVE the delta when
+    /// the re-extracted source still makes the call. The round-9 gate could
+    /// never fire — per-file extraction resolves against LOCAL symbols only,
+    /// so a project callee produces no placeholder evidence — and dropped
+    /// every such edge. The fix regenerates them by running the same
+    /// cross-file resolution a full index runs, scoped to this file's real
+    /// signatures, against the merged graph. This test uses the real
+    /// extractor; no hand-built placeholder fixtures.
     #[test]
-    fn test_outgoing_edges_are_gated_on_the_reextracted_calls() {
+    fn test_outgoing_cross_file_call_edges_are_regenerated_after_a_remerge() {
         let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
         let main = pdg.add_node(symbol("a.rs:main", "a.rs", "main", NodeType::Function));
         let helper = pdg.add_node(symbol("b.rs:helper", "b.rs", "helper", NodeType::Function));
         pdg.add_edge(main, helper, call_edge());
+
+        // Outgoing edges are not snapshotted: regeneration is resolution's job.
         let preserved = preserve_cross_file_edges(&pdg, "a.rs");
-        assert_eq!(preserved.len(), 1);
+        assert!(preserved.is_empty(), "only incoming edges are snapshotted");
         pdg.remove_file("a.rs");
-
-        // Fresh extraction that STILL calls helper: placeholder edge present.
-        let mut file_pdg = crate::graph::pdg::ProgramDependenceGraph::new();
-        let fresh_main = file_pdg.add_node(symbol("a.rs:main", "a.rs", "main", NodeType::Function));
-        let fresh_ext = file_pdg.add_node(Node {
-            language: "external".to_string(),
-            ..symbol(
-                "external::helper",
-                "<external>",
-                "helper",
-                NodeType::External,
-            )
-        });
-        file_pdg.add_edge(fresh_main, fresh_ext, call_edge());
-        assert_eq!(
-            restorable_edges(preserved, &file_pdg).len(),
-            1,
-            "the call still exists — keep the edge"
-        );
-        // The drop-without-evidence half lives in
-        // test_outgoing_gate_requires_a_matching_placeholder_target.
-        let _ = helper;
-        let _ = main;
-    }
-
-    /// (Continuation of the gate test kept separate for clarity: the edge is
-    /// restored end-to-end when the fresh extraction still calls the target.)
-    #[test]
-    fn test_outgoing_edge_restored_when_call_still_exists() {
-        let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
-        let main = pdg.add_node(symbol("a.rs:main", "a.rs", "main", NodeType::Function));
-        let helper = pdg.add_node(symbol("b.rs:helper", "b.rs", "helper", NodeType::Function));
-        pdg.add_edge(main, helper, call_edge());
-        let preserved = preserve_cross_file_edges(&pdg, "a.rs");
-        pdg.remove_file("a.rs");
-
-        let mut file_pdg = crate::graph::pdg::ProgramDependenceGraph::new();
-        let fresh_main = file_pdg.add_node(symbol("a.rs:main", "a.rs", "main", NodeType::Function));
-        let fresh_ext = file_pdg.add_node(Node {
-            language: "external".to_string(),
-            ..symbol(
-                "external::helper",
-                "<external>",
-                "helper",
-                NodeType::External,
-            )
-        });
-        file_pdg.add_edge(fresh_main, fresh_ext, call_edge());
-        let restorable = restorable_edges(preserved, &file_pdg);
-        assert_eq!(restorable.len(), 1);
-
-        let main_new = pdg.add_node(symbol("a.rs:main", "a.rs", "main", NodeType::Function));
-        assert_eq!(restore_cross_file_edges(&mut pdg, restorable), 1);
-        assert!(has_edge(&pdg, main_new, helper, &EdgeType::Call));
-
-        // Fresh extraction with the call REMOVED: no matching placeholder
-        // evidence, and the stale edge must not come back.
-        let preserved2 = preserve_cross_file_edges(&pdg, "a.rs");
-        pdg.remove_file("a.rs");
-        let mut edited_pdg = crate::graph::pdg::ProgramDependenceGraph::new();
-        let edited_main =
-            edited_pdg.add_node(symbol("a.rs:main", "a.rs", "main", NodeType::Function));
-        let other_ext = edited_pdg.add_node(Node {
-            language: "external".to_string(),
-            ..symbol("external::other", "<external>", "other", NodeType::External)
-        });
-        edited_pdg.add_edge(edited_main, other_ext, call_edge());
-        let restorable2 = restorable_edges(preserved2, &edited_pdg);
         assert!(
-            restorable2.is_empty(),
-            "the edited source no longer calls helper — the edge must not be resurrected"
+            !has_edge(&pdg, main, helper, &EdgeType::Call),
+            "premise: removal kills the edited file's outgoing edge"
+        );
+
+        // The REAL per-file extraction of the edited source, which still
+        // calls helper: per-file extraction resolves against LOCAL symbols
+        // only, so the fresh graph holds no edge to b.rs:helper — the exact
+        // evidence the round-9 gate demanded and could never get.
+        let signatures = vec![signature("main", vec!["helper"])];
+        let file_pdg =
+            crate::graph::extract_pdg_from_signatures(signatures.clone(), &[], "a.rs", "rust");
+        let fresh_main = file_pdg.find_by_id("a.rs:main");
+        assert!(fresh_main.is_some(), "premise: the caller was re-extracted");
+        assert!(
+            file_pdg.find_by_id("b.rs:helper").is_none(),
+            "premise: per-file extraction holds no node for another file's definition"
+        );
+
+        index_builder::merge_pdgs(&mut pdg, file_pdg);
+        restore_cross_file_edges(&mut pdg, preserved);
+        resolve_file_cross_file_edges(&mut pdg, "a.rs", signatures);
+
+        let main_new = pdg
+            .find_by_id("a.rs:main")
+            .expect("the merged graph keeps the caller");
+        assert!(
+            has_edge(&pdg, main_new, helper, &EdgeType::Call),
+            "the still-existing call must be resolved against the resident definition"
         );
     }
 
-    /// The gate is precise: a placeholder naming a DIFFERENT function is not
-    /// evidence for this edge.
+    /// The edit removed the call: resolution runs against the fresh source's
+    /// signatures, so the stale edge must NOT come back (the old graph's
+    /// truth is not the edited source's).
     #[test]
-    fn test_outgoing_gate_requires_a_matching_placeholder_target() {
+    fn test_removed_calls_are_not_resurrected_by_the_resolution() {
         let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
         let main = pdg.add_node(symbol("a.rs:main", "a.rs", "main", NodeType::Function));
         let helper = pdg.add_node(symbol("b.rs:helper", "b.rs", "helper", NodeType::Function));
         pdg.add_edge(main, helper, call_edge());
-        let preserved = preserve_cross_file_edges(&pdg, "a.rs");
         pdg.remove_file("a.rs");
 
-        let mut file_pdg = crate::graph::pdg::ProgramDependenceGraph::new();
-        let fresh_main = file_pdg.add_node(symbol("a.rs:main", "a.rs", "main", NodeType::Function));
-        let fresh_ext = file_pdg.add_node(Node {
-            language: "external".to_string(),
-            ..symbol(
-                "external::unrelated",
-                "<external>",
-                "unrelated",
-                NodeType::External,
-            )
-        });
-        file_pdg.add_edge(fresh_main, fresh_ext, call_edge());
+        // The edited source no longer calls helper — it calls something else.
+        let signatures = vec![signature("main", vec!["unrelated_local"])];
+        let file_pdg =
+            crate::graph::extract_pdg_from_signatures(signatures.clone(), &[], "a.rs", "rust");
+        index_builder::merge_pdgs(&mut pdg, file_pdg);
+        resolve_file_cross_file_edges(&mut pdg, "a.rs", signatures);
+
+        let main_new = pdg.find_by_id("a.rs:main").unwrap();
         assert!(
-            restorable_edges(preserved, &file_pdg).is_empty(),
-            "a call to `unrelated` is no evidence that `helper` is still called"
+            !has_edge(&pdg, main_new, helper, &EdgeType::Call),
+            "a removed call must not be resurrected"
         );
     }
 
-    /// Outgoing edges to external placeholders are dropped from the restore
-    /// set: the fresh extraction regenerates one per still-existing call, so
-    /// re-attaching the snapshot would duplicate it (and the resident
-    /// placeholder may carry an annotated id that no longer resolves).
+    /// Outgoing edges to external placeholders are the fresh extraction's
+    /// job (one per still-existing std/prelude call); the scoped resolution
+    /// must not add a second one.
     #[test]
-    fn test_outgoing_placeholder_edges_are_left_to_the_fresh_extraction() {
+    fn test_placeholder_edges_are_left_to_the_fresh_extraction() {
+        use petgraph::visit::EdgeRef;
         let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
         let main = pdg.add_node(symbol("a.rs:main", "a.rs", "main", NodeType::Function));
         let external = pdg.add_node(Node {
             language: "external".to_string(),
-            ..symbol("external::log", "<external>", "log", NodeType::External)
+            ..symbol(
+                "external::std.fs.read",
+                "<external>",
+                "std.fs.read",
+                NodeType::External,
+            )
         });
         pdg.add_edge(main, external, call_edge());
-        let preserved = preserve_cross_file_edges(&pdg, "a.rs");
-        assert_eq!(preserved.len(), 1);
+        pdg.remove_file("a.rs");
 
-        // Fresh extraction regenerates the call.
-        let mut file_pdg = crate::graph::pdg::ProgramDependenceGraph::new();
-        let fresh_main = file_pdg.add_node(symbol("a.rs:main", "a.rs", "main", NodeType::Function));
-        let fresh_ext = file_pdg.add_node(Node {
-            language: "external".to_string(),
-            ..symbol("external::log", "<external>", "log", NodeType::External)
-        });
-        file_pdg.add_edge(fresh_main, fresh_ext, call_edge());
+        // Real extraction: `std::fs::read` is an external call target, so the
+        // per-file graph regenerates the placeholder edge itself (the target
+        // is dot-normalized: `external::std.fs.read`).
+        let signatures = vec![signature("main", vec!["std::fs::read"])];
+        let file_pdg =
+            crate::graph::extract_pdg_from_signatures(signatures.clone(), &[], "a.rs", "rust");
         assert!(
-            restorable_edges(preserved, &file_pdg).is_empty(),
-            "the placeholder edge is the extraction's job"
+            file_pdg.find_by_id("external::std.fs.read").is_some(),
+            "premise: per-file extraction emits the normalized std placeholder"
+        );
+        index_builder::merge_pdgs(&mut pdg, file_pdg);
+        resolve_file_cross_file_edges(&mut pdg, "a.rs", signatures);
+
+        let main_new = pdg.find_by_id("a.rs:main").unwrap();
+        let placeholder = pdg.find_by_id("external::std.fs.read").unwrap();
+        let call_edges = pdg
+            .graph
+            .edges(main_new)
+            .filter(|reference| {
+                reference.target() == placeholder && reference.weight().edge_type == EdgeType::Call
+            })
+            .count();
+        assert_eq!(
+            call_edges, 1,
+            "exactly one placeholder edge: the extraction's, not a resolved duplicate"
         );
     }
 
-    /// An incoming edge whose caller vanished (symbol renamed/removed in the
-    /// other file) is dropped, not re-attached to a stale node.
+    /// The slot-recycling guard has real coverage (round-10 Kilo): `other`
+    /// is carried as a NodeId because the caller's file is untouched by THIS
+    /// delta — but a later file in the same batch can vacate that slot and
+    /// re-add a different node into it. The guard must reject the recycled
+    /// alias, and the id-string fallback must then find nothing (the caller
+    /// really is gone).
+    #[test]
+    fn test_restore_rejects_a_recycled_other_side_slot() {
+        let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
+        let caller = pdg.add_node(symbol("a.rs:main", "a.rs", "main", NodeType::Function));
+        let callee = pdg.add_node(symbol("b.rs:helper", "b.rs", "helper", NodeType::Function));
+        pdg.add_edge(caller, callee, call_edge());
+
+        let preserved = preserve_cross_file_edges(&pdg, "b.rs");
+        assert_eq!(preserved.len(), 1);
+
+        // A later batch file re-merges a.rs: the caller's slot is vacated
+        // and recycled by an unrelated node.
+        pdg.remove_file("a.rs");
+        let recycled = pdg.add_node(symbol(
+            "a.rs:unrelated",
+            "a.rs",
+            "unrelated",
+            NodeType::Function,
+        ));
+        assert_eq!(
+            preserved[0].other, recycled,
+            "premise: petgraph recycled the vacated slot for the new node"
+        );
+
+        assert_eq!(
+            restore_cross_file_edges(&mut pdg, preserved),
+            0,
+            "the carried NodeId now aliases an unrelated node — the edge must be dropped"
+        );
+    }
+
+    /// An incoming edge whose caller vanished without slot recycling
+    /// (symbol removed in the other file, nothing re-added) is dropped via
+    /// the id-string fallback, not re-attached to a stale node.
     #[test]
     fn test_restore_drops_edges_whose_other_side_vanished() {
         let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
@@ -1023,16 +993,8 @@ mod tests {
 
         let preserved = preserve_cross_file_edges(&pdg, "b.rs");
         assert_eq!(preserved.len(), 1);
-        assert!(preserved[0].incoming, "b.rs's node is the edge target");
 
-        pdg.remove_file("b.rs");
-        // The replacement b.rs no longer defines `helper` — only a renamed one.
-        let _replacement = pdg.add_node(symbol(
-            "b.rs:renamed",
-            "b.rs",
-            "renamed",
-            NodeType::Function,
-        ));
+        pdg.remove_file("a.rs");
         assert_eq!(restore_cross_file_edges(&mut pdg, preserved), 0);
     }
 }

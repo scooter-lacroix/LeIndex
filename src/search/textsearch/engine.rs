@@ -612,6 +612,12 @@ pub struct SearchOutput {
     pub complete: bool,
     /// More hits exist beyond `offset + limit`.
     pub has_more: bool,
+    /// The scan ended at the time budget with no window stop: the only
+    /// situation where `complete == false` is the deadline's doing (a
+    /// window/page stop pairs `has_more` with `complete = false` itself).
+    /// `complete` alone cannot distinguish the two causes — the MCP layer
+    /// needs this to name the reason a page looks final.
+    pub stopped_by_deadline: bool,
     /// Hits returned.
     pub returned: usize,
     /// Matches buffered for this page that the per-file cap dropped. A
@@ -1080,6 +1086,7 @@ pub fn search(roots: &[RootSpec], compiled: &Compiled, options: &SearchOptions) 
     if !output.has_more && !output.complete {
         // Stopped by the deadline, not by the window.
         output.has_more = true;
+        output.stopped_by_deadline = true;
     }
     output.stats.millis = started.elapsed().as_millis();
     output

@@ -148,19 +148,24 @@ impl GenerationLease {
                 // The FIRST persist already committed the positive counts and
                 // the hold to the sidecar, so this rollback write MUST land:
                 // if it fails, the on-disk state keeps phantom pins with no
-                // GenerationLease to release them (Drop never runs), and
-                // reclaim_dead_owners cannot repair it while this process
-                // lives. The caller still gets GenerationPruned — the
-                // generation IS gone — but the failure is loud, and the next
-                // successful persist through any handle flushes these
-                // pending rollback deltas.
+                // GenerationLease to release them (Drop never runs). The
+                // repair paths are narrow: a later successful persist through
+                // THIS handle reapplies its pending rollback deltas — persists
+                // through OTHER handles re-assert this handle's sidecar entry
+                // verbatim, because a same-pid owner is live by definition and
+                // `reclaim_dead_owners` never subtracts it — or process exit,
+                // after which the owner is dead and any peer's
+                // `reclaim_if_needed` subtracts the phantom holdings. While
+                // they survive, GC can never free the pinned blobs.
                 if let Err(error) = s.persist() {
                     tracing::error!(
                         generation = manifest.generation,
                         %error,
                         "generation lease rollback (pruned): persist FAILED — \
-                         phantom refcounts/hold may remain durably pinned until \
-                         another persist through any handle succeeds"
+                         phantom refcounts/hold remain durably pinned; they are \
+                         repaired only by a later successful persist through THIS \
+                         same handle or by process exit (a peer's dead-owner reclaim), \
+                         not by persists through other handles"
                     );
                 }
                 return Err(LeaseError::GenerationPruned {

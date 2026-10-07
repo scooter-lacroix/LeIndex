@@ -93,13 +93,17 @@ pub(crate) fn normalize_external_nodes(pdg: &mut ProgramDependenceGraph) {
             is_external && node.node_type != NodeType::External
         })
         .collect();
-    let migrated = to_migrate.len();
-    for idx in to_migrate {
-        if let Some(node) = pdg.get_node_mut(idx) {
+    for idx in &to_migrate {
+        if let Some(node) = pdg.get_node_mut(*idx) {
             node.node_type = NodeType::External;
         }
-        pdg.repath_node(idx, crate::graph::pdg::EXTERNAL_NODE_FILE_PATH);
     }
+    // One batched re-path (round-10 Kilo): per-node `repath_node` calls paid
+    // a whole-trigram-keyspace compaction walk each; the batch runs it once.
+    // This runs on the project write lock in the watcher delta path and
+    // again during persistence fingerprinting, so the factor is real.
+    let migrated =
+        pdg.repath_nodes_to_file_path(&to_migrate, crate::graph::pdg::EXTERNAL_NODE_FILE_PATH);
     if migrated > 0 {
         info!(
             "Normalized {} external nodes to NodeType::External",

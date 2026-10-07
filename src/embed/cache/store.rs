@@ -93,6 +93,12 @@ pub struct CacheCompactionReport {
     pub rows_removed: u64,
     /// Number of rows retained (have live project references).
     pub rows_retained: u64,
+    /// Number of abandoned staging files removed (a crashed writer's
+    /// uniquely-named `<...>.partial`, under either the current or the
+    /// pre-rename convention). These were previously invisible to every
+    /// counter and unreclaimable — no detector claimed them and both
+    /// `gc_row` and eviction bail out in `hex_decode`.
+    pub staging_files_removed: u64,
 }
 
 /// Telemetry counters for the embedding cache (spec section 10.3).
@@ -755,12 +761,10 @@ impl GlobalEmbeddingCache {
             if entry.file_type()?.is_dir() {
                 for sub_entry in fs::read_dir(entry.path())? {
                     let sub_entry = sub_entry?;
-                    if sub_entry.file_type()?.is_file()
-                        && !sub_entry
-                            .file_name()
-                            .to_string_lossy()
-                            .ends_with(".partial")
-                    {
+                    // Same predicate as every other detector (see
+                    // `is_row_file`) — a name that does not hex-decode is a
+                    // staging file or junk, never a row.
+                    if is_row_file(&sub_entry.path()) {
                         count += 1;
                     }
                 }
@@ -786,8 +790,30 @@ impl GlobalEmbeddingCache {
             if !entry.file_type()?.is_dir() {
                 continue;
             }
-            for path in row_file_paths(fs::read_dir(entry.path())?)? {
-                self.gc_row(&path, &mut report);
+            for sub_entry in fs::read_dir(entry.path())? {
+                let path = sub_entry?.path();
+                if !path.is_file() {
+                    continue;
+                }
+                if hex_decode(&path.file_name().unwrap_or_default().to_string_lossy()).is_some() {
+                    self.gc_row(&path, &mut report);
+                    continue;
+                }
+                // Not a real row: an abandoned staging file under either the
+                // current (`<hex>.<pid>.<seq>.partial`) or the intermediate
+                // (`<hex>.partial.<pid>.<seq>`) naming convention, or junk.
+                // It can never be referenced (refs key on the fingerprint
+                // hex) and `gc_row`/eviction both bail out in `hex_decode`,
+                // so it would otherwise be charged against the byte budget
+                // forever while eviction freed live rows to make room for
+                // the phantom. Like the CAS cleanup sweep, this runs on the
+                // explicit maintenance path only — a live writer's staging
+                // file is mid-flight and its loss is a retried miss.
+                let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                if fs::remove_file(&path).is_ok() {
+                    report.staging_files_removed += 1;
+                    report.reclaimed_bytes += size;
+                }
             }
         }
 
@@ -1054,11 +1080,13 @@ impl GlobalEmbeddingCache {
                 for sub_entry in fs::read_dir(entry.path())? {
                     let sub_entry = sub_entry?;
                     let path = sub_entry.path();
-                    // Extension check, NOT `Path::ends_with(".partial")`:
-                    // that is a whole-component comparison and is never true
-                    // for a `x.partial` suffix, which permanently charged
-                    // staging bytes against the budget here.
-                    if path.is_file() && !path.extension().is_some_and(|ext| ext == "partial") {
+                    // Same predicate as every other detector (see
+                    // `is_row_file`): a real row's name is its fingerprint
+                    // hex. The old extension check — and the pre-rename
+                    // `<hex>.partial.<pid>.<seq>` staging spelling whose
+                    // extension is the seq — would charge staging bytes
+                    // against the budget here, permanently.
+                    if is_row_file(&path) {
                         total += fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     }
                 }
@@ -1096,14 +1124,34 @@ fn staging_path_for(final_path: &Path) -> PathBuf {
     final_path.with_file_name(name)
 }
 
-/// Collect the real row files (skipping `.partial` staging files) from a
-/// row-shard directory, propagating directory-read errors to the caller.
+/// Whether `path` names a real cache row: the filename IS the row's
+/// fingerprint hex (64 chars — `hex_decode` enforces exactly that).
+/// Staging files never satisfy this under EITHER naming convention — the
+/// current `<hex>.<pid>.<seq>.partial` (extension `partial`) or the
+/// intermediate `<hex>.partial.<pid>.<seq>` it replaced (extension `seq`) —
+/// and a name that does not hex-decode can never be gc'd or evicted (both
+/// bail in `hex_decode`), so every row detector must agree on this
+/// predicate: counting such a file in `row_count`/`total_bytes` charges a
+/// permanently unfreeable phantom against the byte budget while
+/// `row_file_paths` hands it to callers that silently drop it.
+fn is_row_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(hex_decode)
+            .is_some()
+}
+
+/// Collect the real row files (skipping staging files and any non-hex junk)
+/// from a row-shard directory, propagating directory-read errors to the
+/// caller.
 fn row_file_paths(shard: fs::ReadDir) -> Result<Vec<PathBuf>, CacheError> {
     let mut paths = Vec::new();
     for sub_entry in shard {
         let sub_entry = sub_entry?;
         let path = sub_entry.path();
-        if path.extension().is_some_and(|ext| ext == "partial") || !path.is_file() {
+        if !is_row_file(&path) {
             continue;
         }
         paths.push(path);

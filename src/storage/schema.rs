@@ -1,7 +1,7 @@
 // Storage schema and database management
 
 use crate::storage::{ProjectMetadata, UniqueProjectId};
-use rusqlite::{Connection, OpenFlags, Result as SqliteResult};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -784,11 +784,20 @@ impl Storage {
     /// from freed space, and startup migrations run outside the
     /// cross-process write lock), so a peer committing a sentinel row at or
     /// below the cursor mid-sweep would otherwise be skipped permanently
-    /// once the schema version advances. One cursorless verification
-    /// therefore follows every sweep; a non-empty check (however unlikely —
-    /// only a peer that skipped its own migration could write sentinels
-    /// here) logs loudly and runs exactly one more sweep instead of
-    /// silently advancing the version over unrepaired rows.
+    /// once the schema version advances. One existence verification
+    /// therefore follows every sweep (`SELECT 1 ... LIMIT 1` — the rare
+    /// failure path stops at the first row; the happy path pays one bounded
+    /// column scan instead of a full COUNT aggregate, which would re-read
+    /// the largest table in the store on every upgrade); a match (however
+    /// unlikely — only a peer that skipped its own migration could write
+    /// sentinels here) logs loudly and runs exactly one more sweep instead
+    /// of silently advancing the version over unrepaired rows.
+    ///
+    /// Rows whose fallback column is itself `''` are OUTSIDE the backfill's
+    /// repair scope by construction (there is nothing to copy), so every
+    /// predicate excludes them: counting them would make the verification
+    /// unsatisfiable — and since the tail below is now a hard error, a
+    /// store carrying such rows could never open again.
     fn backfill_column_batched(&mut self, column: &str, fallback: &str) -> SqliteResult<()> {
         if !matches!(
             (column, fallback),
@@ -813,7 +822,8 @@ impl Storage {
                 let upper: Option<i64> = self.conn.query_row(
                     &format!(
                         "SELECT MAX(id) FROM (SELECT id FROM intel_nodes \
-                         WHERE {column} = '' AND id > ?1 ORDER BY id LIMIT {BATCH_ROWS})"
+                         WHERE {column} = '' AND {fallback} <> '' AND id > ?1 \
+                         ORDER BY id LIMIT {BATCH_ROWS})"
                     ),
                     rusqlite::params![cursor],
                     |row| row.get(0),
@@ -824,23 +834,30 @@ impl Storage {
                 self.conn.execute(
                     &format!(
                         "UPDATE intel_nodes SET {column} = {fallback} \
-                         WHERE {column} = '' AND id > ?1 AND id <= ?2"
+                         WHERE {column} = '' AND {fallback} <> '' AND id > ?1 AND id <= ?2"
                     ),
                     rusqlite::params![cursor, upper],
                 )?;
                 cursor = upper;
             }
-            // Cursorless verification sweep.
-            let remaining: i64 = self.conn.query_row(
-                &format!("SELECT COUNT(*) FROM intel_nodes WHERE {column} = ''"),
-                [],
-                |row| row.get(0),
-            )?;
-            if remaining == 0 {
+            // Cursorless existence verification: stops at the first
+            // unrepaired row instead of aggregating the whole table.
+            let remaining: Option<i64> = self
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT 1 FROM intel_nodes \
+                         WHERE {column} = '' AND {fallback} <> '' LIMIT 1"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if remaining.is_none() {
                 return Ok(());
             }
             eprintln!(
-                "backfill {column}: {remaining} sentinel row(s) appeared outside cursor sweep \
+                "backfill {column}: sentinel row(s) appeared outside cursor sweep \
                  #{sweep} (concurrent writer at or below the cursor?); re-running the sweep"
             );
         }
@@ -1115,6 +1132,59 @@ mod tests {
                 ("beta".to_string(), "kept".to_string()),
             ],
             "the empty sentinel is backfilled on upgrade; a real qualified_name is untouched"
+        );
+    }
+
+    /// A row whose fallback column is itself `''` has nothing to backfill
+    /// FROM — it is outside the backfill's repair scope by construction, and
+    /// (round-10 Kilo) must NOT make the verification unsatisfiable: since
+    /// the unfinished-backfill tail is a hard error (round-10 Codex P2), a
+    /// store carrying such rows would otherwise fail `Storage::open` on
+    /// every subsequent run instead of opening and leaving them in place.
+    #[test]
+    fn test_backfill_ignores_rows_with_an_empty_fallback_value() {
+        let temp_file = NamedTempFile::new().unwrap();
+        {
+            let conn = rusqlite::Connection::open(temp_file.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (key TEXT PRIMARY KEY, version INTEGER NOT NULL);
+                 INSERT INTO schema_version (key, version) VALUES ('schema', 4);
+                 CREATE TABLE intel_nodes (
+                     id INTEGER PRIMARY KEY,
+                     project_id TEXT NOT NULL,
+                     file_path TEXT NOT NULL,
+                     node_id TEXT NOT NULL,
+                     symbol_name TEXT NOT NULL,
+                     qualified_name TEXT DEFAULT '',
+                     node_type TEXT NOT NULL
+                 );
+                 INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, node_type)
+                 VALUES ('proj', 'a.rs', 'a-symbol', 'alpha', '', 'Function'),
+                        ('proj', 'z.rs', 'z-symbol', '', '', 'Function');",
+            )
+            .unwrap();
+        }
+
+        let storage = Storage::open(temp_file.path())
+            .expect("an unrepairable (empty fallback) row must not fail the open");
+
+        let rows: Vec<(String, String)> = {
+            let mut stmt = storage
+                .conn()
+                .prepare("SELECT symbol_name, qualified_name FROM intel_nodes ORDER BY symbol_name")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                (String::new(), String::new()),
+                ("alpha".to_string(), "alpha".to_string()),
+            ],
+            "the repairable sentinel is backfilled; the unrepairable row is left in place"
         );
     }
 

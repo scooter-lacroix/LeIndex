@@ -186,12 +186,17 @@ fn run_reindex(handle: ProjectHandle) -> ReindexOutcome {
             // spawn_blocking for the peer's whole run (and with it the
             // watcher's `reindex_active` flag), so probe first: a peer that
             // holds the lock is publishing a fresh index that makes the
-            // escalation redundant — skip, and the next debounce tick sees
-            // the hydrated state. The probe-then-escalate window is not
-            // airtight (a peer can grab the lock between the probe and
-            // `index_project`'s own acquire); in that residual race the
-            // escalation blocks for the peer's run — bounded, rare, and the
-            // same behavior a forced index documents.
+            // escalation redundant — skip, and RETRY on the next debounce
+            // tick: the `Skipped` arm re-arms `dirty`, so once the peer goes
+            // idle this watcher re-runs the incremental attempt and, still
+            // not hydrated, escalates again — this time acquiring the lock.
+            // A peer's publish never hydrates THIS process's resident graph;
+            // only this process's own full index does that. The
+            // probe-then-escalate window is not airtight (a peer can grab
+            // the lock between the probe and `index_project`'s own
+            // acquire); in that residual race the escalation blocks for
+            // the peer's run — bounded, rare, and the same behavior a
+            // forced index documents.
             match idx.try_acquire_write_lock() {
                 Ok(Some(_probe)) => {}
                 Ok(None) => {

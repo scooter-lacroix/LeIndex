@@ -1096,3 +1096,54 @@ fn test_staging_path_is_unique_per_call_and_trailing_partial() {
         "pid is part of the unique suffix: {first}"
     );
 }
+
+/// Round-10 Kilo: staging files under BOTH naming conventions must be
+/// invisible to every row detector and reclaimable by gc. The intermediate
+/// `<hex>.partial.<pid>.<seq>` spelling (extension = seq) used to count as a
+/// real row everywhere: its bytes were charged against the byte budget
+/// forever while `gc_row`/eviction bailed out in `hex_decode` — eviction
+/// freed live rows to make room for a phantom.
+#[test]
+fn test_staging_files_under_both_conventions_are_invisible_and_reclaimable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
+
+    let key = sample_key("live text", 4);
+    cache.put(&key, &sample_vector(4, 0.1), None).unwrap();
+    let fingerprint = key.fingerprint();
+    cache.add_reference(&fingerprint, "project-a", 1);
+    assert_eq!(cache.row_count().unwrap(), 1);
+
+    // Legacy leftovers in the row's shard directory: the pre-rename
+    // convention (`<hex>.partial.<pid>.<seq>`) and the current one
+    // (`<hex>.<pid>.<seq>.partial`).
+    let row_path = cache.row_path(&fingerprint);
+    let hex = row_path.file_name().unwrap().to_string_lossy().to_string();
+    let shard = row_path.parent().unwrap().to_path_buf();
+    let legacy = shard.join(format!("{}.partial.4242.7", hex));
+    let current = shard.join(format!("{}.999.1.partial", hex));
+    std::fs::write(&legacy, b"stale-staging-bytes").unwrap();
+    std::fs::write(&current, b"fresh-staging-bytes").unwrap();
+
+    // The detectors agree: staging is not a row under either convention.
+    assert_eq!(
+        cache.row_count().unwrap(),
+        1,
+        "staging files must not be counted as rows"
+    );
+    let row_bytes = std::fs::metadata(&row_path).unwrap().len();
+    assert_eq!(
+        cache.total_bytes().unwrap(),
+        row_bytes,
+        "staging bytes must not be charged against the byte budget"
+    );
+
+    // And gc reclaims them without touching the live row.
+    let report = cache.gc().unwrap();
+    assert_eq!(report.staging_files_removed, 2);
+    assert_eq!(report.rows_removed, 0);
+    assert_eq!(report.rows_retained, 1);
+    assert!(!legacy.exists() && !current.exists());
+    assert!(row_path.exists(), "the live row survives");
+    assert!(cache.get(&key).unwrap().is_some());
+}

@@ -412,6 +412,18 @@ async fn symbols_result(
     let proposed_next = offset + returned;
     let ceiling_cut = offset + returned < total && continuation_past_ceiling(proposed_next);
     let more = returned > 0 && offset + returned < total && !ceiling_cut;
+    // Same wire shape as the text paths: the key appears only when true, and
+    // a ceiling-cut page carries the same explanation the text paths attach
+    // via `result_note` — a compact renderer prints only `note`, so without
+    // it a symbols page cut at the window ceiling renders exactly like a
+    // complete one.
+    let mut notes: Vec<String> = Vec::new();
+    if primary.iter().all(|r| !r.indexed) {
+        notes.push("Symbol search needs an index: run leindex_manage action=index".to_string());
+    }
+    if ceiling_cut {
+        notes.push(ceiling_sentence());
+    }
     let mut value = json!({
         "pattern": text,
         "target": "symbols",
@@ -429,12 +441,9 @@ async fn symbols_result(
             "exact": h.rank == 0,
             "stale": h.stale,
         })).collect::<Vec<_>>(),
-        "note": if primary.iter().all(|r| !r.indexed) {
-            Some("Symbol search needs an index: run leindex_manage action=index")
-        } else { None },
+        "note": notes.first().map(String::as_str),
         "source_freshness": "live",
     });
-    // Same wire shape as the text paths: the key appears only when true.
     if ceiling_cut {
         value["truncated_by_ceiling"] = json!(true);
     }
@@ -750,32 +759,32 @@ fn shape_rows_page<T>(
 /// Trailing hint for any text payload: why a complete-looking response may
 /// still be incomplete. `None` when no signal applies. `ceiling_ended` is
 /// the caller-computed truncation flag (it needs the request offset); the
-/// ceiling sentence fires only for a COMPLETE scan — a deadline stop is the
-/// time budget's cause to report, not the ceiling's.
+/// ceiling sentence takes precedence because it is the binding cause — the
+/// page's continuation is unservable regardless of the time budget. Whether
+/// the scan ALSO stopped at the deadline is answered by the engine's
+/// `stopped_by_deadline`, not by `complete`: a window stop pairs `has_more`
+/// with `complete = false` itself, so keying the budget sentence on
+/// `complete` mislabeled ceiling-ended pages "time budget".
 fn result_note(
     result: &SearchOutput,
     ceiling_ended: bool,
     response_has_more: bool,
 ) -> Option<String> {
     let mut note = String::new();
-    // Keyed on the RESPONSE's has_more, not the engine's: a page whose
-    // continuation was refused reads as final to the client, so a
-    // deadline-stopped scan must still say its totals are provisional.
-    if !result.complete && !response_has_more {
-        note.push_str("Stopped at the time budget; raise timeout_ms or narrow the search");
-    }
-    if ceiling_ended && result.complete {
-        // The page was served in full, but a continuation past the offset
-        // ceiling is unservable — say so instead of advertising a next_offset
-        // the next request would clamp into a repeat.
+    if ceiling_ended {
         if !note.is_empty() {
             note.push(' ');
         }
-        note.push_str(&format!(
-            "Result stream ends at the {}-hit window ceiling (offset + page); \
-             narrow the search with scope/include_globs to reach further matches",
-            MAX_LIMIT
-        ));
+        note.push_str(&ceiling_sentence());
+    }
+    // Keyed on the RESPONSE's has_more, not the engine's: a page whose
+    // continuation was refused reads as final to the client, so a
+    // deadline-stopped scan must still say its totals are provisional.
+    if result.stopped_by_deadline && !response_has_more {
+        if !note.is_empty() {
+            note.push(' ');
+        }
+        note.push_str("Stopped at the time budget; raise timeout_ms or narrow the search");
     }
     if result.cap_withheld > 0 {
         if !note.is_empty() {
@@ -788,6 +797,18 @@ fn result_note(
         ));
     }
     (!note.is_empty()).then_some(note)
+}
+
+/// The ceiling sentence shared by the text paths (`result_note`) and the
+/// symbols route: the page was served in full, but a continuation past the
+/// offset ceiling is unservable — say so instead of advertising a next_offset
+/// the next request would clamp into a repeat.
+fn ceiling_sentence() -> String {
+    format!(
+        "Result stream ends at the {}-hit window ceiling (offset + page); \
+         narrow the search with scope/include_globs to reach further matches",
+        MAX_LIMIT
+    )
 }
 
 #[cfg(test)]
@@ -927,10 +948,13 @@ mod tests {
     /// page's start — the repeat-forever page (Codex P2, round 8).
     #[test]
     fn test_matches_page_at_ceiling_ends_stream_instead_of_repeating() {
+        // Engine-shaped window stop (`has_more` pairs with `complete=false`;
+        // the deadline never fired): the page starting AT the ceiling is a
+        // window stop, not a time-budget stop.
         let more = || SearchOutput {
             returned: 5,
             has_more: true,
-            complete: true,
+            complete: false,
             ..SearchOutput::default()
         };
 
@@ -957,40 +981,15 @@ mod tests {
         assert_eq!(value["truncated_by_ceiling"], true);
     }
 
-    /// A zero-hit page must end the stream whatever its offset: its
-    /// next_offset equals its own offset, so a `while has_more` client would
-    /// re-serve the identical page forever (the engine forces has_more=true
-    /// on a deadline stop, making this reachable at offset == MAX_LIMIT).
+    /// The round-10 Kilo CRITICAL: a page that ended because the WINDOW
+    /// filled at the ceiling (no deadline involved) must report the ceiling
+    /// as the cause. The old note keyed the budget sentence on `complete`
+    /// — which a window stop also sets false — so the page was mislabeled
+    /// "Stopped at the time budget" and the ceiling sentence was dead code
+    /// on the matches path (`has_more => !complete` made
+    /// `ceiling_ended && result.complete` unreachable).
     #[test]
-    fn test_zero_hit_page_ends_the_stream() {
-        let value = shape_text_result(
-            "p",
-            "matches",
-            &[],
-            SearchOutput {
-                returned: 0,
-                has_more: true,
-                complete: false,
-                ..SearchOutput::default()
-            },
-            MAX_LIMIT,
-            Some(50),
-        );
-        assert_eq!(value["has_more"], false);
-        assert!(value["next_offset"].is_null());
-        assert!(
-            value.get("truncated_by_ceiling").is_none(),
-            "zero hits is not a ceiling truncation"
-        );
-        let note = value["note"].as_str().unwrap_or_default();
-        assert!(note.contains("time budget"), "note: {note}");
-    }
-
-    /// A deadline-stopped page near the ceiling reports the TIME BUDGET as
-    /// the cause, not the ceiling: `has_more` is forced true by the deadline
-    /// fallback, so the ceiling sentence must not contradict it.
-    #[test]
-    fn test_ceiling_note_yields_to_the_time_budget_cause() {
+    fn test_window_stop_at_ceiling_reports_the_ceiling_not_the_budget() {
         let value = shape_text_result(
             "p",
             "matches",
@@ -1008,13 +1007,77 @@ mod tests {
         assert_eq!(value["truncated_by_ceiling"], true);
         let note = value["note"].as_str().unwrap();
         assert!(
-            note.contains("time budget") && !note.contains("window ceiling"),
-            "deadline is the binding constraint, note: {note}"
+            note.contains("window ceiling") && !note.contains("time budget"),
+            "a window stop at the ceiling is not a time-budget stop, note: {note}"
+        );
+    }
+
+    /// A zero-hit page must end the stream whatever its offset: its
+    /// next_offset equals its own offset, so a `while has_more` client would
+    /// re-serve the identical page forever (the engine forces has_more=true
+    /// on a deadline stop, making this reachable at offset == MAX_LIMIT).
+    #[test]
+    fn test_zero_hit_page_ends_the_stream() {
+        let value = shape_text_result(
+            "p",
+            "matches",
+            &[],
+            SearchOutput {
+                returned: 0,
+                has_more: true,
+                complete: false,
+                stopped_by_deadline: true,
+                ..SearchOutput::default()
+            },
+            MAX_LIMIT,
+            Some(50),
+        );
+        assert_eq!(value["has_more"], false);
+        assert!(value["next_offset"].is_null());
+        assert!(
+            value.get("truncated_by_ceiling").is_none(),
+            "zero hits is not a ceiling truncation"
+        );
+        let note = value["note"].as_str().unwrap_or_default();
+        assert!(note.contains("time budget"), "note: {note}");
+    }
+
+    /// A deadline-stopped page at the ceiling reports BOTH causes: the
+    /// ceiling is the binding constraint for the stream (its continuation is
+    /// unservable), and the deadline made the page's totals provisional. The
+    /// old note picked one cause from `complete` alone — which a window stop
+    /// also sets false — so a pure window stop was mislabeled "time budget"
+    /// and a deadline stop at the ceiling lost the ceiling sentence.
+    #[test]
+    fn test_deadline_stopped_page_at_ceiling_reports_both_causes() {
+        let value = shape_text_result(
+            "p",
+            "matches",
+            &[],
+            SearchOutput {
+                returned: 50,
+                has_more: true,
+                complete: false,
+                stopped_by_deadline: true,
+                ..SearchOutput::default()
+            },
+            MAX_LIMIT,
+            Some(50),
+        );
+        assert_eq!(value["has_more"], false);
+        assert_eq!(value["truncated_by_ceiling"], true);
+        let note = value["note"].as_str().unwrap();
+        assert!(
+            note.contains("window ceiling") && note.contains("time budget"),
+            "both the ceiling and the budget must be named, note: {note}"
         );
     }
 
     /// The time-budget sentence applies to every output mode: a truncated
-    /// `count` response carries provisional totals and must say so.
+    /// `count` response carries provisional totals and must say so. The
+    /// engine end state `has_more=false, complete=false` is exactly the
+    /// deadline stop (the closing fallback sets both), so the fixture
+    /// carries `stopped_by_deadline`.
     #[test]
     fn test_budget_note_applies_to_summary_modes() {
         let value = shape_text_result(
@@ -1024,6 +1087,7 @@ mod tests {
             SearchOutput {
                 has_more: false,
                 complete: false,
+                stopped_by_deadline: true,
                 stats: crate::search::textsearch::SearchStats {
                     match_lines: 7,
                     ..Default::default()

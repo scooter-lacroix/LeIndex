@@ -796,3 +796,94 @@ fn test_name_corpus_clones_share_until_they_diverge() {
     let other = ProgramDependenceGraph::new();
     assert_ne!(other.revision(), original.revision());
 }
+
+/// Repathing one of two nodes that share a `(name, file_path)` key must not
+/// evict the sibling's O(1) `name_file_index` entry (round-10 Kilo): the
+/// insert in `add_node` is last-wins, so the surviving key may belong to the
+/// sibling — an unconditional remove silently degrades its lookup to the
+/// linear `name_index` fallback. Extraction produces exactly this shape when
+/// it disambiguates duplicate qualified names with an `@start..end` suffix on
+/// the id only.
+#[test]
+fn test_repath_preserves_a_siblings_name_file_index_entry() {
+    let mut pdg = ProgramDependenceGraph::new();
+    let first = pdg.add_node(make_node(
+        "a.rs:foo@10..20",
+        "foo",
+        "a.rs",
+        NodeType::Function,
+    ));
+    let second = pdg.add_node(make_node(
+        "a.rs:foo@30..40",
+        "foo",
+        "a.rs",
+        NodeType::Function,
+    ));
+    // Last-wins: the O(1) key belongs to `second`.
+    assert_eq!(
+        pdg.name_file_index
+            .get(&("foo".to_string(), "a.rs".to_string())),
+        Some(&second)
+    );
+
+    // Re-path the OTHER node: the sibling's key must survive.
+    assert!(pdg.repath_node(first, EXTERNAL_NODE_FILE_PATH));
+    assert_eq!(
+        pdg.name_file_index
+            .get(&("foo".to_string(), "a.rs".to_string())),
+        Some(&second),
+        "the sibling's O(1) lookup key must not be evicted"
+    );
+    assert_eq!(
+        pdg.name_file_index
+            .get(&("foo".to_string(), "<external>".to_string())),
+        Some(&first),
+        "the migrated node's key landed under the new path"
+    );
+
+    // The eviction still happens when the key really is the mover's.
+    assert!(pdg.repath_node(second, EXTERNAL_NODE_FILE_PATH));
+    assert_eq!(
+        pdg.name_file_index
+            .get(&("foo".to_string(), "a.rs".to_string())),
+        None,
+        "our own key must move off the old path"
+    );
+}
+
+/// The batched re-path has the same index contract as the single-node form
+/// (round-10 Kilo performance fix): weights move, file_index/name_file_index
+/// follow, and the count reports only nodes that actually moved.
+#[test]
+fn test_batch_repath_moves_weights_and_indexes() {
+    let mut pdg = ProgramDependenceGraph::new();
+    let a = pdg.add_node(make_node("a.rs:x", "x", "a.rs", NodeType::Function));
+    let b = pdg.add_node(make_node("a.rs:y", "y", "a.rs", NodeType::Function));
+    let c = pdg.add_node(make_node("a.rs:z", "z", "a.rs", NodeType::Function));
+
+    // `b` already carries the target path: repaired forward, not re-counted.
+    let migrated = pdg.repath_nodes_to_file_path(&[a, b, c], "a.rs");
+    assert_eq!(migrated, 0, "every node already carries a.rs");
+
+    let migrated = pdg.repath_nodes_to_file_path(&[a, c], "migrated.rs");
+    assert_eq!(migrated, 2);
+    assert_eq!(
+        pdg.get_node(a).map(|n| n.file_path.to_string()),
+        Some("migrated.rs".to_string())
+    );
+    assert_eq!(
+        pdg.nodes_in_file("migrated.rs"),
+        vec![a, c],
+        "file_index follows the batch"
+    );
+    assert_eq!(
+        pdg.nodes_in_file("a.rs"),
+        vec![b],
+        "the vacated file_index entry no longer holds the moved nodes"
+    );
+    assert_eq!(
+        pdg.find_by_name_in_file("x", Some("migrated.rs")),
+        Some(a),
+        "the (name, file) key follows the batch"
+    );
+}

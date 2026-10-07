@@ -168,6 +168,34 @@ impl TrigramIndex {
     /// Uses targeted removal: extracts trigrams from the node's text fields
     /// and only cleans those specific posting lists, avoiding O(T) scan.
     pub fn remove_node(&mut self, node_id: NodeId, name: &str, node_id_str: &str, file_path: &str) {
+        self.remove_node_inner(node_id, name, node_id_str, file_path);
+        // Clean up empty posting lists to save memory
+        self.postings.retain(|_, list| !list.is_empty());
+    }
+
+    /// Remove many nodes from the index in one pass.
+    ///
+    /// Identical per-node work to [`Self::remove_node`], but the
+    /// empty-posting-list compaction — a walk of the entire trigram
+    /// keyspace — runs ONCE at the end instead of once per node: a batch
+    /// re-path that would otherwise pay O(nodes x keyspace) pays
+    /// O(nodes x trigrams-per-node + keyspace).
+    pub fn remove_nodes(&mut self, nodes: &[(NodeId, String, String, String)]) {
+        for (node_id, name, node_id_str, file_path) in nodes {
+            self.remove_node_inner(*node_id, name, node_id_str, file_path);
+        }
+        self.postings.retain(|_, list| !list.is_empty());
+    }
+
+    /// Targeted removal of one node's postings; no compaction — the caller
+    /// decides when the batch is done.
+    fn remove_node_inner(
+        &mut self,
+        node_id: NodeId,
+        name: &str,
+        node_id_str: &str,
+        file_path: &str,
+    ) {
         let node_idx = node_id.index() as u32;
         if self.node_count > 0 {
             self.node_count -= 1;
@@ -189,9 +217,6 @@ impl TrigramIndex {
                 }
             }
         }
-
-        // Clean up empty posting lists to save memory
-        self.postings.retain(|_, list| !list.is_empty());
     }
 
     /// Returns the number of unique trigrams in the index.
