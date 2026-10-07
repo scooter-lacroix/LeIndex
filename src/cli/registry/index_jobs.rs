@@ -264,18 +264,22 @@ impl ProjectRegistry {
             .and_then(|storage| crate::cli::index_freshness::load_health(&storage))
             .map(|health| health.generation)
             .unwrap_or(previous_generation.saturating_add(1));
-        let neural_path =
-            crate::cli::leindex::resolve_existing_storage_path(path).and_then(|storage| {
-                crate::cli::index_freshness::load_health(&storage).map(|health| {
-                    storage
-                        .join("generations")
-                        .join(health.generation.to_string())
-                        .join("neural_embeddings.bin")
+        // Neural presence is a property of the published manifest (its Neural
+        // layer hash differs from the canonical empty payload), not of any
+        // file under `generations/<N>/`.
+        let neural_published = crate::cli::leindex::resolve_existing_storage_path(path)
+            .is_some_and(|storage| {
+                crate::cli::index_freshness::load_health(&storage).is_some_and(|health| {
+                    crate::storage::generation::read_generation_manifest(
+                        &storage,
+                        health.generation,
+                    )
+                    .is_ok_and(|manifest| {
+                        crate::storage::generation::manifest_has_neural_vectors(&manifest)
+                    })
                 })
             });
-        if neural_path.as_ref().is_some_and(|path| {
-            path.is_file() && std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0)
-        }) {
+        if neural_published {
             state.mark_neural_published().await;
         }
         state.complete(generation).await;

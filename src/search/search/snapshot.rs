@@ -37,12 +37,16 @@ impl SearchEngine {
         pdg_edges: usize,
         pdg_fingerprint: String,
     ) -> SearchSnapshot {
-        let (dictionary, mut token_ids) = self
-            .tokens
-            .to_dictionary(self.nodes.iter().map(|node| node.node_id.as_str()));
-        let nodes = self
-            .nodes
-            .iter()
+        // Canonical order: nodes sorted by id. The resident list is built in
+        // parse-completion order, which is not stable across runs; sorting
+        // makes the snapshot bytes a pure function of content so the staged
+        // Search layer dedups across identical generations.
+        let mut order: Vec<&super::NodeInfo> = self.nodes.iter().collect();
+        order.sort_unstable_by(|a, b| a.node_id.cmp(&b.node_id));
+        let node_ids: Vec<&str> = order.iter().map(|node| node.node_id.as_str()).collect();
+        let (dictionary, mut token_ids) = self.tokens.to_dictionary(node_ids.into_iter());
+        let nodes = order
+            .into_iter()
             .zip(token_ids.iter_mut())
             .map(|(node, ids)| SearchSnapshotNode {
                 node_id: node.node_id.clone(),

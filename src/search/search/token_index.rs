@@ -169,12 +169,16 @@ impl TokenIndex {
     ) -> (Vec<String>, Vec<Vec<u32>>) {
         let mut remap: Vec<u32> = vec![u32::MAX; self.tokens.len()];
         let mut dictionary: Vec<String> = Vec::with_capacity(self.ids.len());
-        // Ascending by old id keeps the dictionary order deterministic.
-        let mut live: Vec<u32> = self.ids.values().copied().collect();
+        // Lexicographic token order makes the persisted snapshot canonical:
+        // ids are assigned per insertion order (a HashMap walk), so ordering
+        // by id made two identical indexes serialize to different bytes and
+        // defeated CAS dedup between generations.
+        let mut live: Vec<(&str, u32)> =
+            self.ids.iter().map(|(token, &id)| (&**token, id)).collect();
         live.sort_unstable();
-        for id in live {
-            remap[id as usize] = dictionary.len() as u32;
-            dictionary.push(self.tokens[id as usize].to_string());
+        for (position, (token, old_id)) in live.into_iter().enumerate() {
+            remap[old_id as usize] = position as u32;
+            dictionary.push(token.to_string());
         }
         let per_node = order
             .map(|node_id| {
