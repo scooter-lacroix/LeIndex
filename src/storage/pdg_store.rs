@@ -8,28 +8,11 @@ use crate::graph::pdg::{
 };
 use crate::graph::trigram::TrigramIndex;
 use crate::storage::edges::{EdgeMetadata as StorageEdgeMetadata, EdgeType as StorageEdgeType};
-use crate::storage::nodes::{NodeRecord, NodeType as StorageNodeType};
+use crate::storage::nodes::NodeType as StorageNodeType;
 use crate::storage::schema::Storage;
 use rusqlite::{Result as SqliteResult, params};
 use std::collections::HashMap;
 use std::sync::Arc;
-
-/// Type alias for node database rows to reduce type complexity
-type NodeDbRow = (
-    i64,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    Option<i32>,
-    String,
-    Option<Vec<u8>>,
-    Option<i64>,
-    Option<i64>,
-    Option<i32>,
-);
 
 /// Errors that can occur during PDG persistence
 #[derive(Debug, thiserror::Error)]
@@ -63,19 +46,6 @@ pub enum PdgStoreError {
 /// Result type for PDG store operations
 pub type Result<T> = std::result::Result<T, PdgStoreError>;
 
-/// Convert legraphe NodeType to lestockage NodeType
-fn convert_node_type(node_type: &PDGNodeType) -> StorageNodeType {
-    match node_type {
-        PDGNodeType::Function => StorageNodeType::Function,
-        PDGNodeType::Class => StorageNodeType::Class,
-        PDGNodeType::Method => StorageNodeType::Method,
-        PDGNodeType::Variable => StorageNodeType::Variable,
-        PDGNodeType::Module => StorageNodeType::Module,
-        PDGNodeType::External => StorageNodeType::External,
-        PDGNodeType::FileSummary => StorageNodeType::FileSummary,
-    }
-}
-
 /// Convert lestockage NodeType to legraphe NodeType
 fn convert_storage_node_type(node_type: &StorageNodeType) -> PDGNodeType {
     match node_type {
@@ -85,22 +55,8 @@ fn convert_storage_node_type(node_type: &StorageNodeType) -> PDGNodeType {
         StorageNodeType::Variable => PDGNodeType::Variable,
         StorageNodeType::Module => PDGNodeType::Module,
         StorageNodeType::External => PDGNodeType::External,
+        StorageNodeType::DocSection => PDGNodeType::DocSection,
         StorageNodeType::FileSummary => PDGNodeType::FileSummary,
-    }
-}
-
-/// Convert legraphe EdgeType to lestockage EdgeType
-fn convert_edge_type(edge_type: &PDGEdgeType) -> StorageEdgeType {
-    match edge_type {
-        PDGEdgeType::Call => StorageEdgeType::Call,
-        PDGEdgeType::DataDependency => StorageEdgeType::DataDependency,
-        PDGEdgeType::Inheritance => StorageEdgeType::Inheritance,
-        PDGEdgeType::Import => StorageEdgeType::Import,
-        PDGEdgeType::Containment => StorageEdgeType::Containment,
-        PDGEdgeType::StateTransition => StorageEdgeType::StateTransition,
-        PDGEdgeType::CommandArgument => StorageEdgeType::CommandArgument,
-        PDGEdgeType::Environment => StorageEdgeType::Environment,
-        PDGEdgeType::Stdin => StorageEdgeType::Stdin,
     }
 }
 
@@ -112,21 +68,11 @@ fn convert_storage_edge_type(edge_type: &StorageEdgeType) -> PDGEdgeType {
         StorageEdgeType::Inheritance => PDGEdgeType::Inheritance,
         StorageEdgeType::Import => PDGEdgeType::Import,
         StorageEdgeType::Containment => PDGEdgeType::Containment,
+        StorageEdgeType::TypeOf => PDGEdgeType::TypeOf,
         StorageEdgeType::StateTransition => PDGEdgeType::StateTransition,
         StorageEdgeType::CommandArgument => PDGEdgeType::CommandArgument,
         StorageEdgeType::Environment => PDGEdgeType::Environment,
         StorageEdgeType::Stdin => PDGEdgeType::Stdin,
-    }
-}
-
-/// Convert legraphe EdgeMetadata to lestockage EdgeMetadata
-fn convert_edge_metadata(metadata: &PDGEdgeMetadata) -> StorageEdgeMetadata {
-    StorageEdgeMetadata {
-        call_count: metadata.call_count,
-        variable_name: metadata.variable_name.clone(),
-        confidence: metadata.confidence,
-        channel: metadata.channel.clone(),
-        position: metadata.position,
     }
 }
 
@@ -139,205 +85,6 @@ fn convert_storage_edge_metadata(metadata: &StorageEdgeMetadata) -> PDGEdgeMetad
         channel: metadata.channel.clone(),
         position: metadata.position,
     }
-}
-
-/// Save a ProgramDependenceGraph to storage
-///
-/// This function extracts all nodes and edges from the PDG and persists them
-/// to the SQLite database. All previous nodes and edges for the project are
-/// replaced with the new PDG data.
-///
-/// # Arguments
-///
-/// * `storage` - Mutable reference to the storage backend
-/// * `project_id` - Project identifier for the PDG
-/// * `pdg` - Reference to the ProgramDependenceGraph to save
-///
-/// # Returns
-///
-/// `Ok(())` if successful, `Err(PdgStoreError)` if an error occurs
-///
-/// # Example
-///
-/// ```ignore
-/// let pdg = extract_pdg_from_signatures(signatures, source, "test.rs");
-/// save_pdg(&mut storage, "my_project", &pdg)?;
-/// ```
-pub fn save_pdg(
-    storage: &mut Storage,
-    project_id: &str,
-    pdg: &ProgramDependenceGraph,
-) -> Result<()> {
-    let tx = storage.conn_mut().transaction()?;
-
-    // Delete existing edges for this project first (to avoid foreign key constraints)
-    tx.execute(
-        "DELETE FROM intel_edges WHERE caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1)",
-        params![project_id],
-    )?;
-
-    // Then delete existing nodes for this project
-    tx.execute(
-        "DELETE FROM intel_nodes WHERE project_id = ?1",
-        params![project_id],
-    )?;
-
-    let node_id_map = save_nodes(&tx, project_id, pdg)?;
-    save_edges(&tx, &node_id_map, pdg)?;
-
-    // Save trigram index alongside the PDG (within the same transaction)
-    if let Err(e) = save_trigram_index_tx(&tx, project_id, pdg.trigram_index()) {
-        // Log but don't fail — the trigram index is a performance optimization,
-        // not a correctness requirement. It will be rebuilt on load if missing.
-        tracing::warn!("Failed to save trigram index: {e}");
-    }
-
-    tx.commit()?;
-    Ok(())
-}
-
-fn save_nodes(
-    tx: &rusqlite::Transaction<'_>,
-    project_id: &str,
-    pdg: &ProgramDependenceGraph,
-) -> Result<HashMap<NodeId, i64>> {
-    let mut node_id_map = HashMap::new();
-
-    for node_idx in pdg.node_indices() {
-        let pdg_node = pdg
-            .get_node(node_idx)
-            .ok_or_else(|| PdgStoreError::Serialization("Missing node data".to_string()))?;
-
-        // Note: Embeddings are now externalized to EmbeddingStore, not stored in Node.
-        // They are persisted separately if needed.
-        let record = NodeRecord {
-            id: None,
-            project_id: project_id.to_string(),
-            file_path: pdg_node.file_path.to_string(),
-            node_id: pdg_node.id.clone(),
-            symbol_name: pdg_node.name.clone(),
-            qualified_name: pdg_node
-                .id
-                .split(':')
-                .next_back()
-                .unwrap_or(&pdg_node.id)
-                .to_string(),
-            language: pdg_node.language.clone(),
-            node_type: convert_node_type(&pdg_node.node_type),
-            signature: None, // Could be populated from node content
-            complexity: Some(pdg_node.complexity as i32),
-            content_hash: blake3::hash(pdg_node.id.as_bytes()).to_hex().to_string(),
-            embedding: None, // Embeddings externalized to EmbeddingStore
-            byte_range_start: Some(pdg_node.byte_range.0 as i64),
-            byte_range_end: Some(pdg_node.byte_range.1 as i64),
-            embedding_format: Some(0),
-        };
-
-        let db_id = tx.query_row(
-            "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end, created_at, updated_at, embedding_format)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
-             RETURNING id",
-            params![
-                record.project_id,
-                record.file_path,
-                record.node_id,
-                record.symbol_name,
-                record.qualified_name,
-                record.language,
-                record.node_type.as_str(),
-                record.signature,
-                record.complexity,
-                record.content_hash,
-                record.embedding.as_deref(),
-                record.byte_range_start,
-                record.byte_range_end,
-                chrono::Utc::now().timestamp(),
-                chrono::Utc::now().timestamp(),
-                record.embedding_format,
-            ],
-            |row| row.get(0),
-        )?;
-
-        node_id_map.insert(node_idx, db_id);
-    }
-
-    Ok(node_id_map)
-}
-
-fn save_edges(
-    tx: &rusqlite::Transaction<'_>,
-    node_id_map: &HashMap<NodeId, i64>,
-    pdg: &ProgramDependenceGraph,
-) -> Result<()> {
-    for edge_idx in pdg.edge_indices() {
-        let (source, target) = pdg
-            .edge_endpoints(edge_idx)
-            .ok_or_else(|| PdgStoreError::Serialization("Edge has no endpoints".to_string()))?;
-        let pdg_edge = pdg
-            .get_edge(edge_idx)
-            .ok_or_else(|| PdgStoreError::Serialization("Missing edge data".to_string()))?;
-        let caller_id =
-            *node_id_map
-                .get(&source)
-                .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
-                    caller: source.index() as i64,
-                    callee: target.index() as i64,
-                })?;
-        let callee_id =
-            *node_id_map
-                .get(&target)
-                .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
-                    caller: source.index() as i64,
-                    callee: target.index() as i64,
-                })?;
-        let metadata = convert_edge_metadata(&pdg_edge.metadata);
-        let metadata_json = serde_json::to_string(&metadata)
-            .map_err(|e| PdgStoreError::Serialization(e.to_string()))?;
-
-        tx.execute(
-            "INSERT INTO intel_edges (caller_id, callee_id, edge_type, metadata)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT DO UPDATE SET metadata = excluded.metadata",
-            params![
-                caller_id,
-                callee_id,
-                convert_edge_type(&pdg_edge.edge_type).as_str(),
-                metadata_json,
-            ],
-        )?;
-    }
-
-    Ok(())
-}
-
-/// Save trigram index within an existing transaction.
-fn save_trigram_index_tx(
-    tx: &rusqlite::Transaction<'_>,
-    project_id: &str,
-    trigram_index: &TrigramIndex,
-) -> SqliteResult<()> {
-    let serialized = trigram_index.serialize();
-    let node_count = trigram_index.node_count() as i64;
-    let trigram_count = trigram_index.trigram_count() as i64;
-
-    tx.execute(
-        "INSERT INTO trigram_index (project_id, index_data, node_count, trigram_count, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(project_id) DO UPDATE SET
-            index_data = excluded.index_data,
-            node_count = excluded.node_count,
-            trigram_count = excluded.trigram_count,
-            updated_at = excluded.updated_at",
-        params![
-            project_id,
-            serialized,
-            node_count,
-            trigram_count,
-            chrono::Utc::now().timestamp(),
-        ],
-    )?;
-
-    Ok(())
 }
 
 /// Load a ProgramDependenceGraph from storage
@@ -362,120 +109,203 @@ fn save_trigram_index_tx(
 /// println!("Loaded {} nodes and {} edges", pdg.node_count(), pdg.edge_count());
 /// ```
 pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependenceGraph> {
-    let mut pdg = ProgramDependenceGraph::new();
-    let db_id_to_node_id = load_nodes(storage, project_id, &mut pdg)?;
-    load_edges(storage, project_id, &mut pdg, &db_id_to_node_id)?;
+    // Edge rows are decoded on a second thread over their own read-only
+    // connection while this one reads the nodes; applying them needs the
+    // node ids, so that part runs afterwards. Falls back to a single
+    // connection for in-memory databases or if the second one cannot open.
+    let database = storage
+        .conn()
+        .path()
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from);
+    let (nodes, prefetched_edges) = std::thread::scope(|scope| {
+        let edges = database.map(|path| {
+            scope.spawn(move || {
+                let reader = Storage::open_readonly(&path).ok()?;
+                read_edges(reader.conn()).ok()
+            })
+        });
+        let mut pdg = ProgramDependenceGraph::new();
+        let nodes = load_nodes(storage, project_id, &mut pdg).map(|ids| (pdg, ids));
+        (nodes, edges.and_then(|handle| handle.join().ok().flatten()))
+    });
+    let (mut pdg, db_id_to_node_id) = nodes?;
+    let edges = match prefetched_edges {
+        Some(edges) => edges,
+        None => read_edges(storage.conn())?,
+    };
+    apply_edges(&mut pdg, &db_id_to_node_id, edges);
 
     // Try to load persisted trigram index; fall back to rebuilding from nodes.
     // The trigram index is maintained incrementally via add_node during load,
     // but loading the persisted version is faster for large PDGs.
-    if let Ok(Some(trigram_idx)) = load_trigram_index(storage, project_id) {
-        pdg.set_trigram_index(trigram_idx);
+    match load_trigram_index(storage, project_id) {
+        Ok(Some(trigram_idx)) => pdg.set_trigram_index(trigram_idx),
+        // Nodes were bulk-loaded without trigrams; build them once.
+        _ => pdg.rebuild_trigram_index(),
     }
-    // If no persisted index, the one built incrementally via add_node is already correct.
 
     Ok(pdg)
+}
+
+type RowIdMap = HashMap<i64, NodeId, std::hash::BuildHasherDefault<crate::fast_hash::FastHasher>>;
+
+/// Decode the `intel_nodes` row columns that can fail to deserialize
+/// (`file_path`, `node_type`); the remaining columns are plain typed gets.
+fn decode_node_row_strings<'a>(row: &'a rusqlite::Row<'_>) -> Result<(&'a str, &'a str)> {
+    let file_path = row
+        .get_ref(1)?
+        .as_str()
+        .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
+    let node_type_str = row
+        .get_ref(5)?
+        .as_str()
+        .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
+    Ok((file_path, node_type_str))
+}
+
+/// Parse a persisted `node_type` string into the storage enum.
+fn parse_storage_node_type(node_type_str: &str) -> Result<StorageNodeType> {
+    StorageNodeType::from_str_name(node_type_str).ok_or_else(|| {
+        PdgStoreError::Deserialization(format!("Invalid node type: {}", node_type_str))
+    })
+}
+
+/// Count the rows the hydration query will stream, so every per-node map can
+/// be pre-sized (rehash-and-grow while streaming ~30k rows showed up in
+/// hydration profiles).
+fn count_project_nodes(storage: &Storage, project_id: &str) -> usize {
+    storage
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM intel_nodes WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as usize)
+        .unwrap_or(0)
+}
+
+/// One `Arc<str>` per file, shared by all of its nodes.
+fn shared_file_arc(
+    files: &mut crate::fast_hash::FastMap<String, Arc<str>>,
+    file_path: &str,
+) -> Arc<str> {
+    if let Some(shared) = files.get(file_path) {
+        return Arc::clone(shared);
+    }
+    let shared: Arc<str> = Arc::from(file_path);
+    files.insert(file_path.to_string(), Arc::clone(&shared));
+    shared
+}
+
+/// Decode one `intel_nodes` row into a graph node, alongside whether the row
+/// carries a precision (stable) symbol id.
+fn decode_pdg_node(
+    row: &rusqlite::Row<'_>,
+    node_type: StorageNodeType,
+    file_path: Arc<str>,
+) -> Result<(PDGNode, bool)> {
+    let start: Option<i64> = row.get(7)?;
+    let end: Option<i64> = row.get(8)?;
+    let complexity: Option<i32> = row.get(6)?;
+    let precision: i32 = row.get(9)?;
+    let pdg_node = PDGNode {
+        id: row.get(2)?,
+        node_type: convert_storage_node_type(&node_type),
+        name: row.get(3)?,
+        file_path,
+        byte_range: (start.unwrap_or(0) as usize, end.unwrap_or(0) as usize),
+        complexity: complexity.unwrap_or(0) as u32,
+        language: row.get(4)?,
+    };
+    let is_precision = precision != 0;
+    Ok((pdg_node, is_precision))
 }
 
 fn load_nodes(
     storage: &Storage,
     project_id: &str,
     pdg: &mut ProgramDependenceGraph,
-) -> Result<HashMap<i64, NodeId>> {
+) -> Result<RowIdMap> {
+    // Only the columns a graph node needs: `qualified_name`, `content_hash`,
+    // `embedding` and `embedding_format` are not part of a `PDGNode`, and rows
+    // are streamed straight into the graph rather than collected first.
     let mut nodes_stmt = storage.conn().prepare(
-        "SELECT id, file_path, node_id, symbol_name, qualified_name, language, node_type, complexity, content_hash, embedding, byte_range_start, byte_range_end, embedding_format
+        "SELECT id, file_path, node_id, symbol_name, language, node_type, complexity, byte_range_start, byte_range_end, precision
          FROM intel_nodes WHERE project_id = ?1",
     )?;
-    let node_rows: Vec<NodeDbRow> = nodes_stmt
-        .query_map(params![project_id], read_node_row)?
-        .collect::<SqliteResult<Vec<_>>>()?;
-    let mut db_id_to_node_id = HashMap::new();
+    let mut rows = nodes_stmt.query(params![project_id])?;
+    let node_count = count_project_nodes(storage, project_id);
+    let mut db_id_to_node_id = RowIdMap::with_capacity_and_hasher(node_count, Default::default());
+    pdg.reserve_nodes(node_count);
+    // One `Arc<str>` per file, shared by all of its nodes.
+    let mut files: crate::fast_hash::FastMap<String, Arc<str>> = Default::default();
 
-    for (
-        db_id,
-        file_path,
-        node_id_str,
-        symbol_name,
-        _qualified_name,
-        language,
-        node_type_str,
-        complexity,
-        _content_hash,
-        _embedding_blob,
-        start,
-        end,
-        _embedding_format,
-    ) in node_rows
-    {
-        let node_type = StorageNodeType::from_str_name(&node_type_str).ok_or_else(|| {
-            PdgStoreError::Deserialization(format!("Invalid node type: {}", node_type_str))
-        })?;
-        let pdg_node = PDGNode {
-            id: node_id_str,
-            node_type: convert_storage_node_type(&node_type),
-            name: symbol_name,
-            file_path: Arc::from(file_path),
-            byte_range: (start.unwrap_or(0) as usize, end.unwrap_or(0) as usize),
-            complexity: complexity.unwrap_or(0) as u32,
-            language,
+    while let Some(row) = rows.next()? {
+        let db_id: i64 = row.get(0)?;
+        let (file_path, node_type_str) = decode_node_row_strings(row)?;
+        let node_type = parse_storage_node_type(node_type_str)?;
+        let file_path: Arc<str> = shared_file_arc(&mut files, file_path);
+        // Externals are graph-level vocabulary, not file content: rows from
+        // a pre-2.0.0 index still carry the creating file's path, and taking
+        // it verbatim would let `remove_file` delete a shared placeholder
+        // other files' edges point at. Canonicalize on read so the legacy
+        // fallback converges on the graph-level convention.
+        let (pdg_node, precision) = {
+            let (mut node, precision) = decode_pdg_node(row, node_type, file_path)?;
+            if node.node_type == PDGNodeType::External {
+                node.file_path = std::sync::Arc::from(crate::graph::pdg::EXTERNAL_NODE_FILE_PATH);
+            }
+            (node, precision)
         };
-        let node_id = pdg.add_node(pdg_node);
+        let stable_id = if precision {
+            Some(pdg_node.id.clone())
+        } else {
+            None
+        };
+        let node_id = pdg.add_node_without_trigrams(pdg_node);
+        if let Some(stable_id) = stable_id {
+            pdg.mark_precision_symbol(stable_id);
+        }
         db_id_to_node_id.insert(db_id, node_id);
     }
 
     Ok(db_id_to_node_id)
 }
 
-fn read_node_row(row: &rusqlite::Row<'_>) -> SqliteResult<NodeDbRow> {
-    Ok((
-        row.get::<_, i64>(0)?,
-        row.get::<_, String>(1)?,
-        row.get::<_, String>(2)?,
-        row.get::<_, String>(3)?,
-        row.get::<_, String>(4)?,
-        row.get::<_, String>(5)?,
-        row.get::<_, String>(6)?,
-        row.get::<_, Option<i32>>(7)?,
-        row.get::<_, String>(8)?,
-        row.get::<_, Option<Vec<u8>>>(9)?,
-        row.get::<_, Option<i64>>(10)?,
-        row.get::<_, Option<i64>>(11)?,
-        row.get::<_, Option<i32>>(12)?,
-    ))
-}
+/// What an edge with no metadata serializes to (`StorageEdgeMetadata` with every
+/// field `None`); `load_edges` recognises it without parsing.
+const EMPTY_EDGE_METADATA_JSON: &[u8] =
+    br#"{"call_count":null,"variable_name":null,"confidence":null,"channel":null,"position":null}"#;
 
-fn load_edges(
-    storage: &Storage,
-    project_id: &str,
-    pdg: &mut ProgramDependenceGraph,
-    db_id_to_node_id: &HashMap<i64, NodeId>,
-) -> Result<()> {
-    let mut edges_stmt = storage.conn().prepare(
-        "SELECT e.caller_id, e.callee_id, e.edge_type, e.metadata
-         FROM intel_edges e
-         INNER JOIN intel_nodes n1 ON e.caller_id = n1.id
-         INNER JOIN intel_nodes n2 ON e.callee_id = n2.id
-         WHERE n1.project_id = ?1 AND n2.project_id = ?1",
-    )?;
-    let edge_rows: Vec<(i64, i64, String, Option<String>)> = edges_stmt
-        .query_map(params![project_id], read_edge_row)?
-        .collect::<SqliteResult<Vec<_>>>()?;
-
-    for (caller_id, callee_id, edge_type_str, metadata_json) in edge_rows {
-        let caller_node_id = *db_id_to_node_id
-            .get(&caller_id)
-            .ok_or_else(|| PdgStoreError::NodeNotFound(caller_id))?;
-        let callee_node_id = *db_id_to_node_id
-            .get(&callee_id)
-            .ok_or_else(|| PdgStoreError::NodeNotFound(callee_id))?;
-        let edge_type = StorageEdgeType::from_str_name(&edge_type_str).ok_or_else(|| {
+/// Every edge row, decoded into graph edges. No join against `intel_nodes`:
+/// an edge belongs to the project iff both of its endpoints do, which
+/// [`apply_edges`] checks against the loaded node ids. (The double self-join
+/// cost ~150 ms of the load.)
+fn read_edges(conn: &rusqlite::Connection) -> Result<Vec<(i64, i64, PDGEdge)>> {
+    let mut edges_stmt =
+        conn.prepare("SELECT caller_id, callee_id, edge_type, metadata FROM intel_edges")?;
+    let mut rows = edges_stmt.query([])?;
+    let mut edges = Vec::new();
+    while let Some(row) = rows.next()? {
+        let caller_id: i64 = row.get(0)?;
+        let callee_id: i64 = row.get(1)?;
+        let edge_type_str = row
+            .get_ref(2)?
+            .as_str()
+            .map_err(|e| PdgStoreError::Deserialization(e.to_string()))?;
+        let edge_type = StorageEdgeType::from_str_name(edge_type_str).ok_or_else(|| {
             PdgStoreError::Deserialization(format!("Invalid edge type: {}", edge_type_str))
         })?;
-        let metadata = match metadata_json.as_deref() {
-            Some(json) => serde_json::from_str(json).map_err(|e| {
-                PdgStoreError::Deserialization(format!("Invalid edge metadata: {}", e))
-            })?,
-            None => StorageEdgeMetadata {
+        let metadata = match row.get_ref(3)? {
+            // ~70% of edges carry the all-null literal; skip the JSON parse.
+            rusqlite::types::ValueRef::Text(bytes) if bytes != EMPTY_EDGE_METADATA_JSON => {
+                serde_json::from_slice(bytes).map_err(|e| {
+                    PdgStoreError::Deserialization(format!("Invalid edge metadata: {}", e))
+                })?
+            }
+            _ => StorageEdgeMetadata {
                 call_count: None,
                 variable_name: None,
                 confidence: None,
@@ -483,23 +313,32 @@ fn load_edges(
                 position: None,
             },
         };
-        let pdg_edge = PDGEdge {
-            edge_type: convert_storage_edge_type(&edge_type),
-            metadata: convert_storage_edge_metadata(&metadata),
-        };
-        pdg.add_edge(caller_node_id, callee_node_id, pdg_edge);
+        edges.push((
+            caller_id,
+            callee_id,
+            PDGEdge {
+                edge_type: convert_storage_edge_type(&edge_type),
+                metadata: convert_storage_edge_metadata(&metadata),
+            },
+        ));
     }
-
-    Ok(())
+    Ok(edges)
 }
 
-fn read_edge_row(row: &rusqlite::Row<'_>) -> SqliteResult<(i64, i64, String, Option<String>)> {
-    Ok((
-        row.get::<_, i64>(0)?,
-        row.get::<_, i64>(1)?,
-        row.get::<_, String>(2)?,
-        row.get::<_, Option<String>>(3)?,
-    ))
+/// Add the edges whose endpoints are both in `db_id_to_node_id`.
+fn apply_edges(
+    pdg: &mut ProgramDependenceGraph,
+    db_id_to_node_id: &RowIdMap,
+    edges: Vec<(i64, i64, PDGEdge)>,
+) {
+    for (caller_id, callee_id, edge) in edges {
+        if let (Some(&caller), Some(&callee)) = (
+            db_id_to_node_id.get(&caller_id),
+            db_id_to_node_id.get(&callee_id),
+        ) {
+            pdg.add_edge(caller, callee, edge);
+        }
+    }
 }
 
 /// Check if a PDG exists for a project
@@ -521,63 +360,46 @@ pub fn pdg_exists(storage: &Storage, project_id: &str) -> SqliteResult<bool> {
     Ok(count > 0)
 }
 
-/// Delete a PDG from storage
-pub fn delete_pdg(storage: &mut Storage, project_id: &str) -> SqliteResult<()> {
-    // Delete edges first
-    storage.conn().execute(
-        "DELETE FROM intel_edges WHERE caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1)",
-        params![project_id],
-    )?;
-
-    // Then delete nodes
-    storage.conn().execute(
-        "DELETE FROM intel_nodes WHERE project_id = ?1",
-        params![project_id],
-    )?;
-
-    // Delete indexed files records
-    storage.conn().execute(
-        "DELETE FROM indexed_files WHERE project_id = ?1",
-        params![project_id],
-    )?;
-
-    // Delete trigram index
-    if let Err(e) = delete_trigram_index(storage, project_id) {
-        tracing::warn!(
-            "Failed to delete trigram index for project {}: {e}",
-            project_id
-        );
-    }
-
-    Ok(())
-}
-
-/// Delete nodes and edges for a specific file in a project
+/// Remove one file's freshness record. Post-D5 the graph no longer persists
+/// as `intel_nodes`/`intel_edges` rows, so there is nothing else to delete —
+/// the graph state for a removed file is dropped from the in-memory PDG by
+/// the caller and the next published generation encodes the change.
 pub fn delete_file_data(
     storage: &mut Storage,
     project_id: &str,
     file_path: &str,
 ) -> SqliteResult<()> {
-    // Delete edges where caller or callee belongs to this file
-    storage.conn().execute(
-        "DELETE FROM intel_edges WHERE 
-         caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2) OR
-         callee_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2)",
-        params![project_id, file_path],
-    )?;
-
-    // Delete nodes for this file
-    storage.conn().execute(
-        "DELETE FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2",
-        params![project_id, file_path],
-    )?;
-
-    // Delete indexed file record
     storage.conn().execute(
         "DELETE FROM indexed_files WHERE project_id = ?1 AND file_path = ?2",
         params![project_id, file_path],
     )?;
+    Ok(())
+}
 
+/// Delete the freshness record for one file within an existing transaction.
+/// Post-D5 the graph no longer persists as rows, so only `indexed_files`
+/// needs deleting (see `delete_file_data`).
+pub fn delete_file_data_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &str,
+    file_path: &str,
+) -> SqliteResult<()> {
+    tx.execute(
+        "DELETE FROM indexed_files WHERE project_id = ?1 AND file_path = ?2",
+        params![project_id, file_path],
+    )?;
+    Ok(())
+}
+
+/// Delete nodes and edges for multiple files in a single transaction
+pub fn delete_files_data_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &str,
+    file_paths: &[String],
+) -> SqliteResult<()> {
+    for file_path in file_paths {
+        delete_file_data_tx(tx, project_id, file_path)?;
+    }
     Ok(())
 }
 
@@ -632,36 +454,21 @@ pub fn update_indexed_file(
     Ok(())
 }
 
-/// Save the trigram index for a project to storage.
-///
-/// The trigram index is serialized to a binary blob and stored in the
-/// `trigram_index` table. This avoids rebuilding the index on every load.
-pub fn save_trigram_index(
-    storage: &mut Storage,
+/// Update multiple indexed files within a single transaction
+pub fn update_indexed_files_tx(
+    tx: &rusqlite::Transaction<'_>,
     project_id: &str,
-    trigram_index: &TrigramIndex,
-) -> Result<()> {
-    let serialized = trigram_index.serialize();
-    let node_count = trigram_index.node_count() as i64;
-    let trigram_count = trigram_index.trigram_count() as i64;
-
-    storage.conn().execute(
-        "INSERT INTO trigram_index (project_id, index_data, node_count, trigram_count, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(project_id) DO UPDATE SET
-            index_data = excluded.index_data,
-            node_count = excluded.node_count,
-            trigram_count = excluded.trigram_count,
-            updated_at = excluded.updated_at",
-        params![
-            project_id,
-            serialized,
-            node_count,
-            trigram_count,
-            chrono::Utc::now().timestamp(),
-        ],
-    )?;
-
+    files: &[(String, String)], // (file_path, file_hash)
+) -> SqliteResult<()> {
+    let now = chrono::Utc::now().timestamp();
+    for (file_path, file_hash) in files {
+        tx.execute(
+            "INSERT INTO indexed_files (file_path, project_id, file_hash, last_indexed)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_path) DO UPDATE SET file_hash = ?3, last_indexed = ?4",
+            params![file_path, project_id, file_hash, now],
+        )?;
+    }
     Ok(())
 }
 
@@ -688,340 +495,6 @@ pub fn load_trigram_index(storage: &Storage, project_id: &str) -> Result<Option<
     }
 }
 
-/// Delete the trigram index for a project.
-pub fn delete_trigram_index(storage: &mut Storage, project_id: &str) -> SqliteResult<()> {
-    storage.conn().execute(
-        "DELETE FROM trigram_index WHERE project_id = ?1",
-        params![project_id],
-    )?;
-    Ok(())
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::schema::Storage;
-    use tempfile::NamedTempFile;
-
-    fn create_test_pdg() -> ProgramDependenceGraph {
-        let mut pdg = ProgramDependenceGraph::new();
-
-        let n1 = pdg.add_node(PDGNode {
-            id: "func1".to_string(),
-            node_type: PDGNodeType::Function,
-            name: "func1".to_string(),
-            file_path: Arc::from("test.rs"),
-            byte_range: (0, 100),
-            complexity: 5,
-            language: "rust".to_string(),
-        });
-
-        let n2 = pdg.add_node(PDGNode {
-            id: "func2".to_string(),
-            node_type: PDGNodeType::Function,
-            name: "func2".to_string(),
-            file_path: Arc::from("test.rs"),
-            byte_range: (100, 200),
-            complexity: 3,
-            language: "rust".to_string(),
-        });
-
-        pdg.add_edge(
-            n1,
-            n2,
-            PDGEdge {
-                edge_type: PDGEdgeType::Call,
-                metadata: PDGEdgeMetadata {
-                    call_count: Some(5),
-                    variable_name: None,
-                    confidence: None,
-                    channel: None,
-                    position: None,
-                },
-            },
-        );
-
-        pdg
-    }
-
-    #[test]
-    fn test_save_and_load_pdg() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let mut storage = Storage::open(temp_file.path()).unwrap();
-
-        let pdg = create_test_pdg();
-        save_pdg(&mut storage, "test_project", &pdg).unwrap();
-
-        assert!(pdg_exists(&storage, "test_project").unwrap());
-
-        let loaded = load_pdg(&storage, "test_project").unwrap();
-        assert_eq!(loaded.node_count(), 2);
-        assert_eq!(loaded.edge_count(), 1);
-
-        let func1 = loaded.find_by_symbol("func1").unwrap();
-        let node1 = loaded.get_node(func1).unwrap();
-        assert_eq!(node1.complexity, 5);
-    }
-
-    #[test]
-    fn test_save_pdg_replaces_existing() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let mut storage = Storage::open(temp_file.path()).unwrap();
-
-        let pdg1 = create_test_pdg();
-        save_pdg(&mut storage, "test_project", &pdg1).unwrap();
-        assert_eq!(load_pdg(&storage, "test_project").unwrap().node_count(), 2);
-
-        let mut pdg2 = ProgramDependenceGraph::new();
-        pdg2.add_node(PDGNode {
-            id: "new_func".to_string(),
-            node_type: PDGNodeType::Function,
-            name: "new_func".to_string(),
-            file_path: Arc::from("new.rs"),
-            byte_range: (0, 50),
-            complexity: 1,
-            language: "rust".to_string(),
-        });
-
-        save_pdg(&mut storage, "test_project", &pdg2).unwrap();
-        assert_eq!(load_pdg(&storage, "test_project").unwrap().node_count(), 1);
-    }
-
-    #[test]
-    fn test_load_nonexistent_project() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let storage = Storage::open(temp_file.path()).unwrap();
-
-        let loaded = load_pdg(&storage, "nonexistent").unwrap();
-        assert_eq!(loaded.node_count(), 0);
-        assert_eq!(loaded.edge_count(), 0);
-    }
-
-    #[test]
-    fn test_delete_pdg() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let mut storage = Storage::open(temp_file.path()).unwrap();
-
-        let pdg = create_test_pdg();
-        save_pdg(&mut storage, "test_project", &pdg).unwrap();
-        assert!(pdg_exists(&storage, "test_project").unwrap());
-
-        delete_pdg(&mut storage, "test_project").unwrap();
-        assert!(!pdg_exists(&storage, "test_project").unwrap());
-    }
-
-    #[test]
-    fn test_convert_node_types() {
-        assert_eq!(
-            convert_node_type(&PDGNodeType::Function),
-            StorageNodeType::Function
-        );
-        assert_eq!(
-            convert_node_type(&PDGNodeType::Class),
-            StorageNodeType::Class
-        );
-        assert_eq!(
-            convert_node_type(&PDGNodeType::Method),
-            StorageNodeType::Method
-        );
-        assert_eq!(
-            convert_node_type(&PDGNodeType::Variable),
-            StorageNodeType::Variable
-        );
-        assert_eq!(
-            convert_node_type(&PDGNodeType::Module),
-            StorageNodeType::Module
-        );
-
-        assert_eq!(
-            convert_storage_node_type(&StorageNodeType::Function),
-            PDGNodeType::Function
-        );
-        assert_eq!(
-            convert_storage_node_type(&StorageNodeType::Class),
-            PDGNodeType::Class
-        );
-        assert_eq!(
-            convert_storage_node_type(&StorageNodeType::Method),
-            PDGNodeType::Method
-        );
-        assert_eq!(
-            convert_storage_node_type(&StorageNodeType::Variable),
-            PDGNodeType::Variable
-        );
-        assert_eq!(
-            convert_storage_node_type(&StorageNodeType::Module),
-            PDGNodeType::Module
-        );
-
-        // External node type round-trip
-        assert_eq!(
-            convert_node_type(&PDGNodeType::External),
-            StorageNodeType::External
-        );
-        assert_eq!(
-            convert_storage_node_type(&StorageNodeType::External),
-            PDGNodeType::External
-        );
-    }
-
-    #[test]
-    fn test_convert_edge_types() {
-        assert_eq!(convert_edge_type(&PDGEdgeType::Call), StorageEdgeType::Call);
-        assert_eq!(
-            convert_edge_type(&PDGEdgeType::DataDependency),
-            StorageEdgeType::DataDependency
-        );
-        assert_eq!(
-            convert_edge_type(&PDGEdgeType::Inheritance),
-            StorageEdgeType::Inheritance
-        );
-        assert_eq!(
-            convert_edge_type(&PDGEdgeType::Import),
-            StorageEdgeType::Import
-        );
-        for (pdg, storage) in [
-            (PDGEdgeType::Containment, StorageEdgeType::Containment),
-            (
-                PDGEdgeType::StateTransition,
-                StorageEdgeType::StateTransition,
-            ),
-            (
-                PDGEdgeType::CommandArgument,
-                StorageEdgeType::CommandArgument,
-            ),
-            (PDGEdgeType::Environment, StorageEdgeType::Environment),
-            (PDGEdgeType::Stdin, StorageEdgeType::Stdin),
-        ] {
-            assert_eq!(convert_edge_type(&pdg), storage);
-            assert_eq!(convert_storage_edge_type(&storage), pdg);
-        }
-
-        assert_eq!(
-            convert_storage_edge_type(&StorageEdgeType::Call),
-            PDGEdgeType::Call
-        );
-        assert_eq!(
-            convert_storage_edge_type(&StorageEdgeType::DataDependency),
-            PDGEdgeType::DataDependency
-        );
-        assert_eq!(
-            convert_storage_edge_type(&StorageEdgeType::Inheritance),
-            PDGEdgeType::Inheritance
-        );
-        assert_eq!(
-            convert_storage_edge_type(&StorageEdgeType::Import),
-            PDGEdgeType::Import
-        );
-    }
-
-    #[test]
-    fn test_edge_metadata_conversion() {
-        let pdg_meta = PDGEdgeMetadata {
-            call_count: Some(42),
-            variable_name: Some("x".to_string()),
-            confidence: None,
-            channel: Some("env".to_string()),
-            position: Some(1),
-        };
-
-        let storage_meta = convert_edge_metadata(&pdg_meta);
-        assert_eq!(storage_meta.call_count, Some(42));
-        assert_eq!(storage_meta.variable_name, Some("x".to_string()));
-        assert_eq!(storage_meta.channel.as_deref(), Some("env"));
-        assert_eq!(storage_meta.position, Some(1));
-
-        let converted_back = convert_storage_edge_metadata(&storage_meta);
-        assert_eq!(converted_back.call_count, Some(42));
-        assert_eq!(converted_back.channel.as_deref(), Some("env"));
-        assert_eq!(converted_back.position, Some(1));
-        assert_eq!(converted_back.variable_name, Some("x".to_string()));
-    }
-
-    #[test]
-    fn test_save_pdg_with_inheritance_and_data_dependency_edges() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let mut storage = Storage::open(temp_file.path()).unwrap();
-
-        let mut pdg = ProgramDependenceGraph::new();
-
-        let n1 = pdg.add_node(PDGNode {
-            id: "child".to_string(),
-            node_type: PDGNodeType::Class,
-            name: "Child".to_string(),
-            file_path: Arc::from("test.rs"),
-            byte_range: (0, 50),
-            complexity: 1,
-            language: "rust".to_string(),
-        });
-
-        let n2 = pdg.add_node(PDGNode {
-            id: "parent".to_string(),
-            node_type: PDGNodeType::Class,
-            name: "Parent".to_string(),
-            file_path: Arc::from("test.rs"),
-            byte_range: (50, 100),
-            complexity: 1,
-            language: "rust".to_string(),
-        });
-
-        let n3 = pdg.add_node(PDGNode {
-            id: "data_user".to_string(),
-            node_type: PDGNodeType::Function,
-            name: "data_user".to_string(),
-            file_path: Arc::from("test.rs"),
-            byte_range: (100, 150),
-            complexity: 1,
-            language: "rust".to_string(),
-        });
-
-        pdg.add_edge(
-            n1,
-            n2,
-            PDGEdge {
-                edge_type: PDGEdgeType::Inheritance,
-                metadata: PDGEdgeMetadata {
-                    call_count: None,
-                    variable_name: None,
-                    confidence: None,
-                    channel: None,
-                    position: None,
-                },
-            },
-        );
-
-        pdg.add_edge(
-            n3,
-            n1,
-            PDGEdge {
-                edge_type: PDGEdgeType::DataDependency,
-                metadata: PDGEdgeMetadata {
-                    call_count: None,
-                    variable_name: Some("child_instance".to_string()),
-                    confidence: None,
-                    channel: None,
-                    position: None,
-                },
-            },
-        );
-
-        save_pdg(&mut storage, "test_project", &pdg).unwrap();
-
-        let loaded = load_pdg(&storage, "test_project").unwrap();
-        assert_eq!(loaded.node_count(), 3);
-        assert_eq!(loaded.edge_count(), 2);
-
-        // Verify edges by checking connectivity
-        let child_id = loaded.find_by_symbol("child").unwrap();
-        let parent_id = loaded.find_by_symbol("parent").unwrap();
-        let data_user_id = loaded.find_by_symbol("data_user").unwrap();
-
-        // Child should have Parent as neighbor (inheritance)
-        let child_neighbors = loaded.neighbors(child_id);
-        assert!(child_neighbors.contains(&parent_id));
-
-        // data_user should have Child as neighbor (data dependency)
-        let data_user_neighbors = loaded.neighbors(data_user_id);
-        assert!(data_user_neighbors.contains(&child_id));
-    }
-}
+#[path = "pdg_store_test.rs"]
+mod tests;

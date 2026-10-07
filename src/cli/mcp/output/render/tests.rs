@@ -282,6 +282,28 @@ fn test_render_diagnostics_plain_output() {
 }
 
 #[test]
+fn test_render_project_map_community_groups() {
+    let payload = v(r#"{
+        "group_by": "community",
+        "total_files_in_scope": 2,
+        "communities": [{
+            "community": 7,
+            "label": "src::core",
+            "file_count": 1,
+            "files": [{"relative_path": "src/core.rs", "symbol_count": 3}]
+        }],
+        "ungrouped_files": [{"relative_path": "README.md", "symbol_count": 1}]
+    }"#);
+    let output = render_project_map(&payload, false);
+    assert!(output.contains("Community groups (1)"), "output: {output}");
+    assert!(output.contains("Community 7"), "output: {output}");
+    assert!(output.contains("src::core"), "output: {output}");
+    assert!(output.contains("src/core.rs"), "output: {output}");
+    assert!(output.contains("Ungrouped (1 files)"), "output: {output}");
+    assert!(output.contains("README.md"), "output: {output}");
+}
+
+#[test]
 fn test_render_impact_plain_output() {
     let payload = v(r#"{
                 "symbol": "alpha",
@@ -292,11 +314,16 @@ fn test_render_impact_plain_output() {
                 "transitive_affected_symbols": [{"name": "affected"}],
                 "summary": "one caller",
                 "transitive_affected_files": 2,
-                "transitive_callers": 1
+                "transitive_callers": 1,
+                "community_breakdown": {
+                    "same_community": 2,
+                    "crossing": 3,
+                    "boundaries": [{"from": 1, "to": 2, "symbols": 3}]
+                }
             }"#);
     assert_eq!(
         render_impact(&payload, false),
-        "── Impact Analysis ──\n  Symbol: alpha\n  File: src/lib.rs\n  Change type: modify\n  Risk: ● high\n\n  Direct callers (1):\n    ← caller\n\n  Transitive affected symbols (1):\n    → affected\n\n  Summary: one caller\n\n  Affected files: 2\n  Transitive callers: 1\n"
+        "── Impact Analysis ──\n  Symbol: alpha\n  File: src/lib.rs\n  Change type: modify\n  Risk: ● high\n\n  Direct callers (1):\n    ← caller\n\n  Transitive affected symbols (1):\n    → affected\n\n  Summary: one caller\n\n  Affected files: 2\n  Transitive callers: 1\n\n  Community boundaries:\n    Same community: 2\n    Crossing communities: 3\n    1 → 2: 3 symbols\n"
     );
 }
 

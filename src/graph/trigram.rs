@@ -10,7 +10,8 @@
 // intersection typically reduces the candidate set to <1% of all nodes.
 
 use crate::graph::pdg::{NodeId, ProgramDependenceGraph};
-use std::collections::HashMap;
+
+type HashMap<K, V> = crate::fast_hash::FastMap<K, V>;
 
 /// A trigram stored as a packed u32 (3 ASCII bytes + zero high byte).
 /// This avoids heap-allocating a String for every trigram.
@@ -167,6 +168,34 @@ impl TrigramIndex {
     /// Uses targeted removal: extracts trigrams from the node's text fields
     /// and only cleans those specific posting lists, avoiding O(T) scan.
     pub fn remove_node(&mut self, node_id: NodeId, name: &str, node_id_str: &str, file_path: &str) {
+        self.remove_node_inner(node_id, name, node_id_str, file_path);
+        // Clean up empty posting lists to save memory
+        self.postings.retain(|_, list| !list.is_empty());
+    }
+
+    /// Remove many nodes from the index in one pass.
+    ///
+    /// Identical per-node work to [`Self::remove_node`], but the
+    /// empty-posting-list compaction — a walk of the entire trigram
+    /// keyspace — runs ONCE at the end instead of once per node: a batch
+    /// re-path that would otherwise pay O(nodes x keyspace) pays
+    /// O(nodes x trigrams-per-node + keyspace).
+    pub fn remove_nodes(&mut self, nodes: &[(NodeId, String, String, String)]) {
+        for (node_id, name, node_id_str, file_path) in nodes {
+            self.remove_node_inner(*node_id, name, node_id_str, file_path);
+        }
+        self.postings.retain(|_, list| !list.is_empty());
+    }
+
+    /// Targeted removal of one node's postings; no compaction — the caller
+    /// decides when the batch is done.
+    fn remove_node_inner(
+        &mut self,
+        node_id: NodeId,
+        name: &str,
+        node_id_str: &str,
+        file_path: &str,
+    ) {
         let node_idx = node_id.index() as u32;
         if self.node_count > 0 {
             self.node_count -= 1;
@@ -188,9 +217,6 @@ impl TrigramIndex {
                 }
             }
         }
-
-        // Clean up empty posting lists to save memory
-        self.postings.retain(|_, list| !list.is_empty());
     }
 
     /// Returns the number of unique trigrams in the index.
@@ -233,7 +259,12 @@ impl TrigramIndex {
         buf.extend_from_slice(&TRIGRAM_INDEX_VERSION.to_le_bytes());
         buf.extend_from_slice(&entry_count.to_le_bytes());
 
-        for (&trigram, posting_list) in &self.postings {
+        // Ascending trigram order: the bytes must be a pure function of the
+        // index. Hash-map order differs from process to process, which made the
+        // content hash change on every save and the blob get rewritten each time.
+        let mut entries: Vec<(&Trigram, &Vec<u32>)> = self.postings.iter().collect();
+        entries.sort_unstable_by_key(|(trigram, _)| **trigram);
+        for (&trigram, posting_list) in entries {
             buf.extend_from_slice(&trigram.to_le_bytes());
             let len = posting_list.len() as u32;
             buf.extend_from_slice(&len.to_le_bytes());
@@ -259,10 +290,8 @@ impl TrigramIndex {
 
         let entry_count = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
         let mut offset = 8;
-        let mut postings = HashMap::with_capacity_and_hasher(
-            entry_count,
-            std::collections::hash_map::RandomState::default(),
-        );
+        let mut postings: HashMap<Trigram, Vec<u32>> =
+            HashMap::with_capacity_and_hasher(entry_count, Default::default());
 
         for _ in 0..entry_count {
             if offset + 8 > data.len() {
@@ -359,6 +388,32 @@ fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The persisted bytes must depend only on the index's contents, so an
+    /// unchanged graph hashes the same on every save and is not rewritten.
+    #[test]
+    fn test_serialize_is_deterministic_across_independent_builds() {
+        let build = || {
+            let mut index = TrigramIndex::new();
+            for (id, name) in ["alpha_beta", "beta_gamma", "gamma_delta", "delta_alpha"]
+                .iter()
+                .enumerate()
+            {
+                index.add_node(
+                    petgraph::stable_graph::NodeIndex::new(id),
+                    name,
+                    &format!("file.rs:{name}"),
+                    "src/file.rs",
+                );
+            }
+            index
+        };
+        let first = build().serialize();
+        for _ in 0..8 {
+            assert_eq!(build().serialize(), first);
+        }
+        assert!(TrigramIndex::deserialize(&first).is_some());
+    }
 
     #[test]
     fn test_extract_trigrams() {

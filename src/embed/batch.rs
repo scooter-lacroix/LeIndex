@@ -80,6 +80,7 @@ pub fn split_request(
         return SplitResult::Single(EmbedRequest {
             texts: vec![],
             expected_dim: request.expected_dim,
+            cache_keys: vec![],
         });
     }
 
@@ -90,6 +91,7 @@ pub fn split_request(
         return SplitResult::Single(EmbedRequest {
             texts,
             expected_dim: request.expected_dim,
+            cache_keys: request.cache_keys,
         });
     }
 
@@ -139,6 +141,7 @@ pub fn split_request(
         return SplitResult::Single(EmbedRequest {
             texts,
             expected_dim: request.expected_dim,
+            cache_keys: request.cache_keys,
         });
     }
 
@@ -153,6 +156,7 @@ pub fn split_request(
             request: EmbedRequest {
                 texts,
                 expected_dim: request.expected_dim,
+                cache_keys: vec![],
             },
         })
         .collect();
@@ -245,6 +249,7 @@ mod tests {
         let request = EmbedRequest {
             texts: vec!["hello".to_string(), "world".to_string()],
             expected_dim: 4,
+            cache_keys: vec![],
         };
 
         let result = split_request(BatchId::new(1), request, &config);
@@ -263,6 +268,7 @@ mod tests {
         let request = EmbedRequest {
             texts: vec![],
             expected_dim: 4,
+            cache_keys: vec![],
         };
 
         let result = split_request(BatchId::new(1), request, &config);
@@ -287,6 +293,7 @@ mod tests {
         let request = EmbedRequest {
             texts,
             expected_dim: 4,
+            cache_keys: vec![],
         };
 
         let result = split_request(BatchId::new(1), request, &config);
@@ -320,6 +327,7 @@ mod tests {
         let request = EmbedRequest {
             texts,
             expected_dim: 8,
+            cache_keys: vec![],
         };
 
         let batch_id = BatchId::new(42);
@@ -434,6 +442,7 @@ mod tests {
         let request = EmbedRequest {
             texts: texts.clone(),
             expected_dim: dim,
+            cache_keys: vec![],
         };
 
         let batch_id = BatchId::new(99);

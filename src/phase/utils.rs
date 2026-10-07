@@ -20,7 +20,29 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
         }
     }
 
+    if !options.universe.is_empty() {
+        return Ok(collect_from_universe(options));
+    }
+
     Ok(collect_walked_files(root, options))
+}
+
+/// Select code files from the index's own file set instead of walking the tree.
+fn collect_from_universe(options: &PhaseOptions) -> CollectedFiles {
+    let mut collected = CollectedFiles::default();
+    for path in options.universe.iter() {
+        let is_code = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| is_code_extension(&extension.to_ascii_lowercase()))
+            || is_code_suffix(path);
+        if is_code {
+            collected.code_files.push(path.clone());
+        }
+    }
+    deduplicate_collected_files(&mut collected);
+    collected.code_files.truncate(options.max_files);
+    collected
 }
 
 fn collect_focused_files(root: &Path, options: &PhaseOptions) -> CollectedFiles {
@@ -111,13 +133,15 @@ fn is_code_suffix(path: &Path) -> bool {
 
 /// Build (path, hash) inventory for freshness checks.
 pub fn hash_inventory(paths: &[PathBuf]) -> Result<Vec<(PathBuf, String)>> {
-    let mut out = Vec::with_capacity(paths.len());
-    for path in paths {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("failed reading file for hashing: {}", path.display()))?;
-        let hash = blake3::hash(&bytes).to_hex().to_string();
-        out.push((path.clone(), hash));
-    }
+    use rayon::prelude::*;
+    let mut out = paths
+        .par_iter()
+        .map(|path| {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("failed reading file for hashing: {}", path.display()))?;
+            Ok((path.clone(), blake3::hash(&bytes).to_hex().to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
@@ -371,5 +395,25 @@ mod tests {
             "collected file should be src/lib.rs, got: {:?}",
             collected.code_files[0]
         );
+    }
+
+    #[test]
+    fn test_collect_files_stays_inside_the_index_universe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        for name in ["src/a.rs", "src/b.rs", ".hidden.rs", "notes.md"] {
+            std::fs::write(dir.path().join(name), "pub fn f(){}\n").expect("write");
+        }
+        let options = PhaseOptions {
+            root: dir.path().to_path_buf(),
+            // The index tracks a.rs and a doc, but not b.rs or the dotfile.
+            universe: std::sync::Arc::new(vec![
+                dir.path().join("src/a.rs"),
+                dir.path().join("notes.md"),
+            ]),
+            ..PhaseOptions::default()
+        };
+        let collected = collect_files(dir.path(), &options).expect("collect");
+        assert_eq!(collected.code_files, vec![dir.path().join("src/a.rs")]);
     }
 }

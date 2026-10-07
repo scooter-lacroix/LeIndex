@@ -1,4 +1,6 @@
-use super::helpers::{byte_range_to_line_range, extract_bool, extract_string, extract_usize};
+use super::helpers::{
+    byte_range_to_line_range, extract_bool, extract_string, extract_usize, get_direct_callees,
+};
 use super::protocol::JsonRpcError;
 use super::request_meta::WorkBudget;
 use crate::cli::live_project::LiveProject;
@@ -17,7 +19,7 @@ pub struct ReadSymbolHandler;
 #[allow(missing_docs)]
 impl ReadSymbolHandler {
     pub fn name(&self) -> &str {
-        "leindex.read-symbol"
+        "leindex_read_symbol"
     }
     pub fn title(&self) -> &str {
         "LeIndex [Read Symbol]"
@@ -71,23 +73,24 @@ impl ReadSymbolHandler {
             .map(|raw| live.file(raw))
             .transpose()
             .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
-        let (file, source_stale) = match catalog_lookup(&live, &symbol, file.as_deref()).await? {
-            CatalogLookup::Fresh { node, bytes } => {
-                let relations = resident_relations(
-                    registry,
-                    &live,
-                    &node,
-                    include_dependencies,
-                    false,
-                    budget,
-                    started,
-                )
-                .await;
-                return symbol_response(node, bytes, token_budget, false, relations, budget);
-            }
-            CatalogLookup::Stale { file } => (Some(file), true),
-            CatalogLookup::Miss => (file, false),
-        };
+        let (file, source_stale) =
+            match catalog_lookup(registry, &live, &symbol, file.as_deref()).await? {
+                CatalogLookup::Fresh { node, bytes } => {
+                    let relations = resident_relations(
+                        registry,
+                        &live,
+                        &node,
+                        include_dependencies,
+                        false,
+                        budget,
+                        started,
+                    )
+                    .await;
+                    return symbol_response(node, bytes, token_budget, false, relations, budget);
+                }
+                CatalogLookup::Stale { file } => (Some(file), true),
+                CatalogLookup::Miss => (file, false),
+            };
 
         let (parsed, node) = match file {
             Some(file) => parse_live_symbol(file, &symbol).await?,
@@ -114,28 +117,67 @@ enum CatalogLookup {
 }
 
 async fn catalog_lookup(
+    registry: &Arc<ProjectRegistry>,
     live: &LiveProject,
     symbol: &str,
     file: Option<&Path>,
 ) -> Result<CatalogLookup, JsonRpcError> {
-    let db_path = live.active_storage().join("leindex.db");
-    if !db_path.is_file() {
-        return Ok(CatalogLookup::Miss);
+    // D6: the resident PDG is the graph store — resolve symbols against it
+    // first; without a resident project, resolve against the published Pdg
+    // layer (the unhydrated fast path); the SQL catalog remains the legacy
+    // fallback for pre-generation stores (and always serves the freshness
+    // check below, since `indexed_files` survives the graph flip).
+    let db_path = live.catalog_db();
+    let mut graph_symbols = match registry.try_get_loaded(live.root()).await {
+        Some(handle) => {
+            let guard = handle.read().await;
+            guard.pdg().map(|pdg| {
+                crate::storage::catalog::graph::find_symbol(pdg, live.root(), symbol, file)
+            })
+        }
+        None => None,
+    };
+    if graph_symbols.as_ref().is_none_or(Vec::is_empty) {
+        let layer_symbols =
+            crate::storage::catalog::layer::find_symbol(live.storage(), live.root(), symbol, file);
+        if !layer_symbols.is_empty() {
+            graph_symbols = Some(layer_symbols);
+        }
     }
-    let Ok(Some(catalog)) = CatalogReader::open(&db_path, live.root()).await else {
-        return Ok(CatalogLookup::Miss);
+
+    let catalog = if db_path.is_file() {
+        CatalogReader::open(&db_path, live.root())
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
     };
-    let Ok(symbols) = catalog.find_symbol(symbol, file).await else {
-        return Ok(CatalogLookup::Miss);
+
+    let symbols = match graph_symbols {
+        Some(symbols) => symbols,
+        None => match &catalog {
+            Some(catalog) => catalog.find_symbol(symbol, file).await.unwrap_or_default(),
+            None => Vec::new(),
+        },
     };
-    let Some(mut node) = symbols.into_iter().next() else {
+    // A symbol can live in several files (overloads, re-exports, shadowing).
+    // Pick the best-ranked candidate instead of blindly taking the first row
+    // so a struct definition beats a same-named variable in another file.
+    let Some(mut node) = symbols.into_iter().min_by_key(|s| symbol_rank(s, symbol)) else {
         return Ok(CatalogLookup::Miss);
     };
     node.file_path = live
         .file(&node.file_path.to_string_lossy())
         .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
     let bytes = read_live_bytes(node.file_path.clone()).await?;
-    if catalog_is_fresh(&catalog, &node.file_path, &bytes).await {
+    let fresh = match &catalog {
+        Some(catalog) => catalog_is_fresh(catalog, &node.file_path, &bytes).await,
+        // No freshness record exists; treat as stale so the caller parses
+        // live instead of trusting an unverifiable graph row.
+        None => false,
+    };
+    if fresh {
         Ok(CatalogLookup::Fresh { node, bytes })
     } else {
         // A stale catalog still supplies a vetted in-root source candidate;
@@ -157,14 +199,40 @@ async fn parse_live_symbol(
     Ok((parsed, node))
 }
 
+/// Rank candidate symbols for disambiguation. Lower tuple values win:
+///
+/// 1. Exactness: a case-sensitive name/qualified-name match beats a
+///    case-insensitive one.
+/// 2. Type: definition-like nodes (class/struct, then function/method) beat
+///    variables and modules, so a `struct Storage` is preferred over a
+///    same-named CLI variable.
+/// 3. Size: a larger byte range is treated as the real definition over a
+///    reference or re-export with the same name.
+fn symbol_rank(node: &CatalogSymbol, symbol: &str) -> (u8, u8, std::cmp::Reverse<usize>) {
+    let exact = if node.symbol_name == symbol || node.qualified_name == symbol {
+        0
+    } else {
+        1
+    };
+    let type_rank = match node.node_type.as_str() {
+        "class" => 0,
+        "function" | "method" => 1,
+        "module" => 2,
+        _ => 3,
+    };
+    let size = node.byte_range.1.saturating_sub(node.byte_range.0);
+    (exact, type_rank, std::cmp::Reverse(size))
+}
+
 fn find_live_symbol(parsed: &LiveParse, symbol: &str) -> Option<CatalogSymbol> {
     parsed
         .symbols
         .iter()
-        .find(|node| {
+        .filter(|node| {
             node.symbol_name.eq_ignore_ascii_case(symbol)
                 || node.qualified_name.eq_ignore_ascii_case(symbol)
         })
+        .min_by_key(|node| symbol_rank(node, symbol))
         .cloned()
 }
 
@@ -205,6 +273,11 @@ async fn find_live_symbol_in_inventory(
     // (consistent with the eq_ignore_ascii_case catalog fallback).
     let symbol_lower = symbol.to_ascii_lowercase();
     let mut parsed = 0usize;
+    // Collect the best-ranked match across *all* scanned files rather than
+    // returning the first file that mentions the symbol: a later-sorting file
+    // can hold the real definition while an earlier one only shadows or
+    // re-exports the name.
+    let mut best: Option<(LiveParse, CatalogSymbol)> = None;
     for (inspected, candidate) in candidates.into_iter().enumerate() {
         if parsed >= 20 || inspected >= 200 {
             break;
@@ -222,14 +295,23 @@ async fn find_live_symbol_in_inventory(
         let Ok(live_parsed) = parse_live_file(candidate).await else {
             continue;
         };
-        if let Some(node) = find_live_symbol(&live_parsed, symbol) {
-            return Ok((live_parsed, node));
+        let Some(node) = find_live_symbol(&live_parsed, symbol) else {
+            continue;
+        };
+        let is_better = best
+            .as_ref()
+            .is_none_or(|(_, current)| symbol_rank(&node, symbol) < symbol_rank(current, symbol));
+        if is_better {
+            best = Some((live_parsed, node));
         }
     }
-    Err(JsonRpcError::invalid_params(format!(
-        "Symbol '{}' not found: scanned up to 200 live source candidates and parsed up to 20",
-        symbol
-    )))
+    let Some((live_parsed, node)) = best else {
+        return Err(JsonRpcError::invalid_params(format!(
+            "Symbol '{}' not found: scanned up to 200 live source candidates and parsed up to 20",
+            symbol
+        )));
+    };
+    Ok((live_parsed, node))
 }
 
 fn symbol_response(
@@ -422,7 +504,9 @@ async fn resident_relations(
     // dependency list for a requested enrichment layer.
     if include_dependencies {
         let mut guard = handle.write().await;
-        if guard.pdg().is_none() && guard.load_from_storage().is_err() {
+        // Graph-only hydration (see ensure_pdg_loaded_graph_only): relations
+        // never need the search engine.
+        if guard.pdg().is_none() && guard.ensure_pdg_loaded_graph_only().is_err() {
             return ResidentRelations {
                 callers: Vec::new(),
                 callees: Vec::new(),
@@ -460,7 +544,7 @@ async fn resident_relations(
             pdg_status: "partial",
         };
     }
-    let callees = relation_nodes_to_json(pdg, live, pdg.neighbors(node_id));
+    let callees = relation_nodes_to_json(pdg, live, get_direct_callees(pdg, node_id));
     let callers =
         relation_nodes_to_json(pdg, live, super::helpers::get_direct_callers(pdg, node_id));
     ResidentRelations {
@@ -484,8 +568,12 @@ fn relation_nodes_to_json(
     live: &LiveProject,
     node_ids: impl IntoIterator<Item = crate::graph::pdg::NodeId>,
 ) -> Vec<Value> {
+    // Neighbors yields one entry per edge; the same related node can reach
+    // the anchor through several edge types and must render once (N-01).
+    let mut seen = std::collections::HashSet::new();
     node_ids
         .into_iter()
+        .filter(|id| seen.insert(*id))
         .filter_map(|id| {
             let node = pdg.get_node(id)?;
             let file = live.file(&node.file_path).ok()?;
@@ -511,5 +599,82 @@ mod tests {
         let registry = test_registry_for(dir.path());
         let args = serde_json::json!({ "symbol": "my_func" });
         assert!(ReadSymbolHandler.execute(&registry, args).await.is_err());
+    }
+
+    fn catalog_symbol(name: &str, node_type: &str, byte_range: (usize, usize)) -> CatalogSymbol {
+        CatalogSymbol {
+            node_id: format!("{name}:{byte_range:?}"),
+            symbol_name: name.to_string(),
+            qualified_name: name.to_string(),
+            file_path: std::path::PathBuf::from(format!("/project/{name}.rs")),
+            language: "rust".to_string(),
+            node_type: node_type.to_string(),
+            complexity: 0,
+            byte_range,
+        }
+    }
+
+    #[test]
+    fn test_find_live_symbol_prefers_struct_over_variable() {
+        // Regression: a same-named CLI variable must not shadow the struct
+        // definition (read_symbol previously returned the first match).
+        let parsed = LiveParse {
+            bytes: Vec::new(),
+            symbols: vec![
+                catalog_symbol("Storage", "variable", (10, 20)),
+                catalog_symbol("Storage", "class", (30, 90)),
+            ],
+        };
+        let found = find_live_symbol(&parsed, "Storage").unwrap();
+        assert_eq!(found.node_type, "class", "struct/class must beat variable");
+    }
+
+    #[test]
+    fn test_find_live_symbol_prefers_exact_over_case_insensitive() {
+        let parsed = LiveParse {
+            bytes: Vec::new(),
+            symbols: vec![
+                catalog_symbol("storage", "function", (10, 30)),
+                catalog_symbol("Storage", "class", (40, 60)),
+            ],
+        };
+        let found = find_live_symbol(&parsed, "Storage").unwrap();
+        assert_eq!(found.symbol_name, "Storage", "exact case match must win");
+    }
+
+    #[test]
+    fn test_find_live_symbol_prefers_larger_range_within_same_type() {
+        let parsed = LiveParse {
+            bytes: Vec::new(),
+            symbols: vec![
+                catalog_symbol("helper", "function", (5, 9)),
+                catalog_symbol("helper", "function", (20, 60)),
+            ],
+        };
+        let found = find_live_symbol(&parsed, "helper").unwrap();
+        assert_eq!(found.byte_range, (20, 60), "definition-like range must win");
+    }
+
+    #[tokio::test]
+    async fn test_find_live_symbol_in_inventory_picks_best_across_files() {
+        // A variable in an earlier-sorting file must not win over the struct
+        // definition in a later file.
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a_cli.rs"),
+            "pub const Storage: usize = 42;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b_storage.rs"),
+            "pub struct Storage { field: u32 }\n",
+        )
+        .unwrap();
+        let live = LiveProject::resolve(&dir.path().to_string_lossy()).unwrap();
+        let (_parsed, node) = find_live_symbol_in_inventory(&live, "Storage")
+            .await
+            .expect("symbol must be found");
+        assert_eq!(node.node_type, "class");
+        assert!(node.file_path.ends_with("b_storage.rs"));
     }
 }

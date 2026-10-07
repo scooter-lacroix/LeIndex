@@ -191,6 +191,9 @@ impl CodeIntelligence for PhpParser {
 }
 
 fn extract_php_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut imports = Vec::new();
 
     fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
@@ -289,6 +292,9 @@ fn extract_function_signature(
 }
 
 fn extract_php_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut calls = Vec::new();
 
     fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {
@@ -333,6 +339,9 @@ fn extract_php_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String>
 }
 
 fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     // PHP uses PHPDoc comments: /** Description */
     // Look for comment nodes before the function
     let node_start = node.byte_range().start;

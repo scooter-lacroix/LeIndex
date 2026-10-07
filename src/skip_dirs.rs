@@ -30,6 +30,8 @@ pub const SKIP_DIRS: &[&str] = &[
     // Package managers / dependencies
     "bower_components",
     "node_modules",
+    // npm/PyPI packaging scaffolding (e.g., monorepo `packages/` dirs)
+    "packages",
     "vendor",
     // Python caches
     "__pycache__",

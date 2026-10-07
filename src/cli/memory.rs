@@ -1007,6 +1007,16 @@ impl MemoryManager {
 
     /// Get current RSS memory in bytes
     pub fn get_rss_bytes(&self) -> Result<usize, Error> {
+        // Fast path: a direct /proc/self read (~0.1 ms). sysinfo's
+        // `refresh_processes` scans /proc entries and per-thread task
+        // directories even for a single-pid refresh — ~40 ms per call on a
+        // threaded server, and diagnostics calls this twice, which alone
+        // blew the 100 ms response budget. sysinfo remains the fallback for
+        // platforms without procfs.
+        let procfs = super::memory_report::current_rss_bytes();
+        if procfs > 0 {
+            return Ok(procfs as usize);
+        }
         let mut system = self
             .system
             .lock()

@@ -4,7 +4,7 @@
  * LeIndex MCP - Post-install script
  * 
  * Automatically downloads the appropriate LeIndex bundle for the current platform.
- * The bundle includes the main binary, the ONNX worker binary (leindex-embed),
+ * The bundle includes the single main binary (worker mode built in),
  * and ONNX Runtime libraries. `leindex setup` downloads model assets.
  */
 
@@ -266,10 +266,6 @@ function getPlatform() {
 
 function getBinaryName() {
   return process.platform === 'win32' ? 'leindex.exe' : 'leindex';
-}
-
-function getWorkerBinaryName() {
-  return process.platform === 'win32' ? 'leindex-embed.exe' : 'leindex-embed';
 }
 
 function requestResponse(url, options = {}, redirectCount = 0) {
@@ -631,9 +627,7 @@ async function installFromBundle(release) {
     }
 
     const binaryName = getBinaryName();
-    const workerName = getWorkerBinaryName();
     const srcBinary = path.join(bundleDir, 'bin', binaryName);
-    const srcWorker = path.join(bundleDir, 'bin', workerName);
 
     if (fs.existsSync(srcBinary)) {
       copyRegularBundledFile(srcBinary, path.join(BIN_DIR, binaryName), 'binary');
@@ -645,25 +639,22 @@ async function installFromBundle(release) {
       throw new Error(`Main binary not found in bundle: bin/${binaryName}`);
     }
 
-    if (fs.existsSync(srcWorker)) {
-      copyRegularBundledFile(srcWorker, path.join(BIN_DIR, workerName), 'worker binary');
-      if (process.platform !== 'win32') {
-        fs.chmodSync(path.join(BIN_DIR, workerName), 0o755);
+    // The ONNX embed worker is built into the main binary (hidden re-exec
+    // token), so there is no separate worker to install.
+    console.log('   ✓ Worker mode built into the main binary (no separate worker)');
+
+    // `leindex` launches the per-user daemon as a sibling executable, so
+    // `leindexd` must land next to it. The daemon is Unix-only: Windows bundles
+    // do not carry it, and a missing one just means the client serves inline.
+    if (process.platform !== 'win32') {
+      const srcDaemon = path.join(bundleDir, 'bin', 'leindexd');
+      if (fs.existsSync(srcDaemon)) {
+        copyRegularBundledFile(srcDaemon, path.join(BIN_DIR, 'leindexd'), 'daemon binary');
+        fs.chmodSync(path.join(BIN_DIR, 'leindexd'), 0o755);
+        console.log('   ✓ Daemon binary installed');
+      } else {
+        console.log('   ⚠ leindexd not found in bundle; the shared daemon is unavailable');
       }
-      console.log('   ✓ Worker binary installed');
-    } else {
-      // The leindex-embed worker binary is part of the bundle; if it is
-      // missing, neural (ONNX) search is unavailable — there is NO
-      // in-process ONNX fallback (the client delegates all inference to
-      // the worker process). TF-IDF search still works. Recover with:
-      //   npm install (re-fetch the bundle)  |  cargo install leindex --features onnx
-      //   |  leindex setup --neural after obtaining the worker.
-      throw new Error(
-        `Worker binary (leindex-embed) not found in bundle at bin/${workerName}. ` +
-          'Neural search is unavailable until it is installed. ' +
-          'Re-run `npm install`, or run `cargo install leindex --features onnx` ' +
-          'to build both binaries from source, then `leindex setup --neural`.'
-      );
     }
 
     // VAL-NPM-002: Install bundled ORT shared libraries under `lib/`.
@@ -808,20 +799,35 @@ async function install() {
   
   const binaryName = getBinaryName();
   const binaryPath = path.join(BIN_DIR, binaryName);
-  const workerName = getWorkerBinaryName();
-  const workerPath = path.join(BIN_DIR, workerName);
-  
-  // Check if already installed (both main and worker)
+
+  // Check if already installed. The worker is not a separate file anymore
+  // (single binary since 2026-08-20): `binaryPath` IS the worker, so the
+  // reinstall triggers are a stale/unreadable binary, missing assets, or —
+  // on Unix — a missing daemon sibling (an install that predates the daemon
+  // otherwise reports "complete" while every `leindex mcp` session runs its
+  // own inline server with no diagnostic anywhere).
+  const daemonPath = path.join(BIN_DIR, 'leindexd');
+  const needsDaemon = process.platform !== 'win32';
   if (fs.existsSync(binaryPath)) {
     const existing = existingBinaryMatchesPackage(binaryPath);
-    const hasWorker = fs.existsSync(workerPath);
 
     const hasAssets = bundledAssetsComplete();
+    const hasDaemon = !needsDaemon || fs.existsSync(daemonPath);
 
-    if (existing.ok && hasWorker && hasAssets) {
+    // Resolution shared between the repair guard below and the install at
+    // the bottom: one GitHub round-trip for the repair path, and one
+    // authoritative answer for both decisions. Null when the guard never
+    // ran (fresh install, or the binary needed replacing outright) — the
+    // install then resolves for itself, and the fast path pays no resolve.
+    let resolved = null;
+    let resolveFailed = false;
+
+    if (existing.ok && hasAssets && hasDaemon) {
       console.log(`   ✓ LeIndex already installed: ${existing.output}`);
-      console.log('   ✓ Worker binary present');
       console.log('   ✓ Bundled ORT runtime assets present');
+      if (needsDaemon) {
+        console.log('   ✓ Daemon binary present');
+      }
       console.log('\n📦 Installation complete!');
       console.log('   Add this package to your MCP configuration to use LeIndex.');
       return;
@@ -832,18 +838,50 @@ async function install() {
         `   ⚠ Existing LeIndex binary is stale or unreadable: ${existing.version || existing.output}`
       );
       console.log(`   Reinstalling binary for package version ${pkg.version}...`);
-    } else if (!hasWorker) {
-      console.log('   ⚠ Worker binary missing; reinstalling bundled worker...');
-    } else if (!hasAssets) {
-      console.log('   ⚠ Bundled ORT runtime assets missing; reinstalling release bundle...');
+    } else {
+      // Binary is current; the gap is daemon or ORT assets. Before deleting
+      // a working binary, check what the resolved release could actually
+      // install: a legacy bare-binary release ships neither leindexd nor
+      // the ORT bundle, so reinstalling from it recreates the exact same
+      // incomplete state — deleting first would turn every install run
+      // into an endless download loop that keeps "repairing" nothing.
+      const gap = !hasAssets
+        ? 'Bundled ORT runtime assets missing'
+        : 'Daemon binary (leindexd) missing';
+      try {
+        resolved = await resolveReleaseConfig(platform, arch);
+      } catch (_) {
+        resolveFailed = true;
+      }
+
+      if (resolved && !resolved.isBundle) {
+        console.log(
+          `   ⚠ ${gap}, but resolved release ${resolved.version} is the legacy bare-binary format and carries neither leindexd nor the ORT bundle.`
+        );
+        console.log('   Keeping the installed binary; reinstalling would recreate the same state.');
+        console.log('   Sessions run inline (no shared daemon) until a bundle-format release is installed.');
+        return;
+      }
+
+      // Release resolution failed (offline, rate limit): leave the working
+      // binary in place and report, rather than gambling it on the cargo
+      // fallback below.
+      if (resolveFailed) {
+        console.log(`   ⚠ ${gap}, and no release could be resolved to repair it (${getRequestedRelease()}).`);
+        console.log('   Keeping the installed binary; fix connectivity or set LEINDEX_BINARY_VERSION and rerun.');
+        return;
+      }
+
+      console.log(`   ⚠ ${gap}; reinstalling release bundle...`);
     }
 
     try { fs.unlinkSync(binaryPath); } catch (_) {}
-    try { fs.unlinkSync(workerPath); } catch (_) {}
   }
   
   try {
-    const release = await resolveReleaseConfig(platform, arch);
+    // On the repair path this is the resolution the guard already fetched;
+    // a fresh resolve happens only when the guard never ran.
+    const release = resolved || (await resolveReleaseConfig(platform, arch));
     console.log(`   Resolved version: ${release.version} (${release.isBundle ? 'bundle' : 'legacy binary'})`);
 
     if (release.isBundle) {
@@ -871,12 +909,12 @@ async function install() {
     
     try {
       // One published crate (leindex) ships BOTH binaries: `cargo install
-      // leindex --features onnx` installs `leindex` and `leindex-embed`
+      // leindex --features onnx` installs the single `leindex` binary
       // (VAL-CARGO-005). The retired leindex-embed subcrate is gone, so
       // there is no separate worker crate to install — a second
       // `cargo install leindex-embed` would now fail.
       execSync('cargo install leindex --force --features onnx', { stdio: 'inherit' });
-      console.log('\n   ✓ Installed leindex + leindex-embed via cargo (one crate, two binaries)');
+      console.log('\n   ✓ Installed leindex (single binary, worker mode built in)');
 
       // Link cargo-installed binaries to our bin directory.
       try {
@@ -887,16 +925,20 @@ async function install() {
           fs.chmodSync(binaryPath, 0o755);
           console.log('   ✓ Main binary linked to package directory');
         }
-        // The worker binary is co-installed by the same cargo install.
-        const cargoWorker = path.join(cargoHome, 'bin', workerName);
-        if (fs.existsSync(cargoWorker)) {
-          fs.copyFileSync(cargoWorker, workerPath);
-          fs.chmodSync(workerPath, 0o755);
-          console.log('   ✓ Worker binary linked to package directory');
-        } else {
-          // No in-process ONNX fallback exists: if the worker is absent,
-          // neural search is unavailable until it is obtained.
-          console.log('   ⚠ Worker binary (leindex-embed) missing from cargo install; neural search unavailable. Re-run `cargo install leindex --features onnx`.');
+        // The same cargo install also builds `leindexd` (one crate, two
+        // binaries). The daemon is Unix-only, and the shared-daemon
+        // behaviour needs it next to the client, exactly like the bundle
+        // path installs it. The retired worker self-copy (leindex onto
+        // leindex) is gone — worker mode is built into the single binary.
+        if (process.platform !== 'win32') {
+          const cargoDaemon = path.join(cargoHome, 'bin', 'leindexd');
+          if (fs.existsSync(cargoDaemon)) {
+            fs.copyFileSync(cargoDaemon, path.join(BIN_DIR, 'leindexd'));
+            fs.chmodSync(path.join(BIN_DIR, 'leindexd'), 0o755);
+            console.log('   ✓ Daemon binary linked to package directory');
+          } else {
+            console.log('   ⚠ leindexd missing from cargo install; the shared daemon is unavailable (sessions run inline)');
+          }
         }
       } catch (linkErr) {
         console.log('   ⚠ Could not link binary, but cargo install succeeded');

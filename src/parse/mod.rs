@@ -54,12 +54,19 @@ pub mod ruby;
 /// PHP language implementation.
 pub mod php;
 
-/// Swift language implementation (disabled due to tree-sitter version conflicts)
-// pub mod swift;
-/// Kotlin language implementation (disabled due to tree-sitter version conflicts)
-// pub mod kotlin;
-/// Dart language implementation (disabled due to tree-sitter version conflicts)
-// pub mod dart;
+/// Dart language implementation.
+pub mod dart;
+/// Documentation parser (markdown/rst/adoc/txt heading sections).
+pub mod docs;
+/// Tier-0 generic tree-sitter parser for the breadth languages.
+pub mod generic;
+/// Kotlin language implementation.
+pub mod kotlin;
+/// Swift language implementation.
+pub mod swift;
+
+#[cfg(test)]
+mod generic_test;
 /// Lua language implementation.
 pub mod lua;
 
@@ -96,6 +103,10 @@ pub mod prelude;
 /// Test suite for leparse.
 #[cfg(test)]
 mod tests;
+
+/// Equivalence tests between full and signature-only (lite) extraction.
+#[cfg(test)]
+mod lite_test;
 
 /// Library initialization.
 pub fn init() {

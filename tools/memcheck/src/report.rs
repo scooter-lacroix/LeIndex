@@ -8,6 +8,7 @@
 //! per-phase main RSS, worker RSS, and combined RSS rather than a single
 //! undifferentiated number.
 
+use crate::env_capture::EnvironmentCapture;
 use serde::{Deserialize, Serialize};
 
 /// Per-phase memory report (VAL-MEASURE-003, VAL-CPHASE-035).
@@ -37,6 +38,19 @@ pub struct PhaseReport {
     /// (VAL-CPHASE-035). Equal to rss_max_kib when no worker is active.
     #[serde(default)]
     pub combined_rss_max_kib: u64,
+    /// Diagnostic recorded when the binary is worker-capable but no worker
+    /// process was observed in a worker-active phase (e.g. missing ONNX
+    /// runtime library or model). Not a gate failure; `None` (and omitted
+    /// from JSON) in every other case so existing baseline files keep parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_note: Option<String>,
+    /// Peak GPU VRAM used in MiB during this phase (§14 item 8).
+    /// `None` when no GPU is detected (headless CI).
+    #[serde(default)]
+    pub gpu_vram_mib: Option<u64>,
+    /// Descendant process tree summary at phase peak (§14 item: descendant counting).
+    #[serde(default)]
+    pub descendants: crate::sampler::DescendantTree,
 }
 
 /// Full memcheck report containing all phases.
@@ -48,11 +62,15 @@ pub struct MemcheckReport {
     pub phases: Vec<PhaseReport>,
     /// Timestamp of the report.
     pub timestamp: String,
+    /// §14 environment capture (kernel, git, hardware, provider config, etc.).
+    #[serde(default)]
+    pub environment: EnvironmentCapture,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::env_capture::EnvironmentCapture;
     use crate::workload::CANONICAL_PHASES;
     impl MemcheckReport {
         /// Get a phase report by name.
@@ -94,6 +112,9 @@ mod tests {
             duration_ms: 1000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 200,
+            worker_note: None,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         }
     }
 
@@ -110,6 +131,9 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 200000,
+            worker_note: None,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
 
         let json = serde_json::to_string(&report).unwrap();
@@ -123,6 +147,7 @@ mod tests {
             fixture: "/test".to_string(),
             phases: vec![make_phase("idle_warm"), make_phase("index")],
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            environment: EnvironmentCapture::default(),
         };
 
         assert!(report.get_phase("idle_warm").is_some());
@@ -143,6 +168,9 @@ mod tests {
             duration_ms: 2000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 80000,
+            worker_note: None,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
 
         let json = serde_json::to_value(&report).unwrap();
@@ -172,6 +200,7 @@ mod tests {
                 .map(|&name| make_phase(name))
                 .collect(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            environment: EnvironmentCapture::default(),
         };
         assert!(report.validate_canonical_phases().is_ok());
     }
@@ -182,9 +211,10 @@ mod tests {
             fixture: "/test".to_string(),
             phases: vec![make_phase("idle_warm")],
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            environment: EnvironmentCapture::default(),
         };
         let err = report.validate_canonical_phases().unwrap_err();
-        assert!(err.contains("expected 12 phases"));
+        assert!(err.contains("expected 21 phases"));
     }
 
     #[test]
@@ -198,6 +228,7 @@ mod tests {
             fixture: "/test".to_string(),
             phases,
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            environment: EnvironmentCapture::default(),
         };
         let err = report.validate_canonical_phases().unwrap_err();
         assert!(err.contains("expected 'idle_warm'"));

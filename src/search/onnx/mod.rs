@@ -22,6 +22,11 @@ pub mod chunking;
 #[cfg(feature = "onnx")]
 pub mod client;
 
+/// Client-side global embedding cache access (probe hits locally, dispatch
+/// only misses to the worker, store fresh vectors under the same keys).
+#[cfg(feature = "onnx")]
+pub(crate) mod embed_cache_frontend;
+
 /// Remote embedding providers (OpenAI, Cohere, etc.)
 ///
 /// Provides integration with cloud-based embedding services as an
@@ -34,8 +39,8 @@ pub use chunking::{ChunkConfig, CrossLanguageChunker, SemanticChunk};
 
 #[cfg(feature = "onnx")]
 pub use client::{
-    ClientError, EmbedResult, EmbeddingClient, WorkerAvailability, migraphx_cache_path,
-    prune_stale_migraphx_profiles,
+    ClientError, EmbedResult, EmbeddingClient, WorkerAvailability, daemon_active_provider,
+    migraphx_cache_path, prune_stale_migraphx_profiles,
 };
 
 #[cfg(feature = "remote-embeddings")]

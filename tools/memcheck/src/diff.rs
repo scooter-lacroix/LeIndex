@@ -91,6 +91,10 @@ pub struct DiffResult {
     pub phases: Vec<PhaseDiff>,
     /// Whether all phases passed.
     pub all_passed: bool,
+    /// The regression rules this diff was computed with (from the budget
+    /// file). Formatting must report the SAME rules the gate applied —
+    /// hard-coding them here once printed "+5%" details under a +10% rule.
+    pub rules: RegressionRules,
 }
 
 /// Load the budget file from the canonical path.
@@ -228,6 +232,7 @@ pub fn diff_report(
     DiffResult {
         phases: phase_diffs,
         all_passed,
+        rules: budget.regression_rules.clone(),
     }
 }
 
@@ -239,9 +244,15 @@ pub fn format_diff(diff: &DiffResult) -> String {
     let mut lines = Vec::new();
 
     lines.push("═══ Memcheck Phase Diff ═══".to_string());
+    let rules = &diff.rules;
     lines.push(format!(
         "{:<15} {:>12} {:>12} {:>12} {:>12} {:>8}",
-        "Phase", "Main RSS", "Baseline+5%", "Ceiling+10%", "Combined", "Status"
+        "Phase",
+        "Main RSS",
+        format!("Baseline+{}%", rules.baseline_tolerance_pct),
+        format!("Ceiling+{}%", rules.ceiling_tolerance_pct),
+        "Combined",
+        "Status"
     ));
     lines.push("─".repeat(80));
 
@@ -274,9 +285,7 @@ pub fn format_diff(diff: &DiffResult) -> String {
             if let (Some(bl), Some(_thr)) = (pd.baseline_kib, pd.baseline_threshold_kib) {
                 lines.push(format!(
                     "  ⚠ MAIN RSS baseline regression: {} KiB > baseline({} KiB) + {}%",
-                    pd.measured_kib,
-                    bl,
-                    diff_phases_rules(diff).baseline_tolerance_pct
+                    pd.measured_kib, bl, diff.rules.baseline_tolerance_pct
                 ));
             }
         }
@@ -284,9 +293,7 @@ pub fn format_diff(diff: &DiffResult) -> String {
             if let (Some(ce), Some(_thr)) = (pd.ceiling_kib, pd.ceiling_threshold_kib) {
                 lines.push(format!(
                     "  ⚠ MAIN RSS ceiling regression: {} KiB > ceiling({} KiB) + {}%",
-                    pd.measured_kib,
-                    ce,
-                    diff_phases_rules(diff).ceiling_tolerance_pct
+                    pd.measured_kib, ce, diff.rules.ceiling_tolerance_pct
                 ));
             }
         }
@@ -296,9 +303,7 @@ pub fn format_diff(diff: &DiffResult) -> String {
             {
                 lines.push(format!(
                     "  ⚠ COMBINED RSS ceiling regression: {} KiB > combined ceiling({} KiB) + {}%",
-                    pd.combined_measured_kib,
-                    ce,
-                    diff_phases_rules(diff).ceiling_tolerance_pct
+                    pd.combined_measured_kib, ce, diff.rules.ceiling_tolerance_pct
                 ));
             }
         }
@@ -359,16 +364,6 @@ fn extract_fixture_name(fixture_path: &str) -> &str {
 /// Apply a percentage increase to a value.
 fn apply_pct(value: u64, pct: u64) -> u64 {
     value + (value * pct / 100)
-}
-
-/// Helper to get regression rules from a diff result (for formatting).
-fn diff_phases_rules(_diff: &DiffResult) -> RegressionRules {
-    // We don't store the rules in DiffResult; return defaults for formatting.
-    // The actual rules come from the budget file.
-    RegressionRules {
-        baseline_tolerance_pct: 5,
-        ceiling_tolerance_pct: 10,
-    }
 }
 
 /// Find the workspace root by walking up from a starting directory.
@@ -439,9 +434,13 @@ mod tests {
                     duration_ms: 3000,
                     worker_rss_max_kib: 0,
                     combined_rss_max_kib: *rss,
+                    worker_note: None,
+                    gpu_vram_mib: None,
+                    descendants: crate::sampler::DescendantTree::default(),
                 })
                 .collect(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            environment: crate::env_capture::EnvironmentCapture::default(),
         }
     }
 
@@ -478,6 +477,9 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            worker_note: None,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         std::fs::write(small_repo_dir.join("idle_warm.json"), json).unwrap();
@@ -494,6 +496,9 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 700000,
+            worker_note: None,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
         let json2 = serde_json::to_string_pretty(&baseline2).unwrap();
         std::fs::write(small_repo_dir.join("index.json"), json2).unwrap();
@@ -537,6 +542,9 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            worker_note: None,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         std::fs::write(small_repo_dir.join("idle_warm.json"), json).unwrap();
@@ -617,6 +625,9 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            worker_note: None,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         std::fs::write(small_repo_dir.join("idle_warm.json"), json).unwrap();
@@ -649,6 +660,9 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            worker_note: None,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
 
         write_baseline(&baselines_dir, "small_repo", &phase).unwrap();
@@ -679,6 +693,9 @@ mod tests {
                 duration_ms: 3000,
                 worker_rss_max_kib: 0,
                 combined_rss_max_kib: 200000 + i as u64 * 10000,
+                worker_note: None,
+                gpu_vram_mib: None,
+                descendants: crate::sampler::DescendantTree::default(),
             })
             .collect::<Vec<_>>();
 
@@ -714,6 +731,9 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            worker_note: None,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         std::fs::write(small_repo_dir.join("idle_warm.json"), json).unwrap();
@@ -747,6 +767,9 @@ mod tests {
             duration_ms: 3000,
             worker_rss_max_kib: 0,
             combined_rss_max_kib: 400000,
+            worker_note: None,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         std::fs::write(small_repo_dir.join("idle_warm.json"), json).unwrap();

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #############################################
 # LeIndex Universal Installer
-# Version: 1.9.5 - Rust Edition
+# Version: 2.0.0 - Rust Edition
 # Platform: macOS
 #
 # Installer:
@@ -17,7 +17,7 @@ set -euo pipefail
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-readonly SCRIPT_VERSION="1.9.5"
+readonly SCRIPT_VERSION="2.0.0"
 readonly PROJECT_NAME="LeIndex"
 readonly PROJECT_SLUG="leindex"
 readonly MIN_RUST_MAJOR=1
@@ -308,7 +308,7 @@ install_leindex() {
     # Build from source
     log_info "Building LeIndex..."
     # One published crate (leindex) builds BOTH binaries (leindex and
-    # leindex-embed). The retired leindex-embed subcrate is gone.
+    # leindexd). The retired leindex-embed subcrate is gone.
     if cargo build --release -p leindex --features leindex/onnx 2>&1 | tee -a "$INSTALL_LOG"; then
         log_success "Build completed successfully"
     else
@@ -322,7 +322,6 @@ install_leindex() {
 
     # Install main binary
     local binary="target/release/$PROJECT_SLUG"
-    local worker_binary="target/release/leindex-embed"
     if [[ -f "$binary" ]]; then
         ensure_cargo_home_ready
         cp "$binary" "$INSTALL_BIN_PATH"
@@ -338,16 +337,21 @@ install_leindex() {
         exit 1
     fi
 
-    # Install ONNX worker binary
-    if [[ -f "$worker_binary" ]]; then
-        local worker_install_path="${INSTALL_BIN_DIR}/leindex-embed"
-        if cp "$worker_binary" "$worker_install_path" && chmod +x "$worker_install_path"; then
-            log_success "Worker binary installed to: $worker_install_path"
+    # Install the shared daemon beside the client: `leindex` looks for a
+    # sibling `leindexd` (or $LEINDEXD_BIN) when the daemon client is
+    # enabled, and falls back to inline indexing when it is missing. The
+    # same cargo build produces it. (The retired `leindex-embed` worker is
+    # gone — worker mode is built into the single `leindex` binary.)
+    local daemon_binary="target/release/leindexd"
+    local daemon_install_path="${INSTALL_BIN_DIR}/leindexd"
+    if [[ -f "$daemon_binary" ]]; then
+        if cp "$daemon_binary" "$daemon_install_path" && chmod +x "$daemon_install_path"; then
+            log_success "Daemon installed to: $daemon_install_path"
         else
-            log_warn "Failed to install worker binary to $worker_install_path"
+            log_warn "Failed to install daemon to $daemon_install_path"
         fi
     else
-        log_warn "Worker binary (leindex-embed) not found; neural search unavailable. Rebuild with: cargo build --release -p leindex --features leindex/onnx"
+        log_warn "Daemon binary (leindexd) not found; the shared daemon is unavailable and leindex will serve inline"
     fi
 
     # Clean up temporary clone if we created it

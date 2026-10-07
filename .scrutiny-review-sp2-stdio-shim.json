@@ -1,0 +1,46 @@
+{
+  "featureId": "sp2-stdio-shim",
+  "reviewedAt": "2026-08-05T04:25:00Z",
+  "commitId": "16d7f737",
+  "repoPath": "/mnt/WD-SSD/code_index_update/LeIndexer-release-1.8.4",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "The stdio shim implementation is solid and well-structured. The core forwarder (forward_stream_with_reconnect) correctly uses tokio::io::copy for byte-faithful bidirectional piping between stdin/stdout and the daemon Unix socket. The reconnect logic is bounded with appropriate timeouts (500ms retry, 10s total). The feature is properly gated behind daemon-client in Cargo.toml and mod.rs. Integration tests (shim_forward_test.rs) exercise real leindexd binary round-trips with initialize and tools/list, comparing direct vs shim-forwarded responses for semantic equality. Unit tests cover error paths (missing socket) and byte-faithful passthrough with an echo server. The CLI integration in mcp_commands.rs correctly falls back to the inline server when daemon-client fails, satisfying VAL-SHIM-004.",
+    "issues": [
+      {
+        "file": "src/cli/daemon/shim.rs",
+        "line": 121,
+        "severity": "non_blocking",
+        "description": "tokio::join! waits for BOTH copy directions to complete before evaluating exit/reconnect logic. If the client closes stdin (EOF on client_read), the client_to_socket future completes with Ok(0), but socket_to_client continues blocking until the daemon also closes its side. In practice the daemon sees the EOF and closes too, so this is not a hang in normal operation. However, a daemon that keeps the connection open after client EOF (e.g., during a long-running tool call) would delay the shim's exit. Consider using tokio::select! with an abort-on-first-completion pattern for tighter shutdown semantics. This is a design observation, not a blocking defect."
+      },
+      {
+        "file": "src/cli/daemon/shim.rs",
+        "line": 136,
+        "severity": "non_blocking",
+        "description": "After a successful reconnect (continue at line 149), data that was partially written to the old dead socket is silently lost. The client's request may have been half-sent when the daemon died. On reconnect, the shim resumes reading from client_read, but the partial request was never completed by the daemon. This is inherent to the single-reconnect design and acceptable for best-effort recovery, but it could cause confusing protocol-level errors for the client (e.g., a JSON-RPC parse error on the daemon side from a truncated frame). Consider documenting this limitation in the module-level docs."
+      },
+      {
+        "file": "src/cli/daemon/shim.rs",
+        "line": 96,
+        "severity": "info",
+        "description": "The allow_reconnect flag is only checked when socket_closed is true AND client_closed is false. If both close simultaneously (e.g., client EOF and daemon close at the same time), client_closed takes priority and the shim exits cleanly without attempting reconnect. This is correct behavior but worth noting: the ordering of checks (client_closed first, then socket_closed) means a simultaneous close never triggers reconnect."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "library",
+      "observation": "The daemon-client feature flag and its rollout strategy (spec section 12.3 phase 3) should be documented in the library. The feature is OFF by default, and when ON, the shim discovers/spawns leindexd and forwards byte-faithfully. When the shim fails, it falls back to the inline server with a warning. This architectural decision is only documented in code comments and the plan doc, not in library/.",
+      "evidence": "Cargo.toml:249-254 defines daemon-client feature; src/cli/mcp_commands.rs:83-94 shows the fallback pattern; no library/ entry exists for daemon architecture"
+    },
+    {
+      "area": "services",
+      "observation": "The leindexd daemon binary is a new service that runs as a background process. It binds a Unix socket at ~/.leindex/run/d.sock and exits after idle timeout (default 300s). This service should be documented in services.yaml for the mission's shared state.",
+      "evidence": "src/bin/leindexd.rs defines the daemon binary; spawn.rs:47-99 shows how it's spawned as a detached child process with stdin/stdout/stderr set to null"
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "PASS. The stdio shim implementation is correct, well-tested, and properly feature-gated. The core forwarding logic uses tokio::io::copy for byte-faithful bidirectional piping, with bounded single-reconnect on daemon socket close. Integration tests (VAL-SHIM-001) exercise real leindexd round-trips comparing direct vs shim-forwarded responses. VAL-SHIM-004 is satisfied: daemon-client is OFF by default, and the CLI falls back to the inline server on failure. Two non-blocking observations about join! semantics and partial-data loss on reconnect, and one info-level note about check ordering. No blocking issues found."
+}

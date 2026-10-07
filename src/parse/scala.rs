@@ -174,6 +174,9 @@ fn visit(
 
 /// Extract parameters from a parameters node
 fn extract_scala_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut imports = Vec::new();
 
     fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
@@ -229,6 +232,9 @@ fn extract_scala_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Impo
 }
 
 fn extract_scala_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut calls = Vec::new();
 
     fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {
@@ -292,6 +298,9 @@ fn extract_parameters(params_node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec
 
 /// Extract docstring from a node (Scala uses /** */ comments)
 fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "comment" {

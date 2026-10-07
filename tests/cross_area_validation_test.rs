@@ -36,6 +36,30 @@ fn read_file(rel: &str) -> String {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
+/// Read a Rust module as a whole: `rel` plus every file of its child-module
+/// directory (`foo.rs` -> `foo/*.rs`). These tests assert that behaviour exists
+/// in a module, not which file of that module holds it, so they must survive a
+/// module being split into child files.
+fn read_module(rel: &str) -> String {
+    let mut text = read_file(rel);
+    let dir = repo_root().join(rel.trim_end_matches(".rs"));
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut files: Vec<_> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .collect();
+        files.sort();
+        for file in files {
+            text.push('\n');
+            text.push_str(
+                &std::fs::read_to_string(&file)
+                    .unwrap_or_else(|e| panic!("failed to read {}: {e}", file.display())),
+            );
+        }
+    }
+    text
+}
+
 // ============================================================================
 // VAL-CROSS-007 / VAL-CROSS-016:
 // No-ORT TF-IDF fallback works with a clear, consistent, actionable notice.
@@ -51,7 +75,7 @@ mod no_ort_fallback_notice {
     /// gracefully.
     #[test]
     fn worker_runtime_emits_actionable_notice_when_ort_missing() {
-        let src = read_file("src/embed/runtime.rs");
+        let src = read_module("src/embed/runtime.rs");
 
         // Locate the InitResult::NotFound branch (where the worker emits the
         // notice). The surrounding code MUST log an error naming the searched
@@ -476,7 +500,7 @@ mod version_parity {
     fn one_crate_two_bin_layout() {
         read_file("src/embed/mod.rs");
         read_file("src/embed/worker_main.rs");
-        read_file("src/bin/leindex-embed.rs");
+        // Single binary: no wrapper to read; worker_main is the subject.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         assert!(
             !root.join("crates/leindex-embed").exists(),
@@ -653,17 +677,23 @@ mod per_surface_journeys {
     /// cargo install layout tests; here we ensure the inference codepath can
     /// reach neural scoring via the worker spawn.
     #[test]
-    fn cargo_install_lays_out_both_binaries_cooperatively() {
+    fn cargo_install_lays_out_single_binary() {
+        // Single binary (2026-08-20): the ONNX worker is a hidden re-exec of
+        // `leindex --internal-embed-worker`, so a second [[bin]] target must
+        // NOT exist — shipping one reintroduces the discovery/version-
+        // mismatch failure class the re-exec removes.
         let cargo = read_file("Cargo.toml");
-
-        // The root Cargo.toml declares the worker bin target gated on the
-        // onnx feature so `cargo install --features onnx` co-installs it.
-        let has_embed_target = cargo
-            .lines()
-            .any(|line| line.trim().contains("name = \"leindex-embed\""));
         assert!(
-            has_embed_target,
-            "VAL-CROSS-001 / VAL-CARGO-002: root Cargo.toml must declare the leindex-embed bin target"
+            !cargo
+                .lines()
+                .any(|line| line.trim().contains("name = \"leindex-embed\"")),
+            "VAL-CROSS-001: root Cargo.toml must NOT declare a leindex-embed bin target (single binary)"
+        );
+        let bin_main = read_file("src/bin/leindex.rs");
+        assert!(
+            bin_main.contains("INTERNAL_WORKER_TOKEN")
+                || bin_main.contains("--internal-embed-worker"),
+            "src/bin/leindex.rs must dispatch the hidden worker token"
         );
     }
 
@@ -706,29 +736,12 @@ mod per_surface_journeys {
             toml.contains("leindex-setup = \"leindex.bootstrap:setup_main\""),
             "VAL-PYPI-005: pyproject.toml must declare the leindex-setup console script"
         );
-        // VAL-PYPI-008: the bootstrap must ensure the leindex-embed worker
-        // binary is present so neural search functions after setup. Post
-        // embed-merge the worker is a `[[bin]]` of the root crate, so a single
-        // `cargo install leindex --features onnx` co-installs it; the former
-        // standalone `install_embed_worker` helper no longer exists. The
-        // bootstrap tracks the worker via `embed_binary` and repairs a
-        // partial install (main-only) through `ensure_worker_present`.
+        // Single binary: the worker ships inside leindex; the bootstrap
+        // keeps a no-op ensure_worker_present for call-site compatibility.
         let bootstrap = read_file("packages/pypi-leindex/src/leindex/bootstrap.py");
         assert!(
-            bootstrap.contains("embed_binary"),
-            "VAL-PYPI-008: bootstrap must track the leindex-embed worker binary"
-        );
-        assert!(
-            bootstrap.contains("ensure_worker_present"),
-            "VAL-PYPI-008: bootstrap must ensure the leindex-embed worker binary is present"
-        );
-        // The worker must be a [[bin]] of the root crate, onnx-gated, so the
-        // single cargo install co-installs it (VAL-CARGO-005 invariant).
-        let cargo = read_file("Cargo.toml");
-        assert!(
-            cargo.contains("name = \"leindex-embed\"")
-                && cargo.contains("required-features = [\"onnx\"]"),
-            "VAL-PYPI-008: root crate must declare the onnx-gated leindex-embed worker bin"
+            bootstrap.contains("def ensure_worker_present("),
+            "bootstrap must keep the ensure_worker_present stub"
         );
         // The bootstrap installs with the `onnx` feature so the `setup`
         // subcommand is present in the freshly installed binary.

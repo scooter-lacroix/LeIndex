@@ -21,6 +21,30 @@ pub(super) fn embed_daemon_enabled() -> bool {
 /// rejected with a clear protocol error.
 pub(super) const MAX_RESPONSE_FRAME_SIZE: u32 = 32 * 1024 * 1024; // 32 MiB
 
+/// Maximum request frame size budget for a single embed IPC frame.
+///
+/// VAL-FRAME-001: The client must never send a request frame that exceeds the
+/// worker's *incoming* frame guard (`max_frame_size * 2` = 32 MiB by default).
+/// Batching N full contents into one frame routinely exceeded that guard,
+/// deterministically killing the worker (EOF/EPIPE). This budget is chosen
+/// with headroom under the 32 MiB worker cap — bincode adds a small envelope
+/// per frame, so requests are sharded to fit comfortably.
+pub(super) const MAX_REQUEST_FRAME_BUDGET: usize = 16 * 1024 * 1024; // 16 MiB
+
+/// Estimate the serialized size of an embed request frame containing `texts`.
+///
+/// Used to shard oversized batches before framing (VAL-FRAME-001). This is a
+/// conservative upper-bound estimate: bincode adds a per-string length prefix
+/// plus the EmbedRequest envelope; `len()` bytes plus a small per-text fixed
+/// overhead is a safe over-estimate that guarantees the resulting frame fits
+/// within `MAX_REQUEST_FRAME_BUDGET`.
+pub(super) fn embed_request_frame_estimate<S: AsRef<str>>(texts: &[S]) -> usize {
+    texts
+        .iter()
+        .map(|t| t.as_ref().len() + 32) // 32 bytes overhead per string (bincode length + slack)
+        .sum()
+}
+
 /// Read buffer capacity for BufReader wrapping the inference data path.
 ///
 /// VAL-DAEMON-006: A 128KB buffer reduces the number of `read()` syscalls
@@ -67,14 +91,6 @@ pub(super) const DAEMON_READY_MAX_WAIT: Duration = Duration::from_secs(120);
 /// request-path timeout and does not cancel inference.
 pub(super) const STALE_DAEMON_KILL_GRACE: Duration = Duration::from_secs(1);
 
-pub(super) fn platform_binary_name(binary_name: &str) -> String {
-    if cfg!(windows) {
-        format!("{}.exe", binary_name)
-    } else {
-        binary_name.to_string()
-    }
-}
-
 /// Env var override for the worker binary path. When set, the value must point
 /// to a worker that exists; a broken explicit path is an actionable error, not
 /// a silent fallthrough to sibling/PATH resolution.
@@ -82,13 +98,6 @@ pub(super) const WORKER_PATH_ENV: &str = "LEINDEX_WORKER_PATH";
 
 /// The version a PATH-discovered worker must report on `--version`.
 ///
-/// There is no separate worker protocol version: the worker and main crate are
-/// kept version-aligned by the AGENTS.md version-parity rule, so
-/// `env!("CARGO_PKG_VERSION")` is the compatibility check. See
-/// `src/embed/worker_main.rs` (`run`): `leindex-embed --version` prints exactly
-/// `leindex-embed <CARGO_PKG_VERSION>`.
-const EXPECTED_WORKER_VERSION_LINE: &str = concat!("leindex-embed ", env!("CARGO_PKG_VERSION"));
-
 /// Resolve the path to the worker binary.
 ///
 /// Precedence (Task 9, embed-merge-1.10.0):
@@ -101,44 +110,13 @@ const EXPECTED_WORKER_VERSION_LINE: &str = concat!("leindex-embed ", env!("CARGO
 ///    the output `leindex-embed <CARGO_PKG_VERSION>`. Stale/incompatible PATH
 ///    workers are rejected with `NotFound`.
 pub(super) fn resolve_worker_binary() -> Result<PathBuf, std::io::Error> {
-    let binary_name = platform_binary_name("leindex-embed");
-    let exe_dirs: Vec<PathBuf> = std::env::current_exe()
-        .ok()
-        .and_then(|exe| {
-            let dir = exe.parent()?.to_path_buf();
-            let grandparent = exe
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|p| p.to_path_buf());
-            Some(vec![Some(dir), grandparent])
-        })
-        .map(|v| v.into_iter().flatten().collect())
-        .unwrap_or_default();
-
-    let path_lookup = |name: &str| which::which(name);
-    resolve_worker_binary_with(
-        std::env::var_os(WORKER_PATH_ENV),
-        &exe_dirs,
-        &binary_name,
-        &path_lookup,
-    )
-}
-
-/// Pure resolution core, factored out for testing without touching the real
-/// environment or `current_exe`.
-///
-/// `explicit` is the raw `LEINDEX_WORKER_PATH` value (if set). `exe_dirs` are
-/// the trusted sibling search dirs (exe dir then its parent). `path_lookup`
-/// is the `which`-style PATH resolver, injectable so tests never touch the
-/// user's real PATH.
-fn resolve_worker_binary_with(
-    explicit: Option<std::ffi::OsString>,
-    exe_dirs: &[PathBuf],
-    binary_name: &str,
-    path_lookup: &dyn Fn(&str) -> Result<PathBuf, which::Error>,
-) -> Result<PathBuf, std::io::Error> {
-    // 1. Explicit override: set means it must work, never silently fall through.
-    if let Some(raw) = explicit {
+    // Single-binary mode: the worker is THIS executable re-exec'd with the
+    // hidden token. current_exe is version-identical by construction, so the
+    // sibling/grandparent/PATH-probe discovery chain (and its version
+    // validation) is unnecessary. The explicit LEINDEX_WORKER_PATH override
+    // remains for development workflows pointing at a separately built
+    // worker binary.
+    if let Some(raw) = std::env::var_os(WORKER_PATH_ENV) {
         let candidate = PathBuf::from(raw);
         if candidate.is_file() {
             return Ok(candidate);
@@ -147,59 +125,18 @@ fn resolve_worker_binary_with(
             std::io::ErrorKind::NotFound,
             format!(
                 "{} is set to '{}' but no worker binary exists there \
-                 (remove the override or point it at a valid leindex-embed)",
+                 (remove the override or point it at a valid leindex binary)",
                 WORKER_PATH_ENV,
                 candidate.display()
             ),
         ));
     }
-
-    // 2. Sibling binary — trusted by location, no version spawn.
-    for dir in exe_dirs {
-        let sibling = dir.join(binary_name);
-        if sibling.is_file() {
-            return Ok(sibling);
-        }
-    }
-
-    // 3. PATH fallback — must be version-compatible.
-    let candidate = path_lookup(binary_name).map_err(|e| {
+    std::env::current_exe().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("worker binary '{}' not found in PATH: {}", binary_name, e),
+            format!("failed to resolve current executable for worker re-exec: {e}"),
         )
-    })?;
-    if path_candidate_version_matches(&candidate) {
-        Ok(candidate)
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "PATH worker '{}' did not report the expected version \
-                 (want '{}'); remove or update it",
-                candidate.display(),
-                EXPECTED_WORKER_VERSION_LINE
-            ),
-        ))
-    }
-}
-
-/// Run `<candidate> --version` and accept only an exact match against the
-/// current crate version. Used solely for the PATH fallback; sibling and
-/// explicit-override candidates are trusted by location and skip this spawn.
-fn path_candidate_version_matches(candidate: &std::path::Path) -> bool {
-    let output = match std::process::Command::new(candidate)
-        .arg("--version")
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return false,
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.trim_end() == EXPECTED_WORKER_VERSION_LINE
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -375,6 +312,52 @@ pub(super) fn daemon_status_path(
     daemon_socket_path(provider, model_name).map(|path| path.with_extension("status"))
 }
 
+/// Probe the configured embed daemon and report the execution provider the
+/// worker actually activated, plus its lifecycle phase.
+///
+/// `None` when no daemon socket exists (worker never spawned), the daemon
+/// is unreachable, or the worker has not reported a provider yet. This is
+/// the truth source for diagnostics: `leindex.toml` records what provider
+/// was *requested*, while the worker records what *loaded* — e.g.
+/// `migraphx` requested but `cpu` active after a provider-library load
+/// failure. Surfacing the active value keeps diagnostics from reporting a
+/// GPU that is not in use.
+#[cfg(unix)]
+pub fn daemon_active_provider() -> Option<(String, String)> {
+    let config = crate::config::LeIndexConfig::load_cached();
+    let provider = std::env::var("LEINDEX_WORKER_EXECUTION_PROVIDER")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let configured = config.neural.execution_provider.clone();
+            (!configured.is_empty()).then_some(configured)
+        });
+    let model = std::env::var("LEINDEX_WORKER_MODEL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let configured = config.neural.model_name.clone();
+            (!configured.is_empty()).then_some(configured)
+        });
+    let socket_path = daemon_socket_path(provider.as_deref(), model.as_deref())?;
+    if !socket_path.exists() {
+        return None;
+    }
+    // Diagnostics must stay fast; a busy worker answering its health socket
+    // slowly must not add the full 250ms DAEMON_HEALTH_WAIT to every
+    // diagnostics call. A short 50ms probe budget reports the active
+    // provider in the common case and degrades to `None` (configured value
+    // shown) under contention.
+    let health =
+        probe_daemon_health_with_timeout(&socket_path, Some(Duration::from_millis(50))).ok()?;
+    Some((health.provider?, health.phase))
+}
+
+#[cfg(not(unix))]
+pub fn daemon_active_provider() -> Option<(String, String)> {
+    None
+}
+
 #[cfg(unix)]
 pub(super) fn daemon_pid_path(provider: Option<&str>, model_name: Option<&str>) -> Option<PathBuf> {
     daemon_socket_path(provider, model_name).map(|path| path.with_extension("pid"))
@@ -386,6 +369,85 @@ pub(super) fn cleanup_daemon_paths(socket_path: &Path) {
     let _ = std::fs::remove_file(socket_path.with_extension("status"));
     let _ = std::fs::remove_file(socket_path.with_extension("pid"));
     let _ = std::fs::remove_file(socket_path.with_extension("start"));
+    // Advisory spawn locks outlive crashed daemons; two stale ones were left
+    // on the stress-test box from the pre-cleanup era. Harmless (flock-based)
+    // but they accumulate — remove them with the rest of the artifact set.
+    let _ = std::fs::remove_file(socket_path.with_extension("lock"));
+}
+
+/// Single-daemon enforcement: terminate live embed daemons whose descriptor
+/// differs from `keep_socket` (the daemon this client is about to spawn).
+///
+/// The daemon socket is keyed by (version, provider, model, batch, seq), so
+/// a config change leaves the PREVIOUS daemon resident until its idle
+/// timeout — the stress-test OOM post-mortem measured two concurrent
+/// daemons at total_vm ~15 GiB each inside one Maestro cgroup. Newest
+/// config wins. Opt out with `LEINDEX_ALLOW_MULTIPLE_EMBED_DAEMONS=1`
+/// (multi-model setups).
+///
+/// Only pid files whose process still exists AND still looks like an embed
+/// worker are signalled; stale artifacts are cleaned.
+#[cfg(unix)]
+pub(crate) fn terminate_superseded_daemons(keep_socket: &Path) {
+    if std::env::var_os("LEINDEX_ALLOW_MULTIPLE_EMBED_DAEMONS").is_some() {
+        return;
+    }
+    let Some(run_dir) = keep_socket.parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&run_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(base) = name.strip_suffix(".pid") else {
+            continue;
+        };
+        if !base.starts_with("leindex-embed-") {
+            continue;
+        }
+        let foreign_socket = run_dir.join(format!("{base}.sock"));
+        if foreign_socket == keep_socket {
+            continue;
+        }
+        let pid_path = entry.path();
+        let Some(pid) = std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
+        else {
+            // No readable pid — stale artifact set.
+            let _ = std::fs::remove_file(&pid_path);
+            let _ = std::fs::remove_file(&foreign_socket);
+            let _ = std::fs::remove_file(foreign_socket.with_extension("status"));
+            continue;
+        };
+        let alive = unsafe { libc::kill(pid, 0) == 0 };
+        if !alive {
+            let _ = std::fs::remove_file(&pid_path);
+            let _ = std::fs::remove_file(&foreign_socket);
+            let _ = std::fs::remove_file(foreign_socket.with_extension("status"));
+            continue;
+        }
+        // Confirm the pid is still an embed worker before signalling it.
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !comm.starts_with("leindex-embed") {
+            continue;
+        }
+        tracing::warn!(
+            pid,
+            socket = %foreign_socket.display(),
+            "terminating superseded embed daemon (single-daemon policy; \
+             set LEINDEX_ALLOW_MULTIPLE_EMBED_DAEMONS=1 to keep it)"
+        );
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -506,6 +568,12 @@ pub(super) fn worker_health_snapshot(
         provider,
         model: model.unwrap_or_else(|| "qwen3-embed-0.6b".to_string()),
         error,
+        model_digest: None,
+        tokenizer_digest: None,
+        config_digest: None,
+        host_rss_mib: None,
+        gpu_vram_mib: None,
+        provider_compile_cache: None,
     }
 }
 
@@ -532,7 +600,19 @@ pub(super) fn daemon_pid_alive(path: &Path) -> bool {
         return false;
     }
     let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    if !(result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)) {
+        return false;
+    }
+    // A zombie still answers kill(0) but will never serve the socket — the
+    // stress-test index runs repeatedly left defunct workers whose pid files
+    // passed this check and drove 20 s of readiness-poll retries against a
+    // dead socket.
+    matches!(
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).ok(),
+        Some(stat) if !stat.rsplit_once(") ").is_some_and(|(_, fields)| {
+            fields.split_whitespace().next() == Some("Z")
+        })
+    )
 }
 
 #[cfg(unix)]
@@ -587,7 +667,7 @@ pub(super) fn probe_daemon_health_with_timeout(
             .decode_payload::<Response>()
             .map_err(|error| ClientError::Ipc(error.to_string()))?
         {
-            Response::Health(health) => Ok(health),
+            Response::Health(health) => Ok(*health),
             _ => Err(ClientError::Protocol(
                 "expected Health response payload".to_string(),
             )),
@@ -649,6 +729,14 @@ pub enum ClientError {
     /// Worker reported an error.
     #[error("worker error: {0}")]
     Worker(WorkerError),
+
+    /// A request frame exceeded the worker's incoming-frame guard.
+    ///
+    /// The client shards oversized batches before sending (VAL-FRAME-001), so
+    /// this is only reached when a shard still exceeds the budget — a
+    /// configuration mismatch. The caller can down-shard further or fall back.
+    #[error("request frame too large: {0}")]
+    FrameTooLarge(String),
 
     /// Protocol-level error (unexpected message type, etc.).
     #[error("protocol error: {0}")]
@@ -977,10 +1065,12 @@ impl EmbeddingClient {
         if !requested_gpu {
             return None;
         }
-        // Bring the worker up so its actual provider is observable. This spawns
-        // the daemon the enrichment pass would spawn anyway, so it is not net
-        // extra work; on a fast CPU fallback the worker reports Ready quickly.
-        let _ = self.ensure_worker_ready();
+        // Resident-observation only: NEVER spawn the worker from this guard.
+        // It runs on every index start; with the embed cache serving all
+        // hits, spawning here would cold-start a multi-GiB daemon that the
+        // run then never uses (measured: ~26 s added to every cache-hit
+        // index). The CPU-fallback quality gate still applies — at embed
+        // time, where the cost decision actually sits.
         match self.active_execution_provider().as_deref() {
             Some("cpu") => Some(format!(
                 "neural worker fell back to CPU although `{}` was requested; \
@@ -1018,202 +1108,5 @@ mod frame_size_tests {
             MAX_RESPONSE_FRAME_SIZE as usize,
             crate::embed::runtime::DEFAULT_MAX_FRAME_SIZE * 2
         );
-    }
-}
-
-#[cfg(test)]
-mod worker_binary_resolution_tests {
-    use super::*;
-    use std::io::Write;
-
-    /// Build a detached temp fake worker that prints `line` on `--version`
-    /// and exits 0. The file is kept (not auto-removed) so the test can spawn
-    /// it; tests rely on the OS temp cleanup rather than a guard.
-    fn fake_worker(line: &str) -> std::path::PathBuf {
-        // NamedTempFile + keep(): a single temp file we chmod and spawn.
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        let script = format!("#!/bin/sh\necho '{line}'\n");
-        f.write_all(script.as_bytes()).unwrap();
-        f.flush().unwrap();
-        // `keep()` detaches the temp file, returning (File, PathBuf). The
-        // returned PathBuf is what we chmod, spawn, and assert against.
-        let (_file, path) = f.keep().unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        path
-    }
-
-    /// Precedence rule 1: a valid explicit `LEINDEX_WORKER_PATH` wins, even
-    /// when a sibling and a PATH candidate are present.
-    #[test]
-    fn worker_binary_explicit_override_wins() {
-        let explicit_path = fake_worker("leindex-embed 0.0.0-dummy");
-        let binary_name = platform_binary_name("leindex-embed");
-        let lookup = |_: &str| Err(which::Error::CannotFindBinaryPath);
-        let got = resolve_worker_binary_with(
-            Some(explicit_path.clone().into_os_string()),
-            &[],
-            &binary_name,
-            &lookup,
-        )
-        .unwrap();
-        assert_eq!(got, explicit_path);
-    }
-
-    /// Precedence rule 1 (negative): a set-but-missing explicit path returns
-    /// an actionable NotFound error and does NOT silently fall through to the
-    /// sibling or PATH sources.
-    #[test]
-    fn worker_binary_explicit_bad_path_is_actionable_error() {
-        let binary_name = platform_binary_name("leindex-embed");
-        // A sibling exists and a PATH candidate would match — both must be
-        // ignored because the explicit override is set but broken.
-        let tmp = tempfile::tempdir().unwrap();
-        let sibling = tmp.path().join(&binary_name);
-        std::fs::write(&sibling, b"#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let lookup = |_: &str| Ok(sibling.clone());
-        let bad = tmp.path().join("does-not-exist");
-        let err = resolve_worker_binary_with(
-            Some(bad.clone().into_os_string()),
-            &[tmp.path().to_path_buf()],
-            &binary_name,
-            &lookup,
-        )
-        .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-        let msg = err.to_string();
-        assert!(msg.contains(WORKER_PATH_ENV), "msg={msg}");
-        assert!(msg.contains("does-not-exist"), "msg={msg}");
-    }
-
-    /// Precedence rule 2: sibling binary is trusted by location — no
-    /// `--version` spawn, so even a sibling that prints the wrong version is
-    /// accepted.
-    #[test]
-    fn worker_binary_sibling_trusted_no_version_spawn() {
-        let binary_name = platform_binary_name("leindex-embed");
-        let tmp = tempfile::tempdir().unwrap();
-        let sibling = tmp.path().join(&binary_name);
-        // Deliberately wrong version; sibling trust must ignore it.
-        std::fs::write(&sibling, b"#!/bin/sh\necho 'leindex-embed 0.0.0-stale'\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        // A lookup that would panic if reached, proving the sibling short-circuits.
-        let lookup = |_: &str| -> Result<PathBuf, which::Error> {
-            panic!("PATH lookup must not run when a sibling exists")
-        };
-        let got =
-            resolve_worker_binary_with(None, &[tmp.path().to_path_buf()], &binary_name, &lookup)
-                .unwrap();
-        assert_eq!(got, sibling);
-    }
-
-    /// Precedence rule 3 (positive): PATH candidate whose `--version` exactly
-    /// matches `leindex-embed <CARGO_PKG_VERSION>` is accepted.
-    #[test]
-    fn worker_binary_path_version_match_accepted() {
-        let expected = format!("leindex-embed {}", env!("CARGO_PKG_VERSION"));
-        let cand = fake_worker(&expected);
-        let binary_name = platform_binary_name("leindex-embed");
-        let target = cand.clone();
-        let lookup = move |_: &str| Ok(target.clone());
-        let got = resolve_worker_binary_with(None, &[], &binary_name, &lookup).unwrap();
-        assert_eq!(got, cand);
-    }
-
-    /// Precedence rule 3 (negative): a stale PATH worker that prints a
-    /// non-matching version is rejected with NotFound. This is the core
-    /// regression guard for stale globally-installed workers.
-    #[test]
-    fn worker_binary_stale_path_version_rejected() {
-        let cand = fake_worker("leindex-embed 0.0.0-stale");
-        let binary_name = platform_binary_name("leindex-embed");
-        let target = cand.clone();
-        let lookup = move |_: &str| Ok(target.clone());
-        let err = resolve_worker_binary_with(None, &[], &binary_name, &lookup).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-        let msg = err.to_string();
-        assert!(
-            msg.contains("did not report the expected version"),
-            "msg={msg}"
-        );
-    }
-
-    /// Precedence rule 3 (negative): a PATH worker that prints the right
-    /// version line plus trailing junk (e.g. a debug banner) is still
-    /// rejected — the match is exact after trimming only trailing whitespace.
-    #[test]
-    fn worker_binary_path_version_must_be_exact_line() {
-        let expected = format!("leindex-embed {}", env!("CARGO_PKG_VERSION"));
-        // Extra line after the version → stdout is not a single matching line.
-        let cand = fake_worker(&format!("{expected}\nDEBUG banner"));
-        let binary_name = platform_binary_name("leindex-embed");
-        let target = cand.clone();
-        let lookup = move |_: &str| Ok(target.clone());
-        let err = resolve_worker_binary_with(None, &[], &binary_name, &lookup).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-    }
-
-    /// Precedence rule 3: PATH lookup failure propagates as NotFound.
-    #[test]
-    fn worker_binary_path_not_found_propagates() {
-        let binary_name = platform_binary_name("leindex-embed");
-        let lookup = |_: &str| Err(which::Error::CannotFindBinaryPath);
-        let err = resolve_worker_binary_with(None, &[], &binary_name, &lookup).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-    }
-
-    /// `EXPECTED_WORKER_VERSION_LINE` is `leindex-embed <CARGO_PKG_VERSION>` —
-    /// pins the compatibility contract to the crate version (no separate
-    /// protocol version exists).
-    #[test]
-    fn worker_binary_expected_version_line_is_crate_version() {
-        assert_eq!(
-            EXPECTED_WORKER_VERSION_LINE,
-            format!("leindex-embed {}", env!("CARGO_PKG_VERSION"))
-        );
-    }
-
-    /// `platform_binary_name` reflects the host's extension rule; on Windows
-    /// the resolver searches for `leindex-embed.exe`. Kept as a documented
-    /// expectation rather than a cross-compile assertion.
-    #[test]
-    fn worker_binary_platform_name_has_exe_suffix_on_windows() {
-        let name = platform_binary_name("leindex-embed");
-        if cfg!(windows) {
-            assert_eq!(name, "leindex-embed.exe");
-        } else {
-            assert_eq!(name, "leindex-embed");
-        }
-    }
-
-    /// Windows helper parity: under `#[cfg(windows)]` a `.exe` fake worker
-    /// built by `fake_worker` would be exercised here. On non-Windows hosts
-    /// this is a no-op so the suite stays green, but the test documents the
-    /// `.exe`-suffix contract for the stale-rejection path.
-    #[cfg(windows)]
-    #[test]
-    fn worker_binary_stale_exe_rejected_windows() {
-        // Reuse the version-mismatch logic with a `.exe`-named temp file.
-        // NamedTempFile has no extension; build one in a tempdir instead.
-        let tmp = tempfile::tempdir().unwrap();
-        let cand = tmp.path().join("leindex-embed.exe");
-        std::fs::write(&cand, b"this is not a runnable exe\n").unwrap();
-        let binary_name = platform_binary_name("leindex-embed");
-        let target = cand.clone();
-        let lookup = move |_: &str| Ok(target.clone());
-        let err = resolve_worker_binary_with(None, &[], &binary_name, &lookup).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }

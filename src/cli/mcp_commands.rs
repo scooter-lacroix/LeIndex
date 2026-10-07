@@ -17,48 +17,113 @@ pub(super) async fn cmd_tools_impl(
     project: Option<PathBuf>,
 ) -> AnyhowResult<()> {
     match command {
-        ToolCommands::List => {
-            // Display as `LeIndex [Tool Name]  description` so the user sees the
-            // human-readable title first (what they'll write in prompts), with
-            // the canonical dotted name available via `leindex tools help`.
-            let mut handlers = all_tool_handlers();
-            handlers.sort_by(|a, b| a.title().cmp(b.title()));
-            for handler in handlers {
-                println!("{}\t{}", handler.title(), handler.description());
-            }
-            Ok(())
-        }
-        ToolCommands::Help { name } => {
-            let handler = find_tool_handler(&name)
-                .ok_or_else(|| anyhow::anyhow!("Unknown tool '{}'", name))?;
-            print_tool_help(&handler);
-            Ok(())
-        }
-        ToolCommands::Schema { name } => {
-            let handler = find_tool_handler(&name)
-                .ok_or_else(|| anyhow::anyhow!("Unknown tool '{}'", name))?;
-            print_json_value(&handler.argument_schema())?;
-            Ok(())
-        }
+        ToolCommands::List { verbose } => tools_list(verbose),
+        ToolCommands::Inspect { name } => tools_inspect(&name),
+        ToolCommands::Schema { name } => tools_schema(&name),
         ToolCommands::Run {
             name,
             args_json,
             set,
-        } => {
-            let parsed_args = parse_tool_args_json(&args_json)?;
-            let args = merge_tool_args(parsed_args.clone(), &set, project.as_ref())?;
-            let value = execute_tool_handler(&name, args, project).await?;
-
-            // Use the unified renderer — same path used by the MCP transport
-            // so CLI and LLM-visible payloads stay in lock-step.
-            let formatted =
-                crate::cli::mcp::output::render_tool_output(&name, &value, &parsed_args);
-
-            println!("{}", formatted);
-            Ok(())
-        }
+        } => tools_run(&name, &args_json, &set, project).await,
     }
 }
+
+/// `tools list` — the router table plus a pointer to inspect/run.
+fn tools_list(verbose: bool) -> AnyhowResult<()> {
+    print!("{}", crate::cli::mcp::grouped::cli_tools_table(verbose));
+    println!(
+        "\nRun `leindex tools inspect <tool>` for arguments, or `leindex tools run <tool> --set mode=<branch> ...`."
+    );
+    Ok(())
+}
+
+/// Resolve a branch handler by name, or fail with the standard not-found error.
+fn resolve_tool(name: &str) -> AnyhowResult<ToolHandler> {
+    find_tool_handler(name).ok_or_else(|| tool_not_found(name))
+}
+
+/// `tools inspect` — for a router: title, description and the oneOf schema of
+/// its branches; for a branch: the handler's argument help.
+fn tools_inspect(name: &str) -> AnyhowResult<()> {
+    if let Some(group) = crate::cli::mcp::grouped::group_by_name(name) {
+        println!(
+            "{}\n{}\n",
+            group.title,
+            crate::cli::mcp::grouped::full_description(group)
+        );
+        println!("Schema:");
+        return print_json_value(&crate::cli::mcp::grouped::group_schema_oneof(
+            group,
+            &all_tool_handlers(),
+        ));
+    }
+    print_tool_help(&resolve_tool(name)?);
+    Ok(())
+}
+
+/// `tools schema` — the raw JSON argument schema (routers print their oneOf form).
+fn tools_schema(name: &str) -> AnyhowResult<()> {
+    if let Some(group) = crate::cli::mcp::grouped::group_by_name(name) {
+        return print_json_value(&crate::cli::mcp::grouped::group_schema_oneof(
+            group,
+            &all_tool_handlers(),
+        ));
+    }
+    print_json_value(&resolve_tool(name)?.argument_schema())
+}
+
+/// Raise `max_latency_ms` to the one-shot default when the caller left it unset.
+///
+/// One-shot CLI mode: hydration happens inside this process (~1-2 s), which the
+/// 250 ms resident-server default budget can never cover — every enrichment
+/// silently downgraded to empty. No-op for non-object args.
+fn apply_default_latency_budget(args: &mut Value) {
+    let Some(object) = args.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("max_latency_ms") {
+        return;
+    }
+    object.insert("max_latency_ms".to_string(), serde_json::json!(5000));
+}
+
+/// Print a tool result through the unified renderer — same path used by the MCP
+/// transport so CLI and LLM-visible payloads stay in lock-step. The freshness
+/// footer goes to stderr so stdout remains parseable JSON for tools that emit
+/// raw JSON.
+fn emit_rendered_tool_output(name: &str, value: &Value, parsed_args: &Value) -> AnyhowResult<()> {
+    let (formatted, footer) =
+        crate::cli::mcp::output::render_tool_output_split(name, value, parsed_args);
+    println!("{}", formatted);
+    if let Some(footer) = footer {
+        eprintln!("{}", footer);
+    }
+    Ok(())
+}
+
+/// `tools run` — execute one tool and emit its rendered output.
+async fn tools_run(
+    name: &str,
+    args_json: &str,
+    set: &[String],
+    project: Option<PathBuf>,
+) -> AnyhowResult<()> {
+    let parsed_args = parse_tool_args_json(args_json)?;
+    let mut args = merge_tool_args(parsed_args.clone(), set, project.as_ref())?;
+    apply_default_latency_budget(&mut args);
+    // The four public tools pick their operation with `action`
+    // (`--set action=text`); resolve to the underlying tool so the
+    // CLI renders exactly what the MCP transport does.
+    let (name, args) = crate::cli::mcp::grouped::resolve_call(name, args)
+        .map_err(|error| anyhow::anyhow!("{}", error))?;
+    let mut parsed_args = parsed_args;
+    if let Some(object) = parsed_args.as_object_mut() {
+        object.remove("action");
+    }
+    let value = execute_tool_handler(&name, args, project).await?;
+    emit_rendered_tool_output(&name, &value, &parsed_args)
+}
+
 /// MCP stdio command implementation - Run MCP server in stdio mode
 /// This mode allows AI tools to start LeIndex as a subprocess for automatic integration
 ///
@@ -71,6 +136,9 @@ pub(super) async fn cmd_mcp_stdio_impl(
 ) -> AnyhowResult<()> {
     info!("Starting LeIndex MCP stdio server (lazy project loading)");
     crate::cli::memory_report::observe_rss("mcp_stdio_startup");
+
+    // Log feature-flag state at startup (§12.3: flag state visible at start).
+    crate::feature_flags::log_flag_state();
 
     // D-3 advisory single-instance lock: warn when a live sibling already
     // serves the same canonical project, but NEVER hard-exit — a stdio server
@@ -127,7 +195,8 @@ pub(super) async fn cmd_mcp_stdio_impl(
         }
     });
 
-    let mut stdout = io::stdout().lock();
+    let writer = StdioWriter::spawn();
+    let dispatcher = StdioDispatcher::new(writer.sender());
     let mut framed_responses = false;
     let mut idle_ticker = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
@@ -143,12 +212,19 @@ pub(super) async fn cmd_mcp_stdio_impl(
                 };
                 // Any payload (including ping/notifications) resets the clock.
                 idle_clock.touch();
-                if !process_stdio_payload(input, &mut framed_responses, &mut stdout).await {
+                if !dispatcher.dispatch(input, &mut framed_responses).await {
                     break;
                 }
             }
             _ = idle_ticker.tick() => {
-                if idle_exit_due(idle_clock.idle_duration(), idle_timeout) {
+                if writer.failed() {
+                    tracing::debug!("MCP stdio: stdout closed, shutting down");
+                    break;
+                }
+                // A call that outlives the idle window is not "idle".
+                if dispatcher.in_flight() == 0
+                    && idle_exit_due(idle_clock.idle_duration(), idle_timeout)
+                {
                     info!(
                         "MCP stdio server idle for {:?}; exiting (D-1 memory-pressure idle exit)",
                         idle_timeout
@@ -158,36 +234,241 @@ pub(super) async fn cmd_mcp_stdio_impl(
             }
         }
     }
+    // Answer everything already accepted before the process exits (a piped
+    // `printf ... | leindex mcp` closes stdin right after the last request).
+    dispatcher.drain().await;
+    drop(dispatcher);
+    writer.finish();
     Ok(())
 }
 
-/// Process one stdio payload and write its response. Returns `false` when the
-/// server loop should exit (stdin `End`, fatal write failure). Extracted from
-/// `cmd_mcp_stdio_impl` so the entry function stays under the CCN-15 gate.
-async fn process_stdio_payload(
-    input: StdioInput,
-    framed_responses: &mut bool,
-    stdout: &mut impl Write,
-) -> bool {
-    let json = match input {
-        StdioInput::Payload { json, framed } => {
-            *framed_responses |= framed;
-            json
-        }
-        StdioInput::Skip => return true,
-        StdioInput::End => return false,
-    };
-    let Some((response, parse_error)) = response_for_payload(&json).await else {
-        return true;
-    };
-    if write_stdio_response(stdout, &response, *framed_responses).is_err() {
-        if *framed_responses && parse_error {
-            return true;
-        }
-        tracing::debug!("MCP stdio: failed to write to stdout");
-        return false;
+/// Upper bound on tool calls executing at once on one stdio connection.
+const MAX_CONCURRENT_STDIO_CALLS: usize = 64;
+
+/// Upper bound on tool calls WAITING for an execution permit. Admission is
+/// bounded in both dimensions: a client that keeps sending while never
+/// reading stdout gets an explicit JSON-RPC busy error past this point
+/// instead of silently accumulating spawned tasks (each holding its request
+/// payload) until the process exhausts memory.
+const MAX_PENDING_STDIO_CALLS: usize = 256;
+
+/// Upper bound on COMPLETED responses queued behind the stdout writer. A
+/// bounded channel turns a client that stops reading stdout into pipe
+/// backpressure (senders park, stdin reads stall) instead of an unbounded
+/// response queue.
+const STDIO_OUTBOUND_CAPACITY: usize = 256;
+
+/// One response queued for the stdout writer.
+struct StdioOutbound {
+    response: String,
+    framed: bool,
+    /// A framed parse-error reply may fail to write without ending the session.
+    recoverable: bool,
+}
+
+/// Owns stdout on a dedicated thread so response writes (a pipe that a slow
+/// client drains lazily) can never park a tokio worker.
+struct StdioWriter {
+    tx: tokio::sync::mpsc::Sender<StdioOutbound>,
+    thread: std::thread::JoinHandle<()>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StdioWriter {
+    fn spawn() -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StdioOutbound>(STDIO_OUTBOUND_CAPACITY);
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failed_flag = Arc::clone(&failed);
+        let thread = std::thread::spawn(move || {
+            let mut stdout = io::stdout().lock();
+            while let Some(out) = rx.blocking_recv() {
+                if write_stdio_response(&mut stdout, &out.response, out.framed).is_err() {
+                    if out.framed && out.recoverable {
+                        continue;
+                    }
+                    tracing::debug!("MCP stdio: failed to write to stdout");
+                    failed_flag.store(true, std::sync::atomic::Ordering::Release);
+                    break;
+                }
+            }
+        });
+        Self { tx, thread, failed }
     }
-    true
+
+    fn sender(&self) -> tokio::sync::mpsc::Sender<StdioOutbound> {
+        self.tx.clone()
+    }
+
+    fn failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Flush what is queued and join the writer thread.
+    fn finish(self) {
+        drop(self.tx);
+        let _ = self.thread.join();
+    }
+}
+
+/// Routes stdio payloads. Cheap protocol methods (`initialize`, `ping`,
+/// `tools/list`, ...) are answered inline so ordering guarantees hold — the
+/// handshake completes before anything after it runs. `tools/call` is
+/// spawned: a slow or blocked tool must not queue every other request
+/// (including `ping`) behind it, which is how a single cold index used to
+/// make the whole MCP server look hung while the one-shot CLI was fine.
+struct StdioDispatcher {
+    out: tokio::sync::mpsc::Sender<StdioOutbound>,
+    calls: std::sync::Mutex<tokio::task::JoinSet<()>>,
+    limiter: Arc<tokio::sync::Semaphore>,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl StdioDispatcher {
+    fn new(out: tokio::sync::mpsc::Sender<StdioOutbound>) -> Self {
+        Self {
+            out,
+            calls: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+            limiter: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STDIO_CALLS)),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Returns `false` when the server loop should exit (stdin `End`).
+    async fn dispatch(&self, input: StdioInput, framed_responses: &mut bool) -> bool {
+        let json = match input {
+            StdioInput::Payload { json, framed } => {
+                *framed_responses |= framed;
+                json
+            }
+            StdioInput::Skip => return true,
+            StdioInput::End => return false,
+        };
+        let framed = *framed_responses;
+        match tool_call_id(&json) {
+            Some(id) => self.admit_tool_call(json, id, framed).await,
+            None => {
+                if let Some((response, recoverable)) = response_for_payload(&json).await {
+                    // Bounded channel: a client that stopped reading stdout
+                    // parks this send, which stalls stdin reads — pipe
+                    // backpressure instead of an unbounded response queue.
+                    let _ = self
+                        .out
+                        .send(StdioOutbound {
+                            response,
+                            framed,
+                            recoverable,
+                        })
+                        .await;
+                }
+            }
+        }
+        true
+    }
+
+    /// Admit one tool call under BOTH bounds: at most
+    /// `MAX_CONCURRENT_STDIO_CALLS` execute, and at most
+    /// `MAX_PENDING_STDIO_CALLS` wait for a permit. Past the pending bound
+    /// the request is refused with a JSON-RPC busy error — visible
+    /// backpressure — instead of accumulating unbounded spawned tasks.
+    async fn admit_tool_call(&self, json: String, id: Value, framed: bool) {
+        use std::sync::atomic::Ordering;
+        // A free permit means the task executes without queueing.
+        let permit = self.limiter.clone().try_acquire_owned().ok();
+        if permit.is_none() {
+            let waiting = self.pending.fetch_add(1, Ordering::AcqRel) + 1;
+            if waiting > MAX_PENDING_STDIO_CALLS {
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+                let failure = JsonRpcResponse::error(
+                    id,
+                    JsonRpcError::server_busy(format!(
+                        "too many queued tool calls (limit {MAX_PENDING_STDIO_CALLS}); \
+                         wait for earlier calls to finish"
+                    )),
+                );
+                if let Ok(response) = serde_json::to_string(&failure) {
+                    let _ = self
+                        .out
+                        .send(StdioOutbound {
+                            response,
+                            framed,
+                            recoverable: false,
+                        })
+                        .await;
+                }
+                return;
+            }
+        }
+        let out = self.out.clone();
+        let limiter = Arc::clone(&self.limiter);
+        let in_flight = Arc::clone(&self.in_flight);
+        let pending = Arc::clone(&self.pending);
+        // Whether THIS call is consuming a pending slot: only queued calls
+        // incremented the counter above, so only they may decrement it (a
+        // decrement on the immediate-permit path would wrap 0 -> usize::MAX
+        // and admit a later burst past the bound).
+        let was_queued = permit.is_none();
+        in_flight.fetch_add(1, Ordering::AcqRel);
+        let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+        // Reap finished tasks so the set does not grow for the whole session.
+        while calls.try_join_next().is_some() {}
+        calls.spawn(async move {
+            let _permit = match permit {
+                Some(permit) => Some(permit),
+                None => limiter.acquire_owned().await.ok(),
+            };
+            if was_queued {
+                pending.fetch_sub(1, Ordering::AcqRel);
+            }
+            // A panicking handler must still answer: a request that never
+            // gets a response is indistinguishable from a hang to the client.
+            let response =
+                match tokio::spawn(async move { response_for_payload(&json).await }).await {
+                    Ok(response) => response.map(|(body, _)| body),
+                    Err(error) => {
+                        tracing::error!("MCP tool call task failed: {error}");
+                        let failure = JsonRpcResponse::error(
+                            id,
+                            JsonRpcError::internal_error(format!("Tool call aborted: {error}")),
+                        );
+                        serde_json::to_string(&failure).ok()
+                    }
+                };
+            if let Some(response) = response {
+                let _ = out
+                    .send(StdioOutbound {
+                        response,
+                        framed,
+                        recoverable: false,
+                    })
+                    .await;
+            }
+            in_flight.fetch_sub(1, Ordering::AcqRel);
+        });
+    }
+
+    /// Wait for every accepted tool call to publish its response.
+    async fn drain(&self) {
+        let mut pending = {
+            let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *calls)
+        };
+        while pending.join_next().await.is_some() {}
+    }
+}
+
+/// `Some(id)` when `payload` is a `tools/call` request (has an id).
+fn tool_call_id(payload: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(payload).ok()?;
+    if value.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return None;
+    }
+    value.get("id").cloned()
 }
 
 /// Resolve the effective MCP idle self-exit window (D-1): the CLI flag wins
@@ -406,7 +687,7 @@ pub(super) async fn cmd_mcp_socket_impl(
 
     let idle_timeout = effective_mcp_idle_timeout(idle_timeout_secs);
     server
-        .run_socket(socket_path, ProcessIdleClock::new(), idle_timeout)
+        .run_socket(socket_path, ProcessIdleClock::new(), idle_timeout, None)
         .await
 }
 
@@ -576,6 +857,10 @@ fn format_tool_title(title: &str) -> String {
     }
 }
 
+fn tool_not_found(name: &str) -> anyhow::Error {
+    anyhow::anyhow!("{}", crate::cli::mcp::grouped::suggest_unknown_tool(name))
+}
+
 pub(super) fn find_tool_handler(name: &str) -> Option<ToolHandler> {
     let normalized = normalize_tool_name(name);
 
@@ -625,9 +910,12 @@ pub(super) async fn execute_tool_handler(
     args: Value,
     project: Option<PathBuf>,
 ) -> AnyhowResult<Value> {
-    let handler =
-        find_tool_handler(name).ok_or_else(|| anyhow::anyhow!("Unknown tool '{}'", name))?;
+    let handler = find_tool_handler(name).ok_or_else(|| tool_not_found(name))?;
     let registry = build_tool_registry(project)?;
+    let level = crate::cli::mcp::server::hydration_for_tool(&normalize_tool_name(name));
+    registry
+        .ensure_hydrated(args.get("project_path").and_then(Value::as_str), level)
+        .await;
     handler
         .execute(&registry, args)
         .await
@@ -651,14 +939,17 @@ fn build_tool_registry(project: Option<PathBuf>) -> AnyhowResult<Arc<ProjectRegi
         canonical
     };
 
-    let mut leindex =
+    let leindex =
         LeIndex::new(&project_root).context("Failed to create LeIndex instance for tool run")?;
-    let _ = leindex.load_from_storage();
-
-    Ok(Arc::new(ProjectRegistry::with_initial_project(
+    // Nothing is loaded up front: `execute_tool_handler` loads exactly what the
+    // requested tool needs (see `hydration_for_tool`), so `find` and reads pay
+    // nothing and graph tools skip the search engine.
+    let registry = Arc::new(ProjectRegistry::with_initial_project(
         DEFAULT_MAX_PROJECTS,
         leindex,
-    )))
+    ));
+    registry.mark_one_shot();
+    Ok(registry)
 }
 /// Handle a single MCP request and return the response.
 #[allow(clippy::needless_return)]
@@ -667,7 +958,8 @@ async fn handle_mcp_request(
     _project_path: PathBuf,
 ) -> anyhow::Result<Option<JsonRpcResponse>> {
     use crate::cli::mcp::server::{
-        HANDLERS, SERVER_INSTANCE, SERVER_STATE, handle_tool_call, list_tools_json,
+        HANDLERS, SERVER_INSTANCE, SERVER_STATE, handle_prompt_get, handle_resource_read,
+        handle_tool_call, list_prompts_json, list_resources_json, list_tools_json,
     };
 
     let method_name = request.method.clone();
@@ -726,6 +1018,8 @@ async fn handle_mcp_request(
             server_instance
                 .handshake_complete
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            // Hide the cold project load behind the model's think-time.
+            state.spawn_prewarm();
 
             // Return server capabilities with comprehensive description
             return Ok(Some(JsonRpcResponse::success(
@@ -773,6 +1067,19 @@ async fn handle_mcp_request(
                 list_tools_json(handlers),
             )))
         }
+        // Prompts/resources are served on the HTTP and socket transports;
+        // stdio answered them with method-not-found, which clients that probe
+        // them at startup (before any tool call) treat as a broken server.
+        "prompts/list" => Ok(Some(JsonRpcResponse::success(id, list_prompts_json()))),
+        "prompts/get" => Ok(Some(JsonRpcResponse::from_result(
+            id,
+            handle_prompt_get(&request),
+        ))),
+        "resources/list" => Ok(Some(JsonRpcResponse::success(id, list_resources_json()))),
+        "resources/read" => Ok(Some(JsonRpcResponse::from_result(
+            id,
+            handle_resource_read(&request),
+        ))),
         _ => Ok(Some(JsonRpcResponse::error(
             id,
             crate::cli::mcp::protocol::JsonRpcError::method_not_found(method_name),
@@ -921,5 +1228,83 @@ mod tests {
         let mut output = Vec::new();
         write_stdio_response(&mut output, "{}", framed_responses).unwrap();
         assert_eq!(output, b"Content-Length: 2\r\n\r\n{}");
+    }
+
+    /// Admission is bounded in BOTH dimensions (round-11 Codex P2): past
+    /// `MAX_PENDING_STDIO_CALLS` waiting calls, the request is refused with
+    /// a visible JSON-RPC busy error instead of accumulating unbounded
+    /// spawned tasks. The response channel is bounded for the same reason —
+    /// a client that stops reading stdout gets pipe backpressure, not an
+    /// unbounded response queue.
+    #[tokio::test]
+    async fn test_stdio_admission_refuses_past_the_pending_bound() {
+        use std::sync::atomic::Ordering;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(STDIO_OUTBOUND_CAPACITY);
+        let dispatcher = StdioDispatcher::new(tx);
+
+        let request = |id: u64| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "leindex_search", "arguments": {} }
+            })
+            .to_string()
+        };
+
+        // One call takes an IMMEDIATE permit (permits are still free): the
+        // pending counter must stay at zero — an unconditional decrement on
+        // this path wrapped 0 -> usize::MAX and permanently disabled the
+        // bound (round-12 kilo P2). This call runs BEFORE the permits are
+        // drained, or it would queue like the rest.
+        dispatcher
+            .admit_tool_call(request(0), serde_json::json!(0), false)
+            .await;
+        assert_eq!(
+            dispatcher.pending.load(Ordering::Acquire),
+            0,
+            "an immediate-permit call must not touch the pending counter"
+        );
+
+        // Drain the remaining execution permits (the immediate call above
+        // holds one) so each subsequent call has to queue.
+        let _held: Vec<_> = (0..MAX_CONCURRENT_STDIO_CALLS - 1)
+            .map(|_| {
+                dispatcher
+                    .limiter
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("permit available")
+            })
+            .collect();
+
+        // Fill the pending queue exactly to the bound: every call is
+        // accepted (spawned, waiting for a permit), none is answered.
+        for id in 1..=MAX_PENDING_STDIO_CALLS as u64 {
+            dispatcher
+                .admit_tool_call(request(id), serde_json::json!(id), false)
+                .await;
+        }
+        assert_eq!(
+            dispatcher.pending.load(Ordering::Acquire),
+            MAX_PENDING_STDIO_CALLS,
+            "accepted-but-queued calls are counted against the pending bound"
+        );
+        assert!(rx.try_recv().is_err(), "no queued call produced a response");
+
+        // One past the bound: refused with a busy error, and the pending
+        // count returns to the bound.
+        dispatcher
+            .admit_tool_call(request(99_999), serde_json::json!(99_999i64), false)
+            .await;
+        let busy = rx.try_recv().expect("the refused call gets a busy error");
+        assert!(
+            busy.response.contains("too many queued tool calls"),
+            "response: {}",
+            busy.response
+        );
+        assert_eq!(
+            dispatcher.pending.load(Ordering::Acquire),
+            MAX_PENDING_STDIO_CALLS,
+            "the refusal does not consume a pending slot"
+        );
     }
 }

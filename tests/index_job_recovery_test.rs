@@ -193,7 +193,18 @@ fn test_lexical_failure_keeps_core_current_and_restart_reuses_checkpoint() {
     let storage = temp.path().join(".leindex");
     let current = std::fs::read_to_string(storage.join("CURRENT")).expect("core CURRENT");
     assert_eq!(current.trim(), "1");
-    assert!(storage.join("generations/1/search_snapshot.bin").is_file());
+    // Post read-side-flip contract: the generation carries its payload in the
+    // CAS layers the manifest names, not in per-generation files.
+    assert!(
+        leindex::storage::generation::read_generation_manifest(&storage, 1)
+            .expect("generation 1 manifest")
+            .layers
+            .contains_key(&leindex::storage::generation::LayerKind::Search)
+    );
+    assert!(
+        !storage.join("generations/1/search_snapshot.bin").is_file(),
+        "publish must not write per-generation search artifacts"
+    );
 
     let mut resumed = leindex::cli::leindex::LeIndex::new(temp.path()).expect("reopen index");
     resumed
@@ -208,13 +219,17 @@ fn test_lexical_failure_keeps_core_current_and_restart_reuses_checkpoint() {
         generation >= 2,
         "resume must publish a generation after the failed lexical attempt"
     );
-    assert!(
-        storage
-            .join("generations")
-            .join(generation.to_string())
-            .join("leindex.db")
-            .is_file()
-    );
+    // Payload lives in the CAS layers named by the resumed manifest.
+    let resumed_manifest =
+        leindex::storage::generation::read_generation_manifest(&storage, generation)
+            .expect("resumed generation manifest");
+    let db_layer = resumed_manifest
+        .layers
+        .get(&leindex::storage::generation::LayerKind::Db)
+        .copied()
+        .expect("manifest names the Db layer");
+    let cas = leindex::storage::cas::CasStore::open(storage.join("cas")).expect("open CAS");
+    assert!(!cas.get(&db_layer).expect("Db blob").is_empty());
 }
 
 #[tokio::test]

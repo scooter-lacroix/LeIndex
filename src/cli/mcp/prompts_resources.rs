@@ -129,7 +129,7 @@ pub fn get_prompt(
             PromptMessage {
                 role: "user".to_string(),
                 content: PromptContent::Text {
-                    text: "Welcome to LeIndex! Here's how to get started:\n\n1. **Indexing**: First, index your project with `leindex.index`\n2. **Searching**: Use `leindex.search` for semantic code search\n3. **Analysis**: Use `leindex.deep-analyze` for comprehensive code analysis\n4. **Context**: Use `leindex.context` to expand around specific symbols\n\nPro tip: LeIndex auto-indexes on first use, so you can start searching immediately!".to_string(),
+                    text: "Welcome to LeIndex! Here's how to get started:\n\n1. **Indexing**: First, index your project with `leindex_manage action=index`\n2. **Searching**: Use `leindex_explore mode=search` for semantic code search\n3. **Analysis**: Use `leindex_analyze mode=deep` for comprehensive code analysis\n4. **Context**: Use `leindex_explore mode=context` to expand around specific symbols\n\nPro tip: LeIndex auto-indexes on first use, so you can start searching immediately!".to_string(),
                 },
             },
         ]),
@@ -202,6 +202,22 @@ pub struct ResourceContent {
 pub fn get_resources() -> Vec<Resource> {
     vec![
         Resource {
+            uri: "leindex://tools/guide".to_string(),
+            name: "LeIndex Tool Guide".to_string(),
+            mime_type: Some("text/markdown".to_string()),
+            description: Some(
+                "Every tool, its branches (mode/action) and each branch's arguments".to_string(),
+            ),
+        },
+        Resource {
+            uri: "leindex://docs/q".to_string(),
+            name: "LeIndex Quick Reference".to_string(),
+            mime_type: Some("text/markdown".to_string()),
+            description: Some(
+                "One-screen cheat sheet: which call answers which question".to_string(),
+            ),
+        },
+        Resource {
             uri: "leindex://docs/quickstart".to_string(),
             name: "LeIndex Quickstart Guide".to_string(),
             mime_type: Some("text/markdown".to_string()),
@@ -219,6 +235,20 @@ pub fn get_resources() -> Vec<Resource> {
 /// Get a specific resource by URI
 pub fn get_resource(uri: &str) -> Result<ResourceContent, JsonRpcError> {
     match uri {
+        "leindex://tools/guide" => Ok(ResourceContent {
+            uri: uri.to_string(),
+            mime_type: Some("text/markdown".to_string()),
+            text: Some(crate::cli::mcp::grouped::tools_guide_markdown(
+                &crate::cli::mcp::handlers::all_tool_handlers(),
+            )),
+            blob: None,
+        }),
+        "leindex://docs/q" => Ok(ResourceContent {
+            uri: uri.to_string(),
+            mime_type: Some("text/markdown".to_string()),
+            text: Some(QUICK_REFERENCE.to_string()),
+            blob: None,
+        }),
         "leindex://docs/quickstart" => Ok(ResourceContent {
             uri: uri.to_string(),
             mime_type: Some("text/markdown".to_string()),
@@ -237,6 +267,30 @@ pub fn get_resource(uri: &str) -> Result<ResourceContent, JsonRpcError> {
         ))),
     }
 }
+
+/// One-screen cheat sheet (`leindex://docs/q`).
+const QUICK_REFERENCE: &str = r#"# LeIndex quick reference
+
+Four tools. Pick the tool, then the branch (`mode` or `action`). `project_path` is optional
+everywhere; `tier` = `l0` card / `l1` overview (default) / `l2` full detail.
+Full arguments: `leindex://tools/guide`.
+
+| I want to... | Call |
+|---|---|
+| find code by meaning | `leindex_explore` mode=search query=... |
+| find a symbol / where it is used | `leindex_explore` mode=grep pattern=... or mode=symbol_lookup symbol=... |
+| find literal text or a regex | `leindex_explore` mode=text query=... |
+| read a file or one symbol | `leindex_explore` mode=read_file / read_symbol |
+| see the layout of the project | `leindex_explore` mode=project_map |
+| understand how something works | `leindex_analyze` mode=deep query=... |
+| know what breaks if I change X | `leindex_analyze` mode=impact symbol=X |
+| see what my working tree changes | `leindex_analyze` mode=git_diff (or git_status) |
+| check index health | `leindex_analyze` mode=diagnostics |
+| change code safely | `leindex_edit` action=preview, then action=apply |
+| rename across files | `leindex_edit` action=rename old_name=... new_name=... (preview by default) |
+| (re)build the index | `leindex_manage` action=index |
+| architecture report | `leindex_manage` action=phase |
+"#;
 
 /// Quickstart guide content
 const QUICKSTART_GUIDE: &str = r#"# LeIndex Quickstart Guide
@@ -258,8 +312,9 @@ leindex index /path/to/project
 Or use the MCP tool:
 ```json
 {
-  "name": "leindex.index",
+  "name": "leindex_manage",
   "arguments": {
+    "action": "index",
     "project_path": "/path/to/project"
   }
 }
@@ -274,10 +329,11 @@ leindex search "how is authentication handled"
 Or use the MCP tool:
 ```json
 {
-  "name": "leindex.search",
+  "name": "leindex_explore",
   "arguments": {
+    "mode": "search",
     "query": "how is authentication handled",
-    "limit": 10
+    "top_k": 10
   }
 }
 ```
@@ -291,8 +347,9 @@ leindex analyze --symbol "User::authenticate"
 Or use the MCP tool:
 ```json
 {
-  "name": "leindex.deep-analyze",
+  "name": "leindex_analyze",
   "arguments": {
+    "mode": "deep",
     "query": "User::authenticate"
   }
 }

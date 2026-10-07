@@ -3,8 +3,82 @@
 use super::LeIndex;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use tracing::warn;
 
 impl LeIndex {
+    fn determine_embedding_model(&self) -> String {
+        match &self.embedder {
+            None => "unknown".to_string(),
+            Some(crate::cli::index_builder::HybridEmbedder::TfIdfOnly(_)) => {
+                "tfidf_only".to_string()
+            }
+            #[cfg(feature = "onnx")]
+            Some(crate::cli::index_builder::HybridEmbedder::HybridLocal { .. }) => {
+                "onnx_hybrid".to_string()
+            }
+            #[cfg(feature = "remote-embeddings")]
+            Some(crate::cli::index_builder::HybridEmbedder::HybridRemote { .. }) => {
+                "remote_hybrid".to_string()
+            }
+        }
+    }
+
+    fn determine_index_health(&self, search_index_nodes: usize) -> String {
+        let health = crate::cli::index_freshness::load_health(&self.storage_path);
+        if search_index_nodes == 0 {
+            "empty".to_string()
+        } else if health.as_ref().is_some_and(|health| {
+            matches!(
+                health.status,
+                super::ComponentStatus::Stale
+                    | super::ComponentStatus::Partial
+                    | super::ComponentStatus::Failed
+            )
+        }) {
+            "stale".to_string()
+        } else {
+            "healthy".to_string()
+        }
+    }
+
+    fn collect_precision_diagnostics(&self) -> (usize, Vec<String>) {
+        // The resident PDG is authoritative; the lightweight one-shot path (no
+        // hydration) decodes the published generation Pdg layer — the sole
+        // graph store after the write flip — instead of reading the now-empty
+        // catalog graph rows.
+        let hydrated;
+        let pdg = match self.pdg.as_ref() {
+            Some(pdg) => pdg,
+            None => {
+                let snapshot =
+                    crate::storage::generation::GenerationSnapshot::open(&self.storage_path).ok();
+                hydrated = snapshot.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .pdg()
+                        .and_then(|reader| reader.to_program_dependence_graph().ok())
+                });
+                match hydrated.as_ref() {
+                    Some(pdg) => pdg,
+                    None => {
+                        warn!("Precision diagnostics: no resident PDG and no decodable Pdg layer");
+                        return (0, Vec::new());
+                    }
+                }
+            }
+        };
+
+        let mut precision_languages = std::collections::BTreeSet::new();
+        for node_id in pdg.precision_symbols() {
+            if let Some(node) = pdg.find_by_id(node_id).and_then(|id| pdg.get_node(id)) {
+                precision_languages.insert(node.language.to_ascii_lowercase());
+            }
+        }
+        (
+            pdg.precision_symbols().len(),
+            precision_languages.into_iter().collect(),
+        )
+    }
+
     /// Get diagnostics about the indexed project
     ///
     /// # Returns
@@ -54,21 +128,7 @@ impl LeIndex {
 
         // Read persisted health rather than rescanning/hash-stat'ing every
         // source file. The MCP handler adds a live Git delta separately.
-        let health = crate::cli::index_freshness::load_health(&self.storage_path);
-        let index_health = if search_index_nodes == 0 {
-            "empty".to_string()
-        } else if health.as_ref().is_some_and(|health| {
-            matches!(
-                health.status,
-                super::ComponentStatus::Stale
-                    | super::ComponentStatus::Partial
-                    | super::ComponentStatus::Failed
-            )
-        }) {
-            "stale".to_string()
-        } else {
-            "healthy".to_string()
-        };
+        let index_health = self.determine_index_health(search_index_nodes);
 
         let cache_temperature = if memory_stats.cache_hits == 0 {
             "cold".to_string()
@@ -79,20 +139,11 @@ impl LeIndex {
         };
 
         // Determine embedding model status from the embedder variant.
-        let embedding_model = match &self.embedder {
-            None => "unknown".to_string(),
-            Some(crate::cli::index_builder::HybridEmbedder::TfIdfOnly(_)) => {
-                "tfidf_only".to_string()
-            }
-            #[cfg(feature = "onnx")]
-            Some(crate::cli::index_builder::HybridEmbedder::HybridLocal { .. }) => {
-                "onnx_hybrid".to_string()
-            }
-            #[cfg(feature = "remote-embeddings")]
-            Some(crate::cli::index_builder::HybridEmbedder::HybridRemote { .. }) => {
-                "remote_hybrid".to_string()
-            }
-        };
+        let embedding_model = self.determine_embedding_model();
+
+        let precision_enabled = cfg!(feature = "precision")
+            && crate::feature_flags::FeatureFlag::PrecisionIngest.is_enabled();
+        let (precision_nodes, precision_languages) = self.collect_precision_diagnostics();
 
         Ok(super::Diagnostics {
             project_path: self.project_path.display().to_string(),
@@ -124,6 +175,9 @@ impl LeIndex {
             pdg_nodes,
             pdg_edges,
             embedding_model,
+            precision_enabled,
+            precision_nodes,
+            precision_languages: precision_languages.into_iter().collect(),
         })
     }
 

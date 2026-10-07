@@ -128,6 +128,7 @@ mod tests {
             pdg: crate::graph::pdg::ProgramDependenceGraph::new(),
             docs_summary: None,
             generation_hash: "gen".to_string(),
+            pending_graph: None,
         };
 
         let phase1 = Phase1Summary {
@@ -179,6 +180,7 @@ mod tests {
             pdg: crate::graph::pdg::ProgramDependenceGraph::new(),
             docs_summary: None,
             generation_hash: "gen".to_string(),
+            pending_graph: None,
         };
 
         let summary = run(

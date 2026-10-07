@@ -3,13 +3,13 @@
 use crate::cli::memory::{analysis_cache_key, search_cache_key};
 use crate::graph::pdg::{EdgeType, NodeType, ProgramDependenceGraph};
 use crate::search::search::{NodeInfo, SearchEngine};
-use crate::storage::{pdg_store, schema::Storage};
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(feature = "onnx")]
 use crate::search::onnx::{EmbedResult, EmbeddingClient};
@@ -27,6 +27,9 @@ use super::leindex::{
     SOURCE_FILE_EXTENSIONS,
 };
 mod hybrid;
+mod merge;
+
+pub(crate) use merge::{merge_pdgs, normalize_external_nodes, remove_file_from_pdg};
 mod tfidf;
 
 // Fragment chunking (Tier-2 sub-symbol + Tier-3 orphan). `pub(crate)` so
@@ -43,6 +46,10 @@ pub use tfidf::*;
 #[allow(clippy::infallible_destructuring_match)]
 #[path = "index_builder_test.rs"]
 mod test;
+
+#[cfg(test)]
+#[path = "index_builder_hybrid_test.rs"]
+mod hybrid_test;
 
 // ============================================================================
 // TF-IDF EMBEDDING SYSTEM
@@ -147,28 +154,40 @@ pub(crate) fn tokenize_code(text: &str) -> Vec<String> {
 /// preceding a symbol. This keeps semantic chunks useful for review language
 /// without creating a second full-file embedding document.
 pub(crate) fn preceding_doc_context(bytes: &[u8], start: usize) -> String {
-    let prefix = String::from_utf8_lossy(&bytes[..start.min(bytes.len())]);
-    let mut lines = Vec::new();
-    for line in prefix.lines().rev() {
+    // Walk backwards from `start` one line at a time. Decoding the whole file
+    // prefix for every symbol (what this used to do) made enrichment quadratic
+    // in the number of symbols per file.
+    let mut lines: Vec<String> = Vec::new();
+    let mut cursor = start.min(bytes.len());
+    loop {
+        let line_start = bytes[..cursor]
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |position| position + 1);
+        let raw = &bytes[line_start..cursor];
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let line = String::from_utf8_lossy(raw);
         let trimmed = line.trim_start();
+        let mut done = false;
         if trimmed.is_empty() {
-            if lines.is_empty() {
-                continue;
+            if !lines.is_empty() {
+                done = true;
             }
-            break;
-        }
-        if trimmed.starts_with("//") || trimmed.starts_with("#") || trimmed.starts_with("/*") {
+        } else if trimmed.starts_with("//") || trimmed.starts_with("#") || trimmed.starts_with("/*")
+        {
             // Conceptual-recall fix: strip comment markers so the doc embeds as
             // prose (markers add noise tokens that dilute the semantic signal),
             // and capture the full doc (24 lines, was 8 — long doc comments were
             // truncated mid-concept, losing the statement of purpose).
             lines.push(strip_comment_syntax(line.trim()));
-            if lines.len() == 24 {
-                break;
-            }
+            done = lines.len() == 24;
         } else {
+            done = true;
+        }
+        if done || line_start == 0 {
             break;
         }
+        cursor = line_start - 1;
     }
     lines.reverse();
     lines.join("\n")
@@ -252,6 +271,14 @@ impl FileSummaryContext {
                 }
             }
         }
+        // Canonical order. Node insertion order follows PARALLEL parse
+        // completion order, which varies run to run; the file-summary text
+        // embeds this list verbatim, so an unsorted list made the summary's
+        // content hash (and thus its embedding-cache key) unstable — every
+        // index re-embedded ~450 file summaries from scratch.
+        for names in file_symbols.values_mut() {
+            names.sort_unstable();
+        }
         Self { file_symbols }
     }
 }
@@ -267,13 +294,13 @@ pub(crate) fn enriched_node_content(
     connectivity_config: &crate::graph::pdg::TraversalConfig,
     file_summary_ctx: &FileSummaryContext,
 ) -> String {
-    let content = String::from_utf8_lossy(file_bytes);
     let mut enrichment = format!(
         "// type:{} lang:{}",
         match node.node_type {
             NodeType::Function => "function",
             NodeType::Class => "class",
             NodeType::Method => "method",
+            NodeType::DocSection => "doc_section",
             NodeType::Variable => "variable",
             NodeType::Module => "module",
             NodeType::External => "external",
@@ -324,8 +351,11 @@ pub(crate) fn enriched_node_content(
         );
     }
 
-    if !content.is_empty() && node.byte_range.1 > node.byte_range.0 {
-        let content_bytes = content.as_bytes();
+    // Slice the raw bytes (byte ranges refer to the file as written) and decode
+    // only the snippet. Decoding the whole file for every node was quadratic in
+    // the number of symbols per file.
+    if !file_bytes.is_empty() && node.byte_range.1 > node.byte_range.0 {
+        let content_bytes = file_bytes;
         let start = node.byte_range.0.min(content_bytes.len());
         let end = node.byte_range.1.min(content_bytes.len());
         if start < end {
@@ -386,6 +416,23 @@ pub(crate) fn hash_file(path: &Path) -> Result<String> {
     Ok(read_file_once(path)?.0)
 }
 
+/// Per-chunk scratch buffer for source bodies.
+///
+/// **WS6-9 Task 8**: This was previously an LRU cache (capacity 100-200) that
+/// retained source file bodies across indexing phases (scan → parse → lexical →
+/// neural). That cross-phase retention is the §6.1 anti-pattern: RSS grew with
+/// corpus size because hundreds of MiB of source bodies persisted on the heap
+/// from scan through neural enrichment.
+///
+/// Now it is reduced to a per-chunk scratch buffer. A new instance is created
+/// at the start of each indexing batch and dropped when the batch completes.
+/// Within a batch, multiple PDG nodes from the same file share one read (the
+/// file body is read once and reused for sibling nodes in the same batch).
+/// Across batches, the scratch is dropped, so RSS stays bounded by chunk size,
+/// not corpus size (spec §6.1, VAL-STREAM-012).
+///
+/// Callers MUST NOT store a `FileReadCache` in pipeline state or share one
+/// across phases. Use `per_chunk_scratch()` to create a fresh scratch per batch.
 #[derive(Debug)]
 pub(crate) struct FileReadCache {
     capacity: usize,
@@ -394,6 +441,16 @@ pub(crate) struct FileReadCache {
 }
 
 impl FileReadCache {
+    /// Create a per-chunk scratch buffer with capacity 1.
+    ///
+    /// One slot is sufficient because PDG nodes from the same file are typically
+    /// contiguous within a batch. The slot avoids re-reading the same file for
+    /// adjacent sibling nodes while ensuring RSS is bounded by one file body,
+    /// not the entire corpus.
+    pub(crate) fn per_chunk_scratch() -> Self {
+        Self::new(1)
+    }
+
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
@@ -410,7 +467,7 @@ impl FileReadCache {
 
         let (hash, bytes) = read_file_once(path)?;
         self.insert(path.to_path_buf(), bytes.clone());
-        info!(file = %path.display(), hash = %hash, "Read file once for hash and content");
+        debug!(file = %path.display(), hash = %hash, "Read file once for hash and content");
         Ok(bytes)
     }
 
@@ -461,15 +518,71 @@ pub(crate) fn scan_project_files(project_path: &Path) -> Result<ProjectFileScan>
     scan_non_git_project_files(project_path)
 }
 
+/// `tests/fixtures/**` (a `fixtures` directory directly inside a `tests`
+/// directory, at any depth): test-fixture trees are test INPUTS, not
+/// production source. Indexing them put fixture symbols into the production
+/// graph, where they won name-resolution races against real code (the
+/// `String::truncate` → tests/fixtures namesake conflation, N-03) and
+/// polluted search/context output. Excluded from the scan so both the git
+/// and non-git paths drop them.
+pub(crate) fn is_test_fixture_path(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root).ok().is_some_and(|relative| {
+        let mut previous: Option<&str> = None;
+        relative.components().any(|component| {
+            let name = component.as_os_str().to_str();
+            let hit = matches!((previous, name), (Some("tests"), Some("fixtures")));
+            previous = name;
+            hit
+        })
+    })
+}
+
+/// Returns `true` when `path` is reachable only through a hidden directory
+/// (any relative component whose name starts with `.`) or a `SKIP_DIRS`
+/// entry. The project root itself is never rejected — only descendant
+/// components are inspected (a path equal to `root` has zero components).
+///
+/// Mirrors the exclusion behavior of the non-git walker so both scan paths
+/// produce identical results: the non-git scan prunes its walk on dot-prefixed
+/// names and on `SKIP_DIRS`; this filters the same rule set out of the git
+/// inventory output. `tests/fixtures/**` is additionally excluded (see
+/// [`is_test_fixture_path`]).
+fn is_excluded_project_path(path: &Path, root: &Path) -> bool {
+    if is_test_fixture_path(path, root) {
+        return true;
+    }
+    path.strip_prefix(root).ok().is_some_and(|relative| {
+        relative.components().any(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|name| name.starts_with('.') || SKIP_DIRS.contains(&name))
+        })
+    })
+}
+
 fn scan_git_project_files(project_path: &Path) -> Result<ProjectFileScan> {
     let project_config = crate::cli::config::ProjectConfig::load(project_path).unwrap_or_default();
     let limits = &project_config.indexing;
     let inventory = crate::cli::git::source_inventory(project_path)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    // The inventory paths are joined to the canonicalized project root, so
+    // resolve it once here for the post-filter below (avoids a per-file
+    // canonicalize syscall).
+    let root = project_path
+        .canonicalize()
+        .unwrap_or_else(|_| project_path.to_path_buf());
     let mut source_paths = Vec::new();
     let mut manifest_paths = Vec::new();
     let mut total_source_size = 0u64;
     for path in inventory {
+        // Post-filter the git inventory: any path whose relative components
+        // cross a hidden directory (name starts with `.`) or a SKIP_DIRS entry
+        // is rejected. This runs BEFORE the manifest, extension, size, and
+        // max_files checks so excluded files never consume any scan limits.
+        if is_excluded_project_path(&path, &root) {
+            continue;
+        }
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -564,6 +677,18 @@ fn scan_non_git_project_files(project_path: &Path) -> Result<ProjectFileScan> {
 
         if entry.file_type().is_dir() {
             if SKIP_DIRS.contains(&file_name.as_ref()) {
+                walker.skip_current_dir();
+            }
+            // Prune `tests/fixtures/` trees during the walk too (the git
+            // path filters them via `is_excluded_project_path`; the walker
+            // can skip the whole directory instead of filtering files).
+            if file_name == "fixtures"
+                && path
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    == Some("tests")
+            {
                 walker.skip_current_dir();
             }
             continue;
@@ -748,9 +873,12 @@ fn finalize_project_scan(
 
 /// Collect source files with their content hashes.
 ///
-/// If a `FileReadCache` is provided, it will be populated with file contents
-/// so that subsequent calls to `index_nodes` can reuse the same cache and
-/// avoid reading files twice.
+/// Each file is hashed via streaming I/O (`read_file_once`) and its source
+/// body is immediately dropped. No `FileReadCache` is populated — source
+/// bodies MUST NOT be retained across indexing phases (spec §6.1,
+/// VAL-STREAM-002). Later phases (parse, lexical, neural) re-read files
+/// per chunk via a small scratch buffer rather than relying on a cache
+/// populated during scan.
 ///
 /// # Fail-fast on I/O errors
 ///
@@ -765,90 +893,11 @@ fn finalize_project_scan(
 /// silently producing partial indexes with undetectable gaps.
 pub(crate) fn collect_source_files_with_hashes(
     scan: &ProjectFileScan,
-    mut file_cache: Option<&mut FileReadCache>,
 ) -> Result<Vec<(PathBuf, String)>> {
     scan.source_paths
-        .iter()
-        .map(|path| {
-            let hash = if let Some(cache) = file_cache.as_deref_mut() {
-                // get_or_read already logs; extract just the hash
-                let bytes = cache.get_or_read(path)?;
-                // Compute hash from cached bytes (avoiding a second file read)
-                blake3::hash(bytes.as_slice()).to_hex().to_string()
-            } else {
-                read_file_once(path)?.0
-            };
-            Ok((path.clone(), hash))
-        })
+        .par_iter()
+        .map(|path| Ok((path.clone(), read_file_once(path)?.0)))
         .collect()
-}
-
-/// Merge a source PDG into a target PDG.
-///
-/// Assumes source and target have disjoint node sets (e.g., merging a
-/// per-file PDG into the global index). Does not deduplicate by symbol
-/// name to preserve overloaded methods that share the same qualified name.
-pub(crate) fn merge_pdgs(target: &mut ProgramDependenceGraph, source: ProgramDependenceGraph) {
-    let mut id_map: std::collections::HashMap<
-        petgraph::graph::NodeIndex,
-        petgraph::graph::NodeIndex,
-    > = std::collections::HashMap::with_capacity(source.node_count());
-
-    for node_idx in source.node_indices() {
-        if let Some(node) = source.get_node(node_idx) {
-            let new_idx = target.add_node(node.clone());
-            id_map.insert(node_idx, new_idx);
-        }
-    }
-
-    for edge_idx in source.edge_indices() {
-        if let Some(edge) = source.get_edge(edge_idx) {
-            if let Some((s, t)) = source.edge_endpoints(edge_idx) {
-                if let (Some(&si), Some(&ti)) = (id_map.get(&s), id_map.get(&t)) {
-                    target.add_edge(si, ti, edge.clone());
-                }
-            }
-        }
-    }
-}
-
-/// Remove all nodes and edges for a file from the PDG.
-pub(crate) fn remove_file_from_pdg(
-    pdg: &mut ProgramDependenceGraph,
-    file_path: &str,
-) -> Result<()> {
-    pdg.remove_file(file_path);
-    Ok(())
-}
-
-/// Normalize external nodes: ensure any node with `language == "external"`
-/// also has `NodeType::External`.
-pub(crate) fn normalize_external_nodes(pdg: &mut ProgramDependenceGraph) {
-    let mut migrated = 0usize;
-    for node in pdg.node_weights_mut() {
-        let is_external = node.language == "external" || node.language.starts_with("external:");
-        if is_external && node.node_type != NodeType::External {
-            node.node_type = NodeType::External;
-            migrated += 1;
-        }
-    }
-    if migrated > 0 {
-        info!(
-            "Normalized {} external nodes to NodeType::External",
-            migrated
-        );
-    }
-}
-
-/// Save PDG to storage.
-pub(crate) fn save_to_storage(
-    storage: &mut Storage,
-    project_id: &str,
-    pdg: &ProgramDependenceGraph,
-) -> Result<()> {
-    pdg_store::save_pdg(storage, project_id, pdg).context("Failed to save PDG to storage")?;
-    info!("Saved PDG to storage for project: {}", project_id);
-    Ok(())
 }
 
 /// Index nodes from PDG for search.
@@ -861,7 +910,7 @@ pub(crate) fn index_nodes(
     file_stats_cache: &mut Option<HashMap<String, FileStats>>,
     batch_size: usize,
 ) -> Result<HybridEmbedder> {
-    index_nodes_with_embedder(pdg, search_engine, file_stats_cache, batch_size, None, None)
+    index_nodes_with_embedder(pdg, search_engine, file_stats_cache, batch_size, None)
 }
 
 pub(crate) fn index_nodes_with_embedder(
@@ -870,7 +919,6 @@ pub(crate) fn index_nodes_with_embedder(
     file_stats_cache: &mut Option<HashMap<String, FileStats>>,
     batch_size: usize,
     embedder: Option<HybridEmbedder>,
-    shared_file_cache: Option<FileReadCache>,
 ) -> Result<HybridEmbedder> {
     index_nodes_with_embedder_inner(
         pdg,
@@ -878,7 +926,6 @@ pub(crate) fn index_nodes_with_embedder(
         file_stats_cache,
         batch_size,
         embedder,
-        shared_file_cache,
         true,
     )
 }
@@ -892,7 +939,6 @@ pub(crate) fn index_nodes_tfidf_only(
     file_stats_cache: &mut Option<HashMap<String, FileStats>>,
     batch_size: usize,
     embedder: Option<HybridEmbedder>,
-    shared_file_cache: Option<FileReadCache>,
 ) -> Result<HybridEmbedder> {
     index_nodes_with_embedder_inner(
         pdg,
@@ -900,7 +946,6 @@ pub(crate) fn index_nodes_tfidf_only(
         file_stats_cache,
         batch_size,
         embedder,
-        shared_file_cache,
         false,
     )
 }
@@ -911,13 +956,14 @@ fn index_nodes_with_embedder_inner(
     file_stats_cache: &mut Option<HashMap<String, FileStats>>,
     batch_size: usize,
     embedder: Option<HybridEmbedder>,
-    shared_file_cache: Option<FileReadCache>,
     _allow_neural: bool,
 ) -> Result<HybridEmbedder> {
     *file_stats_cache = None;
 
     let batch_size = batch_size.max(1);
-    let mut file_cache = shared_file_cache.unwrap_or_else(|| FileReadCache::new(100));
+
+    // Pass 1: document frequencies. Each worker uses a per-chunk scratch
+    // buffer so only one file body per worker is resident. No cross-phase cache.
     let connectivity_config = crate::graph::pdg::TraversalConfig {
         max_depth: Some(1),
         max_nodes: Some(1000),
@@ -929,13 +975,8 @@ fn index_nodes_with_embedder_inner(
 
     let node_indices: Vec<petgraph::graph::NodeIndex> = pdg.node_indices().collect();
     let file_summary_ctx = FileSummaryContext::from_pdg(pdg);
-    let (df, total_docs) = build_document_frequencies(
-        pdg,
-        &node_indices,
-        &mut file_cache,
-        &connectivity_config,
-        &file_summary_ctx,
-    );
+    let (df, total_docs) =
+        build_document_frequencies(pdg, &node_indices, &connectivity_config, &file_summary_ctx);
     let embedder = build_embedder_from_corpus(embedder, total_docs, df, pdg, _allow_neural);
 
     // A+ bound-gated admission, selective pruning, and work hoisting.
@@ -954,60 +995,117 @@ fn index_nodes_with_embedder_inner(
     let mut nodes: Vec<NodeInfo> = Vec::with_capacity(batch_size);
     let mut total_admitted: usize = 0;
 
-    for batch in node_indices.chunks(batch_size) {
-        nodes.clear();
-        admission_gate.reset();
-        // Collect index-into-nodes for nodes that need a neural embedding.
-        let mut neural_pending: Vec<usize> = Vec::new();
-        for &node_idx in batch {
-            let Some(node) = pdg.get_node(node_idx) else {
-                continue;
-            };
-            match build_indexed_node(
-                pdg,
-                node_idx,
-                node,
-                &mut file_cache,
-                &connectivity_config,
-                &pruner,
-                &mut admission_gate,
-                &mut work_hoister,
-                &embedder,
-                &file_summary_ctx,
-                _allow_neural,
-            ) {
-                NodeBuildOutcome::SkippedExternal => external_skipped_count += 1,
-                NodeBuildOutcome::Pruned => pruned_count += 1,
-                NodeBuildOutcome::Shed => shed_count += 1,
-                NodeBuildOutcome::Indexed {
-                    node: built,
-                    needs_batch_neural,
-                    hoisted,
-                } => {
-                    if hoisted {
-                        hoisted_count += 1;
+    // Appending a batch to the search engine (token index, vectors) is serial
+    // work; a dedicated thread does it while the next batch is being prepared
+    // across all cores.
+    let (batches_tx, batches_rx) = std::sync::mpsc::sync_channel::<Vec<NodeInfo>>(2);
+    std::thread::scope(|scope| {
+        let engine = &mut *search_engine;
+        let appender = scope.spawn(move || {
+            for batch in batches_rx {
+                engine.append_nodes(batch);
+            }
+        });
+
+        for batch in node_indices.chunks(batch_size) {
+            nodes.clear();
+            admission_gate.reset();
+            // Reset the per-chunk scratch so no file body from a prior batch
+            // persists. RSS stays bounded by one file body, not corpus size
+            // (VAL-STREAM-012).
+            // Everything that depends only on the immutable PDG and file bytes
+            // (enriched content, pruning verdict, tokens, TF-IDF vector, signature)
+            // is computed across cores. The stateful admission gate and work
+            // hoister then run in node order, so the outcome is identical to a
+            // sequential pass. Each task owns a capacity-1 file cache, keeping the
+            // one-file-body-per-worker RSS bound (VAL-STREAM-012).
+            let tfidf = embedder.tfidf();
+            let prepared: Vec<PreparedNode> = batch
+                .par_iter()
+                .map_init(FileReadCache::per_chunk_scratch, |file_cache, &node_idx| {
+                    prepare_indexed_node(
+                        pdg,
+                        node_idx,
+                        file_cache,
+                        &connectivity_config,
+                        &pruner,
+                        tfidf,
+                        &file_summary_ctx,
+                    )
+                })
+                .collect();
+            // Collect index-into-nodes for nodes that need a neural embedding.
+            let mut neural_pending: Vec<usize> = Vec::new();
+            for prepared in prepared {
+                match admit_prepared_node(
+                    prepared,
+                    &mut admission_gate,
+                    &mut work_hoister,
+                    &embedder,
+                    _allow_neural,
+                ) {
+                    NodeBuildOutcome::SkippedExternal => external_skipped_count += 1,
+                    NodeBuildOutcome::Pruned => pruned_count += 1,
+                    NodeBuildOutcome::Shed => shed_count += 1,
+                    NodeBuildOutcome::Indexed {
+                        node: built,
+                        needs_batch_neural,
+                        hoisted,
+                    } => {
+                        if hoisted {
+                            hoisted_count += 1;
+                        }
+                        if needs_batch_neural {
+                            neural_pending.push(nodes.len());
+                        }
+                        nodes.push(built);
                     }
-                    if needs_batch_neural {
-                        neural_pending.push(nodes.len());
-                    }
-                    nodes.push(built);
                 }
             }
-        }
-        // Batch neural embedding: process pending nodes in sub-chunks to cap
-        // IPC payload size and ONNX worker memory usage.
-        if !neural_pending.is_empty() {
-            embed_pending_neural_batch(&embedder, &mut nodes, &neural_pending, &mut work_hoister);
-        }
+            // Batch neural embedding: process pending nodes in sub-chunks to cap
+            // IPC payload size and ONNX worker memory usage.
+            if !neural_pending.is_empty() {
+                embed_pending_neural_batch(
+                    &embedder,
+                    &mut nodes,
+                    &neural_pending,
+                    &mut work_hoister,
+                );
+            }
 
-        search_engine.append_nodes(std::mem::replace(
-            &mut nodes,
-            Vec::with_capacity(batch_size),
-        ));
-        total_admitted += admission_gate.nodes_admitted();
-    }
+            let full = std::mem::replace(&mut nodes, Vec::with_capacity(batch_size));
+            if batches_tx.send(full).is_err() {
+                // The appender only stops early by panicking; the join below
+                // re-raises that panic.
+                break;
+            }
+            total_admitted += admission_gate.nodes_admitted();
+        }
+        drop(batches_tx);
+        if let Err(panic) = appender.join() {
+            std::panic::resume_unwind(panic);
+        }
+    });
 
     // A+ logging: run-total stats at info! level (invisible under default WARN).
+    log_indexing_admission_stats(
+        pruned_count,
+        shed_count,
+        hoisted_count,
+        external_skipped_count,
+        total_admitted,
+    );
+
+    Ok(embedder)
+}
+
+fn log_indexing_admission_stats(
+    pruned_count: usize,
+    shed_count: usize,
+    hoisted_count: usize,
+    external_skipped_count: usize,
+    total_admitted: usize,
+) {
     if pruned_count > 0 || shed_count > 0 || hoisted_count > 0 || external_skipped_count > 0 {
         info!(
             pruned = pruned_count,
@@ -1029,9 +1127,27 @@ fn index_nodes_with_embedder_inner(
             "indexing completed with pruning/shedding — some nodes were filtered"
         );
     }
-
-    Ok(embedder)
 }
+
+/// A6: cap the text sent to the neural worker so a single node's content can
+/// never approach the worker's incoming-frame guard, and to bound per-text
+/// tokenize/inference cost. TF-IDF and lexical search keep the FULL content;
+/// only the neural-embedding input is truncated. Cuts on a char boundary so
+/// the tokenizer never receives a partial UTF-8 sequence.
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+fn cap_neural_text(text: &str) -> &str {
+    const NEURAL_TEXT_CAP: usize = 64 * 1024;
+    if text.len() > NEURAL_TEXT_CAP {
+        let mut end = NEURAL_TEXT_CAP;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
+    } else {
+        text
+    }
+}
+
 /// Run deferred neural embedding for the pending batch indices, caching each
 /// result in the work hoister and storing it on the node. Sub-chunked to cap
 /// IPC payload and worker memory. No-op for an empty pending list.
@@ -1045,13 +1161,26 @@ fn embed_pending_neural_batch(
     for ipc_chunk in neural_pending.chunks(NEURAL_IPC_BATCH) {
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
         {
-            let texts: Vec<String> = ipc_chunk
-                .iter()
-                .map(|&idx| nodes[idx].content.clone())
-                .collect();
-            let batch_results = _embedder.embed_neural_batch_blocking(&texts);
-            for (i, &node_vec_idx) in ipc_chunk.iter().enumerate() {
-                let neural = batch_results.get(i).and_then(|r| r.clone());
+            // Borrow the contents instead of cloning every String, cap each at
+            // NEURAL_TEXT_CAP (A6), and dedupe identical capped texts within
+            // the chunk so each unique input is embedded once (nodes with the
+            // same body share one vector).
+            let mut result_by_content: HashMap<&str, Option<Vec<f32>>> = HashMap::new();
+            let mut unique_contents: Vec<&str> = Vec::new();
+            for &idx in ipc_chunk {
+                let capped = cap_neural_text(nodes[idx].content.as_str());
+                if !result_by_content.contains_key(capped) {
+                    result_by_content.insert(capped, None);
+                    unique_contents.push(capped);
+                }
+            }
+            let batch_results = _embedder.embed_neural_batch_blocking(&unique_contents);
+            for (content, result) in unique_contents.iter().zip(batch_results) {
+                result_by_content.insert(content, result);
+            }
+            for &node_vec_idx in ipc_chunk {
+                let capped = cap_neural_text(nodes[node_vec_idx].content.as_str());
+                let neural = result_by_content.get(capped).cloned().flatten();
                 _work_hoister.store(
                     &nodes[node_vec_idx].content,
                     nodes[node_vec_idx].tfidf_embedding.clone(),
@@ -1083,26 +1212,50 @@ enum NodeBuildOutcome {
     SkippedExternal,
 }
 
-/// Build a single indexable `NodeInfo` from a PDG node, applying the external
-/// skip, content pruning, and bound-gated admission filters plus work-hoister
-/// embedding reuse and neural-embedding deferral. Returns the outcome so the
-/// caller can accumulate per-batch counts and the neural-pending queue.
+/// A node after the order-independent part of indexing.
+enum PreparedNode {
+    SkippedExternal,
+    Pruned,
+    Ready(Box<ReadyNode>),
+}
+
+/// Everything about one node that does not depend on other nodes.
+struct ReadyNode {
+    node_id: String,
+    file_path: String,
+    symbol_name: String,
+    language: String,
+    content: String,
+    byte_range: (usize, usize),
+    complexity: u32,
+    tfidf_embedding: Vec<f32>,
+    signature: Option<String>,
+    search_tokens: Vec<String>,
+}
+
+/// Order-independent half of indexing one PDG node: the external skip, content
+/// enrichment, the pruning verdict, tokenization and the TF-IDF vector. Safe to
+/// run for many nodes at once; the stateful admission/hoisting half is
+/// [`admit_prepared_node`].
+///
+/// Enriched content is recomputed per node (keyed by node index, never by
+/// node ID — duplicate IDs are supported and each duplicate must carry its
+/// own body), bounded by the caller's capacity-1 file scratch.
 #[allow(clippy::too_many_arguments)]
-fn build_indexed_node(
+fn prepare_indexed_node(
     pdg: &ProgramDependenceGraph,
     node_idx: petgraph::graph::NodeIndex,
-    node: &crate::graph::pdg::Node,
     file_cache: &mut FileReadCache,
     connectivity_config: &crate::graph::pdg::TraversalConfig,
     pruner: &crate::search::search::ContentPruner,
-    admission_gate: &mut crate::search::search::IndexingAdmissionGate,
-    work_hoister: &mut crate::search::search::WorkHoister,
-    embedder: &HybridEmbedder,
+    tfidf: &TfIdfEmbedder,
     file_summary_ctx: &FileSummaryContext,
-    allow_neural: bool,
-) -> NodeBuildOutcome {
+) -> PreparedNode {
+    let Some(node) = pdg.get_node(node_idx) else {
+        return PreparedNode::SkippedExternal;
+    };
     if is_external_node_excluded(node) {
-        return NodeBuildOutcome::SkippedExternal;
+        return PreparedNode::SkippedExternal;
     }
 
     let file_bytes = file_cache
@@ -1119,32 +1272,11 @@ fn build_indexed_node(
 
     let pruning_decision = pruner.evaluate(&node.file_path, &node_content, &node.name);
     if pruning_decision != crate::search::search::PruningDecision::Keep {
-        return NodeBuildOutcome::Pruned;
-    }
-
-    if !admission_gate.try_admit(node_content.len()) {
-        return NodeBuildOutcome::Shed;
+        return PreparedNode::Pruned;
     }
 
     let tokens = tokenize_code(&node_content);
-
-    // Repeated-work hoisting: reuse a cached embedding pair when available.
-    let (tfidf_embedding, cached_neural, hoisted) = match work_hoister.lookup(&node_content) {
-        Some((tfidf, neural)) => (tfidf, neural, true),
-        None => (embedder.embed_tfidf(&tokens), None, false),
-    };
-
-    // Determine neural embedding: use the cache hit, defer to the batch call,
-    // or store a TF-IDF-only pair when neural is unavailable/disabled.
-    let (neural_embedding, needs_batch_neural) = if cached_neural.is_some() {
-        (cached_neural, false)
-    } else if embedder.has_neural() && allow_neural {
-        (None, true)
-    } else {
-        work_hoister.store(&node_content, tfidf_embedding.clone(), None);
-        (None, false)
-    };
-
+    let tfidf_embedding = tfidf.embed_tokens(&tokens);
     let signature =
         crate::search::search::SearchEngine::extract_signature_from_content(&node_content);
     // R8: pre-tokenize for the search engine (different tokenizer than TF-IDF).
@@ -1154,17 +1286,90 @@ fn build_indexed_node(
         .filter(|s| s.len() >= 2)
         .collect();
 
+    PreparedNode::Ready(Box::new(ReadyNode {
+        node_id: node.id.clone(),
+        file_path: node.file_path.to_string(),
+        symbol_name: node.name.clone(),
+        language: node.language.clone(),
+        content: node_content,
+        byte_range: node.byte_range,
+        complexity: node.complexity,
+        tfidf_embedding,
+        signature,
+        search_tokens,
+    }))
+}
+
+/// Order-dependent half of indexing: bound-gated admission and work-hoister
+/// reuse of a cached embedding pair, plus neural-embedding deferral. Must see
+/// nodes in PDG order.
+fn admit_prepared_node(
+    prepared: PreparedNode,
+    admission_gate: &mut crate::search::search::IndexingAdmissionGate,
+    work_hoister: &mut crate::search::search::WorkHoister,
+    embedder: &HybridEmbedder,
+    allow_neural: bool,
+) -> NodeBuildOutcome {
+    let ready = match prepared {
+        PreparedNode::SkippedExternal => return NodeBuildOutcome::SkippedExternal,
+        PreparedNode::Pruned => return NodeBuildOutcome::Pruned,
+        PreparedNode::Ready(ready) => *ready,
+    };
+    let ReadyNode {
+        node_id,
+        file_path,
+        symbol_name,
+        language,
+        content,
+        byte_range,
+        complexity,
+        tfidf_embedding,
+        signature,
+        search_tokens,
+    } = ready;
+
+    if !admission_gate.try_admit(content.len()) {
+        return NodeBuildOutcome::Shed;
+    }
+
+    // Repeated-work hoisting: reuse a cached neural embedding when the same
+    // content was embedded before (the TF-IDF vector is a pure function of the
+    // content, so the precomputed one is identical to the cached one).
+    // Only a neural embedding is worth caching: the TF-IDF vector was already
+    // computed above, so without a neural provider the lookup (a BLAKE3 of the
+    // content) and the store (a copy of a 768-float vector into the LRU) were
+    // pure overhead on every node.
+    let use_neural = embedder.has_neural() && allow_neural;
+    let (cached_neural, hoisted) = if use_neural {
+        match work_hoister.lookup(&content) {
+            Some((_, neural)) => (neural, true),
+            None => (None, false),
+        }
+    } else {
+        (None, false)
+    };
+
+    // Determine neural embedding: use the cache hit, defer to the batch call,
+    // or store a TF-IDF-only pair when neural is unavailable/disabled.
+    let (neural_embedding, needs_batch_neural) = if cached_neural.is_some() {
+        (cached_neural, false)
+    } else if use_neural {
+        (None, true)
+    } else {
+        (None, false)
+    };
+
     NodeBuildOutcome::Indexed {
         node: NodeInfo {
-            node_id: node.id.clone(),
-            file_path: node.file_path.to_string(),
-            symbol_name: node.name.clone(),
-            language: node.language.clone(),
-            content: node_content,
-            byte_range: node.byte_range,
+            node_id,
+            file_path,
+            symbol_name,
+            language,
+            content,
+            byte_range,
             tfidf_embedding,
             neural_embedding,
-            complexity: node.complexity,
+            complexity,
             signature,
             pre_tokenized: Some(search_tokens),
         },
@@ -1174,44 +1379,89 @@ fn build_indexed_node(
 }
 /// Pass 1: stream over every PDG node, tokenize its enriched content, and
 /// accumulate per-token document frequencies. Returns `(df, total_docs)`.
+///
+/// Enriched content is deliberately NOT cached across passes: caching every
+/// non-external node's body until neural enrichment made peak RSS grow with
+/// total symbol content (unbounded on large corpora), and keying it by node
+/// ID collapsed the distinct bodies of duplicate-ID nodes (multiple
+/// unqualified `new` methods), feeding one method's text to another's index
+/// row. Every consumer recomputes `enriched_node_content` against its own
+/// capacity-1 file scratch instead — one file body per worker, not corpus
+/// size (VAL-STREAM-012).
+///
+/// Every node is independent (content and tokens depend only on the immutable
+/// PDG and the file bytes) and document frequencies merge by addition, so the
+/// work is spread across cores: on a 20k-node project this pass was ~60 % of a
+/// full index run while using one core. The result is identical to the
+/// sequential loop it replaces.
 fn build_document_frequencies(
     pdg: &ProgramDependenceGraph,
     node_indices: &[petgraph::graph::NodeIndex],
-    file_cache: &mut FileReadCache,
     connectivity_config: &crate::graph::pdg::TraversalConfig,
     file_summary_ctx: &FileSummaryContext,
 ) -> (std::collections::HashMap<String, usize>, usize) {
-    let mut df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut seen_tokens: HashSet<String> = HashSet::new();
-    let mut total_docs = 0usize;
-    for &node_idx in node_indices {
-        let Some(node) = pdg.get_node(node_idx) else {
-            continue;
-        };
-        if is_external_node_excluded(node) {
-            continue;
-        }
-        let file_bytes = file_cache
-            .get_or_read(Path::new(&*node.file_path))
-            .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
-        let node_content = enriched_node_content(
-            pdg,
-            node_idx,
-            node,
-            &file_bytes,
-            connectivity_config,
-            file_summary_ctx,
-        );
-        let tokens = tokenize_code(&node_content);
-        seen_tokens.clear();
-        for tok in &tokens {
-            if seen_tokens.insert(tok.clone()) {
-                *df.entry(tok.clone()).or_insert(0) += 1;
-            }
-        }
-        total_docs += 1;
+    /// One task's contribution, merged pairwise.
+    #[derive(Default)]
+    struct Partial {
+        df: std::collections::HashMap<String, usize>,
+        docs: usize,
     }
-    (df, total_docs)
+
+    let merge = |mut left: Partial, mut right: Partial| {
+        // Fold the smaller map into the larger one.
+        if left.df.len() < right.df.len() {
+            std::mem::swap(&mut left, &mut right);
+        }
+        for (token, count) in right.df {
+            *left.df.entry(token).or_insert(0) += count;
+        }
+        left.docs += right.docs;
+        left
+    };
+
+    let combined = node_indices
+        .par_iter()
+        .fold(
+            || (Partial::default(), FileReadCache::per_chunk_scratch()),
+            |(mut acc, mut file_cache), &node_idx| {
+                let Some(node) = pdg.get_node(node_idx) else {
+                    return (acc, file_cache);
+                };
+                if is_external_node_excluded(node) {
+                    return (acc, file_cache);
+                }
+                let file_bytes = file_cache
+                    .get_or_read(Path::new(&*node.file_path))
+                    .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
+                let node_content = enriched_node_content(
+                    pdg,
+                    node_idx,
+                    node,
+                    &file_bytes,
+                    connectivity_config,
+                    file_summary_ctx,
+                );
+                let tokens = tokenize_code(&node_content);
+                // Count each token once per document.
+                let mut unique: Vec<&String> = tokens.iter().collect();
+                unique.sort_unstable();
+                unique.dedup();
+                for token in unique {
+                    match acc.df.get_mut(token.as_str()) {
+                        Some(count) => *count += 1,
+                        None => {
+                            acc.df.insert(token.clone(), 1);
+                        }
+                    }
+                }
+                acc.docs += 1;
+                (acc, file_cache)
+            },
+        )
+        .map(|(partial, _)| partial)
+        .reduce(Partial::default, merge);
+
+    (combined.df, combined.docs)
 }
 
 /// Resolve the indexing embedder: reuse a caller-provided one, build an empty
@@ -1270,6 +1520,7 @@ fn build_embedder_from_corpus(
         pdg_nodes: pdg.node_count(),
         pdg_edges: pdg.edge_count(),
         pdg_fingerprint: pdg_search_fingerprint(pdg),
+        slots: Default::default(),
     };
 
     build_neural_embedder(tfidf_embedder, allow_neural)
@@ -1332,7 +1583,6 @@ fn build_neural_embedder(tfidf_embedder: TfIdfEmbedder, _allow_neural: bool) -> 
 pub(crate) fn enrich_neural_embeddings(
     pdg: &ProgramDependenceGraph,
     embedder: &HybridEmbedder,
-    file_cache: &mut FileReadCache,
     admitted_node_ids: &HashSet<String>,
 ) -> Vec<(String, Vec<f32>)> {
     if !embedder.has_neural() {
@@ -1358,11 +1608,15 @@ pub(crate) fn enrich_neural_embeddings(
         let mut pending = Vec::with_capacity(NEURAL_IPC_BATCH);
         let mut rows = Vec::new();
         let file_summary_ctx = FileSummaryContext::from_pdg(pdg);
+        // Per-chunk scratch buffer: only one file body resident at a time.
+        // No cross-phase cache (VAL-STREAM-012); content is recomputed per
+        // node so duplicate-ID nodes each embed their own body.
+        let mut file_cache = FileReadCache::per_chunk_scratch();
         for node_idx in pdg.node_indices() {
             let Some(node) = pdg.get_node(node_idx) else {
                 continue;
             };
-            // Match build_indexed_node's inclusion rule: external/excluded nodes
+            // Match prepare_indexed_node's inclusion rule: external/excluded nodes
             // never enter the lexical index, so don't send them to the neural batch.
             if is_external_node_excluded(node) {
                 continue;
@@ -1392,8 +1646,23 @@ pub(crate) fn enrich_neural_embeddings(
         if !pending.is_empty() {
             append_neural_batch(embedder, &pending, &mut rows);
         }
+        dedupe_neural_rows_keep_first(&mut rows);
         rows
     }
+}
+
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+/// Keep the first row per node_id, in place.
+///
+/// `append_nodes` retains the FIRST occurrence of a duplicate node_id
+/// (unqualified names, e.g. two `fn new`), while `update_neural_embeddings`
+/// applies rows last-wins — an undeduped vec would hand the retained node a
+/// later duplicate's neural vector. Rows and lexical nodes both follow
+/// pdg.node_indices() order, so the first row per id is the retained node's
+/// own body.
+fn dedupe_neural_rows_keep_first(rows: &mut Vec<(String, Vec<f32>)>) {
+    let mut seen = HashSet::new();
+    rows.retain(|(node_id, _)| seen.insert(node_id.clone()));
 }
 
 #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
@@ -1402,10 +1671,7 @@ fn append_neural_batch(
     pending: &[(String, String)],
     rows: &mut Vec<(String, Vec<f32>)>,
 ) {
-    let texts = pending
-        .iter()
-        .map(|(_, text)| text.clone())
-        .collect::<Vec<_>>();
+    let texts: Vec<&str> = pending.iter().map(|(_, text)| text.as_str()).collect();
     let embeddings = embedder.embed_neural_batch_blocking(&texts);
     for ((node_id, _), embedding) in pending.iter().zip(embeddings) {
         if let Some(embedding) = embedding.filter(|row| !row.is_empty()) {

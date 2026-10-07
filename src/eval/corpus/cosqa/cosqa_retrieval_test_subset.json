@@ -1,0 +1,317 @@
+[
+ {
+  "idx": "cosqa-train-12467",
+  "doc": "sort by a token in string python",
+  "code": "def _process_and_sort(s, force_ascii, full_process=True):\n    \"\"\"Return a cleaned string with token sorted.\"\"\"\n    # pull tokens\n    ts = utils.full_process(s, force_ascii=force_ascii) if full_process else s\n    tokens = ts.split()\n\n    # sort tokens and join\n    sorted_string = u\" \".join(sorted(tokens))\n    return sorted_string.strip()"
+ },
+ {
+  "idx": "cosqa-train-18162",
+  "doc": "input string that replaces occurences python",
+  "code": "def __replace_all(repls: dict, input: str) -> str:\n    \"\"\" Replaces from a string **input** all the occurrences of some\n    symbols according to mapping **repls**.\n\n    :param dict repls: where #key is the old character and\n    #value is the one to substitute with;\n    :param str input: original string where to apply the\n    replacements;\n    :return: *(str)* the string with the desired characters replaced\n    \"\"\"\n    return re.sub('|'.join(re.escape(key) for key in repls.keys()),\n                  lambda k: repls[k.group(0)], input)"
+ },
+ {
+  "idx": "cosqa-train-11671",
+  "doc": "how to make a seconds to time in python",
+  "code": "def time2seconds(t):\n    \"\"\"Returns seconds since 0h00.\"\"\"\n    return t.hour * 3600 + t.minute * 60 + t.second + float(t.microsecond) / 1e6"
+ },
+ {
+  "idx": "cosqa-dev-5",
+  "doc": "python save graph into file",
+  "code": "def to_dotfile(G: nx.DiGraph, filename: str):\n    \"\"\" Output a networkx graph to a DOT file. \"\"\"\n    A = to_agraph(G)\n    A.write(filename)"
+ },
+ {
+  "idx": "cosqa-train-13872",
+  "doc": "how to make paragraphs in python",
+  "code": "def paragraph(separator='\\n\\n', wrap_start='', wrap_end='',\n              html=False, sentences_quantity=3):\n    \"\"\"Return a random paragraph.\"\"\"\n    return paragraphs(quantity=1, separator=separator, wrap_start=wrap_start,\n                      wrap_end=wrap_end, html=html,\n                      sentences_quantity=sentences_quantity)"
+ },
+ {
+  "idx": "cosqa-train-9131",
+  "doc": "get unique list from two lists python",
+  "code": "def unique_list(lst):\n    \"\"\"Make a list unique, retaining order of initial appearance.\"\"\"\n    uniq = []\n    for item in lst:\n        if item not in uniq:\n            uniq.append(item)\n    return uniq"
+ },
+ {
+  "idx": "cosqa-train-13999",
+  "doc": "python setlevel how to only record error",
+  "code": "def print_fatal_results(results, level=0):\n    \"\"\"Print fatal errors that occurred during validation runs.\n    \"\"\"\n    print_level(logger.critical, _RED + \"[X] Fatal Error: %s\", level, results.error)"
+ },
+ {
+  "idx": "cosqa-train-13463",
+  "doc": "python ldap get all groups a user belongs to",
+  "code": "def get_groups(self, username):\n        \"\"\"Get all groups of a user\"\"\"\n        username = ldap.filter.escape_filter_chars(self._byte_p2(username))\n        userdn = self._get_user(username, NO_ATTR)\n\n        searchfilter = self.group_filter_tmpl % {\n            'userdn': userdn,\n            'username': username\n        }\n\n        groups = self._search(searchfilter, NO_ATTR, self.groupdn)\n        ret = []\n        for entry in groups:\n            ret.append(self._uni(entry[0]))\n        return ret"
+ },
+ {
+  "idx": "cosqa-train-12156",
+  "doc": "python upper case lower case converter",
+  "code": "def upcaseTokens(s,l,t):\n    \"\"\"Helper parse action to convert tokens to upper case.\"\"\"\n    return [ tt.upper() for tt in map(_ustr,t) ]"
+ },
+ {
+  "idx": "cosqa-dev-481",
+  "doc": "check if 2 string are equal python",
+  "code": "def indexes_equal(a: Index, b: Index) -> bool:\n    \"\"\"\n    Are two indexes equal? Checks by comparing ``str()`` versions of them.\n    (AM UNSURE IF THIS IS ENOUGH.)\n    \"\"\"\n    return str(a) == str(b)"
+ },
+ {
+  "idx": "cosqa-train-19367",
+  "doc": "how to check a file is empty in python",
+  "code": "def _cnx_is_empty(in_file):\n    \"\"\"Check if cnr or cns files are empty (only have a header)\n    \"\"\"\n    with open(in_file) as in_handle:\n        for i, line in enumerate(in_handle):\n            if i > 0:\n                return False\n    return True"
+ },
+ {
+  "idx": "cosqa-train-10725",
+  "doc": "calling index iterable python",
+  "code": "def stop_at(iterable, idx):\n    \"\"\"Stops iterating before yielding the specified idx.\"\"\"\n    for i, item in enumerate(iterable):\n        if i == idx: return\n        yield item"
+ },
+ {
+  "idx": "cosqa-train-15551",
+  "doc": "have python line continue on to next line",
+  "code": "def advance_one_line(self):\n    \"\"\"Advances to next line.\"\"\"\n\n    current_line = self._current_token.line_number\n    while current_line == self._current_token.line_number:\n      self._current_token = ConfigParser.Token(*next(self._token_generator))"
+ },
+ {
+  "idx": "cosqa-train-11902",
+  "doc": "python series'value non zero index",
+  "code": "def reduce_fn(x):\n    \"\"\"\n    Aggregation function to get the first non-zero value.\n    \"\"\"\n    values = x.values if pd and isinstance(x, pd.Series) else x\n    for v in values:\n        if not is_nan(v):\n            return v\n    return np.NaN"
+ },
+ {
+  "idx": "cosqa-dev-421",
+  "doc": "python pywin32 screenshoot refresh",
+  "code": "def win32_refresh_window(cls):\n        \"\"\"\n        Call win32 API to refresh the whole Window.\n\n        This is sometimes necessary when the application paints background\n        for completion menus. When the menu disappears, it leaves traces due\n        to a bug in the Windows Console. Sending a repaint request solves it.\n        \"\"\"\n        # Get console handle\n        handle = windll.kernel32.GetConsoleWindow()\n\n        RDW_INVALIDATE = 0x0001\n        windll.user32.RedrawWindow(handle, None, None, c_uint(RDW_INVALIDATE))"
+ },
+ {
+  "idx": "cosqa-train-13071",
+  "doc": "python get current users desktop",
+  "code": "def get_current_desktop(self):\n        \"\"\"\n        Get the current desktop.\n        Uses ``_NET_CURRENT_DESKTOP`` of the EWMH spec.\n        \"\"\"\n        desktop = ctypes.c_long(0)\n        _libxdo.xdo_get_current_desktop(self._xdo, ctypes.byref(desktop))\n        return desktop.value"
+ },
+ {
+  "idx": "cosqa-train-15173",
+  "doc": "create column in python by joining columns",
+  "code": "def join_cols(cols):\n    \"\"\"Join list of columns into a string for a SQL query\"\"\"\n    return \", \".join([i for i in cols]) if isinstance(cols, (list, tuple, set)) else cols"
+ },
+ {
+  "idx": "cosqa-train-9034",
+  "doc": "get all dates between range datetime python",
+  "code": "def dates_in_range(start_date, end_date):\n    \"\"\"Returns all dates between two dates.\n\n    Inclusive of the start date but not the end date.\n\n    Args:\n        start_date (datetime.date)\n        end_date (datetime.date)\n\n    Returns:\n        (list) of datetime.date objects\n    \"\"\"\n    return [\n        start_date + timedelta(n)\n        for n in range(int((end_date - start_date).days))\n    ]"
+ },
+ {
+  "idx": "cosqa-train-13207",
+  "doc": "fill is null with other columns python",
+  "code": "def clean_dataframe(df):\n    \"\"\"Fill NaNs with the previous value, the next value or if all are NaN then 1.0\"\"\"\n    df = df.fillna(method='ffill')\n    df = df.fillna(0.0)\n    return df"
+ },
+ {
+  "idx": "cosqa-train-7547",
+  "doc": "how to print all the variables in an object python",
+  "code": "def var_dump(*obs):\n\t\"\"\"\n\t  shows structured information of a object, list, tuple etc\n\t\"\"\"\n\ti = 0\n\tfor x in obs:\n\t\t\n\t\tstr = var_dump_output(x, 0, '  ', '\\n', True)\n\t\tprint (str.strip())\n\t\t\n\t\t#dump(x, 0, i, '', object)\n\t\ti += 1"
+ },
+ {
+  "idx": "cosqa-train-4338",
+  "doc": "best way to read xml in python",
+  "code": "def xmltreefromfile(filename):\n    \"\"\"Internal function to read an XML file\"\"\"\n    try:\n        return ElementTree.parse(filename, ElementTree.XMLParser(collect_ids=False))\n    except TypeError:\n        return ElementTree.parse(filename, ElementTree.XMLParser())"
+ },
+ {
+  "idx": "cosqa-train-14553",
+  "doc": "python boto3 delete key from s3",
+  "code": "def remove_file_from_s3(awsclient, bucket, key):\n    \"\"\"Remove a file from an AWS S3 bucket.\n\n    :param awsclient:\n    :param bucket:\n    :param key:\n    :return:\n    \"\"\"\n    client_s3 = awsclient.get_client('s3')\n    response = client_s3.delete_object(Bucket=bucket, Key=key)"
+ },
+ {
+  "idx": "cosqa-train-16286",
+  "doc": "python tkinter how to create scrollable canvas",
+  "code": "def _set_scroll_v(self, *args):\n        \"\"\"Scroll both categories Canvas and scrolling container\"\"\"\n        self._canvas_categories.yview(*args)\n        self._canvas_scroll.yview(*args)"
+ },
+ {
+  "idx": "cosqa-train-14776",
+  "doc": "python connect to aws rds",
+  "code": "def connect_rds(aws_access_key_id=None, aws_secret_access_key=None, **kwargs):\n    \"\"\"\n    :type aws_access_key_id: string\n    :param aws_access_key_id: Your AWS Access Key ID\n\n    :type aws_secret_access_key: string\n    :param aws_secret_access_key: Your AWS Secret Access Key\n\n    :rtype: :class:`boto.rds.RDSConnection`\n    :return: A connection to RDS\n    \"\"\"\n    from boto.rds import RDSConnection\n    return RDSConnection(aws_access_key_id, aws_secret_access_key, **kwargs)"
+ },
+ {
+  "idx": "cosqa-train-10955",
+  "doc": "python get index of list values that equal",
+  "code": "def equal(list1, list2):\n    \"\"\" takes flags returns indexes of True values \"\"\"\n    return [item1 == item2 for item1, item2 in broadcast_zip(list1, list2)]"
+ },
+ {
+  "idx": "cosqa-train-13450",
+  "doc": "python keep processpool open until tasks complete",
+  "code": "def wait(self, timeout=None):\n    \"\"\"\n    Block until all jobs in the ThreadPool are finished. Beware that this can\n    make the program run into a deadlock if another thread adds new jobs to the\n    pool!\n\n    # Raises\n    Timeout: If the timeout is exceeded.\n    \"\"\"\n\n    if not self.__running:\n      raise RuntimeError(\"ThreadPool ain't running\")\n    self.__queue.wait(timeout)"
+ },
+ {
+  "idx": "cosqa-train-19263",
+  "doc": "how to compute the minimum value of a tensor in python",
+  "code": "def last_location_of_minimum(x):\n    \"\"\"\n    Returns the last location of the minimal value of x.\n    The position is calculated relatively to the length of x.\n\n    :param x: the time series to calculate the feature of\n    :type x: numpy.ndarray\n    :return: the value of this feature\n    :return type: float\n    \"\"\"\n    x = np.asarray(x)\n    return 1.0 - np.argmin(x[::-1]) / len(x) if len(x) > 0 else np.NaN"
+ },
+ {
+  "idx": "cosqa-train-11239",
+  "doc": "python interactive shell color",
+  "code": "def auto():\n\t\"\"\"set colouring on if STDOUT is a terminal device, off otherwise\"\"\"\n\ttry:\n\t\tStyle.enabled = False\n\t\tStyle.enabled = sys.stdout.isatty()\n\texcept (AttributeError, TypeError):\n\t\tpass"
+ },
+ {
+  "idx": "cosqa-train-18571",
+  "doc": "selecting a range of 2d elements from a numpy array gives empty array in python 3",
+  "code": "def to_0d_array(value: Any) -> np.ndarray:\n    \"\"\"Given a value, wrap it in a 0-D numpy.ndarray.\n    \"\"\"\n    if np.isscalar(value) or (isinstance(value, np.ndarray) and\n                              value.ndim == 0):\n        return np.array(value)\n    else:\n        return to_0d_object_array(value)"
+ },
+ {
+  "idx": "cosqa-train-5390",
+  "doc": "python remove element set",
+  "code": "def isolate_element(self, x):\n        \"\"\"Isolates `x` from its equivalence class.\"\"\"\n        members = list(self.members(x))\n        self.delete_set(x)\n        self.union(*(v for v in members if v != x))"
+ },
+ {
+  "idx": "cosqa-train-17371",
+  "doc": "how to fetch one value from one row from mysql query in python",
+  "code": "def fetchvalue(self, sql: str, *args) -> Optional[Any]:\n        \"\"\"Executes SQL; returns the first value of the first row, or None.\"\"\"\n        row = self.fetchone(sql, *args)\n        if row is None:\n            return None\n        return row[0]"
+ },
+ {
+  "idx": "cosqa-train-19190",
+  "doc": "how to make letters uppercase in python skipping spaces",
+  "code": "def uppercase_chars(string: any) -> str:\n        \"\"\"Return all (and only) the uppercase chars in the given string.\"\"\"\n        return ''.join([c if c.isupper() else '' for c in str(string)])"
+ },
+ {
+  "idx": "cosqa-train-19036",
+  "doc": "timing a function call python",
+  "code": "def timeit(func, *args, **kwargs):\n    \"\"\"\n    Time execution of function. Returns (res, seconds).\n\n    >>> res, timing = timeit(time.sleep, 1)\n    \"\"\"\n    start_time = time.time()\n    res = func(*args, **kwargs)\n    timing = time.time() - start_time\n    return res, timing"
+ },
+ {
+  "idx": "cosqa-train-14528",
+  "doc": "python array get element by index with default",
+  "code": "def list_get(l, idx, default=None):\n    \"\"\"\n    Get from a list with an optional default value.\n    \"\"\"\n    try:\n        if l[idx]:\n            return l[idx]\n        else:\n            return default\n    except IndexError:\n        return default"
+ },
+ {
+  "idx": "cosqa-train-7409",
+  "doc": "how to hash a binary file in python",
+  "code": "def generate_hash(filepath):\n    \"\"\"Public function that reads a local file and generates a SHA256 hash digest for it\"\"\"\n    fr = FileReader(filepath)\n    data = fr.read_bin()\n    return _calculate_sha256(data)"
+ },
+ {
+  "idx": "cosqa-train-10997",
+  "doc": "discord python get user from id string",
+  "code": "def get_user_by_id(self, id):\n        \"\"\"Retrieve a User object by ID.\"\"\"\n        return self.db_adapter.get_object(self.UserClass, id=id)"
+ },
+ {
+  "idx": "cosqa-train-14436",
+  "doc": "reduce functon not defined in python",
+  "code": "def compose(func_list):\n    \"\"\"\n    composion of preprocessing functions\n    \"\"\"\n\n    def f(G, bim):\n        for func in func_list:\n            G, bim = func(G, bim)\n        return G, bim\n\n    return f"
+ },
+ {
+  "idx": "cosqa-train-16521",
+  "doc": "maker a string lowercase pythong",
+  "code": "def to_snake_case(text):\n    \"\"\"Convert to snake case.\n\n    :param str text:\n    :rtype: str\n    :return:\n    \"\"\"\n    s1 = re.sub('(.)([A-Z][a-z]+)', r'\\1_\\2', text)\n    return re.sub('([a-z0-9])([A-Z])', r'\\1_\\2', s1).lower()"
+ },
+ {
+  "idx": "cosqa-train-18559",
+  "doc": "python load csv to numpy array",
+  "code": "def csv_to_numpy(string_like, dtype=None):  # type: (str) -> np.array\n    \"\"\"Convert a CSV object to a numpy array.\n\n    Args:\n        string_like (str): CSV string.\n        dtype (dtype, optional):  Data type of the resulting array. If None, the dtypes will be determined by the\n                                        contents of each column, individually. This argument can only be used to\n                                        'upcast' the array.  For downcasting, use the .astype(t) method.\n    Returns:\n        (np.array): numpy array\n    \"\"\"\n    stream = StringIO(string_like)\n    return np.genfromtxt(stream, dtype=dtype, delimiter=',')"
+ },
+ {
+  "idx": "cosqa-train-19520",
+  "doc": "python get index of element each time it appears in list",
+  "code": "def index(self, item):\n        \"\"\" Not recommended for use on large lists due to time\n            complexity, but it works\n\n            -> #int list index of @item\n        \"\"\"\n        for i, x in enumerate(self.iter()):\n            if x == item:\n                return i\n        return None"
+ },
+ {
+  "idx": "cosqa-train-7664",
+  "doc": "python sort data by variable",
+  "code": "def sort_data(x, y):\n    \"\"\"Sort the data.\"\"\"\n    xy = sorted(zip(x, y))\n    x, y = zip(*xy)\n    return x, y"
+ },
+ {
+  "idx": "cosqa-train-6681",
+  "doc": "create copy that doesn't alter original python",
+  "code": "def copy(obj):\n    def copy(self):\n        \"\"\"\n        Copy self to a new object.\n        \"\"\"\n        from copy import deepcopy\n\n        return deepcopy(self)\n    obj.copy = copy\n    return obj"
+ },
+ {
+  "idx": "cosqa-train-7344",
+  "doc": "python pretty print without sort",
+  "code": "def pprint(obj, verbose=False, max_width=79, newline='\\n'):\n    \"\"\"\n    Like `pretty` but print to stdout.\n    \"\"\"\n    printer = RepresentationPrinter(sys.stdout, verbose, max_width, newline)\n    printer.pretty(obj)\n    printer.flush()\n    sys.stdout.write(newline)\n    sys.stdout.flush()"
+ },
+ {
+  "idx": "cosqa-train-6837",
+  "doc": "extract integers from string in python",
+  "code": "def get_numbers(s):\n    \"\"\"Extracts all integers from a string an return them in a list\"\"\"\n\n    result = map(int, re.findall(r'[0-9]+', unicode(s)))\n    return result + [1] * (2 - len(result))"
+ },
+ {
+  "idx": "cosqa-train-19381",
+  "doc": "how to delete an element in a python dictionary",
+  "code": "def dictlist_wipe_key(dict_list: Iterable[Dict], key: str) -> None:\n    \"\"\"\n    Process an iterable of dictionaries. For each dictionary ``d``, delete\n    ``d[key]`` if it exists.\n    \"\"\"\n    for d in dict_list:\n        d.pop(key, None)"
+ },
+ {
+  "idx": "cosqa-train-636",
+  "doc": "python how to move to next command in for loop",
+  "code": "def do_next(self, args):\n        \"\"\"Step over the next statement\n        \"\"\"\n        self._do_print_from_last_cmd = True\n        self._interp.step_over()\n        return True"
+ },
+ {
+  "idx": "cosqa-train-18378",
+  "doc": "string remove the last blank python",
+  "code": "def remove_blank_lines(string):\n    \"\"\" Removes all blank lines in @string\n\n        -> #str without blank lines\n    \"\"\"\n    return \"\\n\".join(line\n                     for line in string.split(\"\\n\")\n                     if len(line.strip()))"
+ },
+ {
+  "idx": "cosqa-train-13884",
+  "doc": "how to model a sphere python",
+  "code": "def Fsphere(q, R):\n    \"\"\"Scattering form-factor amplitude of a sphere normalized to F(q=0)=V\n\n    Inputs:\n    -------\n        ``q``: independent variable\n        ``R``: sphere radius\n\n    Formula:\n    --------\n        ``4*pi/q^3 * (sin(qR) - qR*cos(qR))``\n    \"\"\"\n    return 4 * np.pi / q ** 3 * (np.sin(q * R) - q * R * np.cos(q * R))"
+ },
+ {
+  "idx": "cosqa-train-8092",
+  "doc": "pybool to c++ python 3",
+  "code": "def convertToBool():\n    \"\"\" Convert a byte value to boolean (0 or 1) if\n    the global flag strictBool is True\n    \"\"\"\n    if not OPTIONS.strictBool.value:\n        return []\n\n    REQUIRES.add('strictbool.asm')\n\n    result = []\n    result.append('pop af')\n    result.append('call __NORMALIZE_BOOLEAN')\n    result.append('push af')\n\n    return result"
+ },
+ {
+  "idx": "cosqa-train-17916",
+  "doc": "how to get the datatypes in python",
+  "code": "def dtypes(self):\n        \"\"\"Returns all column names and their data types as a list.\n\n        >>> df.dtypes\n        [('age', 'int'), ('name', 'string')]\n        \"\"\"\n        return [(str(f.name), f.dataType.simpleString()) for f in self.schema.fields]"
+ },
+ {
+  "idx": "cosqa-train-9285",
+  "doc": "python making string lower case",
+  "code": "def to_camel(s):\n    \"\"\"\n    :param string s: under_scored string to be CamelCased\n    :return: CamelCase version of input\n    :rtype: str\n    \"\"\"\n    # r'(?!^)_([a-zA-Z]) original regex wasn't process first groups\n    return re.sub(r'_([a-zA-Z])', lambda m: m.group(1).upper(), '_' + s)"
+ },
+ {
+  "idx": "cosqa-train-14769",
+  "doc": "using sort to move element in to new position in list python",
+  "code": "def insort_no_dup(lst, item):\n    \"\"\"\n    If item is not in lst, add item to list at its sorted position\n    \"\"\"\n    import bisect\n    ix = bisect.bisect_left(lst, item)\n    if lst[ix] != item: \n        lst[ix:ix] = [item]"
+ },
+ {
+  "idx": "cosqa-train-18773",
+  "doc": "python remove phrase from list of strings",
+  "code": "def remove_empty_text(utterances: List[Utterance]) -> List[Utterance]:\n    \"\"\"Remove empty utterances from a list of utterances\n    Args:\n        utterances: The list of utterance we are processing\n    \"\"\"\n    return [utter for utter in utterances if utter.text.strip() != \"\"]"
+ },
+ {
+  "idx": "cosqa-train-10773",
+  "doc": "python expand a path",
+  "code": "def expandpath(path):\n    \"\"\"\n    Expand a filesystem path that may or may not contain user/env vars.\n\n    :param str path: path to expand\n    :return str: expanded version of input path\n    \"\"\"\n    return os.path.expandvars(os.path.expanduser(path)).replace(\"//\", \"/\")"
+ },
+ {
+  "idx": "cosqa-train-18842",
+  "doc": "how to check whether a string is int in python",
+  "code": "def _isint(string):\n    \"\"\"\n    >>> _isint(\"123\")\n    True\n    >>> _isint(\"123.45\")\n    False\n    \"\"\"\n    return type(string) is int or \\\n           (isinstance(string, _binary_type) or isinstance(string, _text_type)) and \\\n           _isconvertible(int, string)"
+ },
+ {
+  "idx": "cosqa-train-7384",
+  "doc": "how to get the parent directory in python",
+  "code": "def get_parent_dir(name):\n    \"\"\"Get the parent directory of a filename.\"\"\"\n    parent_dir = os.path.dirname(os.path.dirname(name))\n    if parent_dir:\n        return parent_dir\n    return os.path.abspath('.')"
+ },
+ {
+  "idx": "cosqa-train-6677",
+  "doc": "create an empty column in data frame python",
+  "code": "def add_blank_row(self, label):\n        \"\"\"\n        Add a blank row with only an index value to self.df.\n        This is done inplace.\n        \"\"\"\n        col_labels = self.df.columns\n        blank_item = pd.Series({}, index=col_labels, name=label)\n        # use .loc to add in place (append won't do that)\n        self.df.loc[blank_item.name] = blank_item\n        return self.df"
+ },
+ {
+  "idx": "cosqa-train-7598",
+  "doc": "python select not null column values",
+  "code": "def selectnotnone(table, field, complement=False):\n    \"\"\"Select rows where the given field is not `None`.\"\"\"\n\n    return select(table, field, lambda v: v is not None,\n                  complement=complement)"
+ },
+ {
+  "idx": "cosqa-train-10077",
+  "doc": "python wrap (s,w) print",
+  "code": "def _wrap(text, columns=80):\n    \"\"\"\n    Own \"dumb\" reimplementation of textwrap.wrap().\n\n    This is because calling .wrap() on bigger strings can take a LOT of\n    processor power. And I mean like 8 seconds of 3GHz CPU just to wrap 20kB of\n    text without spaces.\n\n    Args:\n        text (str): Text to wrap.\n        columns (int): Wrap after `columns` characters.\n\n    Returns:\n        str: Wrapped text.\n    \"\"\"\n    out = []\n    for cnt, char in enumerate(text):\n        out.append(char)\n\n        if (cnt + 1) % columns == 0:\n            out.append(\"\\n\")\n\n    return \"\".join(out)"
+ },
+ {
+  "idx": "cosqa-train-12879",
+  "doc": "center align python text",
+  "code": "def center_text(text, width=80):\n    \"\"\"Center all lines of the text.\n\n    It is assumed that all lines width is smaller then B{width}, because the\n    line width will not be checked.\n\n    Args:\n        text (str): Text to wrap.\n        width (int): Maximum number of characters per line.\n\n    Returns:\n        str: Centered text.\n    \"\"\"\n    centered = []\n    for line in text.splitlines():\n        centered.append(line.center(width))\n    return \"\\n\".join(centered)"
+ },
+ {
+  "idx": "cosqa-train-16638",
+  "doc": "pass defined parser object to subparser python",
+  "code": "def sub(name, func,**kwarg):\n    \"\"\" Add subparser\n\n    \"\"\"\n    sp = subparsers.add_parser(name, **kwarg)\n    sp.set_defaults(func=func)\n    sp.arg = sp.add_argument\n    return sp"
+ },
+ {
+  "idx": "cosqa-train-16594",
+  "doc": "object as list python",
+  "code": "def as_list(self):\n        \"\"\"Return all child objects in nested lists of strings.\"\"\"\n        return [self.name, self.value, [x.as_list for x in self.children]]"
+ },
+ {
+  "idx": "cosqa-train-17740",
+  "doc": "removing columnsns in data frame python",
+  "code": "def clean_column_names(df: DataFrame) -> DataFrame:\n    \"\"\"\n    Strip the whitespace from all column names in the given DataFrame\n    and return the result.\n    \"\"\"\n    f = df.copy()\n    f.columns = [col.strip() for col in f.columns]\n    return f"
+ }
+]

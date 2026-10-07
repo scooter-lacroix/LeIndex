@@ -6,7 +6,7 @@
 
 use leindex::cli::ProjectRegistry;
 use leindex::cli::mcp::handlers::all_tool_handlers;
-use leindex::cli::mcp::handlers::{FileSummaryHandler, GrepSymbolsHandler, ReadSymbolHandler};
+use leindex::cli::mcp::handlers::{FileSummaryHandler, FindHandler, ReadSymbolHandler};
 use leindex::cli::mcp::protocol::JsonRpcRequest;
 use leindex::cli::mcp::request_meta::{
     NEURAL_REQUESTS, PDG_LOADS, PROJECT_HYDRATIONS, PhaseTimings, WorkBudget,
@@ -15,8 +15,15 @@ use leindex::cli::mcp::request_meta::{
 };
 use leindex::cli::mcp::server::handle_tool_call;
 use leindex::search::query_route::{QueryRoute, RequestedMode, classify};
-use leindex::storage::nodes::NodeType;
-use leindex::storage::{NodeRecord, NodeStore, Storage, UniqueProjectId};
+use leindex::storage::Storage;
+use leindex::storage::UniqueProjectId;
+use leindex::storage::cas::CasStore;
+use leindex::storage::generation::GenerationWriter;
+use leindex::storage::generation::LayerKind;
+use leindex::storage::generation::graph_codec::{
+    encode_empty_neural, encode_empty_tfidf, encode_pdg_v2_from_graph,
+    encode_symbols_layer_from_graph, vacuum_catalog_bytes,
+};
 use serde_json::{Value, json};
 use std::fs;
 use std::process::Command;
@@ -333,31 +340,48 @@ fn catalog_fixture() -> (TempDir, std::path::PathBuf) {
     let storage_dir = project.join(".leindex");
     fs::create_dir_all(&storage_dir).expect("create catalog storage directory");
     let db_path = storage_dir.join("leindex.db");
-    let mut storage = Storage::open(&db_path).expect("open catalog storage");
+    let storage = Storage::open(&db_path).expect("open catalog storage");
     let metadata_id = UniqueProjectId::generate(&canonical_project, &[]);
     storage
         .store_project_metadata(&metadata_id, &canonical_project)
         .expect("store catalog metadata");
     let project_id = "project".to_string();
-    NodeStore::new(&mut storage)
-        .insert(&NodeRecord {
-            id: None,
-            project_id: project_id.clone(),
-            file_path: canonical_source.display().to_string(),
-            node_id: "src/lib.rs:Askpass".to_string(),
-            symbol_name: "Askpass".to_string(),
-            qualified_name: "Askpass".to_string(),
-            language: "rust".to_string(),
-            node_type: NodeType::Class,
-            signature: None,
-            complexity: Some(1),
-            content_hash: "catalog-fixture".to_string(),
-            embedding: None,
-            byte_range_start: Some(0),
-            byte_range_end: Some(19),
-            embedding_format: None,
-        })
-        .expect("store catalog symbol");
+    // Post-flip the symbol find path reads the generation's Pdg layer (the
+    // catalog no longer carries graph rows), so seed a graph + published
+    // generation instead of a raw intel_nodes row.
+    let mut pdg = leindex::graph::pdg::ProgramDependenceGraph::new();
+    pdg.add_node(leindex::graph::pdg::Node {
+        id: "src/lib.rs:Askpass".to_string(),
+        node_type: leindex::graph::pdg::NodeType::Class,
+        name: "Askpass".to_string(),
+        file_path: std::sync::Arc::from(canonical_source.display().to_string().as_str()),
+        byte_range: (0, 19),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+    let cas = Arc::new(std::sync::Mutex::new(
+        CasStore::open(storage_dir.join("cas")).expect("open fixture cas"),
+    ));
+    let mut writer = GenerationWriter::new(&storage_dir, cas);
+    let (pdg_bytes, _) = encode_pdg_v2_from_graph(&pdg).expect("encode fixture pdg");
+    writer
+        .stage(LayerKind::Pdg, &pdg_bytes)
+        .expect("stage fixture pdg");
+    let symbols_bytes = encode_symbols_layer_from_graph(&pdg).expect("encode fixture symbols");
+    writer
+        .stage(LayerKind::Symbols, &symbols_bytes)
+        .expect("stage fixture symbols");
+    writer
+        .stage(LayerKind::Tfidf, &encode_empty_tfidf())
+        .expect("stage fixture tfidf");
+    writer
+        .stage(LayerKind::Neural, &encode_empty_neural())
+        .expect("stage fixture neural");
+    let db_bytes = vacuum_catalog_bytes(&db_path).expect("vacuum fixture catalog");
+    writer
+        .stage(LayerKind::Db, &db_bytes)
+        .expect("stage fixture db");
+    writer.publish(1).expect("publish fixture generation");
     storage
         .conn()
         .execute(
@@ -406,29 +430,32 @@ async fn test_canonical_path_read_symbol_uses_the_same_catalog_key() {
 }
 
 #[tokio::test]
-async fn test_default_project_exact_catalog_grep_does_not_hydrate() {
+async fn test_default_project_symbol_find_does_not_hydrate() {
     let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     let registry = Arc::new(ProjectRegistry::new(2));
     registry.set_default_path(project).await;
     reset_path_counters();
 
-    let response = GrepSymbolsHandler
+    let response = FindHandler
         .execute(
             &registry,
             json!({
                 "pattern": "Askpass",
-                "mode": "exact",
-                "type_filter": "class",
+                "target": "symbols",
+                "kind": "class",
                 "scope": "src",
-                "max_results": 1,
+                "limit": 1,
                 "offset": 0,
             }),
         )
         .await
-        .expect("default project exact catalog grep response");
+        .expect("default project symbol find response");
 
-    assert_eq!(response["results"][0]["name"], "Askpass");
+    assert_eq!(response["symbols"][0]["name"], "Askpass");
+    assert_eq!(response["symbols"][0]["kind"], "class");
+    assert_eq!(response["symbols"][0]["file"], "src/lib.rs");
+    assert_eq!(response["symbols"][0]["line"], 1);
     assert_eq!(PROJECT_HYDRATIONS.load(Ordering::Relaxed), 0);
     assert_eq!(PDG_LOADS.load(Ordering::Relaxed), 0);
     assert_eq!(NEURAL_REQUESTS.load(Ordering::Relaxed), 0);
@@ -615,7 +642,7 @@ async fn test_stale_catalog_file_summary_does_not_attach_stale_pdg_relations() {
 }
 
 #[tokio::test]
-async fn test_exact_grep_catalog_miss_uses_live_parser_without_hydration() {
+async fn test_find_sees_edits_made_after_indexing_without_hydration() {
     let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     fs::write(
@@ -624,18 +651,18 @@ async fn test_exact_grep_catalog_miss_uses_live_parser_without_hydration() {
     )
     .expect("make catalog source stale");
     reset_path_counters();
-    let response = GrepSymbolsHandler
+    let response = FindHandler
         .execute(
             &Arc::new(ProjectRegistry::new(2)),
             json!({
                 "project_path": project,
                 "pattern": "live_marker",
-                "mode": "exact",
             }),
         )
         .await
-        .expect("live exact grep response");
-    assert_eq!(response["results"][0]["name"], "live_marker");
+        .expect("live find response");
+    assert_eq!(response["files"][0]["file"], "src/lib.rs");
+    assert_eq!(response["files"][0]["hits"][0]["line"], 2);
     assert_eq!(PROJECT_HYDRATIONS.load(Ordering::Relaxed), 0);
     assert_eq!(PDG_LOADS.load(Ordering::Relaxed), 0);
     assert_eq!(NEURAL_REQUESTS.load(Ordering::Relaxed), 0);

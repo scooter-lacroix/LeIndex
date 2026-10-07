@@ -334,17 +334,32 @@ fn test_existing_model_without_manifest_is_kept_and_reported_present() {
 }
 
 #[test]
-fn test_dynamic_model_assets_require_complete_single_file_download() {
+fn test_dynamic_model_assets_require_complete_pair_download() {
+    use crate::cli::leindex::model_download::DYNAMIC_MODEL_DATA_FILENAME;
     let tmp = tempfile::tempdir().unwrap();
-    let model_path = tmp
+    let shell = tmp
         .path()
         .join(crate::cli::leindex::model_download::DYNAMIC_MODEL_ONNX_FILENAME);
-    let model = std::fs::File::create(model_path).unwrap();
-    model.set_len(100 * 1024 * 1024).unwrap();
+    let data = tmp.path().join(DYNAMIC_MODEL_DATA_FILENAME);
+
+    // Graph shell alone (the classic half-copied install: the loader cannot
+    // resolve external data): incomplete even with the tokenizer present.
+    let f = std::fs::File::create(&shell).unwrap();
+    f.set_len(859_305).unwrap();
     std::fs::write(tmp.path().join("tokenizer.json"), b"{}").unwrap();
     assert!(!dynamic_model_assets_present(tmp.path()));
 
-    std::fs::write(tmp.path().join("config.json"), b"{}").unwrap();
+    // External weights alone (shell deleted): still incomplete.
+    let _ = std::fs::remove_file(&shell);
+    let d = std::fs::File::create(&data).unwrap();
+    d.set_len(331_107_401).unwrap();
+    assert!(!dynamic_model_assets_present(tmp.path()));
+
+    // Shell + weights pair (>= 100 MiB combined) + tokenizer: complete. The
+    // fine-tuned model's shell is ~859 KiB, so the floor must apply to the
+    // PAIR, not the .onnx alone.
+    let f = std::fs::File::create(&shell).unwrap();
+    f.set_len(859_305).unwrap();
     assert!(dynamic_model_assets_present(tmp.path()));
 }
 
@@ -631,7 +646,7 @@ fn test_build_config_selects_dynamic_qwen_model_for_all_local_providers() {
 
         let cfg = build_config(&choices, None, None);
 
-        assert_eq!(cfg.neural.model_name, "qwen3-embed-0.6b-dynamic");
+        assert_eq!(cfg.neural.model_name, "qwen3-embed-0.6b-dynamic-uint8");
     }
 }
 
@@ -645,25 +660,41 @@ fn test_model_download_profile_uses_hugging_face_cli_assets() {
         ExecutionProvider::CoreMl,
     ] {
         let profile = model_download_profile(Some(provider));
-        assert_eq!(profile.repository, "zhiqing/Qwen3-Embedding-0.6B-ONNX");
-        assert_eq!(profile.revision, "c96cc9c82d08ee7869600e2191078fc939957026");
-        assert_eq!(profile.remote_model, "model.onnx");
-        assert_eq!(profile.local_model, "qwen3-embed-0.6b-dynamic.onnx");
+        assert_eq!(
+            profile.repository,
+            "ScooterLacroix/qwen3-embed-0.6b-int4-code"
+        );
+        assert_eq!(profile.revision, "2228b18ed8edce562fcfe88fa99fcf29aba2fef0");
+        // Remote paths live under the repo's onnx/ directory; the graph shell
+        // and its external-weights sibling are BOTH part of the download set.
+        assert_eq!(
+            profile.remote_model,
+            "onnx/qwen3-embed-0.6b-dynamic-uint8.onnx"
+        );
+        assert_eq!(profile.local_model, "qwen3-embed-0.6b-dynamic-uint8.onnx");
         assert_eq!(
             profile.files,
-            &["model.onnx", "tokenizer.json", "config.json"]
+            &[
+                "onnx/qwen3-embed-0.6b-dynamic-uint8.onnx",
+                "onnx/qwen3-embed-0.6b-dynamic-uint8.onnx_data",
+                "onnx/tokenizer.json",
+            ]
         );
     }
 }
 
 #[test]
 fn test_dynamic_profile_requires_all_checksums_to_match() {
+    use crate::cli::leindex::model_download::DYNAMIC_MODEL_DATA_FILENAME;
     let model_dir = tempfile::tempdir().unwrap();
     let profile = model_download_profile(Some(ExecutionProvider::Cpu));
+    // Real installable unit: graph shell + external-weights sibling +
+    // tokenizer (no config.json — the fine-tuned repo does not host one).
     let model = std::fs::File::create(model_dir.path().join(profile.local_model)).unwrap();
-    model.set_len(100 * 1024 * 1024).unwrap();
+    model.set_len(859_305).unwrap();
+    let data = std::fs::File::create(model_dir.path().join(DYNAMIC_MODEL_DATA_FILENAME)).unwrap();
+    data.set_len(100 * 1024 * 1024).unwrap();
     std::fs::write(model_dir.path().join("tokenizer.json"), b"{}").unwrap();
-    std::fs::write(model_dir.path().join("config.json"), b"{}").unwrap();
 
     generate_profile_checksum_manifest(model_dir.path(), profile).unwrap();
     assert!(profile_assets_verified(model_dir.path(), profile));
@@ -680,7 +711,10 @@ fn test_dynamic_profile_requires_all_checksums_to_match() {
 
     generate_profile_checksum_manifest(model_dir.path(), profile).unwrap();
 
-    std::fs::write(model_dir.path().join("config.json"), br#"{"changed":true}"#).unwrap();
+    // Tampering the external-weights sibling must fail verification just like
+    // tampering the shell — the pair is one installable unit.
+    let d = std::fs::File::create(model_dir.path().join(DYNAMIC_MODEL_DATA_FILENAME)).unwrap();
+    d.set_len(100 * 1024 * 1024 + 1).unwrap();
     assert!(!profile_assets_verified(model_dir.path(), profile));
 }
 

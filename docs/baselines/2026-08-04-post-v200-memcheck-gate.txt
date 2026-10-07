@@ -1,0 +1,153 @@
+================================================================
+LeIndex v2.0.0 live memcheck acceptance gate (default-on build)
+Command: cargo build --release && cargo test -p memcheck -- --test-threads=1
+Captured: 2026-08-06T23:39:05Z (UTC)
+Git HEAD: 12fea12434bb1e4ed5943a3ae41ecd4e56cac500 (fix(rollout): document two-state flag lifecycle + adjust flag-default tests)
+Release binary: 36976416 target/release/leindex, timestamp 2026-08-06T19:39:00Z
+================================================================
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/main.rs (target/debug/deps/memcheck-7b8d26c7b9817e63)
+
+running 55 tests
+test diff::tests::test_apply_pct ... ok
+test diff::tests::test_budget_file_serialization ... ok
+test diff::tests::test_diff_all_pass_with_baseline ... ok
+test diff::tests::test_diff_baseline_regression ... ok
+test diff::tests::test_diff_both_rules_fail ... ok
+test diff::tests::test_diff_ceiling_regression ... ok
+test diff::tests::test_diff_missing_baseline_still_enforces_ceiling ... ok
+test diff::tests::test_extract_fixture_name ... ok
+test diff::tests::test_format_diff_failure_output ... ok
+test diff::tests::test_format_diff_output ... ok
+test diff::tests::test_write_all_baselines ... ok
+test diff::tests::test_write_and_load_baseline ... ok
+test env_capture::test::test_allocator_env_captures_malloc_arena_max ... ok
+test env_capture::test::test_allocator_env_omits_unset_malloc_arena_max ... ok
+test env_capture::test::test_capture_records_kernel_and_git ... hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /home/scooter/.claude/tmp/.tmpOkroKq/.git/
+[master (root-commit) 9bcc607] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 a.txt
+ok
+test env_capture::test::test_environment_capture_default ... ok
+test env_capture::test::test_environment_capture_serde_roundtrip ... ok
+test env_capture::test::test_hardware_info_serde_roundtrip ... ok
+test report::tests::test_memcheck_report_get_phase ... ok
+test report::tests::test_phase_report_json_fields ... ok
+test report::tests::test_phase_report_serialization ... ok
+test report::tests::test_validate_canonical_phases_success ... ok
+test report::tests::test_validate_canonical_phases_wrong_count ... ok
+test report::tests::test_validate_canonical_phases_wrong_order ... ok
+test sampler::tests::test_count_descendants_includes_spawned_child ... ok
+test sampler::tests::test_count_descendants_no_children ... ok
+test sampler::tests::test_descendant_tree_serde_roundtrip ... ok
+test sampler::tests::test_find_child_worker_rss_no_worker ... ok
+test sampler::tests::test_gpu_sample_default_is_all_none ... ok
+test sampler::tests::test_gpu_sample_is_consistent ... ok
+test sampler::tests::test_gpu_sample_returns_some_on_amdgpu_or_none_elsewhere ... ok
+test sampler::tests::test_heap_profile_missing_pid ... ok
+test sampler::tests::test_heap_profile_writes_file ... ok
+test sampler::tests::test_is_child_of_self ... ok
+test sampler::tests::test_is_vma_header ... ok
+test sampler::tests::test_read_mapped_anon_smaps_current ... ok
+test sampler::tests::test_read_proc_comm ... ok
+test sampler::tests::test_read_smaps_breakdown_current ... ok
+test sampler::tests::test_read_vm_rss_current ... ok
+test sampler::tests::test_sample_current_process ... ok
+test sampler::tests::test_sample_fast_current_process ... ok
+test workload::tests::test_build_phase_report_empty ... ok
+test workload::tests::test_build_phase_report_p95 ... ok
+test workload::tests::test_build_phase_report_peak_mapped_anon ... ok
+test workload::tests::test_build_phase_report_with_samples ... ok
+test workload::tests::test_build_phase_report_worker_aware ... ok
+test workload::tests::test_canonical_phases_count ... ok
+test workload::tests::test_canonical_phases_order ... ok
+test workload::tests::test_copy_fixture_source_excludes_root_leindex ... ok
+test workload::tests::test_find_worker_pids_finds_no_workers_for_self ... ok
+test workload::tests::test_read_proc_comm_for_self ... ok
+test workload::tests::test_read_proc_comm_missing_pid ... ok
+test workload::tests::test_read_proc_ppid_for_self ... ok
+test workload::tests::test_read_proc_ppid_missing_pid ... ok
+test workload::tests::test_reap_worker_processes_no_crash_with_no_workers ... ok
+
+test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+     Running tests/diff_logic.rs (target/debug/deps/diff_logic-f72403274bebd629)
+
+running 10 tests
+test test_diff_absolute_ceiling_regression_detected ... ok
+test test_diff_baseline_regression_detected ... ok
+test test_diff_passing_both_rules ... ok
+test test_val_measure_007_one_baseline_per_phase ... ok
+test test_val_measure_008_baseline_update_overwrites ... ok
+test test_val_measure_009_budget_file_exists ... ok
+test test_val_measure_010_both_rules_checked ... ok
+test test_val_measure_011_missing_baseline_enforces_ceiling ... ok
+test test_val_measure_012_xtask_memcheck_entrypoint ... ok
+test test_val_measure_013_update_baseline_regenerates ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/harness_integration.rs (target/debug/deps/harness_integration-12c811f52f09e66e)
+
+running 13 tests
+test test_idle_phases_have_reasonable_duration ... ok
+test test_mcp_idle_proliferation_linearity ... ok
+test test_memcheck_help_flag ... ok
+test test_memcheck_missing_fixture_fails ... ok
+test test_report_json_is_valid_and_parseable ... ok
+test test_stale_artifacts_phase_removes_dead_sidecars ... ok
+test test_val_measure_001_canonical_multi_phase_report ... ok
+test test_val_measure_002_phase_order_is_canonical ... ok
+test test_val_measure_003_per_phase_schema_has_required_metrics ... ok
+test test_val_measure_004_samples_fresh_process ... ok
+test test_val_measure_005_linux_rss_is_primary_metric ... ok
+test test_val_measure_006_mapped_file_and_anon_captured ... ok
+test test_worker_ort_threads_cap_leq_nocap ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 488.16s
+
+MEMCHECK_TEST_EXIT=0
+
+================================================================
+LIVE MEASURED RUN (memcheck harness, release build, default-on)
+Command: LEINDEX_HOME=<tmp> LEINDEX_WORKER_EXECUTION_PROVIDER=cpu ./target/release/memcheck tests/fixtures/memcheck/small_repo --output report.json
+Diff result: ALL PHASES PASSED (budget/comparison gate passed, no regression)
+Captured: 2026-08-06T23:48:38Z
+================================================================
+----- Live measured phase report (memcheck harness, default-on build) -----
+environment: kernel=7.1.5-1-cachyos git_revision=12fea12434bb1e4ed5943a3ae41ecd4e56cac500 arch=x86_64 cpu=AMD Ryzen 7 7800X3D 8-Core Processor cpus=16 mem_total_kib=65424824
+phase | rss_max_kib | rss_min_kib | rss_p95_kib | anon_kib | mapped_file_kib | worker_rss_max_kib | combined_rss_max_kib | samples | duration_ms
+idle_warm | 9268 | 9268 | 9268 | 384 | 8884 | 0 | 9268 | 10 | 3215
+index | 16492 | 492 | 16492 | 3052 | 13440 | 0 | 16492 | 5 | 412
+idle_post | 9156 | 9156 | 9156 | 404 | 8752 | 0 | 9156 | 10 | 3215
+query | 352 | 352 | 352 | 32 | 596 | 0 | 352 | 1 | 84
+reindex | 21472 | 172 | 21472 | 7500 | 13972 | 0 | 21472 | 4 | 326
+idle_final | 9052 | 9052 | 9052 | 388 | 8664 | 0 | 9052 | 10 | 3217
+embed_idle | 9260 | 9260 | 9260 | 388 | 8872 | 0 | 9260 | 10 | 3214
+embed_active | 19592 | 9324 | 19592 | 6408 | 13184 | 0 | 19592 | 16 | 5226
+embed_teardown | 9252 | 9252 | 9252 | 400 | 8852 | 0 | 9252 | 10 | 3264
+mcp_idle_proliferation | 27648 | 27648 | 27648 | 1172 | 26476 | 0 | 27648 | 9 | 4142
+worker_ort_threads | 19560 | 9840 | 19560 | 6412 | 13148 | 0 | 19560 | 13 | 4249
+stale_artifacts | 108 | 108 | 108 | 36 | 432 | 0 | 108 | 1 | 83
+contention_3c_2p | 28600 | 28300 | 28600 | 1188 | 27412 | 0 | 28600 | 9 | 4148
+incremental_noop | 20208 | 244 | 20208 | 7420 | 12788 | 0 | 20208 | 3 | 243
+incremental_one_file | 20844 | 108 | 20844 | 6648 | 14200 | 0 | 20844 | 2 | 162
+incremental_burst | 22512 | 300 | 22512 | 8456 | 14056 | 0 | 22512 | 3 | 243
+incremental_delete | 19484 | 252 | 19484 | 6624 | 12860 | 0 | 19484 | 2 | 168
+query_suite_cold | 24 | 24 | 24 | 28 | 388 | 0 | 24 | 1 | 86
+query_suite_warm | 352 | 352 | 352 | 36 | 588 | 0 | 352 | 1 | 86
+full_index_run2 | 23740 | 248 | 23740 | 9360 | 14380 | 0 | 23740 | 5 | 403
+full_index_run3 | 23360 | 300 | 23360 | 9252 | 14108 | 0 | 23360 | 4 | 323

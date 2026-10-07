@@ -2,6 +2,7 @@
 
 use crate::edit::ResolvedEditChange;
 use crate::graph::ProgramDependenceGraph;
+use crate::graph::pdg::NameCorpus;
 use crate::validation::Location;
 use crate::validation::ValidationError;
 use std::collections::{HashMap, HashSet};
@@ -105,6 +106,12 @@ impl ReferenceChecker {
         Self { pdg }
     }
 
+    /// Lower-cased names/paths of the PDG. Owned by the PDG and cached per
+    /// revision, so a validator created per request does not rebuild it.
+    fn corpus(&self) -> Arc<NameCorpus> {
+        self.pdg.name_corpus()
+    }
+
     /// Check references for edit changes
     ///
     /// # Arguments
@@ -117,6 +124,7 @@ impl ReferenceChecker {
         changes: &[ResolvedEditChange],
     ) -> Result<Vec<ReferenceIssue>, ValidationError> {
         let mut issues = Vec::new();
+        let mut import_cache: HashMap<String, bool> = HashMap::new();
 
         for change in changes {
             // Extract imports from new content
@@ -124,7 +132,10 @@ impl ReferenceChecker {
 
             // Check each import against the PDG
             for import in imports {
-                if !self.import_exists_in_pdg(&import) {
+                let known = *import_cache
+                    .entry(import.clone())
+                    .or_insert_with(|| self.import_exists_in_pdg(&import));
+                if !known {
                     issues.push(ReferenceIssue::broken_import(
                         import,
                         change.file_path.clone(),
@@ -277,26 +288,16 @@ impl ReferenceChecker {
         // Check if the import exists as a module or symbol in the PDG
         let import_lower = import.to_lowercase();
 
-        // Check if any node in the PDG matches the import
-        for node_id in self.pdg.node_indices() {
-            if let Some(node) = self.pdg.get_node(node_id) {
-                let node_name_lower = node.name.to_lowercase();
-                if node_name_lower.contains(&import_lower)
-                    || import_lower.contains(&node_name_lower)
-                {
-                    return true;
-                }
-            }
+        let corpus = self.corpus();
+        if corpus
+            .names
+            .iter()
+            .any(|name| name.contains(&import_lower) || import_lower.contains(name.as_str()))
+        {
+            return true;
         }
-
-        // Also check file paths
-        for node_id in self.pdg.node_indices() {
-            if let Some(node) = self.pdg.get_node(node_id) {
-                let file_path_lower = node.file_path.to_lowercase();
-                if file_path_lower.contains(&import_lower) {
-                    return true;
-                }
-            }
+        if corpus.files.iter().any(|file| file.contains(&import_lower)) {
+            return true;
         }
 
         false

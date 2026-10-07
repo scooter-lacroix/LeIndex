@@ -68,6 +68,13 @@ pub struct PhaseOptions {
     /// Keyword list used by phase-4 text signal hotspot heuristic.
     #[serde(default = "default_hotspot_keywords")]
     pub hotspot_keywords: Vec<String>,
+    /// The exact set of files the surrounding index tracks, when a phase run
+    /// shares its store with one. Collection then stays inside it, so the run
+    /// neither adds files the indexer deliberately skips (dotfiles, ignored
+    /// paths) nor treats indexed files outside its own language list as gone.
+    /// Empty means "walk the tree" (a standalone phase run).
+    #[serde(skip)]
+    pub universe: std::sync::Arc<Vec<PathBuf>>,
 }
 
 impl Default for PhaseOptions {
@@ -84,6 +91,7 @@ impl Default for PhaseOptions {
             include_docs: false,
             docs_mode: DocsMode::Off,
             hotspot_keywords: default_hotspot_keywords(),
+            universe: std::sync::Arc::default(),
         }
     }
 }

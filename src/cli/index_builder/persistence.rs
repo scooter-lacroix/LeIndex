@@ -25,8 +25,24 @@ pub(crate) fn persist_embeddings_to_mmap(
     project_path: &Path,
 ) -> Result<()> {
     let path = crate::search::vector::mmap_embeddings_path(project_path);
+    // Skip only when the on-disk mmap already describes the engine's current
+    // row population. The old check (mmap-backed + file exists) skipped
+    // FOREVER after the first write: an incremental reindex on a
+    // mmap-hydrated engine grew the snapshot but never the mmap file, so
+    // every later hydration failed the "mmap row count != snapshot
+    // indexed_nodes" validation and took the full rebuild path.
     if search_engine.is_mmap_backed() && path.is_file() {
-        return Ok(());
+        let engine_rows = search_engine.node_count();
+        let file_rows = crate::search::vector::MmapEmbeddingIndex::open(&path)
+            .map(|index| index.len())
+            .unwrap_or(usize::MAX);
+        if file_rows == engine_rows {
+            return Ok(());
+        }
+        info!(
+            file_rows,
+            engine_rows, "Rewriting mmap embeddings after row-count drift"
+        );
     }
     let embeddings = search_engine.collect_embeddings();
     if embeddings.is_empty() {
@@ -44,6 +60,30 @@ pub(crate) fn persist_embeddings_to_mmap(
 
 fn search_snapshot_path(project_path: &Path) -> PathBuf {
     project_path.join(".leindex").join("search_snapshot.bin")
+}
+
+/// The (nodes, edges, fingerprint) identity of a PDG as it will be
+/// RECONSTRUCTED from the published Pdg layer.
+///
+/// Snapshot and embedder freshness metadata must describe the persisted
+/// graph, not the raw in-memory one: the in-memory graph may legitimately
+/// hold several nodes sharing one `node_id` (external/import duplicates) and
+/// parallel same-type edges, which the layer format collapses (last-wins,
+/// matching the legacy SQL upserts). Identity recorded from the uncollapsed
+/// graph can therefore never match a layer-hydrated graph — every cold
+/// hydration would take the full TF-IDF rebuild path forever. Deriving the
+/// identity through the same collapse the layer round-trip applies makes
+/// save/load agreement structural instead of coincidental.
+pub(crate) fn persisted_search_identity_from_graph(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+) -> (usize, usize, String) {
+    let mut collapsed = crate::storage::generation::graph_codec::collapse_for_layer(pdg);
+    // Mirror hydration exactly: `load_from_storage_inner_at` normalizes
+    // external nodes BEFORE fingerprinting, so the identity must describe
+    // the same post-normalization graph or the freshness check fails.
+    super::normalize_external_nodes(&mut collapsed);
+    let fingerprint = pdg_search_fingerprint(&collapsed);
+    (collapsed.node_count(), collapsed.edge_count(), fingerprint)
 }
 
 /// Persist search metadata required for fast load_from_storage hydration.
@@ -92,6 +132,33 @@ pub(crate) fn persist_search_snapshot(
     }
 
     let path = search_snapshot_path(project_path);
+    // Identity sidecar. `SearchSnapshot` carries no timestamps — it is a pure
+    // function of (PDG content, indexed node set, token dictionary, fragment
+    // layer). The identity is a blake3 of the serialized snapshot itself, so
+    // EVERY content-bearing field is covered: the earlier multi-field
+    // identity omitted the per-node `token_ids` and the token dictionary,
+    // and a comment-only edit inside a function body left every one of those
+    // fields unchanged (same ids, byte ranges, counts, fingerprint), so the
+    // rewrite was skipped and cold hydration kept serving the pre-edit
+    // tokens until an unrelated structural change bumped the fingerprint.
+    // When the identity matches what is already on disk, the ~11MB rewrite
+    // is byte-equivalent and can be skipped. Serializing in memory to hash
+    // is far cheaper than the write + fsync it avoids, and the serialized
+    // bytes are reused for the write itself.
+    let sidecar_path = project_path
+        .join(".leindex")
+        .join("search_snapshot.identity");
+    let bytes = bincode::serialize(&snapshot).context("Failed to serialize search snapshot")?;
+    let identity = format!("v2:{}\n", blake3::hash(&bytes));
+    if path.is_file()
+        && std::fs::read_to_string(&sidecar_path).ok().as_deref() == Some(identity.as_str())
+    {
+        tracing::debug!(
+            path = %path.display(),
+            "Search snapshot unchanged; skipping rewrite"
+        );
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -101,9 +168,14 @@ pub(crate) fn persist_search_snapshot(
         })?;
     }
 
-    let bytes = bincode::serialize(&snapshot).context("Failed to serialize search snapshot")?;
-    std::fs::write(&path, bytes)
+    std::fs::write(&path, &bytes)
         .with_context(|| format!("Failed to write search snapshot: {}", path.display()))?;
+    std::fs::write(&sidecar_path, &identity).with_context(|| {
+        format!(
+            "Failed to write search snapshot identity sidecar: {}",
+            sidecar_path.display()
+        )
+    })?;
     info!(
         count = snapshot.indexed_nodes,
         path = %path.display(),
@@ -162,9 +234,15 @@ pub(crate) fn pdg_search_fingerprint(pdg: &ProgramDependenceGraph) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"leindex-pdg-search-v2");
 
-    let mut nodes: Vec<[u8; 32]> = pdg
-        .node_indices()
-        .filter_map(|node_idx| {
+    // Each record is hashed independently and the digests are sorted, so the
+    // result is order-independent by construction — which makes the per-record
+    // work (167k BLAKE3 hashes on a mid-size project, ~110 ms serial) safe to
+    // spread across cores.
+    use rayon::prelude::*;
+    let node_ids: Vec<_> = pdg.node_indices().collect();
+    let mut nodes: Vec<[u8; 32]> = node_ids
+        .par_iter()
+        .filter_map(|&node_idx| {
             pdg.get_node(node_idx).map(|node| {
                 let mut record = blake3::Hasher::new();
                 write!(
@@ -184,14 +262,15 @@ pub(crate) fn pdg_search_fingerprint(pdg: &ProgramDependenceGraph) -> String {
             })
         })
         .collect();
-    nodes.sort_unstable();
+    nodes.par_sort_unstable();
     for node in nodes {
         hasher.update(&node);
     }
 
-    let mut edges: Vec<[u8; 32]> = pdg
-        .edge_indices()
-        .filter_map(|edge_idx| {
+    let edge_ids: Vec<_> = pdg.edge_indices().collect();
+    let mut edges: Vec<[u8; 32]> = edge_ids
+        .par_iter()
+        .filter_map(|&edge_idx| {
             let edge = pdg.get_edge(edge_idx)?;
             let (from, to) = pdg.edge_endpoints(edge_idx)?;
             let from = pdg.get_node(from)?;
@@ -211,7 +290,7 @@ pub(crate) fn pdg_search_fingerprint(pdg: &ProgramDependenceGraph) -> String {
             Some(*record.finalize().as_bytes())
         })
         .collect();
-    edges.sort_unstable();
+    edges.par_sort_unstable();
     for edge in edges {
         hasher.update(&edge);
     }

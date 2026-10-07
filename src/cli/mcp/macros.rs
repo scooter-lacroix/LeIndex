@@ -65,7 +65,7 @@ macro_rules! dispatch_handler {
                 }
             }
 
-            /// Get the tool title (human-readable: LeIndex [Search])
+            /// Get the tool title (human-readable: LeIndex \[Search\])
             pub fn title(&self) -> &str {
                 match self {
                     $(

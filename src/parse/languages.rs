@@ -4,16 +4,21 @@ pub use crate::parse::bash::BashParser;
 pub use crate::parse::c::CParser;
 pub use crate::parse::cpp::CppParser;
 pub use crate::parse::csharp::CSharpParser;
+pub use crate::parse::dart::DartParser;
+pub use crate::parse::docs::{DocFlavor, DocParser};
+pub use crate::parse::generic::GenericParser;
 pub use crate::parse::go::GoParser;
 pub use crate::parse::java::JavaParser;
 pub use crate::parse::javascript::{JavaScriptParser, TypeScriptParser};
 pub use crate::parse::json::JsonParser;
+pub use crate::parse::kotlin::KotlinParser;
 pub use crate::parse::lua::LuaParser;
 pub use crate::parse::php::PhpParser;
 pub use crate::parse::python::PythonParser;
 pub use crate::parse::ruby::RubyParser;
 pub use crate::parse::rust::RustParser;
 pub use crate::parse::scala::ScalaParser;
+pub use crate::parse::swift::SwiftParser;
 
 /// Type-specific parser factory
 pub fn parser_for_language(
@@ -35,8 +40,86 @@ pub fn parser_for_language(
         "c" => Some(Box::new(CParser::new())),
         "bash" | "sh" => Some(Box::new(BashParser::new())),
         "json" => Some(Box::new(JsonParser::new())),
+        "swift" => Some(Box::new(SwiftParser::new())),
+        "kotlin" | "kt" => Some(Box::new(KotlinParser::new())),
+        "dart" => Some(Box::new(DartParser::new())),
+        "html" | "htm" => Some(Box::new(GenericParser::new("html"))),
+        "css" => Some(Box::new(GenericParser::new("css"))),
+        "scss" => Some(Box::new(GenericParser::new("scss"))),
+        "yaml" | "yml" => Some(Box::new(GenericParser::new("yaml"))),
+        "cmake" => Some(Box::new(GenericParser::new("cmake"))),
+        "elixir" | "ex" | "exs" => Some(Box::new(GenericParser::new("elixir"))),
+        "erlang" | "erl" => Some(Box::new(GenericParser::new("erlang"))),
+        "haskell" | "hs" => Some(Box::new(GenericParser::new("haskell"))),
+        "perl" | "pl" | "pm" => Some(Box::new(GenericParser::new("perl"))),
+        "r" => Some(Box::new(GenericParser::new("r"))),
+        "zig" => Some(Box::new(GenericParser::new("zig"))),
+        "graphql" | "gql" => Some(Box::new(GenericParser::new("graphql"))),
+        "hcl" | "terraform" | "tf" => Some(Box::new(GenericParser::new("hcl"))),
+        "make" | "makefile" => Some(Box::new(GenericParser::new("make"))),
+        "elisp" | "emacs-lisp" | "emacs lisp" => Some(Box::new(GenericParser::new("elisp"))),
+        "julia" | "jl" => Some(Box::new(GenericParser::new("julia"))),
+        "d" => Some(Box::new(GenericParser::new("d"))),
+        "glsl" => Some(Box::new(GenericParser::new("glsl"))),
+        "embedded-template" | "embedded template" | "ejs" | "erb" | "liquid" => {
+            Some(Box::new(GenericParser::new("embedded_template")))
+        }
+        "markdown" | "md" => Some(Box::new(DocParser::new(DocFlavor::Markdown))),
+        "rst" | "restructuredtext" => Some(Box::new(DocParser::new(DocFlavor::Rst))),
+        "asciidoc" | "adoc" => Some(Box::new(DocParser::new(DocFlavor::Adoc))),
+        // `parallel.rs` resolves parsers by the language's DISPLAY name, so
+        // the label forms ("Plain Text", "Emacs Lisp") must resolve too.
+        "text" | "txt" | "plaintext" | "plain text" | "plain" => {
+            Some(Box::new(DocParser::new(DocFlavor::Plain)))
+        }
         _ => None,
     }
+}
+
+/// Number of languages with a registered parser (Tier-0 breadth floor).
+pub fn active_language_count() -> usize {
+    [
+        "python",
+        "javascript",
+        "typescript",
+        "rust",
+        "go",
+        "java",
+        "cpp",
+        "csharp",
+        "ruby",
+        "php",
+        "lua",
+        "scala",
+        "c",
+        "bash",
+        "json",
+        "swift",
+        "kotlin",
+        "dart",
+        "html",
+        "css",
+        "scss",
+        "yaml",
+        "cmake",
+        "elixir",
+        "erlang",
+        "haskell",
+        "perl",
+        "r",
+        "zig",
+        "graphql",
+        "hcl",
+        "make",
+        "elisp",
+        "julia",
+        "d",
+        "glsl",
+        "embedded-template",
+    ]
+    .iter()
+    .filter(|language| parser_for_language(language).is_some())
+    .count()
 }
 
 #[cfg(test)]
@@ -59,5 +142,30 @@ mod tests {
 
         let parser = parser_for_language("unknown");
         assert!(parser.is_none());
+    }
+    /// Completeness gate: every registered file extension must resolve to a
+    /// parser THROUGH ITS DISPLAY NAME — `parallel.rs` looks parsers up by
+    /// `LanguageConfig::name` (e.g. "Plain Text"), not by registry key. This
+    /// class of bug shipped once: .txt files failed with "No parser found for
+    /// language: Plain Text" because the registry arm only listed
+    /// "text"|"txt"|"plaintext".
+    #[test]
+    fn test_every_registered_extension_resolves_a_parser_via_display_name() {
+        let representative_extensions = [
+            "py", "js", "ts", "go", "rs", "java", "cpp", "hpp", "h", "c", "cs", "rb", "php", "lua",
+            "scala", "sh", "json", "swift", "kt", "dart", "html", "htm", "css", "scss", "yaml",
+            "yml", "cmake", "ex", "exs", "erl", "hrl", "hs", "pl", "pm", "r", "zig", "graphql",
+            "gql", "hcl", "tf", "tfvars", "makefile", "mak", "mk", "el", "jl", "d", "di", "glsl",
+            "vert", "frag", "comp", "ejs", "erb", "liquid", "md", "markdown", "rst", "adoc", "txt",
+        ];
+        for ext in representative_extensions {
+            let id = crate::parse::grammar::LanguageId::from_extension(ext)
+                .unwrap_or_else(|| panic!("extension .{ext} has no LanguageId"));
+            let name = id.config().name.clone();
+            assert!(
+                parser_for_language(&name).is_some(),
+                "language display name {name:?} (from .{ext}) resolves to no parser"
+            );
+        }
     }
 }

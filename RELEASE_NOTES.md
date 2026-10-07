@@ -1,3 +1,67 @@
+# LeIndex 2.0.0 Release Notes
+
+Release date: 2026-09-30
+
+LeIndex 2.0.0 replaces twenty MCP tools with four routers, adds a native
+trigram text search, runs every editor session through one shared per-user
+daemon, and is considerably faster from a cold start. Everything below is
+measured on this repository (release build) unless stated otherwise; the full
+list, with the bug fixes, is in [`CHANGELOG.md`](CHANGELOG.md).
+
+## What's new
+
+- **Four tools.** `leindex_explore` (`mode`), `leindex_analyze` (`mode`),
+  `leindex_edit` (`action`, required) and `leindex_manage` (`action`). The
+  original tool names stay callable; `LEINDEX_MCP_LEGACY_TOOLS=1` advertises
+  them. New `leindex_analyze mode=git_diff` maps hunks to PDG symbols.
+- **Native text search** (`leindex_explore mode=find`): a memory-mapped trigram
+  index with live verification, ~1 ms per search on a 700-file repository (was
+  ~980 ms), searchable outside the project with no index.
+- **One daemon, many shims.** `leindex mcp` is a tiny synchronous shim that
+  forwards to a per-user `leindexd`, so any number of editors share one loaded
+  graph and search engine. On by default (`LEINDEX_FEATURE_DAEMON_CLIENT=false`
+  reverts). See [`docs/MCP.md`](docs/MCP.md).
+- **Engine pass.** Lock-free graph traversal, parallel hydration, deterministic
+  trigram blob, signature-only extraction for drift, a shared fast hasher,
+  generation retention. Forced full index 14 s → ~6–7 s.
+- **Engram** (opt-in, `LEINDEX_FEATURE_ENGRAM=1`): a persistent phrase-book of
+  neural query embeddings; repeated queries skip the embedder. Query embeddings
+  only (index-time reuse is the existing embed cache). Counters are in
+  `leindex_analyze mode=diagnostics`.
+- **Fixed: a perpetual background refresh.** After a commit that touched nothing
+  indexed, a new non-indexed file, or in any repository with a fixture manifest,
+  every tool call re-launched an incremental scan and every fourth graph call
+  paid +130–240 ms. Fixed at its three causes; warm p90 9–13 ms.
+
+## Measured against the start of this pass (`8ce59b5`)
+
+| Measurement | Before | After |
+|---|---|---|
+| Rename preview, whole-process instructions (one-shot) | 1.344 G | 1.157 G (−13.9%) |
+| Symbol lookup / impact, instructions | 1.025 G / 1.034 G | 0.932 G / 0.941 G (−9.0%) |
+| Search, instructions | 2.338 G | 2.238 G (−4.3%) |
+| Warm rename preview, median (daemon) | 47.5 – 176.6 ms | 22.8 – 25.1 ms |
+| Warm deep / impact, median | 12.9 – 16.9 / 14.6 – 18.1 ms | 8.0 – 9.2 / 10.0 – 10.2 ms |
+| Warm p90, graph tools (while the refresh loop ran) | 141 – 217 ms | 9 – 13 ms |
+| Cold one-shot wall time (search, symbol lookup) | ~283 / ~208 ms | within noise (298 / 211 ms) |
+
+Ranges are two alternating runs. Cold one-shot wall time is dominated by
+process start, SQLite and git, so the instruction-count reductions do not show
+up there apart from rename preview (252 → 203 ms).
+
+## Upgrade notes
+
+- Version surfaces (Cargo, installers, npm, PyPI, lockfile, dashboard, pi) are
+  aligned at `2.0.0`.
+- No index, generation or snapshot format changed; existing `.leindex/` data
+  loads as is.
+- Engram is off by default. It writes only to `~/.leindex/engram/` (or
+  `$LEINDEX_HOME/engram`).
+- The release workflow publishes on a push to `master` when `v2.0.0` has no tag
+  yet.
+
+---
+
 # LeIndex 1.9.5 Release Notes
 
 Release date: 2026-08-01

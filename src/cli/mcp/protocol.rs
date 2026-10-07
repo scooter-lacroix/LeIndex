@@ -381,6 +381,13 @@ impl JsonRpcError {
         Self::new(error_codes::INTERNAL_ERROR, msg)
     }
 
+    /// Create a server-busy error (code -32009): the stdio admission queue
+    /// is full, so the request is refused instead of being queued without
+    /// bound.
+    pub fn server_busy(msg: impl Into<String>) -> Self {
+        Self::new(error_codes::SERVER_BUSY, msg)
+    }
+
     /// Create a project not found error
     pub fn project_not_found(project: String) -> Self {
         Self::with_data(
@@ -397,14 +404,37 @@ impl JsonRpcError {
             "Project not indexed — call LeIndex [Index] or pass project_path to auto-index",
             serde_json::json!({
                 "project": project,
-                "suggestion": "Pass project_path to any tool to auto-index on first use, or call LeIndex [Index] explicitly.",
+                "suggestion": "Pass project_path to any tool to auto-index on first use, or call LeIndex [Index] explicitly. If a first-use index is already building in the background, retry shortly; LeIndex [Index] reports its progress without starting a second job.",
                 "error_type": "project_not_indexed"
             }),
         )
     }
 
     /// Create an initialization failure error with multi-step remediation.
+    ///
+    /// Transient lock contention (tagged `[transient:lock-contention]` by
+    /// `LeIndex::open_storage_with_retry`) must not advise deleting a valid
+    /// database — the data is intact and the call succeeds on retry once the
+    /// competing writer finishes.
     pub fn init_failed(path: &str, inner: &str) -> Self {
+        if inner.contains("[transient:lock-contention]") {
+            return Self::with_data(
+                error_codes::INIT_FAILED,
+                format!(
+                    "Failed to initialize LeIndex for '{}'.\n\
+                     Inner error: {}\n\n\
+                     Another leindex process is currently writing this project's \
+                     database. The index data is intact; retry shortly.",
+                    path, inner
+                ),
+                serde_json::json!({
+                    "error_type": "storage_locked",
+                    "inner_error": inner,
+                    "retryable": true,
+                    "suggestion": "Retry the call; no cleanup is needed.",
+                }),
+            );
+        }
         Self::with_data(
             error_codes::INIT_FAILED,
             format!(
@@ -454,7 +484,7 @@ impl JsonRpcError {
                  Remediation:\n\
                  1. Ensure the project is indexed (call LeIndex [Index])\n\
                  2. Try a simpler query (single term instead of complex pattern)\n\
-                 3. Use LeIndex [Grep Symbols] for exact/regex pattern matching\n\
+                 3. Use leindex_explore mode=find target=symbols for exact/regex pattern matching\n\
                  4. Try force_reindex=true if the index may be stale",
                 m
             ),
@@ -473,7 +503,7 @@ impl JsonRpcError {
                 "{}\n\n\
                  Remediation:\n\
                  1. Check that the node_id exists in the indexed project\n\
-                 2. Use LeIndex [Grep Symbols] to find valid symbol names\n\
+                 2. Use leindex_explore mode=find target=symbols to find valid symbol names\n\
                  3. Try force_reindex=true if the index may be stale",
                 m
             ),
@@ -499,6 +529,27 @@ impl JsonRpcError {
 impl std::fmt::Display for JsonRpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "[{}] {}", self.code, self.message)
+    }
+}
+
+impl JsonRpcError {
+    /// The remediation hint carried in `data.suggestion`, if any.
+    pub fn suggestion(&self) -> Option<&str> {
+        self.data
+            .as_ref()
+            .and_then(|data| data.get("suggestion"))
+            .and_then(Value::as_str)
+    }
+
+    /// Message plus remediation hint, for text an LLM reads (tool errors are
+    /// returned as content, where `data.suggestion` would otherwise be lost).
+    pub fn message_with_hint(&self) -> String {
+        match self.suggestion() {
+            Some(hint) if !self.message.contains(hint) => {
+                format!("{}\nHint: {hint}", self.message)
+            }
+            _ => self.message.clone(),
+        }
     }
 }
 
@@ -638,6 +689,10 @@ pub mod error_codes {
     /// Index initialization failed (directory creation, permissions, etc.)
     pub const INIT_FAILED: i32 = -32008;
 
+    /// Server busy: the request was refused because the caller's admission
+    /// queue is full (stdio: too many tool calls waiting to execute).
+    pub const SERVER_BUSY: i32 = -32009;
+
     /// Filesystem error (permissions, disk space, etc.)
     pub const FILESYSTEM_ERROR: i32 = -32009;
 }
@@ -655,6 +710,44 @@ mod tests {
         ];
 
         assert!(events.iter().all(|event| event.timestamp_ms > 0));
+    }
+
+    #[test]
+    fn test_init_failed_transient_lock_omits_delete_guidance() {
+        // The stress-test audit's -32008 report: a lock-contention failure
+        // told the user to "Delete .leindex/ directory and retry" over a
+        // perfectly valid database whose only problem was a concurrent
+        // writer. The transient branch must advise retrying instead.
+        let inner = "Failed to open storage at /p/.leindex/leindex.db after 6 attempts \
+                     [transient:lock-contention]. Another leindex process is writing \
+                     the database; the data is intact — retry once it completes.";
+        let error = JsonRpcError::init_failed("/p", inner);
+        let message = error.message.clone();
+        assert!(message.contains("retry"), "message: {message}");
+        assert!(
+            !message.to_lowercase().contains("delete"),
+            "transient lock must not advise deletion: {message}"
+        );
+        let data = error.data.expect("transient branch carries data");
+        assert_eq!(
+            data.get("error_type"),
+            Some(&serde_json::json!("storage_locked"))
+        );
+        assert_eq!(data.get("retryable"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn test_init_failed_genuine_failure_keeps_remediation() {
+        let inner = "unable to open database file";
+        let error = JsonRpcError::init_failed("/p", inner);
+        assert!(error.message.contains("Remediation"));
+        assert!(error.message.contains("Delete .leindex/"));
+        let data = error.data.expect("data present");
+        assert_eq!(
+            data.get("error_type"),
+            Some(&serde_json::json!("init_failed"))
+        );
+        assert_eq!(data.get("retryable"), None);
     }
 
     #[test]

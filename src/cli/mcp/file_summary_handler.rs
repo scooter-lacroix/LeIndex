@@ -20,7 +20,7 @@ pub struct FileSummaryHandler;
 #[allow(missing_docs)]
 impl FileSummaryHandler {
     pub fn name(&self) -> &str {
-        "leindex.file-summary"
+        "leindex_file_summary"
     }
     pub fn title(&self) -> &str {
         "LeIndex [File Summary]"
@@ -124,40 +124,91 @@ async fn catalog_file_summary(
     budget: WorkBudget,
     started: Instant,
 ) -> Result<(Option<Value>, bool), JsonRpcError> {
-    let db_path = live.active_storage().join("leindex.db");
-    if !db_path.is_file() {
-        return Ok((None, false));
-    }
-    let Ok(Some(catalog)) = CatalogReader::open(&db_path, live.root()).await else {
-        return Ok((None, false));
+    // D6: the resident PDG is the graph store — inventory the file's symbols
+    // against it first; without a resident project, inventory against the
+    // published Pdg layer (the unhydrated fast path); the SQL catalog remains
+    // the legacy fallback (and still serves the freshness record, which
+    // survives the graph flip).
+    let db_path = live.catalog_db();
+    let mut graph = match registry.try_get_loaded(live.root()).await {
+        Some(handle) => {
+            let guard = handle.read().await;
+            guard.pdg().map(|pdg| {
+                (
+                    crate::storage::catalog::graph::symbols_in_file(pdg, live.root(), file),
+                    crate::storage::catalog::graph::count_symbols_in_file(pdg, live.root(), file),
+                )
+            })
+        }
+        None => None,
     };
-    let Ok(symbols) = catalog.symbols_in_file(file).await else {
-        return Ok((None, false));
+    if graph
+        .as_ref()
+        .map(|(symbols, _)| symbols.is_empty())
+        .unwrap_or(true)
+    {
+        let layer_symbols =
+            crate::storage::catalog::layer::symbols_in_file(live.storage(), live.root(), file);
+        if !layer_symbols.is_empty() {
+            graph = Some((
+                layer_symbols,
+                crate::storage::catalog::layer::count_symbols_in_file(
+                    live.storage(),
+                    live.root(),
+                    file,
+                ),
+            ));
+        }
+    }
+    let (graph_symbols, graph_total) = graph
+        .map(|(symbols, total)| (Some(symbols), Some(total)))
+        .unwrap_or((None, None));
+
+    let catalog = if db_path.is_file() {
+        CatalogReader::open(&db_path, live.root())
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
+    let symbols = match graph_symbols {
+        Some(symbols) => symbols,
+        None => match &catalog {
+            Some(catalog) => catalog.symbols_in_file(file).await.ok().unwrap_or_default(),
+            None => Vec::new(),
+        },
     };
     // Resolve each symbol's live path; skip (drop) symbols whose lookup fails
     // rather than aborting the whole request. All-stale -> empty -> the caller
-    // falls back to live parsing.
-    let mut resolved = Vec::with_capacity(symbols.len());
-    for mut symbol in symbols {
-        match live.file(&symbol.file_path.to_string_lossy()) {
-            Ok(path) => {
-                symbol.file_path = path;
-                resolved.push(symbol);
-            }
-            Err(_) => continue,
-        }
-    }
-    let symbols = resolved;
+    // falls back to live parsing. `external` rows are import/reference
+    // markers (see the summary comment on the resolver below).
+    let mut dropped_external = 0usize;
+    let symbols = resolve_live_symbol_paths(live, symbols, &mut dropped_external);
     if symbols.is_empty() {
         return Ok((None, false));
     }
-
-    let catalog_total = catalog.count_symbols_in_file(file).await.ok();
+    let catalog_total = match graph_total {
+        Some(count) => Some(count),
+        None => match &catalog {
+            Some(catalog) => catalog.count_symbols_in_file(file).await.ok(),
+            None => None,
+        },
+    };
+    // The row cap compares against ALL rows (externals included), so add the
+    // filtered markers back when deciding whether the DEFINITION list was cut.
     let catalog_truncated = catalog_total
-        .map(|total| total > symbols.len())
+        .map(|total| total > symbols.len() + dropped_external)
         .unwrap_or(symbols.len() >= 200);
     let bytes = read_live_bytes(file.to_path_buf()).await?;
-    if !catalog_is_fresh(&catalog, file, &bytes).await {
+    let fresh = match &catalog {
+        Some(catalog) => catalog_is_fresh(catalog, file, &bytes).await,
+        // No freshness record exists to verify against; fall back to live
+        // parsing rather than trusting an unverifiable graph view.
+        None => false,
+    };
+    if !fresh {
         return Ok((None, true));
     }
 
@@ -178,6 +229,35 @@ async fn catalog_file_summary(
         budget,
     )?;
     Ok((Some(response), false))
+}
+
+/// Resolve each symbol's live path and drop the rows a summary must not
+/// carry; returns the resolved definitions and (by out-param) how many
+/// `external` import/reference markers were dropped.
+///
+/// A file's DEFINITIONS are what a summary should inventory. `external`
+/// rows are import/reference markers (qualified paths like
+/// `crate.cli.index_job.IndexJobSnapshot` from call-target resolution) —
+/// the audit found them dominating the list and drowning the file's own
+/// symbols. They are dropped here rather than in the shared catalog query
+/// so other catalog consumers keep their semantics.
+fn resolve_live_symbol_paths(
+    live: &LiveProject,
+    symbols: Vec<crate::storage::catalog::CatalogSymbol>,
+    dropped_external: &mut usize,
+) -> Vec<crate::storage::catalog::CatalogSymbol> {
+    let mut resolved = Vec::with_capacity(symbols.len());
+    for mut symbol in symbols {
+        if symbol.node_type.eq_ignore_ascii_case("external") {
+            *dropped_external += 1;
+            continue;
+        }
+        if let Ok(path) = live.file(&symbol.file_path.to_string_lossy()) {
+            symbol.file_path = path;
+            resolved.push(symbol);
+        }
+    }
+    resolved
 }
 
 fn file_summary_response(

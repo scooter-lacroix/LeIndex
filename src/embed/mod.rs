@@ -6,6 +6,8 @@
 //! splitting, and idle teardown live here.
 
 pub mod batch;
+pub mod batching;
+pub mod cache;
 pub mod model_path;
 pub mod ort_discovery;
 pub mod protocol;

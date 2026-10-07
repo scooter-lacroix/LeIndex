@@ -42,6 +42,12 @@ pub struct TfIdfEmbedder {
     pub(crate) pdg_edges: usize,
     /// PDG fingerprint captured when persisted for staleness checks
     pub(crate) pdg_fingerprint: String,
+    /// word -> embedding slots, built on first use. Embedding a node then
+    /// probes this once per distinct token (~50) instead of once per
+    /// vocabulary entry (768). The vocabulary is fixed once the embedder is
+    /// built, so the cache never goes stale.
+    #[serde(skip)]
+    pub(crate) slots: std::sync::OnceLock<HashMap<String, Vec<u32>>>,
 }
 
 impl TfIdfEmbedder {
@@ -49,7 +55,7 @@ impl TfIdfEmbedder {
     ///
     /// # Steps
     /// 1. Tokenize every document
-    /// 2. Build document-frequency table (df[token] = # docs containing token)
+    /// 2. Build document-frequency table (df\[token\] = # docs containing token)
     /// 3. Compute IDF = ln(N / df) per token, filtering extreme frequencies
     /// 4. Stratified vocabulary selection across the full IDF range (up to 768 tokens)
     #[cfg_attr(not(test), allow(dead_code))]
@@ -74,6 +80,7 @@ impl TfIdfEmbedder {
                 pdg_nodes: 0,
                 pdg_edges: 0,
                 pdg_fingerprint: String::new(),
+                slots: Default::default(),
             };
         }
 
@@ -148,6 +155,7 @@ impl TfIdfEmbedder {
             pdg_nodes: 0,
             pdg_edges: 0,
             pdg_fingerprint: String::new(),
+            slots: Default::default(),
         }
     }
 
@@ -171,15 +179,26 @@ impl TfIdfEmbedder {
             *tf_map.entry(tok.as_str()).or_insert(0.0) += 1.0;
         }
 
-        // Compute TF-IDF in lockstep over the output vector so a mismatched
-        // persisted vocabulary/dimension can't index out of bounds.
-        for (slot, (word, idf_val)) in vec.iter_mut().zip(self.vocab.iter().zip(self.idf.iter())) {
-            if let Some(&count) = tf_map.get(word.as_str()) {
-                *slot = (count / total) * idf_val;
+        let slots = self.slots.get_or_init(|| {
+            let mut slots: HashMap<String, Vec<u32>> = HashMap::with_capacity(self.vocab.len());
+            for (slot, word) in self
+                .vocab
+                .iter()
+                .enumerate()
+                .take(self.dimension.min(self.idf.len()))
+            {
+                slots.entry(word.clone()).or_default().push(slot as u32);
+            }
+            slots
+        });
+        for (word, count) in &tf_map {
+            if let Some(dims) = slots.get(*word) {
+                for &slot in dims {
+                    vec[slot as usize] = (count / total) * self.idf[slot as usize];
+                }
             }
         }
 
-        // L2 normalize
         let magnitude: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
         if magnitude > 1e-9 {
             for v in &mut vec {
@@ -208,9 +227,23 @@ impl TfIdfEmbedder {
             *tf_map.entry(tok.as_str()).or_insert(0.0) += 1.0;
         }
 
-        for (slot, (word, idf_val)) in vec.iter_mut().zip(self.vocab.iter().zip(self.idf.iter())) {
-            if let Some(&count) = tf_map.get(word.as_str()) {
-                *slot = (count / total) * idf_val;
+        let slots = self.slots.get_or_init(|| {
+            let mut slots: HashMap<String, Vec<u32>> = HashMap::with_capacity(self.vocab.len());
+            for (slot, word) in self
+                .vocab
+                .iter()
+                .enumerate()
+                .take(self.dimension.min(self.idf.len()))
+            {
+                slots.entry(word.clone()).or_default().push(slot as u32);
+            }
+            slots
+        });
+        for (word, count) in &tf_map {
+            if let Some(dims) = slots.get(*word) {
+                for &slot in dims {
+                    vec[slot as usize] = (count / total) * self.idf[slot as usize];
+                }
             }
         }
 
@@ -256,18 +289,32 @@ impl TfIdfEmbedder {
             pdg_nodes: state.pdg_nodes,
             pdg_edges: state.pdg_edges,
             pdg_fingerprint: state.pdg_fingerprint,
+            slots: Default::default(),
         })
     }
 
     fn persisted_state(&self, pdg: &ProgramDependenceGraph) -> TfIdfPersistedState {
+        self.persisted_state_with_identity(
+            pdg.node_count(),
+            pdg.edge_count(),
+            pdg_search_fingerprint(pdg),
+        )
+    }
+
+    fn persisted_state_with_identity(
+        &self,
+        pdg_nodes: usize,
+        pdg_edges: usize,
+        pdg_fingerprint: String,
+    ) -> TfIdfPersistedState {
         TfIdfPersistedState {
             schema_version: TFIDF_SCHEMA_VERSION,
             vocab: self.vocab.clone(),
             idf: self.idf.clone(),
             dimension: self.dimension,
-            pdg_nodes: pdg.node_count(),
-            pdg_edges: pdg.edge_count(),
-            pdg_fingerprint: pdg_search_fingerprint(pdg),
+            pdg_nodes,
+            pdg_edges,
+            pdg_fingerprint,
         }
     }
 
@@ -326,12 +373,17 @@ impl TfIdfEmbedder {
 
     /// Persist the TF-IDF embedder to storage
     ///
-    /// Serializes the embedder state (vocabulary, IDF scores, PDG counts)
+    /// Serializes the embedder state (vocabulary, IDF scores, PDG identity)
     /// to the project's `.leindex/tfidf_embedder.bin` file for future loading.
+    /// The freshness identity defaults to the in-memory PDG's; callers that
+    /// just saved to storage pass `persisted_identity` so `is_fresh` compares
+    /// against what a DB load actually reconstructs (in-memory graphs may
+    /// hold duplicate node_ids the upsert collapses).
     pub fn persist_to_storage(
         &self,
         project_path: &Path,
         pdg: &ProgramDependenceGraph,
+        persisted_identity: Option<(usize, usize, String)>,
     ) -> Result<()> {
         let path = Self::storage_path(project_path);
         if let Some(parent) = path.parent() {
@@ -339,8 +391,13 @@ impl TfIdfEmbedder {
                 format!("Failed to create embedder directory: {}", parent.display())
             })?;
         }
-        let payload = bincode::serialize(&self.persisted_state(pdg))
-            .context("Failed to serialize embedder")?;
+        let state = match persisted_identity {
+            Some((nodes, edges, fingerprint)) => {
+                self.persisted_state_with_identity(nodes, edges, fingerprint)
+            }
+            None => self.persisted_state(pdg),
+        };
+        let payload = bincode::serialize(&state).context("Failed to serialize embedder")?;
         std::fs::write(&path, payload)
             .with_context(|| format!("Failed to persist embedder: {}", path.display()))
     }

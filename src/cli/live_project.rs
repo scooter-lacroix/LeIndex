@@ -31,6 +31,10 @@ impl LiveProject {
     /// Return completed generation storage when `CURRENT` is valid, otherwise
     /// fall back to the legacy root. This read-only selector never creates or
     /// repairs artifacts, so live tools remain safe during an interrupted build.
+    ///
+    /// A generation is complete when it carries its commit markers: the
+    /// manifest (post-step-6 stores publish metadata only) or the legacy
+    /// full-copy `leindex.db`, plus the health record in both layouts.
     pub fn active_storage(&self) -> PathBuf {
         let Ok(raw) = std::fs::read_to_string(self.storage.join("CURRENT")) else {
             return self.storage.clone();
@@ -40,11 +44,33 @@ impl LiveProject {
             return self.storage.clone();
         }
         let generation = self.storage.join("generations").join(value);
-        if generation.join("leindex.db").is_file() && generation.join("index-state.json").is_file()
-        {
+        let committed = (generation.join("manifest").is_file()
+            || generation.join("leindex.db").is_file())
+            && generation.join("index-state.json").is_file();
+        if committed {
             generation
         } else {
             self.storage.clone()
+        }
+    }
+
+    /// Whether `CURRENT` points at a completed generation (either layout).
+    pub fn has_completed_generation(&self) -> bool {
+        self.active_storage() != self.storage
+    }
+
+    /// The SQLite catalog file backing freshness checks for the active
+    /// generation. Legacy full-copy generations carry their own `leindex.db`;
+    /// metadata-only generations keep the catalog in the CAS `Db` layer, and
+    /// the writer's mutable-root catalog is the same table the publisher
+    /// vacuumed into that layer, so it serves the freshness records.
+    pub fn catalog_db(&self) -> PathBuf {
+        let active = self.active_storage();
+        let legacy = active.join("leindex.db");
+        if legacy.is_file() {
+            legacy
+        } else {
+            self.storage.join("leindex.db")
         }
     }
 

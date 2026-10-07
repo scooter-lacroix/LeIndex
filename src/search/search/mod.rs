@@ -16,9 +16,10 @@ use crate::search::ranking::{HybridScorer, Score};
 use crate::search::vector::VectorIndex;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
+pub use token_index::StrSet;
+use token_index::TokenIndex;
 
 // ============================================================================
 // CONSTANTS & VALIDATION
@@ -50,12 +51,15 @@ pub const WORK_HOISTER_MAX_ENTRIES: usize = 4_096;
 pub const WORK_HOISTER_MAX_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 
 mod fragment;
+/// Fast non-cryptographic hasher used by the resident text index.
+pub mod fx;
 mod int8_quality;
 mod node_info;
 mod pruner;
 #[cfg(feature = "storage")]
 mod snapshot;
 mod staged_retrieval;
+mod token_index;
 mod vector_impl;
 
 pub use int8_quality::*;
@@ -134,13 +138,15 @@ pub struct SearchEngine {
     complexity_cache: HashMap<String, u32>,
     /// Inverted index for O(1) text lookups: token -> set of node IDs
     /// This allows sub-linear text search instead of O(N) scan
-    text_index: HashMap<String, HashSet<String>>,
+    ///
+    /// Tokens and node ids are interned `Arc<str>`s shared across every
+    /// (token, node) pair — cold start used to clone a `String` for each of
+    /// roughly a million pairs — and the maps use a fast non-cryptographic
+    /// hasher (see [`fx`]).
+    tokens: TokenIndex,
     /// Node ID to index mapping for O(1) node lookups (fixes A1)
     /// Populated during index_nodes() and maintained on updates
     node_id_to_idx: HashMap<String, usize>,
-    /// Per-node token cache: node_id -> set of normalized tokens
-    /// Populated during index_nodes() to avoid re-tokenization in scoring
-    node_tokens: HashMap<String, HashSet<String>>,
     /// Result cache for repeated queries (A+ Section 8.1: bounded by entries and bytes)
     search_cache: LruCache<String, Vec<SearchResult>>,
     /// Tracked byte estimate for the search cache
@@ -169,9 +175,8 @@ impl SearchEngine {
                 DEFAULT_EMBEDDING_DIMENSION,
             )),
             complexity_cache: HashMap::new(),
-            text_index: HashMap::new(),
+            tokens: TokenIndex::default(),
             node_id_to_idx: HashMap::new(),
-            node_tokens: HashMap::new(),
             search_cache: LruCache::new(NonZeroUsize::new(SEARCH_CACHE_MAX_ENTRIES).unwrap()),
             search_cache_bytes: 0,
             neural_weight: 0.4,
@@ -215,9 +220,8 @@ impl SearchEngine {
             scorer: HybridScorer::new(),
             vector_index: VectorIndexImpl::BruteForce(VectorIndex::new(dimension)),
             complexity_cache: HashMap::new(),
-            text_index: HashMap::new(),
+            tokens: TokenIndex::default(),
             node_id_to_idx: HashMap::new(),
-            node_tokens: HashMap::new(),
             search_cache: LruCache::new(NonZeroUsize::new(SEARCH_CACHE_MAX_ENTRIES).unwrap()),
             search_cache_bytes: 0,
             neural_weight: 0.4,
@@ -282,11 +286,10 @@ impl SearchEngine {
     pub fn clear_index(&mut self) {
         self.nodes.clear();
         self.complexity_cache.clear();
-        self.text_index.clear();
+        self.tokens.clear();
         self.search_cache.clear();
         self.search_cache_bytes = 0;
         self.node_id_to_idx.clear();
-        self.node_tokens.clear();
         self.vector_index.clear();
         // Also drop the lazy-paged neural ANN so a stale mmap isn't reused
         // after a full reindex rebuilds the lexical index from scratch.
@@ -324,7 +327,7 @@ impl SearchEngine {
         });
         let dropped = original_len - nodes.len();
         if dropped > 0 {
-            tracing::warn!(
+            tracing::debug!(
                 "append_nodes: dropped {} duplicate node_id(s) (kept {} of {})",
                 dropped,
                 nodes.len(),
@@ -344,44 +347,30 @@ impl SearchEngine {
         self.search_cache.clear();
         self.search_cache_bytes = 0;
 
-        // Build node_id_to_idx for O(1) node lookups (A1 optimization)
-        // Build complexity cache, inverted index, and token cache before taking ownership
+        // Build node_id_to_idx for O(1) node lookups (A1 optimization), the
+        // complexity cache and the integer-addressed token index.
+        //
+        // R8: pre-tokenized tokens (already lowercase, >= 2 chars) skip
+        // re-tokenization; content-based tokenization is the fallback.
         for (idx, node) in nodes.iter().enumerate() {
             let global_idx = self.nodes.len() + idx;
             self.node_id_to_idx.insert(node.node_id.clone(), global_idx);
             self.complexity_cache
                 .insert(node.node_id.clone(), node.complexity);
-
-            // Build inverted index for O(1) text lookups
-            // This maps each token to the set of node IDs containing it
-            // Also build per-node token cache for scoring (T14 optimization)
-            //
-            // R8: Use pre-tokenized tokens when available to skip re-tokenization.
-            // Falls back to content-based tokenization for backward compatibility.
-            let mut tokens = HashSet::new();
             if let Some(pre_tok) = &node.pre_tokenized {
-                // Use pre-computed tokens directly (already lowercased, filtered >= 2 chars)
-                for token in pre_tok {
-                    self.text_index
-                        .entry(token.clone())
-                        .or_default()
-                        .insert(node.node_id.clone());
-                    tokens.insert(token.clone());
-                }
+                self.tokens
+                    .insert_node(&node.node_id, pre_tok.iter().map(String::as_str));
             } else {
-                for token in node.content.split(|c: char| !c.is_alphanumeric()) {
-                    let normalized_token: String = token.to_ascii_lowercase();
-                    // Skip empty tokens and very short ones (< 2 chars) to reduce noise
-                    if normalized_token.len() >= 2 {
-                        self.text_index
-                            .entry(normalized_token.clone())
-                            .or_default()
-                            .insert(node.node_id.clone());
-                        tokens.insert(normalized_token);
-                    }
-                }
+                // Skip empty and 1-char tokens to reduce noise.
+                let lowered: Vec<String> = node
+                    .content
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|token| token.len() >= 2)
+                    .map(str::to_ascii_lowercase)
+                    .collect();
+                self.tokens
+                    .insert_node(&node.node_id, lowered.iter().map(String::as_str));
             }
-            self.node_tokens.insert(node.node_id.clone(), tokens);
         }
 
         // Build vector index from TF-IDF embeddings — clone only embeddings (A4 optimization)
@@ -492,13 +481,17 @@ impl SearchEngine {
 
     /// Extract signature from node content.
     ///
-    /// Returns the first non-empty, non-comment line after the header.
+    /// Returns the first non-empty line that is actual code. The content is
+    /// prefixed with enrichment comments (stats header, `// name in path`,
+    /// `// review_context:` doc blocks), so every `//`-prefixed line is
+    /// skipped — filtering only `// [`-prefixed lines previously let the
+    /// `// <name> in <path>` header through, making every search result's
+    /// signature a name/path echo instead of the symbol's code.
     pub fn extract_signature_from_content(content: &str) -> Option<String> {
         content
             .lines()
-            .skip(1) // skip "// name in path" header
             .map(|l| l.trim())
-            .find(|l| !l.is_empty() && !l.starts_with("// [No source") && !l.starts_with("// ["))
+            .find(|l| !l.is_empty() && !l.starts_with("//"))
             .map(|l| l.to_string())
     }
 
@@ -563,18 +556,8 @@ impl SearchEngine {
             return; // Node not in index, nothing to do
         };
 
-        // Remove from text_index: for each token the node contributed to,
-        // remove the node_id from the token's set. Clean up empty sets.
-        if let Some(tokens) = self.node_tokens.remove(node_id) {
-            for token in tokens {
-                if let Entry::Occupied(mut entry) = self.text_index.entry(token) {
-                    entry.get_mut().remove(node_id);
-                    if entry.get().is_empty() {
-                        entry.remove();
-                    }
-                }
-            }
-        }
+        // Remove from the token index (postings and the node's token list).
+        self.tokens.remove_node(node_id);
 
         // Remove from complexity_cache
         self.complexity_cache.remove(node_id);
@@ -612,28 +595,19 @@ impl SearchEngine {
         //
         // R8: Use pre-tokenized tokens when available to skip re-tokenization.
         // Falls back to content-based tokenization for backward compatibility.
-        let mut tokens = HashSet::new();
         if let Some(pre_tok) = &node.pre_tokenized {
-            for token in pre_tok {
-                self.text_index
-                    .entry(token.clone())
-                    .or_default()
-                    .insert(node_id.clone());
-                tokens.insert(token.clone());
-            }
+            self.tokens
+                .insert_node(&node_id, pre_tok.iter().map(String::as_str));
         } else {
-            for token in node.content.split(|c: char| !c.is_alphanumeric()) {
-                let normalized_token: String = token.to_ascii_lowercase();
-                if normalized_token.len() >= 2 {
-                    self.text_index
-                        .entry(normalized_token.clone())
-                        .or_default()
-                        .insert(node_id.clone());
-                    tokens.insert(normalized_token);
-                }
-            }
+            let lowered: Vec<String> = node
+                .content
+                .split(|c: char| !c.is_alphanumeric())
+                .map(str::to_ascii_lowercase)
+                .filter(|token| token.len() >= 2)
+                .collect();
+            self.tokens
+                .insert_node(&node_id, lowered.iter().map(String::as_str));
         }
-        self.node_tokens.insert(node_id.clone(), tokens);
 
         // Update node_id_to_idx
         self.node_id_to_idx.insert(node_id.clone(), new_idx);
@@ -776,14 +750,15 @@ impl SearchEngine {
     }
 
     /// Return the tokens associated with a given node.
-    pub fn node_tokens(&self, node_id: &str) -> Option<&HashSet<String>> {
-        self.node_tokens.get(node_id)
+    pub fn node_tokens(&self, node_id: &str) -> Option<StrSet<'_>> {
+        self.tokens.tokens_of_node(node_id).map(StrSet::new)
     }
 
     /// Check whether a token exists in the text index and, if so, which
     /// node IDs contain it.
-    pub fn token_lookup(&self, token: &str) -> Option<&HashSet<String>> {
-        self.text_index.get(token)
+    pub fn token_lookup(&self, token: &str) -> Option<StrSet<'_>> {
+        let nodes: Vec<&str> = self.tokens.nodes_with_token(token).collect();
+        (!nodes.is_empty()).then(|| StrSet::new(nodes))
     }
 
     /// Return the number of entries currently in the search cache.
@@ -819,14 +794,14 @@ impl SearchEngine {
 
         // Build compact token → set-of-rows index
         let mut token_rows: HashMap<String, HashSet<u32>> = HashMap::new();
-        for (token, node_ids) in &self.text_index {
+        for (token, node_ids) in self.tokens.entries() {
             let mut rows = HashSet::new();
             for node_id in node_ids {
                 if let Some(&idx) = self.node_id_to_idx.get(node_id) {
                     rows.insert(idx as u32);
                 }
             }
-            token_rows.insert(token.clone(), rows);
+            token_rows.insert(token.to_string(), rows);
         }
 
         CompactNodeMetadata {
@@ -890,13 +865,13 @@ impl SearchEngine {
 
         // node_tokens must have an entry for every live node
         for node in &self.nodes {
-            if !self.node_tokens.contains_key(&node.node_id) {
+            if !self.tokens.has_node(node.node_id.as_str()) {
                 return Err(format!("node_tokens missing entry for {}", node.node_id));
             }
         }
 
         // text_index must not reference removed nodes
-        for (token, node_ids) in &self.text_index {
+        for (token, node_ids) in self.tokens.entries() {
             for id in node_ids {
                 if !self.node_id_to_idx.contains_key(id) {
                     return Err(format!(
@@ -1072,10 +1047,8 @@ impl SearchEngine {
         }
         let mut candidate_ids: HashSet<&str> = HashSet::new();
         for token in &text_query.query_tokens {
-            if let Some(node_ids) = self.text_index.get(token) {
-                for node_id in node_ids {
-                    candidate_ids.insert(node_id.as_str());
-                }
+            for node_id in self.tokens.nodes_with_token(token.as_str()) {
+                candidate_ids.insert(node_id);
             }
         }
         let no_matches = candidate_ids.is_empty()
@@ -1205,10 +1178,8 @@ impl SearchEngine {
         let text_query = TextQueryPreprocessed::from_query(&query.query);
         let mut coarse_candidate_ids: HashSet<String> = HashSet::new();
         for token in &text_query.query_tokens {
-            if let Some(node_ids) = self.text_index.get(token) {
-                for id in node_ids {
-                    coarse_candidate_ids.insert(id.clone());
-                }
+            for id in self.tokens.nodes_with_token(token.as_str()) {
+                coarse_candidate_ids.insert(id.to_string());
             }
         }
 
@@ -1616,9 +1587,13 @@ impl SearchEngine {
         let base_score = if precomputed.query_tokens.is_empty() {
             // No meaningful tokens in query
             0.0
-        } else if let Some(node_tokens) = self.node_tokens.get(node_id) {
+        } else if self.tokens.has_node(node_id) {
             // Count overlap between query tokens and cached node tokens
-            let matching = precomputed.query_tokens.intersection(node_tokens).count();
+            let matching = precomputed
+                .query_tokens
+                .iter()
+                .filter(|token| self.tokens.node_has_token(node_id, token.as_str()))
+                .count();
             matching as f32 / precomputed.query_tokens.len() as f32
         } else {
             0.0
@@ -1844,13 +1819,9 @@ impl SearchEngine {
         let nodes_size = self.nodes.len() * std::mem::size_of::<NodeInfo>();
         let cache_size = self.complexity_cache.len()
             * (std::mem::size_of::<String>() + std::mem::size_of::<u32>());
-        let text_index_size = self
-            .text_index
-            .values()
-            .map(|set| set.len() * std::mem::size_of::<String>())
-            .sum::<usize>();
+        let token_index_size = self.tokens.estimated_bytes();
 
-        nodes_size + cache_size + text_index_size + self.vector_index.estimated_memory_bytes()
+        nodes_size + cache_size + token_index_size + self.vector_index.estimated_memory_bytes()
     }
 
     /// Estimate byte size of a slice of search results for cache accounting.

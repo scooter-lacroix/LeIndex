@@ -5,6 +5,8 @@
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
+/// Engram: persistent, content-addressed phrase-book of query embeddings.
+pub mod engram;
 /// Hierarchical Navigable Small World (HNSW) implementation for vector search.
 pub mod hnsw;
 /// INT8 Quantization system.
@@ -20,6 +22,8 @@ pub mod ranking;
 pub mod search;
 /// Semantic analysis and embedding generation.
 pub mod semantic;
+/// Native trigram text search (Zoekt-style index, live verification).
+pub mod textsearch;
 /// Vector storage and indexing.
 pub mod vector;
 

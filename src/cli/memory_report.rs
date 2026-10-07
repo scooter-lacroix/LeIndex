@@ -237,9 +237,23 @@ fn read_rss_sysinfo_bytes() -> Option<u64> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
+
+    /// `LEINDEX_MEMORY_REPORT` is process-global state: parallel tests in this
+    /// module that set/remove it race each other's reads. Every env-mutating
+    /// test holds this lock across its arrange/act/cleanup window.
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn test_resolve_report_path_none_when_unset() {
+        let _guard = env_lock();
         // Clear env var to ensure clean state
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var(MEMORY_REPORT_ENV) };
@@ -255,6 +269,7 @@ mod tests {
 
     #[test]
     fn test_resolve_report_path_from_env() {
+        let _guard = env_lock();
         // Clean up first to avoid interference from parallel tests
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var(MEMORY_REPORT_ENV) };
@@ -268,6 +283,7 @@ mod tests {
 
     #[test]
     fn test_flag_takes_precedence_over_env() {
+        let _guard = env_lock();
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var(MEMORY_REPORT_ENV, "/tmp/env-report.json") };
         let flag_path = Path::new("/tmp/flag-report.json");
@@ -279,6 +295,7 @@ mod tests {
 
     #[test]
     fn test_empty_env_var_ignored() {
+        let _guard = env_lock();
         // Ensure clean state first
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var(MEMORY_REPORT_ENV) };

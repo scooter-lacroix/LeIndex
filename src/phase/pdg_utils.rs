@@ -473,6 +473,7 @@ fn edge_type_code(et: &EdgeType) -> u8 {
         EdgeType::Inheritance => 3,
         EdgeType::Import => 4,
         EdgeType::Containment => 5,
+        EdgeType::TypeOf => 10,
         EdgeType::StateTransition => 6,
         EdgeType::CommandArgument => 7,
         EdgeType::Environment => 8,

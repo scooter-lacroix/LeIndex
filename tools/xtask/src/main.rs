@@ -61,10 +61,11 @@ fn run_memcheck(update_baseline: bool) -> Result<()> {
     let root = workspace_root()?;
     let fixture = root.join("tests/fixtures/memcheck/small_repo");
     let leindex_bin = root.join("target/release/leindex");
-    let leindex_embed_bin = root.join("target/release/leindex-embed");
     let memcheck_bin = root.join("target/release/memcheck");
 
-    // Ensure the release binary exists
+    // Ensure the release binary exists. The same executable doubles as the
+    // ONNX embed worker (v2.0.0 retired the separate `leindex-embed` bin),
+    // so `--features onnx` also makes it worker-capable.
     if !leindex_bin.exists() {
         eprintln!("xtask: building release binary...");
         let status = Command::new("cargo")
@@ -74,35 +75,6 @@ fn run_memcheck(update_baseline: bool) -> Result<()> {
             .context("failed to run cargo build")?;
         if !status.success() {
             anyhow::bail!("cargo build --release failed");
-        }
-    }
-
-    // Ensure the worker binary exists (for worker-active phases)
-    if !leindex_embed_bin.exists() {
-        eprintln!("xtask: building leindex-embed worker binary...");
-        // The `leindex-embed` crate was retired in the 1.10.0 embed-merge;
-        // the worker is now a `[[bin]]` of the `leindex` package
-        // (`src/bin/leindex-embed.rs`), so build it with `-p leindex
-        // --bin leindex-embed`. The `onnx` feature keeps the worker able to
-        // load real ORT (matching the embedded worker binary).
-        let status = Command::new("cargo")
-            .args([
-                "build",
-                "--release",
-                "-p",
-                "leindex",
-                "--bin",
-                "leindex-embed",
-                "--features",
-                "onnx",
-            ])
-            .current_dir(&root)
-            .status()
-            .context("failed to build leindex-embed")?;
-        if !status.success() {
-            eprintln!(
-                "xtask: warning — leindex-embed build failed, worker-active phases will be skipped"
-            );
         }
     }
 

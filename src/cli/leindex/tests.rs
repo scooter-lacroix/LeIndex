@@ -102,6 +102,7 @@ fn test_stats_serialization() {
         successful_parses: 95,
         failed_parses: 5,
         total_signatures: 500,
+        signature_scope: "full".to_string(),
         pdg_nodes: 300,
         pdg_edges: 1200,
         indexed_nodes: 300,
@@ -150,6 +151,7 @@ fn test_diagnostics_serialization() {
             successful_parses: 0,
             failed_parses: 0,
             total_signatures: 0,
+            signature_scope: "full".to_string(),
             pdg_nodes: 0,
             pdg_edges: 0,
             indexed_nodes: 0,
@@ -184,6 +186,9 @@ fn test_diagnostics_serialization() {
         pdg_nodes: 500,
         pdg_edges: 800,
         embedding_model: "tfidf_only".to_string(),
+        precision_enabled: false,
+        precision_nodes: 0,
+        precision_languages: Vec::new(),
     };
 
     let json = serde_json::to_string(&diagnostics).unwrap();
@@ -196,4 +201,28 @@ fn test_diagnostics_serialization() {
     assert_eq!(deserialized.cache_entries, 5);
     assert_eq!(deserialized.cache_hits, 9);
     assert_eq!(deserialized.spilled_bytes, 30000);
+}
+
+/// The flock behind [`ProjectWriteLock`] is per open-file description, NOT
+/// reentrant: a second descriptor's acquisition fails while the first is
+/// held. This is the premise behind the watcher's escalation path (round-8
+/// Codex P1): `index_project` opens its own descriptor and blocks, so the
+/// watcher MUST drop its guard before escalating or it deadlocks itself and
+/// pins the project write guard forever.
+#[test]
+fn test_project_write_lock_is_not_reentrant_within_a_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let guard = ProjectWriteLock::try_acquire(dir.path())
+        .expect("probe")
+        .expect("first acquisition must succeed on a free lock");
+    let second = ProjectWriteLock::try_acquire(dir.path()).expect("probe");
+    assert!(
+        second.is_none(),
+        "a second descriptor must NOT acquire while the first guard is held"
+    );
+    drop(guard);
+    let again = ProjectWriteLock::try_acquire(dir.path())
+        .expect("probe")
+        .expect("the lock must be free again after the guard drops");
+    drop(again);
 }

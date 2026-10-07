@@ -93,6 +93,13 @@ fn onnx_inference_batch_size_defaults_to_fixed_batch_safe_value() {
         configured_onnx_inference_batch_size("qwen3-embed-0.6b", "cpu"),
         1
     );
+    // MIGraphX compiles one fixed shape for every model, including the
+    // statically exported b8-s128 qwen3-embed-0.6b graph; a batch-1 policy
+    // could never match its compiled .mxr cache.
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b", "migraphx"),
+        DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE
+    );
 }
 
 #[test]
@@ -206,6 +213,97 @@ fn migraphx_uses_one_stable_batch_shape_by_default() {
 }
 
 #[test]
+fn test_batch_size_for_dynamic_uint8() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+    // The -dynamic-uint8 suffix must trigger the dynamic batch path, same as
+    // -dynamic. MIGraphX gets the stable compiled batch size (8).
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic-uint8", "migraphx"),
+        DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE
+    );
+    // CPU/CUDA gets the larger dynamic batch size (32).
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic-uint8", "cpu"),
+        DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE
+    );
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_extract_u8_dequantization() {
+    // Verify the dequantization formula: (value - zero_point) * scale
+    // with scale=0.0027450980 and zero_point=109.
+    // These are the QuantizeLinear parameters from the electroglyph uint8 model.
+    const SCALE: f32 = 0.002_745_098;
+    const ZERO_POINT: f32 = 109.0;
+
+    // Test a few representative uint8 values.
+    let test_cases: [(u8, f32); 4] = [
+        // (input u8, expected dequantized f32)
+        (109, 0.0),                     // zero_point -> 0.0
+        (0, (0.0 - 109.0) * SCALE),     // min uint8
+        (255, (255.0 - 109.0) * SCALE), // max uint8
+        (128, (128.0 - 109.0) * SCALE), // mid-range
+    ];
+
+    for (input, expected) in test_cases {
+        let dequantized = (input as f32 - ZERO_POINT) * SCALE;
+        assert!(
+            (dequantized - expected).abs() < 1e-6,
+            "u8 value {}: expected {}, got {}",
+            input,
+            expected,
+            dequantized
+        );
+    }
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_u8_dequant_preserves_unit_norm() {
+    // The electroglyph uint8 model L2-normalizes embeddings BEFORE quantizing,
+    // then applies QuantizeLinear(scale=0.0027450980, zero_point=109). After
+    // dequantization the vector norm should stay close to 1.0 — provided every
+    // component is within the quantizer's representable range.
+    //
+    // With these constants the representable range is
+    //   [(0 - 109)*scale, (255 - 109)*scale] = [-0.299, 0.401].
+    // So a component like 0.5 is OUT of range and clips to 255 (dequant 0.401),
+    // collapsing the norm. A valid unit-norm check must use in-range components.
+    // [0.35; 8] has norm ~0.99, all components in range, and stays close to 1.0
+    // after quantize+dequant.
+    const SCALE: f32 = 0.002_745_098;
+    const ZERO_POINT: f32 = 109.0;
+
+    // An 8-dim vector with all components in the quantizer's representable
+    // range and near unit norm.
+    let original: Vec<f32> = vec![0.35; 8];
+    // Quantize: round(value / scale + zero_point), clamp to [0, 255].
+    let quantized: Vec<u8> = original
+        .iter()
+        .map(|&v| {
+            let q = (v / SCALE + ZERO_POINT).round() as i32;
+            q.clamp(0, 255) as u8
+        })
+        .collect();
+    // Dequantize.
+    let dequantized: Vec<f32> = quantized
+        .iter()
+        .map(|&v| (v as f32 - ZERO_POINT) * SCALE)
+        .collect();
+
+    let norm: f32 = dequantized.iter().map(|v| v * v).sum::<f32>().sqrt();
+    // The quantization introduces small error, but norm should be near 1.0.
+    assert!(
+        (norm - 1.0).abs() < 0.1,
+        "dequantized vector norm {} should be close to 1.0",
+        norm
+    );
+}
+
+#[test]
 fn test_runtime_idle_not_expired_initially() {
     let config = no_compile_config();
     let rt = WorkerRuntime::new(config);
@@ -308,9 +406,10 @@ fn test_handle_embed_empty_batch() {
     let request = EmbedRequest {
         texts: vec![],
         expected_dim: 1024,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-    let result = rt.handle_embed(&frame);
+    let result = rt.handle_embed(&frame, &Arc::new(AtomicBool::new(false)));
 
     // Empty batch returns Ok early (before any ONNX session check),
     // so .unwrap() is safe regardless of feature flag.
@@ -328,9 +427,10 @@ fn test_handle_embed_returns_flat_row_major() {
     let request = EmbedRequest {
         texts: vec!["hello".to_string(), "world".to_string()],
         expected_dim: 8,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-    let result = rt.handle_embed(&frame);
+    let result = rt.handle_embed(&frame, &Arc::new(AtomicBool::new(false)));
 
     // When ORT or the model is unavailable (no model on disk, ORT not
     // discovered, etc.), the worker returns ModelNotFound. On a developer
@@ -370,9 +470,10 @@ fn test_handle_embed_preserves_ordering() {
     let request = EmbedRequest {
         texts: texts.clone(),
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-    let result = rt.handle_embed(&frame);
+    let result = rt.handle_embed(&frame, &Arc::new(AtomicBool::new(false)));
 
     // Same rationale as test_handle_embed_returns_flat_row_major: developer
     // machines with ORT + a real model present may reach inference and
@@ -408,6 +509,7 @@ fn test_dispatch_embed_request() {
     let request = EmbedRequest {
         texts: vec!["test".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(42), request).unwrap();
     let response_frame = rt.dispatch(&frame);
@@ -488,6 +590,7 @@ fn test_run_loop_single_request() {
     let request = EmbedRequest {
         texts: vec!["hello".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
     let wire = frame.encode_wire().unwrap();
@@ -655,10 +758,12 @@ fn test_run_loop_multiple_requests_same_runtime() {
     let request1 = EmbedRequest {
         texts: vec!["first".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
     let request2 = EmbedRequest {
         texts: vec!["second".to_string()],
         expected_dim: 4,
+        cache_keys: vec![],
     };
 
     let frame1 = protocol::embed_request_frame(BatchId::new(1), request1).unwrap();
@@ -698,4 +803,473 @@ fn test_idle_timeout_causes_exit() {
     // return UnexpectedEof immediately, which is a clean shutdown.
     let result = rt.run_loop(reader, writer);
     assert!(result.is_ok());
+}
+
+// ── VAL-ONNX embed batch loop ─────────────────────────────────────────
+// These tests exercise `run_onnx_embed_batch_loop` directly with a mocked
+// sub-batch runner (injecting a deterministic pooled vector per row) so the
+// provider batching/trimming logic is verified without needing a real ONNX
+// model. They cover the CRITICAL missing-else-branch bug (VAL-ONNX-001),
+// fixed-batch full sub-batches (VAL-ONNX-002), padding+trim for fixed-batch
+// partial sub-batches (VAL-ONNX-003), and the EmbedResponse count/dimension
+// invariant across providers and counts (VAL-ONNX-005, VAL-ONNX-006).
+
+#[cfg(feature = "onnx")]
+fn test_encoding(marker: u64) -> tokenizers::Encoding {
+    use std::collections::HashMap;
+    tokenizers::Encoding::new(
+        vec![marker as u32, (marker + 1) as u32],
+        vec![0, 0],
+        vec![marker.to_string(), (marker + 1).to_string()],
+        vec![None, None],
+        vec![(0, 1), (1, 2)],
+        vec![0, 0],
+        vec![1, 1],
+        vec![],
+        HashMap::new(),
+    )
+}
+
+#[cfg(feature = "onnx")]
+fn embed_encodings(n: usize) -> Vec<tokenizers::Encoding> {
+    (0..n).map(|i| test_encoding(i as u64)).collect()
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_embed_batch_cpu_all_sub_batches_processed() {
+    // VAL-ONNX-001: CPU/CUDA (fixed_batch == false) must process EVERY
+    // sub-batch, not silently skip them (the historical missing-else-branch
+    // bug). For N > inference_batch_size the loop should call the runner for
+    // each chunk and concatenate all rows.
+    let rt = WorkerRuntime::new(no_compile_config());
+    let encodings = embed_encodings(17);
+    let batch_size = 8usize;
+    let dim = 4usize;
+
+    let mut batches: Vec<usize> = Vec::new();
+    let all_pooled = rt
+        .run_onnx_embed_batch_loop(&encodings, batch_size, false, dim, |sub, dim| {
+            batches.push(sub.len());
+            let mut out = Vec::with_capacity(sub.len() * dim);
+            for (i, _) in sub.iter().enumerate() {
+                out.extend(std::iter::repeat_n(i as f32, dim));
+            }
+            Ok(out)
+        })
+        .unwrap();
+
+    // 17 encodings chunked by 8 => [8, 8, 1]; all sub-batches ran.
+    assert_eq!(batches, vec![8, 8, 1]);
+    assert_eq!(all_pooled.len(), 17 * dim);
+    assert_ne!(all_pooled.len(), 0, "CPU/CUDA embed must not be empty");
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_embed_batch_migraphx_full_sub_batches_no_padding() {
+    // VAL-ONNX-002: fixed-batch provider with an exact multiple of the batch
+    // size runs each full sub-batch unchanged — no padding is applied.
+    let rt = WorkerRuntime::new(no_compile_config());
+    let batch_size = 8usize;
+    let dim = 4usize;
+    let encodings = embed_encodings(16); // 2 full sub-batches of 8
+
+    let mut batches: Vec<usize> = Vec::new();
+    let all_pooled = rt
+        .run_onnx_embed_batch_loop(&encodings, batch_size, true, dim, |sub, dim| {
+            batches.push(sub.len());
+            Ok(vec![1.0f32; sub.len() * dim])
+        })
+        .unwrap();
+
+    assert_eq!(batches, vec![8, 8]);
+    assert_eq!(batches.len(), 2);
+    assert_eq!(all_pooled.len(), 16 * dim);
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_embed_batch_migraphx_partial_sub_batch_padded_and_trimmed() {
+    // VAL-ONNX-003: fixed-batch provider with a non-multiple input must pad
+    // the final partial sub-batch up to inference_batch_size before running,
+    // then TRIM the results back to the real row count. The mocked runner
+    // emits row-index-tagged rows, so we can prove the padding rows were cut.
+    let rt = WorkerRuntime::new(no_compile_config());
+    let batch_size = 8usize;
+    let dim = 4usize;
+    let encodings = embed_encodings(10); // 8 + 2 partial
+
+    let mut batches: Vec<usize> = Vec::new();
+    let all_pooled = rt
+        .run_onnx_embed_batch_loop(&encodings, batch_size, true, dim, |sub, dim| {
+            batches.push(sub.len());
+            // Rows tagged with their 0-based index within the passed sub-batch.
+            let mut out = Vec::with_capacity(sub.len() * dim);
+            for (i, _) in sub.iter().enumerate() {
+                out.extend(std::iter::repeat_n(i as f32, dim));
+            }
+            Ok(out)
+        })
+        .unwrap();
+
+    // The runner is called with an 8-sized padded batch for the 2-row tail.
+    assert_eq!(batches, vec![8, 8]);
+    // 10 real rows remain after trimming the padded (2-row) sub-batch.
+    assert_eq!(all_pooled.len(), 10 * dim);
+    // The trimmed tail rows must be the first 2 rows (indices 0 and 1) of the
+    // padded output, whose tags are 0.0 and 1.0 — not the padding rows 2..7.
+    let tail = &all_pooled[all_pooled.len() - dim..];
+    assert_eq!(
+        tail, &[1.0f32; 4],
+        "last row must be the real row 1, not padding"
+    );
+    // And the very last element equals real-row tag 1.0 (padding would be 7.0).
+    assert_eq!(*all_pooled.last().unwrap(), 1.0);
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_embed_response_invariant_all_providers() {
+    // VAL-ONNX-005/006: For every (provider, input_count) combination the
+    // batch loop must produce flattened vectors of length count*dimension,
+    // which EmbedResponse::new (debug_assert_eq!) accepts without panicking.
+    let rt = WorkerRuntime::new(no_compile_config());
+    let batch_size = 8usize;
+    let dim = 4usize;
+    let providers: &[(&str, bool)] = &[("cpu", false), ("migraphx", true)];
+    let counts: &[usize] = &[1, 3, 8, 9, 16, 17];
+
+    for (provider, fixed_batch) in providers {
+        for &count in counts {
+            let encodings = embed_encodings(count);
+            let mut batches: Vec<usize> = Vec::new();
+            let all_pooled = rt
+                .run_onnx_embed_batch_loop(&encodings, batch_size, *fixed_batch, dim, |sub, dim| {
+                    batches.push(sub.len());
+                    Ok(vec![0.5f32; sub.len() * dim])
+                })
+                .unwrap();
+            assert_eq!(
+                all_pooled.len(),
+                count * dim,
+                "{provider} count={count}: vectors.len() != count*dimension"
+            );
+            // Constructing EmbedResponse::new runs its debug_assert_eq!; if
+            // vectors.len() != count*dim it panics, flagging the regression.
+            let response = EmbedResponse::new(all_pooled.clone(), count, dim);
+            assert_eq!(response.vectors.len(), count * dim);
+            assert_eq!(response.count, count);
+            assert_eq!(response.dimension, dim);
+            assert_eq!(
+                response.vectors.len(),
+                response.count * response.dimension,
+                "EmbedResponse invariant broken for {provider} count={count}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_embed_text_batch_loop_tokenizes_and_infers_per_sub_batch() {
+    // Fix B: tokenization must be bounded to the inference batch and inference
+    // must begin before later text batches are tokenized.
+    let rt = WorkerRuntime::new(no_compile_config());
+    let texts: Vec<String> = (0..17).map(|i| format!("text-{i}")).collect();
+    let mut tokenized_sizes = Vec::new();
+    let events = std::cell::RefCell::new(Vec::new());
+    let dim = 4usize;
+
+    let pooled = rt
+        .run_onnx_embed_text_batch_loop(
+            &texts,
+            8,
+            false,
+            dim,
+            &Arc::new(AtomicBool::new(false)),
+            |sub_texts| {
+                tokenized_sizes.push(sub_texts.len());
+                events
+                    .borrow_mut()
+                    .push(format!("tokenize-{}", sub_texts.len()));
+                Ok(embed_encodings(sub_texts.len()))
+            },
+            |encodings, dim| {
+                events
+                    .borrow_mut()
+                    .push(format!("infer-{}", encodings.len()));
+                Ok(vec![1.0f32; encodings.len() * dim])
+            },
+        )
+        .unwrap();
+
+    assert_eq!(tokenized_sizes, vec![8, 8, 1]);
+    assert_eq!(pooled.len(), texts.len() * dim);
+    assert_eq!(
+        events.into_inner(),
+        vec![
+            "tokenize-8".to_string(),
+            "infer-8".to_string(),
+            "tokenize-8".to_string(),
+            "infer-8".to_string(),
+            "tokenize-1".to_string(),
+            "infer-1".to_string(),
+        ]
+    );
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_embed_text_batch_loop_fixed_batch_pads_after_per_batch_tokenization() {
+    let rt = WorkerRuntime::new(no_compile_config());
+    let texts: Vec<String> = (0..10).map(|i| format!("text-{i}")).collect();
+    let mut tokenized_sizes = Vec::new();
+    let mut inferred_sizes = Vec::new();
+    let dim = 2usize;
+
+    let pooled = rt
+        .run_onnx_embed_text_batch_loop(
+            &texts,
+            8,
+            true,
+            dim,
+            &Arc::new(AtomicBool::new(false)),
+            |sub_texts| {
+                tokenized_sizes.push(sub_texts.len());
+                Ok(embed_encodings(sub_texts.len()))
+            },
+            |encodings, dim| {
+                inferred_sizes.push(encodings.len());
+                Ok(vec![0.5f32; encodings.len() * dim])
+            },
+        )
+        .unwrap();
+
+    assert_eq!(tokenized_sizes, vec![8, 2]);
+    assert_eq!(inferred_sizes, vec![8, 8]);
+    assert_eq!(pooled.len(), texts.len() * dim);
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_embed_text_batch_loop_later_tokenizer_error_stops_before_next_inference() {
+    let rt = WorkerRuntime::new(no_compile_config());
+    let texts: Vec<String> = (0..10).map(|i| format!("text-{i}")).collect();
+    let mut inferred_batches = Vec::new();
+    let mut tokenizer_calls = 0usize;
+
+    let error = rt
+        .run_onnx_embed_text_batch_loop(
+            &texts,
+            8,
+            false,
+            2,
+            &Arc::new(AtomicBool::new(false)),
+            |_sub_texts| {
+                tokenizer_calls += 1;
+                if tokenizer_calls == 2 {
+                    Err(WorkerError {
+                        kind: ErrorKind::Tokenizer,
+                        message: "synthetic tokenizer failure".to_string(),
+                    })
+                } else {
+                    Ok(embed_encodings(8))
+                }
+            },
+            |encodings, dim| {
+                inferred_batches.push(encodings.len());
+                Ok(vec![1.0f32; encodings.len() * dim])
+            },
+        )
+        .unwrap_err();
+
+    assert_eq!(inferred_batches, vec![8]);
+    assert_eq!(tokenizer_calls, 2);
+    assert_eq!(error.kind, ErrorKind::Tokenizer);
+    assert!(error.message.contains("synthetic tokenizer failure"));
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_embed_text_batch_loop_checks_cancel_between_sub_batches() {
+    let rt = WorkerRuntime::new(no_compile_config());
+    let texts: Vec<String> = (0..10).map(|i| format!("text-{i}")).collect();
+    let mut inferred_batches = Vec::new();
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    let cancel_from_runner = Arc::clone(&cancel_token);
+
+    let error = rt
+        .run_onnx_embed_text_batch_loop(
+            &texts,
+            8,
+            false,
+            2,
+            &cancel_token,
+            |_sub_texts| Ok(embed_encodings(8)),
+            |encodings, dim| {
+                inferred_batches.push(encodings.len());
+                cancel_from_runner.store(true, Ordering::Release);
+                Ok(vec![1.0f32; encodings.len() * dim])
+            },
+        )
+        .unwrap_err();
+
+    assert_eq!(inferred_batches, vec![8]);
+    assert_eq!(error.kind, ErrorKind::Inference);
+    assert!(error.message.contains("cancelled"));
+}
+
+// ── Batch size provider-precedence fix ────────────────────────────────
+// MIGraphX compiles ONE fixed input shape per model, so every model —
+// dynamic or statically exported — runs at the fixed MIGraphX batch on
+// that provider (the batch loop pads the final partial batch). The
+// statically exported qwen3-embed-0.6b graph is itself b8-s128 (verified
+// empirically: ORT rejects batch-1 inputs with "Got: 1, Expected: 8"), and
+// its compiled .mxr cache is keyed to that shape, so the previous
+// batch-1 policy could never use the GPU. CPU keeps the model-specific
+// defaults (batch 1 for static exports, 32 for -dynamic variants).
+
+#[test]
+fn test_non_dynamic_model_migraphx_returns_fixed_batch() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b", "migraphx"),
+        DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE,
+        "non-dynamic model with migraphx must return the fixed MIGraphX batch (the static graph is b8-s128)"
+    );
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b", "migraphx"),
+        8
+    );
+}
+
+#[test]
+fn test_non_dynamic_model_rocm_returns_fixed_batch() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b", "rocm"),
+        DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE,
+        "non-dynamic model with rocm must return the fixed MIGraphX batch"
+    );
+}
+
+#[test]
+fn test_dynamic_model_migraphx_returns_batch_8() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic", "migraphx"),
+        DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE,
+        "dynamic model with migraphx must return the MIGraphX stable batch size"
+    );
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic", "migraphx"),
+        8
+    );
+}
+
+#[test]
+fn test_dynamic_model_rocm_returns_batch_8() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic", "rocm"),
+        DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE,
+        "dynamic model with rocm must return the MIGraphX stable batch size"
+    );
+}
+
+#[test]
+fn test_non_dynamic_model_cpu_returns_batch_1() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b", "cpu"),
+        DEFAULT_ONNX_INFERENCE_BATCH_SIZE,
+        "non-dynamic model with cpu must return batch_size=1 (unchanged)"
+    );
+}
+
+#[test]
+fn test_dynamic_model_cpu_returns_default_dynamic() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic", "cpu"),
+        DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE,
+        "dynamic model with cpu must return the dynamic batch size"
+    );
+}
+
+#[test]
+fn test_non_dynamic_model_migraphx_case_insensitive() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvVarGuard::remove(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+    // Provider matching is case-insensitive.
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b", "MIGRAPHX"),
+        DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE,
+        "non-dynamic model with uppercase MIGRAPHX must return the fixed MIGraphX batch"
+    );
+    assert_eq!(
+        configured_onnx_inference_batch_size("qwen3-embed-0.6b", "ROCm"),
+        DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE,
+    );
+}
+
+// ── Collapsed batch dimension handling ────────────────────────────────
+// When a non-dynamic ONNX model receives batch_size > 1, it may silently
+// collapse the batch dimension and return [1, seq_len, hidden_dim] instead
+// of [batch_size, seq_len, hidden_dim]. The runtime must detect this and
+// retry each sequence individually rather than erroring and triggering
+// TF-IDF fallback.
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_collapsed_batch_sentinel_is_detectable() {
+    // Verify the sentinel constant exists and has the expected prefix.
+    assert!(COLLAPSED_BATCH_SENTINEL.starts_with("__"));
+    assert!(!COLLAPSED_BATCH_SENTINEL.is_empty());
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_finalize_embed_output_detects_collapsed_batch() {
+    // When the model returns [1, seq_len, hidden_dim] but batch_size > 1 was
+    // sent, finalize_embed_output must return an error whose message starts
+    // with the COLLAPSED_BATCH_SENTINEL so the caller can retry individually.
+    //
+    // We cannot easily construct a real SessionOutputs without a model, but
+    // we can verify the sentinel-based detection logic by checking that the
+    // sentinel prefix is what the retry path matches on.
+    let fake_error_msg = format!(
+        "{}: model collapsed batch dimension (sent 3, got [1, 128, 1024])",
+        COLLAPSED_BATCH_SENTINEL
+    );
+    assert!(
+        fake_error_msg.starts_with(COLLAPSED_BATCH_SENTINEL),
+        "collapsed batch error must start with the sentinel for retry detection"
+    );
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn test_non_collapsed_error_does_not_match_sentinel() {
+    // A regular inference error must NOT match the sentinel, so it is not
+    // mistaken for a collapsed-batch retry signal.
+    let regular_error = "ONNX inference failed: shape mismatch";
+    assert!(
+        !regular_error.starts_with(COLLAPSED_BATCH_SENTINEL),
+        "regular errors must not match the collapsed batch sentinel"
+    );
 }

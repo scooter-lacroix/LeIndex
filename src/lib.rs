@@ -33,6 +33,9 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+/// Fast deterministic hasher and map/set aliases for internal indexes.
+pub mod fast_hash;
+
 // Core modules (base of dependency DAG)
 #[cfg(feature = "parse")]
 pub mod parse;
@@ -65,6 +68,10 @@ pub mod edit;
 #[cfg(feature = "validation")]
 pub mod validation;
 
+/// SCIP-backed precision ingestion and PDG merge helpers.
+#[cfg(feature = "precision")]
+pub mod intel;
+
 /// Shared directory exclusions used by graph and CLI traversals.
 #[cfg(any(feature = "graph", feature = "cli"))]
 pub mod skip_dirs;
@@ -82,6 +89,19 @@ pub mod embed;
 
 // Feature flag infrastructure (always available)
 pub mod feature_flags;
+
+// Cross-version artifact migration (§12.2). Reads and writes the SQLite/CAS
+// stores, so it exists whenever the `storage` feature does.
+#[cfg(feature = "storage")]
+pub mod migration;
+
+// Fair bounded scheduler (always available; gated at runtime by
+// LEINDEX_FEATURE_BOUNDED_SCHEDULER)
+pub mod scheduler;
+
+// Model evaluation harness (always available; pure-Rust metrics + corpus)
+// WS11 Tasks 1-3: gates, corpus, metrics, fused-retrieval harness.
+pub mod eval;
 
 // Observability infrastructure (always available)
 pub mod observability;

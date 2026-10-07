@@ -184,24 +184,48 @@ impl QueryInvalidation {
         Ok(())
     }
 
-    /// Get affected nodes for a change in a file
+    /// Get content hashes for the nodes in a changed file.
     ///
-    /// # Arguments
-    /// * `file_path` - The path to the changed file
-    ///
-    /// # Returns
-    /// Vector of content hashes for the affected nodes
-    pub fn get_affected_nodes(&self, file_path: &str) -> SqliteResult<Vec<String>> {
-        let mut stmt = self
-            .storage
-            .conn()
-            .prepare("SELECT content_hash FROM intel_nodes WHERE file_path = ?1")?;
+    /// Replaces the former `SELECT content_hash FROM intel_nodes WHERE
+    /// file_path = ?` query. The generation PDG is authoritative for graph
+    /// identity; reconstruct the legacy content hash from the same content
+    /// fields used by the writer rather than consulting graph rows in SQL.
+    pub fn get_affected_nodes(
+        &self,
+        pdg: &crate::graph::pdg::ProgramDependenceGraph,
+        file_path: &str,
+    ) -> Vec<String> {
+        let mut hashes = Vec::new();
+        for node_index in pdg.node_indices() {
+            let Some(node) = pdg.get_node(node_index) else {
+                continue;
+            };
+            if node.file_path.as_ref() != file_path {
+                continue;
+            }
 
-        let hashes = stmt
-            .query_map(params![file_path], |row| row.get::<_, String>(0))?
-            .collect::<SqliteResult<Vec<_>>>()?;
-
-        Ok(hashes)
+            let qualified_name = node.id.rsplit(':').next().unwrap_or(&node.id);
+            let node_type =
+                crate::storage::generation::graph_codec::graph_node_type_str(&node.node_type);
+            let mut hasher = blake3::Hasher::new();
+            for field in [
+                node.file_path.as_bytes(),
+                node.name.as_bytes(),
+                qualified_name.as_bytes(),
+                node.language.as_bytes(),
+                node_type.as_bytes(),
+            ] {
+                hasher.update(field);
+                hasher.update(&[0x1f]);
+            }
+            hasher.update(&node.complexity.to_le_bytes());
+            hasher.update(&[0x1f]);
+            hasher.update(&node.byte_range.0.to_le_bytes());
+            hasher.update(&[0x1f]);
+            hasher.update(&node.byte_range.1.to_le_bytes());
+            hashes.push(hasher.finalize().to_hex().to_string());
+        }
+        hashes
     }
 }
 
@@ -210,6 +234,51 @@ mod tests {
     use super::*;
     use crate::storage::schema::Storage;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_affected_node_hashes_come_from_resident_graph_and_match_writer_fields() {
+        use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};
+        use std::sync::Arc;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let storage = Storage::open(temp_file.path()).unwrap();
+        let invalidation = QueryInvalidation::new(storage);
+        let mut pdg = ProgramDependenceGraph::new();
+        pdg.add_node(Node {
+            id: "src/lib.rs:module::function".to_string(),
+            node_type: NodeType::Function,
+            name: "function".to_string(),
+            file_path: Arc::from("src/lib.rs"),
+            byte_range: (4, 32),
+            complexity: 7,
+            language: "rust".to_string(),
+        });
+
+        let hashes = invalidation.get_affected_nodes(&pdg, "src/lib.rs");
+        let mut expected = blake3::Hasher::new();
+        for field in [
+            b"src/lib.rs".as_slice(),
+            b"function".as_slice(),
+            b"function".as_slice(),
+            b"rust".as_slice(),
+            b"function".as_slice(),
+        ] {
+            expected.update(field);
+            expected.update(&[0x1f]);
+        }
+        expected.update(&7u32.to_le_bytes());
+        expected.update(&[0x1f]);
+        expected.update(&4usize.to_le_bytes());
+        expected.update(&[0x1f]);
+        expected.update(&32usize.to_le_bytes());
+
+        assert_eq!(hashes, vec![expected.finalize().to_hex().to_string()]);
+        assert!(
+            invalidation
+                .get_affected_nodes(&pdg, "src/missing.rs")
+                .is_empty()
+        );
+    }
 
     #[test]
     fn test_node_hash_creation() {

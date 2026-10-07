@@ -147,6 +147,7 @@ mod tests {
             pdg,
             docs_summary: None,
             generation_hash: "gen".to_string(),
+            pending_graph: None,
         };
 
         let summary = run(&context);

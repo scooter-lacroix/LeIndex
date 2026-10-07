@@ -17,7 +17,7 @@ pub struct LanguageCompleteness {
     pub imports_ratio: f32,
     /// Ratio of signatures with non-empty byte range.
     pub byte_range_ratio: f32,
-    /// Composite completeness score in [0,1].
+    /// Composite completeness score in \[0,1\].
     pub score: f32,
 }
 

@@ -216,6 +216,19 @@ impl HybridEmbedder {
         }
     }
 
+    /// Identity of the neural embedder for the Engram query phrase-book, or
+    /// `None` when there is no neural embedder or its identity cannot be
+    /// established (the phrase-book is then bypassed, never guessed).
+    pub fn engram_identity(&self) -> Option<String> {
+        match self {
+            Self::TfIdfOnly(_) => None,
+            #[cfg(feature = "onnx")]
+            Self::HybridLocal { neural, .. } => neural.engram_identity(NEURAL_EMBEDDING_DIMENSION),
+            #[cfg(feature = "remote-embeddings")]
+            Self::HybridRemote { remote, .. } => Some(remote.identity().to_string()),
+        }
+    }
+
     /// Get the neural weight for scoring
     pub fn neural_weight(&self) -> f32 {
         match self {
@@ -407,7 +420,7 @@ impl HybridEmbedder {
     /// This batches all texts into a single IPC call to the ONNX worker,
     /// reducing N round-trips to 1 per chunk.
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-    pub fn embed_neural_batch_blocking(&self, texts: &[String]) -> Vec<Option<Vec<f32>>> {
+    pub fn embed_neural_batch_blocking<S: AsRef<str>>(&self, texts: &[S]) -> Vec<Option<Vec<f32>>> {
         match self {
             Self::TfIdfOnly(_) => vec![None; texts.len()],
             #[cfg(feature = "onnx")]
@@ -456,8 +469,10 @@ impl HybridEmbedder {
         &self,
         project_path: &Path,
         pdg: &ProgramDependenceGraph,
+        persisted_identity: Option<(usize, usize, String)>,
     ) -> Result<()> {
-        self.tfidf().persist_to_storage(project_path, pdg)
+        self.tfidf()
+            .persist_to_storage(project_path, pdg, persisted_identity)
     }
 
     /// Unload the ONNX session if the hybrid backend uses one (A+ idle-unload).

@@ -39,6 +39,30 @@ fn traversal_respects_max_nodes() {
 }
 
 #[test]
+fn traversal_includes_typeof_edges_in_semantic_and_impact_configs() {
+    let mut pdg = ProgramDependenceGraph::new();
+    let source = pdg.add_node(make_node("f:source", "source", "f.rs", NodeType::Function));
+    let target = pdg.add_node(make_node("f:target", "target", "f.rs", NodeType::Class));
+    pdg.add_edge(
+        source,
+        target,
+        Edge {
+            edge_type: EdgeType::TypeOf,
+            metadata: EdgeMetadata::empty(),
+        },
+    );
+
+    assert!(
+        pdg.forward_impact(source, &TraversalConfig::for_semantic_analysis())
+            .contains(&target)
+    );
+    assert!(
+        pdg.forward_impact(source, &TraversalConfig::for_impact_analysis())
+            .contains(&target)
+    );
+}
+
+#[test]
 fn traversal_filters_containment_edges() {
     let mut pdg = ProgramDependenceGraph::new();
     let cls = pdg.add_node(make_node("f:MyClass", "MyClass", "f.rs", NodeType::Class));
@@ -117,6 +141,17 @@ fn name_file_index_maintained_on_remove() {
     assert!(pdg.file_index.contains_key("b.rs"));
     assert!(pdg.name_index.contains_key("bar"));
     assert!(pdg.name_lower_index.contains_key("bar"));
+}
+
+#[test]
+fn remove_node_cleans_up_precision_marker() {
+    let mut pdg = ProgramDependenceGraph::new();
+    let node = pdg.add_node(make_node("f:marked", "marked", "f.rs", NodeType::Function));
+    pdg.mark_precision_symbol("f:marked");
+
+    assert!(pdg.is_precision_symbol("f:marked"));
+    assert!(pdg.remove_node(node).is_some());
+    assert!(!pdg.is_precision_symbol("f:marked"));
 }
 
 #[test]
@@ -308,13 +343,15 @@ fn embedding_store_overwrite() {
 }
 
 #[test]
-fn serialization_preserves_embeddings() {
+fn serialization_preserves_precision_symbols_and_embeddings() {
     let mut pdg = ProgramDependenceGraph::new();
     let n1 = pdg.add_node(make_node("f:foo", "foo", "f.rs", NodeType::Function));
     let n2 = pdg.add_node(make_node("f:bar", "bar", "f.rs", NodeType::Function));
     pdg.add_call_edges(vec![(n1, n2)]);
     pdg.set_embedding("f:foo", vec![0.1, 0.2, 0.3]);
     pdg.set_embedding("f:bar", vec![0.4, 0.5, 0.6]);
+    pdg.mark_precision_symbol("f:foo");
+    pdg.mark_precision_symbol("f:bar");
 
     // Serialize
     let bytes = pdg.serialize().expect("Serialization should succeed");
@@ -327,6 +364,8 @@ fn serialization_preserves_embeddings() {
     assert_eq!(restored.get_embedding("f:foo"), Some(&vec![0.1, 0.2, 0.3]));
     assert_eq!(restored.get_embedding("f:bar"), Some(&vec![0.4, 0.5, 0.6]));
     assert_eq!(restored.embedding_count(), 2);
+    assert!(restored.is_precision_symbol("f:foo"));
+    assert!(restored.is_precision_symbol("f:bar"));
 }
 
 #[test]
@@ -377,15 +416,99 @@ fn deserialization_backward_compat_no_embeddings() {
             .iter()
             .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
             .collect(),
-        embeddings: HashMap::new(), // No embeddings — simulates old format
+        embeddings: HashMap::default(), // No embeddings — simulates old format
+        precision_symbols: HashSet::default(),
     };
 
     let bytes = bincode::serialize(&old_format).expect("Serialize old format");
     let restored = ProgramDependenceGraph::deserialize(&bytes)
         .expect("Should deserialize old format without error");
 
+    let legacy_without_precision = SerializablePDGWithoutPrecision {
+        nodes: old_format.nodes.clone(),
+        edges: old_format.edges.clone(),
+        symbol_index: old_format.symbol_index.clone(),
+        file_index: old_format.file_index.clone(),
+        name_index: old_format.name_index.clone(),
+        name_lower_index: old_format.name_lower_index.clone(),
+        embeddings: old_format.embeddings.clone(),
+    };
+    let legacy_bytes =
+        bincode::serialize(&legacy_without_precision).expect("Serialize legacy format");
+    let legacy_restored = ProgramDependenceGraph::deserialize(&legacy_bytes)
+        .expect("Should deserialize pre-precision format without error");
+
     assert_eq!(restored.embedding_count(), 0);
     assert_eq!(restored.node_count(), 1);
+    assert!(!restored.is_precision_symbol("f:foo"));
+    assert_eq!(legacy_restored.node_count(), 1);
+    assert!(!legacy_restored.is_precision_symbol("f:foo"));
+
+    let pre_embedding = SerializablePDGWithoutEmbeddings {
+        nodes: old_format.nodes.clone(),
+        edges: old_format.edges.clone(),
+        symbol_index: old_format.symbol_index.clone(),
+        file_index: old_format.file_index.clone(),
+        name_index: old_format.name_index.clone(),
+        name_lower_index: old_format.name_lower_index.clone(),
+    };
+    let pre_embedding_bytes =
+        bincode::serialize(&pre_embedding).expect("Serialize pre-embedding format");
+    let pre_embedding_restored = ProgramDependenceGraph::deserialize(&pre_embedding_bytes)
+        .expect("Should deserialize pre-embedding format without error");
+    assert_eq!(pre_embedding_restored.node_count(), 1);
+    assert_eq!(pre_embedding_restored.embedding_count(), 0);
+    assert!(!pre_embedding_restored.is_precision_symbol("f:foo"));
+}
+
+#[test]
+fn deserialization_backward_compat_pre_embedding_inline_node_embeddings() {
+    let node = LegacyNode {
+        id: "f:legacy".to_string(),
+        node_type: NodeType::Function,
+        name: "legacy".to_string(),
+        file_path: "f.rs".to_string(),
+        byte_range: (0, 10),
+        complexity: 2,
+        language: "rust".to_string(),
+        embedding: Some(vec![0.7, 0.8]),
+    };
+    let old_format = SerializablePDGWithInlineEmbeddings {
+        nodes: vec![LegacySerializableNode { index: 0, node }],
+        edges: Vec::new(),
+        symbol_index: HashMap::from_iter([(String::from("f:legacy"), 0)]),
+        file_index: HashMap::from_iter([(String::from("f.rs"), vec![0])]),
+        name_index: HashMap::from_iter([(String::from("legacy"), vec![0])]),
+        name_lower_index: HashMap::from_iter([(String::from("legacy"), vec![0])]),
+    };
+
+    let bytes = bincode::serialize(&old_format).expect("Serialize pre-embedding format");
+    let restored = ProgramDependenceGraph::deserialize(&bytes)
+        .expect("Should deserialize pre-embedding format without error");
+
+    assert_eq!(restored.node_count(), 1);
+    assert_eq!(restored.get_embedding("f:legacy"), Some(&vec![0.7, 0.8]));
+    assert!(!restored.is_precision_symbol("f:legacy"));
+}
+
+#[test]
+fn deserialization_drops_precision_markers_for_missing_nodes() {
+    let mut pdg = ProgramDependenceGraph::new();
+    pdg.add_node(make_node(
+        "f:present",
+        "present",
+        "f.rs",
+        NodeType::Function,
+    ));
+    pdg.mark_precision_symbol("f:present");
+    pdg.mark_precision_symbol("f:missing");
+
+    let bytes = pdg.serialize().expect("Serialization should succeed");
+    let restored =
+        ProgramDependenceGraph::deserialize(&bytes).expect("Deserialization should succeed");
+
+    assert!(restored.is_precision_symbol("f:present"));
+    assert!(!restored.is_precision_symbol("f:missing"));
 }
 
 #[test]
@@ -431,4 +554,336 @@ fn bulk_inheritance_edges_with_confidence() {
     assert_eq!(*src, child);
     assert_eq!(*tgt, parent);
     assert_eq!(edge.metadata.confidence, Some(0.85));
+}
+
+/// VAL-PDG-004: serialize -> deserialize round-trips every NodeType and
+/// EdgeType variant together with their full field/edge-metadata payloads.
+///
+/// Also guards the clone-free serialization shim: this invokes
+/// `SerializablePDGRef::from_pdg` (borrowed) on the write path and
+/// `SerializablePDG::to_pdg` on the read path, verifying the two bincode
+/// layouts agree.
+#[test]
+fn serialization_roundtrip_all_node_and_edge_variants() {
+    let mut pdg = ProgramDependenceGraph::new();
+
+    let n_fn = pdg.add_node(make_node("a.rs:f", "f", "a.rs", NodeType::Function));
+    let n_class = pdg.add_node(make_node("a.rs:Cls", "Cls", "a.rs", NodeType::Class));
+    let n_method = pdg.add_node(make_node("a.rs:Cls::m", "m", "a.rs", NodeType::Method));
+    let n_var = pdg.add_node(make_node("a.rs:v", "v", "a.rs", NodeType::Variable));
+    let n_module = pdg.add_node(make_node("a.rs:mod", "mod", "a.rs", NodeType::Module));
+    let n_external = pdg.add_node(make_node("a.rs:dep", "dep", "a.rs", NodeType::External));
+    let n_summary = pdg.add_node(make_node(
+        "a.rs:summary",
+        "summary",
+        "a.rs",
+        NodeType::FileSummary,
+    ));
+    assert_eq!(pdg.node_count(), 7);
+
+    // One edge per EdgeType variant, exercising every EdgeMetadata field.
+    let edge_specs: Vec<(NodeId, NodeId, EdgeType, EdgeMetadata)> = vec![
+        (
+            n_fn,
+            n_class,
+            EdgeType::Call,
+            EdgeMetadata {
+                call_count: Some(7),
+                variable_name: None,
+                confidence: Some(0.9),
+                channel: Some("call".into()),
+                position: Some(0),
+            },
+        ),
+        (
+            n_method,
+            n_var,
+            EdgeType::DataDependency,
+            EdgeMetadata {
+                call_count: None,
+                variable_name: Some("param".to_string()),
+                confidence: Some(0.5),
+                channel: Some("flow".to_string()),
+                position: Some(2),
+            },
+        ),
+        (
+            n_class,
+            n_summary,
+            EdgeType::Inheritance,
+            EdgeMetadata::with_confidence(0.85),
+        ),
+        (
+            n_module,
+            n_external,
+            EdgeType::Import,
+            EdgeMetadata::empty(),
+        ),
+        (
+            n_class,
+            n_method,
+            EdgeType::Containment,
+            EdgeMetadata::empty(),
+        ),
+        (
+            n_var,
+            n_external,
+            EdgeType::StateTransition,
+            EdgeMetadata {
+                call_count: None,
+                variable_name: None,
+                confidence: Some(0.4),
+                channel: Some("state".to_string()),
+                position: None,
+            },
+        ),
+        (
+            n_external,
+            n_module,
+            EdgeType::CommandArgument,
+            EdgeMetadata {
+                call_count: None,
+                variable_name: Some("argv0".to_string()),
+                confidence: Some(0.3),
+                channel: None,
+                position: Some(1),
+            },
+        ),
+        (
+            n_external,
+            n_module,
+            EdgeType::Environment,
+            EdgeMetadata {
+                call_count: None,
+                variable_name: Some("HOME".to_string()),
+                confidence: Some(0.2),
+                channel: Some("env".to_string()),
+                position: None,
+            },
+        ),
+        (
+            n_external,
+            n_module,
+            EdgeType::Stdin,
+            EdgeMetadata {
+                call_count: None,
+                variable_name: Some("payload".to_string()),
+                confidence: Some(0.1),
+                channel: Some("stdin".to_string()),
+                position: Some(0),
+            },
+        ),
+    ];
+    for (source, target, edge_type, metadata) in &edge_specs {
+        pdg.add_edge(
+            *source,
+            *target,
+            Edge {
+                edge_type: edge_type.clone(),
+                metadata: metadata.clone(),
+            },
+        );
+    }
+    assert_eq!(pdg.edge_count(), 9);
+
+    // Bump an embedding so the shim's embeddings map is exercised too.
+    pdg.set_embedding("a.rs:f", vec![0.25, 0.5, 0.75]);
+
+    let bytes = pdg.serialize().expect("serialize should succeed");
+    let restored = ProgramDependenceGraph::deserialize(&bytes).expect("deserialize should succeed");
+
+    // All nodes + all edges survive.
+    assert_eq!(restored.node_count(), 7);
+    assert_eq!(restored.edge_count(), 9);
+
+    // Embeddings survive.
+    assert_eq!(
+        restored.get_embedding("a.rs:f"),
+        Some(&vec![0.25, 0.5, 0.75])
+    );
+
+    // A fully-populated edge's metadata survives the round-trip.
+    let data_edges: Vec<&Edge> = restored
+        .edge_indices()
+        .filter_map(|idx| {
+            let edge = restored.get_edge(idx)?;
+            if edge.edge_type == EdgeType::DataDependency {
+                Some(edge)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        data_edges.len(),
+        1,
+        "exactly one DataDependency edge expected"
+    );
+    assert_eq!(
+        data_edges[0].metadata.variable_name.as_deref(),
+        Some("param")
+    );
+    assert_eq!(data_edges[0].metadata.position, Some(2));
+    assert_eq!(data_edges[0].metadata.confidence, Some(0.5));
+
+    // Every node type is individually addressable after reload.
+    for id in [
+        "a.rs:f",
+        "a.rs:Cls",
+        "a.rs:Cls::m",
+        "a.rs:v",
+        "a.rs:mod",
+        "a.rs:dep",
+        "a.rs:summary",
+    ] {
+        assert!(
+            restored.find_by_symbol(id).is_some(),
+            "node '{id}' should round-trip"
+        );
+    }
+}
+
+#[test]
+fn test_name_corpus_is_cached_per_revision_and_invalidates_on_mutation() {
+    let mut pdg = ProgramDependenceGraph::new();
+    let a = pdg.add_node(make_node("a", "Alpha", "Src/A.rs", NodeType::Function));
+    let first = pdg.name_corpus();
+    assert_eq!(first.names, vec!["alpha".to_string()]);
+    assert_eq!(first.files, vec!["src/a.rs".to_string()]);
+
+    // Unchanged graph: same Arc, no rebuild.
+    let rev = pdg.revision();
+    assert!(Arc::ptr_eq(&first, &pdg.name_corpus()));
+    assert_eq!(rev, pdg.revision());
+
+    // Adding a node invalidates.
+    let b = pdg.add_node(make_node("b", "Beta", "src/b.rs", NodeType::Function));
+    assert_ne!(rev, pdg.revision());
+    let second = pdg.name_corpus();
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert!(second.names.contains(&"beta".to_string()));
+
+    // Mutating a node in place (rename) invalidates.
+    pdg.get_node_mut(a).unwrap().name = "Gamma".to_string();
+    let third = pdg.name_corpus();
+    assert!(third.names.contains(&"gamma".to_string()));
+    assert!(!third.names.contains(&"alpha".to_string()));
+
+    // Removing a node invalidates.
+    pdg.remove_node(b);
+    let fourth = pdg.name_corpus();
+    assert!(!fourth.names.contains(&"beta".to_string()));
+}
+
+#[test]
+fn test_name_corpus_clones_share_until_they_diverge() {
+    let mut original = ProgramDependenceGraph::new();
+    original.add_node(make_node("a", "Alpha", "a.rs", NodeType::Function));
+    let built = original.name_corpus();
+
+    let mut clone = original.clone();
+    assert_eq!(clone.revision(), original.revision());
+    assert!(Arc::ptr_eq(&built, &clone.name_corpus()));
+
+    clone.add_node(make_node("b", "Beta", "b.rs", NodeType::Function));
+    assert_ne!(clone.revision(), original.revision());
+    assert!(clone.name_corpus().names.contains(&"beta".to_string()));
+    assert!(
+        !original.name_corpus().names.contains(&"beta".to_string()),
+        "a diverged clone must not leak names into the original"
+    );
+
+    let other = ProgramDependenceGraph::new();
+    assert_ne!(other.revision(), original.revision());
+}
+
+/// Repathing one of two nodes that share a `(name, file_path)` key must not
+/// evict the sibling's O(1) `name_file_index` entry (round-10 Kilo): the
+/// insert in `add_node` is last-wins, so the surviving key may belong to the
+/// sibling — an unconditional remove silently degrades its lookup to the
+/// linear `name_index` fallback. Extraction produces exactly this shape when
+/// it disambiguates duplicate qualified names with an `@start..end` suffix on
+/// the id only.
+#[test]
+fn test_repath_preserves_a_siblings_name_file_index_entry() {
+    let mut pdg = ProgramDependenceGraph::new();
+    let first = pdg.add_node(make_node(
+        "a.rs:foo@10..20",
+        "foo",
+        "a.rs",
+        NodeType::Function,
+    ));
+    let second = pdg.add_node(make_node(
+        "a.rs:foo@30..40",
+        "foo",
+        "a.rs",
+        NodeType::Function,
+    ));
+    // Last-wins: the O(1) key belongs to `second`.
+    assert_eq!(
+        pdg.name_file_index
+            .get(&("foo".to_string(), "a.rs".to_string())),
+        Some(&second)
+    );
+
+    // Re-path the OTHER node: the sibling's key must survive.
+    assert!(pdg.repath_node(first, EXTERNAL_NODE_FILE_PATH));
+    assert_eq!(
+        pdg.name_file_index
+            .get(&("foo".to_string(), "a.rs".to_string())),
+        Some(&second),
+        "the sibling's O(1) lookup key must not be evicted"
+    );
+    assert_eq!(
+        pdg.name_file_index
+            .get(&("foo".to_string(), "<external>".to_string())),
+        Some(&first),
+        "the migrated node's key landed under the new path"
+    );
+
+    // The eviction still happens when the key really is the mover's.
+    assert!(pdg.repath_node(second, EXTERNAL_NODE_FILE_PATH));
+    assert_eq!(
+        pdg.name_file_index
+            .get(&("foo".to_string(), "a.rs".to_string())),
+        None,
+        "our own key must move off the old path"
+    );
+}
+
+/// The batched re-path has the same index contract as the single-node form
+/// (round-10 Kilo performance fix): weights move, file_index/name_file_index
+/// follow, and the count reports only nodes that actually moved.
+#[test]
+fn test_batch_repath_moves_weights_and_indexes() {
+    let mut pdg = ProgramDependenceGraph::new();
+    let a = pdg.add_node(make_node("a.rs:x", "x", "a.rs", NodeType::Function));
+    let b = pdg.add_node(make_node("a.rs:y", "y", "a.rs", NodeType::Function));
+    let c = pdg.add_node(make_node("a.rs:z", "z", "a.rs", NodeType::Function));
+
+    // `b` already carries the target path: repaired forward, not re-counted.
+    let migrated = pdg.repath_nodes_to_file_path(&[a, b, c], "a.rs");
+    assert_eq!(migrated, 0, "every node already carries a.rs");
+
+    let migrated = pdg.repath_nodes_to_file_path(&[a, c], "migrated.rs");
+    assert_eq!(migrated, 2);
+    assert_eq!(
+        pdg.get_node(a).map(|n| n.file_path.to_string()),
+        Some("migrated.rs".to_string())
+    );
+    assert_eq!(
+        pdg.nodes_in_file("migrated.rs"),
+        vec![a, c],
+        "file_index follows the batch"
+    );
+    assert_eq!(
+        pdg.nodes_in_file("a.rs"),
+        vec![b],
+        "the vacated file_index entry no longer holds the moved nodes"
+    );
+    assert_eq!(
+        pdg.find_by_name_in_file("x", Some("migrated.rs")),
+        Some(a),
+        "the (name, file) key follows the batch"
+    );
 }

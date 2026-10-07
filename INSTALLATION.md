@@ -91,7 +91,7 @@ Neither the wheel nor source distribution contains model weights.
 ## Neural Provider Setup
 
 Setup installs `huggingface_hub` if the `hf` CLI is unavailable, downloads
-[Qwen3 Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) from
+[Qwen3 Embedding (LeIndex code fine-tune, int4)](https://huggingface.co/ScooterLacroix/qwen3-embed-0.6b-int4-code) from
 Hugging Face via Hugging Face CLI, installs the provider-specific ONNX Runtime
 package, writes configuration, and runs an embedding smoke test.
 

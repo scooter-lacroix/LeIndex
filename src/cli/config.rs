@@ -185,6 +185,12 @@ impl LanguageConfig {
             "rb", "php", "lua", "scala", "sc", // Scripting languages
             "sh", "bash", // Shell
             "json", // Data
+            // Tier-0 breadth wave + docs tier (keep in lockstep with
+            // SOURCE_FILE_EXTENSIONS and docs/LANGUAGES.md)
+            "swift", "kt", "kts", "dart", "html", "htm", "css", "scss", "yaml", "yml", "cmake",
+            "ex", "exs", "erl", "hrl", "hs", "pl", "pm", "r", "zig", "graphql", "gql", "hcl", "tf",
+            "tfvars", "el", "jl", "d", "di", "glsl", "vert", "frag", "comp", "ejs", "erb",
+            "liquid", "md", "markdown", "rst", "adoc", "asciidoc", "txt",
         ];
 
         if self.enable_all {

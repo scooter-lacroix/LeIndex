@@ -1748,3 +1748,39 @@ fn test_sync_read_failure_drops_stale_rows() {
         "stale file_content_hashes entry removed on read failure"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Storage performance: atomic_write single fsync (perf Change 4)
+// ---------------------------------------------------------------------------
+
+/// `atomic_write` must produce a correct file with no temp leftover.
+/// After removing the second `sync_all` (directory sync), the file-level
+/// fsync + rename must still produce a durable, readable artifact.
+#[test]
+fn test_atomic_write_single_fsync() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("artifact.bin");
+    let payload = b"hello-fsync-once";
+
+    atomic_write(&target, payload).expect("atomic_write succeeds");
+
+    // The file must exist and contain the exact payload.
+    assert!(target.exists(), "target artifact exists after atomic_write");
+    let read_back = std::fs::read(&target).expect("read back");
+    assert_eq!(
+        read_back, payload,
+        "payload round-trips through atomic_write"
+    );
+
+    // No temp sibling left behind.
+    assert!(
+        !dir.path().join("artifact.bin.next").exists(),
+        "atomic_write must leave no .next temp sibling"
+    );
+
+    // Overwrite path: writing again replaces the old content cleanly.
+    let payload2 = b"second-write";
+    atomic_write(&target, payload2).expect("second atomic_write succeeds");
+    let read_back2 = std::fs::read(&target).expect("read back second");
+    assert_eq!(read_back2, payload2, "second payload replaces first");
+}

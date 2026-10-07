@@ -17,6 +17,11 @@
 
 use serde::{Deserialize, Serialize};
 
+// Re-export CacheKey for protocol consumers. The cache key types are defined
+// in `embed::cache::key` but are needed here so the wire protocol can carry
+// them in EmbedRequest and CacheProbe messages.
+pub use crate::embed::cache::key::CacheKey;
+
 /// Unique batch identifier carried through the request/response cycle.
 ///
 /// The main daemon assigns a batch ID when sending a request. The worker
@@ -67,6 +72,12 @@ pub enum MsgType {
     HealthRequest,
     /// Health/readiness response.
     HealthResponse,
+    /// Cache probe request: which keys are already cached?
+    CacheProbe,
+    /// Cache probe response: hit/miss index lists.
+    CacheProbeResponse,
+    /// Cancellation request: stop after the current batch boundary.
+    Cancel,
 }
 
 /// A complete protocol frame: header + serialised payload.
@@ -133,6 +144,20 @@ pub struct EmbedRequest {
     pub texts: Vec<String>,
     /// Expected embedding dimension (for validation).
     pub expected_dim: usize,
+    /// Optional cache keys for probe→batch-miss→put flow (WS10 Task 5).
+    ///
+    /// When non-empty, the worker probes the global embedding cache before
+    /// ONNX inference, embeds only the misses under BatchBudget, writes the
+    /// freshly-computed vectors back to the cache, and returns the complete
+    /// result set (hits + misses) in the same input order.
+    ///
+    /// When empty (the default), the worker embeds all texts directly
+    /// (legacy count-only path), preserving full backward compatibility.
+    ///
+    /// Each key corresponds 1:1 with `texts[i]`. If provided, must have the
+    /// same length as `texts`.
+    #[serde(default)]
+    pub cache_keys: Vec<CacheKey>,
 }
 
 /// Embedding response: flat row-major vectors with metadata.
@@ -152,12 +177,32 @@ pub struct EmbedResponse {
 impl EmbedResponse {
     /// Create a new embed response from a flat buffer.
     pub fn new(vectors: Vec<f32>, count: usize, dimension: usize) -> Self {
-        debug_assert_eq!(vectors.len(), count * dimension);
-        Self {
+        Self::try_new(vectors, count, dimension)
+            .expect("EmbedResponse vectors must equal count * dimension")
+    }
+
+    /// Create a response while validating the flat-buffer invariant in every
+    /// build profile. Use this for data-dependent runtime output so malformed
+    /// provider/cache results become recoverable worker errors rather than
+    /// inconsistent wire metadata.
+    pub fn try_new(vectors: Vec<f32>, count: usize, dimension: usize) -> Result<Self, String> {
+        let expected = count
+            .checked_mul(dimension)
+            .ok_or_else(|| "embedding response size overflow".to_string())?;
+        if vectors.len() != expected {
+            return Err(format!(
+                "embedding response length mismatch: got {}, expected {} ({} rows x {} dim)",
+                vectors.len(),
+                expected,
+                count,
+                dimension
+            ));
+        }
+        Ok(Self {
             vectors,
             count,
             dimension,
-        }
+        })
     }
 
     /// Extract the embedding for a specific index.
@@ -226,6 +271,11 @@ pub enum WorkerState {
 }
 
 /// Readiness response. Health is available before model initialization.
+///
+/// WS10 Task 4 extended this struct with model/tokenizer/config digests
+/// and measured memory (host RSS + GPU VRAM on Linux). All new fields use
+/// `#[serde(default)]` so they are backward-compatible with older peers
+/// that do not populate them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub state: WorkerState,
@@ -234,6 +284,28 @@ pub struct HealthResponse {
     pub provider: Option<String>,
     pub model: String,
     pub error: Option<String>,
+    /// Blake3 digest of the loaded ONNX model weights (WS10 Task 4/7).
+    /// `None` when the model is not yet loaded or the digest could not be
+    /// computed.
+    #[serde(default)]
+    pub model_digest: Option<[u8; 32]>,
+    /// Blake3 digest of the tokenizer configuration (WS10 Task 4/7).
+    #[serde(default)]
+    pub tokenizer_digest: Option<[u8; 32]>,
+    /// Blake3 digest of the worker configuration (runtime params that
+    /// affect output vectors: pooling, normalization, seq_len, etc.).
+    #[serde(default)]
+    pub config_digest: Option<[u8; 32]>,
+    /// Measured worker RSS in MiB (WS10 Task 7).
+    #[serde(default)]
+    pub host_rss_mib: Option<u64>,
+    /// Measured GPU VRAM allocation in MiB, if available (WS10 Task 7).
+    #[serde(default)]
+    pub gpu_vram_mib: Option<u64>,
+    /// Provider compile-cache path (e.g. MIGraphX `.mxr` cache) and
+    /// entry count telemetry (WS10 Task 7).
+    #[serde(default)]
+    pub provider_compile_cache: Option<String>,
 }
 
 /// A single reranked result.
@@ -251,6 +323,48 @@ pub struct RerankResult {
 
 // ── Top-level request/response enums ────────────────────────────────────
 
+/// A cache probe request: which of the given keys are already cached?
+///
+/// WS10 Task 4: The daemon-side client can probe the worker's local cache
+/// view before deciding whether to send a full embed request. The worker
+/// returns hit/miss index lists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheProbeRequest {
+    /// Keys to probe.
+    pub keys: Vec<CacheKey>,
+}
+
+/// A cache probe response: hit/miss index lists.
+///
+/// `hit_indices` and `miss_indices` together cover all input indices [0..N).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheProbeResponse {
+    /// Indices of keys that WERE found in the cache (hit).
+    pub hit_indices: Vec<usize>,
+    /// Indices of keys that were NOT found in the cache (miss).
+    pub miss_indices: Vec<usize>,
+}
+
+/// Cancellation request: signal the worker to stop after the current batch.
+///
+/// WS10 Task 5: When the daemon sends a Cancel frame for a batch_id, the
+/// worker checks the cancel flag between sub-batches and, if set, returns
+/// an error response for that batch rather than a partial result set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelRequest {
+    /// Human-readable reason for cancellation (logged for diagnostics).
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// Cancellation acknowledgment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelResponse {
+    /// Whether the cancellation was acknowledged (always true; the worker
+    /// may have already completed the batch).
+    pub acknowledged: bool,
+}
+
 /// Top-level request message from main daemon to worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
@@ -260,6 +374,10 @@ pub enum Request {
     Rerank(RerankRequest),
     /// Query worker lifecycle state.
     Health(HealthRequest),
+    /// Probe the global embedding cache for a set of keys.
+    CacheProbe(CacheProbeRequest),
+    /// Cancel the in-flight batch for this frame's batch_id.
+    Cancel(CancelRequest),
 }
 
 /// Top-level response message from worker to main daemon.
@@ -271,8 +389,13 @@ pub enum Response {
     Rerank(RerankResponse),
     /// Worker error.
     Error(WorkerError),
-    /// Worker lifecycle state.
-    Health(HealthResponse),
+    /// Worker lifecycle state (boxed to avoid large_enum_variant — the struct
+    /// carries 6+ digest/memory fields per WS10 Task 4/7).
+    Health(Box<HealthResponse>),
+    /// Cache probe result.
+    CacheProbe(CacheProbeResponse),
+    /// Cancellation acknowledgment.
+    Cancel(CancelResponse),
 }
 
 /// Structured error from the worker.
@@ -304,6 +427,10 @@ pub enum ErrorKind {
     InvalidRequest,
     /// Internal worker error.
     Internal,
+    /// The incoming request frame exceeded the worker's size guard. The
+    /// client re-shards and retries; the worker treats it as a recoverable
+    /// client-side sizing error, not a worker failure (VAL-FRAME-002).
+    FrameTooLarge,
 }
 
 impl std::fmt::Display for WorkerError {
@@ -389,7 +516,57 @@ pub fn health_response_frame(batch_id: BatchId, response: HealthResponse) -> any
             batch_id,
             msg_type: MsgType::HealthResponse,
         },
-        &Response::Health(response),
+        &Response::Health(Box::new(response)),
+    )
+}
+
+/// Build a cache probe request frame.
+pub fn cache_probe_request_frame(
+    batch_id: BatchId,
+    request: CacheProbeRequest,
+) -> anyhow::Result<Frame> {
+    Frame::new(
+        FrameHeader {
+            batch_id,
+            msg_type: MsgType::CacheProbe,
+        },
+        &Request::CacheProbe(request),
+    )
+}
+
+/// Build a cache probe response frame.
+pub fn cache_probe_response_frame(
+    batch_id: BatchId,
+    response: CacheProbeResponse,
+) -> anyhow::Result<Frame> {
+    Frame::new(
+        FrameHeader {
+            batch_id,
+            msg_type: MsgType::CacheProbeResponse,
+        },
+        &Response::CacheProbe(response),
+    )
+}
+
+/// Build a cancel request frame.
+pub fn cancel_request_frame(batch_id: BatchId, request: CancelRequest) -> anyhow::Result<Frame> {
+    Frame::new(
+        FrameHeader {
+            batch_id,
+            msg_type: MsgType::Cancel,
+        },
+        &Request::Cancel(request),
+    )
+}
+
+/// Build a cancel response frame.
+pub fn cancel_response_frame(batch_id: BatchId, response: CancelResponse) -> anyhow::Result<Frame> {
+    Frame::new(
+        FrameHeader {
+            batch_id,
+            msg_type: MsgType::Cancel,
+        },
+        &Response::Cancel(response),
     )
 }
 
@@ -436,6 +613,7 @@ mod tests {
         let request = EmbedRequest {
             texts: vec!["hello world".to_string(), "foo bar".to_string()],
             expected_dim: 1024,
+            cache_keys: vec![],
         };
 
         let frame = embed_request_frame(batch_id, request.clone()).unwrap();
@@ -553,6 +731,7 @@ mod tests {
         let request = EmbedRequest {
             texts: vec!["test".to_string()],
             expected_dim: 4,
+            cache_keys: vec![],
         };
 
         let frame = embed_request_frame(original_id, request).unwrap();
@@ -569,6 +748,7 @@ mod tests {
         let request = EmbedRequest {
             texts: texts.clone(),
             expected_dim: 4,
+            cache_keys: vec![],
         };
 
         let frame = embed_request_frame(BatchId::new(1), request).unwrap();
@@ -587,6 +767,7 @@ mod tests {
         let request = EmbedRequest {
             texts: vec![],
             expected_dim: 1024,
+            cache_keys: vec![],
         };
 
         let frame = embed_request_frame(BatchId::new(0), request).unwrap();
@@ -610,6 +791,12 @@ mod tests {
             provider: Some("migraphx".to_string()),
             model: "qwen3-embed-0.6b".to_string(),
             error: None,
+            model_digest: None,
+            tokenizer_digest: None,
+            config_digest: None,
+            host_rss_mib: None,
+            gpu_vram_mib: None,
+            provider_compile_cache: None,
         };
 
         let request = health_request_frame(batch_id).unwrap();
@@ -622,6 +809,217 @@ mod tests {
         match decoded {
             Response::Health(actual) => assert_eq!(actual.state, health.state),
             _ => panic!("expected health response"),
+        }
+    }
+
+    /// VAL-CACHE-014: HealthResponse carries model/tokenizer/config digests + memory.
+    #[test]
+    fn test_health_response_carries_digests_and_memory() {
+        let health = HealthResponse {
+            state: WorkerState::Ready,
+            phase: "ready".to_string(),
+            started_unix_ms: 999,
+            provider: Some("migraphx".to_string()),
+            model: "qwen3-embed-0.6b".to_string(),
+            error: None,
+            model_digest: Some([0xAA; 32]),
+            tokenizer_digest: Some([0xBB; 32]),
+            config_digest: Some([0xCC; 32]),
+            host_rss_mib: Some(350),
+            gpu_vram_mib: Some(512),
+            provider_compile_cache: Some("/tmp/migraphx-cache".to_string()),
+        };
+
+        let frame = health_response_frame(BatchId::new(55), health.clone()).unwrap();
+        let wire = frame.encode_wire().unwrap();
+        let decoded_frame = Frame::from_wire_bytes(&wire[4..]).unwrap();
+        assert_eq!(decoded_frame.header.msg_type, MsgType::HealthResponse);
+
+        let decoded: Response = decoded_frame.decode_payload().unwrap();
+        match decoded {
+            Response::Health(actual) => {
+                assert_eq!(actual.model_digest, Some([0xAA; 32]));
+                assert_eq!(actual.tokenizer_digest, Some([0xBB; 32]));
+                assert_eq!(actual.config_digest, Some([0xCC; 32]));
+                assert_eq!(actual.host_rss_mib, Some(350));
+                assert_eq!(actual.gpu_vram_mib, Some(512));
+                assert_eq!(
+                    actual.provider_compile_cache,
+                    Some("/tmp/migraphx-cache".to_string())
+                );
+            }
+            _ => panic!("expected health response"),
+        }
+    }
+
+    /// VAL-CACHE-014: New HealthResponse fields default to None when absent
+    /// (backward-compatible `#[serde(default)]`).
+    #[test]
+    fn test_health_response_new_fields_default_to_none() {
+        let health = HealthResponse {
+            state: WorkerState::Ready,
+            phase: "ready".to_string(),
+            started_unix_ms: 0,
+            provider: Some("cpu".to_string()),
+            model: "test".to_string(),
+            error: None,
+            model_digest: None,
+            tokenizer_digest: None,
+            config_digest: None,
+            host_rss_mib: None,
+            gpu_vram_mib: None,
+            provider_compile_cache: None,
+        };
+        assert!(health.model_digest.is_none());
+        assert!(health.tokenizer_digest.is_none());
+        assert!(health.config_digest.is_none());
+        assert!(health.host_rss_mib.is_none());
+        assert!(health.gpu_vram_mib.is_none());
+        assert!(health.provider_compile_cache.is_none());
+    }
+
+    /// VAL-CACHE-008: EmbedRequest can carry cache_keys alongside texts.
+    #[test]
+    fn test_embed_request_with_cache_keys_roundtrip() {
+        use crate::embed::cache::key::{CacheKey, Normalization, Pooling};
+
+        let key1 = CacheKey {
+            model_digest: CacheKey::model_digest(b"model"),
+            tokenizer_digest: CacheKey::tokenizer_digest(b"tok"),
+            prompt_role_and_version: 0,
+            pooling: Pooling::Mean,
+            normalization: Normalization::L2,
+            output_dimensions: 1024,
+            content_hash: CacheKey::content_hash("hello"),
+        };
+        let key2 = CacheKey {
+            content_hash: CacheKey::content_hash("world"),
+            ..key1.clone()
+        };
+
+        let request = EmbedRequest {
+            texts: vec!["hello".to_string(), "world".to_string()],
+            expected_dim: 1024,
+            cache_keys: vec![key1, key2],
+        };
+
+        let frame = embed_request_frame(BatchId::new(1), request).unwrap();
+        let decoded: Request = frame.decode_payload().unwrap();
+        match decoded {
+            Request::Embed(embed_req) => {
+                assert_eq!(embed_req.texts.len(), 2);
+                assert_eq!(embed_req.cache_keys.len(), 2);
+                assert_eq!(
+                    embed_req.cache_keys[0].content_hash,
+                    CacheKey::content_hash("hello")
+                );
+                assert_eq!(
+                    embed_req.cache_keys[1].content_hash,
+                    CacheKey::content_hash("world")
+                );
+            }
+            _ => panic!("expected embed request"),
+        }
+    }
+
+    /// EmbedRequest without cache_keys is backward-compatible.
+    #[test]
+    fn test_embed_request_without_cache_keys_defaults_empty() {
+        let request = EmbedRequest {
+            texts: vec!["hello".to_string()],
+            expected_dim: 4,
+            cache_keys: vec![],
+        };
+
+        let frame = embed_request_frame(BatchId::new(1), request).unwrap();
+        let decoded: Request = frame.decode_payload().unwrap();
+        match decoded {
+            Request::Embed(embed_req) => {
+                assert!(embed_req.cache_keys.is_empty());
+            }
+            _ => panic!("expected embed request"),
+        }
+    }
+
+    /// CacheProbe round-trip.
+    #[test]
+    fn test_cache_probe_request_response_roundtrip() {
+        use crate::embed::cache::key::{CacheKey, Normalization, Pooling};
+
+        let key = CacheKey {
+            model_digest: CacheKey::model_digest(b"m"),
+            tokenizer_digest: CacheKey::tokenizer_digest(b"t"),
+            prompt_role_and_version: 0,
+            pooling: Pooling::Cls,
+            normalization: Normalization::None,
+            output_dimensions: 768,
+            content_hash: CacheKey::content_hash("text"),
+        };
+
+        let probe_req = CacheProbeRequest {
+            keys: vec![key.clone(); 3],
+        };
+        let frame = cache_probe_request_frame(BatchId::new(10), probe_req).unwrap();
+        let wire = frame.encode_wire().unwrap();
+        let decoded_frame = Frame::from_wire_bytes(&wire[4..]).unwrap();
+        assert_eq!(decoded_frame.header.msg_type, MsgType::CacheProbe);
+
+        let decoded_req: Request = decoded_frame.decode_payload().unwrap();
+        match decoded_req {
+            Request::CacheProbe(req) => assert_eq!(req.keys.len(), 3),
+            _ => panic!("expected cache probe request"),
+        }
+
+        // Test response roundtrip.
+        let probe_resp = CacheProbeResponse {
+            hit_indices: vec![0, 2],
+            miss_indices: vec![1],
+        };
+        let resp_frame = cache_probe_response_frame(BatchId::new(10), probe_resp).unwrap();
+        let resp_wire = resp_frame.encode_wire().unwrap();
+        let decoded_resp_frame = Frame::from_wire_bytes(&resp_wire[4..]).unwrap();
+        assert_eq!(
+            decoded_resp_frame.header.msg_type,
+            MsgType::CacheProbeResponse
+        );
+
+        let decoded_resp: Response = decoded_resp_frame.decode_payload().unwrap();
+        match decoded_resp {
+            Response::CacheProbe(resp) => {
+                assert_eq!(resp.hit_indices, vec![0, 2]);
+                assert_eq!(resp.miss_indices, vec![1]);
+            }
+            _ => panic!("expected cache probe response"),
+        }
+    }
+
+    /// Cancel request/response round-trip.
+    #[test]
+    fn test_cancel_request_response_roundtrip() {
+        let cancel_req = CancelRequest {
+            reason: "index cancelled by scheduler".to_string(),
+        };
+        let frame = cancel_request_frame(BatchId::new(5), cancel_req).unwrap();
+        let wire = frame.encode_wire().unwrap();
+        let decoded_frame = Frame::from_wire_bytes(&wire[4..]).unwrap();
+        assert_eq!(decoded_frame.header.msg_type, MsgType::Cancel);
+
+        let decoded_req: Request = decoded_frame.decode_payload().unwrap();
+        match decoded_req {
+            Request::Cancel(req) => {
+                assert_eq!(req.reason, "index cancelled by scheduler");
+            }
+            _ => panic!("expected cancel request"),
+        }
+
+        let cancel_resp = CancelResponse { acknowledged: true };
+        let resp_frame = cancel_response_frame(BatchId::new(5), cancel_resp).unwrap();
+        let resp_wire = resp_frame.encode_wire().unwrap();
+        let decoded_resp_frame = Frame::from_wire_bytes(&resp_wire[4..]).unwrap();
+        let decoded_resp: Response = decoded_resp_frame.decode_payload().unwrap();
+        match decoded_resp {
+            Response::Cancel(resp) => assert!(resp.acknowledged),
+            _ => panic!("expected cancel response"),
         }
     }
 }

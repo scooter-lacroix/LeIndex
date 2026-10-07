@@ -116,7 +116,14 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install lizard
-        run: pip install lizard jinja2  # jinja2 required for lizard's HTML report (-o)
+        # PINNED: lizard 1.24 changed the Rust CCN scoring (closures/?
+        # handling), flagging ~43 pre-existing functions repo-wide the day
+        # it shipped — an unpinned gate that moves under the code is not a
+        # gate. 1.23.0 is the version this tree's thresholds were calibrated
+        # and reviewed against; the 1.24.1 finding list is tracked in the
+        # follow-up issue before any bump (AGENTS.md: minimum 3-day release
+        # age + explicit recalibration).
+        run: pip install lizard==1.23.0 jinja2  # jinja2 required for lizard's HTML report (-o)
       - name: Run complexity analysis
         run: |
           # Generate the browsable HTML report (lizard -o always exits 0).

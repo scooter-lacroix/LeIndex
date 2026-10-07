@@ -190,6 +190,9 @@ impl CodeIntelligence for PythonParser {
 }
 
 fn extract_python_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportInfo> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut imports = Vec::new();
 
     fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
@@ -327,6 +330,9 @@ fn extract_function_signature_with_path(
 
 /// Extract function calls from a Python node
 fn extract_python_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     let mut calls = Vec::new();
 
     fn clean_call_text(raw: &str) -> String {
@@ -419,6 +425,9 @@ fn extract_parameters(params_node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec
 
 /// Extract docstring from a function or class node
 fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    if crate::parse::traits::lite() {
+        return Default::default();
+    }
     // Look for a string expression as the first statement in the body
     let body = node.child_by_field_name("body")?;
     let mut cursor = body.walk();

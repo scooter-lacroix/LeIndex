@@ -65,7 +65,7 @@ Cargo's binary directory.
 The Rust crate does not package model files. Setup selects the execution
 provider, installs the matching ONNX Runtime package, installs
 `huggingface_hub` if needed, and downloads
-[Qwen3 Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) from
+[Qwen3 Embedding (LeIndex code fine-tune, int4)](https://huggingface.co/ScooterLacroix/qwen3-embed-0.6b-int4-code) from
 Hugging Face via Hugging Face CLI, then writes
 `~/.leindex/config/leindex.toml`.
 

@@ -22,11 +22,207 @@ fn rename_args(args: &Value) -> Result<RenameArgs, JsonRpcError> {
     ))
 }
 
+/// Whole-word containment check mirroring `replace_whole_word`'s boundary
+/// rules (word chars are alphanumeric + `_`). Used by the live fallback so a
+/// text-only rename never touches a `foobar` when renaming `foo`.
+fn content_contains_whole_word(content: &str, word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    content.match_indices(word).any(|(start, matched)| {
+        let end = start + matched.len();
+        let before_ok = start == 0
+            || content[..start]
+                .chars()
+                .last()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        let after_ok = end == content.len()
+            || content[end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        before_ok && after_ok
+    })
+}
+
+/// Normalize a path lexically: drop `.` components and resolve `..` against
+/// the preceding component. `Path::join` never normalizes, so the joined
+/// scope would otherwise carry components that `Path::starts_with` (also
+/// purely lexical, no filesystem access) can never match.
+fn normalize_lexical(path: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::with_capacity(path.as_os_str().len());
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push(std::path::Component::ParentDir);
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Find files referencing `old_name` when the PDG is unavailable, using the
+/// live source inventory (git-aware, walkdir fallback). Also detects a rename
+/// conflict against `new_name` across the same inventory so a text-only rename
+/// cannot silently collide with an existing identifier.
+async fn live_reference_files(
+    project_root: &std::path::Path,
+    old_name: &str,
+    new_name: &str,
+    scope: Option<&str>,
+) -> Result<Vec<String>, JsonRpcError> {
+    let project_root = project_root.to_path_buf();
+    let old_name = old_name.to_owned();
+    let new_name = new_name.to_owned();
+    let scope = scope.map(str::to_owned);
+    // The inventory yields ABSOLUTE paths (source_inventory documents this,
+    // and the walkdir fallback starts at the absolute project root), so a
+    // caller-supplied project-relative scope like "src/" would never prefix-
+    // match and the live fallback would report the symbol as absent. Resolve
+    // relative scopes against the project root and normalize the result
+    // lexically: `Path::join` keeps `.`/`..` components and the filter below
+    // compares components (`Path::starts_with`), so a scope of "." or
+    // "./src" would otherwise match nothing and the tool would report a
+    // symbol that exists as absent — with no rename conflict detected.
+    // canonicalize is deliberately NOT used: it also resolves symlinks,
+    // which can diverge from how the inventory spells the same files.
+    let scope = scope.map(|scope| {
+        let scope_path = std::path::Path::new(&scope);
+        let joined = if scope_path.is_absolute() {
+            scope_path.to_path_buf()
+        } else {
+            project_root.join(scope_path)
+        };
+        normalize_lexical(&joined).display().to_string()
+    });
+    tokio::task::spawn_blocking(move || {
+        let inventory = match crate::cli::git::source_inventory(&project_root) {
+            Ok(paths) => paths,
+            Err(crate::cli::git::GitInventoryError::NotRepository) => {
+                walkdir::WalkDir::new(&project_root)
+                    .follow_links(false)
+                    .into_iter()
+                    .filter_entry(|entry| {
+                        let name = entry.file_name().to_string_lossy();
+                        !crate::skip_dirs::SKIP_DIRS.iter().any(|skip| name == *skip)
+                    })
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_type().is_file())
+                    .map(|entry| entry.path().to_path_buf())
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        };
+        let mut files = std::collections::HashSet::new();
+        let mut conflicts = std::collections::HashSet::new();
+        for path in inventory {
+            // Component-wise containment (deref to `Path::starts_with`), so
+            // scope "src" cannot match "src_backup/x.rs" the way a byte
+            // prefix would.
+            if scope
+                .as_deref()
+                .is_some_and(|scope| !path.starts_with(std::path::Path::new(scope)))
+            {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if content_contains_whole_word(&content, &old_name) {
+                files.insert(path.display().to_string());
+            }
+            if content_contains_whole_word(&content, &new_name) {
+                conflicts.insert(path.display().to_string());
+            }
+        }
+        if !conflicts.is_empty() {
+            let sample: Vec<String> = conflicts.into_iter().take(5).collect();
+            return Err(JsonRpcError::invalid_params(format!(
+                "Rename conflict: '{}' already occurs in the live source ({}). \
+                Renaming '{}' to '{}' would create a duplicate. \
+                Use leindex_explore mode=find target=symbols to inspect '{}'.",
+                new_name,
+                sample.join(", "),
+                old_name,
+                new_name,
+                new_name
+            )));
+        }
+        if files.is_empty() {
+            return Err(JsonRpcError::invalid_params(format!(
+                "Symbol '{}' not found in project source. \
+                Try leindex_explore mode=find target=symbols to find the exact name.",
+                old_name
+            )));
+        }
+        let mut files: Vec<String> = files.into_iter().collect();
+        files.sort();
+        Ok(files)
+    })
+    .await
+    .map_err(|error| {
+        JsonRpcError::internal_error(format!("live rename scan task failed: {error}"))
+    })?
+}
+
+/// Apply a non-preview rename plan, then invalidate the registry's staleness
+/// cache so the next read tool re-runs `is_stale_fast` instead of reusing a
+/// pre-write `false` cached result. The watcher (when enabled via
+/// `LEINDEX_WATCHER=1`) does this on its own reindex path; this explicit
+/// call covers the watcher-disabled default mode where the 30-second
+/// negative-cache TTL would otherwise silently mask the rename.
+async fn apply_rename_and_invalidate(
+    registry: &Arc<ProjectRegistry>,
+    handle: &crate::cli::registry::ProjectHandle,
+    file_contents: Vec<(String, String, String)>,
+) -> Result<(), JsonRpcError> {
+    tokio::task::spawn_blocking(move || apply_rename_plan(file_contents))
+        .await
+        .map_err(|error| {
+            JsonRpcError::internal_error(format!("Rename apply task failed: {}", error))
+        })?
+        .map_err(JsonRpcError::internal_error)?;
+    let project_root = {
+        let guard = handle.read().await;
+        guard.project_path().to_path_buf()
+    };
+    registry.invalidate_stale_cache(&project_root).await;
+    Ok(())
+}
+
+/// The PDG-based reference set for a rename, or `None` when the PDG cannot
+/// load — the caller falls back to the live whole-word scan and annotates
+/// the response with `pdg_status`/`warning`. Extracted from `execute` to
+/// keep both paths' complexity readable.
+fn pdg_reference_files(
+    index: &mut crate::cli::leindex::LeIndex,
+    old_name: &str,
+    new_name: &str,
+    scope: Option<&str>,
+) -> Result<Option<Vec<String>>, JsonRpcError> {
+    if let Err(error) = index.ensure_pdg_loaded_graph_only() {
+        tracing::warn!(
+            project = %index.project_path().display(),
+            "PDG unavailable for rename; falling back to a live whole-word scan: {error}"
+        );
+        return Ok(None);
+    }
+    let Some(pdg) = index.pdg() else {
+        return Ok(None);
+    };
+    reference_files(pdg, old_name, new_name, scope, index.project_path()).map(Some)
+}
+
 fn reference_files(
     pdg: &crate::graph::pdg::ProgramDependenceGraph,
     old_name: &str,
     new_name: &str,
     scope: Option<&str>,
+    project_root: &std::path::Path,
 ) -> Result<Vec<String>, JsonRpcError> {
     let node_id = pdg
         .find_by_symbol(old_name)
@@ -36,7 +232,7 @@ fn reference_files(
             JsonRpcError::invalid_params(format!(
                 "Symbol '{}' not found in project index. The index uses short symbol names \
                 (e.g., 'health_check', not 'ClassName.health_check'). \
-                Try LeIndex [Grep Symbols] to find the exact name.",
+                Try leindex_explore mode=find target=symbols to find the exact name.",
                 old_name
             ))
         })?;
@@ -48,7 +244,7 @@ fn reference_files(
         return Err(JsonRpcError::invalid_params(format!(
             "Rename conflict: symbol '{}' already exists in the project index. \
             Renaming '{}' to '{}' would create a duplicate. \
-            Use LeIndex [Grep Symbols] to inspect '{}'.",
+            Use leindex_explore mode=find target=symbols to inspect '{}'.",
             new_name, old_name, new_name, new_name
         )));
     }
@@ -73,10 +269,68 @@ fn reference_files(
             files.insert(node.file_path.to_string());
         }
     }
-    Ok(files
+    // Scope filter: PDG file paths are absolute while the scope argument may
+    // be project-relative. Resolve relative scopes against the project root,
+    // normalize the join lexically (`.`, `..`), and compare component-wise
+    // (`Path::starts_with`): `Path::join` keeps `.` components, so scope "."
+    // would resolve to `<root>/.`, never prefix-match, and the PDG path
+    // would report a successful zero-file rename. Normalization matches the
+    // live fallback; canonicalize is deliberately NOT used (it also resolves
+    // symlinks, which can diverge from how the inventory spells the files).
+    let resolved_scope = scope.map(|s| {
+        let path = std::path::Path::new(s);
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            project_root.join(path)
+        };
+        normalize_lexical(&joined)
+    });
+    let pre_filter_count = files.len();
+    let filtered: Vec<String> = files
         .into_iter()
-        .filter(|file| scope.is_none_or(|scope| file.starts_with(scope)))
-        .collect())
+        .filter(|file| {
+            resolved_scope
+                .as_ref()
+                .is_none_or(|scope| std::path::Path::new(file).starts_with(scope))
+        })
+        .collect();
+    require_non_empty_reference_set(filtered, pre_filter_count, resolved_scope, old_name)
+}
+
+/// An empty reference set must be an ERROR, not a reported success that wrote
+/// nothing (`{"files_affected": 0, "applied": true}`). With the PDG resident
+/// this is reachable by a scope that prefix-matches no indexed file path — a
+/// typo'd scope, or an absolute scope spelled through a symlink (the project
+/// root is canonicalized, the user's spelling is not reconciled) — matching
+/// the live fallback, which errors on the same condition instead of
+/// returning an empty plan.
+fn require_non_empty_reference_set(
+    filtered: Vec<String>,
+    pre_filter_count: usize,
+    resolved_scope: Option<std::path::PathBuf>,
+    old_name: &str,
+) -> Result<Vec<String>, JsonRpcError> {
+    if !filtered.is_empty() {
+        return Ok(filtered);
+    }
+    if let Some(scope) = resolved_scope {
+        if pre_filter_count > 0 {
+            return Err(JsonRpcError::invalid_params(format!(
+                "Scope '{}' matches none of the {} indexed file(s) that reference '{}'. \
+                 Index paths are absolute and follow the canonical project root — spell \
+                 the scope the way the inventory does (e.g. 'src', not a symlinked path).",
+                scope.display(),
+                pre_filter_count,
+                old_name
+            )));
+        }
+    }
+    Err(JsonRpcError::invalid_params(format!(
+        "Symbol '{}' resolves to no indexed files to rename. \
+         Try leindex_explore mode=find target=symbols to inspect '{}'.",
+        old_name, old_name
+    )))
 }
 
 fn build_rename_plan(
@@ -189,7 +443,7 @@ pub struct RenameSymbolHandler;
 #[allow(missing_docs)]
 impl RenameSymbolHandler {
     pub fn name(&self) -> &str {
-        "leindex.rename-symbol"
+        "leindex_rename_symbol"
     }
 
     pub fn title(&self) -> &str {
@@ -240,19 +494,24 @@ Grep + multi-file Edit with a single atomic operation."
     ) -> Result<Value, JsonRpcError> {
         let (old_name, new_name, scope, preview_only, project_path) = rename_args(&args)?;
         let handle = registry.get_or_create(project_path.as_deref()).await?;
-        let mut index = handle.write().await;
-        index
-            .ensure_pdg_loaded()
-            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
-        let pdg = index.pdg().ok_or_else(|| {
-            JsonRpcError::project_not_indexed(index.project_path().display().to_string())
-        })?;
-
-        let filtered_files = reference_files(pdg, &old_name, &new_name, scope.as_deref())?;
-
+        let (filtered_files, pdg_available) = {
+            let mut index = handle.write().await;
+            match pdg_reference_files(&mut index, &old_name, &new_name, scope.as_deref())? {
+                Some(files) => (files, true),
+                None => (
+                    live_reference_files(
+                        index.project_path(),
+                        &old_name,
+                        &new_name,
+                        scope.as_deref(),
+                    )
+                    .await?,
+                    false,
+                ),
+            }
+        };
         // Release the mutex before spawning blocking I/O.
-        // All PDG data has been extracted into filtered_files above.
-        drop(index);
+        // All reference data has been extracted into filtered_files above.
 
         let plan_old_name = old_name.clone();
         let plan_new_name = new_name.clone();
@@ -273,32 +532,10 @@ Grep + multi-file Edit with a single atomic operation."
         };
 
         if !preview_only {
-            tokio::task::spawn_blocking(move || apply_rename_plan(file_contents))
-                .await
-                .map_err(|error| {
-                    JsonRpcError::internal_error(format!("Rename apply task failed: {}", error))
-                })?
-                .map_err(JsonRpcError::internal_error)?;
-
-            // Invalidate the registry's staleness cache so the next
-            // read tool re-runs `is_stale_fast` instead of reusing
-            // a pre-write `false` cached result. The watcher (when
-            // enabled via `LEINDEX_WATCHER=1`) does this on its
-            // own reindex path; this explicit call covers the
-            // watcher-disabled default mode where the 30-second
-            // negative-cache TTL would otherwise silently mask the
-            // rename. Preview-only runs (the default) skip this
-            // — no files were written, so the cache value is
-            // still accurate and re-running `is_stale_fast` on
-            // the next read would be wasted work.
-            let project_root = {
-                let guard = handle.read().await;
-                guard.project_path().to_path_buf()
-            };
-            registry.invalidate_stale_cache(&project_root).await;
+            apply_rename_and_invalidate(registry, &handle, file_contents).await?;
         }
 
-        let response_data = rename_response(
+        let mut response_data = rename_response(
             old_name,
             new_name,
             preview_only,
@@ -306,6 +543,19 @@ Grep + multi-file Edit with a single atomic operation."
             diffs,
             validation_json,
         );
+        if !pdg_available {
+            if let Some(obj) = response_data.as_object_mut() {
+                obj.insert("pdg_status".to_string(), serde_json::json!("not_loaded"));
+                obj.insert(
+                    "warning".to_string(),
+                    serde_json::json!(
+                        "Index unavailable — reference sites were found by a live whole-word scan \
+                        instead of the PDG call graph. Reindex (LeIndex [Index] with \
+                        force_reindex=true) to restore exact reference discovery."
+                    ),
+                );
+            }
+        }
 
         // Re-acquire the lock for wrap_with_meta (released before spawn_blocking)
         let index = handle.read().await;
@@ -330,6 +580,140 @@ mod tests {
         std::fs::write(&file_path, content).expect("write test file");
         let registry = test_registry_for(dir.path());
         (dir, file_path.to_string_lossy().to_string(), registry)
+    }
+
+    /// A scope that prefix-matches no indexed file must be an ERROR, not a
+    /// reported success that wrote nothing (round-10 Kilo): with the PDG
+    /// resident, a typo'd scope — or an absolute scope spelled through a
+    /// symlink, which never prefix-matches the canonicalized root — used to
+    /// yield `{"files_affected": 0, "applied": true}`.
+    #[test]
+    fn test_reference_files_scope_matching_nothing_is_an_error() {
+        let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
+        pdg.add_node(crate::graph::pdg::Node {
+            id: "/proj/src/a.rs:helper".to_string(),
+            node_type: crate::graph::pdg::NodeType::Function,
+            name: "helper".to_string(),
+            file_path: std::sync::Arc::from("/proj/src/a.rs"),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "rust".to_string(),
+        });
+        let root = std::path::Path::new("/proj");
+
+        // The symbol's own file is found without a scope.
+        let files = reference_files(&pdg, "helper", "renamed", None, root).unwrap();
+        assert_eq!(files, vec!["/proj/src/a.rs".to_string()]);
+
+        // A scope matching nothing errors instead of returning an empty plan.
+        let error = reference_files(&pdg, "helper", "renamed", Some("/elsewhere"), root)
+            .expect_err("an empty scope match must not report success");
+        assert!(
+            error.message.contains("matches none"),
+            "message names the scope problem: {}",
+            error.message
+        );
+
+        // A matching scope keeps the file.
+        let files = reference_files(&pdg, "helper", "renamed", Some("/proj/src"), root).unwrap();
+        assert_eq!(files, vec!["/proj/src/a.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_content_contains_whole_word_boundaries() {
+        assert!(content_contains_whole_word("fn foo() {}", "foo"));
+        assert!(content_contains_whole_word("foo.bar()", "foo"));
+        assert!(content_contains_whole_word("foo_bar()", "foo_bar"));
+        // Prefix/suffix collisions must not match.
+        assert!(!content_contains_whole_word("fn foobar() {}", "foo"));
+        assert!(!content_contains_whole_word("fn sfoo() {}", "foo"));
+        // Word chars include underscore: `foo_bar` is one word, so neither
+        // half matches on its own.
+        assert!(!content_contains_whole_word("fn foo_bar() {}", "foo"));
+        assert!(!content_contains_whole_word("fn foo_bar() {}", "bar"));
+        assert!(content_contains_whole_word("fn foo_bar() { bar() }", "bar"));
+        assert!(!content_contains_whole_word("", "foo"));
+        assert!(!content_contains_whole_word("anything", ""));
+    }
+
+    #[tokio::test]
+    async fn test_live_reference_files_finds_files_and_detects_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn old_name() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn other() {}\n").unwrap();
+
+        let files = live_reference_files(dir.path(), "old_name", "new_name", None)
+            .await
+            .expect("live scan must find the referencing file");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("a.rs"));
+
+        // A file already using the new name is a conflict.
+        std::fs::write(dir.path().join("c.rs"), "fn new_name() {}\n").unwrap();
+        let err = live_reference_files(dir.path(), "old_name", "new_name", None)
+            .await
+            .expect_err("conflict with existing new_name must be rejected");
+        assert!(
+            err.message.contains("Rename conflict"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_live_reference_files_resolves_relative_scope_against_root() {
+        // The inventory yields absolute paths, so a caller-supplied
+        // project-relative scope ("src/") must be resolved against the
+        // project root — the old comparison never matched and the live
+        // fallback reported every symbol as absent.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn old_name() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn old_name() {}\n").unwrap();
+
+        let files = live_reference_files(dir.path(), "old_name", "new_name", Some("src"))
+            .await
+            .expect("relative scope must resolve against the project root");
+        assert_eq!(files.len(), 1, "only the in-scope file matches");
+        assert!(files[0].ends_with("src/a.rs"), "got: {:?}", files);
+    }
+
+    #[tokio::test]
+    async fn test_live_reference_files_normalizes_dot_scopes_and_neighbor_prefixes() {
+        // `Path::join` keeps `.` components ("." -> <root>/., "./src" ->
+        // <root>/./src) and `Path::starts_with` compares components, so an
+        // unnormalized scope filtered out EVERY file — a symbol that exists
+        // was reported absent, with no rename conflict detected either
+        // (round-8 Kilo). The natural scopes must work.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn old_name() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn old_name() {}\n").unwrap();
+
+        let files = live_reference_files(dir.path(), "old_name", "new_name", Some("."))
+            .await
+            .expect("scope '.' means the whole project");
+        assert_eq!(files.len(), 2, "both files are in scope, got: {:?}", files);
+
+        let files = live_reference_files(dir.path(), "old_name", "new_name", Some("./src"))
+            .await
+            .expect("scope './src' must normalize to <root>/src");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("src/a.rs"));
+
+        // Component-wise containment: a sibling directory sharing the
+        // scope's name as a byte prefix is NOT in scope.
+        std::fs::create_dir(dir.path().join("src_backup")).unwrap();
+        std::fs::write(dir.path().join("src_backup/x.rs"), "fn old_name() {}\n").unwrap();
+        let files = live_reference_files(dir.path(), "old_name", "new_name", Some("src"))
+            .await
+            .expect("scope 'src'");
+        assert_eq!(
+            files.len(),
+            1,
+            "src_backup must not match scope 'src', got: {:?}",
+            files
+        );
     }
 
     #[tokio::test]
@@ -456,10 +840,10 @@ mod tests {
     /// the default path no files are written — yet the call still
     /// acquired a read lock and forced the next read to recompute
     /// `is_stale_fast`. The fix moves the invalidation inside the
-    /// `if !preview_only` block. This test verifies the
+    /// `if !preview_only` block (now via the `apply_rename_and_invalidate`
+    /// helper — round-10 lizard-gate extraction). This test verifies the
     /// structural contract by reading the source file (the
-    /// invalidation call is reachable only from inside the
-    /// `if !preview_only { … }` block).
+    /// invalidation call is reachable only through the gated helper).
     #[tokio::test]
     async fn test_rename_preview_only_invalidation_is_gated() {
         // Read the source and confirm the `invalidate_stale_cache`
@@ -473,22 +857,34 @@ mod tests {
         // `test_invalidate_stale_cache_removes_entry` test in
         // `src/cli/registry.rs`.
         let source = include_str!("rename_symbol_handler.rs");
-        let apply_block_start = source
-            .find("if !preview_only {")
-            .expect("if !preview_only block must exist in the handler");
-        let apply_block_open_brace = source[apply_block_start..]
-            .find('{')
-            .map(|i| apply_block_start + i)
-            .expect("if !preview_only block must have an opening brace");
+        // The invalidation lives inside the apply helper...
+        let helper_start = source
+            .find("async fn apply_rename_and_invalidate(")
+            .expect("apply helper must exist in the handler");
         let invalidation_pos = source
             .find("registry.invalidate_stale_cache(&project_root).await")
             .expect("invalidate_stale_cache call must exist in the handler");
         assert!(
-            invalidation_pos > apply_block_open_brace,
-            "invalidate_stale_cache must be inside the if !preview_only block; \
-             apply block opens at byte {} but invalidation is at byte {}",
-            apply_block_open_brace,
+            invalidation_pos > helper_start,
+            "invalidate_stale_cache must live inside the apply helper; \
+             helper starts at byte {} but invalidation is at byte {}",
+            helper_start,
             invalidation_pos
+        );
+        // ...and the helper itself is invoked only from inside the
+        // `if !preview_only` gate, so a preview run can never reach it.
+        let gate_pos = source
+            .find("if !preview_only {")
+            .expect("if !preview_only block must exist in the handler");
+        let call_pos = source
+            .find("apply_rename_and_invalidate(registry")
+            .expect("the apply helper must be called from execute");
+        assert!(
+            call_pos > gate_pos,
+            "the apply helper (and with it the invalidation) must be \
+             gated on !preview_only; gate opens at byte {} but the call is at byte {}",
+            gate_pos,
+            call_pos
         );
     }
 
@@ -534,5 +930,38 @@ mod tests {
         assert!(props.get("preview_only").is_some());
         assert!(props.get("scope").is_some());
         assert!(props.get("project_path").is_some());
+    }
+
+    /// The PDG-backed scope filter normalizes the joined scope too (round-9
+    /// Kilo): `scope: "."` used to resolve to `<root>/.`, filter out every
+    /// file, and report a successful zero-file rename. reference_files is the
+    /// COMMON path (taken whenever the PDG is available).
+    #[test]
+    fn test_reference_files_normalizes_dot_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn old_name() {}\n").unwrap();
+        let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
+        pdg.add_node(crate::graph::pdg::Node {
+            id: "a.rs:old_name".into(),
+            node_type: crate::graph::pdg::NodeType::Function,
+            name: "old_name".into(),
+            file_path: dir
+                .path()
+                .join("a.rs")
+                .to_string_lossy()
+                .into_owned()
+                .into(),
+            byte_range: (0, 18),
+            complexity: 0,
+            language: "rust".into(),
+        });
+
+        let dot = reference_files(&pdg, "old_name", "brand_new", Some("."), dir.path())
+            .expect("scope '.' must keep every file in scope");
+        assert_eq!(dot.len(), 1, "got: {dot:?}");
+
+        let dot_src = reference_files(&pdg, "old_name", "brand_new", Some("./."), dir.path())
+            .expect("scope './.' must normalize to the root");
+        assert_eq!(dot_src.len(), 1, "got: {dot_src:?}");
     }
 }

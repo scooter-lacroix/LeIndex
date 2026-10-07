@@ -2,7 +2,7 @@
 
 <img src="leindex.jpeg" alt="LeIndex" width="500"/>
 
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT%20%7C%20Apache--2.0-blue?style=flat-square)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-Server-purple?style=flat-square)](https://modelcontextprotocol.io)
 [![Release](https://raw.githubusercontent.com/scooter-lacroix/LeIndex/badges/version-badge.svg)](https://github.com/scooter-lacroix/LeIndex/actions/workflows/release.yml)
@@ -11,816 +11,258 @@
 
 # LeIndex
 
-**Understand large codebases instantly.**
+**Semantic code intelligence for humans and AI agents — a Program Dependence Graph, hybrid neural search, and 18 structural tools behind one small daemon.**
 
-LeIndex is a semantic code search engine that lets you search code by **meaning**, not just keywords.
+Ask LeIndex where authentication lives, what breaks if you rename a function,
+or how the indexer resumes across phases — and get the symbols, callers, and
+source back in milliseconds, not a dump of files to read.
 
-Instead of hunting through files with grep or hoping variable names match your query, you can ask things like:
+```text
+you:     "where is request validation enforced?"
 
-- *"Where is authentication enforced?"*
-- *"Where are API tokens validated?"*
-- *"How does session management work?"*
-
-LeIndex surfaces the actual implementation — even if the words you're searching for never appear in the code.
-
-Built in Rust. Built for developers and AI coding tools.
-
----
-
-## Demo: finding logic that grep and LLMs miss
-
-Imagine a codebase where authentication is implemented like this:
-
-```rust
-fn validate_session(req: Request) -> Result<User> { ... }
-fn verify_token(token: &str) -> bool { ... }
-fn authorize_user(user: &User, action: Action) -> bool { ... }
-```
-
-None of these functions contain the word **"authentication"**.
-
-### grep
-
-```bash
-grep -r "authentication" src/
-# (no matches)
-```
-
-### LeIndex
-
-```bash
-leindex search "where is authentication enforced"
-```
-
-```
-src/security/session_validator.rs    validate_session    (0.92)
-src/auth/token_verifier.rs           verify_token        (0.87)
-src/middleware/auth_gate.rs           authorize_user      (0.84)
-```
-
-LeIndex finds the correct logic because it searches by **semantic intent**, not string matches.
-
-It works across multiple repositories too:
-
-```bash
-leindex search "where are API rate limits enforced"
-```
-
-```
-gateway/middleware/rate_limit.rs      throttle_request     (0.91)
-api/server/request_throttle.go        limit_handler        (0.88)
-auth/session_policy.rs                enforce_policy       (0.83)
+LeIndex: src/http/request_validator.rs    validate_session   (0.92)
+         src/middleware/input_guard.rs    authorize_user     (0.84)
+         callers: 3 · callees: 7 · blast radius: 12 files
 ```
 
 ---
 
-## 90%+ Token Savings for AI Coding Tools
+## v2.0.0 — the resource revolution, completed
 
-When an LLM reads your code with standard tools, it burns tokens on entire files just to understand one function. LeIndex returns **only what matters** — structured, context-aware results instead of raw file dumps.
+v2.0.0 rebuilt LeIndex around one idea: **a code index should never be the
+biggest process on your machine.** The architecture work (one user-scoped
+daemon + tiny stdio shims, content-addressed generation storage, a streaming
+bounded indexing pipeline, an admit/defer/reduce memory controller) is
+benchmarked in [`BENCHMARKS.md`](BENCHMARKS.md) — including MRR@10 = 1.0000
+against the v1.9.5 baseline, so none of it cost retrieval quality. The
+final rounds of hardening, all measured on this repository's own source
+(457 files / 20,500 nodes / 122,000 edges):
 
-| Task | Standard Tools | LeIndex | Savings |
+| | before | after |
+|---|---:|---:|
+| Re-index tail after "saving to storage..." | 85.7 s | **5.0 s (17x)** |
+| Neural embeddings recomputed per re-index | 10,242 rows | **only changed content** |
+| Concurrent embed daemons after a config change | stacked (OOM'd a 64 GiB box) | **1, RSS-capped, idle-evicted** |
+| Silent degradation in tool responses | empty relations as fact | **explicit notes + direction labels** |
+| One-shot CLI vs MCP feature parity | enrichment silently skipped | **same enrichment, honest budgets** |
+
+How: a **client-side content-addressed embedding cache** (probe hits locally,
+embed only misses — an all-hit run never loads the model), edge-level **PDG
+diffing** on save (unchanged graphs write nothing), a **single-daemon policy**
+with zombie-aware cleanup and a sibling-aware memory floor, and honest
+reporting end to end (impact direction labels, `impact_note` when a zero
+could mean degradation, `signature_scope` on incremental counts).
+
+### The intelligence stack behind it
+
+- **37 active language grammars** today — Rust, TypeScript/JavaScript, Go,
+  Python, Java, C/C++, C#, Ruby, PHP, Swift, Kotlin, Scala, Elixir, Erlang,
+  Haskell, Zig, R, and more — on a roadmap to **100+**; each grammar is an
+  individually gated crate that cannot regress the build
+  ([`docs/LANGUAGES.md`](docs/LANGUAGES.md)).
+- **Documentation is first-class**: markdown/rst/adoc/txt files index as
+  heading-section nodes, so "how do generations work" retrieves the exact
+  ARCHITECTURE section — not the whole handbook.
+- **Leiden community detection** (feature-flagged, default on) clusters the
+  call/data/containment graph; `project-map` can group by community and
+  `impact-analysis` reports community crossings.
+- **SCIP precision tier** (on by default; `LEINDEX_FEATURE_PRECISION_INGEST=false` disables):
+  when a language indexer such as `rust-analyzer scip` is present, LeIndex
+  merges its exact definitions and relationships into the PDG — upgrading
+  heuristic edges to confidence 1.0 and marking precision-confirmed symbols.
+  Missing indexers degrade silently to the tree-sitter tier.
+- **Engram query phrase-book** (opt-in: `LEINDEX_FEATURE_ENGRAM=1`): a persistent,
+  content-addressed table of neural query embeddings under `~/.leindex/engram/`.
+  A repeated query is served without waking the embedder (no worker spawn, no
+  network round trip); keys include the embedder identity, so a changed model
+  never serves stale vectors. Bounded (20,000 rows / 256 MiB, LRU) and reported in
+  `leindex_analyze mode=diagnostics`. Query embeddings only; index-time neural
+  reuse is the existing global embed cache.
+
+The retrieval quality claims are gated by a deterministic benchmark —
+internal fixtures plus a vendored subset of the CoSQA (ACL 2021)
+human-annotated query/code benchmark — see
+[`docs/baselines/AGENT_TASKS_METHODOLOGY.md`](docs/baselines/AGENT_TASKS_METHODOLOGY.md).
+
+---
+
+## What agents see: 4 MCP tools
+
+Four routers instead of twenty schemas — a `mode` / `action` argument picks the
+operation, every other argument passes straight through:
+
+| Tool | Selector | Branches |
+|---|---|---|
+| `leindex_explore` | `mode` | `search` (hybrid semantic, default) · `find` (exact text / regex / symbol names — indexed, always live, **any path on disk**) · `symbol_lookup` · `read_file` · `read_symbol` · `project_map` · `file_summary` · `context` |
+| `leindex_analyze` | `mode` | `deep` (semantic + PDG traversal, default) · `impact` (transitive blast radius) · `diagnostics` · `git_status` · `git_diff` (PDG-enriched) |
+| `leindex_edit` | `action` (required) | `preview` → `apply` (dry-run supported) · `rename` (atomic multi-file, preview-first) · `write` |
+| `leindex_manage` | `action` | `index` (pollable job, default) · `phase` (5-phase architectural review) |
+
+`find` is a native trigram index (the technique behind Zoekt) built with each
+index run: about a millisecond on a 700-file repository, results always read from
+the live file, and any directory outside the index is scanned on the fly with no
+setup. Every branch takes `tier` (`l0` card · `l1` overview · `l2` full detail),
+and argument detail lives in the `leindex://tools/guide` MCP resource. The
+original per-tool names (`leindex_search`, `leindex_edit_apply`, …) still work
+as direct calls.
+
+Every tool is also on the CLI — the same handlers, the same output:
+
+```bash
+leindex tools list --verbose
+leindex tools inspect leindex_explore
+leindex tools run leindex_explore --set mode=find --set pattern=retry
+leindex tools run leindex_explore --args '{"mode":"search","query":"retry policy","top_k":5}'
+```
+
+---
+
+## 90%+ token savings for AI coding tools
+
+Standard tools burn context reading whole files to find one function. LeIndex
+returns the structured answer:
+
+| Task | Standard tools | LeIndex | Savings |
 |------|---------------:|--------:|--------:|
 | Understand a 500-line file | ~2,000 tokens | ~380 tokens | **81%** |
 | Find all callers of a function | ~5,800 tokens | ~420 tokens | **93%** |
 | Navigate project structure | ~8,500 tokens | ~650 tokens | **92%** |
 | Cross-file symbol rename | ~12,000 tokens | ~340 tokens | **97%** |
 
-Every tool call is **context-aware** — not atomic. When you look up a symbol, you don't just get its definition. You get its callers, callees, data dependencies, and impact radius. When you summarize a file, you get cross-file relationships that `Read` can never provide at any token cost. One LeIndex call replaces chains of `Grep → Read → Read → Read`.
+Each call is **context-aware, not atomic**: symbol lookups return callers,
+callees, data dependencies, and impact radius; file summaries return
+cross-file relationships; renames return a previewed multi-file diff. One
+LeIndex call replaces chains of `Grep → Read → Read → Read`.
 
-> See [full benchmarks](docs/TOOL_SUPREMACY_BENCHMARKS.md) for methodology and detailed comparisons.
+> Methodology: [`docs/TOOL_SUPREMACY_BENCHMARKS.md`](docs/TOOL_SUPREMACY_BENCHMARKS.md).
 
 ---
 
-## Quick Start (2 minutes)
+## Quick start
 
-### Install
-
-LeIndex ships three first-class install paths. Pick one, then run `leindex setup`
-to provision the default hybrid neural path. TF-IDF retrieval and PDG
-relationships are always built first and remain queryable if a provider is
-unavailable.
-
-**Option 1: cargo (recommended for Rust users)**
+**Install** (pick one — then run `leindex setup` to provision the neural path):
 
 ```bash
+# cargo (Rust users)
 cargo install leindex
-cargo install leindex --features onnx --force (to ensure appropriate onnx runtime is installed)
+cargo install leindex --features onnx --force   # ensure the ONNX runtime is linked
 leindex setup
-```
 
-`cargo install` places both `leindex` and `leindex-embed` in `~/.cargo/bin/`.
-The `setup` wizard selects CPU, NVIDIA CUDA, or AMD ROCm/MIGraphX, installs
-the matching ONNX Runtime package, and downloads
-[Qwen3 Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) from
-Hugging Face via Hugging Face CLI into `~/.leindex/models/`. If `hf` is not
-installed, setup installs `huggingface_hub` through Python/pip first.
-
-**Option 2: npm (recommended for AI tools like Cursor, Claude Code, VS Code)**
-
-```bash
+# npm (Cursor / Claude Code / VS Code users)
 npm install -g @leindex/mcp
 npm run setup --prefix "$(npm root -g)/@leindex/mcp"
-```
 
-The npm package downloads a platform-specific bundle containing the main
-binary, the ONNX worker (`leindex-embed`), and bundled ORT libraries.
-`npm run setup` invokes the bundled `leindex setup` wizard to select the
-provider and provision model files outside the npm package.
+# PyPI (Python users; bootstraps the Rust binary via cargo)
+pip install leindex && leindex setup
 
-**Option 3: PyPI (recommended for Python users)**
-
-```bash
-pip install leindex
-leindex setup
-```
-
-The PyPI package installs a small Python launcher that bootstraps the real Rust
-`leindex` binary into `~/.cargo/bin` via `cargo install` on first run, then runs
-`leindex setup` to configure neural search. If Cargo is missing, the launcher
-explains the requirement and points to https://rustup.rs.
-
-**Alternative: install script (GitHub Release bundle with zero-build install)**
-
-```bash
+# prebuilt release bundle
 curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/LeIndex/master/install.sh -o install-leindex.sh
-bash install-leindex.sh
-leindex setup
+bash install-leindex.sh && leindex setup
 ```
 
-The install script downloads a pre-built release bundle (binaries plus bundled
-ORT `lib/`), copies it into `~/.leindex/` and `~/.cargo/bin/`, then runs
-`leindex setup --check` to report status. Models are never shipped in release
-artifacts; the explicit `leindex setup` command downloads the correct model.
+The setup wizard picks CPU, NVIDIA CUDA, or AMD ROCm/MIGraphX, installs the
+matching ONNX Runtime, and downloads the model into `~/.leindex/models/`.
+TF-IDF and the PDG are always built first and stay queryable even if the
+neural provider is unavailable — neural scoring attaches when the worker is
+ready and falls back cleanly when it is not. Default model: CodeRankEmbed
+137M INT8 (~135 MiB); `leindex setup --model qwen3` selects the heavier
+Qwen3 baseline (see [`BENCHMARKS.md`](BENCHMARKS.md) §8 for the bake-off).
 
-> **Core plus neural**: TF-IDF and PDG structural retrieval are mandatory
-> LeIndex result layers. With ONNX enabled, the default `auto` provider starts
-> and awaits the neural worker during indexing and semantic retrieval, so
-> results use all three signals. A terminal provider failure preserves the
-> complete TF-IDF/PDG result. See
-> [docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md) for CPU/GPU/AMD/NVIDIA paths and
-> troubleshooting.
-
-**Environment Variables:**
-
-| Name | Required | Description | Default |
-|------|----------|-------------|---------|
-| `LEINDEX_HOME` | No | Override storage/index home directory | `~/.leindex` |
-| `LEINDEX_PORT` | No | Override HTTP server port | `47500` |
-| `ORT_DYLIB_PATH` | No | Override ONNX Runtime library path | (discovered) |
-
-### Index and search
+**Index and search:**
 
 ```bash
-# Index your project
-leindex index /path/to/project
-
-# Search by meaning
+leindex index /path/to/project     # ~seconds; re-indexes are delta-priced
 leindex search "authentication flow"
-
-# Deep structural analysis
 leindex analyze "how authorization is enforced"
 ```
 
-That's it. You're searching by meaning.
+**Connect your agent** (MCP stdio):
+
+```json
+{
+  "mcpServers": {
+    "leindex": {
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"]
+    }
+  }
+}
+```
+
+Replace `npx -y @leindex/mcp` with `leindex mcp` if you installed the binary
+directly. Zed, Cursor, VS Code, and Claude Code configuration snippets are in
+[`docs/MCP.md`](docs/MCP.md). Long-running servers self-exit after
+`[mcp] idle_timeout_secs` (default 1800) and evict idle engines after
+`engine_max_idle_secs` (default 600).
+
+**Environment variables:** `LEINDEX_HOME` (storage root, default
+`~/.leindex`), `LEINDEX_PORT` (HTTP server, default 47500), `ORT_DYLIB_PATH`
+(ONNX Runtime override). Memory rails — `LEINDEX_WORKER_MAX_RSS_MB` (default
+10240), `LEINDEX_WORKER_MIN_AVAILABLE_MB` (default 2048),
+`LEINDEX_REGISTRY_MAX_HEAP_MB` (default 1536), the Engram bounds
+`LEINDEX_ENGRAM_MAX_ENTRIES` (20000) and `LEINDEX_ENGRAM_MAX_MB` (256) — plus the escape hatches
+`LEINDEX_CLI_SHUTDOWN_DAEMON`, `LEINDEX_ALLOW_MULTIPLE_EMBED_DAEMONS`, and
+the `LEINDEX_FEATURE_*` rollout kills documented in
+[`docs/NEURAL_SETUP.md`](docs/NEURAL_SETUP.md).
 
 ---
 
-## What LeIndex Is Useful For
+## How it works
+
+Tree-sitter parses every source file into symbols that feed two layers over
+the same nodes: a TF-IDF lexical corpus and a Program Dependence Graph
+(call edges, data flow, containment). The configured neural worker embeds
+the same nodes for semantic scoring, joined after readiness — terminal
+failure preserves the complete TF-IDF/PDG result.
+
+```
+Codebase → Tree-sitter → PDG + TF-IDF (core, always) → neural join → hybrid ranking
+```
+
+- **Indexing is resumable and delta-priced.** Phase checkpoints
+  (scan → parse → pdg → lexical → neural) resume after interruption;
+  re-indexes only re-embed changed content; unchanged PDG edges write
+  nothing (`save_pdg` diffs at the edge level).
+- **Generations are immutable and content-addressed.** Publication uses a
+  staging→promote pattern with blake3-hashed layers; no-op reindexes are
+  byte-identical, and `leindex retention --gc` keeps the store bounded.
+- **Memory is bounded by construction.** Streaming pipeline, admission
+  control (admit/defer/reduce — never error), a single RSS-capped embed
+  daemon with idle eviction, and byte-budgeted registry eviction.
+
+---
+
+## Use cases
 
 - **Understanding unfamiliar codebases** — ask questions instead of reading every file
-- **Onboarding new engineers** — find relevant code without tribal knowledge
-- **Exploring legacy systems** — surface logic buried in decades of code
-- **AI coding assistants** — give LLMs real structural context via MCP
-- **Cross-project search** — query across multiple repositories simultaneously
+- **Onboarding** — find relevant code without tribal knowledge
+- **Legacy exploration** — surface logic buried in decades of code
+- **AI coding assistants** — give LLMs real structural context over MCP
+- **Refactoring with confidence** — impact analysis and previews before touching disk
+- **Cross-project search** — query multiple repositories at once
 
 ---
 
-## Built for AI-Assisted Development
+## Under the hood
 
-Modern AI coding tools struggle with large codebases because they lack global structural context.
-
-LeIndex provides that missing layer.
-
-It builds one shared TF-IDF + PDG + neural index of your repository when ONNX
-is enabled; the neural vectors are attached to those same nodes:
-
-- where logic lives
-- how components interact
-- what code paths enforce behavior
-
-LeIndex runs as an **MCP server**, allowing tools like **Claude Code**, **Cursor**, and other MCP-compatible agents to explore your codebase with semantic understanding.
-
-```bash
-# Start MCP stdio mode (for Claude Code / Cursor)
-leindex mcp
-
-# Or run the HTTP MCP server
-leindex serve --host 127.0.0.1 --port 47500
-```
-
-```text
-Claude: "Where is request validation implemented?"
-
-LeIndex MCP → src/http/request_validator.rs
-              src/middleware/input_guard.rs
-```
-
----
-
-## How It Works
-
-LeIndex builds one node-level index of your codebase: tree-sitter symbols feed
-the core TF-IDF lexical corpus and Program Dependence Graph (PDG); the
-configured neural worker is actively evaluated for the same nodes and joined
-to semantic scoring after it reaches `Ready` (terminal failure preserves the
-TF-IDF/PDG core).
-
-This allows queries to match:
-
-- **code intent** — what the code does, not what it's named
-- **related logic paths** — follow data flow and control flow
-- **implementation patterns** — structural similarity across files
-
-Indexes can span multiple repositories, enabling cross-project search.
-
-```
-Codebase → Tree-sitter Parser → PDG Builder → Semantic Index → Query Engine → Results
-```
-
----
-
-## Features
-
-- **Core hybrid retrieval** — TF-IDF lexical matching plus PDG structure on every applicable result
-- **Hybrid neural scoring** — local ONNX similarity over the same symbols, with TF-IDF/PDG fallback
-- **Fragment embeddings (opt-in)** — sub-symbol semantic chunks (tree-sitter) + module-level orphan coverage, content-hash-addressed for idempotent incremental indexing; all-local, no remote service
-- **5-phase analysis** — additive multi-pass codebase analysis pipeline
-- **Cross-project indexing** — search across multiple repos at once
-- **20 MCP tools** — read, analyze, edit preview/apply, rename, impact analysis
-- **HTTP + WebSocket server** — available through the unified `leindex` server modules and commands
+- **18 MCP tools** — search, navigation, analysis, and safe editing (preview/dry-run/preview-only defaults on every destructive path)
+- **Honest degradation everywhere** — direction labels on impact figures, notes when enrichment was skipped, `signature_scope` on incremental counts, freshness footers separated from machine-readable JSON
+- **5-phase analysis** — structural scan, dependency map, logic flow, critical path, synthesis; freshness-aware and incremental
 - **Dashboard** — Bun + React operational UI with project metrics and graph telemetry
-- **Low resource mode** — works on constrained hardware
-- **Built in Rust** — fast indexing, low memory, safe concurrency
-- **Flexible embedding backends** — choose between TF-IDF, local ONNX models (`qwen3-embed-0.6b`), or remote cloud providers (OpenAI, Cohere)
+- **HTTP + WebSocket server** — `leindex serve`
+- **Flexible embedding backends** — TF-IDF, local ONNX models, or remote providers (OpenAI, Cohere)
+- **Built in Rust** — fast, low-memory, safe concurrency
 
 ---
 
-## Other Install Options
-
-### crates.io
-
-```bash
-cargo install leindex
-leindex setup          # enable neural search
-```
-
-### PyPI
-
-```bash
-pip install leindex
-leindex setup          # enable neural search
-```
-
-This package is a bootstrap wrapper for the Rust release. It keeps using the unified
-`leindex` command, installs the binary into `~/.cargo/bin`, and then forwards all CLI
-arguments to the real Rust executable. Run `leindex setup` after install to configure
-neural embeddings (see [docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md)).
-
-### From source
-
-```bash
-git clone https://github.com/scooter-lacroix/LeIndex.git
-cd LeIndex
-cargo build --release --features onnx
-./target/release/leindex setup          # enable neural search
-```
-
-This produces both `target/release/leindex` (main binary) and `target/release/leindex-embed` (ONNX worker). The worker must be discoverable alongside the main binary or in `PATH` for local ONNX inference. The `--features onnx` flag enables the `load-dynamic` ONNX Runtime strategy: no ORT is linked at build time, and the worker discovers the runtime `.so`/`.dylib`/`.dll` at runtime via the discovery chain (see [docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md)).
-
-**Feature flags:** Use `--features` to customize the build:
-- `full` (default) — Full library plus the `leindex` CLI binary
-- `minimal` — Library-focused parse/search build slice; does not produce the `leindex` binary by itself
-- `cli` — Required feature for the `leindex` binary target
-- `server` — Enables the HTTP/WebSocket server library modules; combine with `cli` for a runnable binary
-
-### MCP Server Integration
-
-For AI coding tools, the recommended integration path is the npm MCP wrapper so the client
-resolves the published MCP entrypoint directly:
-
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "command": "npx",
-      "args": ["-y", "@leindex/mcp"]
-    }
-  }
-}
-```
-
-If you intentionally installed the full Rust binary via `cargo install leindex`,
-`install.sh`, or the PyPI bootstrapper, you can replace `npx -y @leindex/mcp`
-with `leindex mcp`.
-
-**Server lifecycle:** long-running MCP servers self-exit after `[mcp] idle_timeout_secs` (default `1800`; `0`=off) and evict idle loaded engines after `[mcp] engine_max_idle_secs` (default `600`) to avoid swap accumulation; override per-invocation with `--mcp-idle-timeout-secs`. See [docs/MCP.md](docs/MCP.md).
-
-Every MCP tool is also available from the CLI bridge:
-
-```bash
-leindex tools list
-leindex tools help leindex-project-map
-leindex tools run leindex-project-map --args '{"path":"src","depth":2}'
-```
-
-`leindex.index` is an owned start/poll job. Its default response is a
-`job_id` plus phase/status snapshot (`wait=false`); poll with the same
-`job_id` or pass `wait=true` for an explicit blocking CLI-style call. MCP
-requests do not cancel indexing, persistence, or publication at a wall-clock
-deadline. Every applicable retrieval response reports core `tfidf_status` and
-`pdg_status`; `neural_status` reports the configured neural provider state.
-
-<details>
-<summary><b>Zed IDE</b></summary>
-
-Add to `~/.config/zed/settings.json`:
-
-```json
-{
-  "context_servers": {
-    "leindex": {
-      "command": {
-        "path": "npx",
-        "args": ["-y", "@leindex/mcp"]
-      }
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>Cursor IDE</b></summary>
-
-Add to Cursor settings (`settings.json`):
-
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "command": "npx",
-      "args": ["-y", "@leindex/mcp"],
-      "env": {}
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>VS Code</b></summary>
-
-Requires the [Model Context Protocol](https://marketplace.visualstudio.com/items?itemName=modelcontextprotocol.vscode-mcp) extension.
-
-Configure in `settings.json`:
-
-```json
-{
-  "mcp.mcpServers": {
-    "leindex": {
-      "command": "npx",
-      "args": ["-y", "@leindex/mcp"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>Claude Code</b></summary>
-
-Add to `~/.claude/settings.json` or project-local `.claude/settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "command": "npx",
-      "args": ["-y", "@leindex/mcp"],
-      "type": "stdio"
-    }
-  }
-}
-```
-
-Optional guidance pack:
-- Install the shared skill from `integrations/skills/leindex-toolkit/` into `~/.claude/skills/leindex-toolkit/`
-- Merge `integrations/claude-code/settings.example.json` to add the LeIndex reminder hook
-</details>
-
-<details>
-<summary><b>Amp CLI (Sourcegraph)</b></summary>
-
-Add to `~/.config/amp/settings.json`:
-
-```json
-{
-  "amp.mcpServers": {
-    "leindex": {
-      "command": "npx",
-      "args": ["-y", "@leindex/mcp"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>OpenCode</b></summary>
-
-Add to `~/.config/opencode/opencode.json`:
-
-```json
-{
-  "mcp": {
-    "leindex": {
-      "command": ["npx", "-y", "@leindex/mcp"],
-      "type": "local"
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>Qwen CLI</b></summary>
-
-Add to `~/.qwen/settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "command": "npx",
-      "args": ["-y", "@leindex/mcp"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>iFlow CLI</b></summary>
-
-Add to `~/.iflow/settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "command": "npx",
-      "args": ["-y", "@leindex/mcp"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>Droid (Factory)</b></summary>
-
-Add to `~/.factory/mcp.json` (note: requires `type: "stdio"`):
-
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@leindex/mcp"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>Gemini CLI</b></summary>
-
-Add to `~/.gemini/settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "command": "npx",
-      "args": ["-y", "@leindex/mcp"]
-    }
-  }
-}
-```
-</details>
-
-Agent guidance packs:
-- Claude Code: shared skill plus reminder hook
-- Codex: install `integrations/skills/leindex-toolkit/` into `~/.codex/skills/leindex-toolkit/`
-- Gemini CLI, Amp, OpenCode, Qwen, and iFlow: reuse the shared skill text as project instructions or agent rules
-- Full instructions: `docs/AGENT_GUIDANCE.md`
-
-<details>
-<summary><b>Claude Desktop</b></summary>
-
-macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-Linux: `~/.config/Claude/claude_desktop_config.json`
-
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "command": "npx",
-      "args": ["-y", "@leindex/mcp"]
-    }
-  }
-}
-```
-</details>
-
-### Dashboard (optional)
-
-```bash
-cd dashboard
-bun install
-bun run build
-leindex dashboard
-```
-
----
-
-## Memory Measurement and Profiling
-
-Plan 0 adds a lightweight memory measurement foundation so you can track LeIndex's RSS behavior without wiring up custom scripts.
-
-- `cargo xtask memcheck` builds the release binary when needed, runs the canonical `small_repo` workload, compares the results against committed baselines and budget ceilings, and exits non-zero on regressions.
-- The Linux CI workflow in `.github/workflows/memory-budget.yml` runs the same memcheck path and uploads the report artifact so baseline and budget enforcement stay consistent in automation.
-- `--memory-report PATH` and `LEINDEX_MEMORY_REPORT=PATH` opt into a compact shutdown JSON with peak RSS and phase summaries; they stay off by default for normal runs.
-- Build with `--features memprof` to enable the optional heap profiling surface for deeper memory investigations when the lightweight report is not enough.
-
----
-
-## CLI Reference
-
-```bash
-leindex index /path/to/project       # Index a project
-leindex search "query"                # Semantic search
-leindex analyze "query"               # Deep structural analysis
-leindex phase --all --path /path      # 5-phase additive analysis
-leindex diagnostics                   # System health check
-leindex mcp                           # MCP stdio mode
-leindex serve                         # HTTP/WebSocket server
-leindex dashboard                     # Launch dashboard UI
-```
-
----
-
-## Output Behavior
-
-LeIndex is designed for **token-efficient** operation when used with AI coding tools.
-
-### Clean Terminal Output
-
-- **Default log level: `WARN`** — Routine operational chatter (storage paths, cache hits, PDG node counts, indexing progress) is suppressed. Only warnings and errors are shown.
-- **Enable verbose diagnostics**: pass `--verbose` or set `RUST_LOG=debug` to see full DEBUG-level output for troubleshooting.
-
-This keeps the terminal clean and minimizes token usage when LeIndex runs as a subprocess (e.g., via MCP stdio).
-
-### Structured MCP Responses
-
-MCP responses are **framed and structured** — transport-level errors (connection drops, protocol issues) never leak into the JSON-RPC response stream. The `leindex mcp` stdio mode produces clean, parseable JSON-RPC responses suitable for LLM consumption.
-
-### Winit Event-Loop Coverage
-
-`leindex analyze` and `leindex context` expand on-demand even when symbol names differ from query terms. If an exact lookup fails, LeIndex performs a fuzzy scan of the project's PDG to discover event-loop-heavy entrypoints (e.g., `run_event_loop`, `EventLoop::run`, `main`) using case-insensitive substring matching with complexity-aware scoring. This ensures framework-heavy codebases remain discoverable without requiring exact symbol names.
-
----
-
-## Embedding Configuration
-
-LeIndex supports multiple embedding backends for semantic search:
-
-### Local ONNX Models (default)
-
-Build with the default features to use Qwen3 embeddings through ONNX Runtime.
-LeIndex keeps TF-IDF and neural vectors per PDG node, then combines semantic,
-lexical, and structural scores during retrieval. ONNX inference runs in a
-resident `leindex-embed` worker so short-lived CLI calls and MCP requests reuse
-the loaded model, GPU allocations, and compiled provider cache.
-
-```bash
-cargo build --release --features onnx
-./target/release/leindex setup          # select provider + install validated Qwen3 model
-```
-
-The `onnx` feature uses the `load-dynamic` ORT strategy: no ONNX Runtime is
-linked at build time, and the worker discovers the runtime shared library at
-startup via a discovery chain (`ORT_DYLIB_PATH` env, config, `~/.leindex/lib/`,
-sibling-to-binary, pip site-packages, system paths). See
-[docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md) for the full chain and
-troubleshooting.
-
-Local models provide:
-- Privacy (data never leaves your machine)
-- No API costs
-- Zero network latency
-- Provider-aware batching: dynamic up to 32 on CPU/CUDA, stable batches of 8 on MIGraphX
-- Default hybrid query enrichment: cold `auto` workers are started and awaited; TF-IDF/PDG remain the mandatory core result
-- Resident worker reuse while keeping ONNX memory outside the main process
-
-The worker binary (`leindex-embed`) is built alongside the main binary and is
-discovered automatically. `leindex setup --neural --gpu amd` installs MIGraphX,
-`--gpu nvidia` installs CUDA, and `--cpu` installs standard ORT. Every path
-uses the same validated `qwen3-embed-0.6b-dynamic.onnx` graph provisioned by
-Hugging Face CLI under `~/.leindex/models/`; model files are not packaged with
-LeIndex.
-
-### Fragment Index (sub-symbol semantic chunks)
-
-LeIndex 1.9.5 adds an **opt-in fragment embedding layer** that improves both
-recall and precision on top of the node-level TF-IDF/PDG/neural stack:
-
-- **Tier 2 — sub-symbol fragments**: large nodes (functions, methods, blocks)
-  are split into semantic chunks with a tree-sitter chunker (ported from Warp's
-  `full_source_code_embedding`), so a conceptual query can hit the exact region
-  that answers it instead of only the whole symbol.
-- **Tier 3 — orphan coverage**: module-level regions no PDG node owns are
-  embedded too, so free-floating code, imports, and file docs stay discoverable.
-- **Content-hash store**: every fragment is addressed by a blake3 hash of its
-  exact embedded text. Incremental indexing re-embeds only changed content and
-  is fully idempotent — the same code always maps to the same fragments.
-- **All-local**: fragments are embedded with the same local Qwen3 ONNX worker.
-  No remote service is used unless you opt into a remote provider. Content
-  hashes, manifests, and embeddings never leave your machine.
-
-Enable it in `~/.leindex/config/leindex.toml`:
-
-```toml
-[search]
-# Master switch. Off by default; the node-level index stays authoritative.
-fragment_index_enabled = true
-# Fusion weight of the fragment score component (renormalized when enabled).
-fragment_weight = 0.35
-# Max bytes per fragment (~200 lines x 60 chars, mirroring Warp's default).
-fragment_max_bytes = 12000
-# Include Tier-3 module-level orphan regions.
-fragment_orphan_enabled = true
-# Naive 200-line chunking when a tree-sitter grammar is unavailable.
-fragment_naive_fallback = true
-```
-
-Fragment candidates fuse into hybrid retrieval as a renormalized score
-component and feed the existing local reranker. See
-[docs/plans/fragment-embeddings-1.11.0.md](docs/plans/fragment-embeddings-1.11.0.md)
-for the full architecture.
-
-### Remote Cloud Providers
-
-Build with the `remote-embeddings` feature to use cloud-based embedding services:
-
-```bash
-cargo build --release --features remote-embeddings
-```
-
-Supported providers:
-- **OpenAI** (`text-embedding-3-small`, `text-embedding-3-large`)
-- **Cohere** (`embed-english-v3.0`, `embed-multilingual-v3.0`)
-- **Custom** (any OpenAI-compatible endpoint)
-
-Configure via environment variables:
-
-```bash
-# OpenAI
-export OPENAI_API_KEY="your-key"
-# LeIndex will automatically use OpenAI embeddings
-
-# Cohere
-export COHERE_API_KEY="your-key"
-# LeIndex will automatically use Cohere embeddings
-
-# Custom provider
-export LEINDEX_EMBEDDING_PROVIDER="custom"
-export LEINDEX_EMBEDDING_API_KEY="your-key"
-export LEINDEX_EMBEDDING_BASE_URL="https://your-endpoint.com/v1"
-export LEINDEX_EMBEDDING_MODEL="your-model-name"
-```
-
-Remote embeddings offer:
-- Higher accuracy with state-of-the-art models
-- No local resource requirements
-- Automatic model updates
-- Multi-language support (Cohere)
-
-**Note**: Remote embeddings require network access and API keys from your provider.
-
-### TF-IDF Fallback
-
-If no embedding backend is configured (i.e. `leindex setup` has not been run),
-LeIndex falls back to TF-IDF for keyword-based search. This works offline with
-zero setup but lacks semantic understanding. A one-time notice points to
-`leindex setup` to enable neural search.
-
----
-
-## MCP Tools (20)
-
-| Tool | Purpose |
-|------|---------|
-| `LeIndex [Context]` | Expand context around a code node via PDG |
-| `LeIndex [Deep Analyze]` | Deep analysis: semantic + PDG traversal |
-| `LeIndex [Diagnostics]` | Index health and stats |
-| `LeIndex [Edit Apply]` | PRIMARY file editor (use instead of `edit_file`) |
-| `LeIndex [Edit Preview]` | Preview a code edit with impact report |
-| `LeIndex [File Summary]` | Structural file analysis |
-| `LeIndex [Git Status]` | Git status with PDG structural analysis |
-| `LeIndex [Grep Symbols]` | Structural symbol search |
-| `LeIndex [Impact Analysis]` | Blast radius analysis |
-| `LeIndex [Index]` | Index a project |
-| `LeIndex [Phase Analysis]` | 5-phase additive analysis |
-| `Phase Analysis` | Compatibility alias for `LeIndex [Phase Analysis]` (same handler, no-bracket title for legacy clients) |
-| `LeIndex [Project Map]` | Annotated project structure |
-| `LeIndex [Read File]` | PRIMARY file reader (replaces `Read`) |
-| `LeIndex [Read Symbol]` | PRIMARY symbol reader (replaces `Read` for symbols) |
-| `LeIndex [Rename Symbol]` | Rename across all references |
-| `LeIndex [Search]` | Semantic code search |
-| `LeIndex [Symbol Lookup]` | Symbol definition + callers/callees |
-| `LeIndex [Text Search]` | PRIMARY text search (replaces `Grep`/`rg`) |
-| `LeIndex [Write]` | Create or overwrite a file |
-
-MCP tool names returned by `tools/list` are the exact strings emitted
-by each handler (e.g. `leindex.index`, `leindex.search`,
-`leindex.edit-preview`, `leindex.write`). The naming is a **mix** of
-dotted and hyphenated forms — single-word tools use a dot
-(`leindex.context`, `leindex.index`, `leindex.search`, `leindex.write`,
-`leindex.diagnostics`), multi-word tools use hyphens
-(`leindex.edit-preview`, `leindex.edit-apply`, `leindex.read-file`,
-`leindex.symbol-lookup`, `leindex.phase-analysis`, etc.). Use these
-exact names when calling `tools/call` — dispatch in
-`handle_tool_call` is exact-equality on the handler name, so a
-hyphen-vs-dot mismatch (e.g. `leindex-search` vs `leindex.search`)
-returns `method-not-found`. The display form above (`LeIndex [...]`)
-is the human-readable title; it is not accepted on the wire. The
-underscore form (`leindex_edit_preview`) is only used by the CLI
-bridge (`leindex tools help`, `leindex tools run`).
-
-### Output formatting
-
-- **MCP payloads** are trimmed to the minimum needed for an LLM: short
-  snippets, capped counts, dropped internal byte ranges and verbose
-  fields. No ANSI color, no UI chrome.
-- **CLI output** is rendered for human reading: split-view color diffs
-  for `LeIndex [Edit Preview]`, `LeIndex [Edit Apply]`, and
-  `LeIndex [Rename Symbol]` (line numbers + `│` separator + paired
-  `+`/`-` markers); tree-style map for `LeIndex [Project Map]`;
-  structured tables for `LeIndex [Search]` and `LeIndex [Context]`.
-
----
-
-## Unified Module Layout
-
-LeIndex is now a single crate with feature-gated modules:
-
-| Module | Role |
-|-------|------|
-| `parse` | Language parsing and signature extraction |
-| `graph` | Graph construction and traversal |
-| `search` | Retrieval, scoring, vector search |
-| `storage` | SQLite persistence + storage |
-| `phase` | Additive phase analysis pipeline |
-| `cli` | CLI + MCP protocol handlers |
-| `global` | Cross-project discovery/registry |
-| `server` | HTTP/WebSocket API server |
-| `edit` | Edit preview/apply support |
-| `validation` | Validation and guardrails |
-
-Legacy crate-style aliases remain available from `leindex::leparse`, `leindex::legraphe`, and similar compatibility re-exports.
-
----
-
-## Security
-
-Database discovery (`LEINDEX_DISCOVERY_ROOTS`) is **opt-in only**. Sensitive directories (`.ssh`, `.aws`, `.gnupg`, etc.) are automatically excluded. All SQL operations use parameterized queries. See [ARCHITECTURE.md](ARCHITECTURE.md) for details.
-
----
-
-## Docs
-
-- [ARCHITECTURE.md](ARCHITECTURE.md) — system design and internals
-- [API.md](API.md) — HTTP API reference
-- [docs/MCP.md](docs/MCP.md) — MCP server documentation
-- [docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md) — neural search setup and troubleshooting (CPU/GPU/AMD/NVIDIA)
-- [dashboard/README.md](dashboard/README.md) — dashboard setup
-
----
+## Learn more
+
+- [`BENCHMARKS.md`](BENCHMARKS.md) — resource benchmarks, model bake-off, acceptance-gate evidence
+- [`docs/NEURAL_SETUP.md`](docs/NEURAL_SETUP.md) — CPU/GPU/AMD/NVIDIA provider setup and troubleshooting
+- [`docs/MCP.md`](docs/MCP.md) — MCP integration for every major client
+- [`CHANGELOG.md`](CHANGELOG.md) — full release history, including the v2.0.0 post-release fix rounds
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) / [`RUST_ARCHITECTURE.md`](RUST_ARCHITECTURE.md) — system design
 
 ## License
 
-MIT
+MIT OR Apache-2.0 — see [LICENSE](LICENSE).
