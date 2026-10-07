@@ -63,6 +63,13 @@ impl Default for EngramLimits {
     }
 }
 
+/// Process-wide staging-file counter. Staging names embed pid + this counter;
+/// a per-instance counter is NOT enough — multiple `Engram` handles in one
+/// process (concurrent test threads, or the MCP server's per-project
+/// instances) share a pid and would collide on `tmp/{key}.{pid}.{n}`,
+/// truncating each other's in-flight rows mid-rename.
+static NEXT_STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+
 impl EngramLimits {
     /// Defaults (20k rows, 256 MiB), overridable with
     /// `LEINDEX_ENGRAM_MAX_ENTRIES` and `LEINDEX_ENGRAM_MAX_MB`.
@@ -135,7 +142,6 @@ pub struct Engram {
     evictions: AtomicU64,
     corrupt: AtomicU64,
     puts_since_sweep: AtomicU64,
-    staging_counter: AtomicU64,
 }
 
 impl Engram {
@@ -158,7 +164,6 @@ impl Engram {
             evictions: AtomicU64::new(0),
             corrupt: AtomicU64::new(0),
             puts_since_sweep: AtomicU64::new(0),
-            staging_counter: AtomicU64::new(0),
         };
         engram.sweep();
         Ok(engram)
@@ -311,7 +316,7 @@ impl Engram {
             "{}.{}.{}",
             hex32(key),
             std::process::id(),
-            self.staging_counter.fetch_add(1, Ordering::Relaxed)
+            NEXT_STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let encoded = encode_row(vector);
         let result = (|| {
