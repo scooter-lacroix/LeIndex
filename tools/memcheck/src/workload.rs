@@ -1236,25 +1236,33 @@ fn run_contention_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
         homes.push(home);
     }
 
-    // Index both fixtures first (so search queries have results).
+    // Index both fixtures first (so search queries have results). Capture
+    // the command output: a bare non-zero status (this phase failed
+    // intermittently under host load with the error swallowed by
+    // Stdio::null) is undiagnosable after the fact.
     for fixture in &[&config.fixture, &fixture_b_path] {
-        let status = Command::new(&config.binary)
+        let output = Command::new(&config.binary)
             .arg("index")
             .arg(fixture)
             .current_dir(fixture)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
             .with_context(|| {
                 format!(
                     "contention_3c_2p: failed to index fixture {}",
                     fixture.display()
                 )
             })?;
-        if !status.success() {
+        if !output.status.success() {
             anyhow::bail!(
-                "contention_3c_2p: index command failed for {}",
-                fixtures[0].display()
+                "contention_3c_2p: index command failed for {} (status {:?})\n\
+                 --- stdout ---\n{}\n\
+                 --- stderr ---\n{}",
+                fixture.display(),
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
             );
         }
     }
