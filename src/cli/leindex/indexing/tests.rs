@@ -131,12 +131,27 @@ fn watcher_delta_publishes_current_generation() {
         .parse::<u64>()
         .expect("published generation number");
     assert!(published > initial);
+    // The generation contract after the read-side flip: the directory carries
+    // metadata only, and its payload lives in the CAS layers the manifest
+    // names. Assert the layer exists and its blob is present, which is what
+    // `leindex.db`-in-the-directory used to stand in for.
+    let manifest = crate::storage::generation::read_generation_manifest(&storage, published)
+        .expect("published manifest");
+    let db_layer = manifest
+        .layers
+        .get(&crate::storage::generation::LayerKind::Db)
+        .copied()
+        .expect("manifest names the Db layer");
+    let cas = crate::storage::cas::CasStore::open(storage.join("cas")).expect("open CAS");
+    let db_bytes = cas.get(&db_layer).expect("Db layer blob present in CAS");
+    assert!(!db_bytes.is_empty());
     assert!(
-        storage
+        !storage
             .join("generations")
             .join(published.to_string())
             .join("leindex.db")
-            .is_file()
+            .is_file(),
+        "publish must not write a per-generation file mirror"
     );
 }
 
@@ -681,5 +696,52 @@ fn test_repeated_indexing_keeps_only_current_and_previous_generation() {
     assert!(
         kept.len() <= 2,
         "expected current + previous only, found {kept:?}"
+    );
+}
+
+/// The save-stage budget scales per-edge, floors for tiny graphs, honors the
+/// env override exactly, and never multiplies the override by the debug scale.
+#[test]
+fn test_save_stage_budget_ms_scaling_floor_and_override() {
+    use super::save_stage_budget_ms;
+
+    let scale = if cfg!(debug_assertions) { 10 } else { 1 };
+
+    // Tiny graphs sit on the floor (× debug scale).
+    assert_eq!(save_stage_budget_ms(0, None), 500 * scale);
+    assert_eq!(save_stage_budget_ms(1_000, None), 500 * scale);
+
+    // Large graphs scale per-edge: 200k edges × 20µs = 4000 ms → floor loses.
+    // (250k edges is the crossover where 20µs/edge exceeds the 500ms floor.)
+    assert_eq!(save_stage_budget_ms(250_000, None), 5_000 * scale);
+
+    // The measured production shape: ~193k edges, ~5µs/edge actual →
+    // budget 3_860·scale ms leaves ~4× headroom in release, ~40× in debug.
+    assert_eq!(save_stage_budget_ms(193_000, None), 3_860 * scale);
+
+    // The override wins absolutely — no per-edge math, no debug multiplier.
+    assert_eq!(save_stage_budget_ms(193_000, Some(60_000)), 60_000);
+    assert_eq!(save_stage_budget_ms(0, Some(1)), 1);
+}
+
+/// The gate trips only when elapsed exceeds the budget, and its error names
+/// the numbers an operator needs.
+#[test]
+fn test_save_stage_gate_trips_only_over_budget() {
+    use super::save_stage_gate;
+    use std::time::Duration;
+
+    let staging = PathBuf::from("/tmp/staging-x");
+    // 200k edges → 4_000·scale ms budget; well under must pass.
+    assert!(save_stage_gate(Duration::from_millis(10), 200_000, &staging).is_ok());
+    // Absurdly over must fail, with the diagnostic fields in the message.
+    let error = save_stage_gate(Duration::from_secs(600), 200_000, &staging)
+        .expect_err("gate must trip over budget");
+    let message = error.to_string();
+    assert!(message.contains("600000 ms"), "message: {message}");
+    assert!(message.contains("200000 edges"), "message: {message}");
+    assert!(
+        message.contains("LEINDEX_SAVE_STAGE_GATE_MS"),
+        "message: {message}"
     );
 }
