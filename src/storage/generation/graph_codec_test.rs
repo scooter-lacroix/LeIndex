@@ -534,3 +534,50 @@ fn write_minimal_catalog(path: &std::path::Path) {
     )
     .expect("seed catalog");
 }
+
+/// NaN confidence is the wire absence sentinel (round-12 codex P2): the
+/// collapse must normalize `Some(NaN)` to `None` with `is_nan` — an
+/// `== Some(f32::NAN)` comparison never fires because IEEE NaN is unequal to
+/// itself, so a persisted `Some(NaN)` decoded back as `None` and the search
+/// fingerprint no longer described the published graph.
+#[test]
+fn test_collapse_normalizes_nan_confidence_to_none() {
+    let mut pdg = ProgramDependenceGraph::new();
+    let a = pdg.add_node(Node {
+        id: "a.rs:x".to_string(),
+        node_type: NodeType::Function,
+        name: "x".to_string(),
+        file_path: std::sync::Arc::from("a.rs"),
+        byte_range: (0, 10),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+    let b = pdg.add_node(Node {
+        id: "a.rs:y".to_string(),
+        node_type: NodeType::Function,
+        name: "y".to_string(),
+        file_path: std::sync::Arc::from("a.rs"),
+        byte_range: (12, 24),
+        complexity: 1,
+        language: "rust".to_string(),
+    });
+    let mut edge = crate::graph::pdg::Edge {
+        edge_type: crate::graph::pdg::EdgeType::Call,
+        metadata: crate::graph::pdg::EdgeMetadata::empty(),
+    };
+    edge.metadata.confidence = Some(f32::NAN);
+    pdg.add_edge(a, b, edge);
+
+    let collapsed = collapse_for_layer(&pdg);
+    let x = collapsed.find_by_id("a.rs:x").expect("node x");
+    let nan_edge = collapsed
+        .graph
+        .edges(x)
+        .map(|reference| reference.weight())
+        .find(|weight| weight.edge_type == crate::graph::pdg::EdgeType::Call)
+        .expect("the call edge survives the collapse");
+    assert_eq!(
+        nan_edge.metadata.confidence, None,
+        "Some(NaN) must normalize to None, mirroring the decode"
+    );
+}

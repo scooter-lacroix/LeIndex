@@ -583,9 +583,12 @@ pub fn collapse_for_layer(pdg: &ProgramDependenceGraph) -> ProgramDependenceGrap
         let key = (source.id.clone(), target.id.clone(), edge.edge_type.clone());
         // Insert or last-wins update — both drop the earlier record.
         // NaN confidence is the wire absence sentinel, so mirror the decode
-        // normalization Some(NaN) -> None.
+        // normalization Some(NaN) -> None. `is_nan`, NOT `== Some(NaN)`:
+        // IEEE NaN is unequal to itself, so the equality never fired and a
+        // persisted `Some(NaN)` decoded back as `None` — the search
+        // fingerprint then no longer described the published graph.
         let mut edge = edge.clone();
-        if edge.metadata.confidence == Some(f32::NAN) {
+        if edge.metadata.confidence.is_some_and(f32::is_nan) {
             edge.metadata.confidence = None;
         }
         edges_by_key.insert(key, edge);

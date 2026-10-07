@@ -82,8 +82,12 @@ pub struct FileIdentity {
     pub size: u64,
     /// Modification time (ns since epoch).
     pub mtime_ns: i64,
-    /// ctime (unix) or creation time (windows), seconds; 0 if unavailable.
-    pub ctime_secs: i64,
+    /// ctime (unix) or creation time (windows), ns since epoch; 0 if
+    /// unavailable. NANOSECOND resolution: second-granular ctime misses an
+    /// in-place same-length edit whose mtime is restored within the same
+    /// clock second (only ctime_nsec moved), which the stale plan then
+    /// excluded forever.
+    pub ctime_ns: i64,
     /// Inode number (unix); 0 elsewhere.
     pub ino: u64,
 }
@@ -94,11 +98,11 @@ fn identity(meta: &std::fs::Metadata) -> FileIdentity {
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_nanos().min(i64::MAX as u128) as i64);
-    let (ctime_secs, ino) = platform_identity(meta);
+    let (ctime_ns, ino) = platform_identity(meta);
     FileIdentity {
         size: meta.len(),
         mtime_ns: mtime,
-        ctime_secs,
+        ctime_ns,
         ino,
     }
 }
@@ -106,7 +110,7 @@ fn identity(meta: &std::fs::Metadata) -> FileIdentity {
 #[cfg(unix)]
 fn platform_identity(meta: &std::fs::Metadata) -> (i64, u64) {
     use std::os::unix::fs::MetadataExt;
-    (meta.ctime(), meta.ino())
+    (meta.ctime_nsec(), meta.ino())
 }
 
 #[cfg(windows)]
@@ -115,7 +119,7 @@ fn platform_identity(meta: &std::fs::Metadata) -> (i64, u64) {
         .created()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs().min(i64::MAX as u64) as i64);
+        .map_or(0, |d| d.as_nanos().min(i64::MAX as u128) as i64);
     (created, 0)
 }
 
@@ -149,18 +153,17 @@ fn git_inventory(root: &Path) -> Option<Vec<String>> {
         .filter_map(|raw| std::str::from_utf8(raw).ok())
         .filter(|rel| !rel.split('/').any(|seg| seg == ".leindex" || seg == ".git"))
         // A tracked or untracked symlink can point anywhere — including
-        // outside the project (a `leak.txt -> ../secret` in the worktree).
-        // Downstream reads follow links, so admit a symlink only when its
-        // target resolves back inside the root as a regular file.
-        // Non-symlinks keep the zero-cost path.
+        // outside the project — and so can an INTERMEDIATE directory
+        // component: `git ls-files --cached` still emits `dir/leak` after
+        // `dir` is replaced by a symlink to /outside, and leaf-only
+        // `symlink_metadata` follows `dir` and reports the far-side target
+        // as a plain regular file. Canonicalize EVERY candidate and require
+        // containment in the canonical root — that covers leaf symlinks,
+        // intermediate symlinks, and vanished paths with one check.
         .filter(|rel| {
             let path = root.join(rel);
-            match std::fs::symlink_metadata(&path) {
-                Ok(meta) if !meta.is_symlink() => true,
-                Ok(_) => std::fs::canonicalize(&path)
-                    .is_ok_and(|resolved| resolved.starts_with(&canon_root) && resolved.is_file()),
-                Err(_) => false,
-            }
+            std::fs::canonicalize(&path)
+                .is_ok_and(|resolved| resolved.starts_with(&canon_root) && resolved.is_file())
         })
         .map(str::to_string)
         .collect();
@@ -261,7 +264,7 @@ pub fn build_index(
                     rel_path: rel.clone(),
                     size: ident.size,
                     mtime_ns: ident.mtime_ns,
-                    ctime_secs: ident.ctime_secs,
+                    ctime_ns: ident.ctime_ns,
                     ino: ident.ino,
                     flags: 0,
                     trigrams: Vec::new(),
@@ -359,7 +362,7 @@ pub fn dirty_files(root: &Path, index: &TextIndex) -> Arc<Vec<String>> {
                             != FileIdentity {
                                 size: known.size,
                                 mtime_ns: known.mtime_ns,
-                                ctime_secs: known.ctime_secs,
+                                ctime_ns: known.ctime_ns,
                                 ino: known.ino,
                             }
                     }
@@ -1952,6 +1955,34 @@ mod tests {
         assert!(
             dirty.contains(&"a.rs".to_string()),
             "rename-replaced same-size/mtime edit must be dirty, got {dirty:?}"
+        );
+    }
+
+    /// Subsecond ctime (round-12 codex P2): an in-place same-length edit
+    /// whose mtime is restored WITHIN the same clock second leaves size,
+    /// mtime, second-granular ctime, and ino all unchanged — only
+    /// ctime_nsec moved. Second-granular identity called this file clean and
+    /// the stale plan excluded the new text forever; nanosecond identity
+    /// catches it. (No artificial sleep: the edit happens inside whatever
+    /// second the build landed in — that is the whole point.)
+    #[cfg(unix)]
+    #[test]
+    fn test_dirty_files_detects_same_second_ctime_only_change() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.rs", "fn alpha() {}\n");
+        let out = dir.path().join(".leindex/textindex/index.bin");
+        build_index(dir.path(), &out, HashMap::new()).unwrap();
+        let index = TextIndex::open(&out).unwrap();
+        let known = index.file(index.id_of("a.rs").unwrap()).unwrap();
+        assert!(dirty_files(dir.path(), &index).is_empty());
+
+        // Same-length in-place edit, mtime restored immediately after.
+        std::fs::write(dir.path().join("a.rs"), "fn delta() {}\n").unwrap();
+        force_mtime_ns(&dir.path().join("a.rs"), known.mtime_ns);
+        let dirty = dirty_files(dir.path(), &index);
+        assert!(
+            dirty.contains(&"a.rs".to_string()),
+            "a same-second ctime-only change must be dirty, got {dirty:?}"
         );
     }
 }

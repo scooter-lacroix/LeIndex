@@ -324,10 +324,21 @@ fn record_cas_stats(
 /// Idempotent and crash-safe: a no-op when the store is already migrated, and
 /// a crash at any point resumes from the last `CURRENT` swap. The destructive
 /// cleanup runs only after the store is durably migrated.
+///
+/// The whole detection → publication → cleanup transaction runs under the
+/// project's cross-process write lock, like every other generation writer:
+/// an unsynchronized migration could share `manifest.partial`/`CURRENT.tmp`
+/// with a concurrent index publication, snapshot the catalog mid-change, or
+/// run the destructive cleanup while another process's publish is in
+/// flight. (Both production callers — the flag-gated first-run sweep and
+/// `storage --migrate` — invoke this without a lock held, so acquiring here
+/// cannot self-deadlock.)
 pub fn migrate_legacy_store(
     storage_root: &Path,
     cfg: &MigrationConfig,
 ) -> Result<MigrationReport, MigrationError> {
+    let _write_lock = crate::storage::ProjectWriteLock::acquire(storage_root)
+        .map_err(|e| MigrationError::Payload(format!("acquire project write lock: {e}")))?;
     let mut report = empty_migration_report(storage_root);
 
     // Idempotency / crash-resume: a store that is not in the legacy layout but

@@ -408,6 +408,11 @@ impl StdioDispatcher {
         let limiter = Arc::clone(&self.limiter);
         let in_flight = Arc::clone(&self.in_flight);
         let pending = Arc::clone(&self.pending);
+        // Whether THIS call is consuming a pending slot: only queued calls
+        // incremented the counter above, so only they may decrement it (a
+        // decrement on the immediate-permit path would wrap 0 -> usize::MAX
+        // and admit a later burst past the bound).
+        let was_queued = permit.is_none();
         in_flight.fetch_add(1, Ordering::AcqRel);
         let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
         // Reap finished tasks so the set does not grow for the whole session.
@@ -417,7 +422,9 @@ impl StdioDispatcher {
                 Some(permit) => Some(permit),
                 None => limiter.acquire_owned().await.ok(),
             };
-            pending.fetch_sub(1, Ordering::AcqRel);
+            if was_queued {
+                pending.fetch_sub(1, Ordering::AcqRel);
+            }
             // A panicking handler must still answer: a request that never
             // gets a response is indistinguishable from a hang to the client.
             let response =
@@ -1235,8 +1242,31 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(STDIO_OUTBOUND_CAPACITY);
         let dispatcher = StdioDispatcher::new(tx);
 
-        // Drain every execution permit so each subsequent call has to queue.
-        let _held: Vec<_> = (0..MAX_CONCURRENT_STDIO_CALLS)
+        let request = |id: u64| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "leindex_search", "arguments": {} }
+            })
+            .to_string()
+        };
+
+        // One call takes an IMMEDIATE permit (permits are still free): the
+        // pending counter must stay at zero — an unconditional decrement on
+        // this path wrapped 0 -> usize::MAX and permanently disabled the
+        // bound (round-12 kilo P2). This call runs BEFORE the permits are
+        // drained, or it would queue like the rest.
+        dispatcher
+            .admit_tool_call(request(0), serde_json::json!(0), false)
+            .await;
+        assert_eq!(
+            dispatcher.pending.load(Ordering::Acquire),
+            0,
+            "an immediate-permit call must not touch the pending counter"
+        );
+
+        // Drain the remaining execution permits (the immediate call above
+        // holds one) so each subsequent call has to queue.
+        let _held: Vec<_> = (0..MAX_CONCURRENT_STDIO_CALLS - 1)
             .map(|_| {
                 dispatcher
                     .limiter
@@ -1246,17 +1276,9 @@ mod tests {
             })
             .collect();
 
-        let request = |id: u64| {
-            serde_json::json!({
-                "jsonrpc": "2.0", "id": id, "method": "tools/call",
-                "params": { "name": "leindex_search", "arguments": {} }
-            })
-            .to_string()
-        };
-
         // Fill the pending queue exactly to the bound: every call is
         // accepted (spawned, waiting for a permit), none is answered.
-        for id in 0..MAX_PENDING_STDIO_CALLS as u64 {
+        for id in 1..=MAX_PENDING_STDIO_CALLS as u64 {
             dispatcher
                 .admit_tool_call(request(id), serde_json::json!(id), false)
                 .await;

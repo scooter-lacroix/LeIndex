@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! header   96 B   magic "LETXIDX1", version, flags, counts, section offsets
-//! files    56 B * file_count   path, size, mtime_ns, ctime_secs, ino,
+//! files    56 B * file_count   path, size, mtime_ns, ctime_ns, ino,
 //!                              symbol range, flags
 //! paths    string pool
 //! syms     16 B * total        start, end, name_off, kind|name_len
@@ -32,7 +32,11 @@ const TRAILER: &[u8; 8] = b"LETXEND1";
 // coarse-resolution filesystems) — the stale trigram plan then excluded the
 // edited file from the scan forever. Old v1 files fail this check on open and
 // are transparently rebuilt by the caller.
-const VERSION: u32 = 2;
+// v3: ctime recorded at NANOSECOND resolution. Second-granular ctime missed
+// an in-place same-length edit whose mtime was restored within the same
+// clock second (only ctime_nsec moved), which the stale plan excluded
+// forever. v2 files fail the version check and rebuild transparently.
+const VERSION: u32 = 3;
 const HEADER_LEN: usize = 96;
 const FILE_ENTRY: usize = 56;
 const SYM_ENTRY: usize = 16;
@@ -91,10 +95,11 @@ pub struct FileInput {
     pub size: u64,
     /// Modification time (ns since epoch) when indexed.
     pub mtime_ns: i64,
-    /// Replacement-sensitive identity: inode change time (seconds, unix) or
+    /// Replacement-sensitive identity: inode change time (ns, unix) or
     /// creation time (windows); 0 where the platform offers neither. Catches
-    /// same-size edits that preserve mtime.
-    pub ctime_secs: i64,
+    /// same-size edits that preserve mtime, including within the same clock
+    /// second.
+    pub ctime_ns: i64,
     /// Inode number (unix); 0 elsewhere. Catches replace-by-rename edits even
     /// when timestamps are preserved.
     pub ino: u64,
@@ -164,7 +169,7 @@ pub fn write_index(path: &Path, files: &[FileInput], has_symbols: bool) -> io::R
         file_table.extend_from_slice(&(file.rel_path.len() as u32).to_le_bytes());
         file_table.extend_from_slice(&file.size.to_le_bytes());
         file_table.extend_from_slice(&file.mtime_ns.to_le_bytes());
-        file_table.extend_from_slice(&file.ctime_secs.to_le_bytes());
+        file_table.extend_from_slice(&file.ctime_ns.to_le_bytes());
         file_table.extend_from_slice(&file.ino.to_le_bytes());
         file_table.extend_from_slice(&sym_total.to_le_bytes());
         file_table.extend_from_slice(&(spans.len() as u32).to_le_bytes());
@@ -267,8 +272,8 @@ pub struct FileMeta<'a> {
     pub size: u64,
     /// mtime (ns) when indexed.
     pub mtime_ns: i64,
-    /// ctime/creation (s) when indexed; see [`FileInput::ctime_secs`].
-    pub ctime_secs: i64,
+    /// ctime/creation (ns) when indexed; see [`FileInput::ctime_ns`].
+    pub ctime_ns: i64,
     /// Inode when indexed (unix); see [`FileInput::ino`].
     pub ino: u64,
     /// Flag bits.
@@ -469,7 +474,7 @@ impl TextIndex {
             path: std::str::from_utf8(path).ok()?,
             size: u64_at(data, at + 8)?,
             mtime_ns: i64::from_le_bytes(data.get(at + 16..at + 24)?.try_into().ok()?),
-            ctime_secs: i64::from_le_bytes(data.get(at + 24..at + 32)?.try_into().ok()?),
+            ctime_ns: i64::from_le_bytes(data.get(at + 24..at + 32)?.try_into().ok()?),
             ino: u64_at(data, at + 32)?,
             sym_start: u32_at(data, at + 40)?,
             sym_count: u32_at(data, at + 44)?,
@@ -606,7 +611,7 @@ mod tests {
             rel_path: path.to_string(),
             size: text.len() as u64,
             mtime_ns: 7,
-            ctime_secs: 0,
+            ctime_ns: 0,
             ino: 0,
             flags: 0,
             trigrams: literal_trigrams(text.as_bytes()),
