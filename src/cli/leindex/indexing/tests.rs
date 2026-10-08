@@ -439,8 +439,10 @@ fn test_streaming_pdg_extraction_equivalent_for_stripped_and_inline_source_bytes
     let real_hash = blake3::hash(&original_source).to_hex().to_string();
     let hashes: HashMap<String, String> =
         std::iter::once((path.display().to_string(), real_hash)).collect();
-    let inline = build_pdg_streaming(vec![make_result(true)], &hashes);
-    let stripped = build_pdg_streaming(vec![make_result(false)], &hashes);
+    let inline =
+        build_pdg_streaming(vec![make_result(true)], &hashes).expect("inline source build");
+    let stripped =
+        build_pdg_streaming(vec![make_result(false)], &hashes).expect("reread source build");
 
     assert_eq!(
         inline.node_count(),
@@ -571,17 +573,87 @@ fn test_resumed_parse_results_stripped_on_streaming_route_and_inline_on_legacy()
     );
 }
 
+/// A failed scan-to-PDG source verification must not publish partial file
+/// removals or advance indexed-file hashes.
+#[test]
+fn test_pdg_source_change_preserves_old_graph_and_indexed_hashes() {
+    let dir = tempfile::tempdir().expect("source-race fixture");
+    let changed_path = dir.path().join("changed.rs");
+    let deleted_path = dir.path().join("deleted.rs");
+    std::fs::write(&changed_path, "pub fn before() {}\n").expect("initial source");
+    let changed_file = changed_path.display().to_string();
+    let deleted_file = deleted_path.display().to_string();
+    let old_hash = blake3::hash(b"pub fn before() {}\n").to_hex().to_string();
+
+    let mut index = LeIndex::new(dir.path()).expect("create index");
+    crate::storage::pdg_store::update_indexed_file(
+        &mut index.storage,
+        &index.project_id,
+        &changed_file,
+        &old_hash,
+    )
+    .expect("seed changed-file hash");
+    crate::storage::pdg_store::update_indexed_file(
+        &mut index.storage,
+        &index.project_id,
+        &deleted_file,
+        "deleted-hash",
+    )
+    .expect("seed deleted-file hash");
+
+    let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
+    for (file_path, name) in [(&changed_file, "before"), (&deleted_file, "deleted")] {
+        pdg.add_node(crate::graph::pdg::Node {
+            id: format!("{file_path}:{name}"),
+            node_type: crate::graph::pdg::NodeType::Function,
+            name: name.to_string(),
+            file_path: std::sync::Arc::from(file_path.as_str()),
+            byte_range: (0, 1),
+            complexity: 1,
+            language: "rust".to_string(),
+        });
+    }
+    let mut parsing_result = sample_parsing_result(&changed_file, "after", "");
+    parsing_result.source_bytes = None;
+
+    let mut state = IndexPipelineState::new(false, Instant::now(), JobPaths::new(dir.path(), 1));
+    state
+        .source_file_hashes
+        .insert(changed_file.clone(), old_hash.clone());
+    state.deleted_files.push(deleted_file.clone());
+
+    std::fs::write(&changed_path, "pub fn after() {}\n").expect("edit source after scan");
+    let result = index.apply_pdg_file_changes(&state, &mut pdg, vec![parsing_result], true);
+    assert!(result.is_err(), "changed source must abort the PDG phase");
+    assert!(
+        pdg.find_by_name("before").is_some(),
+        "old changed-file node stays"
+    );
+    assert!(
+        pdg.find_by_name("deleted").is_some(),
+        "deleted-file node stays"
+    );
+
+    let indexed = crate::storage::pdg_store::get_indexed_files(&index.storage, &index.project_id)
+        .expect("read indexed-file hashes");
+    assert_eq!(indexed.get(&changed_file), Some(&old_hash));
+    assert_eq!(
+        indexed.get(&deleted_file).map(String::as_str),
+        Some("deleted-hash")
+    );
+}
+
 /// PR #90 round 2, cluster C: a file edited after parse must never have its
 /// OLD signatures spliced with NEW bytes at PDG extraction time. The
-/// identity check drops the result (parse-failure semantics) on hash
-/// mismatch; an intact file still extracts.
+/// identity check aborts PDG construction on mismatch; an intact file extracts.
 #[test]
-fn test_streaming_pdg_drops_results_whose_source_changed_after_parse() {
+fn test_streaming_pdg_rejects_results_whose_source_changed_after_parse() {
     let dir = tempfile::tempdir().expect("stale source fixture");
     let path = dir.path().join("stale.rs");
     let original = "pub fn original_marker() -> usize { 1 }\n";
     std::fs::write(&path, original).expect("original source");
     let original_hash = blake3::hash(original.as_bytes()).to_hex().to_string();
+    let hashes = std::iter::once((path.display().to_string(), original_hash.clone())).collect();
 
     let make_result = |source: &[u8]| crate::parse::parallel::ParsingResult {
         file_path: path.clone(),
@@ -606,32 +678,29 @@ fn test_streaming_pdg_drops_results_whose_source_changed_after_parse() {
         parse_time_ms: 0,
     };
 
-    // Intact file: hash matches the scan-stage record — result extracts.
-    let hashes = std::iter::once((path.display().to_string(), original_hash.clone())).collect();
-    let intact = build_pdg_streaming(vec![make_result(original.as_bytes())], &hashes);
+    let intact = build_pdg_streaming(vec![make_result(original.as_bytes())], &hashes)
+        .expect("unchanged source must extract");
     assert!(
         intact.node_count() > 0,
         "unchanged source must extract normally"
     );
 
-    // Edited file: bytes on disk no longer match the scan-stage hash — the
-    // result must be dropped, not spliced from old signatures + new bytes.
+    // Edited file: bytes on disk no longer match the scan-stage hash. The
+    // builder must abort so the PDG phase preserves the previous generation.
     std::fs::write(&path, "pub fn totally_different() -> usize { 2 }\n").expect("edited source");
-    let edited = build_pdg_streaming(vec![make_result(original.as_bytes())], &hashes);
-    assert_eq!(
-        edited.node_count(),
-        0,
-        "stale signatures must never be spliced with fresh bytes (hash mismatch drops the result)"
-    );
+    let edited = match build_pdg_streaming(vec![make_result(original.as_bytes())], &hashes) {
+        Ok(_) => panic!("changed source must abort PDG construction"),
+        Err(error) => error,
+    };
+    assert!(edited.to_string().contains("hash mismatch"));
 
-    // Deleted file: same contract — dropped, not silently empty-extracted.
+    // Deleted file: same retryable failure contract.
     std::fs::remove_file(&path).expect("delete source");
-    let deleted = build_pdg_streaming(vec![make_result(original.as_bytes())], &hashes);
-    assert_eq!(
-        deleted.node_count(),
-        0,
-        "missing source must drop the result like a failed parse"
-    );
+    let deleted = match build_pdg_streaming(vec![make_result(original.as_bytes())], &hashes) {
+        Ok(_) => panic!("missing source must abort PDG construction"),
+        Err(error) => error,
+    };
+    assert!(deleted.to_string().contains("failed to read source"));
 }
 
 /// VAL-PDG-006/007: `FeatureFlag::StreamingPdg` ON routes PDG construction
@@ -651,7 +720,8 @@ fn test_streaming_pdg_flag_routes_through_streaming_vs_legacy_builders() {
             sample_parsing_result("a.rs", "alpha", "beta"),
             sample_parsing_result("b.rs", "beta", "alpha"),
         ];
-        let (pdg, route) = build_changed_file_pdg(results, true, &HashMap::new());
+        let (pdg, route) = build_changed_file_pdg(results, true, &HashMap::new())
+            .expect("streaming fixture build");
         assert_eq!(route, PdgBuildRoute::Streaming);
         assert!(pdg.node_count() >= 2, "streaming build must keep all nodes");
     });
@@ -666,7 +736,8 @@ fn test_streaming_pdg_flag_routes_through_streaming_vs_legacy_builders() {
             sample_parsing_result("a.rs", "alpha", "beta"),
             sample_parsing_result("b.rs", "beta", "alpha"),
         ];
-        let (pdg, route) = build_changed_file_pdg(results, false, &HashMap::new());
+        let (pdg, route) =
+            build_changed_file_pdg(results, false, &HashMap::new()).expect("legacy fixture build");
         assert_eq!(route, PdgBuildRoute::Legacy);
         assert!(pdg.node_count() >= 2, "legacy build must keep all nodes");
     });
@@ -683,8 +754,10 @@ fn test_streaming_and_legacy_pdg_routes_produce_equivalent_graphs() {
         sample_parsing_result("b.rs", "beta", "alpha"),
     ];
     let (streaming_pdg, streaming_route) =
-        build_changed_file_pdg(results.clone(), true, &HashMap::new());
-    let (legacy_pdg, legacy_route) = build_changed_file_pdg(results, false, &HashMap::new());
+        build_changed_file_pdg(results.clone(), true, &HashMap::new())
+            .expect("streaming equivalence fixture");
+    let (legacy_pdg, legacy_route) = build_changed_file_pdg(results, false, &HashMap::new())
+        .expect("legacy equivalence fixture");
     assert_eq!(streaming_route, PdgBuildRoute::Streaming);
     assert_eq!(legacy_route, PdgBuildRoute::Legacy);
 
@@ -730,7 +803,7 @@ fn test_build_pdg_streaming_produces_correct_node_count_for_multiple_files() {
         sample_parsing_result("b.rs", "omega", "alpha"),
         sample_parsing_result("b.rs", "epsilon", "omega"),
     ];
-    let pdg = build_pdg_streaming(results, &HashMap::new());
+    let pdg = build_pdg_streaming(results, &HashMap::new()).expect("streaming PDG build");
     assert_eq!(
         pdg.node_count(),
         4,
@@ -783,7 +856,7 @@ fn test_streaming_route_builds_real_edges_and_complexity() {
         error: None,
         parse_time_ms: 0,
     };
-    let pdg = build_pdg_streaming(vec![result], &HashMap::new());
+    let pdg = build_pdg_streaming(vec![result], &HashMap::new()).expect("streaming PDG build");
 
     // The method node must exist, keyed off its qualified name.
     let bar = pdg
@@ -818,8 +891,8 @@ fn test_parallel_pdg_construction_matches_sequential_baseline() {
     ];
 
     // Run legacy route twice — parallel construction must be deterministic.
-    let pdg1 = build_pdg_legacy(results.clone(), &HashMap::new());
-    let pdg2 = build_pdg_legacy(results.clone(), &HashMap::new());
+    let pdg1 = build_pdg_legacy(results.clone(), &HashMap::new()).expect("legacy PDG build");
+    let pdg2 = build_pdg_legacy(results.clone(), &HashMap::new()).expect("legacy PDG build");
 
     let mut ids1: Vec<String> = pdg1
         .node_indices()
@@ -841,8 +914,8 @@ fn test_parallel_pdg_construction_matches_sequential_baseline() {
     );
 
     // Run streaming route twice — also must be deterministic.
-    let pdg3 = build_pdg_streaming(results.clone(), &HashMap::new());
-    let pdg4 = build_pdg_streaming(results, &HashMap::new());
+    let pdg3 = build_pdg_streaming(results.clone(), &HashMap::new()).expect("streaming PDG build");
+    let pdg4 = build_pdg_streaming(results, &HashMap::new()).expect("streaming PDG build");
 
     let mut ids3: Vec<String> = pdg3
         .node_indices()

@@ -1034,6 +1034,23 @@ impl LeIndex {
         parsing_results: Vec<crate::parse::parallel::ParsingResult>,
         use_streaming: bool,
     ) -> Result<()> {
+        let newly_parsed: Vec<crate::parse::parallel::ParsingResult> = parsing_results
+            .into_iter()
+            .filter(|result| result.is_success())
+            .collect();
+        let changed_file_paths: Vec<String> = newly_parsed
+            .iter()
+            .map(|result| result.file_path.display().to_string())
+            .collect();
+        let rebuilt = if newly_parsed.is_empty() {
+            None
+        } else {
+            Some(build_changed_file_pdg(
+                newly_parsed,
+                use_streaming,
+                &state.source_file_hashes,
+            )?)
+        };
         for path in &state.deleted_files {
             index_builder::remove_file_from_pdg(pdg, path)?;
             if let Err(error) = crate::storage::pdg_store::delete_file_data(
@@ -1047,22 +1064,13 @@ impl LeIndex {
                 );
             }
         }
-        let newly_parsed: Vec<crate::parse::parallel::ParsingResult> = parsing_results
-            .into_iter()
-            .filter(|result| result.is_success())
-            .collect();
-        // Drop stale nodes for freshly parsed files *before* the merge, so node
-        // id namespaces (file_path:qualified_name) stay disjoint when the new
-        // graphs are added.
-        let mut changed_file_count = 0usize;
-        for result in &newly_parsed {
-            let file_path = result.file_path.display().to_string();
-            index_builder::remove_file_from_pdg(pdg, &file_path)?;
-            if let Some(hash) = state.source_file_hashes.get(&file_path) {
+        for file_path in &changed_file_paths {
+            index_builder::remove_file_from_pdg(pdg, file_path)?;
+            if let Some(hash) = state.source_file_hashes.get(file_path) {
                 if let Err(error) = crate::storage::pdg_store::update_indexed_file(
                     &mut self.storage,
                     &self.project_id,
-                    &file_path,
+                    file_path,
                     hash,
                 ) {
                     warn!(
@@ -1071,11 +1079,8 @@ impl LeIndex {
                     );
                 }
             }
-            changed_file_count += 1;
         }
-        if !newly_parsed.is_empty() {
-            let (new_pdg, route) =
-                build_changed_file_pdg(newly_parsed, use_streaming, &state.source_file_hashes);
+        if let Some((new_pdg, route)) = rebuilt {
             if pdg.node_count() == 0 {
                 // A full rebuild merges into an empty graph: adopt the built
                 // one instead of re-inserting every node and edge (and
@@ -1086,7 +1091,7 @@ impl LeIndex {
             }
             info!(
                 "PDG: rebuilt {} changed file(s) via {:?} ({} nodes, {} edges)",
-                changed_file_count,
+                changed_file_paths.len(),
                 route,
                 pdg.node_count(),
                 pdg.edge_count()
@@ -1732,16 +1737,12 @@ fn stage_optional_layers(
 /// time, then hand them to `extract`. The streaming parse route strips
 /// `source_bytes` (peak-RSS contract), and resumed jobs reuse stripped
 /// results, so file-backed results are re-read lazily here — at most one
-/// file per parallel worker, never the corpus (PR #90 round 1, P1).
+/// file per parallel worker, never the corpus.
 ///
-/// Identity guard (PR #90 round 2, cluster C): before extraction, the re-read
-/// bytes are hashed and compared against the scan-stage content hash. A
-/// missing or changed file would splice OLD signatures with NEW bytes, so it
-/// is treated exactly like the existing parse-failure path — the result is
-/// dropped from extraction (with a warning), never spliced. Inline bytes are
-/// borrowed unchanged; they were captured at parse time and carry no re-read
-/// risk. Results absent from the hash map (direct builder callers/tests) keep
-/// the legacy empty-slice fallback.
+/// The scan-stage hash is checked for both inline and re-read bytes. A source
+/// that changed or disappeared after parsing aborts the PDG phase before any
+/// old nodes or indexed-file hashes are mutated, leaving the file eligible
+/// for retry on the next scan.
 fn extract_with_verified_source<T>(
     result: crate::parse::parallel::ParsingResult,
     source_file_hashes: &HashMap<String, String>,
@@ -1751,42 +1752,43 @@ fn extract_with_verified_source<T>(
         String,
         Option<String>,
     ) -> T,
-) -> Option<T> {
+) -> Result<T> {
     let file_path_string = result.file_path.display().to_string();
     let file_path_for_read = result.file_path.clone();
     let expected_hash = source_file_hashes.get(&file_path_string);
     let source: std::borrow::Cow<'_, [u8]> = match (&result.source_bytes, expected_hash) {
-        (Some(bytes), _) => std::borrow::Cow::Borrowed(bytes),
-        (None, Some(expected_hash)) => {
-            let (actual_hash, bytes) = match index_builder::read_file_once(&file_path_for_read) {
-                Ok(pair) => pair,
-                Err(error) => {
-                    warn!(
-                        file = %file_path_string,
-                        %error,
-                        "PDG extraction: source vanished after parse; dropping result like a failed parse"
-                    );
-                    return None;
-                }
-            };
+        (Some(bytes), Some(expected_hash)) => {
+            let actual_hash = blake3::hash(bytes).to_hex().to_string();
             if &actual_hash != expected_hash {
-                warn!(
-                    file = %file_path_string,
-                    "PDG extraction: source changed after parse (hash mismatch); dropping result like a failed parse"
+                bail!(
+                    "PDG extraction: source changed after parse (hash mismatch) for '{file_path_string}'"
                 );
-                return None;
+            }
+            std::borrow::Cow::Borrowed(bytes)
+        }
+        (Some(bytes), None) => std::borrow::Cow::Borrowed(bytes),
+        (None, Some(expected_hash)) => {
+            let (actual_hash, bytes) = index_builder::read_file_once(&file_path_for_read)
+                .with_context(|| {
+                    format!(
+                        "PDG extraction: failed to read source for '{file_path_string}' after parse"
+                    )
+                })?;
+            if &actual_hash != expected_hash {
+                bail!(
+                    "PDG extraction: source changed after parse (hash mismatch) for '{file_path_string}'"
+                );
             }
             std::borrow::Cow::Owned((*bytes).clone())
         }
-        (None, None) => {
-            std::borrow::Cow::Owned(std::fs::read(&file_path_for_read).unwrap_or_default())
-        }
+        (None, None) => std::borrow::Cow::Owned(
+            std::fs::read(&file_path_for_read)
+                .with_context(|| format!("PDG extraction: failed to read '{file_path_string}'"))?,
+        ),
     };
-    // Move the owned fields out individually: the `Borrowed` variant borrows
-    // only `result.source_bytes`, so disjoint field moves are fine under NLL.
     let signatures = result.signatures;
     let language = result.language;
-    Some(extract(source, signatures, file_path_string, language))
+    Ok(extract(source, signatures, file_path_string, language))
 }
 
 /// Which PDG construction route produced a given combined graph.
@@ -1817,17 +1819,17 @@ fn build_changed_file_pdg(
     parsing_results: Vec<crate::parse::parallel::ParsingResult>,
     use_streaming: bool,
     source_file_hashes: &HashMap<String, String>,
-) -> (crate::graph::pdg::ProgramDependenceGraph, PdgBuildRoute) {
+) -> Result<(crate::graph::pdg::ProgramDependenceGraph, PdgBuildRoute)> {
     if use_streaming {
-        (
-            build_pdg_streaming(parsing_results, source_file_hashes),
+        Ok((
+            build_pdg_streaming(parsing_results, source_file_hashes)?,
             PdgBuildRoute::Streaming,
-        )
+        ))
     } else {
-        (
-            build_pdg_legacy(parsing_results, source_file_hashes),
+        Ok((
+            build_pdg_legacy(parsing_results, source_file_hashes)?,
             PdgBuildRoute::Legacy,
-        )
+        ))
     }
 }
 
@@ -1836,12 +1838,12 @@ fn build_changed_file_pdg(
 fn build_pdg_legacy(
     parsing_results: Vec<crate::parse::parallel::ParsingResult>,
     source_file_hashes: &HashMap<String, String>,
-) -> crate::graph::pdg::ProgramDependenceGraph {
+) -> Result<crate::graph::pdg::ProgramDependenceGraph> {
     let mut combined = crate::graph::pdg::ProgramDependenceGraph::new();
-    let file_pdgs: Vec<_> = parsing_results
+    let file_pdgs: Result<Vec<_>> = parsing_results
         .into_par_iter()
         .filter(|result| result.is_success())
-        .filter_map(|result| {
+        .map(|result| {
             extract_with_verified_source(
                 result,
                 source_file_hashes,
@@ -1856,10 +1858,10 @@ fn build_pdg_legacy(
             )
         })
         .collect();
-    for file_pdg in file_pdgs {
+    for file_pdg in file_pdgs? {
         index_builder::merge_pdgs(&mut combined, file_pdg);
     }
-    combined
+    Ok(combined)
 }
 
 /// Map a `SignatureInfo` to the canonical streaming node-type string (mirrors
@@ -1873,11 +1875,11 @@ fn build_pdg_legacy(
 fn build_pdg_streaming(
     parsing_results: Vec<crate::parse::parallel::ParsingResult>,
     source_file_hashes: &HashMap<String, String>,
-) -> crate::graph::pdg::ProgramDependenceGraph {
-    let fragments: Vec<_> = parsing_results
+) -> Result<crate::graph::pdg::ProgramDependenceGraph> {
+    let fragments: Result<Vec<_>> = parsing_results
         .into_par_iter()
         .filter(|result| result.is_success())
-        .filter_map(|result| {
+        .map(|result| {
             extract_with_verified_source(
                 result,
                 source_file_hashes,
@@ -1904,7 +1906,7 @@ fn build_pdg_streaming(
             )
         })
         .collect();
-    let (segment, stats) = streaming::pdg::merge_fragments_to_segment(fragments);
+    let (segment, stats) = streaming::pdg::merge_fragments_to_segment(fragments?);
     info!(
         "Streaming PDG merge: {} fragments, {} nodes, {} edges ({} cross-file resolved, {} unresolved, {} duplicate node records dropped)",
         stats.fragments,
@@ -1914,5 +1916,5 @@ fn build_pdg_streaming(
         stats.cross_file_unresolved,
         stats.duplicate_nodes_dropped
     );
-    streaming::pdg::pdg_from_segment(&segment)
+    Ok(streaming::pdg::pdg_from_segment(&segment))
 }
