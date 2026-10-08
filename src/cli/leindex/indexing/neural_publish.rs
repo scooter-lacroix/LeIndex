@@ -20,7 +20,13 @@ impl streaming::neural::StreamingEmbedder for HybridStreamingEmbedder<'_> {
             }
             let embeddings = self.inner.embed_neural_batch_blocking(&unique_texts);
             if embeddings.len() != unique_texts.len() {
-                return vec![Vec::new(); texts.len()];
+                // Count mismatch = embedder contract violation. Return a
+                // length that cannot match `texts.len()` so `flush_batch`'s
+                // hard-error fires and run_neural's failure path handles it —
+                // a masked mismatch (empty vectors => rows_skipped) would
+                // persist partial batches and resume would skip those rows
+                // forever (PR #90 review, cluster E).
+                return Vec::new();
             }
             let embeddings_by_text: Vec<Option<Vec<f32>>> = embeddings;
             texts
