@@ -199,6 +199,38 @@ fn save_stage_budget_ms(pdg_edges: usize, override_ms: Option<u64>) -> u64 {
     })
 }
 
+fn parse_files_for_route(
+    files: Vec<PathBuf>,
+    scan: &ScanCheckpoint,
+    route: streaming::routes::ParseRoute,
+) -> Vec<crate::parse::parallel::ParsingResult> {
+    match route {
+        streaming::routes::ParseRoute::Streaming => {
+            // Byte sizes come from the scan inventory (single hashing
+            // authority); anything missing sizes to 0 and still parses.
+            let file_sizes: HashMap<PathBuf, u64> = scan
+                .files
+                .iter()
+                .map(|file| (file.canonical_path.clone(), file.bytes))
+                .collect();
+            let bounded = files
+                .into_iter()
+                .map(|path| {
+                    let bytes = file_sizes.get(&path).copied().unwrap_or(0);
+                    (path, bytes)
+                })
+                .collect();
+            streaming::parse::stream_parse_parallel(
+                bounded,
+                &streaming::parse::ParseBudget::default(),
+            )
+        }
+        streaming::routes::ParseRoute::Legacy => {
+            crate::parse::parallel::ParallelParser::new().parse_files(files)
+        }
+    }
+}
+
 impl LeIndex {
     fn checkpoint_store(&self, generation: u64) -> CheckpointStore {
         CheckpointStore::new(self.storage_path(), generation)
@@ -937,11 +969,18 @@ impl LeIndex {
             "Indexing: parsing {} files...",
             plan.files_to_parse.len()
         ));
-        let parser = crate::parse::parallel::ParallelParser::new();
+        let parse_route = streaming::routes::parse_route_for_current_flag();
+        info!(
+            "Index parse: {} route selected by LEINDEX_FEATURE_STREAMING_PARSE",
+            match parse_route {
+                streaming::routes::ParseRoute::Streaming => "streaming",
+                streaming::routes::ParseRoute::Legacy => "legacy",
+            }
+        );
         let mut parsing_results = if plan.files_to_parse.is_empty() {
             Vec::new()
         } else {
-            parser.parse_files(std::mem::take(&mut plan.files_to_parse))
+            parse_files_for_route(std::mem::take(&mut plan.files_to_parse), scan, parse_route)
         };
         parsing_results.extend(resumed_parse_results);
         let parse_checkpoint = self.write_parse_checkpoint(

@@ -93,12 +93,19 @@ pub enum FeatureFlag {
     /// path. Coverage: `test_scan_route_flag_selects_both_routes` and
     /// `test_streaming_scan_flag_indexes_fixture_and_searches`.
     StreamingScan,
-    /// Enable the streaming parse stage (WS6-9 Task 2): bounded parse chunks
-    /// with per-file persist and syntax-tree drop before the next file.
+    /// Enable the streaming parse stage (WS6-9 Task 2): parse chunks bounded
+    /// by file count and aggregate bytes through `stream_parse_parallel`.
     ///
-    /// **Status:** declared but not yet consumed by `index_project_inner`; the
-    /// flag currently has no effect. Tracked in
-    /// <https://github.com/scooter-lacroix/LeIndex/issues/86>.
+    /// Consumer: `run_parse` in `src/cli/leindex/indexing/mod.rs` dispatches
+    /// on `parse_route_for_current_flag()`; the streaming route feeds the same
+    /// production `ParallelParser` in `ParseBudget`-bounded chunks, producing
+    /// the identical `ParsingResult` sequence the legacy route returns. Default
+    /// OFF preserves the legacy whole-set parse. Coverage:
+    /// `test_parse_route_flag_selects_both_routes`,
+    /// `test_chunk_file_inputs_respects_file_limit`,
+    /// `test_chunk_file_inputs_respects_byte_limit_and_keeps_order`,
+    /// `test_stream_parse_parallel_preserves_order_and_result_shape`, and
+    /// `test_streaming_parse_flag_indexes_fixture_and_searches`.
     StreamingParse,
     /// Enable the compact PDG persistence stage (WS6-9 Task 3): per-file graph
     /// fragments to CAS adjacency without whole-PDG clone.
@@ -214,7 +221,6 @@ impl FeatureFlag {
             | Self::DaemonClient
             | Self::GenerationReaders
             | Self::BoundedScheduler
-            | Self::StreamingParse
             | Self::StreamingPdg
             | Self::StreamingTfidf
             | Self::StreamingNeural
@@ -703,7 +709,6 @@ mod test {
             FeatureFlag::DaemonClient,
             FeatureFlag::GenerationReaders,
             FeatureFlag::BoundedScheduler,
-            FeatureFlag::StreamingParse,
             FeatureFlag::StreamingPdg,
             FeatureFlag::StreamingTfidf,
             FeatureFlag::StreamingNeural,
@@ -725,7 +730,7 @@ mod test {
     fn test_pr86_consumer_flags_default_off() {
         let _g = FLAG_TEST_LOCK.lock().unwrap();
         clear_flag_overrides_for_test();
-        for flag in [FeatureFlag::StreamingScan] {
+        for flag in [FeatureFlag::StreamingScan, FeatureFlag::StreamingParse] {
             assert!(!flag.default_value(), "{} must default OFF", flag.env_var());
         }
     }
