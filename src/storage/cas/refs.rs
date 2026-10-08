@@ -414,7 +414,9 @@ fn owner_is_alive(pid: u32, start_ticks: u64) -> bool {
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        // No /proc start time; probe existence.
+        // No /proc start time; probe existence. The start-ticks argument is
+        // unused on this platform but part of the owner-identity contract.
+        let _ = start_ticks;
         // SAFETY: signal 0 only probes for existence.
         let rc = unsafe { libc::kill(pid as i32, 0) };
         rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
