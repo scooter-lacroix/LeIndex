@@ -283,6 +283,38 @@ mod test {
             .collect()
     }
 
+    /// PR #90 round 2, cluster E: a count mismatch between the embedder's
+    /// returned vectors and the batch's texts is a hard error — never a
+    /// silent partial write (a short batch persisted + checkpointed would
+    /// make resume skip the missing rows forever).
+    #[test]
+    fn test_short_embedder_batch_is_a_hard_error_and_persists_nothing() {
+        struct ShortEmbedder;
+        impl StreamingEmbedder for ShortEmbedder {
+            fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
+                texts.iter().skip(1).map(|_| vec![1.0_f32]).collect()
+            }
+        }
+
+        let inputs = make_inputs(6);
+        let mut iter = inputs.into_iter().map(Ok);
+        let mut writer = VecNeuralRowWriter::default();
+        let result = enrich_neural_streaming(
+            &mut iter,
+            &ShortEmbedder,
+            &mut writer,
+            &BatchBudget::unlimited(),
+        );
+        assert!(
+            result.is_err(),
+            "short embedder batch must fail the enrichment, not skip rows silently"
+        );
+        assert!(
+            writer.rows.is_empty(),
+            "no partial rows may be persisted when a batch count mismatches (resume would skip the missing rows forever)"
+        );
+    }
+
     /// VAL-STREAM-006: Direct staged neural writes produce bit-identical vectors.
     #[test]
     fn test_streaming_neural_bit_identical() {

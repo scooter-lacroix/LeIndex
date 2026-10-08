@@ -986,6 +986,17 @@ impl LeIndex {
             parse_files_for_route(std::mem::take(&mut plan.files_to_parse), scan, parse_route)
         };
         parsing_results.extend(resumed_parse_results);
+        // Streaming route (PR #90 round 2, cluster B): resumed results are
+        // reconstructed with re-read source buffers; strip them exactly like
+        // freshly parsed ones so a resumed large job never re-retains the
+        // corpus. PDG extraction re-reads file-backed results lazily with
+        // hash verification, so nothing downstream loses data. The legacy
+        // route keeps inline bytes (unchanged behavior).
+        if parse_route == streaming::routes::ParseRoute::Streaming {
+            for result in &mut parsing_results {
+                result.source_bytes = None;
+            }
+        }
         let parse_checkpoint = self.write_parse_checkpoint(
             checkpoint_store,
             scan,
@@ -1053,7 +1064,8 @@ impl LeIndex {
             changed_file_count += 1;
         }
         if !newly_parsed.is_empty() {
-            let (new_pdg, route) = build_changed_file_pdg(newly_parsed, use_streaming);
+            let (new_pdg, route) =
+                build_changed_file_pdg(newly_parsed, use_streaming, &state.source_file_hashes);
             if pdg.node_count() == 0 {
                 // A full rebuild merges into an empty graph: adopt the built
                 // one instead of re-inserting every node and edge (and
@@ -1706,25 +1718,65 @@ fn stage_optional_layers(
     }
     Ok(())
 }
-/// Resolve the source bytes for a parsed file at PDG-extraction time.
+/// Resolve + verify the source bytes for one parsed file at PDG-extraction
+/// time, then hand them to `extract`. The streaming parse route strips
+/// `source_bytes` (peak-RSS contract), and resumed jobs reuse stripped
+/// results, so file-backed results are re-read lazily here — at most one
+/// file per parallel worker, never the corpus (PR #90 round 1, P1).
 ///
-/// The streaming parse route strips `source_bytes` from its returned results
-/// (peak-RSS contract: no whole-corpus retention), so file-backed results
-/// are re-read lazily here — at most one file per parallel worker, never the
-/// corpus. Missing or unreadable files yield an empty slice, matching the
-/// `unwrap_or(&[])` semantics of the inline path (parse-failure results
-/// carry `None` too, and extraction treats empty source as absent). Inline
-/// bytes are borrowed, never copied; legacy results never touch the
-/// filesystem. Takes the field references (not the whole result) so callers
-/// can move `result.signatures` while the bytes are still borrowed.
-fn extraction_source_bytes<'a>(
-    source_bytes: &'a Option<Vec<u8>>,
-    file_path: &std::path::Path,
-) -> std::borrow::Cow<'a, [u8]> {
-    match source_bytes {
-        Some(bytes) => std::borrow::Cow::Borrowed(bytes),
-        None => std::borrow::Cow::Owned(std::fs::read(file_path).unwrap_or_default()),
-    }
+/// Identity guard (PR #90 round 2, cluster C): before extraction, the re-read
+/// bytes are hashed and compared against the scan-stage content hash. A
+/// missing or changed file would splice OLD signatures with NEW bytes, so it
+/// is treated exactly like the existing parse-failure path — the result is
+/// dropped from extraction (with a warning), never spliced. Inline bytes are
+/// borrowed unchanged; they were captured at parse time and carry no re-read
+/// risk. Results absent from the hash map (direct builder callers/tests) keep
+/// the legacy empty-slice fallback.
+fn extract_with_verified_source<T>(
+    result: crate::parse::parallel::ParsingResult,
+    source_file_hashes: &HashMap<String, String>,
+    extract: impl FnOnce(
+        std::borrow::Cow<'_, [u8]>,
+        Vec<crate::parse::traits::SignatureInfo>,
+        String,
+        Option<String>,
+    ) -> T,
+) -> Option<T> {
+    let file_path_string = result.file_path.display().to_string();
+    let file_path_for_read = result.file_path.clone();
+    let expected_hash = source_file_hashes.get(&file_path_string);
+    let source: std::borrow::Cow<'_, [u8]> = match (&result.source_bytes, expected_hash) {
+        (Some(bytes), _) => std::borrow::Cow::Borrowed(bytes),
+        (None, Some(expected_hash)) => {
+            let (actual_hash, bytes) = match index_builder::read_file_once(&file_path_for_read) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    warn!(
+                        file = %file_path_string,
+                        %error,
+                        "PDG extraction: source vanished after parse; dropping result like a failed parse"
+                    );
+                    return None;
+                }
+            };
+            if &actual_hash != expected_hash {
+                warn!(
+                    file = %file_path_string,
+                    "PDG extraction: source changed after parse (hash mismatch); dropping result like a failed parse"
+                );
+                return None;
+            }
+            std::borrow::Cow::Owned((*bytes).clone())
+        }
+        (None, None) => {
+            std::borrow::Cow::Owned(std::fs::read(&file_path_for_read).unwrap_or_default())
+        }
+    };
+    // Move the owned fields out individually: the `Borrowed` variant borrows
+    // only `result.source_bytes`, so disjoint field moves are fine under NLL.
+    let signatures = result.signatures;
+    let language = result.language;
+    Some(extract(source, signatures, file_path_string, language))
 }
 
 /// Which PDG construction route produced a given combined graph.
@@ -1754,14 +1806,18 @@ pub(crate) fn pdg_route_for_current_flag() -> PdgBuildRoute {
 fn build_changed_file_pdg(
     parsing_results: Vec<crate::parse::parallel::ParsingResult>,
     use_streaming: bool,
+    source_file_hashes: &HashMap<String, String>,
 ) -> (crate::graph::pdg::ProgramDependenceGraph, PdgBuildRoute) {
     if use_streaming {
         (
-            build_pdg_streaming(parsing_results),
+            build_pdg_streaming(parsing_results, source_file_hashes),
             PdgBuildRoute::Streaming,
         )
     } else {
-        (build_pdg_legacy(parsing_results), PdgBuildRoute::Legacy)
+        (
+            build_pdg_legacy(parsing_results, source_file_hashes),
+            PdgBuildRoute::Legacy,
+        )
     }
 }
 
@@ -1769,20 +1825,24 @@ fn build_changed_file_pdg(
 /// merge each into a combined graph (clone-free `merge_pdgs`).
 fn build_pdg_legacy(
     parsing_results: Vec<crate::parse::parallel::ParsingResult>,
+    source_file_hashes: &HashMap<String, String>,
 ) -> crate::graph::pdg::ProgramDependenceGraph {
     let mut combined = crate::graph::pdg::ProgramDependenceGraph::new();
     let file_pdgs: Vec<_> = parsing_results
         .into_par_iter()
         .filter(|result| result.is_success())
-        .map(|result| {
-            let file_path = result.file_path.display().to_string();
-            let language = result.language.as_deref().unwrap_or("unknown");
-            let source_bytes = extraction_source_bytes(&result.source_bytes, &result.file_path);
-            crate::graph::extract_pdg_from_signatures(
-                result.signatures,
-                &source_bytes,
-                &file_path,
-                language,
+        .filter_map(|result| {
+            extract_with_verified_source(
+                result,
+                source_file_hashes,
+                |source_bytes, signatures, file_path, language| {
+                    crate::graph::extract_pdg_from_signatures(
+                        signatures,
+                        &source_bytes,
+                        &file_path,
+                        language.as_deref().unwrap_or("unknown"),
+                    )
+                },
             )
         })
         .collect();
@@ -1802,35 +1862,36 @@ fn build_pdg_legacy(
 /// rebuild the `ProgramDependenceGraph` via `pdg_from_segment`.
 fn build_pdg_streaming(
     parsing_results: Vec<crate::parse::parallel::ParsingResult>,
+    source_file_hashes: &HashMap<String, String>,
 ) -> crate::graph::pdg::ProgramDependenceGraph {
     let fragments: Vec<_> = parsing_results
         .into_par_iter()
         .filter(|result| result.is_success())
-        .map(|result| {
-            let file_path = result.file_path.display().to_string();
-            let language = result
-                .language
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string());
-            let source_bytes = extraction_source_bytes(&result.source_bytes, &result.file_path);
-            // Route through the REAL extraction pipeline
-            // (`extract_pdg_from_signatures` → `fragment_from_pdg`, its
-            // documented production realization) instead of the skeleton
-            // `build_fragment_from_parsed`. The skeleton flattened
-            // signatures to name/kind/bytes, hardcoding complexity 0 and
-            // dropping ALL intra-file call/data edges — which is why the
-            // streaming route's stored graph showed complexity 0 on every
-            // node, empty callee lists, and `forward_impact` returning
-            // nothing. The per-file PDG here is single-file (cheap to
-            // build), so the streaming memory contract (no whole-graph
-            // clone, compact per-file records) is preserved.
-            let file_pdg = crate::graph::extract_pdg_from_signatures(
-                result.signatures,
-                &source_bytes,
-                &file_path,
-                &language,
-            );
-            streaming::pdg::fragment_from_pdg(&file_pdg)
+        .filter_map(|result| {
+            extract_with_verified_source(
+                result,
+                source_file_hashes,
+                |source_bytes, signatures, file_path, language| {
+                    // Route through the REAL extraction pipeline
+                    // (`extract_pdg_from_signatures` → `fragment_from_pdg`, its
+                    // documented production realization) instead of the skeleton
+                    // `build_fragment_from_parsed`. The skeleton flattened
+                    // signatures to name/kind/bytes, hardcoding complexity 0 and
+                    // dropping ALL intra-file call/data edges — which is why the
+                    // streaming route's stored graph showed complexity 0 on every
+                    // node, empty callee lists, and `forward_impact` returning
+                    // nothing. The per-file PDG here is single-file (cheap to
+                    // build), so the streaming memory contract (no whole-graph
+                    // clone, compact per-file records) is preserved.
+                    let file_pdg = crate::graph::extract_pdg_from_signatures(
+                        signatures,
+                        &source_bytes,
+                        &file_path,
+                        language.as_deref().unwrap_or("unknown"),
+                    );
+                    streaming::pdg::fragment_from_pdg(&file_pdg)
+                },
+            )
         })
         .collect();
     let (segment, stats) = streaming::pdg::merge_fragments_to_segment(fragments);

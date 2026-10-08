@@ -236,17 +236,17 @@ pub fn deserialize_tfidf_rows(data: &[u8]) -> Result<Vec<TfidfRow>> {
     Ok(bincode::deserialize(data)?)
 }
 
-/// Read each distinct file in a chunk exactly once and serve all of its
-/// nodes' tokenized-document computations from that single read (PR #90
-/// review, P2: a symbol-dense file used to be re-read once per node).
-///
+/// Extract per-node tokenized documents for one chunk, reading each distinct
+/// file exactly once (PR #90 round 1, P2) and returning ONE DOCUMENT PER
+/// NON-EXTERNAL NODE (PR #90 round 2, cluster A) so document-frequency
+/// granularity matches the legacy `build_document_frequencies` builder.
 /// Generic over the reader so tests can count reads without filesystem
 /// mocking; the production closure is `std::fs::read`.
 fn chunk_docs_from_files<F>(
     nodes: &[petgraph::graph::NodeIndex],
     pdg: &crate::graph::pdg::ProgramDependenceGraph,
     read_file: F,
-) -> Vec<anyhow::Result<(String, Vec<String>)>>
+) -> Vec<anyhow::Result<Vec<(String, Vec<String>)>>>
 where
     F: Fn(&str) -> std::io::Result<Vec<u8>> + Sync,
 {
@@ -285,10 +285,10 @@ where
     by_file
         .into_par_iter()
         .map(
-            |(file_path, node_indices)| -> anyhow::Result<(String, Vec<String>)> {
+            |(file_path, node_indices)| -> anyhow::Result<Vec<(String, Vec<String>)>> {
                 let file_bytes = read_file(&file_path)
                     .with_context(|| format!("read source for TF-IDF node file {file_path}"))?;
-                let mut docs = FileDocTokens::default();
+                let mut docs = Vec::with_capacity(node_indices.len());
                 for node_idx in node_indices {
                     let Some(node) = pdg.get_node(node_idx) else {
                         continue;
@@ -301,42 +301,27 @@ where
                         &connectivity_config,
                         &file_summary_ctx,
                     );
-                    docs.add_tokens(index_builder::tokenize_code(&node_content));
+                    docs.push((
+                        node.id.to_string(),
+                        index_builder::tokenize_code(&node_content),
+                    ));
                 }
-                Ok((file_path, docs.tokens()))
+                Ok(docs)
             },
         )
         .collect()
-}
-
-/// Accumulates deduplicated tokens per file (a document for the DF pass).
-#[derive(Default)]
-struct FileDocTokens {
-    seen: std::collections::HashSet<String>,
-    tokens: Vec<String>,
-}
-
-impl FileDocTokens {
-    fn add_tokens(&mut self, tokens: impl IntoIterator<Item = String>) {
-        for token in tokens {
-            if self.seen.insert(token.clone()) {
-                self.tokens.push(token);
-            }
-        }
-    }
-
-    fn tokens(self) -> Vec<String> {
-        self.tokens
-    }
 }
 
 /// Streaming pass 1 over the PDG for the production lexical route.
 ///
 /// Builds document frequencies in `chunk_size`-node chunks with the
 /// production tokenizer and the exact `enriched_node_content` corpus the
-/// legacy route tokenizes. Each distinct file is read at most once per
-/// chunk and never retained across the pass. IO failures abort rather than
-/// publish partial document frequencies.
+/// legacy route tokenizes. Document granularity matches the legacy builder:
+/// one document per non-external node (round 2, cluster A), with each
+/// distinct file read at most once per chunk (round 1, P2). Unreadable
+/// files match legacy semantics: the read is replaced with empty bytes, a
+/// warning is logged, and indexing proceeds (round 2, cluster D) — the
+/// legacy builder's `unwrap_or_else(|_| Arc::new(Vec::new()))`.
 pub fn build_document_frequencies_chunked(
     pdg: &crate::graph::pdg::ProgramDependenceGraph,
     chunk_size: usize,
@@ -346,13 +331,28 @@ pub fn build_document_frequencies_chunked(
     let mut total_docs = 0usize;
 
     for nodes in node_indices.chunks(chunk_size.max(1)) {
-        let documents = chunk_docs_from_files(nodes, pdg, |path| std::fs::read(path));
+        let documents = chunk_docs_from_files(nodes, pdg, |path| match std::fs::read(path) {
+            Ok(bytes) => Ok(bytes),
+            Err(error) => {
+                tracing::warn!(
+                    file = %path,
+                    %error,
+                    "unreadable source for TF-IDF node; treating as empty document (legacy parity)"
+                );
+                Ok(Vec::new())
+            }
+        });
 
-        total_docs += documents.len();
         for document in documents {
-            let (_, tokens) = document?;
-            for token in tokens {
-                *df.entry(token).or_insert(0) += 1;
+            for (_node_id, tokens) in document? {
+                // One document per node: count each token once per document.
+                let mut unique = tokens;
+                unique.sort_unstable();
+                unique.dedup();
+                for token in unique {
+                    *df.entry(token).or_insert(0) += 1;
+                }
+                total_docs += 1;
             }
         }
     }
@@ -607,17 +607,110 @@ mod test {
         assert_eq!(
             docs.len(),
             1,
-            "all nodes share one file_path, so the chunk yields exactly one document"
+            "all nodes share one file_path, so the chunk reads that file exactly once"
         );
         assert!(docs[0].is_ok());
-        assert!(
-            !docs[0].as_ref().unwrap().1.is_empty(),
-            "the document must contain tokens"
+        let docs = docs[0].as_ref().unwrap();
+        assert_eq!(
+            docs.len(),
+            nodes.len(),
+            "one document per node (DF granularity must match the legacy per-node builder)"
         );
+        for (node_id, tokens) in docs {
+            assert!(!node_id.is_empty());
+            assert!(
+                !tokens.is_empty(),
+                "every node's document must contain tokens"
+            );
+        }
         assert_eq!(
             reads.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "distinct file must be read exactly once per chunk (was once per node)"
         );
+    }
+
+    /// PR #90 round 2, cluster A: the streaming DF pass must produce the
+    /// identical vocabulary + IDF as the legacy `build_document_frequencies`
+    /// builder on a symbol-dense fixture (several nodes per file), because
+    /// documents are per NODE, not per file.
+    #[test]
+    fn test_streaming_df_matches_legacy_builder_on_multi_node_fixture() {
+        let signatures = vec![
+            crate::parse::traits::SignatureInfo {
+                name: "alpha_fn".to_string(),
+                qualified_name: "alpha_fn".to_string(),
+                parameters: vec![],
+                return_type: None,
+                visibility: crate::parse::traits::Visibility::Public,
+                is_async: false,
+                is_method: false,
+                docstring: None,
+                calls: vec![],
+                imports: vec![],
+                byte_range: (0, 40),
+                cyclomatic_complexity: 1,
+                flow_facts: vec![],
+            },
+            crate::parse::traits::SignatureInfo {
+                name: "beta_fn".to_string(),
+                qualified_name: "beta_fn".to_string(),
+                parameters: vec![],
+                return_type: None,
+                visibility: crate::parse::traits::Visibility::Public,
+                is_async: false,
+                is_method: false,
+                docstring: None,
+                calls: vec![],
+                imports: vec![],
+                byte_range: (41, 81),
+                cyclomatic_complexity: 1,
+                flow_facts: vec![],
+            },
+        ];
+        let source = b"pub fn alpha_fn() -> usize { 1 }\npub fn beta_fn() -> usize { 2 }\n";
+        let pdg = crate::graph::extract_pdg_from_signatures(
+            signatures,
+            source,
+            "/fixture/multi.rs",
+            "rust",
+        );
+
+        let node_indices: Vec<petgraph::graph::NodeIndex> = pdg.node_indices().collect();
+        let (stream_df, stream_docs) =
+            build_document_frequencies_chunked(&pdg, node_indices.len().max(1)).unwrap();
+        let (legacy_df, legacy_docs) = index_builder::build_document_frequencies(
+            &pdg,
+            &node_indices,
+            &crate::graph::pdg::TraversalConfig {
+                max_depth: Some(1),
+                max_nodes: Some(1000),
+                allowed_edge_types: Some(&[
+                    crate::graph::pdg::EdgeType::Call,
+                    crate::graph::pdg::EdgeType::DataDependency,
+                ]),
+                excluded_node_types: Some(vec![crate::graph::pdg::NodeType::External]),
+                min_complexity: None,
+                min_edge_confidence: 0.0,
+            },
+            &index_builder::FileSummaryContext::from_pdg(&pdg),
+        );
+
+        assert_eq!(
+            stream_docs, legacy_docs,
+            "document count must match (per-node)"
+        );
+        assert_eq!(
+            stream_df.len(),
+            legacy_df.len(),
+            "vocabulary size must match the legacy builder"
+        );
+        for (token, legacy_count) in &legacy_df {
+            assert_eq!(
+                stream_df.get(token),
+                Some(legacy_count),
+                "DF for '{token}' must match the legacy builder"
+            );
+        }
     }
 }

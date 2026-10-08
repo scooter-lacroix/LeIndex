@@ -129,8 +129,11 @@ that already exists in indexing tests.
 7. `cargo test --lib grouped` (tools/list payload ≤13000 bytes).
 8. Release e2e, scratch copy + isolated HOME (never the real .leindex):
    (a) flags off: index → search → second-index no-op — behavior unchanged;
-   (b) all five flags ON: same flow green, and log lines prove each streaming route
-   ran; force re-index with flags on also green.
+   (b) consumed flags ON (Scan/Parse/Tfidf/Neural + StreamingPdg): same flow
+   green, and log lines prove each streaming route ran; force re-index with
+   flags on also green. BoundedScheduler has no consumer in this PR, so it
+   produces no route evidence — its limitation is recorded separately (D6:
+   annotation + PR body).
 
 ## 4. Landmines (from the adoption brief — binding)
 

@@ -1420,7 +1420,7 @@ fn admit_prepared_node(
 /// work is spread across cores: on a 20k-node project this pass was ~60 % of a
 /// full index run while using one core. The result is identical to the
 /// sequential loop it replaces.
-fn build_document_frequencies(
+pub(crate) fn build_document_frequencies(
     pdg: &ProgramDependenceGraph,
     node_indices: &[petgraph::graph::NodeIndex],
     connectivity_config: &crate::graph::pdg::TraversalConfig,

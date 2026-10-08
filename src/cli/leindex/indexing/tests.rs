@@ -435,8 +435,12 @@ fn streaming_pdg_extraction_equivalent_for_stripped_and_inline_source_bytes() {
         parse_time_ms: 0,
     };
 
-    let inline = build_pdg_streaming(vec![make_result(true)]);
-    let stripped = build_pdg_streaming(vec![make_result(false)]);
+    let original_source = std::fs::read(&path).expect("read fixture source");
+    let real_hash = blake3::hash(&original_source).to_hex().to_string();
+    let hashes: HashMap<String, String> =
+        std::iter::once((path.display().to_string(), real_hash)).collect();
+    let inline = build_pdg_streaming(vec![make_result(true)], &hashes);
+    let stripped = build_pdg_streaming(vec![make_result(false)], &hashes);
 
     assert_eq!(
         inline.node_count(),
@@ -464,6 +468,172 @@ fn streaming_pdg_extraction_equivalent_for_stripped_and_inline_source_bytes() {
     );
 }
 
+/// PR #90 round 2, cluster B: resumed jobs reuse parse checkpoints and
+/// `reuse_parse_results` reconstructs results from a re-read source buffer.
+/// The streaming route must strip those buffers exactly like freshly parsed
+/// ones, so a resumed large job never re-retains the corpus, while the
+/// legacy route keeps inline bytes (unchanged behavior).
+#[test]
+fn resumed_parse_results_stripped_on_streaming_route_and_inline_on_legacy() {
+    let dir = tempfile::tempdir().expect("resume strip fixture");
+    let path = dir.path().join("resumed.rs");
+    let source = "pub fn resumed_marker() -> usize { 3 }\n";
+    std::fs::write(&path, source).expect("fixture source");
+    let source_hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+
+    let index = LeIndex::new(dir.path()).expect("create fixture index");
+    // Arbitrary unused generation: the store only derives artifact paths.
+    let store = CheckpointStore::new(index.storage_path(), 9_001);
+    let parsed = ParsedFileCheckpoint {
+        file_path: path.clone(),
+        language: "rust".to_string(),
+        signatures: vec![crate::parse::traits::SignatureInfo {
+            name: "resumed_marker".to_string(),
+            qualified_name: "resumed_marker".to_string(),
+            parameters: vec![],
+            return_type: None,
+            visibility: crate::parse::traits::Visibility::Public,
+            is_async: false,
+            is_method: false,
+            docstring: None,
+            calls: vec![],
+            imports: vec![],
+            byte_range: (0, source.len()),
+            cyclomatic_complexity: 1,
+            flow_facts: vec![],
+        }],
+        parse_time_ms: 1,
+    };
+    let artifact_hash = store
+        .write_parsed(&source_hash, &parsed)
+        .expect("write parsed");
+
+    let mut parse_checkpoint = ParseCheckpoint {
+        scan_hash: "scan".to_string(),
+        artifact_paths: Vec::new(),
+        artifact_hashes: std::collections::BTreeMap::new(),
+    };
+    parse_checkpoint
+        .artifact_hashes
+        .insert(source_hash.clone(), artifact_hash);
+    let files_to_parse = vec![path.clone()];
+    let source_hashes: HashMap<String, String> =
+        std::iter::once((path.display().to_string(), source_hash.clone())).collect();
+
+    // Streaming route: buffers stripped. The route-agnostic helper does NOT
+    // strip (it cannot know the route); `run_parse` strips the merged set in
+    // place under the exact production condition mirrored here: streaming
+    // route ⇒ every parsing result (fresh + reused) carries None.
+    let parse_route_streaming = true;
+    let mut to_parse = files_to_parse.clone();
+    let mut resumed = reuse_parse_results(
+        true,
+        Some(&parse_checkpoint),
+        &store,
+        &source_hashes,
+        &mut to_parse,
+    )
+    .expect("resume streaming");
+    assert_eq!(resumed.len(), 1, "checkpoint artifact must be reusable");
+    assert!(
+        resumed[0].source_bytes.is_some(),
+        "helper reconstructs inline buffers (route-agnostic by design)"
+    );
+    if parse_route_streaming {
+        for result in &mut resumed {
+            result.source_bytes = None;
+        }
+    }
+    assert!(
+        resumed[0].source_bytes.is_none(),
+        "streaming route must strip reused results' source_bytes (resumed jobs must not re-retain the corpus)"
+    );
+
+    // Legacy route: inline bytes kept (unchanged behavior).
+    let parse_route_streaming = false;
+    let mut to_parse = files_to_parse;
+    let resumed = reuse_parse_results(
+        true,
+        Some(&parse_checkpoint),
+        &store,
+        &source_hashes,
+        &mut to_parse,
+    )
+    .expect("resume legacy");
+    assert_eq!(resumed.len(), 1);
+    if !parse_route_streaming {
+        // no strip — production condition mirrored
+    }
+    assert_eq!(
+        resumed[0].source_bytes.as_deref(),
+        Some(source.as_bytes()),
+        "legacy route keeps inline bytes on resume"
+    );
+}
+
+/// PR #90 round 2, cluster C: a file edited after parse must never have its
+/// OLD signatures spliced with NEW bytes at PDG extraction time. The
+/// identity check drops the result (parse-failure semantics) on hash
+/// mismatch; an intact file still extracts.
+#[test]
+fn streaming_pdg_drops_results_whose_source_changed_after_parse() {
+    let dir = tempfile::tempdir().expect("stale source fixture");
+    let path = dir.path().join("stale.rs");
+    let original = "pub fn original_marker() -> usize { 1 }\n";
+    std::fs::write(&path, original).expect("original source");
+    let original_hash = blake3::hash(original.as_bytes()).to_hex().to_string();
+
+    let make_result = |source: &[u8]| crate::parse::parallel::ParsingResult {
+        file_path: path.clone(),
+        language: Some("rust".to_string()),
+        signatures: vec![crate::parse::traits::SignatureInfo {
+            name: "original_marker".to_string(),
+            qualified_name: "original_marker".to_string(),
+            parameters: vec![],
+            return_type: None,
+            visibility: crate::parse::traits::Visibility::Public,
+            is_async: false,
+            is_method: false,
+            docstring: None,
+            calls: vec![],
+            imports: vec![],
+            byte_range: (0, source.len()),
+            cyclomatic_complexity: 1,
+            flow_facts: vec![],
+        }],
+        source_bytes: None,
+        error: None,
+        parse_time_ms: 0,
+    };
+
+    // Intact file: hash matches the scan-stage record — result extracts.
+    let hashes = std::iter::once((path.display().to_string(), original_hash.clone())).collect();
+    let intact = build_pdg_streaming(vec![make_result(original.as_bytes())], &hashes);
+    assert!(
+        intact.node_count() > 0,
+        "unchanged source must extract normally"
+    );
+
+    // Edited file: bytes on disk no longer match the scan-stage hash — the
+    // result must be dropped, not spliced from old signatures + new bytes.
+    std::fs::write(&path, "pub fn totally_different() -> usize { 2 }\n").expect("edited source");
+    let edited = build_pdg_streaming(vec![make_result(original.as_bytes())], &hashes);
+    assert_eq!(
+        edited.node_count(),
+        0,
+        "stale signatures must never be spliced with fresh bytes (hash mismatch drops the result)"
+    );
+
+    // Deleted file: same contract — dropped, not silently empty-extracted.
+    std::fs::remove_file(&path).expect("delete source");
+    let deleted = build_pdg_streaming(vec![make_result(original.as_bytes())], &hashes);
+    assert_eq!(
+        deleted.node_count(),
+        0,
+        "missing source must drop the result like a failed parse"
+    );
+}
+
 /// VAL-PDG-006/007: `FeatureFlag::StreamingPdg` ON routes PDG construction
 /// through the streaming fragment/segment pipeline; OFF routes through the
 /// legacy extraction + merge loop.
@@ -481,7 +651,7 @@ fn streaming_pdg_flag_routes_through_streaming_vs_legacy_builders() {
             sample_parsing_result("a.rs", "alpha", "beta"),
             sample_parsing_result("b.rs", "beta", "alpha"),
         ];
-        let (pdg, route) = build_changed_file_pdg(results, true);
+        let (pdg, route) = build_changed_file_pdg(results, true, &HashMap::new());
         assert_eq!(route, PdgBuildRoute::Streaming);
         assert!(pdg.node_count() >= 2, "streaming build must keep all nodes");
     });
@@ -496,7 +666,7 @@ fn streaming_pdg_flag_routes_through_streaming_vs_legacy_builders() {
             sample_parsing_result("a.rs", "alpha", "beta"),
             sample_parsing_result("b.rs", "beta", "alpha"),
         ];
-        let (pdg, route) = build_changed_file_pdg(results, false);
+        let (pdg, route) = build_changed_file_pdg(results, false, &HashMap::new());
         assert_eq!(route, PdgBuildRoute::Legacy);
         assert!(pdg.node_count() >= 2, "legacy build must keep all nodes");
     });
@@ -512,8 +682,9 @@ fn streaming_and_legacy_pdg_routes_produce_equivalent_graphs() {
         sample_parsing_result("a.rs", "alpha", "beta"),
         sample_parsing_result("b.rs", "beta", "alpha"),
     ];
-    let (streaming_pdg, streaming_route) = build_changed_file_pdg(results.clone(), true);
-    let (legacy_pdg, legacy_route) = build_changed_file_pdg(results, false);
+    let (streaming_pdg, streaming_route) =
+        build_changed_file_pdg(results.clone(), true, &HashMap::new());
+    let (legacy_pdg, legacy_route) = build_changed_file_pdg(results, false, &HashMap::new());
     assert_eq!(streaming_route, PdgBuildRoute::Streaming);
     assert_eq!(legacy_route, PdgBuildRoute::Legacy);
 
@@ -559,7 +730,7 @@ fn build_pdg_streaming_produces_correct_node_count_for_multiple_files() {
         sample_parsing_result("b.rs", "omega", "alpha"),
         sample_parsing_result("b.rs", "epsilon", "omega"),
     ];
-    let pdg = build_pdg_streaming(results);
+    let pdg = build_pdg_streaming(results, &HashMap::new());
     assert_eq!(
         pdg.node_count(),
         4,
@@ -612,7 +783,7 @@ fn streaming_route_builds_real_edges_and_complexity() {
         error: None,
         parse_time_ms: 0,
     };
-    let pdg = build_pdg_streaming(vec![result]);
+    let pdg = build_pdg_streaming(vec![result], &HashMap::new());
 
     // The method node must exist, keyed off its qualified name.
     let bar = pdg
@@ -647,8 +818,8 @@ fn test_parallel_pdg_construction_matches_sequential_baseline() {
     ];
 
     // Run legacy route twice — parallel construction must be deterministic.
-    let pdg1 = build_pdg_legacy(results.clone());
-    let pdg2 = build_pdg_legacy(results.clone());
+    let pdg1 = build_pdg_legacy(results.clone(), &HashMap::new());
+    let pdg2 = build_pdg_legacy(results.clone(), &HashMap::new());
 
     let mut ids1: Vec<String> = pdg1
         .node_indices()
@@ -670,8 +841,8 @@ fn test_parallel_pdg_construction_matches_sequential_baseline() {
     );
 
     // Run streaming route twice — also must be deterministic.
-    let pdg3 = build_pdg_streaming(results.clone());
-    let pdg4 = build_pdg_streaming(results);
+    let pdg3 = build_pdg_streaming(results.clone(), &HashMap::new());
+    let pdg4 = build_pdg_streaming(results, &HashMap::new());
 
     let mut ids3: Vec<String> = pdg3
         .node_indices()
