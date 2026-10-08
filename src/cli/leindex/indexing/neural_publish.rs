@@ -1,4 +1,166 @@
 use super::*;
+use std::path::Path;
+
+struct HybridStreamingEmbedder<'a> {
+    inner: &'a index_builder::HybridEmbedder,
+}
+
+impl streaming::neural::StreamingEmbedder for HybridStreamingEmbedder<'_> {
+    fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
+        #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+        {
+            let mut unique_texts = Vec::new();
+            let mut positions = HashMap::new();
+            for text in texts {
+                let capped = index_builder::cap_neural_text(text);
+                if !positions.contains_key(capped) {
+                    positions.insert(capped, unique_texts.len());
+                    unique_texts.push(capped);
+                }
+            }
+            let embeddings = self.inner.embed_neural_batch_blocking(&unique_texts);
+            if embeddings.len() != unique_texts.len() {
+                return vec![Vec::new(); texts.len()];
+            }
+            let embeddings_by_text: Vec<Option<Vec<f32>>> = embeddings;
+            texts
+                .iter()
+                .map(|text| {
+                    positions
+                        .get(index_builder::cap_neural_text(text))
+                        .and_then(|&position| embeddings_by_text[position].clone())
+                        .unwrap_or_default()
+                })
+                .collect()
+        }
+        #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
+        {
+            let _ = (self.inner, texts);
+            Vec::new()
+        }
+    }
+}
+
+struct SearchNeuralRowWriter<'a> {
+    engine: &'a mut crate::search::search::SearchEngine,
+    seen_node_ids: HashSet<String>,
+}
+
+impl streaming::neural::NeuralRowWriter for SearchNeuralRowWriter<'_> {
+    fn write_row(&mut self, node_id: &str, embedding: &[f32]) -> Result<()> {
+        self.write_batch(vec![(node_id.to_owned(), embedding.to_vec())])?;
+        Ok(())
+    }
+
+    fn write_batch(&mut self, mut rows: Vec<(String, Vec<f32>)>) -> Result<usize> {
+        rows.retain(|(node_id, _)| self.seen_node_ids.insert(node_id.clone()));
+        Ok(self.engine.update_neural_embeddings(rows))
+    }
+}
+
+fn streaming_neural_inputs<'a>(
+    pdg: &'a crate::graph::pdg::ProgramDependenceGraph,
+    admitted_node_ids: &'a HashSet<String>,
+) -> impl Iterator<Item = Result<streaming::neural::NeuralInput>> + 'a {
+    let connectivity_config = crate::graph::pdg::TraversalConfig {
+        max_depth: Some(1),
+        max_nodes: Some(1000),
+        allowed_edge_types: Some(&[
+            crate::graph::pdg::EdgeType::Call,
+            crate::graph::pdg::EdgeType::DataDependency,
+        ]),
+        excluded_node_types: Some(vec![crate::graph::pdg::NodeType::External]),
+        min_complexity: None,
+        min_edge_confidence: 0.0,
+    };
+    let file_summary_ctx = index_builder::FileSummaryContext::from_pdg(pdg);
+    let mut node_indices = pdg.node_indices();
+    let mut file_cache = index_builder::FileReadCache::per_chunk_scratch();
+
+    std::iter::from_fn(move || {
+        loop {
+            let node_idx = node_indices.next()?;
+            let Some(node) = pdg.get_node(node_idx) else {
+                continue;
+            };
+            if node.node_type == crate::graph::pdg::NodeType::External
+                || !admitted_node_ids.contains(&node.id)
+            {
+                continue;
+            }
+            let input = (|| {
+                let file_bytes = file_cache
+                    .get_or_read(Path::new(&*node.file_path))
+                    .with_context(|| format!("read source for neural node {}", node.id))?;
+                let text = index_builder::enriched_node_content(
+                    pdg,
+                    node_idx,
+                    node,
+                    &file_bytes,
+                    &connectivity_config,
+                    &file_summary_ctx,
+                );
+                Ok(streaming::neural::NeuralInput {
+                    node_id: node.id.clone(),
+                    text: index_builder::cap_neural_text(&text).to_owned(),
+                })
+            })();
+            return Some(input);
+        }
+    })
+}
+
+fn enrich_neural_for_route(
+    engine: &mut crate::search::search::SearchEngine,
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    embedder: &index_builder::HybridEmbedder,
+    admitted_node_ids: &HashSet<String>,
+    route: streaming::routes::NeuralRoute,
+) -> Result<usize> {
+    let (cache_hits_before, _) = neural_cache_counters();
+    match route {
+        streaming::routes::NeuralRoute::Legacy => {
+            let rows = index_builder::enrich_neural_embeddings(pdg, embedder, admitted_node_ids);
+            let (cache_hits_after, cache_misses) = neural_cache_counters();
+            progress_stderr(&format!(
+                "Indexing: neural done — {} rows ({} from embed cache, {} embedded)...",
+                rows.len(),
+                cache_hits_after - cache_hits_before,
+                cache_misses
+            ));
+            Ok(engine.update_neural_embeddings(rows))
+        }
+        streaming::routes::NeuralRoute::Streaming => {
+            let streaming_embedder = HybridStreamingEmbedder { inner: embedder };
+            let mut writer = SearchNeuralRowWriter {
+                engine,
+                seen_node_ids: HashSet::new(),
+            };
+            let mut inputs = streaming_neural_inputs(pdg, admitted_node_ids);
+            let budget = streaming::BatchBudget {
+                max_texts: 256,
+                max_seq_len: 64 * 1024,
+                ..streaming::BatchBudget::default()
+            };
+            let stats = streaming::neural::enrich_neural_streaming(
+                &mut inputs,
+                &streaming_embedder,
+                &mut writer,
+                &budget,
+            )?;
+            let (cache_hits_after, cache_misses) = neural_cache_counters();
+            progress_stderr(&format!(
+                "Indexing: neural done — {} rows ({} from embed cache, {} embedded, {} skipped, {} batches)...",
+                stats.rows_written,
+                cache_hits_after - cache_hits_before,
+                cache_misses,
+                stats.rows_skipped,
+                stats.batches,
+            ));
+            Ok(stats.rows_written)
+        }
+    }
+}
 
 impl LeIndex {
     #[cfg(feature = "onnx")]
@@ -327,31 +489,33 @@ impl LeIndex {
             &lexical_hash,
             &current_embed_model,
         );
-        if neural_rows == 0 && !neural_resume_loaded {
-            if let Some(neural_embedder) = neural_embedder.as_ref() {
-                let pdg = self
-                    .pdg
-                    .as_ref()
-                    .context("PDG is resident before neural enrichment")?;
-                progress_stderr(&format!(
-                    "Indexing: neural embedding {} admitted nodes...",
-                    state.admitted_node_ids.len()
-                ));
-                let (cache_hits_before, _) = neural_cache_counters();
-                let rows = index_builder::enrich_neural_embeddings(
-                    pdg,
-                    neural_embedder,
-                    &state.admitted_node_ids,
-                );
-                let (cache_hits_after, cache_misses) = neural_cache_counters();
-                progress_stderr(&format!(
-                    "Indexing: neural done — {} rows ({} from embed cache, {} embedded)...",
-                    rows.len(),
-                    cache_hits_after - cache_hits_before,
-                    cache_misses
-                ));
-                neural_rows = self.search_engine.update_neural_embeddings(rows);
+        let neural_route = streaming::routes::neural_route_for_current_flag();
+        info!(
+            "Index neural: {} route selected by LEINDEX_FEATURE_STREAMING_NEURAL",
+            match neural_route {
+                streaming::routes::NeuralRoute::Streaming => "streaming",
+                streaming::routes::NeuralRoute::Legacy => "legacy",
             }
+        );
+        if let Some(neural_embedder) = neural_embedder
+            .as_ref()
+            .filter(|_| neural_rows == 0 && !neural_resume_loaded)
+        {
+            let pdg = self
+                .pdg
+                .as_ref()
+                .context("PDG is resident before neural enrichment")?;
+            progress_stderr(&format!(
+                "Indexing: neural embedding {} admitted nodes...",
+                state.admitted_node_ids.len()
+            ));
+            neural_rows = enrich_neural_for_route(
+                &mut self.search_engine,
+                pdg,
+                neural_embedder,
+                &state.admitted_node_ids,
+                neural_route,
+            )?;
         }
         self.persist_neural_mmap(neural_resume_loaded, neural_rows)?;
         self.persist_neural_snapshot(&state, neural_rows, neural_embedder)?;

@@ -44,6 +44,20 @@ pub(crate) fn tfidf_route_for_current_flag() -> TfidfRoute {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NeuralRoute {
+    Streaming,
+    Legacy,
+}
+
+pub(crate) fn neural_route_for_current_flag() -> NeuralRoute {
+    if FeatureFlag::StreamingNeural.is_enabled() {
+        NeuralRoute::Streaming
+    } else {
+        NeuralRoute::Legacy
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -76,5 +90,15 @@ mod test {
         assert_eq!(tfidf_route_for_current_flag(), TfidfRoute::Legacy);
         crate::feature_flags::set_flag_override_for_test(FeatureFlag::StreamingTfidf, true);
         assert_eq!(tfidf_route_for_current_flag(), TfidfRoute::Streaming);
+    }
+
+    #[test]
+    fn test_neural_route_flag_selects_both_routes() {
+        let _guard = crate::feature_flags::lock_flag_tests();
+        let _reset = crate::feature_flags::FlagOverrideReset;
+        crate::feature_flags::set_flag_override_for_test(FeatureFlag::StreamingNeural, false);
+        assert_eq!(neural_route_for_current_flag(), NeuralRoute::Legacy);
+        crate::feature_flags::set_flag_override_for_test(FeatureFlag::StreamingNeural, true);
+        assert_eq!(neural_route_for_current_flag(), NeuralRoute::Streaming);
     }
 }

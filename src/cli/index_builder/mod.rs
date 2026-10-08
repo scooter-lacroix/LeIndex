@@ -1161,8 +1161,7 @@ fn log_indexing_admission_stats(
 /// tokenize/inference cost. TF-IDF and lexical search keep the FULL content;
 /// only the neural-embedding input is truncated. Cuts on a char boundary so
 /// the tokenizer never receives a partial UTF-8 sequence.
-#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-fn cap_neural_text(text: &str) -> &str {
+pub(crate) fn cap_neural_text(text: &str) -> &str {
     const NEURAL_TEXT_CAP: usize = 64 * 1024;
     if text.len() > NEURAL_TEXT_CAP {
         let mut end = NEURAL_TEXT_CAP;

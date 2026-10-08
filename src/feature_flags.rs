@@ -120,12 +120,19 @@ pub enum FeatureFlag {
     /// `test_streaming_vocab_and_rows_match_production_embedder`, and
     /// `test_streaming_tfidf_flag_indexes_fixture_and_searches`.
     StreamingTfidf,
-    /// Enable the streaming neural enrichment stage (WS6-9 Task 6):
-    /// NeuralRowWriter replaces Vec accumulation, direct staged writes.
+    /// Enable bounded neural enrichment for the published lexical index
+    /// (WS6-9 Task 6).
     ///
-    /// **Status:** declared but not yet consumed by `index_project_inner`; the
-    /// flag currently has no effect. Tracked in
-    /// <https://github.com/scooter-lacroix/LeIndex/issues/86>.
+    /// Consumer: `run_neural` in `src/cli/leindex/indexing/neural_publish.rs`
+    /// selects `enrich_neural_streaming` through
+    /// `neural_route_for_current_flag()`. The streaming route feeds the
+    /// production hybrid embedder in bounded `BatchBudget` batches and writes
+    /// accepted rows to the search engine batch-wise, retaining admission,
+    /// capped-text dedupe, cache accounting, and first-row-per-node semantics.
+    /// Default OFF keeps `enrich_neural_embeddings`. Coverage:
+    /// `test_neural_route_flag_selects_both_routes`,
+    /// `test_streaming_neural_bit_identical`, and
+    /// `test_streaming_neural_flag_keeps_fixture_searchable`.
     StreamingNeural,
     /// Enable the global content-addressed embedding cache (WS10 Task 1-2).
     /// The cache stores embedding vectors at user-level (e.g.
@@ -225,7 +232,6 @@ impl FeatureFlag {
             | Self::GenerationReaders
             | Self::BoundedScheduler
             | Self::StreamingPdg
-            | Self::StreamingNeural
             | Self::GlobalEmbedCache
             | Self::CommunityDetection
             | Self::ValidatedModel
@@ -712,7 +718,6 @@ mod test {
             FeatureFlag::GenerationReaders,
             FeatureFlag::BoundedScheduler,
             FeatureFlag::StreamingPdg,
-            FeatureFlag::StreamingNeural,
             FeatureFlag::GlobalEmbedCache,
             FeatureFlag::ValidatedModel,
         ];
@@ -735,6 +740,7 @@ mod test {
             FeatureFlag::StreamingScan,
             FeatureFlag::StreamingParse,
             FeatureFlag::StreamingTfidf,
+            FeatureFlag::StreamingNeural,
         ] {
             assert!(!flag.default_value(), "{} must default OFF", flag.env_var());
         }
