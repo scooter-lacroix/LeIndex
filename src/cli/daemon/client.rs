@@ -368,7 +368,11 @@ fn pid_is_the_connected_daemon(stream: &UnixStream, pid: u32) -> bool {
                 &mut len,
             )
         };
-        if rc != 0 || cred.cr_uid != libc::geteuid() {
+        // SAFETY: `geteuid` is an async-signal-safe libc getter with no
+        // preconditions; the surrounding credential check compares the
+        // socket peer's uid against this process's effective uid.
+        let euid = unsafe { libc::geteuid() };
+        if rc != 0 || cred.cr_uid != euid {
             return false;
         }
         // SAFETY: signal 0 only probes for existence.
