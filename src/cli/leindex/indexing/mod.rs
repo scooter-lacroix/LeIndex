@@ -187,10 +187,13 @@ fn save_stage_gate(
 
 /// Pure budget computation for [`save_stage_gate`], unit-tested without env
 /// access. 20 µs/edge baseline (~4× headroom over the measured ~5 µs/edge),
-/// a 500 ms floor for tiny graphs, ×10 in debug builds (unoptimized encode).
+/// a 2 s floor for tiny graphs (the fixed publish cost — VACUUM + CAS
+/// staging + fsyncs — measured ~600 ms on shared CI runners; a floor near
+/// that number false-trips the gate on 0-edge fixtures), ×10 in debug builds
+/// (unoptimized encode).
 fn save_stage_budget_ms(pdg_edges: usize, override_ms: Option<u64>) -> u64 {
     const US_PER_EDGE: u64 = 20;
-    const FLOOR_MS: u64 = 500;
+    const FLOOR_MS: u64 = 2_000;
     let scale = if cfg!(debug_assertions) { 10 } else { 1 };
     override_ms.unwrap_or_else(|| {
         FLOOR_MS
