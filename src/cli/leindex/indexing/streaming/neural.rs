@@ -41,6 +41,18 @@ pub struct NeuralStats {
 pub trait NeuralRowWriter {
     /// Write a single neural row to staged storage.
     fn write_row(&mut self, node_id: &str, embedding: &[f32]) -> Result<()>;
+
+    /// Write a bounded batch and return its accepted row count. Writers with
+    /// efficient batch sinks may override this; the default preserves the
+    /// existing per-row contract used by fragment streaming.
+    fn write_batch(&mut self, rows: Vec<(String, Vec<f32>)>) -> Result<usize> {
+        let mut written = 0;
+        for (node_id, embedding) in rows {
+            self.write_row(&node_id, &embedding)?;
+            written += 1;
+        }
+        Ok(written)
+    }
 }
 
 /// Vec-backed NeuralRowWriter for testing and equivalence verification.
@@ -65,6 +77,12 @@ impl NeuralRowWriter for VecNeuralRowWriter {
     fn write_row(&mut self, node_id: &str, embedding: &[f32]) -> Result<()> {
         self.rows.push((node_id.to_string(), embedding.to_vec()));
         Ok(())
+    }
+
+    fn write_batch(&mut self, rows: Vec<(String, Vec<f32>)>) -> Result<usize> {
+        let written = rows.len();
+        self.rows.extend(rows);
+        Ok(written)
     }
 }
 
@@ -175,10 +193,7 @@ where
                     false
                 }
             }
-            Some(Err(_)) => {
-                // Error from source — skip this input
-                continue;
-            }
+            Some(Err(error)) => return Err(error),
             None => true,
         };
 
@@ -207,15 +222,23 @@ fn flush_batch<E: StreamingEmbedder, W: NeuralRowWriter>(
     stats: &mut NeuralStats,
 ) -> Result<()> {
     let embeddings = embedder.embed_batch(texts);
-    for (node_id, embedding) in ids.iter().zip(embeddings.iter()) {
-        if !embedding.is_empty() {
-            writer.write_row(node_id, embedding)?;
-            stats.rows_written += 1;
-            stats.bytes_written += embedding.len() * std::mem::size_of::<f32>();
-        } else {
+    if embeddings.len() != ids.len() {
+        anyhow::bail!(
+            "streaming neural embedder returned {} vectors for {} texts",
+            embeddings.len(),
+            ids.len()
+        );
+    }
+    let mut rows = Vec::with_capacity(ids.len());
+    for (node_id, embedding) in ids.iter().zip(embeddings) {
+        if embedding.is_empty() {
             stats.rows_skipped += 1;
+        } else {
+            stats.bytes_written += embedding.len() * std::mem::size_of::<f32>();
+            rows.push((node_id.clone(), embedding));
         }
     }
+    stats.rows_written += writer.write_batch(rows)?;
     stats.batches += 1;
     Ok(())
 }
@@ -258,6 +281,38 @@ mod test {
                 text: format!("fn func_{i}() -> i32 {{ {i} }}"),
             })
             .collect()
+    }
+
+    /// PR #90 round 2, cluster E: a count mismatch between the embedder's
+    /// returned vectors and the batch's texts is a hard error — never a
+    /// silent partial write (a short batch persisted + checkpointed would
+    /// make resume skip the missing rows forever).
+    #[test]
+    fn test_short_embedder_batch_is_a_hard_error_and_persists_nothing() {
+        struct ShortEmbedder;
+        impl StreamingEmbedder for ShortEmbedder {
+            fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
+                texts.iter().skip(1).map(|_| vec![1.0_f32]).collect()
+            }
+        }
+
+        let inputs = make_inputs(6);
+        let mut iter = inputs.into_iter().map(Ok);
+        let mut writer = VecNeuralRowWriter::default();
+        let result = enrich_neural_streaming(
+            &mut iter,
+            &ShortEmbedder,
+            &mut writer,
+            &BatchBudget::unlimited(),
+        );
+        assert!(
+            result.is_err(),
+            "short embedder batch must fail the enrichment, not skip rows silently"
+        );
+        assert!(
+            writer.rows.is_empty(),
+            "no partial rows may be persisted when a batch count mismatches (resume would skip the missing rows forever)"
+        );
     }
 
     /// VAL-STREAM-006: Direct staged neural writes produce bit-identical vectors.

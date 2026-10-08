@@ -136,6 +136,48 @@ pub fn stream_scan<W: ScanRecordWriter>(
     Ok(stats)
 }
 
+fn scan_source_file<W: ScanRecordWriter>(
+    root: &Path,
+    path: &Path,
+    entry: &fs::DirEntry,
+    writer: &mut W,
+    extensions: &[&str],
+    stats: &mut ScanStats,
+) -> Result<()> {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| extensions.contains(&ext));
+    if !ext_ok {
+        return Ok(());
+    }
+    let (hash, size) =
+        hash_file_streaming(path).with_context(|| format!("stream scan {}", path.display()))?;
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mtime = entry
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let record = ScanRecord {
+        path: rel,
+        hash,
+        size,
+        lang: detect_language(path),
+        mtime,
+    };
+    writer.write_record(&record)?;
+    stats.files_scanned += 1;
+    stats.total_bytes += size;
+    Ok(())
+}
+
 fn stream_scan_inner<W: ScanRecordWriter>(
     root: &Path,
     dir: &Path,
@@ -143,29 +185,13 @@ fn stream_scan_inner<W: ScanRecordWriter>(
     extensions: &[&str],
     stats: &mut ScanStats,
 ) -> Result<()> {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => {
-            stats.errors += 1;
-            return Ok(());
-        }
-    };
+    let entries = fs::read_dir(dir).with_context(|| format!("read directory {}", dir.display()))?;
     for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => {
-                stats.errors += 1;
-                continue;
-            }
-        };
+        let entry = entry.with_context(|| format!("read entry in {}", dir.display()))?;
         let path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(t) => t,
-            Err(_) => {
-                stats.errors += 1;
-                continue;
-            }
-        };
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("read file type for {}", path.display()))?;
         if file_type.is_dir() {
             // Skip hidden dirs (e.g. .leindex, .git)
             if path
@@ -177,46 +203,46 @@ fn stream_scan_inner<W: ScanRecordWriter>(
             }
             stream_scan_inner(root, &path, writer, extensions, stats)?;
         } else if file_type.is_file() {
-            // Filter by extension
-            let ext_ok = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|ext| extensions.contains(&ext));
-            if !ext_ok {
-                continue;
-            }
-            match hash_file_streaming(&path) {
-                Ok((hash, size)) => {
-                    let rel = path
-                        .strip_prefix(root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    let mtime = entry
-                        .metadata()
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let record = ScanRecord {
-                        path: rel,
-                        hash,
-                        size,
-                        lang: detect_language(&path),
-                        mtime,
-                    };
-                    writer.write_record(&record)?;
-                    stats.files_scanned += 1;
-                    stats.total_bytes += size;
-                }
-                Err(_) => {
-                    stats.errors += 1;
-                }
-            }
+            scan_source_file(root, &path, &entry, writer, extensions, stats)?;
         }
     }
     Ok(())
+}
+
+/// Hash an existing source inventory in order, emitting metadata records without
+/// retaining source bodies. This keeps configured exclusions and file limits
+/// from the primary project scanner while preserving fail-fast I/O semantics.
+pub fn stream_scan_paths<W: ScanRecordWriter>(
+    root: &Path,
+    paths: &[std::path::PathBuf],
+    writer: &mut W,
+) -> Result<ScanStats> {
+    let mut stats = ScanStats::default();
+    for path in paths {
+        let (hash, size) =
+            hash_file_streaming(path).with_context(|| format!("stream scan {}", path.display()))?;
+        let metadata =
+            fs::metadata(path).with_context(|| format!("read metadata for {}", path.display()))?;
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_secs());
+        let record = ScanRecord {
+            path: relative
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/"),
+            hash,
+            size,
+            lang: detect_language(path),
+            mtime,
+        };
+        writer.write_record(&record)?;
+        stats.files_scanned += 1;
+        stats.total_bytes += size;
+    }
+    Ok(stats)
 }
 
 /// Common source file extensions for scanning.

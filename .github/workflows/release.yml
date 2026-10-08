@@ -351,6 +351,32 @@ jobs:
           fi
           echo "ORT wheel extraction complete"
 
+      # tree-sitter-scss 1.0.0's bindings/rust/build.rs passes the GCC-style
+      # flag -Wno-unused-parameter to MSVC unconditionally; cl.exe rejects it
+      # outright (D8021), which has kept the windows-msvc release build red
+      # (no cc release translates the flag and 1.0.0 is the newest crate).
+      # Patch the runner-local registry copy to the MSVC equivalent /wd4100
+      # (unreferenced formal parameter). Idempotent because the registry is
+      # cached between runs; fails loudly if upstream changes the script.
+      - name: Patch tree-sitter-scss build script for MSVC (D8021)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -e
+          cargo fetch --locked
+          SCRIPT=$(find ~/.cargo/registry/src -path '*tree-sitter-scss-1.0.0/bindings/rust/build.rs' | head -1)
+          test -n "$SCRIPT" \
+            || { echo "::error::tree-sitter-scss-1.0.0 build script not found in registry cache"; exit 1; }
+          if grep -q -- '-Wno-unused-parameter' "$SCRIPT"; then
+            sed -i 's/-Wno-unused-parameter/-wd4100/' "$SCRIPT"
+            echo "Patched $SCRIPT"
+          elif grep -q -- '-wd4100' "$SCRIPT"; then
+            echo "Already patched (restored from cache): $SCRIPT"
+          else
+            echo "::error::$SCRIPT has neither flag — upstream build script changed; re-evaluate this patch step"
+            exit 1
+          fi
+
       - name: Build release binaries
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc

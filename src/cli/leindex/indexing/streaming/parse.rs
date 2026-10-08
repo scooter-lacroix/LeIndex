@@ -5,7 +5,7 @@
 //! dropped before the next file is parsed. RSS does not accumulate linearly
 //! with parsed file count (spec §6.2, VAL-STREAM-003).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -299,6 +299,63 @@ pub fn stream_parse<W: ParseRecordWriter>(
     Ok(stats)
 }
 
+/// Chunk `(path, bytes)` inputs into bounded batches: each batch holds at
+/// most `budget.max_files` paths and at most `budget.max_bytes` aggregate
+/// bytes. Never emits an empty chunk; never splits a single file across
+/// chunks.
+fn chunk_file_inputs(files: &[(PathBuf, u64)], budget: &ParseBudget) -> Vec<Vec<PathBuf>> {
+    let mut chunks = Vec::new();
+    let mut current: Vec<PathBuf> = Vec::new();
+    let mut current_bytes: u64 = 0;
+    for (path, bytes) in files {
+        let would_exceed = !current.is_empty()
+            && (current.len() + 1 > budget.max_files
+                || current_bytes + bytes > budget.max_bytes as u64);
+        if would_exceed {
+            chunks.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current.push(path.clone());
+        current_bytes += bytes;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// Bounded streaming entry point for the production parse route.
+///
+/// Parses `(path, bytes)` pairs through the production `ParallelParser`
+/// (tree-sitter) in chunks bounded by `budget`, so peak RSS is capped by
+/// chunk size instead of the full file set. Returned `ParsingResult`s keep
+/// the exact shape and order the legacy `parse_files` route produces, but
+/// `source_bytes` is stripped to `None` after each chunk: results never
+/// retain the whole corpus (PR #90 review, P1). PDG extraction re-reads
+/// file-backed results lazily (see `extraction_source_bytes` in
+/// `indexing/mod.rs`) and the parse checkpoint persists signatures, so no
+/// downstream consumer loses data. D3: downstream checkpoint/PDG
+/// consumption is route-independent.
+pub fn stream_parse_parallel(
+    files: Vec<(PathBuf, u64)>,
+    budget: &ParseBudget,
+) -> Vec<crate::parse::parallel::ParsingResult> {
+    let parser = crate::parse::parallel::ParallelParser::new();
+    let mut results = Vec::new();
+    for chunk in chunk_file_inputs(&files, budget) {
+        let mut chunk_results = parser.parse_files(chunk);
+        // Streaming memory contract: returned results must not retain the
+        // whole corpus. Signatures are already persisted via the parse
+        // checkpoint and PDG extraction re-reads file-backed results, so
+        // stripping here is lossless for every downstream consumer.
+        for result in &mut chunk_results {
+            result.source_bytes = None;
+        }
+        results.extend(chunk_results);
+    }
+    results
+}
+
 #[cfg(all(test, feature = "full"))]
 mod test {
     use super::*;
@@ -438,6 +495,98 @@ mod test {
             assert!(!record.path.is_empty());
             assert!(!record.content_hash.is_empty());
             assert!(!record.lang.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_chunk_file_inputs_respects_file_limit() {
+        let files: Vec<(PathBuf, u64)> = (0..7)
+            .map(|i| (PathBuf::from(format!("f{i}.rs")), 10))
+            .collect();
+        let budget = ParseBudget {
+            max_files: 3,
+            max_bytes: usize::MAX,
+        };
+        let chunks = chunk_file_inputs(&files, &budget);
+        assert_eq!(chunks.len(), 3); // 3, 3, 1
+        assert_eq!(chunks[0].len(), 3);
+        assert_eq!(chunks[1].len(), 3);
+        assert_eq!(chunks[2].len(), 1);
+    }
+
+    #[test]
+    fn test_chunk_file_inputs_respects_byte_limit_and_keeps_order() {
+        let files: Vec<(PathBuf, u64)> = (0..6)
+            .map(|i| (PathBuf::from(format!("f{i}.rs")), 400))
+            .collect();
+        let budget = ParseBudget {
+            max_files: usize::MAX,
+            max_bytes: 1000,
+        };
+        let chunks = chunk_file_inputs(&files, &budget);
+        // 2 files per chunk (2*400 = 800 <= 1000), order preserved.
+        let flat: Vec<String> = chunks
+            .iter()
+            .flatten()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert_eq!(flat, (0..6).map(|i| format!("f{i}.rs")).collect::<Vec<_>>());
+        for chunk in &chunks {
+            assert!(chunk.len() <= 2);
+        }
+    }
+
+    #[test]
+    fn test_stream_parse_parallel_preserves_order_and_result_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for i in 0..5 {
+            let path = dir.path().join(format!("m{i}.rs"));
+            fs::write(&path, format!("pub fn marker_{i}() -> usize {{ {i} }}\n")).unwrap();
+            files.push((path, 64));
+        }
+        let results = stream_parse_parallel(files, &ParseBudget::default());
+        assert_eq!(results.len(), 5);
+        for (i, result) in results.iter().enumerate() {
+            assert!(result.is_success(), "file {i} must parse successfully");
+            assert!(
+                result
+                    .signatures
+                    .iter()
+                    .any(|s| s.name == format!("marker_{i}")),
+                "order preserved: result {i} must be marker_{i}"
+            );
+        }
+    }
+
+    /// PR #90 review P1: the streaming route's returned results must not
+    /// retain `source_bytes` across chunks — peak memory must stay bounded
+    /// by the chunk budget, not the whole corpus. PDG extraction re-reads
+    /// file-backed results lazily, so `None` here is lossless downstream.
+    #[test]
+    fn test_stream_parse_parallel_strips_source_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for i in 0..3 {
+            let path = dir.path().join(format!("s{i}.rs"));
+            fs::write(
+                &path,
+                format!("pub fn stream_strip_{i}() -> usize {{ {i} }}\n"),
+            )
+            .unwrap();
+            files.push((path, 64));
+        }
+        let results = stream_parse_parallel(files, &ParseBudget::default());
+        assert_eq!(results.len(), 3);
+        for (i, result) in results.iter().enumerate() {
+            assert!(
+                result.is_success(),
+                "file {i} must parse successfully before stripping"
+            );
+            assert!(
+                result.source_bytes.is_none(),
+                "streaming route result {i} must not retain source_bytes (peak-bounded contract)"
+            );
         }
     }
 }

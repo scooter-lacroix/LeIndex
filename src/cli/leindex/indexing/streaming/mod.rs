@@ -13,6 +13,7 @@ pub mod fragment;
 pub mod neural;
 pub mod parse;
 pub mod pdg;
+pub mod routes;
 pub mod scan;
 pub mod tfidf;
 
