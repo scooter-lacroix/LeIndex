@@ -202,6 +202,20 @@ fn save_stage_budget_ms(pdg_edges: usize, override_ms: Option<u64>) -> u64 {
     })
 }
 
+/// Streaming route (PR #90 round 2): drop inline source bytes from every
+/// result so a large job never retains the corpus. The legacy route keeps
+/// inline bytes unchanged.
+fn strip_streamed_source_bytes(
+    route: streaming::routes::ParseRoute,
+    results: &mut [crate::parse::parallel::ParsingResult],
+) {
+    if route == streaming::routes::ParseRoute::Streaming {
+        for result in results {
+            result.source_bytes = None;
+        }
+    }
+}
+
 fn parse_files_for_route(
     files: Vec<PathBuf>,
     scan: &ScanCheckpoint,
@@ -992,11 +1006,7 @@ impl LeIndex {
         // corpus. PDG extraction re-reads file-backed results lazily with
         // hash verification, so nothing downstream loses data. The legacy
         // route keeps inline bytes (unchanged behavior).
-        if parse_route == streaming::routes::ParseRoute::Streaming {
-            for result in &mut parsing_results {
-                result.source_bytes = None;
-            }
-        }
+        strip_streamed_source_bytes(parse_route, &mut parsing_results);
         let parse_checkpoint = self.write_parse_checkpoint(
             checkpoint_store,
             scan,
