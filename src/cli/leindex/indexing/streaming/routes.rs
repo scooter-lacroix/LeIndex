@@ -30,6 +30,20 @@ pub(crate) fn parse_route_for_current_flag() -> ParseRoute {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TfidfRoute {
+    Streaming,
+    Legacy,
+}
+
+pub(crate) fn tfidf_route_for_current_flag() -> TfidfRoute {
+    if FeatureFlag::StreamingTfidf.is_enabled() {
+        TfidfRoute::Streaming
+    } else {
+        TfidfRoute::Legacy
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -52,5 +66,15 @@ mod test {
         assert_eq!(parse_route_for_current_flag(), ParseRoute::Legacy);
         crate::feature_flags::set_flag_override_for_test(FeatureFlag::StreamingParse, true);
         assert_eq!(parse_route_for_current_flag(), ParseRoute::Streaming);
+    }
+
+    #[test]
+    fn test_tfidf_route_flag_selects_both_routes() {
+        let _guard = crate::feature_flags::lock_flag_tests();
+        let _reset = crate::feature_flags::FlagOverrideReset;
+        crate::feature_flags::set_flag_override_for_test(FeatureFlag::StreamingTfidf, false);
+        assert_eq!(tfidf_route_for_current_flag(), TfidfRoute::Legacy);
+        crate::feature_flags::set_flag_override_for_test(FeatureFlag::StreamingTfidf, true);
+        assert_eq!(tfidf_route_for_current_flag(), TfidfRoute::Streaming);
     }
 }

@@ -6,9 +6,12 @@
 //! entire corpus is ever materialized on the heap (spec §6.4, VAL-STREAM-005).
 
 use std::collections::HashMap;
+use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::cli::index_builder;
 
 /// A TF-IDF row: one document's TF-IDF vector ready for CAS staging.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -66,32 +69,11 @@ pub struct TfidfDoc {
     pub tokens: Vec<String>,
 }
 
-/// Tokenize source code text into lowercase tokens (same heuristic as
-/// `index_builder::tokenize_code` but self-contained for streaming).
+/// Tokenize code using the production index-builder tokenizer. Keeping this
+/// public streaming-stage helper as a thin reuse avoids a second camel/acronym/
+/// digit boundary implementation drifting from the legacy route.
 pub fn tokenize_code(text: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    for word in text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '.') {
-        if word.is_empty() {
-            continue;
-        }
-        // Split camelCase and snake_case
-        let mut current = String::new();
-        for ch in word.chars() {
-            if ch.is_uppercase() && !current.is_empty() {
-                let lower = current.to_lowercase();
-                if !lower.is_empty() {
-                    tokens.push(lower);
-                }
-                current.clear();
-            }
-            current.push(ch.to_ascii_lowercase());
-        }
-        let lower = current.to_lowercase();
-        if !lower.is_empty() {
-            tokens.push(lower);
-        }
-    }
-    tokens
+    index_builder::tokenize_code(text)
 }
 
 /// Build document frequencies from a pass over documents.
@@ -255,6 +237,106 @@ pub fn deserialize_tfidf_rows(data: &[u8]) -> Result<Vec<TfidfRow>> {
     Ok(bincode::deserialize(data)?)
 }
 
+/// Streaming pass 1 over the PDG for the production lexical route.
+///
+/// Builds document frequencies in `chunk_size`-node chunks with the
+/// production tokenizer and the exact `enriched_node_content` corpus the
+/// legacy route tokenizes. File bodies are re-read per chunk rather than
+/// retained across the pass. IO failures abort rather than publish partial
+/// document frequencies.
+pub fn build_document_frequencies_chunked(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    chunk_size: usize,
+) -> Result<(HashMap<String, usize>, usize)> {
+    use rayon::prelude::*;
+
+    let connectivity_config = crate::graph::pdg::TraversalConfig {
+        max_depth: Some(1),
+        max_nodes: Some(1000),
+        allowed_edge_types: Some(&[
+            crate::graph::pdg::EdgeType::Call,
+            crate::graph::pdg::EdgeType::DataDependency,
+        ]),
+        excluded_node_types: Some(vec![crate::graph::pdg::NodeType::External]),
+        min_complexity: None,
+        min_edge_confidence: 0.0,
+    };
+    let file_summary_ctx = index_builder::FileSummaryContext::from_pdg(pdg);
+    let node_indices: Vec<petgraph::graph::NodeIndex> = pdg.node_indices().collect();
+    let mut df: HashMap<String, usize> = HashMap::new();
+    let mut total_docs = 0usize;
+
+    for nodes in node_indices.chunks(chunk_size.max(1)) {
+        let documents: Vec<Result<HashMap<String, usize>>> = nodes
+            .par_iter()
+            .filter_map(|&node_idx| {
+                let node = pdg.get_node(node_idx)?;
+                if node.node_type == crate::graph::pdg::NodeType::External {
+                    return None;
+                }
+                Some((|| {
+                    let file_bytes = std::fs::read(Path::new(&*node.file_path))
+                        .with_context(|| format!("read source for TF-IDF node {}", node.id))?;
+                    let node_content = index_builder::enriched_node_content(
+                        pdg,
+                        node_idx,
+                        node,
+                        &file_bytes,
+                        &connectivity_config,
+                        &file_summary_ctx,
+                    );
+                    let tokens = index_builder::tokenize_code(&node_content);
+                    let mut seen = std::collections::HashSet::new();
+                    let mut doc_df = HashMap::new();
+                    for token in tokens {
+                        if seen.insert(token.clone()) {
+                            *doc_df.entry(token).or_insert(0) += 1;
+                        }
+                    }
+                    Ok(doc_df)
+                })())
+            })
+            .collect();
+
+        total_docs += documents.len();
+        for document in documents {
+            for (token, count) in document? {
+                *df.entry(token).or_insert(0) += count;
+            }
+        }
+    }
+
+    Ok((df, total_docs))
+}
+
+/// Build the production TF-IDF embedder from chunked streaming document
+/// frequencies. The vocabulary policy intentionally matches the legacy
+/// builder: moderate-frequency filter, sorted `(idf, token)`, and stratified
+/// sampling to the same fixed dimension.
+pub fn build_streaming_embedder(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    chunk_size: usize,
+) -> Result<index_builder::TfIdfEmbedder> {
+    let (df, total_docs) = build_document_frequencies_chunked(pdg, chunk_size)?;
+    if total_docs == 0 {
+        return Ok(index_builder::TfIdfEmbedder::build_from_tokens(&[]));
+    }
+    let (vocab, idf) = freeze_vocab_idf(
+        &df,
+        total_docs,
+        crate::search::search::DEFAULT_EMBEDDING_DIMENSION,
+    );
+    Ok(index_builder::TfIdfEmbedder {
+        vocab,
+        idf,
+        dimension: crate::search::search::DEFAULT_EMBEDDING_DIMENSION,
+        pdg_nodes: pdg.node_count(),
+        pdg_edges: pdg.edge_count(),
+        pdg_fingerprint: index_builder::pdg_search_fingerprint(pdg),
+        slots: Default::default(),
+    })
+}
+
 #[cfg(all(test, feature = "full"))]
 mod test {
     use super::*;
@@ -350,6 +432,61 @@ mod test {
         let bytes = serialize_tfidf_rows(&rows).unwrap();
         let back = deserialize_tfidf_rows(&bytes).unwrap();
         assert_eq!(back, rows);
+    }
+
+    #[test]
+    fn test_tokenize_code_matches_production_acronym_and_digit_boundaries() {
+        for text in ["HTTP2Connection", "getUserName", "parseJSONResponse"] {
+            assert_eq!(
+                tokenize_code(text),
+                index_builder::tokenize_code(text),
+                "streaming TF-IDF tokenizer must match production for {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_streaming_vocab_and_rows_match_production_embedder() {
+        let texts = [
+            "HTTP2Connection parses UserName and JSONResponse values",
+            "getUserName formats HTTPConnection errors",
+            "JSON2Parser handles UserName and requestID tokens",
+        ];
+        let docs: Vec<TfidfDoc> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| TfidfDoc {
+                doc_id: format!("doc{i}"),
+                tokens: index_builder::tokenize_code(text),
+            })
+            .collect();
+        let (df, n_docs) = build_document_frequencies(&docs);
+        let (stream_vocab, stream_idf) = freeze_vocab_idf(
+            &df,
+            n_docs,
+            crate::search::search::DEFAULT_EMBEDDING_DIMENSION,
+        );
+        let production_docs: Vec<(String, Vec<String>)> = docs
+            .iter()
+            .map(|doc| (doc.doc_id.clone(), doc.tokens.clone()))
+            .collect();
+        let production = index_builder::TfIdfEmbedder::build_from_tokens(&production_docs);
+
+        assert_eq!(stream_vocab, production.vocab);
+        assert_eq!(stream_idf, production.idf);
+        for doc in &docs {
+            assert_eq!(
+                compute_tfidf_row(
+                    doc,
+                    &stream_vocab,
+                    &stream_idf,
+                    crate::search::search::DEFAULT_EMBEDDING_DIMENSION,
+                ),
+                production.embed_tokens(&doc.tokens),
+                "streaming TF-IDF row must be bit-identical for {}",
+                doc.doc_id
+            );
+        }
     }
 
     #[test]

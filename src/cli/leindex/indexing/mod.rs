@@ -1288,13 +1288,34 @@ impl LeIndex {
             }
             None => None,
         };
-        index_builder::index_nodes_tfidf_only(
-            pdg,
-            &mut self.search_engine,
-            &mut self.cache.file_stats_cache,
-            batch_size,
-            persisted.map(index_builder::HybridEmbedder::tfidf_only),
-        )
+        let tfidf_route = streaming::routes::tfidf_route_for_current_flag();
+        info!(
+            "Index TF-IDF: {} route selected by LEINDEX_FEATURE_STREAMING_TFIDF",
+            match tfidf_route {
+                streaming::routes::TfidfRoute::Streaming => "streaming",
+                streaming::routes::TfidfRoute::Legacy => "legacy",
+            }
+        );
+        match tfidf_route {
+            streaming::routes::TfidfRoute::Streaming => {
+                let embedder = streaming::tfidf::build_streaming_embedder(pdg, batch_size)
+                    .context("Failed to build streaming TF-IDF embedder")?;
+                index_builder::index_nodes_tfidf_only_with_embedder(
+                    pdg,
+                    &mut self.search_engine,
+                    &mut self.cache.file_stats_cache,
+                    batch_size,
+                    index_builder::HybridEmbedder::tfidf_only(embedder),
+                )
+            }
+            streaming::routes::TfidfRoute::Legacy => index_builder::index_nodes_tfidf_only(
+                pdg,
+                &mut self.search_engine,
+                &mut self.cache.file_stats_cache,
+                batch_size,
+                persisted.map(index_builder::HybridEmbedder::tfidf_only),
+            ),
+        }
     }
 
     pub(crate) fn run_lexical(

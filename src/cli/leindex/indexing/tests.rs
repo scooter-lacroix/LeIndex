@@ -235,6 +235,46 @@ fn test_streaming_parse_flag_indexes_fixture_and_searches() {
     );
 }
 
+#[test]
+fn test_streaming_tfidf_flag_indexes_fixture_and_searches() {
+    let _guard = crate::feature_flags::lock_flag_tests();
+    let _reset = crate::feature_flags::FlagOverrideReset;
+    for flag in [
+        crate::feature_flags::FeatureFlag::StreamingScan,
+        crate::feature_flags::FeatureFlag::StreamingParse,
+        crate::feature_flags::FeatureFlag::StreamingTfidf,
+        crate::feature_flags::FeatureFlag::StreamingNeural,
+        crate::feature_flags::FeatureFlag::StreamingPdg,
+        crate::feature_flags::FeatureFlag::BoundedScheduler,
+    ] {
+        crate::feature_flags::set_flag_override_for_test(flag, false);
+    }
+    crate::feature_flags::set_flag_override_for_test(
+        crate::feature_flags::FeatureFlag::StreamingTfidf,
+        true,
+    );
+
+    let dir = tempfile::tempdir().expect("stream tfidf fixture");
+    std::fs::create_dir_all(dir.path().join("src")).expect("source directory");
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn streaming_tfidf_marker() -> usize { 42 }\n",
+    )
+    .expect("source file");
+
+    let mut index = LeIndex::new(dir.path()).expect("create fixture index");
+    index.index_project(true).expect("streaming TF-IDF index");
+    let results = index
+        .search("streaming_tfidf_marker", 10, None)
+        .expect("search indexed fixture");
+    assert!(
+        results
+            .iter()
+            .any(|result| result.symbol_name == "streaming_tfidf_marker"),
+        "stream TF-IDF embedder must feed the existing index and search pipeline"
+    );
+}
+
 /// Codex wave-4 P2 regression: a fragment-sync failure must leave the engine
 /// fragment-free BEFORE the snapshot persist runs. Every snapshot persist is
 /// preceded by `sync_fragment_layer_or_clear`; on failure that error branch

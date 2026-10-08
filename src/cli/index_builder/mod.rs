@@ -927,6 +927,7 @@ pub(crate) fn index_nodes_with_embedder(
         batch_size,
         embedder,
         true,
+        false,
     )
 }
 
@@ -947,6 +948,27 @@ pub(crate) fn index_nodes_tfidf_only(
         batch_size,
         embedder,
         false,
+        false,
+    )
+}
+
+/// Index using a TF-IDF embedder already built by the streaming vocabulary
+/// pass. This is the only route that skips the legacy document-frequency scan.
+pub(crate) fn index_nodes_tfidf_only_with_embedder(
+    pdg: &ProgramDependenceGraph,
+    search_engine: &mut SearchEngine,
+    file_stats_cache: &mut Option<HashMap<String, FileStats>>,
+    batch_size: usize,
+    embedder: HybridEmbedder,
+) -> Result<HybridEmbedder> {
+    index_nodes_with_embedder_inner(
+        pdg,
+        search_engine,
+        file_stats_cache,
+        batch_size,
+        Some(embedder),
+        false,
+        true,
     )
 }
 
@@ -957,13 +979,14 @@ fn index_nodes_with_embedder_inner(
     batch_size: usize,
     embedder: Option<HybridEmbedder>,
     _allow_neural: bool,
+    precomputed_tfidf: bool,
 ) -> Result<HybridEmbedder> {
     *file_stats_cache = None;
 
     let batch_size = batch_size.max(1);
 
-    // Pass 1: document frequencies. Each worker uses a per-chunk scratch
-    // buffer so only one file body per worker is resident. No cross-phase cache.
+    // Pass 1: document frequencies. The legacy routes always run this pass;
+    // only the StreamingTfidf route supplies a prebuilt embedder and bypasses it.
     let connectivity_config = crate::graph::pdg::TraversalConfig {
         max_depth: Some(1),
         max_nodes: Some(1000),
@@ -975,9 +998,13 @@ fn index_nodes_with_embedder_inner(
 
     let node_indices: Vec<petgraph::graph::NodeIndex> = pdg.node_indices().collect();
     let file_summary_ctx = FileSummaryContext::from_pdg(pdg);
-    let (df, total_docs) =
-        build_document_frequencies(pdg, &node_indices, &connectivity_config, &file_summary_ctx);
-    let embedder = build_embedder_from_corpus(embedder, total_docs, df, pdg, _allow_neural);
+    let embedder = if precomputed_tfidf {
+        embedder.context("streaming TF-IDF route requires its prebuilt embedder")?
+    } else {
+        let (df, total_docs) =
+            build_document_frequencies(pdg, &node_indices, &connectivity_config, &file_summary_ctx);
+        build_embedder_from_corpus(embedder, total_docs, df, pdg, _allow_neural)
+    };
 
     // A+ bound-gated admission, selective pruning, and work hoisting.
     let pruner = crate::search::search::ContentPruner::new();

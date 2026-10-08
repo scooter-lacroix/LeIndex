@@ -233,7 +233,6 @@ fn test_gate_phase8_all_flags_default_on() {
         FeatureFlag::GenerationReaders,
         FeatureFlag::BoundedScheduler,
         FeatureFlag::StreamingPdg,
-        FeatureFlag::StreamingTfidf,
         FeatureFlag::StreamingNeural,
         FeatureFlag::GlobalEmbedCache,
         FeatureFlag::ValidatedModel,

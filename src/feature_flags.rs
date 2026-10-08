@@ -110,12 +110,15 @@ pub enum FeatureFlag {
     /// Enable the compact PDG persistence stage (WS6-9 Task 3): per-file graph
     /// fragments to CAS adjacency without whole-PDG clone.
     StreamingPdg,
-    /// Enable the streaming TF-IDF stage (WS6-9 Task 4): two-pass external-
-    /// memory TF-IDF with direct CAS-staged row writes.
-    ///
-    /// **Status:** declared but not yet consumed by `index_project_inner`; the
-    /// flag currently has no effect. Tracked in
-    /// <https://github.com/scooter-lacroix/LeIndex/issues/86>.
+    /// Consumer: `build_lexical_embedder` in `src/cli/index_builder/mod.rs`
+    /// selects the production streaming TF-IDF builder through
+    /// `tfidf_route_for_current_flag()` in
+    /// `src/cli/leindex/indexing/streaming/routes.rs`. The streaming route
+    /// reuses production tokenization and writes the same vocabulary, IDF
+    /// values, and vectors as the legacy builder. Default OFF preserves the
+    /// legacy route. Coverage: `test_tfidf_route_flag_selects_both_routes`,
+    /// `test_streaming_vocab_and_rows_match_production_embedder`, and
+    /// `test_streaming_tfidf_flag_indexes_fixture_and_searches`.
     StreamingTfidf,
     /// Enable the streaming neural enrichment stage (WS6-9 Task 6):
     /// NeuralRowWriter replaces Vec accumulation, direct staged writes.
@@ -222,7 +225,6 @@ impl FeatureFlag {
             | Self::GenerationReaders
             | Self::BoundedScheduler
             | Self::StreamingPdg
-            | Self::StreamingTfidf
             | Self::StreamingNeural
             | Self::GlobalEmbedCache
             | Self::CommunityDetection
@@ -710,7 +712,6 @@ mod test {
             FeatureFlag::GenerationReaders,
             FeatureFlag::BoundedScheduler,
             FeatureFlag::StreamingPdg,
-            FeatureFlag::StreamingTfidf,
             FeatureFlag::StreamingNeural,
             FeatureFlag::GlobalEmbedCache,
             FeatureFlag::ValidatedModel,
@@ -730,7 +731,11 @@ mod test {
     fn test_pr86_consumer_flags_default_off() {
         let _g = FLAG_TEST_LOCK.lock().unwrap();
         clear_flag_overrides_for_test();
-        for flag in [FeatureFlag::StreamingScan, FeatureFlag::StreamingParse] {
+        for flag in [
+            FeatureFlag::StreamingScan,
+            FeatureFlag::StreamingParse,
+            FeatureFlag::StreamingTfidf,
+        ] {
             assert!(!flag.default_value(), "{} must default OFF", flag.env_var());
         }
     }
