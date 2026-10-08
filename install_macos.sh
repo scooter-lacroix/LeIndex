@@ -17,7 +17,7 @@ set -euo pipefail
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.0.1"
 readonly PROJECT_NAME="LeIndex"
 readonly PROJECT_SLUG="leindex"
 readonly MIN_RUST_MAJOR=1
