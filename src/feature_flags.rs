@@ -78,9 +78,15 @@ pub enum FeatureFlag {
     /// `spawn_blocking` call. Default OFF = legacy spawn_blocking + error-at-cap
     /// indexing path.
     ///
-    /// **Status:** declared but not yet consumed by `index_project_inner`; the
-    /// flag currently has no effect. Tracked in
-    /// <https://github.com/scooter-lacroix/LeIndex/issues/86>.
+    /// **Status:** declared but NOT consumed — blocked, by design. There is no
+    /// honest consumer: `IndexJob::step` invokes `PhaseExecutor::run_phase`
+    /// wholesale and ignores `WorkBudget`, and the LeIndex pipeline phases
+    /// (`run_scan`, `run_parse`, `run_lexical`, `run_neural`) are monolithic
+    /// `&mut self` methods — there is no bounded stepping surface to route
+    /// through. Wiring this flag requires splitting the phase executor into
+    /// stepped jobs first; wrapping whole-phase methods would be decorative,
+    /// not bounded or fair. See the PR-86 spec, D6
+    /// (docs/plans/2026-10-07-pr86-flag-consumers.md).
     BoundedScheduler,
     /// Enable the streaming scan stage (WS6-9 Task 1): scan walks files lazily,
     /// hashing via a fixed 64KiB buffer, writing metadata records to CAS-staged
