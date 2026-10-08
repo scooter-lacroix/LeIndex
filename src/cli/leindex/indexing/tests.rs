@@ -951,12 +951,14 @@ fn test_save_stage_budget_ms_scaling_floor_and_override() {
 
     let scale = if cfg!(debug_assertions) { 10 } else { 1 };
 
-    // Tiny graphs sit on the floor (× debug scale).
-    assert_eq!(save_stage_budget_ms(0, None), 500 * scale);
-    assert_eq!(save_stage_budget_ms(1_000, None), 500 * scale);
+    // Tiny graphs sit on the floor (× debug scale). The floor is 2 s: the
+    // fixed publish cost (VACUUM + CAS staging + fsyncs) measured ~600 ms on
+    // shared CI runners, so a floor near that false-trips 0-edge fixtures.
+    assert_eq!(save_stage_budget_ms(0, None), 2_000 * scale);
+    assert_eq!(save_stage_budget_ms(1_000, None), 2_000 * scale);
 
-    // Large graphs scale per-edge: 200k edges × 20µs = 4000 ms → floor loses.
-    // (250k edges is the crossover where 20µs/edge exceeds the 500ms floor.)
+    // Large graphs scale per-edge: 250k edges × 20µs = 5000 ms → floor loses.
+    // (100k edges is the crossover where 20µs/edge exceeds the 2 s floor.)
     assert_eq!(save_stage_budget_ms(250_000, None), 5_000 * scale);
 
     // The measured production shape: ~193k edges, ~5µs/edge actual →
