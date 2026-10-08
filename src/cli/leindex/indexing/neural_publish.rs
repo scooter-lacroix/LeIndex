@@ -94,10 +94,18 @@ fn streaming_neural_inputs<'a>(
             {
                 continue;
             }
-            let input = (|| {
+            let input = {
                 let file_bytes = file_cache
                     .get_or_read(Path::new(&*node.file_path))
-                    .with_context(|| format!("read source for neural node {}", node.id))?;
+                    .unwrap_or_else(|error| {
+                        warn!(
+                            node_id = %node.id,
+                            path = %node.file_path,
+                            %error,
+                            "Failed to read source for streaming neural node; using empty bytes"
+                        );
+                        std::sync::Arc::new(Vec::new())
+                    });
                 let text = index_builder::enriched_node_content(
                     pdg,
                     node_idx,
@@ -110,7 +118,7 @@ fn streaming_neural_inputs<'a>(
                     node_id: node.id.clone(),
                     text: index_builder::cap_neural_text(&text).to_owned(),
                 })
-            })();
+            };
             return Some(input);
         }
     })
@@ -666,5 +674,37 @@ impl LeIndex {
         };
         self.pipeline = Some(state);
         Ok(published)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_streaming_neural_inputs_missing_source_uses_empty_bytes() {
+        let dir = tempfile::tempdir().expect("neural source fixture");
+        let file_path = dir.path().join("missing.rs");
+        let file_path = file_path.display().to_string();
+        let node_id = format!("{file_path}:missing_source");
+        let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
+        pdg.add_node(crate::graph::pdg::Node {
+            id: node_id.clone(),
+            node_type: crate::graph::pdg::NodeType::Function,
+            name: "missing_source".to_string(),
+            file_path: std::sync::Arc::from(file_path),
+            byte_range: (0, 1),
+            complexity: 1,
+            language: "rust".to_string(),
+        });
+        let admitted = HashSet::from([node_id.clone()]);
+
+        let mut inputs = streaming_neural_inputs(&pdg, &admitted);
+        let input = inputs
+            .next()
+            .expect("admitted node should produce a neural input")
+            .expect("missing source uses the empty-byte fallback");
+        assert_eq!(input.node_id, node_id);
+        assert!(inputs.next().is_none());
     }
 }
