@@ -5,7 +5,7 @@ use super::*;
 /// source bodies are re-read per chunk via a per-chunk scratch buffer
 /// (capacity 1), dropped at the end of each batch.
 #[test]
-fn pipeline_state_has_no_cross_phase_file_cache() {
+fn test_pipeline_state_has_no_cross_phase_file_cache() {
     // Compile-time check: the struct definition has no shared_file_cache field.
     // If this test compiles, the field was removed (or never present).
     let state = IndexPipelineState::new(
@@ -24,7 +24,7 @@ fn pipeline_state_has_no_cross_phase_file_cache() {
 /// 100-200. Source bodies are dropped after each chunk, preventing RSS
 /// growth proportional to corpus size.
 #[test]
-fn per_chunk_scratch_has_capacity_one() {
+fn test_per_chunk_scratch_has_capacity_one() {
     // Capacity 1 means only one file body is resident at a time.
     // The scratch is intended to avoid re-reading the same file for
     // adjacent sibling nodes in the same batch; it is NOT a cache.
@@ -52,7 +52,7 @@ fn per_chunk_scratch_has_capacity_one() {
 }
 
 #[test]
-fn admitted_node_ids_are_sorted_for_checkpoint_payloads() {
+fn test_admitted_node_ids_are_sorted_for_checkpoint_payloads() {
     let admitted = [
         "node-z".to_string(),
         "node-a".to_string(),
@@ -78,7 +78,7 @@ fn admitted_node_ids_are_sorted_for_checkpoint_payloads() {
 }
 
 #[test]
-fn admitted_node_ids_restore_from_lexical_checkpoint() {
+fn test_admitted_node_ids_restore_from_lexical_checkpoint() {
     let checkpoint = LexicalCheckpoint {
         pdg_hash: "pdg".to_string(),
         snapshot_path: "snapshot.bin".into(),
@@ -93,7 +93,7 @@ fn admitted_node_ids_restore_from_lexical_checkpoint() {
 }
 
 #[test]
-fn missing_lexical_checkpoint_restores_empty_admission_set() {
+fn test_missing_lexical_checkpoint_restores_empty_admission_set() {
     assert!(restored_admitted_node_ids(None).is_empty());
 }
 
@@ -104,7 +104,7 @@ fn missing_lexical_checkpoint_restores_empty_admission_set() {
 static WATCHER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
-fn watcher_delta_publishes_current_generation() {
+fn test_watcher_delta_publishes_current_generation() {
     let _env_guard = WATCHER_ENV_LOCK.lock().unwrap();
     let temp = tempfile::tempdir().expect("watcher fixture");
     std::fs::create_dir_all(temp.path().join("src")).expect("source directory");
@@ -324,7 +324,7 @@ fn test_streaming_neural_flag_keeps_fixture_searchable() {
 /// and byte ranges, letting a changed symbol rank/surface against deleted
 /// content. This pins the clearing contract the error branch depends on.
 #[test]
-fn fragment_sync_failure_clear_empties_engine_fragment_state() {
+fn test_fragment_sync_failure_clear_empties_engine_fragment_state() {
     let mut engine = crate::search::search::SearchEngine::new();
     engine.set_fragment_index_enabled(true);
     // Simulate stale rows from a previous generation.
@@ -638,7 +638,7 @@ fn test_streaming_pdg_drops_results_whose_source_changed_after_parse() {
 /// through the streaming fragment/segment pipeline; OFF routes through the
 /// legacy extraction + merge loop.
 #[test]
-fn streaming_pdg_flag_routes_through_streaming_vs_legacy_builders() {
+fn test_streaming_pdg_flag_routes_through_streaming_vs_legacy_builders() {
     use crate::feature_flags::{FeatureFlag, with_flag_override};
 
     with_flag_override(FeatureFlag::StreamingPdg, true, || {
@@ -677,7 +677,7 @@ fn streaming_pdg_flag_routes_through_streaming_vs_legacy_builders() {
 /// symbol id), identical node/edge counts, and identical edge (source, target,
 /// type) sets.
 #[test]
-fn streaming_and_legacy_pdg_routes_produce_equivalent_graphs() {
+fn test_streaming_and_legacy_pdg_routes_produce_equivalent_graphs() {
     let results = vec![
         sample_parsing_result("a.rs", "alpha", "beta"),
         sample_parsing_result("b.rs", "beta", "alpha"),
@@ -722,7 +722,7 @@ fn streaming_and_legacy_pdg_routes_produce_equivalent_graphs() {
 /// The streaming PDG route must emit exactly one node per successfully parsed
 /// signature, across multiple files. (Direct caller of `build_fragment_from_parsed`.)
 #[test]
-fn build_pdg_streaming_produces_correct_node_count_for_multiple_files() {
+fn test_build_pdg_streaming_produces_correct_node_count_for_multiple_files() {
     // Two files, two signatures each -> four nodes total.
     let results = vec![
         sample_parsing_result("a.rs", "alpha", "beta"),
@@ -759,7 +759,7 @@ fn build_pdg_streaming_produces_correct_node_count_for_multiple_files() {
 /// class node via containment. That extra node is the price of a graph
 /// with actual edges, and matches what the legacy route always produced.
 #[test]
-fn streaming_route_builds_real_edges_and_complexity() {
+fn test_streaming_route_builds_real_edges_and_complexity() {
     use crate::parse::traits::{SignatureInfo, Visibility};
     let result = crate::parse::parallel::ParsingResult {
         file_path: std::path::PathBuf::from("src/lib.rs"),
@@ -910,7 +910,7 @@ fn test_single_publish_generation_per_index_run() {
 /// full `rust-analyzer scip` pass (minutes) would stall every other tool on
 /// the project. Precision re-merges on the next explicit index instead.
 #[test]
-fn watcher_delta_does_not_spawn_precision_indexer() {
+fn test_watcher_delta_does_not_spawn_precision_indexer() {
     let _guard = WATCHER_ENV_LOCK.lock().unwrap();
 
     let indexer_dir = tempfile::tempdir().expect("indexer fixture dir");
@@ -970,7 +970,7 @@ fn watcher_delta_does_not_spawn_precision_indexer() {
 /// preview and rename preview. Mutation while a reader is alive must still
 /// leave that reader a consistent snapshot.
 #[test]
-fn validator_shares_the_resident_graph_and_mutation_leaves_readers_a_snapshot() {
+fn test_validator_shares_the_resident_graph_and_mutation_leaves_readers_a_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("lib.rs"),
