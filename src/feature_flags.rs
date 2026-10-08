@@ -86,9 +86,12 @@ pub enum FeatureFlag {
     /// hashing via a fixed 64KiB buffer, writing metadata records to CAS-staged
     /// scan blob without retaining source bodies.
     ///
-    /// **Status:** declared but not yet consumed by `index_project_inner`; the
-    /// flag currently has no effect. Tracked in
-    /// <https://github.com/scooter-lacroix/LeIndex/issues/86>.
+    /// The feature flag gates `run_scan` in
+    /// `src/cli/leindex/indexing/mod.rs`: the streaming path hashes the existing
+    /// configured source inventory through `stream_scan_paths` without retaining
+    /// bodies and propagates hard I/O failures. Default OFF preserves the legacy
+    /// path. Coverage: `test_scan_route_flag_selects_both_routes` and
+    /// `test_streaming_scan_flag_indexes_fixture_and_searches`.
     StreamingScan,
     /// Enable the streaming parse stage (WS6-9 Task 2): bounded parse chunks
     /// with per-file persist and syntax-tree drop before the next file.
@@ -211,7 +214,6 @@ impl FeatureFlag {
             | Self::DaemonClient
             | Self::GenerationReaders
             | Self::BoundedScheduler
-            | Self::StreamingScan
             | Self::StreamingParse
             | Self::StreamingPdg
             | Self::StreamingTfidf
@@ -701,7 +703,6 @@ mod test {
             FeatureFlag::DaemonClient,
             FeatureFlag::GenerationReaders,
             FeatureFlag::BoundedScheduler,
-            FeatureFlag::StreamingScan,
             FeatureFlag::StreamingParse,
             FeatureFlag::StreamingPdg,
             FeatureFlag::StreamingTfidf,
@@ -715,6 +716,17 @@ mod test {
                 "{} should default ON after gates pass (VAL-ROLLOUT-012 rollout-KILL semantics)",
                 flag.env_var()
             );
+        }
+    }
+
+    /// PR-86 consumer flags are opt-in: each ships default OFF in the same
+    /// commit that wires its consumer, so flags-off equals legacy behavior.
+    #[test]
+    fn test_pr86_consumer_flags_default_off() {
+        let _g = FLAG_TEST_LOCK.lock().unwrap();
+        clear_flag_overrides_for_test();
+        for flag in [FeatureFlag::StreamingScan] {
+            assert!(!flag.default_value(), "{} must default OFF", flag.env_var());
         }
     }
 

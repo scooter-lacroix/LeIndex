@@ -691,7 +691,33 @@ impl LeIndex {
         let old_scan = self.get_project_scan(false).ok();
         // Hash source files without caching bodies (VAL-STREAM-012: no
         // cross-phase source-body retention). Each phase re-reads per chunk.
-        let source_files_with_hashes = self.collect_source_files_with_hashes(true)?;
+        let scan_route = streaming::routes::scan_route_for_current_flag();
+        info!(
+            "Index scan: {} route selected by LEINDEX_FEATURE_STREAMING_SCAN",
+            match scan_route {
+                streaming::routes::ScanRoute::Streaming => "streaming",
+                streaming::routes::ScanRoute::Legacy => "legacy",
+            }
+        );
+        let source_files_with_hashes = match scan_route {
+            streaming::routes::ScanRoute::Streaming => {
+                let project_scan = self.get_project_scan(true)?;
+                let mut writer = streaming::scan::VecScanRecordWriter::new();
+                streaming::scan::stream_scan_paths(
+                    &self.project_path,
+                    &project_scan.source_paths,
+                    &mut writer,
+                )
+                .context("Failed to stream-hash project source files")?;
+                project_scan
+                    .source_paths
+                    .into_iter()
+                    .zip(writer.records)
+                    .map(|(path, record)| (path, record.hash))
+                    .collect()
+            }
+            streaming::routes::ScanRoute::Legacy => self.collect_source_files_with_hashes(true)?,
+        };
         info!("Found {} source files", source_files_with_hashes.len());
         let scan = scan_checkpoint(&source_files_with_hashes);
         let generation = state.job.generation;
