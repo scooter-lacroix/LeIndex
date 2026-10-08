@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #############################################
 # LeIndex Universal Installer
-# Version: 2.0.0 - Rust Edition
+# Version: 2.0.1 - Rust Edition
 # Platform: macOS
 #
 # Installer:

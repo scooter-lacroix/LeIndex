@@ -701,6 +701,13 @@ fn test_streaming_pdg_rejects_results_whose_source_changed_after_parse() {
         Err(error) => error,
     };
     assert!(deleted.to_string().contains("failed to read source"));
+
+    let direct_call = build_pdg_streaming(vec![make_result(original.as_bytes())], &HashMap::new())
+        .expect("direct callers without scan hashes retain empty-source fallback");
+    assert!(
+        direct_call.node_count() > 0,
+        "direct callers without scan hashes keep the legacy empty-source extraction"
+    );
 }
 
 /// VAL-PDG-006/007: `FeatureFlag::StreamingPdg` ON routes PDG construction

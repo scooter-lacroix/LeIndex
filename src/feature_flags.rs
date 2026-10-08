@@ -41,8 +41,8 @@ pub enum FeatureFlag {
     /// When enabled, `leindex mcp --stdio` acts as a thin shim that discovers
     /// (or spawns) the user-scoped `leindexd` daemon and forwards MCP/JSON-RPC
     /// frames to it over a Unix socket. When disabled, the stdio server runs
-    /// the full inline engine (legacy v1.9.x behaviour). Default ON since the
-    /// v2.0.0 rollout phase 8 (VAL-ROLLOUT-012); set
+    /// the full inline engine (legacy v1.9.x behaviour). Default ON as a stable
+    /// rollout capability; set
     /// `LEINDEX_FEATURE_DAEMON_CLIENT=false` (or `LEINDEX_LEGACY=1`) to
     /// revert — the flag doubles as a rollout-KILL.
     ///
@@ -75,8 +75,8 @@ pub enum FeatureFlag {
     /// Route indexing through the fair bounded scheduler (WS5): heavy work is
     /// executed as stepped [`BoundedJob`](crate::scheduler::budget::BoundedJob)s
     /// behind the DRR queues and admission gate instead of one unstepped
-    /// `spawn_blocking` call. Default OFF = legacy spawn_blocking + error-at-cap
-    /// indexing path.
+    /// `spawn_blocking` call. The compiled default is ON; disabling it keeps
+    /// the legacy spawn_blocking + error-at-cap indexing path.
     ///
     /// **Status:** declared but NOT consumed — blocked, by design. There is no
     /// honest consumer: `IndexJob::step` invokes `PhaseExecutor::run_phase`
@@ -163,8 +163,8 @@ pub enum FeatureFlag {
     /// Enable the WS11 validated model profile as the production default
     /// (WS11 Task 7). When ON, the embed worker uses the model bake-off
     /// winner (CodeRankEmbed 137M, INT8 quantized, no reranker) instead of
-    /// the legacy FP16 Qwen3 + reranker baseline. Default ON since the
-    /// v2.0.0 rollout phase 8 (VAL-ROLLOUT-012); set
+    /// the legacy FP16 Qwen3 + reranker baseline. Default ON as the validated
+    /// production model; set
     /// `LEINDEX_FEATURE_VALIDATED_MODEL=false` (or `LEINDEX_LEGACY=1`) to
     /// revert to the legacy FP16 Qwen3 behavior.
     ValidatedModel,
@@ -205,35 +205,23 @@ impl FeatureFlag {
 
     /// Returns whether this flag is enabled by default (without env override).
     ///
-    /// The v2.0.0 rollout follows a two-state lifecycle:
-    ///
-    /// 1. **Initial state** (VAL-ROLLOUT-001, rollout phases 1–7): every new
-    ///    rollout flag defaults OFF, so legacy v1.9.x behavior is preserved and
-    ///    no capability is silently enabled until the copy is verified.
-    /// 2. **Post-gate state** (VAL-ROLLOUT-012, rollout phase 8): after all
-    ///    section 16 acceptance gates pass, the shipped v2.0.0 state flips those
-    ///    flags to default ON. Each flag then acts as a rollout-KILL: an
-    ///    explicit `"0"`/`"false"` (or the umbrella [`LEGACY_ENV`] switch) reverts
-    ///    to legacy behavior for scoped rollback.
-    ///
-    /// The `LEINDEX_LEGACY=1` umbrella reverts all rollout flags back to OFF for
-    /// the phase-9 fallback window independently of this default (see
-    /// [`is_enabled`](Self::is_enabled) and [`legacy_mode_enabled`]).
+    /// Defaults are intentionally per-feature: stable rollout capabilities may
+    /// default ON as rollout-KILLs, while new consumers can remain opt-in until
+    /// their route has passed its own acceptance gates. Do not infer the default
+    /// for one flag from the broader v2.0 rollout state.
     pub fn default_value(&self) -> bool {
         match self {
-            // GA production features default to ON so the flag acts as a
-            // per-deployment rollout-KILL (explicit `false` disables; unset
-            // follows normal config). Genuinely new/experimental features below
-            // still default off.
+            // Stable production capabilities default ON and remain individually
+            // revertible through their flags. New consumer routes are listed only
+            // after their own rollout gates pass; the PR-86 scan, parse, TF-IDF,
+            // and neural consumers intentionally remain opt-in below.
             Self::StreamingMcp
             | Self::GlobalAutoSync
             | Self::NeuralSearch
-            // v2.0.0 rollout phase 8: all section 16 acceptance gates pass.
-            // The v2.0.0 resource architecture (CAS generations, daemon + shim,
-            // bounded scheduler, streaming pipeline, global embed cache,
-            // validated model) is now the production default. Each flag acts as
-            // a rollout-KILL: setting it to "0"/"false" reverts to legacy
-            // behavior for scoped rollback.
+            // Stable architecture capabilities with successful rollout gates
+            // remain default ON and individually revertible. StreamingScan,
+            // StreamingParse, StreamingTfidf, and StreamingNeural intentionally
+            // remain OFF until their consumers complete a separate rollout.
             | Self::DaemonClient
             | Self::GenerationReaders
             | Self::BoundedScheduler
@@ -342,20 +330,18 @@ pub fn is_neural_enabled(config_value: bool) -> bool {
 
 /// Environment variable name for the legacy fallback umbrella switch (phase 9).
 ///
-/// When set to "1", "true", "yes", or "on", ALL rollout feature flags are
-/// forced to their OFF state (legacy behavior). This is the phase-9 fallback
-/// window mechanism: `LEINDEX_LEGACY=1` lets users opt back to the legacy
-/// v1.9.x code paths without downgrading.
+/// When set to "1", "true", "yes", or "on", every legacy-revertible
+/// rollout feature flag is forced OFF, restoring its legacy path where one
+/// exists. GA features predating v2.0.0 are not included.
 ///
 /// VAL-ROLLOUT-013: legacy paths reachable during fallback window.
 pub const LEGACY_ENV: &str = "LEINDEX_LEGACY";
 
 /// Returns `true` when the legacy fallback umbrella is active (`LEINDEX_LEGACY=1`).
 ///
-/// When active, `FeatureFlag::is_enabled()` returns `false` for every rollout
-/// flag, reverting the system to legacy v1.9.x behavior. This is a
-/// convenience switch so users don't have to set each `LEINDEX_FEATURE_*=0`
-/// individually during the phase-9 fallback window.
+/// When active, `FeatureFlag::is_enabled()` returns `false` for every flag
+/// in `LEGACY_REVERTIBLE_FLAGS`, reverting those features to their legacy
+/// paths. This is a convenience switch during the phase-9 fallback window.
 pub fn legacy_mode_enabled() -> bool {
     match env::var(LEGACY_ENV) {
         Ok(v) => matches!(
@@ -709,12 +695,10 @@ mod test {
         assert!(FeatureFlag::ValidatedModel.is_enabled());
     }
 
-    /// VAL-ROLLOUT-012 (phase 8): after all section 16 acceptance gates pass,
-    /// the shipped v2.0.0 state flips all rollout flags to default ON. Each
-    /// flag acts as a rollout-KILL: explicit "false" reverts to legacy behavior
-    /// for scoped rollback. This asserts the post-flip shipped state, NOT the
-    /// initial VAL-ROLLOUT-001 state (which the default_value() doc and
-    /// test_rollout_flags_default_off_with_legacy_mode cover).
+    /// Selected stable rollout flags default ON after their gates pass. Each
+    /// flag acts as a rollout-KILL: explicit "false" reverts that capability.
+    /// This test intentionally covers only the flags listed below; streaming
+    /// scan, parse, TF-IDF, and neural consumers have separate opt-in defaults.
     #[test]
     fn test_rollout_flags_default_on_after_gates_passed() {
         let _g = FLAG_TEST_LOCK.lock().unwrap();
@@ -773,11 +757,9 @@ mod test {
 
     // ── Phase 9 legacy fallback tests (VAL-ROLLOUT-013) ──────────────
 
-    /// VAL-ROLLOUT-001 (initial OFF default) is provable at runtime: the v2.0.0
-    /// rollback umbrella `LEINDEX_LEGACY=1` reverts ALL 10 v2.0.0 rollout flags
-    /// to OFF (legacy v1.9.x behavior), demonstrating that the flag mechanism
-    /// genuinely supports OFF defaults even though the shipped state flips them
-    /// ON after gates pass (VAL-ROLLOUT-012).
+    /// `LEINDEX_LEGACY=1` forces every legacy-revertible flag OFF. This test
+    /// verifies the umbrella over the full legacy-revertible set, including
+    /// streaming consumer flags whose normal defaults are already OFF.
     #[test]
     fn test_rollout_flags_default_off_with_legacy_mode() {
         // Save and restore the env var since this is process-global.
@@ -795,8 +777,9 @@ mod test {
             "GA features unaffected by LEINDEX_LEGACY"
         );
 
-        // v2.0.0 rollout flags should all be OFF under LEINDEX_LEGACY=1,
-        // proving the flag mechanism supports OFF defaults (VAL-ROLLOUT-001).
+        // Legacy-revertible flags are OFF under LEINDEX_LEGACY=1. Some of
+        // these (scan, parse, TF-IDF, neural) are already OFF by default; the
+        // umbrella also disables the stable default-ON flags.
         for flag in [
             FeatureFlag::DaemonClient,
             FeatureFlag::GenerationReaders,
@@ -829,9 +812,10 @@ mod test {
         clear_flag_overrides_for_test();
     }
 
-    /// `LEINDEX_LEGACY=0` (or unset) leaves rollout flags at default-on.
+    /// `LEINDEX_LEGACY=0` (or unset) leaves each flag at its own compiled
+    /// default; the defaults are not globally all-on.
     #[test]
-    fn test_legacy_unset_keeps_default_on() {
+    fn test_legacy_unset_keeps_compiled_defaults() {
         let _g = FLAG_TEST_LOCK.lock().unwrap();
         clear_flag_overrides_for_test();
         let prev = env::var(LEGACY_ENV).ok();

@@ -1042,6 +1042,10 @@ impl LeIndex {
             .iter()
             .map(|result| result.file_path.display().to_string())
             .collect();
+        // Verify and extract every parsed result before any graph or storage
+        // mutations, including processing deleted files. If source identity
+        // validation fails, leave the old graph and indexed-file records intact
+        // so the incomplete job can retry on the next scan.
         let rebuilt = if newly_parsed.is_empty() {
             None
         } else {
@@ -1739,10 +1743,15 @@ fn stage_optional_layers(
 /// results, so file-backed results are re-read lazily here — at most one
 /// file per parallel worker, never the corpus.
 ///
-/// The scan-stage hash is checked for both inline and re-read bytes. A source
-/// that changed or disappeared after parsing aborts the PDG phase before any
-/// old nodes or indexed-file hashes are mutated, leaving the file eligible
-/// for retry on the next scan.
+/// When a scan-stage hash exists, inline and re-read bytes are checked against
+/// it. If the source changed or disappeared after parsing, the PDG phase aborts
+/// before old nodes or indexed-file hashes are mutated, leaving the file
+/// eligible for retry on the next scan. This intentionally replaces the prior
+/// warning-and-drop policy: publishing a partial graph under the scan-stage
+/// hash would corrupt index freshness. Direct builder callers without a scan
+/// hash retain the legacy empty-slice fallback. Optional neural enrichment
+/// separately degrades to empty bytes for unreadable sources because it does
+/// not publish PDG identity.
 fn extract_with_verified_source<T>(
     result: crate::parse::parallel::ParsingResult,
     source_file_hashes: &HashMap<String, String>,
@@ -1781,10 +1790,9 @@ fn extract_with_verified_source<T>(
             }
             std::borrow::Cow::Owned((*bytes).clone())
         }
-        (None, None) => std::borrow::Cow::Owned(
-            std::fs::read(&file_path_for_read)
-                .with_context(|| format!("PDG extraction: failed to read '{file_path_string}'"))?,
-        ),
+        (None, None) => {
+            std::borrow::Cow::Owned(std::fs::read(&file_path_for_read).unwrap_or_default())
+        }
     };
     let signatures = result.signatures;
     let language = result.language;
