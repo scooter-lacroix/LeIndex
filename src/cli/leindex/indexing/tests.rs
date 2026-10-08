@@ -380,6 +380,90 @@ fn sample_parsing_result(
     }
 }
 
+/// PR #90 review P1: PDG extraction must produce the identical graph when a
+/// file-backed result carries `source_bytes: None` (streaming route strips
+/// them after each chunk) and the extractor lazily re-reads the file, as it
+/// does when the bytes are inline (legacy route).
+#[test]
+fn streaming_pdg_extraction_equivalent_for_stripped_and_inline_source_bytes() {
+    let dir = tempfile::tempdir().expect("pdg lazy reread fixture");
+    let path = dir.path().join("lazy.rs");
+    let source = "pub fn lazy_marker() -> usize { 7 }\npub fn lazy_other() -> usize { 8 }\n";
+    std::fs::write(&path, source).expect("fixture source");
+
+    let make_result = |inline: bool| crate::parse::parallel::ParsingResult {
+        file_path: path.clone(),
+        language: Some("rust".to_string()),
+        signatures: vec![
+            crate::parse::traits::SignatureInfo {
+                name: "lazy_marker".to_string(),
+                qualified_name: "lazy_marker".to_string(),
+                parameters: vec![],
+                return_type: None,
+                visibility: crate::parse::traits::Visibility::Public,
+                is_async: false,
+                is_method: false,
+                docstring: None,
+                calls: vec![],
+                imports: vec![],
+                byte_range: (0, 34),
+                cyclomatic_complexity: 1,
+                flow_facts: vec![],
+            },
+            crate::parse::traits::SignatureInfo {
+                name: "lazy_other".to_string(),
+                qualified_name: "lazy_other".to_string(),
+                parameters: vec![],
+                return_type: None,
+                visibility: crate::parse::traits::Visibility::Public,
+                is_async: false,
+                is_method: false,
+                docstring: None,
+                calls: vec![],
+                imports: vec![],
+                byte_range: (35, 70),
+                cyclomatic_complexity: 1,
+                flow_facts: vec![],
+            },
+        ],
+        source_bytes: if inline {
+            Some(source.as_bytes().to_vec())
+        } else {
+            None
+        },
+        error: None,
+        parse_time_ms: 0,
+    };
+
+    let inline = build_pdg_streaming(vec![make_result(true)]);
+    let stripped = build_pdg_streaming(vec![make_result(false)]);
+
+    assert_eq!(
+        inline.node_count(),
+        stripped.node_count(),
+        "lazy re-read must produce the same node count as inline bytes"
+    );
+    assert_eq!(
+        inline.edge_count(),
+        stripped.edge_count(),
+        "lazy re-read must produce the same edge count as inline bytes"
+    );
+    let mut inline_ids: Vec<String> = inline
+        .node_indices()
+        .filter_map(|idx| inline.get_node(idx).map(|node| node.id.clone()))
+        .collect();
+    inline_ids.sort();
+    let mut stripped_ids: Vec<String> = stripped
+        .node_indices()
+        .filter_map(|idx| stripped.get_node(idx).map(|node| node.id.clone()))
+        .collect();
+    stripped_ids.sort();
+    assert_eq!(
+        inline_ids, stripped_ids,
+        "lazy re-read must produce identical node ids"
+    );
+}
+
 /// VAL-PDG-006/007: `FeatureFlag::StreamingPdg` ON routes PDG construction
 /// through the streaming fragment/segment pipeline; OFF routes through the
 /// legacy extraction + merge loop.

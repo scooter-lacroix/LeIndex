@@ -328,9 +328,14 @@ fn chunk_file_inputs(files: &[(PathBuf, u64)], budget: &ParseBudget) -> Vec<Vec<
 ///
 /// Parses `(path, bytes)` pairs through the production `ParallelParser`
 /// (tree-sitter) in chunks bounded by `budget`, so peak RSS is capped by
-/// chunk size instead of the full file set, while returned `ParsingResult`s
-/// keep the exact shape and order the legacy `parse_files` route produces.
-/// D3: downstream checkpoint/PDG consumption is route-independent.
+/// chunk size instead of the full file set. Returned `ParsingResult`s keep
+/// the exact shape and order the legacy `parse_files` route produces, but
+/// `source_bytes` is stripped to `None` after each chunk: results never
+/// retain the whole corpus (PR #90 review, P1). PDG extraction re-reads
+/// file-backed results lazily (see `extraction_source_bytes` in
+/// `indexing/mod.rs`) and the parse checkpoint persists signatures, so no
+/// downstream consumer loses data. D3: downstream checkpoint/PDG
+/// consumption is route-independent.
 pub fn stream_parse_parallel(
     files: Vec<(PathBuf, u64)>,
     budget: &ParseBudget,
@@ -338,7 +343,15 @@ pub fn stream_parse_parallel(
     let parser = crate::parse::parallel::ParallelParser::new();
     let mut results = Vec::new();
     for chunk in chunk_file_inputs(&files, budget) {
-        results.extend(parser.parse_files(chunk));
+        let mut chunk_results = parser.parse_files(chunk);
+        // Streaming memory contract: returned results must not retain the
+        // whole corpus. Signatures are already persisted via the parse
+        // checkpoint and PDG extraction re-reads file-backed results, so
+        // stripping here is lossless for every downstream consumer.
+        for result in &mut chunk_results {
+            result.source_bytes = None;
+        }
+        results.extend(chunk_results);
     }
     results
 }
@@ -542,6 +555,37 @@ mod test {
                     .iter()
                     .any(|s| s.name == format!("marker_{i}")),
                 "order preserved: result {i} must be marker_{i}"
+            );
+        }
+    }
+
+    /// PR #90 review P1: the streaming route's returned results must not
+    /// retain `source_bytes` across chunks — peak memory must stay bounded
+    /// by the chunk budget, not the whole corpus. PDG extraction re-reads
+    /// file-backed results lazily, so `None` here is lossless downstream.
+    #[test]
+    fn test_stream_parse_parallel_strips_source_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for i in 0..3 {
+            let path = dir.path().join(format!("s{i}.rs"));
+            fs::write(
+                &path,
+                format!("pub fn stream_strip_{i}() -> usize {{ {i} }}\n"),
+            )
+            .unwrap();
+            files.push((path, 64));
+        }
+        let results = stream_parse_parallel(files, &ParseBudget::default());
+        assert_eq!(results.len(), 3);
+        for (i, result) in results.iter().enumerate() {
+            assert!(
+                result.is_success(),
+                "file {i} must parse successfully before stripping"
+            );
+            assert!(
+                result.source_bytes.is_none(),
+                "streaming route result {i} must not retain source_bytes (peak-bounded contract)"
             );
         }
     }

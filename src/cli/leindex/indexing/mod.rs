@@ -1703,6 +1703,27 @@ fn stage_optional_layers(
     }
     Ok(())
 }
+/// Resolve the source bytes for a parsed file at PDG-extraction time.
+///
+/// The streaming parse route strips `source_bytes` from its returned results
+/// (peak-RSS contract: no whole-corpus retention), so file-backed results
+/// are re-read lazily here — at most one file per parallel worker, never the
+/// corpus. Missing or unreadable files yield an empty slice, matching the
+/// `unwrap_or(&[])` semantics of the inline path (parse-failure results
+/// carry `None` too, and extraction treats empty source as absent). Inline
+/// bytes are borrowed, never copied; legacy results never touch the
+/// filesystem. Takes the field references (not the whole result) so callers
+/// can move `result.signatures` while the bytes are still borrowed.
+fn extraction_source_bytes<'a>(
+    source_bytes: &'a Option<Vec<u8>>,
+    file_path: &std::path::Path,
+) -> std::borrow::Cow<'a, [u8]> {
+    match source_bytes {
+        Some(bytes) => std::borrow::Cow::Borrowed(bytes),
+        None => std::borrow::Cow::Owned(std::fs::read(file_path).unwrap_or_default()),
+    }
+}
+
 /// Which PDG construction route produced a given combined graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PdgBuildRoute {
@@ -1753,10 +1774,10 @@ fn build_pdg_legacy(
         .map(|result| {
             let file_path = result.file_path.display().to_string();
             let language = result.language.as_deref().unwrap_or("unknown");
-            let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
+            let source_bytes = extraction_source_bytes(&result.source_bytes, &result.file_path);
             crate::graph::extract_pdg_from_signatures(
                 result.signatures,
-                source_bytes,
+                &source_bytes,
                 &file_path,
                 language,
             )
@@ -1788,7 +1809,7 @@ fn build_pdg_streaming(
                 .language
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
-            let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
+            let source_bytes = extraction_source_bytes(&result.source_bytes, &result.file_path);
             // Route through the REAL extraction pipeline
             // (`extract_pdg_from_signatures` → `fragment_from_pdg`, its
             // documented production realization) instead of the skeleton
@@ -1802,7 +1823,7 @@ fn build_pdg_streaming(
             // clone, compact per-file records) is preserved.
             let file_pdg = crate::graph::extract_pdg_from_signatures(
                 result.signatures,
-                source_bytes,
+                &source_bytes,
                 &file_path,
                 &language,
             );

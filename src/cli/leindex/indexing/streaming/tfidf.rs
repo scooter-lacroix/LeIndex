@@ -6,7 +6,6 @@
 //! entire corpus is ever materialized on the heap (spec §6.4, VAL-STREAM-005).
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -237,17 +236,20 @@ pub fn deserialize_tfidf_rows(data: &[u8]) -> Result<Vec<TfidfRow>> {
     Ok(bincode::deserialize(data)?)
 }
 
-/// Streaming pass 1 over the PDG for the production lexical route.
+/// Read each distinct file in a chunk exactly once and serve all of its
+/// nodes' tokenized-document computations from that single read (PR #90
+/// review, P2: a symbol-dense file used to be re-read once per node).
 ///
-/// Builds document frequencies in `chunk_size`-node chunks with the
-/// production tokenizer and the exact `enriched_node_content` corpus the
-/// legacy route tokenizes. File bodies are re-read per chunk rather than
-/// retained across the pass. IO failures abort rather than publish partial
-/// document frequencies.
-pub fn build_document_frequencies_chunked(
+/// Generic over the reader so tests can count reads without filesystem
+/// mocking; the production closure is `std::fs::read`.
+fn chunk_docs_from_files<F>(
+    nodes: &[petgraph::graph::NodeIndex],
     pdg: &crate::graph::pdg::ProgramDependenceGraph,
-    chunk_size: usize,
-) -> Result<(HashMap<String, usize>, usize)> {
+    read_file: F,
+) -> Vec<anyhow::Result<(String, Vec<String>)>>
+where
+    F: Fn(&str) -> std::io::Result<Vec<u8>> + Sync,
+{
     use rayon::prelude::*;
 
     let connectivity_config = crate::graph::pdg::TraversalConfig {
@@ -262,21 +264,35 @@ pub fn build_document_frequencies_chunked(
         min_edge_confidence: 0.0,
     };
     let file_summary_ctx = index_builder::FileSummaryContext::from_pdg(pdg);
-    let node_indices: Vec<petgraph::graph::NodeIndex> = pdg.node_indices().collect();
-    let mut df: HashMap<String, usize> = HashMap::new();
-    let mut total_docs = 0usize;
 
-    for nodes in node_indices.chunks(chunk_size.max(1)) {
-        let documents: Vec<Result<HashMap<String, usize>>> = nodes
-            .par_iter()
-            .filter_map(|&node_idx| {
-                let node = pdg.get_node(node_idx)?;
-                if node.node_type == crate::graph::pdg::NodeType::External {
-                    return None;
-                }
-                Some((|| {
-                    let file_bytes = std::fs::read(Path::new(&*node.file_path))
-                        .with_context(|| format!("read source for TF-IDF node {}", node.id))?;
+    // One entry per distinct file_path in this chunk; each file is read once
+    // and its bytes serve every node backed by that file (chunk-local, so
+    // peak memory stays bounded by the chunk budget).
+    let mut by_file: HashMap<String, Vec<petgraph::graph::NodeIndex>> = HashMap::new();
+    for &node_idx in nodes {
+        let Some(node) = pdg.get_node(node_idx) else {
+            continue;
+        };
+        if node.node_type == crate::graph::pdg::NodeType::External {
+            continue;
+        }
+        by_file
+            .entry(node.file_path.to_string())
+            .or_default()
+            .push(node_idx);
+    }
+
+    by_file
+        .into_par_iter()
+        .map(
+            |(file_path, node_indices)| -> anyhow::Result<(String, Vec<String>)> {
+                let file_bytes = read_file(&file_path)
+                    .with_context(|| format!("read source for TF-IDF node file {file_path}"))?;
+                let mut docs = FileDocTokens::default();
+                for node_idx in node_indices {
+                    let Some(node) = pdg.get_node(node_idx) else {
+                        continue;
+                    };
                     let node_content = index_builder::enriched_node_content(
                         pdg,
                         node_idx,
@@ -285,23 +301,58 @@ pub fn build_document_frequencies_chunked(
                         &connectivity_config,
                         &file_summary_ctx,
                     );
-                    let tokens = index_builder::tokenize_code(&node_content);
-                    let mut seen = std::collections::HashSet::new();
-                    let mut doc_df = HashMap::new();
-                    for token in tokens {
-                        if seen.insert(token.clone()) {
-                            *doc_df.entry(token).or_insert(0) += 1;
-                        }
-                    }
-                    Ok(doc_df)
-                })())
-            })
-            .collect();
+                    docs.add_tokens(index_builder::tokenize_code(&node_content));
+                }
+                Ok((file_path, docs.tokens()))
+            },
+        )
+        .collect()
+}
+
+/// Accumulates deduplicated tokens per file (a document for the DF pass).
+#[derive(Default)]
+struct FileDocTokens {
+    seen: std::collections::HashSet<String>,
+    tokens: Vec<String>,
+}
+
+impl FileDocTokens {
+    fn add_tokens(&mut self, tokens: impl IntoIterator<Item = String>) {
+        for token in tokens {
+            if self.seen.insert(token.clone()) {
+                self.tokens.push(token);
+            }
+        }
+    }
+
+    fn tokens(self) -> Vec<String> {
+        self.tokens
+    }
+}
+
+/// Streaming pass 1 over the PDG for the production lexical route.
+///
+/// Builds document frequencies in `chunk_size`-node chunks with the
+/// production tokenizer and the exact `enriched_node_content` corpus the
+/// legacy route tokenizes. Each distinct file is read at most once per
+/// chunk and never retained across the pass. IO failures abort rather than
+/// publish partial document frequencies.
+pub fn build_document_frequencies_chunked(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    chunk_size: usize,
+) -> Result<(HashMap<String, usize>, usize)> {
+    let node_indices: Vec<petgraph::graph::NodeIndex> = pdg.node_indices().collect();
+    let mut df: HashMap<String, usize> = HashMap::new();
+    let mut total_docs = 0usize;
+
+    for nodes in node_indices.chunks(chunk_size.max(1)) {
+        let documents = chunk_docs_from_files(nodes, pdg, |path| std::fs::read(path));
 
         total_docs += documents.len();
         for document in documents {
-            for (token, count) in document? {
-                *df.entry(token).or_insert(0) += count;
+            let (_, tokens) = document?;
+            for token in tokens {
+                *df.entry(token).or_insert(0) += 1;
             }
         }
     }
@@ -495,5 +546,78 @@ mod test {
         assert!(tokens.contains(&"fn".into()));
         assert!(tokens.contains(&"my".into()));
         assert!(tokens.contains(&"function".into()));
+    }
+
+    /// PR #90 review P2: a symbol-dense file must be read exactly once per
+    /// chunk, no matter how many nodes it backs. Proven with a counting
+    /// reader closure (no filesystem mocking needed).
+    #[test]
+    fn test_chunk_docs_reads_each_distinct_file_once() {
+        let signatures = vec![
+            crate::parse::traits::SignatureInfo {
+                name: "dense_a".to_string(),
+                qualified_name: "dense_a".to_string(),
+                parameters: vec![],
+                return_type: None,
+                visibility: crate::parse::traits::Visibility::Public,
+                is_async: false,
+                is_method: false,
+                docstring: None,
+                calls: vec![],
+                imports: vec![],
+                byte_range: (0, 30),
+                cyclomatic_complexity: 1,
+                flow_facts: vec![],
+            },
+            crate::parse::traits::SignatureInfo {
+                name: "dense_b".to_string(),
+                qualified_name: "dense_b".to_string(),
+                parameters: vec![],
+                return_type: None,
+                visibility: crate::parse::traits::Visibility::Public,
+                is_async: false,
+                is_method: false,
+                docstring: None,
+                calls: vec![],
+                imports: vec![],
+                byte_range: (31, 61),
+                cyclomatic_complexity: 1,
+                flow_facts: vec![],
+            },
+        ];
+        let source: &[u8] = b"pub fn dense_a() -> usize { 1 }\npub fn dense_b() -> usize { 2 }\n";
+        let pdg = crate::graph::extract_pdg_from_signatures(
+            signatures,
+            source,
+            "/fixture/dense.rs",
+            "rust",
+        );
+        let nodes: Vec<petgraph::graph::NodeIndex> = pdg.node_indices().collect();
+        assert!(
+            nodes.len() >= 2,
+            "fixture must produce a symbol-dense (multi-node) file"
+        );
+
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let docs = chunk_docs_from_files(&nodes, &pdg, |_path| {
+            reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(source.to_vec())
+        });
+
+        assert_eq!(
+            docs.len(),
+            1,
+            "all nodes share one file_path, so the chunk yields exactly one document"
+        );
+        assert!(docs[0].is_ok());
+        assert!(
+            !docs[0].as_ref().unwrap().1.is_empty(),
+            "the document must contain tokens"
+        );
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "distinct file must be read exactly once per chunk (was once per node)"
+        );
     }
 }
