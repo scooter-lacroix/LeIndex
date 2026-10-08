@@ -385,7 +385,7 @@ fn sample_parsing_result(
 /// them after each chunk) and the extractor lazily re-reads the file, as it
 /// does when the bytes are inline (legacy route).
 #[test]
-fn streaming_pdg_extraction_equivalent_for_stripped_and_inline_source_bytes() {
+fn test_streaming_pdg_extraction_equivalent_for_stripped_and_inline_source_bytes() {
     let dir = tempfile::tempdir().expect("pdg lazy reread fixture");
     let path = dir.path().join("lazy.rs");
     let source = "pub fn lazy_marker() -> usize { 7 }\npub fn lazy_other() -> usize { 8 }\n";
@@ -474,7 +474,7 @@ fn streaming_pdg_extraction_equivalent_for_stripped_and_inline_source_bytes() {
 /// ones, so a resumed large job never re-retains the corpus, while the
 /// legacy route keeps inline bytes (unchanged behavior).
 #[test]
-fn resumed_parse_results_stripped_on_streaming_route_and_inline_on_legacy() {
+fn test_resumed_parse_results_stripped_on_streaming_route_and_inline_on_legacy() {
     let dir = tempfile::tempdir().expect("resume strip fixture");
     let path = dir.path().join("resumed.rs");
     let source = "pub fn resumed_marker() -> usize { 3 }\n";
@@ -576,7 +576,7 @@ fn resumed_parse_results_stripped_on_streaming_route_and_inline_on_legacy() {
 /// identity check drops the result (parse-failure semantics) on hash
 /// mismatch; an intact file still extracts.
 #[test]
-fn streaming_pdg_drops_results_whose_source_changed_after_parse() {
+fn test_streaming_pdg_drops_results_whose_source_changed_after_parse() {
     let dir = tempfile::tempdir().expect("stale source fixture");
     let path = dir.path().join("stale.rs");
     let original = "pub fn original_marker() -> usize { 1 }\n";
