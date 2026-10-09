@@ -85,8 +85,8 @@ pub enum FeatureFlag {
     /// `&mut self` methods — there is no bounded stepping surface to route
     /// through. Wiring this flag requires splitting the phase executor into
     /// stepped jobs first; wrapping whole-phase methods would be decorative,
-    /// not bounded or fair. See the PR-86 spec, D6
-    /// (docs/plans/2026-10-07-pr86-flag-consumers.md).
+    /// not bounded or fair. Ruling record: PR #90 (merge 237c3d36), spec D6 —
+    /// retained in the repository's local .agent-docs/ archive.
     BoundedScheduler,
     /// Enable the streaming scan stage (WS6-9 Task 1): scan walks files lazily,
     /// hashing via a fixed 64KiB buffer, writing metadata records to CAS-staged
