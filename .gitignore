@@ -58,6 +58,7 @@ htmlcov/
 .hypothesis/
 
 # Agent and AI tool files
+/.agent-docs/
 .gemini/
 .qwen/
 .kiro/
