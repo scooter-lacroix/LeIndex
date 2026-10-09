@@ -263,15 +263,30 @@ impl LeIndex {
 
         #[cfg(feature = "onnx")]
         {
-            match index_builder::HybridEmbedder::hybrid_local(
+            // B1: the query-time embedder follows the same ladder as index
+            // construction and enrichment — remote endpoint first (helper
+            // logs its own degradation), then local ONNX, never hard-failing.
+            #[cfg(feature = "remote-embeddings")]
+            let hybrid = index_builder::try_remote_neural_embedder(
                 tfidf_embedder.clone(),
-                Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
-            ) {
-                Ok(hybrid) => self.embedder = Some(hybrid),
-                Err(e) => {
+                &crate::config::LeIndexConfig::load_cached()
+                    .indexing
+                    .embeddings,
+            );
+            #[cfg(not(feature = "remote-embeddings"))]
+            let hybrid = None;
+            let hybrid = hybrid.or_else(|| {
+                index_builder::HybridEmbedder::hybrid_local(
+                    tfidf_embedder.clone(),
+                    Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
+                )
+                .ok()
+            });
+            match hybrid {
+                Some(hybrid) => self.embedder = Some(hybrid),
+                None => {
                     warn!(
-                        "Failed to create hybrid_local embedder for query embedding: {}",
-                        e
+                        "Failed to create query-time neural embedder; falling back to tfidf_only"
                     );
                     self.embedder = Some(index_builder::HybridEmbedder::tfidf_only(tfidf_embedder));
                 }
@@ -386,7 +401,9 @@ impl LeIndex {
         // to keep this function under the CCN-15 gate.
         self.restore_fragment_layer_from_snapshot(artifact_path);
 
-        // VAL-ONNX-001: upgrade to hybrid_local for query-time neural embedding.
+        // VAL-ONNX-001: upgrade to a neural-capable embedder for query time.
+        // B1: ladder mirrors construction/enrichment — remote endpoint first,
+        // then local ONNX, never hard-failing.
         #[cfg(feature = "onnx")]
         {
             if let Some(tfidf) =
@@ -394,15 +411,27 @@ impl LeIndex {
                     .ok()
                     .flatten()
             {
-                match index_builder::HybridEmbedder::hybrid_local(
-                    tfidf,
-                    Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
-                ) {
-                    Ok(hybrid) => self.embedder = Some(hybrid),
-                    Err(e) => {
+                #[cfg(feature = "remote-embeddings")]
+                let hybrid = index_builder::try_remote_neural_embedder(
+                    tfidf.clone(),
+                    &crate::config::LeIndexConfig::load_cached()
+                        .indexing
+                        .embeddings,
+                );
+                #[cfg(not(feature = "remote-embeddings"))]
+                let hybrid = None;
+                let hybrid = hybrid.or_else(|| {
+                    index_builder::HybridEmbedder::hybrid_local(
+                        tfidf,
+                        Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
+                    )
+                    .ok()
+                });
+                match hybrid {
+                    Some(hybrid) => self.embedder = Some(hybrid),
+                    None => {
                         warn!(
-                            "Failed to create hybrid_local embedder for query embedding: {}",
-                            e
+                            "Failed to create query-time neural embedder; falling back to tfidf_only"
                         );
                         self.embedder = Some(embedder);
                     }
