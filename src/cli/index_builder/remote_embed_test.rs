@@ -85,6 +85,25 @@ fn test_tfidf_only_ladder_terminal() {
     assert_eq!(embedder.neural_status(), "absent");
 }
 
+#[test]
+fn test_try_remote_neural_embedder_ladder_arms() {
+    use crate::config::EmbeddingConfig;
+    // Endpoint unset: helper returns None without constructing anything.
+    assert!(
+        try_remote_neural_embedder(corpus_tfidf(), &EmbeddingConfig::default()).is_none(),
+        "no endpoint configured must yield None"
+    );
+    // Endpoint configured: config-only construction succeeds and is remote.
+    let cfg = EmbeddingConfig {
+        enable_hybrid: true,
+        remote_endpoint: Some("http://127.0.0.1:1/v1".to_string()),
+        ..EmbeddingConfig::default()
+    };
+    let embedder =
+        try_remote_neural_embedder(corpus_tfidf(), &cfg).expect("configured endpoint builds");
+    assert!(matches!(embedder, HybridEmbedder::HybridRemote { .. }));
+}
+
 // ============================================================================
 // Mock /v1/embeddings server (std TcpListener + serde_json body parsing)
 // ============================================================================

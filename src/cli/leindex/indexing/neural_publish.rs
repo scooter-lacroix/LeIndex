@@ -181,12 +181,32 @@ impl LeIndex {
     pub(super) fn configured_neural_embedder(
         &self,
     ) -> Result<Option<index_builder::HybridEmbedder>> {
+        let tfidf = self
+            .embedder
+            .as_ref()
+            .context("core embedder is set before neural enrichment")?
+            .tfidf()
+            .clone();
+        // B1: enrichment construction mirrors the lexical-route ladder —
+        // remote endpoint first (helper logs its own degradation), then local
+        // ONNX, never hard-failing to TF-IDF-only.
+        #[cfg(feature = "remote-embeddings")]
+        let mut embedder = index_builder::try_remote_neural_embedder(
+            tfidf.clone(),
+            &crate::config::LeIndexConfig::load_cached()
+                .indexing
+                .embeddings,
+        )
+        .or_else(|| {
+            index_builder::HybridEmbedder::hybrid_local(
+                tfidf.clone(),
+                Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
+            )
+            .ok()
+        });
+        #[cfg(not(feature = "remote-embeddings"))]
         let mut embedder = index_builder::HybridEmbedder::hybrid_local(
-            self.embedder
-                .as_ref()
-                .context("core embedder is set before neural enrichment")?
-                .tfidf()
-                .clone(),
+            tfidf,
             Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
         )
         .ok();
