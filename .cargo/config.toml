@@ -1,2 +1,9 @@
 [alias]
 xtask = "run --package xtask --"
+
+# Debug-build async test frames are deep enough (MCP handler chains) to
+# exhaust libtest's default 2 MiB thread stack; the git-status fast-path test
+# segfaults under the onnx+remote-embeddings combo without this. Applies to
+# every cargo-spawned test binary (local + CI).
+[env]
+RUST_MIN_STACK = "16777216"

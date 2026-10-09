@@ -51,6 +51,10 @@ mod test;
 #[path = "index_builder_hybrid_test.rs"]
 mod hybrid_test;
 
+#[cfg(all(test, feature = "remote-embeddings"))]
+#[path = "remote_embed_test.rs"]
+mod remote_embed_test;
+
 // ============================================================================
 // TF-IDF EMBEDDING SYSTEM
 // ============================================================================
@@ -1573,28 +1577,63 @@ fn stratify_vocab(idf_scores: Vec<(String, f32)>) -> Vec<(String, f32)> {
 /// Wrap a TF-IDF embedder as hybrid_local (neural query embedding) when the
 /// ONNX feature is enabled and neural indexing is allowed, falling back to
 /// tfidf_only on initialization failure or when neural is disabled.
+///
+/// Remote ladder (B1, spec 2026-10-09): when `[indexing.embeddings]`
+/// configures a remote endpoint AND the `remote-embeddings` feature is
+/// compiled in, the neural layer is `HybridRemote` instead of `HybridLocal`.
+/// Degradation ladder — remote construction error → hybrid_local →
+/// tfidf_only — is logged once at each step and never hard-fails indexing.
 fn build_neural_embedder(tfidf_embedder: TfIdfEmbedder, _allow_neural: bool) -> HybridEmbedder {
+    #[cfg(feature = "remote-embeddings")]
+    {
+        if _allow_neural {
+            let embeddings_cfg = crate::config::LeIndexConfig::load_cached()
+                .indexing
+                .embeddings
+                .clone();
+            if embeddings_cfg.remote_endpoint_configured() {
+                let remote_cfg = RemoteEmbeddingConfig {
+                    provider: crate::search::onnx::RemoteProvider::Custom {
+                        endpoint: embeddings_cfg.remote_endpoint.clone().unwrap_or_default(),
+                    },
+                    api_key: embeddings_cfg.remote_api_key.clone(),
+                    model: embeddings_cfg.remote_model.clone(),
+                    remote_dimension: embeddings_cfg.remote_dimension,
+                    base_url: None,
+                    ..RemoteEmbeddingConfig::default()
+                };
+                match HybridEmbedder::hybrid_remote(
+                    tfidf_embedder.clone(),
+                    remote_cfg,
+                    Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
+                ) {
+                    Ok(hybrid) => return hybrid,
+                    Err(e) => warn!(
+                        "Failed to create hybrid_remote embedder ({}), falling back to local neural path",
+                        e
+                    ),
+                }
+            }
+        }
+    }
     #[cfg(feature = "onnx")]
     {
         if _allow_neural {
-            match HybridEmbedder::hybrid_local(tfidf_embedder.clone(), None) {
-                Ok(hybrid) => hybrid,
+            match HybridEmbedder::hybrid_local(
+                tfidf_embedder.clone(),
+                Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
+            ) {
+                Ok(hybrid) => return hybrid,
                 Err(e) => {
                     warn!(
                         "Failed to create hybrid_local embedder (ONNX), falling back to tfidf_only: {}",
                         e
                     );
-                    HybridEmbedder::tfidf_only(tfidf_embedder)
                 }
             }
-        } else {
-            HybridEmbedder::tfidf_only(tfidf_embedder)
         }
     }
-    #[cfg(not(feature = "onnx"))]
-    {
-        HybridEmbedder::tfidf_only(tfidf_embedder)
-    }
+    HybridEmbedder::tfidf_only(tfidf_embedder)
 }
 
 /// Compute neural rows against an already-published TF-IDF index.

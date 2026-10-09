@@ -23,6 +23,13 @@ const SEARCH_SNAPSHOT_VERSION: u32 = 2;
 
 /// Output dimension of the bundled Qwen3 embedding model (neural + fragment
 /// mmap hydration validation).
+///
+/// Remote-embeddings interplay (B1, spec 2026-10-09): remote providers may
+/// emit a different dimension (measured at runtime). Neural-node rows and
+/// query embeddings stay mutually consistent in that case (both sides use the
+/// remote dimension), so scoring is correct; this constant only gates the
+/// FRAGMENT mmap hydration and Qwen3-dimension assumptions below, which
+/// warn-once and skip for mismatched dimensions — degraded, never panicked.
 pub(super) const NEURAL_EMBEDDING_DIMENSION: usize = 1024;
 
 impl SearchEngine {

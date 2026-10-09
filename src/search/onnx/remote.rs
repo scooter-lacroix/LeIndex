@@ -106,6 +106,12 @@ pub struct RemoteEmbeddingConfig {
     pub max_retries: usize,
     /// Base URL for custom providers
     pub base_url: Option<String>,
+    /// Model name sent as the "model" field of the /v1/embeddings payload
+    /// (custom providers; llama-server accepts the served model name or alias).
+    pub model: Option<String>,
+    /// Dimension override for custom providers. When unset, the dimension is
+    /// measured from the first successful embed response.
+    pub remote_dimension: Option<usize>,
 }
 
 impl Default for RemoteEmbeddingConfig {
@@ -116,6 +122,8 @@ impl Default for RemoteEmbeddingConfig {
             timeout_secs: 30,
             max_retries: 3,
             base_url: None,
+            model: None,
+            remote_dimension: None,
         }
     }
 }
@@ -171,6 +179,14 @@ pub trait RemoteEmbeddingProvider: Send + Sync {
 
     /// Get the embedding dimension
     fn dimension(&self) -> usize;
+
+    /// Runtime-true dimension when the provider knows better than the legacy
+    /// `default_dimension()` table: the configured override or a dimension
+    /// measured from a real response. `None` = no better information (the
+    /// legacy default stays authoritative and the identity string is stable).
+    fn measured_dimension(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// OpenAI embedding provider implementation
@@ -395,13 +411,190 @@ impl RemoteEmbeddingProvider for CohereEmbeddingProvider {
     }
 }
 
+/// OpenAI-compatible embedding provider for user-configured endpoints
+/// (llama-server, vLLM, sglang, Ollama, or any `/v1/embeddings` service).
+///
+/// Dimension truth (spec 2026-10-09 B1.3): the legacy default (1536 for
+/// custom endpoints) is only a bootstrap value used before the first
+/// successful response — it is never enforced. The first successful embed
+/// response's vector length becomes the measured dimension, which then wins
+/// over the `remote_dimension` override; afterwards any response with a
+/// different length is rejected (`InvalidDimension`) so a mid-index drift
+/// cannot poison the neural mmap with ragged rows.
+pub struct CustomEmbeddingProvider {
+    client: Client,
+    endpoint: String,
+    model: Option<String>,
+    api_key: Option<String>,
+    dimension_override: Option<usize>,
+    bootstrap_dimension: usize,
+    /// 0 = not yet measured; else the vector length observed in the first
+    /// successful response.
+    measured: std::sync::atomic::AtomicUsize,
+}
+
+impl CustomEmbeddingProvider {
+    /// Create a custom OpenAI-compatible embedding provider.
+    pub fn new(config: RemoteEmbeddingConfig) -> Result<Self, RemoteEmbeddingError> {
+        let (endpoint, bootstrap_dimension) = match &config.provider {
+            RemoteProvider::Custom { endpoint } => {
+                (endpoint.clone(), config.provider.default_dimension())
+            }
+            _ => {
+                return Err(RemoteEmbeddingError::ApiError(
+                    "Invalid provider".to_string(),
+                ));
+            }
+        };
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .build()
+            .map_err(|e| RemoteEmbeddingError::HttpClient(e.to_string()))?;
+        Ok(Self {
+            client,
+            endpoint,
+            model: config.model.clone(),
+            api_key: config.api_key.clone(),
+            dimension_override: config.remote_dimension,
+            bootstrap_dimension,
+            measured: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Current dimension: measured > override > legacy bootstrap default.
+    fn current_dimension(&self) -> usize {
+        let measured = self.measured.load(std::sync::atomic::Ordering::Relaxed);
+        if measured > 0 {
+            measured
+        } else {
+            self.dimension_override.unwrap_or(self.bootstrap_dimension)
+        }
+    }
+}
+
+#[async_trait]
+impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, RemoteEmbeddingError> {
+        let embeddings = self.embed_batch(vec![text]).await?;
+        embeddings.into_iter().next().ok_or_else(|| {
+            RemoteEmbeddingError::InvalidResponse("No embedding returned".to_string())
+        })
+    }
+
+    async fn embed_batch(&self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
+        #[derive(Serialize)]
+        struct CustomRequest<'a> {
+            model: String,
+            input: Vec<&'a str>,
+        }
+
+        #[derive(Deserialize)]
+        struct CustomResponse {
+            data: Vec<CustomEmbedding>,
+        }
+
+        #[derive(Deserialize)]
+        struct CustomEmbedding {
+            embedding: Vec<f32>,
+        }
+
+        let request = CustomRequest {
+            model: self.model.clone().unwrap_or_default(),
+            input: texts,
+        };
+
+        let url = format!("{}/embeddings", self.endpoint.trim_end_matches('/'));
+        let mut request_builder = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&request);
+        if let Some(api_key) = &self.api_key {
+            request_builder = request_builder.header("Authorization", format!("Bearer {api_key}"));
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .map_err(|e| RemoteEmbeddingError::ApiError(e.to_string()))?;
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| RemoteEmbeddingError::ApiError(e.to_string()))?;
+
+        if !status.is_success() {
+            if status.as_u16() == 429 {
+                return Err(RemoteEmbeddingError::RateLimitExceeded(
+                    "custom".to_string(),
+                ));
+            }
+            return Err(RemoteEmbeddingError::ApiError(format!(
+                "API returned {}: {}",
+                status, response_text
+            )));
+        }
+
+        let parsed: CustomResponse = serde_json::from_str(&response_text)
+            .map_err(|e| RemoteEmbeddingError::InvalidResponse(e.to_string()))?;
+
+        let embeddings: Vec<Vec<f32>> = parsed.data.into_iter().map(|e| e.embedding).collect();
+
+        // Dimension truth: with a measurement or override already known every
+        // vector must match it; otherwise the first successful length becomes
+        // the measurement (bootstrap default is never enforced).
+        let known = {
+            let measured = self.measured.load(std::sync::atomic::Ordering::Relaxed);
+            if measured > 0 {
+                Some(measured)
+            } else {
+                self.dimension_override
+            }
+        };
+        if let Some(expected) = known {
+            for embedding in &embeddings {
+                if embedding.len() != expected {
+                    return Err(RemoteEmbeddingError::InvalidDimension {
+                        expected,
+                        got: embedding.len(),
+                    });
+                }
+            }
+        } else if let Some(first) = embeddings.first() {
+            self.measured
+                .store(first.len(), std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                dimension = first.len(),
+                endpoint = %self.endpoint,
+                "Measured remote embedding dimension from first response"
+            );
+        }
+        Ok(embeddings)
+    }
+
+    fn dimension(&self) -> usize {
+        self.current_dimension()
+    }
+
+    fn measured_dimension(&self) -> Option<usize> {
+        let measured = self.measured.load(std::sync::atomic::Ordering::Relaxed);
+        if measured > 0 {
+            Some(measured)
+        } else {
+            self.dimension_override
+        }
+    }
+}
+
 /// Generic remote embedding provider that wraps specific implementations
 #[derive(Clone)]
 pub struct GenericRemoteProvider {
     provider: Arc<dyn RemoteEmbeddingProvider>,
-    /// Stable embedder identity (provider, model, endpoint, dimension). Never
-    /// contains credentials.
-    identity: String,
+    /// Identity prefix (provider, model, endpoint). Never contains
+    /// credentials; the embedding dimension is appended at call time so a
+    /// measured runtime dimension (custom endpoints) lands in the identity.
+    identity_prefix: String,
 }
 
 impl std::fmt::Debug for GenericRemoteProvider {
@@ -427,20 +620,20 @@ impl GenericRemoteProvider {
         let provider: Arc<dyn RemoteEmbeddingProvider> = match &config.provider {
             RemoteProvider::OpenAI { .. } => Arc::new(OpenAIEmbeddingProvider::new(config)?),
             RemoteProvider::Cohere { .. } => Arc::new(CohereEmbeddingProvider::new(config)?),
-            RemoteProvider::Custom { .. } => {
-                return Err(RemoteEmbeddingError::ApiError(
-                    "Custom provider not yet implemented".to_string(),
-                ));
-            }
+            RemoteProvider::Custom { .. } => Arc::new(CustomEmbeddingProvider::new(config)?),
         };
 
-        let identity = format!("{identity_prefix}|{}", provider.dimension());
-        Ok(Self { provider, identity })
+        Ok(Self {
+            provider,
+            identity_prefix,
+        })
     }
 
     /// Stable identity of this provider for embedding caches (no secrets).
-    pub fn identity(&self) -> &str {
-        &self.identity
+    /// The trailing dimension component is appended per call so a custom
+    /// provider's measured runtime dimension is part of the identity.
+    pub fn identity(&self) -> String {
+        format!("{}|{}", self.identity_prefix, self.provider.dimension())
     }
 }
 
@@ -456,6 +649,10 @@ impl RemoteEmbeddingProvider for GenericRemoteProvider {
 
     fn dimension(&self) -> usize {
         self.provider.dimension()
+    }
+
+    fn measured_dimension(&self) -> Option<usize> {
+        self.provider.measured_dimension()
     }
 }
 

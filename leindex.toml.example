@@ -69,6 +69,22 @@ batch_size = 500
 # Cap on source files indexed per run.
 max_files = 50000
 
+# ── Remote embeddings (OpenAI-compatible /v1/embeddings; remote-embeddings build feature) ──
+# When enabled, the neural layer is served by a remote endpoint (llama-server,
+# vLLM, sglang, Ollama, ...) instead of the local ONNX worker. Endpoint
+# failures degrade to TF-IDF; they never fail indexing.
+[indexing.embeddings]
+# Master switch: remote endpoint takes over the neural layer when true.
+enable_hybrid = false
+# Base URL of an OpenAI-compatible embeddings endpoint.
+#remote_endpoint = "http://127.0.0.1:8765/v1"
+# Bearer token, if the endpoint requires one (local servers usually do not).
+#remote_api_key = ""
+# "model" field of the embeddings payload (llama-server: served model name/alias).
+#remote_model = "embeddinggemma-2"
+# Dimension override. Unset: measured from the first successful response.
+#remote_dimension = 768
+
 # ── MCP server lifecycle (1.9.5 memory-pressure remediation) ───────────────
 [mcp]
 # Exit the MCP server process after this many seconds with no requests.

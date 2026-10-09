@@ -149,6 +149,65 @@ pub struct IndexingConfig {
     /// Maximum number of files to index.
     #[serde(default = "default_max_files")]
     pub max_files: u64,
+
+    /// Hybrid embedding provider configuration (\[indexing.embeddings\]).
+    #[serde(default)]
+    pub embeddings: EmbeddingConfig,
+}
+
+/// Remote/hybrid embedding provider settings (\[indexing.embeddings\] section).
+///
+/// `remote_endpoint` + `enable_hybrid` switch the neural layer from the local
+/// ONNX worker to a remote OpenAI-compatible `/v1/embeddings` endpoint
+/// (llama-server, vLLM, sglang, Ollama, ...). Requires the
+/// `remote-embeddings` build feature; without it the keys parse but stay
+/// inert and indexing uses the local model as configured under `[neural]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EmbeddingConfig {
+    /// Master switch for hybrid (TF-IDF + neural/remote) embeddings.
+    #[serde(default = "default_enable_hybrid")]
+    pub enable_hybrid: bool,
+
+    /// Base URL of an OpenAI-compatible embeddings endpoint
+    /// (e.g. "http://127.0.0.1:8765/v1").
+    #[serde(default)]
+    pub remote_endpoint: Option<String>,
+
+    /// Bearer token for the remote endpoint (local servers usually need none).
+    #[serde(default)]
+    pub remote_api_key: Option<String>,
+
+    /// Model name sent as the "model" field of the /v1/embeddings payload
+    /// (llama-server accepts the served model name or alias).
+    #[serde(default)]
+    pub remote_model: Option<String>,
+
+    /// Dimension override for the remote provider. Unset = measured from the
+    /// first successful embed response (runtime-true); never enforced before
+    /// the first response.
+    #[serde(default)]
+    pub remote_dimension: Option<usize>,
+
+    /// Local ONNX model path override (reserved; the local model is normally
+    /// resolved from `[neural] model_dir`/`model_name`).
+    #[serde(default)]
+    pub onnx_model_path: Option<String>,
+}
+
+impl EmbeddingConfig {
+    /// True when a custom remote endpoint is configured and the hybrid flag
+    /// enables it (remote-embeddings construction precondition).
+    pub fn remote_endpoint_configured(&self) -> bool {
+        self.enable_hybrid
+            && self
+                .remote_endpoint
+                .as_deref()
+                .is_some_and(|e| !e.is_empty())
+    }
+}
+
+const fn default_enable_hybrid() -> bool {
+    false // Default to TF-IDF + local-neural-as-configured for compatibility
 }
 
 /// MCP server lifecycle configuration (\[mcp\] section).
@@ -222,6 +281,7 @@ impl Default for IndexingConfig {
         Self {
             batch_size: default_batch_size(),
             max_files: default_max_files(),
+            embeddings: EmbeddingConfig::default(),
         }
     }
 }
@@ -646,6 +706,7 @@ mod tests {
             indexing: IndexingConfig {
                 batch_size: 1000,
                 max_files: 100_000,
+                embeddings: EmbeddingConfig::default(),
             },
             mcp: McpConfig {
                 idle_timeout_secs: 3600,

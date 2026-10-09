@@ -225,7 +225,7 @@ impl HybridEmbedder {
             #[cfg(feature = "onnx")]
             Self::HybridLocal { neural, .. } => neural.engram_identity(NEURAL_EMBEDDING_DIMENSION),
             #[cfg(feature = "remote-embeddings")]
-            Self::HybridRemote { remote, .. } => Some(remote.identity().to_string()),
+            Self::HybridRemote { remote, .. } => Some(remote.identity()),
         }
     }
 
@@ -403,10 +403,20 @@ impl HybridEmbedder {
                 }
             }
             #[cfg(feature = "remote-embeddings")]
-            Self::HybridRemote { .. } => {
-                // Remote requires async runtime, this is a blocking wrapper
-                // In practice, the indexing pipeline should use the async version
-                Some(Err("Remote embeddings require async runtime".to_string()))
+            Self::HybridRemote { remote, .. } => {
+                // Remote requires an async runtime; the CLI query path is
+                // synchronous and never runs inside a tokio context, so a
+                // scratch single-thread reactor bridges the call. Owned text
+                // + owned provider move into the future (async-trait futures
+                // borrow their arguments, so the borrows must live inside).
+                // Provider errors surface to the caller (query falls back to
+                // TF-IDF); they never hard-fail the search.
+                let remote = remote.clone();
+                let owned_text = text.to_string();
+                match block_on_remote(async move { remote.embed(&owned_text).await }) {
+                    Ok(embedding) => Some(Ok(embedding)),
+                    Err(e) => Some(Err(e)),
+                }
             }
         }
     }
@@ -455,9 +465,40 @@ impl HybridEmbedder {
                 }
             }
             #[cfg(feature = "remote-embeddings")]
-            Self::HybridRemote { .. } => {
-                // Remote requires async runtime; not supported in blocking context
-                vec![None; texts.len()]
+            Self::HybridRemote { remote, .. } => {
+                if texts.is_empty() {
+                    return Vec::new();
+                }
+                // Same scratch-runtime bridge as embed_neural_blocking; batch
+                // API failures degrade to None per text (TF-IDF fallback) so a
+                // flapping endpoint never poisons the index (VAL-CPHASE-018).
+                let remote = remote.clone();
+                let owned: Vec<String> = texts.iter().map(|t| t.as_ref().to_string()).collect();
+                match block_on_remote(async move {
+                    remote
+                        .embed_batch(owned.iter().map(|s| s.as_str()).collect())
+                        .await
+                }) {
+                    Ok(embeddings) if embeddings.len() == texts.len() => {
+                        embeddings.into_iter().map(Some).collect()
+                    }
+                    Ok(embeddings) => {
+                        tracing::warn!(
+                            expected = texts.len(),
+                            got = embeddings.len(),
+                            "Remote batch returned wrong vector count, falling back to None for all"
+                        );
+                        vec![None; texts.len()]
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Remote batch embedding degraded to TF-IDF for {} texts",
+                            texts.len()
+                        );
+                        vec![None; texts.len()]
+                    }
+                }
             }
         }
     }
@@ -510,4 +551,34 @@ impl Default for HybridEmbedder {
     fn default() -> Self {
         Self::TfIdfOnly(TfIdfEmbedder::build_from_tokens(&[]))
     }
+}
+
+/// Bridge a remote-embeddings future onto the synchronous pipeline.
+///
+/// The CLI indexing/query paths never run inside a tokio runtime, so a
+/// scratch single-thread reactor is safe here (`block_on` panics only when
+/// called from within an async context, which cannot happen on these paths).
+/// One runtime per call keeps no global state and no background threads.
+/// The future must be `'static` + `Send` (ours hold only the `Arc`-based
+/// `GenericRemoteProvider`) and resolve to a `Result` whose error is
+/// `Display`; every failure mode collapses to `String`.
+#[cfg(feature = "remote-embeddings")]
+fn block_on_remote<T: Send + 'static, E>(
+    fut: impl std::future::Future<Output = Result<T, E>> + Send + 'static,
+) -> Result<T, String>
+where
+    E: std::fmt::Display,
+{
+    std::thread::Builder::new()
+        .name("remote-embed-bridge".to_string())
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|rt| rt.block_on(fut).map_err(|e| e.to_string()))
+        })
+        .map_err(|e| format!("failed to spawn remote-embed bridge thread: {e}"))?
+        .join()
+        .map_err(|_| "remote-embed bridge thread panicked".to_string())?
 }
