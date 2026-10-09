@@ -71,8 +71,9 @@ pub enum StartupOutcome {
 ///   is alive with matching protocol version.
 ///
 /// Liveness is checked on Linux via `/proc/<pid>/stat` start time (reuses the
-/// pattern from [`mcp/lock.rs`]). On macOS/Windows the check falls back to
-/// `kill(pid, 0)` ("pid exists") because `/proc` is unavailable.
+/// pattern from [`mcp/lock.rs`]). Elsewhere: unix falls back to `kill(pid,
+/// 0)` ("pid exists"), Windows to a query-limited `OpenProcess` probe,
+/// because `/proc` is unavailable.
 ///
 /// Stale sidecars (dead PID, recycled PID, protocol mismatch) are stolen:
 /// deleted so the winner can overwrite them. This prevents a dead daemon from
@@ -243,9 +244,12 @@ fn fallback_start_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Check whether `pid` exists using `kill(pid, 0)` (POSIX) when `/proc` is not
-/// available. Returns `false` on any error.
-#[cfg(not(target_os = "linux"))]
+/// Check whether `pid` exists. On non-Linux unix this uses `kill(pid, 0)`
+/// (POSIX); on Windows there is no `kill`, so probe via kernel32
+/// `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`. Returns `false` on any
+/// error (including access-denied: a false "dead" just means the caller
+/// steals a stale sidecar and spawns fresh).
+#[cfg(all(unix, not(target_os = "linux")))]
 fn pid_exists(pid: u32) -> bool {
     // SAFETY: `kill(pid, 0)` is signal 0 (no signal sent); it only checks
     // existence and permission. Safe per POSIX.
@@ -254,6 +258,42 @@ fn pid_exists(pid: u32) -> bool {
     // EPERM means the process exists but we can't signal it. On Linux this
     // branch is dead code (procfs path handles it); this is the non-Linux
     // fallback.
+}
+
+/// Windows arm of [`pid_exists`]: no `libc::kill` here, so ask the OS
+/// directly. `OpenProcess` with query-limited rights fails (null) for dead
+/// or nonexistent pids and never requires an elevated token for existence
+/// checks.
+#[cfg(target_os = "windows")]
+fn pid_exists(pid: u32) -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(
+            desired_access: u32,
+            inherit_handle: i32,
+            process_id: u32,
+        ) -> *mut core::ffi::c_void;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    // Pid 0 is the System Idle Process pseudo-entry and would open.
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: probe-only handle with limited query rights; closed immediately.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    unsafe { CloseHandle(handle) };
+    true
+}
+
+/// Non-unix, non-Windows targets have no probe surface here; treat every pid
+/// as dead so callers take the "spawn fresh / steal sidecar" path.
+#[cfg(not(any(target_os = "linux", unix, target_os = "windows")))]
+fn pid_exists(_pid: u32) -> bool {
+    false
 }
 
 /// On Linux, [`pid_exists`] is never called because [`proc_start_time_ms`]
