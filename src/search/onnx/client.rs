@@ -40,6 +40,9 @@ use crate::embed::protocol::{
 
 #[path = "client_config.rs"]
 mod client_config;
+// Unix-only (superseded-daemon reaping walks /proc + Unix sockets); callers
+// are likewise gated so the re-export must be too or Windows builds break.
+#[cfg(unix)]
 pub(crate) use client_config::terminate_superseded_daemons;
 use client_config::*;
 pub use client_config::{

@@ -15,13 +15,21 @@
 // VAL-CPHASE-007: Worker idle timeout tears down the resident model process.
 // VAL-CPHASE-008: Worker restart works after idle teardown.
 
-use std::io::{self, Read, Write};
+use std::io;
+// The socket worker is the only unix transport; Windows runs the pipe worker.
+#[cfg(unix)]
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process;
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
 use crate::embed::protocol::{
     self, ErrorKind, Frame, HealthResponse, MsgType, WorkerError, WorkerState,
 };
