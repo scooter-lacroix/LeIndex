@@ -40,6 +40,8 @@ use crate::embed::protocol::{
 
 #[path = "client_config.rs"]
 mod client_config;
+// Unix-only re-export: the fn is #[cfg(unix)] (reaping walks /proc + sockets).
+#[cfg(unix)]
 pub(crate) use client_config::terminate_superseded_daemons;
 use client_config::*;
 pub use client_config::{
