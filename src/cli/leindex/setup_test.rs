@@ -7,6 +7,13 @@ fn test_setup_fresh_preset_and_existing_embedding_preservation() {
         provider: Some(ExecutionProvider::Cpu),
     };
     let fresh = build_config(&choices, None, None);
+    assert!(fresh.neural.enabled);
+    let disabled = build_config(
+        &resolve_from_flags(false, true, false, None).unwrap(),
+        None,
+        None,
+    );
+    assert!(!disabled.neural.enabled);
     let serialized = toml::to_string(&fresh).unwrap();
     assert!(serialized.contains("[indexing.embeddings]"));
     assert!(serialized.contains("enable_hybrid = true"));

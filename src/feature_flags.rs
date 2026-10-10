@@ -218,6 +218,7 @@ impl FeatureFlag {
             Self::StreamingMcp
             | Self::GlobalAutoSync
             | Self::NeuralSearch
+            | Self::RemoteEmbeddings
             // Stable architecture capabilities with successful rollout gates
             // remain default ON and individually revertible. StreamingScan,
             // StreamingParse, StreamingTfidf, and StreamingNeural intentionally
@@ -704,6 +705,7 @@ mod test {
         let _g = FLAG_TEST_LOCK.lock().unwrap();
         clear_flag_overrides_for_test();
         let rollout_flags = [
+            FeatureFlag::RemoteEmbeddings,
             FeatureFlag::DaemonClient,
             FeatureFlag::GenerationReaders,
             FeatureFlag::BoundedScheduler,

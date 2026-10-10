@@ -38,15 +38,17 @@ deprecated alias that routes to MIGraphX and never registers `ort::ep::ROCm`.
 
 ## Remote EmbeddingGemma2 Preset
 
-Build with both `onnx` and `remote-embeddings` for the current neural enrichment
-path. The latter is not part of the default feature set. The following is a
-build command, not an installation step:
+Standard builds include `onnx` and `remote-embeddings`; no extra embedding
+feature flags are needed. The following is a build command, not an installation
+step:
 
 ```bash
-cargo build --release --features onnx,remote-embeddings
+cargo build --release
 ```
 
-Fresh configuration defaults select `embeddinggemma-2`. Existing TOML files,
+Fresh configuration defaults enable neural enrichment and select
+`embeddinggemma-2`. Explicit `[neural] enabled = false`, `--no-neural` at setup,
+or text search mode still disables enrichment. Existing TOML files,
 including empty files and files with only part of `[indexing]` or
 `[indexing.embeddings]`, retain legacy embedding defaults. Setup reruns preserve
 the existing indexing section. To opt in explicitly, merge these keys into
@@ -153,9 +155,13 @@ for each neural generation:
 - A new neural generation retries remote with a fresh selection. Checkpoints
   record the selected provider identity, including remote task templates.
 
-Query failures retain TF-IDF/PDG without a Qwen retry. Fragment incremental
-identity and real local-worker/runtime readiness remain rollout requirements;
-the node-generation regression tests are not evidence of those capabilities.
+Query failures retain TF-IDF/PDG without a Qwen retry. Incremental fragment
+sync pins the selected provider identity before embedding, since it may reuse
+existing rows; remote failure there skips remaining fragments without Qwen.
+Unknown or changed provider identities force re-embedding and exclude old mmap
+rows, including same-dimension task-template changes. Real local-worker and
+model-server readiness remain runtime requirements; focused regression tests
+are not evidence of those capabilities.
 
 To select local Qwen deliberately, keep `[neural] enabled = true`, provision it
 with `leindex setup --neural --cpu` (or a GPU provider), and merge:

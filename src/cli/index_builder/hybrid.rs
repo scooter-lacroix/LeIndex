@@ -64,6 +64,15 @@ impl GenerationNeuralEmbedder {
         }
     }
 
+    /// Incremental layers may already contain reused rows: their selected
+    /// space is pinned before the first request, so local fallback is unsafe.
+    pub(crate) fn pinned(embedder: HybridEmbedder) -> Self {
+        let generation = Self::new(embedder);
+        #[cfg(feature = "remote-embeddings")]
+        generation.remote_rows_landed.set(true);
+        generation
+    }
+
     pub(crate) fn has_neural(&self) -> bool {
         self.selected.borrow().has_neural()
     }
@@ -81,6 +90,17 @@ impl GenerationNeuralEmbedder {
                 NEURAL_EMBEDDING_DIMENSION,
             ),
             HybridEmbedder::TfIdfOnly(_) => "unavailable".to_string(),
+        }
+    }
+
+    pub(crate) fn document_embedding_stopped(&self) -> bool {
+        #[cfg(feature = "remote-embeddings")]
+        {
+            self.stopped.get()
+        }
+        #[cfg(not(feature = "remote-embeddings"))]
+        {
+            false
         }
     }
 
@@ -154,6 +174,35 @@ impl GenerationNeuralEmbedder {
 #[cfg(all(test, feature = "remote-embeddings"))]
 mod generation_tests {
     use super::*;
+
+    #[test]
+    fn test_generation_pinned_remote_failure_never_selects_local() {
+        let tfidf = TfIdfEmbedder::build(&[("a.rs".into(), "fn a() {}".into())]);
+        let generation = GenerationNeuralEmbedder::pinned(
+            HybridEmbedder::hybrid_remote(
+                tfidf,
+                RemoteEmbeddingConfig {
+                    provider: crate::search::onnx::RemoteProvider::Custom {
+                        endpoint: "http://127.0.0.1:1/v1".into(),
+                    },
+                    ..RemoteEmbeddingConfig::default()
+                },
+                None,
+            )
+            .expect("remote construction"),
+        );
+        assert!(
+            generation
+                .embed_neural_batch_blocking(&["document"])
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(generation.stopped.get());
+        assert!(matches!(
+            generation.into_embedder(),
+            HybridEmbedder::HybridRemote { .. }
+        ));
+    }
 
     #[test]
     fn test_generation_remote_pre_success_selects_local_without_remote_rows() {

@@ -22,8 +22,9 @@ const DEFAULT_MODEL_NAME: &str = "qwen3-embed-0.6b-dynamic-uint8";
 /// The complete LeIndex neural search configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct LeIndexConfig {
-    /// Neural embedding configuration.
-    #[serde(default)]
+    /// Neural embedding configuration. Missing sections in existing TOML
+    /// retain the legacy disabled state; fresh construction enables neural.
+    #[serde(default = "default_legacy_neural_config")]
     pub neural: NeuralConfig,
 
     /// Search behavior configuration.
@@ -387,10 +388,17 @@ pub struct McpConfig {
 
 // ── Defaults ─────────────────────────────────────────────────────────────
 
+fn default_legacy_neural_config() -> NeuralConfig {
+    NeuralConfig {
+        enabled: false,
+        ..NeuralConfig::default()
+    }
+}
+
 impl Default for NeuralConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             execution_provider: default_execution_provider(),
             ort_dylib_path: None,
             ort_version: None,
@@ -595,9 +603,13 @@ impl LeIndexConfig {
             Self::load().unwrap_or_else(|err| {
                 tracing::warn!(
                     error = %err,
-                    "failed to load leindex.toml for caching; using defaults"
+                    "failed to load leindex.toml for caching; preserving legacy disabled defaults"
                 );
-                LeIndexConfig::default()
+                Self {
+                    neural: default_legacy_neural_config(),
+                    indexing: default_legacy_indexing_config(),
+                    ..Self::default()
+                }
             })
         })
     }
@@ -665,7 +677,11 @@ impl LeIndexConfig {
                     backup_path.display()
                 );
                 Ok((
-                    Self::default(),
+                    Self {
+                        neural: default_legacy_neural_config(),
+                        indexing: default_legacy_indexing_config(),
+                        ..Self::default()
+                    },
                     RecoveryAction::RecoveredFromCorrupt(backup_path),
                 ))
             }
@@ -733,6 +749,28 @@ mod tests {
         let toml_str = toml::to_string(&config).unwrap();
         let parsed: LeIndexConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(config, parsed);
+    }
+
+    #[test]
+    fn test_fresh_neural_default_and_legacy_toml_boundary() {
+        let fresh = LeIndexConfig::default();
+        assert!(fresh.neural.enabled);
+        assert!(fresh.indexing.embeddings.enable_hybrid);
+        assert_eq!(
+            fresh.indexing.embeddings.remote_preset_label(),
+            "embeddinggemma-2"
+        );
+        for existing in [
+            "",
+            "[neural]\nexecution_provider = \"cpu\"\n",
+            "[neural]\nenabled = false\n",
+        ] {
+            let parsed: LeIndexConfig = toml::from_str(existing).expect("existing TOML");
+            assert!(!parsed.neural.enabled);
+        }
+        let explicit: LeIndexConfig =
+            toml::from_str("[neural]\nenabled = true\n").expect("opt-in TOML");
+        assert!(explicit.neural.enabled);
     }
 
     #[test]
@@ -939,7 +977,7 @@ mod tests {
         unsafe { std::env::set_var(LEINDEX_HOME_ENV, "/nonexistent/path/for/testing") };
         let (config, action) = LeIndexConfig::load_or_recover().unwrap();
         assert!(matches!(action, RecoveryAction::CreatedDefault));
-        assert!(!config.neural.enabled);
+        assert!(config.neural.enabled);
         unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 

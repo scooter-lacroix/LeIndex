@@ -176,6 +176,25 @@ fn enrich_neural_for_route(
     }
 }
 
+fn reusable_fragment_rows(
+    rows: HashMap<String, Vec<f32>>,
+    persisted: Option<&index_builder::fragment::sync::FragmentFileManifest>,
+    selected_identity: &str,
+) -> HashMap<String, Vec<f32>> {
+    if persisted
+        .is_some_and(|manifest| manifest.extraction_identity.model_name == selected_identity)
+    {
+        rows
+    } else {
+        if !rows.is_empty() {
+            warn!(
+                "Fragment provider identity changed or is unknown; skipping old-space rows and forcing re-embedding"
+            );
+        }
+        HashMap::new()
+    }
+}
+
 impl LeIndex {
     #[cfg(feature = "onnx")]
     pub(super) fn configured_neural_embedder(
@@ -279,6 +298,7 @@ impl LeIndex {
         _state: &IndexPipelineState,
         rows: usize,
         embedder: Option<index_builder::HybridEmbedder>,
+        document_embedding_stopped: bool,
     ) -> Result<()> {
         if rows == 0 {
             return Ok(());
@@ -289,7 +309,14 @@ impl LeIndex {
         // Fragment layer (Task 7): incremental sync before the snapshot
         // persist. On failure the layer is CLEARED (not just logged) — see
         // `sync_fragment_layer_or_clear` (Codex wave-4 P2).
-        self.sync_fragment_layer_or_clear();
+        if document_embedding_stopped {
+            warn!(
+                "Node generation stopped remote documents; skipping fragment embedding for this generation"
+            );
+            self.search_engine.set_fragment_embeddings(Vec::new());
+        } else {
+            self.sync_fragment_layer_or_clear();
+        }
         // Neural rows attach to an already-persisted graph; derive the
         // identity from the resident graph as the layer reconstructs it
         // (collapse) so hydration's fingerprint check agrees.
@@ -358,15 +385,28 @@ impl LeIndex {
 
     pub(super) fn sync_fragment_layer(&mut self) -> Result<()> {
         let cfg = crate::config::LeIndexConfig::load_cached();
-        if !cfg.search.fragment_index_enabled || self.pdg.is_none() {
+        if !cfg.search.fragment_index_enabled
+            || self.pdg.is_none()
+            || !crate::feature_flags::is_neural_enabled(cfg.neural.enabled)
+            || cfg.search.search_mode == "text"
+        {
             return Ok(());
         }
         // The fragment layer only produces rows when a neural embedder is
         // configured; without one (e.g. text-only builds) it is a no-op.
-        let embedder = self.configured_neural_embedder()?;
-        if embedder.is_none() {
-            return Ok(());
+        let embedder = match self
+            .embedder
+            .as_ref()
+            .filter(|embedder| embedder.has_neural())
+        {
+            Some(embedder) => Some(embedder.clone()),
+            None => self.configured_neural_embedder()?,
         }
+        .map(index_builder::GenerationNeuralEmbedder::pinned);
+        let Some(embedder) = embedder else {
+            return Ok(());
+        };
+        let selected_identity = embedder.identity();
         let files = self.collect_source_files_with_hashes(false)?;
         if files.is_empty() {
             return Ok(());
@@ -383,7 +423,7 @@ impl LeIndex {
         // re-sync (mirrors the node-level `NeuralCheckpoint.model` discipline;
         // without it the source-hash skip would silently serve stale rows).
         let extraction_identity = index_builder::fragment::sync::FragmentExtractionIdentity::new(
-            &cfg.neural.model_name,
+            &selected_identity,
             max_bytes,
             orphan_enabled,
             naive_fallback,
@@ -401,7 +441,17 @@ impl LeIndex {
             )
             .map(|mmap| mmap.entries().unwrap_or_default().into_iter().collect())
             .unwrap_or_default();
-        let force_reembed = !store.is_empty() && pre_sync_mmap_rows.is_empty();
+        // An unrecorded or different provider cannot prove old rows belong
+        // to this space. Do not merge them after partial re-embedding.
+        let persisted_manifest = index_builder::fragment::sync::load_fragment_sync_manifest(
+            &self.project_path.join(".leindex"),
+        )?;
+        let old_rows = reusable_fragment_rows(
+            pre_sync_mmap_rows,
+            persisted_manifest.as_ref(),
+            &selected_identity,
+        );
+        let force_reembed = !store.is_empty() && old_rows.is_empty();
 
         // Scoped so the chunk closure (which borrows `self.pdg`) is dropped
         // before we mutate `self.search_engine` below.
@@ -420,10 +470,7 @@ impl LeIndex {
             let mut embed_fn = |texts: &[String]| -> Vec<Option<Vec<f32>>> {
                 #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
                 {
-                    match &embedder {
-                        Some(embedder) => embedder.embed_neural_batch_blocking(texts),
-                        None => vec![None; texts.len()],
-                    }
+                    embedder.embed_neural_batch_blocking(texts)
                 }
                 #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
                 {
@@ -459,12 +506,7 @@ impl LeIndex {
         // row-count ≡ engine row-count (invariant 8) is preserved.
         let fresh_rows: std::collections::HashMap<String, Vec<f32>> =
             new_embeddings.into_iter().collect();
-        let old_rows: std::collections::HashMap<String, Vec<f32>> =
-            index_builder::try_load_fragment_mmap_embeddings_from_storage(
-                &self.project_path.join(".leindex"),
-            )
-            .map(|mmap| mmap.entries().unwrap_or_default().into_iter().collect())
-            .unwrap_or_default();
+
         let mut rows: Vec<(String, Vec<f32>)> = Vec::with_capacity(store.len());
         for hash in store.content_hashes() {
             if let Some(embedding) = fresh_rows.get(hash).or_else(|| old_rows.get(hash)) {
@@ -556,6 +598,9 @@ impl LeIndex {
             .as_ref()
             .map(index_builder::GenerationNeuralEmbedder::identity)
             .unwrap_or_else(|| "unavailable".to_string());
+        let document_embedding_stopped = neural_embedder
+            .as_ref()
+            .is_some_and(index_builder::GenerationNeuralEmbedder::document_embedding_stopped);
         let neural_embedder =
             neural_embedder.map(index_builder::GenerationNeuralEmbedder::into_embedder);
         let selected_provider = match neural_embedder.as_ref() {
@@ -566,7 +611,12 @@ impl LeIndex {
             _ => "unavailable",
         };
         self.persist_neural_mmap(neural_resume_loaded, neural_rows)?;
-        self.persist_neural_snapshot(&state, neural_rows, neural_embedder)?;
+        self.persist_neural_snapshot(
+            &state,
+            neural_rows,
+            neural_embedder,
+            document_embedding_stopped,
+        )?;
         progress_stderr("Indexing: publishing enhanced generation...");
         let neural_checkpoint = NeuralCheckpoint {
             lexical_hash,
@@ -711,6 +761,26 @@ impl LeIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_fragment_provider_identity_prevents_old_space_merge() {
+        let mut manifest = index_builder::fragment::sync::FragmentFileManifest::new();
+        manifest.extraction_identity.model_name = "remote|old-template|768".into();
+        let old_rows = HashMap::from([("content-hash".into(), vec![0.5; 768])]);
+        assert_eq!(
+            reusable_fragment_rows(old_rows.clone(), Some(&manifest), "remote|old-template|768")
+                .len(),
+            1
+        );
+        assert!(
+            reusable_fragment_rows(old_rows.clone(), Some(&manifest), "remote|new-template|768")
+                .is_empty()
+        );
+        assert!(
+            reusable_fragment_rows(old_rows.clone(), Some(&manifest), "local|qwen|1024").is_empty()
+        );
+        assert!(reusable_fragment_rows(old_rows, None, "remote|old-template|768").is_empty());
+    }
 
     #[test]
     #[cfg(feature = "remote-embeddings")]

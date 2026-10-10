@@ -304,6 +304,7 @@ fn test_generation_remote_death_after_success_persists_only_remote_space() {
         2,
         "remaining batches must not retry a frozen generation"
     );
+    assert!(generation.document_embedding_stopped());
     assert!(matches!(
         generation.into_embedder(),
         HybridEmbedder::HybridRemote { .. }
