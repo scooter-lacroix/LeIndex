@@ -1202,25 +1202,9 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         }));
     }
 
-    // Determine embedding model from diagnostics or compile-time features.
-    // VAL-ONNX-006: Diagnostics must report ONNX/hybrid embedding status.
-    let embedding_model = if diag.embedding_model != "unknown" {
-        diag.embedding_model.clone()
-    } else {
-        // Lightweight path: embedder not loaded, determine from compile-time features
-        #[cfg(feature = "onnx")]
-        {
-            "onnx_hybrid".to_string()
-        }
-        #[cfg(all(not(feature = "onnx"), not(feature = "remote-embeddings")))]
-        {
-            "tfidf_only".to_string()
-        }
-        #[cfg(all(not(feature = "onnx"), feature = "remote-embeddings"))]
-        {
-            "remote_hybrid".to_string()
-        }
-    };
+    // A lightweight diagnostic does not load an embedder. Compiled support
+    // is not evidence that a particular runtime backend is active.
+    let embedding_model = diag.embedding_model.clone();
 
     // VAL-CROSS-015 / VAL-ORT-022: Report the resolved ORT dylib path, the
     // detected ORT version, and the configured execution provider so support

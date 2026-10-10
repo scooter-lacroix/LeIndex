@@ -169,8 +169,11 @@ impl LeIndex {
             index_builder::TfIdfEmbedder::load_from_artifact_path(artifact_path)
                 .ok()
                 .flatten();
-        let restored =
-            Self::restore_engine_from_snapshot(artifact_path, persisted_embedder.as_ref());
+        let restored = Self::restore_engine_from_snapshot(
+            artifact_path,
+            persisted_embedder.as_ref(),
+            crate::config::LeIndexConfig::load_cached(),
+        );
         PreparedEngine {
             persisted_embedder,
             restored,
@@ -180,6 +183,7 @@ impl LeIndex {
     fn restore_engine_from_snapshot(
         artifact_path: &std::path::Path,
         persisted_embedder: Option<&index_builder::TfIdfEmbedder>,
+        _config: &crate::config::LeIndexConfig,
     ) -> Option<RestoredEngine> {
         let snapshot = index_builder::try_load_search_snapshot_from_storage(artifact_path)?;
         let tfidf_mmap = index_builder::try_load_mmap_embeddings_from_storage(artifact_path)?;
@@ -212,10 +216,11 @@ impl LeIndex {
         // actually persisted instead of discarding the neural mmap and
         // falling back to a full TF-IDF rebuild on every cold query.
         #[cfg(feature = "remote-embeddings")]
-        let expected_neural_dim = crate::config::LeIndexConfig::load_cached()
+        let expected_neural_dim = _config
             .indexing
             .embeddings
-            .remote_dimension;
+            .resolved_remote()
+            .and_then(|remote| remote.remote_dimension);
         #[cfg(not(feature = "remote-embeddings"))]
         let expected_neural_dim = None;
         match engine.restore_from_search_snapshot(
@@ -613,6 +618,49 @@ impl LeIndex {
             rows = ids.len(),
             "Restored fragment layer after TF-IDF-fallback rebuild"
         );
+    }
+}
+
+#[cfg(all(test, feature = "remote-embeddings"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fresh_preset_restores_768_neural_snapshot_without_dimension_override() {
+        let project = tempfile::tempdir().expect("snapshot fixture");
+        let config = crate::config::LeIndexConfig::default();
+        assert_eq!(config.indexing.embeddings.remote_dimension, None);
+        let tfidf =
+            index_builder::TfIdfEmbedder::build(&[("sample.rs".into(), "fn sample() {}".into())]);
+        let mut engine = crate::search::search::SearchEngine::new();
+        engine.index_nodes(vec![crate::search::search::NodeInfo {
+            node_id: "sample".into(),
+            file_path: "sample.rs".into(),
+            symbol_name: "sample".into(),
+            language: "rust".into(),
+            content: "fn sample() {}".into(),
+            byte_range: (0, 14),
+            tfidf_embedding: vec![0.5; 768],
+            neural_embedding: Some(vec![0.25; 768]),
+            complexity: 1,
+            signature: None,
+            pre_tokenized: None,
+        }]);
+        index_builder::persist_embeddings_to_mmap(&engine, project.path()).expect("lexical mmap");
+        index_builder::persist_neural_embeddings_to_mmap(&engine, project.path())
+            .expect("neural mmap");
+        index_builder::persist_search_snapshot(&engine, project.path(), 1, 0, "fixture".into())
+            .expect("snapshot");
+        let restored = LeIndex::restore_engine_from_snapshot(
+            &project.path().join(".leindex"),
+            Some(&tfidf),
+            &config,
+        )
+        .expect("preset dimension must hydrate without falling back to local 1024");
+        assert_eq!(restored.indexed_count, 1);
+        let neural = restored.engine.collect_neural_embeddings();
+        assert_eq!(neural.len(), 1);
+        assert_eq!(neural[0].1.len(), 768);
     }
 }
 
