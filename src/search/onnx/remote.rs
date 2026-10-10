@@ -112,6 +112,12 @@ pub struct RemoteEmbeddingConfig {
     /// Dimension override for custom providers. When unset, the dimension is
     /// measured from the first successful embed response.
     pub remote_dimension: Option<usize>,
+    /// Template applied to DOCUMENT texts before embedding (`{text}`
+    /// placeholder; a prefix-only template may omit it). `None` = raw text.
+    pub doc_template: Option<String>,
+    /// Template applied to QUERY texts (asymmetric retrieval prefixes).
+    /// Same `{text}` contract. `None` = raw text.
+    pub query_template: Option<String>,
 }
 
 impl Default for RemoteEmbeddingConfig {
@@ -124,6 +130,8 @@ impl Default for RemoteEmbeddingConfig {
             base_url: None,
             model: None,
             remote_dimension: None,
+            doc_template: None,
+            query_template: None,
         }
     }
 }
@@ -185,6 +193,12 @@ pub trait RemoteEmbeddingProvider: Send + Sync {
     /// measured from a real response. `None` = no better information (the
     /// legacy default stays authoritative and the identity string is stable).
     fn measured_dimension(&self) -> Option<usize> {
+        None
+    }
+
+    /// Dimension observed in a successful response; unlike
+    /// `measured_dimension`, this never reports a configured override.
+    fn observed_dimension(&self) -> Option<usize> {
         None
     }
 }
@@ -428,9 +442,25 @@ pub struct CustomEmbeddingProvider {
     api_key: Option<String>,
     dimension_override: Option<usize>,
     bootstrap_dimension: usize,
+    /// Template applied to single-text (`embed`) calls — the QUERY path.
+    /// `None` = raw text (back-compat).
+    query_template: Option<String>,
+    /// Template applied to batch (`embed_batch`) calls — the DOCUMENT path.
+    /// `None` = raw text (back-compat).
+    doc_template: Option<String>,
     /// 0 = not yet measured; else the vector length observed in the first
     /// successful response.
     measured: std::sync::atomic::AtomicUsize,
+}
+
+/// Apply a task template to `text`: replace every `{text}` placeholder with
+/// the text (prefix-only templates — no placeholder — prepend + space).
+fn apply_template<'a>(template: Option<&str>, text: &'a str) -> std::borrow::Cow<'a, str> {
+    match template {
+        None => std::borrow::Cow::Borrowed(text),
+        Some(t) if t.contains("{text}") => std::borrow::Cow::Owned(t.replace("{text}", text)),
+        Some(t) => std::borrow::Cow::Owned(format!("{t} {text}")),
+    }
 }
 
 impl CustomEmbeddingProvider {
@@ -456,6 +486,8 @@ impl CustomEmbeddingProvider {
             model: config.model.clone(),
             api_key: config.api_key.clone(),
             dimension_override: config.remote_dimension,
+            query_template: config.query_template.clone(),
+            doc_template: config.doc_template.clone(),
             bootstrap_dimension,
             measured: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -475,13 +507,50 @@ impl CustomEmbeddingProvider {
 #[async_trait]
 impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, RemoteEmbeddingError> {
-        let embeddings = self.embed_batch(vec![text]).await?;
+        // Single-text calls are the QUERY path: apply the query template.
+        let input = apply_template(self.query_template.as_deref(), text);
+        let embeddings = self.embed_via_api(vec![input]).await?;
         embeddings.into_iter().next().ok_or_else(|| {
             RemoteEmbeddingError::InvalidResponse("No embedding returned".to_string())
         })
     }
 
     async fn embed_batch(&self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
+        // Batch calls are the DOCUMENT path: apply the doc template.
+        let inputs = texts
+            .iter()
+            .map(|t| apply_template(self.doc_template.as_deref(), t))
+            .collect();
+        self.embed_via_api(inputs).await
+    }
+
+    fn dimension(&self) -> usize {
+        self.current_dimension()
+    }
+
+    fn measured_dimension(&self) -> Option<usize> {
+        let measured = self.measured.load(std::sync::atomic::Ordering::Relaxed);
+        if measured > 0 {
+            Some(measured)
+        } else {
+            self.dimension_override
+        }
+    }
+
+    fn observed_dimension(&self) -> Option<usize> {
+        let measured = self.measured.load(std::sync::atomic::Ordering::Relaxed);
+        (measured > 0).then_some(measured)
+    }
+}
+
+impl CustomEmbeddingProvider {
+    /// POST one `/embeddings` request with already-templated inputs and
+    /// enforce the dimension-truth contract (shared by query + document
+    /// paths so both always agree on dimension semantics).
+    async fn embed_via_api(
+        &self,
+        inputs: Vec<std::borrow::Cow<'_, str>>,
+    ) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
         #[derive(Serialize)]
         struct CustomRequest<'a> {
             model: String,
@@ -500,7 +569,7 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
 
         let request = CustomRequest {
             model: self.model.clone().unwrap_or_default(),
-            input: texts,
+            input: inputs.iter().map(|i| i.as_ref()).collect(),
         };
 
         let url = format!("{}/embeddings", self.endpoint.trim_end_matches('/'));
@@ -552,7 +621,7 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
                 self.dimension_override
             }
         };
-        if let Some(expected) = known {
+        if let Some(expected) = known.or_else(|| embeddings.first().map(Vec::len)) {
             for embedding in &embeddings {
                 if embedding.len() != expected {
                     return Err(RemoteEmbeddingError::InvalidDimension {
@@ -561,7 +630,11 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
                     });
                 }
             }
-        } else if let Some(first) = embeddings.first() {
+        }
+        if let Some(first) = embeddings
+            .first()
+            .filter(|_| self.measured.load(std::sync::atomic::Ordering::Relaxed) == 0)
+        {
             self.measured
                 .store(first.len(), std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
@@ -571,19 +644,6 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
             );
         }
         Ok(embeddings)
-    }
-
-    fn dimension(&self) -> usize {
-        self.current_dimension()
-    }
-
-    fn measured_dimension(&self) -> Option<usize> {
-        let measured = self.measured.load(std::sync::atomic::Ordering::Relaxed);
-        if measured > 0 {
-            Some(measured)
-        } else {
-            self.dimension_override
-        }
     }
 }
 
@@ -595,6 +655,28 @@ pub struct GenericRemoteProvider {
     /// credentials; the embedding dimension is appended at call time so a
     /// measured runtime dimension (custom endpoints) lands in the identity.
     identity_prefix: String,
+    /// Fingerprint of the active task templates (spec v2 P1): the same
+    /// endpoint with different templates produces DIFFERENT vectors, so the
+    /// caches keyed on this identity (Engram phrase-book, embedding caches)
+    /// must not share entries across template changes. `None` = raw text.
+    template_fingerprint: Option<String>,
+}
+
+/// Short fingerprint of the active task templates for cache identities.
+/// FNV-1a 64-bit: stable, dependency-free, and cheap insurance that a
+/// template change never reuses another template's cache namespace.
+fn template_fingerprint(doc: Option<&str>, query: Option<&str>) -> Option<String> {
+    if doc.is_none() && query.is_none() {
+        return None;
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in [doc.unwrap_or(""), "\u{0}", query.unwrap_or("")] {
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0010_0000_01b3);
+        }
+    }
+    Some(format!("tpl{hash:016x}"))
 }
 
 impl std::fmt::Debug for GenericRemoteProvider {
@@ -617,6 +699,10 @@ impl GenericRemoteProvider {
             "remote|{kind}|{model}|{}",
             config.base_url.as_deref().unwrap_or("")
         );
+        let template_fingerprint = template_fingerprint(
+            config.doc_template.as_deref(),
+            config.query_template.as_deref(),
+        );
         let provider: Arc<dyn RemoteEmbeddingProvider> = match &config.provider {
             RemoteProvider::OpenAI { .. } => Arc::new(OpenAIEmbeddingProvider::new(config)?),
             RemoteProvider::Cohere { .. } => Arc::new(CohereEmbeddingProvider::new(config)?),
@@ -626,14 +712,31 @@ impl GenericRemoteProvider {
         Ok(Self {
             provider,
             identity_prefix,
+            template_fingerprint,
         })
     }
 
     /// Stable identity of this provider for embedding caches (no secrets).
     /// The trailing dimension component is appended per call so a custom
-    /// provider's measured runtime dimension is part of the identity.
+    /// provider's measured runtime dimension is part of the identity. The
+    /// optional template fingerprint separates vector spaces across task-prefix
+    /// changes.
     pub fn identity(&self) -> String {
-        format!("{}|{}", self.identity_prefix, self.provider.dimension())
+        let template = self
+            .template_fingerprint
+            .as_deref()
+            .map(|fingerprint| format!("|{fingerprint}"))
+            .unwrap_or_default();
+        format!(
+            "{}{template}|{}",
+            self.identity_prefix,
+            self.provider.dimension()
+        )
+    }
+
+    /// Dimension observed in the first successful remote response, if any.
+    pub fn observed_dimension(&self) -> Option<usize> {
+        self.provider.observed_dimension()
     }
 }
 
@@ -653,6 +756,10 @@ impl RemoteEmbeddingProvider for GenericRemoteProvider {
 
     fn measured_dimension(&self) -> Option<usize> {
         self.provider.measured_dimension()
+    }
+
+    fn observed_dimension(&self) -> Option<usize> {
+        self.provider.observed_dimension()
     }
 }
 

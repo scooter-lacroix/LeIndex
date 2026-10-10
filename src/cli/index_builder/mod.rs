@@ -1591,16 +1591,16 @@ pub(crate) fn try_remote_neural_embedder(
     tfidf_embedder: TfIdfEmbedder,
     embeddings_cfg: &crate::config::EmbeddingConfig,
 ) -> Option<HybridEmbedder> {
-    if !embeddings_cfg.remote_endpoint_configured() {
-        return None;
-    }
+    let resolved = embeddings_cfg.resolved_remote()?;
     let remote_cfg = RemoteEmbeddingConfig {
         provider: crate::search::onnx::RemoteProvider::Custom {
-            endpoint: embeddings_cfg.remote_endpoint.clone().unwrap_or_default(),
+            endpoint: resolved.endpoint,
         },
         api_key: embeddings_cfg.remote_api_key.clone(),
-        model: embeddings_cfg.remote_model.clone(),
-        remote_dimension: embeddings_cfg.remote_dimension,
+        model: resolved.model,
+        remote_dimension: resolved.remote_dimension,
+        doc_template: resolved.doc_template,
+        query_template: resolved.query_template,
         base_url: None,
         ..RemoteEmbeddingConfig::default()
     };

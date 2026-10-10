@@ -162,6 +162,17 @@ impl HybridEmbedder {
         }
     }
 
+    /// Dimension observed from a successful remote response, if available.
+    pub fn observed_neural_dimension(&self) -> Option<usize> {
+        match self {
+            Self::TfIdfOnly(_) => None,
+            #[cfg(feature = "onnx")]
+            Self::HybridLocal { .. } => None,
+            #[cfg(feature = "remote-embeddings")]
+            Self::HybridRemote { remote, .. } => remote.observed_dimension(),
+        }
+    }
+
     /// Check if neural/remote enhancement is available
     pub fn has_neural(&self) -> bool {
         match self {

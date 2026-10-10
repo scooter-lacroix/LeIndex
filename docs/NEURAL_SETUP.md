@@ -36,6 +36,154 @@ and is the default; `leindex setup` with no provider flag selects Auto, and
 `--neural --coreml` is offered on Apple Silicon. `rocm` is accepted as a
 deprecated alias that routes to MIGraphX and never registers `ort::ep::ROCm`.
 
+## Remote EmbeddingGemma2 Preset
+
+Build with both `onnx` and `remote-embeddings` for the current neural enrichment
+path. The latter is not part of the default feature set. The following is a
+build command, not an installation step:
+
+```bash
+cargo build --release --features onnx,remote-embeddings
+```
+
+Fresh configuration defaults select `embeddinggemma-2`. Existing TOML files,
+including empty files and files with only part of `[indexing]` or
+`[indexing.embeddings]`, retain legacy embedding defaults. Setup reruns preserve
+the existing indexing section. To opt in explicitly, merge these keys into
+`$LEINDEX_HOME/config/leindex.toml` (normally `~/.leindex/config/leindex.toml`):
+
+```toml
+[neural]
+enabled = true
+
+[indexing.embeddings]
+enable_hybrid = true
+remote_provider = "embeddinggemma-2"
+```
+
+Do not duplicate an existing TOML section. `[neural] enabled = true` and the
+neural-search runtime feature flag gate enrichment; `search_mode = "text"`
+disables it. Selecting the remote preset does not launch or install a server.
+
+The preset fills unset keys with:
+
+| Key | Preset value |
+|---|---|
+| `remote_endpoint` | `http://127.0.0.1:8080/v1` |
+| `remote_model` | `embeddinggemma-2` |
+| `remote_dimension` | `768` |
+| `remote_doc_template` | `title: none \| text: {text}` |
+| `remote_query_template` | `task: code retrieval \| query: {text}` |
+
+The task prefixes follow the
+[EmbeddingGemma2 model card](https://huggingface.co/google/embeddinggemma-2)
+CodeRetrieval instructions. LeIndex applies document templates to embedding
+batches and query templates to single-query calls. Serve raw inputs without
+adding a second task prefix. Explicit endpoint, model, dimension, and template
+keys override preset values. Changing model or templates changes the vector
+space: force a reindex rather than mixing old and new vectors.
+
+### llama-server
+
+Use a llama.cpp build that supports EmbeddingGemma2 and a compatible local GGUF
+(for example, the Q8 file from
+[unsloth/embeddinggemma-2-GGUF](https://huggingface.co/unsloth/embeddinggemma-2-GGUF)).
+After downloading the model and accepting its license as needed:
+
+```bash
+llama-server -m /path/to/embeddinggemma-2.gguf \
+  --alias embeddinggemma-2 --embedding --pooling mean \
+  --host 127.0.0.1 --port 8080 -ngl 99
+```
+
+GPU offload depends on the llama.cpp build and available memory; use `-ngl 0`
+for CPU-only execution. Model loading errors must be resolved before indexing.
+
+### vLLM
+
+Use a vLLM version whose pooling runner supports the model's architecture.
+The Hugging Face model is not the GGUF file used by llama.cpp:
+
+```bash
+vllm serve google/embeddinggemma-2 \
+  --runner pooling --served-model-name embeddinggemma-2 \
+  --host 127.0.0.1 --port 8080
+```
+
+Runtime/model support is version-dependent. These are launch recipes, not
+benchmark results or a claim that both runtimes have passed the bakeoff. If
+vLLM rejects the architecture or configuration, retain the actual error and
+use a supported runtime; do not substitute another model under the preset
+alias. Run only one server on port 8080. To use another port, set
+`remote_endpoint` explicitly.
+
+### Readiness and diagnostics
+
+Before indexing, make a real embeddings request:
+
+```bash
+curl --fail-with-body http://127.0.0.1:8080/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"embeddinggemma-2","input":["task: code retrieval | query: find cache invalidation"]}'
+```
+
+Verify that the response contains a 768-element vector, then run
+`leindex index /path/to/project --force`. A healthy `/health` response alone
+does not verify embeddings or task support.
+
+CLI and MCP diagnostics expose `embedding_preset` separately from the active
+`embedding_model` status. `measured_embedding_dimension` is the vector length
+observed in a successful response, **not** the configured `remote_dimension`.
+It is `null` until the resident embedder observes a response; a lightweight CLI
+process without that embedder also reports it as unknown. Missing live MCP
+diagnostics report an unknown preset and a null measured dimension.
+
+### Fallback behavior and local Qwen opt-in
+
+The current construction ladder is remote → local Qwen ONNX → TF-IDF/PDG:
+remote config/construction failure allows the local arm when compiled, and a
+local failure leaves the lexical/graph core usable. Construction does not probe
+the remote server. **A later remote HTTP or dimension-validation failure skips
+neural vectors for the affected batch/query and keeps TF-IDF/PDG; it does not
+retry that batch through Qwen.** Runtime remote-to-Qwen failover remains a
+rollout readiness requirement, not a verified capability.
+
+To select local Qwen deliberately, keep `[neural] enabled = true`, provision it
+with `leindex setup --neural --cpu` (or a GPU provider), and merge:
+
+```toml
+[indexing.embeddings]
+enable_hybrid = false
+remote_provider = "custom"
+```
+
+The remote master switch does not disable the separately configured local
+ONNX path. To disable neural enrichment altogether, use `[neural] enabled =
+false` or text search mode.
+
+### Custom OpenAI-compatible endpoint
+
+Other models remain explicit opt-ins. Supply their own endpoint/model and
+model-card task templates; do not inherit EmbeddingGemma2 prefixes:
+
+```toml
+[indexing.embeddings]
+enable_hybrid = true
+remote_provider = "custom"
+remote_endpoint = "http://127.0.0.1:8081/v1"
+remote_model = "your-served-model"
+# remote_dimension = 1024  # only if verified for this model
+# remote_doc_template = "document instruction: {text}"
+# remote_query_template = "query instruction: {text}"
+```
+
+With `custom`, omitted templates preserve raw text. An omitted dimension is
+measured from the first response; an explicit dimension is validated against
+responses. `remote_api_key` supplies a bearer token if the server requires one;
+keep credentials out of committed config and use TLS for non-loopback servers.
+Code and query text are sent to the configured endpoint. The preset stays on
+loopback; overriding it to a hosted service is an explicit data-sharing choice.
+
 ## Model Provisioning
 
 Models are never included in GitHub Release archives, crates.io, npm, or PyPI

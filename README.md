@@ -258,7 +258,7 @@ Codebase → Tree-sitter → PDG + TF-IDF (core, always) → neural join → hyb
 ## Learn more
 
 - [`BENCHMARKS.md`](BENCHMARKS.md) — resource benchmarks, model bake-off, acceptance-gate evidence
-- [`docs/NEURAL_SETUP.md`](docs/NEURAL_SETUP.md) — CPU/GPU/AMD/NVIDIA provider setup and troubleshooting
+- [`docs/NEURAL_SETUP.md`](docs/NEURAL_SETUP.md) — EmbeddingGemma2 remote preset, llama-server/vLLM recipes, local CPU/GPU provider setup, and fallback troubleshooting
 - [`docs/MCP.md`](docs/MCP.md) — MCP integration for every major client
 - [`CHANGELOG.md`](CHANGELOG.md) — full release history, including the v2.0.0 post-release fix rounds
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) / [`RUST_ARCHITECTURE.md`](RUST_ARCHITECTURE.md) — system design

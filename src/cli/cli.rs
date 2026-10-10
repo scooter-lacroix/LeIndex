@@ -1241,6 +1241,8 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         "freshness": health,
         "last_indexed_secs_ago": last_indexed_secs_ago,
         "embedding_model": embedding_model,
+        "embedding_preset": diag.embedding_preset,
+        "measured_embedding_dimension": diag.measured_embedding_dimension,
         "precision_enabled": diag.precision_enabled,
         "precision_nodes": diag.precision_nodes,
         "precision_languages": diag.precision_languages,

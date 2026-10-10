@@ -13,7 +13,7 @@ fn test_embedding_config_parses_remote_keys() {
     let toml = r#"
 [indexing.embeddings]
 enable_hybrid = true
-remote_endpoint = "http://127.0.0.1:8765/v1"
+remote_endpoint = "http://127.0.0.1:8766/v1"
 remote_api_key = "test-key"
 remote_model = "embeddinggemma-2"
 remote_dimension = 768
@@ -23,7 +23,7 @@ remote_dimension = 768
     assert!(embeddings.remote_endpoint_configured());
     assert_eq!(
         embeddings.remote_endpoint.as_deref(),
-        Some("http://127.0.0.1:8765/v1")
+        Some("http://127.0.0.1:8766/v1")
     );
     assert_eq!(embeddings.remote_model.as_deref(), Some("embeddinggemma-2"));
     assert_eq!(embeddings.remote_dimension, Some(768));
@@ -34,8 +34,46 @@ fn test_embedding_config_defaults_are_inert() {
     let config: crate::config::LeIndexConfig = toml::from_str("").expect("empty config parses");
     let embeddings = &config.indexing.embeddings;
     assert!(!embeddings.remote_endpoint_configured());
+    assert!(!embeddings.enable_hybrid);
+    assert_eq!(embeddings.remote_provider, "custom");
     assert_eq!(embeddings.remote_endpoint, None);
     assert_eq!(embeddings.remote_dimension, None);
+
+    let partial_indexing: crate::config::LeIndexConfig =
+        toml::from_str("[indexing]\nbatch_size = 100\n").expect("partial indexing config parses");
+    assert!(!partial_indexing.indexing.embeddings.enable_hybrid);
+    assert_eq!(
+        partial_indexing.indexing.embeddings.remote_provider,
+        "custom"
+    );
+
+    let partial_embeddings: crate::config::LeIndexConfig =
+        toml::from_str("[indexing.embeddings]\nremote_model = \"legacy-model\"\n")
+            .expect("partial embeddings config parses");
+    assert!(!partial_embeddings.indexing.embeddings.enable_hybrid);
+    assert_eq!(
+        partial_embeddings.indexing.embeddings.remote_provider,
+        "custom"
+    );
+    assert_eq!(
+        partial_embeddings
+            .indexing
+            .embeddings
+            .remote_model
+            .as_deref(),
+        Some("legacy-model")
+    );
+
+    let fresh = crate::config::EmbeddingConfig::default();
+    assert!(fresh.enable_hybrid);
+    assert_eq!(fresh.remote_preset_label(), "embeddinggemma-2");
+    assert_eq!(
+        fresh
+            .resolved_remote()
+            .expect("fresh preset resolves")
+            .remote_dimension,
+        Some(768)
+    );
 }
 
 #[test]
@@ -43,7 +81,7 @@ fn test_embedding_config_disabled_flag_stays_inert() {
     let toml = r#"
 [indexing.embeddings]
 enable_hybrid = false
-remote_endpoint = "http://127.0.0.1:8765/v1"
+remote_endpoint = "http://127.0.0.1:8766/v1"
 "#;
     let config: crate::config::LeIndexConfig = toml::from_str(toml).expect("parse");
     // Endpoint set but master switch off: must NOT be treated as configured.
@@ -88,11 +126,19 @@ fn test_tfidf_only_ladder_terminal() {
 #[test]
 fn test_try_remote_neural_embedder_ladder_arms() {
     use crate::config::EmbeddingConfig;
-    // Endpoint unset: helper returns None without constructing anything.
+    // Fresh construction selects the preset; it does not require a live server.
+    let fresh = try_remote_neural_embedder(corpus_tfidf(), &EmbeddingConfig::default())
+        .expect("fresh preset constructs remote provider without a server");
+    assert!(matches!(fresh, HybridEmbedder::HybridRemote { .. }));
+    assert_eq!(fresh.neural_dimension(), Some(768));
+
+    // A parsed existing/partial config is legacy and remains inert.
+    let legacy: EmbeddingConfig = toml::from_str("").expect("legacy config parses");
     assert!(
-        try_remote_neural_embedder(corpus_tfidf(), &EmbeddingConfig::default()).is_none(),
-        "no endpoint configured must yield None"
+        try_remote_neural_embedder(corpus_tfidf(), &legacy).is_none(),
+        "missing endpoint and legacy provider must yield None"
     );
+
     // Endpoint configured: config-only construction succeeds and is remote.
     let cfg = EmbeddingConfig {
         enable_hybrid: true,
@@ -114,6 +160,13 @@ fn test_try_remote_neural_embedder_ladder_arms() {
 fn spawn_mock_embeddings_server(
     dim_for_request: impl Fn(usize) -> usize + Send + 'static,
 ) -> String {
+    spawn_mock_embeddings_server_with_capture(dim_for_request, None)
+}
+
+fn spawn_mock_embeddings_server_with_capture(
+    dim_for_request: impl Fn(usize) -> usize + Send + 'static,
+    captured_request: Option<std::sync::mpsc::Sender<serde_json::Value>>,
+) -> String {
     use std::io::{Read, Write};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock server");
@@ -123,15 +176,42 @@ fn spawn_mock_embeddings_server(
         .to_string();
     std::thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 65536];
-            let read = stream.read(&mut buf).unwrap_or(0);
-            let request = String::from_utf8_lossy(&buf[..read]).to_string();
-            let body_start = request
-                .find("\r\n\r\n")
-                .map(|i| i + 4)
-                .unwrap_or(request.len());
-            let payload: serde_json::Value =
-                serde_json::from_str(request[body_start..].trim()).unwrap_or(serde_json::json!({}));
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let payload: serde_json::Value = serde_json::from_slice(
+                &request[header_end..header_end + content_length.min(request.len() - header_end)],
+            )
+            .unwrap_or(serde_json::json!({}));
+            if let Some(sender) = captured_request {
+                let _ = sender.send(payload.clone());
+            }
             let input_count = payload["input"].as_array().map(|a| a.len()).unwrap_or(1);
             let dim = dim_for_request(input_count);
             let data: Vec<String> = (0..input_count)
@@ -208,8 +288,10 @@ fn test_remote_embed_dimension_override_wins_over_bootstrap() {
     let provider =
         crate::search::onnx::GenericRemoteProvider::from_config(remote_cfg).expect("ctor");
     assert_eq!(provider.dimension(), 512);
+    assert_eq!(provider.observed_dimension(), None);
     let embedding = block_on_test(provider.embed("hello")).expect("embed");
     assert_eq!(embedding.len(), 512);
+    assert_eq!(provider.observed_dimension(), Some(512));
 }
 
 #[test]
@@ -234,6 +316,97 @@ fn test_remote_embed_dimension_mismatch_rejected_when_known() {
             got: 1536
         }
     ));
+}
+
+#[test]
+fn test_remote_query_template_is_applied_verbatim_on_wire() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let endpoint = spawn_mock_embeddings_server_with_capture(|_| 768, Some(sender));
+    let provider = crate::search::onnx::GenericRemoteProvider::from_config(RemoteEmbeddingConfig {
+        provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+        model: Some("embeddinggemma-2".to_string()),
+        remote_dimension: Some(768),
+        query_template: Some("task: code retrieval | query: {text}".to_string()),
+        ..RemoteEmbeddingConfig::default()
+    })
+    .expect("provider construction");
+
+    block_on_test(provider.embed("find cache invalidation")).expect("query embedding");
+    let request = receiver.recv().expect("captured query request");
+    assert_eq!(
+        request["input"][0],
+        "task: code retrieval | query: find cache invalidation"
+    );
+    assert_eq!(request["model"], "embeddinggemma-2");
+}
+
+#[test]
+fn test_remote_document_template_is_applied_verbatim_on_wire() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let endpoint = spawn_mock_embeddings_server_with_capture(|_| 768, Some(sender));
+    let provider = crate::search::onnx::GenericRemoteProvider::from_config(RemoteEmbeddingConfig {
+        provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+        model: Some("embeddinggemma-2".to_string()),
+        remote_dimension: Some(768),
+        doc_template: Some("title: none | text: {text}".to_string()),
+        ..RemoteEmbeddingConfig::default()
+    })
+    .expect("provider construction");
+
+    block_on_test(provider.embed_batch(vec!["fn cache_key() {}"])).expect("document embedding");
+    let request = receiver.recv().expect("captured document request");
+    assert_eq!(request["input"][0], "title: none | text: fn cache_key() {}");
+}
+
+#[test]
+fn test_remote_templates_none_preserves_raw_text_on_wire() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let endpoint = spawn_mock_embeddings_server_with_capture(|_| 768, Some(sender));
+    let provider = crate::search::onnx::GenericRemoteProvider::from_config(RemoteEmbeddingConfig {
+        provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+        remote_dimension: Some(768),
+        ..RemoteEmbeddingConfig::default()
+    })
+    .expect("provider construction");
+
+    block_on_test(provider.embed("raw query")).expect("query embedding");
+    let request = receiver.recv().expect("captured request");
+    assert_eq!(request["input"][0], "raw query");
+}
+
+#[test]
+fn test_remote_document_template_without_placeholder_prepends_prefix() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let endpoint = spawn_mock_embeddings_server_with_capture(|_| 768, Some(sender));
+    let provider = crate::search::onnx::GenericRemoteProvider::from_config(RemoteEmbeddingConfig {
+        provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+        remote_dimension: Some(768),
+        doc_template: Some("document task".to_string()),
+        ..RemoteEmbeddingConfig::default()
+    })
+    .expect("provider construction");
+
+    block_on_test(provider.embed_batch(vec!["source text"])).expect("document embedding");
+    let request = receiver.recv().expect("captured request");
+    assert_eq!(request["input"][0], "document task source text");
+}
+
+#[test]
+fn test_remote_template_changes_identity() {
+    let make_provider = |template: &str| {
+        crate::search::onnx::GenericRemoteProvider::from_config(RemoteEmbeddingConfig {
+            provider: crate::search::onnx::RemoteProvider::Custom {
+                endpoint: "http://127.0.0.1:1/v1".to_string(),
+            },
+            doc_template: Some(template.to_string()),
+            ..RemoteEmbeddingConfig::default()
+        })
+        .expect("provider construction")
+    };
+    assert_ne!(
+        make_provider("document A").identity(),
+        make_provider("document B").identity()
+    );
 }
 
 #[test]

@@ -584,6 +584,16 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
     if let Some(v) = data.get("embedding_model").and_then(|v| v.as_str()) {
         out.push_str(&field("Embedding model", v, color));
     }
+    if let Some(preset) = data.get("embedding_preset").and_then(Value::as_str) {
+        out.push_str(&field("Embedding preset", preset, color));
+    }
+    if let Some(dimension) = data.get("measured_embedding_dimension") {
+        let value = dimension
+            .as_u64()
+            .map(|dimension| dimension.to_string())
+            .unwrap_or_else(|| "unknown (no successful remote response)".to_string());
+        out.push_str(&field("Measured embedding dimension", &value, color));
+    }
     out.push_str(&render_diagnostics_engram(data, color));
     out.push_str(&render_diagnostics_precision(data, color));
     out.push_str(&render_diagnostics_provider(data, color));

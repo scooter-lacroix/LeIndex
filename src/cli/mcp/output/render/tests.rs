@@ -282,6 +282,19 @@ fn test_render_diagnostics_plain_output() {
 }
 
 #[test]
+fn test_render_diagnostics_embedding_measurement() {
+    let mut payload = serde_json::json!({
+        "embedding_preset": "embeddinggemma-2",
+        "measured_embedding_dimension": null,
+    });
+    let output = render_diagnostics(&payload, false);
+    assert!(output.contains("Embedding preset: embeddinggemma-2"));
+    assert!(output.contains("Measured embedding dimension: unknown"));
+    payload["measured_embedding_dimension"] = serde_json::json!(768);
+    assert!(render_diagnostics(&payload, false).contains("Measured embedding dimension: 768"));
+}
+
+#[test]
 fn test_render_project_map_community_groups() {
     let payload = v(r#"{
         "group_by": "community",
