@@ -206,12 +206,25 @@ impl LeIndex {
             snapshot.pdg_fingerprint.clone(),
         );
         let mut engine = Self::configured_search_engine();
+        // B1.6: when a remote endpoint is active, node embeddings carry the
+        // remote dimension (override or measured), not the local model's 1024
+        // — pass it down so hydration validates against the shape that was
+        // actually persisted instead of discarding the neural mmap and
+        // falling back to a full TF-IDF rebuild on every cold query.
+        #[cfg(feature = "remote-embeddings")]
+        let expected_neural_dim = crate::config::LeIndexConfig::load_cached()
+            .indexing
+            .embeddings
+            .remote_dimension;
+        #[cfg(not(feature = "remote-embeddings"))]
+        let expected_neural_dim = None;
         match engine.restore_from_search_snapshot(
             snapshot,
             std::sync::Arc::new(tfidf_mmap),
             neural_mmap,
             fragment_mmap,
             fragment_ids.as_deref(),
+            expected_neural_dim,
         ) {
             Ok(indexed_count) => {
                 // Fragment owner mapping (Task 6, invariant 6): content hash →

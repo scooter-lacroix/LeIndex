@@ -108,7 +108,7 @@ fn test_search_snapshot_restore_round_trip() {
 
     let mut restored = SearchEngine::new();
     let restored_count = restored
-        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None, None, None)
+        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None, None, None, None)
         .unwrap();
 
     assert_eq!(restored_count, 1);
@@ -177,6 +177,7 @@ fn search_snapshot_restores_neural_rows_without_heap_tfidf_copy() {
             Some(Arc::new(neural_mmap)),
             None,
             None,
+            None,
         )
         .unwrap();
     assert_eq!(restored.collect_neural_embeddings().len(), 1);
@@ -213,7 +214,7 @@ fn test_search_snapshot_restore_rejects_wrong_tfidf_dimension() {
 
     let mut restored = SearchEngine::new();
     let err = restored
-        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None, None, None)
+        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None, None, None, None)
         .unwrap_err();
     assert!(err.contains("TF-IDF mmap dimension"));
     assert!(restored.is_empty());
@@ -1070,6 +1071,7 @@ fn test_search_snapshot_fragment_roundtrip() {
             None,
             Some(Arc::new(frag_mmap)),
             Some(&frag_ids),
+            None,
         )
         .unwrap();
 
@@ -1137,6 +1139,7 @@ fn test_search_snapshot_restore_disables_fragment_on_row_mismatch() {
             None,
             Some(Arc::new(frag_mmap)),
             Some(&frag_ids),
+            None,
         )
         .unwrap();
     assert_eq!(restored.node_count(), 1);
@@ -1196,6 +1199,7 @@ fn test_fragment_owner_union_and_byte_range_surfacing() {
             None,
             Some(Arc::new(frag_mmap)),
             Some(&frag_ids),
+            None,
         )
         .unwrap();
     // Turn the fragment layer ON: master switch + fusion weight + refs map.
@@ -1296,6 +1300,7 @@ fn test_fragment_layer_off_by_default_contributes_nothing() {
             None,
             Some(Arc::new(frag_mmap)),
             Some(&frag_ids),
+            None,
         )
         .unwrap();
     // fragment_index_enabled stays false (default): the fragment layer must
@@ -1766,6 +1771,7 @@ fn test_search_snapshot_disables_fragment_on_id_count_mismatch() {
             None,
             Some(Arc::new(frag_mmap)),
             Some(&frag_ids),
+            None,
         )
         .unwrap();
     assert_eq!(restored.node_count(), 1);

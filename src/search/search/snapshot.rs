@@ -102,8 +102,14 @@ impl SearchEngine {
         neural_mmap: Option<Arc<MmapEmbeddingIndex>>,
         fragment_mmap: Option<Arc<MmapEmbeddingIndex>>,
         fragment_ids: Option<&[String]>,
+        expected_neural_dim: Option<usize>,
     ) -> Result<usize, String> {
-        validate_snapshot_shape(&snapshot, &tfidf_mmap, neural_mmap.as_ref())?;
+        validate_snapshot_shape(
+            &snapshot,
+            &tfidf_mmap,
+            neural_mmap.as_ref(),
+            expected_neural_dim,
+        )?;
         let nodes = hydrate_snapshot_nodes(&snapshot, &tfidf_mmap)?;
         let per_node: Vec<Vec<u32>> = snapshot
             .nodes
@@ -302,6 +308,7 @@ fn validate_snapshot_shape(
     snapshot: &SearchSnapshot,
     tfidf_mmap: &MmapEmbeddingIndex,
     neural_mmap: Option<&Arc<MmapEmbeddingIndex>>,
+    expected_neural_dim: Option<usize>,
 ) -> Result<(), String> {
     if snapshot.version != SEARCH_SNAPSHOT_VERSION {
         return Err(format!(
@@ -331,11 +338,17 @@ fn validate_snapshot_shape(
         ));
     }
     if let Some(mmap) = neural_mmap {
-        if mmap.dimension() as usize != NEURAL_EMBEDDING_DIMENSION {
+        // B1.6 (spec 2026-10-09): remote providers may legitimately store a
+        // different dimension than the bundled Qwen3 model (measured at first
+        // embed, per the CustomEmbeddingProvider dimension contract). The
+        // caller supplies the active embedder's dimension; None falls back to
+        // the local-model constant for pre-remote callers and tests.
+        let expected = expected_neural_dim.unwrap_or(NEURAL_EMBEDDING_DIMENSION);
+        if mmap.dimension() as usize != expected {
             return Err(format!(
                 "neural mmap dimension {} != expected {}",
                 mmap.dimension(),
-                NEURAL_EMBEDDING_DIMENSION
+                expected
             ));
         }
     }
