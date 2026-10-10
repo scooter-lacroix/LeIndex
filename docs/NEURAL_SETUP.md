@@ -140,13 +140,22 @@ diagnostics report an unknown preset and a null measured dimension.
 
 ### Fallback behavior and local Qwen opt-in
 
-The current construction ladder is remote → local Qwen ONNX → TF-IDF/PDG:
-remote config/construction failure allows the local arm when compiled, and a
-local failure leaves the lexical/graph core usable. Construction does not probe
-the remote server. **A later remote HTTP or dimension-validation failure skips
-neural vectors for the affected batch/query and keeps TF-IDF/PDG; it does not
-retry that batch through Qwen.** Runtime remote-to-Qwen failover remains a
-rollout readiness requirement, not a verified capability.
+The construction ladder is remote → local Qwen ONNX → TF-IDF/PDG; construction
+does not probe the remote server. Node enrichment freezes its document provider
+for each neural generation:
+
+- If remote fails before any successful remote rows, the whole generation
+  selects local Qwen (1024 dimensions) when compiled; local worker failures
+  still leave the lexical/graph core usable.
+- Once any remote rows succeed, a later HTTP, count, or dimension failure skips
+  the remaining documents through TF-IDF/PDG. It never switches that generation
+  to Qwen or retries remote within it: one mmap contains one vector space.
+- A new neural generation retries remote with a fresh selection. Checkpoints
+  record the selected provider identity, including remote task templates.
+
+Query failures retain TF-IDF/PDG without a Qwen retry. Fragment incremental
+identity and real local-worker/runtime readiness remain rollout requirements;
+the node-generation regression tests are not evidence of those capabilities.
 
 To select local Qwen deliberately, keep `[neural] enabled = true`, provision it
 with `leindex setup --neural --cpu` (or a GPU provider), and merge:

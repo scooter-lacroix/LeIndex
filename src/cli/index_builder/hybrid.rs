@@ -43,6 +43,154 @@ pub enum HybridEmbedder {
     },
 }
 
+/// Document-side provider selection for one neural generation. Query calls keep
+/// their existing behavior. A new instance retries remote on the next generation.
+pub(crate) struct GenerationNeuralEmbedder {
+    selected: std::cell::RefCell<HybridEmbedder>,
+    #[cfg(feature = "remote-embeddings")]
+    remote_rows_landed: std::cell::Cell<bool>,
+    #[cfg(feature = "remote-embeddings")]
+    stopped: std::cell::Cell<bool>,
+}
+
+impl GenerationNeuralEmbedder {
+    pub(crate) fn new(embedder: HybridEmbedder) -> Self {
+        Self {
+            selected: std::cell::RefCell::new(embedder),
+            #[cfg(feature = "remote-embeddings")]
+            remote_rows_landed: std::cell::Cell::new(false),
+            #[cfg(feature = "remote-embeddings")]
+            stopped: std::cell::Cell::new(false),
+        }
+    }
+
+    pub(crate) fn has_neural(&self) -> bool {
+        self.selected.borrow().has_neural()
+    }
+
+    pub(crate) fn identity(&self) -> String {
+        match &*self.selected.borrow() {
+            #[cfg(feature = "remote-embeddings")]
+            HybridEmbedder::HybridRemote { remote, .. } => remote.identity(),
+            #[cfg(feature = "onnx")]
+            HybridEmbedder::HybridLocal { .. } => format!(
+                "local|{}|{}",
+                crate::config::LeIndexConfig::load_cached()
+                    .neural
+                    .model_name,
+                NEURAL_EMBEDDING_DIMENSION,
+            ),
+            HybridEmbedder::TfIdfOnly(_) => "unavailable".to_string(),
+        }
+    }
+
+    pub(crate) fn into_embedder(self) -> HybridEmbedder {
+        self.selected.into_inner()
+    }
+
+    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+    pub(crate) fn embed_neural_batch_blocking<S: AsRef<str>>(
+        &self,
+        texts: &[S],
+    ) -> Vec<Option<Vec<f32>>> {
+        if texts.is_empty() {
+            return Vec::new();
+        }
+        #[cfg(feature = "remote-embeddings")]
+        if self.stopped.get() {
+            return vec![None; texts.len()];
+        }
+        let embeddings = self.selected.borrow().embed_neural_batch_blocking(texts);
+        #[cfg(feature = "remote-embeddings")]
+        if matches!(*self.selected.borrow(), HybridEmbedder::HybridRemote { .. }) {
+            if embeddings.iter().flatten().any(|row| !row.is_empty()) {
+                // Conservative: once any remote row can reach storage, Qwen is
+                // forbidden even if a future writer rejects that particular row.
+                self.remote_rows_landed.set(true);
+            }
+            if embeddings.len() == texts.len()
+                && embeddings
+                    .iter()
+                    .all(|row| row.as_ref().is_some_and(|row| !row.is_empty()))
+            {
+                return embeddings;
+            }
+            if self.remote_rows_landed.get() {
+                self.stopped.set(true);
+                tracing::warn!(
+                    "Remote failed after accepted rows; neural generation frozen to TF-IDF for remaining documents"
+                );
+                return embeddings;
+            }
+            self.select_local_fallback();
+            return self.selected.borrow().embed_neural_batch_blocking(texts);
+        }
+        embeddings
+    }
+
+    #[cfg(feature = "remote-embeddings")]
+    fn select_local_fallback(&self) {
+        // No remote rows exist in this generation: a coherent all-Qwen
+        // generation is safe. Construction/worker failures retain TF-IDF.
+        let tfidf = self.selected.borrow().tfidf().clone();
+        #[cfg(feature = "onnx")]
+        let fallback = HybridEmbedder::hybrid_local(
+            tfidf.clone(),
+            Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
+        )
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "Local neural fallback unavailable");
+            HybridEmbedder::tfidf_only(tfidf)
+        });
+        #[cfg(not(feature = "onnx"))]
+        let fallback = HybridEmbedder::tfidf_only(tfidf);
+        tracing::warn!(
+            "Remote failed before any rows; selecting local/TF-IDF backend for the whole neural generation"
+        );
+        *self.selected.borrow_mut() = fallback;
+    }
+}
+
+#[cfg(all(test, feature = "remote-embeddings"))]
+mod generation_tests {
+    use super::*;
+
+    #[test]
+    fn test_generation_remote_pre_success_selects_local_without_remote_rows() {
+        let tfidf = TfIdfEmbedder::build(&[("a.rs".into(), "fn a() {}".into())]);
+        let generation = GenerationNeuralEmbedder::new(
+            HybridEmbedder::hybrid_remote(
+                tfidf,
+                RemoteEmbeddingConfig {
+                    provider: crate::search::onnx::RemoteProvider::Custom {
+                        endpoint: "http://127.0.0.1:1/v1".into(),
+                    },
+                    ..RemoteEmbeddingConfig::default()
+                },
+                None,
+            )
+            .expect("remote construction"),
+        );
+        let response = generation
+            .selected
+            .borrow()
+            .embed_neural_batch_blocking(&["document"]);
+        assert!(response.iter().all(Option::is_none));
+        assert!(!generation.remote_rows_landed.get());
+        // Check the real transition separately from worker IO: local readiness
+        // is a runtime gate, not simulated 1024-dimensional evidence.
+        generation.select_local_fallback();
+        let selected = generation.into_embedder();
+        #[cfg(feature = "onnx")]
+        {
+            assert!(matches!(selected, HybridEmbedder::HybridLocal { .. }));
+            assert_eq!(selected.neural_dimension(), Some(1024));
+        }
+        #[cfg(not(feature = "onnx"))]
+        assert!(matches!(selected, HybridEmbedder::TfIdfOnly(_)));
+    }
+}
+
 /// Scoring weights for hybrid embedding combination
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct HybridScoringWeights {

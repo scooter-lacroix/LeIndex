@@ -167,6 +167,14 @@ fn spawn_mock_embeddings_server_with_capture(
     dim_for_request: impl Fn(usize) -> usize + Send + 'static,
     captured_request: Option<std::sync::mpsc::Sender<serde_json::Value>>,
 ) -> String {
+    spawn_mock_embeddings_server_responses(dim_for_request, captured_request, 1)
+}
+
+pub(crate) fn spawn_mock_embeddings_server_responses(
+    dim_for_request: impl Fn(usize) -> usize + Send + 'static,
+    captured_request: Option<std::sync::mpsc::Sender<serde_json::Value>>,
+    responses: usize,
+) -> String {
     use std::io::{Read, Write};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock server");
@@ -175,7 +183,8 @@ fn spawn_mock_embeddings_server_with_capture(
         .expect("mock server local addr")
         .to_string();
     std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
+        for _ in 0..responses {
+            let (mut stream, _) = listener.accept().expect("mock request");
             let mut request = Vec::new();
             let mut chunk = [0u8; 4096];
             let header_end = loop {
@@ -209,11 +218,15 @@ fn spawn_mock_embeddings_server_with_capture(
                 &request[header_end..header_end + content_length.min(request.len() - header_end)],
             )
             .unwrap_or(serde_json::json!({}));
-            if let Some(sender) = captured_request {
+            if let Some(sender) = captured_request.as_ref() {
                 let _ = sender.send(payload.clone());
             }
             let input_count = payload["input"].as_array().map(|a| a.len()).unwrap_or(1);
             let dim = dim_for_request(input_count);
+            if dim == 0 {
+                stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("mock outage response");
+                continue;
+            }
             let data: Vec<String> = (0..input_count)
                 .map(|i| {
                     let vector: Vec<String> = (0..dim)
@@ -246,6 +259,72 @@ fn block_on_test<F: std::future::Future>(fut: F) -> F::Output {
         .build()
         .expect("test runtime")
         .block_on(fut)
+}
+
+#[test]
+fn test_generation_remote_death_after_success_persists_only_remote_space() {
+    let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_count = request_count.clone();
+    let endpoint = spawn_mock_embeddings_server_responses(
+        move |_| {
+            match server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                1 => 0, // remote dies after the first successful batch
+                _ => 768,
+            }
+        },
+        None,
+        3,
+    );
+    let remote_config = RemoteEmbeddingConfig {
+        provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+        remote_dimension: Some(768),
+        model: Some("embeddinggemma-2".to_string()),
+        ..RemoteEmbeddingConfig::default()
+    };
+    let generation = GenerationNeuralEmbedder::new(
+        HybridEmbedder::hybrid_remote(corpus_tfidf(), remote_config.clone(), None).expect("remote"),
+    );
+    let first_batch = vec![
+        ("a".to_string(), "first document".to_string()),
+        ("b".to_string(), "second document".to_string()),
+    ];
+    let mut rows = Vec::new();
+    append_neural_batch(&generation, &first_batch, &mut rows);
+    assert_eq!(
+        rows.len(),
+        2,
+        "remote successes must land before the outage"
+    );
+    // The server fails after the first batch, then recovers. This generation
+    // must not retry remote or switch to 1024-dimensional Qwen.
+    append_neural_batch(&generation, &[("c".into(), "outage".into())], &mut rows);
+    append_neural_batch(&generation, &[("d".into(), "remainder".into())], &mut rows);
+    assert_eq!(
+        request_count.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "remaining batches must not retry a frozen generation"
+    );
+    assert!(matches!(
+        generation.into_embedder(),
+        HybridEmbedder::HybridRemote { .. }
+    ));
+    assert_eq!(rows.len(), 2);
+
+    let dir = tempfile::tempdir().expect("mmap fixture");
+    let path = dir.path().join("neural_embeddings.bin");
+    crate::search::vector::write_mmap_embeddings(&path, &rows).expect("persist generation");
+    let mmap = crate::search::vector::MmapEmbeddingIndex::open(&path).expect("reopen generation");
+    let stored = mmap.entries().expect("stored rows");
+    assert_eq!(stored.len(), 2);
+    assert!(stored.iter().all(|(_, vector)| vector.len() == 768));
+    assert!(!stored.iter().any(|(_, vector)| vector.len() == 1024));
+
+    // A new generation gets a fresh decision and retries remote successfully.
+    let next = GenerationNeuralEmbedder::new(
+        HybridEmbedder::hybrid_remote(corpus_tfidf(), remote_config, None).expect("next remote"),
+    );
+    let next_rows = next.embed_neural_batch_blocking(&["retry"]);
+    assert_eq!(next_rows[0].as_ref().map(Vec::len), Some(768));
 }
 
 #[test]

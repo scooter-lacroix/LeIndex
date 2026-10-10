@@ -2,7 +2,7 @@ use super::*;
 use std::path::Path;
 
 struct HybridStreamingEmbedder<'a> {
-    inner: &'a index_builder::HybridEmbedder,
+    inner: &'a index_builder::GenerationNeuralEmbedder,
 }
 
 impl streaming::neural::StreamingEmbedder for HybridStreamingEmbedder<'_> {
@@ -127,7 +127,7 @@ fn streaming_neural_inputs<'a>(
 fn enrich_neural_for_route(
     engine: &mut crate::search::search::SearchEngine,
     pdg: &crate::graph::pdg::ProgramDependenceGraph,
-    embedder: &index_builder::HybridEmbedder,
+    embedder: &index_builder::GenerationNeuralEmbedder,
     admitted_node_ids: &HashSet<String>,
     route: streaming::routes::NeuralRoute,
 ) -> Result<usize> {
@@ -510,14 +510,15 @@ impl LeIndex {
             .lexical_hash
             .clone()
             .unwrap_or_else(|| lexical.pdg_hash.clone());
-        let neural_embedder = self.configured_neural_embedder()?;
-        // Cache-key fix: a model swap must NOT silently resume the previous
-        // model's embeddings. The checkpoint stores the embedder model_name that
-        // produced its rows; a mismatch forces a full re-embed.
-        let current_embed_model = crate::config::LeIndexConfig::load_cached()
-            .neural
-            .model_name
-            .clone();
+        let neural_embedder = self
+            .configured_neural_embedder()?
+            .map(index_builder::GenerationNeuralEmbedder::new);
+        // Remote identities include endpoint/model/templates/dimension; a
+        // checkpoint from a pre-success Qwen fallback must not resume as remote.
+        let current_embed_model = neural_embedder
+            .as_ref()
+            .map(index_builder::GenerationNeuralEmbedder::identity)
+            .unwrap_or_else(|| "unavailable".to_string());
         let (mut neural_rows, neural_resume_loaded) = self.restore_neural_checkpoint(
             state.resumed_neural.as_ref(),
             &lexical_hash,
@@ -551,6 +552,19 @@ impl LeIndex {
                 neural_route,
             )?;
         }
+        let selected_model = neural_embedder
+            .as_ref()
+            .map(index_builder::GenerationNeuralEmbedder::identity)
+            .unwrap_or_else(|| "unavailable".to_string());
+        let neural_embedder =
+            neural_embedder.map(index_builder::GenerationNeuralEmbedder::into_embedder);
+        let selected_provider = match neural_embedder.as_ref() {
+            #[cfg(feature = "remote-embeddings")]
+            Some(index_builder::HybridEmbedder::HybridRemote { .. }) => "remote",
+            #[cfg(feature = "onnx")]
+            Some(index_builder::HybridEmbedder::HybridLocal { .. }) => "onnx",
+            _ => "unavailable",
+        };
         self.persist_neural_mmap(neural_resume_loaded, neural_rows)?;
         self.persist_neural_snapshot(&state, neural_rows, neural_embedder)?;
         progress_stderr("Indexing: publishing enhanced generation...");
@@ -561,12 +575,9 @@ impl LeIndex {
             provider: if neural_rows == 0 {
                 "unavailable".to_string()
             } else {
-                std::env::var("LEINDEX_NEURAL_PROVIDER").unwrap_or_else(|_| "onnx".to_string())
+                selected_provider.to_string()
             },
-            model: crate::config::LeIndexConfig::load_cached()
-                .neural
-                .model_name
-                .clone(),
+            model: selected_model,
         };
         let checkpoint_store = state
             .checkpoint_store
@@ -700,6 +711,63 @@ impl LeIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "remote-embeddings")]
+    fn test_streaming_generation_remote_outage_persists_single_space() {
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let endpoint = index_builder::remote_embed_test::spawn_mock_embeddings_server_responses(
+            move |_| {
+                if server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    768
+                } else {
+                    0
+                }
+            },
+            None,
+            2,
+        );
+        let tfidf = index_builder::TfIdfEmbedder::build(&[("a.rs".into(), "fn a() {}".into())]);
+        let generation = index_builder::GenerationNeuralEmbedder::new(
+            index_builder::HybridEmbedder::hybrid_remote(
+                tfidf,
+                crate::search::onnx::RemoteEmbeddingConfig {
+                    provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+                    remote_dimension: Some(768),
+                    ..crate::search::onnx::RemoteEmbeddingConfig::default()
+                },
+                None,
+            )
+            .expect("remote generation"),
+        );
+        let adapter = HybridStreamingEmbedder { inner: &generation };
+        let mut inputs = (0..6).map(|i| {
+            Ok(streaming::neural::NeuralInput {
+                node_id: format!("node-{i}"),
+                text: format!("document-{i}"),
+            })
+        });
+        let mut writer = streaming::neural::VecNeuralRowWriter::new();
+        let budget = streaming::BatchBudget {
+            max_texts: 2,
+            ..Default::default()
+        };
+        let stats =
+            streaming::neural::enrich_neural_streaming(&mut inputs, &adapter, &mut writer, &budget)
+                .expect("streaming generation");
+        assert_eq!(stats.rows_written, 2);
+        assert_eq!(stats.rows_skipped, 4);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let dir = tempfile::tempdir().expect("streaming mmap");
+        let path = dir.path().join("neural_embeddings.bin");
+        crate::search::vector::write_mmap_embeddings(&path, &writer.rows)
+            .expect("persist streaming");
+        let mmap = crate::search::vector::MmapEmbeddingIndex::open(&path).expect("open streaming");
+        let rows = mmap.entries().expect("streaming stored rows");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|(_, row)| row.len() == 768));
+    }
 
     #[test]
     fn test_streaming_neural_inputs_missing_source_uses_empty_bytes() {

@@ -53,7 +53,7 @@ mod hybrid_test;
 
 #[cfg(all(test, feature = "remote-embeddings"))]
 #[path = "remote_embed_test.rs"]
-mod remote_embed_test;
+pub(crate) mod remote_embed_test;
 
 // ============================================================================
 // TF-IDF EMBEDDING SYSTEM
@@ -1667,7 +1667,7 @@ fn build_neural_embedder(tfidf_embedder: TfIdfEmbedder, _allow_neural: bool) -> 
 )]
 pub(crate) fn enrich_neural_embeddings(
     pdg: &ProgramDependenceGraph,
-    embedder: &HybridEmbedder,
+    embedder: &GenerationNeuralEmbedder,
     admitted_node_ids: &HashSet<String>,
 ) -> Vec<(String, Vec<f32>)> {
     if !embedder.has_neural() {
@@ -1752,7 +1752,7 @@ fn dedupe_neural_rows_keep_first(rows: &mut Vec<(String, Vec<f32>)>) {
 
 #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
 fn append_neural_batch(
-    embedder: &HybridEmbedder,
+    embedder: &GenerationNeuralEmbedder,
     pending: &[(String, String)],
     rows: &mut Vec<(String, Vec<f32>)>,
 ) {
