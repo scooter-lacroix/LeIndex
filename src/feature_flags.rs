@@ -796,7 +796,11 @@ mod test {
             FeatureFlag::PrecisionIngest,
         ] {
             assert!(flag.default_value(), "{} should default ON", flag.env_var());
-            assert!(flag.is_enabled(), "{} should be enabled by default", flag.env_var());
+            assert!(
+                flag.is_enabled(),
+                "{} should be enabled by default",
+                flag.env_var()
+            );
         }
 
         // SAFETY: single-threaded test under FLAG_TEST_LOCK.
@@ -865,7 +869,11 @@ mod test {
             FeatureFlag::PrecisionIngest,
         ] {
             assert!(flag.default_value(), "{} should default ON", flag.env_var());
-            assert!(flag.is_enabled(), "{} should be enabled with no override", flag.env_var());
+            assert!(
+                flag.is_enabled(),
+                "{} should be enabled with no override",
+                flag.env_var()
+            );
         }
         for flag in [
             FeatureFlag::StreamingScan,
@@ -873,7 +881,11 @@ mod test {
             FeatureFlag::StreamingTfidf,
             FeatureFlag::StreamingNeural,
         ] {
-            assert!(!flag.default_value(), "{} should remain opt-in", flag.env_var());
+            assert!(
+                !flag.default_value(),
+                "{} should remain opt-in",
+                flag.env_var()
+            );
             assert!(!flag.is_enabled(), "{} should remain OFF", flag.env_var());
         }
 
