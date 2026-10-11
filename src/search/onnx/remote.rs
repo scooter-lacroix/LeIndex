@@ -472,8 +472,12 @@ pub struct CustomEmbeddingProvider {
     measured: std::sync::atomic::AtomicUsize,
 }
 
+/// Statuses that can be caused by one bad input (oversized/invalid content;
+/// 500 is llama-server's oversized-input rejection). 502/503/504 are
+/// availability/gateway failures: they fail the batch fast (endpoint-down
+/// freeze path) instead of bisecting into many doomed requests.
 fn is_bisectable_embedding_status(status: u16) -> bool {
-    matches!(status, 400 | 413 | 422) || (500..=599).contains(&status)
+    matches!(status, 400 | 413 | 422 | 500)
 }
 
 /// Apply a task template to `text`: replace every `{text}` placeholder with

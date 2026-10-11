@@ -483,6 +483,46 @@ fn test_remote_batch_all_bad_freezes_after_remote_rows_landed() {
 }
 
 #[test]
+fn test_remote_batch_availability_status_fails_fast_without_bisecting() {
+    for status in [502, 503, 504] {
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_count = request_count.clone();
+        // Budget > 1 so a (wrong) bisect would be answered and observed
+        // instead of hanging until the client timeout.
+        let endpoint = spawn_mock_embeddings_server_scripted(
+            |_| 8,
+            move |_| {
+                server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                status
+            },
+            None,
+            7,
+        );
+        let provider =
+            crate::search::onnx::GenericRemoteProvider::from_config(RemoteEmbeddingConfig {
+                provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+                remote_dimension: Some(8),
+                ..RemoteEmbeddingConfig::default()
+            })
+            .expect("remote provider");
+
+        let error = block_on_test(
+            provider.embed_batch_optional(vec!["first", "second", "third", "fourth"]),
+        )
+        .expect_err("availability failure must fail the whole batch");
+        assert!(matches!(
+            error,
+            crate::search::onnx::RemoteEmbeddingError::HttpStatus { status: got, .. } if got == status
+        ));
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "HTTP {status} must not bisect"
+        );
+    }
+}
+
+#[test]
 fn test_remote_batch_http_then_transport_error_propagates() {
     let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let server_count = request_count.clone();
