@@ -555,6 +555,11 @@ impl LeIndex {
         let neural_embedder = self
             .configured_neural_embedder()?
             .map(index_builder::GenerationNeuralEmbedder::new);
+        if let (Some(generation), Some(checkpoint)) =
+            (neural_embedder.as_ref(), state.resumed_neural.as_ref())
+        {
+            generation.adopt_checkpoint_dimension(&checkpoint.model);
+        }
         // Remote identities include endpoint/model/templates/dimension; a
         // checkpoint from a pre-success Qwen fallback must not resume as remote.
         let current_embed_model = neural_embedder

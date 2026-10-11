@@ -93,6 +93,30 @@ impl GenerationNeuralEmbedder {
         }
     }
 
+    /// A custom endpoint without a pinned dimension only learns it from its
+    /// first response, so a fresh generation's pre-request identity carries
+    /// the bootstrap default while the checkpoint it saved carries the
+    /// measured one: they never match and every run re-embeds. Adopt the
+    /// checkpoint's dimension — only when every other identity component is
+    /// identical — so resume compares like with like.
+    pub(crate) fn adopt_checkpoint_dimension(&self, _checkpoint_model: &str) {
+        #[cfg(feature = "remote-embeddings")]
+        if let HybridEmbedder::HybridRemote { remote, .. } = &*self.selected.borrow() {
+            let Some(dimension) = _checkpoint_model
+                .rsplit('|')
+                .next()
+                .and_then(|suffix| suffix.parse::<usize>().ok())
+            else {
+                return;
+            };
+            if remote.measured_dimension().is_none()
+                && remote.identity_with_dimension(dimension) == _checkpoint_model
+            {
+                remote.seed_measured_dimension(dimension);
+            }
+        }
+    }
+
     pub(crate) fn document_embedding_stopped(&self) -> bool {
         #[cfg(feature = "remote-embeddings")]
         {

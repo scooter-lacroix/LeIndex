@@ -220,6 +220,11 @@ pub trait RemoteEmbeddingProvider: Send + Sync {
     fn observed_dimension(&self) -> Option<usize> {
         None
     }
+
+    /// Adopt a dimension recovered from persisted rows while still unmeasured,
+    /// so identity matches the one those rows were saved under (a custom
+    /// endpoint only measures at its first response). No-op by default.
+    fn seed_measured_dimension(&self, _dimension: usize) {}
 }
 
 /// OpenAI embedding provider implementation
@@ -634,6 +639,16 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
         let measured = self.measured.load(std::sync::atomic::Ordering::Relaxed);
         (measured > 0).then_some(measured)
     }
+
+    fn seed_measured_dimension(&self, dimension: usize) {
+        // Fills an unmeasured provider only; a real response always wins.
+        let _ = self.measured.compare_exchange(
+            0,
+            dimension,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
 
 impl CustomEmbeddingProvider {
@@ -815,16 +830,18 @@ impl GenericRemoteProvider {
     /// optional template fingerprint separates vector spaces across task-prefix
     /// changes.
     pub fn identity(&self) -> String {
+        self.identity_with_dimension(self.provider.dimension())
+    }
+
+    /// Identity as it would read if the provider's dimension were `dimension`
+    /// (used to match a checkpoint saved under a since-measured dimension).
+    pub fn identity_with_dimension(&self, dimension: usize) -> String {
         let template = self
             .template_fingerprint
             .as_deref()
             .map(|fingerprint| format!("|{fingerprint}"))
             .unwrap_or_default();
-        format!(
-            "{}{template}|{}",
-            self.identity_prefix,
-            self.provider.dimension()
-        )
+        format!("{}{template}|{dimension}", self.identity_prefix)
     }
 
     /// Dimension observed in the first successful remote response, if any.
@@ -860,6 +877,10 @@ impl RemoteEmbeddingProvider for GenericRemoteProvider {
 
     fn observed_dimension(&self) -> Option<usize> {
         self.provider.observed_dimension()
+    }
+
+    fn seed_measured_dimension(&self, dimension: usize) {
+        self.provider.seed_measured_dimension(dimension);
     }
 }
 
