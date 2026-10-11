@@ -655,22 +655,28 @@ mod test {
 
     #[test]
     fn test_debug_escape_hatch_override_toggles_state() {
-        let _g = FLAG_TEST_LOCK.lock().unwrap();
+        let _g = lock_flag_tests();
+        let _reset = FlagOverrideReset;
+        assert!(FeatureFlag::RemoteEmbeddings.default_value());
+        assert!(!FeatureFlag::DebugEscapeHatch.default_value());
         assert!(!FeatureFlag::DebugEscapeHatch.is_enabled());
         set_flag_override_for_test(FeatureFlag::DebugEscapeHatch, true);
         assert!(FeatureFlag::DebugEscapeHatch.is_enabled());
-        clear_flag_overrides_for_test();
+        set_flag_override_for_test(FeatureFlag::DebugEscapeHatch, false);
         assert!(!FeatureFlag::DebugEscapeHatch.is_enabled());
     }
 
     #[test]
     fn test_override_toggles_flag() {
         // Serialize the shared override store across this test only.
-        let _g = FLAG_TEST_LOCK.lock().unwrap();
+        let _g = lock_flag_tests();
+        let _reset = FlagOverrideReset;
+        assert!(FeatureFlag::RemoteEmbeddings.default_value());
+        assert!(FeatureFlag::GenerationReaders.default_value());
         assert!(FeatureFlag::GenerationReaders.is_enabled());
         set_flag_override_for_test(FeatureFlag::GenerationReaders, false);
         assert!(!FeatureFlag::GenerationReaders.is_enabled());
-        clear_flag_overrides_for_test();
+        set_flag_override_for_test(FeatureFlag::GenerationReaders, true);
         assert!(FeatureFlag::GenerationReaders.is_enabled());
     }
 
@@ -688,22 +694,22 @@ mod test {
 
     #[test]
     fn test_validated_model_override_toggles() {
-        let _g = FLAG_TEST_LOCK.lock().unwrap();
+        let _g = lock_flag_tests();
+        let _reset = FlagOverrideReset;
+        assert!(FeatureFlag::ValidatedModel.default_value());
         assert!(FeatureFlag::ValidatedModel.is_enabled());
         set_flag_override_for_test(FeatureFlag::ValidatedModel, false);
         assert!(!FeatureFlag::ValidatedModel.is_enabled());
-        clear_flag_overrides_for_test();
+        set_flag_override_for_test(FeatureFlag::ValidatedModel, true);
         assert!(FeatureFlag::ValidatedModel.is_enabled());
     }
 
     /// Selected stable rollout flags default ON after their gates pass. Each
     /// flag acts as a rollout-KILL: explicit "false" reverts that capability.
-    /// This test intentionally covers only the flags listed below; streaming
-    /// scan, parse, TF-IDF, and neural consumers have separate opt-in defaults.
     #[test]
     fn test_rollout_flags_default_on_after_gates_passed() {
-        let _g = FLAG_TEST_LOCK.lock().unwrap();
-        clear_flag_overrides_for_test();
+        let _g = lock_flag_tests();
+        let _reset = FlagOverrideReset;
         let rollout_flags = [
             FeatureFlag::RemoteEmbeddings,
             FeatureFlag::DaemonClient,
@@ -716,18 +722,24 @@ mod test {
         for flag in &rollout_flags {
             assert!(
                 flag.default_value(),
-                "{} should default ON after gates pass (VAL-ROLLOUT-012 rollout-KILL semantics)",
+                "{} should default ON after gates pass (rollout-KILL semantics)",
+                flag.env_var()
+            );
+            assert!(
+                flag.is_enabled(),
+                "{} should be enabled with no override",
                 flag.env_var()
             );
         }
     }
 
-    /// PR-86 consumer flags are opt-in: each ships default OFF in the same
-    /// commit that wires its consumer, so flags-off equals legacy behavior.
+    /// Consumer routes that have not completed their rollout remain opt-in.
     #[test]
     fn test_pr86_consumer_flags_default_off() {
-        let _g = FLAG_TEST_LOCK.lock().unwrap();
-        clear_flag_overrides_for_test();
+        let _g = lock_flag_tests();
+        let _reset = FlagOverrideReset;
+        assert!(FeatureFlag::RemoteEmbeddings.default_value());
+        assert!(FeatureFlag::RemoteEmbeddings.is_enabled());
         for flag in [
             FeatureFlag::StreamingScan,
             FeatureFlag::StreamingParse,
@@ -749,39 +761,54 @@ mod test {
 
     #[test]
     fn test_daemon_client_override_toggles() {
-        let _g = FLAG_TEST_LOCK.lock().unwrap();
+        let _g = lock_flag_tests();
+        let _reset = FlagOverrideReset;
+        assert!(FeatureFlag::DaemonClient.default_value());
+        set_flag_override_for_test(FeatureFlag::DaemonClient, true);
         assert!(FeatureFlag::DaemonClient.is_enabled());
         set_flag_override_for_test(FeatureFlag::DaemonClient, false);
         assert!(!FeatureFlag::DaemonClient.is_enabled());
-        clear_flag_overrides_for_test();
-        assert!(FeatureFlag::DaemonClient.is_enabled());
     }
 
     // ── Phase 9 legacy fallback tests (VAL-ROLLOUT-013) ──────────────
 
-    /// `LEINDEX_LEGACY=1` forces every legacy-revertible flag OFF. This test
-    /// verifies the umbrella over the full legacy-revertible set, including
-    /// streaming consumer flags whose normal defaults are already OFF.
+    /// `LEINDEX_LEGACY=1` disables only the legacy-revertible flags; the fresh
+    /// default-on embedding capability is not part of that v2.0.0 fallback set.
     #[test]
     fn test_rollout_flags_default_off_with_legacy_mode() {
-        // Save and restore the env var since this is process-global.
-        let _g = FLAG_TEST_LOCK.lock().unwrap();
+        let _g = lock_flag_tests();
+        let _reset = FlagOverrideReset;
         clear_flag_overrides_for_test();
         let prev = env::var(LEGACY_ENV).ok();
+        // SAFETY: single-threaded test under FLAG_TEST_LOCK.
+        unsafe { env::remove_var(LEGACY_ENV) };
+
+        assert!(FeatureFlag::RemoteEmbeddings.default_value());
+        assert!(FeatureFlag::RemoteEmbeddings.is_enabled());
+        for flag in [
+            FeatureFlag::DaemonClient,
+            FeatureFlag::GenerationReaders,
+            FeatureFlag::BoundedScheduler,
+            FeatureFlag::StreamingPdg,
+            FeatureFlag::GlobalEmbedCache,
+            FeatureFlag::ValidatedModel,
+            FeatureFlag::CommunityDetection,
+            FeatureFlag::PrecisionIngest,
+        ] {
+            assert!(flag.default_value(), "{} should default ON", flag.env_var());
+            assert!(flag.is_enabled(), "{} should be enabled by default", flag.env_var());
+        }
 
         // SAFETY: single-threaded test under FLAG_TEST_LOCK.
         unsafe { env::set_var(LEGACY_ENV, "1") };
-
-        // NeuralSearch and StreamingMcp are GA features that predate v2.0.0.
-        // They should NOT be affected by LEINDEX_LEGACY.
         assert!(
             FeatureFlag::NeuralSearch.is_enabled(),
             "GA features unaffected by LEINDEX_LEGACY"
         );
-
-        // Legacy-revertible flags are OFF under LEINDEX_LEGACY=1. Some of
-        // these (scan, parse, TF-IDF, neural) are already OFF by default; the
-        // umbrella also disables the stable default-ON flags.
+        assert!(
+            FeatureFlag::RemoteEmbeddings.is_enabled(),
+            "fresh remote embeddings default is not in the legacy fallback set"
+        );
         for flag in [
             FeatureFlag::DaemonClient,
             FeatureFlag::GenerationReaders,
@@ -811,14 +838,14 @@ mod test {
                 None => env::remove_var(LEGACY_ENV),
             }
         }
-        clear_flag_overrides_for_test();
     }
 
-    /// `LEINDEX_LEGACY=0` (or unset) leaves each flag at its own compiled
-    /// default; the defaults are not globally all-on.
+    /// `LEINDEX_LEGACY=0` or unset keeps fresh default-on flags enabled without
+    /// overrides while preserving opt-in defaults for unfinished consumers.
     #[test]
     fn test_legacy_unset_keeps_compiled_defaults() {
-        let _g = FLAG_TEST_LOCK.lock().unwrap();
+        let _g = lock_flag_tests();
+        let _reset = FlagOverrideReset;
         clear_flag_overrides_for_test();
         let prev = env::var(LEGACY_ENV).ok();
 
@@ -826,13 +853,35 @@ mod test {
         unsafe { env::remove_var(LEGACY_ENV) };
 
         assert!(!legacy_mode_enabled());
-        assert!(FeatureFlag::GenerationReaders.is_enabled());
-        assert!(FeatureFlag::ValidatedModel.is_enabled());
+        for flag in [
+            FeatureFlag::RemoteEmbeddings,
+            FeatureFlag::DaemonClient,
+            FeatureFlag::GenerationReaders,
+            FeatureFlag::BoundedScheduler,
+            FeatureFlag::StreamingPdg,
+            FeatureFlag::GlobalEmbedCache,
+            FeatureFlag::ValidatedModel,
+            FeatureFlag::CommunityDetection,
+            FeatureFlag::PrecisionIngest,
+        ] {
+            assert!(flag.default_value(), "{} should default ON", flag.env_var());
+            assert!(flag.is_enabled(), "{} should be enabled with no override", flag.env_var());
+        }
+        for flag in [
+            FeatureFlag::StreamingScan,
+            FeatureFlag::StreamingParse,
+            FeatureFlag::StreamingTfidf,
+            FeatureFlag::StreamingNeural,
+        ] {
+            assert!(!flag.default_value(), "{} should remain opt-in", flag.env_var());
+            assert!(!flag.is_enabled(), "{} should remain OFF", flag.env_var());
+        }
 
         // Setting to 0 also keeps defaults.
         // SAFETY: single-threaded test under FLAG_TEST_LOCK.
         unsafe { env::set_var(LEGACY_ENV, "0") };
         assert!(!legacy_mode_enabled());
+        assert!(FeatureFlag::RemoteEmbeddings.is_enabled());
 
         // SAFETY: single-threaded test under FLAG_TEST_LOCK.
         unsafe {
@@ -841,7 +890,6 @@ mod test {
                 None => env::remove_var(LEGACY_ENV),
             }
         }
-        clear_flag_overrides_for_test();
     }
 
     /// `is_legacy_revertible` covers all v2.0.0 rollout flags.
