@@ -30,6 +30,12 @@ fn isolate(command: &mut Command, home: &Path) {
         .env("LEINDEX_HOME", home)
         .env("LEINDEX_FEATURE_PRECISION_INGEST", "0")
         .env("LEINDEX_FEATURE_DAEMON_CLIENT", "0")
+        // Neural search defaults ON for fresh installs; these tests pin MCP
+        // concurrency/search behavior, not embedding backends. Without this
+        // pin a fresh isolated home attempts the remote ladder (dead endpoint)
+        // and then a local ONNX model load, which can blow the 300s budget
+        // under box load.
+        .env("LEINDEX_FEATURE_NEURAL_SEARCH", "0")
         .env("LEINDEX_WATCHER", "0");
 }
 
