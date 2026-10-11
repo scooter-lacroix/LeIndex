@@ -22,7 +22,12 @@ pub enum RemoteEmbeddingError {
 
     /// HTTP request returned an unsuccessful status.
     #[error("API returned HTTP {status}: {message}")]
-    HttpStatus { status: u16, message: String },
+    HttpStatus {
+        /// HTTP status code returned by the remote endpoint.
+        status: u16,
+        /// Error message body returned with the status.
+        message: String,
+    },
 
     /// Invalid API response
     #[error("Invalid API response: {0}")]

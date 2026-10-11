@@ -159,8 +159,7 @@ impl GenerationNeuralEmbedder {
             self.select_local_fallback();
             return self.selected.borrow().embed_neural_batch_blocking(texts);
         }
-        let embeddings = self.selected.borrow().embed_neural_batch_blocking(texts);
-        embeddings
+        self.selected.borrow().embed_neural_batch_blocking(texts)
     }
 
     #[cfg(feature = "remote-embeddings")]
