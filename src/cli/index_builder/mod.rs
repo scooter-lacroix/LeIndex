@@ -1591,6 +1591,11 @@ pub(crate) fn try_remote_neural_embedder(
     tfidf_embedder: TfIdfEmbedder,
     embeddings_cfg: &crate::config::EmbeddingConfig,
 ) -> Option<HybridEmbedder> {
+    // Runtime kill switch (LEINDEX_FEATURE_REMOTE_EMBEDDINGS=0): config alone
+    // must not select remote; callers fall through to local/TF-IDF.
+    if !crate::feature_flags::FeatureFlag::RemoteEmbeddings.is_enabled() {
+        return None;
+    }
     let resolved = embeddings_cfg.resolved_remote()?;
     let remote_cfg = RemoteEmbeddingConfig {
         provider: crate::search::onnx::RemoteProvider::Custom {

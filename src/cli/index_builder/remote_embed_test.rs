@@ -126,6 +126,8 @@ fn test_tfidf_only_ladder_terminal() {
 #[test]
 fn test_try_remote_neural_embedder_ladder_arms() {
     use crate::config::EmbeddingConfig;
+    let _guard = crate::feature_flags::lock_flag_tests();
+    let _reset = crate::feature_flags::FlagOverrideReset;
     // Fresh construction selects the preset; it does not require a live server.
     let fresh = try_remote_neural_embedder(corpus_tfidf(), &EmbeddingConfig::default())
         .expect("fresh preset constructs remote provider without a server");
@@ -148,6 +150,30 @@ fn test_try_remote_neural_embedder_ladder_arms() {
     let embedder =
         try_remote_neural_embedder(corpus_tfidf(), &cfg).expect("configured endpoint builds");
     assert!(matches!(embedder, HybridEmbedder::HybridRemote { .. }));
+}
+
+#[test]
+fn test_remote_kill_switch_flag_off_skips_remote_despite_config() {
+    use crate::config::EmbeddingConfig;
+    let _guard = crate::feature_flags::lock_flag_tests();
+    let _reset = crate::feature_flags::FlagOverrideReset;
+    let cfg = EmbeddingConfig {
+        enable_hybrid: true,
+        remote_endpoint: Some("http://127.0.0.1:1/v1".to_string()),
+        ..EmbeddingConfig::default()
+    };
+    crate::feature_flags::set_flag_override_for_test(
+        crate::feature_flags::FeatureFlag::RemoteEmbeddings,
+        false,
+    );
+    assert!(
+        try_remote_neural_embedder(corpus_tfidf(), &cfg).is_none(),
+        "flag off + remote config present must not construct HybridRemote"
+    );
+    assert!(
+        try_remote_neural_embedder(corpus_tfidf(), &EmbeddingConfig::default()).is_none(),
+        "flag off must also disable the fresh preset"
+    );
 }
 
 // ============================================================================
