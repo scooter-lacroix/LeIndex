@@ -803,10 +803,32 @@ impl GenericRemoteProvider {
             RemoteProvider::Cohere { model } => ("cohere", model.as_str()),
             RemoteProvider::Custom { endpoint } => ("custom", endpoint.as_str()),
         };
-        let identity_prefix = format!(
-            "remote|{kind}|{model}|{}",
-            config.base_url.as_deref().unwrap_or("")
-        );
+        // The configured model name is part of the identity for custom
+        // endpoints: the endpoint alone does not identify the vector space,
+        // and a model swap behind the same URL would otherwise reuse another
+        // model's checkpoint silently. OpenAI/Cohere already carry their model
+        // name in the `kind` slot above; for custom endpoints the endpoint is
+        // the kind slot, so the model is appended when set. When unset, the
+        // endpoint itself is the identity marker (backward compatible).
+        let identity_prefix = if matches!(&config.provider, RemoteProvider::Custom { .. }) {
+            match config.model.as_deref() {
+                Some(model_name) if !model_name.trim().is_empty() => {
+                    format!(
+                        "remote|{kind}|{model}|{}|m{model_name}",
+                        config.base_url.as_deref().unwrap_or("")
+                    )
+                }
+                _ => format!(
+                    "remote|{kind}|{model}|{}",
+                    config.base_url.as_deref().unwrap_or("")
+                ),
+            }
+        } else {
+            format!(
+                "remote|{kind}|{model}|{}",
+                config.base_url.as_deref().unwrap_or("")
+            )
+        };
         let template_fingerprint = template_fingerprint(
             config.doc_template.as_deref(),
             config.query_template.as_deref(),
@@ -915,6 +937,35 @@ mod tests {
         })
         .unwrap();
         assert_ne!(identity, other.identity());
+    }
+
+    #[test]
+    fn test_custom_remote_identity_includes_model_without_changing_legacy_identity() {
+        let endpoint = "http://127.0.0.1:8080/v1/embeddings".to_string();
+        let base_url = Some("http://127.0.0.1:8080/v1".to_string());
+        let config = |model: Option<&str>| RemoteEmbeddingConfig {
+            provider: RemoteProvider::Custom {
+                endpoint: endpoint.clone(),
+            },
+            base_url: base_url.clone(),
+            model: model.map(str::to_string),
+            remote_dimension: Some(768),
+            ..Default::default()
+        };
+
+        let model_a = GenericRemoteProvider::from_config(config(Some("model-a"))).unwrap();
+        let model_b = GenericRemoteProvider::from_config(config(Some("model-b"))).unwrap();
+        assert_ne!(model_a.identity(), model_b.identity());
+        assert!(model_a.identity().contains("|mmodel-a|"));
+
+        let legacy = GenericRemoteProvider::from_config(config(None)).unwrap();
+        assert_eq!(
+            legacy.identity(),
+            format!(
+                "remote|custom|{endpoint}|{}|768",
+                base_url.as_deref().unwrap()
+            )
+        );
     }
 
     #[test]
