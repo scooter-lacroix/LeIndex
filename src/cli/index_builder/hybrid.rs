@@ -120,31 +120,46 @@ impl GenerationNeuralEmbedder {
         if self.stopped.get() {
             return vec![None; texts.len()];
         }
-        let embeddings = self.selected.borrow().embed_neural_batch_blocking(texts);
         #[cfg(feature = "remote-embeddings")]
         if matches!(*self.selected.borrow(), HybridEmbedder::HybridRemote { .. }) {
-            if embeddings.iter().flatten().any(|row| !row.is_empty()) {
-                // Conservative: once any remote row can reach storage, Qwen is
-                // forbidden even if a future writer rejects that particular row.
-                self.remote_rows_landed.set(true);
-            }
-            if embeddings.len() == texts.len()
-                && embeddings
-                    .iter()
-                    .all(|row| row.as_ref().is_some_and(|row| !row.is_empty()))
-            {
-                return embeddings;
+            let remote = match &*self.selected.borrow() {
+                HybridEmbedder::HybridRemote { remote, .. } => remote.clone(),
+                _ => unreachable!(),
+            };
+            let owned: Vec<String> = texts.iter().map(|text| text.as_ref().to_string()).collect();
+            match block_on_remote(async move {
+                remote
+                    .embed_batch_optional(owned.iter().map(String::as_str).collect())
+                    .await
+            }) {
+                Ok(rows) if rows.len() == texts.len() => {
+                    if rows.iter().flatten().any(|row| !row.is_empty()) {
+                        // Any successful remote row pins this generation's space.
+                        self.remote_rows_landed.set(true);
+                    }
+                    return rows;
+                }
+                Ok(rows) => tracing::warn!(
+                    expected = texts.len(),
+                    got = rows.len(),
+                    "Remote optional batch returned wrong row count"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "Remote batch failed; applying generation fallback policy"
+                ),
             }
             if self.remote_rows_landed.get() {
                 self.stopped.set(true);
                 tracing::warn!(
                     "Remote failed after accepted rows; neural generation frozen to TF-IDF for remaining documents"
                 );
-                return embeddings;
+                return vec![None; texts.len()];
             }
             self.select_local_fallback();
             return self.selected.borrow().embed_neural_batch_blocking(texts);
         }
+        let embeddings = self.selected.borrow().embed_neural_batch_blocking(texts);
         embeddings
     }
 

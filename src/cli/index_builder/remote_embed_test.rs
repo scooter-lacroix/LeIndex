@@ -175,6 +175,15 @@ pub(crate) fn spawn_mock_embeddings_server_responses(
     captured_request: Option<std::sync::mpsc::Sender<serde_json::Value>>,
     responses: usize,
 ) -> String {
+    spawn_mock_embeddings_server_scripted(dim_for_request, |_| 200, captured_request, responses)
+}
+
+fn spawn_mock_embeddings_server_scripted(
+    dim_for_request: impl Fn(usize) -> usize + Send + 'static,
+    status_for_request: impl Fn(&serde_json::Value) -> u16 + Send + 'static,
+    captured_request: Option<std::sync::mpsc::Sender<serde_json::Value>>,
+    responses: usize,
+) -> String {
     use std::io::{Read, Write};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock server");
@@ -220,6 +229,27 @@ pub(crate) fn spawn_mock_embeddings_server_responses(
             .unwrap_or(serde_json::json!({}));
             if let Some(sender) = captured_request.as_ref() {
                 let _ = sender.send(payload.clone());
+            }
+            let status = status_for_request(&payload);
+            if status == 0 {
+                continue;
+            }
+            if status != 200 {
+                let reason = match status {
+                    400 => "Bad Request",
+                    413 => "Payload Too Large",
+                    422 => "Unprocessable Entity",
+                    500 => "Internal Server Error",
+                    503 => "Service Unavailable",
+                    _ => "Mock Error",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("mock status response");
+                continue;
             }
             let input_count = payload["input"].as_array().map(|a| a.len()).unwrap_or(1);
             let dim = dim_for_request(input_count);
@@ -326,6 +356,134 @@ fn test_generation_remote_death_after_success_persists_only_remote_space() {
     );
     let next_rows = next.embed_neural_batch_blocking(&["retry"]);
     assert_eq!(next_rows[0].as_ref().map(Vec::len), Some(768));
+}
+
+#[test]
+fn test_remote_batch_bisects_one_bad_input_without_freezing() {
+    let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_count = request_count.clone();
+    let endpoint = spawn_mock_embeddings_server_scripted(
+        |_| 8,
+        move |payload| {
+            server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let inputs = payload["input"].as_array().expect("input array");
+            if inputs.iter().any(|input| {
+                input
+                    .as_str()
+                    .is_some_and(|text| text.contains("BAD_INPUT"))
+            }) {
+                400
+            } else {
+                200
+            }
+        },
+        None,
+        6,
+    );
+    let generation = GenerationNeuralEmbedder::new(
+        HybridEmbedder::hybrid_remote(
+            corpus_tfidf(),
+            RemoteEmbeddingConfig {
+                provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+                remote_dimension: Some(8),
+                ..RemoteEmbeddingConfig::default()
+            },
+            None,
+        )
+        .expect("remote provider"),
+    );
+
+    let batch = ["good 0", "good 1", "BAD_INPUT", "good 3"];
+    let rows = generation.embed_neural_batch_blocking(&batch);
+    assert_eq!(rows.len(), 4);
+    assert!(rows[0].is_some());
+    assert!(rows[1].is_some());
+    assert!(rows[2].is_none());
+    assert!(rows[3].is_some());
+    assert!(!generation.document_embedding_stopped());
+
+    let next = generation.embed_neural_batch_blocking(&["good after partial"]);
+    assert!(
+        next[0].is_some(),
+        "partial success must not freeze the generation"
+    );
+    assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 6);
+}
+
+#[test]
+fn test_remote_batch_all_bad_freezes_after_remote_rows_landed() {
+    let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_count = request_count.clone();
+    let endpoint = spawn_mock_embeddings_server_scripted(
+        |_| 8,
+        move |payload| {
+            server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let inputs = payload["input"].as_array().expect("input array");
+            if inputs.iter().any(|input| input.as_str() == Some("seed")) {
+                200
+            } else {
+                400
+            }
+        },
+        None,
+        8,
+    );
+    let generation = GenerationNeuralEmbedder::new(
+        HybridEmbedder::hybrid_remote(
+            corpus_tfidf(),
+            RemoteEmbeddingConfig {
+                provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+                remote_dimension: Some(8),
+                ..RemoteEmbeddingConfig::default()
+            },
+            None,
+        )
+        .expect("remote provider"),
+    );
+
+    assert!(generation.embed_neural_batch_blocking(&["seed"])[0].is_some());
+    let all_bad = ["bad 0", "bad 1", "bad 2", "bad 3"];
+    let rows = generation.embed_neural_batch_blocking(&all_bad);
+    assert!(rows.iter().all(Option::is_none));
+    assert!(generation.document_embedding_stopped());
+    assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 8);
+    assert!(
+        generation
+            .embed_neural_batch_blocking(&["must not retry"])
+            .iter()
+            .all(Option::is_none)
+    );
+    assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 8);
+}
+
+#[test]
+fn test_remote_batch_http_then_transport_error_propagates() {
+    let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_count = request_count.clone();
+    let endpoint = spawn_mock_embeddings_server_scripted(
+        |_| 8,
+        move |_| match server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => 400,
+            _ => 0,
+        },
+        None,
+        2,
+    );
+    let provider = crate::search::onnx::GenericRemoteProvider::from_config(RemoteEmbeddingConfig {
+        provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+        remote_dimension: Some(8),
+        ..RemoteEmbeddingConfig::default()
+    })
+    .expect("remote provider");
+
+    let error =
+        block_on_test(provider.embed_batch_optional(vec!["first", "second", "third", "fourth"]))
+            .expect_err("transport failure after HTTP error must propagate");
+    assert!(matches!(
+        error,
+        crate::search::onnx::RemoteEmbeddingError::ApiError(_)
+    ));
+    assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 #[test]

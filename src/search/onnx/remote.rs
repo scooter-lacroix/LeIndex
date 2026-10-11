@@ -20,6 +20,10 @@ pub enum RemoteEmbeddingError {
     #[error("API request failed: {0}")]
     ApiError(String),
 
+    /// HTTP request returned an unsuccessful status.
+    #[error("API returned HTTP {status}: {message}")]
+    HttpStatus { status: u16, message: String },
+
     /// Invalid API response
     #[error("Invalid API response: {0}")]
     InvalidResponse(String),
@@ -184,6 +188,16 @@ pub trait RemoteEmbeddingProvider: Send + Sync {
 
     /// Generate embeddings for multiple texts (batch)
     async fn embed_batch(&self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError>;
+
+    /// Generate a document batch while preserving missing input rows.
+    async fn embed_batch_optional(
+        &self,
+        texts: Vec<&str>,
+    ) -> Result<Vec<Option<Vec<f32>>>, RemoteEmbeddingError> {
+        self.embed_batch(texts)
+            .await
+            .map(|embeddings| embeddings.into_iter().map(Some).collect())
+    }
 
     /// Get the embedding dimension
     fn dimension(&self) -> usize;
@@ -453,6 +467,10 @@ pub struct CustomEmbeddingProvider {
     measured: std::sync::atomic::AtomicUsize,
 }
 
+fn is_bisectable_embedding_status(status: u16) -> bool {
+    matches!(status, 400 | 413 | 422) || (500..=599).contains(&status)
+}
+
 /// Apply a task template to `text`: replace every `{text}` placeholder with
 /// the text (prefix-only templates — no placeholder — prepend + space).
 fn apply_template<'a>(template: Option<&str>, text: &'a str) -> std::borrow::Cow<'a, str> {
@@ -522,6 +540,72 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
             .map(|t| apply_template(self.doc_template.as_deref(), t))
             .collect();
         self.embed_via_api(inputs).await
+    }
+
+    async fn embed_batch_optional(
+        &self,
+        texts: Vec<&str>,
+    ) -> Result<Vec<Option<Vec<f32>>>, RemoteEmbeddingError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let inputs: Vec<_> = texts
+            .iter()
+            .map(|text| apply_template(self.doc_template.as_deref(), text))
+            .collect();
+        let mut rows = vec![None; inputs.len()];
+        let mut pending = vec![(0, inputs.len())];
+        let mut skipped = Vec::new();
+        let mut first_error = None;
+
+        while let Some((start, end)) = pending.pop() {
+            match self.embed_via_api(inputs[start..end].to_vec()).await {
+                Ok(embeddings) if embeddings.len() == end - start => {
+                    for (index, embedding) in (start..end).zip(embeddings) {
+                        rows[index] = Some(embedding);
+                    }
+                }
+                Ok(embeddings) => {
+                    return Err(RemoteEmbeddingError::InvalidResponse(format!(
+                        "Expected {} embeddings, got {}",
+                        end - start,
+                        embeddings.len()
+                    )));
+                }
+                Err(RemoteEmbeddingError::HttpStatus { status, message })
+                    if is_bisectable_embedding_status(status) =>
+                {
+                    first_error.get_or_insert((status, message));
+                    if end - start == 1 {
+                        skipped.push(start);
+                    } else {
+                        tracing::debug!(
+                            start,
+                            end,
+                            batch_len = end - start,
+                            "Bisecting failed remote embedding batch"
+                        );
+                        let middle = start + (end - start) / 2;
+                        pending.push((middle, end));
+                        pending.push((start, middle));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let embedded = rows.iter().filter(|row| row.is_some()).count();
+        if !skipped.is_empty() && embedded == 0 {
+            let (status, _) = first_error.expect("failed leaves have an HTTP status");
+            return Err(RemoteEmbeddingError::HttpStatus {
+                status,
+                message: format!("all {} inputs failed individually", skipped.len()),
+            });
+        }
+        if !skipped.is_empty() {
+            tracing::warn!(skipped_indices = ?skipped, "Skipping remote embedding inputs rejected individually");
+        }
+        Ok(rows)
     }
 
     fn dimension(&self) -> usize {
@@ -599,10 +683,10 @@ impl CustomEmbeddingProvider {
                     "custom".to_string(),
                 ));
             }
-            return Err(RemoteEmbeddingError::ApiError(format!(
-                "API returned {}: {}",
-                status, response_text
-            )));
+            return Err(RemoteEmbeddingError::HttpStatus {
+                status: status.as_u16(),
+                message: response_text,
+            });
         }
 
         let parsed: CustomResponse = serde_json::from_str(&response_text)
@@ -748,6 +832,13 @@ impl RemoteEmbeddingProvider for GenericRemoteProvider {
 
     async fn embed_batch(&self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
         self.provider.embed_batch(texts).await
+    }
+
+    async fn embed_batch_optional(
+        &self,
+        texts: Vec<&str>,
+    ) -> Result<Vec<Option<Vec<f32>>>, RemoteEmbeddingError> {
+        self.provider.embed_batch_optional(texts).await
     }
 
     fn dimension(&self) -> usize {
