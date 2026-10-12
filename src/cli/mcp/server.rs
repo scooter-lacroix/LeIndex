@@ -1032,6 +1032,29 @@ async fn handle_tool_call_timed(
         ));
     };
 
+    // System-One gate (experimental; `system-one` feature + `[system_one]`
+    // config, default off): validate and repair the call before it runs.
+    // Transport-level only; every provider failure fails open (call untouched).
+    // Runs before the args clone so hydration and rendering see healed args.
+    #[cfg(feature = "system-one")]
+    let (tool_call, mut gate_notes) = {
+        let mut notes = crate::cli::mcp::system_one::Notes::default();
+        let mut params = tool_call;
+        if let Some(gate) = crate::cli::mcp::system_one::global() {
+            let schema = handler.argument_schema();
+            params.arguments = gate
+                .pre(
+                    registry,
+                    &canonical_name,
+                    &schema,
+                    params.arguments,
+                    &mut notes,
+                )
+                .await;
+        }
+        (params, notes)
+    };
+
     // Clone arguments before moving them into execute (we need them
     // for render_tool_output_plain which needs the original args).
     let call_args = tool_call.arguments.clone();
@@ -1081,6 +1104,22 @@ async fn handle_tool_call_timed(
                     &mut value,
                 );
             }
+            // System-One post-gate: judge search results before they reach the
+            // model; attach `_system_one` notes (survives trimming via
+            // `merge_meta`, zero tokens when the gate did nothing).
+            #[cfg(feature = "system-one")]
+            if let Some(gate) = crate::cli::mcp::system_one::global() {
+                gate.post(
+                    registry,
+                    &call_name,
+                    &call_args,
+                    &mut value,
+                    &mut gate_notes,
+                )
+                .await;
+            }
+            #[cfg(feature = "system-one")]
+            gate_notes.attach(&mut value);
             // The MCP transport is what the LLM actually sees. Run the
             // tool's raw value through the per-tool payload trimmer so we
             // hand the model only the fields it needs (no scoring

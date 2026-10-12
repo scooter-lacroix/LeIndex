@@ -37,6 +37,10 @@ pub struct LeIndexConfig {
     /// MCP server lifecycle configuration.
     #[serde(default)]
     pub mcp: McpConfig,
+
+    /// System-One gate configuration.
+    #[serde(default)]
+    pub system_one: SystemOneConfig,
 }
 
 /// Neural embeddings configuration (\[neural\] section).
@@ -187,6 +191,108 @@ pub struct McpConfig {
 }
 
 // ── Defaults ─────────────────────────────────────────────────────────────
+
+/// System-One gate configuration (\[system_one\] section).
+///
+/// Experimental: a typed-decision model (local Laya, TypeSafe Jev, OpenAI
+/// Decisions) validates tool calls before they run and classifies search
+/// results before they reach the calling model. Defaults are inert
+/// (`mode = "off"`); invariants are documented in
+/// `src/cli/mcp/system_one/mod.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SystemOneConfig {
+    /// `off` (default), `shadow` (decide and log only) or `enforce`.
+    #[serde(default)]
+    pub mode: String,
+
+    /// `laya` (local, default), `jev` or `openai`.
+    #[serde(default = "default_system_one_provider")]
+    pub provider: String,
+
+    /// Provider base URL; unset = the provider's documented default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+
+    /// Model name; unset = the provider's documented default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Name of the environment variable holding the API key (never the key
+    /// itself). Required for the remote providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+
+    /// Per-request timeout in milliseconds. Over budget = fail open.
+    #[serde(default = "default_system_one_timeout_ms")]
+    pub timeout_ms: u64,
+
+    /// Validate (and when enforcing, repair) tool calls before execution.
+    #[serde(default = "default_true")]
+    pub pre_gate: bool,
+
+    /// Classify (and when enforcing, filter and re-order) search results.
+    #[serde(default = "default_true")]
+    pub post_gate: bool,
+
+    /// Post-gate: drop a result when P(relevant) is below this.
+    #[serde(default = "default_system_one_relevant_min")]
+    pub relevant_min: f32,
+
+    /// Post-gate: drop a result when P(contains instructions) exceeds this.
+    #[serde(default = "default_system_one_instructions_max")]
+    pub instructions_max: f32,
+
+    /// Post-gate: judge at most this many results per call.
+    #[serde(default = "default_system_one_top_n")]
+    pub top_n: usize,
+
+    /// Pre-gate: auto-apply a model-chosen repair at or above this confidence.
+    #[serde(default = "default_system_one_tau_apply")]
+    pub tau_apply: f32,
+}
+
+impl Default for SystemOneConfig {
+    fn default() -> Self {
+        Self {
+            mode: String::new(),
+            provider: default_system_one_provider(),
+            base_url: None,
+            model: None,
+            api_key_env: None,
+            timeout_ms: default_system_one_timeout_ms(),
+            pre_gate: true,
+            post_gate: true,
+            relevant_min: default_system_one_relevant_min(),
+            instructions_max: default_system_one_instructions_max(),
+            top_n: default_system_one_top_n(),
+            tau_apply: default_system_one_tau_apply(),
+        }
+    }
+}
+
+fn default_system_one_provider() -> String {
+    "laya".to_string()
+}
+
+fn default_system_one_timeout_ms() -> u64 {
+    150
+}
+
+fn default_system_one_relevant_min() -> f32 {
+    0.45
+}
+
+fn default_system_one_instructions_max() -> f32 {
+    0.70
+}
+
+fn default_system_one_top_n() -> usize {
+    10
+}
+
+fn default_system_one_tau_apply() -> f32 {
+    0.80
+}
 
 impl Default for NeuralConfig {
     fn default() -> Self {
@@ -652,6 +758,7 @@ mod tests {
                 engine_max_idle_secs: 1200,
                 prewarm: "graph".to_string(),
             },
+            system_one: SystemOneConfig::default(),
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: LeIndexConfig = toml::from_str(&toml_str).unwrap();

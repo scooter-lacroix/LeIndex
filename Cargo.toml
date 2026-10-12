@@ -91,6 +91,10 @@ minimal = ["parse", "search"]
 
 # Community detection over the PDG (Leiden)
 community = ["graph", "dep:leiden-rs"]
+# System-One typed-decision gate (experimental). Off by default; adds the
+# `reqwest` client for the Laya/Jev/OpenAI Decisions providers. The config
+# section is inert without this feature (mode = "off").
+system-one = ["mcp-server", "dep:reqwest"]
 # SCIP precision ingestion is optional at compile time; runtime discovery
 # silently falls back to the Tier-0 PDG when no language indexer is present.
 precision = ["graph", "storage", "dep:scip", "dep:protobuf", "dep:flate2"]

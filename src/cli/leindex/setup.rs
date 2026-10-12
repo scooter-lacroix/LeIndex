@@ -1029,13 +1029,14 @@ fn preserve_existing_sections(
     existing: &crate::config::LeIndexConfig,
 ) -> crate::config::LeIndexConfig {
     // Preserve every section setup does NOT own (it owns only `neural`):
-    // search (incl. fragment_* knobs), indexing, and mcp (memory-pressure
-    // remediation). Any new top-level section added to LeIndexConfig must be
-    // listed here, or `leindex setup` reruns silently clobber it — same class
-    // as the wave-1 fragment clobber (Codex P2).
+    // search (incl. fragment_* knobs), indexing, mcp (memory-pressure
+    // remediation) and system_one. Any new top-level section added to
+    // LeIndexConfig must be listed here, or `leindex setup` reruns silently
+    // clobber it — same class as the wave-1 fragment clobber (Codex P2).
     new_config.search = existing.search.clone();
     new_config.indexing = existing.indexing.clone();
     new_config.mcp = existing.mcp.clone();
+    new_config.system_one = existing.system_one.clone();
     new_config
 }
 
@@ -1114,6 +1115,7 @@ fn build_config(
         search: SearchConfig::default(),
         indexing: IndexingConfig::default(),
         mcp: crate::config::McpConfig::default(),
+        system_one: crate::config::SystemOneConfig::default(),
     }
 }
 
