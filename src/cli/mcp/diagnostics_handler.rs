@@ -252,6 +252,10 @@ struct DiagValues {
     pdg_edges: usize,
     /// Embedding model status.
     embedding_model: String,
+    /// Selected preset; unknown if live diagnostics are unavailable.
+    embedding_preset: String,
+    /// Runtime-observed remote dimension, never a configured guess.
+    measured_embedding_dimension: Option<usize>,
     /// Whether a PDG is resident.
     pdg_loaded: bool,
     /// Number of nodes in the search engine index.
@@ -292,6 +296,10 @@ fn diag_values(
         embedding_model: diagnostics
             .map(|d| d.embedding_model.clone())
             .unwrap_or_else(|| "unknown".to_string()),
+        embedding_preset: diagnostics
+            .map(|d| d.embedding_preset.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
+        measured_embedding_dimension: diagnostics.and_then(|d| d.measured_embedding_dimension),
         pdg_loaded: diagnostics.map(|d| d.pdg_loaded).unwrap_or(false),
         search_index_nodes: diagnostics.map(|d| d.search_index_nodes).unwrap_or(0),
         total_signatures: stats.map(|s| s.total_signatures).unwrap_or(0),
@@ -365,6 +373,14 @@ fn insert_system_health(
     values: &DiagValues,
     storage_path: &std::path::Path,
 ) {
+    map.insert(
+        "embedding_preset".to_string(),
+        serde_json::json!(values.embedding_preset),
+    );
+    map.insert(
+        "measured_embedding_dimension".to_string(),
+        serde_json::json!(values.measured_embedding_dimension),
+    );
     map.insert(
         "system_health".to_string(),
         serde_json::json!({
@@ -451,6 +467,30 @@ fn staleness_json(stale_bool: bool, changed: &[std::path::PathBuf], deleted: &[S
             "suggestion": "Call leindex_manage action=index with force_reindex=true to refresh",
         })
     }
+}
+
+#[cfg(test)]
+#[test]
+fn test_mcp_diagnostics_embedding_fields_survive_trim() {
+    let project = tempfile::tempdir().unwrap();
+    let mut map = serde_json::Map::new();
+    insert_system_health(&mut map, &diag_values(None, None), project.path());
+    assert_eq!(map["embedding_preset"], "unknown");
+    assert!(map["measured_embedding_dimension"].is_null());
+
+    let index = crate::cli::leindex::LeIndex::new(project.path()).unwrap();
+    let mut diagnostics = index.get_diagnostics().unwrap();
+    diagnostics.embedding_preset = "embeddinggemma-2".to_string();
+    diagnostics.measured_embedding_dimension = Some(768);
+    insert_system_health(
+        &mut map,
+        &diag_values(None, Some(&diagnostics)),
+        project.path(),
+    );
+    let trimmed =
+        crate::cli::mcp::output::trim::trim_llm_payload("leindex_diagnostics", &Value::Object(map));
+    assert_eq!(trimmed["embedding_preset"], "embeddinggemma-2");
+    assert_eq!(trimmed["measured_embedding_dimension"], 768);
 }
 
 /// On-disk size (bytes) of the project's `.leindex` store — the number a

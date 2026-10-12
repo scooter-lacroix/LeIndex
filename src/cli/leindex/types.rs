@@ -355,6 +355,12 @@ pub struct Diagnostics {
     /// Embedding model status: "tfidf_only", "onnx_hybrid", "remote_hybrid", or "unknown"
     #[serde(default)]
     pub embedding_model: String,
+    /// Selected remote preset, independent of runtime availability.
+    #[serde(default)]
+    pub embedding_preset: String,
+    /// Dimension observed in a successful remote response; unknown until then.
+    #[serde(default)]
+    pub measured_embedding_dimension: Option<usize>,
     /// Whether the SCIP precision feature is compiled and enabled at runtime.
     #[serde(default)]
     pub precision_enabled: bool,

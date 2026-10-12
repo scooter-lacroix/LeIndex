@@ -1,6 +1,6 @@
 {
   "name": "leindex-pi",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "LeIndex integration for pi coding agent",
   "type": "module",
   "pi": {

@@ -186,6 +186,8 @@ fn test_diagnostics_serialization() {
         pdg_nodes: 500,
         pdg_edges: 800,
         embedding_model: "tfidf_only".to_string(),
+        embedding_preset: "custom".to_string(),
+        measured_embedding_dimension: None,
         precision_enabled: false,
         precision_nodes: 0,
         precision_languages: Vec::new(),
@@ -201,6 +203,18 @@ fn test_diagnostics_serialization() {
     assert_eq!(deserialized.cache_entries, 5);
     assert_eq!(deserialized.cache_hits, 9);
     assert_eq!(deserialized.spilled_bytes, 30000);
+    assert_eq!(deserialized.embedding_preset, "custom");
+    assert_eq!(deserialized.measured_embedding_dimension, None);
+
+    let mut legacy = serde_json::to_value(&diagnostics).unwrap();
+    legacy.as_object_mut().unwrap().remove("embedding_preset");
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("measured_embedding_dimension");
+    let legacy: Diagnostics = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.embedding_preset, "");
+    assert_eq!(legacy.measured_embedding_dimension, None);
 }
 
 /// The flock behind [`ProjectWriteLock`] is per open-file description, NOT

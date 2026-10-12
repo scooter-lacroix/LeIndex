@@ -253,8 +253,11 @@ fn test_layer_hydration_matches_published_graph() {
 #[test]
 fn test_layer_search_hydration_matches_graph_rebuild() {
     let _guard = lock_flag_tests();
+    let _reset = crate::feature_flags::FlagOverrideReset;
     let dir = tempfile::tempdir().expect("tempdir");
     write_fixture_project(dir.path());
+    // Keep this equivalence fixture TF-IDF-only while fresh installs enable neural search.
+    set_flag_override_for_test(FeatureFlag::NeuralSearch, false);
     index_project_fixture(dir.path());
     let storage_root = dir.path().join(".leindex");
 
@@ -278,7 +281,6 @@ fn test_layer_search_hydration_matches_graph_rebuild() {
 
     publish_live_generation(&storage_root, 2);
     let mut from_rebuild = hydrate_generation_instance(dir.path());
-    clear_flag_overrides_for_test();
     assert!(
         !from_rebuild.search_engine().is_mmap_backed(),
         "a generation without the optional layers must take the rebuild route"

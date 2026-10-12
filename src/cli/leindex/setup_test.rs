@@ -1,6 +1,39 @@
 use super::*;
 
 #[test]
+fn test_setup_fresh_preset_and_existing_embedding_preservation() {
+    let choices = SetupChoices {
+        neural_enabled: true,
+        provider: Some(ExecutionProvider::Cpu),
+    };
+    let fresh = build_config(&choices, None, None);
+    assert!(fresh.neural.enabled);
+    let disabled = build_config(
+        &resolve_from_flags(false, true, false, None).unwrap(),
+        None,
+        None,
+    );
+    assert!(!disabled.neural.enabled);
+    let serialized = toml::to_string(&fresh).unwrap();
+    assert!(serialized.contains("[indexing.embeddings]"));
+    assert!(serialized.contains("enable_hybrid = true"));
+    assert!(serialized.contains("remote_provider = \"embeddinggemma-2\""));
+    let round_trip: crate::config::LeIndexConfig = toml::from_str(&serialized).unwrap();
+    assert_eq!(round_trip.indexing.embeddings, fresh.indexing.embeddings);
+
+    for existing_toml in [
+        "",
+        "[indexing]\nbatch_size = 100\n",
+        "[indexing.embeddings]\nremote_model = \"legacy-model\"\n",
+        "[indexing.embeddings]\nenable_hybrid = true\nremote_provider = \"custom\"\nremote_endpoint = \"http://127.0.0.1:8766/v1\"\n",
+    ] {
+        let existing: crate::config::LeIndexConfig = toml::from_str(existing_toml).unwrap();
+        let merged = preserve_existing_sections(fresh.clone(), &existing);
+        assert_eq!(merged.indexing, existing.indexing);
+    }
+}
+
+#[test]
 fn preserve_existing_sections_keeps_fragment_knobs_across_rerun() {
     // Codex P2 regression: rerunning `leindex setup` must not reset fragment_*
     // settings to defaults when search_mode stays at "hybrid" (the default).

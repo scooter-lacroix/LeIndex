@@ -1,5 +1,10 @@
 //! Hybrid embedding backend (unified TF-IDF + neural/remote).
 
+#[cfg(feature = "remote-embeddings")]
+use crate::search::onnx::remote::RemoteEmbeddingProvider;
+#[cfg(feature = "remote-embeddings")]
+use crate::search::onnx::{GenericRemoteProvider, RemoteEmbeddingConfig, RemoteEmbeddingError};
+
 use super::*;
 
 // ============================================================================
@@ -41,6 +46,241 @@ pub enum HybridEmbedder {
         /// Weight for remote embeddings in hybrid scoring (0.0-1.0)
         remote_weight: f32,
     },
+}
+
+/// Document-side provider selection for one neural generation. Query calls keep
+/// their existing behavior. A new instance retries remote on the next generation.
+pub(crate) struct GenerationNeuralEmbedder {
+    selected: std::cell::RefCell<HybridEmbedder>,
+    #[cfg(feature = "remote-embeddings")]
+    remote_rows_landed: std::cell::Cell<bool>,
+    #[cfg(feature = "remote-embeddings")]
+    stopped: std::cell::Cell<bool>,
+}
+
+impl GenerationNeuralEmbedder {
+    pub(crate) fn new(embedder: HybridEmbedder) -> Self {
+        Self {
+            selected: std::cell::RefCell::new(embedder),
+            #[cfg(feature = "remote-embeddings")]
+            remote_rows_landed: std::cell::Cell::new(false),
+            #[cfg(feature = "remote-embeddings")]
+            stopped: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Incremental layers may already contain reused rows: their selected
+    /// space is pinned before the first request, so local fallback is unsafe.
+    pub(crate) fn pinned(embedder: HybridEmbedder) -> Self {
+        let generation = Self::new(embedder);
+        #[cfg(feature = "remote-embeddings")]
+        generation.remote_rows_landed.set(true);
+        generation
+    }
+
+    pub(crate) fn has_neural(&self) -> bool {
+        self.selected.borrow().has_neural()
+    }
+
+    pub(crate) fn identity(&self) -> String {
+        match &*self.selected.borrow() {
+            #[cfg(feature = "remote-embeddings")]
+            HybridEmbedder::HybridRemote { remote, .. } => remote.identity(),
+            #[cfg(feature = "onnx")]
+            HybridEmbedder::HybridLocal { .. } => format!(
+                "local|{}|{}",
+                crate::config::LeIndexConfig::load_cached()
+                    .neural
+                    .model_name,
+                NEURAL_EMBEDDING_DIMENSION,
+            ),
+            HybridEmbedder::TfIdfOnly(_) => "unavailable".to_string(),
+        }
+    }
+
+    /// A custom endpoint without a pinned dimension only learns it from its
+    /// first response, so a fresh generation's pre-request identity carries
+    /// the bootstrap default while the checkpoint it saved carries the
+    /// measured one: they never match and every run re-embeds. Adopt the
+    /// checkpoint's dimension — only when every other identity component is
+    /// identical — so resume compares like with like.
+    pub(crate) fn adopt_checkpoint_dimension(&self, _checkpoint_model: &str) {
+        #[cfg(feature = "remote-embeddings")]
+        if let HybridEmbedder::HybridRemote { remote, .. } = &*self.selected.borrow() {
+            let Some(dimension) = _checkpoint_model
+                .rsplit('|')
+                .next()
+                .and_then(|suffix| suffix.parse::<usize>().ok())
+            else {
+                return;
+            };
+            if remote.measured_dimension().is_none()
+                && remote.identity_with_dimension(dimension) == _checkpoint_model
+            {
+                remote.seed_measured_dimension(dimension);
+            }
+        }
+    }
+
+    pub(crate) fn document_embedding_stopped(&self) -> bool {
+        #[cfg(feature = "remote-embeddings")]
+        {
+            self.stopped.get()
+        }
+        #[cfg(not(feature = "remote-embeddings"))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn into_embedder(self) -> HybridEmbedder {
+        self.selected.into_inner()
+    }
+
+    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+    pub(crate) fn embed_neural_batch_blocking<S: AsRef<str>>(
+        &self,
+        texts: &[S],
+    ) -> Vec<Option<Vec<f32>>> {
+        if texts.is_empty() {
+            return Vec::new();
+        }
+        #[cfg(feature = "remote-embeddings")]
+        if self.stopped.get() {
+            return vec![None; texts.len()];
+        }
+        #[cfg(feature = "remote-embeddings")]
+        if matches!(*self.selected.borrow(), HybridEmbedder::HybridRemote { .. }) {
+            let remote = match &*self.selected.borrow() {
+                HybridEmbedder::HybridRemote { remote, .. } => remote.clone(),
+                _ => unreachable!(),
+            };
+            let owned: Vec<String> = texts.iter().map(|text| text.as_ref().to_string()).collect();
+            match block_on_remote(async move {
+                remote
+                    .embed_batch_optional(owned.iter().map(String::as_str).collect())
+                    .await
+            }) {
+                Ok(rows) if rows.len() == texts.len() => {
+                    if rows.iter().flatten().any(|row| !row.is_empty()) {
+                        // Any successful remote row pins this generation's space.
+                        self.remote_rows_landed.set(true);
+                    }
+                    return rows;
+                }
+                Ok(rows) => tracing::warn!(
+                    expected = texts.len(),
+                    got = rows.len(),
+                    "Remote optional batch returned wrong row count"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "Remote batch failed; applying generation fallback policy"
+                ),
+            }
+            if self.remote_rows_landed.get() {
+                self.stopped.set(true);
+                tracing::warn!(
+                    "Remote failed after accepted rows; neural generation frozen to TF-IDF for remaining documents"
+                );
+                return vec![None; texts.len()];
+            }
+            self.select_local_fallback();
+            return self.selected.borrow().embed_neural_batch_blocking(texts);
+        }
+        self.selected.borrow().embed_neural_batch_blocking(texts)
+    }
+
+    #[cfg(feature = "remote-embeddings")]
+    fn select_local_fallback(&self) {
+        // No remote rows exist in this generation: a coherent all-Qwen
+        // generation is safe. Construction/worker failures retain TF-IDF.
+        let tfidf = self.selected.borrow().tfidf().clone();
+        #[cfg(feature = "onnx")]
+        let fallback = HybridEmbedder::hybrid_local(
+            tfidf.clone(),
+            Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
+        )
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "Local neural fallback unavailable");
+            HybridEmbedder::tfidf_only(tfidf)
+        });
+        #[cfg(not(feature = "onnx"))]
+        let fallback = HybridEmbedder::tfidf_only(tfidf);
+        tracing::warn!(
+            "Remote failed before any rows; selecting local/TF-IDF backend for the whole neural generation"
+        );
+        *self.selected.borrow_mut() = fallback;
+    }
+}
+
+#[cfg(all(test, feature = "remote-embeddings"))]
+mod generation_tests {
+    use super::*;
+
+    #[test]
+    fn test_generation_pinned_remote_failure_never_selects_local() {
+        let tfidf = TfIdfEmbedder::build(&[("a.rs".into(), "fn a() {}".into())]);
+        let generation = GenerationNeuralEmbedder::pinned(
+            HybridEmbedder::hybrid_remote(
+                tfidf,
+                RemoteEmbeddingConfig {
+                    provider: crate::search::onnx::RemoteProvider::Custom {
+                        endpoint: "http://127.0.0.1:1/v1".into(),
+                    },
+                    ..RemoteEmbeddingConfig::default()
+                },
+                None,
+            )
+            .expect("remote construction"),
+        );
+        assert!(
+            generation
+                .embed_neural_batch_blocking(&["document"])
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(generation.stopped.get());
+        assert!(matches!(
+            generation.into_embedder(),
+            HybridEmbedder::HybridRemote { .. }
+        ));
+    }
+
+    #[test]
+    fn test_generation_remote_pre_success_selects_local_without_remote_rows() {
+        let tfidf = TfIdfEmbedder::build(&[("a.rs".into(), "fn a() {}".into())]);
+        let generation = GenerationNeuralEmbedder::new(
+            HybridEmbedder::hybrid_remote(
+                tfidf,
+                RemoteEmbeddingConfig {
+                    provider: crate::search::onnx::RemoteProvider::Custom {
+                        endpoint: "http://127.0.0.1:1/v1".into(),
+                    },
+                    ..RemoteEmbeddingConfig::default()
+                },
+                None,
+            )
+            .expect("remote construction"),
+        );
+        let response = generation
+            .selected
+            .borrow()
+            .embed_neural_batch_blocking(&["document"]);
+        assert!(response.iter().all(Option::is_none));
+        assert!(!generation.remote_rows_landed.get());
+        // Check the real transition separately from worker IO: local readiness
+        // is a runtime gate, not simulated 1024-dimensional evidence.
+        generation.select_local_fallback();
+        let selected = generation.into_embedder();
+        #[cfg(feature = "onnx")]
+        {
+            assert!(matches!(selected, HybridEmbedder::HybridLocal { .. }));
+            assert_eq!(selected.neural_dimension(), Some(1024));
+        }
+        #[cfg(not(feature = "onnx"))]
+        assert!(matches!(selected, HybridEmbedder::TfIdfOnly(_)));
+    }
 }
 
 /// Scoring weights for hybrid embedding combination
@@ -162,6 +402,25 @@ impl HybridEmbedder {
         }
     }
 
+    /// Dimension observed from a successful remote response, if available.
+    pub fn observed_neural_dimension(&self) -> Option<usize> {
+        match self {
+            Self::TfIdfOnly(_) => None,
+            #[cfg(feature = "onnx")]
+            Self::HybridLocal { .. } => None,
+            #[cfg(feature = "remote-embeddings")]
+            Self::HybridRemote { remote, .. } => remote.observed_dimension(),
+        }
+    }
+
+    /// Seed an unmeasured remote provider with a dimension recovered from persisted rows.
+    #[cfg(feature = "remote-embeddings")]
+    pub(crate) fn seed_measured_dimension(&self, dimension: usize) {
+        if let Self::HybridRemote { remote, .. } = self {
+            remote.seed_measured_dimension(dimension);
+        }
+    }
+
     /// Check if neural/remote enhancement is available
     pub fn has_neural(&self) -> bool {
         match self {
@@ -225,7 +484,7 @@ impl HybridEmbedder {
             #[cfg(feature = "onnx")]
             Self::HybridLocal { neural, .. } => neural.engram_identity(NEURAL_EMBEDDING_DIMENSION),
             #[cfg(feature = "remote-embeddings")]
-            Self::HybridRemote { remote, .. } => Some(remote.identity().to_string()),
+            Self::HybridRemote { remote, .. } => Some(remote.identity()),
         }
     }
 
@@ -403,10 +662,20 @@ impl HybridEmbedder {
                 }
             }
             #[cfg(feature = "remote-embeddings")]
-            Self::HybridRemote { .. } => {
-                // Remote requires async runtime, this is a blocking wrapper
-                // In practice, the indexing pipeline should use the async version
-                Some(Err("Remote embeddings require async runtime".to_string()))
+            Self::HybridRemote { remote, .. } => {
+                // Remote requires an async runtime; the CLI query path is
+                // synchronous and never runs inside a tokio context, so a
+                // scratch single-thread reactor bridges the call. Owned text
+                // + owned provider move into the future (async-trait futures
+                // borrow their arguments, so the borrows must live inside).
+                // Provider errors surface to the caller (query falls back to
+                // TF-IDF); they never hard-fail the search.
+                let remote = remote.clone();
+                let owned_text = text.to_string();
+                match block_on_remote(async move { remote.embed(&owned_text).await }) {
+                    Ok(embedding) => Some(Ok(embedding)),
+                    Err(e) => Some(Err(e)),
+                }
             }
         }
     }
@@ -455,9 +724,40 @@ impl HybridEmbedder {
                 }
             }
             #[cfg(feature = "remote-embeddings")]
-            Self::HybridRemote { .. } => {
-                // Remote requires async runtime; not supported in blocking context
-                vec![None; texts.len()]
+            Self::HybridRemote { remote, .. } => {
+                if texts.is_empty() {
+                    return Vec::new();
+                }
+                // Same scratch-runtime bridge as embed_neural_blocking; batch
+                // API failures degrade to None per text (TF-IDF fallback) so a
+                // flapping endpoint never poisons the index (VAL-CPHASE-018).
+                let remote = remote.clone();
+                let owned: Vec<String> = texts.iter().map(|t| t.as_ref().to_string()).collect();
+                match block_on_remote(async move {
+                    remote
+                        .embed_batch(owned.iter().map(|s| s.as_str()).collect())
+                        .await
+                }) {
+                    Ok(embeddings) if embeddings.len() == texts.len() => {
+                        embeddings.into_iter().map(Some).collect()
+                    }
+                    Ok(embeddings) => {
+                        tracing::warn!(
+                            expected = texts.len(),
+                            got = embeddings.len(),
+                            "Remote batch returned wrong vector count, falling back to None for all"
+                        );
+                        vec![None; texts.len()]
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Remote batch embedding degraded to TF-IDF for {} texts",
+                            texts.len()
+                        );
+                        vec![None; texts.len()]
+                    }
+                }
             }
         }
     }
@@ -510,4 +810,34 @@ impl Default for HybridEmbedder {
     fn default() -> Self {
         Self::TfIdfOnly(TfIdfEmbedder::build_from_tokens(&[]))
     }
+}
+
+/// Bridge a remote-embeddings future onto the synchronous pipeline.
+///
+/// The CLI indexing/query paths never run inside a tokio runtime, so a
+/// scratch single-thread reactor is safe here (`block_on` panics only when
+/// called from within an async context, which cannot happen on these paths).
+/// One runtime per call keeps no global state and no background threads.
+/// The future must be `'static` + `Send` (ours hold only the `Arc`-based
+/// `GenericRemoteProvider`) and resolve to a `Result` whose error is
+/// `Display`; every failure mode collapses to `String`.
+#[cfg(feature = "remote-embeddings")]
+fn block_on_remote<T: Send + 'static, E>(
+    fut: impl std::future::Future<Output = Result<T, E>> + Send + 'static,
+) -> Result<T, String>
+where
+    E: std::fmt::Display,
+{
+    std::thread::Builder::new()
+        .name("remote-embed-bridge".to_string())
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|rt| rt.block_on(fut).map_err(|e| e.to_string()))
+        })
+        .map_err(|e| format!("failed to spawn remote-embed bridge thread: {e}"))?
+        .join()
+        .map_err(|_| "remote-embed bridge thread panicked".to_string())?
 }

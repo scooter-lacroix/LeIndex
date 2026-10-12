@@ -750,13 +750,16 @@ impl WorkerRuntime {
         let (session, tokenizer, model_load_time, provider_runtime_status) =
             Self::init_onnx(&config);
 
+        let cache = open_cache_if_enabled();
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
+
         Self {
             config,
-            last_activity: Arc::new(Mutex::new(Instant::now())),
+            last_activity,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             started_unix_ms: unix_now_ms(),
             active_embed_cancels: Arc::new(Mutex::new(HashMap::new())),
-            cache: open_cache_if_enabled(),
+            cache,
             #[cfg(feature = "onnx")]
             input_names: Arc::new(OnceLock::new()),
             #[cfg(feature = "onnx")]

@@ -169,8 +169,11 @@ impl LeIndex {
             index_builder::TfIdfEmbedder::load_from_artifact_path(artifact_path)
                 .ok()
                 .flatten();
-        let restored =
-            Self::restore_engine_from_snapshot(artifact_path, persisted_embedder.as_ref());
+        let restored = Self::restore_engine_from_snapshot(
+            artifact_path,
+            persisted_embedder.as_ref(),
+            crate::config::LeIndexConfig::load_cached(),
+        );
         PreparedEngine {
             persisted_embedder,
             restored,
@@ -180,6 +183,7 @@ impl LeIndex {
     fn restore_engine_from_snapshot(
         artifact_path: &std::path::Path,
         persisted_embedder: Option<&index_builder::TfIdfEmbedder>,
+        _config: &crate::config::LeIndexConfig,
     ) -> Option<RestoredEngine> {
         let snapshot = index_builder::try_load_search_snapshot_from_storage(artifact_path)?;
         let tfidf_mmap = index_builder::try_load_mmap_embeddings_from_storage(artifact_path)?;
@@ -206,12 +210,31 @@ impl LeIndex {
             snapshot.pdg_fingerprint.clone(),
         );
         let mut engine = Self::configured_search_engine();
+        // B1.6: node embeddings carry whatever dimension the generation that
+        // wrote them used (remote override/measured, or the local model's
+        // 1024 after a pre-success local fallback). Validate against the
+        // PERSISTED neural mmap header so a generation is never rejected for
+        // disagreeing with today's config; config only applies when nothing
+        // is persisted.
+        #[cfg(feature = "remote-embeddings")]
+        let configured_neural_dim = _config
+            .indexing
+            .embeddings
+            .resolved_remote()
+            .and_then(|remote| remote.remote_dimension);
+        #[cfg(not(feature = "remote-embeddings"))]
+        let configured_neural_dim = None;
+        let expected_neural_dim = neural_mmap
+            .as_ref()
+            .map(|mmap| mmap.dimension() as usize)
+            .or(configured_neural_dim);
         match engine.restore_from_search_snapshot(
             snapshot,
             std::sync::Arc::new(tfidf_mmap),
             neural_mmap,
             fragment_mmap,
             fragment_ids.as_deref(),
+            expected_neural_dim,
         ) {
             Ok(indexed_count) => {
                 // Fragment owner mapping (Task 6, invariant 6): content hash →
@@ -263,19 +286,26 @@ impl LeIndex {
 
         #[cfg(feature = "onnx")]
         {
-            match index_builder::HybridEmbedder::hybrid_local(
-                tfidf_embedder.clone(),
-                Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
-            ) {
-                Ok(hybrid) => self.embedder = Some(hybrid),
-                Err(e) => {
-                    warn!(
-                        "Failed to create hybrid_local embedder for query embedding: {}",
-                        e
-                    );
-                    self.embedder = Some(index_builder::HybridEmbedder::tfidf_only(tfidf_embedder));
-                }
-            }
+            // B1: the query-time embedder follows the same ladder as index
+            // construction and enrichment — remote endpoint first (helper
+            // logs its own degradation), then local ONNX, never hard-failing.
+            #[cfg(feature = "remote-embeddings")]
+            let decision = query_remote_embedder(
+                &tfidf_embedder,
+                artifact_path,
+                &crate::config::LeIndexConfig::load_cached()
+                    .indexing
+                    .embeddings,
+            );
+            #[cfg(not(feature = "remote-embeddings"))]
+            let decision = QueryNeuralDecision::FollowLocal;
+
+            let fallback = index_builder::HybridEmbedder::tfidf_only(tfidf_embedder.clone());
+            self.embedder = Some(resolve_query_embedder_from_decision(
+                decision,
+                tfidf_embedder,
+                fallback,
+            ));
         }
         #[cfg(not(feature = "onnx"))]
         {
@@ -358,27 +388,7 @@ impl LeIndex {
     ) -> Result<()> {
         // Restore neural embeddings from the persisted neural mmap file (if any).
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-        {
-            if let Some(neural_mmap) =
-                index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path)
-            {
-                let restored = self.search_engine.restore_neural_embeddings(&neural_mmap);
-                if restored > 0 {
-                    info!(
-                        "Restored {} neural embeddings from persisted neural mmap file",
-                        restored
-                    );
-                } else {
-                    info!(
-                        "Neural mmap file loaded but no matching node IDs found; neural scores will be 0"
-                    );
-                }
-            } else {
-                info!(
-                    "No persisted neural embeddings found; run 'leindex index --force' with onnx feature to generate them"
-                );
-            }
-        }
+        self.restore_persisted_neural_embeddings(artifact_path);
 
         // Fragment layer (Codex wave-6 item 1): the slow TF-IDF-fallback
         // rebuild path must restore + validate the persisted fragment layer
@@ -386,7 +396,9 @@ impl LeIndex {
         // to keep this function under the CCN-15 gate.
         self.restore_fragment_layer_from_snapshot(artifact_path);
 
-        // VAL-ONNX-001: upgrade to hybrid_local for query-time neural embedding.
+        // VAL-ONNX-001: upgrade to a neural-capable embedder for query time.
+        // B1: ladder mirrors construction/enrichment — remote endpoint first,
+        // then local ONNX, never hard-failing.
         #[cfg(feature = "onnx")]
         {
             if let Some(tfidf) =
@@ -394,19 +406,20 @@ impl LeIndex {
                     .ok()
                     .flatten()
             {
-                match index_builder::HybridEmbedder::hybrid_local(
-                    tfidf,
-                    Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
-                ) {
-                    Ok(hybrid) => self.embedder = Some(hybrid),
-                    Err(e) => {
-                        warn!(
-                            "Failed to create hybrid_local embedder for query embedding: {}",
-                            e
-                        );
-                        self.embedder = Some(embedder);
-                    }
-                }
+                #[cfg(feature = "remote-embeddings")]
+                let decision = query_remote_embedder(
+                    &tfidf,
+                    artifact_path,
+                    &crate::config::LeIndexConfig::load_cached()
+                        .indexing
+                        .embeddings,
+                );
+                #[cfg(not(feature = "remote-embeddings"))]
+                let decision = QueryNeuralDecision::FollowLocal;
+
+                self.embedder = Some(resolve_query_embedder_from_decision(
+                    decision, tfidf, embedder,
+                ));
             } else {
                 self.embedder = Some(embedder);
             }
@@ -468,17 +481,59 @@ impl LeIndex {
         }
 
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-        {
-            if !persist_artifacts {
-                return Ok(());
-            }
-            index_builder::persist_neural_embeddings_to_mmap(
-                &self.search_engine,
-                &self.project_path,
-            )
-            .context("Failed to persist neural mmap embeddings during hydration")?;
-        }
+        self.persist_neural_mmap_preserving_identity(artifact_path, persist_artifacts)?;
 
+        Ok(())
+    }
+
+    /// Restore neural embeddings from the persisted neural mmap file (if any),
+    /// logging the outcome either way. Extracted from finalize_hydration to
+    /// keep its branch count under the CCN-15 gate.
+    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+    fn restore_persisted_neural_embeddings(&mut self, artifact_path: &std::path::Path) {
+        let Some(neural_mmap) =
+            index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path)
+        else {
+            info!(
+                "No persisted neural embeddings found; run 'leindex index --force' with onnx feature to generate them"
+            );
+            return;
+        };
+        let restored = self.search_engine.restore_neural_embeddings(&neural_mmap);
+        if restored > 0 {
+            info!(
+                "Restored {} neural embeddings from persisted neural mmap file",
+                restored
+            );
+        } else {
+            info!(
+                "Neural mmap file loaded but no matching node IDs found; neural scores will be 0"
+            );
+        }
+    }
+
+    /// Re-persist the resident engine's neural rows under the identity of the
+    /// generation they were restored from, skipped when this hydration must
+    /// not write artifacts. Extracted from finalize_hydration to keep its
+    /// branch count under the CCN-15 gate.
+    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+    fn persist_neural_mmap_preserving_identity(
+        &self,
+        artifact_path: &std::path::Path,
+        persist_artifacts: bool,
+    ) -> Result<()> {
+        if !persist_artifacts {
+            return Ok(());
+        }
+        let neural_identity =
+            index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path)
+                .and_then(|mmap| mmap.identity().map(str::to_owned));
+        index_builder::persist_neural_embeddings_to_mmap(
+            &self.search_engine,
+            &self.project_path,
+            neural_identity.as_deref(),
+        )
+        .context("Failed to persist neural mmap embeddings during hydration")?;
         Ok(())
     }
 }
@@ -571,6 +626,434 @@ impl LeIndex {
             rows = ids.len(),
             "Restored fragment layer after TF-IDF-fallback rebuild"
         );
+    }
+}
+
+/// Query-time neural embedder decision for a hydrated generation (Codex review round-3 P1).
+#[cfg(feature = "onnx")]
+#[derive(Debug)]
+pub(crate) enum QueryNeuralDecision {
+    #[cfg(feature = "remote-embeddings")]
+    Remote(Box<index_builder::HybridEmbedder>),
+    FollowLocal,
+    DisableNeural,
+}
+
+#[cfg(feature = "onnx")]
+fn resolve_query_embedder_from_decision(
+    decision: QueryNeuralDecision,
+    tfidf: index_builder::TfIdfEmbedder,
+    fallback: index_builder::HybridEmbedder,
+) -> index_builder::HybridEmbedder {
+    match decision {
+        #[cfg(feature = "remote-embeddings")]
+        QueryNeuralDecision::Remote(hybrid) => *hybrid,
+        QueryNeuralDecision::FollowLocal => {
+            let neural_weight = crate::config::LeIndexConfig::load_cached().neural_weight_f32();
+            index_builder::HybridEmbedder::hybrid_local(tfidf, Some(neural_weight)).unwrap_or_else(
+                |_| {
+                    warn!(
+                        "Failed to create query-time neural embedder; falling back to tfidf_only"
+                    );
+                    fallback
+                },
+            )
+        }
+        QueryNeuralDecision::DisableNeural => {
+            warn!("Failed to create query-time neural embedder; falling back to tfidf_only");
+            fallback
+        }
+    }
+}
+
+#[cfg(all(feature = "onnx", feature = "remote-embeddings"))]
+fn build_remote_decision(
+    tfidf: &index_builder::TfIdfEmbedder,
+    embeddings_cfg: &crate::config::EmbeddingConfig,
+    persisted_dim: Option<usize>,
+) -> QueryNeuralDecision {
+    let Some(embedder) = index_builder::try_remote_neural_embedder(tfidf.clone(), embeddings_cfg)
+    else {
+        return if persisted_dim.is_some() {
+            QueryNeuralDecision::DisableNeural
+        } else {
+            QueryNeuralDecision::FollowLocal
+        };
+    };
+    let is_unpinned = embeddings_cfg
+        .resolved_remote()
+        .and_then(|r| r.remote_dimension)
+        .is_none();
+    if is_unpinned {
+        if let Some(dim) = persisted_dim {
+            embedder.seed_measured_dimension(dim);
+        }
+    }
+    QueryNeuralDecision::Remote(Box::new(embedder))
+}
+
+/// Query-time remote embedder for a hydrated generation. The generation's
+/// persisted neural rows are authoritative: when their dimension disagrees
+/// with the dimension config pins for the remote endpoint, the rows came from
+/// another provider (e.g. a pre-success local fallback), so remote must not
+/// embed queries against them and neural search is disabled. With no
+/// pinned dimension (custom endpoint, measured at first embed) the persisted
+/// rows cannot be cross-checked here and remote is kept, seeded with the
+/// persisted dimension (Codex review round-3 P1 + P2).
+#[cfg(all(feature = "onnx", feature = "remote-embeddings"))]
+pub(crate) fn query_remote_embedder(
+    tfidf: &index_builder::TfIdfEmbedder,
+    artifact_path: &std::path::Path,
+    embeddings_cfg: &crate::config::EmbeddingConfig,
+) -> QueryNeuralDecision {
+    let Some(mmap) = index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path)
+    else {
+        return build_remote_decision(tfidf, embeddings_cfg, None);
+    };
+
+    let persisted_identity = mmap.identity();
+    let persisted_dim = mmap.dimension() as usize;
+
+    if let Some(identity) = persisted_identity {
+        if identity.starts_with("local|") {
+            info!(
+                identity = ?identity,
+                "Persisted neural rows were produced locally; query embedder follows the recorded generation"
+            );
+            return QueryNeuralDecision::FollowLocal;
+        }
+        if identity.starts_with("remote|") {
+            let configured_identity = configured_remote_identity(embeddings_cfg, persisted_dim);
+            if configured_identity.as_deref() == Some(identity) {
+                return build_remote_decision(tfidf, embeddings_cfg, Some(persisted_dim));
+            }
+            info!(
+                configured = ?configured_identity,
+                persisted = %identity,
+                "Persisted neural rows were produced by a different remote model or remote is unconfigured; \
+                 disabling neural search"
+            );
+            return QueryNeuralDecision::DisableNeural;
+        }
+    }
+
+    let configured_pinned_dim = embeddings_cfg
+        .resolved_remote()
+        .and_then(|r| r.remote_dimension);
+    if let Some(configured_dim) = configured_pinned_dim {
+        if configured_dim != persisted_dim {
+            info!(
+                configured_dim,
+                persisted_dim,
+                "Persisted neural rows were not produced by the configured remote; \
+                 disabling neural search"
+            );
+            return QueryNeuralDecision::DisableNeural;
+        }
+    }
+
+    build_remote_decision(tfidf, embeddings_cfg, Some(persisted_dim))
+}
+
+/// Identity the configured remote would stamp on its rows, built without
+/// network: the provider is constructed from config (no request is made) and
+/// its identity is read from the struct. `api_key` is not part of identity.
+#[cfg(all(feature = "onnx", feature = "remote-embeddings"))]
+fn configured_remote_identity(
+    embeddings_cfg: &crate::config::EmbeddingConfig,
+    dimension: usize,
+) -> Option<String> {
+    let resolved = embeddings_cfg.resolved_remote()?;
+    let remote_cfg = crate::search::onnx::RemoteEmbeddingConfig {
+        provider: crate::search::onnx::RemoteProvider::Custom {
+            endpoint: resolved.endpoint,
+        },
+        model: resolved.model,
+        remote_dimension: resolved.remote_dimension,
+        doc_template: resolved.doc_template,
+        query_template: resolved.query_template,
+        base_url: None,
+        ..crate::search::onnx::RemoteEmbeddingConfig::default()
+    };
+    crate::search::onnx::GenericRemoteProvider::from_config(remote_cfg)
+        .ok()
+        .map(|provider| provider.identity_with_dimension(dimension))
+}
+
+#[cfg(all(test, feature = "remote-embeddings"))]
+mod tests {
+    use super::*;
+
+    /// Persist a generation whose neural rows are `neural_dim`-wide.
+    fn persist_fixture(project: &std::path::Path, neural_dim: usize) {
+        persist_fixture_with_identity(project, neural_dim, None);
+    }
+
+    fn persist_fixture_with_identity(
+        project: &std::path::Path,
+        neural_dim: usize,
+        identity: Option<&str>,
+    ) {
+        let mut engine = crate::search::search::SearchEngine::new();
+        engine.index_nodes(vec![crate::search::search::NodeInfo {
+            node_id: "sample".into(),
+            file_path: "sample.rs".into(),
+            symbol_name: "sample".into(),
+            language: "rust".into(),
+            content: "fn sample() {}".into(),
+            byte_range: (0, 14),
+            tfidf_embedding: vec![0.5; 768],
+            neural_embedding: Some(vec![0.25; neural_dim]),
+            complexity: 1,
+            signature: None,
+            pre_tokenized: None,
+        }]);
+        index_builder::persist_embeddings_to_mmap(&engine, project).expect("lexical mmap");
+        index_builder::persist_neural_embeddings_to_mmap(&engine, project, identity)
+            .expect("neural mmap");
+        index_builder::persist_search_snapshot(&engine, project, 1, 0, "fixture".into())
+            .expect("snapshot");
+    }
+
+    #[test]
+    fn test_persisted_local_1024_generation_hydrates_under_preset_768_config() {
+        let project = tempfile::tempdir().expect("snapshot fixture");
+        persist_fixture(project.path(), 1024);
+        // Default config = embeddinggemma-2 preset pinned at 768.
+        let config = crate::config::LeIndexConfig::default();
+        assert_eq!(
+            config
+                .indexing
+                .embeddings
+                .resolved_remote()
+                .and_then(|r| r.remote_dimension),
+            Some(768)
+        );
+        let tfidf =
+            index_builder::TfIdfEmbedder::build(&[("sample.rs".into(), "fn sample() {}".into())]);
+        let restored = LeIndex::restore_engine_from_snapshot(
+            &project.path().join(".leindex"),
+            Some(&tfidf),
+            &config,
+        )
+        .expect("persisted 1024-dim generation must hydrate, not loop on a TF-IDF rebuild");
+        let neural = restored.engine.collect_neural_embeddings();
+        assert_eq!(neural.len(), 1);
+        assert_eq!(neural[0].1.len(), 1024);
+    }
+
+    #[test]
+    #[cfg(feature = "onnx")]
+    fn test_query_embedder_follows_recorded_generation_space() {
+        let tfidf =
+            index_builder::TfIdfEmbedder::build(&[("sample.rs".into(), "fn sample() {}".into())]);
+        let cfg = crate::config::EmbeddingConfig::default(); // preset, 768
+        let _guard = crate::feature_flags::lock_flag_tests();
+        let _reset = crate::feature_flags::FlagOverrideReset;
+
+        let local = tempfile::tempdir().expect("local generation");
+        persist_fixture_with_identity(local.path(), 768, Some("local|onnx/model|768"));
+        assert!(
+            matches!(
+                query_remote_embedder(&tfidf, &local.path().join(".leindex"), &cfg),
+                QueryNeuralDecision::FollowLocal
+            ),
+            "local identity must follow local pipeline"
+        );
+
+        let remote = tempfile::tempdir().expect("remote generation");
+        persist_fixture_with_identity(
+            remote.path(),
+            768,
+            Some(&configured_remote_identity(&cfg, 768).expect("configured identity")),
+        );
+        assert!(
+            matches!(
+                query_remote_embedder(&tfidf, &remote.path().join(".leindex"), &cfg),
+                QueryNeuralDecision::Remote(_)
+            ),
+            "a matching remote generation keeps the remote query embedder"
+        );
+
+        let legacy = tempfile::tempdir().expect("legacy generation without identity");
+        persist_fixture(legacy.path(), 768);
+        assert!(
+            matches!(
+                query_remote_embedder(&tfidf, &legacy.path().join(".leindex"), &cfg),
+                QueryNeuralDecision::Remote(_)
+            ),
+            "absent identity keeps the dimension-only legacy behavior"
+        );
+
+        let empty = tempfile::tempdir().expect("no persisted neural rows");
+        assert!(
+            matches!(
+                query_remote_embedder(&tfidf, empty.path(), &cfg),
+                QueryNeuralDecision::Remote(_)
+            ),
+            "nothing persisted: config decides"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "onnx")]
+    fn test_query_embedder_rejects_same_dimension_remote_model_swap() {
+        let tfidf =
+            index_builder::TfIdfEmbedder::build(&[("sample.rs".into(), "fn sample() {}".into())]);
+        let cfg = crate::config::EmbeddingConfig::default(); // preset, 768
+        let _guard = crate::feature_flags::lock_flag_tests();
+        let _reset = crate::feature_flags::FlagOverrideReset;
+
+        let swapped = tempfile::tempdir().expect("generation written by another model");
+        let mut other_model = cfg.clone();
+        other_model.remote_model = Some("other-model-768".to_string());
+        let other_identity = configured_remote_identity(&other_model, 768).expect("other identity");
+        persist_fixture_with_identity(swapped.path(), 768, Some(&other_identity));
+        assert!(
+            matches!(
+                query_remote_embedder(&tfidf, &swapped.path().join(".leindex"), &cfg),
+                QueryNeuralDecision::DisableNeural
+            ),
+            "same-dimension remote generation from another model must disable neural"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "onnx")]
+    fn test_query_embedder_keeps_unpinned_custom_endpoint_at_persisted_dimension() {
+        let tfidf =
+            index_builder::TfIdfEmbedder::build(&[("sample.rs".into(), "fn sample() {}".into())]);
+        let cfg = crate::config::EmbeddingConfig {
+            enable_hybrid: true,
+            remote_provider: "custom".to_string(),
+            remote_endpoint: Some("http://127.0.0.1:1/v1".to_string()),
+            remote_model: Some("measured-model".to_string()),
+            remote_dimension: None,
+            remote_doc_template: None,
+            remote_query_template: None,
+            ..Default::default()
+        };
+        let _guard = crate::feature_flags::lock_flag_tests();
+        let _reset = crate::feature_flags::FlagOverrideReset;
+
+        let project = tempfile::tempdir().expect("unpinned custom generation");
+        let persisted_dimension = 1024;
+        let persisted_identity =
+            configured_remote_identity(&cfg, persisted_dimension).expect("configured identity");
+        persist_fixture_with_identity(
+            project.path(),
+            persisted_dimension,
+            Some(&persisted_identity),
+        );
+
+        assert!(
+            matches!(
+                query_remote_embedder(&tfidf, &project.path().join(".leindex"), &cfg),
+                QueryNeuralDecision::Remote(_)
+            ),
+            "unpinned custom endpoint must compare identity using the persisted dimension"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "onnx")]
+    fn test_query_embedder_remote_identity_with_remote_config_removed_disables_neural() {
+        let tfidf =
+            index_builder::TfIdfEmbedder::build(&[("sample.rs".into(), "fn sample() {}".into())]);
+        let cfg = crate::config::EmbeddingConfig::default(); // preset, 768
+        let _guard = crate::feature_flags::lock_flag_tests();
+        let _reset = crate::feature_flags::FlagOverrideReset;
+
+        let remote = tempfile::tempdir().expect("remote generation");
+        let remote_identity = configured_remote_identity(&cfg, 768).expect("configured identity");
+        persist_fixture_with_identity(remote.path(), 768, Some(&remote_identity));
+
+        let mut unconfigured = cfg.clone();
+        unconfigured.enable_hybrid = false;
+        assert!(
+            matches!(
+                query_remote_embedder(&tfidf, &remote.path().join(".leindex"), &unconfigured),
+                QueryNeuralDecision::DisableNeural
+            ),
+            "remote generation when remote config is removed must disable neural"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "onnx")]
+    fn test_query_embedder_seeds_unpinned_provider_with_persisted_dimension() {
+        let tfidf =
+            index_builder::TfIdfEmbedder::build(&[("sample.rs".into(), "fn sample() {}".into())]);
+        let cfg = crate::config::EmbeddingConfig {
+            enable_hybrid: true,
+            remote_provider: "custom".to_string(),
+            remote_endpoint: Some("http://127.0.0.1:1/v1".to_string()),
+            remote_model: Some("seeded-model".to_string()),
+            remote_dimension: None,
+            remote_doc_template: None,
+            remote_query_template: None,
+            ..Default::default()
+        };
+        let _guard = crate::feature_flags::lock_flag_tests();
+        let _reset = crate::feature_flags::FlagOverrideReset;
+
+        let project = tempfile::tempdir().expect("unpinned custom generation 512");
+        let persisted_dimension = 512;
+        let persisted_identity =
+            configured_remote_identity(&cfg, persisted_dimension).expect("configured identity");
+        persist_fixture_with_identity(
+            project.path(),
+            persisted_dimension,
+            Some(&persisted_identity),
+        );
+
+        let decision = query_remote_embedder(&tfidf, &project.path().join(".leindex"), &cfg);
+        let QueryNeuralDecision::Remote(embedder) = decision else {
+            panic!("expected Remote decision, got {:?}", decision);
+        };
+        assert_eq!(
+            embedder.observed_neural_dimension(),
+            Some(512),
+            "unpinned provider must be seeded with persisted dimension 512"
+        );
+    }
+
+    #[test]
+    fn test_fresh_preset_restores_768_neural_snapshot_without_dimension_override() {
+        let project = tempfile::tempdir().expect("snapshot fixture");
+        let config = crate::config::LeIndexConfig::default();
+        assert_eq!(config.indexing.embeddings.remote_dimension, None);
+        let tfidf =
+            index_builder::TfIdfEmbedder::build(&[("sample.rs".into(), "fn sample() {}".into())]);
+        let mut engine = crate::search::search::SearchEngine::new();
+        engine.index_nodes(vec![crate::search::search::NodeInfo {
+            node_id: "sample".into(),
+            file_path: "sample.rs".into(),
+            symbol_name: "sample".into(),
+            language: "rust".into(),
+            content: "fn sample() {}".into(),
+            byte_range: (0, 14),
+            tfidf_embedding: vec![0.5; 768],
+            neural_embedding: Some(vec![0.25; 768]),
+            complexity: 1,
+            signature: None,
+            pre_tokenized: None,
+        }]);
+        index_builder::persist_embeddings_to_mmap(&engine, project.path()).expect("lexical mmap");
+        index_builder::persist_neural_embeddings_to_mmap(&engine, project.path(), None)
+            .expect("neural mmap");
+        index_builder::persist_search_snapshot(&engine, project.path(), 1, 0, "fixture".into())
+            .expect("snapshot");
+        let restored = LeIndex::restore_engine_from_snapshot(
+            &project.path().join(".leindex"),
+            Some(&tfidf),
+            &config,
+        )
+        .expect("preset dimension must hydrate without falling back to local 1024");
+        assert_eq!(restored.indexed_count, 1);
+        let neural = restored.engine.collect_neural_embeddings();
+        assert_eq!(neural.len(), 1);
+        assert_eq!(neural[0].1.len(), 768);
     }
 }
 
