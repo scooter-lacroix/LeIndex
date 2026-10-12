@@ -262,6 +262,9 @@ impl ExecutionProviderSelector {
     fn is_cuda_available() -> bool {
         #[cfg(feature = "onnx")]
         {
+            if crate::embed::ort_discovery::discover_path_only().is_none() {
+                return false;
+            }
             ort::ep::CUDA::default().is_available().unwrap_or(false)
         }
         #[cfg(not(feature = "onnx"))]
@@ -285,6 +288,9 @@ impl ExecutionProviderSelector {
     fn is_migraphx_available() -> bool {
         #[cfg(feature = "onnx")]
         {
+            if crate::embed::ort_discovery::discover_path_only().is_none() {
+                return false;
+            }
             // First, ask ORT if MIGraphX is available in the loaded binary
             if ort::ep::MIGraphX::default().is_available().unwrap_or(false) {
                 return true;
@@ -358,7 +364,14 @@ impl ExecutionProviderSelector {
 
     /// Check if CoreML is available (macOS only).
     fn is_coreml_available() -> bool {
-        cfg!(target_os = "macos")
+        #[cfg(feature = "onnx")]
+        {
+            crate::embed::ort_discovery::discover_path_only().is_some() && cfg!(target_os = "macos")
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            cfg!(target_os = "macos")
+        }
     }
 }
 
