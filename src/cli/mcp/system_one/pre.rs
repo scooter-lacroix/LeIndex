@@ -325,7 +325,11 @@ pub async fn heal(
         ..Healed::default()
     };
     let issues = validate(ctx.schema, &healed.args);
-    let (issues, code_changes) = repair_in_code(ctx.schema, &mut healed.args, issues);
+    let (issues, code_changes) = if ctx.read_only {
+        repair_in_code(ctx.schema, &mut healed.args, issues)
+    } else {
+        (issues, Vec::new())
+    };
     healed.changes.extend(code_changes);
 
     let project_in_schema = ctx
@@ -623,6 +627,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_only_call_applies_code_repairs_without_requests() {
+        let asker = FnAsker(|_: &Request| panic!("must not be called"));
+        let s = schema();
+        let healed = heal(
+            &asker,
+            &ctx(&s, true, &[]),
+            json!({"query": "q", "top_k": 500, "search_mode": "SEMANTIC", "allow_partial": "true"}),
+            None,
+            &HealParams::default(),
+        )
+        .await;
+        assert_eq!(
+            healed.args,
+            json!({"query": "q", "top_k": 100, "search_mode": "semantic", "allow_partial": true})
+        );
+        assert_eq!(healed.requests, 0);
+        assert_eq!(healed.changes.len(), 3);
+        assert!(healed.changes.iter().all(|change| change.by == "code"));
+    }
+
+    #[tokio::test]
     async fn model_picks_candidate_and_read_only_call_is_repaired() {
         let asker = FnAsker(|req: &Request| {
             let mut r = answers_of(&[("call_ok", 0.1), ("wrong:search_mode", 0.9)]);
@@ -654,8 +679,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutating_tool_gets_a_hint_never_a_rewrite() {
+    async fn test_mutating_tool_gets_hints_never_code_or_model_rewrites() {
+        let args =
+            json!({"query": "q", "top_k": 500, "search_mode": "SEMANTIC", "allow_partial": "true"});
         let asker = FnAsker(|req: &Request| {
+            assert_eq!(req.state["arguments"], args);
             let mut r = answers_of(&[("call_ok", 0.0), ("wrong:search_mode", 1.0)]);
             if req.questions.iter().any(|(n, _)| n == "fix:search_mode") {
                 r.answers.insert(
@@ -673,14 +701,22 @@ mod tests {
         let healed = heal(
             &asker,
             &ctx(&s, false, &[]),
-            json!({"query": "q", "search_mode": "fuzzy"}),
+            args.clone(),
             None,
             &HealParams::default(),
         )
         .await;
-        assert_eq!(healed.args["search_mode"], "fuzzy");
+        assert_eq!(healed.args, args);
         assert!(healed.changes.is_empty());
-        assert_eq!(healed.hints.len(), 1);
+        assert_eq!(healed.requests, 2);
+        assert_eq!(healed.hints.len(), 3);
+        assert!(healed.hints.iter().any(|hint| hint.contains("`top_k`")));
+        assert!(
+            healed
+                .hints
+                .iter()
+                .any(|hint| hint.contains("`allow_partial`"))
+        );
     }
 
     #[tokio::test]
