@@ -751,3 +751,35 @@ fn test_render_symbol_lookup_batch_empty() {
     );
     assert!(s.contains("(no results)"), "missing empty marker: {}", s);
 }
+
+#[test]
+fn test_render_search_surfaces_system_one_footer() {
+    // The gate attaches `_system_one` to the JSON payload; the L1 text
+    // surface must show it, or the model never learns its call was
+    // healed/filtered (the annotation would be JSON-only at L2).
+    let args = v(r#"{"query": "foo", "top_k": 500}"#);
+    let payload = v(r#"{
+        "count": 2,
+        "results": [
+            {"file_path": "/p.rs", "symbol_name": "f", "score": 0.5},
+            {"file_path": "/q.rs", "symbol_name": "g", "score": 0.4}
+        ],
+        "_system_one": {
+            "healed": [{"param": "top_k", "from": 500, "to": 100, "by": "code"}],
+            "filtered": {"count": 2, "reasons": ["irrelevant", "irrelevant"]}
+        }
+    }"#);
+    let s = render_tool_output("leindex.search", &payload, &args);
+    assert!(
+        s.contains("System-One: top_k 500 → 100 (code); filtered 2 results"),
+        "gate footer missing: {}",
+        s
+    );
+    // Zero tokens when the gate did nothing.
+    let clean_payload = v(r#"{
+        "count": 1,
+        "results": [{"file_path": "/p.rs", "symbol_name": "f", "score": 0.5}]
+    }"#);
+    let s2 = render_tool_output("leindex.search", &clean_payload, &args);
+    assert!(!s2.contains("System-One:"), "footer leaked: {}", s2);
+}

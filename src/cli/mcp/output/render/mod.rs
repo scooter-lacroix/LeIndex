@@ -1209,6 +1209,7 @@ fn render_tool_output_inner(
         "leindex_rename_symbol" | "rename_symbol" => render_rename_symbol(data, color),
         _ => render_default(data, color),
     };
+    let mut footer = String::new();
     if let Some(freshness) = data
         .get("_meta")
         .and_then(|meta| meta.get("freshness"))
@@ -1227,13 +1228,68 @@ fn render_tool_output_inner(
             .get("advisory")
             .and_then(Value::as_str)
             .or_else(|| freshness.get("warning").and_then(Value::as_str));
-        let mut footer = format!("\nFreshness: status={status}, generation={generation}\n");
+        footer.push_str(&format!(
+            "\nFreshness: status={status}, generation={generation}\n"
+        ));
         if let Some(advisory) = advisory {
             footer.push_str(&format!("Advisory: {advisory}\n"));
         }
-        return (rendered, Some(footer));
     }
-    (rendered, None)
+    if let Some(gate) = system_one_footer(data) {
+        footer.push_str(&gate);
+    }
+    if footer.is_empty() {
+        (rendered, None)
+    } else {
+        (rendered, Some(footer))
+    }
+}
+
+/// One footer line for the System-One gate annotation (`_system_one`), so the
+/// model sees healed arguments and filtered results on the text surface (L1
+/// tier) too, not only in raw JSON. `None` (zero tokens) when the gate did
+/// nothing — `Notes::attach` only emits the key when it has something to say.
+fn system_one_footer(data: &Value) -> Option<String> {
+    let note = data.get("_system_one")?;
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(healed) = note.get("healed").and_then(Value::as_array) {
+        for change in healed {
+            let param = change.get("param").and_then(Value::as_str).unwrap_or("?");
+            let by = change.get("by").and_then(Value::as_str).unwrap_or("code");
+            let show = |key: &str| {
+                change.get(key).map(|value| match value {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+            };
+            match (show("from"), show("to")) {
+                (Some(from), Some(to)) => parts.push(format!("{param} {from} → {to} ({by})")),
+                _ => parts.push(format!("{param} repaired ({by})")),
+            }
+        }
+    }
+    if let Some(hints) = note.get("hints").and_then(Value::as_array) {
+        parts.extend(
+            hints
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|hint| format!("hint: {hint}")),
+        );
+    }
+    if let Some(count) = note
+        .get("filtered")
+        .and_then(|filtered| filtered.get("count"))
+        .and_then(Value::as_u64)
+    {
+        parts.push(format!("filtered {count} results"));
+    }
+    if note.get("reordered").and_then(Value::as_bool) == Some(true) {
+        parts.push("reordered by relevance".to_string());
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("\nSystem-One: {}\n", parts.join("; ")))
 }
 
 // =============================================================================
