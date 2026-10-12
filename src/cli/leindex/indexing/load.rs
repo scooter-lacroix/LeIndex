@@ -694,11 +694,13 @@ fn query_remote_embedder(
             return None;
         }
     }
-    if let Some(persisted_identity) = persisted_identity
-        .as_deref()
-        .filter(|identity| identity.starts_with("remote|"))
-    {
-        let configured_identity = configured_remote_identity(embeddings_cfg)?;
+    if let (Some(persisted_identity), Some(persisted_dimension)) = (
+        persisted_identity
+            .as_deref()
+            .filter(|identity| identity.starts_with("remote|")),
+        persisted,
+    ) {
+        let configured_identity = configured_remote_identity(embeddings_cfg, persisted_dimension)?;
         if configured_identity != persisted_identity {
             info!(
                 configured = %configured_identity,
@@ -716,7 +718,10 @@ fn query_remote_embedder(
 /// network: the provider is constructed from config (no request is made) and
 /// its identity is read from the struct. `api_key` is not part of identity.
 #[cfg(all(feature = "onnx", feature = "remote-embeddings"))]
-fn configured_remote_identity(embeddings_cfg: &crate::config::EmbeddingConfig) -> Option<String> {
+fn configured_remote_identity(
+    embeddings_cfg: &crate::config::EmbeddingConfig,
+    dimension: usize,
+) -> Option<String> {
     let resolved = embeddings_cfg.resolved_remote()?;
     let remote_cfg = crate::search::onnx::RemoteEmbeddingConfig {
         provider: crate::search::onnx::RemoteProvider::Custom {
@@ -731,7 +736,7 @@ fn configured_remote_identity(embeddings_cfg: &crate::config::EmbeddingConfig) -
     };
     crate::search::onnx::GenericRemoteProvider::from_config(remote_cfg)
         .ok()
-        .map(|provider| provider.identity())
+        .map(|provider| provider.identity_with_dimension(dimension))
 }
 
 #[cfg(all(test, feature = "remote-embeddings"))]
@@ -816,7 +821,7 @@ mod tests {
         persist_fixture_with_identity(
             remote.path(),
             768,
-            Some(&configured_remote_identity(&cfg).expect("configured identity")),
+            Some(&configured_remote_identity(&cfg, 768).expect("configured identity")),
         );
         assert!(
             query_remote_embedder(&tfidf, &remote.path().join(".leindex"), &cfg).is_some(),
@@ -849,11 +854,43 @@ mod tests {
         let swapped = tempfile::tempdir().expect("generation written by another model");
         let mut other_model = cfg.clone();
         other_model.remote_model = Some("other-model-768".to_string());
-        let other_identity = configured_remote_identity(&other_model).expect("other identity");
+        let other_identity = configured_remote_identity(&other_model, 768).expect("other identity");
         persist_fixture_with_identity(swapped.path(), 768, Some(&other_identity));
         assert!(
             query_remote_embedder(&tfidf, &swapped.path().join(".leindex"), &cfg).is_none(),
             "same-dimension remote generation from another model must not serve queries"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "onnx")]
+    fn test_query_embedder_keeps_unpinned_custom_endpoint_at_persisted_dimension() {
+        let tfidf =
+            index_builder::TfIdfEmbedder::build(&[("sample.rs".into(), "fn sample() {}".into())]);
+        let mut cfg = crate::config::EmbeddingConfig::default();
+        cfg.enable_hybrid = true;
+        cfg.remote_provider = "custom".to_string();
+        cfg.remote_endpoint = Some("http://127.0.0.1:1/v1".to_string());
+        cfg.remote_model = Some("measured-model".to_string());
+        cfg.remote_dimension = None;
+        cfg.remote_doc_template = None;
+        cfg.remote_query_template = None;
+        let _guard = crate::feature_flags::lock_flag_tests();
+        let _reset = crate::feature_flags::FlagOverrideReset;
+
+        let project = tempfile::tempdir().expect("unpinned custom generation");
+        let persisted_dimension = 1024;
+        let persisted_identity =
+            configured_remote_identity(&cfg, persisted_dimension).expect("configured identity");
+        persist_fixture_with_identity(
+            project.path(),
+            persisted_dimension,
+            Some(&persisted_identity),
+        );
+
+        assert!(
+            query_remote_embedder(&tfidf, &project.path().join(".leindex"), &cfg).is_some(),
+            "unpinned custom endpoint must compare identity using the persisted dimension"
         );
     }
 
