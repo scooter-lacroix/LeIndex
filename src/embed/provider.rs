@@ -325,6 +325,10 @@ impl ExecutionProviderSelector {
     /// `GetAvailableProviders()` lists `MIGraphXExecutionProvider` in the
     /// *currently loaded* libonnxruntime.
     ///
+    /// Discovery-miss implies unloadable: when no libonnxruntime is discoverable
+    /// (CI runners, dev boxes without ORT) the probe returns `false` without
+    /// touching ort, because ort's dlopen/dlsym failure panics (VAL-CROSS-015).
+    ///
     /// Unlike [`is_migraphx_available`](Self::is_migraphx_available), this
     /// does NOT consult the filesystem heuristic and is therefore the right
     /// answer to "is MIGraphX truly compiled into the loaded ORT?". Use this
@@ -340,6 +344,9 @@ impl ExecutionProviderSelector {
     pub(crate) fn is_migraphx_compiled_in() -> bool {
         #[cfg(feature = "onnx")]
         {
+            if crate::embed::ort_discovery::discover_path_only().is_none() {
+                return false;
+            }
             ort::ep::MIGraphX::default().is_available().unwrap_or(false)
         }
         #[cfg(not(feature = "onnx"))]
@@ -354,6 +361,9 @@ impl ExecutionProviderSelector {
     pub(crate) fn is_cuda_compiled_in() -> bool {
         #[cfg(feature = "onnx")]
         {
+            if crate::embed::ort_discovery::discover_path_only().is_none() {
+                return false;
+            }
             ort::ep::CUDA::default().is_available().unwrap_or(false)
         }
         #[cfg(not(feature = "onnx"))]

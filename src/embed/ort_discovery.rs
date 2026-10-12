@@ -606,6 +606,15 @@ fn system_candidates() -> Vec<(DiscoverySource, PathBuf)> {
     out
 }
 
+#[cfg(any(feature = "onnx", test))]
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
 /// Discover and load the ORT dynamic library via `ort::init_from()`.
 ///
 /// MUST be called BEFORE any `Session::builder()` call so that the configured
@@ -634,7 +643,24 @@ pub fn discover_and_init() -> InitResult {
             searched.push((source, path.display().to_string()));
             return None;
         }
-        match ort::init_from(&path) {
+        // ort rc.13 `init_from` panics (rather than returning Err) when dlopen or
+        // dlsym fails on a bare-name candidate, so guard the call against unwinding.
+        let init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ort::init_from(&path)));
+        let result = match init {
+            Ok(result) => result,
+            Err(payload) => {
+                let msg = format!(
+                    "init_from({}) panicked: {}",
+                    path.display(),
+                    panic_message(payload.as_ref())
+                );
+                tracing::warn!("{}", msg);
+                last_error = Some(msg);
+                searched.push((source, path.display().to_string()));
+                return None;
+            }
+        };
+        match result {
             Ok(builder) => {
                 // commit() is required for the environment to take effect; it
                 // returns false if an environment was already committed, which
@@ -1089,6 +1115,17 @@ mod tests {
             after_bare_probe.contains("false"),
             "bare dynamic-loader fallback must call try_path with require_exists=false"
         );
+    }
+
+    #[test]
+    fn test_panic_message_extracts_str_and_string_payloads() {
+        let from_str = std::panic::catch_unwind(|| panic!("dlopen failed")).unwrap_err();
+        assert_eq!(panic_message(from_str.as_ref()), "dlopen failed");
+
+        let owned = String::from("dlsym failed");
+        let from_string =
+            std::panic::catch_unwind(move || std::panic::panic_any(owned)).unwrap_err();
+        assert_eq!(panic_message(from_string.as_ref()), "dlsym failed");
     }
 
     #[test]
