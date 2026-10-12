@@ -83,44 +83,42 @@ fn streaming_neural_inputs<'a>(
     let mut node_indices = pdg.node_indices();
     let mut file_cache = index_builder::FileReadCache::per_chunk_scratch();
 
-    std::iter::from_fn(move || {
-        loop {
-            let node_idx = node_indices.next()?;
-            let Some(node) = pdg.get_node(node_idx) else {
-                continue;
-            };
-            if node.node_type == crate::graph::pdg::NodeType::External
-                || !admitted_node_ids.contains(&node.id)
-            {
-                continue;
-            }
-            let input = {
-                let file_bytes = file_cache
-                    .get_or_read(Path::new(&*node.file_path))
-                    .unwrap_or_else(|error| {
-                        warn!(
-                            node_id = %node.id,
-                            path = %node.file_path,
-                            %error,
-                            "Failed to read source for streaming neural node; using empty bytes"
-                        );
-                        std::sync::Arc::new(Vec::new())
-                    });
-                let text = index_builder::enriched_node_content(
-                    pdg,
-                    node_idx,
-                    node,
-                    &file_bytes,
-                    &connectivity_config,
-                    &file_summary_ctx,
-                );
-                Ok(streaming::neural::NeuralInput {
-                    node_id: node.id.clone(),
-                    text: index_builder::cap_neural_text(&text).to_owned(),
-                })
-            };
-            return Some(input);
+    std::iter::from_fn(move || loop {
+        let node_idx = node_indices.next()?;
+        let Some(node) = pdg.get_node(node_idx) else {
+            continue;
+        };
+        if node.node_type == crate::graph::pdg::NodeType::External
+            || !admitted_node_ids.contains(&node.id)
+        {
+            continue;
         }
+        let input = {
+            let file_bytes = file_cache
+                .get_or_read(Path::new(&*node.file_path))
+                .unwrap_or_else(|error| {
+                    warn!(
+                        node_id = %node.id,
+                        path = %node.file_path,
+                        %error,
+                        "Failed to read source for streaming neural node; using empty bytes"
+                    );
+                    std::sync::Arc::new(Vec::new())
+                });
+            let text = index_builder::enriched_node_content(
+                pdg,
+                node_idx,
+                node,
+                &file_bytes,
+                &connectivity_config,
+                &file_summary_ctx,
+            );
+            Ok(streaming::neural::NeuralInput {
+                node_id: node.id.clone(),
+                text: index_builder::cap_neural_text(&text).to_owned(),
+            })
+        };
+        return Some(input);
     })
 }
 
@@ -353,7 +351,42 @@ impl LeIndex {
         Ok(())
     }
 
-    /// Incremental fragment sync (Task 7): diff the current source files
+    /// Finalize neural persistence and return the model/provider labels used by
+    /// the checkpoint. Extracted from run_neural to keep its branch count
+    /// under the CCN-15 gate.
+    fn persist_neural_outputs(
+        &mut self,
+        state: &IndexPipelineState,
+        neural_rows: usize,
+        neural_resume_loaded: bool,
+        neural_embedder: Option<index_builder::GenerationNeuralEmbedder>,
+    ) -> Result<(String, &'static str)> {
+        let selected_model = neural_embedder
+            .as_ref()
+            .map(index_builder::GenerationNeuralEmbedder::identity)
+            .unwrap_or_else(|| "unavailable".to_string());
+        let document_embedding_stopped = neural_embedder
+            .as_ref()
+            .is_some_and(index_builder::GenerationNeuralEmbedder::document_embedding_stopped);
+        let neural_embedder =
+            neural_embedder.map(index_builder::GenerationNeuralEmbedder::into_embedder);
+        let selected_provider = match neural_embedder.as_ref() {
+            #[cfg(feature = "remote-embeddings")]
+            Some(index_builder::HybridEmbedder::HybridRemote { .. }) => "remote",
+            #[cfg(feature = "onnx")]
+            Some(index_builder::HybridEmbedder::HybridLocal { .. }) => "onnx",
+            _ => "unavailable",
+        };
+        self.persist_neural_mmap(neural_resume_loaded, neural_rows, Some(&selected_model))?;
+        self.persist_neural_snapshot(
+            state,
+            neural_rows,
+            neural_embedder,
+            document_embedding_stopped,
+        )?;
+        Ok((selected_model, selected_provider))
+    }
+
     /// against the persisted manifest, re-chunk ONLY changed files via the
     /// PDG (Tier-2 sub-symbol + Tier-3 orphans), embed ONLY content hashes
     /// missing from the store (batch-256 IPC), then update the store + root
@@ -499,16 +532,22 @@ impl LeIndex {
             reused = summary.reused,
             generation = summary.generation,
             "Fragment incremental sync complete"
-        ); // Merge freshly embedded rows with reused rows, then populate the
-        // engine's fragment index so the snapshot persist twins write the
-        // complete matrix. EVERY content hash in the store needs an embedding:
-        // prefer this pass's fresh rows, fall back to the previous fragment
-        // mmap (reused hashes are not re-embedded). A hash with neither is
-        // skipped — mirroring the engine's skip-on-None discipline so store
-        // row-count ≡ engine row-count (invariant 8) is preserved.
+        );
         let fresh_rows: std::collections::HashMap<String, Vec<f32>> =
             new_embeddings.into_iter().collect();
+        self.populate_fragment_engine_from_sync(&store, fresh_rows, &old_rows);
+        Ok(())
+    }
 
+    /// Merge freshly embedded rows with reused rows and install them plus
+    /// owner refs on the search engine. Extracted from sync_fragment_layer
+    /// to keep its branch count under the CCN-15 gate.
+    fn populate_fragment_engine_from_sync(
+        &mut self,
+        store: &index_builder::fragment::FragmentStore,
+        fresh_rows: std::collections::HashMap<String, Vec<f32>>,
+        old_rows: &std::collections::HashMap<String, Vec<f32>>,
+    ) {
         let mut rows: Vec<(String, Vec<f32>)> = Vec::with_capacity(store.len());
         for hash in store.content_hashes() {
             if let Some(embedding) = fresh_rows.get(hash).or_else(|| old_rows.get(hash)) {
@@ -517,10 +556,6 @@ impl LeIndex {
         }
         self.search_engine.set_fragment_embeddings(rows);
 
-        // Owner refs (invariant 6): content hash → ALL (owner node id, byte
-        // range) refs. A Vec per hash because identical content can live under
-        // N owners — dedup must not collapse multi-owner fragments to the
-        // first (Codex wave-2 item 5).
         let refs: std::collections::HashMap<String, Vec<(String, (usize, usize))>> = store
             .content_hashes()
             .filter_map(|hash| {
@@ -538,7 +573,6 @@ impl LeIndex {
             })
             .collect();
         self.search_engine.set_fragment_refs(refs);
-        Ok(())
     }
 
     pub(crate) fn run_neural(
@@ -601,28 +635,11 @@ impl LeIndex {
                 neural_route,
             )?;
         }
-        let selected_model = neural_embedder
-            .as_ref()
-            .map(index_builder::GenerationNeuralEmbedder::identity)
-            .unwrap_or_else(|| "unavailable".to_string());
-        let document_embedding_stopped = neural_embedder
-            .as_ref()
-            .is_some_and(index_builder::GenerationNeuralEmbedder::document_embedding_stopped);
-        let neural_embedder =
-            neural_embedder.map(index_builder::GenerationNeuralEmbedder::into_embedder);
-        let selected_provider = match neural_embedder.as_ref() {
-            #[cfg(feature = "remote-embeddings")]
-            Some(index_builder::HybridEmbedder::HybridRemote { .. }) => "remote",
-            #[cfg(feature = "onnx")]
-            Some(index_builder::HybridEmbedder::HybridLocal { .. }) => "onnx",
-            _ => "unavailable",
-        };
-        self.persist_neural_mmap(neural_resume_loaded, neural_rows, Some(&selected_model))?;
-        self.persist_neural_snapshot(
+        let (selected_model, selected_provider) = self.persist_neural_outputs(
             &state,
             neural_rows,
+            neural_resume_loaded,
             neural_embedder,
-            document_embedding_stopped,
         )?;
         progress_stderr("Indexing: publishing enhanced generation...");
         let neural_checkpoint = NeuralCheckpoint {
@@ -779,10 +796,12 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
-            reusable_fragment_rows(old_rows.clone(), Some(&manifest), "remote|new-template|768")
-                .is_empty()
-        );
+        assert!(reusable_fragment_rows(
+            old_rows.clone(),
+            Some(&manifest),
+            "remote|new-template|768"
+        )
+        .is_empty());
         assert!(
             reusable_fragment_rows(old_rows.clone(), Some(&manifest), "local|qwen|1024").is_empty()
         );

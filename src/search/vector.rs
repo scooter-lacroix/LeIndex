@@ -936,13 +936,7 @@ pub fn write_mmap_embeddings_with_identity(
     embeddings: &[(String, Vec<f32>)],
     identity: Option<&str>,
 ) -> Result<(), MmapError> {
-    let identity_len = identity
-        .map(|value| {
-            u32::try_from(value.len()).map_err(|_| {
-                MmapError::Corrupt("generation identity byte length exceeds u32::MAX".into())
-            })
-        })
-        .transpose()?;
+    let identity_len = identity.map(identity_len_u32).transpose()?;
     let node_count = embeddings.len() as u32;
     let dimension = if embeddings.is_empty() {
         0u32
@@ -973,19 +967,17 @@ pub fn write_mmap_embeddings_with_identity(
     let file = std::fs::File::create(path)?;
     let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
 
-    // Header
-    let header = MmapHeader {
-        magic: MMAP_MAGIC,
-        version: MMAP_VERSION,
-        node_count,
-        dimension,
-    };
-    let mut header_buf = [0u8; MmapHeader::SIZE];
-    header.write_to(&mut header_buf);
-    writer.write_all(&header_buf)?;
-
-    // Offset and length tables
-    write_id_tables(&mut writer, &id_offsets, &id_lengths)?;
+    write_header_and_ids(
+        &mut writer,
+        MmapHeader {
+            magic: MMAP_MAGIC,
+            version: MMAP_VERSION,
+            node_count,
+            dimension,
+        },
+        &id_offsets,
+        &id_lengths,
+    )?;
 
     // ID strings + alignment padding
     writer.write_all(&id_bytes)?;
@@ -1003,6 +995,25 @@ pub fn write_mmap_embeddings_with_identity(
 
     writer.flush()?;
     Ok(())
+}
+
+/// Byte length of a generation identity as the on-disk `u32` trailer length.
+fn identity_len_u32(value: &str) -> Result<u32, MmapError> {
+    u32::try_from(value.len())
+        .map_err(|_| MmapError::Corrupt("generation identity byte length exceeds u32::MAX".into()))
+}
+
+/// Write the fixed header followed by the offset and length tables.
+fn write_header_and_ids(
+    writer: &mut impl std::io::Write,
+    header: MmapHeader,
+    id_offsets: &[u64],
+    id_lengths: &[u32],
+) -> std::io::Result<()> {
+    let mut header_buf = [0u8; MmapHeader::SIZE];
+    header.write_to(&mut header_buf);
+    writer.write_all(&header_buf)?;
+    write_id_tables(writer, id_offsets, id_lengths)
 }
 
 /// Return the path to the mmap embedding file for a given project.

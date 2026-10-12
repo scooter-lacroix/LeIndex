@@ -397,27 +397,7 @@ impl LeIndex {
     ) -> Result<()> {
         // Restore neural embeddings from the persisted neural mmap file (if any).
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-        {
-            if let Some(neural_mmap) =
-                index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path)
-            {
-                let restored = self.search_engine.restore_neural_embeddings(&neural_mmap);
-                if restored > 0 {
-                    info!(
-                        "Restored {} neural embeddings from persisted neural mmap file",
-                        restored
-                    );
-                } else {
-                    info!(
-                        "Neural mmap file loaded but no matching node IDs found; neural scores will be 0"
-                    );
-                }
-            } else {
-                info!(
-                    "No persisted neural embeddings found; run 'leindex index --force' with onnx feature to generate them"
-                );
-            }
-        }
+        self.restore_persisted_neural_embeddings(artifact_path);
 
         // Fragment layer (Codex wave-6 item 1): the slow TF-IDF-fallback
         // rebuild path must restore + validate the persisted fragment layer
@@ -522,21 +502,59 @@ impl LeIndex {
         }
 
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-        {
-            if !persist_artifacts {
-                return Ok(());
-            }
-            let neural_identity =
-                index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path)
-                    .and_then(|mmap| mmap.identity().map(str::to_owned));
-            index_builder::persist_neural_embeddings_to_mmap(
-                &self.search_engine,
-                &self.project_path,
-                neural_identity.as_deref(),
-            )
-            .context("Failed to persist neural mmap embeddings during hydration")?;
-        }
+        self.persist_neural_mmap_preserving_identity(artifact_path, persist_artifacts)?;
 
+        Ok(())
+    }
+
+    /// Restore neural embeddings from the persisted neural mmap file (if any),
+    /// logging the outcome either way. Extracted from finalize_hydration to
+    /// keep its branch count under the CCN-15 gate.
+    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+    fn restore_persisted_neural_embeddings(&mut self, artifact_path: &std::path::Path) {
+        let Some(neural_mmap) =
+            index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path)
+        else {
+            info!(
+                "No persisted neural embeddings found; run 'leindex index --force' with onnx feature to generate them"
+            );
+            return;
+        };
+        let restored = self.search_engine.restore_neural_embeddings(&neural_mmap);
+        if restored > 0 {
+            info!(
+                "Restored {} neural embeddings from persisted neural mmap file",
+                restored
+            );
+        } else {
+            info!(
+                "Neural mmap file loaded but no matching node IDs found; neural scores will be 0"
+            );
+        }
+    }
+
+    /// Re-persist the resident engine's neural rows under the identity of the
+    /// generation they were restored from, skipped when this hydration must
+    /// not write artifacts. Extracted from finalize_hydration to keep its
+    /// branch count under the CCN-15 gate.
+    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+    fn persist_neural_mmap_preserving_identity(
+        &self,
+        artifact_path: &std::path::Path,
+        persist_artifacts: bool,
+    ) -> Result<()> {
+        if !persist_artifacts {
+            return Ok(());
+        }
+        let neural_identity =
+            index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path)
+                .and_then(|mmap| mmap.identity().map(str::to_owned));
+        index_builder::persist_neural_embeddings_to_mmap(
+            &self.search_engine,
+            &self.project_path,
+            neural_identity.as_deref(),
+        )
+        .context("Failed to persist neural mmap embeddings during hydration")?;
         Ok(())
     }
 }
