@@ -215,30 +215,31 @@ pub fn judge(response: &Response, params: &PostParams) -> Option<Judgement> {
 // gate is a latency optimization, not a storage layer. Raw probabilities are
 // cached (pre-threshold) so `relevant_min` tuning applies to cached hits too.
 
-type VerdictKey = (String, String, String, String);
+type VerdictKey = (String, String, String, String, String, String);
 
 fn verdict_key(query: &str, candidate: &Value) -> VerdictKey {
+    let field = |name: &str| {
+        candidate
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
     (
         query.to_string(),
-        candidate
-            .get("file")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        candidate
-            .get("symbol")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        candidate
-            .get("code")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        field("file"),
+        field("symbol"),
+        field("kind"),
+        field("signature"),
+        field("code"),
     )
 }
 
 const VERDICT_CACHE_CAP: usize = 512;
+
+/// Chunk requests in flight at once. llama-server's default 4 slots make
+/// wider windows pure queue depth.
+const CHUNK_WAVE_WIDTH: usize = 4;
 
 fn verdict_cache() -> &'static Mutex<(HashMap<VerdictKey, RawVerdict>, VecDeque<VerdictKey>)> {
     static CACHE: OnceLock<Mutex<(HashMap<VerdictKey, RawVerdict>, VecDeque<VerdictKey>)>> =
@@ -270,7 +271,7 @@ fn cache_put(key: VerdictKey, verdict: RawVerdict) {
 
 /// Judge the first `top_n` results. Candidates not in the verdict cache are
 /// grouped into size-budgeted chunks (`chunk_chars` of serialized state) and
-/// all chunks are asked concurrently — llama-server fans a request's questions
+/// asked in bounded-width waves — llama-server fans a request's questions
 /// across its slots, so request count (not question count) is the cost.
 /// Returns verdicts (None = unanswered, i.e. fail open for that result) and
 /// total billed input tokens.
@@ -296,26 +297,31 @@ pub async fn judge_results(
         .collect();
     let mut tokens = 0u64;
     if !to_ask.is_empty() {
-        // First wave: all chunks concurrently. Retry wave: results whose chunk
-        // request failed outright (slot contention, dropped keep-alive) get one
-        // more chance once the wave has drained.
+        // Chunk requests run in bounded waves of CHUNK_WAVE_WIDTH: a wider
+        // fan-out only queues at the server and trips timeouts (the concurrent
+        // frame stampede measured 6 transport failures at ~28 in flight).
+        // Retry wave: candidates still unanswered after a wave (slot
+        // contention, dropped keep-alive, model omission) get one more chance.
         let mut wave: Vec<usize> = to_ask;
         for _ in 0..2 {
             if wave.is_empty() {
                 break;
             }
-            let chunks: Vec<Vec<usize>> = chunk_by_size(&candidates, &wave, params.chunk_chars);
-            let asks = chunks
-                .iter()
-                .map(|chunk| ask_chunk(asker, query, &candidates, chunk, timeout_ms));
-            for (chunk, response) in chunks.iter().zip(futures::future::join_all(asks).await) {
-                let Some(response) = response else { continue };
-                tokens += response.input_tokens.unwrap_or(0);
-                for (slot, &i) in chunk.iter().enumerate() {
-                    let verdict = RawVerdict::from_response(&response, slot);
-                    if verdict.relevant.is_some() {
-                        cache_put(keys[i].clone(), verdict);
-                        raw[i] = Some(verdict);
+            let chunks: Vec<Vec<usize>> =
+                chunk_by_size(&candidates, &wave, params.chunk_chars, query);
+            for window in chunks.chunks(CHUNK_WAVE_WIDTH) {
+                let asks = window
+                    .iter()
+                    .map(|chunk| ask_chunk(asker, query, &candidates, chunk, timeout_ms));
+                for (chunk, response) in window.iter().zip(futures::future::join_all(asks).await) {
+                    let Some(response) = response else { continue };
+                    tokens += response.input_tokens.unwrap_or(0);
+                    for (slot, &i) in chunk.iter().enumerate() {
+                        let verdict = RawVerdict::from_response(&response, slot);
+                        if verdict.relevant.is_some() {
+                            cache_put(keys[i].clone(), verdict);
+                            raw[i] = Some(verdict);
+                        }
                     }
                 }
             }
@@ -333,7 +339,16 @@ pub async fn judge_results(
 /// `budget` characters (the query and JSON overhead are charged to every
 /// chunk). A single oversized candidate still gets its own chunk: better one
 /// failing request than silently never judging it.
-fn chunk_by_size(candidates: &[Value], to_ask: &[usize], budget: usize) -> Vec<Vec<usize>> {
+fn chunk_by_size(
+    candidates: &[Value],
+    to_ask: &[usize],
+    budget: usize,
+    query: &str,
+) -> Vec<Vec<usize>> {
+    // Per-request overhead every chunk carries: the query string itself plus
+    // JSON keys/punctuation and the three questions' fixed instructions.
+    let overhead = query.chars().count() + 300;
+    let budget = budget.saturating_sub(overhead).max(1);
     let mut chunks: Vec<Vec<usize>> = Vec::new();
     let mut current: Vec<usize> = Vec::new();
     let mut used = 0usize;

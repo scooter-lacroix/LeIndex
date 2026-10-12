@@ -1267,7 +1267,6 @@ struct ReadyNode {
 /// Enriched content is recomputed per node (keyed by node index, never by
 /// node ID — duplicate IDs are supported and each duplicate must carry its
 /// own body), bounded by the caller's capacity-1 file scratch.
-#[allow(clippy::too_many_arguments)]
 fn prepare_indexed_node(
     pdg: &ProgramDependenceGraph,
     node_idx: petgraph::graph::NodeIndex,

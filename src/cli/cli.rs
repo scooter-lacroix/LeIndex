@@ -18,7 +18,7 @@ mod phase_commands;
 use anyhow::Context;
 use anyhow::Result as AnyhowResult;
 use clap::{Parser, Subcommand, error::ErrorKind};
-use phase_commands::cmd_phase_impl;
+use phase_commands::{PhaseCommandArgs, cmd_phase_impl};
 use serde_json::Value;
 use std::fs;
 use std::net::SocketAddr;
@@ -466,12 +466,12 @@ impl Cli {
                 docs_mode,
                 no_incremental_refresh,
             } => {
-                cmd_phase_impl(
+                cmd_phase_impl(PhaseCommandArgs {
                     phase,
                     all,
                     mode,
                     path,
-                    global_project,
+                    project: global_project,
                     max_files,
                     max_focus_files,
                     top_n,
@@ -479,7 +479,7 @@ impl Cli {
                     include_docs,
                     docs_mode,
                     no_incremental_refresh,
-                )
+                })
                 .await
             }
             Commands::Diagnostics => cmd_diagnostics_impl(global_project).await,

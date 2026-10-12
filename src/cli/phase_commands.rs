@@ -10,22 +10,38 @@ use anyhow::Context;
 use anyhow::Result as AnyhowResult;
 use std::path::PathBuf;
 
+/// Fields of the `phase` CLI command, passed as one value.
+pub(crate) struct PhaseCommandArgs {
+    pub(crate) phase: Option<u8>,
+    pub(crate) all: bool,
+    pub(crate) mode: String,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) project: Option<PathBuf>,
+    pub(crate) max_files: usize,
+    pub(crate) max_focus_files: usize,
+    pub(crate) top_n: usize,
+    pub(crate) max_output_chars: usize,
+    pub(crate) include_docs: bool,
+    pub(crate) docs_mode: String,
+    pub(crate) no_incremental_refresh: bool,
+}
+
 /// Phase command implementation
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn cmd_phase_impl(
-    phase: Option<u8>,
-    all: bool,
-    mode: String,
-    path: Option<PathBuf>,
-    project: Option<PathBuf>,
-    max_files: usize,
-    max_focus_files: usize,
-    top_n: usize,
-    max_output_chars: usize,
-    include_docs: bool,
-    docs_mode: String,
-    no_incremental_refresh: bool,
-) -> AnyhowResult<()> {
+pub(crate) async fn cmd_phase_impl(args: PhaseCommandArgs) -> AnyhowResult<()> {
+    let PhaseCommandArgs {
+        phase,
+        all,
+        mode,
+        path,
+        project,
+        max_files,
+        max_focus_files,
+        top_n,
+        max_output_chars,
+        include_docs,
+        docs_mode,
+        no_incremental_refresh,
+    } = args;
     resolve_phase_flags(all, phase)?;
 
     let target_path = resolve_phase_target(path, project)?;

@@ -13,6 +13,21 @@ use std::time::Instant;
 #[derive(Clone)]
 pub struct SymbolLookupHandler;
 
+/// Per-call lookup context shared by every symbol in one request.
+struct LookupEnv<'a> {
+    pdg: &'a crate::graph::pdg::ProgramDependenceGraph,
+    project_root: &'a std::path::Path,
+    include_source: bool,
+    include_callers: bool,
+    include_callees: bool,
+    depth: usize,
+    started: Instant,
+    budget: WorkBudget,
+    index_freshness: &'static str,
+    index_stale: bool,
+    graph_has_call_edges: bool,
+}
+
 #[allow(missing_docs)]
 impl SymbolLookupHandler {
     pub fn name(&self) -> &str {
@@ -161,6 +176,19 @@ For the exact source implementation use LeIndex [Read Symbol]."
             pdg.get_edge(edge)
                 .is_some_and(|e| e.edge_type == crate::graph::pdg::EdgeType::Call)
         });
+        let env = LookupEnv {
+            pdg,
+            project_root: &project_root,
+            include_source,
+            include_callers,
+            include_callees,
+            depth,
+            started,
+            budget,
+            index_freshness,
+            index_stale,
+            graph_has_call_edges,
+        };
 
         // For batch mode, collect results for each symbol
         if symbols.len() > 1 {
@@ -169,22 +197,7 @@ For the exact source implementation use LeIndex [Read Symbol]."
             let mut results: Vec<Value> = Vec::new();
 
             for symbol in &symbols {
-                match self.lookup_single_symbol(
-                    pdg,
-                    symbol,
-                    &scope,
-                    &project_root,
-                    include_source,
-                    include_callers,
-                    include_callees,
-                    depth,
-                    per_symbol_budget,
-                    started,
-                    budget,
-                    index_freshness,
-                    index_stale,
-                    graph_has_call_edges,
-                ) {
+                match self.lookup_single_symbol(&env, symbol, &scope, per_symbol_budget) {
                     Ok(mut val) => {
                         add_retrieval_meta(&mut val, budget, started);
                         results.push(val);
@@ -209,22 +222,7 @@ For the exact source implementation use LeIndex [Read Symbol]."
 
         // Single symbol mode
         let char_budget = token_budget * 4;
-        let single = self.lookup_single_symbol(
-            pdg,
-            &symbols[0],
-            &scope,
-            &project_root,
-            include_source,
-            include_callers,
-            include_callees,
-            depth,
-            char_budget,
-            started,
-            budget,
-            index_freshness,
-            index_stale,
-            graph_has_call_edges,
-        )?;
+        let single = self.lookup_single_symbol(&env, &symbols[0], &scope, char_budget)?;
 
         let mut single = single;
         add_retrieval_meta(&mut single, budget, started);
@@ -232,46 +230,35 @@ For the exact source implementation use LeIndex [Read Symbol]."
     }
 
     /// Resolve and return full structural context for a single symbol.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::fn_params_excessive_bools)]
     fn lookup_single_symbol(
         &self,
-        pdg: &crate::graph::pdg::ProgramDependenceGraph,
+        env: &LookupEnv<'_>,
         symbol: &str,
         scope: &Option<String>,
-        project_root: &std::path::Path,
-        include_source: bool,
-        include_callers: bool,
-        include_callees: bool,
-        depth: usize,
         char_budget: usize,
-        started: Instant,
-        budget: WorkBudget,
-        index_freshness: &'static str,
-        index_stale: bool,
-        graph_has_call_edges: bool,
     ) -> Result<Value, JsonRpcError> {
-        let node_id = resolve_symbol_node(pdg, symbol, scope)?;
+        let node_id = resolve_symbol_node(env.pdg, symbol, scope)?;
 
-        let node = pdg
+        let node = env
+            .pdg
             .get_node(node_id)
             .ok_or_else(|| JsonRpcError::internal_error("PDG node disappeared after lookup"))?;
 
         let relations = collect_relations(
-            pdg,
+            env.pdg,
             node_id,
-            depth,
-            include_callers,
-            include_callees,
-            started,
-            budget,
+            env.depth,
+            env.include_callers,
+            env.include_callees,
+            env.started,
+            env.budget,
         );
         let partial = relations.partial;
 
         let affected_files: std::collections::HashSet<&str> = relations
             .forward
             .iter()
-            .filter_map(|&nid| pdg.get_node(nid).map(|n| n.file_path.as_ref()))
+            .filter_map(|&nid| env.pdg.get_node(nid).map(|n| n.file_path.as_ref()))
             .collect();
         let impact_radius = serde_json::json!({
             // Direction label: the audit flagged 351-vs-9 confusion against
@@ -283,8 +270,8 @@ For the exact source implementation use LeIndex [Read Symbol]."
 
         let impact_note = impact_degradation_note(
             relations_are_empty(&relations),
-            index_stale,
-            graph_has_call_edges,
+            env.index_stale,
+            env.graph_has_call_edges,
             partial,
         );
         let mut result = serde_json::json!({
@@ -300,15 +287,15 @@ For the exact source implementation use LeIndex [Read Symbol]."
             "callees_truncated": relations.callees_truncated,
             "impact_radius": impact_radius,
             "pdg_status": if partial { "partial" } else { "fresh" },
-            "index_freshness": index_freshness,
-            "retrieval": retrieval_meta_with_partial(budget, partial)
+            "index_freshness": env.index_freshness,
+            "retrieval": retrieval_meta_with_partial(env.budget, partial)
         });
         if let Some(note) = impact_note {
             result["impact_note"] = Value::String(note.to_string());
         }
 
-        if include_source && !partial {
-            attach_source(&mut result, node, project_root, char_budget);
+        if env.include_source && !partial {
+            attach_source(&mut result, node, env.project_root, char_budget);
         }
 
         Ok(result)

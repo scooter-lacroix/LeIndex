@@ -440,11 +440,13 @@ fn apply_project_fill(
         healed,
         ctx,
         params,
-        "project_path",
-        Value::Null,
-        json!(choice),
-        confidence,
-        is_known,
+        Choice {
+            param: "project_path",
+            from: Value::Null,
+            to: json!(choice),
+            confidence,
+            offered: is_known,
+        },
     );
 }
 
@@ -528,27 +530,41 @@ async fn stage2(
             healed,
             ctx,
             params,
-            &issue.param,
-            from,
-            to,
-            confidence,
-            true,
+            Choice {
+                param: &issue.param,
+                from,
+                to,
+                confidence,
+                offered: true,
+            },
         );
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// One model-chosen repair to apply (or, for a mutating tool, hint at).
+struct Choice<'a> {
+    param: &'a str,
+    from: Value,
+    to: Value,
+    confidence: f32,
+    /// False when the model picked a value code never offered.
+    offered: bool,
+}
+
 fn apply_choice(
     healed: &mut Healed,
     ctx: &CallContext<'_>,
     params: &HealParams,
-    param: &str,
-    from: Value,
-    to: Value,
-    confidence: f32,
-    is_candidate: bool,
+    choice: Choice<'_>,
 ) {
-    if !is_candidate {
+    let Choice {
+        param,
+        from,
+        to,
+        confidence,
+        offered,
+    } = choice;
+    if !offered {
         return;
     }
     if ctx.read_only && confidence >= params.tau_apply {
