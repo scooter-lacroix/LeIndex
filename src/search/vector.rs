@@ -938,8 +938,9 @@ pub fn write_mmap_embeddings_with_identity(
 ) -> Result<(), MmapError> {
     let identity_len = identity
         .map(|value| {
-            u32::try_from(value.len())
-                .map_err(|_| MmapError::Corrupt("generation identity exceeds u32 length".into()))
+            u32::try_from(value.len()).map_err(|_| {
+                MmapError::Corrupt("generation identity byte length exceeds u32::MAX".into())
+            })
         })
         .transpose()?;
     let node_count = embeddings.len() as u32;
@@ -1164,11 +1165,14 @@ mod tests {
         write_mmap_embeddings_with_identity(
             &path,
             &embeddings,
-            Some("remote|provider/model|dim=2"),
+            Some("remote|custom|http://127.0.0.1:8080/v1||mtest-model|2"),
         )
         .unwrap();
         let index = MmapEmbeddingIndex::open(&path).unwrap();
-        assert_eq!(index.identity(), Some("remote|provider/model|dim=2"));
+        assert_eq!(
+            index.identity(),
+            Some("remote|custom|http://127.0.0.1:8080/v1||mtest-model|2")
+        );
     }
 
     #[test]

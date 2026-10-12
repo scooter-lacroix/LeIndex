@@ -676,7 +676,44 @@ fn query_remote_embedder(
             return None;
         }
     }
+    if let Some(persisted_identity) = persisted_identity
+        .as_deref()
+        .filter(|identity| identity.starts_with("remote|"))
+    {
+        let configured_identity = configured_remote_identity(embeddings_cfg)?;
+        if configured_identity != persisted_identity {
+            info!(
+                configured = %configured_identity,
+                persisted = %persisted_identity,
+                "Persisted neural rows were produced by a different remote model; \
+                 query embedder follows the recorded generation"
+            );
+            return None;
+        }
+    }
     index_builder::try_remote_neural_embedder(tfidf.clone(), embeddings_cfg)
+}
+
+/// Identity the configured remote would stamp on its rows, built without
+/// network: the provider is constructed from config (no request is made) and
+/// its identity is read from the struct. `api_key` is not part of identity.
+#[cfg(all(feature = "onnx", feature = "remote-embeddings"))]
+fn configured_remote_identity(embeddings_cfg: &crate::config::EmbeddingConfig) -> Option<String> {
+    let resolved = embeddings_cfg.resolved_remote()?;
+    let remote_cfg = crate::search::onnx::RemoteEmbeddingConfig {
+        provider: crate::search::onnx::RemoteProvider::Custom {
+            endpoint: resolved.endpoint,
+        },
+        model: resolved.model,
+        remote_dimension: resolved.remote_dimension,
+        doc_template: resolved.doc_template,
+        query_template: resolved.query_template,
+        base_url: None,
+        ..crate::search::onnx::RemoteEmbeddingConfig::default()
+    };
+    crate::search::onnx::GenericRemoteProvider::from_config(remote_cfg)
+        .ok()
+        .map(|provider| provider.identity())
 }
 
 #[cfg(all(test, feature = "remote-embeddings"))]
@@ -751,14 +788,18 @@ mod tests {
         let _reset = crate::feature_flags::FlagOverrideReset;
 
         let local = tempfile::tempdir().expect("local generation");
-        persist_fixture_with_identity(local.path(), 768, Some("local|onnx/model|dim=768"));
+        persist_fixture_with_identity(local.path(), 768, Some("local|onnx/model|768"));
         assert!(
             query_remote_embedder(&tfidf, &local.path().join(".leindex"), &cfg).is_none(),
             "local identity must reject remote even when dimensions match"
         );
 
         let remote = tempfile::tempdir().expect("remote generation");
-        persist_fixture_with_identity(remote.path(), 768, Some("remote|provider/model|dim=768"));
+        persist_fixture_with_identity(
+            remote.path(),
+            768,
+            Some(&configured_remote_identity(&cfg).expect("configured identity")),
+        );
         assert!(
             query_remote_embedder(&tfidf, &remote.path().join(".leindex"), &cfg).is_some(),
             "a matching remote generation keeps the remote query embedder"
@@ -775,6 +816,26 @@ mod tests {
         assert!(
             query_remote_embedder(&tfidf, empty.path(), &cfg).is_some(),
             "nothing persisted: config decides"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "onnx")]
+    fn test_query_embedder_rejects_same_dimension_remote_model_swap() {
+        let tfidf =
+            index_builder::TfIdfEmbedder::build(&[("sample.rs".into(), "fn sample() {}".into())]);
+        let cfg = crate::config::EmbeddingConfig::default(); // preset, 768
+        let _guard = crate::feature_flags::lock_flag_tests();
+        let _reset = crate::feature_flags::FlagOverrideReset;
+
+        let swapped = tempfile::tempdir().expect("generation written by another model");
+        let mut other_model = cfg.clone();
+        other_model.remote_model = Some("other-model-768".to_string());
+        let other_identity = configured_remote_identity(&other_model).expect("other identity");
+        persist_fixture_with_identity(swapped.path(), 768, Some(&other_identity));
+        assert!(
+            query_remote_embedder(&tfidf, &swapped.path().join(".leindex"), &cfg).is_none(),
+            "same-dimension remote generation from another model must not serve queries"
         );
     }
 
