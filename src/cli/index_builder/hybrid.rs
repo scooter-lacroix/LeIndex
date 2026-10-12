@@ -413,6 +413,14 @@ impl HybridEmbedder {
         }
     }
 
+    /// Seed an unmeasured remote provider with a dimension recovered from persisted rows.
+    #[cfg(feature = "remote-embeddings")]
+    pub(crate) fn seed_measured_dimension(&self, dimension: usize) {
+        if let Self::HybridRemote { remote, .. } = self {
+            remote.seed_measured_dimension(dimension);
+        }
+    }
+
     /// Check if neural/remote enhancement is available
     pub fn has_neural(&self) -> bool {
         match self {

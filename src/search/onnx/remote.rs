@@ -227,6 +227,48 @@ pub trait RemoteEmbeddingProvider: Send + Sync {
     fn seed_measured_dimension(&self, _dimension: usize) {}
 }
 
+/// Reorder embedding vectors by their response index, verifying that the
+/// responses form an exact permutation of `0..expected`.
+///
+/// OpenAI-compatible endpoints do not guarantee that `data` elements are
+/// returned in input order. A missing index, duplicate index, out-of-range
+/// index, or length mismatch violates the contract and is rejected as
+/// `RemoteEmbeddingError::InvalidResponse` (Codex review round-3 P1).
+pub(crate) fn reorder_embeddings_by_index(
+    entries: Vec<(usize, Vec<f32>)>,
+    expected: usize,
+) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
+    if entries.len() != expected {
+        return Err(RemoteEmbeddingError::InvalidResponse(format!(
+            "expected {expected} embeddings in response, got {}",
+            entries.len()
+        )));
+    }
+    let mut ordered: Vec<Option<Vec<f32>>> = (0..expected).map(|_| None).collect();
+    for (idx, vec) in entries {
+        if idx >= expected {
+            return Err(RemoteEmbeddingError::InvalidResponse(format!(
+                "embedding index {idx} out of range 0..{expected}"
+            )));
+        }
+        if ordered[idx].is_some() {
+            return Err(RemoteEmbeddingError::InvalidResponse(format!(
+                "duplicate embedding index {idx}"
+            )));
+        }
+        ordered[idx] = Some(vec);
+    }
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(idx, opt)| {
+            opt.ok_or_else(|| {
+                RemoteEmbeddingError::InvalidResponse(format!("missing embedding for index {idx}"))
+            })
+        })
+        .collect()
+}
+
 /// OpenAI embedding provider implementation
 pub struct OpenAIEmbeddingProvider {
     client: Client,
@@ -280,11 +322,15 @@ impl RemoteEmbeddingProvider for OpenAIEmbeddingProvider {
             data: Vec<OpenAIEmbedding>,
         }
 
+        // `index` is required: OpenAI-compatible endpoints may return `data`
+        // out of request order, and a missing index is a contract violation.
         #[derive(Deserialize)]
         struct OpenAIEmbedding {
+            index: usize,
             embedding: Vec<f32>,
         }
 
+        let texts_len = texts.len();
         let request = OpenAIRequest {
             model: model_name,
             input: texts,
@@ -324,11 +370,14 @@ impl RemoteEmbeddingProvider for OpenAIEmbeddingProvider {
         let openai_response: OpenAIResponse = serde_json::from_str(&response_text)
             .map_err(|e| RemoteEmbeddingError::InvalidResponse(e.to_string()))?;
 
-        Ok(openai_response
-            .data
-            .into_iter()
-            .map(|e| e.embedding)
-            .collect())
+        reorder_embeddings_by_index(
+            openai_response
+                .data
+                .into_iter()
+                .map(|e| (e.index, e.embedding))
+                .collect(),
+            texts_len,
+        )
     }
 
     fn dimension(&self) -> usize {
@@ -670,8 +719,12 @@ impl CustomEmbeddingProvider {
             data: Vec<CustomEmbedding>,
         }
 
+        // `index` is required (no serde default): a missing index on an
+        // OpenAI-compatible endpoint is a contract violation and hard-fails
+        // rather than guessing array order (Codex review round-3 P1).
         #[derive(Deserialize)]
         struct CustomEmbedding {
+            index: usize,
             embedding: Vec<f32>,
         }
 
@@ -679,6 +732,7 @@ impl CustomEmbeddingProvider {
             model: self.model.clone().unwrap_or_default(),
             input: inputs.iter().map(|i| i.as_ref()).collect(),
         };
+        let expected = inputs.len();
 
         let url = format!("{}/embeddings", self.endpoint.trim_end_matches('/'));
         let mut request_builder = self
@@ -716,7 +770,14 @@ impl CustomEmbeddingProvider {
         let parsed: CustomResponse = serde_json::from_str(&response_text)
             .map_err(|e| RemoteEmbeddingError::InvalidResponse(e.to_string()))?;
 
-        let embeddings: Vec<Vec<f32>> = parsed.data.into_iter().map(|e| e.embedding).collect();
+        let embeddings = reorder_embeddings_by_index(
+            parsed
+                .data
+                .into_iter()
+                .map(|e| (e.index, e.embedding))
+                .collect(),
+            expected,
+        )?;
 
         // Dimension truth: with a measurement or override already known every
         // vector must match it; otherwise the first successful length becomes
@@ -870,6 +931,11 @@ impl GenericRemoteProvider {
     pub fn observed_dimension(&self) -> Option<usize> {
         self.provider.observed_dimension()
     }
+
+    /// Adopt a dimension recovered from persisted rows while still unmeasured.
+    pub fn seed_measured_dimension(&self, dimension: usize) {
+        self.provider.seed_measured_dimension(dimension);
+    }
 }
 
 #[async_trait]
@@ -972,5 +1038,51 @@ mod tests {
     fn test_remote_config_openai() {
         let config = RemoteEmbeddingConfig::openai("test-key".to_string(), None);
         assert!(config.api_key.is_some());
+    }
+
+    #[test]
+    fn test_reorder_embeddings_identity() {
+        let entries = vec![(0, vec![1.0]), (1, vec![2.0]), (2, vec![3.0])];
+        let result = reorder_embeddings_by_index(entries, 3).unwrap();
+        assert_eq!(result, vec![vec![1.0], vec![2.0], vec![3.0]]);
+    }
+
+    #[test]
+    fn test_reorder_embeddings_shuffled() {
+        let entries = vec![(2, vec![3.0]), (0, vec![1.0]), (1, vec![2.0])];
+        let result = reorder_embeddings_by_index(entries, 3).unwrap();
+        assert_eq!(result, vec![vec![1.0], vec![2.0], vec![3.0]]);
+    }
+
+    #[test]
+    fn test_reorder_embeddings_duplicate_index() {
+        let entries = vec![(0, vec![1.0]), (0, vec![2.0])];
+        let err = reorder_embeddings_by_index(entries, 2).unwrap_err();
+        assert!(matches!(err, RemoteEmbeddingError::InvalidResponse(_)));
+        assert!(err.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn test_reorder_embeddings_gap_missing_index() {
+        // Length 2, but indices are 0 and 2 (missing 1)
+        let entries = vec![(0, vec![1.0]), (2, vec![3.0])];
+        let err = reorder_embeddings_by_index(entries, 2).unwrap_err();
+        assert!(matches!(err, RemoteEmbeddingError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn test_reorder_embeddings_out_of_range_extra() {
+        let entries = vec![(0, vec![1.0]), (3, vec![4.0])];
+        let err = reorder_embeddings_by_index(entries, 2).unwrap_err();
+        assert!(matches!(err, RemoteEmbeddingError::InvalidResponse(_)));
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn test_reorder_embeddings_length_mismatch() {
+        let entries = vec![(0, vec![1.0])];
+        let err = reorder_embeddings_by_index(entries, 2).unwrap_err();
+        assert!(matches!(err, RemoteEmbeddingError::InvalidResponse(_)));
+        assert!(err.to_string().contains("expected 2"));
     }
 }

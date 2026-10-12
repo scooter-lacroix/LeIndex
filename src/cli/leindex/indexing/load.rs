@@ -290,7 +290,7 @@ impl LeIndex {
             // construction and enrichment — remote endpoint first (helper
             // logs its own degradation), then local ONNX, never hard-failing.
             #[cfg(feature = "remote-embeddings")]
-            let hybrid = query_remote_embedder(
+            let decision = query_remote_embedder(
                 &tfidf_embedder,
                 artifact_path,
                 &crate::config::LeIndexConfig::load_cached()
@@ -298,23 +298,14 @@ impl LeIndex {
                     .embeddings,
             );
             #[cfg(not(feature = "remote-embeddings"))]
-            let hybrid = None;
-            let hybrid = hybrid.or_else(|| {
-                index_builder::HybridEmbedder::hybrid_local(
-                    tfidf_embedder.clone(),
-                    Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
-                )
-                .ok()
-            });
-            match hybrid {
-                Some(hybrid) => self.embedder = Some(hybrid),
-                None => {
-                    warn!(
-                        "Failed to create query-time neural embedder; falling back to tfidf_only"
-                    );
-                    self.embedder = Some(index_builder::HybridEmbedder::tfidf_only(tfidf_embedder));
-                }
-            }
+            let decision = QueryNeuralDecision::FollowLocal;
+
+            let fallback = index_builder::HybridEmbedder::tfidf_only(tfidf_embedder.clone());
+            self.embedder = Some(resolve_query_embedder_from_decision(
+                decision,
+                tfidf_embedder,
+                fallback,
+            ));
         }
         #[cfg(not(feature = "onnx"))]
         {
@@ -416,7 +407,7 @@ impl LeIndex {
                     .flatten()
             {
                 #[cfg(feature = "remote-embeddings")]
-                let hybrid = query_remote_embedder(
+                let decision = query_remote_embedder(
                     &tfidf,
                     artifact_path,
                     &crate::config::LeIndexConfig::load_cached()
@@ -424,23 +415,11 @@ impl LeIndex {
                         .embeddings,
                 );
                 #[cfg(not(feature = "remote-embeddings"))]
-                let hybrid = None;
-                let hybrid = hybrid.or_else(|| {
-                    index_builder::HybridEmbedder::hybrid_local(
-                        tfidf,
-                        Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
-                    )
-                    .ok()
-                });
-                match hybrid {
-                    Some(hybrid) => self.embedder = Some(hybrid),
-                    None => {
-                        warn!(
-                            "Failed to create query-time neural embedder; falling back to tfidf_only"
-                        );
-                        self.embedder = Some(embedder);
-                    }
-                }
+                let decision = QueryNeuralDecision::FollowLocal;
+
+                self.embedder = Some(resolve_query_embedder_from_decision(
+                    decision, tfidf, embedder,
+                ));
             } else {
                 self.embedder = Some(embedder);
             }
@@ -650,68 +629,130 @@ impl LeIndex {
     }
 }
 
+/// Query-time neural embedder decision for a hydrated generation (Codex review round-3 P1).
+#[cfg(feature = "onnx")]
+#[derive(Debug)]
+pub(crate) enum QueryNeuralDecision {
+    #[cfg(feature = "remote-embeddings")]
+    Remote(Box<index_builder::HybridEmbedder>),
+    FollowLocal,
+    DisableNeural,
+}
+
+#[cfg(feature = "onnx")]
+fn resolve_query_embedder_from_decision(
+    decision: QueryNeuralDecision,
+    tfidf: index_builder::TfIdfEmbedder,
+    fallback: index_builder::HybridEmbedder,
+) -> index_builder::HybridEmbedder {
+    match decision {
+        #[cfg(feature = "remote-embeddings")]
+        QueryNeuralDecision::Remote(hybrid) => *hybrid,
+        QueryNeuralDecision::FollowLocal => {
+            let neural_weight = crate::config::LeIndexConfig::load_cached().neural_weight_f32();
+            index_builder::HybridEmbedder::hybrid_local(tfidf, Some(neural_weight)).unwrap_or_else(
+                |_| {
+                    warn!(
+                        "Failed to create query-time neural embedder; falling back to tfidf_only"
+                    );
+                    fallback
+                },
+            )
+        }
+        QueryNeuralDecision::DisableNeural => {
+            warn!("Failed to create query-time neural embedder; falling back to tfidf_only");
+            fallback
+        }
+    }
+}
+
+#[cfg(all(feature = "onnx", feature = "remote-embeddings"))]
+fn build_remote_decision(
+    tfidf: &index_builder::TfIdfEmbedder,
+    embeddings_cfg: &crate::config::EmbeddingConfig,
+    persisted_dim: Option<usize>,
+) -> QueryNeuralDecision {
+    let Some(embedder) = index_builder::try_remote_neural_embedder(tfidf.clone(), embeddings_cfg)
+    else {
+        return if persisted_dim.is_some() {
+            QueryNeuralDecision::DisableNeural
+        } else {
+            QueryNeuralDecision::FollowLocal
+        };
+    };
+    let is_unpinned = embeddings_cfg
+        .resolved_remote()
+        .and_then(|r| r.remote_dimension)
+        .is_none();
+    if is_unpinned {
+        if let Some(dim) = persisted_dim {
+            embedder.seed_measured_dimension(dim);
+        }
+    }
+    QueryNeuralDecision::Remote(Box::new(embedder))
+}
+
 /// Query-time remote embedder for a hydrated generation. The generation's
 /// persisted neural rows are authoritative: when their dimension disagrees
 /// with the dimension config pins for the remote endpoint, the rows came from
 /// another provider (e.g. a pre-success local fallback), so remote must not
-/// embed queries against them and the caller falls through to local. With no
+/// embed queries against them and neural search is disabled. With no
 /// pinned dimension (custom endpoint, measured at first embed) the persisted
-/// rows cannot be cross-checked here and remote is kept.
+/// rows cannot be cross-checked here and remote is kept, seeded with the
+/// persisted dimension (Codex review round-3 P1 + P2).
 #[cfg(all(feature = "onnx", feature = "remote-embeddings"))]
-fn query_remote_embedder(
+pub(crate) fn query_remote_embedder(
     tfidf: &index_builder::TfIdfEmbedder,
     artifact_path: &std::path::Path,
     embeddings_cfg: &crate::config::EmbeddingConfig,
-) -> Option<index_builder::HybridEmbedder> {
-    let configured = embeddings_cfg.resolved_remote()?.remote_dimension;
-    let (persisted_identity, persisted) =
-        index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path)
-            .map(|mmap| {
-                (
-                    mmap.identity().map(str::to_owned),
-                    Some(mmap.dimension() as usize),
-                )
-            })
-            .unwrap_or((None, None));
-    if persisted_identity
-        .as_deref()
-        .is_some_and(|identity| identity.starts_with("local|"))
-    {
-        info!(
-            identity = ?persisted_identity,
-            "Persisted neural rows were produced locally; query embedder follows the recorded generation"
-        );
-        return None;
-    }
-    if let (Some(configured), Some(persisted)) = (configured, persisted) {
-        if configured != persisted {
+) -> QueryNeuralDecision {
+    let Some(mmap) = index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path)
+    else {
+        return build_remote_decision(tfidf, embeddings_cfg, None);
+    };
+
+    let persisted_identity = mmap.identity();
+    let persisted_dim = mmap.dimension() as usize;
+
+    if let Some(identity) = persisted_identity {
+        if identity.starts_with("local|") {
             info!(
-                configured,
-                persisted,
+                identity = ?identity,
+                "Persisted neural rows were produced locally; query embedder follows the recorded generation"
+            );
+            return QueryNeuralDecision::FollowLocal;
+        }
+        if identity.starts_with("remote|") {
+            let configured_identity = configured_remote_identity(embeddings_cfg, persisted_dim);
+            if configured_identity.as_deref() == Some(identity) {
+                return build_remote_decision(tfidf, embeddings_cfg, Some(persisted_dim));
+            }
+            info!(
+                configured = ?configured_identity,
+                persisted = %identity,
+                "Persisted neural rows were produced by a different remote model or remote is unconfigured; \
+                 disabling neural search"
+            );
+            return QueryNeuralDecision::DisableNeural;
+        }
+    }
+
+    let configured_pinned_dim = embeddings_cfg
+        .resolved_remote()
+        .and_then(|r| r.remote_dimension);
+    if let Some(configured_dim) = configured_pinned_dim {
+        if configured_dim != persisted_dim {
+            info!(
+                configured_dim,
+                persisted_dim,
                 "Persisted neural rows were not produced by the configured remote; \
-                 query embedder follows the recorded generation"
+                 disabling neural search"
             );
-            return None;
+            return QueryNeuralDecision::DisableNeural;
         }
     }
-    if let (Some(persisted_identity), Some(persisted_dimension)) = (
-        persisted_identity
-            .as_deref()
-            .filter(|identity| identity.starts_with("remote|")),
-        persisted,
-    ) {
-        let configured_identity = configured_remote_identity(embeddings_cfg, persisted_dimension)?;
-        if configured_identity != persisted_identity {
-            info!(
-                configured = %configured_identity,
-                persisted = %persisted_identity,
-                "Persisted neural rows were produced by a different remote model; \
-                 query embedder follows the recorded generation"
-            );
-            return None;
-        }
-    }
-    index_builder::try_remote_neural_embedder(tfidf.clone(), embeddings_cfg)
+
+    build_remote_decision(tfidf, embeddings_cfg, Some(persisted_dim))
 }
 
 /// Identity the configured remote would stamp on its rows, built without
@@ -813,8 +854,11 @@ mod tests {
         let local = tempfile::tempdir().expect("local generation");
         persist_fixture_with_identity(local.path(), 768, Some("local|onnx/model|768"));
         assert!(
-            query_remote_embedder(&tfidf, &local.path().join(".leindex"), &cfg).is_none(),
-            "local identity must reject remote even when dimensions match"
+            matches!(
+                query_remote_embedder(&tfidf, &local.path().join(".leindex"), &cfg),
+                QueryNeuralDecision::FollowLocal
+            ),
+            "local identity must follow local pipeline"
         );
 
         let remote = tempfile::tempdir().expect("remote generation");
@@ -824,20 +868,29 @@ mod tests {
             Some(&configured_remote_identity(&cfg, 768).expect("configured identity")),
         );
         assert!(
-            query_remote_embedder(&tfidf, &remote.path().join(".leindex"), &cfg).is_some(),
+            matches!(
+                query_remote_embedder(&tfidf, &remote.path().join(".leindex"), &cfg),
+                QueryNeuralDecision::Remote(_)
+            ),
             "a matching remote generation keeps the remote query embedder"
         );
 
         let legacy = tempfile::tempdir().expect("legacy generation without identity");
         persist_fixture(legacy.path(), 768);
         assert!(
-            query_remote_embedder(&tfidf, &legacy.path().join(".leindex"), &cfg).is_some(),
+            matches!(
+                query_remote_embedder(&tfidf, &legacy.path().join(".leindex"), &cfg),
+                QueryNeuralDecision::Remote(_)
+            ),
             "absent identity keeps the dimension-only legacy behavior"
         );
 
         let empty = tempfile::tempdir().expect("no persisted neural rows");
         assert!(
-            query_remote_embedder(&tfidf, empty.path(), &cfg).is_some(),
+            matches!(
+                query_remote_embedder(&tfidf, empty.path(), &cfg),
+                QueryNeuralDecision::Remote(_)
+            ),
             "nothing persisted: config decides"
         );
     }
@@ -857,8 +910,11 @@ mod tests {
         let other_identity = configured_remote_identity(&other_model, 768).expect("other identity");
         persist_fixture_with_identity(swapped.path(), 768, Some(&other_identity));
         assert!(
-            query_remote_embedder(&tfidf, &swapped.path().join(".leindex"), &cfg).is_none(),
-            "same-dimension remote generation from another model must not serve queries"
+            matches!(
+                query_remote_embedder(&tfidf, &swapped.path().join(".leindex"), &cfg),
+                QueryNeuralDecision::DisableNeural
+            ),
+            "same-dimension remote generation from another model must disable neural"
         );
     }
 
@@ -891,8 +947,74 @@ mod tests {
         );
 
         assert!(
-            query_remote_embedder(&tfidf, &project.path().join(".leindex"), &cfg).is_some(),
+            matches!(
+                query_remote_embedder(&tfidf, &project.path().join(".leindex"), &cfg),
+                QueryNeuralDecision::Remote(_)
+            ),
             "unpinned custom endpoint must compare identity using the persisted dimension"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "onnx")]
+    fn test_query_embedder_remote_identity_with_remote_config_removed_disables_neural() {
+        let tfidf =
+            index_builder::TfIdfEmbedder::build(&[("sample.rs".into(), "fn sample() {}".into())]);
+        let cfg = crate::config::EmbeddingConfig::default(); // preset, 768
+        let _guard = crate::feature_flags::lock_flag_tests();
+        let _reset = crate::feature_flags::FlagOverrideReset;
+
+        let remote = tempfile::tempdir().expect("remote generation");
+        let remote_identity = configured_remote_identity(&cfg, 768).expect("configured identity");
+        persist_fixture_with_identity(remote.path(), 768, Some(&remote_identity));
+
+        let mut unconfigured = cfg.clone();
+        unconfigured.enable_hybrid = false;
+        assert!(
+            matches!(
+                query_remote_embedder(&tfidf, &remote.path().join(".leindex"), &unconfigured),
+                QueryNeuralDecision::DisableNeural
+            ),
+            "remote generation when remote config is removed must disable neural"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "onnx")]
+    fn test_query_embedder_seeds_unpinned_provider_with_persisted_dimension() {
+        let tfidf =
+            index_builder::TfIdfEmbedder::build(&[("sample.rs".into(), "fn sample() {}".into())]);
+        let cfg = crate::config::EmbeddingConfig {
+            enable_hybrid: true,
+            remote_provider: "custom".to_string(),
+            remote_endpoint: Some("http://127.0.0.1:1/v1".to_string()),
+            remote_model: Some("seeded-model".to_string()),
+            remote_dimension: None,
+            remote_doc_template: None,
+            remote_query_template: None,
+            ..Default::default()
+        };
+        let _guard = crate::feature_flags::lock_flag_tests();
+        let _reset = crate::feature_flags::FlagOverrideReset;
+
+        let project = tempfile::tempdir().expect("unpinned custom generation 512");
+        let persisted_dimension = 512;
+        let persisted_identity =
+            configured_remote_identity(&cfg, persisted_dimension).expect("configured identity");
+        persist_fixture_with_identity(
+            project.path(),
+            persisted_dimension,
+            Some(&persisted_identity),
+        );
+
+        let decision = query_remote_embedder(&tfidf, &project.path().join(".leindex"), &cfg);
+        let QueryNeuralDecision::Remote(embedder) = decision else {
+            panic!("expected Remote decision, got {:?}", decision);
+        };
+        assert_eq!(
+            embedder.observed_neural_dimension(),
+            Some(512),
+            "unpinned provider must be seeded with persisted dimension 512"
         );
     }
 
