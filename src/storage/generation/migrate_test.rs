@@ -416,6 +416,66 @@ fn test_neural_encoding_missing_file_is_empty_and_corrupt_file_errors() {
 }
 
 #[test]
+fn test_neural_layer_carries_liee_identity_as_v3() {
+    let identity = "local|qwen-embedding|1024";
+    let tmp = tempfile::tempdir().unwrap();
+    let ids = std::collections::HashMap::from([("node-a".to_string(), 1u32)]);
+    let neural = tmp.path().join("neural_embeddings.bin");
+    crate::search::vector::write_mmap_embeddings_with_identity(
+        &neural,
+        &[("node-a".to_string(), vec![1.0_f32, 2.0])],
+        Some(identity),
+    )
+    .unwrap();
+
+    let payload = encode_neural_layer(&neural, &ids).unwrap();
+    assert_eq!(
+        payload[9],
+        crate::storage::generation::reader::NEURAL_VERSION_IDENTITY,
+        "a stamped LIEE must produce a version-3 neural layer"
+    );
+    // Trailer: u32 byte length then the identity, exactly ending the payload.
+    let tail = 4 + identity.len();
+    let trailer_len = u32::from_le_bytes(
+        payload[payload.len() - tail..payload.len() - tail + 4]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(trailer_len as usize, identity.len());
+    assert_eq!(
+        &payload[payload.len() - identity.len()..],
+        identity.as_bytes()
+    );
+
+    // The version-3 layer decodes and reports the identity (CAS round trip).
+    let blob_path = tmp.path().join("neural.blob");
+    fs::write(&blob_path, crate::storage::cas::blob::encode_blob(&payload)).unwrap();
+    let reader = crate::storage::generation::reader::NeuralReader::open(&blob_path).unwrap();
+    assert_eq!(reader.identity(), Some(identity));
+}
+
+#[test]
+fn test_neural_layer_without_identity_stays_v2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ids = std::collections::HashMap::from([("node-a".to_string(), 1u32)]);
+    let neural = tmp.path().join("neural_embeddings.bin");
+    crate::search::vector::write_mmap_embeddings(
+        &neural,
+        &[("node-a".to_string(), vec![1.0_f32, 2.0])],
+    )
+    .unwrap();
+
+    let payload = encode_neural_layer(&neural, &ids).unwrap();
+    assert_eq!(
+        payload[9],
+        crate::storage::generation::reader::NEURAL_VERSION_WITH_IDS,
+        "an unstamped LIEE must keep the byte-identical version-2 layer"
+    );
+    // Header + id table + two f32 values, nothing after the vector data.
+    assert_eq!(payload.len(), 66 + 4 + 8);
+}
+
+#[test]
 fn test_legacy_to_cas_migration() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

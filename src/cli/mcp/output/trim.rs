@@ -229,6 +229,8 @@ fn trim_diagnostics(data: &Value) -> Value {
         "stale": data.get("stale"),
         "last_indexed_secs_ago": data.get("last_indexed_secs_ago"),
         "embedding_model": data.get("embedding_model"),
+        "embedding_preset": data.get("embedding_preset"),
+        "measured_embedding_dimension": data.get("measured_embedding_dimension"),
         "precision_enabled": data.get("precision_enabled"),
         "precision_nodes": data.get("precision_nodes"),
         "precision_languages": data.get("precision_languages"),

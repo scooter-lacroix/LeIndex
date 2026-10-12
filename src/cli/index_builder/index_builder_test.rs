@@ -1040,7 +1040,7 @@ fn test_empty_neural_persist_removes_stale_mmap() {
     std::fs::write(&stale_path, b"stale neural data").unwrap();
 
     let engine = SearchEngine::new();
-    persist_neural_embeddings_to_mmap(&engine, temp.path()).unwrap();
+    persist_neural_embeddings_to_mmap(&engine, temp.path(), None).unwrap();
 
     assert!(
         !stale_path.exists(),

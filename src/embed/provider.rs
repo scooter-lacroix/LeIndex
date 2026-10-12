@@ -258,10 +258,26 @@ impl ExecutionProviderSelector {
         }
     }
 
+    /// Returns true when an ORT runtime has already been initialized OR when
+    /// candidate discovery finds an existing candidate on disk.
+    ///
+    /// This guards ORT symbol queries (like `is_available()`) against panicking
+    /// when no libonnxruntime can be loaded (VAL-CROSS-015). Checking `last_outcome()`
+    /// covers libraries loaded via the bare-name dynamic loader fallback as well
+    /// as explicitly discovered candidate paths.
+    #[cfg(feature = "onnx")]
+    fn is_ort_available() -> bool {
+        crate::embed::ort_discovery::last_outcome().is_some()
+            || crate::embed::ort_discovery::discover_path_only().is_some()
+    }
+
     /// Check if CUDA is available on this system.
     fn is_cuda_available() -> bool {
         #[cfg(feature = "onnx")]
         {
+            if !Self::is_ort_available() {
+                return false;
+            }
             ort::ep::CUDA::default().is_available().unwrap_or(false)
         }
         #[cfg(not(feature = "onnx"))]
@@ -285,6 +301,9 @@ impl ExecutionProviderSelector {
     fn is_migraphx_available() -> bool {
         #[cfg(feature = "onnx")]
         {
+            if !Self::is_ort_available() {
+                return false;
+            }
             // First, ask ORT if MIGraphX is available in the loaded binary
             if ort::ep::MIGraphX::default().is_available().unwrap_or(false) {
                 return true;
@@ -319,6 +338,10 @@ impl ExecutionProviderSelector {
     /// `GetAvailableProviders()` lists `MIGraphXExecutionProvider` in the
     /// *currently loaded* libonnxruntime.
     ///
+    /// Discovery-miss implies unloadable: when no libonnxruntime is discoverable
+    /// (CI runners, dev boxes without ORT) the probe returns `false` without
+    /// touching ort, because ort's dlopen/dlsym failure panics (VAL-CROSS-015).
+    ///
     /// Unlike [`is_migraphx_available`](Self::is_migraphx_available), this
     /// does NOT consult the filesystem heuristic and is therefore the right
     /// answer to "is MIGraphX truly compiled into the loaded ORT?". Use this
@@ -334,6 +357,9 @@ impl ExecutionProviderSelector {
     pub(crate) fn is_migraphx_compiled_in() -> bool {
         #[cfg(feature = "onnx")]
         {
+            if !Self::is_ort_available() {
+                return false;
+            }
             ort::ep::MIGraphX::default().is_available().unwrap_or(false)
         }
         #[cfg(not(feature = "onnx"))]
@@ -348,6 +374,9 @@ impl ExecutionProviderSelector {
     pub(crate) fn is_cuda_compiled_in() -> bool {
         #[cfg(feature = "onnx")]
         {
+            if !Self::is_ort_available() {
+                return false;
+            }
             ort::ep::CUDA::default().is_available().unwrap_or(false)
         }
         #[cfg(not(feature = "onnx"))]
@@ -358,7 +387,14 @@ impl ExecutionProviderSelector {
 
     /// Check if CoreML is available (macOS only).
     fn is_coreml_available() -> bool {
-        cfg!(target_os = "macos")
+        #[cfg(feature = "onnx")]
+        {
+            Self::is_ort_available() && cfg!(target_os = "macos")
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            cfg!(target_os = "macos")
+        }
     }
 }
 

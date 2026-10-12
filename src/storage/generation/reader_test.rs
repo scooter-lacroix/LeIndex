@@ -763,6 +763,77 @@ fn test_reader_survives_generation_swap() {
 }
 
 // ===========================================================================
+// NeuralReader: version-3 identity trailer (FIX5 leased-generation space)
+// ===========================================================================
+
+/// Build a valid v2-or-v3 `LIDX-NRL1` payload: one F32 row `[1.0, 2.0]`
+/// belonging to node 7, with `identity` appended as the v3 trailer when set.
+fn neural_identity_payload(version: u8, identity: Option<&str>) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"LIDX-NRL1");
+    payload.push(version); // version
+    payload.extend_from_slice(&[0u8; 3]); // pad
+    payload.extend_from_slice(&1u32.to_le_bytes()); // count
+    payload.extend_from_slice(&2u32.to_le_bytes()); // dim
+    payload.extend_from_slice(&0u32.to_le_bytes()); // dtype = F32
+    payload.extend_from_slice(&1.0f32.to_le_bytes()); // scale (unused)
+    payload.extend_from_slice(&0.0f32.to_le_bytes()); // zero_point (unused)
+    payload.extend_from_slice(&[0u8; 32]); // content_hash placeholder
+    payload.push(0); // alignment_pad
+    payload.extend_from_slice(&7u32.to_le_bytes()); // node-id table
+    payload.extend_from_slice(&1.0f32.to_le_bytes());
+    payload.extend_from_slice(&2.0f32.to_le_bytes());
+    let data_hash = crate::storage::cas::blob::blob_hash(&payload[66..]);
+    payload[33..65].copy_from_slice(&data_hash);
+    if let Some(identity) = identity {
+        payload.extend_from_slice(&(identity.len() as u32).to_le_bytes());
+        payload.extend_from_slice(identity.as_bytes());
+    }
+    payload
+}
+
+#[test]
+fn test_neural_v3_identity_round_trip() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let blob_path = dir.path().join("neural_v3.blob");
+    let identity = "local|qwen-embedding|1024";
+    let payload = neural_identity_payload(3, Some(identity));
+    write_blob(&blob_path, &payload);
+
+    let reader = NeuralReader::open(&blob_path).expect("open v3 neural reader");
+    assert_eq!(reader.count(), 1);
+    assert_eq!(reader.dim(), 2);
+    assert_eq!(reader.identity(), Some(identity));
+    // Identity lives outside the hashed region; the vector data is intact.
+    assert_eq!(reader.vector(0).as_f32_slice(), &[1.0, 2.0]);
+}
+
+#[test]
+fn test_neural_v2_payload_has_no_identity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let blob_path = dir.path().join("neural_v2.blob");
+    let payload = neural_identity_payload(2, None);
+    write_blob(&blob_path, &payload);
+
+    let reader = NeuralReader::open(&blob_path).expect("open v2 neural reader");
+    assert_eq!(reader.identity(), None);
+    assert_eq!(reader.vector(0).as_f32_slice(), &[1.0, 2.0]);
+}
+
+#[test]
+fn test_neural_v3_identity_truncated_trailer_reads_none() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let blob_path = dir.path().join("neural_v3_truncated.blob");
+    let full = neural_identity_payload(3, Some("local|qwen|1024"));
+    let truncated = &full[..full.len() - 1];
+    write_blob(&blob_path, truncated);
+
+    let reader = NeuralReader::open(&blob_path).expect("open truncated-trailer reader");
+    assert_eq!(reader.identity(), None);
+    assert_eq!(reader.vector(0).as_f32_slice(), &[1.0, 2.0]);
+}
+
+// ===========================================================================
 // Helpers used by tests (small fixed structs that mirror the on-disk layout)
 // ===========================================================================
 

@@ -340,9 +340,14 @@ impl LeIndex {
         // Persist neural embeddings separately for fast load_from_storage
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
         {
+            let neural_identity = index_builder::try_load_neural_mmap_embeddings_from_storage(
+                &self.project_path.join(".leindex"),
+            )
+            .and_then(|mmap| mmap.identity().map(str::to_owned));
             index_builder::persist_neural_embeddings_to_mmap(
                 &self.search_engine,
                 &self.project_path,
+                neural_identity.as_deref(),
             )?;
         }
 

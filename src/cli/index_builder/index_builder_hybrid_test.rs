@@ -484,6 +484,7 @@ fn test_persist_search_snapshot_writes_fragment_artifacts() {
             None,
             Some(std::sync::Arc::new(frag_mmap)),
             Some(&frag_ids),
+            None,
         )
         .unwrap();
 

@@ -22,8 +22,9 @@ const DEFAULT_MODEL_NAME: &str = "qwen3-embed-0.6b-dynamic-uint8";
 /// The complete LeIndex neural search configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct LeIndexConfig {
-    /// Neural embedding configuration.
-    #[serde(default)]
+    /// Neural embedding configuration. Missing sections in existing TOML
+    /// retain the legacy disabled state; fresh construction enables neural.
+    #[serde(default = "default_legacy_neural_config")]
     pub neural: NeuralConfig,
 
     /// Search behavior configuration.
@@ -31,7 +32,7 @@ pub struct LeIndexConfig {
     pub search: SearchConfig,
 
     /// Indexing pipeline configuration.
-    #[serde(default)]
+    #[serde(default = "default_legacy_indexing_config")]
     pub indexing: IndexingConfig,
 
     /// MCP server lifecycle configuration.
@@ -153,6 +154,205 @@ pub struct IndexingConfig {
     /// Maximum number of files to index.
     #[serde(default = "default_max_files")]
     pub max_files: u64,
+
+    /// Hybrid embedding provider configuration (\[indexing.embeddings\]).
+    #[serde(default = "default_legacy_embedding_config")]
+    pub embeddings: EmbeddingConfig,
+}
+
+/// Remote/hybrid embedding provider settings (\[indexing.embeddings\] section).
+///
+/// `remote_endpoint` + `enable_hybrid` switch the neural layer from the local
+/// ONNX worker to a remote OpenAI-compatible `/v1/embeddings` endpoint
+/// (llama-server, vLLM, sglang, Ollama, ...). Requires the
+/// `remote-embeddings` build feature; without it the keys parse but stay
+/// inert and indexing uses the local model as configured under `[neural]`.
+///
+/// `Default` selects the fresh-install preset. Serde defaults are deliberately
+/// legacy/inert so existing full or partial TOML files do not opt in by being
+/// upgraded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EmbeddingConfig {
+    /// Master switch for hybrid (TF-IDF + neural/remote) embeddings.
+    #[serde(default = "default_enable_hybrid")]
+    pub enable_hybrid: bool,
+
+    /// Provider preset filling unset keys below. Empty/`"custom"` = the
+    /// generic OpenAI-compatible path (every key must be set explicitly).
+    /// `"embeddinggemma-2"` fills endpoint/model/dimension/templates from
+    /// the `EMBEDDINGGEMMA2_*` constants; explicit keys always win.
+    #[serde(default = "default_remote_provider")]
+    pub remote_provider: String,
+
+    /// Base URL of an OpenAI-compatible embeddings endpoint
+    /// (e.g. "http://127.0.0.1:8080/v1").
+    #[serde(default)]
+    pub remote_endpoint: Option<String>,
+
+    /// Bearer token for the remote endpoint (local servers usually need none).
+    #[serde(default)]
+    pub remote_api_key: Option<String>,
+
+    /// Model name sent as the "model" field of the /v1/embeddings payload
+    /// (llama-server accepts the served model name or alias).
+    #[serde(default)]
+    pub remote_model: Option<String>,
+
+    /// Dimension override for the remote provider. Unset = measured from the
+    /// first successful embed response (runtime-true); never enforced before
+    /// the first response.
+    #[serde(default)]
+    pub remote_dimension: Option<usize>,
+
+    /// Template applied to DOCUMENT texts before they leave the machine
+    /// (`{text}` placeholder; prefix-only templates may omit it). Unset =
+    /// preset template when a preset is active, else raw text (back-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_doc_template: Option<String>,
+
+    /// Template applied to QUERY texts (asymmetric retrieval prefixes).
+    /// Same `{text}` / preset / back-compat rules as `remote_doc_template`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_query_template: Option<String>,
+
+    /// Local ONNX model path override (reserved; the local model is normally
+    /// resolved from `[neural] model_dir`/`model_name`).
+    #[serde(default)]
+    pub onnx_model_path: Option<String>,
+}
+
+/// `embeddinggemma-2` preset: loopback endpoint on llama-server's standard
+/// port. Runtime selection remains subject to the bakeoff; keep 8765 reserved
+/// for the owner's mcp_agent_mail service.
+pub const EMBEDDINGGEMMA2_DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8080/v1";
+
+/// `embeddinggemma-2` preset: model name sent in the embeddings payload.
+pub const EMBEDDINGGEMMA2_MODEL: &str = "embeddinggemma-2";
+
+/// `embeddinggemma-2` preset: native (untruncated) embedding dimension.
+pub const EMBEDDINGGEMMA2_DIMENSION: usize = 768;
+
+/// `embeddinggemma-2` DOCUMENT template, code-search task, no title
+/// available. Source: google/embeddinggemma-2 model card (Best Practices →
+/// Prefix Notation & Usage table, CodeRetrieval row): document instruction
+/// `title: {title or filename} | text: {code}`, with `title: none` mandated
+/// when no title is available — the provider call site receives raw text
+/// only, so `title: none` is correct here. llama.cpp applies NO server-side
+/// template (content-only passthrough in `/props`), so the client owns it.
+pub const EMBEDDINGGEMMA2_DOC_TEMPLATE: &str = "title: none | text: {text}";
+
+/// `embeddinggemma-2` QUERY template, code-search task. Same source (model
+/// card CodeRetrieval row): `task: code retrieval | query: {query}`.
+pub const EMBEDDINGGEMMA2_QUERY_TEMPLATE: &str = "task: code retrieval | query: {text}";
+
+/// A preset-resolved remote configuration: every unset key already filled.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedRemote {
+    /// Effective endpoint (explicit config, or preset default).
+    pub endpoint: String,
+    /// Effective model name (explicit config, or preset).
+    pub model: Option<String>,
+    /// Effective dimension override (explicit config, or preset).
+    pub remote_dimension: Option<usize>,
+    /// Effective document template (explicit config, or preset; None = raw).
+    pub doc_template: Option<String>,
+    /// Effective query template (explicit config, or preset; None = raw).
+    pub query_template: Option<String>,
+}
+
+impl EmbeddingConfig {
+    /// Human-readable provider label for diagnostics ("embeddinggemma-2"
+    /// preset active, else "custom").
+    pub fn remote_preset_label(&self) -> &str {
+        if self.embeddinggemma2_preset_active() {
+            "embeddinggemma-2"
+        } else {
+            "custom"
+        }
+    }
+
+    /// Whether the `embeddinggemma-2` preset is selected (spelling variants
+    /// accepted; case-insensitive).
+    fn embeddinggemma2_preset_active(&self) -> bool {
+        matches!(
+            self.remote_provider.trim().to_ascii_lowercase().as_str(),
+            "embeddinggemma-2" | "embeddinggemma2"
+        )
+    }
+
+    /// Resolve the remote ladder configuration: preset fills unset keys,
+    /// explicit config always wins. Returns `None` when the ladder is off
+    /// (flag false) or nothing can produce an endpoint (no explicit endpoint
+    /// and no preset default).
+    pub fn resolved_remote(&self) -> Option<ResolvedRemote> {
+        if !self.enable_hybrid {
+            return None;
+        }
+        let preset = self.embeddinggemma2_preset_active();
+        let endpoint = match self.remote_endpoint.as_deref().map(str::trim) {
+            Some(e) if !e.is_empty() => Some(e.to_string()),
+            _ => preset.then(|| EMBEDDINGGEMMA2_DEFAULT_ENDPOINT.to_string()),
+        }?;
+        let fill = |value: &Option<String>, preset_value: &str| match value {
+            Some(v) if !v.trim().is_empty() => Some(v.clone()),
+            _ if preset => Some(preset_value.to_string()),
+            _ => None,
+        };
+        Some(ResolvedRemote {
+            endpoint,
+            model: fill(&self.remote_model, EMBEDDINGGEMMA2_MODEL),
+            doc_template: fill(&self.remote_doc_template, EMBEDDINGGEMMA2_DOC_TEMPLATE),
+            query_template: fill(&self.remote_query_template, EMBEDDINGGEMMA2_QUERY_TEMPLATE),
+            remote_dimension: self
+                .remote_dimension
+                .or_else(|| preset.then_some(EMBEDDINGGEMMA2_DIMENSION)),
+        })
+    }
+
+    /// True when the remote ladder is constructible: enabled AND an endpoint
+    /// resolves (explicit `remote_endpoint`, or the preset's default port).
+    /// (remote-embeddings construction precondition.)
+    pub fn remote_endpoint_configured(&self) -> bool {
+        self.resolved_remote().is_some()
+    }
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            enable_hybrid: true,
+            remote_provider: "embeddinggemma-2".to_string(),
+            remote_endpoint: None,
+            remote_api_key: None,
+            remote_model: None,
+            remote_dimension: None,
+            remote_doc_template: None,
+            remote_query_template: None,
+            onnx_model_path: None,
+        }
+    }
+}
+
+fn default_legacy_embedding_config() -> EmbeddingConfig {
+    EmbeddingConfig {
+        enable_hybrid: default_enable_hybrid(),
+        remote_provider: default_remote_provider(),
+        remote_endpoint: None,
+        remote_api_key: None,
+        remote_model: None,
+        remote_dimension: None,
+        remote_doc_template: None,
+        remote_query_template: None,
+        onnx_model_path: None,
+    }
+}
+
+const fn default_enable_hybrid() -> bool {
+    false
+}
+
+fn default_remote_provider() -> String {
+    "custom".to_string()
 }
 
 /// MCP server lifecycle configuration (\[mcp\] section).
@@ -294,10 +494,17 @@ fn default_system_one_tau_apply() -> f32 {
     0.80
 }
 
+fn default_legacy_neural_config() -> NeuralConfig {
+    NeuralConfig {
+        enabled: false,
+        ..NeuralConfig::default()
+    }
+}
+
 impl Default for NeuralConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             execution_provider: default_execution_provider(),
             ort_dylib_path: None,
             ort_version: None,
@@ -328,7 +535,16 @@ impl Default for IndexingConfig {
         Self {
             batch_size: default_batch_size(),
             max_files: default_max_files(),
+            embeddings: EmbeddingConfig::default(),
         }
+    }
+}
+
+fn default_legacy_indexing_config() -> IndexingConfig {
+    IndexingConfig {
+        batch_size: default_batch_size(),
+        max_files: default_max_files(),
+        embeddings: default_legacy_embedding_config(),
     }
 }
 
@@ -493,9 +709,13 @@ impl LeIndexConfig {
             Self::load().unwrap_or_else(|err| {
                 tracing::warn!(
                     error = %err,
-                    "failed to load leindex.toml for caching; using defaults"
+                    "failed to load leindex.toml for caching; preserving legacy disabled defaults"
                 );
-                LeIndexConfig::default()
+                Self {
+                    neural: default_legacy_neural_config(),
+                    indexing: default_legacy_indexing_config(),
+                    ..Self::default()
+                }
             })
         })
     }
@@ -563,7 +783,11 @@ impl LeIndexConfig {
                     backup_path.display()
                 );
                 Ok((
-                    Self::default(),
+                    Self {
+                        neural: default_legacy_neural_config(),
+                        indexing: default_legacy_indexing_config(),
+                        ..Self::default()
+                    },
                     RecoveryAction::RecoveredFromCorrupt(backup_path),
                 ))
             }
@@ -631,6 +855,28 @@ mod tests {
         let toml_str = toml::to_string(&config).unwrap();
         let parsed: LeIndexConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(config, parsed);
+    }
+
+    #[test]
+    fn test_fresh_neural_default_and_legacy_toml_boundary() {
+        let fresh = LeIndexConfig::default();
+        assert!(fresh.neural.enabled);
+        assert!(fresh.indexing.embeddings.enable_hybrid);
+        assert_eq!(
+            fresh.indexing.embeddings.remote_preset_label(),
+            "embeddinggemma-2"
+        );
+        for existing in [
+            "",
+            "[neural]\nexecution_provider = \"cpu\"\n",
+            "[neural]\nenabled = false\n",
+        ] {
+            let parsed: LeIndexConfig = toml::from_str(existing).expect("existing TOML");
+            assert!(!parsed.neural.enabled);
+        }
+        let explicit: LeIndexConfig =
+            toml::from_str("[neural]\nenabled = true\n").expect("opt-in TOML");
+        assert!(explicit.neural.enabled);
     }
 
     #[test]
@@ -710,9 +956,16 @@ mod tests {
         assert!(config.search.fragment_orphan_enabled);
         assert!(config.search.fragment_naive_fallback);
 
-        // Parse from empty TOML -> same defaults (backward compatible).
+        // Existing TOML retains legacy embeddings; search defaults are unchanged.
         let parsed: LeIndexConfig = toml::from_str("").unwrap();
-        assert_eq!(parsed, config);
+        assert_eq!(parsed.search, config.search);
+        assert!(!parsed.indexing.embeddings.enable_hybrid);
+        assert_eq!(parsed.indexing.embeddings.remote_preset_label(), "custom");
+        assert!(config.indexing.embeddings.enable_hybrid);
+        assert_eq!(
+            config.indexing.embeddings.remote_preset_label(),
+            "embeddinggemma-2"
+        );
     }
 
     #[test]
@@ -752,6 +1005,7 @@ mod tests {
             indexing: IndexingConfig {
                 batch_size: 1000,
                 max_files: 100_000,
+                embeddings: EmbeddingConfig::default(),
             },
             mcp: McpConfig {
                 idle_timeout_secs: 3600,
@@ -830,7 +1084,7 @@ mod tests {
         unsafe { std::env::set_var(LEINDEX_HOME_ENV, "/nonexistent/path/for/testing") };
         let (config, action) = LeIndexConfig::load_or_recover().unwrap();
         assert!(matches!(action, RecoveryAction::CreatedDefault));
-        assert!(!config.neural.enabled);
+        assert!(config.neural.enabled);
         unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 

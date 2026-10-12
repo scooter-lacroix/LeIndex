@@ -86,6 +86,10 @@ pub const NEURAL_VERSION_POSITIONAL: u8 = 1;
 /// Neural payload version carrying a `count * u32` PDG node-id table between
 /// the header and the vector data.
 pub const NEURAL_VERSION_WITH_IDS: u8 = 2;
+/// Neural payload version carrying the embedding-space identity recorded for
+/// the generation: version-2 layout plus a trailing `u32` byte length followed
+/// by UTF-8 identity bytes (mirroring the `LIEE` mmap trailer).
+pub const NEURAL_VERSION_IDENTITY: u8 = 3;
 /// Fixed size of the TF-IDF payload header (in bytes).
 pub const TFIDF_HEADER_LEN: usize = 9 + 1 + 3 + 4 + 4 + 4 + 32;
 /// Fixed size of the PDG payload header (in bytes).
@@ -390,7 +394,10 @@ impl NeuralHeader {
             )));
         }
         let version = payload[9];
-        if !matches!(version, NEURAL_VERSION_POSITIONAL | NEURAL_VERSION_WITH_IDS) {
+        if !matches!(
+            version,
+            NEURAL_VERSION_POSITIONAL | NEURAL_VERSION_WITH_IDS | NEURAL_VERSION_IDENTITY
+        ) {
             return Err(ReaderError::BadHeader(format!(
                 "unsupported neural version {}",
                 version
@@ -419,7 +426,7 @@ impl NeuralHeader {
     }
 
     fn has_ids(&self) -> bool {
-        self.version == NEURAL_VERSION_WITH_IDS
+        self.version >= NEURAL_VERSION_WITH_IDS
     }
 
     /// Payload offset where the vector data begins (after the optional id
@@ -427,6 +434,14 @@ impl NeuralHeader {
     fn data_offset(&self) -> usize {
         let ids_len = if self.has_ids() { self.count * 4 } else { 0 };
         NEURAL_HEADER_LEN + ids_len
+    }
+
+    /// Payload offset of the `u32` byte length that precedes the optional
+    /// identity trailer. `None` when the version predates the identity
+    /// section.
+    fn identity_len_offset(&self) -> Option<usize> {
+        (self.version == NEURAL_VERSION_IDENTITY)
+            .then(|| self.data_offset() + self.count * self.dim * self.dtype.element_size())
     }
 }
 
@@ -444,6 +459,9 @@ pub struct NeuralReader {
     /// Offset, from the start of the CAS payload, where the vectors data
     /// begins (after the neural header and the optional id table).
     data_offset_in_payload: usize,
+    /// Payload offset of the identity length word, when the payload version
+    /// carries the identity trailer (version 3+).
+    identity_len_offset: Option<usize>,
 }
 
 impl NeuralReader {
@@ -465,6 +483,7 @@ impl NeuralReader {
             zero_point: header.zero_point,
             has_ids: header.has_ids(),
             data_offset_in_payload: header.data_offset(),
+            identity_len_offset: header.identity_len_offset(),
         })
     }
 
@@ -485,6 +504,18 @@ impl NeuralReader {
     /// Dimensionality of each stored vector.
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// The embedding-space identity recorded in the payload's identity
+    /// trailer (version 3+). `None` for earlier payload versions or when the
+    /// trailer is truncated or not valid UTF-8.
+    pub fn identity(&self) -> Option<&str> {
+        let offset = self.identity_len_offset?;
+        let payload = self.payload_byte();
+        let len_bytes = payload.get(offset..offset + 4)?;
+        let len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
+        let identity = payload.get(offset + 4..offset + 4 + len)?;
+        std::str::from_utf8(identity).ok()
     }
 
     /// Underlying dtype (F32 or Int8).

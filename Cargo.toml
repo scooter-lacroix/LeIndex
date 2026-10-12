@@ -1,6 +1,6 @@
 [package]
 name = "leindex"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2024"
 rust-version = "1.85"
 authors = ["LeIndex Contributors"]
@@ -84,6 +84,7 @@ full = [
     "community",
     "precision",
     "daemon-client",
+    "remote-embeddings",
 ]
 
 # Minimal feature set (parsing and search only)
@@ -280,9 +281,9 @@ onnx = ["search", "dep:ort", "ort/half", "ort/cuda", "ort/migraphx", "ort/rocm",
 onnx-migraphx = ["onnx"]
 
 # Remote embedding API support (OpenAI, etc.)
-# Opt-in feature: Use cloud-based embedding services instead of local models
-# Use with: cargo build --features "remote-embeddings"
-# Note: Requires onnx feature for remote embedding providers
+# Included in standard builds for the default EmbeddingGemma2 local server.
+# Minimal builds can still opt in with --features "remote-embeddings".
+# Requires the onnx interface for remote embedding providers.
 remote-embeddings = ["search", "onnx", "dep:reqwest", "dep:async-trait"]
 
 # Deep heap profiling support (opt-in, build-time gated).

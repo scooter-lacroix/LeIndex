@@ -28,6 +28,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+#[cfg(feature = "onnx")]
+use ort::ep::ExecutionProvider as _;
+
 /// Environment variable name for explicit ORT dylib override.
 pub const ORT_DYLIB_ENV: &str = "ORT_DYLIB_PATH";
 
@@ -606,6 +609,123 @@ fn system_candidates() -> Vec<(DiscoverySource, PathBuf)> {
     out
 }
 
+#[cfg(any(feature = "onnx", test))]
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
+/// Try to load and commit a candidate ORT library.
+///
+/// If `require_exists` is true and `path` does not exist on disk, the candidate
+/// is skipped immediately.
+///
+/// NOTE: ort rc.13 `init_from` defers dylib loading to first symbol access, so
+/// `Ok(builder)` does not prove the library is loadable. For a bare-name candidate
+/// (`require_exists=false`), we force a cheap symbol touch (`CPU::default().is_available()`)
+/// inside `catch_unwind` to verify that dynamic loading and symbol resolution succeed.
+/// Real-path candidates that `init_from` accepts keep the fast path.
+#[cfg(feature = "onnx")]
+#[doc(hidden)]
+pub fn try_init_candidate(
+    source: DiscoverySource,
+    path: PathBuf,
+    require_exists: bool,
+    searched: &mut Vec<(DiscoverySource, String)>,
+    last_error: &mut Option<String>,
+) -> Option<DiscoveryOutcome> {
+    if require_exists && !path.exists() {
+        searched.push((source, path.display().to_string()));
+        return None;
+    }
+    // ort rc.13 `init_from` panics (rather than returning Err) when dlopen or
+    // dlsym fails on a bare-name candidate, so guard the call against unwinding.
+    let init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ort::init_from(&path)));
+    let result = match init {
+        Ok(result) => result,
+        Err(payload) => {
+            let msg = format!(
+                "init_from({}) panicked: {}",
+                path.display(),
+                panic_message(payload.as_ref())
+            );
+            tracing::warn!("{}", msg);
+            *last_error = Some(msg);
+            searched.push((source, path.display().to_string()));
+            return None;
+        }
+    };
+    match result {
+        Ok(builder) => {
+            // commit() is required for the environment to take effect; it
+            // returns false if an environment was already committed, which
+            // we treat as success (the prior environment wins, but ORT is
+            // in fact loaded).
+            let _ = builder.commit();
+
+            // rc.13 init_from defers dylib load to first symbol access, so Ok ≠ loadable.
+            // For a bare-name candidate (require_exists=false), verify the library
+            // actually loads by forcing a symbol touch inside catch_unwind.
+            // The probe MUST be an EP whose is_available() consults
+            // GetAvailableProviders() — observed runner panics at ort lib.rs:234
+            // (Dlopen) / :239 (DlSym OrtGetApiBase) prove MIGraphX's query forces
+            // the deferred load. CPU is NOT usable here: rc.13 special-cases it as
+            // the always-available baseline and resolves without touching the
+            // dylib, which let a bare-name phantom pass as Initialized on
+            // ORT-less runners (Validate job 114972336073).
+            if !require_exists {
+                let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ort::ep::MIGraphX::default().is_available()
+                }));
+                match probe {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        let msg = format!(
+                            "bare-name candidate {} not loadable (symbol probe error): {}",
+                            path.display(),
+                            e
+                        );
+                        tracing::warn!("{}", msg);
+                        *last_error = Some(msg);
+                        searched.push((source, path.display().to_string()));
+                        return None;
+                    }
+                    Err(payload) => {
+                        let msg = format!(
+                            "bare-name candidate {} not loadable: {}",
+                            path.display(),
+                            panic_message(payload.as_ref())
+                        );
+                        tracing::warn!("{}", msg);
+                        *last_error = Some(msg);
+                        searched.push((source, path.display().to_string()));
+                        return None;
+                    }
+                }
+            }
+
+            let outcome = DiscoveryOutcome { source, path };
+            record_last_outcome(Some(outcome.clone()));
+            tracing::info!(
+                "loaded ONNX Runtime dylib from {} [{}]",
+                outcome.path.display(),
+                outcome.source
+            );
+            Some(outcome)
+        }
+        Err(e) => {
+            let msg = format!("init_from({}) failed: {}", path.display(), e);
+            tracing::warn!("{}", msg);
+            *last_error = Some(msg);
+            searched.push((source, path.display().to_string()));
+            None
+        }
+    }
+}
+
 /// Discover and load the ORT dynamic library via `ort::init_from()`.
 ///
 /// MUST be called BEFORE any `Session::builder()` call so that the configured
@@ -630,34 +750,7 @@ pub fn discover_and_init() -> InitResult {
                         path: PathBuf,
                         require_exists: bool|
      -> Option<DiscoveryOutcome> {
-        if require_exists && !path.exists() {
-            searched.push((source, path.display().to_string()));
-            return None;
-        }
-        match ort::init_from(&path) {
-            Ok(builder) => {
-                // commit() is required for the environment to take effect; it
-                // returns false if an environment was already committed, which
-                // we treat as success (the prior environment wins, but ORT is
-                // in fact loaded).
-                let _ = builder.commit();
-                let outcome = DiscoveryOutcome { source, path };
-                record_last_outcome(Some(outcome.clone()));
-                tracing::info!(
-                    "loaded ONNX Runtime dylib from {} [{}]",
-                    outcome.path.display(),
-                    outcome.source
-                );
-                Some(outcome)
-            }
-            Err(e) => {
-                let msg = format!("init_from({}) failed: {}", path.display(), e);
-                tracing::warn!("{}", msg);
-                last_error = Some(msg);
-                searched.push((source, path.display().to_string()));
-                None
-            }
-        }
+        try_init_candidate(source, path, require_exists, &mut searched, &mut last_error)
     };
 
     // 1-4: high-priority static candidates (env / config / user_lib / sibling).
@@ -1092,6 +1185,17 @@ mod tests {
     }
 
     #[test]
+    fn test_panic_message_extracts_str_and_string_payloads() {
+        let from_str = std::panic::catch_unwind(|| panic!("dlopen failed")).unwrap_err();
+        assert_eq!(panic_message(from_str.as_ref()), "dlopen failed");
+
+        let owned = String::from("dlsym failed");
+        let from_string =
+            std::panic::catch_unwind(move || std::panic::panic_any(owned)).unwrap_err();
+        assert_eq!(panic_message(from_string.as_ref()), "dlsym failed");
+    }
+
+    #[test]
     fn test_source_as_str_covers_all_variants() {
         // Sanity check that every variant has a stable label
         assert_eq!(DiscoverySource::EnvVar.as_str(), "env");
@@ -1195,6 +1299,13 @@ mod tests {
         let dirs = system_site_packages_dirs();
         let _ = dirs;
     }
+
+    // NOTE: the bare-name loadability probe's negative test lives in
+    // tests/ort_bare_name_test.rs — a separate integration-test binary —
+    // because a rejected non-ORT candidate still commits ort's process-wide
+    // environment (rc.13 init_from commits lazily on the Ok path before the
+    // probe runs), which would poison every later ort symbol query in the
+    // same test binary on machines that DO have a working ORT.
 
     // Tests that actually invoke ort::init_from() require a real libonnxruntime
     // and are gated behind the `onnx` feature plus a present system ORT. The

@@ -140,6 +140,15 @@ impl LeIndex {
 
         // Determine embedding model status from the embedder variant.
         let embedding_model = self.determine_embedding_model();
+        let embedding_preset = crate::config::LeIndexConfig::load_cached()
+            .indexing
+            .embeddings
+            .remote_preset_label()
+            .to_string();
+        let measured_embedding_dimension = self
+            .embedder
+            .as_ref()
+            .and_then(crate::cli::index_builder::HybridEmbedder::observed_neural_dimension);
 
         let precision_enabled = cfg!(feature = "precision")
             && crate::feature_flags::FeatureFlag::PrecisionIngest.is_enabled();
@@ -175,6 +184,8 @@ impl LeIndex {
             pdg_nodes,
             pdg_edges,
             embedding_model,
+            embedding_preset,
+            measured_embedding_dimension,
             precision_enabled,
             precision_nodes,
             precision_languages: precision_languages.into_iter().collect(),

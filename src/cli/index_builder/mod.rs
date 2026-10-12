@@ -17,11 +17,6 @@ use crate::search::onnx::{EmbedResult, EmbeddingClient};
 #[cfg(feature = "onnx")]
 use tokio::task;
 
-#[cfg(feature = "remote-embeddings")]
-use crate::search::onnx::remote::RemoteEmbeddingProvider;
-#[cfg(feature = "remote-embeddings")]
-use crate::search::onnx::{GenericRemoteProvider, RemoteEmbeddingConfig, RemoteEmbeddingError};
-
 use super::leindex::{
     DEPENDENCY_MANIFEST_NAMES, FileStats, IndexStats, ProjectFileScan, SKIP_DIRS,
     SOURCE_FILE_EXTENSIONS,
@@ -50,6 +45,10 @@ mod test;
 #[cfg(test)]
 #[path = "index_builder_hybrid_test.rs"]
 mod hybrid_test;
+
+#[cfg(all(test, feature = "remote-embeddings"))]
+#[path = "remote_embed_test.rs"]
+pub(crate) mod remote_embed_test;
 
 // ============================================================================
 // TF-IDF EMBEDDING SYSTEM
@@ -1569,31 +1568,45 @@ fn stratify_vocab(idf_scores: Vec<(String, f32)>) -> Vec<(String, f32)> {
         .collect()
 }
 
-/// Wrap a TF-IDF embedder as hybrid_local (neural query embedding) when the
-/// ONNX feature is enabled and neural indexing is allowed, falling back to
-/// tfidf_only on initialization failure or when neural is disabled.
+#[cfg(feature = "remote-embeddings")]
+mod remote;
+#[cfg(feature = "remote-embeddings")]
+pub(crate) use remote::try_remote_neural_embedder;
+
+/// Degradation ladder — remote construction error → hybrid_local →
+/// tfidf_only — is logged once at each step and never hard-fails indexing.
 fn build_neural_embedder(tfidf_embedder: TfIdfEmbedder, _allow_neural: bool) -> HybridEmbedder {
+    #[cfg(feature = "remote-embeddings")]
+    {
+        if _allow_neural {
+            if let Some(hybrid) = try_remote_neural_embedder(
+                tfidf_embedder.clone(),
+                &crate::config::LeIndexConfig::load_cached()
+                    .indexing
+                    .embeddings,
+            ) {
+                return hybrid;
+            }
+        }
+    }
     #[cfg(feature = "onnx")]
     {
         if _allow_neural {
-            match HybridEmbedder::hybrid_local(tfidf_embedder.clone(), None) {
-                Ok(hybrid) => hybrid,
+            match HybridEmbedder::hybrid_local(
+                tfidf_embedder.clone(),
+                Some(crate::config::LeIndexConfig::load_cached().neural_weight_f32()),
+            ) {
+                Ok(hybrid) => return hybrid,
                 Err(e) => {
                     warn!(
                         "Failed to create hybrid_local embedder (ONNX), falling back to tfidf_only: {}",
                         e
                     );
-                    HybridEmbedder::tfidf_only(tfidf_embedder)
                 }
             }
-        } else {
-            HybridEmbedder::tfidf_only(tfidf_embedder)
         }
     }
-    #[cfg(not(feature = "onnx"))]
-    {
-        HybridEmbedder::tfidf_only(tfidf_embedder)
-    }
+    HybridEmbedder::tfidf_only(tfidf_embedder)
 }
 
 /// Compute neural rows against an already-published TF-IDF index.
@@ -1607,7 +1620,7 @@ fn build_neural_embedder(tfidf_embedder: TfIdfEmbedder, _allow_neural: bool) -> 
 )]
 pub(crate) fn enrich_neural_embeddings(
     pdg: &ProgramDependenceGraph,
-    embedder: &HybridEmbedder,
+    embedder: &GenerationNeuralEmbedder,
     admitted_node_ids: &HashSet<String>,
 ) -> Vec<(String, Vec<f32>)> {
     if !embedder.has_neural() {
@@ -1692,7 +1705,7 @@ fn dedupe_neural_rows_keep_first(rows: &mut Vec<(String, Vec<f32>)>) {
 
 #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
 fn append_neural_batch(
-    embedder: &HybridEmbedder,
+    embedder: &GenerationNeuralEmbedder,
     pending: &[(String, String)],
     rows: &mut Vec<(String, Vec<f32>)>,
 ) {

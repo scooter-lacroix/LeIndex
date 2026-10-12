@@ -152,8 +152,12 @@ fn write_neural_matrix(
             .with_context(|| format!("Neural row {row} references unknown node {node}"))?;
         rows.push((id.clone(), neural.vector(row).as_f32_slice().to_vec()));
     }
-    crate::search::vector::write_mmap_embeddings(&dir.join("neural_embeddings.bin"), &rows)
-        .map_err(|error| anyhow::anyhow!("write Neural matrix: {error}"))
+    crate::search::vector::write_mmap_embeddings_with_identity(
+        &dir.join("neural_embeddings.bin"),
+        &rows,
+        neural.identity(),
+    )
+    .map_err(|error| anyhow::anyhow!("write Neural matrix: {error}"))
 }
 
 /// Unpack the Fragments bundle. Entry names are checked against the closed

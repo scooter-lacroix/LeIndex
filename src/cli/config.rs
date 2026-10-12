@@ -10,6 +10,10 @@ use std::path::Path;
 
 use crate::storage::schema::{PROJECT_STORE_MMAP_SIZE, PROJECT_WRITER_CACHE_SIZE_KIB};
 
+// Re-exported so `crate::cli::config::EmbeddingConfig` paths keep resolving
+// after the duplicate struct was folded into the live user-level schema.
+pub use crate::config::EmbeddingConfig;
+
 /// Default configuration file name
 pub const DEFAULT_CONFIG_FILE: &str = ".leindex/config.toml";
 
@@ -504,47 +508,13 @@ pub struct MemoryConfig {
     pub max_memory_mb: usize,
 }
 
-/// Embedding configuration for hybrid embedding system.
-///
-/// The `neural_weight` field was removed on 2026-08-01 (dead: never read by
-/// scoring — the canonical knob is `[search] neural_weight` in `src/config.rs`).
-/// Existing project configs that set it under `[indexing.embeddings]` still
-/// parse fine: serde ignores unknown fields (no `deny_unknown_fields`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbeddingConfig {
-    /// Enable hybrid embeddings (TF-IDF + neural/remote)
-    #[serde(default = "default_enable_hybrid")]
-    pub enable_hybrid: bool,
-
-    /// Remote embedding API endpoint (if using remote embeddings)
-    #[serde(default)]
-    pub remote_endpoint: Option<String>,
-
-    /// Remote embedding API key (if using remote embeddings)
-    #[serde(default)]
-    pub remote_api_key: Option<String>,
-
-    /// Local ONNX model path (if using local neural embeddings)
-    #[serde(default)]
-    pub onnx_model_path: Option<String>,
-}
-
-const fn default_enable_hybrid() -> bool {
-    false // Default to TF-IDF only for compatibility
-}
-
-impl Default for EmbeddingConfig {
-    fn default() -> Self {
-        Self {
-            enable_hybrid: default_enable_hybrid(),
-            remote_endpoint: None,
-            remote_api_key: None,
-            onnx_model_path: None,
-        }
-    }
-}
-
 /// Indexing configuration
+///
+/// `embeddings` is the live `crate::config::EmbeddingConfig` (user-level
+/// remote-embeddings schema). Mounting the live type here keeps
+/// project-level `.leindex/config.toml` files serde-compatible (same keys)
+/// while the runtime ladder reads the user-level config — one schema, one
+/// implementation, no duplicate struct to keep in sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexingConfig {
     /// Batch size for TF-IDF/index construction
