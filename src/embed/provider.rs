@@ -258,11 +258,24 @@ impl ExecutionProviderSelector {
         }
     }
 
+    /// Returns true when an ORT runtime has already been initialized OR when
+    /// candidate discovery finds an existing candidate on disk.
+    ///
+    /// This guards ORT symbol queries (like `is_available()`) against panicking
+    /// when no libonnxruntime can be loaded (VAL-CROSS-015). Checking `last_outcome()`
+    /// covers libraries loaded via the bare-name dynamic loader fallback as well
+    /// as explicitly discovered candidate paths.
+    #[cfg(feature = "onnx")]
+    fn is_ort_available() -> bool {
+        crate::embed::ort_discovery::last_outcome().is_some()
+            || crate::embed::ort_discovery::discover_path_only().is_some()
+    }
+
     /// Check if CUDA is available on this system.
     fn is_cuda_available() -> bool {
         #[cfg(feature = "onnx")]
         {
-            if crate::embed::ort_discovery::discover_path_only().is_none() {
+            if !Self::is_ort_available() {
                 return false;
             }
             ort::ep::CUDA::default().is_available().unwrap_or(false)
@@ -288,7 +301,7 @@ impl ExecutionProviderSelector {
     fn is_migraphx_available() -> bool {
         #[cfg(feature = "onnx")]
         {
-            if crate::embed::ort_discovery::discover_path_only().is_none() {
+            if !Self::is_ort_available() {
                 return false;
             }
             // First, ask ORT if MIGraphX is available in the loaded binary
@@ -344,7 +357,7 @@ impl ExecutionProviderSelector {
     pub(crate) fn is_migraphx_compiled_in() -> bool {
         #[cfg(feature = "onnx")]
         {
-            if crate::embed::ort_discovery::discover_path_only().is_none() {
+            if !Self::is_ort_available() {
                 return false;
             }
             ort::ep::MIGraphX::default().is_available().unwrap_or(false)
@@ -361,7 +374,7 @@ impl ExecutionProviderSelector {
     pub(crate) fn is_cuda_compiled_in() -> bool {
         #[cfg(feature = "onnx")]
         {
-            if crate::embed::ort_discovery::discover_path_only().is_none() {
+            if !Self::is_ort_available() {
                 return false;
             }
             ort::ep::CUDA::default().is_available().unwrap_or(false)
@@ -376,7 +389,7 @@ impl ExecutionProviderSelector {
     fn is_coreml_available() -> bool {
         #[cfg(feature = "onnx")]
         {
-            crate::embed::ort_discovery::discover_path_only().is_some() && cfg!(target_os = "macos")
+            Self::is_ort_available() && cfg!(target_os = "macos")
         }
         #[cfg(not(feature = "onnx"))]
         {
