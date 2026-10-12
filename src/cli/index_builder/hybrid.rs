@@ -1,5 +1,10 @@
 //! Hybrid embedding backend (unified TF-IDF + neural/remote).
 
+#[cfg(feature = "remote-embeddings")]
+use crate::search::onnx::remote::RemoteEmbeddingProvider;
+#[cfg(feature = "remote-embeddings")]
+use crate::search::onnx::{GenericRemoteProvider, RemoteEmbeddingConfig, RemoteEmbeddingError};
+
 use super::*;
 
 // ============================================================================

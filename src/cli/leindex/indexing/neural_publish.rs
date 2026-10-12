@@ -83,42 +83,44 @@ fn streaming_neural_inputs<'a>(
     let mut node_indices = pdg.node_indices();
     let mut file_cache = index_builder::FileReadCache::per_chunk_scratch();
 
-    std::iter::from_fn(move || loop {
-        let node_idx = node_indices.next()?;
-        let Some(node) = pdg.get_node(node_idx) else {
-            continue;
-        };
-        if node.node_type == crate::graph::pdg::NodeType::External
-            || !admitted_node_ids.contains(&node.id)
-        {
-            continue;
+    std::iter::from_fn(move || {
+        loop {
+            let node_idx = node_indices.next()?;
+            let Some(node) = pdg.get_node(node_idx) else {
+                continue;
+            };
+            if node.node_type == crate::graph::pdg::NodeType::External
+                || !admitted_node_ids.contains(&node.id)
+            {
+                continue;
+            }
+            let input = {
+                let file_bytes = file_cache
+                    .get_or_read(Path::new(&*node.file_path))
+                    .unwrap_or_else(|error| {
+                        warn!(
+                            node_id = %node.id,
+                            path = %node.file_path,
+                            %error,
+                            "Failed to read source for streaming neural node; using empty bytes"
+                        );
+                        std::sync::Arc::new(Vec::new())
+                    });
+                let text = index_builder::enriched_node_content(
+                    pdg,
+                    node_idx,
+                    node,
+                    &file_bytes,
+                    &connectivity_config,
+                    &file_summary_ctx,
+                );
+                Ok(streaming::neural::NeuralInput {
+                    node_id: node.id.clone(),
+                    text: index_builder::cap_neural_text(&text).to_owned(),
+                })
+            };
+            return Some(input);
         }
-        let input = {
-            let file_bytes = file_cache
-                .get_or_read(Path::new(&*node.file_path))
-                .unwrap_or_else(|error| {
-                    warn!(
-                        node_id = %node.id,
-                        path = %node.file_path,
-                        %error,
-                        "Failed to read source for streaming neural node; using empty bytes"
-                    );
-                    std::sync::Arc::new(Vec::new())
-                });
-            let text = index_builder::enriched_node_content(
-                pdg,
-                node_idx,
-                node,
-                &file_bytes,
-                &connectivity_config,
-                &file_summary_ctx,
-            );
-            Ok(streaming::neural::NeuralInput {
-                node_id: node.id.clone(),
-                text: index_builder::cap_neural_text(&text).to_owned(),
-            })
-        };
-        return Some(input);
     })
 }
 
@@ -796,12 +798,10 @@ mod tests {
                 .len(),
             1
         );
-        assert!(reusable_fragment_rows(
-            old_rows.clone(),
-            Some(&manifest),
-            "remote|new-template|768"
-        )
-        .is_empty());
+        assert!(
+            reusable_fragment_rows(old_rows.clone(), Some(&manifest), "remote|new-template|768")
+                .is_empty()
+        );
         assert!(
             reusable_fragment_rows(old_rows.clone(), Some(&manifest), "local|qwen|1024").is_empty()
         );
