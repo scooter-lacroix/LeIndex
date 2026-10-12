@@ -30,7 +30,6 @@ impl LeIndex {
         storage_override: Option<&crate::storage::schema::Storage>,
         artifact_path: std::path::PathBuf,
         prebuilt_pdg: Option<crate::graph::pdg::ProgramDependenceGraph>,
-        generation_identity: Option<&str>,
     ) -> Result<()> {
         crate::cli::mcp::request_meta::PROJECT_HYDRATIONS
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -92,7 +91,7 @@ impl LeIndex {
         }
 
         let prepared = prepared.unwrap_or_else(|| Self::load_snapshot_engine(&artifact_path));
-        self.hydrate_search_after_pdg_with(pdg, artifact_path, prepared, generation_identity)
+        self.hydrate_search_after_pdg_with(pdg, artifact_path, prepared)
     }
 
     /// Hydrate the search engine on top of a PDG that is *already resident*.
@@ -107,7 +106,7 @@ impl LeIndex {
         };
         let artifact_path = self.active_storage_path();
         let prepared = Self::load_snapshot_engine(&artifact_path);
-        self.hydrate_search_after_pdg_with(pdg, artifact_path, prepared, None)
+        self.hydrate_search_after_pdg_with(pdg, artifact_path, prepared)
     }
 
     /// Restore the search engine for `pdg` from a persisted snapshot when it is
@@ -117,7 +116,6 @@ impl LeIndex {
         pdg: crate::graph::pdg::ProgramDependenceGraph,
         artifact_path: std::path::PathBuf,
         prepared: PreparedEngine,
-        generation_identity: Option<&str>,
     ) -> Result<()> {
         let persist_artifacts = artifact_path == self.storage_path;
         let pdg_node_count = pdg.node_count();
