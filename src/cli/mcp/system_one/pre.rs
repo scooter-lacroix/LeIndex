@@ -10,7 +10,7 @@
 //!            code-enumerated candidates plus `keep_as_is`
 
 use super::ask_bounded;
-use super::types::{Asker, Question, Request};
+use super::types::{Asker, Question, Request, Response};
 use crate::cli::mcp::grouped::edit_distance;
 use serde_json::{Map, Value, json};
 
@@ -332,6 +332,23 @@ pub async fn heal(
     };
     healed.changes.extend(code_changes);
 
+    let wants_project = wants_project_hint(ctx, &mut healed);
+    if issues.is_empty() && !wants_project {
+        return healed;
+    }
+
+    let Some(answers) = stage1(asker, ctx, &mut healed, intent, wants_project, params).await else {
+        return healed;
+    };
+    apply_project_fill(&answers, ctx, &mut healed, params, wants_project);
+    let flagged = flagged_issues(&answers, &issues, wants_project, params);
+    stage2(asker, ctx, &mut healed, flagged, intent, params).await;
+    healed
+}
+
+/// Whether the call should be offered a model-chosen `project_path`; emits the
+/// no-projects hint as a side effect.
+fn wants_project_hint(ctx: &CallContext<'_>, healed: &mut Healed) -> bool {
     let project_in_schema = ctx
         .schema
         .get("properties")
@@ -343,12 +360,19 @@ pub async fn heal(
                 .into(),
         );
     }
-    let wants_project = unresolved && !ctx.known_projects.is_empty();
-    if issues.is_empty() && !wants_project {
-        return healed;
-    }
+    unresolved && !ctx.known_projects.is_empty()
+}
 
-    // Stage 1: one batched request.
+/// Stage 1: one batched request (`call_ok` + one `wrong:<param>` yes/no per
+/// parameter + the project questions when needed).
+async fn stage1(
+    asker: &impl Asker,
+    ctx: &CallContext<'_>,
+    healed: &mut Healed,
+    intent: Option<&str>,
+    wants_project: bool,
+    params: &HealParams,
+) -> Option<Response> {
     let supplied: Vec<String> = healed
         .args
         .as_object()
@@ -394,36 +418,64 @@ pub async fn heal(
         questions,
     };
     healed.requests += 1;
-    let Some(answers) = ask_bounded(asker, &stage1, params.timeout_ms).await else {
-        return healed;
-    };
+    ask_bounded(asker, &stage1, params.timeout_ms).await
+}
 
-    if wants_project && answers.p_yes("needs:project_path").unwrap_or(0.0) > params.needs_min {
-        if let Some((choice, confidence)) = answers.pick("fill:project_path") {
-            let is_known = ctx.known_projects.iter().any(|p| p == choice);
-            apply_choice(
-                &mut healed,
-                ctx,
-                params,
-                "project_path",
-                Value::Null,
-                json!(choice),
-                confidence,
-                is_known,
-            );
-        }
+/// Fill in `project_path` when Stage 1 said the call needs one.
+fn apply_project_fill(
+    answers: &Response,
+    ctx: &CallContext<'_>,
+    healed: &mut Healed,
+    params: &HealParams,
+    wants_project: bool,
+) {
+    if !wants_project || answers.p_yes("needs:project_path").unwrap_or(0.0) <= params.needs_min {
+        return;
     }
+    let Some((choice, confidence)) = answers.pick("fill:project_path") else {
+        return;
+    };
+    let is_known = ctx.known_projects.iter().any(|p| p == choice);
+    apply_choice(
+        healed,
+        ctx,
+        params,
+        "project_path",
+        Value::Null,
+        json!(choice),
+        confidence,
+        is_known,
+    );
+}
 
+/// Hard violations are known-bad by code; soft flags need the model's vote.
+fn flagged_issues<'i>(
+    answers: &Response,
+    issues: &'i [Issue],
+    wants_project: bool,
+    params: &HealParams,
+) -> Vec<&'i Issue> {
     let call_ok = answers.p_yes("call_ok").unwrap_or(1.0);
-    let flagged: Vec<&Issue> = issues
+    issues
         .iter()
         .filter(|i| i.kind != IssueKind::Missing || i.param != "project_path" || !wants_project)
         .filter(|i| {
-            // Hard violations are known-bad by code; soft flags need the model's vote.
             call_ok < params.ok_min
                 || answers.p_yes(&format!("wrong:{}", i.param)).unwrap_or(1.0) > params.wrong_min
         })
-        .collect();
+        .collect()
+}
+
+/// Stage 2: one batched pick request per flagged parameter, over
+/// code-enumerated candidates plus `keep_as_is`.
+async fn stage2(
+    asker: &impl Asker,
+    ctx: &CallContext<'_>,
+    healed: &mut Healed,
+    flagged: Vec<&Issue>,
+    intent: Option<&str>,
+    params: &HealParams,
+) {
     let mut asks: Vec<(String, Question)> = Vec::new();
     let mut offered: Vec<(&Issue, Vec<Value>)> = Vec::new();
     for issue in flagged {
@@ -447,17 +499,15 @@ pub async fn heal(
         offered.push((issue, options));
     }
     if asks.is_empty() {
-        return healed;
+        return;
     }
-
-    // Stage 2: one batched pick request.
     let stage2 = Request {
         state: json!({"tool": ctx.tool, "arguments": healed.args, "intent": intent}),
         questions: asks,
     };
     healed.requests += 1;
     let Some(picks) = ask_bounded(asker, &stage2, params.timeout_ms).await else {
-        return healed;
+        return;
     };
     for (issue, options) in offered {
         let Some((choice, confidence)) = picks.pick(&format!("fix:{}", issue.param)) else {
@@ -475,7 +525,7 @@ pub async fn heal(
             .cloned()
             .unwrap_or(Value::Null);
         apply_choice(
-            &mut healed,
+            healed,
             ctx,
             params,
             &issue.param,
@@ -485,7 +535,6 @@ pub async fn heal(
             true,
         );
     }
-    healed
 }
 
 #[allow(clippy::too_many_arguments)]
