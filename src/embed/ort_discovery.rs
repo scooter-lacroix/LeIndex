@@ -668,10 +668,17 @@ pub fn try_init_candidate(
 
             // rc.13 init_from defers dylib load to first symbol access, so Ok ≠ loadable.
             // For a bare-name candidate (require_exists=false), verify the library
-            // actually loads by forcing a cheap symbol touch inside catch_unwind.
+            // actually loads by forcing a symbol touch inside catch_unwind.
+            // The probe MUST be an EP whose is_available() consults
+            // GetAvailableProviders() — observed runner panics at ort lib.rs:234
+            // (Dlopen) / :239 (DlSym OrtGetApiBase) prove MIGraphX's query forces
+            // the deferred load. CPU is NOT usable here: rc.13 special-cases it as
+            // the always-available baseline and resolves without touching the
+            // dylib, which let a bare-name phantom pass as Initialized on
+            // ORT-less runners (Validate job 114972336073).
             if !require_exists {
                 let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    ort::ep::CPU::default().is_available()
+                    ort::ep::MIGraphX::default().is_available()
                 }));
                 match probe {
                     Ok(Ok(_)) => {}
