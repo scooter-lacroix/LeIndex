@@ -30,6 +30,7 @@ impl LeIndex {
         storage_override: Option<&crate::storage::schema::Storage>,
         artifact_path: std::path::PathBuf,
         prebuilt_pdg: Option<crate::graph::pdg::ProgramDependenceGraph>,
+        generation_identity: Option<&str>,
     ) -> Result<()> {
         crate::cli::mcp::request_meta::PROJECT_HYDRATIONS
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -91,7 +92,7 @@ impl LeIndex {
         }
 
         let prepared = prepared.unwrap_or_else(|| Self::load_snapshot_engine(&artifact_path));
-        self.hydrate_search_after_pdg_with(pdg, artifact_path, prepared)
+        self.hydrate_search_after_pdg_with(pdg, artifact_path, prepared, generation_identity)
     }
 
     /// Hydrate the search engine on top of a PDG that is *already resident*.
@@ -106,7 +107,7 @@ impl LeIndex {
         };
         let artifact_path = self.active_storage_path();
         let prepared = Self::load_snapshot_engine(&artifact_path);
-        self.hydrate_search_after_pdg_with(pdg, artifact_path, prepared)
+        self.hydrate_search_after_pdg_with(pdg, artifact_path, prepared, None)
     }
 
     /// Restore the search engine for `pdg` from a persisted snapshot when it is
@@ -116,6 +117,7 @@ impl LeIndex {
         pdg: crate::graph::pdg::ProgramDependenceGraph,
         artifact_path: std::path::PathBuf,
         prepared: PreparedEngine,
+        generation_identity: Option<&str>,
     ) -> Result<()> {
         let persist_artifacts = artifact_path == self.storage_path;
         let pdg_node_count = pdg.node_count();
@@ -526,9 +528,13 @@ impl LeIndex {
             if !persist_artifacts {
                 return Ok(());
             }
+            let neural_identity =
+                index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path)
+                    .and_then(|mmap| mmap.identity().map(str::to_owned));
             index_builder::persist_neural_embeddings_to_mmap(
                 &self.search_engine,
                 &self.project_path,
+                neural_identity.as_deref(),
             )
             .context("Failed to persist neural mmap embeddings during hydration")?;
         }
@@ -642,8 +648,25 @@ fn query_remote_embedder(
     embeddings_cfg: &crate::config::EmbeddingConfig,
 ) -> Option<index_builder::HybridEmbedder> {
     let configured = embeddings_cfg.resolved_remote()?.remote_dimension;
-    let persisted = index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path)
-        .map(|mmap| mmap.dimension() as usize);
+    let (persisted_identity, persisted) =
+        index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path)
+            .map(|mmap| {
+                (
+                    mmap.identity().map(str::to_owned),
+                    Some(mmap.dimension() as usize),
+                )
+            })
+            .unwrap_or((None, None));
+    if persisted_identity
+        .as_deref()
+        .is_some_and(|identity| identity.starts_with("local|"))
+    {
+        info!(
+            identity = ?persisted_identity,
+            "Persisted neural rows were produced locally; query embedder follows the recorded generation"
+        );
+        return None;
+    }
     if let (Some(configured), Some(persisted)) = (configured, persisted) {
         if configured != persisted {
             info!(
@@ -664,6 +687,14 @@ mod tests {
 
     /// Persist a generation whose neural rows are `neural_dim`-wide.
     fn persist_fixture(project: &std::path::Path, neural_dim: usize) {
+        persist_fixture_with_identity(project, neural_dim, None);
+    }
+
+    fn persist_fixture_with_identity(
+        project: &std::path::Path,
+        neural_dim: usize,
+        identity: Option<&str>,
+    ) {
         let mut engine = crate::search::search::SearchEngine::new();
         engine.index_nodes(vec![crate::search::search::NodeInfo {
             node_id: "sample".into(),
@@ -679,7 +710,8 @@ mod tests {
             pre_tokenized: None,
         }]);
         index_builder::persist_embeddings_to_mmap(&engine, project).expect("lexical mmap");
-        index_builder::persist_neural_embeddings_to_mmap(&engine, project).expect("neural mmap");
+        index_builder::persist_neural_embeddings_to_mmap(&engine, project, identity)
+            .expect("neural mmap");
         index_builder::persist_search_snapshot(&engine, project, 1, 0, "fixture".into())
             .expect("snapshot");
     }
@@ -721,17 +753,24 @@ mod tests {
         let _reset = crate::feature_flags::FlagOverrideReset;
 
         let local = tempfile::tempdir().expect("local generation");
-        persist_fixture(local.path(), 1024);
+        persist_fixture_with_identity(local.path(), 768, Some("local|onnx/model|dim=768"));
         assert!(
             query_remote_embedder(&tfidf, &local.path().join(".leindex"), &cfg).is_none(),
-            "a local-1024 generation must not be queried with the 768 remote"
+            "local identity must reject remote even when dimensions match"
         );
 
         let remote = tempfile::tempdir().expect("remote generation");
-        persist_fixture(remote.path(), 768);
+        persist_fixture_with_identity(remote.path(), 768, Some("remote|provider/model|dim=768"));
         assert!(
             query_remote_embedder(&tfidf, &remote.path().join(".leindex"), &cfg).is_some(),
-            "a matching 768 generation keeps the remote query embedder"
+            "a matching remote generation keeps the remote query embedder"
+        );
+
+        let legacy = tempfile::tempdir().expect("legacy generation without identity");
+        persist_fixture(legacy.path(), 768);
+        assert!(
+            query_remote_embedder(&tfidf, &legacy.path().join(".leindex"), &cfg).is_some(),
+            "absent identity keeps the dimension-only legacy behavior"
         );
 
         let empty = tempfile::tempdir().expect("no persisted neural rows");
@@ -763,7 +802,7 @@ mod tests {
             pre_tokenized: None,
         }]);
         index_builder::persist_embeddings_to_mmap(&engine, project.path()).expect("lexical mmap");
-        index_builder::persist_neural_embeddings_to_mmap(&engine, project.path())
+        index_builder::persist_neural_embeddings_to_mmap(&engine, project.path(), None)
             .expect("neural mmap");
         index_builder::persist_search_snapshot(&engine, project.path(), 1, 0, "fixture".into())
             .expect("snapshot");

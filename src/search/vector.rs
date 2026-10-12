@@ -382,6 +382,7 @@ pub struct MmapEmbeddingIndex {
     ids_section_offset: usize,
     /// Byte offset where the embedding matrix begins (4-byte aligned).
     embedding_matrix_offset: usize,
+    identity: Option<String>,
 }
 
 impl std::fmt::Debug for MmapEmbeddingIndex {
@@ -508,6 +509,19 @@ fn build_id_rows(
     Ok(id_rows)
 }
 
+fn read_mmap_identity(mmap: &[u8], matrix_end: usize) -> Option<String> {
+    let length_end = matrix_end.checked_add(4)?;
+    let identity_len =
+        u32::from_le_bytes(mmap.get(matrix_end..length_end)?.try_into().ok()?) as usize;
+    let identity_end = length_end.checked_add(identity_len)?;
+    if identity_end != mmap.len() {
+        return None;
+    }
+    std::str::from_utf8(mmap.get(length_end..identity_end)?)
+        .ok()
+        .map(str::to_owned)
+}
+
 impl MmapEmbeddingIndex {
     /// Open an existing mmap embedding file for read-only access.
     pub fn open(path: &Path) -> Result<Self, MmapError> {
@@ -518,13 +532,16 @@ impl MmapEmbeddingIndex {
         let dimension = header.dimension;
 
         if node_count == 0 {
+            let embedding_matrix_offset = MmapHeader::SIZE;
+            let identity = read_mmap_identity(&mmap, embedding_matrix_offset);
             return Ok(Self {
                 mmap,
                 node_count: 0,
                 dimension,
                 id_rows: HashMap::new(),
                 ids_section_offset: MmapHeader::SIZE,
-                embedding_matrix_offset: MmapHeader::SIZE,
+                embedding_matrix_offset,
+                identity,
             });
         }
 
@@ -553,6 +570,7 @@ impl MmapEmbeddingIndex {
 
         // Malformed UTF-8 remains deferred to `entries()`; valid IDs stay searchable.
         let id_rows = build_id_rows(&mmap, node_count, ids_section_offset)?;
+        let identity = read_mmap_identity(&mmap, expected_size);
 
         Ok(Self {
             mmap,
@@ -561,6 +579,7 @@ impl MmapEmbeddingIndex {
             id_rows,
             ids_section_offset,
             embedding_matrix_offset,
+            identity,
         })
     }
 
@@ -685,6 +704,11 @@ impl MmapEmbeddingIndex {
     /// Return the embedding dimension.
     pub fn dimension(&self) -> u32 {
         self.dimension
+    }
+
+    /// Return the persisted generation identity, if the mmap has a valid trailer.
+    pub fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
     }
 
     /// Return all `(node_id, embedding)` records in row order.
@@ -896,11 +920,28 @@ fn write_matrix_rows<W: std::io::Write>(
 /// ID strings: concatenated UTF-8 bytes
 /// Padding to 4-byte alignment
 /// Embedding matrix: node_count × dimension × 4 bytes (f32 LE)
+/// Optional identity trailer: u32 LE byte length followed by UTF-8 identity.
 /// ```
 pub fn write_mmap_embeddings(
     path: &Path,
     embeddings: &[(String, Vec<f32>)],
 ) -> Result<(), MmapError> {
+    write_mmap_embeddings_with_identity(path, embeddings, None)
+}
+
+/// Write embeddings to a binary file in the mmap format, optionally recording
+/// the generation identity in an in-band trailer.
+pub fn write_mmap_embeddings_with_identity(
+    path: &Path,
+    embeddings: &[(String, Vec<f32>)],
+    identity: Option<&str>,
+) -> Result<(), MmapError> {
+    let identity_len = identity
+        .map(|value| {
+            u32::try_from(value.len())
+                .map_err(|_| MmapError::Corrupt("generation identity exceeds u32 length".into()))
+        })
+        .transpose()?;
     let node_count = embeddings.len() as u32;
     let dimension = if embeddings.is_empty() {
         0u32
@@ -953,6 +994,11 @@ pub fn write_mmap_embeddings(
 
     // Embedding matrix — one row (dim × 4 bytes) at a time.
     write_matrix_rows(&mut writer, embeddings, dimension as usize)?;
+
+    if let (Some(identity), Some(identity_len)) = (identity, identity_len) {
+        writer.write_all(&identity_len.to_le_bytes())?;
+        writer.write_all(identity.as_bytes())?;
+    }
 
     writer.flush()?;
     Ok(())
@@ -1108,6 +1154,56 @@ mod tests {
     // ========================================================================
     // Mmap embedding tests
     // ========================================================================
+
+    #[test]
+    fn test_mmap_identity_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.bin");
+        let embeddings = vec![("node".to_string(), vec![0.5, 0.25])];
+
+        write_mmap_embeddings_with_identity(
+            &path,
+            &embeddings,
+            Some("remote|provider/model|dim=2"),
+        )
+        .unwrap();
+        let index = MmapEmbeddingIndex::open(&path).unwrap();
+        assert_eq!(index.identity(), Some("remote|provider/model|dim=2"));
+    }
+
+    #[test]
+    fn test_mmap_identity_none_preserves_legacy_layout_and_ignores_arbitrary_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.bin");
+        let embeddings = vec![("node".to_string(), vec![0.5, 0.25])];
+
+        write_mmap_embeddings(&path, &embeddings).unwrap();
+        let legacy = std::fs::read(&path).unwrap();
+        let matrix_end = MmapEmbeddingIndex::open(&path)
+            .unwrap()
+            .embedding_matrix_offset
+            + 2 * 4;
+        assert_eq!(legacy.len(), matrix_end);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"arbitrary trailing bytes").unwrap();
+        let index = MmapEmbeddingIndex::open(&path).unwrap();
+        assert_eq!(index.identity(), None);
+    }
+
+    #[test]
+    fn test_mmap_empty_index_identity_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty-identity.bin");
+
+        write_mmap_embeddings_with_identity(&path, &[], Some("local|onnx/model")).unwrap();
+        let index = MmapEmbeddingIndex::open(&path).unwrap();
+        assert!(index.is_empty());
+        assert_eq!(index.identity(), Some("local|onnx/model"));
+    }
 
     #[test]
     fn test_mmap_roundtrip() {

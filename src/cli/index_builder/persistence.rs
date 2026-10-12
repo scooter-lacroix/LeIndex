@@ -307,6 +307,7 @@ pub(crate) fn pdg_search_fingerprint(pdg: &ProgramDependenceGraph) -> String {
 pub(crate) fn persist_neural_embeddings_to_mmap(
     search_engine: &SearchEngine,
     project_path: &Path,
+    identity: Option<&str>,
 ) -> Result<()> {
     let embeddings = search_engine.collect_neural_embeddings();
     let path = neural_mmap_embeddings_path(project_path);
@@ -322,7 +323,7 @@ pub(crate) fn persist_neural_embeddings_to_mmap(
         }
         return Ok(());
     }
-    crate::search::vector::write_mmap_embeddings(&path, &embeddings)
+    crate::search::vector::write_mmap_embeddings_with_identity(&path, &embeddings, identity)
         .map_err(|e| anyhow::anyhow!("Failed to write neural mmap embeddings: {e}"))?;
     info!(
         count = embeddings.len(),

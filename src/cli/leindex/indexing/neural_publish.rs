@@ -340,12 +340,14 @@ impl LeIndex {
         &self,
         _neural_resume_loaded: bool,
         _neural_rows: usize,
+        _identity: Option<&str>,
     ) -> Result<()> {
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
         if !_neural_resume_loaded && _neural_rows > 0 {
             index_builder::persist_neural_embeddings_to_mmap(
                 &self.search_engine,
                 &self.project_path,
+                _identity,
             )?;
         }
         Ok(())
@@ -615,7 +617,7 @@ impl LeIndex {
             Some(index_builder::HybridEmbedder::HybridLocal { .. }) => "onnx",
             _ => "unavailable",
         };
-        self.persist_neural_mmap(neural_resume_loaded, neural_rows)?;
+        self.persist_neural_mmap(neural_resume_loaded, neural_rows, Some(&selected_model))?;
         self.persist_neural_snapshot(
             &state,
             neural_rows,
