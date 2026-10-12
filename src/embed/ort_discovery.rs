@@ -629,7 +629,8 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// inside `catch_unwind` to verify that dynamic loading and symbol resolution succeed.
 /// Real-path candidates that `init_from` accepts keep the fast path.
 #[cfg(feature = "onnx")]
-pub(crate) fn try_init_candidate(
+#[doc(hidden)]
+pub fn try_init_candidate(
     source: DiscoverySource,
     path: PathBuf,
     require_exists: bool,
@@ -1292,57 +1293,12 @@ mod tests {
         let _ = dirs;
     }
 
-    #[test]
-    #[cfg(feature = "onnx")]
-    fn test_bare_name_probe_rejects_non_ort_dylib() {
-        // Find a real, dlopen-able library that is NOT ONNX Runtime (e.g. libc or libm).
-        let candidates = [
-            "/usr/lib/x86_64-linux-gnu/libc.so.6",
-            "/usr/lib/x86_64-linux-gnu/libm.so.6",
-            "/usr/lib/libc.so.6",
-            "/usr/lib/libm.so.6",
-            "/lib64/libc.so.6",
-            "/lib/x86_64-linux-gnu/libc.so.6",
-        ];
-        let non_ort_lib = candidates.iter().map(PathBuf::from).find(|p| p.exists());
-        let Some(non_ort_lib) = non_ort_lib else {
-            eprintln!(
-                "skipping test_bare_name_probe_rejects_non_ort_dylib: no non-ORT system dylib found"
-            );
-            return;
-        };
-
-        let mut searched = Vec::new();
-        let mut last_error = None;
-        let outcome = try_init_candidate(
-            DiscoverySource::System,
-            non_ort_lib,
-            false,
-            &mut searched,
-            &mut last_error,
-        );
-
-        assert!(
-            outcome.is_none(),
-            "dlopen-able non-ORT library must fail symbol verification probe, not return Initialized"
-        );
-        assert!(
-            !searched.is_empty(),
-            "failed candidate must be recorded in searched list"
-        );
-        assert!(
-            last_error.is_some(),
-            "failure reason must be recorded in last_error"
-        );
-        let err = last_error.unwrap();
-        assert!(
-            err.contains("not loadable")
-                || err.contains("does not export")
-                || err.contains("panicked")
-                || err.contains("failed"),
-            "expected failure message in last_error, got: {err}"
-        );
-    }
+    // NOTE: the bare-name loadability probe's negative test lives in
+    // tests/ort_bare_name_test.rs — a separate integration-test binary —
+    // because a rejected non-ORT candidate still commits ort's process-wide
+    // environment (rc.13 init_from commits lazily on the Ok path before the
+    // probe runs), which would poison every later ort symbol query in the
+    // same test binary on machines that DO have a working ORT.
 
     // Tests that actually invoke ort::init_from() require a real libonnxruntime
     // and are gated behind the `onnx` feature plus a present system ORT. The
