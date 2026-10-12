@@ -24,9 +24,10 @@
 //!   dropped, so the dense vector is exactly recoverable). `doc_id` is the
 //!   catalog integer id, matching the Pdg/Symbols layers.
 //! - **Neural** — the legacy `neural_embeddings.bin` (same `LIEE` frame; only
-//!   present when a neural model ran) becomes a version-2 `LIDX-NRL1` payload
-//!   carrying the f32 rows plus a per-row PDG node-id table. A store with no
-//!   neural file gets the canonical empty payload.
+//!   present when a neural model ran) becomes a `LIDX-NRL1` payload carrying
+//!   the f32 rows plus a per-row PDG node-id table (version 3 when the `LIEE`
+//!   file carries the generation identity trailer, else version 2). A store
+//!   with no neural file gets the canonical empty payload.
 //! - **Pdg** — reconstructed from the legacy catalog's `intel_nodes` /
 //!   `intel_edges` tables into the **version-2 (lossless)** `LIDX-PDG1`
 //!   payload: graph node ids, symbol names, file paths, languages, types,
@@ -74,9 +75,10 @@ use crate::storage::cas::blob::hash_to_hex;
 use super::lease::{GENERATIONS_DIR, MANIFEST_FILE, read_current_generation};
 use super::manifest::{LayerKind, Manifest};
 use super::reader::{
-    NEURAL_HEADER_LEN, NEURAL_MAGIC, NEURAL_VERSION_WITH_IDS, PDG_EDGE_LEN, PDG_HEADER_LEN,
-    PDG_MAGIC, PDG_NODE_V2_LEN, PDG_STRING_OFFSET_LEN, PDG_V2_NONE, SYMBOL_ENTRY_LEN,
-    SYMBOLS_HEADER_LEN, SYMBOLS_MAGIC, TFIDF_ENTRY_LEN, TFIDF_HEADER_LEN, TFIDF_MAGIC,
+    NEURAL_HEADER_LEN, NEURAL_MAGIC, NEURAL_VERSION_IDENTITY, NEURAL_VERSION_WITH_IDS,
+    PDG_EDGE_LEN, PDG_HEADER_LEN, PDG_MAGIC, PDG_NODE_V2_LEN, PDG_STRING_OFFSET_LEN, PDG_V2_NONE,
+    SYMBOL_ENTRY_LEN, SYMBOLS_HEADER_LEN, SYMBOLS_MAGIC, TFIDF_ENTRY_LEN, TFIDF_HEADER_LEN,
+    TFIDF_MAGIC,
 };
 use super::retention::DEFAULT_JOB_BYTES_MAX;
 use super::writer::GenerationWriter;
@@ -864,9 +866,10 @@ fn liee_u32(bytes: &[u8], offset: usize) -> Result<usize, MigrationError> {
 }
 
 /// Parse a legacy `LIEE` file (layout: see `write_mmap_embeddings`) into its
-/// row ids, dimension and raw little-endian f32 matrix bytes. Strict: any
+/// row ids, dimension, raw little-endian f32 matrix bytes and — when present
+/// and exactly file-terminating — the generation identity trailer. Strict: any
 /// truncation or non-UTF-8 id aborts the migration before anything destructive.
-fn parse_liee(bytes: &[u8]) -> Result<(Vec<&str>, usize, &[u8]), MigrationError> {
+fn parse_liee(bytes: &[u8]) -> Result<(Vec<&str>, usize, &[u8], Option<&str>), MigrationError> {
     if bytes.len() < LIEE_HEADER_LEN || bytes[0..4] != LIEE_MAGIC {
         return Err(MigrationError::Payload(
             "embeddings file has no LIEE header".into(),
@@ -885,7 +888,23 @@ fn parse_liee(bytes: &[u8]) -> Result<(Vec<&str>, usize, &[u8]), MigrationError>
     let matrix = bytes
         .get(matrix_offset..matrix_offset + matrix_len)
         .ok_or_else(|| MigrationError::Payload("embeddings matrix truncated".into()))?;
-    Ok((ids, dim, matrix))
+    let matrix_end = matrix_offset + matrix_len;
+    let identity = if bytes.len() >= matrix_end + 4 {
+        let len = u32::from_le_bytes(
+            bytes[matrix_end..matrix_end + 4]
+                .try_into()
+                .expect("4-byte slice"),
+        ) as usize;
+        let identity_end = matrix_end + 4 + len;
+        if identity_end == bytes.len() {
+            std::str::from_utf8(&bytes[matrix_end + 4..identity_end]).ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok((ids, dim, matrix, identity))
 }
 
 /// Walk the LIEE offset/length tables and borrow each row's UTF-8 id.
@@ -959,7 +978,7 @@ pub(crate) fn encode_tfidf_layer(
             embeddings_path.display()
         ))
     })?;
-    let (ids, dim, matrix) = parse_liee(&bytes)?;
+    let (ids, dim, matrix, _identity) = parse_liee(&bytes)?;
     let rows = rows_by_node(&ids, node_ids, "tfidf");
     let mut entries: Vec<(u32, u32, f32)> = Vec::new();
     for (&node, &row) in &rows {
@@ -976,9 +995,10 @@ pub(crate) fn encode_tfidf_layer(
 }
 
 /// Convert the legacy neural embedding file (`neural_embeddings.bin`, `LIEE`)
-/// into a version-2 [`LIDX-NRL1`] payload: f32 rows plus the PDG node id of
-/// each row, sorted by node id. A missing file means no neural model ran, so
-/// the layer is the canonical empty payload.
+/// into a [`LIDX-NRL1`] payload: f32 rows plus the PDG node id of
+/// each row, sorted by node id (version 3 when the source file carries the
+/// generation identity trailer, else version 2). A missing file means no
+/// neural model ran, so the layer is the canonical empty payload.
 pub(crate) fn encode_neural_layer(
     neural_path: &Path,
     node_ids: &HashMap<String, u32>,
@@ -987,14 +1007,22 @@ pub(crate) fn encode_neural_layer(
         return Ok(encode_empty_neural());
     }
     let bytes = fs::read(neural_path)?;
-    let (ids, dim, matrix) = parse_liee(&bytes)?;
+    let (ids, dim, matrix, identity) = parse_liee(&bytes)?;
     let rows = rows_by_node(&ids, node_ids, "neural");
     let mut data = Vec::with_capacity(rows.len() * dim * 4);
     for &row in rows.values() {
         data.extend_from_slice(&matrix[row * dim * 4..(row + 1) * dim * 4]);
     }
     let node_order: Vec<u32> = rows.keys().copied().collect();
-    Ok(encode_neural_payload(&node_order, dim, &data))
+    match identity.as_deref() {
+        Some(identity) => Ok(encode_neural_payload_with_identity(
+            &node_order,
+            dim,
+            &data,
+            identity,
+        )),
+        None => Ok(encode_neural_payload(&node_order, dim, &data)),
+    }
 }
 
 /// Assemble a version-2 [`LIDX-NRL1`] F32 payload: `nodes[i]` is the PDG node
@@ -1018,6 +1046,23 @@ pub(crate) fn encode_neural_payload(nodes: &[u32], dim: usize, data: &[u8]) -> V
     payload.extend_from_slice(&crate::storage::cas::blob::blob_hash(&body));
     payload.push(0); // 4-byte alignment pad for the id table / f32 array
     payload.extend_from_slice(&body);
+    payload
+}
+
+/// Assemble a version-3 [`LIDX-NRL1`] F32 payload: the version-2 layout plus
+/// a trailing identity section (`u32` byte length then UTF-8 bytes), mirroring
+/// the `LIEE` mmap trailer. The content hash still covers the id table and
+/// vector data only; the identity section lives outside the hashed region.
+pub(crate) fn encode_neural_payload_with_identity(
+    nodes: &[u32],
+    dim: usize,
+    data: &[u8],
+    identity: &str,
+) -> Vec<u8> {
+    let mut payload = encode_neural_payload(nodes, dim, data);
+    payload[9] = NEURAL_VERSION_IDENTITY;
+    payload.extend_from_slice(&(identity.len() as u32).to_le_bytes());
+    payload.extend_from_slice(identity.as_bytes());
     payload
 }
 
