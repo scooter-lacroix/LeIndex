@@ -104,9 +104,11 @@ impl FileSummaryHandler {
             include_source,
             focus_symbol,
             token_budget,
-            true,
-            false,
-            None,
+            SummaryProvenance {
+                live_parse: true,
+                catalog_truncated: false,
+                catalog_total: None,
+            },
             &relations,
             pdg_status,
             budget,
@@ -221,9 +223,11 @@ async fn catalog_file_summary(
         include_source,
         focus_symbol,
         token_budget,
-        false,
-        catalog_truncated,
-        catalog_total,
+        SummaryProvenance {
+            live_parse: false,
+            catalog_truncated,
+            catalog_total,
+        },
         &relations,
         pdg_status,
         budget,
@@ -260,6 +264,19 @@ fn resolve_live_symbol_paths(
     resolved
 }
 
+/// Provenance markers for a file summary: where the symbol list came from and
+/// how trustworthy it is. Rendered into the response so clients can tell a
+/// live-parse summary from a catalog-backed one.
+#[derive(Debug, Clone, Copy)]
+struct SummaryProvenance {
+    /// True when the symbol list came from a live parse (always current).
+    live_parse: bool,
+    /// True when the catalog query hit its row cap before returning all rows.
+    catalog_truncated: bool,
+    /// Total catalog rows for the file, when known.
+    catalog_total: Option<usize>,
+}
+
 fn file_summary_response(
     file_path: &Path,
     bytes: &[u8],
@@ -267,9 +284,7 @@ fn file_summary_response(
     include_source: bool,
     focus_symbol: Option<&str>,
     token_budget: usize,
-    symbol_index_miss: bool,
-    catalog_truncated: bool,
-    catalog_total: Option<usize>,
+    provenance: SummaryProvenance,
     relations: &HashMap<String, Value>,
     pdg_status: &'static str,
     budget: WorkBudget,
@@ -340,18 +355,18 @@ fn file_summary_response(
         .iter()
         .filter(|symbol| symbol["type"] == "class")
         .count();
-    let symbol_count = catalog_total.unwrap_or(total);
+    let symbol_count = provenance.catalog_total.unwrap_or(total);
     Ok(serde_json::json!({
         "file_path": file_path,
         "language": file_path.extension().and_then(|ext| ext.to_str()).unwrap_or("text"),
         "line_count": content.lines().count(),
         "symbol_count": symbol_count,
         "symbols_shown": shown.len(),
-        "symbols_truncated": shown.len() < symbol_count || catalog_truncated,
-        "catalog_truncated": catalog_truncated,
+        "symbols_truncated": shown.len() < symbol_count || provenance.catalog_truncated,
+        "catalog_truncated": provenance.catalog_truncated,
         "symbols": shown,
         "module_role": if class_count > function_count { "Class definitions" } else { "Function module" },
-        "symbol_index_miss": symbol_index_miss,
+        "symbol_index_miss": provenance.live_parse,
         "source_freshness": "live",
         "pdg_status": pdg_status,
         "retrieval": {

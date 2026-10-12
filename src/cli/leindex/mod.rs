@@ -581,24 +581,24 @@ impl LeIndex {
                 .flatten()
                 .map(|root| root.root_hash)
                 .unwrap_or_default();
-        index_builder::search_cache_key_for(
-            &self.project_id,
-            &self.project_path,
-            &self.stats,
+        index_builder::search_cache_key_for(&index_builder::SearchCacheKeyInputs {
+            project_id: &self.project_id,
+            project_path: &self.project_path,
+            stats: &self.stats,
             query,
             top_k,
             query_type,
             neural_available,
-            &cfg.search.search_mode,
-            cfg.search.neural_weight,
-            cfg.search.rerank_enabled,
-            cfg.search.rerank_top_n,
-            cfg.search.fragment_index_enabled,
-            cfg.search.fragment_weight,
-            &fragment_root_hash,
-            &cfg.neural.model_name,
-            &rerank_model,
-        )
+            search_mode: &cfg.search.search_mode,
+            neural_weight: cfg.search.neural_weight,
+            rerank_enabled: cfg.search.rerank_enabled,
+            rerank_top_n: cfg.search.rerank_top_n,
+            rerank_model: &rerank_model,
+            fragment_index_enabled: cfg.search.fragment_index_enabled,
+            fragment_weight: cfg.search.fragment_weight,
+            fragment_root_hash: &fragment_root_hash,
+            embed_model: &cfg.neural.model_name,
+        })
     }
 
     fn analysis_cache_key_for(&self, query: &str, token_budget: usize) -> String {

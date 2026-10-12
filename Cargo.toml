@@ -618,7 +618,6 @@ members = [
 #     entry is needed for them.
 [workspace.lints.clippy]
 # ── Allowed — intentional codebase patterns (mirror in-source #[allow]) ──
-too_many_arguments = "allow"        # CLI handlers carry rich context; counted
 module_inception = "allow"          # Multiple crate roots intentionally mirror
 result_unit_err = "allow"           # Registry operations surface cover Err(())
 arc_with_non_send_sync = "allow"    # Tokio Mutex<Arc<...>> pattern
