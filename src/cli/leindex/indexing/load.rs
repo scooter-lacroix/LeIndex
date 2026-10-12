@@ -867,14 +867,16 @@ mod tests {
     fn test_query_embedder_keeps_unpinned_custom_endpoint_at_persisted_dimension() {
         let tfidf =
             index_builder::TfIdfEmbedder::build(&[("sample.rs".into(), "fn sample() {}".into())]);
-        let mut cfg = crate::config::EmbeddingConfig::default();
-        cfg.enable_hybrid = true;
-        cfg.remote_provider = "custom".to_string();
-        cfg.remote_endpoint = Some("http://127.0.0.1:1/v1".to_string());
-        cfg.remote_model = Some("measured-model".to_string());
-        cfg.remote_dimension = None;
-        cfg.remote_doc_template = None;
-        cfg.remote_query_template = None;
+        let cfg = crate::config::EmbeddingConfig {
+            enable_hybrid: true,
+            remote_provider: "custom".to_string(),
+            remote_endpoint: Some("http://127.0.0.1:1/v1".to_string()),
+            remote_model: Some("measured-model".to_string()),
+            remote_dimension: None,
+            remote_doc_template: None,
+            remote_query_template: None,
+            ..Default::default()
+        };
         let _guard = crate::feature_flags::lock_flag_tests();
         let _reset = crate::feature_flags::FlagOverrideReset;
 

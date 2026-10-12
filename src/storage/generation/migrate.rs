@@ -1014,7 +1014,7 @@ pub(crate) fn encode_neural_layer(
         data.extend_from_slice(&matrix[row * dim * 4..(row + 1) * dim * 4]);
     }
     let node_order: Vec<u32> = rows.keys().copied().collect();
-    match identity.as_deref() {
+    match identity {
         Some(identity) => Ok(encode_neural_payload_with_identity(
             &node_order,
             dim,

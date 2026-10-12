@@ -3,9 +3,9 @@
 //! All gated behind `remote-embeddings` so default builds skip them entirely.
 
 #[cfg(feature = "remote-embeddings")]
-use crate::search::onnx::remote::RemoteEmbeddingProvider;
+use crate::search::onnx::RemoteEmbeddingConfig;
 #[cfg(feature = "remote-embeddings")]
-use crate::search::onnx::{GenericRemoteProvider, RemoteEmbeddingConfig, RemoteEmbeddingError};
+use crate::search::onnx::remote::RemoteEmbeddingProvider;
 
 use super::*;
 
