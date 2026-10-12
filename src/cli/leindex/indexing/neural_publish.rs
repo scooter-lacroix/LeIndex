@@ -644,17 +644,12 @@ impl LeIndex {
             neural_embedder,
         )?;
         progress_stderr("Indexing: publishing enhanced generation...");
-        let neural_checkpoint = NeuralCheckpoint {
+        let neural_checkpoint = self.neural_checkpoint_for(
             lexical_hash,
-            mmap_path: self.project_path.join(".leindex/neural_embeddings.bin"),
-            rows: neural_rows,
-            provider: if neural_rows == 0 {
-                "unavailable".to_string()
-            } else {
-                selected_provider.to_string()
-            },
-            model: selected_model,
-        };
+            neural_rows,
+            selected_provider,
+            selected_model,
+        );
         let checkpoint_store = state
             .checkpoint_store
             .as_ref()
@@ -667,6 +662,28 @@ impl LeIndex {
         state.neural_checkpoint = Some(neural_checkpoint.clone());
         self.pipeline = Some(state);
         Ok(neural_checkpoint)
+    }
+
+    /// Assemble the neural checkpoint from the phase outcome. Kept out of
+    /// `run_neural` to bound its branch count (cyclomatic gate).
+    fn neural_checkpoint_for(
+        &self,
+        lexical_hash: String,
+        rows: usize,
+        selected_provider: &str,
+        model: String,
+    ) -> NeuralCheckpoint {
+        NeuralCheckpoint {
+            lexical_hash,
+            mmap_path: self.project_path.join(".leindex/neural_embeddings.bin"),
+            rows,
+            provider: if rows == 0 {
+                "unavailable".to_string()
+            } else {
+                selected_provider.to_string()
+            },
+            model,
+        }
     }
 
     pub(crate) fn publish_generation(
