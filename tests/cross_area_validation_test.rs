@@ -331,8 +331,8 @@ mod setup_idempotency_and_preservation {
             "save() must create the config dir if missing (idempotent re-run after upgrade)"
         );
         assert!(
-            save_fn.contains("std::fs::write"),
-            "save() must atomically overwrite the file (no append path that duplicates keys)"
+            save_fn.contains(".persist("),
+            "save() must atomically overwrite via temp-file + persist (no append path that duplicates keys)"
         );
         assert!(
             !save_fn.contains("append"),

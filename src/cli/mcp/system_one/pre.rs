@@ -122,6 +122,20 @@ fn type_matches(expected: &str, value: &Value) -> bool {
     }
 }
 
+/// Whether `value` satisfies the schema's `type`, recursing into `items` for arrays.
+fn fits_type(spec: &Value, value: &Value) -> bool {
+    let Some(expected) = spec.get("type").and_then(Value::as_str) else {
+        return true;
+    };
+    if !type_matches(expected, value) {
+        return false;
+    }
+    match (value.as_array(), spec.get("items")) {
+        (Some(elements), Some(items)) => elements.iter().all(|element| fits_type(items, element)),
+        _ => true,
+    }
+}
+
 /// Stage 0a: find every schema violation. Pure.
 pub fn validate(schema: &Value, args: &Value) -> Vec<Issue> {
     let empty = Map::new();
@@ -139,14 +153,12 @@ pub fn validate(schema: &Value, args: &Value) -> Vec<Issue> {
             });
             continue;
         };
-        if let Some(expected) = spec.get("type").and_then(Value::as_str) {
-            if !type_matches(expected, value) {
-                issues.push(Issue {
-                    param: key.clone(),
-                    kind: IssueKind::WrongType,
-                });
-                continue;
-            }
+        if !fits_type(spec, value) {
+            issues.push(Issue {
+                param: key.clone(),
+                kind: IssueKind::WrongType,
+            });
+            continue;
         }
         if let Some(options) = spec.get("enum").and_then(Value::as_array) {
             if !options.contains(value) {
@@ -188,6 +200,17 @@ pub fn validate(schema: &Value, args: &Value) -> Vec<Issue> {
     issues
 }
 
+/// Clamp `n` into the schema's `minimum`/`maximum` (either bound optional).
+fn clamp_to_spec(spec: &Value, mut n: f64) -> f64 {
+    if let Some(min) = spec.get("minimum").and_then(Value::as_f64) {
+        n = n.max(min);
+    }
+    if let Some(max) = spec.get("maximum").and_then(Value::as_f64) {
+        n = n.min(max);
+    }
+    n
+}
+
 /// Stage 0b: repairs that have exactly one correct answer. Returns the
 /// issues left over.
 pub fn repair_in_code(
@@ -202,14 +225,17 @@ pub fn repair_in_code(
         let current = args.get(&issue.param).cloned();
         let fixed = match (&issue.kind, spec, &current) {
             (IssueKind::OutOfRange, Some(spec), Some(Value::Number(n))) => {
-                let mut n = n.as_f64().unwrap_or(0.0);
-                if let Some(min) = spec.get("minimum").and_then(Value::as_f64) {
-                    n = n.max(min);
-                }
-                if let Some(max) = spec.get("maximum").and_then(Value::as_f64) {
-                    n = n.min(max);
-                }
-                Some(json!(n as i64))
+                let n = clamp_to_spec(spec, n.as_f64().unwrap_or(0.0));
+                // Integer params round; number params keep their fraction. A
+                // blanket `as i64` truncated floats (clamped 2.5 became 2) and
+                // could emit values below a fractional minimum (0.5 became 0).
+                Some(
+                    if spec.get("type").and_then(Value::as_str) == Some("integer") {
+                        json!(n.round() as i64)
+                    } else {
+                        json!(n)
+                    },
+                )
             }
             (IssueKind::NotInEnum, Some(spec), Some(Value::String(text))) => spec
                 .get("enum")
@@ -226,7 +252,11 @@ pub fn repair_in_code(
                 }),
             (IssueKind::WrongType, Some(spec), Some(Value::String(text))) => {
                 match spec.get("type").and_then(Value::as_str) {
-                    Some("integer") => text.trim().parse::<i64>().ok().map(|n| json!(n)),
+                    Some("integer") => text
+                        .trim()
+                        .parse::<i64>()
+                        .ok()
+                        .map(|n| json!(clamp_to_spec(spec, n as f64).round() as i64)),
                     Some("boolean") => match text.trim().to_ascii_lowercase().as_str() {
                         "true" => Some(json!(true)),
                         "false" => Some(json!(false)),
@@ -330,6 +360,7 @@ pub async fn heal(
         args,
         ..Healed::default()
     };
+    let original = healed.args.clone();
     let issues = validate(ctx.schema, &healed.args);
     let (issues, code_changes) = if ctx.read_only {
         repair_in_code(ctx.schema, &mut healed.args, issues)
@@ -338,12 +369,16 @@ pub async fn heal(
     };
     healed.changes.extend(code_changes);
 
-    let wants_project = wants_project_hint(ctx, &mut healed);
+    let wants_project = wants_project_hint(ctx, &original, &mut healed);
     if issues.is_empty() && !wants_project {
         return healed;
     }
 
     let Some(answers) = stage1(asker, ctx, &mut healed, intent, wants_project, params).await else {
+        // Provider failed: fail open with the caller's original call, not a
+        // half-repaired one (Stage 0 edits would otherwise leak through).
+        healed.args = original;
+        healed.changes.clear();
         return healed;
     };
     apply_project_fill(&answers, ctx, &mut healed, params, wants_project);
@@ -354,12 +389,15 @@ pub async fn heal(
 
 /// Whether the call should be offered a model-chosen `project_path`; emits the
 /// no-projects hint as a side effect.
-fn wants_project_hint(ctx: &CallContext<'_>, healed: &mut Healed) -> bool {
+fn wants_project_hint(ctx: &CallContext<'_>, args: &Value, healed: &mut Healed) -> bool {
     let project_in_schema = ctx
         .schema
         .get("properties")
         .is_some_and(|p| p.get("project_path").is_some());
-    let unresolved = ctx.project_unresolved && project_in_schema;
+    // Offer a project only when the caller gave none. A present-but-invalid
+    // `project_path` is a different failure and must not be silently replaced.
+    let missing = args.get("project_path").is_none();
+    let unresolved = ctx.project_unresolved && project_in_schema && missing;
     if unresolved && ctx.known_projects.is_empty() {
         healed.hints.push(
             "no project could be resolved and none is loaded: pass project_path (an absolute project directory)"
@@ -469,7 +507,7 @@ fn flagged_issues<'i>(
         .filter(|i| i.kind != IssueKind::Missing || i.param != "project_path" || !wants_project)
         .filter(|i| {
             call_ok < params.ok_min
-                || answers.p_yes(&format!("wrong:{}", i.param)).unwrap_or(1.0) > params.wrong_min
+                || answers.p_yes(&format!("wrong:{}", i.param)).unwrap_or(0.0) > params.wrong_min
         })
         .collect()
 }
@@ -571,6 +609,13 @@ fn apply_choice(
         offered,
     } = choice;
     if !offered {
+        // The model picked a value code never offered (e.g. a `project_path`
+        // that is not a loaded project). Reject it — but say so, so the
+        // calling model learns the pick was refused instead of assuming the
+        // fill succeeded.
+        healed.hints.push(format!(
+            "refusing to set `{param}` to {to}: not one of the code-enumerated candidates"
+        ));
         return;
     }
     if ctx.read_only && confidence >= params.tau_apply {
@@ -619,7 +664,7 @@ fn apply_choice(
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
     use crate::cli::mcp::system_one::testing::{FnAsker, answers_of};
     use crate::cli::mcp::system_one::types::{Answer, SystemOneError};
@@ -645,6 +690,20 @@ mod tests {
             // scenario. Everywhere else the registry resolved a project fine.
             project_unresolved: !projects.is_empty(),
         }
+    }
+
+    #[test]
+    fn project_autofill_only_when_project_path_is_absent() {
+        // Regression: an invalid but present `project_path` used to be
+        // offered a replacement project. Only a missing one may be filled.
+        let schema = schema();
+        let projects = vec!["/srv/a".to_string(), "/srv/b".to_string()];
+        let context = ctx(&schema, true, &projects);
+        let mut healed = Healed::default();
+        let missing = json!({"query": "q"});
+        assert!(wants_project_hint(&context, &missing, &mut healed));
+        let given = json!({"query": "q", "project_path": "/nope"});
+        assert!(!wants_project_hint(&context, &given, &mut healed));
     }
 
     #[test]
@@ -950,6 +1009,10 @@ mod tests {
         )
         .await;
         assert!(healed.args.get("project_path").is_none());
+        // The refusal must be visible to the checking agent, not a silent drop.
+        assert_eq!(healed.hints.len(), 1);
+        assert!(healed.hints[0].contains("refusing to set `project_path`"));
+        assert!(healed.hints[0].contains("/etc"));
     }
 
     #[test]

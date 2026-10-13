@@ -107,8 +107,11 @@ pub fn plan(base: &[f32], judgements: &[Option<Judgement>], params: &PostParams)
     Plan { order, dropped }
 }
 
-/// Reorder `results` per `plan`, renumber `rank`, and fix `count`.
+/// Reorder `results` per `plan` and reassign the existing `rank` sequence by
+/// output position. Engine ranks are global, so a page at `offset > 0` starts
+/// past 1; renumbering from 1 would discard that offset.
 pub fn apply_plan(results: &mut Vec<Value>, plan: &Plan) {
+    let ranks: Vec<Option<Value>> = results.iter().map(|r| r.get("rank").cloned()).collect();
     let mut old: Vec<Option<Value>> = results.drain(..).map(Some).collect();
     *results = plan
         .order
@@ -116,9 +119,9 @@ pub fn apply_plan(results: &mut Vec<Value>, plan: &Plan) {
         .filter_map(|&i| old.get_mut(i).and_then(Option::take))
         .collect();
     for (index, result) in results.iter_mut().enumerate() {
-        if let Some(object) = result.as_object_mut() {
+        if let (Some(object), Some(Some(rank))) = (result.as_object_mut(), ranks.get(index)) {
             if object.contains_key("rank") {
-                object.insert("rank".into(), json!(index + 1));
+                object.insert("rank".into(), rank.clone());
             }
         }
     }
@@ -347,7 +350,10 @@ fn chunk_by_size(
 ) -> Vec<Vec<usize>> {
     // Per-request overhead every chunk carries: the query string itself plus
     // JSON keys/punctuation and the three questions' fixed instructions.
-    let overhead = query.chars().count() + 300;
+    // Breakdown of the 300: JSON envelope (keys, quotes, commas) ~40 chars,
+    // three fixed yes/no question templates ~80 chars each.
+    const CHUNK_OVERHEAD_CHARS: usize = 300;
+    let overhead = query.chars().count() + CHUNK_OVERHEAD_CHARS;
     let budget = budget.saturating_sub(overhead).max(1);
     let mut chunks: Vec<Vec<usize>> = Vec::new();
     let mut current: Vec<usize> = Vec::new();
@@ -410,7 +416,7 @@ async fn ask_chunk(
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
     use crate::cli::mcp::system_one::testing::{FnAsker, yes_answers};
     use crate::cli::mcp::system_one::types::{Answer, SystemOneError};
@@ -503,6 +509,27 @@ mod tests {
         assert_eq!(results[0]["n"], "b");
         assert_eq!(results[0]["rank"], 1);
         assert_eq!(results[1]["rank"], 2);
+    }
+
+    #[test]
+    fn apply_plan_preserves_global_rank_on_offset_page() {
+        // Page at offset 10: engine ranks are global (11, 12, 13).
+        let mut results = vec![
+            json!({"rank": 11, "n": "a"}),
+            json!({"rank": 12, "n": "b"}),
+            json!({"rank": 13, "n": "c"}),
+        ];
+        apply_plan(
+            &mut results,
+            &Plan {
+                order: vec![2, 0, 1],
+                dropped: vec![],
+            },
+        );
+        assert_eq!(results[0]["n"], "c");
+        assert_eq!(results[0]["rank"], 11);
+        assert_eq!(results[1]["rank"], 12);
+        assert_eq!(results[2]["rank"], 13);
     }
 
     #[test]

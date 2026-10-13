@@ -7,6 +7,7 @@ pub(crate) mod indexing;
 pub(crate) mod model_download;
 mod query;
 pub(crate) mod setup;
+pub(crate) mod setup_config;
 mod types;
 
 #[cfg(test)]

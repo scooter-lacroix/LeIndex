@@ -255,6 +255,7 @@ fn test_setup_command_parsing() {
             check,
             warmup: _,
             remote_gemma: _,
+            options: _,
         }) => {
             assert!(neural);
             assert!(!no_neural);
@@ -309,6 +310,7 @@ fn test_setup_command_no_neural() {
             check,
             warmup: _,
             remote_gemma: _,
+            options: _,
         }) => {
             assert!(!neural);
             assert!(no_neural);
@@ -317,6 +319,31 @@ fn test_setup_command_no_neural() {
             assert!(!check);
         }
         _ => panic!("Expected Setup command"),
+    }
+}
+
+#[test]
+fn test_config_command_parsing() {
+    // `leindex config <action>` parses into the setup_config subcommand
+    // surface; dispatch happens in run().
+    let cli = Cli::try_parse_from(["leindex", "config", "show"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Config {
+            action: crate::cli::leindex::setup_config::ConfigAction::Show
+        })
+    ));
+
+    let cli = Cli::try_parse_from(["leindex", "config", "set", "search.search_mode", "\"text\""])
+        .unwrap();
+    match cli.command {
+        Some(Commands::Config {
+            action: crate::cli::leindex::setup_config::ConfigAction::Set { key, value },
+        }) => {
+            assert_eq!(key, "search.search_mode");
+            assert_eq!(value, "\"text\"");
+        }
+        _ => panic!("Expected Config Set command"),
     }
 }
 

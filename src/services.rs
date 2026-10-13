@@ -236,17 +236,31 @@ fn basename(path: &str) -> &str {
 }
 
 /// Pid-reuse guard: the process must still exist AND its cmdline must match
-/// the configured binary before we treat it as ours — argv[0] equal (exact
+/// the configured service before we treat it as ours — argv[0] equal (exact
 /// path or basename), or the exact path present as an argument (shebang
 /// scripts run with the interpreter as argv[0] and the script as argv[1]).
-fn pid_is_ours(pid: i32, binary: &str) -> bool {
+/// Binary shape alone is not enough: a stale pidfile reused by an unrelated
+/// `llama-server` (different model/host/port) must not be signaled, so the
+/// distinctive arguments `build_command` always passes must be present too.
+fn pid_is_ours(pid: i32, cfg: &ServiceConfig) -> bool {
     let Some(args) = read_cmdline_args(pid) else {
         return false;
     };
     let Some(argv0) = args.first() else {
         return false;
     };
-    argv0 == binary || basename(argv0) == basename(binary) || args.iter().any(|a| a == binary)
+    let binary = &cfg.binary;
+    let binary_matches =
+        argv0 == binary || basename(argv0) == basename(binary) || args.iter().any(|a| a == binary);
+    if !binary_matches {
+        return false;
+    }
+    if let Some(model) = &cfg.model {
+        if !args.iter().any(|a| a == model) {
+            return false;
+        }
+    }
+    args.iter().any(|a| a == &cfg.host) && args.iter().any(|a| a == &cfg.port.to_string())
 }
 
 fn read_pidfile(name: &str) -> Result<Option<i32>, ServiceError> {
@@ -274,9 +288,9 @@ fn remove_pidfile(name: &str) {
 }
 
 /// Drop a pidfile whose pid is gone or no longer ours.
-fn clean_stale_pidfile(name: &str, binary: &str) -> Result<bool, ServiceError> {
+fn clean_stale_pidfile(name: &str, cfg: &ServiceConfig) -> Result<bool, ServiceError> {
     if let Some(pid) = read_pidfile(name)? {
-        if !pid_is_ours(pid, binary) {
+        if !pid_is_ours(pid, cfg) {
             remove_pidfile(name);
             return Ok(true);
         }
@@ -405,7 +419,11 @@ fn wait_exit(pid: i32, grace: Duration) -> bool {
         }
         std::thread::sleep(STOP_POLL_INTERVAL);
     }
-    proc_exists(pid)
+    // True only when the process actually exited. Returning `proc_exists`
+    // here inverted the result: a server that ignored SIGTERM for the whole
+    // grace period read as "exited", so callers skipped SIGKILL, dropped the
+    // pidfile, and reported Stopped over a still-running process.
+    !proc_exists(pid)
 }
 
 // ── Public lifecycle ─────────────────────────────────────────────────────
@@ -425,7 +443,7 @@ pub fn ensure_running(name: &str, cfg: &ServiceConfig) -> Result<bool, ServiceEr
         // in flight — converge on it instead of racing a doomed duplicate.
         return Ok(wait_ready(cfg, cfg.start_timeout_secs));
     }
-    clean_stale_pidfile(name, &cfg.binary)?;
+    clean_stale_pidfile(name, cfg)?;
     match StartGuard::acquire(name)? {
         Some(_guard) => start_locked(name, cfg).map(|_| true),
         // Another leindex process is mid-start; converge by waiting for HTTP
@@ -458,7 +476,7 @@ pub fn start(name: &str, cfg: &ServiceConfig) -> Result<bool, ServiceError> {
         }
         return Ok(false);
     }
-    clean_stale_pidfile(name, &cfg.binary)?;
+    clean_stale_pidfile(name, cfg)?;
     let Some(_guard) = StartGuard::acquire(name)? else {
         return Err(ServiceError::Concurrent(name.to_string()));
     };
@@ -500,7 +518,7 @@ pub fn stop(name: &str, cfg: &ServiceConfig) -> Result<StopOutcome, ServiceError
         remove_pidfile(name);
         return Ok(StopOutcome::StalePidfileRemoved);
     }
-    if !pid_is_ours(pid, &cfg.binary) {
+    if !pid_is_ours(pid, cfg) {
         // Foreign process wearing our pid — clean nothing, signal nothing.
         return Err(ServiceError::NotOurs(name.to_string(), pid));
     }
@@ -515,8 +533,8 @@ pub fn stop(name: &str, cfg: &ServiceConfig) -> Result<StopOutcome, ServiceError
 
 /// Current status: live verified pid, port health, endpoint, model info.
 pub fn status(name: &str, cfg: &ServiceConfig) -> Result<ServiceStatus, ServiceError> {
-    clean_stale_pidfile(name, &cfg.binary)?;
-    let pid = read_pidfile(name)?.filter(|pid| pid_is_ours(*pid, &cfg.binary));
+    clean_stale_pidfile(name, cfg)?;
+    let pid = read_pidfile(name)?.filter(|pid| pid_is_ours(*pid, cfg));
     Ok(ServiceStatus {
         name: name.to_string(),
         pid,
@@ -630,7 +648,20 @@ mod tests {
         let pid = spawn_detached("life", &cfg).unwrap();
         write_pidfile("life", pid).unwrap();
         assert!(proc_exists(pid));
-        assert!(pid_is_ours(pid, &cfg.binary));
+        // spawn() returns after fork, before exec: /proc/<pid>/cmdline still
+        // shows the pre-exec image for a scheduling-dependent instant, and
+        // pid_is_ours correctly refuses to claim a process whose argv is not
+        // yet the configured binary. Wait (bounded) for exec to land instead
+        // of racing it.
+        let mut ours = false;
+        for _ in 0..200 {
+            if pid_is_ours(pid, &cfg) {
+                ours = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(ours, "child argv never matched the configured binary");
 
         let st = status("life", &cfg).unwrap();
         assert_eq!(st.pid, Some(pid));

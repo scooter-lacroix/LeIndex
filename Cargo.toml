@@ -199,6 +199,8 @@ cli = [
     "dep:diffy",
     "dep:dialoguer",
     "dep:sha2",
+    "dep:tar",
+    "dep:flate2",
 ]
 
 # MCP server feature for CLI
@@ -275,7 +277,7 @@ turso = ["dep:rusqlite_migration"]
 #
 # VAL-CARGO-002/005: `cargo install leindex --features onnx` installs both the
 # main binary and the worker binary with real ONNX inference support.
-onnx = ["search", "dep:ort", "ort/half", "ort/cuda", "ort/migraphx", "ort/rocm", "ort/coreml", "dep:tokenizers", "dep:ndarray", "dep:half", "dep:which", "dep:toml", "dep:dirs"]
+onnx = ["search", "dep:ort", "ort/half", "ort/cuda", "ort/migraphx", "ort/rocm", "ort/coreml", "dep:tokenizers", "dep:ndarray", "dep:half", "dep:which", "dep:toml", "dep:dirs", "dep:tempfile"]
 
 # Legacy build-command alias; onnx now compiles every runtime-selectable EP.
 onnx-migraphx = ["onnx"]
@@ -377,6 +379,7 @@ leiden-rs = { version = "0.8", optional = true, features = ["petgraph"] }
 scip = { version = "0.9", optional = true }
 protobuf = { version = "=3.7.2", optional = true }
 flate2 = { version = "1.1", optional = true, default-features = true }
+tar = { version = "=0.4.44", optional = true, default-features = false }
 
 # Storage feature dependencies
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }

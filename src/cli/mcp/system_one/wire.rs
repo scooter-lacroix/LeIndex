@@ -240,7 +240,7 @@ fn decode_decisions(request: &Request, body: &Value) -> Result<Response, SystemO
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
 
     fn sample() -> Request {

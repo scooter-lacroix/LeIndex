@@ -1133,7 +1133,15 @@ async fn handle_tool_call_timed(
             let payload = match tier {
                 // Identity card: a few lines regardless of result size.
                 crate::cli::mcp::tier::Tier::L0 => {
-                    crate::cli::mcp::tier::identity_card(&call_name, &trimmed)
+                    // The identity card skips `_`-prefixed keys, so the gate's
+                    // footer must be appended here or L0 hides every annotation.
+                    let mut payload = crate::cli::mcp::tier::identity_card(&call_name, &trimmed);
+                    if let Some(footer) =
+                        crate::cli::mcp::output::render::system_one_footer(&trimmed)
+                    {
+                        payload.push_str(&footer);
+                    }
+                    payload
                 }
                 // Full detail: the complete, untrimmed handler result.
                 crate::cli::mcp::tier::Tier::L2 => serde_json::to_string_pretty(&value)
@@ -1176,11 +1184,20 @@ async fn handle_tool_call_timed(
         Err(e) => {
             // MCP standard: return errors as a successful JSON-RPC response with isError: true
             warn!("Tool execution failed: {}", e);
+            // Pre-gate hints still apply to a failed call: surface them in the error text.
+            #[cfg(feature = "system-one")]
+            let footer = {
+                let mut note = serde_json::json!({});
+                gate_notes.attach(&mut note);
+                crate::cli::mcp::output::render::system_one_footer(&note).unwrap_or_default()
+            };
+            #[cfg(not(feature = "system-one"))]
+            let footer = String::new();
             Ok(serde_json::json!({
                 "content": [
                     {
                         "type": "text",
-                        "text": format!("Error: {}", e.message_with_hint())
+                        "text": format!("Error: {}{footer}", e.message_with_hint())
                     }
                 ],
                 "isError": true,

@@ -21,14 +21,23 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "setup_llama.rs"]
+mod setup_llama;
 #[path = "setup_models.rs"]
 mod setup_models;
 #[path = "setup_ort.rs"]
 mod setup_ort;
+#[path = "setup_routes.rs"]
+mod setup_routes;
+#[path = "setup_status.rs"]
+mod setup_status;
+#[path = "setup_system_one.rs"]
+mod setup_system_one;
 use setup_models::*;
 pub(crate) use setup_ort::discover_ort_path;
 pub use setup_ort::get_ort_version;
 use setup_ort::*;
+pub use setup_routes::SetupOptions;
 
 /// Execution provider selected during setup.
 ///
@@ -152,6 +161,8 @@ pub struct SetupChoices {
     /// path (fresh-install preset active + rollout flag on) does the same
     /// without this flag.
     pub remote_gemma: bool,
+    /// Explicit model, server, and endpoint configuration.
+    pub options: SetupOptions,
 }
 
 /// The result of running setup.
@@ -159,6 +170,8 @@ pub struct SetupChoices {
 pub struct SetupResult {
     /// The choices that were applied.
     pub choices: SetupChoices,
+    /// Whether the selected embedding route is remote rather than local ONNX.
+    pub remote_active: bool,
     /// Path where config was written (None for --check mode).
     pub config_path: Option<PathBuf>,
     /// ORT dylib path discovered after installation (if any).
@@ -322,6 +335,7 @@ pub fn resolve_from_flags(
             neural_enabled: false,
             provider: None,
             remote_gemma: false,
+            options: SetupOptions::default(),
         });
     }
 
@@ -350,6 +364,7 @@ pub fn resolve_from_flags(
         neural_enabled: true,
         provider,
         remote_gemma: false,
+        options: SetupOptions::default(),
     })
 }
 
@@ -376,6 +391,20 @@ pub fn run_interactive_flow() -> Result<SetupChoices, SetupError> {
             neural_enabled: false,
             provider: None,
             remote_gemma: false,
+            options: SetupOptions {
+                interactive: true,
+                ..Default::default()
+            },
+        });
+    }
+
+    let options = setup_routes::select_interactive()?;
+    if options.embedding.as_deref() != Some("qwen3") {
+        return Ok(SetupChoices {
+            neural_enabled: true,
+            provider: None,
+            remote_gemma: false,
+            options,
         });
     }
 
@@ -442,6 +471,7 @@ pub fn run_interactive_flow() -> Result<SetupChoices, SetupError> {
         neural_enabled: true,
         provider: Some(provider),
         remote_gemma: false,
+        options,
     })
 }
 
@@ -568,6 +598,39 @@ pub fn is_interactive() -> bool {
     std::io::stdin().is_terminal()
 }
 
+/// Configure the managed embeddinggemma-2 service and remote embedding ladder.
+/// Existing service model paths and explicit endpoints remain user-owned.
+fn wire_gemma_preset(config: &mut crate::config::LeIndexConfig, gguf: &Path) {
+    let entry = config.services.entry("gemma".to_string()).or_default();
+    let missing_model = entry.model.as_deref().map(str::is_empty).unwrap_or(true);
+    if missing_model {
+        entry.model = Some(gguf.display().to_string());
+        entry.alias = Some(crate::config::EMBEDDINGGEMMA2_MODEL.to_string());
+        entry.extra_args = vec![
+            "--embedding".into(),
+            "--pooling".into(),
+            "mean".into(),
+            // Use llama.cpp's portable GPU offload count; device names vary by build.
+            "-ngl".into(),
+            "99".into(),
+        ];
+        entry.auto_start = true;
+        if entry.port == 0 {
+            // 8080 = the preset's documented llama-server port; keep 8765 reserved.
+            entry.port = 8080;
+        }
+    }
+
+    let embeddings = &mut config.indexing.embeddings;
+    embeddings.enable_hybrid = true;
+    if !embeddings.embeddinggemma2_preset_active() {
+        embeddings.remote_provider = "embeddinggemma-2".to_string();
+    }
+    if embeddings.remote_service.is_none() && embeddings.remote_endpoint.is_none() {
+        embeddings.remote_service = Some("gemma".into());
+    }
+}
+
 /// Execute setup with the resolved choices.
 ///
 /// Writes config, installs ORT (if neural), checks models.
@@ -588,60 +651,108 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
     ensure_home_writable()?;
 
     let desired_model_name = model_name_for_provider(choices.provider);
+    let config = build_config(choices, None, None);
+    let (mut config, recovery) = merge_config_for_setup(config, choices)?;
+    let remote_active = setup_routes::configure(&mut config, choices)?;
+    if choices.options.interactive || choices.options.system_one {
+        if !is_interactive() {
+            return Err(SetupError::Interactive("System One wizard requires a terminal; use leindex config set for scripted configuration".into()));
+        }
+        setup_system_one::configure_interactive(&mut config)?;
+    }
     let NeuralRuntimeState {
         ort_dylib_path,
         ort_version,
         ort_installed,
         model_present,
-    } = prepare_neural_runtime(choices, desired_model_name)?;
-
-    // Write the config
-    let config = build_config(choices, ort_dylib_path.as_deref(), ort_version.as_deref());
-    let (mut config, recovery) = merge_with_existing(config);
-
-    // Provision the embeddinggemma-2 remote-embeddings preset when asked
-    // (--remote-gemma) or when the effective config already selects it AND
-    // the rollout flag allows remote embeddings. Explicit user intent beats
-    // the rollout flag (they asked for the download); the automatic path
-    // respects it so default installs never pull a 300 MB GGUF uninvited.
-    let preset_active = config.indexing.embeddings.embeddinggemma2_preset_active();
-    let remote_flag_on = crate::feature_flags::FeatureFlag::RemoteEmbeddings.is_enabled();
-    if choices.remote_gemma || (preset_active && remote_flag_on) {
-        let model_dir = crate::config::model_dir_path()
-            .ok_or_else(|| SetupError::Io("Cannot resolve model directory".to_string()))?;
-        println!("\nProvisioning embeddinggemma-2 remote-embeddings preset...");
-        let gguf = ensure_embeddinggemma2_gguf_present(&model_dir)?;
-
-        // Wire [services.gemma] pointing at the GGUF. An existing section
-        // with a model path is left alone (user's own wiring wins); only a
-        // missing or model-less section is filled in.
-        let services = &mut config.services;
-        let entry = services.entry("gemma".to_string()).or_default();
-        let missing_model = entry.model.as_deref().map(str::is_empty).unwrap_or(true);
-        if missing_model {
-            entry.model = Some(gguf.display().to_string());
-            entry.alias = Some(crate::config::EMBEDDINGGEMMA2_MODEL.to_string());
-            entry.extra_args = vec!["--embedding".into(), "--pooling".into(), "mean".into()];
-            if entry.port == 0 {
-                // 8080 = the preset's documented llama-server port; keep
-                // 8765 reserved (owner's mcp_agent_mail).
-                entry.port = 8080;
-            }
-        }
-        // Point [indexing.embeddings] at the managed service unless an
-        // explicit endpoint already wins the resolution ladder.
-        let embeddings = &mut config.indexing.embeddings;
-        embeddings.enable_hybrid = true;
-        if embeddings.remote_service.is_none() && embeddings.remote_endpoint.is_none() {
-            embeddings.remote_service = Some("gemma".into());
-        }
-        println!("  -> [services.gemma] wired; use `leindex services start gemma` to launch.");
+    } = prepare_neural_state(choices, remote_active, desired_model_name)?;
+    if !remote_active && choices.neural_enabled {
+        config.neural.ort_dylib_path = ort_dylib_path.as_ref().map(|p| p.display().to_string());
+        config.neural.ort_version = ort_version.clone();
     }
 
     let config_path = config
         .save()
         .map_err(|e| SetupError::ConfigWrite(e.to_string()))?;
 
+    print_recovery_notice(recovery);
+
+    // VAL-SETUP-025/026: Run the post-setup embedding smoke test. We only run
+    // it when neural is enabled, ORT is installed, and the model is present.
+    // On failure we still return `Ok` (with a failed `SmokeTestResult`) so the
+    // caller can print the summary and exit non-zero, rather than bailing
+    // before the user sees the actionable diagnostic.
+    // A resolved remote endpoint owns the neural layer: verify IT (bringing
+    // the managed service up first) instead of the local ONNX worker, which
+    // on a GPU-incapable host structurally fails and would report the whole
+    // setup broken even though remote is the point. Remote also does not
+    // need the local ORT install or the qwen3 model, so it runs the smoke
+    // test even when those are absent. Uses the in-hand config, not the
+    // process-wide OnceLock cache — the cache may predate this run's save.
+    let smoke_test = run_setup_smoke_test(
+        &config,
+        choices,
+        remote_active,
+        ort_installed,
+        model_present,
+    );
+
+    setup_system_one::print_status(&config);
+    if !matches!(config.system_one.effective().mode.as_str(), "" | "off") {
+        setup_system_one::smoke_test(&config)?;
+    }
+
+    Ok(SetupResult {
+        choices: choices.clone(),
+        remote_active,
+        config_path: Some(config_path),
+        ort_dylib_path,
+        ort_version,
+        model_present,
+        ort_installed,
+        smoke_test,
+    })
+}
+
+/// CCN-gate extraction from `execute_setup`: merges the built config with any existing one and applies the `keep` embedding choice.
+fn merge_config_for_setup(
+    config: crate::config::LeIndexConfig,
+    choices: &SetupChoices,
+) -> Result<(crate::config::LeIndexConfig, Option<RecoveryNotice>), SetupError> {
+    let (mut config, recovery) = merge_with_existing(config)?;
+    if choices.options.embedding.as_deref() == Some("keep") {
+        config.neural = crate::config::LeIndexConfig::load()
+            .map_err(|e| SetupError::ConfigRead(e.to_string()))?
+            .neural;
+        config.neural.enabled = choices.neural_enabled;
+    }
+    Ok((config, recovery))
+}
+
+/// CCN-gate extraction from `execute_setup`: resolves the neural runtime (local ORT/model prep, or remote/disabled defaults).
+fn prepare_neural_state(
+    choices: &SetupChoices,
+    remote_active: bool,
+    model_name: &str,
+) -> Result<NeuralRuntimeState, SetupError> {
+    if !choices.neural_enabled || remote_active {
+        return Ok(NeuralRuntimeState {
+            ort_dylib_path: None,
+            ort_version: None,
+            ort_installed: false,
+            model_present: remote_active,
+        });
+    }
+    if !cfg!(feature = "onnx") {
+        return Err(SetupError::Conflict {
+            message: "Local Qwen3 requires a binary built with --features onnx".into(),
+        });
+    }
+    prepare_neural_runtime(choices, model_name)
+}
+
+/// CCN-gate extraction from `execute_setup`: prints the config migration or corrupt-config recovery notice.
+fn print_recovery_notice(recovery: Option<RecoveryNotice>) {
     if let Some(action) = recovery {
         match action {
             RecoveryNotice::Migrated => {
@@ -655,62 +766,24 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
             }
         }
     }
+}
 
-    // VAL-SETUP-025/026: Run the post-setup embedding smoke test. We only run
-    // it when neural is enabled, ORT is installed, and the model is present.
-    // On failure we still return `Ok` (with a failed `SmokeTestResult`) so the
-    // caller can print the summary and exit non-zero, rather than bailing
-    // before the user sees the actionable diagnostic.
-    let smoke_test = if choices.neural_enabled && ort_installed && model_present {
+/// CCN-gate extraction from `execute_setup`: runs the post-setup smoke test when prerequisites hold, else explains the skip.
+/// VAL-SETUP-025/026: a failed result is returned (not bailed) so the summary still prints.
+fn run_setup_smoke_test(
+    config: &crate::config::LeIndexConfig,
+    choices: &SetupChoices,
+    remote_active: bool,
+    ort_installed: bool,
+    model_present: bool,
+) -> Option<SmokeTestResult> {
+    if choices.neural_enabled && (remote_active || (ort_installed && model_present)) {
         println!("\nVerifying neural search on a sample query...");
-        let result = run_embedding_smoke_test(choices.provider);
-        match &result {
-            SmokeTestResult {
-                passed: true,
-                dimension: Some(dim),
-                configured_provider_label: Some(provider),
-                ..
-            } => {
-                println!("  -> {}.", result.status_line());
-                println!("  -> Configured execution provider: {}.", provider);
-                if let Some(active) = &result.execution_provider {
-                    println!("  -> Active execution provider: {}.", active);
-                }
-                let _ = dim; // already in status_line
-            }
-            SmokeTestResult {
-                skipped: true,
-                note: Some(note),
-                ..
-            } => {
-                println!("  -> {}.", result.status_line());
-                println!("     {}", truncate_for_display(note, 200));
-            }
-            SmokeTestResult { passed: true, .. } => {
-                println!("  -> {}.", result.status_line());
-            }
-            SmokeTestResult {
-                passed: false,
-                error: Some(err),
-                ..
-            } => {
-                println!("  -> {}.", result.status_line());
-                println!("     Worker error: {}", truncate_for_display(err, 200));
-                println!("     Actionable guidance: run `leindex setup --check` for diagnostics,");
-                println!("     verify ORT and model files are intact, or re-run `leindex setup`.");
-            }
-            SmokeTestResult {
-                passed: false,
-                error: None,
-                ..
-            } => {
-                println!("  -> {}.", result.status_line());
-            }
-        }
+        let result = run_configured_smoke_test(config, choices, remote_active);
+        print_smoke_test_result(&result, remote_active);
         Some(result)
     } else if choices.neural_enabled {
-        // Neural enabled but prerequisites incomplete: skip the smoke test
-        // with a clear message so the user knows why it was not run.
+        // Neural enabled but prerequisites incomplete: skip with a clear reason.
         if !ort_installed {
             println!("\nSkipping embedding smoke test: ORT not installed.");
         } else if !model_present {
@@ -719,17 +792,74 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
         None
     } else {
         None
-    };
+    }
+}
 
-    Ok(SetupResult {
-        choices: choices.clone(),
-        config_path: Some(config_path),
-        ort_dylib_path,
-        ort_version,
-        model_present,
-        ort_installed,
-        smoke_test,
-    })
+/// CCN-gate extraction from `run_setup_smoke_test`: remote route when a remote endpoint owns the neural layer.
+#[cfg(feature = "remote-embeddings")]
+fn run_configured_smoke_test(
+    config: &crate::config::LeIndexConfig,
+    choices: &SetupChoices,
+    remote_active: bool,
+) -> SmokeTestResult {
+    if remote_active {
+        run_remote_smoke_test(&config.indexing.embeddings, &config.services)
+    } else {
+        run_embedding_smoke_test(choices.provider)
+    }
+}
+
+/// CCN-gate extraction from `run_setup_smoke_test`: without `remote-embeddings` only the local ONNX worker exists.
+#[cfg(not(feature = "remote-embeddings"))]
+fn run_configured_smoke_test(
+    _config: &crate::config::LeIndexConfig,
+    choices: &SetupChoices,
+    _remote_active: bool,
+) -> SmokeTestResult {
+    run_embedding_smoke_test(choices.provider)
+}
+
+/// CCN-gate extraction from `run_setup_smoke_test`: prints the smoke-test verdict with actionable guidance on failure.
+fn print_smoke_test_result(result: &SmokeTestResult, remote_active: bool) {
+    match result {
+        SmokeTestResult {
+            passed: true,
+            dimension: Some(_),
+            configured_provider_label: Some(provider),
+            ..
+        } => {
+            println!("  -> {}.", result.status_line());
+            println!("  -> Configured execution provider: {}.", provider);
+            if let Some(active) = &result.execution_provider {
+                println!("  -> Active execution provider: {}.", active);
+            }
+        }
+        SmokeTestResult {
+            skipped: true,
+            note: Some(note),
+            ..
+        } => {
+            println!("  -> {}.", result.status_line());
+            println!("     {}", truncate_for_display(note, 200));
+        }
+        SmokeTestResult {
+            passed: false,
+            error: Some(err),
+            ..
+        } => {
+            println!("  -> {}.", result.status_line());
+            println!("     Worker error: {}", truncate_for_display(err, 200));
+            println!("     Actionable guidance: run `leindex setup --check` for diagnostics,");
+            if remote_active {
+                println!("     verify the selected server, model, authentication and service log.");
+            } else {
+                println!("     verify ORT and model files are intact, or re-run `leindex setup`.");
+            }
+        }
+        _ => {
+            println!("  -> {}.", result.status_line());
+        }
+    }
 }
 
 fn prepare_neural_runtime(
@@ -966,6 +1096,154 @@ fn ensure_home_writable() -> Result<(), SetupError> {
     Ok(())
 }
 
+/// Exercise the configured remote embedding provider through the production
+/// hybrid embedder path and report its actual vector dimension.
+#[cfg(feature = "remote-embeddings")]
+fn run_remote_smoke_test(
+    embeddings: &crate::config::EmbeddingConfig,
+    services: &std::collections::BTreeMap<String, crate::config::ServiceConfig>,
+) -> SmokeTestResult {
+    run_remote_smoke_test_inner(embeddings, services, true)
+}
+
+#[cfg(feature = "remote-embeddings")]
+fn run_remote_smoke_test_inner(
+    embeddings: &crate::config::EmbeddingConfig,
+    services: &std::collections::BTreeMap<String, crate::config::ServiceConfig>,
+    start_managed: bool,
+) -> SmokeTestResult {
+    use crate::cli::index_builder::{HybridEmbedder, TfIdfEmbedder};
+    use crate::search::onnx::{RemoteEmbeddingConfig, RemoteProvider};
+
+    const SMOKE_TEST_TEXT: &str = "hello world";
+    let Some(resolved) = embeddings.resolved_remote_with(services) else {
+        return SmokeTestResult {
+            passed: false,
+            skipped: false,
+            dimension: None,
+            execution_provider: Some("remote".to_string()),
+            configured_provider_label: None,
+            error: Some("remote embedding endpoint is not configured".to_string()),
+            note: None,
+        };
+    };
+    let provider_label = format!("remote:{}", resolved.endpoint);
+
+    if let Some(name) = embeddings.remote_service.as_deref().filter(|_| {
+        start_managed
+            && embeddings
+                .remote_endpoint
+                .as_deref()
+                .is_none_or(|endpoint| endpoint.trim().is_empty())
+    }) {
+        if let Some(service) = services.get(name) {
+            if service.auto_start {
+                if let Err(error) = crate::services::ensure_running(name, service) {
+                    return SmokeTestResult {
+                        passed: false,
+                        skipped: false,
+                        dimension: None,
+                        execution_provider: Some("remote".to_string()),
+                        configured_provider_label: Some(provider_label),
+                        error: Some(format!("could not start managed service {name}: {error}")),
+                        note: None,
+                    };
+                }
+            }
+        }
+    }
+
+    let api_key = match embeddings.resolved_api_key() {
+        Ok(key) => key,
+        Err(error) => {
+            return SmokeTestResult {
+                passed: false,
+                skipped: false,
+                dimension: None,
+                execution_provider: Some("remote".into()),
+                configured_provider_label: Some(provider_label),
+                error: Some(error),
+                note: None,
+            };
+        }
+    };
+    let remote_config = RemoteEmbeddingConfig {
+        provider: RemoteProvider::Custom {
+            endpoint: resolved.endpoint,
+        },
+        api_key,
+        timeout_secs: 15,
+        max_retries: 0,
+        model: resolved.model,
+        remote_dimension: resolved.remote_dimension,
+        doc_template: resolved.doc_template,
+        query_template: resolved.query_template,
+        ..RemoteEmbeddingConfig::default()
+    };
+    let embedder =
+        match HybridEmbedder::hybrid_remote(TfIdfEmbedder::build(&[]), remote_config, None) {
+            Ok(embedder) => embedder,
+            Err(error) => {
+                return SmokeTestResult {
+                    passed: false,
+                    skipped: false,
+                    dimension: None,
+                    execution_provider: Some("remote".to_string()),
+                    configured_provider_label: Some(provider_label),
+                    error: Some(error.to_string()),
+                    note: None,
+                };
+            }
+        };
+
+    let embedding = embedder.embed_neural_blocking(SMOKE_TEST_TEXT);
+    match embedding {
+        Some(Ok(vector)) if vector.is_empty() => SmokeTestResult {
+            passed: false,
+            skipped: false,
+            dimension: Some(0),
+            execution_provider: Some("remote".to_string()),
+            configured_provider_label: Some(provider_label),
+            error: Some("remote provider returned an empty embedding".to_string()),
+            note: None,
+        },
+        Some(Ok(vector)) => {
+            let dimension = vector.len();
+            let error = resolved.remote_dimension.and_then(|expected| {
+                (dimension != expected)
+                    .then(|| format!("expected {expected}-dim vector, got {dimension}-dim"))
+            });
+            SmokeTestResult {
+                passed: error.is_none(),
+                skipped: false,
+                dimension: Some(dimension),
+                execution_provider: Some("remote".to_string()),
+                configured_provider_label: Some(provider_label),
+                error,
+                note: None,
+            }
+        }
+        Some(Err(error)) => SmokeTestResult {
+            passed: false,
+            skipped: false,
+            dimension: None,
+            execution_provider: Some("remote".to_string()),
+            configured_provider_label: Some(provider_label),
+            error: Some(error),
+            note: None,
+        },
+        None => SmokeTestResult {
+            passed: false,
+            skipped: false,
+            dimension: None,
+            execution_provider: Some("remote".to_string()),
+            configured_provider_label: Some(provider_label),
+            error: Some("remote provider returned no embedding".to_string()),
+            note: None,
+        },
+    }
+}
+
 /// Run a single embedding through the leindex-embed worker to verify that
 /// ORT, the model, and the configured execution provider all work together.
 ///
@@ -1094,7 +1372,7 @@ fn preserve_existing_sections(
 
 fn merge_with_existing(
     mut new_config: crate::config::LeIndexConfig,
-) -> (crate::config::LeIndexConfig, Option<RecoveryNotice>) {
+) -> Result<(crate::config::LeIndexConfig, Option<RecoveryNotice>), SetupError> {
     // Try to load existing config with recovery
     match crate::config::LeIndexConfig::load_or_recover() {
         Ok((existing, action)) => {
@@ -1128,9 +1406,9 @@ fn merge_with_existing(
                 }
                 crate::config::RecoveryAction::CreatedDefault => None,
             };
-            (new_config, notice)
+            Ok((new_config, notice))
         }
-        Err(_) => (new_config, None),
+        Err(error) => Err(SetupError::ConfigRead(error.to_string())),
     }
 }
 
@@ -1306,14 +1584,50 @@ fn print_check_search_settings(search: &crate::config::SearchConfig) {
     );
 }
 
+/// Report the remote (system-one / gemma) setup status and return whether it is fully configured.
+///
+/// `ready` is the remote-route verdict from `setup_status::remote_status`.
+fn print_check_remote_status(config: &crate::config::LeIndexConfig, ready: bool) -> bool {
+    print_check_search_settings(&config.search);
+    let system_ready = setup_system_one::print_status(config);
+    let system_enabled = !matches!(config.system_one.effective().mode.as_str(), "" | "off");
+    // A static "active" verdict is not proof the provider answers: when
+    // the gate is fully configured, run the same never-spawning probe as
+    // the wizard so `--check` reports reachability, not just configuration.
+    let probe_ok = if system_ready {
+        match setup_system_one::check_probe(config) {
+            Ok(()) => {
+                println!("  probe: provider answered");
+                true
+            }
+            Err(e) => {
+                println!("  probe: FAILED ({e})");
+                false
+            }
+        }
+    } else {
+        true
+    };
+    if let Some(path) = crate::config::config_file_path() {
+        println!("Config file: {}", path.display());
+    }
+    ready && (!system_enabled || (system_ready && probe_ok))
+}
+
 /// Print a status report without modifying anything.
 ///
 /// VAL-SETUP-014: --check mode reads config and reports status
 /// VAL-SETUP-020: Reports the ORT version (from config + live detection)
 /// VAL-SETUP-034: Surfaces full configuration
 pub fn run_check() -> Result<CheckResult, SetupError> {
-    let (config, action) = crate::config::LeIndexConfig::load_or_recover()
-        .map_err(|e| SetupError::ConfigRead(e.to_string()))?;
+    let config =
+        crate::config::LeIndexConfig::load().map_err(|e| SetupError::ConfigRead(e.to_string()))?;
+
+    if let Some(ready) = setup_status::remote_status(&config)? {
+        return Ok(CheckResult {
+            fully_configured: print_check_remote_status(&config, ready),
+        });
+    }
 
     let live_version = get_ort_version();
     let ort_installed = live_version.is_some();
@@ -1372,15 +1686,6 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
 
     // Search settings
     print_check_search_settings(&config.search);
-
-    // Recovery notice
-    if let crate::config::RecoveryAction::RecoveredFromCorrupt(ref backup) = action {
-        println!();
-        println!(
-            "WARNING: Previous config was corrupted. Backed up to: {}",
-            backup.display()
-        );
-    }
 
     // Overall status
     println!();
@@ -1516,15 +1821,18 @@ fn print_smoke_summary(smoke: &SmokeTestResult) {
 
 fn print_summary_ready_status(result: &SetupResult) {
     if result.choices.neural_enabled {
-        let fully_ready = result.model_present
-            && result.ort_installed
+        let fully_ready = (result.remote_active || (result.model_present && result.ort_installed))
             && result
                 .smoke_test
                 .as_ref()
-                .map(|smoke| smoke.passed)
-                .unwrap_or(false);
+                .is_some_and(|smoke| smoke.passed && !smoke.skipped);
         if fully_ready {
             println!("Neural search is ready!");
+        } else if result.remote_active {
+            println!("Remote neural search is configured but inference has not passed.");
+            println!(
+                "Check the selected server, model, authentication and service log; run `leindex setup --check`."
+            );
         } else if result.model_present && result.ort_installed {
             println!("Neural search is configured but the smoke test failed.");
             println!("Re-run: leindex setup --neural --cpu, or run `leindex setup --check`.");
@@ -1567,7 +1875,9 @@ pub fn print_summary(result: &SetupResult) {
         println!("Provider:     {}", provider.config_value());
     }
 
-    let ort_str = if result.ort_installed {
+    let ort_str = if result.remote_active {
+        "not required (remote route)"
+    } else if result.ort_installed {
         "installed"
     } else {
         "not installed"
@@ -1583,7 +1893,9 @@ pub fn print_summary(result: &SetupResult) {
         println!("ORT path:     {}", path.display());
     }
 
-    let model_str = if result.model_present {
+    let model_str = if result.remote_active {
+        "server-managed (see embedding probe)"
+    } else if result.model_present {
         "present"
     } else {
         "absent"

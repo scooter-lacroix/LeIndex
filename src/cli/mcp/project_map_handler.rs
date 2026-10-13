@@ -2,6 +2,7 @@ use super::helpers::{extract_bool, extract_usize, resolve_scope, wrap_with_meta}
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
+#[cfg(feature = "community")]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -1,11 +1,108 @@
 use super::*;
 
 #[test]
+fn test_setup_check_preserves_corrupt_config() {
+    let _lock = PIPE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let _env = EnvVarGuard::set("LEINDEX_HOME", &home.path().display().to_string());
+    let path = home.path().join("config/leindex.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let corrupt = "[neural\nbroken toml";
+    std::fs::write(&path, corrupt).unwrap();
+
+    assert!(matches!(run_check(), Err(SetupError::ConfigRead(_))));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
+    assert!(!path.with_extension("toml.bak").exists());
+}
+
+#[test]
+fn test_setup_merge_surfaces_config_read_failure() {
+    let _lock = PIPE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let _env = EnvVarGuard::set("LEINDEX_HOME", &home.path().display().to_string());
+    // A directory at the config filename deterministically fails reading,
+    // including when tests run as root (permission-bit fixtures do not).
+    std::fs::create_dir_all(home.path().join("config/leindex.toml")).unwrap();
+
+    assert!(matches!(
+        merge_with_existing(crate::config::LeIndexConfig::default()),
+        Err(SetupError::ConfigRead(_))
+    ));
+}
+
+#[test]
+fn test_wire_gemma_preset_configures_service_and_preset_dimension() {
+    let mut config = crate::config::LeIndexConfig::default();
+    let gguf = Path::new("/models/embeddinggemma-2.gguf");
+
+    wire_gemma_preset(&mut config, gguf);
+
+    let service = &config.services["gemma"];
+    assert_eq!(
+        service.model.as_deref(),
+        Some("/models/embeddinggemma-2.gguf")
+    );
+    assert_eq!(service.alias.as_deref(), Some("embeddinggemma-2"));
+    assert_eq!(service.port, 8080);
+    assert!(service.auto_start);
+    assert!(
+        service
+            .extra_args
+            .windows(2)
+            .any(|args| args == ["-ngl", "99"])
+    );
+    assert!(service.extra_args.contains(&"--embedding".to_string()));
+    assert!(config.indexing.embeddings.enable_hybrid);
+    assert_eq!(
+        config.indexing.embeddings.remote_provider,
+        "embeddinggemma-2"
+    );
+    assert_eq!(
+        config.indexing.embeddings.remote_service.as_deref(),
+        Some("gemma")
+    );
+    assert_eq!(
+        config
+            .indexing
+            .embeddings
+            .resolved_remote_with(&config.services)
+            .and_then(|remote| remote.remote_dimension),
+        Some(crate::config::EMBEDDINGGEMMA2_DIMENSION)
+    );
+}
+
+#[test]
+fn test_wire_gemma_preset_preserves_existing_service_and_endpoint() {
+    let mut config = crate::config::LeIndexConfig::default();
+    let service = config.services.entry("gemma".to_string()).or_default();
+    service.model = Some("/models/user-model.gguf".into());
+    service.alias = Some("user-model".into());
+    service.port = 9090;
+    service.extra_args = vec!["--ctx-size".into(), "4096".into()];
+    service.auto_start = false;
+    config.indexing.embeddings.remote_endpoint = Some("http://127.0.0.1:9090/v1".into());
+
+    wire_gemma_preset(&mut config, Path::new("/models/embeddinggemma-2.gguf"));
+
+    let service = &config.services["gemma"];
+    assert_eq!(service.model.as_deref(), Some("/models/user-model.gguf"));
+    assert_eq!(service.alias.as_deref(), Some("user-model"));
+    assert_eq!(service.port, 9090);
+    assert_eq!(service.extra_args, ["--ctx-size", "4096"]);
+    assert!(!service.auto_start);
+    assert_eq!(
+        config.indexing.embeddings.remote_endpoint.as_deref(),
+        Some("http://127.0.0.1:9090/v1")
+    );
+}
+
+#[test]
 fn test_setup_fresh_preset_and_existing_embedding_preservation() {
     let choices = SetupChoices {
         neural_enabled: true,
         provider: Some(ExecutionProvider::Cpu),
         remote_gemma: false,
+        options: SetupOptions::default(),
     };
     let fresh = build_config(&choices, None, None);
     assert!(fresh.neural.enabled);
@@ -650,6 +747,7 @@ fn test_build_config_records_ort_version() {
         neural_enabled: true,
         provider: Some(ExecutionProvider::Cpu),
         remote_gemma: false,
+        options: SetupOptions::default(),
     };
     let cfg = build_config(
         &choices,
@@ -678,6 +776,7 @@ fn test_build_config_selects_dynamic_qwen_model_for_all_local_providers() {
             neural_enabled: true,
             provider: Some(provider),
             remote_gemma: false,
+            options: SetupOptions::default(),
         };
 
         let cfg = build_config(&choices, None, None);
@@ -792,6 +891,7 @@ fn test_build_config_without_version() {
         neural_enabled: true,
         provider: Some(ExecutionProvider::Cpu),
         remote_gemma: false,
+        options: SetupOptions::default(),
     };
     let cfg = build_config(&choices, None, None);
     assert!(cfg.neural.ort_version.is_none());
@@ -1369,6 +1469,7 @@ fn test_setup_persists_auto_provider() {
         neural_enabled: true,
         provider: Some(ExecutionProvider::Auto),
         remote_gemma: false,
+        options: SetupOptions::default(),
     };
     let config = build_config(&choices, None, None);
 

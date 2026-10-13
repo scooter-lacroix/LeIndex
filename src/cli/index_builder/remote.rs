@@ -35,11 +35,18 @@ pub(crate) fn try_remote_neural_embedder(
         }
     }
     let resolved = embeddings_cfg.resolved_remote()?;
+    let api_key = match embeddings_cfg.resolved_api_key() {
+        Ok(key) => key,
+        Err(error) => {
+            warn!("{error}; remote embeddings unavailable");
+            return None;
+        }
+    };
     let remote_cfg = crate::search::onnx::RemoteEmbeddingConfig {
         provider: crate::search::onnx::RemoteProvider::Custom {
             endpoint: resolved.endpoint,
         },
-        api_key: embeddings_cfg.remote_api_key.clone(),
+        api_key,
         model: resolved.model,
         remote_dimension: resolved.remote_dimension,
         doc_template: resolved.doc_template,

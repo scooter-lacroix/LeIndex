@@ -1,10 +1,10 @@
 # Neural Search Setup
 
-LeIndex 1.9.5 combines TF-IDF, PDG, and neural signals over the same nodes when
-the ONNX feature is enabled:
+LeIndex combines TF-IDF, PDG, and neural signals over the same nodes through
+local ONNX or remote embeddings:
 
 - TF-IDF for exact vocabulary and identifier matches
-- Qwen3 embeddings for semantic similarity
+- Qwen3 or remote embeddings for semantic similarity
 - graph structure for callers, callees, dependencies, and symbol importance
 
 Neural scoring is the active semantic companion to the existing node index. It
@@ -22,7 +22,9 @@ leindex setup
 leindex setup --neural --cpu
 leindex setup --neural --gpu nvidia
 leindex setup --neural --gpu amd
-leindex setup --remote-gemma
+leindex setup --embedding embeddinggemma2 --download-llama cpu --gpu-layers 0
+leindex setup --embedding remote --embedding-endpoint http://127.0.0.1:9000/v1 \
+  --embedding-model your-served-model
 leindex setup --check
 ```
 
@@ -31,16 +33,27 @@ Setup writes `$LEINDEX_HOME/config/leindex.toml`, normally
 setup is successful only when the requested provider is active; silent CPU
 fallback is reported as a failure.
 
-`--remote-gemma` implies the neural path (like `--cpu`/`--gpu`) and
-provisions the remote-embeddings preset in one step: it downloads the pinned
-embeddinggemma-2 GGUF (~295 MiB) into the model dir and wires
-`[services.gemma]` + `[indexing.embeddings]` in `leindex.toml`. See
-[Remote EmbeddingGemma2 Preset](#remote-embeddinggemma2-preset) below.
+`--embedding qwen3` selects local ONNX; non-interactive `--neural` also selects
+Qwen3. `--embedding keep` retains the existing route. `--embedding embeddinggemma2`
+(or the `--remote-gemma` alias) provisions the GGUF and a managed Linux service.
+Supply `--llama-server /absolute/path/to/llama-server` (or its directory), or
+`--download-llama cpu|vulkan|cuda`; setup never guesses PATH or another tool's runtime.
+Official downloads use tag `b11574` and verify the archive against SHA256 metadata
+from GitHub's HTTPS release API. Release assets are not claimed immutable.
+CPU/Vulkan support x86_64 and ARM64 Linux; CUDA supports x86_64 Linux.
+
+Managed setup binds loopback only. `--gpu-layers 0` selects llama.cpp CPU offload;
+this is independent of ONNX `--cpu`/`--gpu`. Driver/SDK dependencies must be
+available for the selected backend. Use an authenticated external HTTP(S) server
+on other platforms or for nonlocal inference. Remote routes need neither ORT nor
+a local Qwen model. `--check` sends a bounded inference request without starting
+services; a stopped managed service is not ready, even when `auto_start = true`.
+See [Remote EmbeddingGemma2 Preset](#remote-embeddinggemma2-preset) below.
 
 The persisted provider is one of `auto`, `cpu`, `cuda`, `migraphx`, or
 `coreml`. `auto` resolves by availability (CoreML -> MIGraphX -> CUDA -> CPU)
-and is the default; `leindex setup` with no provider flag selects Auto, and
-`--neural --coreml` is offered on Apple Silicon. `rocm` is accepted as a
+and is the local provider default; the interactive wizard selects a route first.
+`rocm` is accepted as a
 deprecated alias that routes to MIGraphX and never registers `ort::ep::ROCm`.
 
 ## Remote EmbeddingGemma2 Preset
@@ -57,8 +70,8 @@ Fresh configuration defaults enable neural enrichment and select
 `embeddinggemma-2`. Explicit `[neural] enabled = false`, `--no-neural` at setup,
 or text search mode still disables enrichment. Existing TOML files,
 including empty files and files with only part of `[indexing]` or
-`[indexing.embeddings]`, retain legacy embedding defaults. Setup reruns preserve
-the existing indexing section. To opt in explicitly, merge these keys into
+`[indexing.embeddings]`, retain legacy embedding defaults. `--embedding keep` preserves
+the existing route; choosing another route changes it deliberately. To opt in manually, merge these keys into
 `$LEINDEX_HOME/config/leindex.toml` (normally `~/.leindex/config/leindex.toml`):
 
 ```toml
@@ -110,13 +123,13 @@ for CPU-only execution. Model loading errors must be resolved before indexing.
 
 ### Managed services (`leindex services`)
 
-Instead of keeping a terminal open, declare the server as a managed service and
-let LeIndex own the process:
+On Linux, instead of keeping a terminal open, declare the server as a managed
+service and let LeIndex own the process:
 
 ```toml
 # ~/.leindex/config/leindex.toml
 [services.gemma]
-binary = "llama-server"
+binary = "/absolute/path/to/llama-server"
 model = "/path/to/embeddinggemma-2.gguf"
 alias = "embeddinggemma-2"
 host = "127.0.0.1"
@@ -199,14 +212,9 @@ rows, including same-dimension task-template changes. Real local-worker and
 model-server readiness remain runtime requirements; focused regression tests
 are not evidence of those capabilities.
 
-To select local Qwen deliberately, keep `[neural] enabled = true`, provision it
-with `leindex setup --neural --cpu` (or a GPU provider), and merge:
-
-```toml
-[indexing.embeddings]
-enable_hybrid = false
-remote_provider = "custom"
-```
+To select local Qwen deliberately, run `leindex setup --embedding qwen3 --cpu`
+(or use `--gpu amd|nvidia`). Setup clears remote endpoint/service selection.
+Use `--embedding keep` instead when you do not want to change the existing route.
 
 The remote master switch does not disable the separately configured local
 ONNX path. To disable neural enrichment altogether, use `[neural] enabled =
@@ -230,10 +238,34 @@ remote_model = "your-served-model"
 
 With `custom`, omitted templates preserve raw text. An omitted dimension is
 measured from the first response; an explicit dimension is validated against
-responses. `remote_api_key` supplies a bearer token if the server requires one;
-keep credentials out of committed config and use TLS for non-loopback servers.
+responses. Prefer `remote_api_key_env = "EMBEDDINGS_API_KEY"` to name an environment
+variable holding the bearer token; do not commit the token. Use TLS for non-loopback servers.
+CLI equivalents are `--embedding-api-key-env EMBEDDINGS_API_KEY`,
+`--embedding-dimension 1024`, `--embedding-doc-template 'document instruction: {text}'`
+and `--embedding-query-template 'query instruction: {text}'`. Omitted fields on
+same-route reruns are retained; explicit empty template or key-variable flags clear them.
 Code and query text are sent to the configured endpoint. The preset stays on
 loopback; overriding it to a hosted service is an explicit data-sharing choice.
+
+## Configuration and System One
+
+```bash
+leindex config path
+leindex config show
+leindex config get search.search_mode
+leindex config set search.search_mode '"hybrid"'
+leindex config unset indexing.embeddings.remote_endpoint
+leindex config validate
+```
+
+`config set` takes a dotted key and TOML value; quote string values as shown.
+`show`/`get` redact secrets. Validate configuration after manual changes.
+
+`leindex setup --system-one` opens the terminal wizard for the separate decision
+route (managed Laya or external provider). The gate requires a build with
+`--features system-one` and `LEINDEX_FEATURE_SYSTEM_ONE=1` in the MCP/server
+process. Configuration alone does not enable that runtime gate. Name credentials
+through `api_key_env`, never place tokens in examples or shared config.
 
 ## Model Provisioning
 

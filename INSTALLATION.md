@@ -1,11 +1,12 @@
 # LeIndex Installation Guide
 
-Last updated: 2026-08-01 for LeIndex 1.9.5.
+Last updated: 2026-10-13 for LeIndex 2.0.
 
 LeIndex is distributed through GitHub release bundles, crates.io, npm, and
 PyPI. Core TF-IDF retrieval and PDG relationships are published first after
-the binary is installed. Run `leindex setup` once to provision the default
-hybrid neural provider and model; healthy `auto` builds then use all three
+the binary is installed. Run `leindex setup` once to provision a neural
+embedding route (local Qwen3 ONNX by default, a managed Linux GGUF service,
+or an external embeddings server); healthy builds then use all three
 signals for indexing and semantic retrieval.
 
 Model files are never included in a release artifact.
@@ -36,6 +37,13 @@ leindex setup
 The platform archive contains `leindex`, `leindex-embed`, and ONNX Runtime
 libraries. The installer verifies the archive and installs those runtime
 files. It does not copy or download model weights.
+
+On Linux, `leindex setup --embedding embeddinggemma2` can additionally
+download a separate official llama.cpp runtime (`--download-llama
+cpu|vulkan|cuda`): the download pins tag `b11574` and verifies the archive
+against SHA256 metadata from GitHub's HTTPS release API before extraction.
+Release assets are not claimed immutable. Managed services bind loopback
+only; see [docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md).
 
 ## Cargo
 

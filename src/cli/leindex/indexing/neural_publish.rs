@@ -105,14 +105,18 @@ impl NeuralProgress {
         let rows = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (rows_t, stop_t) = (rows.clone(), stop.clone());
-        // Arm the CPU-fallback watch only when a GPU provider was requested.
+        // Arm the CPU-fallback watch only when the LOCAL ONNX worker owns the
+        // neural layer and a GPU provider was requested. When a remote
+        // endpoint takes over (enable_hybrid with a resolved remote), the
+        // local daemon may never spawn — probing it is meaningless, and a
+        // stale CPU daemon left over from an earlier run must not raise a
+        // false warning.
         #[cfg(feature = "onnx")]
-        let gpu_requested = is_gpu_provider(
-            &crate::config::LeIndexConfig::load_cached()
-                .neural
-                .execution_provider
-                .to_ascii_lowercase(),
-        );
+        let gpu_requested = {
+            let config = crate::config::LeIndexConfig::load_cached();
+            config.indexing.embeddings.resolved_remote().is_none()
+                && is_gpu_provider(&config.neural.execution_provider.to_ascii_lowercase())
+        };
         #[cfg(not(feature = "onnx"))]
         let gpu_requested = false;
         // Best-effort: a failed spawn must not fail indexing — the counter
@@ -129,20 +133,26 @@ impl NeuralProgress {
                     // provider only after model init (observed ~45s cold:
                     // rocprof + MIGraphX probe), so this sees through both
                     // cold and warm starts without delaying the phase.
+                    // Gated like `gpu_requested` above: without onnx there is
+                    // no local daemon to probe, and provider_resolved starts
+                    // true (`!gpu_requested`), so the gate never fires.
                     if !provider_resolved {
-                        match crate::search::onnx::daemon_active_provider() {
-                            Some((active, _phase)) if active.eq_ignore_ascii_case("cpu") => {
-                                cpu_fallback = true;
-                                provider_resolved = true;
-                                progress_stderr(
-                                    "\nWarning: neural embedder fell back to CPU after a GPU \
-                                     provider was requested; inference is 100-1000x slower — see \
-                                     leindex.toml execution_provider.\nDetails: \
-                                     ~/.leindex/logs/leindex-embed-daemon.log\n",
-                                );
+                        #[cfg(feature = "onnx")]
+                        {
+                            match crate::search::onnx::daemon_active_provider() {
+                                Some((active, _phase)) if active.eq_ignore_ascii_case("cpu") => {
+                                    cpu_fallback = true;
+                                    provider_resolved = true;
+                                    progress_stderr(
+                                        "\nWarning: neural embedder fell back to CPU after a GPU \
+                                         provider was requested; inference is 100-1000x slower — see \
+                                         leindex.toml execution_provider.\nDetails: \
+                                         ~/.leindex/logs/leindex-embed-daemon.log\n",
+                                    );
+                                }
+                                Some(_) => provider_resolved = true,
+                                None => {}
                             }
-                            Some(_) => provider_resolved = true,
-                            None => {}
                         }
                     }
                     let suffix = if cpu_fallback {
@@ -962,14 +972,15 @@ mod tests {
                 inner: &mut inner,
                 rows_reported: &rows,
             };
-            let batch = |w: &mut ProgressNeuralRowWriter<streaming::neural::VecNeuralRowWriter>,
-                         base: usize,
-                         n: usize| {
-                let batch: Vec<_> = (base..base + n)
-                    .map(|i| (format!("node-{i}"), vec![i as f32, (i + 1) as f32]))
-                    .collect();
-                w.write_batch(batch).expect("write_batch");
-            };
+            let batch =
+                |w: &mut ProgressNeuralRowWriter<'_, streaming::neural::VecNeuralRowWriter>,
+                 base: usize,
+                 n: usize| {
+                    let batch: Vec<_> = (base..base + n)
+                        .map(|i| (format!("node-{i}"), vec![i as f32, (i + 1) as f32]))
+                        .collect();
+                    w.write_batch(batch).expect("write_batch");
+                };
             batch(&mut writer, 0, 2);
             assert_eq!(rows.load(std::sync::atomic::Ordering::Relaxed), 2);
             batch(&mut writer, 2, 3);

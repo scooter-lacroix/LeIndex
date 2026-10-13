@@ -1,6 +1,6 @@
 # LeIndex Rust Installation Guide
 
-This guide covers crates.io and source builds for LeIndex 1.9.5. For release
+This guide covers crates.io and source builds for LeIndex 2.0. For release
 bundles, npm, and PyPI, see [INSTALLATION.md](INSTALLATION.md).
 
 ## Requirements
@@ -62,24 +62,33 @@ Cargo's binary directory.
 
 ## Neural Setup
 
-The Rust crate does not package model files. Setup selects the execution
-provider, installs the matching ONNX Runtime package, installs
-`huggingface_hub` if needed, and downloads
-[Qwen3 Embedding (LeIndex code fine-tune, int4)](https://huggingface.co/ScooterLacroix/qwen3-embed-0.6b-int4-code) from
-Hugging Face via Hugging Face CLI, then writes
+The Rust crate does not package model files. Setup selects the embedding
+route — local Qwen3 ONNX, a managed EmbeddingGemma2 GGUF service on Linux, or
+an external OpenAI-compatible server — then writes
 `~/.leindex/config/leindex.toml`.
 
 ```bash
-leindex setup --neural --cpu
-leindex setup --neural --gpu nvidia
-leindex setup --neural --gpu amd
+leindex setup --embedding qwen3 --cpu
+leindex setup --embedding qwen3 --gpu nvidia
+leindex setup --embedding qwen3 --gpu amd
+# Linux managed service: explicit compatible runtime, or verified official download
+leindex setup --embedding embeddinggemma2 --download-llama cpu --gpu-layers 0
+# Alternative: --llama-server /absolute/path/to/llama-server
+leindex setup --embedding remote --embedding-endpoint http://127.0.0.1:9000/v1 \
+  --embedding-model your-served-model
 leindex setup --check
 ```
 
-The provider packages are `onnxruntime`, `onnxruntime-gpu`, and
+The Qwen3 ONNX provider packages are `onnxruntime`, `onnxruntime-gpu`, and
 `onnxruntime-migraphx`, respectively. CUDA or ROCm/MIGraphX system
 dependencies remain the responsibility of the host. Setup validates the active
 provider and rejects silent GPU-to-CPU fallback.
+
+Managed Gemma services are Linux-only and bind loopback only. Official
+llama.cpp downloads pin tag `b11574` and verify the archive against SHA256
+metadata from GitHub's HTTPS release API before extraction. Remote routes do
+not require ONNX Runtime. `--check` makes a bounded readiness request without
+starting services; a stopped managed service is reported as not ready.
 
 The model is stored under `$LEINDEX_HOME/models`, normally
 `~/.leindex/models`; it is not written into the Cargo registry or build

@@ -515,7 +515,19 @@ fn attach_source(
     if let Some(src) =
         read_source_snippet_resolved(&node.file_path, node.byte_range, Some(project_root))
     {
-        let truncated: String = src.chars().take(char_budget / 2).collect();
+        let half = char_budget / 2;
+        if half == 0 {
+            // A zero-share batch (e.g. 20 symbols on a tiny token_budget) would
+            // otherwise attach `"source": ""`, which reads as "empty file"
+            // rather than "budget too thin" (same disclosure rule as N-15).
+            result["source_omitted"] = Value::String(
+                "per-symbol share of token_budget is too small for a source snippet; \
+                 raise token_budget or look up symbols individually"
+                    .to_string(),
+            );
+            return;
+        }
+        let truncated: String = src.chars().take(half).collect();
         result["source"] = Value::String(truncated);
     }
 }

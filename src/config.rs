@@ -10,6 +10,7 @@
 // VAL-SETUP-032: LEINDEX_HOME override honored
 
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Environment variable for the LeIndex home directory override.
@@ -333,6 +334,10 @@ pub struct EmbeddingConfig {
     #[serde(default)]
     pub remote_api_key: Option<String>,
 
+    /// Environment variable containing the remote API key; preferred over storing secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_api_key_env: Option<String>,
+
     /// Model name sent as the "model" field of the /v1/embeddings payload
     /// (llama-server accepts the served model name or alias).
     #[serde(default)]
@@ -401,6 +406,20 @@ pub struct ResolvedRemote {
 }
 
 impl EmbeddingConfig {
+    /// Resolve a key without persisting the environment's secret value.
+    pub fn resolved_api_key(&self) -> Result<Option<String>, String> {
+        if let Some(name) = &self.remote_api_key_env {
+            return std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(Some)
+                .ok_or_else(|| {
+                    format!("Embedding API key environment variable {name} is unset or empty")
+                });
+        }
+        Ok(self.remote_api_key.clone())
+    }
+
     /// Human-readable provider label for diagnostics ("embeddinggemma-2"
     /// preset active, else "custom").
     pub fn remote_preset_label(&self) -> &str {
@@ -486,6 +505,7 @@ impl Default for EmbeddingConfig {
             remote_service: None,
             remote_endpoint: None,
             remote_api_key: None,
+            remote_api_key_env: None,
             remote_model: None,
             remote_dimension: None,
             remote_doc_template: None,
@@ -502,6 +522,7 @@ fn default_legacy_embedding_config() -> EmbeddingConfig {
         remote_service: None,
         remote_endpoint: None,
         remote_api_key: None,
+        remote_api_key_env: None,
         remote_model: None,
         remote_dimension: None,
         remote_doc_template: None,
@@ -892,8 +913,16 @@ impl LeIndexConfig {
         let toml_str =
             toml::to_string_pretty(self).map_err(|e| ConfigError::Serialize(e.to_string()))?;
 
-        std::fs::write(&config_path, toml_str)
+        let parent = config_path.parent().ok_or(ConfigError::NoHomeDir)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)
             .map_err(|e| ConfigError::Io(config_path.clone(), e.to_string()))?;
+        temporary
+            .write_all(toml_str.as_bytes())
+            .and_then(|_| temporary.as_file().sync_all())
+            .map_err(|e| ConfigError::Io(config_path.clone(), e.to_string()))?;
+        temporary
+            .persist(&config_path)
+            .map_err(|e| ConfigError::Io(config_path.clone(), e.error.to_string()))?;
 
         Ok(config_path)
     }

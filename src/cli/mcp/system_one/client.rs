@@ -1,6 +1,8 @@
 //! HTTP `Asker` for Laya (`laya-serve`), TypeSafe Jev and OpenAI Decisions.
-//! Single attempt, no retry: the gate is latency-bounded and fails open.
+//! Single attempt per call, with one managed-service restart and one retry on
+//! transport failure. The gate is latency-bounded and fails open.
 
+use super::scrub::PathScrub;
 use super::types::{Asker, Provider, Request, Response, SystemOneError};
 use super::wire::{decode, encode};
 use serde_json::Value;
@@ -133,7 +135,18 @@ impl HttpAsker {
 
 impl Asker for HttpAsker {
     async fn ask(&self, request: &Request) -> Result<Response, SystemOneError> {
-        match self.ask_once(request).await {
+        // Remote providers never see machine paths. One alias map serves both
+        // attempts, so a retry sends the same payload as the first try.
+        let mut scrub = self.provider.is_remote().then(|| PathScrub::new(request));
+        let scrubbed;
+        let request = match scrub.as_mut() {
+            Some(scrub) => {
+                scrubbed = scrub.scrub_request(request);
+                &scrubbed
+            }
+            None => request,
+        };
+        let response = match self.ask_once(request).await {
             Err(SystemOneError::Transport(reason)) => {
                 // Service-backed endpoint: one restart attempt, one retry.
                 if self.try_managed_restart().await {
@@ -143,12 +156,16 @@ impl Asker for HttpAsker {
                 }
             }
             other => other,
-        }
+        }?;
+        Ok(match scrub {
+            Some(scrub) => scrub.unscrub_response(response),
+            None => response,
+        })
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
     use crate::cli::mcp::system_one::types::Question;
     use serde_json::json;
@@ -209,7 +226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn posts_jev_shape_with_bearer_and_decodes() {
+    async fn test_posts_jev_shape_with_bearer_and_decodes() {
         let (base, rx) = mock_server(
             200,
             json!({"answers": {"ok": {"type": "noul", "noul": 0.9}},
@@ -237,7 +254,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_uses_decisions_path() {
+    async fn test_openai_uses_decisions_path() {
         let (base, rx) = mock_server(
             200,
             json!({"answers": [{"type": "predicate", "name": "ok", "probability": 0.2}]})
@@ -256,7 +273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_success_status_is_an_error_not_a_panic() {
+    async fn test_non_success_status_is_an_error_not_a_panic() {
         let (base, _rx) = mock_server(429, "{}".into());
         let asker = HttpAsker::new(
             Provider::Jev,
@@ -273,7 +290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreachable_endpoint_is_a_transport_error() {
+    async fn test_unreachable_endpoint_is_a_transport_error() {
         let asker = HttpAsker::new(
             Provider::Laya,
             "http://127.0.0.1:1",
@@ -286,5 +303,110 @@ mod tests {
             asker.ask(&request()).await,
             Err(SystemOneError::Transport(_))
         ));
+    }
+
+    fn pick_request(state: Value, instructions: &str) -> Request {
+        Request {
+            state,
+            questions: vec![(
+                "dept".into(),
+                Question::Pick {
+                    instructions: instructions.into(),
+                    options: vec![
+                        (
+                            "/home/alice/proj".into(),
+                            "the project at /home/alice/proj".into(),
+                        ),
+                        ("keep".into(), "other project".into()),
+                    ],
+                },
+            )],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_payload_excludes_absolute_paths() {
+        let request = pick_request(
+            json!({
+                "unix": "/home/alice/proj/src/a.rs",
+                "win": "C:\\Users\\bob\\app\\b.rs",
+                "home": "~/code/c.rs",
+                "outside": "/srv/data/d.rs"
+            }),
+            "Which project is /home/alice/proj?",
+        );
+        let (base, rx) = mock_server(200, json!({"answers": {}}).to_string());
+        let asker = HttpAsker::new(
+            Provider::Jev,
+            &base,
+            "jev-latest",
+            None,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        asker.ask(&request).await.unwrap();
+        let raw = rx.recv().unwrap();
+        for leak in ["alice", "bob", "C:\\", "~/code", "/srv/data", "/home/"] {
+            assert!(!raw.contains(leak), "leaked {leak}: {raw}");
+        }
+        assert!(raw.contains("pathref-"), "nothing was aliased: {raw}");
+    }
+
+    #[tokio::test]
+    async fn test_pick_choice_alias_roundtrips_to_real_path() {
+        let request = pick_request(json!({"note": "no paths"}), "Which project?");
+        // The first path span in this request is the option value, so it is `pathref-1`.
+        let (base, _rx) = mock_server(
+            200,
+            json!({"answers": {"dept": {
+                "choice": "pathref-1",
+                "probabilities": {"pathref-1": 0.9, "keep": 0.1},
+                "confidence": 0.9
+            }}})
+            .to_string(),
+        );
+        let asker = HttpAsker::new(
+            Provider::Jev,
+            &base,
+            "jev-latest",
+            None,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let response = asker.ask(&request).await.unwrap();
+        assert_eq!(response.pick("dept"), Some(("/home/alice/proj", 0.9)));
+    }
+
+    #[tokio::test]
+    async fn test_unknown_pick_choice_is_still_rejected() {
+        let request = pick_request(json!({"note": "no paths"}), "Which project?");
+        let (base, _rx) = mock_server(
+            200,
+            json!({"answers": {"dept": {
+                "choice": "/home/alice/invented",
+                "probabilities": {},
+                "confidence": 0.9
+            }}})
+            .to_string(),
+        );
+        let asker = HttpAsker::new(
+            Provider::Jev,
+            &base,
+            "jev-latest",
+            None,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(asker.ask(&request).await.unwrap().pick("dept"), None);
+    }
+
+    #[tokio::test]
+    async fn test_laya_payload_is_not_scrubbed() {
+        let request = pick_request(json!({"path": "/home/alice/proj"}), "Which project?");
+        let (base, rx) = mock_server(200, json!({"answers": {}}).to_string());
+        let asker =
+            HttpAsker::new(Provider::Laya, &base, "laya", None, Duration::from_secs(2)).unwrap();
+        asker.ask(&request).await.unwrap();
+        assert!(rx.recv().unwrap().contains("/home/alice/proj"));
     }
 }

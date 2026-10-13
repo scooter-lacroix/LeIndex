@@ -12,6 +12,7 @@
 pub mod client;
 pub mod post;
 pub mod pre;
+mod scrub;
 pub mod types;
 pub mod wire;
 
@@ -96,6 +97,7 @@ pub fn is_read_only(tool: &str) -> bool {
             | "leindex_git_status"
             | "leindex_git_diff"
             | "leindex_phase_analysis"
+            | "phase_analysis"
             | "leindex_edit_preview"
     )
 }
@@ -368,11 +370,21 @@ impl Gate {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let root = registry
+        // Root must resolve before any result text is sent to the provider:
+        // `candidate_state` relativizes paths against it, and an empty root
+        // would pass absolute host paths through ("nothing machine-specific
+        // leaves the host"). Fail open instead — the post-gate is an
+        // optimization, not a correctness requirement.
+        let root = match registry
             .resolve_project_root(args.get("project_path").and_then(Value::as_str))
             .await
-            .map(|path| path.display().to_string())
-            .unwrap_or_default();
+        {
+            Ok(path) => path.display().to_string(),
+            Err(_) => {
+                debug!("system_one post-gate skipped: project root unresolved");
+                return;
+            }
+        };
         let total = results.len();
         let base: Vec<f32> = results
             .iter()
@@ -431,7 +443,7 @@ impl Gate {
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
     use crate::cli::mcp::system_one::testing::{FnAsker, yes_answers};
     use crate::cli::mcp::system_one::types::SystemOneError;
