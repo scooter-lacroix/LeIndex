@@ -163,16 +163,26 @@ pub struct Gate {
 }
 
 /// The process-wide gate, built once from `[system_one]`. `None` when off or
-/// misconfigured.
+/// misconfigured. The active preset overlay is applied first, so switching
+/// presets takes effect on next process start.
 pub fn global() -> Option<&'static Gate> {
     static GATE: OnceLock<Option<Gate>> = OnceLock::new();
-    GATE.get_or_init(|| Gate::from_config(&LeIndexConfig::load_cached().system_one))
-        .as_ref()
+    GATE.get_or_init(|| {
+        let config = LeIndexConfig::load_cached();
+        Gate::from_config(&config.system_one, &config.services)
+    })
+    .as_ref()
 }
 
 impl Gate {
     /// Build from config; `None` (with a warning) when disabled or invalid.
-    pub fn from_config(config: &SystemOneConfig) -> Option<Self> {
+    /// `services` is the `[services.<name>]` map the section's `service` key
+    /// may reference for endpoint derivation and managed start.
+    pub fn from_config(
+        config: &SystemOneConfig,
+        services: &std::collections::BTreeMap<String, crate::config::ServiceConfig>,
+    ) -> Option<Self> {
+        let config = config.effective();
         let Some(mode) = Mode::parse(&config.mode) else {
             warn!(mode = %config.mode, "unknown [system_one] mode; gate disabled (use off|shadow|enforce)");
             return None;
@@ -184,6 +194,15 @@ impl Gate {
             warn!(provider = %config.provider, "unknown [system_one] provider; gate disabled (use laya|jev|openai)");
             return None;
         };
+        let service = config.service.as_deref().and_then(|name| {
+            match services.get(name) {
+                Some(svc) => Some(svc),
+                None => {
+                    warn!(service = %name, "[system_one] service names no [services] section; ignoring");
+                    None
+                }
+            }
+        });
         let api_key = config
             .api_key_env
             .as_deref()
@@ -195,13 +214,17 @@ impl Gate {
             );
             return None;
         }
+        // base_url ladder: section (incl. preset) > referenced service > provider default.
         let base_url = config
             .base_url
             .clone()
+            .or_else(|| service.map(|s| s.base_url()))
             .unwrap_or_else(|| default_base_url(provider).to_string());
+        // model ladder: section > referenced service served name > provider default.
         let model = config
             .model
             .clone()
+            .or_else(|| service.and_then(|s| s.served_name()))
             .unwrap_or_else(|| default_model(provider).to_string());
         let timeout_ms = config.timeout_ms.max(1);
         let asker = match HttpAsker::new(
@@ -216,6 +239,14 @@ impl Gate {
                 warn!(%error, "could not build the system-one HTTP client; gate disabled");
                 return None;
             }
+        };
+        // Managed self-healing: only for service sections that allow it.
+        let asker = match service {
+            Some(svc) if svc.auto_start && svc.model.is_some() => {
+                let name = config.service.clone().unwrap_or_default();
+                asker.with_managed_service(name, svc.clone())
+            }
+            _ => asker,
         };
         Some(Self {
             mode,
@@ -473,25 +504,50 @@ mod tests {
 
     #[test]
     fn test_from_config_is_off_by_default_and_rejects_bad_values() {
-        assert!(Gate::from_config(&SystemOneConfig::default()).is_none());
+        let no_services = std::collections::BTreeMap::new();
+        assert!(Gate::from_config(&SystemOneConfig::default(), &no_services).is_none());
         let remote_without_key = SystemOneConfig {
             mode: "shadow".into(),
             provider: "jev".into(),
             api_key_env: Some("LEINDEX_TEST_UNSET_KEY_VAR".into()),
             ..SystemOneConfig::default()
         };
-        assert!(Gate::from_config(&remote_without_key).is_none());
+        assert!(Gate::from_config(&remote_without_key, &no_services).is_none());
         let bad_provider = SystemOneConfig {
             mode: "shadow".into(),
             provider: "nope".into(),
             ..SystemOneConfig::default()
         };
-        assert!(Gate::from_config(&bad_provider).is_none());
+        assert!(Gate::from_config(&bad_provider, &no_services).is_none());
         let laya = SystemOneConfig {
             mode: "shadow".into(),
             provider: "laya".into(),
             ..SystemOneConfig::default()
         };
-        assert!(Gate::from_config(&laya).is_some());
+        assert!(Gate::from_config(&laya, &no_services).is_some());
+    }
+
+    #[test]
+    fn test_from_config_derives_endpoint_from_service() {
+        let mut services = std::collections::BTreeMap::new();
+        services.insert(
+            "laya".to_string(),
+            crate::config::ServiceConfig {
+                host: "127.0.0.1".into(),
+                port: 8181,
+                model: Some("/models/laya-bf16.gguf".into()),
+                auto_start: false,
+                ..Default::default()
+            },
+        );
+        // service reference derives base_url and model; gate builds.
+        let cfg = SystemOneConfig {
+            mode: "shadow".into(),
+            provider: "laya".into(),
+            service: Some("laya".into()),
+            ..SystemOneConfig::default()
+        };
+        let gate = Gate::from_config(&cfg, &services).expect("gate from service-backed config");
+        assert!(gate.asker.endpoint().starts_with("http://127.0.0.1:8181"));
     }
 }

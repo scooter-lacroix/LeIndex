@@ -42,6 +42,140 @@ pub struct LeIndexConfig {
     /// System-One gate configuration.
     #[serde(default)]
     pub system_one: SystemOneConfig,
+
+    /// Managed model-server services (\[services.<name>\] sections). Each
+    /// names a llama-server-compatible process LeIndex can start, stop, and
+    /// health-check on the user's behalf; consumers reference a service by
+    /// name (`[system_one] service`, `[indexing.embeddings] remote_service`)
+    /// and derive their endpoint from it. Empty by default: no config ever
+    /// gains a managed process by being upgraded.
+    #[serde(default)]
+    pub services: std::collections::BTreeMap<String, ServiceConfig>,
+}
+
+/// One managed model-server process (\[services.<name>\] section).
+///
+/// Describes how to spawn a llama-server-compatible binary (`binary -m model
+/// --host host --port port <extra_args>`), whether LeIndex may start it on
+/// demand, and how long a start may take (large GGUF loads are slow). The
+/// service never runs unless a consumer references it by name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServiceConfig {
+    /// Binary to execute (PATH-resolved). Default: "llama-server".
+    #[serde(default = "default_service_binary")]
+    pub binary: String,
+
+    /// Model file path passed via `-m` (required for spawning; referencing a
+    /// service without one only derives its endpoint, it can never start).
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// Served model alias (`--alias`); also the payload `model` fallback for
+    /// consumers that did not set one. Default: model file stem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+
+    /// Listen host passed via `--host`. Default: "127.0.0.1".
+    #[serde(default = "default_service_host")]
+    pub host: String,
+
+    /// Listen port passed via `--port` (required).
+    #[serde(default)]
+    pub port: u16,
+
+    /// Extra CLI arguments appended verbatim (e.g. "--ctx-size", "4096",
+    /// "--embeddings").
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+
+    /// Allow LeIndex to start this service on demand when a consumer that
+    /// references it finds the endpoint down. Default: false — referencing a
+    /// service only derives its endpoint unless this is set.
+    #[serde(default)]
+    pub auto_start: bool,
+
+    /// How long a start may wait for the port to accept connections before
+    /// giving up (and terminating the attempt). Default: 120s (GGUF loads).
+    #[serde(default = "default_service_start_timeout_secs")]
+    pub start_timeout_secs: u64,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            binary: default_service_binary(),
+            model: None,
+            alias: None,
+            host: default_service_host(),
+            port: 0,
+            extra_args: Vec::new(),
+            auto_start: false,
+            start_timeout_secs: default_service_start_timeout_secs(),
+        }
+    }
+}
+
+fn default_service_binary() -> String {
+    "llama-server".to_string()
+}
+
+fn default_service_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+const fn default_service_start_timeout_secs() -> u64 {
+    120
+}
+
+impl ServiceConfig {
+    /// `http://host:port` — the base URL consumers derive from this service.
+    pub fn base_url(&self) -> String {
+        format!("http://{}:{}", self.host, self.port)
+    }
+
+    /// The payload model name consumers fall back to: explicit alias, else
+    /// the model file stem, else nothing.
+    pub fn served_name(&self) -> Option<String> {
+        if let Some(alias) = self.alias.as_deref() {
+            if !alias.trim().is_empty() {
+                return Some(alias.to_string());
+            }
+        }
+        self.model.as_deref().map(|path| {
+            std::path::Path::new(path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string())
+        })
+    }
+}
+
+/// One saved System-One provider profile (\[system_one.presets.<name>\]).
+///
+/// While `[system_one] active_preset = "<name>"` names an existing preset,
+/// every field the preset sets overrides the section's own value — switching
+/// providers is a one-line change and the wire templates follow the provider.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SystemOnePreset {
+    /// Provider: "laya", "jev" or "openai".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
+    /// Model name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Base URL (overrides the provider default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+
+    /// Name of a `[services.<name>]` entry the endpoint derives from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+
+    /// Environment variable holding the API key (remote providers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
 }
 
 /// Neural embeddings configuration (\[neural\] section).
@@ -177,6 +311,12 @@ pub struct EmbeddingConfig {
     #[serde(default = "default_enable_hybrid")]
     pub enable_hybrid: bool,
 
+    /// Name of a `[services.<name>]` entry the endpoint derives from.
+    /// Sits below an explicit `remote_endpoint` in the resolution ladder:
+    /// explicit endpoint > service base URL > preset default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_service: Option<String>,
+
     /// Provider preset filling unset keys below. Empty/`"custom"` = the
     /// generic OpenAI-compatible path (every key must be set explicitly).
     /// `"embeddinggemma-2"` fills endpoint/model/dimension/templates from
@@ -281,17 +421,37 @@ impl EmbeddingConfig {
     }
 
     /// Resolve the remote ladder configuration: preset fills unset keys,
-    /// explicit config always wins. Returns `None` when the ladder is off
-    /// (flag false) or nothing can produce an endpoint (no explicit endpoint
-    /// and no preset default).
+    /// explicit config always wins. Endpoint ladder: explicit
+    /// `remote_endpoint` > `remote_service` base URL > preset default.
+    /// Returns `None` when the ladder is off (flag false) or nothing can
+    /// produce an endpoint.
+    ///
+    /// Services are read from the process-wide cached config (the daemon
+    /// serves every consumer from it); tests use [`Self::resolved_remote_with`].
     pub fn resolved_remote(&self) -> Option<ResolvedRemote> {
+        self.resolved_remote_with(&LeIndexConfig::load_cached().services)
+    }
+
+    /// Pure [`Self::resolved_remote`] with an explicit services map.
+    pub fn resolved_remote_with(
+        &self,
+        services: &std::collections::BTreeMap<String, ServiceConfig>,
+    ) -> Option<ResolvedRemote> {
         if !self.enable_hybrid {
             return None;
         }
         let preset = self.embeddinggemma2_preset_active();
+        let service = self
+            .remote_service
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|name| services.get(name));
         let endpoint = match self.remote_endpoint.as_deref().map(str::trim) {
             Some(e) if !e.is_empty() => Some(e.to_string()),
-            _ => preset.then(|| EMBEDDINGGEMMA2_DEFAULT_ENDPOINT.to_string()),
+            _ => service
+                .map(|s| format!("{}/v1", s.base_url()))
+                .or_else(|| preset.then(|| EMBEDDINGGEMMA2_DEFAULT_ENDPOINT.to_string())),
         }?;
         let fill = |value: &Option<String>, preset_value: &str| match value {
             Some(v) if !v.trim().is_empty() => Some(v.clone()),
@@ -300,7 +460,8 @@ impl EmbeddingConfig {
         };
         Some(ResolvedRemote {
             endpoint,
-            model: fill(&self.remote_model, EMBEDDINGGEMMA2_MODEL),
+            model: fill(&self.remote_model, EMBEDDINGGEMMA2_MODEL)
+                .or_else(|| service.and_then(|s| s.served_name())),
             doc_template: fill(&self.remote_doc_template, EMBEDDINGGEMMA2_DOC_TEMPLATE),
             query_template: fill(&self.remote_query_template, EMBEDDINGGEMMA2_QUERY_TEMPLATE),
             remote_dimension: self
@@ -322,6 +483,7 @@ impl Default for EmbeddingConfig {
         Self {
             enable_hybrid: true,
             remote_provider: "embeddinggemma-2".to_string(),
+            remote_service: None,
             remote_endpoint: None,
             remote_api_key: None,
             remote_model: None,
@@ -337,6 +499,7 @@ fn default_legacy_embedding_config() -> EmbeddingConfig {
     EmbeddingConfig {
         enable_hybrid: default_enable_hybrid(),
         remote_provider: default_remote_provider(),
+        remote_service: None,
         remote_endpoint: None,
         remote_api_key: None,
         remote_model: None,
@@ -449,6 +612,51 @@ pub struct SystemOneConfig {
     /// Pre-gate: auto-apply a model-chosen repair at or above this confidence.
     #[serde(default = "default_system_one_tau_apply")]
     pub tau_apply: f32,
+
+    /// Name of a `[services.<name>]` entry the endpoint derives from.
+    /// `[system_one] base_url` (or the preset's) still wins when set; the
+    /// service supplies the base URL otherwise and (when `auto_start`) can be
+    /// started on demand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+
+    /// Name of a profile under `[system_one.presets]` whose set fields
+    /// override this section's. Switching providers end-to-end is changing
+    /// this one line; wire templates follow the provider automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_preset: Option<String>,
+
+    /// Saved provider profiles (`[system_one.presets.<name>]` sections).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub presets: std::collections::BTreeMap<String, SystemOnePreset>,
+}
+
+impl SystemOneConfig {
+    /// Apply the active preset overlay: every field the preset sets overrides
+    /// this section's value. An `active_preset` naming a missing preset is
+    /// ignored (warned by the consumer) — config stays usable.
+    pub fn effective(&self) -> Self {
+        let Some(name) = self.active_preset.as_deref().map(str::trim) else {
+            return self.clone();
+        };
+        let Some(preset) = self.presets.get(name) else {
+            return self.clone();
+        };
+        Self {
+            provider: preset
+                .provider
+                .clone()
+                .unwrap_or_else(|| self.provider.clone()),
+            model: preset.model.clone().or_else(|| self.model.clone()),
+            base_url: preset.base_url.clone().or_else(|| self.base_url.clone()),
+            service: preset.service.clone().or_else(|| self.service.clone()),
+            api_key_env: preset
+                .api_key_env
+                .clone()
+                .or_else(|| self.api_key_env.clone()),
+            ..self.clone()
+        }
+    }
 }
 
 impl Default for SystemOneConfig {
@@ -466,6 +674,9 @@ impl Default for SystemOneConfig {
             instructions_max: default_system_one_instructions_max(),
             top_n: default_system_one_top_n(),
             tau_apply: default_system_one_tau_apply(),
+            service: None,
+            active_preset: None,
+            presets: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1013,6 +1224,7 @@ mod tests {
                 prewarm: "graph".to_string(),
             },
             system_one: SystemOneConfig::default(),
+            services: std::collections::BTreeMap::new(),
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: LeIndexConfig = toml::from_str(&toml_str).unwrap();
@@ -1097,5 +1309,139 @@ mod tests {
             Some(PathBuf::from("/custom/leindex"))
         );
         unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
+    }
+
+    fn service(
+        name: &str,
+        host: &str,
+        port: u16,
+        model: Option<&str>,
+        alias: Option<&str>,
+    ) -> (String, ServiceConfig) {
+        (
+            name.to_string(),
+            ServiceConfig {
+                host: host.to_string(),
+                port,
+                model: model.map(str::to_string),
+                alias: alias.map(str::to_string),
+                ..ServiceConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn test_service_base_url_and_served_name() {
+        let (_, laya) = service(
+            "laya",
+            "127.0.0.1",
+            8181,
+            Some("/models/laya-bf16.gguf"),
+            None,
+        );
+        assert_eq!(laya.base_url(), "http://127.0.0.1:8181");
+        // No alias: served name falls back to the model file stem.
+        assert_eq!(laya.served_name().as_deref(), Some("laya-bf16"));
+        let (_, aliased) = service("e", "127.0.0.1", 8080, None, Some("embeddinggemma-2"));
+        assert_eq!(aliased.served_name().as_deref(), Some("embeddinggemma-2"));
+    }
+
+    #[test]
+    fn test_resolved_remote_endpoint_ladder() {
+        let mut services: std::collections::BTreeMap<String, ServiceConfig> =
+            std::collections::BTreeMap::new();
+        services.insert(
+            "embed".to_string(),
+            ServiceConfig {
+                port: 8123,
+                ..ServiceConfig::default()
+            },
+        );
+        // Service derives the endpoint when no explicit one is set.
+        let via_service = EmbeddingConfig {
+            enable_hybrid: true,
+            remote_service: Some("embed".into()),
+            ..EmbeddingConfig::default()
+        };
+        let resolved = via_service.resolved_remote_with(&services).unwrap();
+        assert_eq!(resolved.endpoint, "http://127.0.0.1:8123/v1");
+        // Explicit endpoint beats the service.
+        let explicit_wins = EmbeddingConfig {
+            enable_hybrid: true,
+            remote_service: Some("embed".into()),
+            remote_endpoint: Some("http://explicit:9/v1".into()),
+            ..EmbeddingConfig::default()
+        };
+        assert_eq!(
+            explicit_wins
+                .resolved_remote_with(&services)
+                .unwrap()
+                .endpoint,
+            "http://explicit:9/v1"
+        );
+        // Preset default applies when neither is set.
+        let preset_only = EmbeddingConfig {
+            enable_hybrid: true,
+            ..EmbeddingConfig::default()
+        };
+        assert_eq!(
+            preset_only
+                .resolved_remote_with(&services)
+                .unwrap()
+                .endpoint,
+            EMBEDDINGGEMMA2_DEFAULT_ENDPOINT
+        );
+    }
+
+    #[test]
+    fn test_resolved_remote_model_falls_back_to_service() {
+        let mut services: std::collections::BTreeMap<String, ServiceConfig> =
+            std::collections::BTreeMap::new();
+        services.insert(
+            "embed".to_string(),
+            ServiceConfig {
+                model: Some("/models/embeddinggemma-2-Q8_0.gguf".into()),
+                ..ServiceConfig::default()
+            },
+        );
+        let cfg = EmbeddingConfig {
+            enable_hybrid: true,
+            remote_service: Some("embed".into()),
+            remote_provider: "custom".into(),
+            ..EmbeddingConfig::default()
+        };
+        // Custom preset (no model fill) + no remote_model -> service stem.
+        assert_eq!(
+            cfg.resolved_remote_with(&services)
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("embeddinggemma-2-Q8_0")
+        );
+    }
+
+    #[test]
+    fn test_system_one_preset_overlay_swaps_provider() {
+        let mut cfg = SystemOneConfig::default();
+        cfg.provider = "laya".into();
+        cfg.mode = "enforce".into();
+        cfg.presets.insert(
+            "openai-prod".into(),
+            SystemOnePreset {
+                provider: Some("openai".into()),
+                model: Some("gpt-6-luna".into()),
+                api_key_env: Some("OPENAI_API_KEY".into()),
+                ..SystemOnePreset::default()
+            },
+        );
+        cfg.active_preset = Some("openai-prod".into());
+        let effective = cfg.effective();
+        assert_eq!(effective.provider, "openai");
+        assert_eq!(effective.model.as_deref(), Some("gpt-6-luna"));
+        // Section-level fields survive when the preset leaves them unset.
+        assert_eq!(effective.mode, "enforce");
+        // Clearing the preset (or naming a missing one) reverts to laya.
+        cfg.active_preset = Some("nope".into());
+        assert_eq!(cfg.effective().provider, "laya");
     }
 }

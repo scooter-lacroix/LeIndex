@@ -1116,6 +1116,7 @@ fn build_config(
         indexing: IndexingConfig::default(),
         mcp: crate::config::McpConfig::default(),
         system_one: crate::config::SystemOneConfig::default(),
+        services: Default::default(),
     }
 }
 

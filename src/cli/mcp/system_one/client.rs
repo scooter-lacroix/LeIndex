@@ -4,6 +4,7 @@
 use super::types::{Asker, Provider, Request, Response, SystemOneError};
 use super::wire::{decode, encode};
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Default base URL per provider (Laya's `laya-serve` default port is 8000).
@@ -38,7 +39,15 @@ pub struct HttpAsker {
     url: String,
     model: String,
     api_key: Option<String>,
+    /// Managed service to (re)start when transport fails and retry once.
+    /// Attached by the gate only for `[system_one] service` sections with
+    /// `auto_start = true` and a model.
+    managed: Option<(String, crate::config::ServiceConfig)>,
 }
+
+/// One managed-start attempt per process: a service that cannot come up
+/// must not turn every gated call into a spawn attempt.
+static MANAGED_START_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 impl HttpAsker {
     /// Build a client. `base_url` may omit the endpoint path.
@@ -63,12 +72,42 @@ impl HttpAsker {
             ),
             model: model.to_string(),
             api_key,
+            managed: None,
         })
     }
-}
 
-impl Asker for HttpAsker {
-    async fn ask(&self, request: &Request) -> Result<Response, SystemOneError> {
+    /// Attach a managed service for transport-failure self-healing.
+    pub fn with_managed_service(
+        mut self,
+        name: String,
+        config: crate::config::ServiceConfig,
+    ) -> Self {
+        self.managed = Some((name, config));
+        self
+    }
+
+    /// Endpoint URL (test/telemetry surface).
+    pub fn endpoint(&self) -> &str {
+        &self.url
+    }
+
+    /// Try to bring the managed service up (once per process). True when
+    /// this call spawned it and a retry is worth attempting.
+    async fn try_managed_restart(&self) -> bool {
+        let Some((name, config)) = self.managed.clone() else {
+            return false;
+        };
+        if MANAGED_START_ATTEMPTED.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        tracing::warn!(service = %name, "transport failure; starting managed service once");
+        let result =
+            tokio::task::spawn_blocking(move || crate::services::ensure_running(&name, &config))
+                .await;
+        matches!(result, Ok(Ok(true)))
+    }
+
+    async fn ask_once(&self, request: &Request) -> Result<Response, SystemOneError> {
         let mut call =
             self.client
                 .post(&self.url)
@@ -89,6 +128,22 @@ impl Asker for HttpAsker {
             .await
             .map_err(|e| SystemOneError::Decode(e.to_string()))?;
         decode(self.provider, request, &body)
+    }
+}
+
+impl Asker for HttpAsker {
+    async fn ask(&self, request: &Request) -> Result<Response, SystemOneError> {
+        match self.ask_once(request).await {
+            Err(SystemOneError::Transport(reason)) => {
+                // Service-backed endpoint: one restart attempt, one retry.
+                if self.try_managed_restart().await {
+                    self.ask_once(request).await
+                } else {
+                    Err(SystemOneError::Transport(reason))
+                }
+            }
+            other => other,
+        }
     }
 }
 

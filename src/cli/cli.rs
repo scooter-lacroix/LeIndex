@@ -351,6 +351,45 @@ pub enum Commands {
         #[arg(long = "warmup")]
         warmup: bool,
     },
+
+    /// Manage managed model-server services ([services.<name>] sections)
+    ///
+    /// List, inspect, start, stop and restart the llama-server-compatible
+    /// processes declared in leindex.toml. Health is a TCP connect on the
+    /// configured port; `status` shows pid (from our pidfile, verified),
+    /// endpoint, model and auto-start policy.
+    Services {
+        /// Action to perform (list when omitted)
+        #[command(subcommand)]
+        action: Option<ServiceAction>,
+    },
+}
+
+/// Actions for `leindex services`.
+#[derive(Subcommand, Debug)]
+pub enum ServiceAction {
+    /// Show every configured service and its state (default)
+    List,
+    /// Show one service's state in detail
+    Status {
+        /// Service name ([services.<name>] key)
+        name: String,
+    },
+    /// Start a service (waits for the port to answer)
+    Start {
+        /// Service name ([services.<name>] key)
+        name: String,
+    },
+    /// Stop a service (SIGTERM its process group; refuses foreign pids)
+    Stop {
+        /// Service name ([services.<name>] key)
+        name: String,
+    },
+    /// Stop then start a service
+    Restart {
+        /// Service name ([services.<name>] key)
+        name: String,
+    },
 }
 
 /// Subcommands for inspecting and executing MCP tools from the CLI.
@@ -543,6 +582,7 @@ impl Cli {
                 check,
                 warmup,
             } => cmd_setup_impl(neural, no_neural, cpu, gpu, check, warmup).await,
+            Commands::Services { action } => cmd_services_impl(action).await,
         };
 
         // Write the memory report (if tracking was enabled) before returning.
@@ -1686,6 +1726,111 @@ fn check_neutral_conflicts(
         anyhow::bail!("Cannot use --cpu and --gpu together. Choose one execution provider.");
     }
     Ok(())
+}
+
+/// `leindex services` — manage `[services.<name>]` model servers.
+async fn cmd_services_impl(action: Option<ServiceAction>) -> AnyhowResult<()> {
+    use crate::services as svc;
+    let config = crate::config::LeIndexConfig::load_cached();
+
+    let resolve = |name: &str| -> AnyhowResult<&crate::config::ServiceConfig> {
+        config
+            .services
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("no [services.{name}] section in the config"))
+    };
+
+    match action {
+        None | Some(ServiceAction::List) => {
+            if config.services.is_empty() {
+                println!("No [services] sections configured.");
+                println!("Add one to ~/.leindex/config/leindex.toml, e.g.:");
+                println!();
+                println!("[services.laya]");
+                println!("model = \"/path/to/model.gguf\"");
+                println!("port = 8181");
+                return Ok(());
+            }
+            println!(
+                "{:<14} {:<7} {:<6} {:<24} {:<10} MODEL",
+                "SERVICE", "STATE", "PID", "ENDPOINT", "AUTO-START"
+            );
+            for (name, cfg) in &config.services {
+                let st = svc::status(name, cfg)?;
+                let state = if st.port_open {
+                    "up"
+                } else if st.pid.is_some() {
+                    "starting"
+                } else {
+                    "down"
+                };
+                println!(
+                    "{:<14} {:<7} {:<6} {:<24} {:<10} {}",
+                    name,
+                    state,
+                    st.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                    st.endpoint,
+                    if st.auto_start { "yes" } else { "no" },
+                    st.served_model.as_deref().unwrap_or("-")
+                );
+            }
+            Ok(())
+        }
+        Some(ServiceAction::Status { name }) => {
+            let cfg = resolve(&name)?;
+            let st = svc::status(&name, cfg)?;
+            println!("service:     {}", st.name);
+            println!(
+                "state:       {}",
+                if st.port_open {
+                    "up (port answering)"
+                } else if st.pid.is_some() {
+                    "starting (process live, port not answering)"
+                } else {
+                    "down"
+                }
+            );
+            println!(
+                "pid:         {}",
+                st.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+            );
+            println!("endpoint:    {}", st.endpoint);
+            println!(
+                "model:       {}",
+                st.model.as_deref().unwrap_or("(none — cannot start)")
+            );
+            println!("served name: {}", st.served_model.as_deref().unwrap_or("-"));
+            println!("auto-start:  {}", if st.auto_start { "yes" } else { "no" });
+            println!("log:         ~/.leindex/logs/services/{name}.log");
+            Ok(())
+        }
+        Some(ServiceAction::Start { name }) => {
+            let cfg = resolve(&name)?;
+            if svc::start(&name, cfg)? {
+                println!("started {name} ({} ready)", cfg.base_url());
+            } else {
+                println!("{name} already up ({})", cfg.base_url());
+            }
+            Ok(())
+        }
+        Some(ServiceAction::Stop { name }) => {
+            let cfg = resolve(&name)?;
+            match svc::stop(&name, cfg)? {
+                svc::StopOutcome::Stopped(pid) => println!("stopped {name} (pid {pid})"),
+                svc::StopOutcome::AlreadyDown => println!("{name} already down"),
+                svc::StopOutcome::StalePidfileRemoved => {
+                    println!("{name}: stale pidfile removed (was not running)")
+                }
+            }
+            Ok(())
+        }
+        Some(ServiceAction::Restart { name }) => {
+            let cfg = resolve(&name)?;
+            svc::restart(&name, cfg)?;
+            println!("restarted {name} ({})", cfg.base_url());
+            Ok(())
+        }
+    }
 }
 
 /// Main entry point for the CLI

@@ -101,6 +101,35 @@ llama-server -m /path/to/embeddinggemma-2.gguf \
 GPU offload depends on the llama.cpp build and available memory; use `-ngl 0`
 for CPU-only execution. Model loading errors must be resolved before indexing.
 
+### Managed services (`leindex services`)
+
+Instead of keeping a terminal open, declare the server as a managed service and
+let LeIndex own the process:
+
+```toml
+# ~/.leindex/config/leindex.toml
+[services.gemma]
+binary = "llama-server"
+model = "/path/to/embeddinggemma-2.gguf"
+alias = "embeddinggemma-2"
+host = "127.0.0.1"
+port = 8080
+extra_args = ["--embedding", "--pooling", "mean", "-ngl", "99"]
+auto_start = false
+
+[indexing.embeddings]
+enable_hybrid = true
+remote_provider = "embeddinggemma-2"
+remote_service = "gemma"   # endpoint + model derive from the service
+```
+
+`leindex services list` shows state, `start`/`stop`/`restart` manage the
+process (logs land in `~/.leindex/logs/services/gemma.log`). With
+`auto_start = true`, LeIndex spawns it on demand before the first remote
+embedding call. One llama-server serves one model: run a second section (for
+example `[services.laya]` on port 8181) for the System-One gate's decision
+model — see the `[system_one]` block in `leindex.toml.example`.
+
 ### vLLM
 
 Use a vLLM version whose pooling runner supports the model's architecture.
