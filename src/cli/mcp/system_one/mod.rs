@@ -190,6 +190,15 @@ impl Gate {
         if mode == Mode::Off {
             return None;
         }
+        // Progressive-rollout gate (AGENTS.md): experimental capabilities are
+        // default-off behind LEINDEX_FEATURE_* so fleet rollout/rollback uses
+        // the repo's standard mechanism, independent of user TOML.
+        if !crate::feature_flags::FeatureFlag::SystemOne.is_enabled() {
+            warn!(
+                "system-one gate is experimental and disabled by feature flag; set LEINDEX_FEATURE_SYSTEM_ONE=1 to enable"
+            );
+            return None;
+        }
         let Some(provider) = Provider::parse(&config.provider) else {
             warn!(provider = %config.provider, "unknown [system_one] provider; gate disabled (use laya|jev|openai)");
             return None;
@@ -337,7 +346,13 @@ impl Gate {
         value: &mut Value,
         notes: &mut Notes,
     ) {
-        if !self.post || !matches!(tool, "leindex_search" | "leindex_deep_analyze") {
+        if !self.post || tool != "leindex_search" {
+            // deep_analyze is deliberately NOT post-gated: its top-level
+            // `context` blob is pre-rendered from the unfiltered entry set,
+            // so filtering `results` would annotate "filtered" while the
+            // blob still delivered every dropped entry verbatim. Rebuilding
+            // the blob requires PDG re-expansion in the handler, which a
+            // transport-level gate cannot do.
             return;
         }
         let Some(results) = value.get("results").and_then(Value::as_array) else {
@@ -519,16 +534,32 @@ mod tests {
             ..SystemOneConfig::default()
         };
         assert!(Gate::from_config(&bad_provider, &no_services).is_none());
+        let _guard = crate::feature_flags::lock_flag_tests();
+        crate::feature_flags::set_flag_override_for_test(
+            crate::feature_flags::FeatureFlag::SystemOne,
+            true,
+        );
         let laya = SystemOneConfig {
             mode: "shadow".into(),
             provider: "laya".into(),
             ..SystemOneConfig::default()
         };
         assert!(Gate::from_config(&laya, &no_services).is_some());
+        // The runtime rollout flag blocks even a fully valid config.
+        crate::feature_flags::set_flag_override_for_test(
+            crate::feature_flags::FeatureFlag::SystemOne,
+            false,
+        );
+        assert!(Gate::from_config(&laya, &no_services).is_none());
     }
 
     #[test]
     fn test_from_config_derives_endpoint_from_service() {
+        let _guard = crate::feature_flags::lock_flag_tests();
+        crate::feature_flags::set_flag_override_for_test(
+            crate::feature_flags::FeatureFlag::SystemOne,
+            true,
+        );
         let mut services = std::collections::BTreeMap::new();
         services.insert(
             "laya".to_string(),

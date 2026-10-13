@@ -26,6 +26,8 @@ use std::sync::{Mutex, OnceLock};
 pub enum FeatureFlag {
     /// Enable neural (ONNX) embedding search at runtime.
     NeuralSearch,
+    /// Enable the System-One typed-decision MCP gate (experimental).
+    SystemOne,
     /// Enable remote embedding API (OpenAI, etc.).
     RemoteEmbeddings,
     /// Enable cross-language symbol resolution.
@@ -180,6 +182,7 @@ impl FeatureFlag {
     pub fn env_var(&self) -> &'static str {
         match self {
             Self::NeuralSearch => "LEINDEX_FEATURE_NEURAL_SEARCH",
+            Self::SystemOne => "LEINDEX_FEATURE_SYSTEM_ONE",
             Self::RemoteEmbeddings => "LEINDEX_FEATURE_REMOTE_EMBEDDINGS",
             Self::CrossLanguageResolution => "LEINDEX_FEATURE_CROSS_LANGUAGE",
             Self::ExperimentalHnsw => "LEINDEX_FEATURE_EXPERIMENTAL_HNSW",
@@ -271,6 +274,7 @@ impl FeatureFlag {
     pub fn description(&self) -> &'static str {
         match self {
             Self::NeuralSearch => "Enable neural (ONNX) embedding search at runtime",
+            Self::SystemOne => "Enable the System-One typed-decision MCP gate (experimental)",
             Self::RemoteEmbeddings => "Enable remote embedding API (OpenAI, etc.)",
             Self::CrossLanguageResolution => "Enable cross-language symbol resolution",
             Self::ExperimentalHnsw => "Enable experimental HNSW algorithm parameters",

@@ -1144,12 +1144,22 @@ async fn handle_tool_call_timed(
                     );
                     let is_substantive =
                         rendered.trim().lines().count() > 1 || rendered.trim().len() > 80;
-                    if is_substantive {
+                    let mut payload = if is_substantive {
                         rendered
                     } else {
                         serde_json::to_string_pretty(&trimmed)
                             .unwrap_or_else(|_| "Error serializing result".to_string())
+                    };
+                    // The text renderers ignore `_system_one` (merge_meta only
+                    // keeps it alive in the JSON), so the default tier would
+                    // silently drop the gate's annotations. Append a compact
+                    // footer so filtering/reordering/healing stays visible.
+                    if let Some(footer) =
+                        crate::cli::mcp::output::render::system_one_footer(&trimmed)
+                    {
+                        payload.push_str(&footer);
                     }
+                    payload
                 }
             };
             Ok(serde_json::json!({

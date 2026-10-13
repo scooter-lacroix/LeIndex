@@ -22,6 +22,7 @@ leindex setup
 leindex setup --neural --cpu
 leindex setup --neural --gpu nvidia
 leindex setup --neural --gpu amd
+leindex setup --remote-gemma
 leindex setup --check
 ```
 
@@ -29,6 +30,12 @@ Setup writes `$LEINDEX_HOME/config/leindex.toml`, normally
 `~/.leindex/config/leindex.toml`, then runs an embedding smoke test. A GPU
 setup is successful only when the requested provider is active; silent CPU
 fallback is reported as a failure.
+
+`--remote-gemma` implies the neural path (like `--cpu`/`--gpu`) and
+provisions the remote-embeddings preset in one step: it downloads the pinned
+embeddinggemma-2 GGUF (~295 MiB) into the model dir and wires
+`[services.gemma]` + `[indexing.embeddings]` in `leindex.toml`. See
+[Remote EmbeddingGemma2 Preset](#remote-embeddinggemma2-preset) below.
 
 The persisted provider is one of `auto`, `cpu`, `cuda`, `migraphx`, or
 `coreml`. `auto` resolves by availability (CoreML -> MIGraphX -> CUDA -> CPU)

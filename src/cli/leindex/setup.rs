@@ -147,6 +147,11 @@ pub struct SetupChoices {
     pub neural_enabled: bool,
     /// The execution provider to use (None when neural is disabled).
     pub provider: Option<ExecutionProvider>,
+    /// Explicitly provision the `embeddinggemma-2` remote-embeddings preset:
+    /// download the pinned GGUF and wire `[services.gemma]`. The automatic
+    /// path (fresh-install preset active + rollout flag on) does the same
+    /// without this flag.
+    pub remote_gemma: bool,
 }
 
 /// The result of running setup.
@@ -316,6 +321,7 @@ pub fn resolve_from_flags(
         return Ok(SetupChoices {
             neural_enabled: false,
             provider: None,
+            remote_gemma: false,
         });
     }
 
@@ -343,6 +349,7 @@ pub fn resolve_from_flags(
     Ok(SetupChoices {
         neural_enabled: true,
         provider,
+        remote_gemma: false,
     })
 }
 
@@ -368,6 +375,7 @@ pub fn run_interactive_flow() -> Result<SetupChoices, SetupError> {
         return Ok(SetupChoices {
             neural_enabled: false,
             provider: None,
+            remote_gemma: false,
         });
     }
 
@@ -433,6 +441,7 @@ pub fn run_interactive_flow() -> Result<SetupChoices, SetupError> {
     Ok(SetupChoices {
         neural_enabled: true,
         provider: Some(provider),
+        remote_gemma: false,
     })
 }
 
@@ -588,7 +597,47 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
 
     // Write the config
     let config = build_config(choices, ort_dylib_path.as_deref(), ort_version.as_deref());
-    let (config, recovery) = merge_with_existing(config);
+    let (mut config, recovery) = merge_with_existing(config);
+
+    // Provision the embeddinggemma-2 remote-embeddings preset when asked
+    // (--remote-gemma) or when the effective config already selects it AND
+    // the rollout flag allows remote embeddings. Explicit user intent beats
+    // the rollout flag (they asked for the download); the automatic path
+    // respects it so default installs never pull a 300 MB GGUF uninvited.
+    let preset_active = config.indexing.embeddings.embeddinggemma2_preset_active();
+    let remote_flag_on = crate::feature_flags::FeatureFlag::RemoteEmbeddings.is_enabled();
+    if choices.remote_gemma || (preset_active && remote_flag_on) {
+        let model_dir = crate::config::model_dir_path()
+            .ok_or_else(|| SetupError::Io("Cannot resolve model directory".to_string()))?;
+        println!("\nProvisioning embeddinggemma-2 remote-embeddings preset...");
+        let gguf = ensure_embeddinggemma2_gguf_present(&model_dir)?;
+
+        // Wire [services.gemma] pointing at the GGUF. An existing section
+        // with a model path is left alone (user's own wiring wins); only a
+        // missing or model-less section is filled in.
+        let services = &mut config.services;
+        let entry = services.entry("gemma".to_string()).or_default();
+        let missing_model = entry.model.as_deref().map(str::is_empty).unwrap_or(true);
+        if missing_model {
+            entry.model = Some(gguf.display().to_string());
+            entry.alias = Some(crate::config::EMBEDDINGGEMMA2_MODEL.to_string());
+            entry.extra_args = vec!["--embedding".into(), "--pooling".into(), "mean".into()];
+            if entry.port == 0 {
+                // 8080 = the preset's documented llama-server port; keep
+                // 8765 reserved (owner's mcp_agent_mail).
+                entry.port = 8080;
+            }
+        }
+        // Point [indexing.embeddings] at the managed service unless an
+        // explicit endpoint already wins the resolution ladder.
+        let embeddings = &mut config.indexing.embeddings;
+        embeddings.enable_hybrid = true;
+        if embeddings.remote_service.is_none() && embeddings.remote_endpoint.is_none() {
+            embeddings.remote_service = Some("gemma".into());
+        }
+        println!("  -> [services.gemma] wired; use `leindex services start gemma` to launch.");
+    }
+
     let config_path = config
         .save()
         .map_err(|e| SetupError::ConfigWrite(e.to_string()))?;
@@ -1030,13 +1079,16 @@ fn preserve_existing_sections(
 ) -> crate::config::LeIndexConfig {
     // Preserve every section setup does NOT own (it owns only `neural`):
     // search (incl. fragment_* knobs), indexing, mcp (memory-pressure
-    // remediation) and system_one. Any new top-level section added to
-    // LeIndexConfig must be listed here, or `leindex setup` reruns silently
-    // clobber it — same class as the wave-1 fragment clobber (Codex P2).
+    // remediation), system_one, and services. Any new top-level section
+    // added to LeIndexConfig must be listed here, or `leindex setup` reruns
+    // silently clobber it — same class as the wave-1 fragment clobber
+    // (Codex P2). `services` was initially omitted, wiping [services.gemma]
+    // sections on rerun; preserve it too.
     new_config.search = existing.search.clone();
     new_config.indexing = existing.indexing.clone();
     new_config.mcp = existing.mcp.clone();
     new_config.system_one = existing.system_one.clone();
+    new_config.services = existing.services.clone();
     new_config
 }
 

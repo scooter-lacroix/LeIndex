@@ -413,7 +413,7 @@ impl EmbeddingConfig {
 
     /// Whether the `embeddinggemma-2` preset is selected (spelling variants
     /// accepted; case-insensitive).
-    fn embeddinggemma2_preset_active(&self) -> bool {
+    pub fn embeddinggemma2_preset_active(&self) -> bool {
         matches!(
             self.remote_provider.trim().to_ascii_lowercase().as_str(),
             "embeddinggemma-2" | "embeddinggemma2"
@@ -1422,9 +1422,11 @@ mod tests {
 
     #[test]
     fn test_system_one_preset_overlay_swaps_provider() {
-        let mut cfg = SystemOneConfig::default();
-        cfg.provider = "laya".into();
-        cfg.mode = "enforce".into();
+        let mut cfg = SystemOneConfig {
+            provider: "laya".into(),
+            mode: "enforce".into(),
+            ..SystemOneConfig::default()
+        };
         cfg.presets.insert(
             "openai-prod".into(),
             SystemOnePreset {

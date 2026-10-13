@@ -295,6 +295,12 @@ fn describe(value: &Value) -> String {
         .map_or_else(|| value.to_string(), str::to_string)
 }
 
+/// Escape a bare token for interpolation into a JSON-pointer path (`~` and
+/// `/` are the two reserved characters).
+fn escape_pointer(token: &str) -> String {
+    token.replace('~', "~0").replace('/', "~1")
+}
+
 fn pick_question(param: &str, current: &Value, candidates: &[Value]) -> Question {
     let mut options: Vec<(String, String)> = candidates
         .iter()
@@ -569,24 +575,31 @@ fn apply_choice(
     }
     if ctx.read_only && confidence >= params.tau_apply {
         if let Some(object) = healed.args.as_object_mut() {
-            // Unknown-key repair is a rename.
-            if from.is_string()
-                && object.get(param).is_some()
-                && ctx
+            // Unknown-key repair is a rename. The discriminator is the pair
+            // (param unknown to the schema, `to` a string naming a real
+            // schema property) — NOT the type of the value being carried
+            // (a `topk: 5` repair must move the 5, not stringify it).
+            if let Some(target) = to.as_str() {
+                let param_known = ctx
                     .schema
-                    .pointer(&format!("/properties/{}", describe(&to)))
-                    .is_some()
-            {
-                if let Some(value) = object.remove(param) {
-                    object.insert(describe(&to), value);
+                    .pointer(&format!("/properties/{}", escape_pointer(param)))
+                    .is_some();
+                let target_known = ctx
+                    .schema
+                    .pointer(&format!("/properties/{}", escape_pointer(target)))
+                    .is_some();
+                if !param_known && target_known && object.get(param).is_some() {
+                    if let Some(value) = object.remove(param) {
+                        object.insert(target.to_string(), value);
+                    }
+                    healed.changes.push(Change {
+                        param: param.into(),
+                        from,
+                        to,
+                        by: "model",
+                    });
+                    return;
                 }
-                healed.changes.push(Change {
-                    param: param.into(),
-                    from,
-                    to,
-                    by: "model",
-                });
-                return;
             }
             object.insert(param.into(), to.clone());
         }
@@ -663,6 +676,62 @@ mod tests {
         assert_eq!(args["search_mode"], "semantic");
         assert_eq!(args["allow_partial"], true);
         assert!(changes.iter().all(|c| c.by == "code"));
+    }
+
+    #[test]
+    fn unknown_key_rename_carries_the_original_value_type() {
+        // Regression: `topk: 5` used to fall past the rename branch (which
+        // tested `from.is_string()`) and produce `topk: "top_k"`, dropping
+        // the value. The rename must be keyed on the unknown-key/target-key
+        // pair, not on the carried value's JSON type.
+        let schema = schema();
+        let context = ctx(&schema, true, &[]);
+        let mut healed = Healed {
+            args: json!({"query": "q", "topk": 5}),
+            ..Healed::default()
+        };
+        apply_choice(
+            &mut healed,
+            &context,
+            &HealParams::default(),
+            Choice {
+                param: "topk",
+                from: json!(5),
+                to: json!("top_k"),
+                confidence: 0.95,
+                offered: true,
+            },
+        );
+        assert_eq!(healed.args, json!({"query": "q", "top_k": 5}));
+        assert_eq!(healed.changes.len(), 1);
+        assert_eq!(healed.changes[0].param, "topk");
+        assert_eq!(healed.changes[0].to, json!("top_k"));
+    }
+
+    #[test]
+    fn known_key_repair_is_a_set_not_a_rename() {
+        // When the flagged param IS in the schema, the model's choice is a
+        // value replacement — the rename branch must not swallow it even
+        // when `to` happens to name another property.
+        let schema = schema();
+        let context = ctx(&schema, true, &[]);
+        let mut healed = Healed {
+            args: json!({"query": "q", "search_mode": "fuzzy"}),
+            ..Healed::default()
+        };
+        apply_choice(
+            &mut healed,
+            &context,
+            &HealParams::default(),
+            Choice {
+                param: "search_mode",
+                from: json!("fuzzy"),
+                to: json!("auto"),
+                confidence: 0.95,
+                offered: true,
+            },
+        );
+        assert_eq!(healed.args, json!({"query": "q", "search_mode": "auto"}));
     }
 
     #[test]

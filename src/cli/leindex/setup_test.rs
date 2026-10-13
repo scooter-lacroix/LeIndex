@@ -5,6 +5,7 @@ fn test_setup_fresh_preset_and_existing_embedding_preservation() {
     let choices = SetupChoices {
         neural_enabled: true,
         provider: Some(ExecutionProvider::Cpu),
+        remote_gemma: false,
     };
     let fresh = build_config(&choices, None, None);
     assert!(fresh.neural.enabled);
@@ -648,6 +649,7 @@ fn test_build_config_records_ort_version() {
     let choices = SetupChoices {
         neural_enabled: true,
         provider: Some(ExecutionProvider::Cpu),
+        remote_gemma: false,
     };
     let cfg = build_config(
         &choices,
@@ -675,6 +677,7 @@ fn test_build_config_selects_dynamic_qwen_model_for_all_local_providers() {
         let choices = SetupChoices {
             neural_enabled: true,
             provider: Some(provider),
+            remote_gemma: false,
         };
 
         let cfg = build_config(&choices, None, None);
@@ -788,6 +791,7 @@ fn test_build_config_without_version() {
     let choices = SetupChoices {
         neural_enabled: true,
         provider: Some(ExecutionProvider::Cpu),
+        remote_gemma: false,
     };
     let cfg = build_config(&choices, None, None);
     assert!(cfg.neural.ort_version.is_none());
@@ -1364,6 +1368,7 @@ fn test_setup_persists_auto_provider() {
     let choices = SetupChoices {
         neural_enabled: true,
         provider: Some(ExecutionProvider::Auto),
+        remote_gemma: false,
     };
     let config = build_config(&choices, None, None);
 

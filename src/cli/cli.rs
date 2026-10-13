@@ -350,6 +350,14 @@ pub enum Commands {
         /// Auto-runs on cold cache when neural is enabled with a GPU provider.
         #[arg(long = "warmup")]
         warmup: bool,
+
+        /// Provision the embeddinggemma-2 remote-embeddings preset: download
+        /// the pinned GGUF into the model dir and wire [services.gemma] +
+        /// [indexing.embeddings] in leindex.toml. Implies the neural path
+        /// (like --cpu/--gpu) — resolved in cmd_setup_impl, not clap
+        /// `requires`, which would *demand* --neural instead.
+        #[arg(long = "remote-gemma")]
+        remote_gemma: bool,
     },
 
     /// Manage managed model-server services ([services.<name>] sections)
@@ -581,7 +589,8 @@ impl Cli {
                 gpu,
                 check,
                 warmup,
-            } => cmd_setup_impl(neural, no_neural, cpu, gpu, check, warmup).await,
+                remote_gemma,
+            } => cmd_setup_impl(neural, no_neural, cpu, gpu, check, warmup, remote_gemma).await,
             Commands::Services { action } => cmd_services_impl(action).await,
         };
 
@@ -1559,6 +1568,7 @@ async fn cmd_setup_impl(
     gpu: Option<String>,
     check: bool,
     warmup: bool,
+    remote_gemma: bool,
 ) -> AnyhowResult<()> {
     use crate::cli::leindex::setup;
 
@@ -1583,13 +1593,22 @@ async fn cmd_setup_impl(
     // Determine the mode: interactive or non-interactive.
     // VAL-SETUP-015: conflicts are validated by clap (conflicts_with) and also
     // redundantly checked here for the --neural + --no-neural case.
-    let has_flags = neural || no_neural || cpu || gpu.is_some();
+    let has_flags = neural || no_neural || cpu || gpu.is_some() || remote_gemma;
     if has_flags {
         check_neutral_conflicts(neural, no_neural, cpu, gpu.as_deref())?;
     }
 
     // Resolve choices from flags, interactive prompts, or emit guidance.
-    let choices = resolve_setup_choices(neural, no_neural, cpu, gpu_vendor, has_flags)?;
+    // --remote-gemma implies the neural path (mirrors --cpu/--gpu implication
+    // inside resolve_from_flags) so it works standalone on a fresh install.
+    let mut choices = resolve_setup_choices(
+        neural || remote_gemma,
+        no_neural,
+        cpu,
+        gpu_vendor,
+        has_flags,
+    )?;
+    choices.remote_gemma = remote_gemma;
 
     // Execute the setup with the resolved choices
     let result = setup::execute_setup(&choices).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1728,6 +1747,78 @@ fn check_neutral_conflicts(
     Ok(())
 }
 
+/// Row state for the services table: "up" once the port answers, "starting"
+/// while a live pid has not bound the port yet, else "down".
+fn service_row_state(st: &crate::services::ServiceStatus) -> &'static str {
+    match (st.port_open, st.pid.is_some()) {
+        (true, _) => "up",
+        (false, true) => "starting",
+        (false, false) => "down",
+    }
+}
+
+/// Print the `services list` table (or the empty-config hint).
+fn print_services_table(
+    services: &std::collections::BTreeMap<String, crate::config::ServiceConfig>,
+) {
+    if services.is_empty() {
+        println!("No [services] sections configured.");
+        println!("Add one to ~/.leindex/config/leindex.toml, e.g.:");
+        println!();
+        println!("[services.laya]");
+        println!("model = \"/path/to/model.gguf\"");
+        println!("port = 8181");
+        return;
+    }
+    println!(
+        "{:<14} {:<7} {:<6} {:<24} {:<10} MODEL",
+        "SERVICE", "STATE", "PID", "ENDPOINT", "AUTO-START"
+    );
+    for (name, cfg) in services {
+        let st = crate::services::status(name, cfg).ok();
+        let st_ref = st.as_ref();
+        println!(
+            "{:<14} {:<7} {:<6} {:<24} {:<10} {}",
+            name,
+            st_ref.map(service_row_state).unwrap_or("error"),
+            st_ref
+                .and_then(|s| s.pid)
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".into()),
+            st_ref.map(|s| s.endpoint.as_str()).unwrap_or("-"),
+            st_ref.map(|s| s.auto_start).unwrap_or(false),
+            st_ref
+                .and_then(|s| s.served_model.clone())
+                .unwrap_or_else(|| "-".into())
+        );
+    }
+}
+
+/// Print the `services status <name>` detail block.
+fn print_service_detail(name: &str, st: &crate::services::ServiceStatus) {
+    println!("service:     {}", st.name);
+    println!(
+        "state:       {}",
+        match service_row_state(st) {
+            "up" => "up (endpoint answering)",
+            "starting" => "starting (process live, endpoint not answering)",
+            _ => "down",
+        }
+    );
+    println!(
+        "pid:         {}",
+        st.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+    );
+    println!("endpoint:    {}", st.endpoint);
+    println!(
+        "model:       {}",
+        st.model.as_deref().unwrap_or("(none — cannot start)")
+    );
+    println!("served name: {}", st.served_model.as_deref().unwrap_or("-"));
+    println!("auto-start:  {}", if st.auto_start { "yes" } else { "no" });
+    println!("log:         ~/.leindex/logs/services/{name}.log");
+}
+
 /// `leindex services` — manage `[services.<name>]` model servers.
 async fn cmd_services_impl(action: Option<ServiceAction>) -> AnyhowResult<()> {
     use crate::services as svc;
@@ -1742,66 +1833,12 @@ async fn cmd_services_impl(action: Option<ServiceAction>) -> AnyhowResult<()> {
 
     match action {
         None | Some(ServiceAction::List) => {
-            if config.services.is_empty() {
-                println!("No [services] sections configured.");
-                println!("Add one to ~/.leindex/config/leindex.toml, e.g.:");
-                println!();
-                println!("[services.laya]");
-                println!("model = \"/path/to/model.gguf\"");
-                println!("port = 8181");
-                return Ok(());
-            }
-            println!(
-                "{:<14} {:<7} {:<6} {:<24} {:<10} MODEL",
-                "SERVICE", "STATE", "PID", "ENDPOINT", "AUTO-START"
-            );
-            for (name, cfg) in &config.services {
-                let st = svc::status(name, cfg)?;
-                let state = if st.port_open {
-                    "up"
-                } else if st.pid.is_some() {
-                    "starting"
-                } else {
-                    "down"
-                };
-                println!(
-                    "{:<14} {:<7} {:<6} {:<24} {:<10} {}",
-                    name,
-                    state,
-                    st.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-                    st.endpoint,
-                    if st.auto_start { "yes" } else { "no" },
-                    st.served_model.as_deref().unwrap_or("-")
-                );
-            }
+            print_services_table(&config.services);
             Ok(())
         }
         Some(ServiceAction::Status { name }) => {
             let cfg = resolve(&name)?;
-            let st = svc::status(&name, cfg)?;
-            println!("service:     {}", st.name);
-            println!(
-                "state:       {}",
-                if st.port_open {
-                    "up (port answering)"
-                } else if st.pid.is_some() {
-                    "starting (process live, port not answering)"
-                } else {
-                    "down"
-                }
-            );
-            println!(
-                "pid:         {}",
-                st.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
-            );
-            println!("endpoint:    {}", st.endpoint);
-            println!(
-                "model:       {}",
-                st.model.as_deref().unwrap_or("(none — cannot start)")
-            );
-            println!("served name: {}", st.served_model.as_deref().unwrap_or("-"));
-            println!("auto-start:  {}", if st.auto_start { "yes" } else { "no" });
-            println!("log:         ~/.leindex/logs/services/{name}.log");
+            print_service_detail(&name, &svc::status(&name, cfg)?);
             Ok(())
         }
         Some(ServiceAction::Start { name }) => {

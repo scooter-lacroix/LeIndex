@@ -201,8 +201,11 @@ directly. Zed, Cursor, VS Code, and Claude Code configuration snippets are in
 `LEINDEX_REGISTRY_MAX_HEAP_MB` (default 1536), the Engram bounds
 `LEINDEX_ENGRAM_MAX_ENTRIES` (20000) and `LEINDEX_ENGRAM_MAX_MB` (256) — plus the escape hatches
 `LEINDEX_CLI_SHUTDOWN_DAEMON`, `LEINDEX_ALLOW_MULTIPLE_EMBED_DAEMONS`, and
-the `LEINDEX_FEATURE_*` rollout kills documented in
-[`docs/NEURAL_SETUP.md`](https://github.com/scooter-lacroix/LeIndex/blob/master/docs/NEURAL_SETUP.md).
+the `LEINDEX_FEATURE_*` rollout kills catalogued in
+[`.env.example`](https://github.com/scooter-lacroix/LeIndex/blob/master/.env.example). The experimental System-One
+decision gate (source builds with `--features system-one`) additionally needs
+`LEINDEX_FEATURE_SYSTEM_ONE=1` and a `[system_one]` section — see
+`leindex.toml.example`.
 
 ---
 

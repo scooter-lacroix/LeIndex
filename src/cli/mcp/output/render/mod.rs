@@ -1259,7 +1259,9 @@ fn render_tool_output_inner(
 /// model sees healed arguments and filtered results on the text surface (L1
 /// tier) too, not only in raw JSON. `None` (zero tokens) when the gate did
 /// nothing — `Notes::attach` only emits the key when it has something to say.
-fn system_one_footer(data: &Value) -> Option<String> {
+/// Not feature-gated: without the `system-one` build the `_system_one` key
+/// never exists, so this returns `None` at zero cost.
+pub(crate) fn system_one_footer(data: &Value) -> Option<String> {
     let note = data.get("_system_one")?;
     let mut parts: Vec<String> = Vec::new();
     if let Some(healed) = note.get("healed").and_then(Value::as_array) {

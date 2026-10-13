@@ -254,6 +254,7 @@ fn test_setup_command_parsing() {
             gpu,
             check,
             warmup: _,
+            remote_gemma: _,
         }) => {
             assert!(neural);
             assert!(!no_neural);
@@ -307,6 +308,7 @@ fn test_setup_command_no_neural() {
             gpu,
             check,
             warmup: _,
+            remote_gemma: _,
         }) => {
             assert!(!neural);
             assert!(no_neural);
@@ -324,6 +326,24 @@ fn test_setup_command_check() {
     let cli = Cli::try_parse_from(["leindex", "setup", "--check"]).unwrap();
     match cli.command {
         Some(Commands::Setup { check, .. }) => assert!(check),
+        _ => panic!("Expected Setup command"),
+    }
+}
+
+#[test]
+fn test_setup_command_remote_gemma() {
+    // --remote-gemma parses standalone; the neural implication is applied in
+    // cmd_setup_impl (neural || remote_gemma), not by clap.
+    let cli = Cli::try_parse_from(["leindex", "setup", "--remote-gemma"]).unwrap();
+    match cli.command {
+        Some(Commands::Setup {
+            neural,
+            remote_gemma,
+            ..
+        }) => {
+            assert!(remote_gemma);
+            assert!(!neural); // parse-level; implied at resolve time
+        }
         _ => panic!("Expected Setup command"),
     }
 }

@@ -122,6 +122,30 @@ pub fn hf_url(remote_subpath: &str) -> String {
     )
 }
 
+/// `embeddinggemma-2` remote-embeddings preset: Hugging Face repo shipping
+/// the GGUF builds consumed by llama-server.
+pub const EMBEDDINGGEMMA2_GGUF_REPO: &str = "unsloth/embeddinggemma-2-GGUF";
+
+/// `embeddinggemma-2` preset: quantization served by the managed llama-server.
+pub const EMBEDDINGGEMMA2_GGUF_FILE: &str = "embeddinggemma-2-Q8_0.gguf";
+
+/// Pinned sha256 of [`EMBEDDINGGEMMA2_GGUF_FILE`] (Q8_0 build from
+/// `unsloth/embeddinggemma-2-GGUF`).
+pub const EMBEDDINGGEMMA2_GGUF_SHA256: &str =
+    "6f1bd4ac6c5df7444f9cca7ca36cafe6cfa34cd6f49fefb1e0b4be8143aed8bc";
+
+/// Approximate size of [`EMBEDDINGGEMMA2_GGUF_FILE`] in bytes (progress
+/// messaging only; the pinned sha256 is the integrity check).
+pub const EMBEDDINGGEMMA2_GGUF_APPROX_BYTES: u64 = 309_855_520;
+
+/// CDN URL for the pinned `embeddinggemma-2` GGUF.
+pub fn embeddinggemma2_gguf_url() -> String {
+    format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        EMBEDDINGGEMMA2_GGUF_REPO, EMBEDDINGGEMMA2_GGUF_FILE
+    )
+}
+
 /// Parsed `checksums.sha256` manifest: maps `filename -> lowercase hex sha256`.
 ///
 /// Lines have the shape `<64-hex>  <filename>` (two-space separator, as
@@ -280,7 +304,7 @@ pub fn is_curl_network_error(exit_code: i32, stderr: &str) -> bool {
     }
 }
 
-fn curl_download_args() -> [&'static str; 12] {
+pub fn curl_download_args() -> [&'static str; 12] {
     [
         "--fail",
         "--location",
@@ -451,7 +475,7 @@ pub fn download_file_with_retry(
 }
 
 /// Human-readable byte size for progress logging ("596.3 MiB").
-fn human_bytes(n: u64) -> String {
+pub fn human_bytes(n: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = KIB * 1024;
     const GIB: u64 = MIB * 1024;

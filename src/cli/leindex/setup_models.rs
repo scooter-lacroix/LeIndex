@@ -590,6 +590,138 @@ pub(super) fn ensure_model_file_present(
     Ok((true, is_model))
 }
 
+/// Ensure the pinned `embeddinggemma-2` GGUF (remote-embeddings preset) is
+/// present in `model_dir`, verified against the pinned sha256.
+///
+/// Same curl + tmp-then-rename discipline as the ONNX triplet: a failed or
+/// corrupt download never occupies the canonical path. A mismatching existing
+/// file is removed and re-fetched (VAL-SETUP-018 behaviour).
+pub(super) fn ensure_embeddinggemma2_gguf_present(
+    model_dir: &Path,
+) -> Result<std::path::PathBuf, SetupError> {
+    use crate::cli::leindex::model_download::{self, DEFAULT_DOWNLOAD_RETRIES, RETRY_DELAY};
+
+    std::fs::create_dir_all(model_dir).map_err(|e| {
+        SetupError::Io(format!(
+            "Cannot create model dir {}: {e}",
+            model_dir.display()
+        ))
+    })?;
+
+    let file = model_download::EMBEDDINGGEMMA2_GGUF_FILE;
+    let pinned = model_download::EMBEDDINGGEMMA2_GGUF_SHA256;
+    let dest = model_dir.join(file);
+
+    if dest.exists() {
+        match model_download::sha256_of_file(&dest) {
+            Ok(sha) if sha == pinned => {
+                println!("  -> {file} already present, checksum verified.");
+                return Ok(dest);
+            }
+            Ok(sha) => {
+                println!(
+                    "  -> WARNING: {file} checksum mismatch (expected {}..., got {}...); \
+                     removing and re-downloading.",
+                    &pinned[..8],
+                    &sha[..8]
+                );
+                let _ = std::fs::remove_file(&dest);
+            }
+            Err(e) => {
+                return Err(SetupError::Io(format!(
+                    "Cannot read {}: {e}",
+                    dest.display()
+                )));
+            }
+        }
+    }
+
+    let curl = model_download::find_curl().ok_or_else(|| {
+        SetupError::Io("curl is required to download the embeddinggemma-2 GGUF".into())
+    })?;
+    let url = model_download::embeddinggemma2_gguf_url();
+    let tmp_dest = model_dir.join(format!("{file}.tmp"));
+
+    let mut last_err: Option<SetupError> = None;
+    for attempt in 1..=DEFAULT_DOWNLOAD_RETRIES.max(1) {
+        // A stale partial from a previous attempt must never be mistaken for
+        // a complete download.
+        let _ = std::fs::remove_file(&tmp_dest);
+        if attempt > 1 {
+            println!(
+                "  -> Retry {attempt}/{} for {file} ...",
+                DEFAULT_DOWNLOAD_RETRIES.max(1)
+            );
+            std::thread::sleep(RETRY_DELAY);
+        }
+        println!(
+            "  -> Downloading {file} ({}) from {} ...",
+            model_download::human_bytes(model_download::EMBEDDINGGEMMA2_GGUF_APPROX_BYTES),
+            model_download::EMBEDDINGGEMMA2_GGUF_REPO,
+        );
+
+        let status = Command::new(curl)
+            .args(model_download::curl_download_args())
+            .arg(&tmp_dest)
+            .arg(&url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status();
+        match status {
+            Ok(exit) if exit.success() => {}
+            Ok(exit) => {
+                let code = exit.code().unwrap_or(-1);
+                last_err = Some(SetupError::ModelDownloadFailed {
+                    file: file.to_string(),
+                    url: url.clone(),
+                    exit_code: code,
+                    network: model_download::is_curl_network_error(code, ""),
+                });
+                continue;
+            }
+            Err(e) => {
+                last_err = Some(SetupError::Io(format!("Failed to run curl: {e}")));
+                continue;
+            }
+        }
+
+        // Verify the pinned digest BEFORE the rename so a bad response (or a
+        // truncated transfer) cannot replace a previously valid GGUF.
+        match model_download::sha256_of_file(&tmp_dest) {
+            Ok(sha) if sha == pinned => {}
+            Ok(sha) => {
+                let _ = std::fs::remove_file(&tmp_dest);
+                last_err = Some(SetupError::ModelChecksumPostDownload {
+                    file: file.to_string(),
+                    expected: pinned.to_string(),
+                    actual: sha,
+                });
+                continue;
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_dest);
+                last_err = Some(SetupError::Io(format!(
+                    "Cannot hash downloaded file {}: {e}",
+                    tmp_dest.display()
+                )));
+                continue;
+            }
+        }
+
+        std::fs::rename(&tmp_dest, &dest).map_err(|e| {
+            SetupError::Io(format!(
+                "Cannot move {} into place: {e}",
+                tmp_dest.display()
+            ))
+        })?;
+        println!("  -> {file} downloaded, checksum verified.");
+        return Ok(dest);
+    }
+
+    Err(last_err.unwrap_or_else(|| SetupError::Io(format!("download of {file} failed"))))
+}
+
 /// Provision the configured embedding model.
 ///
 /// Current provider profiles use the validated single-file dynamic Qwen3

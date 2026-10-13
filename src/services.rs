@@ -7,8 +7,9 @@
 //! - spawn is detached into its own process group (stdout/stderr appended to
 //!   `~/.leindex/logs/services/<name>.log`),
 //! - the child pid is recorded in `~/.leindex/run/services/<name>.pid`,
-//! - health is a stdlib TCP connect (llama-server accepts only after the
-//!   model is loaded),
+//! - health is an HTTP `GET /health` (llama-server binds its port before the
+//!   model is resident and answers 503 on every route until loading
+//!   completes — a TCP connect alone is NOT readiness),
 //! - a start holds an flock on `<name>.lock` so the daemon and the CLI can
 //!   not double-spawn,
 //! - stop only ever signals pids recorded in our own pidfiles, after
@@ -130,20 +131,65 @@ fn log_path(name: &str) -> Result<PathBuf, ServiceError> {
 
 // ── Health ───────────────────────────────────────────────────────────────
 
-/// True when `host:port` accepts a TCP connection. llama-server binds its
-/// port only after the model is loaded, so an accepted connect means ready.
+fn first_addr(host: &str, port: u16) -> Option<std::net::SocketAddr> {
+    (host, port).to_socket_addrs().ok()?.next()
+}
+
+/// True when `host:port` accepts a TCP connection. NOT readiness: modern
+/// llama-server builds bind the port before the model is resident and answer
+/// HTTP 503 on every route until the load finishes.
 pub fn port_open(host: &str, port: u16) -> bool {
-    let Ok(mut addrs) = (host, port).to_socket_addrs() else {
-        return false;
-    };
-    let Some(addr) = addrs.next() else {
+    let Some(addr) = first_addr(host, port) else {
         return false;
     };
     TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).is_ok()
 }
 
+/// HTTP-level readiness: `GET /health` answers 503 while the model loads and
+/// 200 once the server is usable. This is the signal starts must wait for; a
+/// bare TCP accept would pass mid-load and hand the caller a 503.
+pub fn http_ready(host: &str, port: u16) -> bool {
+    use std::io::Write;
+    let Some(addr) = first_addr(host, port) else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(CONNECT_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(CONNECT_TIMEOUT));
+    let request = format!("GET /health HTTP/1.0\r\nHost: {host}\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 256];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    if n == 0 {
+        return false;
+    }
+    let head = String::from_utf8_lossy(&buf[..n]);
+    head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+}
+
 fn service_port_open(cfg: &ServiceConfig) -> bool {
     port_open(&cfg.host, cfg.port)
+}
+
+fn service_http_ready(cfg: &ServiceConfig) -> bool {
+    http_ready(&cfg.host, cfg.port)
+}
+
+/// Poll until HTTP-ready or `secs` elapse. Used to converge on a start that
+/// another process owns (lock held, or the port is held mid-load).
+fn wait_ready(cfg: &ServiceConfig, secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs.max(1));
+    while Instant::now() < deadline {
+        if service_http_ready(cfg) {
+            return true;
+        }
+        std::thread::sleep(HEALTH_POLL_INTERVAL);
+    }
+    service_http_ready(cfg)
 }
 
 // ── Pid identity ──────────────────────────────────────────────────────────
@@ -306,11 +352,11 @@ impl StartGuard {
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 
-/// Wait until the port answers or the process dies.
+/// Wait until HTTP-ready (model resident), the process dies, or timeout.
 fn wait_healthy(name: &str, cfg: &ServiceConfig, pid: i32) -> Result<(), ServiceError> {
     let deadline = Instant::now() + Duration::from_secs(cfg.start_timeout_secs.max(1));
     loop {
-        if service_port_open(cfg) {
+        if service_http_ready(cfg) {
             return Ok(());
         }
         if !proc_exists(pid) {
@@ -371,23 +417,25 @@ pub fn ensure_running(name: &str, cfg: &ServiceConfig) -> Result<bool, ServiceEr
     if !cfg.auto_start || cfg.model.is_none() {
         return Ok(false);
     }
-    if service_port_open(cfg) {
+    if service_http_ready(cfg) {
         return Ok(false);
+    }
+    if service_port_open(cfg) {
+        // Port bound but model still loading (503 window). Someone's start is
+        // in flight — converge on it instead of racing a doomed duplicate.
+        return Ok(wait_ready(cfg, cfg.start_timeout_secs));
     }
     clean_stale_pidfile(name, &cfg.binary)?;
     match StartGuard::acquire(name)? {
         Some(_guard) => start_locked(name, cfg).map(|_| true),
-        // Another leindex process is mid-start; converge by waiting for the
-        // port instead of erroring into the caller's fail-open path.
+        // Another leindex process is mid-start; converge by waiting for HTTP
+        // readiness instead of erroring into the caller's fail-open path.
         None => {
-            let deadline = Instant::now() + Duration::from_secs(cfg.start_timeout_secs.max(1));
-            while Instant::now() < deadline {
-                if service_port_open(cfg) {
-                    return Ok(false);
-                }
-                std::thread::sleep(HEALTH_POLL_INTERVAL);
+            if wait_ready(cfg, cfg.start_timeout_secs) {
+                Ok(false)
+            } else {
+                Err(ServiceError::Concurrent(name.to_string()))
             }
-            Err(ServiceError::Concurrent(name.to_string()))
         }
     }
 }
@@ -395,7 +443,19 @@ pub fn ensure_running(name: &str, cfg: &ServiceConfig) -> Result<bool, ServiceEr
 /// Explicit start (the `leindex services start` path; ignores `auto_start`,
 /// still requires `model`). Returns `true` when this call spawned it.
 pub fn start(name: &str, cfg: &ServiceConfig) -> Result<bool, ServiceError> {
+    if service_http_ready(cfg) {
+        return Ok(false);
+    }
     if service_port_open(cfg) {
+        // Mid-load window owned by another start; wait it out.
+        if !wait_ready(cfg, cfg.start_timeout_secs) {
+            return Err(ServiceError::StartTimeout {
+                name: name.to_string(),
+                endpoint: cfg.base_url(),
+                timeout_secs: cfg.start_timeout_secs,
+                log: log_path(name)?,
+            });
+        }
         return Ok(false);
     }
     clean_stale_pidfile(name, &cfg.binary)?;
