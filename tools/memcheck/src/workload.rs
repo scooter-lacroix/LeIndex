@@ -820,8 +820,8 @@ fn run_command_phase(
         .join()
         .map_err(|_| anyhow::anyhow!("sampler thread panicked"))?;
 
-    let (status, lifetime_peak_kib) = waited
-        .with_context(|| format!("{} command did not complete", phase_name))?;
+    let (status, lifetime_peak_kib) =
+        waited.with_context(|| format!("{} command did not complete", phase_name))?;
     let duration = start.elapsed();
 
     // Join drain threads so they don't outlive the phase.
@@ -891,12 +891,20 @@ fn wait_command_with_peak(child: &mut Child) -> Result<(std::process::ExitStatus
         // SAFETY: status and usage are valid writable pointers. wait4 is
         // restricted to our owned child, and usage is read only on success.
         let result = unsafe {
-            libc::wait4(child.id() as libc::pid_t, &mut status, 0, usage.as_mut_ptr())
+            libc::wait4(
+                child.id() as libc::pid_t,
+                &mut status,
+                0,
+                usage.as_mut_ptr(),
+            )
         };
         if result >= 0 {
             // SAFETY: successful wait4 initialized the rusage structure.
             let usage = unsafe { usage.assume_init() };
-            return Ok((std::process::ExitStatus::from_raw(status), usage.ru_maxrss.max(0) as u64));
+            return Ok((
+                std::process::ExitStatus::from_raw(status),
+                usage.ru_maxrss.max(0) as u64,
+            ));
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::Interrupted {
@@ -1728,12 +1736,17 @@ mod tests {
         };
         let report = run_command_phase(&config, "between_ticks", |bin, _| {
             let mut command = Command::new(bin);
-            command.args(["--exact", "workload::tests::test_command_peak_child"])
+            command
+                .args(["--exact", "workload::tests::test_command_peak_child"])
                 .env("MEMCHECK_PEAK_CHILD", "1");
             command
-        }).unwrap();
-        assert!(report.rss_max_kib >= 64 * 1024,
-            "lifetime peak must include the allocation, got {} KiB", report.rss_max_kib);
+        })
+        .unwrap();
+        assert!(
+            report.rss_max_kib >= 64 * 1024,
+            "lifetime peak must include the allocation, got {} KiB",
+            report.rss_max_kib
+        );
         assert!(report.combined_rss_max_kib >= report.rss_max_kib);
     }
 
