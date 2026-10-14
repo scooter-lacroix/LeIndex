@@ -655,6 +655,30 @@ pub fn configure_system_one_only() -> Result<(), SetupError> {
     Ok(())
 }
 
+/// Run the gate wizard without invoking embedding setup when it is the only
+/// requested option. Return whether this path handled the command.
+pub fn configure_system_one_if_standalone(
+    options: &SetupOptions,
+    embedding_setup_requested: bool,
+    warmup: bool,
+) -> Result<bool, SetupError> {
+    if !options.system_one || embedding_setup_requested {
+        return Ok(false);
+    }
+    let mut embedding_options = options.clone();
+    embedding_options.system_one = false;
+    if embedding_options.has_flags() {
+        return Ok(false);
+    }
+    if warmup {
+        return Err(SetupError::Conflict {
+            message: "--warmup requires an embedding setup option".into(),
+        });
+    }
+    configure_system_one_only()?;
+    Ok(true)
+}
+
 /// Execute setup with the resolved choices.
 ///
 /// Writes config, installs ORT (if neural), checks models.

@@ -1611,17 +1611,12 @@ async fn cmd_setup_impl(
         );
     }
 
-    // The gate wizard is independent of embedding provisioning. In particular,
-    // do not imply --neural and download/reset the user's embedding route.
-    if options.system_one && !neural && !no_neural && !cpu && gpu.is_none() && !remote_gemma {
-        let mut embedding_options = options.clone();
-        embedding_options.system_one = false;
-        if !embedding_options.has_flags() {
-            if warmup {
-                anyhow::bail!("--warmup requires an embedding setup option");
-            }
-            return setup::configure_system_one_only().map_err(Into::into);
-        }
+    if setup::configure_system_one_if_standalone(
+        &options,
+        neural || no_neural || cpu || gpu.is_some() || remote_gemma,
+        warmup,
+    )? {
+        return Ok(());
     }
 
     let choices = build_setup_choices(neural, no_neural, cpu, gpu, remote_gemma, options)?;
