@@ -464,6 +464,8 @@ mod test {
     fn test_unlisted_tools_are_treated_as_mutating() {
         assert!(is_read_only("leindex_search"));
         assert!(is_read_only("leindex_edit_preview"));
+        assert!(is_read_only("leindex_phase_analysis"));
+        assert!(is_read_only("phase_analysis"));
         assert!(!is_read_only("leindex_edit_apply"));
         assert!(!is_read_only("leindex_write"));
         assert!(!is_read_only("leindex_rename_symbol"));

@@ -633,6 +633,34 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn test_batch_source_budget_remains_bounded_and_discloses_zero_share() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("source.rs");
+        let source = "fn example() { println!(\"hello\"); }";
+        std::fs::write(&path, source).unwrap();
+        let mut node = crate::graph::pdg::Node::new_file_summary(path.to_str().unwrap(), "rust");
+        node.byte_range = (0, source.len());
+        for budget in [0, 1, 20] {
+            let mut result = serde_json::json!({});
+            attach_source(&mut result, &node, dir.path(), budget);
+            if budget < 2 {
+                assert!(result.get("source").is_none());
+                assert!(
+                    result["source_omitted"]
+                        .as_str()
+                        .unwrap()
+                        .contains("raise token_budget")
+                );
+            } else {
+                assert_eq!(
+                    result["source"].as_str().unwrap().chars().count(),
+                    budget / 2
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_symbol_lookup_schema_supports_batch() {
         let handler = SymbolLookupHandler;
         let schema = handler.argument_schema();

@@ -135,17 +135,11 @@ impl HttpAsker {
 
 impl Asker for HttpAsker {
     async fn ask(&self, request: &Request) -> Result<Response, SystemOneError> {
-        // Remote providers never see machine paths. One alias map serves both
-        // attempts, so a retry sends the same payload as the first try.
-        let mut scrub = self.provider.is_remote().then(|| PathScrub::new(request));
-        let scrubbed;
-        let request = match scrub.as_mut() {
-            Some(scrub) => {
-                scrubbed = scrub.scrub_request(request);
-                &scrubbed
-            }
-            None => request,
-        };
+        // Scrub every endpoint, including Laya: provider identity does not
+        // prove a configured URL is local. The same aliases serve both attempts.
+        let mut scrub = PathScrub::new(request);
+        let scrubbed = scrub.scrub_request(request);
+        let request = &scrubbed;
         let response = match self.ask_once(request).await {
             Err(SystemOneError::Transport(reason)) => {
                 // Service-backed endpoint: one restart attempt, one retry.
@@ -157,10 +151,7 @@ impl Asker for HttpAsker {
             }
             other => other,
         }?;
-        Ok(match scrub {
-            Some(scrub) => scrub.unscrub_response(response),
-            None => response,
-        })
+        Ok(scrub.unscrub_response(response))
     }
 }
 
@@ -401,12 +392,17 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_laya_payload_is_not_scrubbed() {
+    async fn test_laya_payload_also_excludes_absolute_paths() {
         let request = pick_request(json!({"path": "/home/alice/proj"}), "Which project?");
         let (base, rx) = mock_server(200, json!({"answers": {}}).to_string());
         let asker =
             HttpAsker::new(Provider::Laya, &base, "laya", None, Duration::from_secs(2)).unwrap();
         asker.ask(&request).await.unwrap();
-        assert!(rx.recv().unwrap().contains("/home/alice/proj"));
+        let raw = rx.recv().unwrap();
+        assert!(
+            !raw.contains("/home/alice/proj"),
+            "Laya leaked a host path: {raw}"
+        );
+        assert!(raw.contains("pathref-"));
     }
 }

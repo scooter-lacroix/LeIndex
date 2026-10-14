@@ -598,6 +598,25 @@ mod test {
     }
 
     #[test]
+    fn test_system_one_is_registered_in_production_flag_store() {
+        assert_eq!(
+            FeatureFlag::SystemOne.env_var(),
+            "LEINDEX_FEATURE_SYSTEM_ONE"
+        );
+        assert!(!FeatureFlag::SystemOne.default_value());
+        assert!(
+            FlagStore::new()
+                .values
+                .contains_key(&FeatureFlag::SystemOne)
+        );
+        assert!(
+            all_flags()
+                .iter()
+                .any(|(flag, _)| *flag == FeatureFlag::SystemOne)
+        );
+    }
+
+    #[test]
     fn test_default_values() {
         // NeuralSearch is a GA feature: its flag defaults ON so it acts as a
         // per-deployment rollout-KILL (explicit `false` disables; unset follows

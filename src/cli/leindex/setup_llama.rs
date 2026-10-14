@@ -430,11 +430,59 @@ fn publish_verified(
         .strip_prefix(&bundle)
         .map_err(|e| io_context("Invalid runtime server layout", e))?
         .to_path_buf();
-    if destination.exists() {
-        compare_bundle(&bundle, &destination.join("bundle"))?;
-        return validate_binary(&destination.join("bundle").join(relative));
-    }
+    // Validate the replacement before touching an existing installation.
     validate_binary(&server)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| failure("Runtime destination has no parent"))?;
+    let _lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(parent.join(".publish.lock"))
+        .map_err(|e| io_context("Cannot open runtime publication lock", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the file descriptor is owned and live for this entire scope.
+        if unsafe { libc::flock(_lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(io_context(
+                "Cannot lock runtime publication",
+                io::Error::last_os_error(),
+            ));
+        }
+    }
+    if destination.exists() {
+        if compare_bundle(&bundle, &destination.join("bundle")).is_ok() {
+            return validate_binary(&destination.join("bundle").join(relative));
+        }
+        // A directory rename cannot replace a nonempty bundle. Retire it under
+        // the publication lock, keep it for rollback, then publish verified data.
+        let backup = tempfile::Builder::new()
+            .prefix(".llama-repair-")
+            .tempdir_in(parent)
+            .map_err(|e| io_context("Cannot stage runtime repair", e))?;
+        let retired = backup.path().join("previous");
+        fs::rename(destination, &retired)
+            .map_err(|e| io_context("Cannot retire corrupt runtime", e))?;
+        let result = publish_bundle(stage, destination, &relative);
+        if result.is_err() {
+            let restored = (|| -> io::Result<()> {
+                if destination.exists() {
+                    fs::rename(destination, backup.path().join("failed"))?;
+                }
+                fs::rename(&retired, destination)
+            })();
+            if let Err(error) = restored {
+                let retained = backup.keep();
+                return Err(failure(format!(
+                    "Cannot restore runtime after repair failed: {error}; original retained at {}",
+                    retained.display()
+                )));
+            }
+        }
+        return result;
+    }
     publish_bundle(stage, destination, &relative)
 }
 

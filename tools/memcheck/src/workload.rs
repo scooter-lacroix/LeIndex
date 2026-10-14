@@ -5,6 +5,11 @@
 //! is `idle_warm → index → idle_post → query → reindex → idle_final`
 //! (VAL-MEASURE-001, VAL-MEASURE-002).
 //!
+//! Linux is the supported measurement platform: command maxima also include
+//! the per-child `wait4` lifetime high-water mark. Other targets only reap
+//! commands and retain any available periodic samples; that fallback cannot
+//! establish lifetime peaks or certify the Linux memory budget.
+//!
 //! Worker-aware extensions (VAL-CPHASE-036): the canonical workload includes
 //! an idle pre-embed phase, a worker-active embed phase, and a phase that
 //! exercises teardown/restart behavior.
@@ -863,6 +868,12 @@ fn run_command_phase(
     // /proc ticks can miss an entire short command or an allocation between
     // ticks. wait4 retains the lifetime high-water mark after process exit.
     // Keep percentiles/breakdowns and sample_count tied to actual /proc reads.
+    if config.verbose {
+        eprintln!(
+            "memcheck: phase '{}' peak sources — sampled: {} KiB, kernel lifetime: {} KiB",
+            phase_name, report.rss_max_kib, lifetime_peak_kib
+        );
+    }
     report.rss_max_kib = report.rss_max_kib.max(lifetime_peak_kib);
     report.combined_rss_max_kib = report.combined_rss_max_kib.max(lifetime_peak_kib);
     report.descendants = descendants;
@@ -885,19 +896,13 @@ fn run_command_phase(
 #[cfg(target_os = "linux")]
 fn wait_command_with_peak(child: &mut Child) -> Result<(std::process::ExitStatus, u64)> {
     use std::os::unix::process::ExitStatusExt;
+    let pid = measured_pid(child.id())?;
     let mut status = 0;
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     loop {
         // SAFETY: status and usage are valid writable pointers. wait4 is
         // restricted to our owned child, and usage is read only on success.
-        let result = unsafe {
-            libc::wait4(
-                child.id() as libc::pid_t,
-                &mut status,
-                0,
-                usage.as_mut_ptr(),
-            )
-        };
+        let result = unsafe { libc::wait4(pid, &mut status, 0, usage.as_mut_ptr()) };
         if result >= 0 {
             // SAFETY: successful wait4 initialized the rusage structure.
             let usage = unsafe { usage.assume_init() };
@@ -913,9 +918,29 @@ fn wait_command_with_peak(child: &mut Child) -> Result<(std::process::ExitStatus
     }
 }
 
+/// The harness's /proc sampler and kernel lifetime peak are Linux-only.
+/// On other platforms this fallback only reaps the child; zero means the
+/// kernel peak is unavailable, not that the command used no memory. Command
+/// reports retain their sampled maximum, which cannot prove a lifetime peak.
 #[cfg(not(target_os = "linux"))]
 fn wait_command_with_peak(child: &mut Child) -> Result<(std::process::ExitStatus, u64)> {
     Ok((child.wait()?, 0))
+}
+
+#[cfg(target_os = "linux")]
+fn measured_pid(id: u32) -> Result<libc::pid_t> {
+    // Linux allocates positive signed PIDs, but never let a future invalid
+    // Child ID turn wait4's PID argument into a process-group selector.
+    let pid = libc::pid_t::try_from(id)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid measured child PID",
+            )
+        })?;
+    Ok(pid)
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -1705,6 +1730,16 @@ mod tests {
         assert_eq!(report.anon_kib, 0);
         assert_eq!(report.worker_rss_max_kib, 0);
         assert_eq!(report.combined_rss_max_kib, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_measured_pid_rejects_wait4_selectors() {
+        assert_eq!(measured_pid(1).unwrap(), 1);
+        assert_eq!(measured_pid(i32::MAX as u32).unwrap(), i32::MAX);
+        assert!(measured_pid(0).is_err());
+        assert!(measured_pid(i32::MAX as u32 + 1).is_err());
+        assert!(measured_pid(u32::MAX).is_err());
     }
 
     #[cfg(target_os = "linux")]

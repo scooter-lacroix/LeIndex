@@ -25,10 +25,14 @@ pub struct PostParams {
     pub top_n: usize,
     /// Snippet cap in characters.
     pub snippet_chars: usize,
-    /// Serialized candidates per request. llama-server's physical batch
-    /// (default 512 tokens) bounds the whole prompt: state + question.
-    /// ~1400 chars of state ≈ 350-450 tokens, which fits with headroom.
+    /// Serialized STATE characters per request, including the escaped query,
+    /// candidate array, JSON keys, and punctuation (not question text).
+    /// ~1400 chars of state ≈ 350-450 tokens, leaving question headroom in
+    /// llama-server's default 512-token physical batch.
     pub chunk_chars: usize,
+    /// Maximum chunk requests in flight at once; zero is normalized to one.
+    /// Defaults to four for llama-server's default slot count.
+    pub chunk_wave_width: usize,
 }
 
 impl Default for PostParams {
@@ -41,6 +45,7 @@ impl Default for PostParams {
             top_n: 10,
             snippet_chars: 800,
             chunk_chars: 1400,
+            chunk_wave_width: 4,
         }
     }
 }
@@ -243,10 +248,6 @@ fn verdict_key(query: &str, candidate: &Value) -> VerdictKey {
 
 const VERDICT_CACHE_CAP: usize = 512;
 
-/// Chunk requests in flight at once. llama-server's default 4 slots make
-/// wider windows pure queue depth.
-const CHUNK_WAVE_WIDTH: usize = 4;
-
 fn verdict_cache() -> &'static Mutex<(HashMap<VerdictKey, RawVerdict>, VecDeque<VerdictKey>)> {
     static CACHE: OnceLock<Mutex<(HashMap<VerdictKey, RawVerdict>, VecDeque<VerdictKey>)>> =
         OnceLock::new();
@@ -303,9 +304,9 @@ pub async fn judge_results(
         .collect();
     let mut tokens = 0u64;
     if !to_ask.is_empty() {
-        // Chunk requests run in bounded waves of CHUNK_WAVE_WIDTH: a wider
-        // fan-out only queues at the server and trips timeouts (the concurrent
-        // frame stampede measured 6 transport failures at ~28 in flight).
+        // Bound chunk concurrency to the deployment's available capacity.
+        // Zero still makes progress, with one request in flight.
+        let wave_width = params.chunk_wave_width.max(1);
         // Retry wave: candidates still unanswered after a wave (slot
         // contention, dropped keep-alive, model omission) get one more chance.
         let mut wave: Vec<usize> = to_ask;
@@ -315,7 +316,7 @@ pub async fn judge_results(
             }
             let chunks: Vec<Vec<usize>> =
                 chunk_by_size(&candidates, &wave, params.chunk_chars, query);
-            for window in chunks.chunks(CHUNK_WAVE_WIDTH) {
+            for window in chunks.chunks(wave_width) {
                 let asks = window
                     .iter()
                     .map(|chunk| ask_chunk(asker, query, &candidates, chunk, timeout_ms));
@@ -351,29 +352,40 @@ fn chunk_by_size(
     budget: usize,
     query: &str,
 ) -> Vec<Vec<usize>> {
-    // Per-request overhead every chunk carries: the query string itself plus
-    // JSON keys/punctuation and the three questions' fixed instructions.
-    // Breakdown of the 300: JSON envelope (keys, quotes, commas) ~40 chars,
-    // three fixed yes/no question templates ~80 chars each.
-    const CHUNK_OVERHEAD_CHARS: usize = 300;
-    let overhead = query.chars().count() + CHUNK_OVERHEAD_CHARS;
-    let budget = budget.saturating_sub(overhead).max(1);
+    // Use the same STATE envelope as ask_chunk. Serializing it charges JSON
+    // escaping (including the query) and every key/bracket exactly. Question
+    // instructions are outside the documented STATE budget.
+    let overhead = chunk_state(query, candidates, &[])
+        .to_string()
+        .chars()
+        .count();
     let mut chunks: Vec<Vec<usize>> = Vec::new();
     let mut current: Vec<usize> = Vec::new();
-    let mut used = 0usize;
+    let mut used = overhead;
     for &i in to_ask {
-        let size = candidates[i].to_string().len();
-        if !current.is_empty() && used + size > budget {
+        let size = candidates[i].to_string().chars().count();
+        let separator = usize::from(!current.is_empty());
+        if !current.is_empty() && used.saturating_add(size).saturating_add(separator) > budget {
             chunks.push(std::mem::take(&mut current));
-            used = 0;
+            used = overhead;
         }
+        used = used
+            .saturating_add(size)
+            .saturating_add(usize::from(!current.is_empty()));
         current.push(i);
-        used += size;
     }
     if !current.is_empty() {
         chunks.push(current);
     }
     chunks
+}
+
+/// The exact shared STATE sent for a chunk, also used to compute its budget.
+fn chunk_state(query: &str, candidates: &[Value], chunk: &[usize]) -> Value {
+    json!({
+        "query": query,
+        "candidates": chunk.iter().map(|&i| &candidates[i]).collect::<Vec<_>>(),
+    })
 }
 
 /// One request for one chunk. Candidates are renumbered `c0..` per chunk so
@@ -409,10 +421,7 @@ async fn ask_chunk(
         ));
     }
     let request = Request {
-        state: json!({
-            "query": query,
-            "candidates": chunk.iter().map(|&i| &candidates[i]).collect::<Vec<_>>(),
-        }),
+        state: chunk_state(query, candidates, chunk),
         questions,
     };
     ask_bounded(asker, &request, timeout_ms).await
@@ -429,7 +438,7 @@ mod test {
     }
 
     #[test]
-    fn judge_applies_thresholds_in_code() {
+    fn test_judge_applies_thresholds_in_code() {
         let p = PostParams::default();
         let r = yes_answers(&[
             ("is_relevant", 0.9),
@@ -454,7 +463,7 @@ mod test {
     }
 
     #[test]
-    fn never_drops_rank_one_and_reorders_by_blend() {
+    fn test_never_drops_rank_one_and_reorders_by_blend() {
         let p = PostParams {
             min_keep: 1,
             ..Default::default()
@@ -473,7 +482,7 @@ mod test {
     }
 
     #[test]
-    fn min_keep_restores_highest_signal_drops_first() {
+    fn test_min_keep_restores_highest_signal_drops_first() {
         let p = PostParams {
             min_keep: 3,
             ..Default::default()
@@ -492,7 +501,7 @@ mod test {
     }
 
     #[test]
-    fn unjudged_tail_keeps_position() {
+    fn test_unjudged_tail_keeps_position() {
         let p = PostParams::default();
         let base = [0.9, 0.8, 0.7, 0.6, 0.5];
         let plan = plan(&base, &[j(0.5, None), j(0.5, None)], &p);
@@ -500,7 +509,7 @@ mod test {
     }
 
     #[test]
-    fn apply_plan_keeps_rank_with_item_through_reorder() {
+    fn test_apply_plan_keeps_rank_with_item_through_reorder() {
         let mut results = vec![json!({"rank": 1, "n": "a"}), json!({"rank": 2, "n": "b"})];
         apply_plan(
             &mut results,
@@ -516,7 +525,7 @@ mod test {
     }
 
     #[test]
-    fn apply_plan_preserves_global_rank_on_offset_page() {
+    fn test_apply_plan_preserves_global_rank_on_offset_page() {
         // Page at offset 10: engine ranks are global (11, 12, 13). Reordering
         // to [c, a, b] must carry each rank with its item: c keeps 13.
         let mut results = vec![
@@ -540,7 +549,7 @@ mod test {
     }
 
     #[test]
-    fn apply_plan_pairs_noncontiguous_ranks_with_their_items() {
+    fn test_apply_plan_pairs_noncontiguous_ranks_with_their_items() {
         // Non-identity reorder with non-contiguous ranks: each rank stays
         // paired with its own item, whatever slot it lands in (asserted by
         // the stable `id` field, not output position).
@@ -573,14 +582,14 @@ mod test {
     }
 
     #[test]
-    fn base_score_reads_overall_or_number_or_falls_back() {
+    fn test_base_score_reads_overall_or_number_or_falls_back() {
         assert!((base_score(&json!({"score": {"overall": 0.4}}), 0, 4) - 0.4).abs() < 1e-6);
         assert!((base_score(&json!({"score": 0.25}), 0, 4) - 0.25).abs() < 1e-6);
         assert!((base_score(&json!({}), 1, 4) - 0.75).abs() < 1e-6);
     }
 
     #[test]
-    fn candidate_state_relativizes_path_and_caps_snippet() {
+    fn test_candidate_state_relativizes_path_and_caps_snippet() {
         let r =
             json!({"file_path": "/proj/src/a.rs", "symbol_name": "f", "context": "x".repeat(2000)});
         let state = candidate_state("q", &r, "/proj", 800);
@@ -590,7 +599,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn judge_results_batches_all_candidates_into_one_request() {
+    async fn test_judge_results_batches_all_candidates_into_one_request() {
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let asker = FnAsker(|req: &Request| {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -632,7 +641,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn judge_results_cache_hit_skips_the_model() {
+    async fn test_judge_results_cache_hit_skips_the_model() {
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let asker = FnAsker(|_req: &Request| {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -661,13 +670,152 @@ mod test {
     }
 
     #[tokio::test]
-    async fn judge_results_fails_open_when_unanswered() {
+    async fn test_judge_results_fails_open_when_unanswered() {
         let asker = FnAsker(|_req: &Request| Err(SystemOneError::Status(529)));
         let results = vec![json!({"symbol_name": "a"}), json!({"symbol_name": "b"})];
         let (verdicts, _) =
             judge_results(&asker, "q", "/p", &results, &PostParams::default(), 500).await;
         assert_eq!(verdicts.len(), 2);
         assert!(verdicts.iter().all(|v| v.is_none()), "fail open");
+    }
+
+    #[test]
+    fn test_chunk_by_size_charges_exact_escaped_unicode_state() {
+        let query = format!("find \\\"雪\\\"\n\t\\symbols{}", "\0".repeat(80));
+        let candidates: Vec<Value> = (0..3)
+            .map(|i| {
+                candidate_state(
+                    &query,
+                    &json!({"symbol_name": format!("雪{i}"), "context": "\"\\\n\tλ"}),
+                    "/p",
+                    800,
+                )
+            })
+            .collect();
+        let serialized = chunk_state(&query, &candidates, &[0, 1]).to_string();
+        let budget = serialized.chars().count();
+        assert!(
+            serialized.len() > budget,
+            "budget is characters, not UTF-8 bytes"
+        );
+        assert!(serialized.contains("\\n"));
+        assert!(serialized.contains("\\\\"));
+        assert!(serialized.contains("\\u0000"));
+        assert_eq!(
+            chunk_by_size(&candidates, &[0, 1, 2], budget, &query),
+            vec![vec![0, 1], vec![2]],
+            "two candidates fit exactly, including their separating comma"
+        );
+        let chunks = chunk_by_size(&candidates, &[0, 1, 2], budget - 1, &query);
+        assert_eq!(chunks, vec![vec![0], vec![1], vec![2]]);
+        for chunk in chunks {
+            assert!(
+                chunk_state(&query, &candidates, &chunk)
+                    .to_string()
+                    .chars()
+                    .count()
+                    < budget
+            );
+        }
+    }
+
+    #[test]
+    fn test_chunk_by_size_preserves_oversized_single_candidate() {
+        let candidates = vec![json!({"code": "x".repeat(2000)}), json!({"code": "small"})];
+        assert_eq!(
+            chunk_by_size(&candidates, &[0, 1], 100, "q"),
+            vec![vec![0], vec![1]]
+        );
+        assert_eq!(
+            chunk_by_size(&candidates, &[0, 1], 0, "q"),
+            vec![vec![0], vec![1]]
+        );
+        assert!(chunk_by_size(&candidates, &[], 0, "q").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_judge_results_cache_key_distinguishes_kind_and_signature() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let asker = FnAsker(|_req: &Request| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(yes_answers(&[("c0_is_relevant", 0.9)]))
+        });
+        let baseline = json!({
+            "file_path": "/p/cache_identity.rs", "symbol_name": "symbol",
+            "symbol_type": "function", "signature": "fn symbol()", "context": "same code"
+        });
+        let mut changed_kind = baseline.clone();
+        changed_kind["symbol_type"] = json!("method");
+        let mut changed_signature = baseline.clone();
+        changed_signature["signature"] = json!("fn symbol(value: i32)");
+        let query = "cache key kind and signature regression";
+        for result in [&baseline, &changed_kind, &changed_signature, &baseline] {
+            let (verdicts, _) = judge_results(
+                &asker,
+                query,
+                "/p",
+                std::slice::from_ref(result),
+                &PostParams::default(),
+                500,
+            )
+            .await;
+            assert!(verdicts_complete(&verdicts));
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_judge_results_chunk_concurrency_is_tunable_and_zero_is_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct ConcurrentAsker {
+            in_flight: AtomicUsize,
+            peak: AtomicUsize,
+            calls: AtomicUsize,
+        }
+
+        impl Asker for ConcurrentAsker {
+            async fn ask(&self, request: &Request) -> Result<Response, SystemOneError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let active = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                // Keep each request pending until join_all has polled its wave.
+                tokio::task::yield_now().await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                assert_eq!(request.state["candidates"].as_array().unwrap().len(), 1);
+                Ok(yes_answers(&[("c0_is_relevant", 0.9)]))
+            }
+        }
+
+        assert_eq!(PostParams::default().chunk_wave_width, 4);
+        for width in [0, 1, 2, 4, 20] {
+            let asker = ConcurrentAsker::default();
+            let params = PostParams {
+                chunk_chars: 1,
+                chunk_wave_width: width,
+                ..Default::default()
+            };
+            let results: Vec<Value> = (0..7)
+                .map(|i| json!({"symbol_name": format!("concurrent_{width}_{i}")}))
+                .collect();
+            let (verdicts, _) = judge_results(
+                &asker,
+                &format!("bounded concurrency width {width}"),
+                "/p",
+                &results,
+                &params,
+                500,
+            )
+            .await;
+            assert!(verdicts_complete(&verdicts));
+            assert_eq!(asker.calls.load(Ordering::SeqCst), results.len());
+            assert_eq!(
+                asker.peak.load(Ordering::SeqCst),
+                width.max(1).min(results.len())
+            );
+            assert_eq!(asker.in_flight.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]

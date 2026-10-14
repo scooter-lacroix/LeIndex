@@ -31,6 +31,35 @@ fn archive_fixture(path: &Path, aliases: bool) {
     archive.into_inner().unwrap().finish().unwrap();
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn test_publish_verified_repairs_corrupt_installed_bundle() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = temp.path().join("runtime.tar.gz");
+    archive_fixture(&archive, true);
+    let destination = temp.path().join("installed");
+    let stage = staging_dir(temp.path()).unwrap();
+    let installed = publish_verified(stage, &archive, &destination).unwrap();
+    for permissions_only in [false, true] {
+        use std::os::unix::fs::PermissionsExt;
+        if permissions_only {
+            fs::set_permissions(&installed, fs::Permissions::from_mode(0o644)).unwrap();
+        } else {
+            fs::write(&installed, b"corrupt").unwrap();
+        }
+        let stage = staging_dir(temp.path()).unwrap();
+        assert_eq!(
+            publish_verified(stage, &archive, &destination).unwrap(),
+            installed
+        );
+        assert!(fs::read(&installed).unwrap().starts_with(b"#!/bin/sh"));
+        assert_ne!(
+            fs::metadata(&installed).unwrap().permissions().mode() & 0o111,
+            0
+        );
+    }
+}
+
 #[test]
 fn test_asset_table_rejects_unsupported_backends_and_platforms() {
     assert_eq!(

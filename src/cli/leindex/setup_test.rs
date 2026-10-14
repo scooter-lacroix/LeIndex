@@ -31,6 +31,28 @@ fn test_setup_merge_surfaces_config_read_failure() {
 }
 
 #[test]
+fn test_setup_rerun_preserves_managed_services_and_consumers() {
+    let mut existing = crate::config::LeIndexConfig::default();
+    existing.services.insert(
+        "judge".into(),
+        crate::config::ServiceConfig {
+            port: 8181,
+            model: Some("/models/judge.gguf".into()),
+            ..Default::default()
+        },
+    );
+    existing.system_one.service = Some("judge".into());
+    existing.indexing.embeddings.remote_service = Some("judge".into());
+    let merged = preserve_existing_sections(crate::config::LeIndexConfig::default(), &existing);
+    assert_eq!(merged.services, existing.services);
+    assert_eq!(merged.system_one.service, existing.system_one.service);
+    assert_eq!(
+        merged.indexing.embeddings.remote_service,
+        existing.indexing.embeddings.remote_service
+    );
+}
+
+#[test]
 fn test_wire_gemma_preset_configures_service_and_preset_dimension() {
     let mut config = crate::config::LeIndexConfig::default();
     let gguf = Path::new("/models/embeddinggemma-2.gguf");

@@ -268,7 +268,7 @@ mod test {
     }
 
     #[test]
-    fn jev_encodes_noul_and_choice_criteria_map() {
+    fn test_jev_encodes_noul_and_choice_criteria_map() {
         let body = encode(Provider::Jev, "jev-latest", &sample());
         assert_eq!(body["model"], "jev-latest");
         assert_eq!(body["questions"]["ok"]["type"], "noul");
@@ -277,7 +277,7 @@ mod test {
     }
 
     #[test]
-    fn laya_encodes_yes_no_as_neutral_two_option_choice() {
+    fn test_laya_encodes_yes_no_as_neutral_two_option_choice() {
         let body = encode(Provider::Laya, "laya", &sample());
         let q = &body["questions"]["ok"];
         assert_eq!(q["type"], "choice");
@@ -287,7 +287,7 @@ mod test {
     }
 
     #[test]
-    fn laya_yes_key_varies_with_question_name() {
+    fn test_laya_yes_key_varies_with_question_name() {
         let keys: std::collections::HashSet<_> = ["a", "b", "ab", "wrong:search_mode"]
             .iter()
             .map(|n| laya_keys(n).0)
@@ -296,7 +296,7 @@ mod test {
     }
 
     #[test]
-    fn openai_encodes_predicate_array_with_names() {
+    fn test_openai_encodes_predicate_array_with_names() {
         let body = encode(Provider::OpenAi, "gpt-6-luna", &sample());
         assert_eq!(body["model"], "gpt-6-luna");
         assert!(body["input"].is_string());
@@ -306,7 +306,7 @@ mod test {
     }
 
     #[test]
-    fn jev_decodes_documented_response() {
+    fn test_jev_decodes_documented_response() {
         let body = json!({
             "model": "jev-1.13.0",
             "answers": {
@@ -323,7 +323,7 @@ mod test {
     }
 
     #[test]
-    fn laya_decodes_yes_from_the_yes_key() {
+    fn test_laya_decodes_yes_from_the_yes_key() {
         let (yes, no) = laya_keys("ok");
         let mut probs = Map::new();
         probs.insert(yes.into(), json!(0.8));
@@ -335,7 +335,7 @@ mod test {
     }
 
     #[test]
-    fn openai_decodes_documented_response_and_skips_refusal() {
+    fn test_openai_decodes_documented_response_and_skips_refusal() {
         let body = json!({"answers": [
             {"type": "refusal", "name": "ok"},
             {"type": "choice", "name": "dept", "choice": "billing",
@@ -349,7 +349,7 @@ mod test {
     }
 
     #[test]
-    fn rejects_choice_outside_offered_options_and_bad_probabilities() {
+    fn test_rejects_choice_outside_offered_options_and_bad_probabilities() {
         let body = json!({"answers": {
             "ok": {"type": "noul", "noul": 1.7},
             "dept": {"type": "choice", "choice": "invented", "probabilities": {}}
@@ -359,7 +359,7 @@ mod test {
     }
 
     #[test]
-    fn structurally_wrong_body_is_an_error() {
+    fn test_structurally_wrong_body_is_an_error() {
         assert!(decode(Provider::Jev, &sample(), &json!({"nope": 1})).is_err());
         assert!(decode(Provider::OpenAi, &sample(), &json!({"answers": {}})).is_err());
     }

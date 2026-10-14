@@ -69,6 +69,15 @@ fn test_external_rejects_url_query_fragment_and_zero_dimension() {
 }
 
 #[test]
+fn test_strip_gpu_options_handles_a_trailing_flag() {
+    for flag in ["-ngl", "--gpu-layers", "--n-gpu-layers"] {
+        let mut args = vec!["--ctx-size".into(), "8192".into(), flag.into()];
+        strip_gpu_options(&mut args);
+        assert_eq!(args, ["--ctx-size", "8192"]);
+    }
+}
+
+#[test]
 fn test_gpu_arguments_preserve_and_override_without_duplicates() {
     let mut args: Vec<String> = [
         "--ctx-size",

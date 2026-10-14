@@ -1,5 +1,38 @@
 use super::*;
 
+#[tokio::test]
+async fn test_standalone_system_one_reaches_wizard_without_neural_flags() {
+    let options = crate::cli::leindex::setup::SetupOptions {
+        system_one: true,
+        ..Default::default()
+    };
+    let error = cmd_setup_impl(false, false, false, None, false, false, false, options)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("requires a terminal"), "{error}");
+    assert!(!error.contains("NoFlags"), "{error}");
+}
+
+#[test]
+fn test_service_row_state_requires_http_health() {
+    let mut status = crate::services::ServiceStatus {
+        name: "test".into(),
+        pid: None,
+        port_open: true,
+        http_ready: false,
+        endpoint: "http://127.0.0.1:8181".into(),
+        model: None,
+        served_model: None,
+        auto_start: false,
+    };
+    assert_eq!(service_row_state(&status), "down");
+    status.pid = Some(123);
+    assert_eq!(service_row_state(&status), "starting");
+    status.http_ready = true;
+    assert_eq!(service_row_state(&status), "up");
+}
+
 #[test]
 fn test_cli_parsing() {
     let cli = Cli::try_parse_from(["leindex", "index", "/path/to/project"]).unwrap();

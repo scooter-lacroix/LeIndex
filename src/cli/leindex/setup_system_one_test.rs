@@ -60,6 +60,31 @@ fn test_section_issues_thresholds_keep_runtime_invariants() {
 }
 
 #[test]
+fn test_section_issues_requires_two_results() {
+    let mut config = enabled_laya();
+    for top_n in [0, 1] {
+        config.system_one.top_n = top_n;
+        assert!(
+            section_issues(&config)
+                .iter()
+                .any(|issue| issue.starts_with("top_n"))
+        );
+    }
+    config.system_one.top_n = 2;
+    assert!(section_issues(&config).is_empty());
+}
+
+#[test]
+fn test_managed_listen_host_requires_loopback() {
+    for host in ["localhost", "127.0.0.1", "127.0.0.2", "::1"] {
+        assert!(validate_listen_host(host).is_ok(), "{host}");
+    }
+    for host in ["", "0.0.0.0", "::", "192.168.1.1", "example.com"] {
+        assert!(validate_listen_host(host).is_err(), "{host}");
+    }
+}
+
+#[test]
 fn test_section_issues_accepts_large_timeout_and_top_n() {
     let mut config = enabled_laya();
     config.system_one.timeout_ms = 600_000;

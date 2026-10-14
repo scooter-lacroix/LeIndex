@@ -417,6 +417,56 @@ fn wants_project_hint(ctx: &CallContext<'_>, args: &Value, healed: &mut Healed) 
     unresolved && !ctx.known_projects.is_empty()
 }
 
+/// Apply schema string limits to evidence, not execution arguments: mutating
+/// tools must still receive exactly the caller's original arguments.
+fn bound_evidence(spec: &Value, value: &mut Value) {
+    if let (Some(limit), Some(text)) = (
+        spec.get("maxLength").and_then(Value::as_u64),
+        value.as_str(),
+    ) {
+        *value = json!(text.chars().take(limit as usize).collect::<String>());
+        return;
+    }
+    match value {
+        Value::Array(items) => {
+            if let Some(item_spec) = spec.get("items") {
+                for item in items {
+                    bound_evidence(item_spec, item);
+                }
+            }
+        }
+        Value::Object(fields) => {
+            if let Some(properties) = spec.get("properties") {
+                for (name, field) in fields {
+                    if let Some(field_spec) = properties.get(name) {
+                        bound_evidence(field_spec, field);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn request_state(ctx: &CallContext<'_>, args: &Value, intent: Option<&str>) -> Value {
+    let mut evidence = args.clone();
+    bound_evidence(ctx.schema, &mut evidence);
+    // Gate::pre derives intent from task_context or query; cap its duplicate
+    // by the same schema limit rather than transmitting the original text.
+    let intent_spec = ctx.schema.get("properties").and_then(|p| {
+        p.get(if args.get("task_context").is_some() {
+            "task_context"
+        } else {
+            "query"
+        })
+    });
+    let mut intent = json!(intent);
+    if let Some(spec) = intent_spec {
+        bound_evidence(spec, &mut intent);
+    }
+    json!({"tool": ctx.tool, "arguments": evidence, "intent": intent})
+}
+
 /// Stage 1: one batched request (`call_ok` + one `wrong:<param>` yes/no per
 /// parameter + the project questions when needed).
 async fn stage1(
@@ -468,11 +518,24 @@ async fn stage1(
         ));
     }
     let stage1 = Request {
-        state: json!({"tool": ctx.tool, "arguments": healed.args, "intent": intent}),
+        state: request_state(ctx, &healed.args, intent),
         questions,
     };
     healed.requests += 1;
-    ask_bounded(asker, &stage1, params.timeout_ms).await
+    let answers = ask_bounded(asker, &stage1, params.timeout_ms).await?;
+    // Missing/refused verdicts are provider failures, not evidence of a bad
+    // argument. Propagate failure so heal rolls back the entire cascade.
+    for (name, question) in &stage1.questions {
+        match question {
+            Question::YesNo { .. } => {
+                answers.p_yes(name)?;
+            }
+            Question::Pick { .. } => {
+                answers.pick(name)?;
+            }
+        }
+    }
+    Some(answers)
 }
 
 /// Fill in `project_path` when Stage 1 said the call needs one.
@@ -559,15 +622,13 @@ async fn stage2(
         return Some(());
     }
     let stage2 = Request {
-        state: json!({"tool": ctx.tool, "arguments": healed.args, "intent": intent}),
+        state: request_state(ctx, &healed.args, intent),
         questions: asks,
     };
     healed.requests += 1;
     let picks = ask_bounded(asker, &stage2, params.timeout_ms).await?;
     for (issue, options) in offered {
-        let Some((choice, confidence)) = picks.pick(&format!("fix:{}", issue.param)) else {
-            continue;
-        };
+        let (choice, confidence) = picks.pick(&format!("fix:{}", issue.param))?;
         if choice == KEEP {
             continue;
         }
@@ -679,6 +740,19 @@ mod test {
     use crate::cli::mcp::system_one::testing::{FnAsker, answers_of};
     use crate::cli::mcp::system_one::types::{Answer, SystemOneError};
 
+    fn requested_answers(req: &Request, pairs: &[(&str, f32)]) -> Response {
+        let mut response = answers_of(pairs);
+        for (name, question) in &req.questions {
+            if matches!(question, Question::YesNo { .. }) {
+                response
+                    .answers
+                    .entry(name.clone())
+                    .or_insert(Answer::YesNo { p_yes: 0.0 });
+            }
+        }
+        response
+    }
+
     fn schema() -> Value {
         json!({"type": "object", "properties": {
             "query": {"type": "string"},
@@ -703,7 +777,7 @@ mod test {
     }
 
     #[test]
-    fn project_autofill_only_when_project_path_is_absent() {
+    fn test_project_autofill_only_when_project_path_is_absent() {
         // Regression: an invalid but present `project_path` used to be
         // offered a replacement project. Only a missing one may be filled.
         let schema = schema();
@@ -717,7 +791,7 @@ mod test {
     }
 
     #[test]
-    fn validate_finds_each_violation_kind() {
+    fn test_validate_finds_each_violation_kind() {
         let issues = validate(
             &schema(),
             &json!({"top_k": 500, "search_mode": "fuzzy", "allow_partial": "yes", "colour": 1}),
@@ -735,7 +809,7 @@ mod test {
     }
 
     #[test]
-    fn code_repairs_clamp_case_and_coercion_only() {
+    fn test_code_repairs_clamp_case_and_coercion_only() {
         let mut args =
             json!({"query": "q", "top_k": 500, "search_mode": "SEMANTIC", "allow_partial": "true"});
         let issues = validate(&schema(), &args);
@@ -748,7 +822,7 @@ mod test {
     }
 
     #[test]
-    fn unknown_key_rename_carries_the_original_value_type() {
+    fn test_unknown_key_rename_carries_the_original_value_type() {
         // Regression: `topk: 5` used to fall past the rename branch (which
         // tested `from.is_string()`) and produce `topk: "top_k"`, dropping
         // the value. The rename must be keyed on the unknown-key/target-key
@@ -778,7 +852,7 @@ mod test {
     }
 
     #[test]
-    fn known_key_repair_is_a_set_not_a_rename() {
+    fn test_known_key_repair_is_a_set_not_a_rename() {
         // When the flagged param IS in the schema, the model's choice is a
         // value replacement — the rename branch must not swallow it even
         // when `to` happens to name another property.
@@ -804,7 +878,7 @@ mod test {
     }
 
     #[test]
-    fn ambiguous_enum_case_is_not_guessed() {
+    fn test_ambiguous_enum_case_is_not_guessed() {
         let s = json!({"properties": {"m": {"type": "string", "enum": ["Ab", "aB"]}}});
         let mut args = json!({"m": "ab"});
         let issues = validate(&s, &args);
@@ -814,7 +888,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn clean_call_costs_zero_requests() {
+    async fn test_clean_call_costs_zero_requests() {
         let asker = FnAsker(|_: &Request| panic!("must not be called"));
         let s = schema();
         let healed = heal(
@@ -851,9 +925,9 @@ mod test {
     }
 
     #[tokio::test]
-    async fn model_picks_candidate_and_read_only_call_is_repaired() {
+    async fn test_model_picks_candidate_and_read_only_call_is_repaired() {
         let asker = FnAsker(|req: &Request| {
-            let mut r = answers_of(&[("call_ok", 0.1), ("wrong:search_mode", 0.9)]);
+            let mut r = requested_answers(req, &[("call_ok", 0.1), ("wrong:search_mode", 0.9)]);
             if req.questions.iter().any(|(n, _)| n == "fix:search_mode") {
                 r.answers.insert(
                     "fix:search_mode".into(),
@@ -887,7 +961,7 @@ mod test {
             json!({"query": "q", "top_k": 500, "search_mode": "SEMANTIC", "allow_partial": "true"});
         let asker = FnAsker(|req: &Request| {
             assert_eq!(req.state["arguments"], args);
-            let mut r = answers_of(&[("call_ok", 0.0), ("wrong:search_mode", 1.0)]);
+            let mut r = requested_answers(req, &[("call_ok", 0.0), ("wrong:search_mode", 1.0)]);
             if req.questions.iter().any(|(n, _)| n == "fix:search_mode") {
                 r.answers.insert(
                     "fix:search_mode".into(),
@@ -923,9 +997,9 @@ mod test {
     }
 
     #[tokio::test]
-    async fn low_confidence_and_keep_as_is_change_nothing() {
+    async fn test_low_confidence_and_keep_as_is_change_nothing() {
         let asker = FnAsker(|req: &Request| {
-            let mut r = answers_of(&[("call_ok", 0.0), ("wrong:search_mode", 1.0)]);
+            let mut r = requested_answers(req, &[("call_ok", 0.0), ("wrong:search_mode", 1.0)]);
             if req.questions.iter().any(|(n, _)| n == "fix:search_mode") {
                 r.answers.insert(
                     "fix:search_mode".into(),
@@ -952,7 +1026,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn provider_failure_fails_open() {
+    async fn test_provider_failure_fails_open() {
         let asker = FnAsker(|_: &Request| Err(SystemOneError::Status(529)));
         let s = schema();
         let healed = heal(
@@ -987,7 +1061,8 @@ mod test {
                     }
                     return Err(SystemOneError::Status(529));
                 }
-                let mut response = answers_of(&[("call_ok", 0.0), ("needs:project_path", 1.0)]);
+                let mut response =
+                    requested_answers(req, &[("call_ok", 0.0), ("needs:project_path", 1.0)]);
                 response.answers.insert(
                     "fill:project_path".into(),
                     Answer::Pick {
@@ -1028,10 +1103,10 @@ mod test {
     }
 
     #[tokio::test]
-    async fn missing_project_path_is_filled_only_from_known_projects() {
+    async fn test_missing_project_path_is_filled_only_from_known_projects() {
         let projects = vec!["/a".to_string(), "/b".to_string()];
-        let asker = FnAsker(|_: &Request| {
-            let mut r = answers_of(&[("call_ok", 0.9), ("needs:project_path", 0.95)]);
+        let asker = FnAsker(|req: &Request| {
+            let mut r = requested_answers(req, &[("call_ok", 0.9), ("needs:project_path", 0.95)]);
             r.answers.insert(
                 "fill:project_path".into(),
                 Answer::Pick {
@@ -1055,10 +1130,10 @@ mod test {
     }
 
     #[tokio::test]
-    async fn invented_project_path_is_rejected() {
+    async fn test_invented_project_path_is_rejected() {
         let projects = vec!["/a".to_string(), "/b".to_string()];
-        let asker = FnAsker(|_: &Request| {
-            let mut r = answers_of(&[("call_ok", 0.9), ("needs:project_path", 0.95)]);
+        let asker = FnAsker(|req: &Request| {
+            let mut r = requested_answers(req, &[("call_ok", 0.9), ("needs:project_path", 0.95)]);
             r.answers.insert(
                 "fill:project_path".into(),
                 Answer::Pick {
@@ -1085,8 +1160,144 @@ mod test {
         assert!(healed.hints[0].contains("/etc"));
     }
 
+    #[tokio::test]
+    async fn test_stage1_missing_parameter_verdict_rolls_back_every_repair() {
+        let s = schema();
+        let original = json!({"query": "q", "top_k": 500, "search_mode": "fuzzy"});
+        let asker = FnAsker(|req: &Request| {
+            if req.questions.iter().any(|(n, _)| n == "fix:search_mode") {
+                let mut response = Response::default();
+                response.answers.insert(
+                    "fix:search_mode".into(),
+                    Answer::Pick {
+                        choice: "exact".into(),
+                        probabilities: vec![],
+                        confidence: 1.0,
+                    },
+                );
+                return Ok(response);
+            }
+            Ok(answers_of(&[
+                ("call_ok", 0.0),
+                ("wrong:query", 0.0),
+                ("wrong:top_k", 0.0),
+            ]))
+        });
+        let healed = heal(
+            &asker,
+            &ctx(&s, true, &[]),
+            original.clone(),
+            None,
+            &HealParams::default(),
+        )
+        .await;
+        assert_eq!(healed.args, original);
+        assert_eq!(healed.requests, 1);
+        assert!(healed.changes.is_empty());
+        assert!(healed.hints.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_schema_string_limits_bound_both_provider_stages_and_intent() {
+        let mut s = schema();
+        s["properties"]["task_context"] = json!({"type": "string", "maxLength": 3});
+        let original =
+            json!({"query": "q", "search_mode": "fuzzy", "task_context": "é".repeat(10000)});
+        for read_only in [true, false] {
+            let asker = FnAsker(|req: &Request| {
+                assert_eq!(req.state["arguments"]["task_context"], "ééé");
+                assert_eq!(req.state["intent"], "ééé");
+                let mut response = answers_of(&[
+                    ("call_ok", 0.0),
+                    ("wrong:query", 0.0),
+                    ("wrong:task_context", 0.0),
+                    ("wrong:search_mode", 1.0),
+                ]);
+                response.answers.insert(
+                    "fix:search_mode".into(),
+                    Answer::Pick {
+                        choice: "keep_as_is".into(),
+                        probabilities: vec![],
+                        confidence: 1.0,
+                    },
+                );
+                Ok(response)
+            });
+            let healed = heal(
+                &asker,
+                &ctx(&s, read_only, &[]),
+                original.clone(),
+                original["task_context"].as_str(),
+                &HealParams::default(),
+            )
+            .await;
+            assert_eq!(healed.requests, 2);
+            assert_eq!(healed.args, original);
+        }
+    }
+
     #[test]
-    fn unknown_key_candidates_are_near_schema_names() {
+    fn test_float_bounds_and_string_integer_coercion_respect_schema() {
+        let s = json!({"properties": {
+            "ratio": {"type": "number", "minimum": 0.5, "maximum": 2.5},
+            "top_k": {"type": "integer", "minimum": 1, "maximum": 100}
+        }});
+        for (given, expected) in [(json!(0.1), json!(0.5)), (json!(9.5), json!(2.5))] {
+            let mut args = json!({"ratio": given, "top_k": "500"});
+            let (remaining, changes) = repair_in_code(
+                &s,
+                &mut args,
+                validate(&s, &json!({"ratio": given, "top_k": "500"})),
+            );
+            assert!(remaining.is_empty());
+            assert_eq!(args["ratio"], expected);
+            assert_eq!(args["top_k"], 100);
+            assert_eq!(changes.len(), 2);
+            assert!(validate(&s, &args).is_empty());
+        }
+    }
+
+    #[test]
+    fn test_array_item_types_are_checked_recursively() {
+        let s = json!({"properties": {
+            "symbols": {"type": "array", "items": {"type": "string"}},
+            "matrix": {"type": "array", "items": {"type": "array", "items": {"type": "integer"}}}
+        }});
+        let issues = validate(
+            &s,
+            &json!({"symbols": [123, "valid"], "matrix": [[1], ["bad"]]}),
+        );
+        assert_eq!(issues.len(), 2);
+        assert!(issues.iter().all(|i| i.kind == IssueKind::WrongType));
+        assert!(validate(&s, &json!({"symbols": ["valid"], "matrix": [[1], [2, 3]]})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stage2_missing_answer_rolls_back_prior_changes() {
+        let s = schema();
+        let original = json!({"query": "q", "top_k": 500, "search_mode": "fuzzy"});
+        let asker = FnAsker(|req: &Request| {
+            Ok(requested_answers(
+                req,
+                &[("call_ok", 0.0), ("wrong:search_mode", 1.0)],
+            ))
+        });
+        let healed = heal(
+            &asker,
+            &ctx(&s, true, &[]),
+            original.clone(),
+            None,
+            &HealParams::default(),
+        )
+        .await;
+        assert_eq!(healed.requests, 2);
+        assert_eq!(healed.args, original);
+        assert!(healed.changes.is_empty());
+        assert!(healed.hints.is_empty());
+    }
+
+    #[test]
+    fn test_unknown_key_candidates_are_near_schema_names() {
         let s = schema();
         let c = ctx(&s, true, &[]);
         let issue = Issue {

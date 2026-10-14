@@ -13,7 +13,8 @@
 //! - a start holds an flock on `<name>.lock` so the daemon and the CLI can
 //!   not double-spawn,
 //! - stop only ever signals pids recorded in our own pidfiles, after
-//!   re-verifying via `/proc/<pid>/cmdline` that the process is still ours
+//!   re-verifying the process arguments (Linux `/proc`, macOS `sysctl`)
+//!   that the process is still ours
 //!   (pid-reuse guard), and only ever its own process group.
 
 use crate::config::{ServiceConfig, resolve_leindex_home};
@@ -33,6 +34,8 @@ pub struct ServiceStatus {
     pub pid: Option<i32>,
     /// True when the configured host:port accepts TCP connections.
     pub port_open: bool,
+    /// True when HTTP `GET /health` reports readiness, not merely TCP accept.
+    pub http_ready: bool,
     /// Derived base URL (`http://host:port`).
     pub endpoint: String,
     /// Configured model file, if any.
@@ -99,6 +102,9 @@ pub enum ServiceError {
     /// Another process is starting the same service.
     #[error("another start of '{0}' is already in progress")]
     Concurrent(String),
+    /// Process identity and signal delivery are unsupported on this target.
+    #[error("managed service lifecycle is supported only on Linux and macOS")]
+    UnsupportedPlatform,
 }
 
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -117,6 +123,7 @@ fn pid_path(name: &str) -> Result<PathBuf, ServiceError> {
     Ok(run_dir()?.join(format!("{name}.pid")))
 }
 
+#[cfg(unix)]
 fn lock_path(name: &str) -> Result<PathBuf, ServiceError> {
     Ok(run_dir()?.join(format!("{name}.lock")))
 }
@@ -145,9 +152,11 @@ pub fn port_open(host: &str, port: u16) -> bool {
     TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).is_ok()
 }
 
-/// HTTP-level readiness: `GET /health` answers 503 while the model loads and
-/// 200 once the server is usable. This is the signal starts must wait for; a
-/// bare TCP accept would pass mid-load and hand the caller a 503.
+/// HTTP-level readiness: managed services must implement the llama-server
+/// contract (`GET /health` answers 503 while loading and 200 when usable).
+/// A 404, redirect, or an unrelated HTTP listener is not proof of readiness.
+/// This is the signal starts must wait for; a bare TCP accept would pass
+/// mid-load and hand the caller a 503.
 pub fn http_ready(host: &str, port: u16) -> bool {
     use std::io::Write;
     let Some(addr) = first_addr(host, port) else {
@@ -162,13 +171,32 @@ pub fn http_ready(host: &str, port: u16) -> bool {
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
     }
-    let mut buf = [0u8; 256];
-    let n = stream.read(&mut buf).unwrap_or(0);
-    if n == 0 {
-        return false;
+    // TCP reads need not contain the complete status line. Bound both the
+    // line length and total read time so a slow drip cannot hold startup.
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    let mut line = Vec::new();
+    while line.len() < 256 {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
+            return false;
+        }
+        let mut byte = [0];
+        if stream.read_exact(&mut byte).is_err() {
+            return false;
+        }
+        if byte[0] == b'\n' {
+            let Ok(head) = std::str::from_utf8(&line) else {
+                return false;
+            };
+            let mut parts = head.split_whitespace();
+            return matches!(parts.next(), Some("HTTP/1.1" | "HTTP/1.0"))
+                && parts.next() == Some("200");
+        }
+        line.push(byte[0]);
     }
-    let head = String::from_utf8_lossy(&buf[..n]);
-    head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+    false
 }
 
 fn service_port_open(cfg: &ServiceConfig) -> bool {
@@ -208,14 +236,19 @@ fn proc_exists(pid: i32) -> bool {
 /// still proves the pid exists).
 #[cfg(all(unix, not(target_os = "linux")))]
 fn proc_exists(pid: i32) -> bool {
+    // Reap our exited child before signal 0: zombies still answer that probe.
+    // ECHILD for an unrelated process is harmless; fall back to signal 0.
+    if unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } == pid {
+        return false;
+    }
     if unsafe { libc::kill(pid, 0) } == 0 {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Windows has no signal probe and no managed-service writer path today;
-/// report unknown so `stop` treats the pidfile as stale and `start` runs.
+/// Unsupported targets never spawn or signal managed services. Status
+/// cannot prove liveness there and preserves any existing pidfile.
 #[cfg(not(unix))]
 fn proc_exists(_pid: i32) -> bool {
     false
@@ -232,6 +265,7 @@ fn stat_is_zombie(stat: &str) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn read_cmdline_args(pid: i32) -> Option<Vec<String>> {
     let mut bytes = Vec::new();
     File::open(format!("/proc/{pid}/cmdline"))
@@ -246,6 +280,75 @@ fn read_cmdline_args(pid: i32) -> Option<Vec<String>> {
     Some(args)
 }
 
+/// Native macOS argument lookup: `/proc` is not available on that target.
+#[cfg(target_os = "macos")]
+fn read_cmdline_args(pid: i32) -> Option<Vec<String>> {
+    let mut argmax = 0i32;
+    let mut size = std::mem::size_of_val(&argmax);
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    // SAFETY: sysctl receives valid buffers and their exact byte lengths.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            (&mut argmax as *mut i32).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || argmax <= 0
+    {
+        return None;
+    }
+    let mut bytes = vec![0u8; argmax as usize];
+    size = bytes.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: sysctl writes at most `size` bytes to the allocated buffer.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    bytes.truncate(size);
+    parse_macos_procargs(&bytes)
+}
+
+/// KERN_PROCARGS2 is argc, executable path, NUL padding, argc NUL-terminated
+/// arguments, then environment entries. Never count environment as argv.
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_procargs(bytes: &[u8]) -> Option<Vec<String>> {
+    let argc = i32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?);
+    if argc <= 0 || argc as usize > bytes.len() {
+        return None;
+    }
+    let mut rest = bytes.get(4..)?;
+    rest = rest.get(rest.iter().position(|b| *b == 0)? + 1..)?;
+    while rest.first() == Some(&0) {
+        rest = &rest[1..];
+    }
+    let mut args = Vec::new();
+    for _ in 0..argc {
+        let end = rest.iter().position(|b| *b == 0)?;
+        args.push(std::str::from_utf8(&rest[..end]).ok()?.to_string());
+        rest = &rest[end + 1..];
+    }
+    Some(args)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_cmdline_args(_pid: i32) -> Option<Vec<String>> {
+    None
+}
+
 fn basename(path: &str) -> &str {
     let trimmed = path.trim_end_matches('/');
     match trimmed.rsplit_once('/') {
@@ -256,30 +359,42 @@ fn basename(path: &str) -> &str {
 
 /// Pid-reuse guard: the process must still exist AND its cmdline must match
 /// the configured service before we treat it as ours — argv[0] equal (exact
-/// path or basename), or the exact path present as an argument (shebang
-/// scripts run with the interpreter as argv[0] and the script as argv[1]).
+/// path, or basename for a PATH-resolved binary), or the exact path as
+/// argv[1] (shebang scripts run with an interpreter as argv[0]).
 /// Binary shape alone is not enough: a stale pidfile reused by an unrelated
 /// `llama-server` (different model/host/port) must not be signaled, so the
 /// distinctive arguments `build_command` always passes must be present too.
 fn pid_is_ours(pid: i32, cfg: &ServiceConfig) -> bool {
+    if !proc_exists(pid) {
+        return false;
+    }
     let Some(args) = read_cmdline_args(pid) else {
         return false;
     };
+    command_matches(&args, cfg)
+}
+
+fn command_matches(args: &[String], cfg: &ServiceConfig) -> bool {
     let Some(argv0) = args.first() else {
         return false;
     };
     let binary = &cfg.binary;
-    let binary_matches =
-        argv0 == binary || basename(argv0) == basename(binary) || args.iter().any(|a| a == binary);
+    let binary_matches = argv0 == binary
+        || (!binary.contains('/') && basename(argv0) == binary)
+        || args.get(1) == Some(binary);
     if !binary_matches {
         return false;
     }
+    let has_option = |flag: &str, value: &str| {
+        args.windows(2)
+            .any(|pair| pair[0] == flag && pair[1] == value)
+    };
     if let Some(model) = &cfg.model {
-        if !args.iter().any(|a| a == model) {
+        if !has_option("-m", model) {
             return false;
         }
     }
-    args.iter().any(|a| a == &cfg.host) && args.iter().any(|a| a == &cfg.port.to_string())
+    has_option("--host", &cfg.host) && has_option("--port", &cfg.port.to_string())
 }
 
 fn read_pidfile(name: &str) -> Result<Option<i32>, ServiceError> {
@@ -306,10 +421,14 @@ fn remove_pidfile(name: &str) {
     let _ = std::fs::remove_file(pid_path(name).unwrap_or_else(|_| PathBuf::from("/dev/null")));
 }
 
-/// Drop a pidfile whose pid is gone or no longer ours.
-fn clean_stale_pidfile(name: &str, cfg: &ServiceConfig) -> Result<bool, ServiceError> {
+/// Drop only a provably dead pidfile. Failed identity reads (permissions,
+/// unsupported platforms) must never erase tracking for a live service.
+fn clean_stale_pidfile(name: &str, _cfg: &ServiceConfig) -> Result<bool, ServiceError> {
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return Ok(false);
+    }
     if let Some(pid) = read_pidfile(name)? {
-        if !pid_is_ours(pid, cfg) {
+        if !proc_exists(pid) {
             remove_pidfile(name);
             return Ok(true);
         }
@@ -470,6 +589,14 @@ fn wait_exit(pid: i32, grace: Duration) -> bool {
 
 // ── Public lifecycle ─────────────────────────────────────────────────────
 
+fn require_managed_platform() -> Result<(), ServiceError> {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        Ok(())
+    } else {
+        Err(ServiceError::UnsupportedPlatform)
+    }
+}
+
 /// Ensure the service is running, spawning it if `auto_start` allows and the
 /// port is down. Returns `true` when this call spawned it. Never spawns a
 /// service whose section lacks `auto_start` or `model`.
@@ -477,6 +604,7 @@ pub fn ensure_running(name: &str, cfg: &ServiceConfig) -> Result<bool, ServiceEr
     if !cfg.auto_start || cfg.model.is_none() {
         return Ok(false);
     }
+    require_managed_platform()?;
     if service_http_ready(cfg) {
         return Ok(false);
     }
@@ -503,6 +631,7 @@ pub fn ensure_running(name: &str, cfg: &ServiceConfig) -> Result<bool, ServiceEr
 /// Explicit start (the `leindex services start` path; ignores `auto_start`,
 /// still requires `model`). Returns `true` when this call spawned it.
 pub fn start(name: &str, cfg: &ServiceConfig) -> Result<bool, ServiceError> {
+    require_managed_platform()?;
     if service_http_ready(cfg) {
         return Ok(false);
     }
@@ -559,9 +688,10 @@ fn cleanup_failed_start(pid: i32) {
 fn cleanup_failed_start(_pid: i32) {}
 
 /// Stop the service. Only ever signals pids from our own pidfiles, only
-/// after the `/proc/<pid>/cmdline` pid-reuse check, and only the child's own
+/// after the native process-argument pid-reuse check, and only the child's own
 /// process group. Unmanaged listeners are never touched.
 pub fn stop(name: &str, cfg: &ServiceConfig) -> Result<StopOutcome, ServiceError> {
+    require_managed_platform()?;
     let Some(pid) = read_pidfile(name)? else {
         return Ok(StopOutcome::AlreadyDown);
     };
@@ -582,8 +712,8 @@ pub fn stop(name: &str, cfg: &ServiceConfig) -> Result<StopOutcome, ServiceError
     Ok(StopOutcome::Stopped(pid))
 }
 
-// `stop` is unix-only end to end (signal delivery); on Windows the module's
-// public surface is read-only status/health, which never reaches here.
+// On unsupported targets lifecycle entry points fail before spawning,
+// signaling, or altering a pidfile; status/health remain available.
 
 /// Current status: live verified pid, port health, endpoint, model info.
 pub fn status(name: &str, cfg: &ServiceConfig) -> Result<ServiceStatus, ServiceError> {
@@ -593,6 +723,7 @@ pub fn status(name: &str, cfg: &ServiceConfig) -> Result<ServiceStatus, ServiceE
         name: name.to_string(),
         pid,
         port_open: service_port_open(cfg),
+        http_ready: service_http_ready(cfg),
         endpoint: cfg.base_url(),
         model: cfg.model.clone(),
         served_model: cfg.served_name(),
@@ -642,6 +773,7 @@ mod test {
     /// A fake llama-server: ignores all argv, sleeps in the foreground (no
     /// exec, so argv[0] stays the script path and the group kill has a child
     /// to catch).
+    #[cfg(unix)]
     fn fake_server(home: &std::path::Path, port: u16) -> ServiceConfig {
         let script = home.join("fake-server.sh");
         std::fs::write(&script, "#!/bin/sh\nsleep 300\n").unwrap();
@@ -673,6 +805,170 @@ mod test {
     }
 
     #[test]
+    fn test_parse_macos_procargs_preserves_spaces_and_excludes_environment() {
+        let mut bytes = 4i32.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(
+            b"/usr/bin/server\0\0\0server\0-m\0/models/my model.gguf\0\0PORT=9000\0",
+        );
+        assert_eq!(
+            parse_macos_procargs(&bytes).unwrap(),
+            ["server", "-m", "/models/my model.gguf", ""]
+        );
+        bytes[..4].copy_from_slice(&(-1i32).to_ne_bytes());
+        assert!(parse_macos_procargs(&bytes).is_none());
+        assert!(parse_macos_procargs(b"bad").is_none());
+    }
+
+    #[test]
+    fn test_command_matches_requires_binary_and_flag_values() {
+        let mut cfg = sh_service(9000);
+        cfg.binary = "/managed/llama-server".to_string();
+        cfg.model = Some("/models/model.gguf".to_string());
+        let args: Vec<String> = [
+            "/managed/llama-server",
+            "-m",
+            "/models/model.gguf",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "9000",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert!(command_matches(&args, &cfg));
+        let mut foreign = args.clone();
+        foreign[0] = "/other/llama-server".to_string();
+        assert!(!command_matches(&foreign, &cfg));
+        foreign = args.clone();
+        foreign[3] = "--alias".to_string();
+        assert!(
+            !command_matches(&foreign, &cfg),
+            "host must be a host argument"
+        );
+        foreign = args.clone();
+        foreign[6] = "9001".to_string();
+        assert!(!command_matches(&foreign, &cfg));
+        foreign = args.clone();
+        foreign[2] = "/models/other.gguf".to_string();
+        assert!(!command_matches(&foreign, &cfg));
+        cfg.binary = "llama-server".to_string();
+        assert!(command_matches(&args, &cfg));
+    }
+
+    #[test]
+    fn test_status_distinguishes_tcp_from_http_readiness() {
+        use std::io::Write;
+        let _home = HomeGuard::new();
+        for code in [200, 503, 404, 2000] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                // status first probes TCP, then sends the HTTP health request.
+                drop(listener.accept().unwrap());
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 128];
+                let _ = stream.read(&mut request);
+                write!(stream, "HTTP/1.1 {code} Test\r\n\r\n").unwrap();
+            });
+            let st = status("http-status", &sh_service(port)).unwrap();
+            server.join().unwrap();
+            assert!(st.port_open);
+            assert_eq!(st.http_ready, code == 200);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_status_preserves_live_unverified_pidfile() {
+        let _home = HomeGuard::new();
+        let pid = std::process::id() as i32;
+        write_pidfile("unverified", pid).unwrap();
+        let st = status("unverified", &sh_service(9)).unwrap();
+        assert_eq!(st.pid, None);
+        assert_eq!(read_pidfile("unverified").unwrap(), Some(pid));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn test_unsupported_lifecycle_preserves_pidfile() {
+        let _home = HomeGuard::new();
+        let mut cfg = sh_service(9);
+        cfg.auto_start = true;
+        cfg.model = Some("model.gguf".to_string());
+        write_pidfile("unsupported", 123).unwrap();
+        assert!(matches!(
+            start("unsupported", &cfg),
+            Err(ServiceError::UnsupportedPlatform)
+        ));
+        assert!(matches!(
+            ensure_running("unsupported", &cfg),
+            Err(ServiceError::UnsupportedPlatform)
+        ));
+        assert!(matches!(
+            stop("unsupported", &cfg),
+            Err(ServiceError::UnsupportedPlatform)
+        ));
+        assert_eq!(read_pidfile("unsupported").unwrap(), Some(123));
+    }
+
+    #[test]
+    fn test_http_ready_accepts_fragmented_status_line() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 128];
+            let _ = stream.read(&mut request);
+            stream.write_all(b"HTTP/1.").unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            let _ = stream.write_all(b"1 200 OK\r\n\r\n");
+        });
+        let ready = http_ready("127.0.0.1", port);
+        server.join().unwrap();
+        assert!(ready, "a fragmented HTTP 200 status must be ready");
+    }
+
+    #[test]
+    fn test_http_ready_bounds_slow_status_line() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 128];
+            let _ = stream.read(&mut request);
+            for byte in b"HTTP/1.1 200 OK\r\n" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(80));
+            }
+        });
+        let began = Instant::now();
+        let ready = http_ready("127.0.0.1", port);
+        let elapsed = began.elapsed();
+        server.join().unwrap();
+        assert!(!ready);
+        assert!(elapsed < Duration::from_secs(1), "probe took {elapsed:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_wait_exit_reports_live_process_after_grace() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 300"])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let exited = wait_exit(pid, Duration::ZERO);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!exited, "a live process must not count as exited");
+    }
+
+    #[test]
     fn test_ensure_running_skips_when_port_answers() {
         let _home = HomeGuard::new();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -695,6 +991,7 @@ mod test {
         assert!(!ensure_running("x", &cfg).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_spawn_pidfile_stop_lifecycle() {
         let home = HomeGuard::new();
@@ -729,6 +1026,7 @@ mod test {
         assert_eq!(read_pidfile("life").unwrap(), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_stop_refuses_foreign_pid() {
         let _home = HomeGuard::new();
@@ -747,6 +1045,7 @@ mod test {
         assert!(proc_exists(std::process::id() as i32));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_stale_pidfile_cleaned_by_status() {
         let _home = HomeGuard::new();
@@ -767,6 +1066,7 @@ mod test {
         assert_eq!(read_pidfile("stale").unwrap(), None, "pidfile must be gone");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_start_times_out_and_cleans_up() {
         let home = HomeGuard::new();

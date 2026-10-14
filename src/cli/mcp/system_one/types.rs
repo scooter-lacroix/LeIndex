@@ -105,7 +105,8 @@ impl Provider {
         }
     }
 
-    /// True when evidence leaves the machine (paths must be scrubbed).
+    /// True for hosted providers that require an API key. This is not a
+    /// privacy boundary: any provider's configured endpoint may be remote.
     pub fn is_remote(self) -> bool {
         !matches!(self, Self::Laya)
     }

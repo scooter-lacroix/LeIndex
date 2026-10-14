@@ -1611,6 +1611,19 @@ async fn cmd_setup_impl(
         );
     }
 
+    // The gate wizard is independent of embedding provisioning. In particular,
+    // do not imply --neural and download/reset the user's embedding route.
+    if options.system_one && !neural && !no_neural && !cpu && gpu.is_none() && !remote_gemma {
+        let mut embedding_options = options.clone();
+        embedding_options.system_one = false;
+        if !embedding_options.has_flags() {
+            if warmup {
+                anyhow::bail!("--warmup requires an embedding setup option");
+            }
+            return setup::configure_system_one_only().map_err(Into::into);
+        }
+    }
+
     let choices = build_setup_choices(neural, no_neural, cpu, gpu, remote_gemma, options)?;
     let result = setup::execute_setup(&choices).map_err(|e| anyhow::anyhow!("{}", e))?;
     finish_setup(&choices, &result, warmup)
@@ -1842,10 +1855,10 @@ fn check_neutral_conflicts(
     Ok(())
 }
 
-/// Row state for the services table: "up" once the port answers, "starting"
-/// while a live pid has not bound the port yet, else "down".
+/// Only successful HTTP readiness is "up"; TCP alone may be another process
+/// or a model server that is still loading.
 fn service_row_state(st: &crate::services::ServiceStatus) -> &'static str {
-    match (st.port_open, st.pid.is_some()) {
+    match (st.http_ready, st.pid.is_some()) {
         (true, _) => "up",
         (false, true) => "starting",
         (false, false) => "down",
@@ -1897,8 +1910,8 @@ fn print_service_detail(name: &str, st: &crate::services::ServiceStatus) {
     println!(
         "state:       {}",
         match service_row_state(st) {
-            "up" => "up (endpoint answering)",
-            "starting" => "starting (process live, endpoint not answering)",
+            "up" => "up (HTTP health ready)",
+            "starting" => "starting (process live, HTTP health not ready)",
             _ => "down",
         }
     );

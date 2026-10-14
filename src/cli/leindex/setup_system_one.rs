@@ -146,8 +146,8 @@ fn threshold_issues(section: &SystemOneConfig) -> Vec<String> {
     if section.timeout_ms == 0 {
         issues.push("timeout_ms must be at least 1".to_string());
     }
-    if section.top_n == 0 {
-        issues.push("top_n must be at least 1".to_string());
+    if section.top_n < 2 {
+        issues.push("top_n must be at least 2".to_string());
     }
     for (label, value) in [
         ("relevant_min", section.relevant_min),
@@ -316,21 +316,25 @@ fn prompt_runtime_args(service: &ServiceConfig) -> Result<(String, String), Setu
     Ok((gpu_layers, context))
 }
 
+fn validate_listen_host(value: &str) -> Result<(), &'static str> {
+    let host = value.trim();
+    if host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    {
+        Ok(())
+    } else {
+        Err("managed services require a loopback host such as 127.0.0.1 or ::1")
+    }
+}
+
 /// CCN-gate extraction from `configure_managed`: listen host and port prompts.
 fn prompt_listen(service: &ServiceConfig) -> Result<(String, u16), SetupError> {
     let host = Input::<String>::new()
         .with_prompt("Listen host")
         .default(service.host.clone())
-        .validate_with(|v: &String| -> Result<(), &str> {
-            let h = v.trim();
-            if h.is_empty() {
-                Err("host must not be empty")
-            } else if h == "0.0.0.0" || h == "::" {
-                Err("binding all interfaces is refused; use a specific host such as 127.0.0.1")
-            } else {
-                Ok(())
-            }
-        })
+        .validate_with(|v: &String| -> Result<(), &str> { validate_listen_host(v) })
         .interact_text()
         .map_err(prompt_error)?;
     let mut port_prompt = Input::<u16>::new()
@@ -537,10 +541,10 @@ fn configure_thresholds(section: &mut SystemOneConfig) -> Result<(), SetupError>
         .with_prompt("Post-gate: results judged per call")
         .default(section.top_n)
         .validate_with(|v: &usize| -> Result<(), &str> {
-            if *v >= 1 {
+            if *v >= 2 {
                 Ok(())
             } else {
-                Err("must be at least 1")
+                Err("must be at least 2")
             }
         })
         .interact_text()

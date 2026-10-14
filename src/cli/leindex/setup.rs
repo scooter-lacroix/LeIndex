@@ -634,6 +634,27 @@ fn wire_gemma_preset(config: &mut crate::config::LeIndexConfig, gguf: &Path) {
     }
 }
 
+/// Configure only the decision gate, preserving the embedding/runtime config.
+/// This path must not install ORT or provision an unrelated embedding model.
+pub fn configure_system_one_only() -> Result<(), SetupError> {
+    if !is_interactive() {
+        return Err(SetupError::Interactive(
+            "System One wizard requires a terminal; use leindex config set for scripted configuration".into(),
+        ));
+    }
+    let mut config =
+        crate::config::LeIndexConfig::load().map_err(|e| SetupError::ConfigRead(e.to_string()))?;
+    setup_system_one::configure_interactive(&mut config)?;
+    config
+        .save()
+        .map_err(|e| SetupError::ConfigWrite(e.to_string()))?;
+    setup_system_one::print_status(&config);
+    if !matches!(config.system_one.effective().mode.as_str(), "" | "off") {
+        setup_system_one::smoke_test(&config)?;
+    }
+    Ok(())
+}
+
 /// Execute setup with the resolved choices.
 ///
 /// Writes config, installs ORT (if neural), checks models.
