@@ -164,6 +164,7 @@ fn copy_fixture_contents(source: &Path, destination: &Path) -> Result<()> {
 /// Worker-active phases (VAL-CPHASE-036) are appended after the original
 /// 6 phases. They exercise the worker spawn/embed/teardown lifecycle.
 pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
+    require_linux_measurement_support(cfg!(target_os = "linux"))?;
     let mut reports = Vec::with_capacity(CANONICAL_PHASES.len());
 
     // Clean any pre-existing index state so the run is deterministic.
@@ -744,6 +745,21 @@ fn run_command_phase(
     phase_name: &str,
     build_cmd: impl Fn(&PathBuf, &PathBuf) -> Command,
 ) -> Result<PhaseReport> {
+    run_command_phase_with_peak_support(
+        config,
+        phase_name,
+        build_cmd,
+        cfg!(target_os = "linux"),
+    )
+}
+
+fn run_command_phase_with_peak_support(
+    config: &WorkloadConfig,
+    phase_name: &str,
+    build_cmd: impl Fn(&PathBuf, &PathBuf) -> Command,
+    linux_supported: bool,
+) -> Result<PhaseReport> {
+    require_linux_measurement_support(linux_supported)?;
     if config.verbose {
         eprintln!("memcheck: phase '{}' starting (command)", phase_name);
     }
@@ -918,13 +934,21 @@ fn wait_command_with_peak(child: &mut Child) -> Result<(std::process::ExitStatus
     }
 }
 
+/// Linux-only command workload support is required to certify lifetime peaks.
+fn require_linux_measurement_support(linux_supported: bool) -> Result<()> {
+    anyhow::ensure!(
+        linux_supported,
+        "memcheck workload execution requires Linux: /proc sampling and wait4 lifetime peak RSS are unavailable on this platform"
+    );
+    Ok(())
+}
+
 /// The harness's /proc sampler and kernel lifetime peak are Linux-only.
-/// On other platforms this fallback only reaps the child; zero means the
-/// kernel peak is unavailable, not that the command used no memory. Command
-/// reports retain their sampled maximum, which cannot prove a lifetime peak.
 #[cfg(not(target_os = "linux"))]
-fn wait_command_with_peak(child: &mut Child) -> Result<(std::process::ExitStatus, u64)> {
-    Ok((child.wait()?, 0))
+fn wait_command_with_peak(_child: &mut Child) -> Result<(std::process::ExitStatus, u64)> {
+    anyhow::bail!(
+        "memcheck workload execution requires Linux: /proc sampling and wait4 lifetime peak RSS are unavailable on this platform"
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1730,6 +1754,31 @@ mod tests {
         assert_eq!(report.anon_kib, 0);
         assert_eq!(report.worker_rss_max_kib, 0);
         assert_eq!(report.combined_rss_max_kib, 0);
+    }
+
+    #[test]
+    fn test_non_linux_command_phase_fails_before_launch_or_measurement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let config = WorkloadConfig {
+            binary: PathBuf::from("missing-binary-must-not-be-launched"),
+            fixture: fixture.path().to_path_buf(),
+            sample_interval: Duration::from_millis(10),
+            verbose: false,
+            worker_capable: false,
+            heap_profile_dir: None,
+        };
+        let error = run_command_phase_with_peak_support(
+            &config,
+            "unsupported_platform",
+            |_, _| panic!("unsupported command phase must fail before building its command"),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("requires Linux"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[cfg(target_os = "linux")]
