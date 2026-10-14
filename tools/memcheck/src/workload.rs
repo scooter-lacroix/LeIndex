@@ -785,7 +785,8 @@ fn run_command_phase(
     });
 
     let start = Instant::now();
-    let _sample_interval = config.sample_interval;
+    // Respect the configured cadence, capped at 10ms for short commands.
+    let sample_interval = config.sample_interval.min(Duration::from_millis(10));
 
     // §14 item 9: Capture heap-profile snapshot (smaps) before the phase.
     if let Some(ref profile_dir) = config.heap_profile_dir {
@@ -801,7 +802,7 @@ fn run_command_phase(
         // Use a tighter inner loop for command phases: sample as fast as
         // possible (every 10ms) so we capture peak RSS even for short-lived
         // commands.  The outer `done` flag is checked between samples.
-        let fast_interval = Duration::from_millis(10);
+        let fast_interval = sample_interval;
         while !done_clone.load(Ordering::Relaxed) {
             if let Ok(s) = sampler::sample(pid, false) {
                 samples.push(s);
@@ -812,14 +813,16 @@ fn run_command_phase(
     });
 
     // Wait for the command to finish.
-    let status = child
-        .wait()
-        .with_context(|| format!("{} command did not complete", phase_name))?;
+    let waited = wait_command_with_peak(&mut child);
     done.store(true, Ordering::Relaxed);
 
     let mut samples = sampler_handle
         .join()
         .map_err(|_| anyhow::anyhow!("sampler thread panicked"))?;
+
+    let (status, lifetime_peak_kib) = waited
+        .with_context(|| format!("{} command did not complete", phase_name))?;
+    let duration = start.elapsed();
 
     // Join drain threads so they don't outlive the phase.
     let _ = stdout_handle.join();
@@ -839,8 +842,6 @@ fn run_command_phase(
     }
     cleanup_command_phase_workers(&worker_pids);
 
-    let duration = start.elapsed();
-
     if !status.success() {
         anyhow::bail!(
             "{} command exited with {:?} — aborting memcheck",
@@ -859,6 +860,11 @@ fn run_command_phase(
     let descendants = sampler::count_descendants(pid).unwrap_or_default();
 
     let mut report = build_phase_report(phase_name, &mut samples, duration);
+    // /proc ticks can miss an entire short command or an allocation between
+    // ticks. wait4 retains the lifetime high-water mark after process exit.
+    // Keep percentiles/breakdowns and sample_count tied to actual /proc reads.
+    report.rss_max_kib = report.rss_max_kib.max(lifetime_peak_kib);
+    report.combined_rss_max_kib = report.combined_rss_max_kib.max(lifetime_peak_kib);
     report.descendants = descendants;
 
     if config.verbose {
@@ -869,6 +875,39 @@ fn run_command_phase(
     }
 
     Ok(report)
+}
+
+/// Reap only the measured child and retain its kernel lifetime peak RSS.
+/// Linux wait4 reports KiB; unlike RUSAGE_CHILDREN it is scoped to this PID,
+/// not unrelated children previously reaped by the harness. Linux includes
+/// reaped descendants in this peak, so command phases conservatively account
+/// for their subprocesses too (periodic worker accounting is unchanged).
+#[cfg(target_os = "linux")]
+fn wait_command_with_peak(child: &mut Child) -> Result<(std::process::ExitStatus, u64)> {
+    use std::os::unix::process::ExitStatusExt;
+    let mut status = 0;
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    loop {
+        // SAFETY: status and usage are valid writable pointers. wait4 is
+        // restricted to our owned child, and usage is read only on success.
+        let result = unsafe {
+            libc::wait4(child.id() as libc::pid_t, &mut status, 0, usage.as_mut_ptr())
+        };
+        if result >= 0 {
+            // SAFETY: successful wait4 initialized the rusage structure.
+            let usage = unsafe { usage.assume_init() };
+            return Ok((std::process::ExitStatus::from_raw(status), usage.ru_maxrss.max(0) as u64));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error.into());
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wait_command_with_peak(child: &mut Child) -> Result<(std::process::ExitStatus, u64)> {
+    Ok((child.wait()?, 0))
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -1658,6 +1697,44 @@ mod tests {
         assert_eq!(report.anon_kib, 0);
         assert_eq!(report.worker_rss_max_kib, 0);
         assert_eq!(report.combined_rss_max_kib, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_command_peak_child() {
+        if std::env::var_os("MEMCHECK_PEAK_CHILD").is_some() {
+            // Leave time for the startup sample, then touch and immediately
+            // free an allocation between periodic ticks.
+            std::thread::sleep(Duration::from_millis(100));
+            let mut allocation = vec![0u8; 64 * 1024 * 1024];
+            for byte in allocation.iter_mut().step_by(4096) {
+                *byte = 1;
+            }
+            std::hint::black_box(&allocation);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_command_peak_captures_between_tick_allocation() {
+        let fixture = tempfile::tempdir().unwrap();
+        let config = WorkloadConfig {
+            binary: std::env::current_exe().unwrap(),
+            fixture: fixture.path().to_path_buf(),
+            sample_interval: Duration::from_millis(500),
+            verbose: false,
+            worker_capable: false,
+            heap_profile_dir: None,
+        };
+        let report = run_command_phase(&config, "between_ticks", |bin, _| {
+            let mut command = Command::new(bin);
+            command.args(["--exact", "workload::tests::test_command_peak_child"])
+                .env("MEMCHECK_PEAK_CHILD", "1");
+            command
+        }).unwrap();
+        assert!(report.rss_max_kib >= 64 * 1024,
+            "lifetime peak must include the allocation, got {} KiB", report.rss_max_kib);
+        assert!(report.combined_rss_max_kib >= report.rss_max_kib);
     }
 
     #[test]
