@@ -349,6 +349,29 @@ export LEINDEX_MEMORY_TOTAL_BUDGET_MB=3072
 
 ### 3. Update MCP Configuration
 
+The optional System-One gate requires a source build with `--features system-one`.
+Set `LEINDEX_FEATURE_SYSTEM_ONE=1` in the MCP server's environment (the client's
+`env` object for stdio, or the HTTP server's environment), then add this to
+`$LEINDEX_HOME/config/leindex.toml` (default `~/.leindex/config/leindex.toml`):
+
+```toml
+[system_one]
+mode = "shadow" # observe decisions first; use "enforce" to apply them
+provider = "openai"
+base_url = "https://api.openai.com/v1"
+model = "gpt-4.1-mini"
+api_key_env = "SYSTEM_ONE_API_KEY" # environment variable NAME, never the key
+timeout_ms = 10000
+top_n = 5
+```
+
+Set `SYSTEM_ONE_API_KEY` through your server's secret environment, not in this
+file or a committed MCP config. For a local service, use `provider = "laya"`
+with its HTTP base URL and served model, and omit `api_key_env`. Keep
+`mode = "off"` (the default) to disable the gate; `leindex setup --system-one`
+opens the terminal wizard.
+
+
 Update MCP client configuration if needed:
 
 ```json

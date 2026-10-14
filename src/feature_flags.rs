@@ -26,6 +26,8 @@ use std::sync::{Mutex, OnceLock};
 pub enum FeatureFlag {
     /// Enable neural (ONNX) embedding search at runtime.
     NeuralSearch,
+    /// Enable the System-One typed-decision MCP gate (experimental).
+    SystemOne,
     /// Enable remote embedding API (OpenAI, etc.).
     RemoteEmbeddings,
     /// Enable cross-language symbol resolution.
@@ -180,6 +182,7 @@ impl FeatureFlag {
     pub fn env_var(&self) -> &'static str {
         match self {
             Self::NeuralSearch => "LEINDEX_FEATURE_NEURAL_SEARCH",
+            Self::SystemOne => "LEINDEX_FEATURE_SYSTEM_ONE",
             Self::RemoteEmbeddings => "LEINDEX_FEATURE_REMOTE_EMBEDDINGS",
             Self::CrossLanguageResolution => "LEINDEX_FEATURE_CROSS_LANGUAGE",
             Self::ExperimentalHnsw => "LEINDEX_FEATURE_EXPERIMENTAL_HNSW",
@@ -271,6 +274,7 @@ impl FeatureFlag {
     pub fn description(&self) -> &'static str {
         match self {
             Self::NeuralSearch => "Enable neural (ONNX) embedding search at runtime",
+            Self::SystemOne => "Enable the System-One typed-decision MCP gate (experimental)",
             Self::RemoteEmbeddings => "Enable remote embedding API (OpenAI, etc.)",
             Self::CrossLanguageResolution => "Enable cross-language symbol resolution",
             Self::ExperimentalHnsw => "Enable experimental HNSW algorithm parameters",
@@ -388,6 +392,7 @@ impl FlagStore {
         let mut values = HashMap::new();
         for flag in [
             FeatureFlag::NeuralSearch,
+            FeatureFlag::SystemOne,
             FeatureFlag::RemoteEmbeddings,
             FeatureFlag::CrossLanguageResolution,
             FeatureFlag::ExperimentalHnsw,
@@ -549,6 +554,7 @@ pub fn log_flag_state() {
 pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
     [
         FeatureFlag::NeuralSearch,
+        FeatureFlag::SystemOne,
         FeatureFlag::RemoteEmbeddings,
         FeatureFlag::CrossLanguageResolution,
         FeatureFlag::ExperimentalHnsw,
@@ -588,6 +594,25 @@ mod test {
         assert_eq!(
             FeatureFlag::GlobalAutoSync.env_var(),
             "LEINDEX_FEATURE_GLOBAL_AUTO_SYNC"
+        );
+    }
+
+    #[test]
+    fn test_system_one_is_registered_in_production_flag_store() {
+        assert_eq!(
+            FeatureFlag::SystemOne.env_var(),
+            "LEINDEX_FEATURE_SYSTEM_ONE"
+        );
+        assert!(!FeatureFlag::SystemOne.default_value());
+        assert!(
+            FlagStore::new()
+                .values
+                .contains_key(&FeatureFlag::SystemOne)
+        );
+        assert!(
+            all_flags()
+                .iter()
+                .any(|(flag, _)| *flag == FeatureFlag::SystemOne)
         );
     }
 

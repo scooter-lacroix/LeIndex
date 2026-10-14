@@ -80,6 +80,10 @@ pub mod skip_dirs;
 #[cfg(any(feature = "cli", feature = "onnx"))]
 pub mod config;
 
+/// Managed model-server service lifecycle (`[services.<name>]` sections).
+#[cfg(any(feature = "cli", feature = "onnx"))]
+pub mod services;
+
 /// ONNX worker protocol and implementation.
 ///
 /// Public for package worker binary and integration tests; not stable user API.

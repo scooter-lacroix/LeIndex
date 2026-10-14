@@ -7,6 +7,7 @@ pub(crate) mod indexing;
 pub(crate) mod model_download;
 mod query;
 pub(crate) mod setup;
+pub(crate) mod setup_config;
 mod types;
 
 #[cfg(test)]
@@ -111,6 +112,16 @@ pub struct LeIndex {
     /// instance — which may hold a hydrated core — instead of installing an
     /// un-hydrated temp over it.
     pub(crate) last_index_coalesced: bool,
+
+    /// Identity of the `index.lock` file this instance's writer flocked at
+    /// acquire time (empty until a write lock is taken). Before publishing a
+    /// generation, `promote_generation_snapshot` checks it via
+    /// `still_guards()` to detect the lock file being deleted/replaced
+    /// mid-run (which would allow a second concurrent writer and corrupt
+    /// the store) and refuses to publish. Mutex (not a plain field) because
+    /// the lock-acquire helpers take `&self`.
+    pub(crate) write_lock_identity:
+        std::sync::Mutex<Option<crate::storage::project_lock::LockIdentity>>,
 }
 
 // The write lock moved to `storage::project_lock` so the `phase` feature
@@ -296,12 +307,25 @@ impl LeIndex {
 
     /// Acquire the cross-process write lock for this project's storage.
     ///
-    /// Call at the top of any write entry point (`index_project_inner`,
-    /// `incremental_reindex_from_watcher`) and hold the returned guard for the
-    /// duration of the write (RAII releases on drop). Serializes concurrent
-    /// writers across processes to prevent SQLite WAL contention/corruption.
+    /// Bounded (`LEINDEX_WRITE_LOCK_TIMEOUT_MS`): instead of parking forever
+    /// behind a wedged holder — which, inside an uncancellable
+    /// `spawn_blocking` task, stalls every tool call — it fails fast with a
+    /// transient, retryable error naming the lock path. The captured lock
+    /// file identity is recorded so `promote_generation_snapshot` can detect
+    /// a deleted/replaced lock file mid-run (see `LockIdentity`).
     fn acquire_write_lock(&self) -> Result<ProjectWriteLock> {
-        ProjectWriteLock::acquire(self.storage_path())
+        let guard = ProjectWriteLock::acquire_bounded(self.storage_path())?;
+        self.record_write_lock_identity(&guard);
+        Ok(guard)
+    }
+
+    /// Record the identity of a freshly acquired write-lock guard for the
+    /// pre-publish `still_guards()` check. Best-effort: a poisoned mutex
+    /// skips the check (the store stays writable).
+    fn record_write_lock_identity(&self, guard: &ProjectWriteLock) {
+        if let Ok(mut slot) = self.write_lock_identity.lock() {
+            *slot = Some(guard.identity());
+        }
     }
 
     /// Non-blocking cross-process write lock: `Ok(Some(guard))` if free,
@@ -310,7 +334,11 @@ impl LeIndex {
     /// block indefinitely — a blocking flock here would stall the watcher,
     /// since spawn_blocking can't be cancelled; see watcher.rs).
     pub(crate) fn try_acquire_write_lock(&self) -> Result<Option<ProjectWriteLock>> {
-        ProjectWriteLock::try_acquire(self.storage_path())
+        let guard = ProjectWriteLock::try_acquire(self.storage_path())?;
+        if let Some(guard) = guard.as_ref() {
+            self.record_write_lock_identity(guard);
+        }
+        Ok(guard)
     }
 
     /// Acquire the cross-process write lock, coalescing with a concurrent
@@ -332,6 +360,12 @@ impl LeIndex {
         if force {
             return self.acquire_write_lock().map(Some);
         }
+        // Bounded wait: the poll used to spin forever behind a wedged holder
+        // (uncancellable inside `spawn_blocking`), parking every queued tool
+        // call with it. Same budget and transient sentinel as
+        // `acquire_bounded`.
+        let timeout_ms = crate::storage::project_lock::configured_timeout_ms();
+        let started = std::time::Instant::now();
         loop {
             match self.try_acquire_write_lock()? {
                 Some(guard) => {
@@ -346,9 +380,35 @@ impl LeIndex {
                     if !self.is_stale_fast() && self.no_incomplete_job() {
                         return Ok(None);
                     }
+                    // The lock file this guard flocked may have been deleted
+                    // and re-created while we polled (flock locks the inode,
+                    // not the path): a second writer may already be active on
+                    // the re-created file. Bail transient instead of risking
+                    // a two-writer store.
+                    if !guard.still_guards() {
+                        anyhow::bail!(
+                            "[transient:lock-contention] The project write lock file at {} \
+                             was deleted and re-created while waiting to acquire it; a second \
+                             writer may be active. Retry the index operation.",
+                            self.storage_path().join("index.lock").display()
+                        );
+                    }
+                    // recorded by try_acquire_write_lock above.
                     return Ok(Some(guard));
                 }
-                None => std::thread::sleep(std::time::Duration::from_millis(200)),
+                None => {
+                    if timeout_ms > 0 && started.elapsed().as_millis() as u64 >= timeout_ms {
+                        anyhow::bail!(
+                            "[transient:lock-contention] Timed out after {}ms waiting for the \
+                             cross-process write lock at {} (another leindex writer is active). \
+                             The index data is intact; retry shortly, or set \
+                             LEINDEX_WRITE_LOCK_TIMEOUT_MS to adjust the wait budget.",
+                            timeout_ms,
+                            self.storage_path().join("index.lock").display()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
             }
         }
     }
@@ -492,6 +552,7 @@ impl LeIndex {
             generation_snapshot: None,
             hydrated_generation: std::sync::atomic::AtomicU64::new(0),
             last_index_coalesced: false,
+            write_lock_identity: std::sync::Mutex::new(None),
         };
 
         // Restore persisted index stats (if any) so diagnostics can report
@@ -581,24 +642,24 @@ impl LeIndex {
                 .flatten()
                 .map(|root| root.root_hash)
                 .unwrap_or_default();
-        index_builder::search_cache_key_for(
-            &self.project_id,
-            &self.project_path,
-            &self.stats,
+        index_builder::search_cache_key_for(&index_builder::SearchCacheKeyInputs {
+            project_id: &self.project_id,
+            project_path: &self.project_path,
+            stats: &self.stats,
             query,
             top_k,
             query_type,
             neural_available,
-            &cfg.search.search_mode,
-            cfg.search.neural_weight,
-            cfg.search.rerank_enabled,
-            cfg.search.rerank_top_n,
-            cfg.search.fragment_index_enabled,
-            cfg.search.fragment_weight,
-            &fragment_root_hash,
-            &cfg.neural.model_name,
-            &rerank_model,
-        )
+            search_mode: &cfg.search.search_mode,
+            neural_weight: cfg.search.neural_weight,
+            rerank_enabled: cfg.search.rerank_enabled,
+            rerank_top_n: cfg.search.rerank_top_n,
+            rerank_model: &rerank_model,
+            fragment_index_enabled: cfg.search.fragment_index_enabled,
+            fragment_weight: cfg.search.fragment_weight,
+            fragment_root_hash: &fragment_root_hash,
+            embed_model: &cfg.neural.model_name,
+        })
     }
 
     fn analysis_cache_key_for(&self, query: &str, token_budget: usize) -> String {
@@ -896,7 +957,16 @@ impl LeIndex {
             ),
         }
         self.ensure_pdg_loaded()?;
-        if self.search_engine.is_empty() && self.active_has_indexed_files() {
+        // Rebuild the engine when either signal of indexed content is
+        // present. Keying only on `active_has_indexed_files()` misses
+        // metadata-only CAS generations (KB-scale index_stats.json +
+        // index-state.json, no heap-mirrored leindex.db): the PDG is hydrated
+        // from the generation layers, but the engine stays empty and every
+        // search reports "project not indexed" — the permanent lie this
+        // closes. `hydrate_search_engine_from_loaded_pdg` builds from the
+        // owned PDG and does not need the active db.
+        if self.search_engine.is_empty() && (self.pdg.is_some() || self.active_has_indexed_files())
+        {
             // The graph may already be resident (graph-only tool, prewarm):
             // hydrate just the engine on top of it rather than reloading both.
             self.hydrate_search_engine_from_loaded_pdg()?;
@@ -1052,16 +1122,46 @@ impl LeIndex {
     }
 
     /// Load IndexStats from an explicit storage directory.
+    ///
+    /// Falls back to the ACTIVE generation's `index_stats.json` copy when the
+    /// root copy is missing or reports zero indexed nodes: the root copy is
+    /// mutable-root state that `restore_latest_generation` (corruption
+    /// auto-repair) does not rewrite, so keying `is_indexed` on it alone made
+    /// a healthy generation look permanently unindexed after a repair.
     pub(crate) fn load_stats_from_path(&mut self, storage_path: &Path) -> Result<()> {
         let stats_path = storage_path.join("index_stats.json");
-        if !stats_path.exists() {
+        if stats_path.exists() {
+            let json = std::fs::read_to_string(&stats_path)
+                .with_context(|| format!("Failed to read index stats from {:?}", stats_path))?;
+            let stored: IndexStats =
+                serde_json::from_str(&json).context("Failed to deserialize IndexStats")?;
+            self.stats = stored;
+            let _ = self.stats.indexed_nodes;
             return Ok(());
         }
-        let json = std::fs::read_to_string(&stats_path)
-            .with_context(|| format!("Failed to read index stats from {:?}", stats_path))?;
-        let stored: IndexStats =
-            serde_json::from_str(&json).context("Failed to deserialize IndexStats")?;
-        self.stats = stored;
+        // Root copy missing or empty-handed: the committed generation is the
+        // authority (CURRENT swaps only after a complete publish).
+        if let Some(generation) =
+            crate::storage::generation::lease::read_current_generation(storage_path)
+        {
+            let gen_stats = storage_path
+                .join("generations")
+                .join(generation.to_string())
+                .join("index_stats.json");
+            if gen_stats.exists() {
+                let json = std::fs::read_to_string(&gen_stats)
+                    .with_context(|| format!("Failed to read index stats from {:?}", gen_stats))?;
+                let stored: IndexStats =
+                    serde_json::from_str(&json).context("Failed to deserialize IndexStats")?;
+                if stored.indexed_nodes > 0 {
+                    debug!(
+                        "Root index_stats.json absent/empty; restored {} indexed nodes from generation {generation}",
+                        stored.indexed_nodes
+                    );
+                    self.stats = stored;
+                }
+            }
+        }
         Ok(())
     }
 }

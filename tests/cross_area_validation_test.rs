@@ -331,8 +331,8 @@ mod setup_idempotency_and_preservation {
             "save() must create the config dir if missing (idempotent re-run after upgrade)"
         );
         assert!(
-            save_fn.contains("std::fs::write"),
-            "save() must atomically overwrite the file (no append path that duplicates keys)"
+            save_fn.contains(".persist("),
+            "save() must atomically overwrite via temp-file + persist (no append path that duplicates keys)"
         );
         assert!(
             !save_fn.contains("append"),
@@ -614,7 +614,9 @@ mod diagnostics_ort_info {
     /// either command sees identical fields.
     #[test]
     fn setup_check_reports_same_ort_info_shape() {
-        let setup = read_file("src/cli/leindex/setup.rs");
+        // The --check surface moved from setup.rs into setup_check.rs
+        // (Large-File gate extraction); the shape contract follows the code.
+        let setup = read_file("src/cli/leindex/setup_check.rs");
 
         for header in ["ORT dylib path:", "ORT version:", "Execution provider:"] {
             assert!(

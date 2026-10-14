@@ -92,6 +92,10 @@ minimal = ["parse", "search"]
 
 # Community detection over the PDG (Leiden)
 community = ["graph", "dep:leiden-rs"]
+# System-One typed-decision gate (experimental). Off by default; adds the
+# `reqwest` client for the Laya/Jev/OpenAI Decisions providers. The config
+# section is inert without this feature (mode = "off").
+system-one = ["mcp-server", "dep:reqwest"]
 # SCIP precision ingestion is optional at compile time; runtime discovery
 # silently falls back to the Tier-0 PDG when no language indexer is present.
 precision = ["graph", "storage", "dep:scip", "dep:protobuf", "dep:flate2"]
@@ -195,6 +199,8 @@ cli = [
     "dep:diffy",
     "dep:dialoguer",
     "dep:sha2",
+    "dep:tar",
+    "dep:flate2",
 ]
 
 # MCP server feature for CLI
@@ -271,7 +277,7 @@ turso = ["dep:rusqlite_migration"]
 #
 # VAL-CARGO-002/005: `cargo install leindex --features onnx` installs both the
 # main binary and the worker binary with real ONNX inference support.
-onnx = ["search", "dep:ort", "ort/half", "ort/cuda", "ort/migraphx", "ort/rocm", "ort/coreml", "dep:tokenizers", "dep:ndarray", "dep:half", "dep:which", "dep:toml", "dep:dirs"]
+onnx = ["search", "dep:ort", "ort/half", "ort/cuda", "ort/migraphx", "ort/rocm", "ort/coreml", "dep:tokenizers", "dep:ndarray", "dep:half", "dep:which", "dep:toml", "dep:dirs", "dep:tempfile"]
 
 # Legacy build-command alias; onnx now compiles every runtime-selectable EP.
 onnx-migraphx = ["onnx"]
@@ -373,6 +379,7 @@ leiden-rs = { version = "0.8", optional = true, features = ["petgraph"] }
 scip = { version = "0.9", optional = true }
 protobuf = { version = "=3.7.2", optional = true }
 flate2 = { version = "1.1", optional = true, default-features = true }
+tar = { version = "=0.4.45", optional = true, default-features = false }
 
 # Storage feature dependencies
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
@@ -615,7 +622,6 @@ members = [
 #     entry is needed for them.
 [workspace.lints.clippy]
 # ── Allowed — intentional codebase patterns (mirror in-source #[allow]) ──
-too_many_arguments = "allow"        # CLI handlers carry rich context; counted
 module_inception = "allow"          # Multiple crate roots intentionally mirror
 result_unit_err = "allow"           # Registry operations surface cover Err(())
 arc_with_non_send_sync = "allow"    # Tokio Mutex<Arc<...>> pattern

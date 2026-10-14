@@ -2,6 +2,23 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [Unreleased]
+
+### Setup: embedding routes, managed llama.cpp, config subcommands
+
+- `leindex setup` gains route selection: local Qwen3 ONNX (`--embedding
+  qwen3`), a managed EmbeddingGemma2 GGUF service on Linux (`--embedding
+  embeddinggemma2` with an explicit `--llama-server` path or a verified
+  official `--download-llama cpu|vulkan|cuda` runtime), and external
+  OpenAI-compatible servers (`--embedding remote`). `--embedding keep`
+  preserves the existing route across reruns.
+- Official llama.cpp downloads pin tag `b11574` and verify the archive
+  against SHA256 metadata from GitHub's HTTPS release API before extraction.
+- New `leindex config` subcommands (path/show/get/set/unset/validate) expose
+  the shared config file without rerunning setup.
+- `--check` runs a bounded, never-spawning readiness probe (embeddings route
+  and System One gate) instead of only reporting static configuration.
+
 ## [2.0.0] - 2026-09-30 - Four tools, native text search, millisecond cold starts
 
 Reconstruction and continuation of the tool layer after the local working tree

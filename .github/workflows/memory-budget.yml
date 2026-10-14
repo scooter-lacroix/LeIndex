@@ -61,7 +61,11 @@ jobs:
         run: cargo build --release --bin leindex
 
       - name: Run memcheck against canonical fixture
-        timeout-minutes: 10
+        # Serialized memcheck measures ~21m on 2-core ubuntu runners (index and
+        # reindex phases alone are ~4m each); a 10m step timeout killed the
+        # gate mid-contention_3c_2p on PR #95 (run 38460712629) — the same
+        # timeout-vs-runtime issue documented on PR #94. 30m leaves headroom.
+        timeout-minutes: 30
         run: cargo xtask memcheck
 
       - name: Upload memcheck report

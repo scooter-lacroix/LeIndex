@@ -1283,24 +1283,24 @@ fn cache_key_with_fragments(
     fragment_weight: f64,
     fragment_root_hash: &str,
 ) -> String {
-    search_cache_key_for(
-        "proj-a",
-        Path::new("/tmp/proj-a"),
-        &cache_key_stats(),
-        "auth token verify",
-        10,
-        None,
-        true,
-        "hybrid",
-        0.4,
-        true,
-        80,
-        fragment_enabled,
+    search_cache_key_for(&SearchCacheKeyInputs {
+        project_id: "proj-a",
+        project_path: Path::new("/tmp/proj-a"),
+        stats: &cache_key_stats(),
+        query: "auth token verify",
+        top_k: 10,
+        query_type: None,
+        neural_available: true,
+        search_mode: "hybrid",
+        neural_weight: 0.4,
+        rerank_enabled: true,
+        rerank_top_n: 80,
+        rerank_model: "qwen3-reranker-0.6b-seq-cls",
+        fragment_index_enabled: fragment_enabled,
         fragment_weight,
         fragment_root_hash,
-        "qwen3-embed-0.6b",
-        "qwen3-reranker-0.6b-seq-cls",
-    )
+        embed_model: "qwen3-embed-0.6b",
+    })
 }
 
 /// A `fragment_weight` change must produce a different key (config invalidation).
