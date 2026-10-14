@@ -1528,7 +1528,10 @@ mod tests {
         preset.api_key_env = Some("REMOTE_API_KEY".into());
         let effective = cfg.effective();
         assert_eq!(effective.model.as_deref(), Some("remote-model"));
-        assert_eq!(effective.base_url.as_deref(), Some("https://remote.example"));
+        assert_eq!(
+            effective.base_url.as_deref(),
+            Some("https://remote.example")
+        );
         assert_eq!(effective.service.as_deref(), Some("remote-service"));
         assert_eq!(effective.api_key_env.as_deref(), Some("REMOTE_API_KEY"));
     }

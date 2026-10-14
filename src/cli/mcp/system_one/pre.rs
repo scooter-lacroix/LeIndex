@@ -974,7 +974,11 @@ mod test {
         let s = schema();
         for read_only in [true, false] {
             let asker = FnAsker(|req: &Request| {
-                if req.questions.iter().any(|(name, _)| name == "fix:search_mode") {
+                if req
+                    .questions
+                    .iter()
+                    .any(|(name, _)| name == "fix:search_mode")
+                {
                     // Stage 0 repairs and Stage 1 fill (or hint for a mutating
                     // tool) have already happened before the provider fails.
                     if read_only {
