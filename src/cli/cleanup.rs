@@ -814,7 +814,7 @@ pub fn retention_gc_cli(
 
     // Serialise against any concurrent writer (indexer / publisher) for the
     // whole sweep.
-    let _write_guard = crate::cli::leindex::ProjectWriteLock::acquire(&storage_root)
+    let _write_guard = crate::cli::leindex::ProjectWriteLock::acquire_bounded(&storage_root)
         .map_err(|e| anyhow::anyhow!("failed to acquire project write lock: {e}"))?;
 
     let cas_dir = storage_root.join("cas");
@@ -1200,7 +1200,7 @@ mod tests {
     #[test]
     fn test_is_locked_detects_held_write_lock() {
         let dir = tempfile::tempdir().unwrap();
-        let guard = crate::cli::leindex::ProjectWriteLock::acquire(dir.path()).unwrap();
+        let guard = crate::cli::leindex::ProjectWriteLock::acquire_bounded(dir.path()).unwrap();
         assert!(is_locked(dir.path()));
         drop(guard);
         assert!(!is_locked(dir.path()));

@@ -392,6 +392,7 @@ impl FlagStore {
         let mut values = HashMap::new();
         for flag in [
             FeatureFlag::NeuralSearch,
+            FeatureFlag::SystemOne,
             FeatureFlag::RemoteEmbeddings,
             FeatureFlag::CrossLanguageResolution,
             FeatureFlag::ExperimentalHnsw,
@@ -553,6 +554,7 @@ pub fn log_flag_state() {
 pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
     [
         FeatureFlag::NeuralSearch,
+        FeatureFlag::SystemOne,
         FeatureFlag::RemoteEmbeddings,
         FeatureFlag::CrossLanguageResolution,
         FeatureFlag::ExperimentalHnsw,

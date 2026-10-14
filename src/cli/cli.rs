@@ -1881,7 +1881,9 @@ fn print_services_table(
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "-".into()),
             st_ref.map(|s| s.endpoint.as_str()).unwrap_or("-"),
-            st_ref.map(|s| s.auto_start).unwrap_or(false),
+            st_ref
+                .map(|s| if s.auto_start { "yes" } else { "no" })
+                .unwrap_or("-"),
             st_ref
                 .and_then(|s| s.served_model.clone())
                 .unwrap_or_else(|| "-".into())

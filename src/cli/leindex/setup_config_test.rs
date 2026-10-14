@@ -294,6 +294,68 @@ fn test_validate_rejects_zero_service_port() {
 }
 
 #[test]
+fn test_validate_rejects_system_one_top_n_below_two() {
+    for bad in [0, 1] {
+        let config = LeIndexConfig {
+            system_one: SystemOneConfig {
+                top_n: bad,
+                ..SystemOneConfig::default()
+            },
+            ..LeIndexConfig::default()
+        };
+        let err = validate(&config).unwrap_err().to_string();
+        assert!(
+            err.contains("system_one.top_n"),
+            "top_n={bad} must be rejected with the field path, got: {err}"
+        );
+    }
+    // 2 is the boundary the gate needs (>=2 judges) and must pass.
+    let ok = LeIndexConfig {
+        system_one: SystemOneConfig {
+            top_n: 2,
+            ..SystemOneConfig::default()
+        },
+        ..LeIndexConfig::default()
+    };
+    assert!(validate(&ok).is_ok());
+}
+
+#[test]
+fn test_show_redacts_joined_form_service_secret_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(
+        &dir,
+        "[indexing.embeddings]\nremote_api_key = \"sk-super-secret\"\n\n[services.llama]\nport = 8080\nextra_args = [\"--api-key=hunter2\", \"--port\", \"1234\", \"--host\", \"10.9.8.7\", \"--api-key\", \"hunter3\"]\n",
+    );
+
+    let shown = show_at(&path).unwrap();
+    // Joined form is masked as `--flag=REDACTED` without leaking the value.
+    assert!(
+        shown.contains("--api-key=[REDACTED]"),
+        "joined form must be masked: {shown}"
+    );
+    assert!(!shown.contains("hunter2"), "joined secret leaked: {shown}");
+    // The bare form still masks its value...
+    assert!(!shown.contains("hunter3"), "bare secret leaked: {shown}");
+    // ...and, critically, a joined secret flag does NOT consume the next
+    // argument: `1234` stays visible after --api-key=hunter2.
+    assert!(
+        shown.contains("1234"),
+        "value after joined secret must stay visible: {shown}"
+    );
+    // --host is also secret-bearing here: its bare value is masked (the
+    // service's own `host` field is a struct default and stays visible).
+    assert!(
+        !shown.contains("10.9.8.7"),
+        "--host value must be masked: {shown}"
+    );
+    assert!(!shown.contains("sk-super-secret"));
+    // The on-disk file keeps the real secrets (redaction is display-only).
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("hunter2"));
+}
+
+#[test]
 fn test_show_and_get_redact_remote_api_key() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_config(

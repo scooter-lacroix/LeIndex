@@ -194,6 +194,7 @@ fn wait_ready(cfg: &ServiceConfig, secs: u64) -> bool {
 
 // ── Pid identity ──────────────────────────────────────────────────────────
 
+#[cfg(target_os = "linux")]
 fn proc_exists(pid: i32) -> bool {
     // A zombie is dead for our purposes: its cmdline is empty and it only
     // lingers until the parent reaps it.
@@ -203,7 +204,25 @@ fn proc_exists(pid: i32) -> bool {
     }
 }
 
+/// macOS/BSD have no /proc: probe with signal 0 (permission-safe — EPERM
+/// still proves the pid exists).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn proc_exists(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Windows has no signal probe and no managed-service writer path today;
+/// report unknown so `stop` treats the pidfile as stale and `start` runs.
+#[cfg(not(unix))]
+fn proc_exists(_pid: i32) -> bool {
+    false
+}
+
 /// True when a `/proc/<pid>/stat` contents show state `Z`.
+#[cfg(target_os = "linux")]
 fn stat_is_zombie(stat: &str) -> bool {
     // `comm` may contain ')' so parse after the last one; the next token is
     // the process state.
@@ -328,8 +347,9 @@ fn spawn_detached(name: &str, cfg: &ServiceConfig) -> Result<i32, ServiceError> 
     cmd.stdout(Stdio::from(log_file.try_clone()?))
         .stderr(Stdio::from(log_file))
         .stdin(Stdio::null())
-        .current_dir("/")
-        .process_group(0);
+        .current_dir("/");
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     let child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -348,6 +368,7 @@ struct StartGuard {
 
 impl StartGuard {
     /// Non-blocking exclusive flock; `Ok(None)` when someone else holds it.
+    #[cfg(unix)]
     fn acquire(name: &str) -> Result<Option<Self>, ServiceError> {
         let path = lock_path(name)?;
         if let Some(parent) = path.parent() {
@@ -361,9 +382,18 @@ impl StartGuard {
             Ok(None)
         }
     }
+
+    /// Windows has no flock(2); a start lock is unavailable, so concurrent
+    /// starts are serialized only by the OS. Windows builds have no writer
+    /// path today (see setup docs); revisit if one ships.
+    #[cfg(not(unix))]
+    fn acquire(_name: &str) -> Result<Option<Self>, ServiceError> {
+        Ok(None)
+    }
 }
 
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 /// Wait until HTTP-ready (model resident), the process dies, or timeout.
@@ -391,6 +421,7 @@ fn wait_healthy(name: &str, cfg: &ServiceConfig, pid: i32) -> Result<(), Service
     }
 }
 
+#[cfg(unix)]
 fn terminate_group(pid: i32) {
     // Only the process group we created (pgid == child pid); never a
     // foreign group even if the pid was recycled into one.
@@ -402,6 +433,7 @@ fn terminate_group(pid: i32) {
     }
 }
 
+#[cfg(unix)]
 fn kill_group(pid: i32) {
     let pgid = unsafe { libc::getpgid(pid) };
     if pgid == pid {
@@ -410,6 +442,15 @@ fn kill_group(pid: i32) {
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
 }
+
+/// Windows has no signal delivery; managed starts cannot produce a child to
+/// signal there (see `StartGuard::acquire`), so this is unreachable in
+/// practice and a no-op for compile completeness.
+#[cfg(not(unix))]
+fn terminate_group(_pid: i32) {}
+
+#[cfg(not(unix))]
+fn kill_group(_pid: i32) {}
 
 fn wait_exit(pid: i32, grace: Duration) -> bool {
     let deadline = Instant::now() + grace;
@@ -493,19 +534,28 @@ fn start_locked(name: &str, cfg: &ServiceConfig) -> Result<(), ServiceError> {
     write_pidfile(name, pid)?;
     if let Err(e) = wait_healthy(name, cfg, pid) {
         if proc_exists(pid) {
-            terminate_group(pid);
-            if wait_exit(pid, STOP_GRACE) {
-                // graceful exit
-            } else {
-                kill_group(pid);
-                let _ = wait_exit(pid, STOP_GRACE);
-            }
+            cleanup_failed_start(pid);
         }
         remove_pidfile(name);
         return Err(e);
     }
     Ok(())
 }
+
+/// Terminate and reap a failed start attempt (best effort).
+#[cfg(unix)]
+fn cleanup_failed_start(pid: i32) {
+    terminate_group(pid);
+    if !wait_exit(pid, STOP_GRACE) {
+        kill_group(pid);
+        let _ = wait_exit(pid, STOP_GRACE);
+    }
+}
+
+/// Windows: no signal delivery; managed starts are a no-op there today
+/// (see `StartGuard::acquire`).
+#[cfg(not(unix))]
+fn cleanup_failed_start(_pid: i32) {}
 
 /// Stop the service. Only ever signals pids from our own pidfiles, only
 /// after the `/proc/<pid>/cmdline` pid-reuse check, and only the child's own
@@ -531,6 +581,9 @@ pub fn stop(name: &str, cfg: &ServiceConfig) -> Result<StopOutcome, ServiceError
     Ok(StopOutcome::Stopped(pid))
 }
 
+// `stop` is unix-only end to end (signal delivery); on Windows the module's
+// public surface is read-only status/health, which never reaches here.
+
 /// Current status: live verified pid, port health, endpoint, model info.
 pub fn status(name: &str, cfg: &ServiceConfig) -> Result<ServiceStatus, ServiceError> {
     clean_stale_pidfile(name, cfg)?;
@@ -553,7 +606,7 @@ pub fn restart(name: &str, cfg: &ServiceConfig) -> Result<bool, ServiceError> {
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
 
     /// Hold LEINDEX_HOME for the whole test body; parallel tests serialize.

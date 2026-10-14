@@ -192,15 +192,16 @@ fn remote_service_ready(config: &LeIndexConfig) -> bool {
         println!("Status: Managed runtime/model paths are incomplete or unsupported");
         return false;
     }
+    let ready = crate::services::http_ready(&service.host, service.port);
     println!(
         "Managed HTTP health: {}",
-        if crate::services::http_ready(&service.host, service.port) {
+        if ready {
             "ready"
         } else {
             "not ready (check does not start services)"
         }
     );
-    true
+    ready
 }
 
 // CCN-gate extraction: probe passes only with a measured non-zero dimension matching any configured one.

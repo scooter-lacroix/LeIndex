@@ -614,7 +614,9 @@ mod diagnostics_ort_info {
     /// either command sees identical fields.
     #[test]
     fn setup_check_reports_same_ort_info_shape() {
-        let setup = read_file("src/cli/leindex/setup.rs");
+        // The --check surface moved from setup.rs into setup_check.rs
+        // (Large-File gate extraction); the shape contract follows the code.
+        let setup = read_file("src/cli/leindex/setup_check.rs");
 
         for header in ["ORT dylib path:", "ORT version:", "Execution provider:"] {
             assert!(

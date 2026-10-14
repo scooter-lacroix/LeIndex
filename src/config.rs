@@ -130,8 +130,14 @@ const fn default_service_start_timeout_secs() -> u64 {
 
 impl ServiceConfig {
     /// `http://host:port` — the base URL consumers derive from this service.
+    /// IPv6 literals are bracketed (`http://[::1]:8080`) so the URL parses.
     pub fn base_url(&self) -> String {
-        format!("http://{}:{}", self.host, self.port)
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        format!("http://{}:{}", host, self.port)
     }
 
     /// The payload model name consumers fall back to: explicit alias, else
@@ -1474,5 +1480,21 @@ mod tests {
         // Clearing the preset (or naming a missing one) reverts to laya.
         cfg.active_preset = Some("nope".into());
         assert_eq!(cfg.effective().provider, "laya");
+    }
+
+    #[test]
+    fn test_service_base_url_brackets_ipv6_host() {
+        let v6 = ServiceConfig {
+            host: "::1".into(),
+            port: 8080,
+            ..ServiceConfig::default()
+        };
+        assert_eq!(v6.base_url(), "http://[::1]:8080");
+        let v4 = ServiceConfig {
+            host: "127.0.0.1".into(),
+            port: 8080,
+            ..ServiceConfig::default()
+        };
+        assert_eq!(v4.base_url(), "http://127.0.0.1:8080");
     }
 }

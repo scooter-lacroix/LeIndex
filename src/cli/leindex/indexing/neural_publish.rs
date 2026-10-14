@@ -125,8 +125,17 @@ impl NeuralProgress {
             .name("neural-progress".to_owned())
             .spawn(move || {
                 let started = std::time::Instant::now();
+                // cfg-split decls: without `onnx` neither binding is ever
+                // reassigned (the probe block below is feature-gated out),
+                // so `mut` would trip unused_mut in narrow builds.
+                #[cfg(feature = "onnx")]
                 let mut cpu_fallback = false;
+                #[cfg(not(feature = "onnx"))]
+                let cpu_fallback = false;
+                #[cfg(feature = "onnx")]
                 let mut provider_resolved = !gpu_requested;
+                #[cfg(not(feature = "onnx"))]
+                let provider_resolved = !gpu_requested;
                 loop {
                     // Probe the daemon once per heartbeat while the provider
                     // is still unknown. The health socket publishes the

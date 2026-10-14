@@ -207,7 +207,12 @@ fn configure_route(
             config.indexing.embeddings.remote_provider = "custom".into();
             config.indexing.embeddings.remote_endpoint = None;
             config.indexing.embeddings.remote_service = None;
-            config.indexing.embeddings.enable_hybrid = true;
+            // Local ONNX route: `enable_hybrid` is the remote-takeover switch
+            // (`remote_endpoint` + `enable_hybrid` switch the neural layer to
+            // a remote endpoint), and validate_embeddings rejects hybrid
+            // without a resolvable endpoint — the local route must leave it
+            // off or every subsequent validate bricks the config.
+            config.indexing.embeddings.enable_hybrid = false;
             Ok(false)
         }
         "keep" => {
@@ -560,7 +565,9 @@ fn strip_gpu_options(args: &mut Vec<String>) {
     let mut index = 0;
     while index < args.len() {
         if gpu_option(&args[index]) {
-            args.drain(index..index + 2);
+            // A trailing flag with no value has no pair to drain.
+            let end = (index + 2).min(args.len());
+            args.drain(index..end);
         } else if args[index]
             .split_once('=')
             .is_some_and(|(key, _)| gpu_option(key))

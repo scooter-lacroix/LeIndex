@@ -380,7 +380,7 @@ impl PhaseExecutionContext {
         };
 
         let storage_root = self.root.join(".leindex");
-        let _write_lock = crate::storage::ProjectWriteLock::acquire(&storage_root)
+        let _write_lock = crate::storage::ProjectWriteLock::acquire_bounded(&storage_root)
             .context("phase graph: acquire project write lock")?;
         let db_path = storage_root.join("leindex.db");
         // WAL checkpoint before vacuum so the layer snapshots committed rows.

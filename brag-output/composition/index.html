@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en" data-resolution="landscape">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <script src="assets/gsap.min.js"></script>
+    <style>
+      @font-face { font-family: "Space Grotesk"; src: local("Space Grotesk"); }
+      @font-face { font-family: "IBM Plex Mono"; src: local("IBM Plex Mono"); }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body {
+        width: 1920px; height: 1080px; overflow: hidden;
+        background: #061423;
+      }
+      #root {
+        position: relative; width: 1920px; height: 1080px; overflow: hidden;
+        background: radial-gradient(ellipse at 50% 35%, #12263a 0%, #061423 70%);
+        color: #ecf9ff;
+        font-family: "Space Grotesk", Inter, ui-sans-serif, system-ui, sans-serif;
+      }
+      .clip { position: absolute; inset: 0; opacity: 0; }
+      .center { display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+      .hook { font-size: 96px; font-weight: 600; letter-spacing: -0.03em; line-height: 1.1; max-width: 1500px; margin: 0 auto; }
+      .tagline { font-size: 44px; color: #9ac6d8; margin-top: 28px; }
+      .wordmark { font-size: 180px; font-weight: 700; letter-spacing: -0.05em; color: #3de6d4; }
+      .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+      .panel {
+        background: rgba(12, 37, 57, 0.78);
+        border: 1px solid rgba(82, 208, 255, 0.28);
+        border-radius: 18px;
+      }
+      .terminal { width: 1400px; padding: 56px 64px; font-size: 40px; line-height: 1.6; }
+      .terminal .label { font-size: 24px; color: #9ac6d8; letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 24px; }
+      .terminal .prompt { color: #ff9f5a; }
+      .terminal .result { color: #3de6d4; }
+      .terminal .meta { color: #9ac6d8; font-size: 34px; }
+      .stat-row { display: flex; gap: 120px; align-items: center; justify-content: center; }
+      .stat { text-align: center; }
+      .stat .num { font-size: 150px; font-weight: 700; letter-spacing: -0.04em; }
+      .stat .unit { font-size: 36px; color: #9ac6d8; margin-top: 12px; }
+      .stat.before .num { color: #9ac6d8; text-decoration: line-through; text-decoration-thickness: 8px; text-decoration-color: #ff9f5a; }
+      .stat.after .num { color: #3de6d4; }
+      .arrow { font-size: 110px; color: #ffcf5a; }
+      .note { font-size: 28px; color: #9ac6d8; margin-top: 40px; }
+      .app { width: 1500px; height: 760px; display: flex; overflow: hidden; }
+      .side { width: 340px; padding: 40px 28px; border-right: 1px solid rgba(82, 208, 255, 0.2); font-size: 30px; color: #9ac6d8; }
+      .side .active { color: #ecf9ff; }
+      .main { flex: 1; padding: 48px 56px; }
+      .main h3 { font-size: 40px; margin-bottom: 28px; }
+      .file { font-size: 30px; padding: 18px 22px; border-radius: 12px; background: #0b2032; margin-bottom: 14px; }
+      .btn { display: inline-block; font-size: 30px; padding: 16px 34px; border-radius: 12px; font-weight: 600; margin-right: 18px; }
+      .btn.primary { background: #3de6d4; color: #061423; }
+      .btn.ghost { border: 2px solid #3de6d4; color: #3de6d4; }
+      .cursor { position: absolute; width: 36px; height: 36px; border-radius: 50%; background: rgba(255, 207, 90, 0.85); pointer-events: none; }
+      .punch { font-size: 120px; font-weight: 700; letter-spacing: -0.04em; color: #3de6d4; }
+      .url { font-size: 40px; color: #ecf9ff; margin-top: 36px; }
+    </style>
+  </head>
+  <body>
+    <div
+      id="root"
+      data-composition-id="main"
+      data-start="0"
+      data-duration="20"
+      data-width="1920"
+      data-height="1080"
+    >
+      <!-- Scene 1: hook, 0–2.5s -->
+      <div id="s1" class="clip center" data-start="0" data-duration="2.5" data-track-index="0">
+        <p class="hook">Your agent just read 2,000 tokens to understand one file.</p>
+      </div>
+
+      <!-- Scene 2: reveal, 2.5–6s -->
+      <div id="s2" class="clip center" data-start="2.5" data-duration="3.5" data-track-index="0">
+        <div class="wordmark">LeIndex</div>
+        <p class="tagline">Semantic code intelligence for humans and AI agents.</p>
+      </div>
+
+      <!-- Scene 3: ask, 6–10s -->
+      <div id="s3" class="clip center" data-start="6" data-duration="4" data-track-index="0">
+        <div class="panel terminal mono">
+          <div class="label">example</div>
+          <div><span class="prompt">you:</span> "where is request validation enforced?"</div>
+          <div class="result" id="s3-result">src/http/request_validator.rs &nbsp;validate_session (0.92)</div>
+          <div class="meta" id="s3-meta">callers: 3 · callees: 7 · blast radius: 12 files</div>
+        </div>
+      </div>
+
+      <!-- Scene 4: stat, 10–14s -->
+      <div id="s4" class="clip center" data-start="10" data-duration="4" data-track-index="0">
+        <div class="stat-row">
+          <div class="stat before">
+            <div class="num">~12,000</div>
+            <div class="unit">tokens</div>
+          </div>
+          <div class="arrow">→</div>
+          <div class="stat after">
+            <div class="num">~340</div>
+            <div class="unit">tokens</div>
+          </div>
+        </div>
+        <p class="note">cross-file symbol rename · 97% less context</p>
+      </div>
+
+      <!-- Scene 5: dashboard app, 14–18s -->
+      <div id="s5" class="clip center" data-start="14" data-duration="4" data-track-index="0">
+        <div class="panel app">
+          <div class="side">
+            <div>Codebases</div>
+            <div class="active" style="margin-top:18px">Graph</div>
+            <div style="margin-top:18px">Search</div>
+            <div style="margin-top:18px">Editor</div>
+          </div>
+          <div class="main">
+            <h3>request_validator.rs</h3>
+            <div class="file mono">validate_session &nbsp;<span style="color:#3de6d4">edited</span></div>
+            <div class="file mono">validate_token &nbsp;<span style="color:#ffcf5a">staged</span></div>
+            <div style="margin-top:36px">
+              <span class="btn ghost" id="s5-stage">Stage Changes</span>
+              <span class="btn primary" id="s5-apply">Apply All</span>
+            </div>
+          </div>
+        </div>
+        <div class="cursor" id="s5-cursor" style="left:1040px; top:610px; opacity:0;"></div>
+      </div>
+
+      <!-- Scene 6: punchline + CTA, 18–20s -->
+      <div id="s6" class="clip center" data-start="18" data-duration="2" data-track-index="0">
+        <div class="punch" id="s6-punch">85.7 s → 5.0 s</div>
+        <p class="tagline" id="s6-sub">re-index tail · 17x faster</p>
+        <p class="url mono" id="s6-url">github.com/scooter-lacroix/LeIndex</p>
+      </div>
+    </div>
+
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+
+      // Scene 1
+      tl.fromTo("#s1", { opacity: 0, y: 24 }, { opacity: 1, y: 0, duration: 0.6 }, 0);
+      tl.to("#s1", { opacity: 0, duration: 0.3 }, 2.2);
+
+      // Scene 2
+      tl.fromTo("#s2 .wordmark", { opacity: 0, y: 30 }, { opacity: 1, y: 0, duration: 0.7 }, 2.5);
+      tl.fromTo("#s2 .tagline", { opacity: 0 }, { opacity: 1, duration: 0.6 }, 3.2);
+      tl.to("#s2", { opacity: 0, duration: 0.3 }, 5.7);
+
+      // Scene 3
+      tl.fromTo("#s3", { opacity: 0 }, { opacity: 1, duration: 0.4 }, 6);
+      tl.fromTo("#s3-result", { opacity: 0 }, { opacity: 1, duration: 0.4 }, 6.9);
+      tl.fromTo("#s3-meta", { opacity: 0 }, { opacity: 1, duration: 0.4 }, 7.5);
+      tl.to("#s3", { opacity: 0, duration: 0.3 }, 9.7);
+
+      // Scene 4
+      tl.fromTo("#s4", { opacity: 0 }, { opacity: 1, duration: 0.4 }, 10);
+      tl.fromTo("#s4 .before .num", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.5 }, 10.3);
+      tl.fromTo("#s4 .after .num", { opacity: 0, scale: 0.9 }, { opacity: 1, scale: 1, duration: 0.5 }, 11.1);
+      tl.to("#s4", { opacity: 0, duration: 0.3 }, 13.7);
+
+      // Scene 5
+      tl.fromTo("#s5", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 14);
+      tl.to("#s5-cursor", { opacity: 1, duration: 0.2 }, 15);
+      tl.to("#s5-cursor", { x: -420, y: 200, duration: 0.5 }, 15.2);
+      tl.to("#s5-stage", { opacity: 0.6, duration: 0.1 }, 15.7);
+      tl.to("#s5-stage", { opacity: 1, duration: 0.1 }, 15.8);
+      tl.to("#s5-cursor", { x: 0, y: 0, duration: 0.5 }, 16);
+      tl.to("#s5-apply", { opacity: 0.6, duration: 0.1 }, 16.5);
+      tl.to("#s5-apply", { opacity: 1, duration: 0.1 }, 16.6);
+      tl.to("#s5", { opacity: 0, duration: 0.3 }, 17.7);
+
+      // Scene 6
+      tl.fromTo("#s6", { opacity: 0 }, { opacity: 1, duration: 0.4 }, 18);
+      tl.fromTo("#s6-punch", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.5 }, 18.2);
+      tl.fromTo("#s6-url", { opacity: 0 }, { opacity: 1, duration: 0.4 }, 19.2);
+
+      window.__timelines["main"] = tl;
+      tl.seek(0);
+    </script>
+  </body>
+</html>

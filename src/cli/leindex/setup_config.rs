@@ -206,6 +206,11 @@ pub fn validate(config: &LeIndexConfig) -> Result<(), SetupError> {
                 .to_string(),
         ));
     }
+    if config.system_one.top_n < 2 {
+        return Err(invalid(
+            "system_one.top_n must be at least 2 (fewer judges no meaningful ranking)".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -763,7 +768,18 @@ fn redacted_value(config: &LeIndexConfig) -> Result<toml::Value> {
                     *item = toml::Value::String(REDACTED.to_string());
                     redact_next = false;
                 } else {
-                    redact_next = SECRET_FLAGS.contains(&arg.as_str());
+                    // Joined (`--flag=value`) and bare (`--flag value`) forms
+                    // of a secret-bearing flag are both masked; the joined
+                    // form carries its own value, so it does not consume the
+                    // next argument.
+                    let flag = arg.split('=').next().unwrap_or_default();
+                    if flag != arg {
+                        if SECRET_FLAGS.contains(&flag) {
+                            *item = toml::Value::String(format!("{flag}={REDACTED}"));
+                        }
+                    } else {
+                        redact_next = SECRET_FLAGS.contains(&flag);
+                    }
                 }
             }
         }
@@ -797,4 +813,4 @@ fn save_config_at(path: &Path, config: &LeIndexConfig) -> Result<PathBuf> {
 
 #[cfg(test)]
 #[path = "setup_config_test.rs"]
-mod setup_config_test;
+mod test;

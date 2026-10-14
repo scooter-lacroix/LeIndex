@@ -729,3 +729,82 @@ async fn test_one_shot_registry_never_prewarms() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(registry.len().await, 0);
 }
+
+/// T4 (RC4b): a resident instance created before any index existed (never
+/// hydrated, `is_indexed() == false`) must be evicted and re-created once the
+/// disk carries a committed non-empty CURRENT generation — the N-13
+/// advanced-generation check can never fire for it (0 is never > disk), the
+/// auto-index cooldown suppresses repair, and every tool call kept answering
+/// "project not indexed" forever. Pre-fix, `get_or_load` returned the stale
+/// resident handle unconditionally.
+#[tokio::test]
+async fn test_never_hydrated_resident_picks_up_external_index() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.rs"), "fn externally_indexed() {}\n").unwrap();
+    let root = dir.path().canonicalize().unwrap();
+
+    // Resident instance created BEFORE any index existed: never hydrated.
+    let resident = LeIndex::new(&root).unwrap();
+    assert!(
+        !resident.is_indexed(),
+        "fixture: resident must predate any index"
+    );
+    let registry = Arc::new(ProjectRegistry::with_initial_project(5, resident));
+
+    // An external process (CLI --force, another server) builds the index.
+    {
+        let mut external = LeIndex::new(&root).unwrap();
+        external.index_project(true).unwrap();
+    }
+
+    // The discriminating call: must evict the never-hydrated resident and
+    // re-create so the disk truth is visible.
+    let handle = registry
+        .get_or_load(Some(root.to_str().unwrap()))
+        .await
+        .expect("get_or_load must succeed");
+    assert!(
+        handle.read().await.is_indexed(),
+        "a committed non-empty CURRENT generation must be picked up by a \
+         never-hydrated resident — this was the permanent not-indexed lie"
+    );
+}
+
+/// T7 (RC2): N concurrent cold-start `get_or_create` calls on one project
+/// must all succeed and resolve to the same handle. Pre-fix, each caller ran
+/// its own inline blocking `LeIndex::new` + corruption repair, starving the
+/// async workers; the single-flight fix joins every caller onto one build.
+#[tokio::test]
+async fn test_concurrent_cold_start_creations_join_one_build() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.rs"), "fn cold_start_join() {}\n").unwrap();
+    let root = dir.path().canonicalize().unwrap();
+
+    let registry = Arc::new(ProjectRegistry::new(5));
+    let mut joins = Vec::new();
+    for _ in 0..8 {
+        let registry = Arc::clone(&registry);
+        let path = root.to_string_lossy().to_string();
+        joins.push(tokio::spawn(async move {
+            registry
+                .get_or_create(Some(&path))
+                .await
+                .expect("every concurrent creation must succeed")
+        }));
+    }
+    let handles: Vec<_> = futures_util::future::join_all(joins)
+        .await
+        .into_iter()
+        .map(|r| r.expect("join"))
+        .collect();
+
+    // All eight callers must observe the same project handle.
+    let first = handles[0].clone();
+    for (i, handle) in handles.iter().enumerate().skip(1) {
+        assert!(
+            Arc::ptr_eq(&first, handle),
+            "caller {i} must join the single creation flight, not build its own"
+        );
+    }
+    assert_eq!(registry.len().await, 1, "exactly one project resident");
+}

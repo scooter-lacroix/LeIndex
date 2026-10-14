@@ -1365,9 +1365,32 @@ impl McpServer {
     ) -> anyhow::Result<()> {
         use tokio::net::UnixListener;
 
-        // Remove stale socket file if present
+        // Stale-socket detection (incident RC5b): unlinking a socket whose
+        // listener is still alive forks the daemon fleet — the old daemon
+        // keeps serving on the unlinked inode while we bind a fresh one at
+        // the same path, and two daemons then race the same stores. Probe
+        // first: a live listener refuses to bind here; only a dead socket
+        // file (connect refused / not a socket) is removed.
         if socket_path.exists() {
-            std::fs::remove_file(socket_path).context("Failed to remove existing socket file")?;
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                tokio::net::UnixStream::connect(socket_path),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    anyhow::bail!(
+                        "refusing to bind {}: another leindexd is already listening there. \
+                         Stop it first (pkill leindexd) or point this instance at a different \
+                         socket; deleting the socket file would fork two daemons onto one store",
+                        socket_path.display()
+                    );
+                }
+                _ => {
+                    std::fs::remove_file(socket_path)
+                        .context("Failed to remove stale socket file")?;
+                }
+            }
         }
 
         // Ensure parent directory exists

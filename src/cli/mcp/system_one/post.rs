@@ -107,24 +107,17 @@ pub fn plan(base: &[f32], judgements: &[Option<Judgement>], params: &PostParams)
     Plan { order, dropped }
 }
 
-/// Reorder `results` per `plan` and reassign the existing `rank` sequence by
-/// output position. Engine ranks are global, so a page at `offset > 0` starts
-/// past 1; renumbering from 1 would discard that offset.
+/// Reorder `results` per `plan`, keeping every `rank` paired with its own
+/// item. Engine ranks are global, so a page at `offset > 0` starts past 1;
+/// ranks are never renumbered from output position — a slot-position rename
+/// would hand item i the rank of whatever used to sit at i.
 pub fn apply_plan(results: &mut Vec<Value>, plan: &Plan) {
-    let ranks: Vec<Option<Value>> = results.iter().map(|r| r.get("rank").cloned()).collect();
     let mut old: Vec<Option<Value>> = results.drain(..).map(Some).collect();
     *results = plan
         .order
         .iter()
         .filter_map(|&i| old.get_mut(i).and_then(Option::take))
         .collect();
-    for (index, result) in results.iter_mut().enumerate() {
-        if let (Some(object), Some(Some(rank))) = (result.as_object_mut(), ranks.get(index)) {
-            if object.contains_key("rank") {
-                object.insert("rank".into(), rank.clone());
-            }
-        }
-    }
 }
 
 /// Existing composite score of result `index` (0..=1 scale assumed).
@@ -497,7 +490,7 @@ mod test {
     }
 
     #[test]
-    fn apply_plan_renumbers_rank() {
+    fn apply_plan_keeps_rank_with_item_through_reorder() {
         let mut results = vec![json!({"rank": 1, "n": "a"}), json!({"rank": 2, "n": "b"})];
         apply_plan(
             &mut results,
@@ -507,13 +500,15 @@ mod test {
             },
         );
         assert_eq!(results[0]["n"], "b");
-        assert_eq!(results[0]["rank"], 1);
-        assert_eq!(results[1]["rank"], 2);
+        assert_eq!(results[0]["rank"], 2);
+        assert_eq!(results[1]["n"], "a");
+        assert_eq!(results[1]["rank"], 1);
     }
 
     #[test]
     fn apply_plan_preserves_global_rank_on_offset_page() {
-        // Page at offset 10: engine ranks are global (11, 12, 13).
+        // Page at offset 10: engine ranks are global (11, 12, 13). Reordering
+        // to [c, a, b] must carry each rank with its item: c keeps 13.
         let mut results = vec![
             json!({"rank": 11, "n": "a"}),
             json!({"rank": 12, "n": "b"}),
@@ -527,9 +522,44 @@ mod test {
             },
         );
         assert_eq!(results[0]["n"], "c");
-        assert_eq!(results[0]["rank"], 11);
-        assert_eq!(results[1]["rank"], 12);
-        assert_eq!(results[2]["rank"], 13);
+        assert_eq!(results[0]["rank"], 13);
+        assert_eq!(results[1]["n"], "a");
+        assert_eq!(results[1]["rank"], 11);
+        assert_eq!(results[2]["n"], "b");
+        assert_eq!(results[2]["rank"], 12);
+    }
+
+    #[test]
+    fn apply_plan_pairs_noncontiguous_ranks_with_their_items() {
+        // Non-identity reorder with non-contiguous ranks: each rank stays
+        // paired with its own item, whatever slot it lands in (asserted by
+        // the stable `id` field, not output position).
+        let mut results = vec![
+            json!({"rank": 11, "id": "alpha"}),
+            json!({"rank": 12, "id": "beta"}),
+            json!({"rank": 13, "id": "gamma"}),
+        ];
+        apply_plan(
+            &mut results,
+            &Plan {
+                order: vec![2, 0, 1],
+                dropped: vec![],
+            },
+        );
+        let rank_of = |id: &str| {
+            results
+                .iter()
+                .find(|r| r["id"] == id)
+                .map(|r| r["rank"].clone())
+                .unwrap()
+        };
+        assert_eq!(rank_of("alpha"), 11);
+        assert_eq!(rank_of("beta"), 12);
+        assert_eq!(rank_of("gamma"), 13);
+        // The reorder itself still happened.
+        assert_eq!(results[0]["id"], "gamma");
+        assert_eq!(results[1]["id"], "alpha");
+        assert_eq!(results[2]["id"], "beta");
     }
 
     #[test]

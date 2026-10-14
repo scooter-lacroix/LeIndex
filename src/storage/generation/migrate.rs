@@ -339,7 +339,7 @@ pub fn migrate_legacy_store(
     storage_root: &Path,
     cfg: &MigrationConfig,
 ) -> Result<MigrationReport, MigrationError> {
-    let _write_lock = crate::storage::ProjectWriteLock::acquire(storage_root)
+    let _write_lock = crate::storage::ProjectWriteLock::acquire_bounded(storage_root)
         .map_err(|e| MigrationError::Payload(format!("acquire project write lock: {e}")))?;
     let mut report = empty_migration_report(storage_root);
 

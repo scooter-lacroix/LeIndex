@@ -106,6 +106,25 @@ pub fn watcher_enabled() -> bool {
     }
 }
 
+/// Whether a committed generation directory carries a non-empty
+/// `index_stats.json` (indexed_nodes > 0). The livelock guard for the
+/// never-hydrated eviction in [`ProjectRegistry::get_or_load`]: an empty
+/// project publishes a 0-node generation, and evict-recreating on every call
+/// for it would churn forever — only non-empty generations prove an index
+/// this process should load.
+fn generation_has_indexed_nodes(storage_root: &Path, generation: u64) -> bool {
+    let stats_path = storage_root
+        .join("generations")
+        .join(generation.to_string())
+        .join("index_stats.json");
+    let Ok(json) = std::fs::read_to_string(&stats_path) else {
+        return false;
+    };
+    serde_json::from_str::<IndexStats>(&json)
+        .map(|stats| stats.indexed_nodes > 0)
+        .unwrap_or(false)
+}
+
 /// How much of a project a tool needs resident before it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hydration {
@@ -334,6 +353,10 @@ pub struct ProjectRegistry {
     prewarm_started: std::sync::atomic::AtomicBool,
     /// Single-flight latches for off-lock hydration, one per project.
     hydration_flights: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
+    /// Single-flight latches for project creation, one per project (RC2:
+    /// concurrent cold-start creations must join one blocking build, not run
+    /// N blocking SQLite constructions).
+    creation_flights: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     /// Projects a `spawn_prewarm_at` is currently warming.
     prewarming: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
 }
@@ -356,6 +379,7 @@ impl ProjectRegistry {
             one_shot: std::sync::atomic::AtomicBool::new(false),
             prewarm_started: std::sync::atomic::AtomicBool::new(false),
             hydration_flights: Mutex::new(HashMap::new()),
+            creation_flights: Mutex::new(HashMap::new()),
             prewarming: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -615,6 +639,7 @@ impl ProjectRegistry {
             one_shot: std::sync::atomic::AtomicBool::new(false),
             prewarm_started: std::sync::atomic::AtomicBool::new(false),
             hydration_flights: Mutex::new(HashMap::new()),
+            creation_flights: Mutex::new(HashMap::new()),
             prewarming: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -657,13 +682,35 @@ impl ProjectRegistry {
                 // this call re-hydrates from the new generation.
                 let advanced = {
                     let idx = handle.read().await;
-                    idx.hydrated_generation().is_some_and(|hydrated| {
-                        let storage_root =
-                            crate::cli::leindex::resolve_existing_storage_path(&canonical)
-                                .unwrap_or_else(|| canonical.join(".leindex"));
+                    let storage_root =
+                        crate::cli::leindex::resolve_existing_storage_path(&canonical)
+                            .unwrap_or_else(|| canonical.join(".leindex"));
+                    if idx.hydrated_generation().is_some_and(|hydrated| {
                         crate::storage::generation::lease::read_current_generation(&storage_root)
                             .is_some_and(|disk| disk > hydrated)
-                    })
+                    }) {
+                        true
+                    } else {
+                        // Never-hydrated gap (incident RC4): a resident
+                        // instance created before any index existed has
+                        // hydrated_generation = 0 and `is_indexed() == false`
+                        // FOREVER — the N-13 check above can never fire
+                        // (0 is never > disk), the cooldown suppresses
+                        // auto-index, and every tool call answers "project
+                        // not indexed". If the disk now has a committed,
+                        // non-empty CURRENT generation this instance never
+                        // saw, evict and re-create so it loads the truth.
+                        // Livelock guard: an EMPTY current generation
+                        // (0-node project) must not evict-churn.
+                        !idx.is_indexed()
+                            && crate::storage::generation::lease::read_current_generation(
+                                &storage_root,
+                            )
+                            .is_some_and(|generation| {
+                                generation > 0
+                                    && generation_has_indexed_nodes(&storage_root, generation)
+                            })
+                    }
                 };
                 if advanced {
                     drop(projects);
@@ -1071,9 +1118,14 @@ impl ProjectRegistry {
 
     /// Create a new `LeIndex`, attempt to load from storage, and insert into
     /// the registry. Evicts LRU if at capacity.
+    ///
+    /// Creation is single-flight per project (creation_flights): `LeIndex::new`
+    /// and the corruption auto-repair's inline `index_project(true)` are
+    /// blocking SQLite work that must not run on the async runtime — with the
+    /// daemon's small worker pool, N concurrent cold-start tool calls each
+    /// ran a copy inline and starved every other tool call (incident RC2).
     async fn create_and_insert(&self, canonical: PathBuf) -> Result<ProjectHandle, JsonRpcError> {
-        self.evict_lru_if_needed().await;
-
+        // Fast path under the read lock, matching the old behavior.
         {
             let projects = self.projects.read().await;
             if let Some(handle) = projects.get(&canonical) {
@@ -1082,53 +1134,44 @@ impl ProjectRegistry {
             }
         }
 
-        let mut leindex = LeIndex::new(&canonical).map_err(|e| {
-            JsonRpcError::init_failed(&canonical.display().to_string(), &e.to_string())
-        })?;
+        // Single-flight: one creation per project; concurrent callers join
+        // the winner's result. Entry-keyed (not removed on finish) so a
+        // repeat eviction + re-create reuses the same flight without
+        // racing an in-flight insert.
+        let flight = {
+            let mut flights = self.creation_flights.lock().await;
+            Arc::clone(flights.entry(canonical.clone()).or_default())
+        };
+        let _creation = flight.lock().await;
+
+        // Double-check under the flight: the winner may have inserted while
+        // we waited.
+        {
+            let projects = self.projects.read().await;
+            if let Some(handle) = projects.get(&canonical) {
+                self.touch_lru(&canonical).await;
+                return Ok(handle.clone());
+            }
+        }
+
+        self.evict_lru_if_needed().await;
+
+        // Blocking construction + corruption repair off the async workers
+        // (RC2): `LeIndex::new` retries SQLite for up to ~36s and the repair
+        // path runs a full inline `index_project(true)`; inline on an async
+        // worker, N cold-start tool calls starved the daemon's whole worker
+        // pool.
+        let build_canonical = canonical.clone();
+        let leindex = tokio::task::spawn_blocking(move || Self::build_leindex(&build_canonical))
+            .await
+            .map_err(|e| JsonRpcError::internal_error(format!("project creation task: {e}")))?
+            .map_err(|e| JsonRpcError::init_failed(&canonical.display().to_string(), &e))?;
         // Hydration is LAZY and need-based: `LeIndex::new` already restored
         // persisted stats (so is_indexed() is truthful), and every tool
         // hydrates exactly what it uses — graph-only tools via
         // ensure_pdg_loaded_graph_only, search tools via
-        // ensure_analysis_context_loaded. Eagerly loading PDG + search
-        // snapshot + embedding mmaps here cost ~1.5s per cold project for
-        // every tool, including ones that never touch the engine.
-        let hydrate_ms = 0_u64;
-        crate::cli::mcp::request_meta::record_hydrate_ms(hydrate_ms);
-
-        // Corruption detection and auto-repair. Never delete the whole
-        // storage root: an interrupted build may still have reusable job
-        // artifacts and an older generation for rollback.
-        let corruption =
-            detect_corruption(&canonical).unwrap_or(crate::cli::errors::CorruptionStatus::Healthy);
-        if !corruption.is_usable() {
-            warn!(
-                "Corruption detected in {}: {}. Auto-repairing...",
-                canonical.display(),
-                corruption.message()
-            );
-            let storage_path = crate::cli::leindex::resolve_existing_storage_path(&canonical)
-                .unwrap_or_else(|| canonical.join(".leindex"));
-            if restore_latest_generation(&storage_path) {
-                warn!(
-                    "Rolled back {} to latest usable generation; preserved corrupt root artifact",
-                    canonical.display()
-                );
-            }
-            let mut fresh = LeIndex::new(&canonical).map_err(|e| {
-                JsonRpcError::init_failed(
-                    &canonical.display().to_string(),
-                    &format!(
-                        "Original: {}. Preserving artifacts: {}",
-                        corruption.message(),
-                        e
-                    ),
-                )
-            })?;
-            fresh.index_project(true).map_err(|e| {
-                JsonRpcError::indexing_failed(format!("Auto-repair reindex failed: {}", e))
-            })?;
-            leindex = fresh;
-        }
+        // ensure_analysis_context_loaded.
+        crate::cli::mcp::request_meta::record_hydrate_ms(0);
 
         let handle: ProjectHandle = Arc::new(ProjectRwLock::new(leindex));
 
@@ -1182,6 +1225,46 @@ impl ProjectRegistry {
         } else {
             None
         }
+    }
+
+    /// Blocking project construction for [`Self::create_and_insert`]:
+    /// `LeIndex::new` (SQLite open-retry budget) plus corruption detection
+    /// and, when the store is unusable, the restore-then-reindex repair.
+    /// Runs inside `spawn_blocking` — never on an async worker.
+    fn build_leindex(canonical: &Path) -> Result<LeIndex, String> {
+        let mut leindex = LeIndex::new(canonical).map_err(|e| e.to_string())?;
+        // Corruption detection and auto-repair. Never delete the whole
+        // storage root: an interrupted build may still have reusable job
+        // artifacts and an older generation for rollback.
+        let corruption =
+            detect_corruption(canonical).unwrap_or(crate::cli::errors::CorruptionStatus::Healthy);
+        if !corruption.is_usable() {
+            warn!(
+                "Corruption detected in {}: {}. Auto-repairing...",
+                canonical.display(),
+                corruption.message()
+            );
+            let storage_path = crate::cli::leindex::resolve_existing_storage_path(canonical)
+                .unwrap_or_else(|| canonical.join(".leindex"));
+            if restore_latest_generation(&storage_path) {
+                warn!(
+                    "Rolled back {} to latest usable generation; preserved corrupt root artifact",
+                    canonical.display()
+                );
+            }
+            let mut fresh = LeIndex::new(canonical).map_err(|e| {
+                format!(
+                    "Original: {}. Preserving artifacts: {}",
+                    corruption.message(),
+                    e
+                )
+            })?;
+            fresh
+                .index_project(true)
+                .map_err(|e| format!("Auto-repair reindex failed: {e}"))?;
+            leindex = fresh;
+        }
+        Ok(leindex)
     }
 
     /// Build a fresh index for the project behind `handle`, then swap it in.

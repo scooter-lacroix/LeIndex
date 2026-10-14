@@ -1,0 +1,3 @@
+Your AI agent just read 2,000 tokens to understand one file. LeIndex answers the same question in ~380.
+Semantic code intelligence for humans and AI agents, local-first. Open source.
+github.com/scooter-lacroix/LeIndex

@@ -321,6 +321,16 @@ fn prompt_listen(service: &ServiceConfig) -> Result<(String, u16), SetupError> {
     let host = Input::<String>::new()
         .with_prompt("Listen host")
         .default(service.host.clone())
+        .validate_with(|v: &String| -> Result<(), &str> {
+            let h = v.trim();
+            if h.is_empty() {
+                Err("host must not be empty")
+            } else if h == "0.0.0.0" || h == "::" {
+                Err("binding all interfaces is refused; use a specific host such as 127.0.0.1")
+            } else {
+                Ok(())
+            }
+        })
         .interact_text()
         .map_err(prompt_error)?;
     let mut port_prompt = Input::<u16>::new()
