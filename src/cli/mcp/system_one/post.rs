@@ -55,6 +55,16 @@ pub struct Judgement {
     pub drop: Option<&'static str>,
 }
 
+/// Whether a verdict set is complete enough to act on.
+///
+/// Any `None` verdict means one judged result went unanswered (timeout,
+/// refusal, decode miss). Mixing answered and unanswered signals would let
+/// `plan` drop/reorder against an incomparable set — a partial failure must
+/// fail open for the *entire* post-gate, not just the missing slot.
+pub fn verdicts_complete(verdicts: &[Option<Judgement>]) -> bool {
+    verdicts.iter().all(Option::is_some)
+}
+
 /// What to do with the result list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
@@ -658,5 +668,28 @@ mod test {
             judge_results(&asker, "q", "/p", &results, &PostParams::default(), 500).await;
         assert_eq!(verdicts.len(), 2);
         assert!(verdicts.iter().all(|v| v.is_none()), "fail open");
+    }
+
+    #[test]
+    fn test_verdicts_complete_rejects_partial_answers() {
+        // Regression (PR #95 review): a mix of answered and unanswered
+        // verdicts used to reach `plan`, reordering against an
+        // incomparable signal set. Any None must fail open the whole gate.
+        let answered = || Judgement {
+            signal: 0.9,
+            drop: None,
+        };
+        assert!(verdicts_complete(&[
+            Some(answered()),
+            Some(answered()),
+            Some(answered())
+        ]));
+        assert!(!verdicts_complete(&[
+            Some(answered()),
+            None,
+            Some(answered())
+        ]));
+        assert!(!verdicts_complete(&[None, None]));
+        assert!(verdicts_complete(&[]));
     }
 }

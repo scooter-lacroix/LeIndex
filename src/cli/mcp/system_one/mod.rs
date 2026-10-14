@@ -22,7 +22,7 @@ pub(crate) mod testing;
 use crate::cli::registry::ProjectRegistry;
 use crate::config::{LeIndexConfig, SystemOneConfig};
 use client::{HttpAsker, default_base_url, default_model};
-use post::{PostParams, apply_plan, base_score, judge_results, plan};
+use post::{PostParams, apply_plan, base_score, judge_results, plan, verdicts_complete};
 use pre::{CallContext, Change, HealParams, heal};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -338,8 +338,9 @@ impl Gate {
         healed.args
     }
 
-    /// Post-gate: judge `leindex_search` / `leindex_deep_analyze` results and,
-    /// when enforcing, drop and re-order them.
+    /// Post-gate: judge `leindex_search` results and, when enforcing, drop
+    /// and re-order them. (`leindex_deep_analyze` is deliberately excluded —
+    /// see the comment at the guard below.)
     pub async fn post(
         &self,
         registry: &Arc<ProjectRegistry>,
@@ -405,7 +406,10 @@ impl Gate {
             self.timeout_ms,
         )
         .await;
-        if verdicts.iter().all(Option::is_none) {
+        if !verdicts_complete(&verdicts) {
+            // Partial answers are not actionable: a mix of answered and
+            // unanswered verdicts would drop/reorder against an
+            // incomparable signal set. Fail open for the whole list.
             return;
         }
         let decision = plan(&base, &verdicts, &self.post_params);
