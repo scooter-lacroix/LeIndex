@@ -392,6 +392,7 @@ impl StartGuard {
     }
 }
 
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
