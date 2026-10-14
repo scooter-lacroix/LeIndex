@@ -745,12 +745,7 @@ fn run_command_phase(
     phase_name: &str,
     build_cmd: impl Fn(&PathBuf, &PathBuf) -> Command,
 ) -> Result<PhaseReport> {
-    run_command_phase_with_peak_support(
-        config,
-        phase_name,
-        build_cmd,
-        cfg!(target_os = "linux"),
-    )
+    run_command_phase_with_peak_support(config, phase_name, build_cmd, cfg!(target_os = "linux"))
 }
 
 fn run_command_phase_with_peak_support(
