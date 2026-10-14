@@ -379,11 +379,21 @@ pub async fn heal(
         // half-repaired one (Stage 0 edits would otherwise leak through).
         healed.args = original;
         healed.changes.clear();
+        healed.hints.clear();
         return healed;
     };
     apply_project_fill(&answers, ctx, &mut healed, params, wants_project);
     let flagged = flagged_issues(&answers, &issues, wants_project, params);
-    stage2(asker, ctx, &mut healed, flagged, intent, params).await;
+    if stage2(asker, ctx, &mut healed, flagged, intent, params)
+        .await
+        .is_none()
+    {
+        // Stage 2 failed: roll back the entire cascade, including Stage 1's
+        // project fill and advice, while retaining the request accounting.
+        healed.args = original;
+        healed.changes.clear();
+        healed.hints.clear();
+    }
     healed
 }
 
@@ -513,7 +523,8 @@ fn flagged_issues<'i>(
 }
 
 /// Stage 2: one batched pick request per flagged parameter, over
-/// code-enumerated candidates plus `keep_as_is`.
+/// code-enumerated candidates plus `keep_as_is`. `None` signals a provider
+/// failure so the caller can roll back the entire cascade.
 async fn stage2(
     asker: &impl Asker,
     ctx: &CallContext<'_>,
@@ -521,7 +532,7 @@ async fn stage2(
     flagged: Vec<&Issue>,
     intent: Option<&str>,
     params: &HealParams,
-) {
+) -> Option<()> {
     let mut asks: Vec<(String, Question)> = Vec::new();
     let mut offered: Vec<(&Issue, Vec<Value>)> = Vec::new();
     for issue in flagged {
@@ -545,16 +556,14 @@ async fn stage2(
         offered.push((issue, options));
     }
     if asks.is_empty() {
-        return;
+        return Some(());
     }
     let stage2 = Request {
         state: json!({"tool": ctx.tool, "arguments": healed.args, "intent": intent}),
         questions: asks,
     };
     healed.requests += 1;
-    let Some(picks) = ask_bounded(asker, &stage2, params.timeout_ms).await else {
-        return;
-    };
+    let picks = ask_bounded(asker, &stage2, params.timeout_ms).await?;
     for (issue, options) in offered {
         let Some((choice, confidence)) = picks.pick(&format!("fix:{}", issue.param)) else {
             continue;
@@ -583,6 +592,7 @@ async fn stage2(
             },
         );
     }
+    Some(())
 }
 
 /// One model-chosen repair to apply (or, for a mutating tool, hint at).
@@ -955,6 +965,62 @@ mod test {
         .await;
         assert_eq!(healed.args["search_mode"], "fuzzy");
         assert!(healed.changes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stage2_failure_rolls_back_code_repairs_project_fill_and_hints() {
+        let projects = vec!["/a".to_string()];
+        let args = json!({"query": "q", "top_k": 500, "search_mode": "fuzzy", "colour": 1});
+        let s = schema();
+        for read_only in [true, false] {
+            let asker = FnAsker(|req: &Request| {
+                if req.questions.iter().any(|(name, _)| name == "fix:search_mode") {
+                    // Stage 0 repairs and Stage 1 fill (or hint for a mutating
+                    // tool) have already happened before the provider fails.
+                    if read_only {
+                        assert_eq!(req.state["arguments"]["top_k"], 100);
+                        assert_eq!(req.state["arguments"]["project_path"], "/a");
+                    }
+                    return Err(SystemOneError::Status(529));
+                }
+                let mut response = answers_of(&[("call_ok", 0.0), ("needs:project_path", 1.0)]);
+                response.answers.insert(
+                    "fill:project_path".into(),
+                    Answer::Pick {
+                        choice: "/a".into(),
+                        probabilities: vec![],
+                        confidence: 1.0,
+                    },
+                );
+                Ok(response)
+            });
+            let healed = heal(
+                &asker,
+                &ctx(&s, read_only, &projects),
+                args.clone(),
+                None,
+                &HealParams::default(),
+            )
+            .await;
+            assert_eq!(healed.requests, 2);
+            assert_eq!(healed.args, args);
+            assert!(healed.changes.is_empty());
+            assert!(healed.hints.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stage1_failure_rolls_back_code_repairs_and_hints() {
+        let asker = FnAsker(|_: &Request| Err(SystemOneError::Status(529)));
+        let s = schema();
+        let mut context = ctx(&s, true, &[]);
+        context.project_unresolved = true;
+        let args = json!({"query": "q", "top_k": 500, "search_mode": "fuzzy"});
+        let healed = heal(&asker, &context, args.clone(), None, &HealParams::default()).await;
+        assert_eq!(healed.requests, 1);
+        assert_eq!(healed.args, args);
+        assert!(healed.changes.is_empty());
+        assert!(healed.hints.is_empty());
     }
 
     #[tokio::test]

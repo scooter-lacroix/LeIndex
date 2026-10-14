@@ -660,8 +660,11 @@ pub struct SystemOneConfig {
 
 impl SystemOneConfig {
     /// Apply the active preset overlay: every field the preset sets overrides
-    /// this section's value. An `active_preset` naming a missing preset is
-    /// ignored (warned by the consumer) — config stays usable.
+    /// this section's value. Unset provider-specific fields inherit only
+    /// when the provider is unchanged; switching providers uses that provider's
+    /// defaults rather than retaining the old endpoint, model, or credentials.
+    /// An `active_preset` naming a missing preset is ignored (warned by the
+    /// consumer) — config stays usable.
     pub fn effective(&self) -> Self {
         let Some(name) = self.active_preset.as_deref().map(str::trim) else {
             return self.clone();
@@ -669,18 +672,27 @@ impl SystemOneConfig {
         let Some(preset) = self.presets.get(name) else {
             return self.clone();
         };
+        let provider = preset
+            .provider
+            .clone()
+            .unwrap_or_else(|| self.provider.clone());
+        // Match the provider parser's case/whitespace and Jev alias rules.
+        let provider_identity = |value: &str| match value.trim().to_ascii_lowercase().as_str() {
+            "typesafe" => "jev".to_string(),
+            value => value.to_string(),
+        };
+        let same_provider = provider_identity(&provider) == provider_identity(&self.provider);
+        let overlay = |value: &Option<String>, base: &Option<String>| {
+            value
+                .clone()
+                .or_else(|| if same_provider { base.clone() } else { None })
+        };
         Self {
-            provider: preset
-                .provider
-                .clone()
-                .unwrap_or_else(|| self.provider.clone()),
-            model: preset.model.clone().or_else(|| self.model.clone()),
-            base_url: preset.base_url.clone().or_else(|| self.base_url.clone()),
-            service: preset.service.clone().or_else(|| self.service.clone()),
-            api_key_env: preset
-                .api_key_env
-                .clone()
-                .or_else(|| self.api_key_env.clone()),
+            provider,
+            model: overlay(&preset.model, &self.model),
+            base_url: overlay(&preset.base_url, &self.base_url),
+            service: overlay(&preset.service, &self.service),
+            api_key_env: overlay(&preset.api_key_env, &self.api_key_env),
             ..self.clone()
         }
     }
@@ -1480,6 +1492,72 @@ mod tests {
         // Clearing the preset (or naming a missing one) reverts to laya.
         cfg.active_preset = Some("nope".into());
         assert_eq!(cfg.effective().provider, "laya");
+    }
+
+    #[test]
+    fn test_system_one_provider_change_clears_unset_provider_fields() {
+        let mut cfg = SystemOneConfig {
+            provider: "laya".into(),
+            model: Some("local-model".into()),
+            base_url: Some("http://127.0.0.1:8000".into()),
+            service: Some("laya".into()),
+            api_key_env: Some("LOCAL_API_KEY".into()),
+            mode: "enforce".into(),
+            active_preset: Some("remote".into()),
+            ..SystemOneConfig::default()
+        };
+        cfg.presets.insert(
+            "remote".into(),
+            SystemOnePreset {
+                provider: Some("openai".into()),
+                ..SystemOnePreset::default()
+            },
+        );
+        let effective = cfg.effective();
+        assert_eq!(effective.provider, "openai");
+        assert_eq!(effective.model, None);
+        assert_eq!(effective.base_url, None);
+        assert_eq!(effective.service, None);
+        assert_eq!(effective.api_key_env, None);
+        assert_eq!(effective.mode, "enforce");
+
+        let preset = cfg.presets.get_mut("remote").unwrap();
+        preset.model = Some("remote-model".into());
+        preset.base_url = Some("https://remote.example".into());
+        preset.service = Some("remote-service".into());
+        preset.api_key_env = Some("REMOTE_API_KEY".into());
+        let effective = cfg.effective();
+        assert_eq!(effective.model.as_deref(), Some("remote-model"));
+        assert_eq!(effective.base_url.as_deref(), Some("https://remote.example"));
+        assert_eq!(effective.service.as_deref(), Some("remote-service"));
+        assert_eq!(effective.api_key_env.as_deref(), Some("REMOTE_API_KEY"));
+    }
+
+    #[test]
+    fn test_system_one_same_provider_presets_inherit_unset_fields() {
+        let mut cfg = SystemOneConfig {
+            provider: "jev".into(),
+            model: Some("base-model".into()),
+            base_url: Some("https://base.example".into()),
+            service: Some("base-service".into()),
+            api_key_env: Some("BASE_API_KEY".into()),
+            active_preset: Some("same".into()),
+            ..SystemOneConfig::default()
+        };
+        for provider in [None, Some("jev"), Some(" JEV "), Some("typesafe")] {
+            cfg.presets.insert(
+                "same".into(),
+                SystemOnePreset {
+                    provider: provider.map(str::to_string),
+                    ..SystemOnePreset::default()
+                },
+            );
+            let effective = cfg.effective();
+            assert_eq!(effective.model, cfg.model);
+            assert_eq!(effective.base_url, cfg.base_url);
+            assert_eq!(effective.service, cfg.service);
+            assert_eq!(effective.api_key_env, cfg.api_key_env);
+        }
     }
 
     #[test]
