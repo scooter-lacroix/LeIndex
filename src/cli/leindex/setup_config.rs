@@ -283,7 +283,8 @@ fn validate_embeddings(config: &LeIndexConfig) -> Result<(), SetupError> {
     if let Some(service) = non_empty(embeddings.remote_service.as_deref()) {
         if !config.services.contains_key(service) {
             return Err(invalid(format!(
-                "indexing.embeddings.remote_service references missing [services.{service}]"
+                "indexing.embeddings.remote_service references missing [services.{service}] \
+                 (add it, or run `leindex config unset indexing.embeddings.remote_service`)"
             )));
         }
     }
@@ -324,14 +325,16 @@ fn validate_system_one_refs(config: &LeIndexConfig) -> Result<(), SetupError> {
     if let Some(service) = non_empty(config.system_one.service.as_deref()) {
         if !config.services.contains_key(service) {
             return Err(invalid(format!(
-                "system_one.service references missing [services.{service}]"
+                "system_one.service references missing [services.{service}] \
+                 (add it, or run `leindex config unset system_one.service`)"
             )));
         }
     }
     if let Some(preset) = non_empty(config.system_one.active_preset.as_deref()) {
         if !config.system_one.presets.contains_key(preset) {
             return Err(invalid(format!(
-                "system_one.active_preset references missing [system_one.presets.{preset}]"
+                "system_one.active_preset references missing [system_one.presets.{preset}] \
+                 (add it, or run `leindex config unset system_one.active_preset`)"
             )));
         }
     }
@@ -368,7 +371,8 @@ fn validate_presets(config: &LeIndexConfig) -> Result<(), SetupError> {
         if let Some(service) = non_empty(preset.service.as_deref()) {
             if !config.services.contains_key(service) {
                 return Err(invalid(format!(
-                    "system_one.presets.{name}.service references missing [services.{service}]"
+                    "system_one.presets.{name}.service references missing [services.{service}] \
+                     (add it, or run `leindex config unset system_one.presets.{name}.service`)"
                 )));
             }
         }

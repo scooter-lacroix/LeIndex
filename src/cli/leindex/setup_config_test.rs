@@ -182,6 +182,30 @@ fn test_validate_rejects_missing_service_reference() {
 }
 
 #[test]
+fn test_set_on_config_with_missing_service_reference_names_unset_escape() {
+    // Cross-reference failures make the WHOLE document unsaveable, so `set`
+    // on an unrelated key fails until the dangling reference is gone. The
+    // error must name the escape hatch or the user is stuck in a loop.
+    let dir = tempfile::tempdir().unwrap();
+    let original = "[system_one]\nservice = \"ghost\"\n";
+    let path = write_config(&dir, original);
+
+    let err = apply_set_at(&path, "search.search_mode", "\"hybrid\"")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("references missing [services.ghost]")
+            && err.contains("leindex config unset system_one.service"),
+        "error must name the unset escape hatch: {err}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+    // And the escape hatch actually unsticks the file.
+    apply_unset_at(&path, "system_one.service").unwrap();
+    apply_set_at(&path, "search.search_mode", "\"hybrid\"").unwrap();
+}
+
+#[test]
 fn test_validate_rejects_non_http_url() {
     // "http:///v1" is NOT hostless: the WHATWG special-authority state skips
     // extra slashes, so it parses as http://v1/ (probed against url 2.5.8).
