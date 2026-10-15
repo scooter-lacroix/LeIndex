@@ -838,3 +838,37 @@ fn test_show_and_get_redact_secret_extra_args() {
     let got = get_at(&path, "services.gemma.extra_args").unwrap();
     assert!(!got.contains("secret-host-key"), "leaked: {got}");
 }
+
+#[test]
+fn test_unset_removes_each_of_two_dangling_references() {
+    // The unset escape hatch must not dead-end on a SECOND dangling
+    // reference: unset is the repair command, so the edited document saves
+    // while another dangling reference remains (deferred strict validation,
+    // see commit_table_at), and only a fully-resolved document validates
+    // strictly again.
+    let dir = tempfile::tempdir().unwrap();
+    let original = concat!(
+        "[indexing.embeddings]\n",
+        "remote_service = \"ghost1\"\n",
+        "\n",
+        "[system_one]\n",
+        "service = \"ghost2\"\n",
+    );
+    let path = write_config(&dir, original);
+
+    // While both references dangle, `set` is still refused (whole-document
+    // strict validation) and the file is untouched.
+    let err = apply_set_at(&path, "search.search_mode", "\"hybrid\"")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("references missing"), "must refuse set: {err}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+    // The suggested escape for ghost2 works even though ghost1 still dangles…
+    apply_unset_at(&path, "system_one.service").unwrap();
+    // …and so does the escape for ghost1.
+    apply_unset_at(&path, "indexing.embeddings.remote_service").unwrap();
+
+    // Fully resolved again: set validates strictly and succeeds.
+    apply_set_at(&path, "search.search_mode", "\"hybrid\"").unwrap();
+}
