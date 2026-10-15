@@ -718,13 +718,16 @@ fn ensure_table_path<'a>(
 /// then save. The file is never rewritten on any failure. `repair` marks the
 /// `config unset` path and carries the dangling references of the PRE-EDIT
 /// document: unset is itself the escape hatch for dangling cross-references,
-/// so when the edited document still fails validation ONLY because of
-/// dangling references that predate the edit, strict validation is deferred —
-/// refusing to save because *another* pre-existing dangling reference remains
-/// would recreate the dead end. Dangling references created by the edit
-/// (deleting a service that is still referenced) are never tolerated, every
-/// other invariant (ranges, enums, nonzero bounds) stays strict in repair
-/// mode, and unknown-key and type checks always run.
+/// so when the edited document still fails validation only because of
+/// dangling references that predate the edit, validation is retried without
+/// them — refusing to save because *another* pre-existing dangling reference
+/// remains would recreate the dead end. Every other failure refuses the save,
+/// including anything the deferral would otherwise mask: `validate` is
+/// short-circuiting, so a pre-existing reference must never shield a
+/// different violation (a repair that silently saves `timeout_ms = 0` behind
+/// a dangling reference is not a repair). Dangling references created by the
+/// edit (deleting a service that is still referenced) are never tolerated,
+/// and unknown-key and type checks always run.
 fn commit_table_at(
     path: &Path,
     root: &toml::Table,
@@ -738,17 +741,47 @@ fn commit_table_at(
     if let Err(err) = validate(&config) {
         let post_dangling = dangling_references(&config);
         let repairable = repair.is_some_and(|pre_dangling| {
-            is_reference_error(&err)
-                && !post_dangling.is_empty()
+            !post_dangling.is_empty()
                 && post_dangling
                     .iter()
                     .all(|reference| pre_dangling.contains(reference))
         });
-        if !repairable {
+        if !repairable || scrub_and_validate(&config, &post_dangling).is_err() {
             return Err(err.into());
         }
     }
     save_config_at(path, &config)
+}
+
+/// Validate `config` with the given dangling references blanked out, so a
+/// repair saves only when the edit introduces nothing invalid of its own:
+/// every remaining invariant (ranges, enums, nonzero bounds) is enforced
+/// instead of being masked behind the first reference error. Blanking is a
+/// pure relaxation of the reference checks — it can never hide a violation.
+fn scrub_and_validate(config: &LeIndexConfig, dangling: &[CrossRef]) -> Result<(), SetupError> {
+    let mut scrubbed = config.clone();
+    for reference in dangling {
+        match reference {
+            CrossRef::EmbeddingService(_) => {
+                scrubbed.indexing.embeddings.remote_service = None;
+            }
+            CrossRef::SystemService(_) => scrubbed.system_one.service = None,
+            CrossRef::ActivePreset(_) => scrubbed.system_one.active_preset = None,
+            CrossRef::PresetService(name) => {
+                for preset in scrubbed.system_one.presets.values_mut() {
+                    if preset
+                        .service
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|service| service == name.trim())
+                    {
+                        preset.service = None;
+                    }
+                }
+            }
+        }
+    }
+    validate(&scrubbed)
 }
 
 /// One cross-reference between config sections, as checked by [`validate`].
@@ -813,14 +846,6 @@ fn dangling_references(config: &LeIndexConfig) -> Vec<CrossRef> {
         .into_iter()
         .filter(|reference| reference.is_dangling(config))
         .collect()
-}
-
-/// Whether a validation failure is one the unset repair path may defer: a
-/// dangling cross-reference or the hybrid ladder failing to resolve because
-/// of one. Every other invariant stays strict even in repair mode.
-fn is_reference_error(err: &SetupError) -> bool {
-    let message = err.to_string();
-    message.contains("references missing") || message.contains("no endpoint resolves")
 }
 
 /// Reject every unknown section/field anywhere in the document BEFORE saving:

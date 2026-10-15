@@ -217,8 +217,8 @@ leaves calls and results untouched — and ships off by default.
 Fail-open tuning lives in `[system_one]`: `mode` (`off`/`shadow` — decide and
 log only —/`enforce`), `pre_gate`, `post_gate`, `timeout_ms`, and the
 `relevant_min`/`instructions_max`/`top_n`/`tau_apply` thresholds. See
-[`leindex.toml.example`](leindex.toml.example) and
-[`docs/NEURAL_SETUP.md`](docs/NEURAL_SETUP.md#configuration-and-system-one).
+[`leindex.toml.example`](https://github.com/scooter-lacroix/LeIndex/blob/master/leindex.toml.example) and
+[`docs/NEURAL_SETUP.md`](https://github.com/scooter-lacroix/LeIndex/blob/master/docs/NEURAL_SETUP.md#configuration-and-system-one).
 
 Inspect or edit configuration without rerunning setup:
 

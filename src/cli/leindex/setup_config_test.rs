@@ -872,3 +872,25 @@ fn test_unset_removes_each_of_two_dangling_references() {
     // Fully resolved again: set validates strictly and succeeds.
     apply_set_at(&path, "search.search_mode", "\"hybrid\"").unwrap();
 }
+
+#[test]
+fn test_unset_repair_refuses_when_scrubbed_document_still_invalid() {
+    // A pre-existing dangling reference must not shield other violations:
+    // validate is short-circuiting, so the repair re-validates with the
+    // pre-existing references blanked out. Here the zero timeout_ms hides
+    // behind the surviving ghost reference in the first pass — the repair
+    // must refuse instead of saving an invalid document.
+    let dir = tempfile::tempdir().unwrap();
+    let original = "[indexing.embeddings]\nremote_service = \"ghost1\"\n\n\
+                    [system_one]\nservice = \"ghost2\"\ntimeout_ms = 0\n";
+    let path = write_config(&dir, original);
+
+    let err = apply_unset_at(&path, "indexing.embeddings.remote_service")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("references missing"),
+        "must refuse the repair: {err}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}

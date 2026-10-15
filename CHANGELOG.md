@@ -11,6 +11,11 @@ All notable changes to the LeIndex project are documented in this file.
   `presets.<n>.service`) now name the exact `leindex config unset <key>`
   escape; previously every `config set` failed while such a reference existed,
   with no unstick path in the error.
+- `config unset` also repairs multi-dangling configurations: removing one
+  dangling reference no longer fails because another pre-existing one remains.
+  The repair saves only when nothing else is invalid — a pre-existing
+  reference never masks other violations — and references the edit itself
+  creates (deleting a service that is still referenced) are still refused.
 - `leindex setup --check` no longer panics with "Cannot start a runtime from
   within a runtime" when the System One laya probe runs: the CLI wraps every
   command in a tokio runtime, and the probe's confirmation prompt now drives
