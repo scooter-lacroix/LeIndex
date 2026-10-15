@@ -150,6 +150,11 @@ embedding call. One llama-server serves one model: run a second section (for
 example `[services.laya]` on port 8181) for the System-One gate's decision
 model — see the `[system_one]` block in `leindex.toml.example`.
 
+On multi-GPU hosts, pin the device explicitly in `extra_args`, for example
+`extra_args = ["-ngl", "99", "--device", "Vulkan1"]`: llama-server auto device
+selection can land on an integrated GPU and thrash. Verify the pinned device
+in the service log after `services start`.
+
 ### vLLM
 
 Use a vLLM version whose pooling runner supports the model's architecture.
@@ -260,12 +265,55 @@ leindex config validate
 
 `config set` takes a dotted key and TOML value; quote string values as shown.
 `show`/`get` redact secrets. Validate configuration after manual changes.
+`config set` is all-or-nothing: the whole document is validated after every
+edit, so a dangling cross-reference (for example `system_one.service` naming a
+service that no longer exists) blocks *every* set until removed — the error
+names the exact `leindex config unset <key>` escape.
 
-`leindex setup --system-one` opens the terminal wizard for the separate decision
-route (managed Laya or external provider). The gate requires a build with
-`--features system-one` and `LEINDEX_FEATURE_SYSTEM_ONE=1` in the MCP/server
-process. Configuration alone does not enable that runtime gate. Name credentials
-through `api_key_env`, never place tokens in examples or shared config.
+### System One (experimental decision gate)
+
+System One is a separate decision route: a small typed-decision model
+validates tool calls before they run (pre-gate) and classifies search results
+before they reach your agent (post-gate). It fails open — any provider
+problem leaves calls and results untouched — and ships off by default. It is
+**experimental** and requires a source build:
+
+```bash
+cargo install leindex --features system-one
+leindex setup --system-one   # interactive wizard; writes [system_one] + [services.laya]
+```
+
+The wizard prompts for the llama-server binary and an absolute Laya GGUF path
+(the gate's decision model has no auto-download;
+`ggml-org/Laya-GGUF` on Hugging Face is a known source), saves the
+`[services.laya]` section before running smoke tests, and derives the gate's
+endpoint from that service (port 8181 by default — the embeddings service on
+8080 stays untouched; one llama-server serves one model).
+
+Three things must line up before the gate runs:
+
+1. a build with `--features system-one` (`setup --check` reports
+   `build (system-one feature): yes/no`);
+2. a `[system_one]` section with `mode` other than `"off"`, or the gate stays
+   dormant — `mode = "shadow"` decides and logs without applying;
+   `"enforce"` applies decisions;
+3. `LEINDEX_FEATURE_SYSTEM_ONE=1` in every process that serves MCP or runs
+   the CLI — for an MCP stdio server, an `env` block in the client's server
+   entry. Configuration alone never enables the runtime gate.
+
+`leindex setup --check` on an armed, feature-built binary reports the gate as
+`active` and its probe sends one real decision request (bounded by
+`system_one.timeout_ms`); unlike the embedding probe, it starts an
+`auto_start` service first.
+
+Tuning keys (see `leindex.toml.example` for defaults and the full list):
+`mode` (`off`/`shadow`/`enforce`), `pre_gate`/`post_gate` toggles,
+`timeout_ms`, result-selection `top_n`, and the thresholds `relevant_min`,
+`instructions_max`, `tau_apply`. Providers: `laya` and `jev` run as managed
+local services and need no credentials; the remote `openai` provider takes
+`base_url`, `model`, and `api_key_env` — the environment variable *name*
+holding the key, never the key itself. Name credentials through `api_key_env`;
+do not place tokens in examples or shared config.
 
 ## Model Provisioning
 
