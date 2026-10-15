@@ -154,6 +154,94 @@ const QUERIES: &[&str] = &[
 // Tests
 // ===========================================================================
 
+/// T2 (RC3): a graph-only hydrated instance (metadata-only generation: the
+/// leased layers carry the graph but no heap-mirrored `leindex.db`, so
+/// `active_has_indexed_files()` reports false) must still rebuild its search
+/// engine in `ensure_analysis_context_loaded`. Pre-fix, the rebuild gate
+/// keyed only on `active_has_indexed_files()`, the engine stayed empty
+/// forever, and every search answered "project not indexed".
+#[test]
+fn test_engine_rebuilt_after_graph_only_hydration() {
+    let _guard = lock_flag_tests();
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_fixture_project(dir.path());
+    index_project_fixture(dir.path());
+
+    set_flag_override_for_test(FeatureFlag::GenerationReaders, true);
+    let mut idx = LeIndex::new(dir.path()).expect("new");
+    assert!(
+        idx.try_hydrate_generation_pdg_only()
+            .expect("pdg-only hydrate"),
+        "fixture must produce a graph-only hydrated instance"
+    );
+    // The discriminating state: graph resident, engine empty, no indexed
+    // files visible through the heap-mirrored db probe.
+    assert!(idx.pdg().is_some(), "graph must be resident");
+    assert!(
+        idx.search_engine().is_empty(),
+        "pdg-only hydration must not populate the engine"
+    );
+    assert!(
+        !idx.active_has_indexed_files(),
+        "metadata-only generation must not look indexed via the db probe"
+    );
+
+    // The fix: this must rebuild the engine from the resident PDG.
+    idx.ensure_analysis_context_loaded()
+        .expect("ensure analysis context");
+    clear_flag_overrides_for_test();
+
+    assert!(
+        !idx.search_engine().is_empty(),
+        "engine must be rebuilt from the resident PDG even when \
+         active_has_indexed_files() is false"
+    );
+    let results = idx
+        .search("authenticate user", 10, None)
+        .expect("search must work after engine rebuild");
+    assert!(
+        !results.is_empty(),
+        "rebuilt engine must return real results, not a not-indexed lie"
+    );
+}
+
+/// T3 (RC4a): a missing (or zero-node) root `index_stats.json` must not make
+/// a healthy committed generation look unindexed — `load_stats_from_path`
+/// falls back to the ACTIVE generation's stats copy. Pre-fix, the root copy
+/// was the only source, so a lost/stale root file (e.g. after
+/// `restore_latest_generation` repair, which does not rewrite it) made
+/// `is_indexed()` permanently false.
+#[test]
+fn test_stats_fallback_to_generation_copy() {
+    let _guard = lock_flag_tests();
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_fixture_project(dir.path());
+    index_project_fixture(dir.path());
+    let storage_root = dir.path().join(".leindex");
+
+    // The published generation must carry its stats copy.
+    let generation =
+        read_current_generation(&storage_root).expect("current generation after index");
+    let gen_stats = storage_root
+        .join("generations")
+        .join(generation.to_string())
+        .join("index_stats.json");
+    assert!(
+        gen_stats.is_file(),
+        "generation must carry index_stats.json"
+    );
+
+    // Lose the root copy (the mutable-root state repair never rewrites).
+    std::fs::remove_file(storage_root.join("index_stats.json"))
+        .expect("remove root index_stats.json");
+
+    let idx = LeIndex::new(dir.path()).expect("new");
+    assert!(
+        idx.is_indexed(),
+        "generation stats copy must keep is_indexed true after root loss"
+    );
+}
+
 /// The generation read path is the single source of truth after the D5 write
 /// flip (the SQL catalog no longer holds graph rows): with the flag on, the
 /// search/symbol/deep-analyze read path hydrates a populated graph and search
@@ -328,7 +416,8 @@ fn test_no_stall_read_during_index() {
     let (tx_mid, rx_mid) = mpsc::channel();
     let writer_storage = storage_root.clone();
     let writer = thread::spawn(move || {
-        let _write_lock = ProjectWriteLock::acquire(&writer_storage).expect("acquire write lock");
+        let _write_lock =
+            ProjectWriteLock::acquire_bounded(&writer_storage).expect("acquire write lock");
         // Stage + write manifest for gen 2, but leave CURRENT on gen 1.
         let cas = Arc::new(Mutex::new(
             CasStore::open(writer_storage.join("cas")).expect("open cas"),

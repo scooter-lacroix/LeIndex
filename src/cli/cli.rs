@@ -18,7 +18,7 @@ mod phase_commands;
 use anyhow::Context;
 use anyhow::Result as AnyhowResult;
 use clap::{Parser, Subcommand, error::ErrorKind};
-use phase_commands::cmd_phase_impl;
+use phase_commands::{PhaseCommandArgs, cmd_phase_impl};
 use serde_json::Value;
 use std::fs;
 use std::net::SocketAddr;
@@ -350,6 +350,64 @@ pub enum Commands {
         /// Auto-runs on cold cache when neural is enabled with a GPU provider.
         #[arg(long = "warmup")]
         warmup: bool,
+
+        /// Provision the embeddinggemma-2 remote-embeddings preset: download
+        /// the pinned GGUF into the model dir and wire [services.gemma] +
+        /// [indexing.embeddings] in leindex.toml. Implies the neural path
+        /// (like --cpu/--gpu) — resolved in cmd_setup_impl, not clap
+        /// `requires`, which would *demand* --neural instead.
+        #[arg(long = "remote-gemma")]
+        remote_gemma: bool,
+
+        /// Model route, managed runtime, and external endpoint options.
+        #[command(flatten)]
+        options: crate::cli::leindex::setup::SetupOptions,
+    },
+
+    /// Manage managed model-server services ([services.<name>] sections)
+    ///
+    /// List, inspect, start, stop and restart the llama-server-compatible
+    /// processes declared in leindex.toml. Health probes the service's HTTP
+    /// /health endpoint (503-aware); `status` shows pid (from our pidfile,
+    /// verified), endpoint, model and auto-start policy.
+    Services {
+        /// Action to perform (list when omitted)
+        #[command(subcommand)]
+        action: Option<ServiceAction>,
+    },
+
+    /// Inspect and edit leindex.toml (show/get/set/unset/validate/path)
+    Config {
+        /// Config action to perform
+        #[command(subcommand)]
+        action: crate::cli::leindex::setup_config::ConfigAction,
+    },
+}
+
+/// Actions for `leindex services`.
+#[derive(Subcommand, Debug)]
+pub enum ServiceAction {
+    /// Show every configured service and its state (default)
+    List,
+    /// Show one service's state in detail
+    Status {
+        /// Service name ([services.<name>] key)
+        name: String,
+    },
+    /// Start a service (waits for the port to answer)
+    Start {
+        /// Service name ([services.<name>] key)
+        name: String,
+    },
+    /// Stop a service (SIGTERM its process group; refuses foreign pids)
+    Stop {
+        /// Service name ([services.<name>] key)
+        name: String,
+    },
+    /// Stop then start a service
+    Restart {
+        /// Service name ([services.<name>] key)
+        name: String,
     },
 }
 
@@ -466,12 +524,12 @@ impl Cli {
                 docs_mode,
                 no_incremental_refresh,
             } => {
-                cmd_phase_impl(
+                cmd_phase_impl(PhaseCommandArgs {
                     phase,
                     all,
                     mode,
                     path,
-                    global_project,
+                    project: global_project,
                     max_files,
                     max_focus_files,
                     top_n,
@@ -479,7 +537,7 @@ impl Cli {
                     include_docs,
                     docs_mode,
                     no_incremental_refresh,
-                )
+                })
                 .await
             }
             Commands::Diagnostics => cmd_diagnostics_impl(global_project).await,
@@ -542,7 +600,23 @@ impl Cli {
                 gpu,
                 check,
                 warmup,
-            } => cmd_setup_impl(neural, no_neural, cpu, gpu, check, warmup).await,
+                remote_gemma,
+                options,
+            } => {
+                cmd_setup_impl(
+                    neural,
+                    no_neural,
+                    cpu,
+                    gpu,
+                    check,
+                    warmup,
+                    remote_gemma,
+                    options,
+                )
+                .await
+            }
+            Commands::Services { action } => cmd_services_impl(action).await,
+            Commands::Config { action } => crate::cli::leindex::setup_config::run(action),
         };
 
         // Write the memory report (if tracking was enabled) before returning.
@@ -1519,51 +1593,139 @@ async fn cmd_setup_impl(
     gpu: Option<String>,
     check: bool,
     warmup: bool,
+    remote_gemma: bool,
+    options: crate::cli::leindex::setup::SetupOptions,
 ) -> AnyhowResult<()> {
     use crate::cli::leindex::setup;
 
     // VAL-SETUP-014: --check mode is read-only
     if check {
-        check_neutral_conflicts(neural, no_neural, cpu, gpu.as_deref())?;
-        let result = setup::run_check().map_err(|e| anyhow::anyhow!("{}", e))?;
-        // Exit code reflects completeness
-        if !result.fully_configured {
-            anyhow::bail!("setup check incomplete");
-        }
+        return run_setup_check_mode(
+            neural,
+            no_neural,
+            cpu,
+            gpu.as_deref(),
+            warmup,
+            remote_gemma,
+            &options,
+        );
+    }
+
+    if setup::configure_system_one_if_standalone(
+        &options,
+        neural || no_neural || cpu || gpu.is_some() || remote_gemma,
+        warmup,
+    )? {
         return Ok(());
     }
 
+    let choices = build_setup_choices(neural, no_neural, cpu, gpu, remote_gemma, options)?;
+    let result = setup::execute_setup(&choices).map_err(|e| anyhow::anyhow!("{}", e))?;
+    finish_setup(&choices, &result, warmup)
+}
+
+/// Validate setup flags and resolve them into choices (flags, interactive
+/// prompts, or guidance-and-bail).
+fn build_setup_choices(
+    neural: bool,
+    no_neural: bool,
+    cpu: bool,
+    gpu: Option<String>,
+    remote_gemma: bool,
+    options: crate::cli::leindex::setup::SetupOptions,
+) -> AnyhowResult<crate::cli::leindex::setup::SetupChoices> {
+    use crate::cli::leindex::setup;
+
     // Parse GPU vendor if provided
-    let gpu_vendor = if let Some(gpu_str) = &gpu {
-        Some(setup::parse_gpu_vendor(gpu_str).map_err(|e| anyhow::anyhow!("{}", e))?)
-    } else {
-        None
-    };
+    let gpu_vendor = gpu
+        .as_deref()
+        .map(setup::parse_gpu_vendor)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     // Determine the mode: interactive or non-interactive.
     // VAL-SETUP-015: conflicts are validated by clap (conflicts_with) and also
     // redundantly checked here for the --neural + --no-neural case.
-    let has_flags = neural || no_neural || cpu || gpu.is_some();
+    let has_flags =
+        neural || no_neural || cpu || gpu.is_some() || remote_gemma || options.has_flags();
     if has_flags {
         check_neutral_conflicts(neural, no_neural, cpu, gpu.as_deref())?;
     }
 
     // Resolve choices from flags, interactive prompts, or emit guidance.
-    let choices = resolve_setup_choices(neural, no_neural, cpu, gpu_vendor, has_flags)?;
+    // --remote-gemma implies the neural path (mirrors --cpu/--gpu implication
+    // inside resolve_from_flags) so it works standalone on a fresh install.
+    let embedding_requested = neural || remote_gemma || options.embedding.is_some();
+    let mut choices =
+        resolve_setup_choices(embedding_requested, no_neural, cpu, gpu_vendor, has_flags)?;
+    choices.remote_gemma = remote_gemma;
+    if has_flags {
+        choices.options = options;
+    }
+    if onnx_provider_conflict(
+        cpu,
+        gpu.is_some(),
+        remote_gemma,
+        choices.options.embedding.as_deref(),
+    ) {
+        anyhow::bail!("--cpu/--gpu select ONNX providers; use --gpu-layers for managed llama.cpp");
+    }
+    Ok(choices)
+}
 
-    // Execute the setup with the resolved choices
-    let result = setup::execute_setup(&choices).map_err(|e| anyhow::anyhow!("{}", e))?;
+/// Print the setup summary, then run the smoke test and optional MIGraphX warmup.
+fn finish_setup(
+    choices: &crate::cli::leindex::setup::SetupChoices,
+    result: &crate::cli::leindex::setup::SetupResult,
+    warmup: bool,
+) -> AnyhowResult<()> {
+    use crate::cli::leindex::setup;
 
-    // Print the final summary
     // VAL-SETUP-034: surfaces neural on/off, provider, ORT, model, config
-    setup::print_summary(&result);
+    setup::print_summary(result);
 
     // Smoke test (fatal on real failure) + MIGraphX warmup (non-fatal).
     #[cfg(feature = "onnx")]
-    let do_warmup = warmup || should_auto_warmup(&choices, &result);
+    let do_warmup = warmup || should_auto_warmup(choices, result);
     #[cfg(not(feature = "onnx"))]
     let do_warmup = warmup;
-    handle_smoke_and_warmup(&result, do_warmup)
+    handle_smoke_and_warmup(result, do_warmup)
+}
+
+/// True when `--cpu`/`--gpu` (ONNX providers) is combined with an embedding
+/// backend that ONNX cannot serve (`--remote-gemma` or any non-qwen3 embedding).
+fn onnx_provider_conflict(
+    cpu: bool,
+    gpu: bool,
+    remote_gemma: bool,
+    embedding: Option<&str>,
+) -> bool {
+    (cpu || gpu) && (remote_gemma || embedding.is_some_and(|r| r != "qwen3"))
+}
+
+/// `leindex setup --check`: read-only status run; rejects any configuration flag.
+fn run_setup_check_mode(
+    neural: bool,
+    no_neural: bool,
+    cpu: bool,
+    gpu: Option<&str>,
+    warmup: bool,
+    remote_gemma: bool,
+    options: &crate::cli::leindex::setup::SetupOptions,
+) -> AnyhowResult<()> {
+    use crate::cli::leindex::setup;
+
+    if neural || no_neural || cpu || gpu.is_some() || warmup || remote_gemma || options.has_flags()
+    {
+        anyhow::bail!("--check cannot be combined with setup configuration flags");
+    }
+    check_neutral_conflicts(neural, no_neural, cpu, gpu)?;
+    let result = setup::run_check().map_err(|e| anyhow::anyhow!("{}", e))?;
+    // Exit code reflects completeness
+    if !result.fully_configured {
+        anyhow::bail!("setup check incomplete");
+    }
+    Ok(())
 }
 
 /// Resolve setup choices: from explicit flags, interactive prompts, or by
@@ -1686,6 +1848,131 @@ fn check_neutral_conflicts(
         anyhow::bail!("Cannot use --cpu and --gpu together. Choose one execution provider.");
     }
     Ok(())
+}
+
+/// Only successful HTTP readiness is "up"; TCP alone may be another process
+/// or a model server that is still loading.
+fn service_row_state(st: &crate::services::ServiceStatus) -> &'static str {
+    match (st.http_ready, st.pid.is_some()) {
+        (true, _) => "up",
+        (false, true) => "starting",
+        (false, false) => "down",
+    }
+}
+
+/// Print the `services list` table (or the empty-config hint).
+fn print_services_table(
+    services: &std::collections::BTreeMap<String, crate::config::ServiceConfig>,
+) {
+    if services.is_empty() {
+        println!("No [services] sections configured.");
+        println!("Add one to ~/.leindex/config/leindex.toml, e.g.:");
+        println!();
+        println!("[services.laya]");
+        println!("model = \"/path/to/model.gguf\"");
+        println!("port = 8181");
+        return;
+    }
+    println!(
+        "{:<14} {:<7} {:<6} {:<24} {:<10} MODEL",
+        "SERVICE", "STATE", "PID", "ENDPOINT", "AUTO-START"
+    );
+    for (name, cfg) in services {
+        let st = crate::services::status(name, cfg).ok();
+        let st_ref = st.as_ref();
+        println!(
+            "{:<14} {:<7} {:<6} {:<24} {:<10} {}",
+            name,
+            st_ref.map(service_row_state).unwrap_or("error"),
+            st_ref
+                .and_then(|s| s.pid)
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".into()),
+            st_ref.map(|s| s.endpoint.as_str()).unwrap_or("-"),
+            st_ref
+                .map(|s| if s.auto_start { "yes" } else { "no" })
+                .unwrap_or("-"),
+            st_ref
+                .and_then(|s| s.served_model.clone())
+                .unwrap_or_else(|| "-".into())
+        );
+    }
+}
+
+/// Print the `services status <name>` detail block.
+fn print_service_detail(name: &str, st: &crate::services::ServiceStatus) {
+    println!("service:     {}", st.name);
+    println!(
+        "state:       {}",
+        match service_row_state(st) {
+            "up" => "up (HTTP health ready)",
+            "starting" => "starting (process live, HTTP health not ready)",
+            _ => "down",
+        }
+    );
+    println!(
+        "pid:         {}",
+        st.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+    );
+    println!("endpoint:    {}", st.endpoint);
+    println!(
+        "model:       {}",
+        st.model.as_deref().unwrap_or("(none — cannot start)")
+    );
+    println!("served name: {}", st.served_model.as_deref().unwrap_or("-"));
+    println!("auto-start:  {}", if st.auto_start { "yes" } else { "no" });
+    println!("log:         ~/.leindex/logs/services/{name}.log");
+}
+
+/// `leindex services` — manage `[services.<name>]` model servers.
+async fn cmd_services_impl(action: Option<ServiceAction>) -> AnyhowResult<()> {
+    use crate::services as svc;
+    let config = crate::config::LeIndexConfig::load_cached();
+
+    let resolve = |name: &str| -> AnyhowResult<&crate::config::ServiceConfig> {
+        config
+            .services
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("no [services.{name}] section in the config"))
+    };
+
+    match action {
+        None | Some(ServiceAction::List) => {
+            print_services_table(&config.services);
+            Ok(())
+        }
+        Some(ServiceAction::Status { name }) => {
+            let cfg = resolve(&name)?;
+            print_service_detail(&name, &svc::status(&name, cfg)?);
+            Ok(())
+        }
+        Some(ServiceAction::Start { name }) => {
+            let cfg = resolve(&name)?;
+            if svc::start(&name, cfg)? {
+                println!("started {name} ({} ready)", cfg.base_url());
+            } else {
+                println!("{name} already up ({})", cfg.base_url());
+            }
+            Ok(())
+        }
+        Some(ServiceAction::Stop { name }) => {
+            let cfg = resolve(&name)?;
+            match svc::stop(&name, cfg)? {
+                svc::StopOutcome::Stopped(pid) => println!("stopped {name} (pid {pid})"),
+                svc::StopOutcome::AlreadyDown => println!("{name} already down"),
+                svc::StopOutcome::StalePidfileRemoved => {
+                    println!("{name}: stale pidfile removed (was not running)")
+                }
+            }
+            Ok(())
+        }
+        Some(ServiceAction::Restart { name }) => {
+            let cfg = resolve(&name)?;
+            svc::restart(&name, cfg)?;
+            println!("restarted {name} ({})", cfg.base_url());
+            Ok(())
+        }
+    }
 }
 
 /// Main entry point for the CLI

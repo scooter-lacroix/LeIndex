@@ -596,7 +596,6 @@ pub fn build_default_corpus() -> Corpus {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 fn add(
     corpus: &mut Corpus,
     id: &str,
@@ -622,7 +621,6 @@ fn add(
     });
 }
 
-#[allow(clippy::too_many_arguments)]
 fn add_with_negs(
     corpus: &mut Corpus,
     id: &str,

@@ -39,6 +39,9 @@ pub mod output;
 pub mod protocol;
 /// Request budgets, timing metadata, and causal-path counters.
 pub mod request_meta;
+/// System-One gate (experimental; `system-one` feature).
+#[cfg(feature = "system-one")]
+pub mod system_one;
 /// Response detail tiers (`l0` identity card, `l1` overview, `l2` full detail).
 pub mod tier;
 

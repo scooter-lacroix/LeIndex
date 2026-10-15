@@ -159,13 +159,46 @@ curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/LeIndex/master/inst
 bash install-leindex.sh && leindex setup
 ```
 
-The setup wizard picks CPU, NVIDIA CUDA, or AMD ROCm/MIGraphX, installs the
-matching ONNX Runtime, and downloads the model into `~/.leindex/models/`.
-TF-IDF and the PDG are always built first and stay queryable even if the
-neural provider is unavailable — neural scoring attaches when the worker is
-ready and falls back cleanly when it is not. Default model: CodeRankEmbed
-137M INT8 (~135 MiB); `leindex setup --model qwen3` selects the heavier
-Qwen3 baseline (see [`BENCHMARKS.md`](https://github.com/scooter-lacroix/LeIndex/blob/master/BENCHMARKS.md) §8 for the bake-off).
+The setup wizard selects local Qwen3 ONNX, managed EmbeddingGemma2 GGUF, an
+external embeddings server, or the existing configuration. TF-IDF and the PDG
+remain available without a neural provider. Non-interactive `--neural` selects
+local Qwen3; use `--embedding keep` to retain an existing route.
+
+```bash
+leindex setup --embedding qwen3 --cpu
+# Linux managed service: explicit compatible runtime, or verified official download
+leindex setup --embedding embeddinggemma2 --download-llama cpu --gpu-layers 0
+# Alternative: --llama-server /absolute/path/to/llama-server
+leindex setup --embedding remote --embedding-endpoint http://127.0.0.1:9000/v1 \
+  --embedding-model your-served-model
+leindex setup --check
+```
+
+ONNX `--cpu`/`--gpu amd|nvidia` selects a local execution provider; llama.cpp
+`--gpu-layers` controls managed offload independently. Official runtime backends
+are `cpu`, `vulkan`, and `cuda` on supported Linux architectures. Managed setup
+binds loopback only; use an authenticated external server for nonlocal inference.
+Remote routes do not require ORT or a local Qwen model. `--check` makes a bounded
+embedding request without starting services; start a stopped managed service first.
+See [neural setup](https://github.com/scooter-lacroix/LeIndex/blob/master/docs/NEURAL_SETUP.md) for authentication, dimensions and templates.
+
+`leindex setup --system-one` opens the System One wizard in a terminal. The gate
+requires a `system-one` build and `LEINDEX_FEATURE_SYSTEM_ONE=1` in the serving
+process; configuring it does not enable the runtime flag.
+
+Inspect or edit configuration without rerunning setup:
+
+```bash
+leindex config path
+leindex config show
+leindex config get search.search_mode
+leindex config set search.search_mode '"hybrid"'
+leindex config unset indexing.embeddings.remote_endpoint
+leindex config validate
+```
+
+Values passed to `config set` are TOML; strings need the inner double quotes.
+Store API-key environment variable names, never credentials, in shared config.
 
 **Index and search:**
 
@@ -201,8 +234,34 @@ directly. Zed, Cursor, VS Code, and Claude Code configuration snippets are in
 `LEINDEX_REGISTRY_MAX_HEAP_MB` (default 1536), the Engram bounds
 `LEINDEX_ENGRAM_MAX_ENTRIES` (20000) and `LEINDEX_ENGRAM_MAX_MB` (256) — plus the escape hatches
 `LEINDEX_CLI_SHUTDOWN_DAEMON`, `LEINDEX_ALLOW_MULTIPLE_EMBED_DAEMONS`, and
-the `LEINDEX_FEATURE_*` rollout kills documented in
-[`docs/NEURAL_SETUP.md`](https://github.com/scooter-lacroix/LeIndex/blob/master/docs/NEURAL_SETUP.md).
+the `LEINDEX_FEATURE_*` rollout kills catalogued in
+[`.env.example`](https://github.com/scooter-lacroix/LeIndex/blob/master/.env.example). The experimental System-One
+decision gate (source builds with `--features system-one`) additionally needs
+`LEINDEX_FEATURE_SYSTEM_ONE=1` and a `[system_one]` section — see
+`leindex.toml.example`.
+
+The optional System-One gate requires a source build with `--features system-one`.
+Set `LEINDEX_FEATURE_SYSTEM_ONE=1` in the MCP server's environment (the client's
+`env` object for stdio, or the HTTP server's environment), then add this to
+`$LEINDEX_HOME/config/leindex.toml` (default `~/.leindex/config/leindex.toml`):
+
+```toml
+[system_one]
+mode = "shadow" # observe decisions first; use "enforce" to apply them
+provider = "openai"
+base_url = "https://api.openai.com/v1"
+model = "gpt-4.1-mini"
+api_key_env = "SYSTEM_ONE_API_KEY" # environment variable NAME, never the key
+timeout_ms = 10000
+top_n = 5
+```
+
+Set `SYSTEM_ONE_API_KEY` through your server's secret environment, not in this
+file or a committed MCP config. For a local service, use `provider = "laya"`
+with its HTTP base URL and served model, and omit `api_key_env`. Keep
+`mode = "off"` (the default) to disable the gate; `leindex setup --system-one`
+opens the terminal wizard.
+
 
 ---
 

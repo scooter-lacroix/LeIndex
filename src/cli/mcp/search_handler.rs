@@ -215,8 +215,25 @@ fn load_search_context(index: &mut crate::cli::leindex::LeIndex) -> Result<(), J
 }
 
 /// A project with no loaded engine cannot answer a semantic query.
+///
+/// Distinguishes never-indexed (the classic actionable guidance) from
+/// indexed-but-unhydrated (a hydration failure masquerading as "not
+/// indexed" — the permanent lie from the multi-writer incident: persisted
+/// stats say indexed, but the engine never built). The latter names the
+/// actual failure and its remediation instead of sending the user to
+/// re-index an already-indexed project.
 fn ensure_searchable(index: &crate::cli::leindex::LeIndex) -> Result<(), JsonRpcError> {
     if index.search_engine().is_empty() {
+        if index.is_indexed() {
+            return Err(JsonRpcError::indexing_failed(format!(
+                "Search engine failed to hydrate for {} (the index exists on disk with {} \
+                 indexed nodes, but the in-memory engine is empty). Retry the tool call; if \
+                 it persists, run `leindex index --force` in {} to rebuild.",
+                index.project_path().display(),
+                index.get_stats().indexed_nodes,
+                index.project_path().display(),
+            )));
+        }
         return Err(JsonRpcError::project_not_indexed(
             index.project_path().display().to_string(),
         ));

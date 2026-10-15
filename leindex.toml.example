@@ -78,6 +78,11 @@ max_files = 50000
 enable_hybrid = false
 # Preset: "embeddinggemma-2" fills endpoint/model/dimension/templates; "custom" requires explicit keys.
 #remote_provider = "embeddinggemma-2"
+# Derive the endpoint (and model fallback) from a [services.<name>] section
+# instead of hardcoding remote_endpoint. Sits BELOW an explicit remote_endpoint
+# in the resolution ladder. With auto_start = true on that service, LeIndex
+# brings it up before the first remote call.
+#remote_service = "gemma"
 # Base URL of an OpenAI-compatible embeddings endpoint.
 #remote_endpoint = "http://127.0.0.1:8080/v1"
 # Bearer token, if the endpoint requires one (local servers usually do not).
@@ -105,3 +110,70 @@ engine_max_idle_secs = 600
 # Hides the one-time cold-load cost of the first semantic query behind the
 # model's think-time. The engine is still unloaded after engine_max_idle_secs.
 prewarm = "full"
+
+# ── Managed model-server services ──────────────────────────────────────────
+# Each [services.<name>] declares a llama-server-compatible process LeIndex
+# can start, stop and health-check on your behalf (`leindex services` CLI).
+# Consumers reference a service BY NAME to derive their endpoint:
+#   [system_one] service = "laya"
+#   [indexing.embeddings] remote_service = "gemma"
+# Empty by default: an upgrade never adds a managed process by itself.
+# One llama-server serves ONE model — run one section per model you need.
+
+[services.laya]
+# Binary to execute (PATH-resolved).
+binary = "llama-server"
+# Model file passed via -m. Without a model the section can only derive an
+# endpoint; it can never be started.
+model = "/models/laya-bf16.gguf"
+# Served model alias (--alias); also the payload model fallback for consumers.
+alias = "laya"
+host = "127.0.0.1"
+port = 8181
+# Extra args appended verbatim.
+extra_args = ["--ctx-size", "8192"]
+# Allow LeIndex to start this service on demand (transport failure with the
+# system-one gate, first remote-embeddings use). false = endpoint only.
+auto_start = false
+# How long a start may wait for the port to answer before giving up (GGUF
+# loads are slow). Default 120s.
+start_timeout_secs = 120
+
+#[services.gemma]
+# Second server for embeddinggemma-2 (llama-server serves one model each).
+#binary = "llama-server"
+#model = "/models/embeddinggemma-2-Q8_0.gguf"
+#alias = "embeddinggemma-2"
+#port = 8080
+#extra_args = ["--embeddings"]
+
+# ── System-One gate (typed-decision provider; system-one build feature) ────
+# A decision model (Laya, TypeSafe Jev, OpenAI Decisions) checks tool calls
+# before they run and classifies search results before they reach the model.
+# Fail-open: any provider problem leaves calls/results untouched.
+#[system_one]
+# off | shadow (log only) | enforce (apply decisions). Default off.
+#mode = "enforce"
+# laya | jev | openai. Default laya.
+#provider = "laya"
+# Derive base URL + model from [services.laya] instead of hardcoding them.
+#service = "laya"
+# Explicit overrides (win over the service).
+#model = "laya"
+#base_url = "http://127.0.0.1:8181"
+#api_key_env = "OPENAI_API_KEY"   # required for remote providers
+# Latency budget per decision (ms).
+#timeout_ms = 150
+
+# Preset profiles: while active_preset names one, its fields override the
+# section's own — switching local <-> remote is a one-line change.
+#[system_one.presets.local]
+#provider = "laya"
+#service = "laya"
+#[system_one.presets.openai]
+#provider = "openai"
+#model = "gpt-6-luna"
+#api_key_env = "OPENAI_API_KEY"
+#[system_one]
+#active_preset = "local"
+

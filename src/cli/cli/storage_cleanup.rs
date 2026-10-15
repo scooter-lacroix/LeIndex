@@ -29,7 +29,7 @@ pub(super) async fn cmd_cleanup_impl(
         // a publisher's manifest.partial write and its CURRENT swap would
         // abort the publish). Programmatic callers of
         // `cleanup_project_store` manage their own locking.
-        let _write_guard = crate::cli::leindex::ProjectWriteLock::acquire(&storage_root)
+        let _write_guard = crate::cli::leindex::ProjectWriteLock::acquire_bounded(&storage_root)
             .map_err(|e| anyhow::anyhow!("failed to acquire project write lock: {e}"))?;
         let report = crate::cli::cleanup::cleanup_project_store(&storage_root, dry_run)?;
         println!("{}", report);

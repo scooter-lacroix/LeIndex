@@ -1,11 +1,12 @@
 # LeIndex Installation Guide
 
-Last updated: 2026-08-01 for LeIndex 1.9.5.
+Last updated: 2026-10-13 for LeIndex 2.0.
 
 LeIndex is distributed through GitHub release bundles, crates.io, npm, and
 PyPI. Core TF-IDF retrieval and PDG relationships are published first after
-the binary is installed. Run `leindex setup` once to provision the default
-hybrid neural provider and model; healthy `auto` builds then use all three
+the binary is installed. Run `leindex setup` once to provision a neural
+embedding route (local Qwen3 ONNX by default, a managed Linux GGUF service,
+or an external embeddings server); healthy builds then use all three
 signals for indexing and semantic retrieval.
 
 Model files are never included in a release artifact.
@@ -37,6 +38,13 @@ The platform archive contains `leindex`, `leindex-embed`, and ONNX Runtime
 libraries. The installer verifies the archive and installs those runtime
 files. It does not copy or download model weights.
 
+On Linux, `leindex setup --embedding embeddinggemma2` can additionally
+download a separate official llama.cpp runtime (`--download-llama
+cpu|vulkan|cuda`): the download pins tag `b11574` and verifies the archive
+against SHA256 metadata from GitHub's HTTPS release API before extraction.
+Release assets are not claimed immutable. Managed services bind loopback
+only; see [docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md).
+
 ## Cargo
 
 ```bash
@@ -62,6 +70,29 @@ npm run setup --prefix "$(npm root -g)/@leindex/mcp"
 ```
 
 Use the standard MCP command after setup:
+
+The optional System-One gate requires a source build with `--features system-one`.
+Set `LEINDEX_FEATURE_SYSTEM_ONE=1` in the MCP server's environment (the client's
+`env` object for stdio, or the HTTP server's environment), then add this to
+`$LEINDEX_HOME/config/leindex.toml` (default `~/.leindex/config/leindex.toml`):
+
+```toml
+[system_one]
+mode = "shadow" # observe decisions first; use "enforce" to apply them
+provider = "openai"
+base_url = "https://api.openai.com/v1"
+model = "gpt-4.1-mini"
+api_key_env = "SYSTEM_ONE_API_KEY" # environment variable NAME, never the key
+timeout_ms = 10000
+top_n = 5
+```
+
+Set `SYSTEM_ONE_API_KEY` through your server's secret environment, not in this
+file or a committed MCP config. For a local service, use `provider = "laya"`
+with its HTTP base URL and served model, and omit `api_key_env`. Keep
+`mode = "off"` (the default) to disable the gate; `leindex setup --system-one`
+opens the terminal wizard.
+
 
 ```json
 {

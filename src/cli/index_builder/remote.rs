@@ -21,12 +21,32 @@ pub(crate) fn try_remote_neural_embedder(
     if !crate::feature_flags::FeatureFlag::RemoteEmbeddings.is_enabled() {
         return None;
     }
+    // Managed service: bring it up before the first remote call when the
+    // section allows auto_start. Failure is logged and non-fatal (the
+    // provider construction below fails on its own if the port stays down).
+    if let Some(name) = embeddings_cfg.remote_service.as_deref() {
+        let services = &crate::config::LeIndexConfig::load_cached().services;
+        if let Some(svc) = services.get(name) {
+            if svc.auto_start {
+                if let Err(e) = crate::services::ensure_running(name, svc) {
+                    tracing::warn!(service = %name, %e, "could not start managed embedding service");
+                }
+            }
+        }
+    }
     let resolved = embeddings_cfg.resolved_remote()?;
+    let api_key = match embeddings_cfg.resolved_api_key() {
+        Ok(key) => key,
+        Err(error) => {
+            warn!("{error}; remote embeddings unavailable");
+            return None;
+        }
+    };
     let remote_cfg = crate::search::onnx::RemoteEmbeddingConfig {
         provider: crate::search::onnx::RemoteProvider::Custom {
             endpoint: resolved.endpoint,
         },
-        api_key: embeddings_cfg.remote_api_key.clone(),
+        api_key,
         model: resolved.model,
         remote_dimension: resolved.remote_dimension,
         doc_template: resolved.doc_template,

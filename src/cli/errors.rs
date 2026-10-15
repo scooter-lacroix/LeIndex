@@ -427,7 +427,12 @@ impl CorruptionStatus {
 /// `Result<CorruptionStatus>` - Corruption detection result
 pub fn detect_corruption<P: AsRef<Path>>(project_path: P) -> Result<CorruptionStatus> {
     let project_path = project_path.as_ref();
-    let leindex_dir = project_path.join(".leindex");
+    // Probe the RESOLVED storage root, not blindly in-project `.leindex`:
+    // stores under LEINDEX_HOME/XDG never match `project/.leindex`, so
+    // corruption went undetected (and auto-repair never fired) for every
+    // redirected store (incident RC6).
+    let leindex_dir = crate::cli::leindex::resolve_existing_storage_path(project_path)
+        .unwrap_or_else(|| project_path.join(".leindex"));
 
     if !leindex_dir.exists() {
         return Ok(CorruptionStatus::Healthy);
@@ -614,6 +619,42 @@ mod tests {
         assert!(
             status.is_usable(),
             "lock contention must never classify as corruption: {:?}",
+            status.message()
+        );
+    }
+
+    /// T8 (RC6): the corruption probe must check the RESOLVED storage root,
+    /// not blindly `project/.leindex`. Pre-fix, a store under LEINDEX_HOME or
+    /// the XDG data dir never matched the in-project path, so corruption in a
+    /// redirected store went undetected and auto-repair never fired. This
+    /// fixture places the store ONLY at the XDG fallback (no in-project
+    /// `.leindex`), corrupts it, and requires detection.
+    #[test]
+    fn test_detect_corruption_probes_resolved_storage_root() {
+        let dir = tempfile::tempdir().unwrap();
+        // No in-project `.leindex` — the store lives only at the resolved
+        // XDG fallback path for this project.
+        let path_hash = &blake3::hash(dir.path().to_string_lossy().as_bytes()).to_hex()[..12];
+        let xdg_store = dirs::data_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join("leindex")
+            .join(format!(
+                "{}-{}",
+                dir.path().file_name().unwrap().to_str().unwrap(),
+                path_hash
+            ));
+        std::fs::create_dir_all(&xdg_store).unwrap();
+        // Garbage bytes: SQLite open fails with "file is not a database",
+        // which is not lock contention, so it must classify as unusable.
+        std::fs::write(xdg_store.join("leindex.db"), b"definitely not sqlite").unwrap();
+
+        let status = detect_corruption(dir.path()).unwrap();
+        let usable = status.is_usable();
+        let _ = std::fs::remove_dir_all(&xdg_store);
+        assert!(
+            !usable,
+            "corruption in a redirected (XDG) store must be detected via the \
+             resolved storage root, not missed by probing project/.leindex: {:?}",
             status.message()
         );
     }

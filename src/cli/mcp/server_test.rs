@@ -639,3 +639,54 @@ async fn test_bind_with_fallback_port_zero_skips_fallback_loop() {
     // The IP is preserved through the fast path.
     assert_eq!(bound.ip(), preferred.ip());
 }
+
+/// T6 (RC5b): `run_socket` must REFUSE to bind when the socket path is
+/// already served by a live listener. Pre-fix, it unlinked the socket file
+/// unconditionally — the old daemon kept serving on the orphaned inode while
+/// a second daemon bound a fresh socket at the same path, forking the daemon
+/// fleet onto one store. The connect-probe must distinguish live (refuse)
+/// from stale (remove + bind).
+#[cfg(unix)]
+#[tokio::test]
+async fn test_run_socket_refuses_to_steal_live_socket() {
+    use tokio::net::UnixListener;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("d.sock");
+
+    // A live daemon's listener owns the socket path.
+    let live = UnixListener::bind(&socket_path).unwrap();
+
+    // Build a server without touching the process-global OnceLocks
+    // (`McpServer::new` would collide with other tests in this binary).
+    let registry = Arc::new(ProjectRegistry::new(2));
+    let server = McpServer {
+        config: McpServerConfig::default(),
+        _registry: registry,
+        handshake_complete: Arc::new(AtomicBool::new(false)),
+        session_handshakes: Arc::new(DashMap::new()),
+        in_flight: Arc::new(DashMap::new()),
+        freshness_advisories: Arc::new(DashMap::new()),
+    };
+
+    let result = server
+        .run_socket(&socket_path, ProcessIdleClock::new(), None, None)
+        .await;
+    let message = result
+        .expect_err("must refuse to steal a live socket")
+        .to_string();
+    drop(live);
+
+    assert!(
+        message.contains("refusing to bind"),
+        "error must name the refusal; got: {message}"
+    );
+    assert!(
+        message.contains("leindexd"),
+        "error must point at the daemon remediation; got: {message}"
+    );
+    assert!(
+        socket_path.exists(),
+        "the live daemon's socket file must survive the refused bind"
+    );
+}

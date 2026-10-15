@@ -395,6 +395,26 @@ impl LeIndex {
         generation: u64,
         writer: &mut crate::storage::generation::GenerationWriter,
     ) -> Result<()> {
+        // Lock-file-deletion guard (incident RC5): flock locks the inode, not
+        // the path — if `index.lock` was deleted (the operator "fix" for a
+        // wedged writer) a second process re-created it and may be writing
+        // this store right now. Publishing the CURRENT swap from two writers
+        // is the WAL-bricking sequence. If the identity check proves the lock
+        // file changed, refuse to publish; the run fails as transient lock
+        // contention and can be retried cleanly.
+        if let Ok(slot) = self.write_lock_identity.lock() {
+            if let Some(identity) = slot.as_ref() {
+                if !identity.still_guards() {
+                    anyhow::bail!(
+                        "[transient:lock-contention] The project write lock file {} was \
+                         deleted or replaced while this index run held it; a second writer \
+                         may be active, so generation {generation} will not be published. \
+                         Retry the index operation.",
+                        identity.lock_file_path().display()
+                    );
+                }
+            }
+        }
         // Rename the complete directory once. Readers either see no new
         // generation or the fully materialized immutable snapshot.
         std::fs::rename(staging, target).with_context(|| {

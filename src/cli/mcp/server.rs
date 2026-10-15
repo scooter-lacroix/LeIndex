@@ -1032,6 +1032,29 @@ async fn handle_tool_call_timed(
         ));
     };
 
+    // System-One gate (experimental; `system-one` feature + `[system_one]`
+    // config, default off): validate and repair the call before it runs.
+    // Transport-level only; every provider failure fails open (call untouched).
+    // Runs before the args clone so hydration and rendering see healed args.
+    #[cfg(feature = "system-one")]
+    let (tool_call, mut gate_notes) = {
+        let mut notes = crate::cli::mcp::system_one::Notes::default();
+        let mut params = tool_call;
+        if let Some(gate) = crate::cli::mcp::system_one::global() {
+            let schema = handler.argument_schema();
+            params.arguments = gate
+                .pre(
+                    registry,
+                    &canonical_name,
+                    &schema,
+                    params.arguments,
+                    &mut notes,
+                )
+                .await;
+        }
+        (params, notes)
+    };
+
     // Clone arguments before moving them into execute (we need them
     // for render_tool_output_plain which needs the original args).
     let call_args = tool_call.arguments.clone();
@@ -1081,6 +1104,22 @@ async fn handle_tool_call_timed(
                     &mut value,
                 );
             }
+            // System-One post-gate: judge search results before they reach the
+            // model; attach `_system_one` notes (survives trimming via
+            // `merge_meta`, zero tokens when the gate did nothing).
+            #[cfg(feature = "system-one")]
+            if let Some(gate) = crate::cli::mcp::system_one::global() {
+                gate.post(
+                    registry,
+                    &call_name,
+                    &call_args,
+                    &mut value,
+                    &mut gate_notes,
+                )
+                .await;
+            }
+            #[cfg(feature = "system-one")]
+            gate_notes.attach(&mut value);
             // The MCP transport is what the LLM actually sees. Run the
             // tool's raw value through the per-tool payload trimmer so we
             // hand the model only the fields it needs (no scoring
@@ -1094,7 +1133,15 @@ async fn handle_tool_call_timed(
             let payload = match tier {
                 // Identity card: a few lines regardless of result size.
                 crate::cli::mcp::tier::Tier::L0 => {
-                    crate::cli::mcp::tier::identity_card(&call_name, &trimmed)
+                    // The identity card skips `_`-prefixed keys, so the gate's
+                    // footer must be appended here or L0 hides every annotation.
+                    let mut payload = crate::cli::mcp::tier::identity_card(&call_name, &trimmed);
+                    if let Some(footer) =
+                        crate::cli::mcp::output::render::system_one_footer(&trimmed)
+                    {
+                        payload.push_str(&footer);
+                    }
+                    payload
                 }
                 // Full detail: the complete, untrimmed handler result.
                 crate::cli::mcp::tier::Tier::L2 => serde_json::to_string_pretty(&value)
@@ -1105,12 +1152,22 @@ async fn handle_tool_call_timed(
                     );
                     let is_substantive =
                         rendered.trim().lines().count() > 1 || rendered.trim().len() > 80;
-                    if is_substantive {
+                    let mut payload = if is_substantive {
                         rendered
                     } else {
                         serde_json::to_string_pretty(&trimmed)
                             .unwrap_or_else(|_| "Error serializing result".to_string())
+                    };
+                    // The text renderers ignore `_system_one` (merge_meta only
+                    // keeps it alive in the JSON), so the default tier would
+                    // silently drop the gate's annotations. Append a compact
+                    // footer so filtering/reordering/healing stays visible.
+                    if let Some(footer) =
+                        crate::cli::mcp::output::render::system_one_footer(&trimmed)
+                    {
+                        payload.push_str(&footer);
                     }
+                    payload
                 }
             };
             Ok(serde_json::json!({
@@ -1127,11 +1184,20 @@ async fn handle_tool_call_timed(
         Err(e) => {
             // MCP standard: return errors as a successful JSON-RPC response with isError: true
             warn!("Tool execution failed: {}", e);
+            // Pre-gate hints still apply to a failed call: surface them in the error text.
+            #[cfg(feature = "system-one")]
+            let footer = {
+                let mut note = serde_json::json!({});
+                gate_notes.attach(&mut note);
+                crate::cli::mcp::output::render::system_one_footer(&note).unwrap_or_default()
+            };
+            #[cfg(not(feature = "system-one"))]
+            let footer = String::new();
             Ok(serde_json::json!({
                 "content": [
                     {
                         "type": "text",
-                        "text": format!("Error: {}", e.message_with_hint())
+                        "text": format!("Error: {}{footer}", e.message_with_hint())
                     }
                 ],
                 "isError": true,
@@ -1299,9 +1365,32 @@ impl McpServer {
     ) -> anyhow::Result<()> {
         use tokio::net::UnixListener;
 
-        // Remove stale socket file if present
+        // Stale-socket detection (incident RC5b): unlinking a socket whose
+        // listener is still alive forks the daemon fleet — the old daemon
+        // keeps serving on the unlinked inode while we bind a fresh one at
+        // the same path, and two daemons then race the same stores. Probe
+        // first: a live listener refuses to bind here; only a dead socket
+        // file (connect refused / not a socket) is removed.
         if socket_path.exists() {
-            std::fs::remove_file(socket_path).context("Failed to remove existing socket file")?;
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                tokio::net::UnixStream::connect(socket_path),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    anyhow::bail!(
+                        "refusing to bind {}: another leindexd is already listening there. \
+                         Stop it first (pkill leindexd) or point this instance at a different \
+                         socket; deleting the socket file would fork two daemons onto one store",
+                        socket_path.display()
+                    );
+                }
+                _ => {
+                    std::fs::remove_file(socket_path)
+                        .context("Failed to remove stale socket file")?;
+                }
+            }
         }
 
         // Ensure parent directory exists

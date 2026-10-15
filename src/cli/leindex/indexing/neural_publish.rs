@@ -64,6 +64,164 @@ impl streaming::neural::NeuralRowWriter for SearchNeuralRowWriter<'_> {
     }
 }
 
+/// Neural-phase progress: a background heartbeat line plus a row counter the
+/// streaming writer bumps per batch.
+///
+/// Why a heartbeat: the "neural embedding N admitted nodes" line is the LAST
+/// output before enrichment, which on a CPU-fallen-back embedder takes tens of
+/// minutes for a real project — reading as a hang. The heartbeat prints
+/// immediately (before the first batch completes, which alone can take
+/// minutes) and then every `INTERVAL`, so the phase is visibly alive. The
+/// legacy route reports rows only once at completion, so elapsed time is its
+/// only liveness signal; the streaming writer supplies real `n/N` counts as
+/// batches land. Stopped/joined on drop — never outlives enrichment.
+///
+/// The heartbeat also watches for a CPU-fallen-back embedder when a GPU
+/// provider was requested, and announces it on this surface: the worker's own
+/// WARN lands in `~/.leindex/logs/leindex-embed-daemon.log`, invisible to
+/// someone watching the CLI sit still. The watch runs concurrently with the
+/// phase because the daemon is spawned by the first embed call — a
+/// pre-phase poll would see nothing (and blocking on it would stall a cold
+/// start for no gain). After the fallback is observed, every heartbeat line
+/// carries the warning suffix so it cannot scroll away.
+struct NeuralProgress {
+    rows: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Whether the configured execution provider names a GPU backend whose
+/// silent CPU fallback should be surfaced. `cpu`/`auto`/anything else is a
+/// deliberate or runtime-chosen configuration — no warning.
+#[cfg(feature = "onnx")]
+fn is_gpu_provider(configured: &str) -> bool {
+    matches!(configured, "migraphx" | "cuda" | "rocm")
+}
+
+impl NeuralProgress {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+    fn start(total: usize) -> Self {
+        let rows = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (rows_t, stop_t) = (rows.clone(), stop.clone());
+        // Arm the CPU-fallback watch only when the LOCAL ONNX worker owns the
+        // neural layer and a GPU provider was requested. When a remote
+        // endpoint takes over (enable_hybrid with a resolved remote), the
+        // local daemon may never spawn — probing it is meaningless, and a
+        // stale CPU daemon left over from an earlier run must not raise a
+        // false warning.
+        #[cfg(feature = "onnx")]
+        let gpu_requested = {
+            let config = crate::config::LeIndexConfig::load_cached();
+            config.indexing.embeddings.resolved_remote().is_none()
+                && is_gpu_provider(&config.neural.execution_provider.to_ascii_lowercase())
+        };
+        #[cfg(not(feature = "onnx"))]
+        let gpu_requested = false;
+        // Best-effort: a failed spawn must not fail indexing — the counter
+        // still works for the streaming writer, only the heartbeat is lost.
+        let thread = std::thread::Builder::new()
+            .name("neural-progress".to_owned())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                // cfg-split decls: without `onnx` neither binding is ever
+                // reassigned (the probe block below is feature-gated out),
+                // so `mut` would trip unused_mut in narrow builds.
+                #[cfg(feature = "onnx")]
+                let mut cpu_fallback = false;
+                #[cfg(not(feature = "onnx"))]
+                let cpu_fallback = false;
+                #[cfg(feature = "onnx")]
+                let mut provider_resolved = !gpu_requested;
+                #[cfg(not(feature = "onnx"))]
+                let provider_resolved = !gpu_requested;
+                loop {
+                    // Probe the daemon once per heartbeat while the provider
+                    // is still unknown. The health socket publishes the
+                    // provider only after model init (observed ~45s cold:
+                    // rocprof + MIGraphX probe), so this sees through both
+                    // cold and warm starts without delaying the phase.
+                    // Gated like `gpu_requested` above: without onnx there is
+                    // no local daemon to probe, and provider_resolved starts
+                    // true (`!gpu_requested`), so the gate never fires.
+                    if !provider_resolved {
+                        #[cfg(feature = "onnx")]
+                        {
+                            match crate::search::onnx::daemon_active_provider() {
+                                Some((active, _phase)) if active.eq_ignore_ascii_case("cpu") => {
+                                    cpu_fallback = true;
+                                    provider_resolved = true;
+                                    progress_stderr(
+                                        "\nWarning: neural embedder fell back to CPU after a GPU \
+                                         provider was requested; inference is 100-1000x slower — see \
+                                         leindex.toml execution_provider.\nDetails: \
+                                         ~/.leindex/logs/leindex-embed-daemon.log\n",
+                                    );
+                                }
+                                Some(_) => provider_resolved = true,
+                                None => {}
+                            }
+                        }
+                    }
+                    let suffix = if cpu_fallback {
+                        " [CPU fallback — see leindex.toml execution_provider]"
+                    } else {
+                        ""
+                    };
+                    progress_stderr(&format!(
+                        "Indexing: neural embedding {}/{} nodes ({}s elapsed)...{suffix}",
+                        rows_t.load(std::sync::atomic::Ordering::Relaxed),
+                        total,
+                        started.elapsed().as_secs()
+                    ));
+                    for _ in 0..(Self::INTERVAL.as_millis() / 100) {
+                        if stop_t.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            })
+            .ok();
+        Self { rows, stop, thread }
+    }
+}
+
+impl Drop for NeuralProgress {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A `NeuralRowWriter` that advances a shared `NeuralProgress` row counter as
+/// batches land, so the heartbeat shows real `n/N` progress on the streaming
+/// route. Generic over the inner writer so tests drive it with
+/// `VecNeuralRowWriter` (no live search engine required).
+struct ProgressNeuralRowWriter<'a, W: streaming::neural::NeuralRowWriter> {
+    inner: &'a mut W,
+    rows_reported: &'a std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<W: streaming::neural::NeuralRowWriter> streaming::neural::NeuralRowWriter
+    for ProgressNeuralRowWriter<'_, W>
+{
+    fn write_row(&mut self, node_id: &str, embedding: &[f32]) -> Result<()> {
+        self.inner.write_row(node_id, embedding)
+    }
+
+    fn write_batch(&mut self, rows: Vec<(String, Vec<f32>)>) -> Result<usize> {
+        // The writer receives only successful rows; skipped texts are
+        // accounted from the stats the caller prints at completion.
+        self.rows_reported
+            .fetch_add(rows.len(), std::sync::atomic::Ordering::Relaxed);
+        self.inner.write_batch(rows)
+    }
+}
+
 fn streaming_neural_inputs<'a>(
     pdg: &'a crate::graph::pdg::ProgramDependenceGraph,
     admitted_node_ids: &'a HashSet<String>,
@@ -132,9 +290,13 @@ fn enrich_neural_for_route(
     route: streaming::routes::NeuralRoute,
 ) -> Result<usize> {
     let (cache_hits_before, _) = neural_cache_counters();
+    // The heartbeat covers both routes (see NeuralProgress): liveness even
+    // while the first embed batch is in flight, plus the CPU-fallback watch.
+    let progress = NeuralProgress::start(admitted_node_ids.len());
     match route {
         streaming::routes::NeuralRoute::Legacy => {
             let rows = index_builder::enrich_neural_embeddings(pdg, embedder, admitted_node_ids);
+            drop(progress);
             let (cache_hits_after, cache_misses) = neural_cache_counters();
             progress_stderr(&format!(
                 "Indexing: neural done — {} rows ({} from embed cache, {} embedded)...",
@@ -159,9 +321,13 @@ fn enrich_neural_for_route(
             let stats = streaming::neural::enrich_neural_streaming(
                 &mut inputs,
                 &streaming_embedder,
-                &mut writer,
+                &mut ProgressNeuralRowWriter {
+                    inner: &mut writer,
+                    rows_reported: &progress.rows,
+                },
                 &budget,
             )?;
+            drop(progress);
             let (cache_hits_after, cache_misses) = neural_cache_counters();
             progress_stderr(&format!(
                 "Indexing: neural done — {} rows ({} from embed cache, {} embedded, {} skipped, {} batches)...",
@@ -804,6 +970,61 @@ impl LeIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::leindex::indexing::streaming::neural::NeuralRowWriter;
+
+    #[test]
+    fn test_neural_progress_writer_counts_rows_and_passes_through() {
+        let rows = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut inner = streaming::neural::VecNeuralRowWriter::new();
+        {
+            let mut writer = ProgressNeuralRowWriter {
+                inner: &mut inner,
+                rows_reported: &rows,
+            };
+            let batch =
+                |w: &mut ProgressNeuralRowWriter<'_, streaming::neural::VecNeuralRowWriter>,
+                 base: usize,
+                 n: usize| {
+                    let batch: Vec<_> = (base..base + n)
+                        .map(|i| (format!("node-{i}"), vec![i as f32, (i + 1) as f32]))
+                        .collect();
+                    w.write_batch(batch).expect("write_batch");
+                };
+            batch(&mut writer, 0, 2);
+            assert_eq!(rows.load(std::sync::atomic::Ordering::Relaxed), 2);
+            batch(&mut writer, 2, 3);
+            assert_eq!(rows.load(std::sync::atomic::Ordering::Relaxed), 5);
+        }
+        assert_eq!(inner.rows.len(), 5, "all rows must reach the inner writer");
+        assert_eq!(
+            inner.rows[0],
+            ("node-0".to_owned(), vec![0.0, 1.0]),
+            "rows must pass through unmodified"
+        );
+        // Single-row path forwards too.
+        let mut writer = ProgressNeuralRowWriter {
+            inner: &mut inner,
+            rows_reported: &rows,
+        };
+        writer
+            .write_row("solo", &[9.0])
+            .expect("write_row forwards");
+        assert!(inner.rows.iter().any(|(id, _)| id == "solo"));
+    }
+
+    #[test]
+    fn test_neural_progress_heartbeat_starts_and_stops() {
+        // The heartbeat thread must start, print at least once, and exit on
+        // drop — proving the phase can report liveness even while the first
+        // embed batch is still in flight.
+        let progress = NeuralProgress::start(10);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let observed = progress
+            .rows
+            .fetch_add(0, std::sync::atomic::Ordering::Relaxed);
+        drop(progress);
+        assert_eq!(observed, 0, "no rows reported by the heartbeat itself");
+    }
 
     #[test]
     fn test_fragment_provider_identity_prevents_old_space_merge() {

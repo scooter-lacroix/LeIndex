@@ -94,10 +94,38 @@ mod imp {
             .open(path)?;
         // SAFETY: `flock` on a descriptor we own; no memory is touched.
         let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if locked == 0 {
-            Ok(file)
+        if locked != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Inode identity check (incident RC5): if the lock file was deleted
+        // and re-created between our `open` and `flock`, we hold the lock on
+        // an orphaned inode while another daemon can win the fresh one at the
+        // same path — the single-winner guarantee is already broken. Refuse
+        // instead; the caller retries with a fresh open.
+        let held = fstat_pair(&file);
+        let at_path = std::fs::metadata(path).ok().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            (m.dev(), m.ino())
+        });
+        if let (Some((dev, ino)), Some((pdev, pino))) = (held, at_path) {
+            if (dev, ino) != (pdev, pino) {
+                return Err(std::io::Error::other(
+                    "daemon lock file was replaced during acquisition; retrying would race two daemons",
+                ));
+            }
+        }
+        Ok(file)
+    }
+
+    /// `(dev, ino)` of a descriptor via `fstat`.
+    fn fstat_pair(file: &std::fs::File) -> Option<(u64, u64)> {
+        use std::os::fd::AsRawFd;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `stat` writes into a plain `stat` struct we own.
+        if unsafe { libc::fstat(file.as_raw_fd(), &mut st) } == 0 {
+            Some((st.st_dev as u64, st.st_ino as u64))
         } else {
-            Err(std::io::Error::last_os_error())
+            None
         }
     }
 
@@ -150,7 +178,14 @@ mod imp {
         // wrong, and any number of shims may race to start a daemon.
         let _lock = match acquire_daemon_lock(&run_dir.join(LOCK_NAME)) {
             Ok(lock) => lock,
-            Err(_) => {
+            Err(e) => {
+                // The inode-race refusal (ErrorKind::Other) must not be
+                // reported as "another daemon is live" — it means the lock
+                // file churned during acquisition; retrying is safe, racing
+                // two daemons is not.
+                if e.kind() == std::io::ErrorKind::Other {
+                    anyhow::bail!("{e}");
+                }
                 let holder = read_sidecar(&run_dir.join(ENDPOINT_SIDECAR)).ok().flatten();
                 match holder {
                     Some(ep) => anyhow::bail!(

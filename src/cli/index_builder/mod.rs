@@ -1266,7 +1266,6 @@ struct ReadyNode {
 /// Enriched content is recomputed per node (keyed by node index, never by
 /// node ID — duplicate IDs are supported and each duplicate must carry its
 /// own body), bounded by the caller's capacity-1 file scratch.
-#[allow(clippy::too_many_arguments)]
 fn prepare_indexed_node(
     pdg: &ProgramDependenceGraph,
     node_idx: petgraph::graph::NodeIndex,
@@ -1805,24 +1804,28 @@ pub(crate) fn stable_project_cache_id(project_id: &str, project_path: &Path) -> 
     format!("{}:{}", project_id, &hash[..12])
 }
 
-pub(crate) fn search_cache_key_for(
-    project_id: &str,
-    project_path: &Path,
-    stats: &IndexStats,
-    query: &str,
-    top_k: usize,
-    query_type: Option<&crate::search::ranking::QueryType>,
-    neural_available: bool,
-    search_mode: &str,
-    neural_weight: f64,
-    rerank_enabled: bool,
-    rerank_top_n: u32,
-    fragment_index_enabled: bool,
-    fragment_weight: f64,
-    fragment_root_hash: &str,
-    embed_model: &str,
-    rerank_model: &str,
-) -> String {
+/// Inputs to the search cache key: project identity/state, the query, and
+/// every result-affecting neural/rerank/fragment configuration knob.
+pub(crate) struct SearchCacheKeyInputs<'a> {
+    pub(crate) project_id: &'a str,
+    pub(crate) project_path: &'a Path,
+    pub(crate) stats: &'a IndexStats,
+    pub(crate) query: &'a str,
+    pub(crate) top_k: usize,
+    pub(crate) query_type: Option<&'a crate::search::ranking::QueryType>,
+    pub(crate) neural_available: bool,
+    pub(crate) search_mode: &'a str,
+    pub(crate) neural_weight: f64,
+    pub(crate) rerank_enabled: bool,
+    pub(crate) rerank_top_n: u32,
+    pub(crate) rerank_model: &'a str,
+    pub(crate) fragment_index_enabled: bool,
+    pub(crate) fragment_weight: f64,
+    pub(crate) fragment_root_hash: &'a str,
+    pub(crate) embed_model: &'a str,
+}
+
+pub(crate) fn search_cache_key_for(inputs: &SearchCacheKeyInputs<'_>) -> String {
     // v2: widens the key to include every result-affecting config knob + model
     // identity (search_mode, neural_weight, rerank_enabled/top_n, fragment
     // knobs incl. the persisted content root hash, embedder + reranker model).
@@ -1832,21 +1835,21 @@ pub(crate) fn search_cache_key_for(
     // entries are identifiably stale and sweepable, not silent.
     search_cache_key(&format!(
         "v2:query:{}:{}:{}:{}:{:?}:neural={}:mode={}:nw={}:rr={}|{}|{}:frag={}|{}|{}:embed={}",
-        stable_project_cache_id(project_id, project_path),
-        index_fingerprint(stats),
-        top_k,
-        query.trim().to_lowercase(),
-        query_type,
-        neural_available,
-        search_mode,
-        neural_weight,
-        rerank_enabled,
-        rerank_top_n,
-        rerank_model,
-        fragment_index_enabled,
-        fragment_weight,
-        fragment_root_hash,
-        embed_model,
+        stable_project_cache_id(inputs.project_id, inputs.project_path),
+        index_fingerprint(inputs.stats),
+        inputs.top_k,
+        inputs.query.trim().to_lowercase(),
+        inputs.query_type,
+        inputs.neural_available,
+        inputs.search_mode,
+        inputs.neural_weight,
+        inputs.rerank_enabled,
+        inputs.rerank_top_n,
+        inputs.rerank_model,
+        inputs.fragment_index_enabled,
+        inputs.fragment_weight,
+        inputs.fragment_root_hash,
+        inputs.embed_model,
     ))
 }
 
