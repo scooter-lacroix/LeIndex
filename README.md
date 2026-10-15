@@ -196,10 +196,13 @@ leaves calls and results untouched — and ships off by default.
 1. **Build with the feature**: `cargo install leindex --features system-one`.
    Prebuilt bundles and default crates.io builds do not include the gate;
    `leindex setup --check` reports `build (system-one feature): yes/no`.
-2. **Provision a decision model.** The default `laya` provider runs as a
-   managed llama-server service on Linux — `leindex setup --system-one`
-   prompts for the llama-server binary and an absolute Laya GGUF path (for
-   example `ggml-org/Laya-GGUF` on Hugging Face) and writes a
+2. **Provision a decision model.** `leindex setup --system-one` writes the
+   `[system_one]` section and, for the default `laya` provider, asks which
+   Laya backend to use: `external` (the fresh-install default) prompts for
+   an existing HTTP endpoint, with optional model and `api_key_env` values
+   (empty = provider default / no key); `managed` (explicit choice, Linux)
+   prompts for the llama-server binary and an absolute Laya
+   GGUF path (for example `ggml-org/Laya-GGUF` on Hugging Face) and writes a
    `[services.laya]` section the gate derives its endpoint from. One
    llama-server serves one model, so the embeddings service must use a
    different port. On GPUs, pin the device explicitly

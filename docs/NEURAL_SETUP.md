@@ -280,13 +280,16 @@ problem leaves calls and results untouched — and ships off by default. It is
 
 ```bash
 cargo install leindex --features system-one
-leindex setup --system-one   # interactive wizard; writes [system_one] + [services.laya]
+leindex setup --system-one   # interactive wizard; writes [system_one] (+ [services.laya] for the managed backend)
 ```
 
-The wizard prompts for the llama-server binary and an absolute Laya GGUF path
-(the gate's decision model has no auto-download;
-`ggml-org/Laya-GGUF` on Hugging Face is a known source), saves the
-`[services.laya]` section before running smoke tests, and derives the gate's
+For the default `laya` provider the wizard asks which Laya backend to use.
+`external` (the fresh-install default) prompts for an existing HTTP endpoint;
+the model and `api_key_env` names are optional (empty = provider default /
+no key). `managed` prompts for the llama-server binary and
+an absolute Laya GGUF path (the gate's decision model has no auto-download;
+`ggml-org/Laya-GGUF` on Hugging Face is a known source) and writes the
+`[services.laya]` section before running smoke tests; the gate derives its
 endpoint from that service (port 8181 by default — the embeddings service on
 8080 stays untouched; one llama-server serves one model).
 
@@ -309,8 +312,9 @@ it beforehand or the probe fails, even with `auto_start = true`.
 Tuning keys (see `leindex.toml.example` for defaults and the full list):
 `mode` (`off`/`shadow`/`enforce`), `pre_gate`/`post_gate` toggles,
 `timeout_ms`, result-selection `top_n`, and the thresholds `relevant_min`,
-`instructions_max`, `tau_apply`. Providers: `laya` runs as a managed local
-service and needs no credentials; the remote `jev`/`typesafe`/`openai`
+`instructions_max`, `tau_apply`. Providers: `laya` targets a local Laya model (managed
+llama-server backend, or an external endpoint with an optional
+`api_key_env` name); the remote `jev`/`typesafe`/`openai`
 providers take `base_url`, `model`, and `api_key_env` — the environment
 variable *name* holding the key, never the key itself. Name credentials
 through `api_key_env`; do not place tokens in examples or shared config.

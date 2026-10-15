@@ -889,8 +889,8 @@ fn test_unset_repair_refuses_when_scrubbed_document_still_invalid() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("references missing"),
-        "must refuse the repair: {err}"
+        err.contains("timeout_ms"),
+        "must surface the masked violation, not the reference error: {err}"
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }

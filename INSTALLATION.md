@@ -139,8 +139,8 @@ section: with it true, any CLI, daemon, or MCP call needing the service starts
 it on demand. Edit ports, model paths, or `extra_args` through
 `leindex config set` or the config file. One llama-server serves one model,
 so the embeddings service and a System One decision-model service must use
-different ports (the embeddinggemma-2 preset targets 8080; the System One
-wizard defaults `laya` to 8181).
+different ports (the embeddinggemma-2 preset targets 8080; a managed `laya`
+service defaults to 8181).
 
 **System One (experimental)** validates tool calls and search results with a
 small typed-decision model before/after they reach your agent. It requires a
@@ -150,8 +150,10 @@ section (`leindex setup --system-one` writes one), and
 `LEINDEX_FEATURE_SYSTEM_ONE=1` exported in every process that serves MCP or
 runs the CLI — configuring `[system_one]` alone never enables the gate. It
 fails open: any provider problem leaves calls and results untouched. The
-`laya` provider runs as a managed local service and needs no API key; the
-remote `jev`/`typesafe`/`openai` providers take `base_url`, `model`, and
+`laya` provider targets a local Laya model: the managed backend runs one as
+a local llama-server service with no API key, and the external backend
+takes an endpoint with an optional `api_key_env` name. The remote
+`jev`/`typesafe`/`openai` providers take `base_url`, `model`, and
 `api_key_env` (the environment variable *name* — never the key itself);
 `mode = "off"` is the default and disables the gate.
 

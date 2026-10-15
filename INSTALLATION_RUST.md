@@ -109,7 +109,7 @@ feature builds:
 
 ```bash
 cargo install leindex --features system-one
-leindex setup --system-one   # interactive wizard; writes [system_one] + [services.laya]
+leindex setup --system-one   # interactive wizard; writes [system_one] (+ [services.laya] for the managed laya backend)
 ```
 
 Then arm the runtime flag in every process that serves MCP or runs the CLI:
@@ -120,8 +120,10 @@ status, and its probe sends one real decision request (bounded by
 `system_one.timeout_ms`). `--check` never starts the managed service: start
 it beforehand or the probe fails, even with `auto_start = true`. The gate
 fails open: any provider problem leaves calls and results untouched.
-The `laya` provider runs as a managed local service and needs no API key;
-the remote `jev`/`typesafe`/`openai` providers take `base_url`, `model`, and
+The `laya` provider targets a local Laya model: the managed backend runs
+one as a local llama-server service with no API key, and the external
+backend takes an endpoint with an optional `api_key_env` name. The remote
+`jev`/`typesafe`/`openai` providers take `base_url`, `model`, and
 `api_key_env` — the environment variable *name* holding the key, never the
 key itself.
 

@@ -746,8 +746,16 @@ fn commit_table_at(
                     .iter()
                     .all(|reference| pre_dangling.contains(reference))
         });
-        if !repairable || scrub_and_validate(&config, &post_dangling).is_err() {
+        if !repairable {
             return Err(err.into());
+        }
+        // When the surviving references mask another violation, surface that
+        // violation instead of the reference error: the unset suggestion
+        // cannot commit while the masked problem stands, and the reference
+        // message would send the user chasing the surviving reference first.
+        // When scrubbing passes, nothing else is invalid and the unset saves.
+        if let Err(scrubbed) = scrub_and_validate(&config, &post_dangling) {
+            return Err(scrubbed.into());
         }
     }
     save_config_at(path, &config)
