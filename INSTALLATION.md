@@ -167,8 +167,9 @@ Known sharp edges, learned the hard way:
   `extra_args = ["-ngl", "99", "--device", "Vulkan1"]`.
 - **`--check` probes but never spawns** the embedding service; a stopped
   managed service reads as not ready even with `auto_start = true`. The
-  System One probe is the exception — it starts an `auto_start` service and
-  sends one real decision request (bounded by `system_one.timeout_ms`).
+  System One probe also never starts the managed service: start it beforehand
+  or the probe fails, even with `auto_start = true`. It sends one real decision
+  request (bounded by `system_one.timeout_ms`).
 - **Changing the embedding model changes the vector space.** Re-index after
   switching models or prompt templates; never mix old and new vectors.
 - **Release-mode LTO links are memory-hungry.** On busy machines a

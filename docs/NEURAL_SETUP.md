@@ -303,8 +303,8 @@ Three things must line up before the gate runs:
 
 `leindex setup --check` on an armed, feature-built binary reports the gate as
 `active` and its probe sends one real decision request (bounded by
-`system_one.timeout_ms`); unlike the embedding probe, it starts an
-`auto_start` service first.
+`system_one.timeout_ms`). `--check` never starts the managed service: start
+it beforehand or the probe fails, even with `auto_start = true`.
 
 Tuning keys (see `leindex.toml.example` for defaults and the full list):
 `mode` (`off`/`shadow`/`enforce`), `pre_gate`/`post_gate` toggles,

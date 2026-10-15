@@ -115,7 +115,8 @@ Then arm the runtime flag in every process that serves MCP or runs the CLI:
 Configuring `[system_one]` alone never enables the gate. `leindex setup
 --check` on a feature build reports the gate's build, flag, and endpoint
 status, and its probe sends one real decision request (bounded by
-`system_one.timeout_ms`), starting an `auto_start` service first. The gate
+`system_one.timeout_ms`). `--check` never starts the managed service: start
+it beforehand or the probe fails, even with `auto_start = true`. The gate
 fails open: any provider problem leaves calls and results untouched.
 `laya`/`jev` providers run as managed services and need no API key; the
 remote `openai` provider reads a key from the environment variable *name*

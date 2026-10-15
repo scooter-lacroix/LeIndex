@@ -210,8 +210,9 @@ leaves calls and results untouched — and ships off by default.
    the gate.
 4. **Verify**: `leindex setup --check` reports the gate `active` with
    `probe: provider answered`. The probe sends a real decision request
-   (timeout: `system_one.timeout_ms`); it starts an `auto_start` service
-   first, while `--check`'s embedding probe never spawns anything.
+   (timeout: `system_one.timeout_ms`). `--check` never starts the managed
+   service: start it beforehand or the probe fails, even with
+   `auto_start = true`.
 
 Fail-open tuning lives in `[system_one]`: `mode` (`off`/`shadow` — decide and
 log only —/`enforce`), `pre_gate`, `post_gate`, `timeout_ms`, and the
