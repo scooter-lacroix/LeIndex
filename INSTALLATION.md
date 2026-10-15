@@ -146,12 +146,12 @@ wizard defaults `laya` to 8181).
 small typed-decision model before/after they reach your agent. It requires a
 source build (`cargo install leindex --features system-one` — release bundles
 and default crates.io builds do not include it), a `[system_one]` config
-section (`leindex setup --system-one` writes one; the `laya`/`jev` providers
-run as managed services and need no API key), and
+section (`leindex setup --system-one` writes one), and
 `LEINDEX_FEATURE_SYSTEM_ONE=1` exported in every process that serves MCP or
 runs the CLI — configuring `[system_one]` alone never enables the gate. It
-fails open: any provider problem leaves calls and results untouched. Remote
-`openai`-compatible providers also work: set `base_url`, `model`, and
+fails open: any provider problem leaves calls and results untouched. The
+`laya` provider runs as a managed local service and needs no API key; the
+remote `jev`/`typesafe`/`openai` providers take `base_url`, `model`, and
 `api_key_env` (the environment variable *name* — never the key itself);
 `mode = "off"` is the default and disables the gate.
 

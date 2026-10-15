@@ -91,8 +91,10 @@ metadata from GitHub's HTTPS release API before extraction. Remote routes do
 not require ONNX Runtime. `--check` makes a bounded readiness request without
 starting services; a stopped managed service is reported as not ready.
 Manage the llama-server processes with `leindex services
-list|start|stop`; with `auto_start = true` in `[services.<name>]`, any CLI,
-daemon, or MCP call needing the service starts it on demand. One llama-server
+list|start|stop`; with `auto_start = true` in `[services.<name>]`, LeIndex
+spawns the service on demand before remote embedding calls. `--check`
+probes never spawn services — System One included — so start a stopped
+service before checking. One llama-server
 serves one model, so an embeddings service (port 8080 in the embeddinggemma-2
 preset) and a System One decision-model service (port 8181 for `laya`) use
 different ports. On multi-GPU hosts pin the device explicitly, e.g.
@@ -118,9 +120,10 @@ status, and its probe sends one real decision request (bounded by
 `system_one.timeout_ms`). `--check` never starts the managed service: start
 it beforehand or the probe fails, even with `auto_start = true`. The gate
 fails open: any provider problem leaves calls and results untouched.
-`laya`/`jev` providers run as managed services and need no API key; the
-remote `openai` provider reads a key from the environment variable *name*
-given in `api_key_env`.
+The `laya` provider runs as a managed local service and needs no API key;
+the remote `jev`/`typesafe`/`openai` providers take `base_url`, `model`, and
+`api_key_env` — the environment variable *name* holding the key, never the
+key itself.
 
 The model is stored under `$LEINDEX_HOME/models`, normally
 `~/.leindex/models`; it is not written into the Cargo registry or build

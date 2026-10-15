@@ -309,11 +309,11 @@ it beforehand or the probe fails, even with `auto_start = true`.
 Tuning keys (see `leindex.toml.example` for defaults and the full list):
 `mode` (`off`/`shadow`/`enforce`), `pre_gate`/`post_gate` toggles,
 `timeout_ms`, result-selection `top_n`, and the thresholds `relevant_min`,
-`instructions_max`, `tau_apply`. Providers: `laya` and `jev` run as managed
-local services and need no credentials; the remote `openai` provider takes
-`base_url`, `model`, and `api_key_env` — the environment variable *name*
-holding the key, never the key itself. Name credentials through `api_key_env`;
-do not place tokens in examples or shared config.
+`instructions_max`, `tau_apply`. Providers: `laya` runs as a managed local
+service and needs no credentials; the remote `jev`/`typesafe`/`openai`
+providers take `base_url`, `model`, and `api_key_env` — the environment
+variable *name* holding the key, never the key itself. Name credentials
+through `api_key_env`; do not place tokens in examples or shared config.
 
 ## Model Provisioning
 

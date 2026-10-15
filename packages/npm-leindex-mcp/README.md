@@ -164,7 +164,8 @@ external embeddings server, or the existing configuration. TF-IDF and the PDG
 remain available without a neural provider. Non-interactive `--neural` selects
 local Qwen3; use `--embedding keep` to retain an existing route. Managed
 services (`leindex services list|start|stop`) own the llama-server process on
-Linux; `auto_start = true` brings them up on demand.
+Linux; `auto_start = true` brings them up on demand for runtime embedding
+calls (`--check` never starts services).
 
 ```bash
 leindex setup --embedding qwen3 --cpu
@@ -293,8 +294,9 @@ block, verification — is in the
 [setup section](#system-one-experimental-decision-gate). `[system_one]`
 provider keys live in
 [`leindex.toml.example`](https://github.com/scooter-lacroix/LeIndex/blob/master/leindex.toml.example)
-(`laya`/`jev` local providers need no API key; `openai` reads one from the
-environment variable *name* in `api_key_env`, never the key itself).
+(`laya` runs as a managed local service and needs no API key; the remote
+`jev`/`typesafe`/`openai` providers take `base_url`, `model`, and
+`api_key_env` — the environment variable *name*, never the key itself).
 
 
 ---
