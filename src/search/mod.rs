@@ -9,6 +9,8 @@
 pub mod engram;
 /// Hierarchical Navigable Small World (HNSW) implementation for vector search.
 pub mod hnsw;
+/// Matryoshka (MRL) slicing policy for EmbeddingGemma2 embeddings.
+pub mod mrl;
 /// INT8 Quantization system.
 pub mod quantization;
 /// Query parsing and intent detection.

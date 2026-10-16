@@ -96,6 +96,7 @@ const EMBEDDINGS_FIELDS: &[&str] = &[
     "remote_doc_template",
     "remote_query_template",
     "onnx_model_path",
+    "matryoshka",
 ];
 const MCP_FIELDS: &[&str] = &["idle_timeout_secs", "engine_max_idle_secs", "prewarm"];
 const SYSTEM_ONE_FIELDS: &[&str] = &[

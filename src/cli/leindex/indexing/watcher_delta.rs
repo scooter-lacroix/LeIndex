@@ -348,6 +348,10 @@ impl LeIndex {
                 &self.search_engine,
                 &self.project_path,
                 neural_identity.as_deref(),
+                crate::config::LeIndexConfig::load_cached()
+                    .indexing
+                    .embeddings
+                    .effective_matryoshka(),
             )?;
         }
 

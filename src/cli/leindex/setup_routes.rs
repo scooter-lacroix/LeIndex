@@ -742,6 +742,11 @@ fn external_embedding_config(
     crate::config::EmbeddingConfig {
         enable_hybrid: true,
         remote_provider: "custom".into(),
+        matryoshka: if same_route {
+            previous.matryoshka
+        } else {
+            crate::config::MatryoshkaSetting::Off
+        },
         remote_service: None,
         remote_endpoint: Some(route.endpoint),
         remote_model: Some(route.model),

@@ -298,16 +298,21 @@ pub(crate) fn pdg_search_fingerprint(pdg: &ProgramDependenceGraph) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// Persist neural embeddings to a separate mmap file for fast load_from_storage.
+/// Persist neural embeddings to mmap files for fast load_from_storage.
 ///
-/// This stores the ONNX neural embeddings (1024-dim) separately from the
-/// TF-IDF embeddings (768-dim) so they can be restored without re-computing
-/// ONNX inference for all nodes.
+/// This stores the neural embeddings separately from the TF-IDF embeddings
+/// so they can be restored without re-computing inference for all nodes.
+///
+/// Rows are partitioned by the Matryoshka policy: full-dimension rows go to
+/// `neural_embeddings.bin` (the canonical file every reader understands),
+/// sliced tiers go to per-dimension sidecar files that MRL-aware readers
+/// union at query time.
 #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
 pub(crate) fn persist_neural_embeddings_to_mmap(
     search_engine: &SearchEngine,
     project_path: &Path,
     identity: Option<&str>,
+    matryoshka: crate::config::MatryoshkaSetting,
 ) -> Result<()> {
     let embeddings = search_engine.collect_neural_embeddings();
     let path = neural_mmap_embeddings_path(project_path);
@@ -321,16 +326,93 @@ pub(crate) fn persist_neural_embeddings_to_mmap(
                 "Removed stale neural embeddings mmap file"
             );
         }
+        remove_neural_tier_mmaps(project_path, &[])?;
         return Ok(());
     }
-    crate::search::vector::write_mmap_embeddings_with_identity(&path, &embeddings, identity)
-        .map_err(|e| anyhow::anyhow!("Failed to write neural mmap embeddings: {e}"))?;
-    info!(
-        count = embeddings.len(),
-        path = %path.display(),
-        "Persisted neural embeddings to mmap file"
-    );
+    let spans = search_engine.collect_node_span_bytes();
+    let buckets =
+        crate::search::mrl::partition_rows_by_slice_dimension(&embeddings, &spans, matryoshka);
+    let native_dim = crate::search::mrl::MRL_TIERS[3];
+    let mut keep = Vec::with_capacity(buckets.len());
+    for (dim, rows) in &buckets {
+        let tier_path = if *dim == native_dim {
+            path.clone()
+        } else {
+            neural_tier_mmap_embeddings_path(project_path, *dim)
+        };
+        crate::search::vector::write_mmap_embeddings_with_identity(&tier_path, rows, identity)
+            .map_err(|e| anyhow::anyhow!("Failed to write neural mmap embeddings: {e}"))?;
+        info!(
+            count = rows.len(),
+            dim = *dim,
+            path = %tier_path.display(),
+            "Persisted neural embeddings to mmap file"
+        );
+        keep.push(*dim);
+    }
+    // A narrowed policy must not leave orphaned sidecars from a previous run.
+    remove_neural_tier_mmaps(project_path, &keep)?;
     Ok(())
+}
+
+/// Path for a per-dimension MRL sidecar neural embeddings mmap file.
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+pub(crate) fn neural_tier_mmap_embeddings_path(project_path: &Path, dim: usize) -> PathBuf {
+    project_path
+        .join(".leindex")
+        .join(format!("neural_embeddings_{dim}.bin"))
+}
+
+/// Remove sidecar tier mmaps whose dimension is not in `keep`. `keep` may
+/// contain the native dimension; its canonical file is never touched here.
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+fn remove_neural_tier_mmaps(project_path: &Path, keep: &[usize]) -> Result<()> {
+    for dim in crate::search::mrl::MRL_TIERS {
+        if keep.contains(&dim) {
+            continue;
+        }
+        let path = neural_tier_mmap_embeddings_path(project_path, dim);
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|e| anyhow::anyhow!("Failed to remove stale neural tier mmap: {e}"))?;
+            info!(
+                path = %path.display(),
+                "Removed stale neural tier mmap file"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Load every MRL sidecar neural mmap present in storage, ascending by
+/// dimension. Missing or corrupt sidecars are skipped (non-fatal): the tier
+/// simply does not contribute at query time.
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+pub(crate) fn load_neural_tier_mmaps_from_storage(
+    storage_path: &Path,
+) -> Vec<crate::search::vector::MmapEmbeddingIndex> {
+    let native_dim = crate::search::mrl::MRL_TIERS[3];
+    crate::search::mrl::MRL_TIERS
+        .iter()
+        .filter(|dim| **dim != native_dim)
+        .filter_map(|dim| {
+            let path = storage_path.join(format!("neural_embeddings_{dim}.bin"));
+            if !path.exists() {
+                return None;
+            }
+            match crate::search::vector::MmapEmbeddingIndex::open(&path) {
+                Ok(index) => Some(index),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to load neural tier mmap; tier disabled"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// Path for the neural embeddings mmap file.

@@ -482,6 +482,7 @@ fn test_persist_search_snapshot_writes_fragment_artifacts() {
             snapshot,
             std::sync::Arc::new(tfidf_mmap),
             None,
+            Vec::new(),
             Some(std::sync::Arc::new(frag_mmap)),
             Some(&frag_ids),
             None,
