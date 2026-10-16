@@ -292,7 +292,8 @@ the `LEINDEX_FEATURE_*` rollout kills catalogued in
 wizard, runtime flag, MCP `env` block, verification — is in the
 [setup section](#system-one-experimental-decision-gate). `[system_one]`
 provider keys live in [`leindex.toml.example`](leindex.toml.example)
-(`laya` runs as a managed local service and needs no API key; the remote
+(`laya` targets a local Laya model — managed llama-server backend or an
+external endpoint with an optional `api_key_env` name; the remote
 `jev`/`typesafe`/`openai` providers take `base_url`, `model`, and
 `api_key_env` — the environment variable *name*, never the key itself).
 

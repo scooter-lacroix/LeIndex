@@ -297,7 +297,8 @@ block, verification — is in the
 [setup section](#system-one-experimental-decision-gate). `[system_one]`
 provider keys live in
 [`leindex.toml.example`](https://github.com/scooter-lacroix/LeIndex/blob/master/leindex.toml.example)
-(`laya` runs as a managed local service and needs no API key; the remote
+(`laya` targets a local Laya model — managed llama-server backend or an
+external endpoint with an optional `api_key_env` name; the remote
 `jev`/`typesafe`/`openai` providers take `base_url`, `model`, and
 `api_key_env` — the environment variable *name*, never the key itself).
 
