@@ -1675,7 +1675,7 @@ pub(crate) fn enrich_neural_embeddings(
                 &connectivity_config,
                 &file_summary_ctx,
             );
-            pending.push((node.id.clone(), text));
+            pending.push((node.id.clone(), node.file_path.to_string(), text));
             if pending.len() == NEURAL_IPC_BATCH {
                 append_neural_batch(embedder, &pending, &mut rows);
                 pending.clear();
@@ -1706,12 +1706,16 @@ fn dedupe_neural_rows_keep_first(rows: &mut Vec<(String, Vec<f32>)>) {
 #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
 fn append_neural_batch(
     embedder: &GenerationNeuralEmbedder,
-    pending: &[(String, String)],
+    pending: &[(String, String, String)],
     rows: &mut Vec<(String, Vec<f32>)>,
 ) {
-    let texts: Vec<&str> = pending.iter().map(|(_, text)| text.as_str()).collect();
-    let embeddings = embedder.embed_neural_batch_blocking(&texts);
-    for ((node_id, _), embedding) in pending.iter().zip(embeddings) {
+    let texts: Vec<&str> = pending.iter().map(|(_, _, text)| text.as_str()).collect();
+    let titles: Vec<Option<String>> = pending
+        .iter()
+        .map(|(_, title, _)| Some(title.clone()))
+        .collect();
+    let embeddings = embedder.embed_neural_batch_blocking_titled(&texts, titles);
+    for ((node_id, _, _), embedding) in pending.iter().zip(embeddings) {
         if let Some(embedding) = embedding.filter(|row| !row.is_empty()) {
             rows.push((node_id.clone(), embedding));
         }

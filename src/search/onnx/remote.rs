@@ -204,6 +204,36 @@ pub trait RemoteEmbeddingProvider: Send + Sync {
             .map(|embeddings| embeddings.into_iter().map(Some).collect())
     }
 
+    /// Generate a document batch with per-document titles (EmbeddingGemma2
+    /// document inputs are `title: {title} | text: {text}`). Providers that
+    /// own a document template should override this; the default forwards to
+    /// [`Self::embed_batch`] and ignores titles (title-less templates). Rows
+    /// are full vectors — skipped rows are empty (same contract as
+    /// [`Self::embed_batch`]).
+    async fn embed_batch_titled(
+        &self,
+        texts: Vec<&str>,
+        titles: std::iter::Peekable<std::vec::IntoIter<Option<String>>>,
+    ) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
+        let rows = self.embed_batch_optional_titled(texts, titles).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.unwrap_or_default())
+            .collect())
+    }
+
+    /// Titled counterpart of [`Self::embed_batch_optional`]: skipped rows
+    /// stay `None` instead of collapsing to empty vectors. Providers that do
+    /// not override it degrade to the untitled batch (titles ignored).
+    async fn embed_batch_optional_titled(
+        &self,
+        texts: Vec<&str>,
+        titles: std::iter::Peekable<std::vec::IntoIter<Option<String>>>,
+    ) -> Result<Vec<Option<Vec<f32>>>, RemoteEmbeddingError> {
+        let _ = titles;
+        self.embed_batch_optional(texts).await
+    }
+
     /// Get the embedding dimension
     fn dimension(&self) -> usize;
 
@@ -544,6 +574,35 @@ fn apply_template<'a>(template: Option<&str>, text: &'a str) -> std::borrow::Cow
     }
 }
 
+/// Apply the DOCUMENT task template with a title.
+///
+/// EmbeddingGemma2 document inputs are `title: {title} | text: {text}`; the
+/// model card mandates `title: none` when no title is available, so callers
+/// without a title (queries aside, the title-less doc paths, fragments)
+/// pass `None` and every `{title}` placeholder resolves to `none`.
+fn apply_doc_template<'a>(
+    template: Option<&str>,
+    title: Option<&str>,
+    text: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    let title = title.unwrap_or("none");
+    match template {
+        None => std::borrow::Cow::Borrowed(text),
+        Some(t) => {
+            let filled = if t.contains("{title}") {
+                t.replace("{title}", title)
+            } else {
+                t.to_string()
+            };
+            if filled.contains("{text}") {
+                std::borrow::Cow::Owned(filled.replace("{text}", text))
+            } else {
+                std::borrow::Cow::Owned(format!("{filled} {text}"))
+            }
+        }
+    }
+}
+
 impl CustomEmbeddingProvider {
     /// Create a custom OpenAI-compatible embedding provider.
     pub fn new(config: RemoteEmbeddingConfig) -> Result<Self, RemoteEmbeddingError> {
@@ -597,24 +656,59 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
     }
 
     async fn embed_batch(&self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
-        // Batch calls are the DOCUMENT path: apply the doc template.
-        let inputs = texts
-            .iter()
-            .map(|t| apply_template(self.doc_template.as_deref(), t))
-            .collect();
-        self.embed_via_api(inputs).await
+        // Batch calls are the DOCUMENT path: apply the doc template (no
+        // titles — every {title} placeholder resolves to `none`).
+        let titles = std::iter::repeat_n(None, texts.len())
+            .collect::<Vec<Option<String>>>()
+            .into_iter()
+            .peekable();
+        let rows = self.embed_batch_optional_titled(texts, titles).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.unwrap_or_default())
+            .collect())
     }
 
     async fn embed_batch_optional(
         &self,
         texts: Vec<&str>,
     ) -> Result<Vec<Option<Vec<f32>>>, RemoteEmbeddingError> {
+        // Legacy (title-less) documents: every title resolves to `none`.
+        let titles = std::iter::repeat_n(None, texts.len())
+            .collect::<Vec<Option<String>>>()
+            .into_iter()
+            .peekable();
+        self.embed_batch_optional_titled(texts, titles).await
+    }
+
+    async fn embed_batch_titled(
+        &self,
+        texts: Vec<&str>,
+        titles: std::iter::Peekable<std::vec::IntoIter<Option<String>>>,
+    ) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
+        let rows = self.embed_batch_optional_titled(texts, titles).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.unwrap_or_default())
+            .collect())
+    }
+
+    /// Shared document-batch path: template with optional titles, send, and
+    /// bisect-retry any batch the endpoint rejects wholesale.
+    async fn embed_batch_optional_titled(
+        &self,
+        texts: Vec<&str>,
+        titles: std::iter::Peekable<std::vec::IntoIter<Option<String>>>,
+    ) -> Result<Vec<Option<Vec<f32>>>, RemoteEmbeddingError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
         let inputs: Vec<_> = texts
             .iter()
-            .map(|text| apply_template(self.doc_template.as_deref(), text))
+            .zip(titles)
+            .map(|(text, title)| {
+                apply_doc_template(self.doc_template.as_deref(), title.as_deref(), text)
+            })
             .collect();
         let mut rows = vec![None; inputs.len()];
         let mut pending = vec![(0, inputs.len())];
@@ -953,6 +1047,24 @@ impl RemoteEmbeddingProvider for GenericRemoteProvider {
         texts: Vec<&str>,
     ) -> Result<Vec<Option<Vec<f32>>>, RemoteEmbeddingError> {
         self.provider.embed_batch_optional(texts).await
+    }
+
+    async fn embed_batch_titled(
+        &self,
+        texts: Vec<&str>,
+        titles: std::iter::Peekable<std::vec::IntoIter<Option<String>>>,
+    ) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
+        self.provider.embed_batch_titled(texts, titles).await
+    }
+
+    async fn embed_batch_optional_titled(
+        &self,
+        texts: Vec<&str>,
+        titles: std::iter::Peekable<std::vec::IntoIter<Option<String>>>,
+    ) -> Result<Vec<Option<Vec<f32>>>, RemoteEmbeddingError> {
+        self.provider
+            .embed_batch_optional_titled(texts, titles)
+            .await
     }
 
     fn dimension(&self) -> usize {

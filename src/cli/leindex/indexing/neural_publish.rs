@@ -7,18 +7,37 @@ struct HybridStreamingEmbedder<'a> {
 
 impl streaming::neural::StreamingEmbedder for HybridStreamingEmbedder<'_> {
     fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
+        let untitled: Vec<Option<String>> = std::iter::repeat_n(None, texts.len()).collect();
+        self.embed_batch_titled(texts, &untitled)
+    }
+
+    fn embed_batch_titled(&self, texts: &[String], titles: &[Option<String>]) -> Vec<Vec<f32>> {
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
         {
-            let mut unique_texts = Vec::new();
+            if titles.len() != texts.len() {
+                // Aligned-slices contract: a misshapen call is the same
+                // embedder-violation class as the count mismatch below.
+                return Vec::new();
+            }
+            // Dedup key is (title, capped_text): the same body under two
+            // titles must embed twice — the title joins the remote doc
+            // template, so the wire texts differ.
+            let mut unique_texts: Vec<&str> = Vec::new();
+            let mut unique_titles: Vec<Option<String>> = Vec::new();
             let mut positions = HashMap::new();
-            for text in texts {
+            for (text, title) in texts.iter().zip(titles) {
                 let capped = index_builder::cap_neural_text(text);
-                if !positions.contains_key(capped) {
-                    positions.insert(capped, unique_texts.len());
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    positions.entry((title, capped))
+                {
+                    slot.insert(unique_texts.len());
                     unique_texts.push(capped);
+                    unique_titles.push(title.clone());
                 }
             }
-            let embeddings = self.inner.embed_neural_batch_blocking(&unique_texts);
+            let embeddings = self
+                .inner
+                .embed_neural_batch_blocking_titled(&unique_texts, unique_titles);
             if embeddings.len() != unique_texts.len() {
                 // Count mismatch = embedder contract violation. Return a
                 // length that cannot match `texts.len()` so `flush_batch`'s
@@ -31,9 +50,10 @@ impl streaming::neural::StreamingEmbedder for HybridStreamingEmbedder<'_> {
             let embeddings_by_text: Vec<Option<Vec<f32>>> = embeddings;
             texts
                 .iter()
-                .map(|text| {
+                .zip(titles)
+                .map(|(text, title)| {
                     positions
-                        .get(index_builder::cap_neural_text(text))
+                        .get(&(title, index_builder::cap_neural_text(text)))
                         .and_then(|&position| embeddings_by_text[position].clone())
                         .unwrap_or_default()
                 })
@@ -41,7 +61,7 @@ impl streaming::neural::StreamingEmbedder for HybridStreamingEmbedder<'_> {
         }
         #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
         {
-            let _ = (self.inner, texts);
+            let _ = (self.inner, texts, titles);
             Vec::new()
         }
     }
@@ -275,6 +295,11 @@ fn streaming_neural_inputs<'a>(
                 Ok(streaming::neural::NeuralInput {
                     node_id: node.id.clone(),
                     text: index_builder::cap_neural_text(&text).to_owned(),
+                    // Legacy-route parity: the relative source path rides
+                    // along as the document title so the remote doc template
+                    // ({title}) receives the same input shape on both routes
+                    // (EmbeddingGemma2 trains on title+text prompts).
+                    title: Some(node.file_path.to_string()),
                 })
             };
             return Some(input);
@@ -514,6 +539,10 @@ impl LeIndex {
                 &self.search_engine,
                 &self.project_path,
                 _identity,
+                crate::config::LeIndexConfig::load_cached()
+                    .indexing
+                    .embeddings
+                    .effective_matryoshka(),
             )?;
         }
         Ok(())
@@ -1080,6 +1109,7 @@ mod tests {
             Ok(streaming::neural::NeuralInput {
                 node_id: format!("node-{i}"),
                 text: format!("document-{i}"),
+                title: Some(format!("src/file-{i}.rs")),
             })
         });
         let mut writer = streaming::neural::VecNeuralRowWriter::new();

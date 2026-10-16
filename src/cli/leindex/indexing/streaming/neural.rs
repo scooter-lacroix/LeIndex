@@ -17,6 +17,8 @@ pub struct NeuralInput {
     pub node_id: String,
     /// Enriched text content for embedding (may include connectivity context).
     pub text: String,
+    /// Optional document title (normally the relative source path).
+    pub title: Option<String>,
 }
 
 /// Statistics from a streaming neural enrichment run.
@@ -93,6 +95,11 @@ impl NeuralRowWriter for VecNeuralRowWriter {
 pub trait StreamingEmbedder {
     /// Embed a batch of texts, returning one embedding vector per text.
     fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>>;
+
+    /// Embed titled documents. CPU/local embedders preserve the text-only path.
+    fn embed_batch_titled(&self, texts: &[String], _titles: &[Option<String>]) -> Vec<Vec<f32>> {
+        self.embed_batch(texts)
+    }
 }
 
 /// A deterministic mock embedder for testing. Uses a simple hash-based
@@ -156,6 +163,7 @@ where
     let mut stats = NeuralStats::default();
     let mut pending_ids: Vec<String> = Vec::new();
     let mut pending_texts: Vec<String> = Vec::new();
+    let mut pending_titles: Vec<Option<String>> = Vec::new();
     let mut pending_bytes: usize = 0;
 
     loop {
@@ -165,14 +173,23 @@ where
                     pending_bytes += input.text.len();
                     pending_ids.push(input.node_id);
                     pending_texts.push(input.text);
+                    pending_titles.push(input.title);
                     false
                 } else {
                     // Text by itself exceeds a batch limit — flush current
                     // batch, then add this text as a single-item batch
                     if !pending_texts.is_empty() {
-                        flush_batch(&pending_ids, &pending_texts, embedder, writer, &mut stats)?;
+                        flush_batch(
+                            &pending_ids,
+                            &pending_texts,
+                            &pending_titles,
+                            embedder,
+                            writer,
+                            &mut stats,
+                        )?;
                         pending_ids.clear();
                         pending_texts.clear();
+                        pending_titles.clear();
                         pending_bytes = 0;
                     }
                     // Single-item batch for oversized text. Text longer than
@@ -189,6 +206,7 @@ where
                         pending_bytes = input.text.len();
                         pending_ids.push(input.node_id);
                         pending_texts.push(input.text);
+                        pending_titles.push(input.title);
                     }
                     false
                 }
@@ -200,9 +218,17 @@ where
         let batch_full =
             pending_texts.len() >= budget.max_texts || pending_bytes >= budget.max_utf8_bytes;
         if (batch_full || exhausted) && !pending_texts.is_empty() {
-            flush_batch(&pending_ids, &pending_texts, embedder, writer, &mut stats)?;
+            flush_batch(
+                &pending_ids,
+                &pending_texts,
+                &pending_titles,
+                embedder,
+                writer,
+                &mut stats,
+            )?;
             pending_ids.clear();
             pending_texts.clear();
+            pending_titles.clear();
             pending_bytes = 0;
         }
 
@@ -217,11 +243,12 @@ where
 fn flush_batch<E: StreamingEmbedder, W: NeuralRowWriter>(
     ids: &[String],
     texts: &[String],
+    titles: &[Option<String>],
     embedder: &E,
     writer: &mut W,
     stats: &mut NeuralStats,
 ) -> Result<()> {
-    let embeddings = embedder.embed_batch(texts);
+    let embeddings = embedder.embed_batch_titled(texts, titles);
     if embeddings.len() != ids.len() {
         anyhow::bail!(
             "streaming neural embedder returned {} vectors for {} texts",
@@ -279,6 +306,7 @@ mod test {
             .map(|i| NeuralInput {
                 node_id: format!("node{i}"),
                 text: format!("fn func_{i}() -> i32 {{ {i} }}"),
+                title: None,
             })
             .collect()
     }
@@ -352,6 +380,69 @@ mod test {
 
     /// VAL-STREAM-007: BatchBudget enforced during neural enrichment.
     #[test]
+    fn test_titled_batches_preserve_alignment_and_cpu_fallback() {
+        struct Titled(std::cell::RefCell<Vec<Option<String>>>);
+        impl StreamingEmbedder for Titled {
+            fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
+                MockEmbedder::new(8).embed_batch(texts)
+            }
+
+            fn embed_batch_titled(
+                &self,
+                texts: &[String],
+                titles: &[Option<String>],
+            ) -> Vec<Vec<f32>> {
+                assert_eq!(texts.len(), titles.len());
+                self.0.borrow_mut().extend_from_slice(titles);
+                self.embed_batch(texts)
+            }
+        }
+        let mut inputs = make_inputs(7);
+        for (index, input) in inputs.iter_mut().enumerate() {
+            input.title = Some(format!("source-{index}.rs"));
+        }
+        let expected_titles: Vec<_> = inputs.iter().map(|input| input.title.clone()).collect();
+        let expected_rows: Vec<_> = inputs
+            .iter()
+            .map(|input| {
+                (
+                    input.node_id.clone(),
+                    MockEmbedder::new(8).embed_batch(std::slice::from_ref(&input.text))[0].clone(),
+                )
+            })
+            .collect();
+        // Exercise count-triggered flushes and byte-triggered flushes.
+        for (max_texts, max_utf8_bytes) in [(2, usize::MAX), (10, 55)] {
+            let budget = BatchBudget {
+                max_texts,
+                max_utf8_bytes,
+                ..BatchBudget::default()
+            };
+            let embedder = Titled(std::cell::RefCell::new(Vec::new()));
+            let mut writer = VecNeuralRowWriter::new();
+            enrich_neural_streaming(
+                &mut inputs.clone().into_iter().map(Ok),
+                &embedder,
+                &mut writer,
+                &budget,
+            )
+            .unwrap();
+            assert_eq!(*embedder.0.borrow(), expected_titles);
+            assert_eq!(writer.rows, expected_rows);
+            // A local embedder ignores titles, retaining identical CPU output.
+            let mut cpu_writer = VecNeuralRowWriter::new();
+            enrich_neural_streaming(
+                &mut inputs.clone().into_iter().map(Ok),
+                &MockEmbedder::new(8),
+                &mut cpu_writer,
+                &budget,
+            )
+            .unwrap();
+            assert_eq!(cpu_writer.rows, expected_rows);
+        }
+    }
+
+    #[test]
     fn test_batch_budget_enforced() {
         let inputs = make_inputs(100);
         let budget = BatchBudget {
@@ -383,6 +474,7 @@ mod test {
             NeuralInput {
                 node_id: "huge".to_string(),
                 text: "x".repeat(4096),
+                title: None,
             },
         );
         let budget = BatchBudget {
