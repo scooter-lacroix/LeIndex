@@ -378,7 +378,7 @@ mod test {
         }
     }
 
-    /// VAL-STREAM-007: BatchBudget enforced during neural enrichment.
+    /// Titles stay aligned across flushes and skipped rows; CPU output is unchanged.
     #[test]
     fn test_titled_batches_preserve_alignment_and_cpu_fallback() {
         struct Titled(std::cell::RefCell<Vec<Option<String>>>);
@@ -399,7 +399,7 @@ mod test {
         }
         let mut inputs = make_inputs(7);
         for (index, input) in inputs.iter_mut().enumerate() {
-            input.title = Some(format!("source-{index}.rs"));
+            input.title = (index % 2 == 0).then(|| format!("source-{index}.rs"));
         }
         let expected_titles: Vec<_> = inputs.iter().map(|input| input.title.clone()).collect();
         let expected_rows: Vec<_> = inputs
@@ -411,22 +411,33 @@ mod test {
                 )
             })
             .collect();
+        inputs.insert(
+            3,
+            NeuralInput {
+                node_id: "oversized".into(),
+                text: "x".repeat(4096),
+                title: Some("must-not-be-forwarded.rs".into()),
+            },
+        );
         // Exercise count-triggered flushes and byte-triggered flushes.
         for (max_texts, max_utf8_bytes) in [(2, usize::MAX), (10, 55)] {
             let budget = BatchBudget {
                 max_texts,
                 max_utf8_bytes,
+                max_seq_len: 1024,
                 ..BatchBudget::default()
             };
             let embedder = Titled(std::cell::RefCell::new(Vec::new()));
             let mut writer = VecNeuralRowWriter::new();
-            enrich_neural_streaming(
+            let stats = enrich_neural_streaming(
                 &mut inputs.clone().into_iter().map(Ok),
                 &embedder,
                 &mut writer,
                 &budget,
             )
             .unwrap();
+            assert_eq!(stats.rows_written, expected_rows.len());
+            assert_eq!(stats.rows_skipped, 1);
             assert_eq!(*embedder.0.borrow(), expected_titles);
             assert_eq!(writer.rows, expected_rows);
             // A local embedder ignores titles, retaining identical CPU output.

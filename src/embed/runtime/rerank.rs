@@ -5,9 +5,9 @@ impl WorkerRuntime {
     /// Lazily load + return the reranker cross-encoder session + tokenizer (on
     /// demand). The reranker is loaded only on the first rerank request and
     /// evicted after `RERANK_IDLE_EVICTION_SECS` of idleness
-    /// (`maybe_evict_rerank`). Uses the CPU execution provider so it does not
-    /// contend with the embedder's GPU session and stays cheap (a cross-encoder
-    /// over a small top-N). Double-checked under `rerank_init_lock` so concurrent
+    /// (`maybe_evict_rerank`). Requests the embedder's resolved execution
+    /// provider; session construction can fall back to CPU for this model.
+    /// Double-checked under `rerank_init_lock` so concurrent
     /// socket requests don't double-load.
     #[cfg(feature = "onnx")]
     pub(super) fn ensure_rerank_session(
@@ -58,14 +58,8 @@ impl WorkerRuntime {
                 message: format!("rerank tokenizer load failed ({}): {}", tokenizer_path, e),
             },
         )?);
-        // Use the same concrete provider the embedder session resolved to
-        // (self.provider_runtime_status.execution_provider), so the
-        // cross-encoder is fast (~1-3s after a one-time compile cached as a
-        // .mxr) and the reranker never receives the unresolved "auto" token.
-        // The native ORT_MIGraphX_MODEL_CACHE_PATH cache persists across idle
-        // evictions, so on-demand reloads stay warm. CPU is ~70s/query for
-        // top-20 × 512 — unusable interactively. If the provider is unavailable
-        // for this model, build_session falls back to CPU automatically.
+        // Request the embedder's concrete provider rather than unresolved
+        // "auto". This model may resolve differently if its GPU probe fails.
         let provider = self.provider_runtime_status.execution_provider.as_str();
         let outcome =
             Self::build_session(&model_path, provider, self.config.ort_threads).map_err(|e| {
@@ -75,7 +69,13 @@ impl WorkerRuntime {
                 }
             })?;
         let session = Arc::new(Mutex::new(outcome.session));
-        tracing::info!(model = %model_name, provider, "reranker loaded on demand");
+        tracing::info!(
+            model = %model_name,
+            requested_provider = provider,
+            provider = %outcome.provider_status.execution_provider,
+            fallback_reason = ?outcome.provider_status.fallback_reason,
+            "reranker loaded on demand"
+        );
         *self.rerank_session.lock().unwrap() = Some(session.clone());
         *self.rerank_tokenizer.lock().unwrap() = Some(tokenizer.clone());
         *self.last_rerank_activity.lock().unwrap() = Instant::now();
