@@ -106,6 +106,14 @@ pub enum Commands {
         /// Maximum number of results to return
         #[arg(long = "top-k", default_value = "10")]
         top_k: usize,
+
+        /// Rerank backend for this run (overrides [search] rerank_backend).
+        #[arg(
+            long = "rerank",
+            value_name = "BACKEND",
+            value_parser = ["onnx", "system-one", "off"]
+        )]
+        rerank: Option<String>,
     },
 
     /// Perform deep analysis with context expansion
@@ -500,9 +508,11 @@ impl Cli {
                 progress,
                 max_memory,
             } => cmd_index_impl(path, force, progress, max_memory).await,
-            Commands::Search { query, top_k } => {
-                cmd_search_impl(query, top_k, global_project).await
-            }
+            Commands::Search {
+                query,
+                top_k,
+                rerank,
+            } => cmd_search_impl(query, top_k, rerank, global_project).await,
             Commands::Analyze {
                 query,
                 token_budget,
@@ -965,12 +975,18 @@ async fn cmd_index_impl(
 async fn cmd_search_impl(
     query: String,
     top_k: usize,
+    rerank: Option<String>,
     project: Option<PathBuf>,
 ) -> AnyhowResult<()> {
     let project_path = get_project_path(project);
     let canonical_path = project_path
         .canonicalize()
         .context("Failed to canonicalize project path")?;
+
+    // Per-run backend override: clap already validated the allowlist.
+    if let Some(backend) = &rerank {
+        super::leindex::set_rerank_backend_override(backend);
+    }
 
     info!("Searching for: {}", query);
 

@@ -176,6 +176,84 @@ pub fn global() -> Option<&'static Gate> {
     .as_ref()
 }
 
+/// Build the provider asker from `[system_one]` — the same endpoint/key/model
+/// ladder as [`Gate::from_config`] minus the gate's mode check: the search
+/// reranker is independent of `mode` and needs only a configured provider
+/// (plus the SystemOne feature flag). `None` when the flag is off, the
+/// provider is unknown, a remote provider has no API key, or the HTTP client
+/// cannot be built.
+pub fn asker_from_config(
+    config: &SystemOneConfig,
+    services: &std::collections::BTreeMap<String, crate::config::ServiceConfig>,
+) -> Option<HttpAsker> {
+    let config = config.effective();
+    // Progressive-rollout gate (AGENTS.md): same feature flag as the MCP gate.
+    if !crate::feature_flags::FeatureFlag::SystemOne.is_enabled() {
+        warn!(
+            "system-one is experimental and disabled by feature flag; set LEINDEX_FEATURE_SYSTEM_ONE=1 to enable"
+        );
+        return None;
+    }
+    let Some(provider) = types::Provider::parse(&config.provider) else {
+        warn!(provider = %config.provider, "unknown [system_one] provider; reranker disabled (use laya|jev|openai)");
+        return None;
+    };
+    let service = config.service.as_deref().and_then(|name| {
+        match services.get(name) {
+            Some(svc) => Some(svc),
+            None => {
+                warn!(service = %name, "[system_one] service names no [services] section; ignoring");
+                None
+            }
+        }
+    });
+    let api_key = config
+        .api_key_env
+        .as_deref()
+        .and_then(|name| std::env::var(name).ok())
+        .filter(|key| !key.is_empty());
+    if provider.is_remote() && api_key.is_none() {
+        warn!(
+            "[system_one] remote provider needs api_key_env naming a set environment variable; reranker disabled"
+        );
+        return None;
+    }
+    // base_url ladder: section (incl. preset) > referenced service > provider default.
+    let base_url = config
+        .base_url
+        .clone()
+        .or_else(|| service.map(|s| s.base_url()))
+        .unwrap_or_else(|| default_base_url(provider).to_string());
+    // model ladder: section > referenced service served name > provider default.
+    let model = config
+        .model
+        .clone()
+        .or_else(|| service.and_then(|s| s.served_name()))
+        .unwrap_or_else(|| default_model(provider).to_string());
+    let timeout_ms = config.timeout_ms.max(1);
+    let asker = match HttpAsker::new(
+        provider,
+        &base_url,
+        &model,
+        api_key,
+        Duration::from_millis(timeout_ms),
+    ) {
+        Ok(asker) => asker,
+        Err(error) => {
+            warn!(%error, "could not build the system-one HTTP client; reranker disabled");
+            return None;
+        }
+    };
+    // Managed self-healing: only for service sections that allow it.
+    Some(match service {
+        Some(svc) if svc.auto_start && svc.model.is_some() => {
+            let name = config.service.clone().unwrap_or_default();
+            asker.with_managed_service(name, svc.clone())
+        }
+        _ => asker,
+    })
+}
+
 impl Gate {
     /// Build from config; `None` (with a warning) when disabled or invalid.
     /// `services` is the `[services.<name>]` map the section's `service` key
