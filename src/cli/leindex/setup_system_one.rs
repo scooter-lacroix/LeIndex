@@ -770,12 +770,23 @@ fn ask_verify(asker: &HttpAsker, timeout: Duration, timeout_ms: u64) -> Result<(
             },
         )],
     };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| SetupError::Io(format!("cannot start smoke-test runtime: {e}")))?;
-    let outcome =
-        runtime.block_on(async { tokio::time::timeout(timeout, asker.ask(&request)).await });
+    let fut = async { tokio::time::timeout(timeout, asker.ask(&request)).await };
+    // The CLI wraps every command (including `setup --check`) in a
+    // multi-threaded Tokio runtime; calling block_on directly there panics
+    // with "Cannot start a runtime from within a runtime". Inside a runtime,
+    // hop to the blocking pool and drive the future on the ambient handle;
+    // standalone (interactive wizard), build the private current-thread
+    // runtime as before.
+    let outcome = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Err(_) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| SetupError::Io(format!("cannot start smoke-test runtime: {e}")))?;
+            runtime.block_on(fut)
+        }
+    };
     let response = match outcome {
         Err(_) => {
             return Err(SetupError::Io(format!(

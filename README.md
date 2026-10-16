@@ -163,7 +163,10 @@ bash install-leindex.sh && leindex setup
 The setup wizard selects local Qwen3 ONNX, managed EmbeddingGemma2 GGUF, an
 external embeddings server, or the existing configuration. TF-IDF and the PDG
 remain available without a neural provider. Non-interactive `--neural` selects
-local Qwen3; use `--embedding keep` to retain an existing route.
+local Qwen3; use `--embedding keep` to retain an existing route. Managed
+services (`leindex services list|start|stop`) own the llama-server process on
+Linux; `auto_start = true` brings them up on demand for runtime embedding
+calls (`--check` never starts services).
 
 ```bash
 leindex setup --embedding qwen3 --cpu
@@ -183,9 +186,43 @@ Remote routes do not require ORT or a local Qwen model. `--check` makes a bounde
 embedding request without starting services; start a stopped managed service first.
 See [neural setup](docs/NEURAL_SETUP.md) for authentication, dimensions and templates.
 
-`leindex setup --system-one` opens the System One wizard in a terminal. The gate
-requires a `system-one` build and `LEINDEX_FEATURE_SYSTEM_ONE=1` in the serving
-process; configuring it does not enable the runtime flag.
+### System One (experimental decision gate)
+
+System One is an **experimental** typed-decision gate: a small decision model
+validates tool calls before they run (pre-gate) and classifies search results
+before they reach your agent (post-gate). It fails open — any provider problem
+leaves calls and results untouched — and ships off by default.
+
+1. **Build with the feature**: `cargo install leindex --features system-one`.
+   Prebuilt bundles and default crates.io builds do not include the gate;
+   `leindex setup --check` reports `build (system-one feature): yes/no`.
+2. **Provision a decision model.** `leindex setup --system-one` writes the
+   `[system_one]` section and, for the default `laya` provider, asks which
+   Laya backend to use: `external` (the fresh-install default) prompts for
+   an existing HTTP endpoint, with optional model and `api_key_env` values
+   (empty = provider default / no key); `managed` (explicit choice, Linux)
+   prompts for the llama-server binary and an absolute Laya
+   GGUF path (for example `ggml-org/Laya-GGUF` on Hugging Face) and writes a
+   `[services.laya]` section the gate derives its endpoint from. One
+   llama-server serves one model, so the embeddings service must use a
+   different port. On GPUs, pin the device explicitly
+   (e.g. `extra_args = ["-ngl", "99", "--device", "Vulkan1"]`) — auto device
+   selection can pick an integrated GPU.
+3. **Arm the runtime flag** in every process that serves MCP or runs the CLI:
+   `export LEINDEX_FEATURE_SYSTEM_ONE=1` (and set the same variable in your
+   MCP client's `env` block). Configuring `[system_one]` alone never enables
+   the gate.
+4. **Verify**: `leindex setup --check` reports the gate `active` with
+   `probe: provider answered`. The probe sends a real decision request
+   (timeout: `system_one.timeout_ms`). `--check` never starts the managed
+   service: start it beforehand or the probe fails, even with
+   `auto_start = true`.
+
+Fail-open tuning lives in `[system_one]`: `mode` (`off`/`shadow` — decide and
+log only —/`enforce`), `pre_gate`, `post_gate`, `timeout_ms`, and the
+`relevant_min`/`instructions_max`/`top_n`/`tau_apply` thresholds. See
+[`leindex.toml.example`](leindex.toml.example) and
+[`docs/NEURAL_SETUP.md`](docs/NEURAL_SETUP.md#configuration-and-system-one).
 
 Inspect or edit configuration without rerunning setup:
 
@@ -223,7 +260,22 @@ leindex analyze "how authorization is enforced"
 ```
 
 Replace `npx -y @leindex/mcp` with `leindex mcp` if you installed the binary
-directly. Zed, Cursor, VS Code, and Claude Code configuration snippets are in
+directly. To expose experimental features to the spawned server, pass them in
+an `env` block — an MCP server only sees variables its client sets:
+
+```json
+{
+  "mcpServers": {
+    "leindex": {
+      "command": "leindex",
+      "args": ["mcp"],
+      "env": { "LEINDEX_FEATURE_SYSTEM_ONE": "1" }
+    }
+  }
+}
+```
+
+Zed, Cursor, VS Code, and Claude Code configuration snippets are in
 [`docs/MCP.md`](docs/MCP.md). Long-running servers self-exit after
 `[mcp] idle_timeout_secs` (default 1800) and evict idle engines after
 `engine_max_idle_secs` (default 600).
@@ -236,32 +288,14 @@ directly. Zed, Cursor, VS Code, and Claude Code configuration snippets are in
 `LEINDEX_ENGRAM_MAX_ENTRIES` (20000) and `LEINDEX_ENGRAM_MAX_MB` (256) — plus the escape hatches
 `LEINDEX_CLI_SHUTDOWN_DAEMON`, `LEINDEX_ALLOW_MULTIPLE_EMBED_DAEMONS`, and
 the `LEINDEX_FEATURE_*` rollout kills catalogued in
-[`.env.example`](.env.example). The experimental System-One
-decision gate (source builds with `--features system-one`) additionally needs
-`LEINDEX_FEATURE_SYSTEM_ONE=1` and a `[system_one]` section — see
-`leindex.toml.example`.
-
-The optional System-One gate requires a source build with `--features system-one`.
-Set `LEINDEX_FEATURE_SYSTEM_ONE=1` in the MCP server's environment (the client's
-`env` object for stdio, or the HTTP server's environment), then add this to
-`$LEINDEX_HOME/config/leindex.toml` (default `~/.leindex/config/leindex.toml`):
-
-```toml
-[system_one]
-mode = "shadow" # observe decisions first; use "enforce" to apply them
-provider = "openai"
-base_url = "https://api.openai.com/v1"
-model = "gpt-4.1-mini"
-api_key_env = "SYSTEM_ONE_API_KEY" # environment variable NAME, never the key
-timeout_ms = 10000
-top_n = 5
-```
-
-Set `SYSTEM_ONE_API_KEY` through your server's secret environment, not in this
-file or a committed MCP config. For a local service, use `provider = "laya"`
-with its HTTP base URL and served model, and omit `api_key_env`. Keep
-`mode = "off"` (the default) to disable the gate; `leindex setup --system-one`
-opens the terminal wizard.
+[`.env.example`](.env.example). The full System-One walkthrough — build flag,
+wizard, runtime flag, MCP `env` block, verification — is in the
+[setup section](#system-one-experimental-decision-gate). `[system_one]`
+provider keys live in [`leindex.toml.example`](leindex.toml.example)
+(`laya` targets a local Laya model — managed llama-server backend or an
+external endpoint with an optional `api_key_env` name; the remote
+`jev`/`typesafe`/`openai` providers take `base_url`, `model`, and
+`api_key_env` — the environment variable *name*, never the key itself).
 
 
 ---
@@ -305,6 +339,8 @@ Codebase → Tree-sitter → PDG + TF-IDF (core, always) → neural join → hyb
 ## Under the hood
 
 - **18 MCP tools** — search, navigation, analysis, and safe editing (preview/dry-run/preview-only defaults on every destructive path)
+- **Flexible embedding backends** — TF-IDF, local ONNX models (Qwen3), a managed llama.cpp GGUF service (EmbeddingGemma2), or remote OpenAI-compatible providers
+- **System One decision gate (experimental)** — pre/post-gate validation of MCP calls and search results by a local typed-decision model, off by default, fail-open
 - **Honest degradation everywhere** — direction labels on impact figures, notes when enrichment was skipped, `signature_scope` on incremental counts, freshness footers separated from machine-readable JSON
 - **5-phase analysis** — structural scan, dependency map, logic flow, critical path, synthesis; freshness-aware and incremental
 - **Dashboard** — Bun + React operational UI with project metrics and graph telemetry

@@ -344,8 +344,14 @@ fn test_layer_search_hydration_matches_graph_rebuild() {
     let _reset = crate::feature_flags::FlagOverrideReset;
     let dir = tempfile::tempdir().expect("tempdir");
     write_fixture_project(dir.path());
-    // Keep this equivalence fixture TF-IDF-only while fresh installs enable neural search.
+    // Keep this equivalence fixture TF-IDF-only while fresh installs enable
+    // neural search. RemoteEmbeddings must also be pinned: it is default-ON,
+    // and on hosts where an embeddinggemma route resolves (config or preset
+    // default) the layer-restored engine carries a live remote embedder while
+    // the graph rebuild stays TF-IDF — scores then diverge for environment
+    // reasons that have nothing to do with layer hydration.
     set_flag_override_for_test(FeatureFlag::NeuralSearch, false);
+    set_flag_override_for_test(FeatureFlag::RemoteEmbeddings, false);
     index_project_fixture(dir.path());
     let storage_root = dir.path().join(".leindex");
 

@@ -4,6 +4,39 @@ All notable changes to the LeIndex project are documented in this file.
 
 ## [Unreleased]
 
+### Setup fixes: config escape hints, hermetic hydration test, System One probe
+
+- `config set`/`config unset` failures caused by dangling cross-references
+  (`embeddings.remote_service`, `system_one.service`, `active_preset`,
+  `presets.<n>.service`) now name the exact `leindex config unset <key>`
+  escape; previously every `config set` failed while such a reference existed,
+  with no unstick path in the error.
+- `config unset` also repairs multi-dangling configurations: removing one
+  dangling reference no longer fails because another pre-existing one remains.
+  The repair saves only when nothing else is invalid — a pre-existing
+  reference never masks other violations, and the reported error is the
+  masked one, not the reference — while references the edit itself creates
+  (deleting a service that is still referenced) are still refused.
+- `leindex setup --check` no longer panics with "Cannot start a runtime from
+  within a runtime" when the System One laya probe runs: the CLI wraps every
+  command in a tokio runtime, and the probe's confirmation prompt now drives
+  the request on the ambient handle (`block_in_place`), building a private
+  runtime only when invoked standalone.
+- `test_layer_search_hydration_matches_graph_rebuild` pins
+  `LEINDEX_FEATURE_REMOTE_EMBEDDINGS=0`: the flag is default-ON, and a
+  resolvable remote route leaked into the layer-restored path only, making
+  the equivalence test fail on configured hosts.
+- `.env.example` corrected: `LEINDEX_FEATURE_REMOTE_EMBEDDINGS` is
+  default-ON, not default-OFF.
+- Setup documentation overhauled: README (and package mirrors) document the
+  System One gate (experimental) with build/wizard/flag/verify steps and an
+  MCP `env` block; INSTALLATION and INSTALLATION_RUST cover managed services,
+  System One provisioning, expanded verification, and the sharp edges learned
+  during bring-up (all-or-nothing `config set`, GPU device pinning, one
+  model per llama-server, reindex-on-model-change, probe spawn semantics,
+  release-LTO memory pressure); NEURAL_SETUP expands Configuration and
+  System One with mode semantics, thresholds, and Laya GGUF sourcing.
+
 ### Setup: embedding routes, managed llama.cpp, config subcommands
 
 - `leindex setup` gains route selection: local Qwen3 ONNX (`--embedding

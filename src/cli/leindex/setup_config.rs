@@ -11,7 +11,11 @@
 //   the typed config and run [`validate`] BEFORE writing. Unknown keys are
 //   rejected by an explicit schema map (never silently ignored), so the
 //   typed re-serialization in `save` can never silently drop parts of a
-//   user's file.
+//   user's file. `config unset` is the repair path: when the edited
+//   document still fails validation only because of dangling
+//   cross-references that predate the edit, strict validation is deferred
+//   (see `commit_table_at`) so the documented escape hatch cannot dead-end
+//   on a second dangling reference.
 // - Secret redaction: `indexing.embeddings.remote_api_key` is replaced with
 //   `[REDACTED]` for every output path (Show/Get).
 //
@@ -281,9 +285,10 @@ fn validate_embeddings(config: &LeIndexConfig) -> Result<(), SetupError> {
         check_env_var_name("indexing.embeddings.remote_api_key_env", name)?;
     }
     if let Some(service) = non_empty(embeddings.remote_service.as_deref()) {
-        if !config.services.contains_key(service) {
+        if CrossRef::EmbeddingService(service.to_string()).is_dangling(config) {
             return Err(invalid(format!(
-                "indexing.embeddings.remote_service references missing [services.{service}]"
+                "indexing.embeddings.remote_service references missing [services.{service}] \
+                 (add it, or run `leindex config unset indexing.embeddings.remote_service`)"
             )));
         }
     }
@@ -322,16 +327,18 @@ fn validate_system_one_refs(config: &LeIndexConfig) -> Result<(), SetupError> {
         check_env_var_name("system_one.api_key_env", name)?;
     }
     if let Some(service) = non_empty(config.system_one.service.as_deref()) {
-        if !config.services.contains_key(service) {
+        if CrossRef::SystemService(service.to_string()).is_dangling(config) {
             return Err(invalid(format!(
-                "system_one.service references missing [services.{service}]"
+                "system_one.service references missing [services.{service}] \
+                 (add it, or run `leindex config unset system_one.service`)"
             )));
         }
     }
     if let Some(preset) = non_empty(config.system_one.active_preset.as_deref()) {
-        if !config.system_one.presets.contains_key(preset) {
+        if CrossRef::ActivePreset(preset.to_string()).is_dangling(config) {
             return Err(invalid(format!(
-                "system_one.active_preset references missing [system_one.presets.{preset}]"
+                "system_one.active_preset references missing [system_one.presets.{preset}] \
+                 (add it, or run `leindex config unset system_one.active_preset`)"
             )));
         }
     }
@@ -366,9 +373,10 @@ fn validate_presets(config: &LeIndexConfig) -> Result<(), SetupError> {
             check_env_var_name(&format!("system_one.presets.{name}.api_key_env"), env_name)?;
         }
         if let Some(service) = non_empty(preset.service.as_deref()) {
-            if !config.services.contains_key(service) {
+            if CrossRef::PresetService(service.to_string()).is_dangling(config) {
                 return Err(invalid(format!(
-                    "system_one.presets.{name}.service references missing [services.{service}]"
+                    "system_one.presets.{name}.service references missing [services.{service}] \
+                     (add it, or run `leindex config unset system_one.presets.{name}.service`)"
                 )));
             }
         }
@@ -598,11 +606,12 @@ fn apply_set_at(path: &Path, key: &str, value: &str) -> Result<PathBuf> {
     let mut root = load_table_at(path)?;
     let table = ensure_table_path(&mut root, &segments[..segments.len() - 1], key)?;
     table.insert(segments[segments.len() - 1].to_string(), new_value);
-    commit_table_at(path, &root, key)
+    commit_table_at(path, &root, key, None)
 }
 
-/// Remove one dotted key (or section), then typed-deserialize + validate +
-/// save. Removing a key that other parts reference fails in [`validate`].
+/// Remove one dotted key (or section), then typed-deserialize + save. Unset
+/// is the repair path for dangling cross-references — see
+/// [`commit_table_at`] for the deferred-validation rule.
 fn apply_unset_at(path: &Path, key: &str) -> Result<PathBuf> {
     let segments = key_segments(key)?;
     if !is_known_path(&segments) {
@@ -612,6 +621,17 @@ fn apply_unset_at(path: &Path, key: &str) -> Result<PathBuf> {
         bail!("config file does not exist: {}", path.display());
     }
     let mut root = load_table_at(path)?;
+    // Dangling references BEFORE the edit: the repair path only defers
+    // validation for dangling references it did not create (see
+    // `commit_table_at`). A pre-edit document that fails to deserialize
+    // surfaces at commit time; an empty set here just disables deferral.
+    let pre_dangling = toml::to_string(&root)
+        .ok()
+        .and_then(|rendered| {
+            let pre: Result<LeIndexConfig, _> = toml::from_str(&rendered);
+            pre.ok().map(|pre| dangling_references(&pre))
+        })
+        .unwrap_or_default();
     let mut table = &mut root;
     for segment in &segments[..segments.len() - 1] {
         table = match table.get_mut(*segment) {
@@ -624,7 +644,7 @@ fn apply_unset_at(path: &Path, key: &str) -> Result<PathBuf> {
     if table.remove(last).is_none() {
         bail!("key '{key}' is not set");
     }
-    commit_table_at(path, &root, key)
+    commit_table_at(path, &root, key, Some(&pre_dangling))
 }
 
 fn key_segments(key: &str) -> Result<Vec<&str>> {
@@ -695,14 +715,145 @@ fn ensure_table_path<'a>(
 }
 
 /// Shared write path: sweep for unknown keys, typed-deserialize, validate,
-/// then save. The file is never rewritten on any failure.
-fn commit_table_at(path: &Path, root: &toml::Table, key: &str) -> Result<PathBuf> {
+/// then save. The file is never rewritten on any failure. `repair` marks the
+/// `config unset` path and carries the dangling references of the PRE-EDIT
+/// document: unset is itself the escape hatch for dangling cross-references,
+/// so when the edited document still fails validation only because of
+/// dangling references that predate the edit, validation is retried without
+/// them — refusing to save because *another* pre-existing dangling reference
+/// remains would recreate the dead end. Every other failure refuses the save,
+/// including anything the deferral would otherwise mask: `validate` is
+/// short-circuiting, so a pre-existing reference must never shield a
+/// different violation (a repair that silently saves `timeout_ms = 0` behind
+/// a dangling reference is not a repair). Dangling references created by the
+/// edit (deleting a service that is still referenced) are never tolerated,
+/// and unknown-key and type checks always run.
+fn commit_table_at(
+    path: &Path,
+    root: &toml::Table,
+    key: &str,
+    repair: Option<&[CrossRef]>,
+) -> Result<PathBuf> {
     sweep_table_schema(root, &mut Vec::new())?;
     let rendered = toml::to_string(root).context("failed to render the edited document")?;
     let config: LeIndexConfig = toml::from_str(&rendered)
         .map_err(|e| anyhow::anyhow!("'{key}' would make the config invalid: {e}"))?;
-    validate(&config)?;
+    if let Err(err) = validate(&config) {
+        let post_dangling = dangling_references(&config);
+        let repairable = repair.is_some_and(|pre_dangling| {
+            !post_dangling.is_empty()
+                && post_dangling
+                    .iter()
+                    .all(|reference| pre_dangling.contains(reference))
+        });
+        if !repairable {
+            return Err(err.into());
+        }
+        // When the surviving references mask another violation, surface that
+        // violation instead of the reference error: the unset suggestion
+        // cannot commit while the masked problem stands, and the reference
+        // message would send the user chasing the surviving reference first.
+        // When scrubbing passes, nothing else is invalid and the unset saves.
+        if let Err(scrubbed) = scrub_and_validate(&config, &post_dangling) {
+            return Err(scrubbed.into());
+        }
+    }
     save_config_at(path, &config)
+}
+
+/// Validate `config` with the given dangling references blanked out, so a
+/// repair saves only when the edit introduces nothing invalid of its own:
+/// every remaining invariant (ranges, enums, nonzero bounds) is enforced
+/// instead of being masked behind the first reference error. Blanking is a
+/// pure relaxation of the reference checks — it can never hide a violation.
+fn scrub_and_validate(config: &LeIndexConfig, dangling: &[CrossRef]) -> Result<(), SetupError> {
+    let mut scrubbed = config.clone();
+    for reference in dangling {
+        match reference {
+            CrossRef::EmbeddingService(_) => {
+                scrubbed.indexing.embeddings.remote_service = None;
+            }
+            CrossRef::SystemService(_) => scrubbed.system_one.service = None,
+            CrossRef::ActivePreset(_) => scrubbed.system_one.active_preset = None,
+            CrossRef::PresetService(name) => {
+                for preset in scrubbed.system_one.presets.values_mut() {
+                    if preset
+                        .service
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|service| service == name.trim())
+                    {
+                        preset.service = None;
+                    }
+                }
+            }
+        }
+    }
+    validate(&scrubbed)
+}
+
+/// One cross-reference between config sections, as checked by [`validate`].
+/// Shared by the strict validators and the unset repair path's deferral rule
+/// (see `commit_table_at`) so the two predicates cannot drift.
+#[derive(Debug, PartialEq, Eq)]
+enum CrossRef {
+    /// `indexing.embeddings.remote_service` → `services.<name>`.
+    EmbeddingService(String),
+    /// `system_one.service` → `services.<name>`.
+    SystemService(String),
+    /// `system_one.active_preset` → `system_one.presets.<name>`.
+    ActivePreset(String),
+    /// `system_one.presets.<name>.service` → `services.<other>`.
+    PresetService(String),
+}
+
+impl CrossRef {
+    /// Dangling when the referenced name is non-empty (post-trim) and its
+    /// target section does not exist. This is the exact predicate the
+    /// reference validators branch on.
+    fn is_dangling(&self, config: &LeIndexConfig) -> bool {
+        match self {
+            CrossRef::EmbeddingService(name)
+            | CrossRef::SystemService(name)
+            | CrossRef::PresetService(name) => {
+                let name = name.trim();
+                !name.is_empty() && !config.services.contains_key(name)
+            }
+            CrossRef::ActivePreset(name) => {
+                let name = name.trim();
+                !name.is_empty() && !config.system_one.presets.contains_key(name)
+            }
+        }
+    }
+}
+
+/// Every cross-reference present in `config` (valid or dangling), in
+/// declaration order; `[system_one.presets]` follows BTreeMap order.
+fn cross_references(config: &LeIndexConfig) -> Vec<CrossRef> {
+    let mut references = Vec::new();
+    if let Some(service) = non_empty(config.indexing.embeddings.remote_service.as_deref()) {
+        references.push(CrossRef::EmbeddingService(service.to_string()));
+    }
+    if let Some(service) = non_empty(config.system_one.service.as_deref()) {
+        references.push(CrossRef::SystemService(service.to_string()));
+    }
+    if let Some(preset) = non_empty(config.system_one.active_preset.as_deref()) {
+        references.push(CrossRef::ActivePreset(preset.to_string()));
+    }
+    for preset in config.system_one.presets.values() {
+        if let Some(service) = non_empty(preset.service.as_deref()) {
+            references.push(CrossRef::PresetService(service.to_string()));
+        }
+    }
+    references
+}
+
+/// Every dangling cross-reference in `config` (its target section missing).
+fn dangling_references(config: &LeIndexConfig) -> Vec<CrossRef> {
+    cross_references(config)
+        .into_iter()
+        .filter(|reference| reference.is_dangling(config))
+        .collect()
 }
 
 /// Reject every unknown section/field anywhere in the document BEFORE saving:

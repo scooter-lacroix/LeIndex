@@ -182,6 +182,30 @@ fn test_validate_rejects_missing_service_reference() {
 }
 
 #[test]
+fn test_set_on_config_with_missing_service_reference_names_unset_escape() {
+    // Cross-reference failures make the WHOLE document unsaveable, so `set`
+    // on an unrelated key fails until the dangling reference is gone. The
+    // error must name the escape hatch or the user is stuck in a loop.
+    let dir = tempfile::tempdir().unwrap();
+    let original = "[system_one]\nservice = \"ghost\"\n";
+    let path = write_config(&dir, original);
+
+    let err = apply_set_at(&path, "search.search_mode", "\"hybrid\"")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("references missing [services.ghost]")
+            && err.contains("leindex config unset system_one.service"),
+        "error must name the unset escape hatch: {err}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+    // And the escape hatch actually unsticks the file.
+    apply_unset_at(&path, "system_one.service").unwrap();
+    apply_set_at(&path, "search.search_mode", "\"hybrid\"").unwrap();
+}
+
+#[test]
 fn test_validate_rejects_non_http_url() {
     // "http:///v1" is NOT hostless: the WHATWG special-authority state skips
     // extra slashes, so it parses as http://v1/ (probed against url 2.5.8).
@@ -813,4 +837,60 @@ fn test_show_and_get_redact_secret_extra_args() {
 
     let got = get_at(&path, "services.gemma.extra_args").unwrap();
     assert!(!got.contains("secret-host-key"), "leaked: {got}");
+}
+
+#[test]
+fn test_unset_removes_each_of_two_dangling_references() {
+    // The unset escape hatch must not dead-end on a SECOND dangling
+    // reference: unset is the repair command, so the edited document saves
+    // while another dangling reference remains (deferred strict validation,
+    // see commit_table_at), and only a fully-resolved document validates
+    // strictly again.
+    let dir = tempfile::tempdir().unwrap();
+    let original = concat!(
+        "[indexing.embeddings]\n",
+        "remote_service = \"ghost1\"\n",
+        "\n",
+        "[system_one]\n",
+        "service = \"ghost2\"\n",
+    );
+    let path = write_config(&dir, original);
+
+    // While both references dangle, `set` is still refused (whole-document
+    // strict validation) and the file is untouched.
+    let err = apply_set_at(&path, "search.search_mode", "\"hybrid\"")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("references missing"), "must refuse set: {err}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+    // The suggested escape for ghost2 works even though ghost1 still dangles…
+    apply_unset_at(&path, "system_one.service").unwrap();
+    // …and so does the escape for ghost1.
+    apply_unset_at(&path, "indexing.embeddings.remote_service").unwrap();
+
+    // Fully resolved again: set validates strictly and succeeds.
+    apply_set_at(&path, "search.search_mode", "\"hybrid\"").unwrap();
+}
+
+#[test]
+fn test_unset_repair_refuses_when_scrubbed_document_still_invalid() {
+    // A pre-existing dangling reference must not shield other violations:
+    // validate is short-circuiting, so the repair re-validates with the
+    // pre-existing references blanked out. Here the zero timeout_ms hides
+    // behind the surviving ghost reference in the first pass — the repair
+    // must refuse instead of saving an invalid document.
+    let dir = tempfile::tempdir().unwrap();
+    let original = "[indexing.embeddings]\nremote_service = \"ghost1\"\n\n\
+                    [system_one]\nservice = \"ghost2\"\ntimeout_ms = 0\n";
+    let path = write_config(&dir, original);
+
+    let err = apply_unset_at(&path, "indexing.embeddings.remote_service")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("timeout_ms"),
+        "must surface the masked violation, not the reference error: {err}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }

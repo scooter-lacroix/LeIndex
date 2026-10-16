@@ -58,7 +58,8 @@ Outputs:
 - `target/release/leindex-embed`
 
 Use `cargo install --path . --locked` to install the checked-out source into
-Cargo's binary directory.
+Cargo's binary directory. Add `--features system-one` to include the
+experimental System-One gate.
 
 ## Neural Setup
 
@@ -89,6 +90,42 @@ llama.cpp downloads pin tag `b11574` and verify the archive against SHA256
 metadata from GitHub's HTTPS release API before extraction. Remote routes do
 not require ONNX Runtime. `--check` makes a bounded readiness request without
 starting services; a stopped managed service is reported as not ready.
+Manage the llama-server processes with `leindex services
+list|start|stop`; with `auto_start = true` in `[services.<name>]`, LeIndex
+spawns the service on demand before remote embedding calls. `--check`
+probes never spawn services — System One included — so start a stopped
+service before checking. One llama-server
+serves one model, so an embeddings service (port 8080 in the embeddinggemma-2
+preset) and a System One decision-model service (port 8181 for `laya`) use
+different ports. On multi-GPU hosts pin the device explicitly, e.g.
+`extra_args = ["-ngl", "99", "--device", "Vulkan1"]`, because auto device
+selection can pick an integrated GPU. Changing the embedding model or its
+prompt templates changes the vector space — re-index afterwards.
+
+### System One (experimental)
+
+The optional System-One decision gate is **experimental** and ships only in
+feature builds:
+
+```bash
+cargo install leindex --features system-one
+leindex setup --system-one   # interactive wizard; writes [system_one] (+ [services.laya] for the managed laya backend)
+```
+
+Then arm the runtime flag in every process that serves MCP or runs the CLI:
+`export LEINDEX_FEATURE_SYSTEM_ONE=1` (or an `env` block in your MCP client).
+Configuring `[system_one]` alone never enables the gate. `leindex setup
+--check` on a feature build reports the gate's build, flag, and endpoint
+status, and its probe sends one real decision request (bounded by
+`system_one.timeout_ms`). `--check` never starts the managed service: start
+it beforehand or the probe fails, even with `auto_start = true`. The gate
+fails open: any provider problem leaves calls and results untouched.
+The `laya` provider targets a local Laya model: the managed backend runs
+one as a local llama-server service with no API key, and the external
+backend takes an endpoint with an optional `api_key_env` name. The remote
+`jev`/`typesafe`/`openai` providers take `base_url`, `model`, and
+`api_key_env` — the environment variable *name* holding the key, never the
+key itself.
 
 The model is stored under `$LEINDEX_HOME/models`, normally
 `~/.leindex/models`; it is not written into the Cargo registry or build
@@ -102,6 +139,8 @@ runtime details.
 ```bash
 leindex --version
 leindex setup --check
+leindex config validate
+leindex services list
 leindex diagnostics
 leindex index /path/to/project
 leindex search "request authentication" --project /path/to/project
@@ -134,6 +173,12 @@ forces a full rebuild.
 
 Build or install all binaries with `cargo build --release --bins` or
 `cargo install leindex --force`.
+
+**Release link step dies under memory pressure**
+
+`--release` builds use link-time optimization, which is memory-hungry. On a
+busy machine the linker can be killed; retry the install without competing
+builds before suspecting the toolchain.
 
 **ONNX Runtime is not found**
 
