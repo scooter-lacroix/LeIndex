@@ -1675,7 +1675,7 @@ pub(crate) fn enrich_neural_embeddings(
                 &connectivity_config,
                 &file_summary_ctx,
             );
-            pending.push((node.id.clone(), text));
+            pending.push((node.id.clone(), node.file_path.to_string(), text));
             if pending.len() == NEURAL_IPC_BATCH {
                 append_neural_batch(embedder, &pending, &mut rows);
                 pending.clear();
@@ -1706,12 +1706,16 @@ fn dedupe_neural_rows_keep_first(rows: &mut Vec<(String, Vec<f32>)>) {
 #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
 fn append_neural_batch(
     embedder: &GenerationNeuralEmbedder,
-    pending: &[(String, String)],
+    pending: &[(String, String, String)],
     rows: &mut Vec<(String, Vec<f32>)>,
 ) {
-    let texts: Vec<&str> = pending.iter().map(|(_, text)| text.as_str()).collect();
-    let embeddings = embedder.embed_neural_batch_blocking(&texts);
-    for ((node_id, _), embedding) in pending.iter().zip(embeddings) {
+    let texts: Vec<&str> = pending.iter().map(|(_, _, text)| text.as_str()).collect();
+    let titles: Vec<Option<String>> = pending
+        .iter()
+        .map(|(_, title, _)| Some(title.clone()))
+        .collect();
+    let embeddings = embedder.embed_neural_batch_blocking_titled(&texts, titles);
+    for ((node_id, _, _), embedding) in pending.iter().zip(embeddings) {
         if let Some(embedding) = embedding.filter(|row| !row.is_empty()) {
             rows.push((node_id.clone(), embedding));
         }
@@ -1819,6 +1823,10 @@ pub(crate) struct SearchCacheKeyInputs<'a> {
     pub(crate) rerank_enabled: bool,
     pub(crate) rerank_top_n: u32,
     pub(crate) rerank_model: &'a str,
+    /// Which reranker consumes the top-N (onnx|system-one|off). Part of the
+    /// cache key: backend choice changes result order even when rerank
+    /// enable/top_n/model are identical.
+    pub(crate) rerank_backend: &'a str,
     pub(crate) fragment_index_enabled: bool,
     pub(crate) fragment_weight: f64,
     pub(crate) fragment_root_hash: &'a str,
@@ -1827,14 +1835,14 @@ pub(crate) struct SearchCacheKeyInputs<'a> {
 
 pub(crate) fn search_cache_key_for(inputs: &SearchCacheKeyInputs<'_>) -> String {
     // v2: widens the key to include every result-affecting config knob + model
-    // identity (search_mode, neural_weight, rerank_enabled/top_n, fragment
-    // knobs incl. the persisted content root hash, embedder + reranker model).
-    // v1 keys omitted these, so a config or model change silently served stale
-    // cached results until a re-index changed the node count. The `v2:`
-    // namespace prefix lands in the (sanitized) cache filename so legacy v1
-    // entries are identifiably stale and sweepable, not silent.
+    // identity (search_mode, neural_weight, rerank_enabled/top_n/model/backend,
+    // fragment knobs incl. the persisted content root hash, embedder + reranker
+    // model). v1 keys omitted these, so a config or model change silently
+    // served stale cached results until a re-index changed the node count. The
+    // `v2:` namespace prefix lands in the (sanitized) cache filename so legacy
+    // v1 entries are identifiably stale and sweepable, not silent.
     search_cache_key(&format!(
-        "v2:query:{}:{}:{}:{}:{:?}:neural={}:mode={}:nw={}:rr={}|{}|{}:frag={}|{}|{}:embed={}",
+        "v2:query:{}:{}:{}:{}:{:?}:neural={}:mode={}:nw={}:rr={}|{}|{}|rb={}:frag={}|{}|{}:embed={}",
         stable_project_cache_id(inputs.project_id, inputs.project_path),
         index_fingerprint(inputs.stats),
         inputs.top_k,
@@ -1846,6 +1854,7 @@ pub(crate) fn search_cache_key_for(inputs: &SearchCacheKeyInputs<'_>) -> String 
         inputs.rerank_enabled,
         inputs.rerank_top_n,
         inputs.rerank_model,
+        inputs.rerank_backend,
         inputs.fragment_index_enabled,
         inputs.fragment_weight,
         inputs.fragment_root_hash,

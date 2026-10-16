@@ -238,6 +238,14 @@ pub struct SearchConfig {
     #[serde(default = "default_rerank_top_n")]
     pub rerank_top_n: u32,
 
+    /// Which reranker backend consumes the top-N candidates: `onnx` (default;
+    /// local cross-encoder via the neural worker), `system-one` (LLM judge
+    /// through the `[system_one]` provider; reranks regardless of
+    /// `rerank_enabled`), or `off` (rerank disabled even when `rerank_enabled`
+    /// is true).
+    #[serde(default = "default_rerank_backend")]
+    pub rerank_backend: String,
+
     /// Enable fragment-level (sub-symbol) embeddings. Off by default; the node
     /// index remains authoritative. When enabled, Tier-2/3 fragments participate
     /// in Semantic/hybrid retrieval.
@@ -370,6 +378,11 @@ pub struct EmbeddingConfig {
     /// resolved from `[neural] model_dir`/`model_name`).
     #[serde(default)]
     pub onnx_model_path: Option<String>,
+
+    /// EmbeddingGemma2 Matryoshka slicing policy (see [`MatryoshkaSetting`]).
+    /// `Off` (default) preserves pre-MRL behavior byte-for-byte.
+    #[serde(default)]
+    pub matryoshka: MatryoshkaSetting,
 }
 
 /// `embeddinggemma-2` preset: loopback endpoint on llama-server's standard
@@ -383,14 +396,71 @@ pub const EMBEDDINGGEMMA2_MODEL: &str = "embeddinggemma-2";
 /// `embeddinggemma-2` preset: native (untruncated) embedding dimension.
 pub const EMBEDDINGGEMMA2_DIMENSION: usize = 768;
 
-/// `embeddinggemma-2` DOCUMENT template, code-search task, no title
-/// available. Source: google/embeddinggemma-2 model card (Best Practices →
-/// Prefix Notation & Usage table, CodeRetrieval row): document instruction
-/// `title: {title or filename} | text: {code}`, with `title: none` mandated
-/// when no title is available — the provider call site receives raw text
-/// only, so `title: none` is correct here. llama.cpp applies NO server-side
+/// `[indexing.embeddings] matryoshka`: how EmbeddingGemma2's Matryoshka
+/// Representation Learning output is sliced. The model is trained so any
+/// leading-dimension prefix (768/512/256/128) stays usable after
+/// re-normalization; shorter vectors shrink the store and speed similarity
+/// at a small quality cost (model card: near-lossless to 256, 128 degrades).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MatryoshkaSetting {
+    /// No slicing: full native dimension everywhere. Identical to pre-MRL
+    /// behavior (default; old configs deserialize to this).
+    #[default]
+    Off,
+    /// Kind-based dynamic tiers: module/file-summary/doc-section nodes →
+    /// 768, functions/methods/classes → 512, variables → 256. Tier is a
+    /// pure function of node kind (computable without the chunk text, so
+    /// checkpoint resume needs no new state). Query embeds once at native
+    /// dimension and fans out renormalized slices per populated tier.
+    Dynamic,
+    /// Fixed 768-dim slice (no-op vs Off, but pins the identity suffix).
+    #[serde(rename = "768")]
+    Dim768,
+    /// Fixed 512-dim slice.
+    #[serde(rename = "512")]
+    Dim512,
+    /// Fixed 256-dim slice.
+    #[serde(rename = "256")]
+    Dim256,
+    /// Fixed 128-dim slice. Model card flags substantial quality loss at
+    /// this depth; opt-in only.
+    #[serde(rename = "128")]
+    Dim128,
+}
+
+impl MatryoshkaSetting {
+    /// Per-document slice dimension under this setting (`None` = never
+    /// slice; `Some(n)` = fixed slice for every document).
+    pub fn fixed_slice(self) -> Option<usize> {
+        match self {
+            Self::Off | Self::Dynamic => None,
+            Self::Dim768 => Some(768),
+            Self::Dim512 => Some(512),
+            Self::Dim256 => Some(256),
+            Self::Dim128 => Some(128),
+        }
+    }
+
+    /// Stable identity tag for provider/cache identities and checkpoints.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Dynamic => "dynamic",
+            Self::Dim768 => "768",
+            Self::Dim512 => "512",
+            Self::Dim256 => "256",
+            Self::Dim128 => "128",
+        }
+    }
+}
+
+/// `embeddinggemma-2` DOCUMENT template, code-search task. Source:
+/// google/embeddinggemma-2 model card (Best Practices → Prefix Notation &
+/// Usage table, CodeRetrieval row): document instruction `title: {title or
+/// filename} | text: {code}`. Call sites thread the file's project-relative
+/// path as `{title}` (see `apply_template`); llama.cpp applies NO server-side
 /// template (content-only passthrough in `/props`), so the client owns it.
-pub const EMBEDDINGGEMMA2_DOC_TEMPLATE: &str = "title: none | text: {text}";
+pub const EMBEDDINGGEMMA2_DOC_TEMPLATE: &str = "title: {title} | text: {text}";
 
 /// `embeddinggemma-2` QUERY template, code-search task. Same source (model
 /// card CodeRetrieval row): `task: code retrieval | query: {query}`.
@@ -433,6 +503,18 @@ impl EmbeddingConfig {
             "embeddinggemma-2"
         } else {
             "custom"
+        }
+    }
+
+    /// Effective Matryoshka slicing for this configuration. `Dynamic` and the
+    /// fixed dimensions only engage under the EmbeddingGemma2 preset — its MRL
+    /// training is what makes truncation quality-preserving; any other
+    /// provider keeps full-dimension rows regardless of the setting.
+    pub fn effective_matryoshka(&self) -> MatryoshkaSetting {
+        if self.embeddinggemma2_preset_active() {
+            self.matryoshka
+        } else {
+            MatryoshkaSetting::Off
         }
     }
 
@@ -517,6 +599,7 @@ impl Default for EmbeddingConfig {
             remote_doc_template: None,
             remote_query_template: None,
             onnx_model_path: None,
+            matryoshka: MatryoshkaSetting::Off,
         }
     }
 }
@@ -525,6 +608,7 @@ fn default_legacy_embedding_config() -> EmbeddingConfig {
     EmbeddingConfig {
         enable_hybrid: default_enable_hybrid(),
         remote_provider: default_remote_provider(),
+        matryoshka: MatryoshkaSetting::Off,
         remote_service: None,
         remote_endpoint: None,
         remote_api_key: None,
@@ -771,6 +855,7 @@ impl Default for SearchConfig {
             neural_weight: default_neural_weight(),
             rerank_enabled: false,
             rerank_top_n: default_rerank_top_n(),
+            rerank_backend: default_rerank_backend(),
             fragment_index_enabled: false,
             fragment_max_bytes: default_fragment_max_bytes(),
             fragment_weight: default_fragment_weight(),
@@ -861,6 +946,31 @@ fn default_rerank_top_n() -> u32 {
     // Cross-encoder rerank literature plateaus ~100-200; 80 is the sweet spot.
     // Revisit if rerank latency regresses.
     80
+}
+
+fn default_rerank_backend() -> String {
+    "onnx".to_string()
+}
+
+/// Allowed values for `[search] rerank_backend`.
+pub const RERANK_BACKENDS: &[&str] = &["onnx", "system-one", "off"];
+
+impl SearchConfig {
+    /// Whether the rerank stage runs at all under the configured backend:
+    /// `off` never reranks; `system-one` reranks regardless of
+    /// `rerank_enabled`; `onnx` (and any unknown string, treated as the
+    /// default) reranks only when `rerank_enabled` is true. The single
+    /// semantic bridge consumed by the rerank dispatch, the over-fetch
+    /// decision, and the search-cache key fold.
+    pub fn rerank_effectively_enabled(&self) -> bool {
+        if self.rerank_backend == "off" {
+            return false;
+        }
+        if self.rerank_backend == "system-one" {
+            return true;
+        }
+        self.rerank_enabled
+    }
 }
 
 fn default_batch_size() -> u64 {
@@ -1168,9 +1278,33 @@ mod tests {
         let mut config = LeIndexConfig::default();
         config.search.rerank_enabled = true;
         config.search.rerank_top_n = 80;
+        config.search.rerank_backend = "system-one".to_string();
         let decoded: LeIndexConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
         assert!(decoded.search.rerank_enabled);
         assert_eq!(decoded.search.rerank_top_n, 80);
+        assert_eq!(decoded.search.rerank_backend, "system-one");
+    }
+
+    #[test]
+    fn test_rerank_backend_semantics() {
+        // Default: onnx, rerank off unless rerank_enabled.
+        let mut config = LeIndexConfig::default();
+        assert_eq!(config.search.rerank_backend, "onnx");
+        assert!(!config.search.rerank_effectively_enabled());
+        // onnx + rerank_enabled => rerank on.
+        config.search.rerank_enabled = true;
+        assert!(config.search.rerank_effectively_enabled());
+        // system-one implies rerank regardless of rerank_enabled.
+        config.search.rerank_backend = "system-one".to_string();
+        config.search.rerank_enabled = false;
+        assert!(config.search.rerank_effectively_enabled());
+        // off is an explicit no-rerank even with rerank_enabled set.
+        config.search.rerank_backend = "off".to_string();
+        config.search.rerank_enabled = true;
+        assert!(!config.search.rerank_effectively_enabled());
+        // Unknown strings are treated as the onnx default (rerank_enabled gates).
+        config.search.rerank_backend = "bogus".to_string();
+        assert!(config.search.rerank_effectively_enabled());
     }
 
     #[test]
@@ -1254,6 +1388,7 @@ mod tests {
                 neural_weight: 0.35,
                 rerank_enabled: true,
                 rerank_top_n: 80,
+                rerank_backend: "onnx".to_string(),
                 fragment_index_enabled: false,
                 fragment_max_bytes: 12_000,
                 fragment_weight: 0.35,

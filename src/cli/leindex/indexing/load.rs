@@ -196,6 +196,24 @@ impl LeIndex {
         #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
         let neural_mmap: Option<std::sync::Arc<crate::search::vector::MmapEmbeddingIndex>> = None;
 
+        // MRL sidecar tiers only make sense alongside a canonical neural
+        // store: if the base file failed to load, tiers are dropped with it.
+        #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+        let neural_tier_mmaps: Vec<
+            std::sync::Arc<crate::search::vector::MmapEmbeddingIndex>,
+        > = if neural_mmap.is_some() {
+            index_builder::load_neural_tier_mmaps_from_storage(artifact_path)
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
+        let neural_tier_mmaps: Vec<
+            std::sync::Arc<crate::search::vector::MmapEmbeddingIndex>,
+        > = Vec::new();
+
         // Fragment layer (Task 5, invariant 8): thread the fragment mmap + id
         // list into the restore call. `fragment_layer_is_valid` rejects stale
         // roots, so a mismatched artifact can never poison the node-level path.
@@ -232,6 +250,7 @@ impl LeIndex {
             snapshot,
             std::sync::Arc::new(tfidf_mmap),
             neural_mmap,
+            neural_tier_mmaps,
             fragment_mmap,
             fragment_ids.as_deref(),
             expected_neural_dim,
@@ -532,6 +551,10 @@ impl LeIndex {
             &self.search_engine,
             &self.project_path,
             neural_identity.as_deref(),
+            crate::config::LeIndexConfig::load_cached()
+                .indexing
+                .embeddings
+                .effective_matryoshka(),
         )
         .context("Failed to persist neural mmap embeddings during hydration")?;
         Ok(())
@@ -809,8 +832,13 @@ mod tests {
             pre_tokenized: None,
         }]);
         index_builder::persist_embeddings_to_mmap(&engine, project).expect("lexical mmap");
-        index_builder::persist_neural_embeddings_to_mmap(&engine, project, identity)
-            .expect("neural mmap");
+        index_builder::persist_neural_embeddings_to_mmap(
+            &engine,
+            project,
+            identity,
+            crate::config::MatryoshkaSetting::Off,
+        )
+        .expect("neural mmap");
         index_builder::persist_search_snapshot(&engine, project, 1, 0, "fixture".into())
             .expect("snapshot");
     }
@@ -1040,8 +1068,13 @@ mod tests {
             pre_tokenized: None,
         }]);
         index_builder::persist_embeddings_to_mmap(&engine, project.path()).expect("lexical mmap");
-        index_builder::persist_neural_embeddings_to_mmap(&engine, project.path(), None)
-            .expect("neural mmap");
+        index_builder::persist_neural_embeddings_to_mmap(
+            &engine,
+            project.path(),
+            None,
+            crate::config::MatryoshkaSetting::Off,
+        )
+        .expect("neural mmap");
         index_builder::persist_search_snapshot(&engine, project.path(), 1, 0, "fixture".into())
             .expect("snapshot");
         let restored = LeIndex::restore_engine_from_snapshot(

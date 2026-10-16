@@ -43,7 +43,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::cli::leindex::setup::SetupError;
-use crate::config::{LeIndexConfig, config_file_path};
+use crate::config::{LeIndexConfig, RERANK_BACKENDS, config_file_path};
 
 /// Placeholder written in place of a redacted secret.
 const REDACTED: &str = "[REDACTED]";
@@ -77,6 +77,7 @@ const SEARCH_FIELDS: &[&str] = &[
     "neural_weight",
     "rerank_enabled",
     "rerank_top_n",
+    "rerank_backend",
     "fragment_index_enabled",
     "fragment_max_bytes",
     "fragment_weight",
@@ -96,6 +97,7 @@ const EMBEDDINGS_FIELDS: &[&str] = &[
     "remote_doc_template",
     "remote_query_template",
     "onnx_model_path",
+    "matryoshka",
 ];
 const MCP_FIELDS: &[&str] = &["idle_timeout_secs", "engine_max_idle_secs", "prewarm"];
 const SYSTEM_ONE_FIELDS: &[&str] = &[
@@ -231,6 +233,12 @@ fn validate_search(config: &LeIndexConfig) -> Result<(), SetupError> {
         return Err(invalid(format!(
             "search.search_mode {:?} is not one of {SEARCH_MODES:?}",
             config.search.search_mode
+        )));
+    }
+    if !RERANK_BACKENDS.contains(&config.search.rerank_backend.as_str()) {
+        return Err(invalid(format!(
+            "search.rerank_backend {:?} is not one of {RERANK_BACKENDS:?}",
+            config.search.rerank_backend
         )));
     }
     if !(0.0..=1.0).contains(&config.search.neural_weight) {

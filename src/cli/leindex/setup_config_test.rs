@@ -45,6 +45,22 @@ fn test_validate_rejects_unknown_search_mode() {
 }
 
 #[test]
+fn test_validate_rejects_unknown_rerank_backend() {
+    let config = LeIndexConfig {
+        search: SearchConfig {
+            rerank_backend: "bogus".to_string(),
+            ..SearchConfig::default()
+        },
+        ..LeIndexConfig::default()
+    };
+    let err = validate(&config).unwrap_err();
+    assert!(
+        err.to_string().contains("search.rerank_backend"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn test_validate_rejects_out_of_range_probabilities_but_accepts_boundaries() {
     for weight in [1.5, -0.1, f64::NAN] {
         let config = LeIndexConfig {

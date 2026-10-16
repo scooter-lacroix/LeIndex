@@ -108,7 +108,7 @@ fn test_search_snapshot_restore_round_trip() {
 
     let mut restored = SearchEngine::new();
     let restored_count = restored
-        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None, None, None, None)
+        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None, Vec::new(), None, None, None)
         .unwrap();
 
     assert_eq!(restored_count, 1);
@@ -175,6 +175,7 @@ fn search_snapshot_restores_neural_rows_without_heap_tfidf_copy() {
             snapshot,
             Arc::new(tfidf_mmap),
             Some(Arc::new(neural_mmap)),
+            Vec::new(),
             None,
             None,
             None,
@@ -214,7 +215,7 @@ fn test_search_snapshot_restore_rejects_wrong_tfidf_dimension() {
 
     let mut restored = SearchEngine::new();
     let err = restored
-        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None, None, None, None)
+        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None, Vec::new(), None, None, None)
         .unwrap_err();
     assert!(err.contains("TF-IDF mmap dimension"));
     assert!(restored.is_empty());
@@ -1069,6 +1070,7 @@ fn test_search_snapshot_fragment_roundtrip() {
             snapshot,
             Arc::new(tfidf_mmap),
             None,
+            Vec::new(),
             Some(Arc::new(frag_mmap)),
             Some(&frag_ids),
             None,
@@ -1137,6 +1139,7 @@ fn test_search_snapshot_restore_disables_fragment_on_row_mismatch() {
             snapshot,
             Arc::new(tfidf_mmap),
             None,
+            Vec::new(),
             Some(Arc::new(frag_mmap)),
             Some(&frag_ids),
             None,
@@ -1197,6 +1200,7 @@ fn test_fragment_owner_union_and_byte_range_surfacing() {
             snapshot,
             Arc::new(tfidf_mmap),
             None,
+            Vec::new(),
             Some(Arc::new(frag_mmap)),
             Some(&frag_ids),
             None,
@@ -1298,6 +1302,7 @@ fn test_fragment_layer_off_by_default_contributes_nothing() {
             snapshot,
             Arc::new(tfidf_mmap),
             None,
+            Vec::new(),
             Some(Arc::new(frag_mmap)),
             Some(&frag_ids),
             None,
@@ -1769,6 +1774,7 @@ fn test_search_snapshot_disables_fragment_on_id_count_mismatch() {
             snapshot,
             Arc::new(tfidf_mmap),
             None,
+            Vec::new(),
             Some(Arc::new(frag_mmap)),
             Some(&frag_ids),
             None,

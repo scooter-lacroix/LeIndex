@@ -1021,6 +1021,46 @@ fn test_embed_text_batch_loop_tokenizes_and_infers_per_sub_batch() {
 
 #[cfg(feature = "onnx")]
 #[test]
+fn test_cpu_only_fallback_preserves_vectors_across_batch_sizes() {
+    use crate::embed::provider::{Provider, select_auto_from_availability};
+
+    let provider = select_auto_from_availability(false, false, false);
+    assert_eq!(provider, Provider::Cpu);
+    let rt = WorkerRuntime::new(RuntimeConfig {
+        execution_provider: provider.name(),
+        ..no_compile_config()
+    });
+    let texts: Vec<String> = (0..17).map(|i| i.to_string()).collect();
+    let expected: Vec<f32> = (0..17).flat_map(|i| [i as f32, -(i as f32)]).collect();
+    for batch_size in [1, 8, 32] {
+        let actual = rt
+            .run_onnx_embed_text_batch_loop(
+                &texts,
+                batch_size,
+                false,
+                2,
+                &Arc::new(AtomicBool::new(false)),
+                |texts| Ok(texts.to_vec()),
+                |texts, _| {
+                    Ok(texts
+                        .iter()
+                        .flat_map(|text| {
+                            let value = text.parse::<f32>().unwrap();
+                            [value, -value]
+                        })
+                        .collect())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            actual, expected,
+            "CPU fallback changed rows at batch {batch_size}"
+        );
+    }
+}
+
+#[cfg(feature = "onnx")]
+#[test]
 fn test_embed_text_batch_loop_fixed_batch_pads_after_per_batch_tokenization() {
     let rt = WorkerRuntime::new(no_compile_config());
     let texts: Vec<String> = (0..10).map(|i| format!("text-{i}")).collect();
