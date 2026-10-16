@@ -124,9 +124,11 @@ environment overrides, and troubleshooting.
 
 ## Managed GGUF Services and System One
 
-`leindex setup --embedding embeddinggemma2` and `leindex setup --system-one`
-create **managed services** — llama-server processes that LeIndex starts,
-health-checks, and stops (Linux only):
+`leindex setup --embedding embeddinggemma2` creates a **managed service** —
+a llama-server process that LeIndex starts, health-checks, and stops
+(Linux only). `leindex setup --system-one` adds a managed service only
+when the managed Laya backend is explicitly selected; the default
+external backend configures an endpoint and creates no service:
 
 ```bash
 leindex services list   # name, port, model, auto_start, running state
