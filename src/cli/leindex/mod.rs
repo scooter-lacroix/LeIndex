@@ -655,6 +655,7 @@ impl LeIndex {
             rerank_enabled: cfg.search.rerank_enabled,
             rerank_top_n: cfg.search.rerank_top_n,
             rerank_model: &rerank_model,
+            rerank_backend: &cfg.search.rerank_backend,
             fragment_index_enabled: cfg.search.fragment_index_enabled,
             fragment_weight: cfg.search.fragment_weight,
             fragment_root_hash: &fragment_root_hash,

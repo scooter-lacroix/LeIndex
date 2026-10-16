@@ -125,8 +125,13 @@ fn print_check_search_settings(search: &crate::config::SearchConfig) {
     println!("Neural weight:      {}", search.neural_weight);
     println!(
         "Rerank enabled:     {}",
-        if search.rerank_enabled { "ON" } else { "OFF" }
+        if search.rerank_effectively_enabled() {
+            "ON"
+        } else {
+            "OFF"
+        }
     );
+    println!("Rerank backend:     {}", search.rerank_backend);
     println!(
         "Fragment index:     {}",
         if search.fragment_index_enabled {

@@ -121,7 +121,7 @@ impl LeIndex {
         exact_route: bool,
     ) {
         let rerank_cfg = &crate::config::LeIndexConfig::load_cached().search;
-        if rerank_cfg.rerank_enabled && !exact_route && !results.is_empty() {
+        if rerank_cfg.rerank_effectively_enabled() && !exact_route && !results.is_empty() {
             if let Some(embedder) = self.embedder.as_ref() {
                 let n = (rerank_cfg.rerank_top_n as usize).min(results.len());
                 let mut docs: Vec<(String, String, f32)> = Vec::with_capacity(n);
@@ -266,7 +266,7 @@ impl LeIndex {
         // When rerank is enabled, over-fetch candidates so the cross-encoder
         // sees a wider pool than the final top_k (it can only reorder what was
         // retrieved). We truncate back to top_k after reranking below.
-        let rerank_enabled = search_config.rerank_enabled && !exact_route;
+        let rerank_enabled = search_config.rerank_effectively_enabled() && !exact_route;
         let search_top_k = if rerank_enabled {
             top_k.max(search_config.rerank_top_n as usize)
         } else {

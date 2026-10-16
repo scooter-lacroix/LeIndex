@@ -1823,6 +1823,10 @@ pub(crate) struct SearchCacheKeyInputs<'a> {
     pub(crate) rerank_enabled: bool,
     pub(crate) rerank_top_n: u32,
     pub(crate) rerank_model: &'a str,
+    /// Which reranker consumes the top-N (onnx|system-one|off). Part of the
+    /// cache key: backend choice changes result order even when rerank
+    /// enable/top_n/model are identical.
+    pub(crate) rerank_backend: &'a str,
     pub(crate) fragment_index_enabled: bool,
     pub(crate) fragment_weight: f64,
     pub(crate) fragment_root_hash: &'a str,
@@ -1831,14 +1835,14 @@ pub(crate) struct SearchCacheKeyInputs<'a> {
 
 pub(crate) fn search_cache_key_for(inputs: &SearchCacheKeyInputs<'_>) -> String {
     // v2: widens the key to include every result-affecting config knob + model
-    // identity (search_mode, neural_weight, rerank_enabled/top_n, fragment
-    // knobs incl. the persisted content root hash, embedder + reranker model).
-    // v1 keys omitted these, so a config or model change silently served stale
-    // cached results until a re-index changed the node count. The `v2:`
-    // namespace prefix lands in the (sanitized) cache filename so legacy v1
-    // entries are identifiably stale and sweepable, not silent.
+    // identity (search_mode, neural_weight, rerank_enabled/top_n/model/backend,
+    // fragment knobs incl. the persisted content root hash, embedder + reranker
+    // model). v1 keys omitted these, so a config or model change silently
+    // served stale cached results until a re-index changed the node count. The
+    // `v2:` namespace prefix lands in the (sanitized) cache filename so legacy
+    // v1 entries are identifiably stale and sweepable, not silent.
     search_cache_key(&format!(
-        "v2:query:{}:{}:{}:{}:{:?}:neural={}:mode={}:nw={}:rr={}|{}|{}:frag={}|{}|{}:embed={}",
+        "v2:query:{}:{}:{}:{}:{:?}:neural={}:mode={}:nw={}:rr={}|{}|{}|rb={}:frag={}|{}|{}:embed={}",
         stable_project_cache_id(inputs.project_id, inputs.project_path),
         index_fingerprint(inputs.stats),
         inputs.top_k,
@@ -1850,6 +1854,7 @@ pub(crate) fn search_cache_key_for(inputs: &SearchCacheKeyInputs<'_>) -> String 
         inputs.rerank_enabled,
         inputs.rerank_top_n,
         inputs.rerank_model,
+        inputs.rerank_backend,
         inputs.fragment_index_enabled,
         inputs.fragment_weight,
         inputs.fragment_root_hash,

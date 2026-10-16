@@ -238,6 +238,14 @@ pub struct SearchConfig {
     #[serde(default = "default_rerank_top_n")]
     pub rerank_top_n: u32,
 
+    /// Which reranker backend consumes the top-N candidates: `onnx` (default;
+    /// local cross-encoder via the neural worker), `system-one` (LLM judge
+    /// through the `[system_one]` provider; reranks regardless of
+    /// `rerank_enabled`), or `off` (rerank disabled even when `rerank_enabled`
+    /// is true).
+    #[serde(default = "default_rerank_backend")]
+    pub rerank_backend: String,
+
     /// Enable fragment-level (sub-symbol) embeddings. Off by default; the node
     /// index remains authoritative. When enabled, Tier-2/3 fragments participate
     /// in Semantic/hybrid retrieval.
@@ -847,6 +855,7 @@ impl Default for SearchConfig {
             neural_weight: default_neural_weight(),
             rerank_enabled: false,
             rerank_top_n: default_rerank_top_n(),
+            rerank_backend: default_rerank_backend(),
             fragment_index_enabled: false,
             fragment_max_bytes: default_fragment_max_bytes(),
             fragment_weight: default_fragment_weight(),
@@ -937,6 +946,31 @@ fn default_rerank_top_n() -> u32 {
     // Cross-encoder rerank literature plateaus ~100-200; 80 is the sweet spot.
     // Revisit if rerank latency regresses.
     80
+}
+
+fn default_rerank_backend() -> String {
+    "onnx".to_string()
+}
+
+/// Allowed values for `[search] rerank_backend`.
+pub const RERANK_BACKENDS: &[&str] = &["onnx", "system-one", "off"];
+
+impl SearchConfig {
+    /// Whether the rerank stage runs at all under the configured backend:
+    /// `off` never reranks; `system-one` reranks regardless of
+    /// `rerank_enabled`; `onnx` (and any unknown string, treated as the
+    /// default) reranks only when `rerank_enabled` is true. The single
+    /// semantic bridge consumed by the rerank dispatch, the over-fetch
+    /// decision, and the search-cache key fold.
+    pub fn rerank_effectively_enabled(&self) -> bool {
+        if self.rerank_backend == "off" {
+            return false;
+        }
+        if self.rerank_backend == "system-one" {
+            return true;
+        }
+        self.rerank_enabled
+    }
 }
 
 fn default_batch_size() -> u64 {
@@ -1244,9 +1278,33 @@ mod tests {
         let mut config = LeIndexConfig::default();
         config.search.rerank_enabled = true;
         config.search.rerank_top_n = 80;
+        config.search.rerank_backend = "system-one".to_string();
         let decoded: LeIndexConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
         assert!(decoded.search.rerank_enabled);
         assert_eq!(decoded.search.rerank_top_n, 80);
+        assert_eq!(decoded.search.rerank_backend, "system-one");
+    }
+
+    #[test]
+    fn test_rerank_backend_semantics() {
+        // Default: onnx, rerank off unless rerank_enabled.
+        let mut config = LeIndexConfig::default();
+        assert_eq!(config.search.rerank_backend, "onnx");
+        assert!(!config.search.rerank_effectively_enabled());
+        // onnx + rerank_enabled => rerank on.
+        config.search.rerank_enabled = true;
+        assert!(config.search.rerank_effectively_enabled());
+        // system-one implies rerank regardless of rerank_enabled.
+        config.search.rerank_backend = "system-one".to_string();
+        config.search.rerank_enabled = false;
+        assert!(config.search.rerank_effectively_enabled());
+        // off is an explicit no-rerank even with rerank_enabled set.
+        config.search.rerank_backend = "off".to_string();
+        config.search.rerank_enabled = true;
+        assert!(!config.search.rerank_effectively_enabled());
+        // Unknown strings are treated as the onnx default (rerank_enabled gates).
+        config.search.rerank_backend = "bogus".to_string();
+        assert!(config.search.rerank_effectively_enabled());
     }
 
     #[test]
@@ -1330,6 +1388,7 @@ mod tests {
                 neural_weight: 0.35,
                 rerank_enabled: true,
                 rerank_top_n: 80,
+                rerank_backend: "onnx".to_string(),
                 fragment_index_enabled: false,
                 fragment_max_bytes: 12_000,
                 fragment_weight: 0.35,
