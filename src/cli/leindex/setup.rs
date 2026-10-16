@@ -595,10 +595,16 @@ fn detect_nvidia_gpu() -> bool {
     false
 }
 
-/// Check if the stdin is a terminal (interactive mode available).
+/// Check if the streams the interactive wizard needs are terminals.
+///
+/// Prompts (dialoguer) read stdin and draw on stderr; checking stdin alone
+/// lets a stdin-TTY + captured-stderr harness enter the wizard and die inside
+/// dialoguer with `IO error: not a terminal` instead of this guard's
+/// actionable `requires a terminal` error
+/// (test_standalone_system_one_reaches_wizard_without_neural_flags).
 pub fn is_interactive() -> bool {
     use std::io::IsTerminal;
-    std::io::stdin().is_terminal()
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
 /// Configure the managed embeddinggemma-2 service and remote embedding ladder.
