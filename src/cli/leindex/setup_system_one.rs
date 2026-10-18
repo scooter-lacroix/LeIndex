@@ -781,17 +781,15 @@ fn ask_verify(asker: &HttpAsker, timeout: Duration, timeout_ms: u64) -> Result<(
     //     `Ok`, so a `block_in_place` branch would be taken and would panic,
     //     because a current-thread runtime has no blocking pool to hop to.
     // The future borrows `asker` and `request`, so `thread::scope` (not `spawn`)
-    // avoids cloning them.
+    // avoids cloning them. The closure's own error type is stated explicitly:
+    // left to inference it is ambiguous against the `?` inside the scope.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| SetupError::Io(format!("cannot start smoke-test runtime: {e}")))?;
-    let outcome = std::thread::scope(|scope| {
-        scope
-            .spawn(move || runtime.block_on(fut))
-            .join()
-            .map_err(|_| SetupError::Io("smoke-test bridge thread panicked".to_string()))?
-    });
+    let joined = std::thread::scope(|scope| scope.spawn(move || runtime.block_on(fut)).join());
+    let outcome =
+        joined.map_err(|_| SetupError::Io("smoke-test bridge thread panicked".to_string()))?;
     let response = match outcome {
         Err(_) => {
             return Err(SetupError::Io(format!(

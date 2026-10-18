@@ -153,44 +153,8 @@ impl LeIndex {
                 docs.push((result.node_id.clone(), content, result.score.overall));
             }
 
-            let reranked: Option<Vec<(String, f32)>> = match super::effective_rerank_backend(
-                rerank_cfg,
-            ) {
-                "system-one" => {
-                    #[cfg(feature = "system-one")]
-                    {
-                        super::rerank_system_one::rerank(
-                            query,
-                            &results[..n],
-                            &docs,
-                            &self.project_path.to_string_lossy(),
-                        )
-                    }
-                    #[cfg(not(feature = "system-one"))]
-                    {
-                        let _ = (&query, &docs, &self.project_path);
-                        tracing::debug!(
-                            "rerank_backend=system-one requires the system-one feature; skipping rerank"
-                        );
-                        None
-                    }
-                }
-                // "onnx" (default; unknown strings are treated as the default).
-                _ => {
-                    match self
-                        .embedder
-                        .as_ref()
-                        .and_then(|e| e.rerank_blocking(query, docs))
-                    {
-                        Some(Ok(reranked)) => Some(reranked),
-                        Some(Err(error)) => {
-                            tracing::warn!(error = %error, "reranker failed; keeping original order");
-                            None
-                        }
-                        None => None,
-                    }
-                }
-            };
+            let reranked: Option<Vec<(String, f32)>> =
+                self.rerank_backend(rerank_cfg, query, docs, &results[..n]);
             if let Some(reranked) = reranked {
                 let by_id: std::collections::HashMap<String, SearchResult> = results[..n]
                     .iter()
@@ -216,6 +180,56 @@ impl LeIndex {
                 }
                 debug!("reranker re-ordered top-{} for '{}'", n, query);
             }
+        }
+    }
+
+    /// Dispatch to the configured rerank backend and return its ordering.
+    ///
+    /// `None` means "keep the original order": the backend is unavailable
+    /// (system-one built out), produced no scores, or failed. A backend
+    /// failure is logged and degraded to the un-reranked ordering rather than
+    /// propagated — reranking is an ordering refinement, never a correctness
+    /// gate.
+    fn rerank_backend(
+        &self,
+        rerank_cfg: &crate::config::SearchConfig,
+        query: &str,
+        docs: Vec<(String, String, f32)>,
+        candidates: &[SearchResult],
+    ) -> Option<Vec<(String, f32)>> {
+        match super::effective_rerank_backend(rerank_cfg) {
+            "system-one" => {
+                #[cfg(feature = "system-one")]
+                {
+                    super::rerank_system_one::rerank(
+                        query,
+                        candidates,
+                        &docs,
+                        &self.project_path.to_string_lossy(),
+                    )
+                }
+                #[cfg(not(feature = "system-one"))]
+                {
+                    let _ = (query, docs, candidates, &self.project_path);
+                    tracing::debug!(
+                        "rerank_backend=system-one requires the system-one feature; skipping rerank"
+                    );
+                    None
+                }
+            }
+            // "onnx" (default; unknown strings are treated as the default).
+            _ => match self
+                .embedder
+                .as_ref()
+                .and_then(|e| e.rerank_blocking(query, docs))
+            {
+                Some(Ok(reranked)) => Some(reranked),
+                Some(Err(error)) => {
+                    tracing::warn!(error = %error, "reranker failed; keeping original order");
+                    None
+                }
+                None => None,
+            },
         }
     }
 
