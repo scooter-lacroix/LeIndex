@@ -1304,6 +1304,23 @@ fn cache_key_with_rerank_backend(
     fragment_root_hash: &str,
     rerank_backend: &str,
 ) -> String {
+    cache_key_with_rerank_activation(
+        fragment_enabled,
+        fragment_weight,
+        fragment_root_hash,
+        rerank_backend,
+        true,
+    )
+}
+
+/// Same, but also controls whether the rerank backend is armed at runtime.
+fn cache_key_with_rerank_activation(
+    fragment_enabled: bool,
+    fragment_weight: f64,
+    fragment_root_hash: &str,
+    rerank_backend: &str,
+    rerank_backend_active: bool,
+) -> String {
     search_cache_key_for(&SearchCacheKeyInputs {
         project_id: "proj-a",
         project_path: Path::new("/tmp/proj-a"),
@@ -1318,6 +1335,7 @@ fn cache_key_with_rerank_backend(
         rerank_top_n: 80,
         rerank_model: "qwen3-reranker-0.6b-seq-cls",
         rerank_backend,
+        rerank_backend_active,
         fragment_index_enabled: fragment_enabled,
         fragment_weight,
         fragment_root_hash,
@@ -1338,6 +1356,19 @@ fn test_cache_key_rerank_backend_change_invalidates() {
     );
     assert_ne!(onnx, off, "onnx vs off must invalidate the key");
     assert_ne!(system_one, off, "system-one vs off must invalidate the key");
+}
+
+/// System-One fails open while `LEINDEX_FEATURE_SYSTEM_ONE` is off, so a search
+/// cached before the flag is armed must not be served after it, even though
+/// every config knob is identical. Activation therefore has to move the key.
+#[test]
+fn test_cache_key_rerank_activation_change_invalidates() {
+    let disabled = cache_key_with_rerank_activation(false, 0.0, "", "system-one", false);
+    let enabled = cache_key_with_rerank_activation(false, 0.0, "", "system-one", true);
+    assert_ne!(
+        disabled, enabled,
+        "arming the system-one flag must invalidate the key"
+    );
 }
 
 /// Identical rerank backends produce the identical key (deterministic).

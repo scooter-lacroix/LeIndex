@@ -131,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn sliced_vector_is_unit_length() {
+    fn test_sliced_vector_is_unit_length() {
         let v = unit_vector(768, 3);
         let s = slice_l2_normalized(&v, 256);
         assert_eq!(s.len(), 256);
@@ -145,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_dim_clamped_to_input() {
+    fn test_slice_dim_clamped_to_input() {
         let v = vec![0.5f32; 8];
         let s = slice_l2_normalized(&v, 256);
         assert_eq!(s.len(), 8);
@@ -154,14 +154,14 @@ mod tests {
     }
 
     #[test]
-    fn zero_slice_stays_zero_not_nan() {
+    fn test_zero_slice_stays_zero_not_nan() {
         let v = vec![0.0f32; 768];
         let s = slice_l2_normalized(&v, 256);
         assert!(s.iter().all(|x| *x == 0.0));
     }
 
     #[test]
-    fn span_tiers_follow_thresholds() {
+    fn test_span_tiers_follow_thresholds() {
         assert_eq!(dynamic_tier_for_span(0), 768);
         assert_eq!(dynamic_tier_for_span(1), 256);
         assert_eq!(dynamic_tier_for_span(SMALL_SYMBOL_SPAN_BYTES - 1), 256);
@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_dimension_matrix() {
+    fn test_slice_dimension_matrix() {
         assert_eq!(slice_dimension_for(MatryoshkaSetting::Off, 0), None);
         assert_eq!(
             slice_dimension_for(MatryoshkaSetting::Dynamic, 100),
@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn off_partition_is_identity_single_bucket() {
+    fn test_off_partition_is_identity_single_bucket() {
         let rows = vec![("a".to_string(), vec![0.5f32; 768])];
         let buckets =
             partition_rows_by_slice_dimension(&rows, &HashMap::new(), MatryoshkaSetting::Off);
@@ -203,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_partition_groups_by_tier_and_slices() {
+    fn test_dynamic_partition_groups_by_tier_and_slices() {
         let rows = vec![
             ("small".to_string(), unit_vector(768, 1)),
             ("big".to_string(), unit_vector(768, 2)),

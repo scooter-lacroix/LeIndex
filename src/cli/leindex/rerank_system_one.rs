@@ -105,9 +105,6 @@ pub(crate) fn rerank(
         top_n: config.search.rerank_top_n as usize,
         ..PostParams::default()
     };
-    // Sync bridge: the CLI wraps search in a multi-threaded runtime, so hop
-    // to the blocking pool inside one; standalone callers get a private
-    // current-thread runtime (same idiom as the setup smoke test).
     let fut = judge_with(
         &asker,
         query,
@@ -117,16 +114,32 @@ pub(crate) fn rerank(
         timeout_ms,
         &params,
     );
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
-        Err(_) => {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .ok()?;
-            runtime.block_on(fut)
-        }
-    }
+    // Sync bridge: drive the judged future on a thread that owns a scratch
+    // current-thread runtime. This is the shape used by
+    // `index_builder::hybrid::block_on_remote`, and it is the only one that is
+    // correct in every context `rerank` is called from:
+    //   * outside any runtime (sync callers) — trivially fine;
+    //   * inside the CLI's multi-threaded runtime — `block_on` directly panics
+    //     ("Cannot start a runtime from within a runtime") and `block_in_place`
+    //     would work, but only on the multi-threaded flavor;
+    //   * inside a CURRENT-THREAD runtime, e.g. any `#[tokio::test]` caller —
+    //     `Handle::try_current()` still returns `Ok`, so the `block_in_place`
+    //     branch was taken, and it panics because a current-thread runtime has
+    //     no blocking pool to hop to (Codex Major).
+    // A scoped thread sidesteps the flavor question entirely; the judge future
+    // borrows its inputs, so `thread::scope` (not `spawn`) avoids cloning them.
+    // Any failure to build the runtime fails open like every other judge error.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || runtime.block_on(fut))
+            .join()
+            .ok()
+            .flatten()
+    })
 }
 
 #[cfg(test)]

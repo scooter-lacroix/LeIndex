@@ -407,11 +407,16 @@ pub enum MatryoshkaSetting {
     /// behavior (default; old configs deserialize to this).
     #[default]
     Off,
-    /// Kind-based dynamic tiers: module/file-summary/doc-section nodes →
-    /// 768, functions/methods/classes → 512, variables → 256. Tier is a
-    /// pure function of node kind (computable without the chunk text, so
-    /// checkpoint resume needs no new state). Query embeds once at native
-    /// dimension and fans out renormalized slices per populated tier.
+    /// Span-based dynamic tiers, resolved per node from its source span
+    /// (`NodeInfo::byte_range`) by `search::mrl::dynamic_tier_for_span`:
+    /// spans under 512 bytes → 256, under 4096 bytes → 512, anything larger →
+    /// 768, and the `(0, 0)` span of synthetic per-file summary nodes → 768.
+    /// The span is persisted in the search snapshot, so the same tier is
+    /// recomputed at enrich, persist, and checkpoint-resume time with no extra
+    /// state. Note this is a function of SIZE ONLY, not of node kind: a large
+    /// method lands in 768 and a tiny module header lands in 256. Query embeds
+    /// once at native dimension and fans out renormalized slices per populated
+    /// tier.
     Dynamic,
     /// Fixed 768-dim slice (no-op vs Off, but pins the identity suffix).
     #[serde(rename = "768")]
@@ -507,11 +512,20 @@ impl EmbeddingConfig {
     }
 
     /// Effective Matryoshka slicing for this configuration. `Dynamic` and the
-    /// fixed dimensions only engage under the EmbeddingGemma2 preset — its MRL
-    /// training is what makes truncation quality-preserving; any other
-    /// provider keeps full-dimension rows regardless of the setting.
+    /// fixed dimensions only engage when BOTH hold:
+    ///
+    /// 1. the EmbeddingGemma2 preset is selected — its MRL training is what makes
+    ///    truncation quality-preserving; any other provider keeps full-dimension
+    ///    rows regardless of the setting, and
+    /// 2. the `LEINDEX_FEATURE_MATRYOSHKA` rollout flag is armed — the capability
+    ///    is experimental, so per AGENTS.md it defaults OFF and a configured
+    ///    policy is inert until the flag is exported. Without this gate, editing
+    ///    a config file would be enough to turn the capability on fleet-wide and
+    ///    there would be no per-deployment kill switch.
     pub fn effective_matryoshka(&self) -> MatryoshkaSetting {
-        if self.embeddinggemma2_preset_active() {
+        if self.embeddinggemma2_preset_active()
+            && crate::feature_flags::FeatureFlag::Matryoshka.is_enabled()
+        {
             self.matryoshka
         } else {
             MatryoshkaSetting::Off

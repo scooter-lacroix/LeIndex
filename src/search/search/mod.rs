@@ -113,10 +113,13 @@ pub struct SearchEngine {
     neural_vector_index: Option<VectorIndexImpl>,
     /// Per-dimension MRL sidecar ANN indices (ascending dimension, excluding
     /// the native store). Built from `neural_embeddings_{dim}.bin` sidecars at
-    /// search-load; each is queried with the full query vector — the mmap
-    /// indices length-guard and simply return nothing for mismatched dims, so
-    /// tiers silently no-op under Off/foreign-dim queries. Empty when no
-    /// sidecars exist, keeping the default path byte-identical.
+    /// search-load. Each tier stores vectors sliced to ITS OWN dimension, so
+    /// both the fan-out search and `tier_similarity` slice and re-normalize the
+    /// native query to `index.dimension()` first — the mmap indices
+    /// length-guard and return nothing/`None` for a mismatched query, so passing
+    /// the full vector would make every tier a silent no-op and strand every
+    /// tier-homed node. Empty when no sidecars exist, keeping the default path
+    /// byte-identical.
     neural_tier_indices: Vec<VectorIndexImpl>,
     /// Fragment embeddings (sub-symbol semantic chunks), hydrated from
     /// `.leindex/fragments_embeddings.bin` at search-load. Same lazy-paged
@@ -724,6 +727,18 @@ impl SearchEngine {
                         self.neural_vector_index
                             .as_ref()
                             .and_then(|idx| idx.embedding(&n.node_id))
+                    })
+                    // MRL tiers are subset stores: a restored node whose vector
+                    // lives only in a sidecar has no in-memory embedding and no
+                    // row in the native index. Without this fallback it is
+                    // invisible to collection, so the next persist writes native
+                    // rows only and `remove_neural_tier_mmaps` then deletes the
+                    // sidecars — one saved file would wipe every tier vector
+                    // until a full re-embed (CodeRabbit outside-diff finding).
+                    .or_else(|| {
+                        self.neural_tier_indices
+                            .iter()
+                            .find_map(|tier| tier.embedding(&n.node_id))
                     });
                 embedding.map(|e| (n.node_id.clone(), e))
             })
@@ -987,13 +1002,18 @@ impl SearchEngine {
                     .collect(),
                 _ => HashSet::new(),
             };
-        // MRL fan-out: each sidecar tier retrieves with the same query vector
-        // (length-guarded to its dimension), so tier-homed nodes enter the
-        // candidate pool alongside full-dimension hits.
+        // MRL fan-out: each sidecar tier holds vectors sliced to ITS dimension,
+        // so the native-dimensional query must be sliced and re-normalized to
+        // match before searching. Passing the full vector here is silently
+        // fatal: `MmapVectorIndex::search` length-guards (`query.len() !=
+        // dimension` -> empty) and `similarity` does the same, so every tier
+        // would return nothing and tier-homed nodes could never enter the
+        // candidate pool or receive a neural score (Codex P1 / CodeRabbit Major).
         if let Some(q_emb) = query.query_neural_embedding.as_deref() {
             for tier in &self.neural_tier_indices {
+                let tier_query = crate::search::mrl::slice_l2_normalized(q_emb, tier.dimension());
                 neural_candidates.extend(
-                    tier.search(q_emb, neural_top_k)
+                    tier.search(&tier_query, neural_top_k)
                         .into_iter()
                         .map(|(id, _)| id),
                 );
@@ -1507,14 +1527,19 @@ impl SearchEngine {
         score
     }
 
-    /// Best similarity across the MRL sidecar tiers for one node. Each tier is
-    /// queried with the full query vector; the mmap similarity is
-    /// length-guarded, so non-matching dimensions return `None` and only the
-    /// tier holding this node contributes.
+    /// Best similarity across the MRL sidecar tiers for one node. Each tier
+    /// stores vectors sliced to its own dimension, so the query is sliced and
+    /// re-normalized to that same dimension before scoring — ``similarity`` is
+    /// length-guarded and would otherwise return `None` for every tier, making
+    /// this function always `None` and every tier-homed node score 0.
     fn tier_similarity(&self, node_id: &str, query_embedding: &[f32]) -> Option<f32> {
         self.neural_tier_indices
             .iter()
-            .filter_map(|index| index.similarity(node_id, query_embedding))
+            .filter_map(|index| {
+                let tier_query =
+                    crate::search::mrl::slice_l2_normalized(query_embedding, index.dimension());
+                index.similarity(node_id, &tier_query)
+            })
             .reduce(f32::max)
     }
 

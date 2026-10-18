@@ -196,19 +196,21 @@ impl LeIndex {
         #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
         let neural_mmap: Option<std::sync::Arc<crate::search::vector::MmapEmbeddingIndex>> = None;
 
-        // MRL sidecar tiers only make sense alongside a canonical neural
-        // store: if the base file failed to load, tiers are dropped with it.
+        // MRL sidecar tiers are independent stores, NOT a projection of the
+        // canonical file: under a fixed sub-native Matryoshka policy every row is
+        // sliced, so no canonical store is written at all and gating tier loading
+        // on `neural_mmap.is_some()` dropped every tier at restart — a fully
+        // persistent index silently lost all neural retrieval until a complete
+        // re-embed (Codex P1 / CodeRabbit Major). Load whatever sidecars exist;
+        // each one validates its own header, and snapshot install filters by node
+        // id below.
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
         let neural_tier_mmaps: Vec<
             std::sync::Arc<crate::search::vector::MmapEmbeddingIndex>,
-        > = if neural_mmap.is_some() {
-            index_builder::load_neural_tier_mmaps_from_storage(artifact_path)
-                .into_iter()
-                .map(std::sync::Arc::new)
-                .collect()
-        } else {
-            Vec::new()
-        };
+        > = index_builder::load_neural_tier_mmaps_from_storage(artifact_path)
+            .into_iter()
+            .map(std::sync::Arc::new)
+            .collect();
         #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
         let neural_tier_mmaps: Vec<
             std::sync::Arc<crate::search::vector::MmapEmbeddingIndex>,

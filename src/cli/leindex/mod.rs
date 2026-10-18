@@ -707,6 +707,13 @@ impl LeIndex {
             rerank_top_n: cfg.search.rerank_top_n,
             rerank_model: &rerank_model,
             rerank_backend: effective_rerank_backend(&cfg.search),
+            // System-One fails open when its flag is off, so the flag state is
+            // result-affecting and belongs in the key (Codex P1). Other
+            // backends are driven purely by config and stay `true`.
+            rerank_backend_active: {
+                let backend = effective_rerank_backend(&cfg.search);
+                backend != "system-one" || crate::feature_flags::FeatureFlag::SystemOne.is_enabled()
+            },
             fragment_index_enabled: cfg.search.fragment_index_enabled,
             fragment_weight: cfg.search.fragment_weight,
             fragment_root_hash: &fragment_root_hash,

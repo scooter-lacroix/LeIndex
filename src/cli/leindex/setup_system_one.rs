@@ -771,22 +771,27 @@ fn ask_verify(asker: &HttpAsker, timeout: Duration, timeout_ms: u64) -> Result<(
         )],
     };
     let fut = async { tokio::time::timeout(timeout, asker.ask(&request)).await };
-    // The CLI wraps every command (including `setup --check`) in a
-    // multi-threaded Tokio runtime; calling block_on directly there panics
-    // with "Cannot start a runtime from within a runtime". Inside a runtime,
-    // hop to the blocking pool and drive the future on the ambient handle;
-    // standalone (interactive wizard), build the private current-thread
-    // runtime as before.
-    let outcome = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
-        Err(_) => {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| SetupError::Io(format!("cannot start smoke-test runtime: {e}")))?;
-            runtime.block_on(fut)
-        }
-    };
+    // Drive the probe on a thread that owns a scratch current-thread runtime.
+    // This is the shape used by `index_builder::hybrid::block_on_remote`, and it
+    // is the only one that is correct in every context the probe runs from:
+    //   * standalone (interactive wizard) — trivially fine;
+    //   * inside the CLI's multi-threaded runtime — `block_on` directly panics
+    //     with "Cannot start a runtime from within a runtime";
+    //   * inside a CURRENT-THREAD runtime — `Handle::try_current()` still returns
+    //     `Ok`, so a `block_in_place` branch would be taken and would panic,
+    //     because a current-thread runtime has no blocking pool to hop to.
+    // The future borrows `asker` and `request`, so `thread::scope` (not `spawn`)
+    // avoids cloning them.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| SetupError::Io(format!("cannot start smoke-test runtime: {e}")))?;
+    let outcome = std::thread::scope(|scope| {
+        scope
+            .spawn(move || runtime.block_on(fut))
+            .join()
+            .map_err(|_| SetupError::Io("smoke-test bridge thread panicked".to_string()))?
+    });
     let response = match outcome {
         Err(_) => {
             return Err(SetupError::Io(format!(

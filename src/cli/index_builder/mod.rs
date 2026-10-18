@@ -1827,6 +1827,14 @@ pub(crate) struct SearchCacheKeyInputs<'a> {
     /// cache key: backend choice changes result order even when rerank
     /// enable/top_n/model are identical.
     pub(crate) rerank_backend: &'a str,
+    /// Whether that backend is actually armed at runtime, folded in separately
+    /// from `rerank_backend`. System-One fails OPEN when
+    /// `LEINDEX_FEATURE_SYSTEM_ONE` is off, so without this a search run before
+    /// the flag is armed caches the unreranked order under the same key the
+    /// armed run computes, and `cached_search_results` returns it before the
+    /// judge ever runs — the progressive rollout would never take effect for
+    /// already-queried inputs (Codex P1).
+    pub(crate) rerank_backend_active: bool,
     pub(crate) fragment_index_enabled: bool,
     pub(crate) fragment_weight: f64,
     pub(crate) fragment_root_hash: &'a str,
@@ -1841,8 +1849,13 @@ pub(crate) fn search_cache_key_for(inputs: &SearchCacheKeyInputs<'_>) -> String 
     // served stale cached results until a re-index changed the node count. The
     // `v2:` namespace prefix lands in the (sanitized) cache filename so legacy
     // v1 entries are identifiably stale and sweepable, not silent.
+    // v3: folds whether the selected rerank backend is actually ARMED. System-One
+    // fails open when LEINDEX_FEATURE_SYSTEM_ONE is off, so v2 keys let an
+    // unreranked result be served from cache after the flag was armed. v2 keys
+    // land in a different (sanitized) filename, so stale entries are
+    // identifiably stale and sweepable, not silent.
     search_cache_key(&format!(
-        "v2:query:{}:{}:{}:{}:{:?}:neural={}:mode={}:nw={}:rr={}|{}|{}|rb={}:frag={}|{}|{}:embed={}",
+        "v3:query:{}:{}:{}:{}:{:?}:neural={}:mode={}:nw={}:rr={}|{}|{}|rb={}:rba={}:frag={}|{}|{}:embed={}",
         stable_project_cache_id(inputs.project_id, inputs.project_path),
         index_fingerprint(inputs.stats),
         inputs.top_k,
@@ -1855,6 +1868,7 @@ pub(crate) fn search_cache_key_for(inputs: &SearchCacheKeyInputs<'_>) -> String 
         inputs.rerank_top_n,
         inputs.rerank_model,
         inputs.rerank_backend,
+        inputs.rerank_backend_active,
         inputs.fragment_index_enabled,
         inputs.fragment_weight,
         inputs.fragment_root_hash,

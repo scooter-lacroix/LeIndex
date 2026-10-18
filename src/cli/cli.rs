@@ -1764,7 +1764,7 @@ fn resolve_setup_choices(
         setup::run_interactive_flow().map_err(|e| anyhow::anyhow!("{}", e))
     } else {
         // No flags and not interactive: show guidance and exit with error
-        eprintln!("No setup options specified and stdin is not interactive (not a TTY).");
+        eprintln!("No setup options specified and stdin/stderr is not a terminal.");
         eprintln!("For non-interactive setup, use flags:");
         eprintln!("  leindex setup --neural --cpu       # CPU neural search");
         eprintln!("  leindex setup --neural --gpu amd   # AMD GPU (MIGraphX)");

@@ -175,6 +175,16 @@ pub enum FeatureFlag {
     /// entirely (no worker spawn, no model digest, no network round trip).
     /// New capability: defaults OFF until enabled per deployment.
     Engram,
+    /// Matryoshka (MRL) dimension slicing: persist neural vectors truncated to
+    /// 128/256/512 dimensions in sidecar stores so short nodes are searched at
+    /// their own granularity instead of at the full 768-d native width.
+    ///
+    /// Experimental, so it defaults OFF per AGENTS.md progressive rollout: even
+    /// a configured `[search] matryoshka` policy stays inert until
+    /// `LEINDEX_FEATURE_MATRYOSHKA=1` is exported. The retrieval and persistence
+    /// code is written to be a no-op at the native dimension, so OFF reproduces
+    /// the pre-Matryoshka behavior byte for byte.
+    Matryoshka,
 }
 
 impl FeatureFlag {
@@ -203,6 +213,7 @@ impl FeatureFlag {
             Self::DebugEscapeHatch => "LEINDEX_FEATURE_EMBED_CACHE_DEBUG",
             Self::ValidatedModel => "LEINDEX_FEATURE_VALIDATED_MODEL",
             Self::Engram => "LEINDEX_FEATURE_ENGRAM",
+            Self::Matryoshka => "LEINDEX_FEATURE_MATRYOSHKA",
         }
     }
 
@@ -318,6 +329,9 @@ impl FeatureFlag {
             }
             Self::Engram => {
                 "Engram: persistent phrase-book of neural query embeddings (repeat queries skip the embedder)"
+            }
+            Self::Matryoshka => {
+                "Persist/search neural vectors at sliced MRL dimensions (128/256/512; experimental)"
             }
         }
     }
@@ -575,6 +589,7 @@ pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
         FeatureFlag::DebugEscapeHatch,
         FeatureFlag::ValidatedModel,
         FeatureFlag::Engram,
+        FeatureFlag::Matryoshka,
     ]
     .into_iter()
     .map(|f| (f, f.is_enabled()))
