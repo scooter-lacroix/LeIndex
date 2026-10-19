@@ -245,7 +245,25 @@ impl SearchEngine {
         mmap: &Arc<MmapEmbeddingIndex>,
         node_ids: &[String],
     ) {
-        match MmapVectorIndex::from_snapshot(std::sync::Arc::clone(mmap), node_ids) {
+        // Not every snapshot node necessarily has a neural row: the provider
+        // rejects some inputs individually (the batch path skips them rather
+        // than failing), and a node can be added after the neural publish.
+        // `from_snapshot` takes a strict all-ids contract, so pre-filter to the
+        // rows that exist — the same shape the MRL tier path uses below —
+        // instead of letting one orphan discard every other node's vector.
+        let present: Vec<String> = node_ids
+            .iter()
+            .filter(|id| mmap.find_node_row(id).is_some())
+            .cloned()
+            .collect();
+        if present.len() != node_ids.len() {
+            tracing::warn!(
+                missing = node_ids.len() - present.len(),
+                total = node_ids.len(),
+                "snapshot nodes without a neural row; they cannot contribute to semantic retrieval"
+            );
+        }
+        match MmapVectorIndex::from_snapshot(std::sync::Arc::clone(mmap), &present) {
             Ok(idx) => staged.neural_vector_index = Some(VectorIndexImpl::Mmap(idx)),
             Err(error) => tracing::warn!(
                 error = %error,

@@ -185,6 +185,82 @@ fn search_snapshot_restores_neural_rows_without_heap_tfidf_copy() {
     assert!(restored.nodes[0].tfidf_embedding.is_empty());
 }
 
+/// A snapshot node with no neural row must not discard every other node's
+/// vector.
+///
+/// Regression: `install_neural_vector_index` handed the full node id list to
+/// `MmapVectorIndex::from_snapshot`, whose contract is strict — the FIRST id
+/// without a row returned `Err` and the whole ANN was dropped, so semantic
+/// retrieval silently degraded to TF-IDF for the entire project. Orphans are
+/// normal: the remote provider rejects some inputs individually and the batch
+/// path skips them rather than failing.
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+#[cfg(feature = "storage")]
+#[test]
+fn test_snapshot_neural_rows_survive_an_unembedded_node() {
+    let mut engine = SearchEngine::new();
+    let nodes: Vec<NodeInfo> = ["embedded-node", "orphan-node"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let mut tfidf = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+            tfidf[index] = 1.0;
+            NodeInfo {
+                node_id: id.to_string(),
+                file_path: "main.rs".to_string(),
+                symbol_name: id.replace('-', "_"),
+                language: "rust".to_string(),
+                content: format!("fn {}() {{}}\n", id.replace('-', "_")),
+                byte_range: (0, 20),
+                tfidf_embedding: tfidf,
+                neural_embedding: None,
+                complexity: 1,
+                signature: None,
+                pre_tokenized: Some(vec!["fn".to_string()]),
+            }
+        })
+        .collect();
+    engine.index_nodes(nodes);
+    // Only ONE of the two nodes gets a neural row; "orphan-node" does not.
+    let neural = vec![(
+        "embedded-node".to_string(),
+        vec![0.5; NEURAL_EMBEDDING_DIMENSION],
+    )];
+    engine.update_neural_embeddings(neural.clone());
+    let snapshot = engine.search_snapshot(1, 0, "orphan-fingerprint".to_string());
+
+    let dir = tempfile::tempdir().unwrap();
+    let tfidf_path = dir.path().join("tfidf.bin");
+    let neural_path = dir.path().join("neural.bin");
+    crate::search::vector::write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings())
+        .unwrap();
+    crate::search::vector::write_mmap_embeddings(&neural_path, &neural).unwrap();
+    let tfidf_mmap = crate::search::vector::MmapEmbeddingIndex::open(&tfidf_path).unwrap();
+    let neural_mmap = crate::search::vector::MmapEmbeddingIndex::open(&neural_path).unwrap();
+
+    let mut restored = SearchEngine::new();
+    restored
+        .restore_from_search_snapshot(
+            snapshot,
+            Arc::new(tfidf_mmap),
+            Some(Arc::new(neural_mmap)),
+            Vec::new(),
+            None,
+            None,
+            None,
+        )
+        .expect("one unembedded node must not fail hydration");
+
+    // The node that HAS a vector keeps it; the orphan simply cannot contribute.
+    let rows = restored.collect_neural_embeddings();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the embedded node's vector must survive an orphan sibling"
+    );
+    assert_eq!(rows[0].0, "embedded-node");
+}
+
 #[cfg(feature = "storage")]
 #[test]
 fn test_search_snapshot_restore_rejects_wrong_tfidf_dimension() {
