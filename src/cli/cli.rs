@@ -655,14 +655,21 @@ impl Cli {
 /// This keeps CLI output clean and token-efficient for LLM consumers while
 /// preserving full diagnostics behind the `--verbose` flag.
 fn init_logging_impl(verbose: bool) {
-    let level = if verbose {
-        tracing::Level::DEBUG
+    // `--verbose` is an explicit opt-in and outranks the environment. Without
+    // it, honour `RUST_LOG` so the documented `RUST_LOG=debug leindex index .`
+    // (docs/CLI.md) actually takes effect; the pre-`RUST_LOG` form used
+    // `with_max_level`, which silently ignored the variable and left remote
+    // embedding failures invisible except by their coarse `warn!` summary.
+    // Default stays WARN: CLI output remains clean for LLM consumers.
+    let filter = if verbose {
+        tracing_subscriber::EnvFilter::new("debug")
     } else {
-        tracing::Level::WARN
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"))
     };
 
     let subscriber = tracing_subscriber::fmt()
-        .with_max_level(level)
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .finish();
 

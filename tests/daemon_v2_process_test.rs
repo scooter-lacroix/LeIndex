@@ -54,6 +54,15 @@ impl Home {
             .env("LEINDEX_HOME", self.path())
             .env("LEINDEXD_BIN", leindexd())
             .env("LEINDEX_FEATURE_PRECISION_INGEST", "0")
+            // These tests pin daemon concurrency and socket behavior, not
+            // embedding backends. Neural search defaults ON for a fresh home,
+            // so the 300-file index in the ping test pays for the full neural
+            // phase — measured 348s of a 363s run against a live remote at
+            // dim 768, with an 899ms core pipeline. That is embedder
+            // throughput, unrelated to whether `ping` queues behind a tool
+            // call, and it blows the test's 300s wait under any load. Same pin
+            // and same reasoning as `tests/mcp_stdio_process_test.rs`.
+            .env("LEINDEX_FEATURE_NEURAL_SEARCH", "0")
             .env("LEINDEX_WATCHER", "0")
             .env_remove("LEINDEX_FEATURE_DAEMON_CLIENT");
     }

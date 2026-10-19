@@ -1622,6 +1622,7 @@ pub(crate) fn enrich_neural_embeddings(
     pdg: &ProgramDependenceGraph,
     embedder: &GenerationNeuralEmbedder,
     admitted_node_ids: &HashSet<String>,
+    on_batch: &mut dyn FnMut(usize),
 ) -> Vec<(String, Vec<f32>)> {
     if !embedder.has_neural() {
         return Vec::new();
@@ -1677,12 +1678,14 @@ pub(crate) fn enrich_neural_embeddings(
             );
             pending.push((node.id.clone(), node.file_path.to_string(), text));
             if pending.len() == NEURAL_IPC_BATCH {
-                append_neural_batch(embedder, &pending, &mut rows);
+                let written = append_neural_batch(embedder, &pending, &mut rows);
+                on_batch(written);
                 pending.clear();
             }
         }
         if !pending.is_empty() {
-            append_neural_batch(embedder, &pending, &mut rows);
+            let written = append_neural_batch(embedder, &pending, &mut rows);
+            on_batch(written);
         }
         dedupe_neural_rows_keep_first(&mut rows);
         rows
@@ -1708,18 +1711,21 @@ fn append_neural_batch(
     embedder: &GenerationNeuralEmbedder,
     pending: &[(String, String, String)],
     rows: &mut Vec<(String, Vec<f32>)>,
-) {
+) -> usize {
     let texts: Vec<&str> = pending.iter().map(|(_, _, text)| text.as_str()).collect();
     let titles: Vec<Option<String>> = pending
         .iter()
         .map(|(_, title, _)| Some(title.clone()))
         .collect();
     let embeddings = embedder.embed_neural_batch_blocking_titled(&texts, titles);
+    let mut written = 0;
     for ((node_id, _, _), embedding) in pending.iter().zip(embeddings) {
         if let Some(embedding) = embedding.filter(|row| !row.is_empty()) {
             rows.push((node_id.clone(), embedding));
+            written += 1;
         }
     }
+    written
 }
 
 /// Compare current manifest hashes against the persisted scan's hashes.

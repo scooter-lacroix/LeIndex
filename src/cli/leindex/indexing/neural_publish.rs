@@ -85,16 +85,19 @@ impl streaming::neural::NeuralRowWriter for SearchNeuralRowWriter<'_> {
 }
 
 /// Neural-phase progress: a background heartbeat line plus a row counter the
-/// streaming writer bumps per batch.
+/// enrichment route bumps per completed batch.
 ///
 /// Why a heartbeat: the "neural embedding N admitted nodes" line is the LAST
 /// output before enrichment, which on a CPU-fallen-back embedder takes tens of
 /// minutes for a real project — reading as a hang. The heartbeat prints
 /// immediately (before the first batch completes, which alone can take
-/// minutes) and then every `INTERVAL`, so the phase is visibly alive. The
-/// legacy route reports rows only once at completion, so elapsed time is its
-/// only liveness signal; the streaming writer supplies real `n/N` counts as
-/// batches land. Stopped/joined on drop — never outlives enrichment.
+/// minutes) and then every `INTERVAL`, so the phase is visibly alive. BOTH
+/// routes now feed real `n/N` counts: the streaming writer through
+/// `ProgressNeuralRowWriter`, the legacy route through the `on_batch` callback
+/// `enrich_neural_embeddings` invokes at each 256-row IPC flush. The legacy
+/// route used to report only at completion, so the heartbeat sat on `0/N` for
+/// the whole phase and was indistinguishable from a hang on a large project.
+/// Stopped/joined on drop — never outlives enrichment.
 ///
 /// The heartbeat also watches for a CPU-fallen-back embedder when a GPU
 /// provider was requested, and announces it on this surface: the worker's own
@@ -118,8 +121,75 @@ fn is_gpu_provider(configured: &str) -> bool {
     matches!(configured, "migraphx" | "cuda" | "rocm")
 }
 
+/// Explain a neural phase that is about to run with no embedder.
+///
+/// A missing embedder is a deliberate, silent no-op everywhere downstream:
+/// `restore_neural_checkpoint` and the enrichment `if let` both yield zero
+/// rows, the phase finishes in milliseconds, and the run prints a normal
+/// success summary. The only user-visible clue is a store that stayed
+/// TF-IDF-only. Say why, once.
+///
+/// The usual cause is a `leindex.toml` whose `[neural] enabled` was never set
+/// — it defaults to false so that upgrading an existing config cannot silently
+/// opt a user into a worker download — while `[indexing.embeddings]` (remote
+/// endpoint, provider preset) *is* configured and looks authoritative. Naming
+/// the actual gate is the whole point of the two branches: "neural is off"
+/// and "neural is on but every backend failed" have completely different
+/// fixes, and the second one is invisible without this.
+fn warn_if_missing_neural_embedder(embedder: Option<&index_builder::GenerationNeuralEmbedder>) {
+    if embedder.is_some() {
+        return;
+    }
+    let config = crate::config::LeIndexConfig::load_cached();
+    if crate::feature_flags::FeatureFlag::NeuralSearch.is_enabled()
+        && !crate::feature_flags::is_neural_enabled(config.neural.enabled)
+    {
+        warn!(
+            "[neural] enabled = false in leindex.toml: skipping neural embedding entirely (this \
+             run is TF-IDF only). Set `enabled = true` under [neural] to build the neural layer; \
+             [indexing.embeddings] settings alone do not enable it."
+        );
+    } else {
+        warn!(
+            neural_enabled = config.neural.enabled,
+            search_mode = %config.search.search_mode,
+            "[neural] is enabled but no embedding backend could be constructed; this run is \
+             TF-IDF only. Check the local ONNX worker and any remote endpoint with `leindex \
+             diagnostics`; rerun with RUST_LOG=debug for the backend errors."
+        );
+    }
+}
+
+/// Route label for the "Index neural: ... route selected" line.
+fn neural_route_label(route: streaming::routes::NeuralRoute) -> &'static str {
+    match route {
+        streaming::routes::NeuralRoute::Streaming => "streaming",
+        streaming::routes::NeuralRoute::Legacy => "legacy",
+    }
+}
+
 impl NeuralProgress {
     const INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+    /// Suffix for the heartbeat once the phase has run long enough that a
+    /// pinned row counter is diagnostic rather than merely early.
+    ///
+    /// A remote provider that is unreachable costs `timeout_secs *
+    /// max_retries` of *silence* before the generation fallback fires —
+    /// measured 115s against a dead port with the defaults (30s × 3), and the
+    /// per-request `WARN` only appears at the end. On a real project that
+    /// window reads exactly like a hang, and the elapsed counter climbing
+    /// proves nothing. Say what is happening as soon as the window is long
+    /// enough to be suspicious (`WARN_AFTER`): before the first row lands the
+    /// phase is either still connecting or already grinding through retries.
+    fn stuck_hint(rows: usize, elapsed: std::time::Duration) -> &'static str {
+        const WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(45);
+        if rows > 0 || elapsed < WARN_AFTER {
+            return "";
+        }
+        " [no rows yet — provider slow or unreachable; each failed request waits \
+timeout_secs × max_retries before falling back]"
+    }
 
     fn start(total: usize) -> Self {
         let rows = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -189,8 +259,12 @@ impl NeuralProgress {
                     } else {
                         ""
                     };
+                    let stuck = Self::stuck_hint(
+                        rows_t.load(std::sync::atomic::Ordering::Relaxed),
+                        started.elapsed(),
+                    );
                     progress_stderr(&format!(
-                        "Indexing: neural embedding {}/{} nodes ({}s elapsed)...{suffix}",
+                        "Indexing: neural embedding {}/{} nodes ({}s elapsed)...{suffix}{stuck}",
                         rows_t.load(std::sync::atomic::Ordering::Relaxed),
                         total,
                         started.elapsed().as_secs()
@@ -320,8 +394,42 @@ fn enrich_neural_for_route(
     let progress = NeuralProgress::start(admitted_node_ids.len());
     match route {
         streaming::routes::NeuralRoute::Legacy => {
-            let rows = index_builder::enrich_neural_embeddings(pdg, embedder, admitted_node_ids);
+            // The counter must advance on this route too: `rows` is only bumped
+            // by `ProgressNeuralRowWriter`, which exists solely on the streaming
+            // route, so before this callback the heartbeat printed `0/N` for the
+            // entire phase on the (default) legacy route — indistinguishable
+            // from a hang.
+            let rows_reported = progress.rows.clone();
+            // Batches that COMPLETE but write no rows are the signature of a
+            // dead embedder (remote endpoint unreachable, provider 4xx/5xx, or
+            // a worker that answers with empty vectors). Without this, such a
+            // run shows a live "N/131381" counter marching to completion while
+            // every batch contributes zero rows, and the neural layer silently
+            // ends up empty. Count them and say so once, at the end.
+            let empty_batches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let empty_batches_report = empty_batches.clone();
+            let rows = index_builder::enrich_neural_embeddings(
+                pdg,
+                embedder,
+                admitted_node_ids,
+                &mut |written| {
+                    rows_reported.fetch_add(written, std::sync::atomic::Ordering::Relaxed);
+                    if written == 0 {
+                        empty_batches_report.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                },
+            );
             drop(progress);
+            let empty = empty_batches.load(std::sync::atomic::Ordering::Relaxed);
+            if empty > 0 && rows.is_empty() {
+                warn!(
+                    empty_batches = empty,
+                    "neural enrichment completed with zero rows: the embedder returned no \
+                     vectors for every batch. Search falls back to TF-IDF only. Check \
+                     `leindex setup --check` for provider/model state and \
+                     ~/.leindex/logs/leindex-embed-daemon.log for worker errors."
+                );
+            }
             let (cache_hits_after, cache_misses) = neural_cache_counters();
             progress_stderr(&format!(
                 "Indexing: neural done — {} rows ({} from embed cache, {} embedded)...",
@@ -788,6 +896,7 @@ impl LeIndex {
         let neural_embedder = self
             .configured_neural_embedder()?
             .map(index_builder::GenerationNeuralEmbedder::new);
+        warn_if_missing_neural_embedder(neural_embedder.as_ref());
         if let (Some(generation), Some(checkpoint)) =
             (neural_embedder.as_ref(), state.resumed_neural.as_ref())
         {
@@ -807,10 +916,7 @@ impl LeIndex {
         let neural_route = streaming::routes::neural_route_for_current_flag();
         info!(
             "Index neural: {} route selected by LEINDEX_FEATURE_STREAMING_NEURAL",
-            match neural_route {
-                streaming::routes::NeuralRoute::Streaming => "streaming",
-                streaming::routes::NeuralRoute::Legacy => "legacy",
-            }
+            neural_route_label(neural_route)
         );
         if let Some(neural_embedder) = neural_embedder
             .as_ref()
@@ -1000,6 +1106,19 @@ impl LeIndex {
 mod tests {
     use super::*;
     use crate::cli::leindex::indexing::streaming::neural::NeuralRowWriter;
+
+    #[test]
+    fn test_stuck_hint_only_after_quiet_timeout_window() {
+        use std::time::Duration;
+        // Fresh phase: nothing to report.
+        assert!(NeuralProgress::stuck_hint(0, Duration::from_secs(0)).is_empty());
+        // Still inside the pre-fallback window (30s timeout x 3 retries).
+        assert!(NeuralProgress::stuck_hint(0, Duration::from_secs(44)).is_empty());
+        // Past it with zero rows: the provider is slow or unreachable.
+        assert!(!NeuralProgress::stuck_hint(0, Duration::from_secs(45)).is_empty());
+        // Rows landing means the provider is fine; never cry wolf.
+        assert!(NeuralProgress::stuck_hint(1, Duration::from_secs(600)).is_empty());
+    }
 
     #[test]
     fn test_neural_progress_writer_counts_rows_and_passes_through() {
