@@ -379,7 +379,8 @@ pub struct EmbeddingConfig {
     #[serde(default)]
     pub onnx_model_path: Option<String>,
 
-    /// EmbeddingGemma2 Matryoshka slicing policy (see [`MatryoshkaSetting`]).
+    /// EmbeddingGemma2 Matryoshka slicing policy (see
+    /// [`crate::search::mrl::MatryoshkaSetting`]).
     /// `Off` (default) preserves pre-MRL behavior byte-for-byte.
     #[serde(default)]
     pub matryoshka: MatryoshkaSetting,
@@ -396,68 +397,13 @@ pub const EMBEDDINGGEMMA2_MODEL: &str = "embeddinggemma-2";
 /// `embeddinggemma-2` preset: native (untruncated) embedding dimension.
 pub const EMBEDDINGGEMMA2_DIMENSION: usize = 768;
 
-/// `[indexing.embeddings] matryoshka`: how EmbeddingGemma2's Matryoshka
-/// Representation Learning output is sliced. The model is trained so any
-/// leading-dimension prefix (768/512/256/128) stays usable after
-/// re-normalization; shorter vectors shrink the store and speed similarity
-/// at a small quality cost (model card: near-lossless to 256, 128 degrades).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum MatryoshkaSetting {
-    /// No slicing: full native dimension everywhere. Identical to pre-MRL
-    /// behavior (default; old configs deserialize to this).
-    #[default]
-    Off,
-    /// Span-based dynamic tiers, resolved per node from its source span
-    /// (`NodeInfo::byte_range`) by `search::mrl::dynamic_tier_for_span`:
-    /// spans under 512 bytes → 256, under 4096 bytes → 512, anything larger →
-    /// 768, and the `(0, 0)` span of synthetic per-file summary nodes → 768.
-    /// The span is persisted in the search snapshot, so the same tier is
-    /// recomputed at enrich, persist, and checkpoint-resume time with no extra
-    /// state. Note this is a function of SIZE ONLY, not of node kind: a large
-    /// method lands in 768 and a tiny module header lands in 256. Query embeds
-    /// once at native dimension and fans out renormalized slices per populated
-    /// tier.
-    Dynamic,
-    /// Fixed 768-dim slice (no-op vs Off, but pins the identity suffix).
-    #[serde(rename = "768")]
-    Dim768,
-    /// Fixed 512-dim slice.
-    #[serde(rename = "512")]
-    Dim512,
-    /// Fixed 256-dim slice.
-    #[serde(rename = "256")]
-    Dim256,
-    /// Fixed 128-dim slice. Model card flags substantial quality loss at
-    /// this depth; opt-in only.
-    #[serde(rename = "128")]
-    Dim128,
-}
-
-impl MatryoshkaSetting {
-    /// Per-document slice dimension under this setting (`None` = never
-    /// slice; `Some(n)` = fixed slice for every document).
-    pub fn fixed_slice(self) -> Option<usize> {
-        match self {
-            Self::Off | Self::Dynamic => None,
-            Self::Dim768 => Some(768),
-            Self::Dim512 => Some(512),
-            Self::Dim256 => Some(256),
-            Self::Dim128 => Some(128),
-        }
-    }
-
-    /// Stable identity tag for provider/cache identities and checkpoints.
-    pub fn tag(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Dynamic => "dynamic",
-            Self::Dim768 => "768",
-            Self::Dim512 => "512",
-            Self::Dim256 => "256",
-            Self::Dim128 => "128",
-        }
-    }
-}
+/// `[indexing.embeddings] matryoshka` policy value.
+///
+/// The type lives in `search::mrl` next to the slicing code that consumes it:
+/// that module is reachable from the `search` feature alone, whereas this
+/// module only exists under `cli`/`onnx`, so defining it here made the core
+/// search module depend on a feature-gated one and broke the minimal build.
+pub use crate::search::mrl::MatryoshkaSetting;
 
 /// `embeddinggemma-2` DOCUMENT template, code-search task. Source:
 /// google/embeddinggemma-2 model card (Best Practices → Prefix Notation &
