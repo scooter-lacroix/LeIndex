@@ -8,6 +8,8 @@ use crate::cli::index_job::{
     latest_incomplete_job,
 };
 use crate::cli::memory_cap::MemoryCapGuard;
+use crate::cli::memory_report;
+use crate::scheduler::index_job::IndexPhaseId;
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -637,13 +639,19 @@ impl LeIndex {
             self.project_id, force
         );
 
-        let scan = self.run_scan(&job)?;
+        let scan = {
+            let _phase = memory_report::PhaseScope::enter(super::IndexPhase::Scan.as_str());
+            self.run_scan(&job)?
+        };
         check_memory_cap(&mut cap_guard)?;
         self.mark_index_phase(
             super::IndexPhase::Parse,
             super::ComponentStatus::Initializing,
         );
-        let parsed = self.run_parse(&job, &scan)?;
+        let parsed = {
+            let _phase = memory_report::PhaseScope::enter(super::IndexPhase::Parse.as_str());
+            self.run_parse(&job, &scan)?
+        };
         check_memory_cap(&mut cap_guard)?;
         if self.pipeline.as_ref().is_some_and(|state| state.skip) {
             self.pipeline = None;
@@ -651,9 +659,15 @@ impl LeIndex {
             return Ok(self.stats.clone());
         }
 
-        let pdg = self.run_pdg(&job, &parsed)?;
+        let pdg = {
+            let _phase = memory_report::PhaseScope::enter(super::IndexPhase::Pdg.as_str());
+            self.run_pdg(&job, &parsed)?
+        };
         check_memory_cap(&mut cap_guard)?;
-        let lexical = self.run_lexical(&job, &pdg)?;
+        let lexical = {
+            let _phase = memory_report::PhaseScope::enter(super::IndexPhase::Lexical.as_str());
+            self.run_lexical(&job, &pdg)?
+        };
 
         self.run_and_publish_neural(&job, &lexical)?;
         self.finalize_indexing()?;
@@ -668,22 +682,38 @@ impl LeIndex {
         // Publish the core (lexical-only) generation as a crash-recovery
         // checkpoint.  If the process dies during neural, the resumed run
         // can skip straight to the neural phase using this snapshot.
-        let _core = self.publish_generation(job, None)?;
+        let _core = {
+            let _phase = memory_report::PhaseScope::enter(IndexPhaseId::PublishCore.as_str());
+            self.publish_generation(job, None)?
+        };
         // The text index only needs the core generation's symbols, so it builds
         // beside the neural phase instead of after it.
         let text_index_job = self.spawn_text_index_refresh();
 
-        let neural = self.run_neural(job, lexical);
-        // Never leave the builder running past this run, even on failure.
-        if text_index_job.join().is_err() {
-            warn!("Text index build panicked (search will scan live)");
-        }
+        // The text-index build is joined inside the neural scope on purpose:
+        // it runs concurrently with `run_neural` and its footprint is part of
+        // what that phase actually costs the process.
+        let neural = {
+            let _phase = memory_report::PhaseScope::enter(super::IndexPhase::Neural.as_str());
+            let neural = self.run_neural(job, lexical);
+            // Never leave the builder running past this run, even on failure.
+            if text_index_job.join().is_err() {
+                warn!("Text index build panicked (search will scan live)");
+            }
+            neural
+        };
         let neural = neural?;
-        let _enhanced = self.publish_generation(job, Some(&neural))?;
+        let _enhanced = {
+            let _phase = memory_report::PhaseScope::enter(IndexPhaseId::PublishEnhanced.as_str());
+            self.publish_generation(job, Some(&neural))?
+        };
         Ok(())
     }
 
     fn finalize_indexing(&mut self) -> Result<()> {
+        // Close the trailing phase before the bookkeeping below, which belongs
+        // to no phase and must not inflate the last one's peak.
+        memory_report::exit_phase();
         let state = self
             .pipeline
             .take()
@@ -1407,6 +1437,11 @@ impl LeIndex {
             super::IndexPhase::Persist,
             super::ComponentStatus::Initializing,
         );
+        // Close the lexical phase here so the persist work below (embedder
+        // persistence, community detection, snapshot layer) is attributed to
+        // `persist` rather than inflating the TF-IDF build's peak.
+        memory_report::close_phase(super::IndexPhase::Lexical.as_str());
+        memory_report::enter_phase(super::IndexPhase::Persist.as_str());
         // D5: the graph no longer persists as SQL rows. It is published as
         // the Pdg layer of a CAS generation (stage_generation_layers); the
         // catalog keeps only `indexed_files` and metadata tables.

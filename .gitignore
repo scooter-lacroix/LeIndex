@@ -148,8 +148,11 @@ dmypy.json
 /faiss_index/
 /maestro/
 /test_check/
-/tests/
 /logs/
+# NOTE: /tests/ is deliberately NOT ignored. It holds 80 tracked Rust
+# integration tests; ignoring the directory silently swallowed every newly
+# added test file (they existed on disk, ran locally, and never reached a
+# commit or CI).
 
 # Rust build artifacts
 /target/
