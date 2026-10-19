@@ -163,7 +163,6 @@ fn test_streaming_scan_flag_indexes_fixture_and_searches() {
         crate::feature_flags::FeatureFlag::StreamingScan,
         crate::feature_flags::FeatureFlag::StreamingParse,
         crate::feature_flags::FeatureFlag::StreamingTfidf,
-        crate::feature_flags::FeatureFlag::StreamingNeural,
         crate::feature_flags::FeatureFlag::StreamingPdg,
         crate::feature_flags::FeatureFlag::BoundedScheduler,
     ] {
@@ -203,7 +202,6 @@ fn test_streaming_parse_flag_indexes_fixture_and_searches() {
         crate::feature_flags::FeatureFlag::StreamingScan,
         crate::feature_flags::FeatureFlag::StreamingParse,
         crate::feature_flags::FeatureFlag::StreamingTfidf,
-        crate::feature_flags::FeatureFlag::StreamingNeural,
         crate::feature_flags::FeatureFlag::StreamingPdg,
         crate::feature_flags::FeatureFlag::BoundedScheduler,
     ] {
@@ -243,7 +241,6 @@ fn test_streaming_tfidf_flag_indexes_fixture_and_searches() {
         crate::feature_flags::FeatureFlag::StreamingScan,
         crate::feature_flags::FeatureFlag::StreamingParse,
         crate::feature_flags::FeatureFlag::StreamingTfidf,
-        crate::feature_flags::FeatureFlag::StreamingNeural,
         crate::feature_flags::FeatureFlag::StreamingPdg,
         crate::feature_flags::FeatureFlag::BoundedScheduler,
     ] {
@@ -276,23 +273,21 @@ fn test_streaming_tfidf_flag_indexes_fixture_and_searches() {
 }
 
 #[test]
-fn test_streaming_neural_flag_keeps_fixture_searchable() {
+fn test_neural_phase_keeps_fixture_searchable() {
     let _guard = crate::feature_flags::lock_flag_tests();
     let _reset = crate::feature_flags::FlagOverrideReset;
+    // Neural publication is unconditional; this pins it to the legacy
+    // scan/parse/TF-IDF route so the assertion covers the path where the
+    // neural phase must not disturb an already-published lexical index.
     for flag in [
         crate::feature_flags::FeatureFlag::StreamingScan,
         crate::feature_flags::FeatureFlag::StreamingParse,
         crate::feature_flags::FeatureFlag::StreamingTfidf,
-        crate::feature_flags::FeatureFlag::StreamingNeural,
         crate::feature_flags::FeatureFlag::StreamingPdg,
         crate::feature_flags::FeatureFlag::BoundedScheduler,
     ] {
         crate::feature_flags::set_flag_override_for_test(flag, false);
     }
-    crate::feature_flags::set_flag_override_for_test(
-        crate::feature_flags::FeatureFlag::StreamingNeural,
-        true,
-    );
 
     let dir = tempfile::tempdir().expect("stream neural fixture");
     std::fs::create_dir_all(dir.path().join("src")).expect("source directory");

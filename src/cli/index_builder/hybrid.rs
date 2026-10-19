@@ -78,10 +78,6 @@ impl GenerationNeuralEmbedder {
         generation
     }
 
-    pub(crate) fn has_neural(&self) -> bool {
-        self.selected.borrow().has_neural()
-    }
-
     pub(crate) fn identity(&self) -> String {
         match &*self.selected.borrow() {
             #[cfg(feature = "remote-embeddings")]

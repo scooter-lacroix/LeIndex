@@ -128,20 +128,6 @@ pub enum FeatureFlag {
     /// `test_streaming_vocab_and_rows_match_production_embedder`, and
     /// `test_streaming_tfidf_flag_indexes_fixture_and_searches`.
     StreamingTfidf,
-    /// Enable bounded neural enrichment for the published lexical index
-    /// (WS6-9 Task 6).
-    ///
-    /// Consumer: `run_neural` in `src/cli/leindex/indexing/neural_publish.rs`
-    /// selects `enrich_neural_streaming` through
-    /// `neural_route_for_current_flag()`. The streaming route feeds the
-    /// production hybrid embedder in bounded `BatchBudget` batches and writes
-    /// accepted rows to the search engine batch-wise, retaining admission,
-    /// capped-text dedupe, cache accounting, and first-row-per-node semantics.
-    /// Default OFF keeps `enrich_neural_embeddings`. Coverage:
-    /// `test_neural_route_flag_selects_both_routes`,
-    /// `test_streaming_neural_bit_identical`, and
-    /// `test_streaming_neural_flag_keeps_fixture_searchable`.
-    StreamingNeural,
     /// Enable the global content-addressed embedding cache (WS10 Task 1-2).
     /// The cache stores embedding vectors at user-level (e.g.
     /// `~/.leindex/embed-cache/`) keyed by a 6-tuple CacheKey (model digest,
@@ -206,7 +192,6 @@ impl FeatureFlag {
             Self::StreamingParse => "LEINDEX_FEATURE_STREAMING_PARSE",
             Self::StreamingPdg => "LEINDEX_FEATURE_STREAMING_PDG",
             Self::StreamingTfidf => "LEINDEX_FEATURE_STREAMING_TFIDF",
-            Self::StreamingNeural => "LEINDEX_FEATURE_STREAMING_NEURAL",
             Self::GlobalEmbedCache => "LEINDEX_FEATURE_GLOBAL_EMBED_CACHE",
             Self::CommunityDetection => "LEINDEX_FEATURE_COMMUNITY_DETECTION",
             Self::PrecisionIngest => "LEINDEX_FEATURE_PRECISION_INGEST",
@@ -235,7 +220,7 @@ impl FeatureFlag {
             | Self::RemoteEmbeddings
             // Stable architecture capabilities with successful rollout gates
             // remain default ON and individually revertible. StreamingScan,
-            // StreamingParse, StreamingTfidf, and StreamingNeural intentionally
+            // StreamingParse, and StreamingTfidf intentionally
             // remain OFF until their consumers complete a separate rollout.
             | Self::DaemonClient
             | Self::GenerationReaders
@@ -309,9 +294,6 @@ impl FeatureFlag {
                 "Compact PDG persistence: per-file fragments to CAS, no whole-PDG clone"
             }
             Self::StreamingTfidf => "Streaming two-pass TF-IDF with direct CAS-staged row writes",
-            Self::StreamingNeural => {
-                "Streaming neural enrichment via NeuralRowWriter (kills Vec accumulation)"
-            }
             Self::GlobalEmbedCache => {
                 "Global content-addressed embedding cache with cross-project dedup"
             }
@@ -384,7 +366,6 @@ const LEGACY_REVERTIBLE_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::StreamingParse,
     FeatureFlag::StreamingPdg,
     FeatureFlag::StreamingTfidf,
-    FeatureFlag::StreamingNeural,
     FeatureFlag::GlobalEmbedCache,
     FeatureFlag::CommunityDetection,
     FeatureFlag::PrecisionIngest,
@@ -420,7 +401,6 @@ impl FlagStore {
             FeatureFlag::StreamingParse,
             FeatureFlag::StreamingPdg,
             FeatureFlag::StreamingTfidf,
-            FeatureFlag::StreamingNeural,
             FeatureFlag::GlobalEmbedCache,
             FeatureFlag::DebugEscapeHatch,
             FeatureFlag::ValidatedModel,
@@ -582,7 +562,6 @@ pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
         FeatureFlag::StreamingParse,
         FeatureFlag::StreamingPdg,
         FeatureFlag::StreamingTfidf,
-        FeatureFlag::StreamingNeural,
         FeatureFlag::GlobalEmbedCache,
         FeatureFlag::CommunityDetection,
         FeatureFlag::PrecisionIngest,
@@ -784,7 +763,6 @@ mod test {
             FeatureFlag::StreamingScan,
             FeatureFlag::StreamingParse,
             FeatureFlag::StreamingTfidf,
-            FeatureFlag::StreamingNeural,
         ] {
             assert!(!flag.default_value(), "{} must default OFF", flag.env_var());
         }
@@ -861,7 +839,6 @@ mod test {
             FeatureFlag::StreamingParse,
             FeatureFlag::StreamingPdg,
             FeatureFlag::StreamingTfidf,
-            FeatureFlag::StreamingNeural,
             FeatureFlag::GlobalEmbedCache,
             FeatureFlag::ValidatedModel,
             FeatureFlag::CommunityDetection,
@@ -919,7 +896,6 @@ mod test {
             FeatureFlag::StreamingScan,
             FeatureFlag::StreamingParse,
             FeatureFlag::StreamingTfidf,
-            FeatureFlag::StreamingNeural,
         ] {
             assert!(
                 !flag.default_value(),

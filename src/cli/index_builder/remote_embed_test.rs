@@ -345,20 +345,22 @@ fn test_generation_remote_death_after_success_persists_only_remote_space() {
     let generation = GenerationNeuralEmbedder::new(
         HybridEmbedder::hybrid_remote(corpus_tfidf(), remote_config.clone(), None).expect("remote"),
     );
-    let first_batch = vec![
-        (
-            "a".to_string(),
-            "src/a.rs".to_string(),
-            "first document".to_string(),
-        ),
-        (
-            "b".to_string(),
-            "src/b.rs".to_string(),
-            "second document".to_string(),
-        ),
-    ];
-    let mut rows = Vec::new();
-    append_neural_batch(&generation, &first_batch, &mut rows);
+    // Batch shapes mirror the production flush: the first request carries the
+    // whole batch (so rows land), the next one survives the outage.
+    let landed = |ids: &[&str], texts: &[&str]| -> Vec<(String, Vec<f32>)> {
+        let owned: Vec<String> = texts.iter().map(|text| text.to_string()).collect();
+        let titles = vec![None; owned.len()];
+        generation
+            .embed_neural_batch_blocking_titled(&owned, titles)
+            .into_iter()
+            .zip(ids)
+            .filter_map(|(row, node_id)| {
+                row.filter(|vector| !vector.is_empty())
+                    .map(|vector| ((*node_id).to_string(), vector))
+            })
+            .collect()
+    };
+    let mut rows = landed(&["a", "b"], &["first document", "second document"]);
     assert_eq!(
         rows.len(),
         2,
@@ -366,16 +368,8 @@ fn test_generation_remote_death_after_success_persists_only_remote_space() {
     );
     // The server fails after the first batch, then recovers. This generation
     // must not retry remote or switch to 1024-dimensional Qwen.
-    append_neural_batch(
-        &generation,
-        &[("c".into(), "src/c.rs".into(), "outage".into())],
-        &mut rows,
-    );
-    append_neural_batch(
-        &generation,
-        &[("d".into(), "src/d.rs".into(), "remainder".into())],
-        &mut rows,
-    );
+    rows.extend(landed(&["c"], &["outage"]));
+    rows.extend(landed(&["d"], &["remainder"]));
     assert_eq!(
         request_count.load(std::sync::atomic::Ordering::SeqCst),
         2,

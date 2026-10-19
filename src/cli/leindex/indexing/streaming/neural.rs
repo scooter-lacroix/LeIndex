@@ -1,10 +1,10 @@
 //! Streaming neural enrichment via NeuralRowWriter (WS6-9 Task 6).
 //!
-//! This is the headline fix for spec §6.6. Replaces the legacy
-//! `enrich_neural_embeddings(...) -> Vec<(String, Vec<f32>)>` accumulation
-//! pattern with direct staged writes. Only one bounded input batch + one
-//! bounded output batch exist on the heap at any time (VAL-STREAM-006,
-//! VAL-STREAM-014).
+//! This is the headline fix for spec §6.6. The whole-project
+//! `Vec<(String, Vec<f32>)>` accumulation it replaced has been deleted;
+//! publication writes through `NeuralRowWriter` in bounded batches. Only one
+//! bounded input batch + one bounded output batch exist on the heap at any
+//! time (VAL-STREAM-006, VAL-STREAM-014).
 
 use anyhow::Result;
 

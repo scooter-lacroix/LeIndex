@@ -275,25 +275,43 @@ fn is_child_of(child_pid: u32, parent_pid: u32) -> bool {
     false
 }
 
-/// Read VmRSS from /proc/`<pid>`/status.
-fn read_vm_rss(pid: u32) -> anyhow::Result<u64> {
+/// Read a `Key: <value> kB` field from /proc/`<pid>`/status.
+fn read_status_kib(pid: u32, key: &str) -> anyhow::Result<u64> {
     let path = PathBuf::from(format!("/proc/{}/status", pid));
     let content = std::fs::read_to_string(&path)
         .map_err(|_| anyhow::anyhow!("cannot read {}", path.display()))?;
 
+    let prefix = format!("{key}:");
     for line in content.lines() {
-        if line.starts_with("VmRSS:") {
+        if line.starts_with(&prefix) {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2 {
                 let kib: u64 = parts[1]
                     .parse()
-                    .map_err(|_| anyhow::anyhow!("invalid VmRSS value in {}", path.display()))?;
+                    .map_err(|_| anyhow::anyhow!("invalid {} value in {}", key, path.display()))?;
                 return Ok(kib);
             }
         }
     }
 
-    anyhow::bail!("VmRSS not found in {}", path.display())
+    anyhow::bail!("{} not found in {}", key, path.display())
+}
+
+/// Read VmRSS from /proc/`<pid>`/status.
+fn read_vm_rss(pid: u32) -> anyhow::Result<u64> {
+    read_status_kib(pid, "VmRSS")
+}
+
+/// Read the kernel's peak RSS high-water mark (`VmHWM`) for `pid` alone.
+///
+/// Unlike the `wait4` `ru_maxrss` returned for a reaped child, `VmHWM` counts
+/// only this process: reaped descendants contribute nothing. That is what
+/// makes it the honest main-process peak when the measured command spawns
+/// oversized subprocesses (SCIP precision ingest launches an external indexer
+/// that can dwarf the parent). It is monotonic, so callers may keep the last
+/// value read rather than tracking a maximum.
+pub fn read_vm_hwm(pid: u32) -> anyhow::Result<u64> {
+    read_status_kib(pid, "VmHWM")
 }
 
 /// Read mapped-file, anonymous, and PSS from `/proc/<pid>/smaps`.
@@ -446,6 +464,16 @@ pub struct DescendantTree {
     pub by_name: HashMap<String, usize>,
     /// Sum of RSS across all descendants, in KiB.
     pub combined_rss_kib: u64,
+    /// Descendant-inclusive peak RSS for the whole tree, in KiB, as reported by
+    /// the kernel for the measured process when it was reaped (`wait4`
+    /// `ru_maxrss`). The kernel keeps this high-water mark for the process
+    /// *and every descendant it reaped*, so it can exceed the measured
+    /// process's own peak by an arbitrary margin — one external indexer
+    /// (`rust-analyzer scip`, ~700 MiB) is enough to dominate it. Kept here,
+    /// apart from `PhaseReport::rss_max_kib`, so main-process accounting stays
+    /// honest. 0 when no kernel lifetime reading was available.
+    #[serde(default)]
+    pub peak_rss_kib: u64,
 }
 
 use std::collections::HashMap;
@@ -746,6 +774,7 @@ mod tests {
             total: 1,
             by_name,
             combined_rss_kib: 50000,
+            peak_rss_kib: 735848,
         };
         let json = serde_json::to_string(&tree).unwrap();
         let deserialized: DescendantTree = serde_json::from_str(&json).unwrap();

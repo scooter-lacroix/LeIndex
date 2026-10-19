@@ -6,7 +6,7 @@ use crate::search::search::{NodeInfo, SearchEngine};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
@@ -1607,125 +1607,6 @@ fn build_neural_embedder(tfidf_embedder: TfIdfEmbedder, _allow_neural: bool) -> 
         }
     }
     HybridEmbedder::tfidf_only(tfidf_embedder)
-}
-
-/// Compute neural rows against an already-published TF-IDF index.
-///
-/// The mandatory TF-IDF/PDG generation is published first; this phase then
-/// actively starts the configured neural worker and appends its rows. If the
-/// provider reports a terminal failure, the core generation remains usable.
-#[cfg_attr(
-    not(any(feature = "onnx", feature = "remote-embeddings")),
-    allow(unused_variables)
-)]
-pub(crate) fn enrich_neural_embeddings(
-    pdg: &ProgramDependenceGraph,
-    embedder: &GenerationNeuralEmbedder,
-    admitted_node_ids: &HashSet<String>,
-    on_batch: &mut dyn FnMut(usize),
-) -> Vec<(String, Vec<f32>)> {
-    if !embedder.has_neural() {
-        return Vec::new();
-    }
-
-    #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
-    {
-        Vec::new()
-    }
-
-    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-    {
-        const NEURAL_IPC_BATCH: usize = 256;
-        let connectivity_config = crate::graph::pdg::TraversalConfig {
-            max_depth: Some(1),
-            max_nodes: Some(1000),
-            allowed_edge_types: Some(&[EdgeType::Call, EdgeType::DataDependency]),
-            excluded_node_types: Some(vec![NodeType::External]),
-            min_complexity: None,
-            min_edge_confidence: 0.0,
-        };
-        let mut pending = Vec::with_capacity(NEURAL_IPC_BATCH);
-        let mut rows = Vec::new();
-        let file_summary_ctx = FileSummaryContext::from_pdg(pdg);
-        // Per-chunk scratch buffer: only one file body resident at a time.
-        // No cross-phase cache (VAL-STREAM-012); content is recomputed per
-        // node so duplicate-ID nodes each embed their own body.
-        let mut file_cache = FileReadCache::per_chunk_scratch();
-        for node_idx in pdg.node_indices() {
-            let Some(node) = pdg.get_node(node_idx) else {
-                continue;
-            };
-            // Match prepare_indexed_node's inclusion rule: external/excluded nodes
-            // never enter the lexical index, so don't send them to the neural batch.
-            if is_external_node_excluded(node) {
-                continue;
-            }
-            // A1: Neural/lexical consistency — only embed nodes that survived
-            // the lexical admission gate (ContentPruner + IndexingAdmissionGate).
-            if !admitted_node_ids.contains(&node.id) {
-                continue;
-            }
-            let file_bytes = file_cache
-                .get_or_read(Path::new(&*node.file_path))
-                .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
-            let text = enriched_node_content(
-                pdg,
-                node_idx,
-                node,
-                &file_bytes,
-                &connectivity_config,
-                &file_summary_ctx,
-            );
-            pending.push((node.id.clone(), node.file_path.to_string(), text));
-            if pending.len() == NEURAL_IPC_BATCH {
-                let written = append_neural_batch(embedder, &pending, &mut rows);
-                on_batch(written);
-                pending.clear();
-            }
-        }
-        if !pending.is_empty() {
-            let written = append_neural_batch(embedder, &pending, &mut rows);
-            on_batch(written);
-        }
-        dedupe_neural_rows_keep_first(&mut rows);
-        rows
-    }
-}
-
-#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-/// Keep the first row per node_id, in place.
-///
-/// `append_nodes` retains the FIRST occurrence of a duplicate node_id
-/// (unqualified names, e.g. two `fn new`), while `update_neural_embeddings`
-/// applies rows last-wins — an undeduped vec would hand the retained node a
-/// later duplicate's neural vector. Rows and lexical nodes both follow
-/// pdg.node_indices() order, so the first row per id is the retained node's
-/// own body.
-fn dedupe_neural_rows_keep_first(rows: &mut Vec<(String, Vec<f32>)>) {
-    let mut seen = HashSet::new();
-    rows.retain(|(node_id, _)| seen.insert(node_id.clone()));
-}
-
-#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-fn append_neural_batch(
-    embedder: &GenerationNeuralEmbedder,
-    pending: &[(String, String, String)],
-    rows: &mut Vec<(String, Vec<f32>)>,
-) -> usize {
-    let texts: Vec<&str> = pending.iter().map(|(_, _, text)| text.as_str()).collect();
-    let titles: Vec<Option<String>> = pending
-        .iter()
-        .map(|(_, title, _)| Some(title.clone()))
-        .collect();
-    let embeddings = embedder.embed_neural_batch_blocking_titled(&texts, titles);
-    let mut written = 0;
-    for ((node_id, _, _), embedding) in pending.iter().zip(embeddings) {
-        if let Some(embedding) = embedding.filter(|row| !row.is_empty()) {
-            rows.push((node_id.clone(), embedding));
-            written += 1;
-        }
-    }
-    written
 }
 
 /// Compare current manifest hashes against the persisted scan's hashes.

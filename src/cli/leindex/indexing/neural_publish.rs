@@ -85,19 +85,16 @@ impl streaming::neural::NeuralRowWriter for SearchNeuralRowWriter<'_> {
 }
 
 /// Neural-phase progress: a background heartbeat line plus a row counter the
-/// enrichment route bumps per completed batch.
+/// streaming writer bumps per completed batch.
 ///
 /// Why a heartbeat: the "neural embedding N admitted nodes" line is the LAST
 /// output before enrichment, which on a CPU-fallen-back embedder takes tens of
 /// minutes for a real project — reading as a hang. The heartbeat prints
 /// immediately (before the first batch completes, which alone can take
-/// minutes) and then every `INTERVAL`, so the phase is visibly alive. BOTH
-/// routes now feed real `n/N` counts: the streaming writer through
-/// `ProgressNeuralRowWriter`, the legacy route through the `on_batch` callback
-/// `enrich_neural_embeddings` invokes at each 256-row IPC flush. The legacy
-/// route used to report only at completion, so the heartbeat sat on `0/N` for
-/// the whole phase and was indistinguishable from a hang on a large project.
-/// Stopped/joined on drop — never outlives enrichment.
+/// minutes) and then every `INTERVAL`, so the phase is visibly alive. Real
+/// `n/N` counts come from `ProgressNeuralRowWriter` around the streaming
+/// writer, so the counter advances as rows land rather than only at
+/// completion. Stopped/joined on drop — never outlives enrichment.
 ///
 /// The heartbeat also watches for a CPU-fallen-back embedder when a GPU
 /// provider was requested, and announces it on this surface: the worker's own
@@ -157,14 +154,6 @@ fn warn_if_missing_neural_embedder(embedder: Option<&index_builder::GenerationNe
              TF-IDF only. Check the local ONNX worker and any remote endpoint with `leindex \
              diagnostics`; rerun with RUST_LOG=debug for the backend errors."
         );
-    }
-}
-
-/// Route label for the "Index neural: ... route selected" line.
-fn neural_route_label(route: streaming::routes::NeuralRoute) -> &'static str {
-    match route {
-        streaming::routes::NeuralRoute::Streaming => "streaming",
-        streaming::routes::NeuralRoute::Legacy => "legacy",
     }
 }
 
@@ -386,93 +375,55 @@ fn enrich_neural_for_route(
     pdg: &crate::graph::pdg::ProgramDependenceGraph,
     embedder: &index_builder::GenerationNeuralEmbedder,
     admitted_node_ids: &HashSet<String>,
-    route: streaming::routes::NeuralRoute,
 ) -> Result<usize> {
     let (cache_hits_before, _) = neural_cache_counters();
-    // The heartbeat covers both routes (see NeuralProgress): liveness even
+    // The heartbeat covers the whole pass (see NeuralProgress): liveness even
     // while the first embed batch is in flight, plus the CPU-fallback watch.
     let progress = NeuralProgress::start(admitted_node_ids.len());
-    match route {
-        streaming::routes::NeuralRoute::Legacy => {
-            // The counter must advance on this route too: `rows` is only bumped
-            // by `ProgressNeuralRowWriter`, which exists solely on the streaming
-            // route, so before this callback the heartbeat printed `0/N` for the
-            // entire phase on the (default) legacy route — indistinguishable
-            // from a hang.
-            let rows_reported = progress.rows.clone();
-            // Batches that COMPLETE but write no rows are the signature of a
-            // dead embedder (remote endpoint unreachable, provider 4xx/5xx, or
-            // a worker that answers with empty vectors). Without this, such a
-            // run shows a live "N/131381" counter marching to completion while
-            // every batch contributes zero rows, and the neural layer silently
-            // ends up empty. Count them and say so once, at the end.
-            let empty_batches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let empty_batches_report = empty_batches.clone();
-            let rows = index_builder::enrich_neural_embeddings(
-                pdg,
-                embedder,
-                admitted_node_ids,
-                &mut |written| {
-                    rows_reported.fetch_add(written, std::sync::atomic::Ordering::Relaxed);
-                    if written == 0 {
-                        empty_batches_report.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                },
-            );
-            drop(progress);
-            let empty = empty_batches.load(std::sync::atomic::Ordering::Relaxed);
-            if empty > 0 && rows.is_empty() {
-                warn!(
-                    empty_batches = empty,
-                    "neural enrichment completed with zero rows: the embedder returned no \
-                     vectors for every batch. Search falls back to TF-IDF only. Check \
-                     `leindex setup --check` for provider/model state and \
-                     ~/.leindex/logs/leindex-embed-daemon.log for worker errors."
-                );
-            }
-            let (cache_hits_after, cache_misses) = neural_cache_counters();
-            progress_stderr(&format!(
-                "Indexing: neural done — {} rows ({} from embed cache, {} embedded)...",
-                rows.len(),
-                cache_hits_after - cache_hits_before,
-                cache_misses
-            ));
-            Ok(engine.update_neural_embeddings(rows))
-        }
-        streaming::routes::NeuralRoute::Streaming => {
-            let streaming_embedder = HybridStreamingEmbedder { inner: embedder };
-            let mut writer = SearchNeuralRowWriter {
-                engine,
-                seen_node_ids: HashSet::new(),
-            };
-            let mut inputs = streaming_neural_inputs(pdg, admitted_node_ids);
-            let budget = streaming::BatchBudget {
-                max_texts: 256,
-                max_seq_len: 64 * 1024,
-                ..streaming::BatchBudget::default()
-            };
-            let stats = streaming::neural::enrich_neural_streaming(
-                &mut inputs,
-                &streaming_embedder,
-                &mut ProgressNeuralRowWriter {
-                    inner: &mut writer,
-                    rows_reported: &progress.rows,
-                },
-                &budget,
-            )?;
-            drop(progress);
-            let (cache_hits_after, cache_misses) = neural_cache_counters();
-            progress_stderr(&format!(
-                "Indexing: neural done — {} rows ({} from embed cache, {} embedded, {} skipped, {} batches)...",
-                stats.rows_written,
-                cache_hits_after - cache_hits_before,
-                cache_misses,
-                stats.rows_skipped,
-                stats.batches,
-            ));
-            Ok(stats.rows_written)
-        }
+    let streaming_embedder = HybridStreamingEmbedder { inner: embedder };
+    let mut writer = SearchNeuralRowWriter {
+        engine,
+        seen_node_ids: HashSet::new(),
+    };
+    let mut inputs = streaming_neural_inputs(pdg, admitted_node_ids);
+    let budget = streaming::BatchBudget {
+        max_texts: 256,
+        max_seq_len: 64 * 1024,
+        ..streaming::BatchBudget::default()
+    };
+    let stats = streaming::neural::enrich_neural_streaming(
+        &mut inputs,
+        &streaming_embedder,
+        &mut ProgressNeuralRowWriter {
+            inner: &mut writer,
+            rows_reported: &progress.rows,
+        },
+        &budget,
+    )?;
+    drop(progress);
+    let (cache_hits_after, cache_misses) = neural_cache_counters();
+    // Batches that COMPLETE but write no rows are the signature of a dead
+    // embedder (remote endpoint unreachable, provider 4xx/5xx, or a worker
+    // answering with empty vectors). Without this, such a run shows a live
+    // "N/N" counter marching to completion while every batch contributes
+    // zero rows, and the neural layer silently ends up empty.
+    if stats.batches > 0 && stats.rows_written == 0 {
+        warn!(
+            batches = stats.batches,
+            "neural enrichment completed with zero rows: the embedder returned no vectors for \
+             every batch. Search falls back to TF-IDF only. Check `leindex setup --check` for \
+             provider/model state and ~/.leindex/logs/leindex-embed-daemon.log for worker errors."
+        );
     }
+    progress_stderr(&format!(
+        "Indexing: neural done — {} rows ({} from embed cache, {} embedded, {} skipped, {} batches)...",
+        stats.rows_written,
+        cache_hits_after - cache_hits_before,
+        cache_misses,
+        stats.rows_skipped,
+        stats.batches,
+    ));
+    Ok(stats.rows_written)
 }
 
 fn reusable_fragment_rows(
@@ -913,11 +864,6 @@ impl LeIndex {
             &lexical_hash,
             &current_embed_model,
         );
-        let neural_route = streaming::routes::neural_route_for_current_flag();
-        info!(
-            "Index neural: {} route selected by LEINDEX_FEATURE_STREAMING_NEURAL",
-            neural_route_label(neural_route)
-        );
         if let Some(neural_embedder) = neural_embedder
             .as_ref()
             .filter(|_| neural_rows == 0 && !neural_resume_loaded)
@@ -935,7 +881,6 @@ impl LeIndex {
                 pdg,
                 neural_embedder,
                 &state.admitted_node_ids,
-                neural_route,
             )?;
         }
         let (selected_model, selected_provider) = self.persist_neural_outputs(
@@ -1172,6 +1117,105 @@ mod tests {
             .fetch_add(0, std::sync::atomic::Ordering::Relaxed);
         drop(progress);
         assert_eq!(observed, 0, "no rows reported by the heartbeat itself");
+    }
+
+    #[test]
+    fn test_all_batches_empty_is_distinguishable_from_no_work() {
+        // enrich_neural_for_route warns only when batches ran and produced no
+        // rows. Pin the stats contract that condition reads: an embedder that
+        // answers with only empty vectors must land in rows_skipped with
+        // batches > 0, never be mistaken for "no nodes to embed".
+        struct DeadEmbedder;
+        impl streaming::neural::StreamingEmbedder for DeadEmbedder {
+            fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
+                vec![Vec::new(); texts.len()]
+            }
+        }
+        let mut inputs = (0..4).map(|i| {
+            Ok(streaming::neural::NeuralInput {
+                node_id: format!("node-{i}"),
+                text: format!("document-{i}"),
+                title: None,
+            })
+        });
+        let mut writer = streaming::neural::VecNeuralRowWriter::new();
+        let budget = streaming::BatchBudget {
+            max_texts: 2,
+            ..Default::default()
+        };
+        let dead = streaming::neural::enrich_neural_streaming(
+            &mut inputs,
+            &DeadEmbedder,
+            &mut writer,
+            &budget,
+        )
+        .expect("empty vectors are a skip, not an error");
+        assert!(dead.batches > 0, "batches ran");
+        assert_eq!(dead.rows_written, 0, "no rows landed");
+        assert_eq!(dead.rows_skipped, 4, "every input accounted for");
+        assert!(writer.rows.is_empty());
+
+        // Zero inputs is the other side of the same condition: no batches, so
+        // the dead-embedder warning must not fire.
+        let mut none = std::iter::empty();
+        let idle = streaming::neural::enrich_neural_streaming(
+            &mut none,
+            &DeadEmbedder,
+            &mut streaming::neural::VecNeuralRowWriter::new(),
+            &budget,
+        )
+        .expect("empty input");
+        assert_eq!(idle.batches, 0);
+        assert_eq!(idle.rows_written, 0);
+    }
+
+    #[test]
+    fn test_search_neural_row_writer_keeps_first_row_per_node_id() {
+        use crate::search::search::{DEFAULT_EMBEDDING_DIMENSION, NodeInfo, SearchEngine};
+
+        // append_nodes keeps the FIRST occurrence of a duplicate node_id while
+        // update_neural_embeddings applies rows last-wins. A late duplicate row
+        // must therefore not overwrite the retained node's own body.
+        let node = |node_id: &str, file_path: &str| {
+            let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+            tfidf_embedding[0] = 1.0;
+            NodeInfo {
+                node_id: node_id.to_string(),
+                file_path: file_path.to_string(),
+                symbol_name: "new".to_string(),
+                language: "rust".to_string(),
+                content: "fn new() {}".to_string(),
+                byte_range: (0, 11),
+                tfidf_embedding,
+                neural_embedding: None,
+                complexity: 1,
+                signature: None,
+                pre_tokenized: None,
+            }
+        };
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(vec![node("a.rs:new", "a.rs"), node("b.rs:new", "b.rs")]);
+
+        let mut writer = SearchNeuralRowWriter {
+            engine: &mut engine,
+            seen_node_ids: HashSet::new(),
+        };
+        writer
+            .write_batch(vec![
+                ("a.rs:new".to_string(), vec![1.0, 0.0]),
+                ("a.rs:new".to_string(), vec![0.0, 1.0]),
+            ])
+            .expect("first batch");
+        writer
+            .write_batch(vec![("a.rs:new".to_string(), vec![0.25, 0.75])])
+            .expect("second batch");
+        drop(writer);
+
+        assert_eq!(
+            engine.collect_neural_embeddings(),
+            vec![("a.rs:new".to_string(), vec![1.0, 0.0])],
+            "first occurrence per node_id kept, later duplicates dropped"
+        );
     }
 
     #[test]

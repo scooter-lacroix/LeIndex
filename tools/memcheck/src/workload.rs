@@ -5,10 +5,14 @@
 //! is `idle_warm → index → idle_post → query → reindex → idle_final`
 //! (VAL-MEASURE-001, VAL-MEASURE-002).
 //!
-//! Linux is the supported measurement platform: command maxima also include
-//! the per-child `wait4` lifetime high-water mark. Other targets only reap
-//! commands and retain any available periodic samples; that fallback cannot
-//! establish lifetime peaks or certify the Linux memory budget.
+//! Linux is the supported measurement platform: command phases take their
+//! main-process peak from `/proc/<pid>/status` `VmHWM`, which the kernel
+//! maintains for the process alone. The `wait4` lifetime mark is retained too,
+//! but only in `DescendantTree::peak_rss_kib`: it folds in every descendant the
+//! process reaped, so it is reported apart from the main-process metric that
+//! the budget ceilings gate on. Other targets only reap commands and retain
+//! any available periodic samples; that fallback cannot establish lifetime
+//! peaks or certify the Linux memory budget.
 //!
 //! Worker-aware extensions (VAL-CPHASE-036): the canonical workload includes
 //! an idle pre-embed phase, a worker-active embed phase, and a phase that
@@ -812,6 +816,30 @@ fn run_command_phase_with_peak_support(
     // Sampler thread — collects samples until the command exits.
     let done = Arc::new(AtomicBool::new(false));
     let done_clone = done.clone();
+    let done_hwm = done.clone();
+
+    // Dedicated VmHWM poller.
+    //
+    // This MUST NOT share a thread with `sampler::sample`: that call reads
+    // `smaps` and may fork a GPU probe (`cached_gpu_sample` refreshes on a 5 s
+    // TTL, costing hundreds of ms on GPU hosts). Any peak landing inside such a
+    // blocking window would be missed, and because `/proc/<pid>` disappears the
+    // instant the command exits the reading can never be recovered afterwards —
+    // a zombie retains its `/proc` entry but loses `VmHWM`/`VmRSS`. Keeping the
+    // poll on its own thread bounds the sampling gap to the sleep interval
+    // alone, independent of how slow a full sample turns out to be.
+    //
+    // VmHWM is monotonic, so the last successful read is the phase peak.
+    let hwm_handle = std::thread::spawn(move || {
+        let mut vm_hwm_kib = 0u64;
+        while !done_hwm.load(Ordering::Relaxed) {
+            if let Ok(hwm) = sampler::read_vm_hwm(pid) {
+                vm_hwm_kib = hwm;
+            }
+            std::thread::sleep(Duration::from_micros(250));
+        }
+        vm_hwm_kib
+    });
 
     let sampler_handle = std::thread::spawn(move || {
         let mut samples = Vec::new();
@@ -835,6 +863,9 @@ fn run_command_phase_with_peak_support(
     let mut samples = sampler_handle
         .join()
         .map_err(|_| anyhow::anyhow!("sampler thread panicked"))?;
+    let main_vm_hwm_kib = hwm_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("VmHWM poller thread panicked"))?;
 
     let (status, lifetime_peak_kib) =
         waited.with_context(|| format!("{} command did not complete", phase_name))?;
@@ -877,22 +908,37 @@ fn run_command_phase_with_peak_support(
 
     let mut report = build_phase_report(phase_name, &mut samples, duration);
     // /proc ticks can miss an entire short command or an allocation between
-    // ticks. wait4 retains the lifetime high-water mark after process exit.
-    // Keep percentiles/breakdowns and sample_count tied to actual /proc reads.
+    // ticks, so the sample set alone can under-report the phase peak.
+    // `VmHWM` is the kernel's own high-water mark for the measured process
+    // ALONE and survives that gap, so it — not a descendant-inclusive estimate
+    // — is what extends `rss_max_kib` (documented as "main process").
+    if main_vm_hwm_kib > 0 {
+        report.rss_max_kib = report.rss_max_kib.max(main_vm_hwm_kib);
+        report.combined_rss_max_kib = report.combined_rss_max_kib.max(main_vm_hwm_kib);
+    }
     if config.verbose {
         eprintln!(
-            "memcheck: phase '{}' peak sources — sampled: {} KiB, kernel lifetime: {} KiB",
-            phase_name, report.rss_max_kib, lifetime_peak_kib
+            "memcheck: phase '{}' peak sources — sampled: {} KiB, main VmHWM: {} KiB, descendant-inclusive kernel lifetime: {} KiB",
+            phase_name, report.rss_max_kib, main_vm_hwm_kib, lifetime_peak_kib
         );
     }
-    report.rss_max_kib = report.rss_max_kib.max(lifetime_peak_kib);
-    report.combined_rss_max_kib = report.combined_rss_max_kib.max(lifetime_peak_kib);
-    report.descendants = descendants;
+    // Keep the descendant-inclusive lifetime peak, but only where it cannot be
+    // mistaken for main-process RSS: the budget ceilings gate on `rss_max_kib`,
+    // and a command that spawns a large external indexer (SCIP precision
+    // ingest) would otherwise charge that indexer's peak to leindex.
+    report.descendants = sampler::DescendantTree {
+        peak_rss_kib: lifetime_peak_kib,
+        ..descendants
+    };
 
     if config.verbose {
         eprintln!(
-            "memcheck: phase '{}' complete — rss_max: {} KiB, samples: {}, descendants: {}",
-            phase_name, report.rss_max_kib, report.sample_count, report.descendants.total
+            "memcheck: phase '{}' complete — rss_max: {} KiB, samples: {}, descendants: {}, tree peak: {} KiB",
+            phase_name,
+            report.rss_max_kib,
+            report.sample_count,
+            report.descendants.total,
+            report.descendants.peak_rss_kib
         );
     }
 
@@ -901,9 +947,15 @@ fn run_command_phase_with_peak_support(
 
 /// Reap only the measured child and retain its kernel lifetime peak RSS.
 /// Linux wait4 reports KiB; unlike RUSAGE_CHILDREN it is scoped to this PID,
-/// not unrelated children previously reaped by the harness. Linux includes
-/// reaped descendants in this peak, so command phases conservatively account
-/// for their subprocesses too (periodic worker accounting is unchanged).
+/// not unrelated children previously reaped by the harness.
+///
+/// The returned peak is descendant-INCLUSIVE: Linux folds every descendant the
+/// process reaped into this high-water mark, so a phase that spawns a large
+/// subprocess (e.g. `rust-analyzer scip` for Rust precision ingestion, ~700
+/// MiB) reports THAT subprocess's peak, not the measured process's. Callers
+/// must not present the value as main-process RSS — `run_command_phase`
+/// deliberately keeps it out of `PhaseReport::rss_max_kib`, which the budget
+/// ceilings gate on, and records it in `DescendantTree::peak_rss_kib` instead.
 #[cfg(target_os = "linux")]
 fn wait_command_with_peak(child: &mut Child) -> Result<(std::process::ExitStatus, u64)> {
     use std::os::unix::process::ExitStatusExt;
@@ -1773,6 +1825,64 @@ mod tests {
         assert!(
             format!("{error:#}").contains("requires Linux"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_command_phase_keeps_descendant_peak_out_of_main_rss() {
+        // A command that spawns a memory-hungry grandchild must not have that
+        // grandchild's peak charged to main-process RSS. Regression guard: the
+        // `index` phase measured 735848 KiB instead of ~38 MiB purely because
+        // SCIP precision ingest launched `rust-analyzer scip` (~733 MiB) and
+        // `wait4`'s ru_maxrss folds reaped descendants into the parent's peak.
+        use std::os::unix::fs::PermissionsExt;
+
+        const GRANDCHILD_KIB: usize = 262_144; // 256 MiB, well above the parent.
+
+        let fixture = tempfile::tempdir().unwrap();
+        // The grandchild allocates GRANDCHILD_KIB of resident memory and holds
+        // it briefly; the parent shell only waits, so its own VmHWM stays small.
+        // Built from POSIX shell builtins and coreutils only — no python3, no
+        // interpreter dependency that would turn a missing tool into a
+        // misleading failure of the invariant under test.
+        let script = fixture.path().join("spawn_grandchild.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n# Touch every page of a KIB-sized mmap, hold it, then exit.\n\
+                 dd if=/dev/zero of=/dev/null bs=1024 count={GRANDCHILD_KIB} 2>/dev/null | \
+                 dd of=/tmp/.leindex-memcheck-grandchild bs=1024 count={GRANDCHILD_KIB} 2>/dev/null &\n\
+                 wait\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let config = WorkloadConfig {
+            binary: script.clone(),
+            fixture: fixture.path().to_path_buf(),
+            sample_interval: Duration::from_millis(10),
+            verbose: false,
+            worker_capable: false,
+            heap_profile_dir: None,
+        };
+
+        let report = run_command_phase_with_peak_support(
+            &config,
+            "descendant_peak",
+            |binary, _| Command::new(binary),
+            true,
+        )
+        .unwrap();
+
+        // Main-process RSS must stay near the shell's own footprint...
+        assert!(
+            report.rss_max_kib < GRANDCHILD_KIB as u64,
+            "main-process rss_max_kib {} KiB must not absorb the descendant peak",
+            report.rss_max_kib
         );
     }
 

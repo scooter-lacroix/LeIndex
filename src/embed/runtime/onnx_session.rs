@@ -181,7 +181,11 @@ impl WorkerRuntime {
             .env("LEINDEX_MIGRAPHX_PROBE_CHILD", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            // The child reports the exact probe failure on stderr
+            // ("migraphx probe failed: <reason>"). Capturing it is the whole
+            // reason a silent CPU fallback was previously undiagnosable: the
+            // parent could only report the bare exit status.
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|error| format!("failed to spawn MIGraphX probe child: {}", error))?;
         let deadline = Instant::now() + max_wait;
@@ -189,10 +193,16 @@ impl WorkerRuntime {
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => return Ok(()),
                 Ok(Some(status)) => {
-                    return Err(format!(
-                        "MIGraphX probe child exited with status {}",
-                        status
-                    ));
+                    let reason = probe_child_stderr(&mut child);
+                    return Err(match reason {
+                        Some(reason) => {
+                            format!(
+                                "MIGraphX probe child exited with status {}: {}",
+                                status, reason
+                            )
+                        }
+                        None => format!("MIGraphX probe child exited with status {}", status),
+                    });
                 }
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(25));
@@ -410,4 +420,26 @@ impl WorkerRuntime {
             provider_status,
         })
     }
+}
+
+/// Drain a finished MIGraphX probe child's stderr and reduce it to the
+/// single diagnostic line the child writes on failure.
+///
+/// The child exits as soon as the probe fails, so its stderr pipe is already
+/// closed and draining it cannot block. The child prefixes the useful reason
+/// with `migraphx probe failed: `; anything else on stderr (ORT's own
+/// `[MIGraphX EP]` banner noise) is discarded so the parent's error message
+/// stays a single actionable line.
+#[cfg(feature = "onnx")]
+fn probe_child_stderr(child: &mut std::process::Child) -> Option<String> {
+    use std::io::Read;
+
+    const PREFIX: &str = "migraphx probe failed:";
+    let mut output = String::new();
+    child.stderr.take()?.read_to_string(&mut output).ok()?;
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(PREFIX))
+        .map(|reason| reason.trim().to_string())
+        .filter(|reason| !reason.is_empty())
 }
