@@ -564,6 +564,19 @@ path = "benches/gpu_embed_bench.rs"
 harness = false
 required-features = ["onnx"]
 
+# Speaks the worker wire protocol directly (`leindex::embed::protocol`, onnx-
+# only), so it needs onnx declared like the two benches above. Without this it
+# was compiled by `cargo check --all-targets --no-default-features --features
+# minimal` and failed with E0433 "cannot find `embed` in `leindex`".
+#
+# Default libtest harness on purpose: the file is a `#[test]` bench with no
+# `fn main`, so `harness = false` strips its `#[test]` fns and fails with
+# E0601 while making their imports look unused.
+[[bench]]
+name = "neural_stage"
+path = "benches/neural_stage.rs"
+required-features = ["onnx"]
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
