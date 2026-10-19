@@ -45,6 +45,24 @@ pub enum IndexPhase {
     Complete,
 }
 
+impl IndexPhase {
+    /// Stable lowercase identifier, matching the `snake_case` serde form.
+    ///
+    /// Single vocabulary for the health snapshot and the `--memory-report`
+    /// phase names, so the two can never drift apart.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IndexPhase::Scan => "scan",
+            IndexPhase::Parse => "parse",
+            IndexPhase::Pdg => "pdg",
+            IndexPhase::Lexical => "lexical",
+            IndexPhase::Neural => "neural",
+            IndexPhase::Persist => "persist",
+            IndexPhase::Complete => "complete",
+        }
+    }
+}
+
 /// Small, durable health snapshot for the current generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexHealth {

@@ -151,12 +151,30 @@ fn run_bounded(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::from(file))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .map_err(|e| io_context("Cannot execute runtime provisioning command", e))?;
+        .stderr(Stdio::from(stderr));
+    // `execve`'s ETXTBSY check runs before O_CLOEXEC descriptors are closed, so
+    // a sibling thread that forked while this binary was open for writing lends
+    // that descriptor to our child and gets the exec refused. The borrowed
+    // window is a single open/write/close, so a short retry clears it.
+    let mut attempt = 0u32;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error) if is_text_file_busy(&error) && attempt < EXEC_RETRY_LIMIT => {
+                attempt += 1;
+                std::thread::sleep(EXEC_RETRY_DELAY);
+            }
+            Err(error) => {
+                return Err(io_context(
+                    "Cannot execute runtime provisioning command",
+                    error,
+                ));
+            }
+        }
+    };
     let deadline = Instant::now() + timeout;
     loop {
         let length = match fs::metadata(output) {
@@ -198,6 +216,29 @@ fn run_bounded(
             }
         }
     }
+}
+
+/// Consecutive ETXTBSY retries before `run_bounded` reports the exec failure.
+///
+/// The busy window is a sibling thread's fork borrowing our binary's write
+/// descriptor, which lasts one open/write/close (well under a millisecond);
+/// ten spaced retries clear it without masking a genuinely undisplaceable block.
+///
+/// Deliberately not `cfg(unix)`: the retry arm is compiled on every platform,
+/// and off Unix `is_text_file_busy` is always false, so these stay inert.
+const EXEC_RETRY_LIMIT: u32 = 10;
+const EXEC_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+/// True when `execve` refused the binary because another thread's fork briefly
+/// borrowed a write descriptor to it (ETXTBSY) rather than a real failure.
+#[cfg(unix)]
+fn is_text_file_busy(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+#[cfg(not(unix))]
+fn is_text_file_busy(_error: &io::Error) -> bool {
+    false
 }
 
 fn terminate_probe(child: &mut std::process::Child) -> io::Result<()> {
