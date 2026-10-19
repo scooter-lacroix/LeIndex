@@ -22,6 +22,7 @@ pub use super::read_file_handler::ReadFileHandler;
 pub use super::read_symbol_handler::ReadSymbolHandler;
 pub use super::rename_symbol_handler::RenameSymbolHandler;
 pub use super::search_handler::SearchHandler;
+pub use super::structural_handler::StructuralHandler;
 pub use super::symbol_lookup_handler::SymbolLookupHandler;
 pub use super::write_handler::WriteHandler;
 
@@ -73,6 +74,8 @@ dispatch_handler! {
     GitStatus           => GitStatusHandler,
     /// Handler for PDG-enriched git diff
     GitDiff             => GitDiffHandler,
+    /// Handler for ast-grep AST-pattern (structural) search
+    Structural          => StructuralHandler,
 }
 
 #[cfg(test)]

@@ -1701,6 +1701,11 @@ fn build_setup_choices(
 }
 
 /// Print the setup summary, then run the smoke test and optional MIGraphX warmup.
+///
+/// `choices` feeds only the auto-warmup decision, which exists only under the
+/// `onnx` feature; a `--features cli` build without `onnx` would otherwise flag
+/// it as an unused variable.
+#[cfg_attr(not(feature = "onnx"), allow(unused_variables))]
 fn finish_setup(
     choices: &crate::cli::leindex::setup::SetupChoices,
     result: &crate::cli::leindex::setup::SetupResult,

@@ -185,6 +185,15 @@ pub enum FeatureFlag {
     /// code is written to be a no-op at the native dimension, so OFF reproduces
     /// the pre-Matryoshka behavior byte for byte.
     Matryoshka,
+    /// Enable structural (AST-pattern) search via ast-grep.
+    ///
+    /// Consumer: the `structural` branch of `leindex_explore`. It compiles an
+    /// ast-grep pattern for a language and matches it against LeIndex's own
+    /// tree-sitter grammars. New capability, so it defaults OFF per AGENTS.md
+    /// progressive rollout: even in a build with the `structural-search`
+    /// Cargo feature, the branch refuses to run until
+    /// `LEINDEX_FEATURE_STRUCTURAL_SEARCH=1` is exported.
+    StructuralSearch,
 }
 
 impl FeatureFlag {
@@ -214,6 +223,7 @@ impl FeatureFlag {
             Self::ValidatedModel => "LEINDEX_FEATURE_VALIDATED_MODEL",
             Self::Engram => "LEINDEX_FEATURE_ENGRAM",
             Self::Matryoshka => "LEINDEX_FEATURE_MATRYOSHKA",
+            Self::StructuralSearch => "LEINDEX_FEATURE_STRUCTURAL_SEARCH",
         }
     }
 
@@ -333,6 +343,9 @@ impl FeatureFlag {
             Self::Matryoshka => {
                 "Persist/search neural vectors at sliced MRL dimensions (128/256/512; experimental)"
             }
+            Self::StructuralSearch => {
+                "Structural (AST-pattern) search: ast-grep patterns matched against LeIndex's tree-sitter grammars"
+            }
         }
     }
 }
@@ -427,6 +440,7 @@ impl FlagStore {
             FeatureFlag::CommunityDetection,
             FeatureFlag::PrecisionIngest,
             FeatureFlag::Engram,
+            FeatureFlag::StructuralSearch,
         ] {
             let enabled = match env::var(flag.env_var()) {
                 Ok(v) => matches!(
@@ -590,6 +604,7 @@ pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
         FeatureFlag::ValidatedModel,
         FeatureFlag::Engram,
         FeatureFlag::Matryoshka,
+        FeatureFlag::StructuralSearch,
     ]
     .into_iter()
     .map(|f| (f, f.is_enabled()))
@@ -942,6 +957,48 @@ mod test {
                 None => env::remove_var(LEGACY_ENV),
             }
         }
+    }
+
+    #[test]
+    fn test_structural_search_is_opt_in_and_listed() {
+        // New capabilities default OFF (AGENTS.md progressive rollout): the
+        // Cargo feature compiles the code, this flag decides whether the MCP
+        // branch will run it.
+        assert_eq!(
+            FeatureFlag::StructuralSearch.env_var(),
+            "LEINDEX_FEATURE_STRUCTURAL_SEARCH"
+        );
+        assert!(!FeatureFlag::StructuralSearch.default_value());
+        assert!(
+            !FeatureFlag::StructuralSearch.description().is_empty(),
+            "every flag needs a description for log_flag_state"
+        );
+        // Both enumerations must carry the flag: `FlagStore` is what
+        // `is_enabled` reads, `all_flags` is what `leindex feature-flags`
+        // prints. A flag in one and not the other is a silent bug.
+        assert!(
+            FlagStore::new()
+                .values
+                .contains_key(&FeatureFlag::StructuralSearch),
+            "StructuralSearch missing from the production flag store"
+        );
+        assert!(
+            all_flags()
+                .iter()
+                .any(|(flag, _)| *flag == FeatureFlag::StructuralSearch),
+            "StructuralSearch missing from all_flags"
+        );
+    }
+
+    #[test]
+    fn test_structural_search_override_toggles() {
+        let _g = lock_flag_tests();
+        let _reset = FlagOverrideReset;
+        assert!(!FeatureFlag::StructuralSearch.is_enabled());
+        set_flag_override_for_test(FeatureFlag::StructuralSearch, true);
+        assert!(FeatureFlag::StructuralSearch.is_enabled());
+        set_flag_override_for_test(FeatureFlag::StructuralSearch, false);
+        assert!(!FeatureFlag::StructuralSearch.is_enabled());
     }
 
     /// `is_legacy_revertible` covers all v2.0.0 rollout flags.

@@ -787,6 +787,17 @@ fn read_scan_file(path: &Path) -> Option<Vec<u8>> {
     Some(data)
 }
 
+/// Read a file as text under the same policy a scan uses: regular file, no
+/// bigger than [`MAX_SCAN_FILE_BYTES`], not binary.
+///
+/// Structural search needs the source as `&str` (ast-grep's `StrDoc`), so the
+/// bytes from [`read_scan_file`] are converted here rather than duplicating the
+/// size and binary rules in a second module where they could drift.
+/// Non-UTF-8 files are skipped: they cannot be handed to ast-grep.
+pub fn read_scannable(path: &Path) -> Option<String> {
+    String::from_utf8(read_scan_file(path)?).ok()
+}
+
 fn resolve_symbol_index<'a>(
     index: Option<&'a TextIndex>,
     candidate: &Candidate,
