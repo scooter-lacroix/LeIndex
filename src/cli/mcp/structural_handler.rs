@@ -76,7 +76,7 @@ impl StructuralHandler {
                 "exclude_globs": { "type": "array", "items": { "type": "string" }, "description": "Skip these, e.g. [\"vendor/\"]" },
                 "limit": { "type": "integer", "default": DEFAULT_LIMIT, "minimum": 0, "maximum": MAX_LIMIT, "description": "Matches per page; 0 = ceiling (10000)" },
                 "offset": { "type": "integer", "default": 0, "minimum": 0, "maximum": MAX_LIMIT, "description": "Matches to skip" },
-                "per_file_cap": { "type": "integer", "default": DEFAULT_PER_FILE, "minimum": 0, "description": "Shown per file; 0 = no cap" },
+                "per_file_cap": { "type": "integer", "default": DEFAULT_PER_FILE, "minimum": 0, "maximum": MAX_LIMIT, "description": "Shown per file; 0 = no cap" },
                 "timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": 0, "description": "Time budget; partial results + has_more. 0 = none" },
                 "project_path": { "type": "string", "description": "Project directory; omit to use the current project" }
             },
@@ -151,10 +151,7 @@ async fn run(args: &Value) -> Result<Value, JsonRpcError> {
 /// The search itself. Only compiled when the capability exists.
 #[cfg(feature = "structural-search")]
 async fn search(args: &Value) -> Result<Value, JsonRpcError> {
-    use crate::cli::live_project::LiveProject;
-    use crate::search::textsearch::{CompiledPattern, StructuralOptions, search_structural};
-    use std::path::PathBuf;
-    use std::time::{Duration, Instant};
+    use crate::search::textsearch::{StructuralOptions, search_structural};
 
     let pattern_text = args
         .get("pattern")
@@ -166,56 +163,91 @@ async fn search(args: &Value) -> Result<Value, JsonRpcError> {
                 "Missing required argument: pattern",
                 "Add \"pattern\": \"<ast-grep pattern>\", e.g. \"fn $NAME($$$ARGS) { $$$BODY }\"",
             )
-        })?
-        .to_string();
+        })?;
 
-    let limit = match extract_usize(args, "limit", DEFAULT_LIMIT)? {
-        0 => MAX_LIMIT,
-        n => n.min(MAX_LIMIT),
-    };
-    let offset = extract_usize(args, "offset", 0)?.min(MAX_LIMIT);
-    let per_file_cap = extract_usize(args, "per_file_cap", DEFAULT_PER_FILE)?;
+    let (limit, offset, per_file_cap) = paging_options(args)?;
     let timeout_ms = extract_usize(args, "timeout_ms", DEFAULT_TIMEOUT_MS)?;
 
-    // ── Root ────────────────────────────────────────────────────────────────
-    let root: PathBuf = match args.get("project_path").and_then(Value::as_str) {
-        Some(path) => LiveProject::resolve(path)
-            .map(|live| live.root().to_path_buf())
-            .map_err(|e| {
-                JsonRpcError::invalid_params_with_suggestion(
-                    format!("Cannot resolve project_path {path:?}: {e}"),
-                    "Pass an existing project directory, or omit project_path for the current one",
-                )
-            })?,
-        None => LiveProject::resolve(".")
-            .map(|live| live.root().to_path_buf())
-            .map_err(|e| {
-                JsonRpcError::invalid_params_with_suggestion(
-                    format!("Cannot resolve the current project: {e}"),
-                    "Pass project_path explicitly",
-                )
-            })?,
-    };
-
+    let root = resolve_root(args)?;
     let filter = build_filter(args);
+    let (compiled, language_name) = compile_pattern(args, &root, &filter, pattern_text).await?;
+
+    let options = StructuralOptions {
+        limit,
+        offset,
+        per_file_cap,
+        max_match_chars: MAX_MATCH_CHARS,
+        deadline: deadline_after(timeout_ms),
+    };
+    let output =
+        tokio::task::spawn_blocking(move || search_structural(&root, &compiled, &filter, &options))
+            .await
+            .map_err(|e| JsonRpcError::internal_error(format!("structural search failed: {e}")))?;
+
+    Ok(shape(pattern_text, language_name, &output))
+}
+
+/// The wall-clock deadline for one call, or `None` when no budget was asked for
+/// (`timeout_ms: 0`).
+#[cfg(feature = "structural-search")]
+fn deadline_after(timeout_ms: usize) -> Option<std::time::Instant> {
+    (timeout_ms > 0)
+        .then(|| std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64))
+}
+
+/// The project whose files are searched: `project_path` when given, otherwise
+/// the current project.
+#[cfg(feature = "structural-search")]
+fn resolve_root(args: &Value) -> Result<std::path::PathBuf, JsonRpcError> {
+    use crate::cli::live_project::LiveProject;
+
+    let resolved = match args.get("project_path").and_then(Value::as_str) {
+        Some(path) => LiveProject::resolve(path).map_err(|e| {
+            JsonRpcError::invalid_params_with_suggestion(
+                format!("Cannot resolve project_path {path:?}: {e}"),
+                "Pass an existing project directory, or omit project_path for the current one",
+            )
+        })?,
+        None => LiveProject::resolve(".").map_err(|e| {
+            JsonRpcError::invalid_params_with_suggestion(
+                format!("Cannot resolve the current project: {e}"),
+                "Pass project_path explicitly",
+            )
+        })?,
+    };
+    Ok(resolved.root().to_path_buf())
+}
+
+/// Compile the pattern for the target language, inferring the language when the
+/// caller named none.
+///
+/// Compiling a pattern parses it as source for the target grammar — pure CPU,
+/// and stack-hungry — so it stays off the async worker, exactly as `find` keeps
+/// regex compilation off it.
+#[cfg(feature = "structural-search")]
+async fn compile_pattern(
+    args: &Value,
+    root: &std::path::Path,
+    filter: &crate::search::textsearch::FileFilter,
+    pattern_text: &str,
+) -> Result<(crate::search::textsearch::CompiledPattern, &'static str), JsonRpcError> {
+    use crate::search::textsearch::CompiledPattern;
+
     let requested_lang = args
         .get("lang")
         .or_else(|| args.get("language"))
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    // Compiling a pattern parses it as source for the target grammar — pure
-    // CPU, and stack-hungry: keep it off the async worker like `find` does for
-    // regex compilation.
-    let root_for_lang = root.clone();
-    let filter_for_lang = filter.clone();
-    let pattern_for_compile = pattern_text.clone();
-    let (compiled, language_name) = tokio::task::spawn_blocking(move || {
+    let root = root.to_path_buf();
+    let filter = filter.clone();
+    let pattern = pattern_text.to_string();
+    tokio::task::spawn_blocking(move || {
         let language = match requested_lang {
             Some(name) => name,
-            None => infer_language(&root_for_lang, &filter_for_lang)?,
+            None => infer_language(&root, &filter)?,
         };
-        let compiled = CompiledPattern::new(&language, &pattern_for_compile).map_err(|e| {
+        let compiled = CompiledPattern::new(&language, &pattern).map_err(|e| {
             JsonRpcError::invalid_params_with_suggestion(
                 e.to_string(),
                 "Write the pattern in the target language's own syntax; use $NAME and $$$ARGS \
@@ -226,47 +258,95 @@ async fn search(args: &Value) -> Result<Value, JsonRpcError> {
         Ok::<_, JsonRpcError>((compiled, name))
     })
     .await
-    .map_err(|e| JsonRpcError::internal_error(format!("structural search failed: {e}")))??;
-
-    let options = StructuralOptions {
-        limit,
-        offset,
-        per_file_cap,
-        max_match_chars: MAX_MATCH_CHARS,
-        deadline: (timeout_ms > 0)
-            .then(|| Instant::now() + Duration::from_millis(timeout_ms as u64)),
-    };
-    let output =
-        tokio::task::spawn_blocking(move || search_structural(&root, &compiled, &filter, &options))
-            .await
-            .map_err(|e| JsonRpcError::internal_error(format!("structural search failed: {e}")))?;
-
-    Ok(shape(&pattern_text, language_name, &output))
+    .map_err(|e| JsonRpcError::internal_error(format!("structural search failed: {e}")))?
 }
+
+/// Parse the three paging knobs, each with the contract its own semantics
+/// demand.
+///
+/// `limit` is a budget: a page larger than [`MAX_LIMIT`] is a request for "as
+/// much as you can give", and the page is still well defined, so it is clamped.
+/// `offset` is a cursor: silently rewriting it moves the window and returns a
+/// page from the wrong position, which a paging caller cannot detect — it
+/// either loops forever or skips/duplicates a range. It is rejected.
+/// `per_file_cap` is a display request too, but `NO_CAP` (0) is remapped to
+/// `UNLIMITED_FILE_BUFFER` inside `scan`, so clamping only the explicit numbers
+/// keeps "uncapped" meaning the documented ceiling instead of letting a caller
+/// allocate past it by asking for a huge number instead of `0`.
+#[cfg(feature = "structural-search")]
+fn paging_options(args: &Value) -> Result<(usize, usize, usize), JsonRpcError> {
+    let limit = match extract_usize(args, "limit", DEFAULT_LIMIT)? {
+        0 => MAX_LIMIT,
+        n => n.min(MAX_LIMIT),
+    };
+    let offset = extract_usize(args, "offset", 0)?;
+    if offset > MAX_LIMIT {
+        return Err(JsonRpcError::invalid_params_with_suggestion(
+            format!("offset {offset} exceeds the maximum {MAX_LIMIT}"),
+            "Page with `offset` at most 10000; narrow the query (path/lang/include) rather than \
+             paging deeper",
+        ));
+    }
+    let per_file_cap = match extract_usize(args, "per_file_cap", DEFAULT_PER_FILE)? {
+        n @ 0..=MAX_LIMIT => n,
+        _ => MAX_LIMIT,
+    };
+    Ok((limit, offset, per_file_cap))
+}
+
+/// Files inspected when guessing the target language for a caller that named
+/// none.
+///
+/// Deliberately NOT `structural::MAX_CANDIDATE_FILES`, which is an order of
+/// magnitude larger (300_000): inference only needs enough files to see which
+/// languages are present, and dragging a 300k-file inventory forward before the
+/// real search even starts would make a language-less call far slower than a
+/// scoped one. Being a sample is exactly why truncation is reported rather than
+/// hidden.
+#[cfg(feature = "structural-search")]
+const LANGUAGE_INFERENCE_FILES: usize = 10_000;
 
 /// Pick the language from the files in scope when the caller named none.
 ///
 /// Refuses to guess between two languages rather than searching the wrong one:
 /// a Rust pattern run against Python files returns nothing, and "nothing" reads
 /// as "the code does not exist".
+///
+/// Inference sees only [`LANGUAGE_INFERENCE_FILES`] of the scope, so an empty
+/// result on a larger tree must not claim the language is absent — see the
+/// `truncated` branch below.
 #[cfg(feature = "structural-search")]
 fn infer_language(
     root: &std::path::Path,
     filter: &crate::search::textsearch::FileFilter,
 ) -> Result<String, JsonRpcError> {
     use std::collections::BTreeSet;
-    let languages: BTreeSet<&'static str> =
-        crate::search::textsearch::engine::list_files(root, 10_000, None)
-            .into_iter()
-            .filter(|rel| filter.allows(rel))
-            .filter_map(|rel| {
-                crate::search::textsearch::language_for_path(std::path::Path::new(&rel))
-                    .map(|id| id.config().name.as_str())
-            })
-            .collect();
+    let (rels, truncated) = crate::search::textsearch::engine::list_files_reporting(
+        root,
+        LANGUAGE_INFERENCE_FILES,
+        None,
+    );
+    // shh: a one-language scope that is 99% another language still infers the
+    // minority one when truncation hid the majority — inference is a sample, not
+    // a survey. Fixing that needs a sampling strategy, not a bigger constant.
+    let languages: BTreeSet<&'static str> = rels
+        .into_iter()
+        .filter(|rel| filter.allows(rel))
+        .filter_map(|rel| {
+            crate::search::textsearch::language_for_path(std::path::Path::new(&rel))
+                .map(|id| id.config().name.as_str())
+        })
+        .collect();
     match languages.len() {
         0 => Err(JsonRpcError::invalid_params_with_suggestion(
-            "No structural-search language found in scope".to_string(),
+            if truncated {
+                format!(
+                    "No structural-search language found in the first \
+                     {LANGUAGE_INFERENCE_FILES} files of scope; more remain unexamined"
+                )
+            } else {
+                "No structural-search language found in scope".to_string()
+            },
             "Pass \"lang\" explicitly (rust, python, go, typescript, …) or widen the scope",
         )),
         1 => Ok(languages.into_iter().next().unwrap_or_default().to_string()),
@@ -353,6 +433,7 @@ fn shape(
         "stats": {
             "candidates": output.stats.candidates,
             "scanned": output.stats.scanned,
+            "skipped_deadline": output.stats.skipped_deadline,
             "files_matched": output.stats.files_matched,
             "files_capped": output.stats.files_capped,
             "millis": output.stats.millis,
@@ -366,4 +447,33 @@ fn shape(
         ));
     }
     value
+}
+
+#[cfg(all(test, feature = "structural-search"))]
+mod tests {
+    use super::{MAX_LIMIT, paging_options};
+    use serde_json::json;
+
+    /// `per_file_cap` must not be a back door around the documented
+    /// `UNLIMITED_FILE_BUFFER` ceiling: `scan` uses a non-zero value verbatim as
+    /// a per-file hit-buffer capacity, so an arbitrary number is an arbitrary
+    /// allocation. `0` is the sanctioned way to ask for "uncapped".
+    #[test]
+    fn test_per_file_cap_clamped_to_max_limit() {
+        let (_, _, cap) =
+            paging_options(&json!({ "per_file_cap": MAX_LIMIT * 1000 })).expect("parsed");
+        assert_eq!(
+            cap, MAX_LIMIT,
+            "an oversized per_file_cap must be clamped to the ceiling, not passed through"
+        );
+    }
+
+    /// `0` is [`NO_CAP`](crate::search::textsearch::NO_CAP) and must survive the
+    /// clamp untouched, or the caller's "show me everything" request silently
+    /// becomes a cap of 10,000.
+    #[test]
+    fn test_per_file_cap_zero_still_means_uncapped() {
+        let (_, _, cap) = paging_options(&json!({ "per_file_cap": 0 })).expect("parsed");
+        assert_eq!(cap, 0, "0 must survive as NO_CAP");
+    }
 }

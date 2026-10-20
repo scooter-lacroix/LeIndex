@@ -66,6 +66,23 @@ fn write(root: &Path, rel: &str, contents: &str) {
     fs::write(&path, contents).expect("write fixture");
 }
 
+/// Make `root` a git worktree.
+///
+/// Inventory is `git ls-files` when a repository exists and a filesystem walk
+/// otherwise, and the two disagree about budgets: `ls-files` ignores the
+/// deadline, the walk does not. A test that cares *which* files were enumerated
+/// has to pin the repository state, or it silently exercises the other path.
+fn git_init(root: &Path) {
+    std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(root)
+        .status()
+        .expect("git init")
+        .success()
+        .then_some(())
+        .expect("git init failed");
+}
+
 fn filter(include: &[&str], exclude: &[&str], scope: Option<&str>) -> FileFilter {
     let owned = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     FileFilter::new(&owned(include), &owned(exclude), scope)
@@ -471,6 +488,81 @@ fn test_zero_limit_returns_totals_without_hits() {
     assert!(output.has_more, "everything is still ahead of offset 0");
 }
 
+/// A deadline that has already passed must report a PARTIAL result, not a clean
+/// one. Every candidate is skipped, so nothing was parsed: `scanned` is 0 (not
+/// the candidate count, which is what it used to report) and `has_more` is
+/// forced true because unexamined files may still hold matches (Codex P2).
+#[test]
+fn test_expired_deadline_reports_partial_not_complete() {
+    let dir = fixture();
+    // The fixture must be a repository. A git inventory ignores the deadline,
+    // so candidates exist and are then skipped by the scan loop; a plain walk
+    // would stop at the deadline and enumerate nothing, leaving this test with
+    // no candidates and nothing to assert about skipping.
+    git_init(dir.path());
+    let pattern = CompiledPattern::new("rust", "fn $NAME() { $$$BODY }").expect("pattern");
+    let output = search_structural(
+        dir.path(),
+        &pattern,
+        &FileFilter::default(),
+        &StructuralOptions {
+            deadline: Some(std::time::Instant::now()),
+            ..options(100, NO_CAP)
+        },
+    );
+
+    assert_eq!(output.returned, 0);
+    assert!(
+        output.stats.candidates > 0,
+        "the fixture has Rust candidates"
+    );
+    assert_eq!(
+        output.stats.scanned, 0,
+        "a skipped file was not scanned, and must not be counted as if it were"
+    );
+    assert_eq!(
+        output.stats.skipped_deadline, output.stats.candidates,
+        "every candidate was skipped by the expired deadline"
+    );
+    assert!(
+        output.has_more,
+        "an unexamined file may hold matches, so the result cannot claim to be complete"
+    );
+}
+
+/// A deadline that expires while the *inventory* is being walked must also
+/// report a partial result. `walk_inventory` stops at the deadline and returns
+/// whatever it had, so a non-git tree can yield zero candidates and
+/// `has_more: false` — a clean-looking "nothing matched" for a scan that never
+/// ran. `list_files_reporting` carries that truncation out so `search` can
+/// refuse to claim completeness (Codex P2).
+#[test]
+fn test_truncated_inventory_forces_has_more() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "src/one.rs", "fn one() {}\n");
+    // Deliberately NOT a repository: this is the walk path.
+    let pattern = CompiledPattern::new("rust", "fn $NAME() { $$$BODY }").expect("pattern");
+    let output = search_structural(
+        dir.path(),
+        &pattern,
+        &FileFilter::default(),
+        &StructuralOptions {
+            deadline: Some(std::time::Instant::now()),
+            ..options(100, NO_CAP)
+        },
+    );
+
+    assert_eq!(
+        output.stats.candidates, 0,
+        "the expired deadline stops the walk before it enumerates anything"
+    );
+    assert_eq!(output.returned, 0);
+    assert!(
+        output.has_more,
+        "an inventory that was cut short cannot be reported as a complete scan"
+    );
+}
+
 #[test]
 fn test_no_candidates_is_an_empty_success() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -584,6 +676,75 @@ fn test_enabled_handler_searches_a_real_project() {
         assert_eq!(alpha["hits"][0]["kind"], "function_item");
         assert_eq!(alpha["hits"][0]["capture"], "NAME");
         assert_eq!(alpha["hits"][0]["captured"], "alpha");
+    });
+}
+
+/// `offset` is a pagination cursor, not a budget. Silently clamping it returns
+/// a page from the wrong position, which a `offset += returned` loop cannot
+/// detect. The schema advertises `maximum: MAX_LIMIT`, so an out-of-range value
+/// is rejected rather than reshaped.
+#[test]
+fn test_offset_above_max_limit_is_rejected() {
+    let dir = fixture();
+    with_flag_override(FeatureFlag::StructuralSearch, true, || {
+        let err = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(StructuralHandler.execute(
+                &registry(),
+                json!({
+                    "pattern": "fn $NAME() { $$$BODY }",
+                    "lang": "rust",
+                    "offset": 10_001u64,
+                    "project_path": dir.path()
+                }),
+            ))
+            .expect_err("an out-of-range cursor must not be silently rewritten");
+
+        assert_eq!(err.code, -32602, "invalid_params");
+        assert!(
+            err.message.contains("offset"),
+            "message must name the offending argument: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("10000"),
+            "message must name the ceiling: {}",
+            err.message
+        );
+        assert!(
+            err.suggestion().is_some_and(|hint| hint.contains("offset")),
+            "the hint must tell the caller how to page"
+        );
+    });
+}
+
+/// The boundary itself is inside the advertised range and must be accepted.
+#[test]
+fn test_offset_at_max_limit_is_accepted() {
+    let dir = fixture();
+    with_flag_override(FeatureFlag::StructuralSearch, true, || {
+        let value = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(StructuralHandler.execute(
+                &registry(),
+                json!({
+                    "pattern": "fn $NAME() { $$$BODY }",
+                    "lang": "rust",
+                    "offset": 10_000u64,
+                    "project_path": dir.path()
+                }),
+            ))
+            .expect("offset == MAX_LIMIT is within the advertised range");
+
+        // Skipping past 3 matches yields an empty page, but a well-defined one.
+        assert_eq!(value["returned"], 0);
+        assert_eq!(value["total_matches"], 3);
     });
 }
 

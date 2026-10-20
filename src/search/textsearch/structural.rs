@@ -30,13 +30,15 @@
 //!
 //! ## Scanning
 //!
-//! Files are enumerated with [`engine::list_files`] (gitignore-aware, live — no
-//! index required) and filtered with the same [`FileFilter`] the text search
-//! uses. Contents are read through [`engine::read_scannable`], so the binary
-//! and size limits stay the engine's rather than becoming a second policy that
-//! could drift.
+//! Files are enumerated with [`engine::list_files_reporting`] (gitignore-aware,
+//! live — no index required) and filtered with the same [`FileFilter`] the text
+//! search uses. The listing's own "was it truncated" flag is folded into
+//! [`StructuralOutput::has_more`], because a budget that expires during
+//! enumeration is as partial as one that expires during parsing. Contents are
+//! read through [`engine::read_scannable`], so the binary and size limits stay
+//! the engine's rather than becoming a second policy that could drift.
 
-use super::engine::{list_files, read_scannable};
+use super::engine::{list_files_reporting, read_scannable};
 use super::glob::FileFilter;
 use crate::parse::grammar::LanguageId;
 use ast_grep_core::Language;
@@ -143,6 +145,10 @@ pub struct StructuralStats {
     pub candidates: usize,
     /// Files parsed (read and handed to ast-grep).
     pub scanned: usize,
+    /// Candidates whose scan did not complete before the deadline. Non-zero
+    /// means the result is partial: an unexamined file may still hold matches,
+    /// so `has_more` is forced true rather than reporting a clean page.
+    pub skipped_deadline: usize,
     /// Files with at least one match, including files paged out by `offset`.
     pub files_matched: usize,
     /// Matches found, before the per-file cap and paging.
@@ -503,25 +509,51 @@ pub fn search(
     let started = Instant::now();
     let mut output = StructuralOutput::default();
 
-    let rels: Vec<String> = list_files(root, MAX_CANDIDATE_FILES, options.deadline)
+    let (rels, listing_incomplete) =
+        list_files_reporting(root, MAX_CANDIDATE_FILES, options.deadline);
+    let rels: Vec<String> = rels
         .into_iter()
         .filter(|rel| filter.allows(rel))
         .filter(|rel| language_for_path(Path::new(rel)) == Some(pattern.language_id()))
         .collect();
     output.stats.candidates = rels.len();
-    output.stats.scanned = rels.len();
 
+    // `scanned` below counts candidates *admitted*, not work done. Two things
+    // never produce a `StructuralFile`, and only one of them means the answer is
+    // incomplete:
+    //   * the worker hit the deadline before opening the file — that file may
+    //     still hold matches, so the result is partial; and
+    //   * `read_scannable` refused the file (binary, oversized, unreadable) —
+    //     legitimately not matched, and counting it as incomplete would pin
+    //     `has_more` forever on any tree containing a binary.
+    // They are distinguished here rather than lumped into `None`, or the
+    // deadline fix becomes a permanent false alarm.
+    let deadline_skips = std::sync::atomic::AtomicUsize::new(0);
+    let read_failures = std::sync::atomic::AtomicUsize::new(0);
     let deadline = options.deadline;
     let scanned: Vec<Option<StructuralFile>> = rels
         .par_iter()
         .map(|rel| {
             if deadline.is_some_and(|d| Instant::now() >= d) {
+                deadline_skips.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return None;
             }
-            let source = read_scannable(&root.join(rel))?;
+            let source = match read_scannable(&root.join(rel)) {
+                Some(source) => source,
+                None => {
+                    read_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
+            };
             pattern.scan(rel, &source, options)
         })
         .collect();
+
+    let skipped_deadline = deadline_skips.into_inner();
+    output.stats.scanned = rels
+        .len()
+        .saturating_sub(skipped_deadline + read_failures.into_inner());
+    output.stats.skipped_deadline = skipped_deadline;
 
     let mut files: Vec<StructuralFile> = scanned.into_iter().flatten().collect();
     // Deterministic order keeps `offset`/`limit` paging stable even if the
@@ -554,7 +586,8 @@ pub fn search(
         output.returned += hits.len();
         output.files.push(StructuralFile { hits, ..file });
     }
-    output.has_more = output.returned < paged;
+    output.has_more =
+        output.returned < paged || output.stats.skipped_deadline > 0 || listing_incomplete;
     output.stats.millis = started.elapsed().as_millis();
     output
 }

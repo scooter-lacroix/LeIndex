@@ -172,12 +172,17 @@ fn git_inventory(root: &Path) -> Option<Vec<String>> {
     Some(files)
 }
 
-fn walk_inventory(root: &Path, limit: usize, deadline: Option<Instant>) -> Vec<String> {
+/// Walk `root`, returning the files seen and whether the budget cut the walk
+/// short. A truncated walk must be distinguishable from a tree with no files:
+/// otherwise an expired deadline yields "zero candidates, nothing matched".
+fn walk_inventory(root: &Path, limit: usize, deadline: Option<Instant>) -> (Vec<String>, bool) {
     let mut out = Vec::new();
     let mut stack = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, prefix)) = stack.pop() {
         if out.len() >= limit || deadline.is_some_and(|d| Instant::now() >= d) {
-            break;
+            // Directories are still queued (or the file budget is exhausted),
+            // so there is unexplored tree left.
+            return (out, true);
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -201,18 +206,46 @@ fn walk_inventory(root: &Path, limit: usize, deadline: Option<Instant>) -> Vec<S
                 out.push(rel);
             }
         }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return (out, true);
+        }
     }
     out.sort_unstable();
-    out
+    (out, false)
 }
 
 /// Files under `dir`, relative to it, sorted, forward slashes. Uses git's own
 /// ignore rules inside a repository; elsewhere a plain walk that skips VCS
 /// metadata and package caches.
 pub fn list_files(dir: &Path, limit: usize, deadline: Option<Instant>) -> Vec<String> {
-    let mut files = git_inventory(dir).unwrap_or_else(|| walk_inventory(dir, limit, deadline));
+    list_files_reporting(dir, limit, deadline).0
+}
+
+/// [`list_files`], plus whether the listing is known to be incomplete.
+///
+/// The flag exists because a truncated listing is otherwise indistinguishable
+/// from a tree that simply has no matching files: `walk_inventory` stops at the
+/// deadline and returns what it saw, so a deadline-expired structural search
+/// once reported zero candidates and `has_more: false` — a clean-looking
+/// "nothing matched" for a scan that never looked (Codex P2). Callers that
+/// report completeness (`search` in `structural`) must use this.
+///
+/// `git ls-files` does not accept the budget, so inside a worktree the
+/// inventory is always complete; only the non-git walk can be cut short.
+pub fn list_files_reporting(
+    dir: &Path,
+    limit: usize,
+    deadline: Option<Instant>,
+) -> (Vec<String>, bool) {
+    let (mut files, mut incomplete) = match git_inventory(dir) {
+        Some(files) => (files, false),
+        None => walk_inventory(dir, limit, deadline),
+    };
+    if files.len() > limit {
+        incomplete = true;
+    }
     files.truncate(limit);
-    files
+    (files, incomplete)
 }
 
 // ── Index building ───────────────────────────────────────────────────────────
