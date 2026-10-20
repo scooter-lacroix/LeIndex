@@ -94,6 +94,7 @@ fn test_resume_each_phase() {
             rows: 0,
             provider: "unavailable".to_string(),
             model: "none".to_string(),
+            matryoshka: Some("off".to_string()),
         })
         .expect("persist neural");
 

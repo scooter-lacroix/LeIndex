@@ -421,6 +421,7 @@ impl FlagStore {
             FeatureFlag::PrecisionIngest,
             FeatureFlag::Engram,
             FeatureFlag::StructuralSearch,
+            FeatureFlag::Matryoshka,
         ] {
             let enabled = match env::var(flag.env_var()) {
                 Ok(v) => matches!(
@@ -622,6 +623,24 @@ mod test {
             all_flags()
                 .iter()
                 .any(|(flag, _)| *flag == FeatureFlag::SystemOne)
+        );
+    }
+
+    /// `effective_matryoshka()` requires this flag, so an unregistered variant
+    /// means MRL can never be enabled in production: `FlagStore::get` returns
+    /// `false` for absent entries, so `LEINDEX_FEATURE_MATRYOSHKA=1` would be
+    /// silently ignored while `all_flags()` still advertised the flag.
+    #[test]
+    fn test_matryoshka_is_registered_in_production_flag_store() {
+        assert_eq!(
+            FeatureFlag::Matryoshka.env_var(),
+            "LEINDEX_FEATURE_MATRYOSHKA"
+        );
+        assert!(!FeatureFlag::Matryoshka.default_value());
+        assert!(
+            FlagStore::new()
+                .values
+                .contains_key(&FeatureFlag::Matryoshka)
         );
     }
 

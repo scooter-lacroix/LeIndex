@@ -207,6 +207,19 @@ pub struct NeuralCheckpoint {
     pub rows: usize,
     pub provider: String,
     pub model: String,
+    /// Matryoshka policy tag the rows were written under
+    /// ([`MatryoshkaSetting::tag`]). Sliced and native rows are otherwise
+    /// indistinguishable at resume, so a checkpoint taken while MRL was armed
+    /// would be accepted after the kill switch is set. Serialized as the
+    /// policy tag and compared exactly. Absent in checkpoints written before
+    /// the policy was tracked; those deserialize to `None` and are still
+    /// accepted — a resumed run under a native policy reproduces the old
+    /// behavior, and the sidecar restore is separately gated on the
+    /// *effective* setting.
+    ///
+    /// [`MatryoshkaSetting::tag`]: crate::search::mrl::MatryoshkaSetting::tag
+    #[serde(default)]
+    pub matryoshka: Option<String>,
 }
 
 /// Result of an atomic immutable-generation publication.

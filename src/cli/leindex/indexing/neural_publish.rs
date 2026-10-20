@@ -462,6 +462,20 @@ fn reusable_fragment_rows(
     }
 }
 
+/// The Matryoshka policy tag in force right now, as recorded in neural
+/// checkpoints and compared at resume.
+///
+/// `effective_matryoshka()` already folds in the rollout flag, so the tag is
+/// `off` whenever the capability is not actually active — including when a
+/// non-Off policy is configured but `LEINDEX_FEATURE_MATRYOSHKA` is unset.
+fn checkpoint_matryoshka_tag() -> &'static str {
+    crate::config::LeIndexConfig::load_cached()
+        .indexing
+        .embeddings
+        .effective_matryoshka()
+        .tag()
+}
+
 impl LeIndex {
     #[cfg(feature = "onnx")]
     pub(super) fn configured_neural_embedder(
@@ -535,9 +549,18 @@ impl LeIndex {
         lexical_hash: &str,
         current_model: &str,
     ) -> (usize, bool) {
+        // A checkpoint taken under a different Matryoshka policy describes a
+        // different on-disk row shape (sliced vs native), so it cannot be
+        // resumed: the row count would match while the vectors mean something
+        // else. An untagged checkpoint predates this field and is accepted.
+        let policy_tag = checkpoint_matryoshka_tag();
         let requested = checkpoint.is_some_and(|checkpoint| {
             checkpoint.lexical_hash == lexical_hash
                 && checkpoint.model == current_model
+                && checkpoint
+                    .matryoshka
+                    .as_deref()
+                    .is_none_or(|tag| tag == policy_tag)
                 && (checkpoint.rows == 0 || checkpoint.mmap_path.is_file())
         });
         let rows = 0;
@@ -558,22 +581,43 @@ impl LeIndex {
                 // missing every tier-homed node — and those nodes were then
                 // skipped for re-embedding (Codex P2). Accept the checkpoint only
                 // when the restored total matches what was checkpointed.
+                //
+                // Gated on the effective Matryoshka setting, like the hydration
+                // path: a generation checkpointed while MRL was armed must not
+                // keep serving sliced rows after the kill switch is set or the
+                // policy changes, so the rollback actually rolls back (Codex P1).
                 let artifact_path = self.project_path.join(".leindex");
                 if let Some(neural_mmap) =
                     index_builder::try_load_neural_mmap_embeddings(&self.project_path)
                 {
                     rows = self.search_engine.restore_neural_embeddings(&neural_mmap);
                 }
-                for mmap in index_builder::load_neural_tier_mmaps_from_storage(&artifact_path) {
-                    rows += self.search_engine.restore_neural_embeddings(&mmap);
+                if crate::config::LeIndexConfig::load_cached()
+                    .indexing
+                    .embeddings
+                    .effective_matryoshka()
+                    != crate::config::MatryoshkaSetting::Off
+                {
+                    for mmap in index_builder::load_neural_tier_mmaps_from_storage(&artifact_path) {
+                        rows += self.search_engine.restore_neural_embeddings(&mmap);
+                    }
                 }
                 let checkpointed = checkpoint.map_or(0, |checkpoint| checkpoint.rows);
                 if checkpointed > 0 && rows != checkpointed {
                     warn!(
                         restored = rows,
                         checkpointed,
-                        "Neural checkpoint row count mismatch; re-embedding instead of resuming"
+                        "Neural checkpoint row count mismatch; discarding partial restore and \
+                         re-embedding"
                     );
+                    // The partial restore already wrote these into the resident
+                    // engine. Zeroing the count is what makes the caller re-embed:
+                    // its gate is `neural_rows == 0 && !loaded`, and publishing
+                    // `rows` here would ship a partial store over the artifacts
+                    // this check just rejected. The partially restored embeddings
+                    // left behind are harmless — `enrich_neural_for_route`
+                    // overwrites them for every admitted node.
+                    rows = 0;
                 } else {
                     loaded = rows > 0;
                 }
@@ -969,6 +1013,7 @@ impl LeIndex {
                 selected_provider.to_string()
             },
             model,
+            matryoshka: Some(checkpoint_matryoshka_tag().to_string()),
         }
     }
 
@@ -1103,6 +1148,70 @@ mod tests {
         assert!(!NeuralProgress::stuck_hint(0, Duration::from_secs(45)).is_empty());
         // Rows landing means the provider is fine; never cry wolf.
         assert!(NeuralProgress::stuck_hint(1, Duration::from_secs(600)).is_empty());
+    }
+
+    /// A checkpoint whose recorded row count disagrees with what the mmap
+    /// actually restored must report ZERO rows. The mismatch is the only
+    /// signal that the persisted store is partial, and the caller's
+    /// re-embed gate is `neural_rows == 0 && !neural_resume_loaded` — handing
+    /// it the partial count closes that gate and publishes the partial store
+    /// over the good artifacts, committing the exact corruption the row-count
+    /// check exists to reject.
+    #[test]
+    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+    fn test_checkpoint_row_mismatch_reports_no_rows() {
+        use crate::search::search::{DEFAULT_EMBEDDING_DIMENSION, NodeInfo};
+
+        let dir = tempfile::tempdir().expect("checkpoint fixture");
+        let storage = dir.path().join(".leindex");
+        std::fs::create_dir_all(&storage).expect("storage dir");
+        let mmap_path = storage.join("neural_embeddings.bin");
+
+        let node = |node_id: &str| {
+            let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+            tfidf_embedding[0] = 1.0;
+            NodeInfo {
+                node_id: node_id.to_string(),
+                file_path: "fixture.rs".to_string(),
+                symbol_name: "new".to_string(),
+                language: "rust".to_string(),
+                content: "fn new() {}".to_string(),
+                byte_range: (0, 11),
+                tfidf_embedding,
+                neural_embedding: None,
+                complexity: 1,
+                signature: None,
+                pre_tokenized: None,
+            }
+        };
+
+        // 2 rows on disk, 2 matching nodes in the resident engine, but the
+        // checkpoint claims 5 — the partial-store case.
+        let rows = vec![
+            ("fixture.rs:new".to_string(), vec![1.0, 0.0]),
+            ("fixture.rs:other".to_string(), vec![0.0, 1.0]),
+        ];
+        crate::search::vector::write_mmap_embeddings(&mmap_path, &rows).expect("persist fixture");
+
+        let mut index = LeIndex::new(dir.path()).expect("checkpoint index");
+        index
+            .search_engine
+            .index_nodes(vec![node("fixture.rs:new"), node("fixture.rs:other")]);
+
+        let checkpoint = NeuralCheckpoint {
+            lexical_hash: "lexical".to_string(),
+            mmap_path: mmap_path.clone(),
+            rows: 5,
+            provider: "remote".to_string(),
+            model: "model".to_string(),
+            matryoshka: None,
+        };
+
+        assert_eq!(
+            index.restore_neural_checkpoint(Some(&checkpoint), "lexical", "model"),
+            (0, false),
+            "a partial restore must report zero rows so the caller re-embeds"
+        );
     }
 
     #[test]

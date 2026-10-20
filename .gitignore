@@ -176,6 +176,8 @@ docs/R15_*.md
 docs/planning/
 docs/review/
 docs/optimization/
+docs/extra/
+docs/system-one/
 
 # Test-generated memcheck baseline scaffolding (regenerates on each test run)
 docs/baselines/
