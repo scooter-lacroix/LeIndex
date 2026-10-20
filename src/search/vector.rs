@@ -937,7 +937,7 @@ fn write_atomic(
         // generation whose bytes never reached the device.
         writer.get_ref().sync_all()?;
         drop(writer);
-        std::fs::rename(&staging, path)?;
+        replace_file_atomically(&staging, path)?;
         sync_parent_dir(path);
         Ok(())
     })();
@@ -947,6 +947,74 @@ fn write_atomic(
         let _ = std::fs::remove_file(&staging);
     }
     result
+}
+
+/// Swap `staging` onto `target` so a reader sees wholly-old or wholly-new.
+///
+/// Unix `rename` replaces the destination atomically even while it is mapped, so
+/// a serving process keeps its pages and the next open sees the new file.
+///
+/// Windows does not: `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` refuses to
+/// replace a file that has an active mapped section, failing with a sharing
+/// violation. That is not hypothetical here — `MmapEmbeddingIndex` holds a live
+/// `memmap2::Mmap` over the very files this replaces, so a publish running
+/// beside a serving daemon would fail outright. `ReplaceFileW` performs the
+/// swap without that restriction and keeps the atomicity `rename` has, which is
+/// why it is used instead of a remove-then-rename (that sequence has a window
+/// where the canonical file, the sole carrier of the generation identity,
+/// simply does not exist).
+///
+/// Exported because the neural tier publish renames mmap files onto the same
+/// fixed paths, so it needs the identical guarantee.
+pub(crate) fn replace_file_atomically(staging: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(staging, target)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn ReplaceFileW(
+                replaced: *const u16,
+                replacement: *const u16,
+                backup: *const u16,
+                flags: u32,
+                exclude: *mut core::ffi::c_void,
+                reserved: *mut core::ffi::c_void,
+            ) -> i32;
+        }
+
+        fn wide(path: &Path) -> Vec<u16> {
+            path.as_os_str().encode_wide().chain([0]).collect()
+        }
+
+        // A destination that does not exist yet is a plain move: ReplaceFileW
+        // requires both paths to name existing files.
+        if !target.exists() {
+            return std::fs::rename(staging, target);
+        }
+        let replaced = wide(target);
+        let replacement = wide(staging);
+        // SAFETY: both paths are NUL-terminated UTF-16 buffers that outlive the
+        // call; the remaining arguments are documented as optional and null.
+        let ok = unsafe {
+            ReplaceFileW(
+                replaced.as_ptr(),
+                replacement.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 /// The unique sibling a [`write_atomic`] caller stages into, with its parent

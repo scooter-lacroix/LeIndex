@@ -325,11 +325,12 @@ fn infer_language(
     filter: &crate::search::textsearch::FileFilter,
 ) -> Result<String, JsonRpcError> {
     use std::collections::BTreeSet;
-    let (rels, truncated) = crate::search::textsearch::engine::list_files_reporting(
+    let (rels, truncation) = crate::search::textsearch::engine::list_files_reporting(
         root,
         LANGUAGE_INFERENCE_FILES,
         None,
     );
+    let truncated = truncation.truncated();
     // shh: a one-language scope that is 99% another language still infers the
     // minority one when truncation hid the majority — inference is a sample, not
     // a survey. Fixing that needs a sampling strategy, not a bigger constant.
@@ -355,10 +356,26 @@ fn infer_language(
         )),
         1 => Ok(languages.into_iter().next().unwrap_or_default().to_string()),
         _ => Err(JsonRpcError::invalid_params_with_suggestion(
-            format!(
-                "Scope holds several languages ({}); refusing to guess which to parse",
-                languages.into_iter().collect::<Vec<_>>().join(", ")
-            ),
+            {
+                let found = languages.into_iter().collect::<Vec<_>>().join(", ");
+                if truncated {
+                    // The same cut that can HIDE the majority language can also
+                    // invent a false ambiguity: a scope that is overwhelmingly
+                    // one language still reports "several" when the sample
+                    // happened to catch a minority one. Saying so is the
+                    // difference between a caller choosing `lang` and a caller
+                    // concluding the scope is genuinely polyglot.
+                    format!(
+                        "Scope holds several languages ({found}) in the first \
+                         {LANGUAGE_INFERENCE_FILES} files; more remain unexamined, so this set \
+                         may be incomplete"
+                    )
+                } else {
+                    format!(
+                        "Scope holds several languages ({found}); refusing to guess which to parse"
+                    )
+                }
+            },
             "Pass \"lang\" to choose one",
         )),
     }

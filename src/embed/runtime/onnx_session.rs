@@ -440,6 +440,17 @@ struct ProbeStderr {
 impl ProbeStderr {
     const MAX_BYTES: usize = 64 * 1024;
 
+    /// Smallest grace granted to the reader thread before reading what it has.
+    ///
+    /// The child is reaped by the time `reason` runs, so EOF is imminent and the
+    /// drain completes in microseconds — but "imminent" is a scheduling
+    /// expectation, not a guarantee, and a fixed cap shorter than the time the
+    /// OS takes to run the reader on a loaded host drops exactly the line this
+    /// exists to keep. A floor that does not depend on the remaining budget keeps
+    /// the report deterministic without weakening the never-block-forever
+    /// property, which the deadline-vs-grace bound below still provides.
+    const MIN_DRAIN_GRACE: Duration = Duration::from_millis(250);
+
     fn capture(mut reader: impl std::io::Read + Send + 'static) -> Self {
         let output = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&output);
@@ -465,12 +476,12 @@ impl ProbeStderr {
     }
 
     fn reason(&self, deadline: Instant) -> Option<String> {
-        // Allow the final pipe read to finish, but never exceed the probe budget
-        // or wait indefinitely for an inherited pipe held open by a descendant.
+        // The probe's remaining budget bounds descendants that inherited the pipe
+        // and never close it, but it must never shrink the grace below the floor:
+        // on the timeout path `remaining` is already 0, and waiting 0 there made
+        // the diagnostic unreportable in precisely the case it is wanted.
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let _ = self
-            .done
-            .recv_timeout(remaining.min(Duration::from_millis(25)));
+        let _ = self.done.recv_timeout(remaining.max(Self::MIN_DRAIN_GRACE));
         let output = self.output.lock().unwrap_or_else(|p| p.into_inner());
         String::from_utf8_lossy(&output)
             .lines()
@@ -526,5 +537,42 @@ mod tests {
         };
         assert!(!status.success());
         assert_eq!(stderr.reason(deadline).as_deref(), Some("verbose failure"));
+    }
+
+    /// A reader that stays silent for `delay` before yielding its bytes, so the
+    /// drain thread is provably still blocked when `reason` is called.
+    struct SlowReader {
+        data: Vec<u8>,
+        delay: Duration,
+        slept: bool,
+    }
+
+    impl std::io::Read for SlowReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.slept {
+                std::thread::sleep(self.delay);
+                self.slept = true;
+            }
+            let count = self.data.len().min(buf.len());
+            buf[..count].copy_from_slice(&self.data[..count]);
+            self.data.drain(..count);
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn test_probe_stderr_reports_a_reason_when_the_deadline_has_already_passed() {
+        // The timeout path reports after the budget is gone, so the remaining
+        // time is zero there. Capping the wait to the remaining budget made the
+        // diagnostic unreportable in exactly the case it was added for.
+        let stderr = ProbeStderr::capture(SlowReader {
+            data: b"migraphx probe failed: compile timeout\n".to_vec(),
+            delay: Duration::from_millis(50),
+            slept: false,
+        });
+        // Captured before the call, so `reason`'s own clock read puts it in the
+        // past and `remaining` is zero — the timeout path's actual condition.
+        let expired = Instant::now();
+        assert_eq!(stderr.reason(expired).as_deref(), Some("compile timeout"));
     }
 }

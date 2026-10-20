@@ -414,6 +414,11 @@ unicode-normalization = { version = "0.1", optional = true }
 # tree-sitter ^0.26.3, which unifies with our 0.26 grammar generation; the
 # grammar handles themselves come from `crate::parse::grammar::LanguageId`,
 # so no grammar is pulled twice. Do NOT bump to 0.51 (tree-sitter 0.27).
+#
+# Release-age record (AGENTS.md: 3-day minimum between a crate release and the
+# bump adopting it): 0.45.0 was published 2026-07-23T16:07:17Z, verified against
+# https://crates.io/api/v1/crates/ast-grep-core/0.45.0. Any future bump must
+# re-check the publication date for the new version before landing.
 ast-grep-core = { version = "0.45.0", optional = true }
 
 # ONNX Runtime dependencies. `load-dynamic` disables build-time ORT/SDK

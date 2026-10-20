@@ -168,6 +168,10 @@ pub(crate) fn trim_structural(data: &Value) -> Value {
         "returned",
         "total_matches",
         "has_more",
+        // The machine-readable half of the deadline signal: `note` carries the
+        // prose, but a client that branches on truncation needs the boolean, and
+        // an allowlist that dropped it made the note the only evidence.
+        "stopped_by_deadline",
         "stats",
         "note",
     ] {

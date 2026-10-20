@@ -318,55 +318,82 @@ pub(crate) fn persist_neural_embeddings_to_mmap(
     let path = neural_mmap_embeddings_path(project_path);
     let storage_path = project_path.join(".leindex");
     if embeddings.is_empty() {
-        if path.exists() {
-            std::fs::remove_file(&path).map_err(|e| {
-                anyhow::anyhow!("Failed to remove stale neural mmap embeddings: {e}")
-            })?;
-            info!(
-                path = %path.display(),
-                "Removed stale neural embeddings mmap file"
-            );
-        }
-        remove_neural_tier_mmaps(project_path, &[])?;
-        // Nothing is published, so nothing may claim to be the committed
-        // generation either.
-        remove_neural_generation_manifest(&storage_path)?;
+        remove_neural_generation(&path, project_path, &storage_path)?;
         return Ok(());
     }
     let spans = search_engine.collect_node_span_bytes();
     let buckets =
         crate::search::mrl::partition_rows_by_slice_dimension(&embeddings, &spans, matryoshka);
-    // Off also serves providers with native dimensions other than 768. Use
-    // their recorded dimension so actual-width buckets retain the canonical
-    // path; shorter restored rows stay in sidecars instead of mixing widths.
-    let native_dim = if matryoshka == crate::config::MatryoshkaSetting::Off {
-        identity
-            .and_then(|value| value.rsplit('|').next()?.parse::<usize>().ok())
-            .filter(|dim| *dim > 0)
-            .unwrap_or_else(|| {
-                embeddings
-                    .iter()
-                    .map(|(_, row)| row.len())
-                    .max()
-                    .unwrap_or(0)
-                    .max(crate::search::mrl::MRL_TIERS[3])
-            })
-    } else {
-        crate::search::mrl::MRL_TIERS[3]
-    };
+    let native_dim = canonical_native_dim(&embeddings);
+    // Stage every tier, then commit them, then commit the manifest. See
+    // `stage_neural_tiers` for why the order matters.
+    let staged = stage_neural_tiers(project_path, &path, identity, native_dim, &buckets)?;
+    commit_neural_generation(
+        project_path,
+        &path,
+        &storage_path,
+        identity,
+        matryoshka,
+        native_dim,
+        staged,
+    )
+}
 
-    // Publish as ONE generation. The three phases below are what make a crash
-    // anywhere leave a self-consistent generation on disk rather than a mix of
-    // new and previous files that nothing on disk can distinguish (Codex P2).
-    //
-    // Stage: every tier is written to a private staging path and validated by
-    // REOPENING it. Existence proves more than nothing, but weight is the real
-    // check — opening the mmap validates the payload's extent and checksum, so a
-    // truncated write fails here while the previous generation is still whole.
+/// The dimension that owns the canonical `neural_embeddings.bin`.
+///
+/// Always the width the provider returned — read off the rows, never inferred
+/// from the identity trailer and never a constant. See the call site for why
+/// each of those alternatives produced a store whose canonical file disagreed
+/// with its own identity.
+fn canonical_native_dim(embeddings: &[(String, Vec<f32>)]) -> usize {
+    embeddings
+        .iter()
+        .map(|(_, row)| row.len())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Drop every neural artifact. Nothing is published, so nothing may claim to be
+/// the committed generation either — otherwise a restart would honour a
+/// manifest whose files no longer exist.
+fn remove_neural_generation(path: &Path, project_path: &Path, storage_path: &Path) -> Result<()> {
+    if path.exists() {
+        std::fs::remove_file(path)
+            .map_err(|e| anyhow::anyhow!("Failed to remove stale neural mmap embeddings: {e}"))?;
+        info!(
+            path = %path.display(),
+            "Removed stale neural embeddings mmap file"
+        );
+    }
+    remove_neural_tier_mmaps(project_path, &[])?;
+    remove_neural_generation_manifest(storage_path)?;
+    Ok(())
+}
+
+/// Publish phase 1: write every tier to a private staging path and validate it
+/// by REOPENING it.
+///
+/// Existence proves more than nothing, but weight is the real check — opening
+/// the mmap validates the payload's extent and checksum, so a truncated write
+/// fails here, while the previous generation is still whole on disk.
+///
+/// The canonical path is a tier too: it owns `native_dim`, which is now
+/// guaranteed to be a dimension present in `buckets`. When no bucket is native
+/// (a fixed sub-native policy such as Dim512/Dim256/Dim128, where every row is
+/// sliced), it instead receives a zero-row header carrying the identity and
+/// native dimension: readers restore nothing from it (`len() == 0`) but still
+/// resolve identity and dimension, which `query_remote_embedder` raw-reads.
+fn stage_neural_tiers(
+    project_path: &Path,
+    canonical_path: &Path,
+    identity: Option<&str>,
+    native_dim: usize,
+    buckets: &[(usize, Vec<(String, Vec<f32>)>)],
+) -> Result<Vec<StagedNeuralTier>> {
     let mut staged: Vec<StagedNeuralTier> = Vec::with_capacity(buckets.len());
-    for (dim, rows) in &buckets {
+    for (dim, rows) in buckets {
         let final_path = if *dim == native_dim {
-            path.clone()
+            canonical_path.to_path_buf()
         } else {
             neural_tier_mmap_embeddings_path(project_path, *dim)
         };
@@ -398,24 +425,8 @@ pub(crate) fn persist_neural_embeddings_to_mmap(
         });
     }
 
-    // Under a fixed sub-native policy (Dim512/Dim256/Dim128) every row is sliced,
-    // so no bucket is native. Two things must be true afterwards:
-    //   1. the stale canonical file from a previous 768-dim run must not be
-    //      served as if it described this generation, and
-    //   2. the generation's identity and native dimension must survive.
-    // Deleting the canonical file satisfies (1) but breaks (2): it is the only
-    // artifact `query_remote_embedder` raw-reads for provider identity and
-    // dimension, so a tier-only generation would look absent and query
-    // embedding would fall back to a different vector space than the sidecars
-    // hold (Codex P1). Overwrite it with a zero-row header carrying the native
-    // dimension and the identity instead: readers restore nothing from it
-    // (`len() == 0`) but still resolve identity and dimension.
-    //
-    // Staged like the tiers so the commit phase below is the only thing that
-    // touches canonical storage paths.
-    let header_is_tier = staged.iter().any(|tier| tier.dim == native_dim);
-    if !header_is_tier {
-        let stage_path = neural_staging_path(&path);
+    if !staged.iter().any(|tier| tier.dim == native_dim) {
+        let stage_path = neural_staging_path(canonical_path);
         crate::search::vector::write_empty_mmap_embeddings_with_identity(
             &stage_path,
             native_dim as u32,
@@ -429,14 +440,52 @@ pub(crate) fn persist_neural_embeddings_to_mmap(
             dim = native_dim,
             "Staged tier-only canonical neural mmap header (identity + native dimension, zero rows)"
         );
+        staged.push(StagedNeuralTier {
+            dim: native_dim,
+            rows: 0,
+            final_path: canonical_path.to_path_buf(),
+            stage_path,
+        });
     }
+    Ok(staged)
+}
 
-    // Commit. Rename every staged tier onto its canonical path, then write the
-    // manifest. `rename` within one filesystem is atomic and replaces the
-    // destination, so each tier flips from wholly-previous to wholly-new; and
-    // because the manifest lands LAST, it only ever names a generation whose
-    // files are already in place. A crash during this phase cannot produce a
-    // mixed generation that a reader would honour.
+/// Publish phase 2 and 3: rename staged tiers into place, then commit the
+/// manifest.
+///
+/// `rename` within one filesystem replaces the destination, so a tier flips from
+/// wholly-previous to wholly-new — never a mix of both files' bytes. The manifest
+/// lands LAST, so it always names a generation whose files were all written and
+/// validated in phase 1.
+///
+/// What that does NOT buy, stated plainly because the comment here once
+/// overclaimed it: the commit is a sequence of renames onto FIXED paths, so a
+/// crash between two of them leaves some tiers new and some previous while the
+/// PREVIOUS manifest is still in force. The previous files are gone (the rename
+/// replaced them), so there is no earlier generation to fall back to; the reader
+/// compares that mixed set against the old manifest and disables any tier whose
+/// ROW COUNT changed. A tier whose row count happens to be unchanged — the common
+/// incremental case, same documents re-embedded — passes that check and is
+/// served. So the guarantee is: the manifest never describes a generation whose
+/// files are missing, and a changed-row-count tier never serves across a torn
+/// commit; full protection against serving a torn commit needs
+/// generation-scoped filenames (write `neural_embeddings_{dim}.{generation}.bin`,
+/// let the manifest name the exact files, delete the old generation only after
+/// the manifest swap), which is a storage-layout change and is tracked
+/// separately. A publish must not run concurrently with a served index for
+/// exactly this reason.
+fn commit_neural_generation(
+    project_path: &Path,
+    canonical_path: &Path,
+    storage_path: &Path,
+    identity: Option<&str>,
+    matryoshka: crate::config::MatryoshkaSetting,
+    native_dim: usize,
+    staged: Vec<StagedNeuralTier>,
+) -> Result<()> {
+    let empty_header = staged
+        .iter()
+        .any(|tier| tier.dim == native_dim && tier.rows == 0);
     for tier in &staged {
         publish_staged_tier(tier)?;
         info!(
@@ -446,20 +495,42 @@ pub(crate) fn persist_neural_embeddings_to_mmap(
             "Published neural embeddings mmap tier"
         );
     }
-    if !header_is_tier {
-        publish_staged_tier(&StagedNeuralTier {
-            dim: native_dim,
-            rows: 0,
-            final_path: path.clone(),
-            stage_path: neural_staging_path(&path),
-        })?;
+    // The manifest describes EVERY file the publish wrote. A tier-only
+    // generation's canonical file is a zero-row identity header: naming it here
+    // is what tells readers it is the intended state rather than a stale
+    // artifact from a superseded publish. A row count of 0 marks it as carrying
+    // identity only, so it is never mistaken for a tier with rows.
+    let header_only = staged
+        .iter()
+        .any(|tier| tier.dim == native_dim && tier.rows == 0);
+    let mut committed: Vec<(usize, usize)> = staged
+        .iter()
+        .filter(|tier| tier.rows > 0)
+        .map(|tier| (tier.dim, tier.rows))
+        .collect();
+    if header_only {
+        committed.push((native_dim, 0));
     }
-    let committed: Vec<(usize, usize)> = staged.iter().map(|tier| (tier.dim, tier.rows)).collect();
-    persist_neural_generation_manifest(&storage_path, identity, matryoshka, &committed)?;
+    persist_neural_generation_manifest(storage_path, identity, matryoshka, &committed)?;
     // Only now is the previous generation definitively superseded, so only now
-    // is it safe to drop its orphans.
-    let keep: Vec<usize> = staged.iter().map(|tier| tier.dim).collect();
+    // is it safe to drop its orphans. "Keep" is the dimensions published to
+    // SIDECAR paths: the native dimension's rows went to the canonical file, so
+    // a sidecar still sitting at its dimension is a leftover from a generation
+    // that partitioned differently, and keeping it would let the loader union it
+    // against the canonical rows it duplicates.
+    let keep: Vec<usize> = staged
+        .iter()
+        .filter(|tier| tier.final_path != canonical_path)
+        .map(|tier| tier.dim)
+        .collect();
     remove_neural_tier_mmaps(project_path, &keep)?;
+    if empty_header {
+        info!(
+            path = %canonical_path.display(),
+            dim = native_dim,
+            "Canonical neural mmap carries identity only (all rows are sliced)"
+        );
+    }
     Ok(())
 }
 
@@ -494,13 +565,17 @@ fn publish_staged_tier(tier: &StagedNeuralTier) -> Result<()> {
             )
         })?;
     }
-    std::fs::rename(&tier.stage_path, &tier.final_path).with_context(|| {
-        format!(
-            "Failed to publish staged neural mmap {} -> {}",
-            tier.stage_path.display(),
-            tier.final_path.display()
-        )
-    })?;
+    // Same swap the mmap writer uses: a plain `rename` cannot replace a file a
+    // serving process still has mapped on Windows, and these tiers are exactly
+    // the files `MmapEmbeddingIndex` keeps mapped.
+    crate::search::vector::replace_file_atomically(&tier.stage_path, &tier.final_path)
+        .with_context(|| {
+            format!(
+                "Failed to publish staged neural mmap {} -> {}",
+                tier.stage_path.display(),
+                tier.final_path.display()
+            )
+        })?;
     Ok(())
 }
 
@@ -529,7 +604,10 @@ struct NeuralGenerationManifest {
     identity: Option<String>,
     /// Matryoshka policy the generation was partitioned under.
     matryoshka: String,
-    /// `(dimension, rows)` for each published tier, ascending by dimension.
+    /// `(dimension, rows)` for every file the publish wrote, ascending. A row
+    /// count of 0 names the canonical file's zero-row identity header (written
+    /// when every row was sliced), so the manifest describes the whole
+    /// generation rather than only its row-bearing part.
     tiers: Vec<(usize, usize)>,
 }
 
@@ -542,8 +620,10 @@ fn neural_generation_manifest_path(storage_path: &Path) -> PathBuf {
 }
 
 /// Atomically commit the manifest. Written LAST in the publish sequence, so a
-/// crash before this call leaves the previous manifest in force and readers fall
-/// back to the previous generation instead of serving a short new one.
+/// crash before this call leaves the previous manifest in force — and the tiers
+/// it names are rejected on row-count mismatch rather than served (the previous
+/// FILES are already gone, so there is no earlier generation to fall back to;
+/// see `commit_neural_generation` for what this does and does not guarantee).
 #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
 fn persist_neural_generation_manifest(
     storage_path: &Path,
@@ -677,6 +757,34 @@ pub(crate) fn load_neural_tier_mmaps_from_storage(
     // (crash midway through a publish under an UNCHANGED provider identity)
     // visible, which per-file identity comparison alone cannot see.
     let manifest = try_load_neural_generation_manifest(storage_path);
+    // A generation is partitioned under one policy, so a generation committed
+    // under a DIFFERENT policy is not the store the current setting describes.
+    // Identity and row counts cannot see this: a `Dynamic` generation (tiers
+    // 256/512/768) narrowed to `Dim512` has the same identity and the same rows,
+    // so it would be served forever and the policy change would never take
+    // effect. Comparing the recorded policy makes the narrowing real. The kill
+    // switch is separate (`Off` makes callers skip this loader entirely).
+    let policy_matches = manifest.as_ref().is_none_or(|manifest| {
+        manifest.matryoshka
+            == format!(
+                "{:?}",
+                crate::config::LeIndexConfig::load_cached()
+                    .indexing
+                    .embeddings
+                    .effective_matryoshka()
+            )
+    });
+    if !policy_matches {
+        tracing::warn!(
+            recorded = manifest
+                .as_ref()
+                .map(|manifest| manifest.matryoshka.as_str())
+                .unwrap_or_default(),
+            "Neural generation was partitioned under a different Matryoshka policy; \
+             tier disabled until re-indexed"
+        );
+        return Vec::new();
+    }
     let mut loaded: Vec<crate::search::vector::MmapEmbeddingIndex> = crate::search::mrl::MRL_TIERS
         .iter()
         .filter_map(|dim| {
@@ -751,42 +859,6 @@ pub(crate) fn load_neural_tier_mmaps_from_storage(
         })
         .collect();
     loaded.sort_by_key(|index| index.dimension());
-
-    // The canonical file is a tier too when the provider's native width is not
-    // one of the MRL tier dimensions (a 1024-dim model, say): publish routes the
-    // actual-width bucket there, and skipping it here would silently drop the
-    // widest — and for an `Off` store, only — rows. It is read only when no
-    // sidecar already carries that dimension, so the committed 768 bucket keeps
-    // the canonical file to itself.
-    let storage = storage_path.to_path_buf();
-    if let Some(canonical) = try_load_neural_mmap_embeddings_from_storage(&storage) {
-        let width = canonical.dimension();
-        let already_covered = loaded.iter().any(|index| index.dimension() == width);
-        let committed = manifest.as_ref().is_none_or(|manifest| {
-            manifest
-                .tiers
-                .iter()
-                .any(|(dim, _)| u32::try_from(*dim).ok() == Some(width))
-        });
-        let rows_agree = manifest
-            .as_ref()
-            .and_then(|manifest| {
-                manifest
-                    .tiers
-                    .iter()
-                    .find(|(dim, _)| u32::try_from(*dim).ok() == Some(width))
-                    .map(|(_, rows)| *rows)
-            })
-            .is_none_or(|rows| rows == canonical.len());
-        if !already_covered && committed && rows_agree {
-            loaded.push(canonical);
-        } else if !already_covered && !committed {
-            tracing::warn!(
-                dim = width,
-                "Canonical neural mmap is not part of the committed generation; tier disabled"
-            );
-        }
-    }
     loaded
 }
 
@@ -1039,10 +1111,17 @@ mod tests {
     /// Commit a manifest naming `tiers` for `dir`, the way a finished publish
     /// would.
     fn commit_manifest(dir: &tempfile::TempDir, identity: Option<&str>, tiers: &[(usize, usize)]) {
+        // Commit under the policy that is EFFECTIVE here, the way a real publish
+        // does: the loader refuses a generation recorded under a policy other
+        // than the current one, so a fixture that pinned `Dynamic` would model a
+        // store this configuration would never write.
         persist_neural_generation_manifest(
             dir.path(),
             identity,
-            crate::config::MatryoshkaSetting::Dynamic,
+            crate::config::LeIndexConfig::load_cached()
+                .indexing
+                .embeddings
+                .effective_matryoshka(),
             tiers,
         )
         .unwrap();
@@ -1160,7 +1239,10 @@ mod tests {
         persist_neural_generation_manifest(
             &storage,
             Some("id"),
-            crate::config::MatryoshkaSetting::Dynamic,
+            crate::config::LeIndexConfig::load_cached()
+                .indexing
+                .embeddings
+                .effective_matryoshka(),
             &[(tier.dim, tier.rows)],
         )
         .unwrap();
@@ -1190,7 +1272,10 @@ mod tests {
         persist_neural_generation_manifest(
             &storage,
             Some("id"),
-            crate::config::MatryoshkaSetting::Dynamic,
+            crate::config::LeIndexConfig::load_cached()
+                .indexing
+                .embeddings
+                .effective_matryoshka(),
             &[(dim, previous.len())],
         )
         .unwrap();
@@ -1217,41 +1302,45 @@ mod tests {
     }
 
     #[test]
-    fn test_native_width_not_in_the_tier_ladder_loads_from_the_canonical_file() {
-        // Publish routes an actual-width bucket (a 1024-dim provider, say) to the
-        // canonical file because 1024 is not one of MRL_TIERS. The loader used to
-        // filter every MRL_TIERS dimension as a sidecar and never read the
-        // canonical path, so those rows were unreachable at restart.
-        let dir = tempfile::tempdir().unwrap();
-        let width = 1024usize;
-        let rows = vec![("node-1".to_string(), vec![0.5_f32; width])];
-        crate::search::vector::write_mmap_embeddings_with_identity(
-            &dir.path().join("neural_embeddings.bin"),
-            &rows,
-            Some("remote|openai|m||1024"),
-        )
-        .unwrap();
+    fn test_generation_partitioned_under_another_policy_is_not_loaded() {
+        // A `Dynamic` generation narrowed to `Dim512` keeps the same identity and
+        // the same row counts, so nothing about the files marks them stale — only
+        // the recorded policy does. Without this check the narrowing would never
+        // take effect and differently-partitioned vectors would keep serving.
+        let dir = tier_store(Some("remote|openai|same||768"));
+        let dim = crate::search::mrl::MRL_TIERS[1];
         persist_neural_generation_manifest(
             dir.path(),
-            Some("remote|openai|m||1024"),
-            crate::config::MatryoshkaSetting::Off,
-            &[(width, rows.len())],
+            Some("remote|openai|same||768"),
+            crate::config::MatryoshkaSetting::Dynamic,
+            &[(dim, 1)],
         )
         .unwrap();
-        let loaded = load_neural_tier_mmaps_from_storage(dir.path(), Some("remote|openai|m||1024"));
-        assert_eq!(
-            loaded.len(),
-            1,
-            "the canonical file is a tier when its width is not on the ladder"
+        let effective = crate::config::LeIndexConfig::load_cached()
+            .indexing
+            .embeddings
+            .effective_matryoshka();
+        if effective == crate::config::MatryoshkaSetting::Dynamic {
+            // Nothing to prove when the policy under test is the one recorded.
+            return;
+        }
+        let loaded =
+            load_neural_tier_mmaps_from_storage(dir.path(), Some("remote|openai|same||768"));
+        assert!(
+            loaded.is_empty(),
+            "a generation committed under a different policy must not serve"
         );
-        assert_eq!(loaded[0].dimension(), width as u32);
-        assert_eq!(loaded[0].len(), rows.len());
     }
 
     #[test]
-    fn test_canonical_file_is_not_re_read_when_a_sidecar_covers_its_width() {
-        // The committed 768 bucket belongs to the canonical file and is reached as
-        // a tier; reading it a second time would double its rows.
+    fn test_canonical_file_is_never_returned_as_a_tier() {
+        // All three callers load the canonical file themselves and then merge
+        // this function's result into the same index. Under `Dynamic` the
+        // canonical path holds the 768 bucket, so returning it here as well would
+        // count those rows twice: `neural_publish` compares the merged total
+        // against the checkpoint, sees a mismatch, and discards the whole
+        // restored set to re-embed — defeating checkpoint resume in exactly the
+        // configuration it exists for.
         let dir = tier_store(Some("remote|openai|same||768"));
         let canonical_rows = vec![("node-1".to_string(), vec![0.5_f32; 768])];
         crate::search::vector::write_mmap_embeddings_with_identity(
@@ -1264,7 +1353,12 @@ mod tests {
         commit_manifest(&dir, Some("remote|openai|same||768"), &[(dim, 1)]);
         let loaded =
             load_neural_tier_mmaps_from_storage(dir.path(), Some("remote|openai|same||768"));
-        assert_eq!(loaded.len(), 1, "one file, one entry");
+        assert_eq!(loaded.len(), 1, "one sidecar, one entry");
+        assert_eq!(
+            loaded[0].dimension(),
+            dim as u32,
+            "the canonical file is never returned as a tier"
+        );
     }
 
     #[test]
@@ -1278,6 +1372,38 @@ mod tests {
         assert_eq!(
             staged.file_name().and_then(|name| name.to_str()),
             Some(".neural_embeddings_256.bin.staged")
+        );
+    }
+
+    #[test]
+    fn test_canonical_native_dim_is_the_provider_width() {
+        // The canonical file carries the generation's native dimension, and
+        // `query_remote_embedder` raw-reads it to seed a query embedder. Both a
+        // constant (768 regardless of provider) and the identity trailer (absent,
+        // stale, or naming another model) can disagree with the rows actually
+        // stored — which is how a 256-dim provider ended up with a canonical
+        // header claiming 768.
+        let rows = |dim: usize, count: usize| -> Vec<(String, Vec<f32>)> {
+            (0..count)
+                .map(|i| (format!("node-{i}"), vec![0.5_f32; dim]))
+                .collect()
+        };
+
+        assert_eq!(
+            canonical_native_dim(&rows(1024, 2)),
+            1024,
+            "a width the ladder never produces still owns the canonical file"
+        );
+        assert_eq!(
+            canonical_native_dim(&rows(256, 3)),
+            256,
+            "a sub-768 provider must not be reported as 768"
+        );
+        assert_eq!(canonical_native_dim(&rows(768, 1)), 768);
+        assert_eq!(
+            canonical_native_dim(&[]),
+            0,
+            "no rows means no width to claim"
         );
     }
 }

@@ -32,9 +32,11 @@
 //!
 //! Files are enumerated with [`engine::list_files_reporting`] (gitignore-aware,
 //! live — no index required) and filtered with the same [`FileFilter`] the text
-//! search uses. The listing's own "was it truncated" flag is folded into
+//! search uses. Why the listing stopped short is folded into
 //! [`StructuralOutput::has_more`], because a budget that expires during
-//! enumeration is as partial as one that expires during parsing. Contents are
+//! enumeration is as partial as one that expires during parsing; the *cause*
+//! decides [`StructuralOutput::stopped_by_deadline`], which may only cite the
+//! time budget. Contents are
 //! read through [`engine::read_scannable`], so the binary and size limits stay
 //! the engine's rather than becoming a second policy that could drift.
 
@@ -511,8 +513,7 @@ pub fn search(
     let started = Instant::now();
     let mut output = StructuralOutput::default();
 
-    let (rels, listing_incomplete) =
-        list_files_reporting(root, MAX_CANDIDATE_FILES, options.deadline);
+    let (rels, truncation) = list_files_reporting(root, MAX_CANDIDATE_FILES, options.deadline);
     let rels: Vec<String> = rels
         .into_iter()
         .filter(|rel| filter.allows(rel))
@@ -588,9 +589,16 @@ pub fn search(
         output.returned += hits.len();
         output.files.push(StructuralFile { hits, ..file });
     }
-    output.stopped_by_deadline =
-        output.stats.skipped_deadline > 0 || options.deadline.is_some_and(|d| Instant::now() >= d);
-    output.has_more = output.returned < paged || output.stopped_by_deadline || listing_incomplete;
+    // `stopped_by_deadline` claims the TIME BUDGET cut this scan, so it may only
+    // cite deadline evidence: files the workers skipped on expiry, or a walk
+    // that stopped on expiry. A listing cut by the file count limit is not time
+    // pressure — reporting it as one makes a large tree look time-starved and
+    // would hide a genuine deadline skip behind the wrong explanation.
+    output.stopped_by_deadline = output.stats.skipped_deadline > 0 || truncation.deadline;
+    // `has_more`, by contrast, only needs *some* tree left unexamined — a limit
+    // truncation counts, because those files were never candidates.
+    output.has_more =
+        output.returned < paged || output.stopped_by_deadline || truncation.truncated();
     output.stats.millis = started.elapsed().as_millis();
     output
 }

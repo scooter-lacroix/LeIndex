@@ -69,17 +69,53 @@ fn git_inventory(root: &Path) -> Option<Vec<String>> {
     Some(files)
 }
 
-/// Walk `root`, returning the files seen and whether the budget cut the walk
-/// short. A truncated walk must be distinguishable from a tree with no files:
+/// Why a file listing stopped short of the whole tree.
+///
+/// The cause is not cosmetic. A structural search reports `stopped_by_deadline`
+/// to say "the time budget cut this scan, retry or raise it" — a claim that must
+/// not be made on the strength of a page limit, which is a deliberate bound the
+/// caller asked for. Collapsing both into one "incomplete" boolean makes a large
+/// tree look time-starved, and (worse) lets a scan that already skipped files on
+/// the deadline report `stopped_by_deadline: false` merely because the listing
+/// itself was cut by the limit instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InventoryTruncation {
+    /// The `limit` was reached with files still unlisted.
+    pub limit: bool,
+    /// The wall-clock deadline stopped the walk.
+    pub deadline: bool,
+}
+
+impl InventoryTruncation {
+    /// Either cause: the listing does not describe the whole tree.
+    pub fn truncated(self) -> bool {
+        self.limit || self.deadline
+    }
+}
+
+/// Walk `root`, returning the files seen and why the walk stopped short.
+/// A truncated walk must be distinguishable from a tree with no files:
 /// otherwise an expired deadline yields "zero candidates, nothing matched".
-fn walk_inventory(root: &Path, limit: usize, deadline: Option<Instant>) -> (Vec<String>, bool) {
+fn walk_inventory(
+    root: &Path,
+    limit: usize,
+    deadline: Option<Instant>,
+) -> (Vec<String>, InventoryTruncation) {
     let mut out = Vec::new();
     let mut stack = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, prefix)) = stack.pop() {
-        if out.len() >= limit || deadline.is_some_and(|d| Instant::now() >= d) {
+        let expired = deadline.is_some_and(|d| Instant::now() >= d);
+        let hit_limit = out.len() >= limit;
+        if hit_limit || expired {
             // Directories are still queued (or the file budget is exhausted),
             // so there is unexplored tree left.
-            return (out, true);
+            return (
+                out,
+                InventoryTruncation {
+                    limit: hit_limit,
+                    deadline: expired,
+                },
+            );
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -103,12 +139,24 @@ fn walk_inventory(root: &Path, limit: usize, deadline: Option<Instant>) -> (Vec<
                 out.push(rel);
             }
         }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            return (out, true);
+        // A deadline that expires exactly as the queue empties is NOT a
+        // truncation: every directory was walked, so `deadline` here would mark a
+        // complete scan as partial. The check runs after the work, and the final
+        // batch of entries can easily push elapsed time past a deadline that was
+        // met — `stopped_by_deadline` is a claim about unexamined tree, so it may
+        // only be raised when tree is actually left.
+        if deadline.is_some_and(|d| Instant::now() >= d) && !stack.is_empty() {
+            return (
+                out,
+                InventoryTruncation {
+                    limit: false,
+                    deadline: true,
+                },
+            );
         }
     }
     out.sort_unstable();
-    (out, false)
+    (out, InventoryTruncation::default())
 }
 
 /// Files under `dir`, relative to it, sorted, forward slashes. Uses git's own
@@ -118,9 +166,9 @@ pub fn list_files(dir: &Path, limit: usize, deadline: Option<Instant>) -> Vec<St
     list_files_reporting(dir, limit, deadline).0
 }
 
-/// [`list_files`], plus whether the listing is known to be incomplete.
+/// [`list_files`], plus why the listing stopped short.
 ///
-/// The flag exists because a truncated listing is otherwise indistinguishable
+/// The cause exists because a truncated listing is otherwise indistinguishable
 /// from a tree that simply has no matching files: `walk_inventory` stops at the
 /// deadline and returns what it saw, so a deadline-expired structural search
 /// once reported zero candidates and `has_more: false` — a clean-looking
@@ -133,14 +181,14 @@ pub fn list_files_reporting(
     dir: &Path,
     limit: usize,
     deadline: Option<Instant>,
-) -> (Vec<String>, bool) {
-    let (mut files, mut incomplete) = match git_inventory(dir) {
-        Some(files) => (files, false),
+) -> (Vec<String>, InventoryTruncation) {
+    let (mut files, mut truncation) = match git_inventory(dir) {
+        Some(files) => (files, InventoryTruncation::default()),
         None => walk_inventory(dir, limit, deadline),
     };
     if files.len() > limit {
-        incomplete = true;
+        truncation.limit = true;
     }
     files.truncate(limit);
-    (files, incomplete)
+    (files, truncation)
 }
