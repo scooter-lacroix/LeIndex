@@ -153,24 +153,12 @@ async fn run(args: &Value) -> Result<Value, JsonRpcError> {
 async fn search(args: &Value) -> Result<Value, JsonRpcError> {
     use crate::search::textsearch::{StructuralOptions, search_structural};
 
-    let pattern_text = args
-        .get("pattern")
-        .or_else(|| args.get("query"))
-        .and_then(Value::as_str)
-        .filter(|p| !p.trim().is_empty())
-        .ok_or_else(|| {
-            JsonRpcError::invalid_params_with_suggestion(
-                "Missing required argument: pattern",
-                "Add \"pattern\": \"<ast-grep pattern>\", e.g. \"fn $NAME($$$ARGS) { $$$BODY }\"",
-            )
-        })?;
-
-    let (limit, offset, per_file_cap) = paging_options(args)?;
-    let timeout_ms = extract_usize(args, "timeout_ms", DEFAULT_TIMEOUT_MS)?;
+    let pattern_text = parse_pattern(args)?;
+    let (limit, offset, per_file_cap, timeout_ms) = parse_paging(args)?;
 
     let root = resolve_root(args)?;
     let filter = build_filter(args);
-    let (compiled, language_name) = compile_pattern(args, &root, &filter, pattern_text).await?;
+    let (compiled, language_name) = compile_for(args, &root, &filter, pattern_text).await?;
 
     let options = StructuralOptions {
         limit,
@@ -185,6 +173,21 @@ async fn search(args: &Value) -> Result<Value, JsonRpcError> {
             .map_err(|e| JsonRpcError::internal_error(format!("structural search failed: {e}")))?;
 
     Ok(shape(pattern_text, language_name, &output))
+}
+
+/// Validate the required pattern, accepting the query alias.
+#[cfg(feature = "structural-search")]
+fn parse_pattern(args: &Value) -> Result<&str, JsonRpcError> {
+    args.get("pattern")
+        .or_else(|| args.get("query"))
+        .and_then(Value::as_str)
+        .filter(|p| !p.trim().is_empty())
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params_with_suggestion(
+                "Missing required argument: pattern",
+                "Add \"pattern\": \"<ast-grep pattern>\", e.g. \"fn $NAME($$$ARGS) { $$$BODY }\"",
+            )
+        })
 }
 
 /// The wall-clock deadline for one call, or `None` when no budget was asked for
@@ -225,7 +228,7 @@ fn resolve_root(args: &Value) -> Result<std::path::PathBuf, JsonRpcError> {
 /// and stack-hungry — so it stays off the async worker, exactly as `find` keeps
 /// regex compilation off it.
 #[cfg(feature = "structural-search")]
-async fn compile_pattern(
+async fn compile_for(
     args: &Value,
     root: &std::path::Path,
     filter: &crate::search::textsearch::FileFilter,
@@ -274,7 +277,7 @@ async fn compile_pattern(
 /// keeps "uncapped" meaning the documented ceiling instead of letting a caller
 /// allocate past it by asking for a huge number instead of `0`.
 #[cfg(feature = "structural-search")]
-fn paging_options(args: &Value) -> Result<(usize, usize, usize), JsonRpcError> {
+fn parse_paging(args: &Value) -> Result<(usize, usize, usize, usize), JsonRpcError> {
     let limit = match extract_usize(args, "limit", DEFAULT_LIMIT)? {
         0 => MAX_LIMIT,
         n => n.min(MAX_LIMIT),
@@ -291,7 +294,8 @@ fn paging_options(args: &Value) -> Result<(usize, usize, usize), JsonRpcError> {
         n @ 0..=MAX_LIMIT => n,
         _ => MAX_LIMIT,
     };
-    Ok((limit, offset, per_file_cap))
+    let timeout_ms = extract_usize(args, "timeout_ms", DEFAULT_TIMEOUT_MS)?;
+    Ok((limit, offset, per_file_cap, timeout_ms))
 }
 
 /// Files inspected when guessing the target language for a caller that named
@@ -430,6 +434,7 @@ fn shape(
         "returned": output.returned,
         "total_matches": output.stats.total_matches,
         "has_more": output.has_more,
+        "stopped_by_deadline": output.stopped_by_deadline,
         "stats": {
             "candidates": output.stats.candidates,
             "scanned": output.stats.scanned,
@@ -446,13 +451,38 @@ fn shape(
             output.stats.files_capped
         ));
     }
+    if output.stopped_by_deadline {
+        let note = "Search stopped at the time budget; results are partial. Raise timeout_ms or set it to 0 to scan without a deadline";
+        value["note"] = json!(match value.get("note").and_then(Value::as_str) {
+            Some(existing) => format!("{existing}. {note}"),
+            None => note.to_string(),
+        });
+    }
     value
 }
 
 #[cfg(all(test, feature = "structural-search"))]
 mod tests {
-    use super::{MAX_LIMIT, paging_options};
+    use super::{MAX_LIMIT, parse_paging, shape};
     use serde_json::json;
+
+    #[test]
+    fn test_shape_reports_deadline_and_preserves_cap_note() {
+        let mut output = crate::search::textsearch::StructuralOutput {
+            stopped_by_deadline: true,
+            has_more: true,
+            ..Default::default()
+        };
+        for capped in [0, 1] {
+            output.stats.files_capped = capped;
+            let value = shape("fn $NAME() {}", "rust", &output);
+            assert_eq!(value["stopped_by_deadline"], true);
+            assert_eq!(value["has_more"], true);
+            let note = value["note"].as_str().unwrap();
+            assert!(note.contains("results are partial"));
+            assert_eq!(note.contains("per_file_cap"), capped > 0);
+        }
+    }
 
     /// `per_file_cap` must not be a back door around the documented
     /// `UNLIMITED_FILE_BUFFER` ceiling: `scan` uses a non-zero value verbatim as
@@ -460,8 +490,8 @@ mod tests {
     /// allocation. `0` is the sanctioned way to ask for "uncapped".
     #[test]
     fn test_per_file_cap_clamped_to_max_limit() {
-        let (_, _, cap) =
-            paging_options(&json!({ "per_file_cap": MAX_LIMIT * 1000 })).expect("parsed");
+        let (_, _, cap, _) =
+            parse_paging(&json!({ "per_file_cap": MAX_LIMIT * 1000 })).expect("parsed");
         assert_eq!(
             cap, MAX_LIMIT,
             "an oversized per_file_cap must be clamped to the ceiling, not passed through"
@@ -473,7 +503,7 @@ mod tests {
     /// becomes a cap of 10,000.
     #[test]
     fn test_per_file_cap_zero_still_means_uncapped() {
-        let (_, _, cap) = paging_options(&json!({ "per_file_cap": 0 })).expect("parsed");
+        let (_, _, cap, _) = parse_paging(&json!({ "per_file_cap": 0 })).expect("parsed");
         assert_eq!(cap, 0, "0 must survive as NO_CAP");
     }
 }

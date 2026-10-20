@@ -189,11 +189,12 @@ impl WorkerRuntime {
             .spawn()
             .map_err(|error| format!("failed to spawn MIGraphX probe child: {}", error))?;
         let deadline = Instant::now() + max_wait;
+        let stderr = ProbeStderr::capture(child.stderr.take().expect("piped probe stderr"));
         loop {
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => return Ok(()),
                 Ok(Some(status)) => {
-                    let reason = probe_child_stderr(&mut child);
+                    let reason = stderr.reason(deadline);
                     return Err(match reason {
                         Some(reason) => {
                             format!(
@@ -211,14 +212,19 @@ impl WorkerRuntime {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(format!(
-                        "MIGraphX compile probe timed out after {:?}; child killed",
-                        max_wait
+                        "MIGraphX compile probe timed out after {:?}; child killed{}",
+                        max_wait,
+                        stderr.diagnostic(deadline)
                     ));
                 }
                 Err(error) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("MIGraphX probe child wait failed: {}", error));
+                    return Err(format!(
+                        "MIGraphX probe child wait failed: {}{}",
+                        error,
+                        stderr.diagnostic(deadline)
+                    ));
                 }
             }
         }
@@ -422,24 +428,103 @@ impl WorkerRuntime {
     }
 }
 
-/// Drain a finished MIGraphX probe child's stderr and reduce it to the
-/// single diagnostic line the child writes on failure.
-///
-/// The child exits as soon as the probe fails, so its stderr pipe is already
-/// closed and draining it cannot block. The child prefixes the useful reason
-/// with `migraphx probe failed: `; anything else on stderr (ORT's own
-/// `[MIGraphX EP]` banner noise) is discarded so the parent's error message
-/// stays a single actionable line.
+/// Drain stderr while the probe runs so provider logs cannot fill its pipe.
+/// Keep only the diagnostic tail; the child's failure reason follows provider logs.
 #[cfg(feature = "onnx")]
-fn probe_child_stderr(child: &mut std::process::Child) -> Option<String> {
-    use std::io::Read;
+struct ProbeStderr {
+    output: Arc<Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
 
-    const PREFIX: &str = "migraphx probe failed:";
-    let mut output = String::new();
-    child.stderr.take()?.read_to_string(&mut output).ok()?;
-    output
-        .lines()
-        .find_map(|line| line.trim().strip_prefix(PREFIX))
-        .map(|reason| reason.trim().to_string())
-        .filter(|reason| !reason.is_empty())
+#[cfg(feature = "onnx")]
+impl ProbeStderr {
+    const MAX_BYTES: usize = 64 * 1024;
+
+    fn capture(mut reader: impl std::io::Read + Send + 'static) -> Self {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&output);
+        let (finished, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let mut output = captured.lock().unwrap_or_else(|p| p.into_inner());
+                        let discard = (output.len() + count).saturating_sub(Self::MAX_BYTES);
+                        output.drain(..discard);
+                        output.extend_from_slice(&chunk[..count]);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            let _ = finished.send(());
+        });
+        Self { output, done }
+    }
+
+    fn reason(&self, deadline: Instant) -> Option<String> {
+        // Allow the final pipe read to finish, but never exceed the probe budget
+        // or wait indefinitely for an inherited pipe held open by a descendant.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let _ = self
+            .done
+            .recv_timeout(remaining.min(Duration::from_millis(25)));
+        let output = self.output.lock().unwrap_or_else(|p| p.into_inner());
+        String::from_utf8_lossy(&output)
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("migraphx probe failed:"))
+            .map(|reason| reason.trim().to_string())
+            .filter(|reason| !reason.is_empty())
+    }
+
+    fn diagnostic(&self, deadline: Instant) -> String {
+        self.reason(deadline)
+            .map(|reason| format!(": {reason}"))
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(all(test, feature = "onnx"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_probe_stderr_drains_large_output_and_keeps_bounded_diagnostic() {
+        let mut logs = vec![b'x'; ProbeStderr::MAX_BYTES * 4];
+        logs.extend_from_slice(b"\nmigraphx probe failed: provider failed\n");
+        let stderr = ProbeStderr::capture(std::io::Cursor::new(logs));
+        stderr.done.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(stderr.output.lock().unwrap().len(), ProbeStderr::MAX_BYTES);
+        assert_eq!(
+            stderr.reason(Instant::now()).as_deref(),
+            Some("provider failed")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_probe_stderr_does_not_block_a_verbose_child() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "head -c 262144 /dev/zero >&2; echo '\nmigraphx probe failed: verbose failure' >&2; exit 1"])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = ProbeStderr::capture(child.stderr.take().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("verbose probe blocked on stderr");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(!status.success());
+        assert_eq!(stderr.reason(deadline).as_deref(), Some("verbose failure"));
+    }
 }

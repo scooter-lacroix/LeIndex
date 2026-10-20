@@ -2079,7 +2079,7 @@ mod tests {
         // descendant resident, which is exactly how the previous version rotted.
         // The kernel's descendant-inclusive lifetime peak is the witness.
         assert!(
-            report.descendants.peak_rss_kib >= GRANDCHILD_KIB,
+            report.descendants.peak_rss_kib > GRANDCHILD_KIB,
             "no {GRANDCHILD_KIB} KiB descendant was observed (kernel lifetime peak {} KiB) — \
              the guard would pass vacuously",
             report.descendants.peak_rss_kib

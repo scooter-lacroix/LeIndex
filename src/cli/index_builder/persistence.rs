@@ -332,7 +332,24 @@ pub(crate) fn persist_neural_embeddings_to_mmap(
     let spans = search_engine.collect_node_span_bytes();
     let buckets =
         crate::search::mrl::partition_rows_by_slice_dimension(&embeddings, &spans, matryoshka);
-    let native_dim = crate::search::mrl::MRL_TIERS[3];
+    // Off also serves providers with native dimensions other than 768. Use
+    // their recorded dimension so actual-width buckets retain the canonical
+    // path; shorter restored rows stay in sidecars instead of mixing widths.
+    let native_dim = if matryoshka == crate::config::MatryoshkaSetting::Off {
+        identity
+            .and_then(|value| value.rsplit('|').next()?.parse::<usize>().ok())
+            .filter(|dim| *dim > 0)
+            .unwrap_or_else(|| {
+                embeddings
+                    .iter()
+                    .map(|(_, row)| row.len())
+                    .max()
+                    .unwrap_or(0)
+                    .max(crate::search::mrl::MRL_TIERS[3])
+            })
+    } else {
+        crate::search::mrl::MRL_TIERS[3]
+    };
     let mut keep = Vec::with_capacity(buckets.len());
     for (dim, rows) in &buckets {
         let tier_path = if *dim == native_dim {

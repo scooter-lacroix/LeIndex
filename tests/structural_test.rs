@@ -520,6 +520,7 @@ fn test_expired_deadline_reports_partial_not_complete() {
         output.stats.scanned, 0,
         "a skipped file was not scanned, and must not be counted as if it were"
     );
+    assert!(output.stopped_by_deadline);
     assert_eq!(
         output.stats.skipped_deadline, output.stats.candidates,
         "every candidate was skipped by the expired deadline"
@@ -557,6 +558,7 @@ fn test_truncated_inventory_forces_has_more() {
         "the expired deadline stops the walk before it enumerates anything"
     );
     assert_eq!(output.returned, 0);
+    assert!(output.stopped_by_deadline);
     assert!(
         output.has_more,
         "an inventory that was cut short cannot be reported as a complete scan"
@@ -582,6 +584,27 @@ fn test_no_candidates_is_an_empty_success() {
     );
     assert_eq!(output.stats.total_matches, 0);
     assert!(!output.has_more);
+    assert!(!output.stopped_by_deadline);
+}
+
+#[test]
+fn test_scanned_counts_successful_reads_including_files_without_matches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "hit.rs", "fn found() {}\n");
+    write(dir.path(), "miss.rs", "struct NoMatch;\n");
+    std::fs::write(dir.path().join("binary.rs"), b"\0binary").unwrap();
+    let pattern = CompiledPattern::new("rust", "fn $NAME() { $$$BODY }").expect("pattern");
+    let output = search_structural(
+        dir.path(),
+        &pattern,
+        &FileFilter::default(),
+        &options(100, NO_CAP),
+    );
+    assert_eq!(output.stats.candidates, 3);
+    assert_eq!(output.stats.scanned, 2);
+    assert_eq!(output.returned, 1);
+    assert!(!output.has_more);
+    assert!(!output.stopped_by_deadline);
 }
 
 // =============================================================================

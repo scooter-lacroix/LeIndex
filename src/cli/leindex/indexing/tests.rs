@@ -1237,3 +1237,55 @@ fn test_save_stage_gate_trips_only_over_budget() {
         "message: {message}"
     );
 }
+
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+#[test]
+fn test_neural_checkpoint_mismatch_discards_resident_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut index = LeIndex::new(dir.path()).unwrap();
+    index
+        .search_engine
+        .index_nodes(vec![crate::search::search::NodeInfo {
+            node_id: "node".to_string(),
+            file_path: "test.rs".to_string(),
+            symbol_name: "node".to_string(),
+            language: "rust".to_string(),
+            content: "fn node() {}".to_string(),
+            byte_range: (0, 12),
+            tfidf_embedding: vec![1.0, 0.0],
+            neural_embedding: None,
+            complexity: 1,
+            signature: None,
+            pre_tokenized: None,
+        }]);
+    let mmap_path = index_builder::neural_mmap_embeddings_path(dir.path());
+    crate::search::vector::write_mmap_embeddings(
+        &mmap_path,
+        &[("node".to_string(), vec![1.0, 0.0])],
+    )
+    .unwrap();
+    let mut checkpoint = NeuralCheckpoint {
+        lexical_hash: "lexical".to_string(),
+        mmap_path,
+        rows: 1,
+        provider: "test".to_string(),
+        model: "model".to_string(),
+        matryoshka: None,
+    };
+    assert_eq!(
+        index.restore_neural_checkpoint(Some(&checkpoint), "lexical", "model"),
+        (1, true)
+    );
+    assert_eq!(index.search_engine.collect_neural_embeddings().len(), 1);
+
+    checkpoint.rows = 2;
+    assert_eq!(
+        index.restore_neural_checkpoint(Some(&checkpoint), "lexical", "model"),
+        (0, false),
+        "mismatch must trigger re-embedding"
+    );
+    assert!(
+        index.search_engine.collect_neural_embeddings().is_empty(),
+        "a later persist must not collect partial restored rows"
+    );
+}

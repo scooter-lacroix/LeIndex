@@ -617,13 +617,9 @@ impl LeIndex {
                         "Neural checkpoint row count mismatch; discarding partial restore and \
                          re-embedding"
                     );
-                    // The partial restore already wrote these into the resident
-                    // engine. Zeroing the count is what makes the caller re-embed:
-                    // its gate is `neural_rows == 0 && !loaded`, and publishing
-                    // `rows` here would ship a partial store over the artifacts
-                    // this check just rejected. The partially restored embeddings
-                    // left behind are harmless — `enrich_neural_for_route`
-                    // overwrites them for every admitted node.
+                    // Discard resident rows too: re-embedding may be unavailable
+                    // or fail, and a later persist must not publish a partial restore.
+                    self.search_engine.clear_neural_embeddings();
                     rows = 0;
                 } else {
                     loaded = rows > 0;

@@ -169,6 +169,8 @@ pub struct StructuralOutput {
     /// Matches exist beyond `offset + limit` (cap-withheld matches excluded:
     /// they appear on no page, so paging cannot reach them).
     pub has_more: bool,
+    /// The time budget expired, so results may be incomplete.
+    pub stopped_by_deadline: bool,
     /// Totals.
     pub stats: StructuralStats,
 }
@@ -518,7 +520,7 @@ pub fn search(
         .collect();
     output.stats.candidates = rels.len();
 
-    // `scanned` below counts candidates *admitted*, not work done. Two things
+    // Two things
     // never produce a `StructuralFile`, and only one of them means the answer is
     // incomplete:
     //   * the worker hit the deadline before opening the file — that file may
@@ -586,8 +588,9 @@ pub fn search(
         output.returned += hits.len();
         output.files.push(StructuralFile { hits, ..file });
     }
-    output.has_more =
-        output.returned < paged || output.stats.skipped_deadline > 0 || listing_incomplete;
+    output.stopped_by_deadline =
+        output.stats.skipped_deadline > 0 || options.deadline.is_some_and(|d| Instant::now() >= d);
+    output.has_more = output.returned < paged || output.stopped_by_deadline || listing_incomplete;
     output.stats.millis = started.elapsed().as_millis();
     output
 }

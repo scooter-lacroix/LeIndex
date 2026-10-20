@@ -1441,7 +1441,7 @@ impl LeIndex {
         // persistence, community detection, snapshot layer) is attributed to
         // `persist` rather than inflating the TF-IDF build's peak.
         memory_report::close_phase(super::IndexPhase::Lexical.as_str());
-        memory_report::enter_phase(super::IndexPhase::Persist.as_str());
+        let _persist_phase = memory_report::PhaseScope::enter(super::IndexPhase::Persist.as_str());
         // D5: the graph no longer persists as SQL rows. It is published as
         // the Pdg layer of a CAS generation (stage_generation_layers); the
         // catalog keeps only `indexed_files` and metadata tables.

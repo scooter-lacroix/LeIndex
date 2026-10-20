@@ -937,12 +937,6 @@ fn write_atomic(
         // generation whose bytes never reached the device.
         writer.get_ref().sync_all()?;
         drop(writer);
-        // Windows refuses to rename over an existing file; the repo's other
-        // atomic writers remove first for the same reason.
-        #[cfg(windows)]
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
         std::fs::rename(&staging, path)?;
         sync_parent_dir(path);
         Ok(())
@@ -1420,6 +1414,37 @@ mod tests {
             observed, published,
             "an in-place rewrite truncates the file under live readers"
         );
+    }
+
+    #[test]
+    fn test_empty_mmap_publish_preserves_open_reader_and_failed_write_preserves_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embeddings.bin");
+        write_mmap_embeddings_with_identity(
+            &path,
+            &[("node".to_string(), vec![1.0, 0.0])],
+            Some("old"),
+        )
+        .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+        write_empty_mmap_embeddings_with_identity(&path, 2, Some("new")).unwrap();
+        let mut observed = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut observed).unwrap();
+        assert_eq!(observed, original);
+        let empty = MmapEmbeddingIndex::open(&path).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.dimension(), 2);
+        assert_eq!(empty.identity(), Some("new"));
+
+        let published = std::fs::read(&path).unwrap();
+        let result = write_atomic(&path, |writer| {
+            writer.write_all(b"incomplete header")?;
+            Err(MmapError::Corrupt("injected write failure".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), published);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

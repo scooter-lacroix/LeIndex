@@ -156,31 +156,27 @@ pub fn slice_dimension_for(setting: MatryoshkaSetting, span_bytes: usize) -> Opt
 /// Returns rows grouped by their slice dimension, each row already sliced and
 /// re-normalized. Rows whose node id has no span entry are treated as
 /// unknown-span and keep the full dimension (safe default: full fidelity).
-/// Under `Off` (or an empty input) the single bucket holds the rows
-/// untouched, so callers can treat "no slicing" as the degenerate case.
+/// Under `Off` rows remain untouched and are grouped by their actual length,
+/// keeping already-sliced rows out of wider buckets.
 pub fn partition_rows_by_slice_dimension(
     rows: &[(String, Vec<f32>)],
     span_bytes: &std::collections::HashMap<String, usize>,
     setting: MatryoshkaSetting,
 ) -> Vec<(usize, Vec<(String, Vec<f32>)>)> {
     let mut buckets: Vec<(usize, Vec<(String, Vec<f32>)>)> = Vec::new();
-    if rows.is_empty() || setting == MatryoshkaSetting::Off {
-        if !rows.is_empty() {
-            buckets.push((MRL_TIERS[3], rows.to_vec()));
-        }
-        return buckets;
-    }
     for (node_id, embedding) in rows {
         let span = span_bytes.get(node_id).copied().unwrap_or(usize::MAX);
-        let dim = slice_dimension_for(setting, span).unwrap_or(MRL_TIERS[3]);
+        let dim = slice_dimension_for(setting, span)
+            .unwrap_or(embedding.len())
+            .min(embedding.len());
+        let row = if setting == MatryoshkaSetting::Off {
+            embedding.clone()
+        } else {
+            slice_l2_normalized(embedding, dim)
+        };
         match buckets.iter_mut().find(|(d, _)| *d == dim) {
-            Some((_, bucket)) => {
-                bucket.push((node_id.clone(), slice_l2_normalized(embedding, dim)))
-            }
-            None => buckets.push((
-                dim,
-                vec![(node_id.clone(), slice_l2_normalized(embedding, dim))],
-            )),
+            Some((_, bucket)) => bucket.push((node_id.clone(), row)),
+            None => buckets.push((dim, vec![(node_id.clone(), row)])),
         }
     }
     buckets.sort_by_key(|(dim, _)| *dim);
@@ -269,6 +265,43 @@ mod tests {
             partition_rows_by_slice_dimension(&[], &HashMap::new(), MatryoshkaSetting::Dynamic)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn test_partition_keeps_restored_rows_in_buckets_of_their_actual_length() {
+        let rows = vec![
+            ("native".to_string(), unit_vector(768, 1)),
+            ("restored".to_string(), unit_vector(256, 2)),
+            ("short".to_string(), unit_vector(128, 3)),
+        ];
+        for setting in [
+            MatryoshkaSetting::Off,
+            MatryoshkaSetting::Dynamic,
+            MatryoshkaSetting::Dim512,
+        ] {
+            let buckets = partition_rows_by_slice_dimension(&rows, &HashMap::new(), setting);
+            let dimensions: Vec<_> = buckets.iter().map(|(dim, _)| *dim).collect();
+            assert_eq!(
+                dimensions,
+                vec![
+                    128,
+                    256,
+                    if setting == MatryoshkaSetting::Dim512 {
+                        512
+                    } else {
+                        768
+                    }
+                ]
+            );
+            for (dim, bucket) in buckets {
+                assert!(bucket.iter().all(|(_, embedding)| embedding.len() == dim));
+                if setting == MatryoshkaSetting::Off {
+                    for row in bucket {
+                        assert!(rows.contains(&row), "Off must preserve row values");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
