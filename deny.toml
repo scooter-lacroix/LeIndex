@@ -32,3 +32,29 @@ ignore = []
 # Parity with prior cargo-audit behavior: unmaintained crates are reported but
 # do not fail the gate.
 unmaintained = "none"
+
+# --- Deliberate exception to the AGENTS.md:60 3-day release-age rule ---------
+#
+# RUSTSEC-2026-0382 (rustls-webpki < 0.103.16) and RUSTSEC-2026-0381
+# (webpki-roots < 1.0.10) both cover versions this tree shipped, reached through
+# the real runtime path `remote-embeddings` -> reqwest -> rustls -> webpki, so
+# neither the "remove the unused dependency" escape nor an `ignore` entry
+# applies — the crates are load-bearing and the advisories are live.
+#
+# Both advisories concern the same defect: certificate paths through distrusted
+# emSign intermediates are accepted where the trust anchors allow it, and the
+# corresponding private keys are now public. The only fix is the version bump,
+# but the patched releases are younger than the 3-day minimum:
+#
+#   rustls-webpki 0.103.16  published 2026-10-20T08:58:28Z  (~14h at the bump)
+#   webpki-roots  1.0.10    published 2026-10-19T20:11:32Z  (~27h at the bump)
+#
+# Resolved by explicit owner decision to prefer the security patch over the
+# cooling-off window, since the alternative was shipping a known-bad TLS
+# validator to satisfy a supply-chain heuristic. Both versions were fetched
+# from crates.io directly and verified to be the advisory's named fixes, not
+# pre-releases. No `--all-features`-only or dev-only path is involved.
+#
+# This exception needs NO suppression entry: the bump to the patched versions
+# resolves both ids outright, so `ignore` above stays empty. This note is the
+# audit trail for landing them inside the cooling-off window.
