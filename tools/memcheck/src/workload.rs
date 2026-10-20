@@ -830,6 +830,14 @@ fn run_command_phase_with_peak_support(
     // alone, independent of how slow a full sample turns out to be.
     //
     // VmHWM is monotonic, so the last successful read is the phase peak.
+    //
+    // # shh: a peak reached in the last ~250us before the command exits is
+    // still missed — the poller cannot outlive `done`, because `/proc/<pid>`
+    // loses `VmHWM` the moment `wait4` reaps the child. For phases that ran no
+    // descendants `ru_maxrss` closes that gap exactly (see the certified fold
+    // below); for descendant-spawning phases it cannot be used without folding
+    // the descendants' peaks in too, so the gap is genuine there and not worth
+    // closing. It only under-reports an allocation made in the final tick.
     let hwm_handle = std::thread::spawn(move || {
         let mut vm_hwm_kib = 0u64;
         while !done_hwm.load(Ordering::Relaxed) {
@@ -840,6 +848,8 @@ fn run_command_phase_with_peak_support(
         }
         vm_hwm_kib
     });
+
+    let descendants_handle = poll_descendants(pid, done.clone());
 
     let sampler_handle = std::thread::spawn(move || {
         let mut samples = Vec::new();
@@ -866,6 +876,9 @@ fn run_command_phase_with_peak_support(
     let main_vm_hwm_kib = hwm_handle
         .join()
         .map_err(|_| anyhow::anyhow!("VmHWM poller thread panicked"))?;
+    let descendant_observation = descendants_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("descendant poller thread panicked"))?;
 
     let (status, lifetime_peak_kib) =
         waited.with_context(|| format!("{} command did not complete", phase_name))?;
@@ -921,6 +934,23 @@ fn run_command_phase_with_peak_support(
             "memcheck: phase '{}' peak sources — sampled: {} KiB, main VmHWM: {} KiB, descendant-inclusive kernel lifetime: {} KiB",
             phase_name, report.rss_max_kib, main_vm_hwm_kib, lifetime_peak_kib
         );
+    }
+    // `wait4`'s ru_maxrss is exact but descendant-inclusive, so it is only a
+    // valid main-process peak when the command ran no descendants at all. When
+    // it did — live children seen during the phase, or a descendant still
+    // running now that the command is gone — the lifetime mark would charge
+    // that descendant's peak to leindex, which is the regression the budget
+    // ceilings were fixed for.
+    let descendant_observation = DescendantObservation {
+        seen: descendant_observation.seen || !descendants.by_name.is_empty(),
+        observable: descendant_observation.observable || descendants.by_name.is_empty(),
+    };
+    if descendant_observation.certifies_no_descendants() && lifetime_peak_kib > 0 {
+        // No descendant could have contributed to it, so ru_maxrss is this
+        // process's own peak — and unlike the 250us VmHWM poll it cannot miss
+        // an allocation made in the final tick before exit.
+        report.rss_max_kib = report.rss_max_kib.max(lifetime_peak_kib);
+        report.combined_rss_max_kib = report.combined_rss_max_kib.max(lifetime_peak_kib);
     }
     // Keep the descendant-inclusive lifetime peak, but only where it cannot be
     // mistaken for main-process RSS: the budget ceilings gate on `rss_max_kib`,
@@ -979,6 +1009,90 @@ fn wait_command_with_peak(child: &mut Child) -> Result<(std::process::ExitStatus
             return Err(error.into());
         }
     }
+}
+
+/// How often a running command is inspected for live descendants.
+///
+/// Coarser than the `VmHWM` poll on purpose: each check opens `/proc/<pid>/task`
+/// and reads one `children` file per thread, versus a single `status` line for
+/// `VmHWM`. The signal being detected is a process that allocates real memory,
+/// and that lives far longer than this interval.
+const DESCENDANT_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+/// What the descendant poller learned about one command phase.
+///
+/// `sampler::count_descendants` cannot answer this: it runs after `wait4` has
+/// reaped the measured process, so a descendant the command already waited for
+/// is gone by then and contributes nothing to the count. That blindness is
+/// exactly the shape of the `index` regression — the SCIP indexer is reaped
+/// before the phase ends — so the descendant check has to happen while the
+/// command is still running.
+#[derive(Clone, Copy, Default)]
+struct DescendantObservation {
+    /// A live child was seen while polling, or one was still running when the
+    /// phase completed.
+    seen: bool,
+    /// `/proc/<pid>/task/<tid>/children` was readable at least once, so
+    /// `seen == false` means "ran no descendants" rather than "could not look".
+    observable: bool,
+}
+
+impl DescendantObservation {
+    /// Whether `wait4`'s `ru_maxrss` can be trusted as the measured process's
+    /// own peak for this phase.
+    fn certifies_no_descendants(self) -> bool {
+        self.observable && !self.seen
+    }
+}
+
+/// Whether `pid` has at least one live child right now.
+///
+/// Reads `/proc/<pid>/task/<tid>/children` (`CONFIG_PROC_CHILDREN`). Returns
+/// `Err` when the process is gone or the kernel does not expose the file, which
+/// the caller must not mistake for "no children".
+fn has_live_child(pid: u32) -> std::io::Result<bool> {
+    let mut observable = false;
+    let mut saw_child = false;
+    for task in std::fs::read_dir(format!("/proc/{pid}/task"))?.flatten() {
+        let Ok(children) = std::fs::read_to_string(task.path().join("children")) else {
+            continue;
+        };
+        observable = true;
+        saw_child |= !children.trim().is_empty();
+    }
+    if !observable {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "kernel does not expose per-thread child lists",
+        ));
+    }
+    Ok(saw_child)
+}
+
+/// Watch `pid` for live descendants until `done` is set.
+///
+/// On its own thread, for the same reason the `VmHWM` poller has one: the
+/// regular sampler reads `smaps` and can block for hundreds of milliseconds on
+/// a GPU probe, so sharing a thread would blind the descendant check for most
+/// of the phase.
+fn poll_descendants(
+    pid: u32,
+    done: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<DescendantObservation> {
+    std::thread::spawn(move || {
+        let mut observation = DescendantObservation::default();
+        while !done.load(Ordering::Relaxed) {
+            match has_live_child(pid) {
+                Ok(true) => observation.seen = true,
+                Ok(false) => observation.observable = true,
+                // The measured process is gone, or this kernel cannot show its
+                // children: either way there is nothing further to learn.
+                Err(_) => break,
+            }
+            std::thread::sleep(DESCENDANT_POLL_INTERVAL);
+        }
+        observation
+    })
 }
 
 /// Linux-only command workload support is required to certify lifetime peaks.
@@ -1828,59 +1942,151 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_descendant_observation_certifies_own_peak_only_without_descendants() {
+        // The condition that decides whether ru_maxrss may extend rss_max_kib.
+        // It is exact and cheap, and it is the whole of finding 8's safety.
+        assert!(
+            DescendantObservation {
+                seen: false,
+                observable: true,
+            }
+            .certifies_no_descendants(),
+            "a clean poll of a childless process certifies its own peak"
+        );
+        assert!(
+            !DescendantObservation {
+                seen: true,
+                observable: true,
+            }
+            .certifies_no_descendants(),
+            "a descendant was seen — folding would be charged to the main process"
+        );
+        assert!(
+            !DescendantObservation {
+                seen: false,
+                observable: false,
+            }
+            .certifies_no_descendants(),
+            "an unreadable children file must not be mistaken for 'no children'"
+        );
+        assert!(
+            !DescendantObservation::default().certifies_no_descendants(),
+            "a phase that could not poll must not certify anything"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn test_command_phase_keeps_descendant_peak_out_of_main_rss() {
-        // A command that spawns a memory-hungry grandchild must not have that
-        // grandchild's peak charged to main-process RSS. Regression guard: the
-        // `index` phase measured 735848 KiB instead of ~38 MiB purely because
-        // SCIP precision ingest launched `rust-analyzer scip` (~733 MiB) and
-        // `wait4`'s ru_maxrss folds reaped descendants into the parent's peak.
-        use std::os::unix::fs::PermissionsExt;
-
-        const GRANDCHILD_KIB: usize = 262_144; // 256 MiB, well above the parent.
-
+    fn test_descendant_phase_does_not_fold_reaped_peak_into_main_rss() {
+        // The mirror of `test_command_peak_captures_final_tick_allocation`: the
+        // same reaped-peak fold must NOT happen here, or `index` would report
+        // rust-analyzer scip's 733 MiB as leindex's own.
+        //
+        // Unlike the non-descendant side this one is deterministic. The
+        // descendant allocates far more than `sh` ever will, so the
+        // descendant-inclusive lifetime peak and the main process's own peak
+        // differ by two orders of magnitude — no reliance on a poll landing
+        // inside the allocation window.
+        const DESCENDANT_KIB: u64 = 128 * 1024;
         let fixture = tempfile::tempdir().unwrap();
-        // The grandchild allocates GRANDCHILD_KIB of resident memory and holds
-        // it briefly; the parent shell only waits, so its own VmHWM stays small.
-        // Built from POSIX shell builtins and coreutils only — no python3, no
-        // interpreter dependency that would turn a missing tool into a
-        // misleading failure of the invariant under test.
-        let script = fixture.path().join("spawn_grandchild.sh");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n# Touch every page of a KIB-sized mmap, hold it, then exit.\n\
-                 dd if=/dev/zero of=/dev/null bs=1024 count={GRANDCHILD_KIB} 2>/dev/null | \
-                 dd of=/tmp/.leindex-memcheck-grandchild bs=1024 count={GRANDCHILD_KIB} 2>/dev/null &\n\
-                 wait\n"
-            ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).unwrap();
-
         let config = WorkloadConfig {
-            binary: script.clone(),
+            binary: PathBuf::from("/bin/sh"),
             fixture: fixture.path().to_path_buf(),
             sample_interval: Duration::from_millis(10),
             verbose: false,
             worker_capable: false,
             heap_profile_dir: None,
         };
-
         let report = run_command_phase_with_peak_support(
             &config,
-            "descendant_peak",
-            |binary, _| Command::new(binary),
+            "descendant_reaped",
+            |_, _| {
+                let mut command = Command::new("/bin/sh");
+                command.arg("-c").arg(format!(
+                    "MEMCHECK_PEAK_CHILD=transient MEMCHECK_PEAK_CHILD_KIB={DESCENDANT_KIB} \
+                     MEMCHECK_PEAK_CHILD_SLEEP_MS=0 '{helper}' --exact \
+                     workload::tests::test_command_peak_child & wait",
+                    helper = std::env::current_exe().unwrap().display(),
+                ));
+                command
+            },
             true,
         )
         .unwrap();
 
-        // Main-process RSS must stay near the shell's own footprint...
+        assert_eq!(
+            report.descendants.total, 0,
+            "the shell reaped the helper, so the post-phase scan must see nothing"
+        );
         assert!(
-            report.rss_max_kib < GRANDCHILD_KIB as u64,
+            report.descendants.peak_rss_kib >= DESCENDANT_KIB,
+            "the lifetime peak {} KiB must include the {DESCENDANT_KIB} KiB descendant",
+            report.descendants.peak_rss_kib
+        );
+        assert!(
+            report.rss_max_kib < DESCENDANT_KIB,
+            "rss_max_kib {} KiB must not fold the descendant's peak into the main process",
+            report.rss_max_kib
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_command_phase_keeps_descendant_peak_out_of_main_rss() {
+        // A command that runs a memory-hungry descendant must not have that
+        // descendant's peak charged to main-process RSS. Regression guard: the
+        // `index` phase measured 735848 KiB instead of ~38 MiB purely because
+        // SCIP precision ingest launched `rust-analyzer scip` (~733 MiB) and
+        // `wait4`'s ru_maxrss folds reaped descendants into the parent's peak.
+        //
+        // The descendant is a second `memcheck` process that allocates and
+        // touches GRANDCHILD_KIB, so it is genuinely resident — the previous
+        // `dd`-to-a-file grandchild lived in the page cache, reached a few MiB,
+        // and never exercised the invariant at all.
+        const GRANDCHILD_KIB: u64 = 131_072; // 128 MiB: far above the harness's sh.
+        let fixture = tempfile::tempdir().unwrap();
+        let config = WorkloadConfig {
+            binary: PathBuf::from("/bin/sh"),
+            fixture: fixture.path().to_path_buf(),
+            sample_interval: Duration::from_millis(10),
+            verbose: false,
+            worker_capable: false,
+            heap_profile_dir: None,
+        };
+        let report = run_command_phase_with_peak_support(
+            &config,
+            "descendant_peak",
+            |_, _| {
+                let mut command = Command::new("/bin/sh");
+                // `sh` stays resident for the whole phase, spawns the helper as
+                // a child, and waits for it — so the descendant is reaped before
+                // the phase ends, which is the `index` shape.
+                command.arg("-c").arg(format!(
+                    "MEMCHECK_PEAK_CHILD=resident MEMCHECK_PEAK_CHILD_KIB={GRANDCHILD_KIB} \
+                     '{helper}' --exact workload::tests::test_command_peak_child & wait",
+                    helper = std::env::current_exe().unwrap().display(),
+                ));
+                command
+            },
+            true,
+        )
+        .unwrap();
+
+        // The descendant must have been observed at all, or the assertion below
+        // passes for the wrong reason. `wait` reaped it, so the post-phase scan
+        // cannot see it; falling back to `VmHWM` would let this test pass with no
+        // descendant resident, which is exactly how the previous version rotted.
+        // The kernel's descendant-inclusive lifetime peak is the witness.
+        assert!(
+            report.descendants.peak_rss_kib >= GRANDCHILD_KIB,
+            "no {GRANDCHILD_KIB} KiB descendant was observed (kernel lifetime peak {} KiB) — \
+             the guard would pass vacuously",
+            report.descendants.peak_rss_kib
+        );
+        // ...and that peak must not be charged to the main process.
+        assert!(
+            report.rss_max_kib < GRANDCHILD_KIB,
             "main-process rss_max_kib {} KiB must not absorb the descendant peak",
             report.rss_max_kib
         );
@@ -1896,19 +2102,44 @@ mod tests {
         assert!(measured_pid(u32::MAX).is_err());
     }
 
+    /// Payload for the self-invoked helper processes the tests around it spawn.
+    /// A no-op unless `MEMCHECK_PEAK_CHILD` selects a mode.
+    ///
+    /// `resident` touches every page of a large allocation and exits, so the
+    /// kernel's lifetime peak for it is genuinely large even though the process
+    /// is short-lived. `transient` outlives the startup sample, then touches and
+    /// immediately releases its allocation — after `MEMCHECK_PEAK_CHILD_SLEEP_MS`,
+    /// zero meaning "peak and exit immediately".
     #[cfg(target_os = "linux")]
     #[test]
     fn test_command_peak_child() {
-        if std::env::var_os("MEMCHECK_PEAK_CHILD").is_some() {
-            // Leave time for the startup sample, then touch and immediately
-            // free an allocation between periodic ticks.
-            std::thread::sleep(Duration::from_millis(100));
-            let mut allocation = vec![0u8; 64 * 1024 * 1024];
+        let Some(mode) = std::env::var_os("MEMCHECK_PEAK_CHILD") else {
+            return;
+        };
+        let kib: usize = std::env::var("MEMCHECK_PEAK_CHILD_KIB")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(64 * 1024);
+        if mode == "resident" {
+            let mut allocation = vec![0u8; kib * 1024];
             for byte in allocation.iter_mut().step_by(4096) {
                 *byte = 1;
             }
             std::hint::black_box(&allocation);
+            return;
         }
+        // Outlive the startup sample, then touch and immediately free an
+        // allocation between periodic ticks.
+        let sleep_ms = std::env::var("MEMCHECK_PEAK_CHILD_SLEEP_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(100);
+        std::thread::sleep(Duration::from_millis(sleep_ms));
+        let mut allocation = vec![0u8; kib * 1024];
+        for byte in allocation.iter_mut().step_by(4096) {
+            *byte = 1;
+        }
+        std::hint::black_box(&allocation);
     }
 
     #[cfg(target_os = "linux")]
@@ -1927,7 +2158,7 @@ mod tests {
             let mut command = Command::new(bin);
             command
                 .args(["--exact", "workload::tests::test_command_peak_child"])
-                .env("MEMCHECK_PEAK_CHILD", "1");
+                .env("MEMCHECK_PEAK_CHILD", "transient");
             command
         })
         .unwrap();
@@ -1937,6 +2168,60 @@ mod tests {
             report.rss_max_kib
         );
         assert!(report.combined_rss_max_kib >= report.rss_max_kib);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_command_peak_captures_final_tick_allocation() {
+        // A peak reached in the last few hundred microseconds of a process's
+        // life escapes both the 250us VmHWM poll and the periodic samples, and
+        // `/proc/<pid>` stops answering the moment `wait4` reaps it — so
+        // neither can be recovered afterwards. `wait4`'s ru_maxrss is exact, and
+        // when the phase ran no descendants there is nothing else folded into
+        // it, which is what makes folding it into `rss_max_kib` sound.
+        //
+        // The allocation is what the child realistically carries: its own
+        // startup footprint plus 64 MiB. Asserting on the allocation alone is
+        // not enough — the child's baseline already clears 64 MiB, so the test
+        // would pass without ever touching the fold. The real witness is that
+        // `rss_max_kib` now agrees with the kernel's exact lifetime mark; every
+        // other peak source is sampled and under-reports it.
+        const ALLOCATION_KIB: u64 = 64 * 1024;
+        let fixture = tempfile::tempdir().unwrap();
+        let config = WorkloadConfig {
+            binary: std::env::current_exe().unwrap(),
+            fixture: fixture.path().to_path_buf(),
+            sample_interval: Duration::from_millis(500),
+            verbose: false,
+            worker_capable: false,
+            heap_profile_dir: None,
+        };
+        let report = run_command_phase(&config, "final_tick", |bin, _| {
+            let mut command = Command::new(bin);
+            command
+                .args(["--exact", "workload::tests::test_command_peak_child"])
+                .env("MEMCHECK_PEAK_CHILD", "transient")
+                .env("MEMCHECK_PEAK_CHILD_KIB", ALLOCATION_KIB.to_string())
+                .env("MEMCHECK_PEAK_CHILD_SLEEP_MS", "0");
+            command
+        })
+        .unwrap();
+        assert_eq!(
+            report.descendants.total, 0,
+            "this phase must run no descendants for ru_maxrss to be a main-process peak"
+        );
+        assert!(
+            report.descendants.peak_rss_kib >= ALLOCATION_KIB,
+            "the kernel lifetime peak {} KiB must include the {ALLOCATION_KIB} KiB allocation",
+            report.descendants.peak_rss_kib
+        );
+        assert!(
+            report.rss_max_kib >= report.descendants.peak_rss_kib,
+            "rss_max_kib {} KiB must not under-report the main process's own peak ({} KiB) — \
+             the final tick is missing",
+            report.rss_max_kib,
+            report.descendants.peak_rss_kib
+        );
     }
 
     #[test]
