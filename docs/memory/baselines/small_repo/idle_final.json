@@ -1,14 +1,14 @@
 {
   "phase": "idle_final",
   "rss_min_kib": 11052,
-  "rss_max_kib": 11052,
-  "rss_p95_kib": 11052,
+  "rss_max_kib": 11788,
+  "rss_p95_kib": 11788,
   "mapped_file_kib": 10600,
   "anon_kib": 452,
   "sample_count": 12,
   "duration_ms": 3087,
   "worker_rss_max_kib": 0,
-  "combined_rss_max_kib": 11052,
+  "combined_rss_max_kib": 11788,
   "gpu_vram_mib": 823,
   "descendants": {
     "total": 0,
