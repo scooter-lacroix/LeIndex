@@ -353,18 +353,30 @@ pub(crate) fn persist_neural_embeddings_to_mmap(
     // A narrowed policy must not leave orphaned sidecars from a previous run.
     remove_neural_tier_mmaps(project_path, &keep)?;
     // Under a fixed sub-native policy (Dim512/Dim256/Dim128) every row is sliced,
-    // so no bucket is native and `neural_embeddings.bin` is left exactly as a
-    // previous 768-dim run wrote it. The readers do not gate tier loading on it
-    // (see `restore_engine_from_snapshot`), so the tiers below are honored — but
-    // a stale native file would still be loaded and served as if it described
-    // this generation. Drop it so the sidecars are the only neural state.
-    if !keep.contains(&native_dim) && path.exists() {
-        std::fs::remove_file(&path).map_err(|e| {
-            anyhow::anyhow!("Failed to remove stale canonical neural mmap embeddings: {e}")
+    // so no bucket is native. Two things must be true afterwards:
+    //   1. the stale canonical file from a previous 768-dim run must not be
+    //      served as if it described this generation, and
+    //   2. the generation's identity and native dimension must survive.
+    // Deleting the canonical file satisfies (1) but breaks (2): it is the only
+    // artifact `query_remote_embedder` raw-reads for provider identity and
+    // dimension, so a tier-only generation would look absent and query
+    // embedding would fall back to a different vector space than the sidecars
+    // hold (Codex P1). Overwrite it with a zero-row header carrying the native
+    // dimension and the identity instead: readers restore nothing from it
+    // (`len() == 0`) but still resolve identity and dimension.
+    if !keep.contains(&native_dim) {
+        crate::search::vector::write_empty_mmap_embeddings_with_identity(
+            &path,
+            native_dim as u32,
+            identity,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("Failed to write tier-only canonical neural mmap header: {e}")
         })?;
         info!(
             path = %path.display(),
-            "Removed stale canonical neural mmap; this generation is tier-only"
+            dim = native_dim,
+            "Wrote tier-only canonical neural mmap header (identity + native dimension, zero rows)"
         );
     }
     Ok(())

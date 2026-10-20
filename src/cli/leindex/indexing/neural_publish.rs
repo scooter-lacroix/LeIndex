@@ -308,6 +308,7 @@ impl<W: streaming::neural::NeuralRowWriter> streaming::neural::NeuralRowWriter
 fn streaming_neural_inputs<'a>(
     pdg: &'a crate::graph::pdg::ProgramDependenceGraph,
     admitted_node_ids: &'a HashSet<String>,
+    project_path: &'a std::path::Path,
 ) -> impl Iterator<Item = Result<streaming::neural::NeuralInput>> + 'a {
     let connectivity_config = crate::graph::pdg::TraversalConfig {
         max_depth: Some(1),
@@ -358,11 +359,26 @@ fn streaming_neural_inputs<'a>(
                 Ok(streaming::neural::NeuralInput {
                     node_id: node.id.clone(),
                     text: index_builder::cap_neural_text(&text).to_owned(),
-                    // Legacy-route parity: the relative source path rides
-                    // along as the document title so the remote doc template
-                    // ({title}) receives the same input shape on both routes
-                    // (EmbeddingGemma2 trains on title+text prompts).
-                    title: Some(node.file_path.to_string()),
+                    // Legacy-route parity: the project-relative source path
+                    // rides along as the document title so the remote doc
+                    // template ({title}) receives the same input shape on both
+                    // routes (EmbeddingGemma2 trains on title+text prompts).
+                    //
+                    // It MUST be project-relative, not `node.file_path`: some
+                    // nodes carry an absolute path (submodule summaries store
+                    // `summary.path` verbatim), and sending that as the title
+                    // leaks the local checkout path to a remote provider and
+                    // makes title-aware embeddings differ between two identical
+                    // checkouts (CodeRabbit Security/Privacy). Only the title is
+                    // relativized — `node.file_path` above is still the
+                    // absolute path used to READ the source.
+                    title: Some(
+                        std::path::Path::new(&*node.file_path)
+                            .strip_prefix(project_path)
+                            .unwrap_or(std::path::Path::new(&*node.file_path))
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    ),
                 })
             };
             return Some(input);
@@ -375,6 +391,7 @@ fn enrich_neural_for_route(
     pdg: &crate::graph::pdg::ProgramDependenceGraph,
     embedder: &index_builder::GenerationNeuralEmbedder,
     admitted_node_ids: &HashSet<String>,
+    project_path: &std::path::Path,
 ) -> Result<usize> {
     let (cache_hits_before, _) = neural_cache_counters();
     // The heartbeat covers the whole pass (see NeuralProgress): liveness even
@@ -385,7 +402,7 @@ fn enrich_neural_for_route(
         engine,
         seen_node_ids: HashSet::new(),
     };
-    let mut inputs = streaming_neural_inputs(pdg, admitted_node_ids);
+    let mut inputs = streaming_neural_inputs(pdg, admitted_node_ids, project_path);
     let budget = streaming::BatchBudget {
         max_texts: 256,
         max_seq_len: 64 * 1024,
@@ -533,11 +550,33 @@ impl LeIndex {
         let mut loaded = loaded;
         if requested {
             #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-            if let Some(neural_mmap) =
-                index_builder::try_load_neural_mmap_embeddings(&self.project_path)
             {
-                rows = self.search_engine.restore_neural_embeddings(&neural_mmap);
-                loaded = rows > 0;
+                // Restore EVERY persisted tier, not just the canonical file. A
+                // Dynamic or fixed sub-native generation writes some (or all) of
+                // its rows to sidecars, so accepting the checkpoint on the
+                // canonical row count alone resumed with the resident engine
+                // missing every tier-homed node — and those nodes were then
+                // skipped for re-embedding (Codex P2). Accept the checkpoint only
+                // when the restored total matches what was checkpointed.
+                let artifact_path = self.project_path.join(".leindex");
+                if let Some(neural_mmap) =
+                    index_builder::try_load_neural_mmap_embeddings(&self.project_path)
+                {
+                    rows = self.search_engine.restore_neural_embeddings(&neural_mmap);
+                }
+                for mmap in index_builder::load_neural_tier_mmaps_from_storage(&artifact_path) {
+                    rows += self.search_engine.restore_neural_embeddings(&mmap);
+                }
+                let checkpointed = checkpoint.map_or(0, |checkpoint| checkpoint.rows);
+                if checkpointed > 0 && rows != checkpointed {
+                    warn!(
+                        restored = rows,
+                        checkpointed,
+                        "Neural checkpoint row count mismatch; re-embedding instead of resuming"
+                    );
+                } else {
+                    loaded = rows > 0;
+                }
             }
         }
         (rows, loaded)
@@ -881,6 +920,7 @@ impl LeIndex {
                 pdg,
                 neural_embedder,
                 &state.admitted_node_ids,
+                &self.project_path,
             )?;
         }
         let (selected_model, selected_provider) = self.persist_neural_outputs(
@@ -1299,8 +1339,9 @@ mod tests {
     #[test]
     fn test_streaming_neural_inputs_missing_source_uses_empty_bytes() {
         let dir = tempfile::tempdir().expect("neural source fixture");
-        let file_path = dir.path().join("missing.rs");
-        let file_path = file_path.display().to_string();
+        let project_path = dir.path().join("checkout");
+        std::fs::create_dir_all(&project_path).expect("project root fixture");
+        let file_path = project_path.join("missing.rs").display().to_string();
         let node_id = format!("{file_path}:missing_source");
         let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
         pdg.add_node(crate::graph::pdg::Node {
@@ -1314,12 +1355,16 @@ mod tests {
         });
         let admitted = HashSet::from([node_id.clone()]);
 
-        let mut inputs = streaming_neural_inputs(&pdg, &admitted);
+        let mut inputs = streaming_neural_inputs(&pdg, &admitted, &project_path);
         let input = inputs
             .next()
             .expect("admitted node should produce a neural input")
             .expect("missing source uses the empty-byte fallback");
         assert_eq!(input.node_id, node_id);
+        // The title is the PROJECT-RELATIVE path: an absolute one would leak the
+        // local checkout path to a remote provider and make title-aware
+        // embeddings differ between identical checkouts.
+        assert_eq!(input.title.as_deref(), Some("missing.rs"));
         assert!(inputs.next().is_none());
     }
 }

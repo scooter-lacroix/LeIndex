@@ -224,7 +224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn judged_order_keeps_base_order_when_relevance_is_uniform() {
+    async fn test_judged_order_keeps_base_order_when_relevance_is_uniform() {
         let results = vec![
             result("n0", "a.rs", "alpha", 0.9),
             result("n1", "b.rs", "beta", 0.8),
@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn judge_promotes_highly_relevant_candidate_over_base_leader() {
+    async fn test_judge_promotes_highly_relevant_candidate_over_base_leader() {
         let results = vec![
             result("n0", "a.rs", "alpha", 0.9),
             result("n1", "b.rs", "beta", 0.8),
@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incomplete_verdicts_fail_open_to_original_order() {
+    async fn test_incomplete_verdicts_fail_open_to_original_order() {
         let results = vec![
             result("n0", "a.rs", "alpha", 0.9),
             result("n1", "b.rs", "beta", 0.8),
@@ -299,7 +299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_error_fails_open_to_original_order() {
+    async fn test_provider_error_fails_open_to_original_order() {
         let results = vec![result("n0", "a.rs", "alpha", 0.9)];
         let docs = docs_of(&results);
         let asker = FnAsker(|_request: &Request| -> Result<Response, SystemOneError> {
@@ -321,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn candidates_carry_dispatch_fields_for_the_judge_wire() {
+    fn test_candidates_carry_dispatch_fields_for_the_judge_wire() {
         let results = vec![result("n0", "src/a.rs", "alpha", 0.9)];
         let docs = docs_of(&results);
         let values = candidate_values(&results, &docs);

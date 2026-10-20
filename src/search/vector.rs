@@ -1003,6 +1003,69 @@ fn identity_len_u32(value: &str) -> Result<u32, MmapError> {
         .map_err(|_| MmapError::Corrupt("generation identity byte length exceeds u32::MAX".into()))
 }
 
+/// Write a zero-row neural mmap that still carries an identity and a dimension.
+///
+/// [`write_mmap_embeddings_with_identity`] hardcodes `dimension = 0` for an
+/// empty slice, which is right for the generic writer but wrong for a
+/// *tier-only* neural generation: every row was sliced to a sub-native tier, so
+/// no canonical rows exist, yet the header is the only artifact raw-read for
+/// the persisted provider identity and native dimension (see
+/// `query_remote_embedder`, which seeds the query embedder from
+/// `dimension()`). A deleted canonical file therefore makes a tier-only
+/// generation look absent, and query embedding then silently falls back to a
+/// different vector space than the sidecars hold (Codex P1).
+///
+/// The file is a pure header: zero rows, the native dimension, the identity
+/// trailer. Readers see `len() == 0` (so nothing is restored from it) while
+/// still resolving identity and dimension.
+pub fn write_empty_mmap_embeddings_with_identity(
+    path: &Path,
+    dimension: u32,
+    identity: Option<&str>,
+) -> Result<(), MmapError> {
+    let identity_len = identity.map(identity_len_u32).transpose()?;
+
+    let (id_bytes, id_offsets, id_lengths): (Vec<u8>, Vec<u64>, Vec<u32>) =
+        (Vec::new(), Vec::new(), Vec::new());
+    let header_size = MmapHeader::SIZE;
+    let ids_end = header_size + id_bytes.len();
+    let embedding_matrix_offset = (ids_end + 3) & !3; // align to 4 bytes
+    let padding_len = embedding_matrix_offset - ids_end;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    use std::io::Write;
+    let file = std::fs::File::create(path)?;
+    let mut writer = std::io::BufWriter::new(file);
+
+    write_header_and_ids(
+        &mut writer,
+        MmapHeader {
+            magic: MMAP_MAGIC,
+            version: MMAP_VERSION,
+            node_count: 0,
+            dimension,
+        },
+        &id_offsets,
+        &id_lengths,
+    )?;
+
+    writer.write_all(&id_bytes)?;
+    if padding_len > 0 {
+        writer.write_all(&vec![0u8; padding_len])?;
+    }
+
+    if let (Some(identity), Some(identity_len)) = (identity, identity_len) {
+        writer.write_all(&identity_len.to_le_bytes())?;
+        writer.write_all(identity.as_bytes())?;
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
 /// Write the fixed header followed by the offset and length tables.
 fn write_header_and_ids(
     writer: &mut impl std::io::Write,
@@ -1218,6 +1281,31 @@ mod tests {
         let index = MmapEmbeddingIndex::open(&path).unwrap();
         assert!(index.is_empty());
         assert_eq!(index.identity(), Some("local|onnx/model"));
+    }
+
+    /// A tier-only generation has no canonical rows but MUST still advertise its
+    /// native dimension and provider identity: `query_remote_embedder` seeds the
+    /// query embedder from both, so losing them silently swaps the query into a
+    /// different vector space than the MRL sidecars hold (Codex P1). The generic
+    /// writer hardcodes dimension 0 for an empty slice, which is exactly the bug
+    /// this separate entry point exists to avoid.
+    #[test]
+    fn test_mmap_empty_index_keeps_dimension_and_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tier-only.bin");
+
+        write_empty_mmap_embeddings_with_identity(&path, 768, Some("remote|custom|x|m")).unwrap();
+        let index = MmapEmbeddingIndex::open(&path).unwrap();
+        assert_eq!(index.len(), 0);
+        assert_eq!(index.dimension(), 768);
+        assert_eq!(index.identity(), Some("remote|custom|x|m"));
+
+        // No identity: still a valid, openable header carrying the dimension.
+        write_empty_mmap_embeddings_with_identity(&path, 768, None).unwrap();
+        let index = MmapEmbeddingIndex::open(&path).unwrap();
+        assert_eq!(index.len(), 0);
+        assert_eq!(index.dimension(), 768);
+        assert_eq!(index.identity(), None);
     }
 
     #[test]

@@ -1,8 +1,10 @@
 use super::{AnyhowResult, ServiceAction};
 
 // `print_services_table`, `print_service_detail` and `service_row_state` live
-// here; `cli.rs` re-exports them (`pub(crate) use`) so `cli_test.rs`, which does
-// `use super::*` on `cli`, resolves them exactly as before.
+// here. `cli.rs` imports only `cmd_services_impl`, and does so privately — there
+// is no `pub(crate) use` re-export. `cli_test.rs` reaches `service_row_state`
+// through an explicit `use super::services_commands::service_row_state;`, so a
+// re-export is neither present nor needed.
 
 /// Only successful HTTP readiness is "up"; TCP alone may be another process
 /// or a model server that is still loading.

@@ -183,7 +183,7 @@ impl LeIndex {
     fn restore_engine_from_snapshot(
         artifact_path: &std::path::Path,
         persisted_embedder: Option<&index_builder::TfIdfEmbedder>,
-        _config: &crate::config::LeIndexConfig,
+        config: &crate::config::LeIndexConfig,
     ) -> Option<RestoredEngine> {
         let snapshot = index_builder::try_load_search_snapshot_from_storage(artifact_path)?;
         let tfidf_mmap = index_builder::try_load_mmap_embeddings_from_storage(artifact_path)?;
@@ -204,13 +204,26 @@ impl LeIndex {
         // re-embed (Codex P1 / CodeRabbit Major). Load whatever sidecars exist;
         // each one validates its own header, and snapshot install filters by node
         // id below.
+        //
+        // Sidecars ARE gated on the effective Matryoshka setting: a generation
+        // persisted while the rollout flag was armed must not keep serving sliced
+        // vectors after the flag is switched off, or the deployment has no way to
+        // roll the capability back short of a full re-index (Codex P1). When the
+        // flag is off we simply do not install them, so search falls back to
+        // whatever canonical rows exist.
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
         let neural_tier_mmaps: Vec<
             std::sync::Arc<crate::search::vector::MmapEmbeddingIndex>,
-        > = index_builder::load_neural_tier_mmaps_from_storage(artifact_path)
-            .into_iter()
-            .map(std::sync::Arc::new)
-            .collect();
+        > = if config.indexing.embeddings.effective_matryoshka()
+            == crate::config::MatryoshkaSetting::Off
+        {
+            Vec::new()
+        } else {
+            index_builder::load_neural_tier_mmaps_from_storage(artifact_path)
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect()
+        };
         #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
         let neural_tier_mmaps: Vec<
             std::sync::Arc<crate::search::vector::MmapEmbeddingIndex>,
@@ -237,7 +250,7 @@ impl LeIndex {
         // disagreeing with today's config; config only applies when nothing
         // is persisted.
         #[cfg(feature = "remote-embeddings")]
-        let configured_neural_dim = _config
+        let configured_neural_dim = config
             .indexing
             .embeddings
             .resolved_remote()
@@ -510,25 +523,46 @@ impl LeIndex {
     /// Restore neural embeddings from the persisted neural mmap file (if any),
     /// logging the outcome either way. Extracted from finalize_hydration to
     /// keep its branch count under the CCN-15 gate.
+    ///
+    /// This must restore the MRL sidecars too, not just the canonical file:
+    /// `finalize_hydration` re-persists immediately afterwards, and
+    /// `persist_neural_embeddings_to_mmap` removes every sidecar whose dimension
+    /// is absent from the buckets it just wrote. Restoring only
+    /// `neural_embeddings.bin` therefore *deleted* the generation's own sidecars
+    /// — a fixed 128/256/512 generation lost every neural row, and Dynamic lost
+    /// its 256/512 tiers (Codex P1). Gated on the effective Matryoshka setting so
+    /// this path agrees with `restore_engine_from_snapshot`.
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
     fn restore_persisted_neural_embeddings(&mut self, artifact_path: &std::path::Path) {
-        let Some(neural_mmap) =
-            index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path)
-        else {
-            info!(
-                "No persisted neural embeddings found; run 'leindex index --force' with onnx feature to generate them"
-            );
-            return;
-        };
-        let restored = self.search_engine.restore_neural_embeddings(&neural_mmap);
+        let canonical = index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path);
+        let mut restored = canonical
+            .as_ref()
+            .map(|neural_mmap| self.search_engine.restore_neural_embeddings(neural_mmap))
+            .unwrap_or(0);
+        let mut any_store = canonical.is_some();
+        if crate::config::LeIndexConfig::load_cached()
+            .indexing
+            .embeddings
+            .effective_matryoshka()
+            != crate::config::MatryoshkaSetting::Off
+        {
+            for mmap in index_builder::load_neural_tier_mmaps_from_storage(artifact_path) {
+                any_store = true;
+                restored += self.search_engine.restore_neural_embeddings(&mmap);
+            }
+        }
         if restored > 0 {
             info!(
-                "Restored {} neural embeddings from persisted neural mmap file",
+                "Restored {} neural embeddings from persisted neural mmap file(s)",
                 restored
+            );
+        } else if any_store {
+            info!(
+                "Neural mmap file loaded but no matching node IDs found; neural scores will be 0"
             );
         } else {
             info!(
-                "Neural mmap file loaded but no matching node IDs found; neural scores will be 0"
+                "No persisted neural embeddings found; run 'leindex index --force' with onnx feature to generate them"
             );
         }
     }
