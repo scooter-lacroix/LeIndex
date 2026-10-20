@@ -219,7 +219,12 @@ impl LeIndex {
         {
             Vec::new()
         } else {
-            index_builder::load_neural_tier_mmaps_from_storage(artifact_path)
+            // Sidecar paths are stable per dimension, so a failed republish can
+            // leave a previous generation's sliced vectors beside a canonical
+            // file describing the current one. The canonical trailer is the
+            // generation marker; a sidecar that disagrees with it is disabled.
+            let expected_identity = neural_mmap.as_ref().and_then(|mmap| mmap.identity());
+            index_builder::load_neural_tier_mmaps_from_storage(artifact_path, expected_identity)
                 .into_iter()
                 .map(std::sync::Arc::new)
                 .collect()
@@ -546,7 +551,13 @@ impl LeIndex {
             .effective_matryoshka()
             != crate::config::MatryoshkaSetting::Off
         {
-            for mmap in index_builder::load_neural_tier_mmaps_from_storage(artifact_path) {
+            // Same generation gate as `restore_engine_from_snapshot`: the
+            // canonical trailer identifies the generation these sidecars must
+            // belong to before their rows are merged into one index.
+            let expected_identity = canonical.as_ref().and_then(|mmap| mmap.identity());
+            for mmap in
+                index_builder::load_neural_tier_mmaps_from_storage(artifact_path, expected_identity)
+            {
                 any_store = true;
                 restored += self.search_engine.restore_neural_embeddings(&mmap);
             }

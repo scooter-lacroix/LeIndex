@@ -414,9 +414,31 @@ fn remove_neural_tier_mmaps(project_path: &Path, keep: &[usize]) -> Result<()> {
 /// Load every MRL sidecar neural mmap present in storage, ascending by
 /// dimension. Missing or corrupt sidecars are skipped (non-fatal): the tier
 /// simply does not contribute at query time.
+///
+/// # Generation filtering
+///
+/// Sidecars live at a FIXED path per dimension (`neural_embeddings_{dim}.bin`),
+/// so the filenames carry no generation. On its own that is not enough to
+/// re-persist cleanly: when a publication fails partway — or the process dies
+/// between writing a tier and rewriting the canonical trailer — the previous
+/// generation's sidecar survives next to a canonical file that already
+/// describes the NEW one. Sliced vectors from one provider, model, dimension
+/// or template are not comparable with the current query embedding, yet they
+/// would be cosined against it, producing confident nonsense.
+///
+/// The canonical mmap trailer records the exact identity the current
+/// generation was persisted under, so a sidecar is admitted only when it
+/// agrees. Two cases stay permissive:
+///  - `expected_identity` is `None`: the caller has no canonical generation to
+///    compare against (tier-only stores whose header is absent or corrupt);
+///    refusing then would silently drop every tier, so we load as before.
+///  - the sidecar has no identity trailer: pre-trailer artifacts. Their rows
+///    are still the best available, and refusing them would regress existing
+///    installations for no provable gain.
 #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
 pub(crate) fn load_neural_tier_mmaps_from_storage(
     storage_path: &Path,
+    expected_identity: Option<&str>,
 ) -> Vec<crate::search::vector::MmapEmbeddingIndex> {
     let native_dim = crate::search::mrl::MRL_TIERS[3];
     crate::search::mrl::MRL_TIERS
@@ -428,7 +450,22 @@ pub(crate) fn load_neural_tier_mmaps_from_storage(
                 return None;
             }
             match crate::search::vector::MmapEmbeddingIndex::open(&path) {
-                Ok(index) => Some(index),
+                Ok(index) => {
+                    if let (Some(expected), Some(found)) = (expected_identity, index.identity()) {
+                        if found != expected {
+                            tracing::warn!(
+                                path = %path.display(),
+                                dim = *dim,
+                                found = %found,
+                                expected = %expected,
+                                "Neural tier mmap is from a different generation \
+                                 (provider/model/dimension/template); tier disabled"
+                            );
+                            return None;
+                        }
+                    }
+                    Some(index)
+                }
                 Err(e) => {
                     tracing::warn!(
                         path = %path.display(),
@@ -614,5 +651,77 @@ pub(crate) fn fragment_layer_is_valid(
             );
             false
         }
+    }
+}
+
+#[cfg(all(test, any(feature = "onnx", feature = "remote-embeddings")))]
+mod tests {
+    use super::*;
+
+    /// Write a sidecar tier mmap carrying `identity`, the way a publication
+    /// would. Returns the storage dir it landed in.
+    fn tier_store(identity: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let dim = crate::search::mrl::MRL_TIERS[1]; // 256: a non-native tier
+        let rows = vec![("node-1".to_string(), vec![0.25_f32; dim])];
+        crate::search::vector::write_mmap_embeddings_with_identity(
+            &dir.path().join(format!("neural_embeddings_{dim}.bin")),
+            &rows,
+            identity,
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_tier_mmap_from_a_foreign_generation_is_not_loaded() {
+        // Sidecar paths are fixed per dimension, so a republish that failed
+        // partway leaves the previous generation's sliced rows beside a
+        // canonical file describing the new one. Serving them would cosine
+        // vectors from another provider/model/template against the current
+        // query embedding.
+        let dir = tier_store(Some("remote|openai|old-model||768"));
+        let loaded =
+            load_neural_tier_mmaps_from_storage(dir.path(), Some("remote|openai|new-model||768"));
+        assert!(
+            loaded.is_empty(),
+            "a sidecar from another generation must not contribute rows"
+        );
+    }
+
+    #[test]
+    fn test_tier_mmap_of_the_current_generation_is_loaded() {
+        let dir = tier_store(Some("remote|openai|same-model||768"));
+        let loaded =
+            load_neural_tier_mmaps_from_storage(dir.path(), Some("remote|openai|same-model||768"));
+        assert_eq!(loaded.len(), 1, "the current generation's sidecar loads");
+        assert_eq!(loaded[0].len(), 1, "and its rows are reachable");
+    }
+
+    #[test]
+    fn test_tier_mmap_is_loaded_when_no_generation_is_known() {
+        // No canonical file to compare against (tier-only store whose header is
+        // absent or corrupt). Refusing here would drop every tier, regressing a
+        // deployment that legitimately has no canonical generation.
+        let dir = tier_store(Some("remote|openai|whatever||768"));
+        let loaded = load_neural_tier_mmaps_from_storage(dir.path(), None);
+        assert_eq!(
+            loaded.len(),
+            1,
+            "an unknown generation must not disable tiers"
+        );
+    }
+
+    #[test]
+    fn test_tier_mmap_without_an_identity_trailer_is_loaded() {
+        // Pre-trailer artifacts carry no generation at all. Their rows are the
+        // best available and are still admitted.
+        let dir = tier_store(None);
+        let loaded = load_neural_tier_mmaps_from_storage(dir.path(), Some("any|identity||768"));
+        assert_eq!(
+            loaded.len(),
+            1,
+            "a sidecar with no trailer is not provably foreign"
+        );
     }
 }

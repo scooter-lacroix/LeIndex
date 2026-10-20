@@ -587,10 +587,14 @@ impl LeIndex {
                 // keep serving sliced rows after the kill switch is set or the
                 // policy changes, so the rollback actually rolls back (Codex P1).
                 let artifact_path = self.project_path.join(".leindex");
-                if let Some(neural_mmap) =
-                    index_builder::try_load_neural_mmap_embeddings(&self.project_path)
-                {
-                    rows = self.search_engine.restore_neural_embeddings(&neural_mmap);
+                // Borrow the canonical index rather than consuming it: its
+                // identity trailer is the generation marker for the tier gate
+                // below, and moving it would drop that information before the
+                // sidecars are considered.
+                let canonical = index_builder::try_load_neural_mmap_embeddings(&self.project_path);
+                let canonical_identity = canonical.as_ref().and_then(|mmap| mmap.identity());
+                if let Some(neural_mmap) = canonical.as_ref() {
+                    rows = self.search_engine.restore_neural_embeddings(neural_mmap);
                 }
                 if crate::config::LeIndexConfig::load_cached()
                     .indexing
@@ -598,7 +602,10 @@ impl LeIndex {
                     .effective_matryoshka()
                     != crate::config::MatryoshkaSetting::Off
                 {
-                    for mmap in index_builder::load_neural_tier_mmaps_from_storage(&artifact_path) {
+                    for mmap in index_builder::load_neural_tier_mmaps_from_storage(
+                        &artifact_path,
+                        canonical_identity,
+                    ) {
                         rows += self.search_engine.restore_neural_embeddings(&mmap);
                     }
                 }

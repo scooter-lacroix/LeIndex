@@ -925,15 +925,41 @@ pub struct GenericRemoteProvider {
     template_fingerprint: Option<String>,
 }
 
+/// Version of the *semantics* applied by [`apply_doc_template`] and
+/// [`apply_template`], folded into [`template_fingerprint`].
+///
+/// The fingerprint hashes the template STRING. That is not enough: the same
+/// string can mean different inputs to the model as the substitution rules
+/// change, and this is not hypothetical — builds before document titles were
+/// threaded embedded a literal `{title}` that is now replaced per document.
+/// Existing installations with a custom template containing `{title}` would
+/// otherwise keep their old vectors, because neither the template nor the
+/// lexical hash changed, and silently mix two vector spaces in one store.
+///
+/// Bump this whenever the substituted result of an unchanged template changes.
+/// 1 = pre-title-substitution. 2 = `{title}` is replaced (with `none` when
+/// absent) and a template with no `{text}` placeholder gets the text appended.
+const TEMPLATE_SEMANTICS_VERSION: u32 = 2;
+
 /// Short fingerprint of the active task templates for cache identities.
 /// FNV-1a 64-bit: stable, dependency-free, and cheap insurance that a
 /// template change never reuses another template's cache namespace.
+///
+/// The [`TEMPLATE_SEMANTICS_VERSION`] is hashed first so a semantics change
+/// with an unchanged template string also lands in a fresh namespace.
 fn template_fingerprint(doc: Option<&str>, query: Option<&str>) -> Option<String> {
     if doc.is_none() && query.is_none() {
         return None;
     }
+    let version = TEMPLATE_SEMANTICS_VERSION.to_string();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for part in [doc.unwrap_or(""), "\u{0}", query.unwrap_or("")] {
+    for part in [
+        version.as_str(),
+        "\u{0}",
+        doc.unwrap_or(""),
+        "\u{0}",
+        query.unwrap_or(""),
+    ] {
         for byte in part.as_bytes() {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x0010_0000_01b3);
@@ -1094,6 +1120,31 @@ mod tests {
             model: "text-embedding-3-small".to_string(),
         };
         assert_eq!(provider.default_dimension(), 1536);
+    }
+
+    #[test]
+    fn test_template_fingerprint_covers_substitution_semantics() {
+        // A template-string-only hash is not enough: `apply_doc_template`
+        // started replacing `{title}` without the template changing, so every
+        // installation holding a `{title}` template kept its old vectors in
+        // the current namespace while new rows were embedded from different
+        // input — two vector spaces under one identity. Guard the property:
+        // the fingerprint must not be reproducible from the template text
+        // alone (the pre-fix formula), which is what folding in
+        // TEMPLATE_SEMANTICS_VERSION buys.
+        let doc = "title: {title} | text: {text}";
+        let mut lexical: u64 = 0xcbf2_9ce4_8422_2325;
+        for part in [doc, "\u{0}", ""] {
+            for byte in part.as_bytes() {
+                lexical ^= u64::from(*byte);
+                lexical = lexical.wrapping_mul(0x0010_0000_01b3);
+            }
+        }
+        assert_ne!(
+            template_fingerprint(Some(doc), None),
+            Some(format!("tpl{lexical:016x}")),
+            "the fingerprint must vary with substitution semantics, not only the text"
+        );
     }
 
     #[test]
