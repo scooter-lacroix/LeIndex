@@ -209,3 +209,4 @@ jscpd-report/
 # Rejected-patch scratch from git apply --reject (never commit)
 *.rej
 brag-output/brag.mp4
+.zcodeignore

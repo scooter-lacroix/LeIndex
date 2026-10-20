@@ -324,7 +324,7 @@ pub(crate) fn persist_neural_embeddings_to_mmap(
     let spans = search_engine.collect_node_span_bytes();
     let buckets =
         crate::search::mrl::partition_rows_by_slice_dimension(&embeddings, &spans, matryoshka);
-    let native_dim = canonical_native_dim(&embeddings);
+    let native_dim = canonical_native_dim(&embeddings, project_path);
     // Stage every tier, then commit them, then commit the manifest. See
     // `stage_neural_tiers` for why the order matters.
     let staged = stage_neural_tiers(project_path, &path, identity, native_dim, &buckets)?;
@@ -341,16 +341,36 @@ pub(crate) fn persist_neural_embeddings_to_mmap(
 
 /// The dimension that owns the canonical `neural_embeddings.bin`.
 ///
-/// Always the width the provider returned — read off the rows, never inferred
-/// from the identity trailer and never a constant. See the call site for why
-/// each of those alternatives produced a store whose canonical file disagreed
-/// with its own identity.
-fn canonical_native_dim(embeddings: &[(String, Vec<f32>)]) -> usize {
-    embeddings
+/// Two sources, because the rows alone are not always enough:
+///
+///  * Normally the width the provider returned, read off the rows. This is the
+///    correct answer whenever the engine holds unsliced vectors — a freshly
+///    embedded generation, or one re-persisted from a full-width canonical.
+///    Deriving it from the identity trailer instead is wrong (the trailer can be
+///    absent, stale, or name another model) and hardcoding 768 is worse: a
+///    sub-768 provider was sliced to its real width and then handed a zero-row
+///    header claiming 768, so the canonical file disagreed with the very
+///    identity `query_remote_embedder` reads it for.
+///
+///  * The generation already on disk, when that is WIDER than every restored row.
+///    Fallback hydration (`restore_persisted_neural_embeddings`) restores only
+///    sliced sidecar rows under a fixed sub-native policy, then re-persists
+///    them. Taking the widest row there reports the SLICE width (e.g. 512) as
+///    the native width and narrows the canonical header, so the next restart
+///    seeds the query embedder with 512-wide vectors while the retained identity
+///    still declares 768 — disabling neural search, and mismatching the index
+///    dimension even if it did not. The persisted width is the provider's own and
+///    the rows are slices of it, so it is authoritative for this decision.
+fn canonical_native_dim(embeddings: &[(String, Vec<f32>)], project_path: &Path) -> usize {
+    let widest_row = embeddings
         .iter()
         .map(|(_, row)| row.len())
         .max()
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let persisted = try_load_neural_mmap_embeddings(project_path)
+        .map(|mmap| mmap.dimension() as usize)
+        .unwrap_or(0);
+    widest_row.max(persisted)
 }
 
 /// Drop every neural artifact. Nothing is published, so nothing may claim to be
@@ -785,11 +805,32 @@ pub(crate) fn load_neural_tier_mmaps_from_storage(
         );
         return Vec::new();
     }
+    // A sidecar at the canonical's own dimension is always a leftover, never a
+    // tier: the publish sends the native bucket to the canonical path, so the
+    // only way both files carry that dimension is a superseded generation
+    // surviving a torn commit (the cleanup after the manifest swap did not run).
+    // Returning it would hand the caller the same node rows twice — callers sum
+    // the per-file restore counts against `checkpoint.rows`, so the sum
+    // overshoots, the mismatch branch fires, and a checkpoint resume that had in
+    // fact restored cleanly is discarded. Resolved once: the canonical is read
+    // here for its dimension only, and a zero-row header names no tier.
+    let canonical_dim = try_load_neural_mmap_embeddings_from_storage(storage_path)
+        .filter(|index| !index.is_empty())
+        .map(|index| index.dimension() as usize);
     let mut loaded: Vec<crate::search::vector::MmapEmbeddingIndex> = crate::search::mrl::MRL_TIERS
         .iter()
         .filter_map(|dim| {
             let path = storage_path.join(format!("neural_embeddings_{dim}.bin"));
             if !path.exists() {
+                return None;
+            }
+            if canonical_dim == Some(*dim) {
+                tracing::warn!(
+                    path = %path.display(),
+                    dim = *dim,
+                    "Stale neural tier mmap duplicates the canonical generation; \
+                     tier disabled"
+                );
                 return None;
             }
             // The committed generation, when present, decides membership AND
@@ -1362,6 +1403,45 @@ mod tests {
     }
 
     #[test]
+    fn test_stale_sidecar_duplicating_the_canonical_dimension_is_not_returned_as_a_tier() {
+        // A torn commit can leave a sidecar at the canonical's own dimension: the
+        // native bucket is published to `neural_embeddings.bin`, but the cleanup
+        // that removes the superseded sidecar runs after the manifest swap, so a
+        // crash in between leaves both files holding that dimension. Serving the
+        // sidecar hands the caller the same rows twice — every caller merges this
+        // function's result into an index it already seeded from the canonical,
+        // and `neural_publish` sums the per-file restore counts against
+        // `checkpoint.rows`. The overshoot trips the mismatch branch, discards a
+        // restore that was in fact clean, and re-embeds the whole set.
+        let dir = tier_store(None);
+        let native = *crate::search::mrl::MRL_TIERS.last().unwrap(); // 768
+        let canonical_rows = vec![("node-1".to_string(), vec![0.5_f32; native])];
+        crate::search::vector::write_mmap_embeddings_with_identity(
+            &dir.path().join("neural_embeddings.bin"),
+            &canonical_rows,
+            Some("remote|openai|same||768"),
+        )
+        .unwrap();
+        crate::search::vector::write_mmap_embeddings_with_identity(
+            &dir.path().join(format!("neural_embeddings_{native}.bin")),
+            &canonical_rows,
+            Some("remote|openai|same||768"),
+        )
+        .unwrap();
+        commit_manifest(
+            &dir,
+            Some("remote|openai|same||768"),
+            &[(native, canonical_rows.len())],
+        );
+        let loaded =
+            load_neural_tier_mmaps_from_storage(dir.path(), Some("remote|openai|same||768"));
+        assert!(
+            loaded.is_empty(),
+            "a sidecar at the canonical dimension duplicates the generation and must not load"
+        );
+    }
+
+    #[test]
     fn test_staging_path_is_a_sibling_of_the_tier_file() {
         // The commit step relies on `rename` being atomic, which only holds
         // within one filesystem — so the staging file must live beside the
@@ -1388,22 +1468,51 @@ mod tests {
                 .map(|i| (format!("node-{i}"), vec![0.5_f32; dim]))
                 .collect()
         };
+        let empty = tempfile::tempdir().unwrap();
 
         assert_eq!(
-            canonical_native_dim(&rows(1024, 2)),
+            canonical_native_dim(&rows(1024, 2), empty.path()),
             1024,
             "a width the ladder never produces still owns the canonical file"
         );
         assert_eq!(
-            canonical_native_dim(&rows(256, 3)),
+            canonical_native_dim(&rows(256, 3), empty.path()),
             256,
             "a sub-768 provider must not be reported as 768"
         );
-        assert_eq!(canonical_native_dim(&rows(768, 1)), 768);
+        assert_eq!(canonical_native_dim(&rows(768, 1), empty.path()), 768);
         assert_eq!(
-            canonical_native_dim(&[]),
+            canonical_native_dim(&[], empty.path()),
             0,
-            "no rows means no width to claim"
+            "no rows and nothing persisted means no width to claim"
+        );
+    }
+
+    #[test]
+    fn test_canonical_native_dim_keeps_the_persisted_width_over_restored_slices() {
+        // Fallback hydration restores only SLICED sidecar rows under a fixed
+        // sub-native policy and then re-persists them. Deriving the native width
+        // from those rows reports the slice width (512) and narrows the canonical
+        // header, so the next restart seeds the query embedder with 512-wide
+        // vectors while the identity still says 768 — neural search disabled, and
+        // the canonical index dimension wrong even if it were not.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join(".leindex");
+        std::fs::create_dir_all(&storage).unwrap();
+        crate::search::vector::write_empty_mmap_embeddings_with_identity(
+            &storage.join("neural_embeddings.bin"),
+            768,
+            Some("remote|openai|same||768"),
+        )
+        .unwrap();
+
+        let sliced: Vec<(String, Vec<f32>)> = (0..3)
+            .map(|i| (format!("node-{i}"), vec![0.5_f32; 512]))
+            .collect();
+        assert_eq!(
+            canonical_native_dim(&sliced, dir.path()),
+            768,
+            "the persisted provider width outranks the restored slice width"
         );
     }
 }

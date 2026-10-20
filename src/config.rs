@@ -915,21 +915,38 @@ fn default_rerank_backend() -> String {
 /// Allowed values for `[search] rerank_backend`.
 pub const RERANK_BACKENDS: &[&str] = &["onnx", "system-one", "off"];
 
+/// Whether the `system-one` rerank backend can actually construct its reranker.
+///
+/// `system-one` is experimental and doubly gated: the binary must be built with
+/// the `system-one` feature, and the `LEINDEX_FEATURE_SYSTEM_ONE` rollout flag
+/// must be on. `rerank_effectively_enabled` alone cannot answer this — it reads
+/// config only, so a config asking for `system-one` on a default build reports
+/// rerank ON while `asker_from_config` refuses to construct the reranker and the
+/// rerank stage silently falls open. Every ON/OFF surface (setup status, the
+/// dispatch, over-fetch, the cache-key fold) folds this in so what is reported
+/// matches what will run.
+pub fn system_one_rerank_available() -> bool {
+    if !cfg!(feature = "system-one") {
+        return false;
+    }
+    crate::feature_flags::FeatureFlag::SystemOne.is_enabled()
+}
+
 impl SearchConfig {
     /// Whether the rerank stage runs at all under the configured backend:
     /// `off` never reranks; `system-one` reranks regardless of
-    /// `rerank_enabled`; `onnx` (and any unknown string, treated as the
-    /// default) reranks only when `rerank_enabled` is true. The single
-    /// semantic bridge consumed by the rerank dispatch, the over-fetch
+    /// `rerank_enabled` — but only when the backend is actually constructible
+    /// (see [`system_one_rerank_available`]), otherwise it degrades to no
+    /// reranking exactly as the dispatch does; `onnx` (and any unknown string,
+    /// treated as the default) reranks only when `rerank_enabled` is true. The
+    /// single semantic bridge consumed by the rerank dispatch, the over-fetch
     /// decision, and the search-cache key fold.
     pub fn rerank_effectively_enabled(&self) -> bool {
-        if self.rerank_backend == "off" {
-            return false;
+        match self.rerank_backend.as_str() {
+            "off" => false,
+            "system-one" => system_one_rerank_available(),
+            _ => self.rerank_enabled,
         }
-        if self.rerank_backend == "system-one" {
-            return true;
-        }
-        self.rerank_enabled
     }
 }
 
@@ -1254,10 +1271,34 @@ mod tests {
         // onnx + rerank_enabled => rerank on.
         config.search.rerank_enabled = true;
         assert!(config.search.rerank_effectively_enabled());
-        // system-one implies rerank regardless of rerank_enabled.
+        // system-one implies rerank regardless of rerank_enabled — but only when
+        // the backend is constructible: the flag must be on AND the feature
+        // compiled in. A config asking for it otherwise reports OFF, matching
+        // the dispatch, which refuses to construct the reranker.
+        let _guard = crate::feature_flags::FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::feature_flags::set_flag_override_for_test(
+            crate::feature_flags::FeatureFlag::SystemOne,
+            false,
+        );
         config.search.rerank_backend = "system-one".to_string();
         config.search.rerank_enabled = false;
-        assert!(config.search.rerank_effectively_enabled());
+        assert!(
+            !config.search.rerank_effectively_enabled(),
+            "system-one without LEINDEX_FEATURE_SYSTEM_ONE cannot rerank"
+        );
+        crate::feature_flags::set_flag_override_for_test(
+            crate::feature_flags::FeatureFlag::SystemOne,
+            true,
+        );
+        assert_eq!(
+            config.search.rerank_effectively_enabled(),
+            cfg!(feature = "system-one"),
+            "available system-one reranks regardless of rerank_enabled; a build \
+             without the feature still cannot"
+        );
+        crate::feature_flags::clear_flag_overrides_for_test();
         // off is an explicit no-rerank even with rerank_enabled set.
         config.search.rerank_backend = "off".to_string();
         config.search.rerank_enabled = true;

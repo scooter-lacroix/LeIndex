@@ -84,11 +84,13 @@ pub(crate) fn effective_rerank_backend(cfg: &crate::config::SearchConfig) -> &st
 
 /// [`SearchConfig::rerank_effectively_enabled`] folded with the CLI override:
 /// the override replaces the configured backend before the enable/disable
-/// semantics are applied.
+/// semantics are applied. `system-one` also requires the backend to be
+/// constructible, so the override cannot turn rerank ON on a build that lacks
+/// the feature or whose rollout flag is off.
 pub(crate) fn rerank_effectively_enabled_with_override(cfg: &crate::config::SearchConfig) -> bool {
     match effective_rerank_backend(cfg) {
         "off" => false,
-        "system-one" => true,
+        "system-one" => crate::config::system_one_rerank_available(),
         _ => cfg.rerank_enabled,
     }
 }

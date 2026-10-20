@@ -941,9 +941,19 @@ fn run_command_phase_with_peak_support(
     // running now that the command is gone — the lifetime mark would charge
     // that descendant's peak to leindex, which is the regression the budget
     // ceilings were fixed for.
+    //
+    // The post-reap count `sampler::count_descendants` returns must NOT count as
+    // evidence: `/proc/<pid>` is gone the instant `wait4` reaps, so it comes back
+    // empty for EVERY phase whether or not descendants ever existed. Folding that
+    // emptiness into `observable` would certify "ran no descendants" on the
+    // strength of not having looked — precisely the false positive that would
+    // charge a reaped SCIP indexer's ~700 MiB to leindex. Only the LIVE poller
+    // (`DescendantObservation::observable`, set while the command was running)
+    // may establish that, and only the live-or-still-running signals may refute
+    // it. The count is used solely to report what is running now.
     let descendant_observation = DescendantObservation {
         seen: descendant_observation.seen || !descendants.by_name.is_empty(),
-        observable: descendant_observation.observable || descendants.by_name.is_empty(),
+        observable: descendant_observation.observable,
     };
     if descendant_observation.certifies_no_descendants() && lifetime_peak_kib > 0 {
         // No descendant could have contributed to it, so ru_maxrss is this

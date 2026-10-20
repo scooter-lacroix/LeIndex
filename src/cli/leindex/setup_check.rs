@@ -132,6 +132,24 @@ fn print_check_search_settings(search: &crate::config::SearchConfig) {
         }
     );
     println!("Rerank backend:     {}", search.rerank_backend);
+    // A configured `system-one` backend is only constructible with the feature
+    // compiled in AND `LEINDEX_FEATURE_SYSTEM_ONE` set. Without this line the
+    // report says "backend: system-one, enabled: OFF" with no reason, or — the
+    // bug this guards — "enabled: ON" while `asker_from_config` refuses and
+    // every search silently falls open.
+    if search.rerank_backend == "system-one" && !crate::config::system_one_rerank_available() {
+        println!(
+            "  -> system-one is unavailable: {}",
+            if cfg!(feature = "system-one") {
+                format!(
+                    "set {}=1 to enable the experimental gate",
+                    crate::feature_flags::FeatureFlag::SystemOne.env_var()
+                )
+            } else {
+                "this binary was built without the `system-one` feature".to_string()
+            }
+        );
+    }
     println!(
         "Fragment index:     {}",
         if search.fragment_index_enabled {
