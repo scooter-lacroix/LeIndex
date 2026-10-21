@@ -452,7 +452,13 @@ fn test_command_peak_captures_final_tick_allocation() {
     // would pass without ever touching the fold. The real witness is that
     // `rss_max_kib` now agrees with the kernel's exact lifetime mark; every
     // other peak source is sampled and under-reports it.
-    const ALLOCATION_KIB: u64 = 64 * 1024;
+    // 16 MiB, deliberately WELL BELOW `LIFETIME_FOLD_TOLERANCE_KIB` (64 MiB).
+    // This is the final-tick allocation the fold exists to recover: it must be
+    // accepted even when the VmHWM poll misses it. At 64 MiB the margin was
+    // exactly the tolerance, so whether the fold accepted depended on
+    // millisecond timing in the child's last tick — the assertion passed for the
+    // wrong reason on a fast machine.
+    const ALLOCATION_KIB: u64 = 16 * 1024;
     let fixture = tempfile::tempdir().unwrap();
     let config = WorkloadConfig {
         binary: std::env::current_exe().unwrap(),
