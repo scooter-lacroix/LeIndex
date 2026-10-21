@@ -488,17 +488,57 @@ fn test_zero_limit_returns_totals_without_hits() {
     assert!(output.has_more, "everything is still ahead of offset 0");
 }
 
+/// The complement of the expired-deadline test, and the guard that catches the
+/// obvious way to break the fix: enforcing a deadline in the git branch must not
+/// cost a live search its candidates. With a deadline that has NOT expired, a
+/// repository fixture must still enumerate its Rust files — which is where they
+/// came from all along, and what the previous version of the test above quietly
+/// depended on.
+#[test]
+fn test_live_deadline_keeps_git_inventory_candidates() {
+    let dir = fixture();
+    git_init(dir.path());
+    let pattern = CompiledPattern::new("rust", "fn $NAME() { $$$BODY }").expect("pattern");
+    let output = search_structural(
+        dir.path(),
+        &pattern,
+        &FileFilter::default(),
+        &StructuralOptions {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            ..options(100, NO_CAP)
+        },
+    );
+
+    assert!(
+        output.stats.candidates > 0,
+        "an unexpired deadline must not cost the git inventory its listing"
+    );
+    assert!(
+        output.stats.scanned > 0,
+        "the candidates must actually be parsed when time remains"
+    );
+    assert_eq!(output.stats.skipped_deadline, 0);
+    assert!(!output.stopped_by_deadline);
+}
+
 /// A deadline that has already passed must report a PARTIAL result, not a clean
-/// one. Every candidate is skipped, so nothing was parsed: `scanned` is 0 (not
-/// the candidate count, which is what it used to report) and `has_more` is
-/// forced true because unexamined files may still hold matches (Codex P2).
+/// one — whichever stage of the inventory it stops.
+///
+/// The deadline is now enforced in BOTH inventory branches, so an expired one
+/// yields zero candidates here: `git ls-files` is reaped before it reports (it
+/// used to run to completion, which is what an earlier version of this test
+/// relied on to get candidates past an expired deadline), and the non-git walk
+/// stops before enumerating. The claims that matter are stage-independent: the
+/// result cannot claim a clean scan, and nothing may be counted as parsed.
+///
+/// The scan-loop half of the same defect — a candidate the worker declined to
+/// open — is the `skipped_deadline` accounting, which this asserts no longer
+/// double-counts into `scanned`.
 #[test]
 fn test_expired_deadline_reports_partial_not_complete() {
     let dir = fixture();
-    // The fixture must be a repository. A git inventory ignores the deadline,
-    // so candidates exist and are then skipped by the scan loop; a plain walk
-    // would stop at the deadline and enumerate nothing, leaving this test with
-    // no candidates and nothing to assert about skipping.
+    // The fixture must be a repository, so the git branch is the one exercised:
+    // it is the branch that used to ignore the deadline outright.
     git_init(dir.path());
     let pattern = CompiledPattern::new("rust", "fn $NAME() { $$$BODY }").expect("pattern");
     let output = search_structural(
@@ -512,23 +552,22 @@ fn test_expired_deadline_reports_partial_not_complete() {
     );
 
     assert_eq!(output.returned, 0);
-    assert!(
-        output.stats.candidates > 0,
-        "the fixture has Rust candidates"
-    );
     assert_eq!(
         output.stats.scanned, 0,
         "a skipped file was not scanned, and must not be counted as if it were"
     );
-    assert!(output.stopped_by_deadline);
     assert_eq!(
         output.stats.skipped_deadline, output.stats.candidates,
-        "every candidate was skipped by the expired deadline"
+        "every candidate the inventory produced was skipped by the expired deadline"
     );
     assert!(
         output.has_more,
         "an unexamined file may hold matches, so the result cannot claim to be complete"
     );
+    // `stopped_by_deadline` may only claim time pressure, and here it must: the
+    // deadline is genuinely expired at both stages. It must never be inferred
+    // from a file-count limit — see `test_truncated_inventory_forces_has_more`.
+    assert!(output.stopped_by_deadline);
 }
 
 /// A deadline that expires while the *inventory* is being walked must also

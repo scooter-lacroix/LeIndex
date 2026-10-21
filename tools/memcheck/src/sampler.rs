@@ -485,13 +485,15 @@ pub struct DescendantTree {
     ///
     /// Serialized only into the run's own report, so a failing phase can still
     /// be diagnosed after the fact. It is kept OUT of the committed baselines
-    /// by `diff::write_baseline`, which strips `descendants` before writing —
-    /// a pid is meaningless after the run that produced it, and
+    /// by `diff::write_baseline`, which strips `descendants.pids` before writing
+    /// — a pid is meaningless after the run that produced it, and
     /// `write_baseline` otherwise writes the whole `PhaseReport`, so any phase
     /// that spawned a descendant would bake machine-specific pids into
-    /// `docs/memory/baselines/`. `skip_serializing_if = "Vec::is_empty"` would
-    /// not have done it: it only omits the empty case, which is the one case
-    /// that was never a problem. `default` keeps existing report JSON and
+    /// `docs/memory/baselines/`. Only the pids go: `total`, `by_name`,
+    /// `combined_rss_kib` and `peak_rss_kib` are retained in the committed
+    /// baseline as diagnostic data. `skip_serializing_if = "Vec::is_empty"`
+    /// would not have done it: it only omits the empty case, which is the one
+    /// case that was never a problem. `default` keeps existing report JSON and
     /// baselines parsing.
     #[serde(default)]
     pub pids: Vec<u32>,
@@ -747,20 +749,32 @@ mod tests {
         // guarantee, and polling `/proc` after it could only observe a pid
         // recycled by an unrelated process.
         //
-        // The pid is asserted GONE from every accumulator, not just `pids`:
-        // `total` and `by_name` are accumulated in the same branch, so a walk
-        // that leaked a reaped pid into any one of them is the bug this covers.
+        // The pid is asserted GONE from `pids`, which is the field under test,
+        // and the root is asserted ABSENT: `count_descendants` skips
+        // `pid == root_pid` in the BFS, so a walk that reported the measured
+        // process as its own descendant is the bug that guard exists for.
+        //
+        // Deliberately NOT asserted: `total == by_name.values().sum()`. Both are
+        // incremented in the same BFS branch, so that equality holds by
+        // construction and cannot fail for any input — it reads like coverage
+        // and is none. `pids.len() == total` is the real link between the new
+        // field and the count, and it can fail.
         let reaped = count_descendants(std::process::id()).unwrap();
         assert!(
             !reaped.pids.contains(&child_pid),
             "reaped child (pid {child_pid}) must not be reported as a descendant: {:?}",
             reaped.pids
         );
+        assert!(
+            !reaped.pids.contains(&std::process::id()),
+            "the measured process must not be reported as its own descendant: {:?}",
+            reaped.pids
+        );
         assert_eq!(
+            reaped.pids.len(),
             reaped.total,
-            reaped.by_name.values().sum::<usize>(),
-            "a dropped pid must leave total and by_name consistent: {:?}",
-            reaped.by_name
+            "every counted descendant must carry its pid: {:?}",
+            reaped.pids
         );
     }
 

@@ -122,8 +122,12 @@ pub fn load_baseline(baselines_dir: &Path, fixture: &str, phase: &str) -> Option
 /// the run that produced it, and a baseline is committed, so a phase that
 /// spawned a descendant would otherwise bake machine-specific pids into
 /// `docs/memory/baselines/` — noise that churns the baseline-metadata gate on
-/// every run. The rest of the tree is kept: `peak_rss_kib` and `total` are what
-/// a baseline comparison is for. Stripping `pids` here rather than
+/// every run. The rest of the tree is kept — `peak_rss_kib`, `total` and
+/// `by_name` all stay — as retained diagnostic data recorded alongside the
+/// measurement. They are NOT compared: `diff_report` gates on `rss_max_kib`
+/// alone (baseline + tolerance, and the budget ceiling + tolerance), so a
+/// movement in `peak_rss_kib` or `total` is recorded for a reader to inspect
+/// rather than failing a phase. Stripping `pids` here rather than
 /// `skip_serializing` on the field keeps them in the run's own report, which is
 /// the one place a failing phase can still be diagnosed from.
 pub fn write_baseline(baselines_dir: &Path, fixture: &str, phase: &PhaseReport) -> Result<()> {

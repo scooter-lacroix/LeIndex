@@ -1928,8 +1928,11 @@ fn run_query_suite_warm_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
     Ok(report)
 }
 
-// The tests live in a sibling file to keep this one clear of the 2000-line
-// large-file gate; the split test module is ~670 lines.
+// The tests live in a sibling file so this one stays a readable length: the
+// module is ~670 lines, which inline would put this file at ~2 600. Note that
+// the quality workflow's 2 000-line check scans `src/` only (`find src -name
+// '*.rs'`), so nothing ENFORCES a limit on `tools/memcheck/src/` — the split is
+// for the next reader, not for a gate.
 #[cfg(test)]
 #[path = "workload_test.rs"]
 mod tests;

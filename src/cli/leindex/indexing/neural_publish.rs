@@ -305,6 +305,72 @@ impl<W: streaming::neural::NeuralRowWriter> streaming::neural::NeuralRowWriter
     }
 }
 
+/// How many trailing path components the title fallback keeps.
+///
+/// Three, not one or two, because the collision it is reducing is a suffix
+/// collision: `a/src/lib.rs` and `b/src/lib.rs` differ only in their FIRST
+/// component, so every fixed-length suffix of the two is identical. One
+/// component (`lib.rs`) is the `file_name()` behaviour that made titles stop
+/// disambiguating; two (`src/lib.rs`) is no better. Three separates them.
+///
+/// It cannot be a guarantee — two paths three components deep that differ
+/// earlier still collide — and that is the honest contract: the fallback is
+/// prefix-free and non-empty, and it separates the layouts that actually
+/// collide in practice. Those are the properties the tests pin.
+const TITLE_TAIL_COMPONENTS: usize = 3;
+
+/// Document title for a neural node: the source path as it will be sent to a
+/// remote provider as `{title}`.
+///
+/// It MUST be project-relative. Some nodes carry an absolute path (submodule
+/// summaries store `summary.path` verbatim), and sending that as the title
+/// leaks the local checkout path to a remote provider and makes title-aware
+/// embeddings differ between two identical checkouts (CodeRabbit
+/// Security/Privacy). Note that only the TITLE is relativized — the node's
+/// `file_path` is still the absolute path used to READ the source.
+///
+/// Three cases where there is no relative path to send:
+/// * `strip_prefix` fails — a non-canonical path through a symlink, or one
+///   outside `project_path` like a submodule summary;
+/// * it succeeds with an EMPTY remainder — the node's path IS `project_path`,
+///   e.g. a project summary node at the checkout root; and
+/// * the path has no components at all (a bare root, or one ending in `..`).
+///
+/// The first two take the trailing-components fallback; the third has no
+/// components to take, so the symbol name stands in. The empty remainder needs
+/// the explicit `is_empty` check below rather than a plain `Ok(relative)` arm:
+/// `Ok("")` is a SUCCESS, so matching the `Result` alone sends it straight
+/// through as an empty title — a shape the legacy route never produces, which
+/// would leave the two routes' title-conditioned embeddings divergent.
+///
+/// The node ID may NOT be the fallback: it is `{file_path}:{qname}@{range}`
+/// (see `graph::extraction`), so it carries the absolute path this exists to
+/// strip.
+fn document_title(file_path: &str, project_path: &Path, node_name: &str) -> String {
+    let path = Path::new(file_path);
+    if let Ok(relative) = path.strip_prefix(project_path) {
+        if !relative.as_os_str().is_empty() {
+            return relative.to_string_lossy().replace('\\', "/");
+        }
+    }
+    let mut tail: Vec<String> = path
+        .components()
+        .rev()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .take(TITLE_TAIL_COMPONENTS)
+        .collect();
+    // Collected right-to-left, so reverse for the natural `dir/file` order.
+    tail.reverse();
+    if tail.is_empty() {
+        node_name.to_string()
+    } else {
+        tail.join("/")
+    }
+}
+
 fn streaming_neural_inputs<'a>(
     pdg: &'a crate::graph::pdg::ProgramDependenceGraph,
     admitted_node_ids: &'a HashSet<String>,
@@ -363,62 +429,9 @@ fn streaming_neural_inputs<'a>(
                     // rides along as the document title so the remote doc
                     // template ({title}) receives the same input shape on both
                     // routes (EmbeddingGemma2 trains on title+text prompts).
-                    //
-                    // It MUST be project-relative, not `node.file_path`: some
-                    // nodes carry an absolute path (submodule summaries store
-                    // `summary.path` verbatim), and sending that as the title
-                    // leaks the local checkout path to a remote provider and
-                    // makes title-aware embeddings differ between two identical
-                    // checkouts (CodeRabbit Security/Privacy). Only the title is
-                    // relativized — `node.file_path` above is still the
-                    // absolute path used to READ the source.
-                    //
-                    // The fallback is the trailing path components, never the
-                    // raw path and never an empty string. Falling back to
-                    // `node.file_path` reintroduced exactly the leak this
-                    // documents, for precisely the nodes it describes: a path
-                    // that fails `strip_prefix` (non-canonical through a
-                    // symlink, or outside `project_path` like a submodule
-                    // summary) was sent in full.
-                    //
-                    // A bare `file_name()` would fix the leak but break two
-                    // other things: `a/src/lib.rs` and `b/src/lib.rs` both
-                    // collapse to `lib.rs`, so titles stop disambiguating; and
-                    // `file_name()` is `None` for a path with no final component
-                    // (a bare root, or one ending in `..`), which sent an EMPTY
-                    // title — a shape the legacy route never produces, so the
-                    // two routes' title-conditioned embeddings diverge. Keeping
-                    // the last two components fixes the collision, and the
-                    // symbol name covers the no-component case without leaking a
-                    // path. The node ID may NOT: it is
-                    // `{file_path}:{qname}@{range}` (see `graph::extraction`), so
-                    // it carries the absolute path this fallback exists to strip.
-                    title: Some(
-                        match std::path::Path::new(&*node.file_path).strip_prefix(project_path) {
-                            Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
-                            Err(_) => {
-                                let mut tail: Vec<String> = std::path::Path::new(&*node.file_path)
-                                    .components()
-                                    .rev()
-                                    .filter_map(|component| match component {
-                                        std::path::Component::Normal(name) => {
-                                            Some(name.to_string_lossy().into_owned())
-                                        }
-                                        _ => None,
-                                    })
-                                    .take(2)
-                                    .collect();
-                                // Collected right-to-left, so reverse for the
-                                // natural `dir/file` order.
-                                tail.reverse();
-                                if tail.is_empty() {
-                                    node.name.clone()
-                                } else {
-                                    tail.join("/")
-                                }
-                            }
-                        },
-                    ),
+                    // `document_title` relativizes it and owns the leak
+                    // guarantees; see its doc.
+                    title: Some(document_title(&node.file_path, project_path, &node.name)),
                 })
             };
             return Some(input);
@@ -1179,6 +1192,84 @@ impl LeIndex {
 mod tests {
     use super::*;
     use crate::cli::leindex::indexing::streaming::neural::NeuralRowWriter;
+
+    /// The title is what a remote provider receives as `{title}`, so a leak here
+    /// is a leak on the wire. These pin the two properties the previous inline
+    /// match got wrong: an empty remainder after `strip_prefix` must NOT become
+    /// an empty title, and the fallback must actually separate the paths the
+    /// "last two components" version claimed to separate.
+    #[test]
+    fn test_document_title_relativizes_inside_the_project() {
+        let root = std::path::Path::new("/checkout/project");
+        assert_eq!(
+            document_title("/checkout/project/src/lib.rs", root, "new"),
+            "src/lib.rs",
+            "a path inside the project becomes project-relative"
+        );
+        assert_eq!(
+            document_title("/checkout/project/src\\win.rs", root, "new"),
+            "src/win.rs",
+            "backslashes are normalized so both routes agree on the title"
+        );
+    }
+
+    #[test]
+    fn test_document_title_at_the_project_root_is_never_empty() {
+        // The reported bug: `strip_prefix` SUCCEEDS with an empty remainder for
+        // a node whose path IS the checkout root (a project summary node), and a
+        // plain `Ok(relative)` arm sent `Some("")` as the title.
+        let root = std::path::Path::new("/checkout/project");
+        let title = document_title("/checkout/project", root, "project-summary");
+        assert!(
+            !title.is_empty(),
+            "a checkout-root node must not get an empty title"
+        );
+        assert_eq!(
+            title, "checkout/project",
+            "it falls back to trailing components, not to the raw path"
+        );
+    }
+
+    #[test]
+    fn test_document_title_never_leaks_an_absolute_path() {
+        // A submodule summary carries a path outside `project_path`, so
+        // `strip_prefix` fails. The fallback must stay relative — this is the
+        // CodeRabbit privacy finding the whole fallback exists for.
+        let root = std::path::Path::new("/checkout/project");
+        let title = document_title("/elsewhere/sub/module/file.rs", root, "new");
+        assert!(
+            !title.starts_with('/'),
+            "the fallback must be prefix-free: {title}"
+        );
+        // `/checkout/project` is not a prefix of this path, so nothing is
+        // stripped: the title is the last three components and nothing else.
+        assert_eq!(title, "sub/module/file.rs");
+    }
+
+    #[test]
+    fn test_document_title_separates_same_named_files() {
+        // `file_name()` alone collapsed these to `lib.rs`, and the previous
+        // "last two components" version still collapsed both to `src/lib.rs`,
+        // despite claiming otherwise. Three components separate them.
+        let root = std::path::Path::new("/checkout/project");
+        let a = document_title("/outside/a/src/lib.rs", root, "new");
+        let b = document_title("/outside/b/src/lib.rs", root, "new");
+        assert_ne!(
+            a, b,
+            "same-named files in differently-named directories must not share a title"
+        );
+        assert_eq!(a, "a/src/lib.rs");
+        assert_eq!(b, "b/src/lib.rs");
+    }
+
+    #[test]
+    fn test_document_title_falls_back_to_the_symbol_name() {
+        // A path with no `Normal` components at all: nothing to take, and the
+        // symbol name is the only non-leaking stand-in available.
+        let root = std::path::Path::new("/checkout/project");
+        assert_eq!(document_title("/", root, "root-symbol"), "root-symbol");
+        assert_eq!(document_title("..", root, "parent-symbol"), "parent-symbol");
+    }
 
     #[test]
     fn test_stuck_hint_only_after_quiet_timeout_window() {

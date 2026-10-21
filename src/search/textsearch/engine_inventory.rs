@@ -11,8 +11,9 @@
 //! reports whether it was cut short — a truncated listing must never be
 //! mistaken for a tree with no files.
 
+use std::io::Read;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Directories never worth searching, at any depth.
 const NEVER_WALK: &[&str] = &[
@@ -27,8 +28,32 @@ const NEVER_WALK: &[&str] = &[
     ".tox",
 ];
 
-fn git_inventory(root: &Path) -> Option<Vec<String>> {
-    let output = std::process::Command::new("git")
+/// Interval between liveness checks on a running `git ls-files`.
+const GIT_POLL: Duration = Duration::from_millis(5);
+
+/// `git ls-files`, or `None` when this is not a worktree, when the listing
+/// could not be read, or when `deadline` expired first.
+///
+/// The deadline is enforced HERE, and not only around the walk: `git ls-files`
+/// over a large worktree takes real time, and `Command::output()` blocks for all
+/// of it. A structural search with `timeout_ms: 50` and an explicit `lang` —
+/// which skips language inference and so reaches this call immediately — would
+/// spend seconds past its budget before the first file was ever scanned. `None`
+/// from an expired deadline routes the caller to `walk_inventory`, which sees
+/// the same expired deadline and reports it, so the result is a correctly
+/// labelled partial listing rather than a silent overrun.
+///
+/// stdout is drained on a reader thread rather than left in a pipe nobody reads:
+/// a listing larger than the pipe buffer would fill it, block `git`, and make
+/// the expiry check below unreachable. The thread OUTLIVES the kill — abandoned,
+/// never joined — because a process killed mid-write leaves its reader waiting
+/// for an EOF that never comes, and joining would reintroduce exactly the hang
+/// this function exists to prevent. It owns nothing but the pipe and a buffer.
+fn git_inventory(root: &Path, deadline: Option<Instant>) -> Option<Vec<String>> {
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return None;
+    }
+    let mut child = std::process::Command::new("git")
         .args([
             "ls-files",
             "-z",
@@ -37,17 +62,40 @@ fn git_inventory(root: &Path) -> Option<Vec<String>> {
             "--exclude-standard",
         ])
         .current_dir(root)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        // Never leave a piped stderr unread: a chatty git must not block on it
+        // before the expiry check can reap it.
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+    let mut pipe = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut raw = Vec::new();
+        let _ = pipe.read_to_end(&mut raw);
+        raw
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(_) => break None,
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(GIT_POLL);
+    };
+    if !status.is_some_and(|status| status.success()) {
         return None;
     }
+    let raw = reader.join().ok()?;
     let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let mut files: Vec<String> = output
-        .stdout
+    let mut files: Vec<String> = raw
         .split(|b| *b == 0)
-        .filter(|raw| !raw.is_empty())
-        .filter_map(|raw| std::str::from_utf8(raw).ok())
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
         .filter(|rel| !rel.split('/').any(|seg| seg == ".leindex" || seg == ".git"))
         // A tracked or untracked symlink can point anywhere — including
         // outside the project — and so can an INTERMEDIATE directory
@@ -101,17 +149,20 @@ impl InventoryTruncation {
 ///
 /// The result budget (`limit`) and the work budget must be separate counters.
 /// Bounding the traversal by admitted files alone means a selective predicate
-/// never reaches `limit`, so the walk reads every dirent in the tree: language
-/// inference asks for 10_000 files with `deadline: None` and a scope predicate,
-/// and structural search asks for a language-filtered listing with an optional
-/// deadline that is `None` whenever the caller passes `timeout_ms: 0`. Both
-/// would go from O(limit) work to O(tree) on every call.
+/// never reaches `limit`, so the walk reads every dirent in the tree. Language
+/// inference is exactly that shape: it asks for 10_000 files with
+/// `deadline: None` and a scope predicate, so a narrow scope went from O(limit)
+/// work to O(tree) on every call.
 ///
-/// A fixed multiple keeps the budget proportional to what the caller asked for
-/// — the traversal still stops early on a tree whose matches sort late — while
-/// leaving a selective predicate enough room to find its files. It is
-/// deliberately generous: a scope filter that admits one file in a hundred
-/// still completes, and the caller's deadline remains the real bound.
+/// What this bounds, precisely, so nobody budgets against a promise the code
+/// does not keep: only FILES it walks, applied inside the entry loop. It binds
+/// language inference (10_000 x 64 = 640k files, reachable) and does NOT bind
+/// structural search (300_000 x 64 = 19.2M, which no repository reaches) — that
+/// call is *meant* to enumerate the whole tree, since a match can be anywhere
+/// in it. Directories are never counted, so a tree that is mostly directories
+/// costs nothing against the budget; their traversal depth is bounded by the
+/// `NEVER_WALK` exclusions instead. Inside a git worktree the budget does not
+/// apply at all — see `list_files_matching`.
 const WORK_BUDGET_PER_ADMITTED_FILE: usize = 64;
 
 /// Walk `root`, returning the files `admit` accepts and why the walk stopped
@@ -133,28 +184,24 @@ fn walk_inventory(
     let work_budget = limit.saturating_mul(WORK_BUDGET_PER_ADMITTED_FILE);
     let mut seen = 0usize;
     let mut out = Vec::new();
+    // Finish the partial listing the same way the complete one is finished: the
+    // walk yields in stack-traversal order, and `list_files` promises a sorted
+    // listing on EVERY path, not just the complete one.
+    fn finish(
+        mut out: Vec<String>,
+        truncation: InventoryTruncation,
+    ) -> (Vec<String>, InventoryTruncation) {
+        out.sort_unstable();
+        (out, truncation)
+    }
     let mut stack = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, prefix)) = stack.pop() {
-        let expired = deadline.is_some_and(|d| Instant::now() >= d);
-        let hit_limit = out.len() >= limit;
-        let hit_work = seen >= work_budget;
-        if hit_limit || hit_work || expired {
-            // Files are still unlisted, so there is unexplored tree left. Sort
-            // before returning: the walk yields in stack-traversal order, and
-            // `list_files` promises a sorted listing on EVERY path, not just
-            // the complete one.
-            //
-            // `hit_work` alone does not mean tree is left: an exhausted stack is
-            // a COMPLETE walk, and `work_budget` can fire at zero files seen
-            // (`limit == 0`). Reporting `limit: true` there would turn a clean
-            // scan into a false partial — the same misreport, in the opposite
-            // direction, that the post-batch deadline check below guards against.
-            out.sort_unstable();
-            return (
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return finish(
                 out,
                 InventoryTruncation {
-                    limit: hit_limit || (hit_work && !stack.is_empty()),
-                    deadline: expired,
+                    limit: false,
+                    deadline: true,
                 },
             );
         }
@@ -176,32 +223,45 @@ fn walk_inventory(
                 if !NEVER_WALK.contains(&name) {
                     stack.push((entry.path(), rel));
                 }
-            } else if kind.is_file() {
-                seen += 1;
-                if admit(&rel) {
-                    out.push(rel);
-                }
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            // The work budget is tested PER FILE, not once per directory. Tested
+            // between directories it was an advisory cap: a single directory
+            // holding a million files overshot a budget of 64 by a million, so
+            // "bounded by `limit * WORK_BUDGET_PER_ADMITTED_FILE` files SEEN"
+            // was never true. Here it is the ceiling that sentence promises, and
+            // `seen` only ever equals the budget on return from this branch — so
+            // tree is unexamined by construction and `limit: true` is never a
+            // false partial, for a queued directory or an unread remainder of
+            // this one alike.
+            if seen >= work_budget {
+                return finish(
+                    out,
+                    InventoryTruncation {
+                        limit: true,
+                        deadline: false,
+                    },
+                );
+            }
+            seen += 1;
+            if out.len() >= limit {
+                return finish(
+                    out,
+                    InventoryTruncation {
+                        limit: true,
+                        deadline: false,
+                    },
+                );
+            }
+            if admit(&rel) {
+                out.push(rel);
             }
         }
-        // A deadline that expires exactly as the queue empties is NOT a
-        // truncation: every directory was walked, so `deadline` here would mark a
-        // complete scan as partial. The check runs after the work, and the final
-        // batch of entries can easily push elapsed time past a deadline that was
-        // met — `stopped_by_deadline` is a claim about unexamined tree, so it may
-        // only be raised when tree is actually left.
-        if deadline.is_some_and(|d| Instant::now() >= d) && !stack.is_empty() {
-            out.sort_unstable();
-            return (
-                out,
-                InventoryTruncation {
-                    limit: false,
-                    deadline: true,
-                },
-            );
-        }
     }
-    out.sort_unstable();
-    (out, InventoryTruncation::default())
+    finish(out, InventoryTruncation::default())
 }
 
 /// Files under `dir`, relative to it, sorted, forward slashes. Uses git's own
@@ -220,8 +280,10 @@ pub fn list_files(dir: &Path, limit: usize, deadline: Option<Instant>) -> Vec<St
 /// "nothing matched" for a scan that never looked (Codex P2). Callers that
 /// report completeness (`search` in `structural`) must use this.
 ///
-/// `git ls-files` does not accept the budget, so inside a worktree the
-/// inventory is always complete; only the non-git walk can be cut short.
+/// `git ls-files` does not accept the file budget, so inside a worktree the
+/// listing is bounded by `limit` alone. Both branches honour `deadline`: the
+/// subprocess is reaped when it overruns, and the walk then runs with the same
+/// expired deadline and reports the truncation.
 pub fn list_files_reporting(
     dir: &Path,
     limit: usize,
@@ -257,8 +319,12 @@ pub fn list_files_matching(
     // That is acceptable because `git ls-files` is a single fast subprocess
     // over an already-ignore-filtered set, not a dirent walk: the O(tree) cost
     // `WORK_BUDGET_PER_ADMITTED_FILE` exists to bound is the non-git walk's.
-    // The walk is also the only branch that can cut short on a deadline.
-    let (mut files, mut truncation) = match git_inventory(dir) {
+    //
+    // Both branches honour the deadline. When `git ls-files` is reaped for
+    // overrunning it, the result is `None` and the walk below runs with the
+    // same — already expired — deadline, so the truncation is reported instead
+    // of the overrun hidden.
+    let (mut files, mut truncation) = match git_inventory(dir, deadline) {
         Some(mut files) => {
             files.retain(|rel| admit(rel));
             (files, InventoryTruncation::default())
@@ -305,7 +371,19 @@ mod test {
 
         let (one, truncation) =
             list_files_matching(dir.path(), 1, None, |rel| rel.ends_with(".rs"));
-        assert_eq!(one, vec!["zzz.rs".to_string()]);
+        // WHICH matching file survives is not specified and must not be pinned:
+        // the walk admits as it goes, so the first one it sees wins, and
+        // `read_dir` order is filesystem-dependent. (Asserting `zzz.rs` here was
+        // an artifact of the walk once admitting everything and truncating a
+        // sorted list afterwards — the very behaviour that made `limit` mean
+        // "first N paths" instead of "first N matches".) The contract is that
+        // the ONE file returned is a match and that the cut is reported.
+        assert_eq!(one.len(), 1, "the limit bounds the files returned");
+        assert!(
+            one[0].ends_with(".rs"),
+            "the one file returned must be an admitted match, got {:?}",
+            one
+        );
         assert!(
             truncation.limit,
             "a second matching file exists, so the listing is incomplete"
@@ -332,34 +410,93 @@ mod test {
         // asks for 10_000 files with `deadline: None` and a scope predicate, so
         // a narrow scope used to cost a full traversal per call.
         //
-        // Three directories each larger than the work budget, so the cutoff
-        // fires after the FIRST one regardless of the order `read_dir` returns
-        // them: with two directories left on the stack the walk cannot mistake
-        // this for a finished traversal.
+        // `walk_inventory` is called DIRECTLY rather than through
+        // `list_files_matching`: the latter tries `git ls-files` first and only
+        // falls back to the walk outside a worktree, and `tempfile::tempdir()`
+        // honours TMPDIR — so on a machine whose TMPDIR sits inside a checkout
+        // the assertion below would be made against the git branch and fail,
+        // while the budget path under test was never entered.
+        //
+        // ONE flat directory, deliberately: the budget is spent inside the
+        // entry loop now, so a single directory larger than the budget proves
+        // it binds. A budget tested once per directory passes this test too,
+        // which is why the count of examined files is asserted exactly.
         let dir = tempfile::tempdir().unwrap();
-        let per_dir = WORK_BUDGET_PER_ADMITTED_FILE + 1;
-        for d in ["d1", "d2", "d3"] {
-            std::fs::create_dir_all(dir.path().join(d)).unwrap();
-            for i in 0..per_dir {
-                std::fs::write(dir.path().join(d).join(format!("f{i}.txt")), "x").unwrap();
-            }
+        for i in 0..WORK_BUDGET_PER_ADMITTED_FILE + 1 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), "x").unwrap();
         }
 
         // `limit: 1` gives a work budget of `WORK_BUDGET_PER_ADMITTED_FILE`, and
         // this predicate admits nothing at all.
-        let (matched, truncation) = list_files_matching(dir.path(), 1, None, |_| false);
+        let examined = std::cell::Cell::new(0usize);
+        let (matched, truncation) = walk_inventory(dir.path(), 1, None, |_| {
+            examined.set(examined.get() + 1);
+            false
+        });
         assert!(
             matched.is_empty(),
             "nothing is admitted, so nothing may be returned"
         );
+        assert_eq!(
+            examined.get(),
+            WORK_BUDGET_PER_ADMITTED_FILE,
+            "the walk must examine exactly the work budget, not one directory's worth: \
+             without it the walk reads the whole tree"
+        );
         assert!(
             truncation.limit,
-            "the work budget must cut the traversal short even though no file was admitted; \
-             without it the walk reads the whole tree"
+            "the work budget cut the traversal, so files remain unlisted"
         );
         assert!(
             !truncation.deadline,
             "no deadline was given, so this is a file budget, not time pressure"
         );
+    }
+
+    #[test]
+    fn test_walk_stops_once_the_result_budget_is_admitted() {
+        // `limit` is the RESULT budget: it bounds admitted files. Which file is
+        // admitted first depends on `read_dir` order, so only the count is
+        // asserted — the returned list is sorted on the way out regardless.
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        let (matched, truncation) = walk_inventory(dir.path(), 2, None, |_| true);
+        assert_eq!(matched.len(), 2, "the limit bounds the files returned");
+        assert!(
+            truncation.limit,
+            "a third file exists, so the listing is incomplete"
+        );
+        assert!(!truncation.deadline);
+    }
+
+    #[test]
+    fn test_walk_of_exactly_the_admitted_budget_is_complete() {
+        // The opposite misreport, and the one the old `!stack.is_empty()` guard
+        // was reaching for: a walk that admits exactly `limit` files from a tree
+        // that holds exactly that many must NOT claim to be cut short. Nothing
+        // is left unexamined, so `has_more` must stay false.
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        let (matched, truncation) = walk_inventory(dir.path(), 2, None, |_| true);
+        assert_eq!(matched, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        assert!(
+            !truncation.truncated(),
+            "every file in the tree was admitted, so nothing was cut short"
+        );
+    }
+
+    #[test]
+    fn test_walk_with_a_zero_limit_reports_truncation() {
+        // `limit: 0` makes the work budget zero, so the first file seen stops
+        // the walk. Reporting completion here would hide a whole tree.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("only.rs"), "x").unwrap();
+        let (matched, truncation) = walk_inventory(dir.path(), 0, None, |_| true);
+        assert!(matched.is_empty(), "a zero limit admits nothing");
+        assert!(truncation.limit, "the tree was never listed");
     }
 }
