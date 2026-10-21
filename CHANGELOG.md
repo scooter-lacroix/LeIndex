@@ -2,9 +2,12 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
-## [2.0.4]
+## [2.1.1]
 
 ### Review fixes: inventory budgets, embedding prompts, checkpoint honesty
+
+> Versioning note: 2.0.4 was never published (it lived only on this branch),
+> so the review fixes below ship in 2.1.1. 2.0.4 does not exist as a release.
 
 - File inventory no longer reports a truncated listing when nothing was
   withheld. The result budget was checked BEFORE the predicate ran, so a walk
@@ -37,6 +40,18 @@ All notable changes to the LeIndex project are documented in this file.
 - Structural search distinguishes deadline skips from read failures, reports
   inventory truncation when a deadline halts the walk, and folds an incomplete
   listing into `has_more` instead of presenting a partial scan as complete.
+- Structural search reports multi-capture bindings (`$$$ARGS`) that ast-grep
+  stores outside its single-capture map, resolves `Makefile`/`CMakeLists.txt`
+  by filename before the extension probe, and detects a scan that finished
+  past its deadline instead of presenting an over-budget run as a clean page.
+- Disabling `LEINDEX_FEATURE_MATRYOSHKA` mid-rollout is now a real rollback:
+  a restart treats the tier-only generation's identity-only canonical header
+  as no neural state (TF-IDF-only scoring) instead of seeding a query vector
+  that scored every node 0.0 under the configured neural weight. The header
+  survives, so re-enabling the flag resumes the generation.
+- Installer scripts keep their executable bit; a committed-mode guard fails
+  CI on any release bump that drops it (third recurrence), and
+  `leindex_structural` is classified read-only for the System-One gate.
 
 ## [Unreleased]
 

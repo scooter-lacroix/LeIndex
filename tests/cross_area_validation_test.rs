@@ -495,8 +495,8 @@ mod version_parity {
     }
 
     /// The installers carry shebangs and are invoked directly (`./install.sh`),
-    /// so the COMMITTED mode must stay executable. The v2.0.4 release commit
-    /// flipped both to 100644 — the third time a release bump dropped the bit
+    /// so the COMMITTED mode must stay executable. The branch's v2.0.4 bump
+    /// (59012060 — never published as a release) flipped both to 100644 — the third time a release bump dropped the bit
     /// (see 74160a52, 3ceb2f14) — because the version-parity checks above
     /// inspect file contents, never modes. Pin the mode itself: this fails on
     /// any commit that rewrites the installers through a non-executable copy.
