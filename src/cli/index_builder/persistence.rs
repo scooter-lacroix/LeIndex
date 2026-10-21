@@ -513,9 +513,9 @@ fn stage_neural_tiers(
 /// commit; full protection against serving a torn commit needs
 /// generation-scoped filenames (write `neural_embeddings_{dim}.{generation}.bin`,
 /// let the manifest name the exact files, delete the old generation only after
-/// the manifest swap), which is a storage-layout change and is tracked
-/// separately. A publish must not run concurrently with a served index for
-/// exactly this reason.
+/// the manifest swap), which is a storage-layout change tracked in #103. A
+/// publish must not run concurrently with a served index for exactly this
+/// reason.
 fn commit_neural_generation(
     project_path: &Path,
     canonical_path: &Path,
