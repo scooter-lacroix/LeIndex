@@ -352,11 +352,25 @@ fn walk_inventory(
                 return finish(out, truncation);
             }
             seen += 1;
-            if out.len() >= limit {
-                truncation.limit = true;
-                return finish(out, truncation);
-            }
             if admit(&rel) {
+                // The result budget is full and THIS file would have been
+                // returned, so files remain unlisted — decided on an admitted
+                // file, never on `out.len() >= limit` alone. Checked before
+                // `admit`, that turned a rejected dirent arriving after the
+                // last match into a false "incomplete": the predicate said no
+                // to the file, nothing was withheld, yet the listing called
+                // itself truncated. Which dirent comes last is `read_dir`
+                // order, so the same tree reported completeness or truncation
+                // at random — green on this machine, red in CI.
+                //
+                // A walk that fills the budget on the tree's last matching
+                // file keeps going until it either finds another match (which
+                // is withheld, so the cut is real) or runs out of tree and
+                // reports completion. Bounded by the same work budget above.
+                if out.len() >= limit {
+                    truncation.limit = true;
+                    return finish(out, truncation);
+                }
                 out.push(rel);
             }
         }
@@ -691,6 +705,37 @@ mod test {
         let (matched, truncation) = walk_inventory(dir.path(), 0, None, |_| true);
         assert!(matched.is_empty(), "a zero limit admits nothing");
         assert!(truncation.limit, "the tree was never listed");
+    }
+
+    #[test]
+    fn test_filling_the_result_budget_on_rejects_alone_is_not_truncation() {
+        // CI-only flake this guard exists for. With the result-budget check
+        // placed BEFORE `admit`, a walk that had already admitted `limit`
+        // matches reported `limit: true` on the NEXT dirent even when `admit`
+        // rejected it — nothing was withheld, but the listing called itself
+        // incomplete. Whether a reject is the last dirent visited is `read_dir`
+        // order, so the same tree reported completeness or truncation at
+        // random: green locally, red in CI. That is why `admit` here counts
+        // CALLS instead of matching a name — the first `limit` dirents are
+        // admitted however the filesystem orders them, so every ordering puts
+        // a reject after the budget is full and the assertion cannot flake.
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+
+        let admitted = std::cell::Cell::new(0usize);
+        let (matched, truncation) = walk_inventory(dir.path(), 2, None, |_| {
+            let n = admitted.get();
+            admitted.set(n + 1);
+            n < 2
+        });
+        assert_eq!(matched.len(), 2, "the first two dirents are admitted");
+        assert!(
+            !truncation.truncated(),
+            "every match in the tree was admitted and the rejects withheld \
+             nothing — reporting truncation here is the CI flake"
+        );
     }
 
     #[test]
