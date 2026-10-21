@@ -488,12 +488,14 @@ mod test {
 
     /// A command that exits immediately, so `run_captured` has something cheap
     /// to drive that is not git.
+    #[cfg(unix)]
     fn exits_now() -> std::process::Command {
         let mut command = std::process::Command::new("sh");
         command.args(["-c", "printf 'a\\0b\\0'"]);
         command
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_run_captured_reads_a_command_that_exits() {
         let out = run_captured(exits_now(), None).expect("a quick command must be captured");
@@ -509,6 +511,7 @@ mod test {
     /// the child is killed rather than waited on: without the kill this test
     /// would take 30 seconds, and with the join instead of an abandoned reader it
     /// would hang forever.
+    #[cfg(unix)]
     #[test]
     fn test_run_captured_kills_a_child_that_overruns_the_deadline() {
         let started = Instant::now();
@@ -523,6 +526,7 @@ mod test {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_run_captured_reports_a_failing_command_as_none() {
         let mut command = std::process::Command::new("sh");
@@ -539,6 +543,7 @@ mod test {
     ///
     /// The root must hold no admitted file of its own, or the walk would return
     /// on a budget path before reaching the directory it cannot read.
+    #[cfg(unix)]
     #[test]
     fn test_walk_reports_an_unreadable_subtree_as_truncated() {
         let dir = tempfile::tempdir().unwrap();

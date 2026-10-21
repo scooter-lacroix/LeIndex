@@ -321,8 +321,8 @@ fn parse_paging(args: &Value) -> Result<(usize, usize, usize, usize), JsonRpcErr
     Ok((limit, offset, per_file_cap, timeout_ms))
 }
 
-/// Files inspected when guessing the target language for a caller that named
-/// none.
+/// Maximum files sampled when guessing the target language for a caller that
+/// named none.
 ///
 /// Deliberately NOT `structural::MAX_CANDIDATE_FILES`, which is an order of
 /// magnitude larger (300_000): inference only needs enough files to see which
@@ -336,18 +336,18 @@ const LANGUAGE_INFERENCE_FILES: usize = 10_000;
 /// Why the inference sample stopped short of the whole scope, one sentence per
 /// cause — the causes are materially different and must not be conflated:
 ///
-/// * `limit` — a *result* cap: the 10k-file sample budget ran out. Not time
-///   pressure.
+/// * `limit` — the result/traversal file budget was reached: either the sample
+///   filled or the walk exhausted its work budget before filling it.
 /// * `deadline` — the wall-clock budget expired mid-walk.
-/// * `skip` — a subtree could not be entered (permissions, bad entries); those
-///   files were never candidates and NEVER will be, whatever the budget.
+/// * `skip` — a subtree could not be read (e.g. permission denied); its files
+///   were never examined, and a larger budget cannot make them reachable.
 fn truncation_reason(
     truncation: &crate::search::textsearch::engine::InventoryTruncation,
 ) -> &'static str {
     if truncation.skip {
-        "some subtrees could not be read (e.g. permission denied) and were never examined"
+        "some subtrees could not be read (e.g. permission denied) and were never examined; a larger budget cannot reach them"
     } else if truncation.limit {
-        "the result cap was reached; further files remain unexamined"
+        "the result/traversal file budget was reached; further files remain unexamined"
     } else {
         "the time budget expired before the scope was fully examined"
     }
@@ -359,9 +359,9 @@ fn truncation_reason(
 /// a Rust pattern run against Python files returns nothing, and "nothing" reads
 /// as "the code does not exist".
 ///
-/// Inference sees only [`LANGUAGE_INFERENCE_FILES`] of the scope, so an empty
-/// result on a larger tree must not claim the language is absent — see the
-/// `truncated` branch below.
+/// Inference samples at most [`LANGUAGE_INFERENCE_FILES`] files of the scope,
+/// so an empty result on a larger tree must not claim the language is absent —
+/// see the `truncated` branch below.
 #[cfg(feature = "structural-search")]
 fn infer_language(
     root: &std::path::Path,
@@ -369,8 +369,9 @@ fn infer_language(
 ) -> Result<String, JsonRpcError> {
     use std::collections::BTreeSet;
     // The filter is applied INSIDE the walk, so `LANGUAGE_INFERENCE_FILES`
-    // bounds the matching files rather than the tree. Filtering afterwards
-    // sampled "the first N paths root-wide, of which maybe none are in scope",
+    // caps matching files; a separate traversal budget can stop the walk sooner.
+    // Filtering afterwards sampled "the first N paths root-wide, of which maybe
+    // none are in scope",
     // which made a scoped call report no language for a scope full of them —
     // and then advise widening a scope that was never examined.
     let (rels, truncation) = crate::search::textsearch::engine::list_files_matching(
@@ -394,8 +395,8 @@ fn infer_language(
         0 => Err(JsonRpcError::invalid_params_with_suggestion(
             if truncated {
                 format!(
-                    "No structural-search language found in the first \
-                     {LANGUAGE_INFERENCE_FILES} files of scope: {}",
+                    "No structural-search language found in the sampled files \
+                     (at most {LANGUAGE_INFERENCE_FILES}) of scope: {}",
                     truncation_reason(&truncation)
                 )
             } else {
@@ -421,8 +422,8 @@ fn infer_language(
                     // difference between a caller choosing `lang` and a caller
                     // concluding the scope is genuinely polyglot.
                     format!(
-                        "Scope holds several languages ({found}) in the first \
-                         {LANGUAGE_INFERENCE_FILES} files: {}; the set may be incomplete",
+                        "Scope holds several languages ({found}) in the sampled files \
+                         (at most {LANGUAGE_INFERENCE_FILES}): {}; the set may be incomplete",
                         truncation_reason(&truncation)
                     )
                 } else {
@@ -581,9 +582,9 @@ mod tests {
 
     /// Each truncation cause must produce its own message: collapsing them into
     /// one generic "incomplete" line would tell a caller whose walk hit a
-    /// permission-denied subtree that "more remain unexamined" (they never
-    /// will), and tell a caller whose result cap fired that the time budget cut
-    /// the scan (it did not).
+    /// permission-denied subtree that a larger budget would reach it, or tell
+    /// a caller whose result/traversal file budget ran out that the time budget
+    /// cut the scan.
     #[test]
     fn test_truncation_reason_distinguishes_causes() {
         use crate::search::textsearch::engine::InventoryTruncation;
@@ -599,9 +600,10 @@ mod tests {
             skip: true,
             ..Default::default()
         };
-        assert!(truncation_reason(&limit).contains("result cap"));
+        assert!(truncation_reason(&limit).contains("result/traversal file budget"));
         assert!(truncation_reason(&deadline).contains("time budget"));
         assert!(truncation_reason(&skip).contains("permission denied"));
         assert!(truncation_reason(&skip).contains("never examined"));
+        assert!(truncation_reason(&skip).contains("a larger budget cannot reach them"));
     }
 }
