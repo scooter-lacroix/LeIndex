@@ -130,6 +130,60 @@ fn test_descendant_observation_certifies_own_peak_only_without_descendants() {
     );
 }
 
+#[test]
+fn test_lifetime_fold_refuses_a_peak_no_observation_accounts_for() {
+    // `certifies_no_descendants` is necessary but not sufficient. `children`
+    // lists DIRECT children only, so "not seen" is not evidence that nothing
+    // ran — a reaped, reparented grandchild leaves `seen == false` while its
+    // high-water mark is already inside `ru_maxrss`. The magnitude guard is
+    // what stops that from being certified as the measured process's own peak.
+    let clean = DescendantObservation {
+        seen: false,
+        observable: true,
+    };
+    // Agreement inside the tolerance: fold, because it recovers the final-tick
+    // allocation the VmHWM poll can miss.
+    assert!(matches!(
+        lifetime_fold(clean, 100_000, 100_500),
+        LifetimeFold::Accepted
+    ));
+    // A lifetime mark far above every peak we actually measured is a folded
+    // descendant, not our own allocation.
+    assert!(matches!(
+        lifetime_fold(clean, 40_000, 750_000),
+        LifetimeFold::ExceedsObserved
+    ));
+    // The regression this guard exists for, at its real magnitude: `index`
+    // measured 735848 KiB instead of ~38 MiB because rust-analyzer scip's peak
+    // was folded in. A tolerance wide enough to accept this (1 GiB was the
+    // first attempt) would certify the regression instead of catching it.
+    assert!(
+        matches!(
+            lifetime_fold(clean, 38 * 1024, 735_848),
+            LifetimeFold::ExceedsObserved
+        ),
+        "the 733 MiB SCIP fold must be refused, not certified"
+    );
+    // A descendant we DID see is refused regardless of magnitude, since its
+    // peak may be folded in.
+    assert!(matches!(
+        lifetime_fold(
+            DescendantObservation {
+                seen: true,
+                observable: true
+            },
+            100_000,
+            100_500
+        ),
+        LifetimeFold::DescendantsSeen
+    ));
+    // Nothing was observed, so nothing is certifiable.
+    assert!(matches!(
+        lifetime_fold(DescendantObservation::default(), 100_000, 100_500),
+        LifetimeFold::DescendantsSeen
+    ));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn test_descendant_phase_does_not_fold_reaped_peak_into_main_rss() {
@@ -181,6 +235,64 @@ fn test_descendant_phase_does_not_fold_reaped_peak_into_main_rss() {
     assert!(
         report.rss_max_kib < DESCENDANT_KIB,
         "rss_max_kib {} KiB must not fold the descendant's peak into the main process",
+        report.rss_max_kib
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_reaped_unseen_descendant_is_not_folded_into_main_rss() {
+    // The case `seen == false` cannot rule out, and the reason the fold cannot
+    // rest on the live poller alone: `/proc/<pid>/task/<tid>/children` lists
+    // DIRECT children, so a descendant that is reaped and reparented is never
+    // observed. Here the shell spawns a memory-hungry helper in the background
+    // and exits without waiting for it, so `wait4` still folds the helper's
+    // peak into `ru_maxrss` while the poller only ever saw an immediate child
+    // it can no longer report.
+    //
+    // Without a magnitude guard this phase certifies "ran no descendants" and
+    // charges the helper's peak to leindex — precisely the 733 MiB SCIP
+    // regression the descendant check exists to prevent. The guard rejects it
+    // because the lifetime mark dwarfs every peak actually measured on the
+    // measured process.
+    const DESCENDANT_KIB: u64 = 128 * 1024;
+    let fixture = tempfile::tempdir().unwrap();
+    let config = WorkloadConfig {
+        binary: PathBuf::from("/bin/sh"),
+        fixture: fixture.path().to_path_buf(),
+        sample_interval: Duration::from_millis(10),
+        verbose: false,
+        worker_capable: false,
+        heap_profile_dir: None,
+    };
+    let report = run_command_phase_with_peak_support(
+        &config,
+        "descendant_orphaned",
+        |_, _| {
+            let mut command = Command::new("/bin/sh");
+            // The helper is backgrounded and NOT waited on; the shell exits
+            // first, leaving the helper reparented to init.
+            command.arg("-c").arg(format!(
+                "MEMCHECK_PEAK_CHILD=transient MEMCHECK_PEAK_CHILD_KIB={DESCENDANT_KIB} \
+                 MEMCHECK_PEAK_CHILD_SLEEP_MS=0 '{helper}' --exact \
+                 workload::tests::test_command_peak_child & sleep 0.15",
+                helper = std::env::current_exe().unwrap().display(),
+            ));
+            command
+        },
+        true,
+    )
+    .unwrap();
+
+    assert!(
+        report.descendants.peak_rss_kib >= DESCENDANT_KIB,
+        "the lifetime peak {} KiB must include the orphaned descendant",
+        report.descendants.peak_rss_kib
+    );
+    assert!(
+        report.rss_max_kib < DESCENDANT_KIB,
+        "rss_max_kib {} KiB must not adopt a descendant's peak that was reaped \
+         before the poller could see it",
         report.rss_max_kib
     );
 }

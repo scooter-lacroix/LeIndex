@@ -86,10 +86,10 @@ impl StructuralHandler {
 
     pub async fn execute(
         &self,
-        _registry: &std::sync::Arc<crate::cli::registry::ProjectRegistry>,
+        registry: &std::sync::Arc<crate::cli::registry::ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
-        run(&args).await
+        run(registry, &args).await
     }
 }
 
@@ -132,13 +132,16 @@ fn gate_error(reason: &str, args: &Value) -> JsonRpcError {
     )
 }
 
-async fn run(args: &Value) -> Result<Value, JsonRpcError> {
+async fn run(
+    registry: &std::sync::Arc<crate::cli::registry::ProjectRegistry>,
+    args: &Value,
+) -> Result<Value, JsonRpcError> {
     if let Some(reason) = unavailable_reason() {
         return Err(gate_error(&reason, args));
     }
     #[cfg(feature = "structural-search")]
     {
-        search(args).await
+        search(registry, args).await
     }
     // `unavailable_reason` above is the single source of truth for this gate;
     // reaching here without the feature would mean the two disagreed.
@@ -150,13 +153,16 @@ async fn run(args: &Value) -> Result<Value, JsonRpcError> {
 
 /// The search itself. Only compiled when the capability exists.
 #[cfg(feature = "structural-search")]
-async fn search(args: &Value) -> Result<Value, JsonRpcError> {
+async fn search(
+    registry: &std::sync::Arc<crate::cli::registry::ProjectRegistry>,
+    args: &Value,
+) -> Result<Value, JsonRpcError> {
     use crate::search::textsearch::{StructuralOptions, search_structural};
 
     let pattern_text = parse_pattern(args)?;
     let (limit, offset, per_file_cap, timeout_ms) = parse_paging(args)?;
 
-    let root = resolve_root(args)?;
+    let root = resolve_root(registry, args).await?;
     let filter = build_filter(args);
     let (compiled, language_name) = compile_for(args, &root, &filter, pattern_text).await?;
 
@@ -199,9 +205,20 @@ fn deadline_after(timeout_ms: usize) -> Option<std::time::Instant> {
 }
 
 /// The project whose files are searched: `project_path` when given, otherwise
-/// the current project.
+/// the registry's current project.
+///
+/// The fallback must come from the registry, not from `.`: the daemon's working
+/// directory is whatever it was launched in and has no relation to the project
+/// the caller is talking to. Resolving `.` silently defined `scope` and the
+/// include/exclude globs against a different tree than every sibling tool
+/// (`read_symbol`, `find`, `git_status`, `file_summary` all use the registry
+/// default), so a bare `leindex_structural` call walked the wrong project — or,
+/// when the daemon was started from `/`, an enormous one.
 #[cfg(feature = "structural-search")]
-fn resolve_root(args: &Value) -> Result<std::path::PathBuf, JsonRpcError> {
+async fn resolve_root(
+    registry: &std::sync::Arc<crate::cli::registry::ProjectRegistry>,
+    args: &Value,
+) -> Result<std::path::PathBuf, JsonRpcError> {
     use crate::cli::live_project::LiveProject;
 
     let resolved = match args.get("project_path").and_then(Value::as_str) {
@@ -211,12 +228,18 @@ fn resolve_root(args: &Value) -> Result<std::path::PathBuf, JsonRpcError> {
                 "Pass an existing project directory, or omit project_path for the current one",
             )
         })?,
-        None => LiveProject::resolve(".").map_err(|e| {
-            JsonRpcError::invalid_params_with_suggestion(
-                format!("Cannot resolve the current project: {e}"),
-                "Pass project_path explicitly",
-            )
-        })?,
+        None => {
+            let default = registry.default_project_path().await?;
+            LiveProject::resolve(&default.to_string_lossy()).map_err(|e| {
+                JsonRpcError::invalid_params_with_suggestion(
+                    format!(
+                        "Cannot resolve the current project {}: {e}",
+                        default.display()
+                    ),
+                    "Pass project_path explicitly",
+                )
+            })?
+        }
     };
     Ok(resolved.root().to_path_buf())
 }
@@ -325,10 +348,16 @@ fn infer_language(
     filter: &crate::search::textsearch::FileFilter,
 ) -> Result<String, JsonRpcError> {
     use std::collections::BTreeSet;
-    let (rels, truncation) = crate::search::textsearch::engine::list_files_reporting(
+    // The filter is applied INSIDE the walk, so `LANGUAGE_INFERENCE_FILES`
+    // bounds the matching files rather than the tree. Filtering afterwards
+    // sampled "the first N paths root-wide, of which maybe none are in scope",
+    // which made a scoped call report no language for a scope full of them —
+    // and then advise widening a scope that was never examined.
+    let (rels, truncation) = crate::search::textsearch::engine::list_files_matching(
         root,
         LANGUAGE_INFERENCE_FILES,
         None,
+        |rel| filter.allows(rel),
     );
     let truncated = truncation.truncated();
     // shh: a one-language scope that is 99% another language still infers the
@@ -336,7 +365,6 @@ fn infer_language(
     // a survey. Fixing that needs a sampling strategy, not a bigger constant.
     let languages: BTreeSet<&'static str> = rels
         .into_iter()
-        .filter(|rel| filter.allows(rel))
         .filter_map(|rel| {
             crate::search::textsearch::language_for_path(std::path::Path::new(&rel))
                 .map(|id| id.config().name.as_str())

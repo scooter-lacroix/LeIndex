@@ -709,12 +709,21 @@ impl LeIndex {
             rerank_top_n: cfg.search.rerank_top_n,
             rerank_model: &rerank_model,
             rerank_backend: effective_rerank_backend(&cfg.search),
-            // System-One fails open when its flag is off, so the flag state is
-            // result-affecting and belongs in the key (Codex P1). Other
-            // backends are driven purely by config and stay `true`.
+            // System-One fails open when its flag is off, so the capability to
+            // actually run the judge is result-affecting and belongs in the key
+            // (Codex P1). Fold `system_one_rerank_available()`, NOT the raw
+            // `is_enabled()`: the predicate also requires the `system-one`
+            // feature to be compiled in, and the default build does not have it
+            // (`default = ["full"]`, and `full` omits `system-one`). Folding the
+            // bare flag made a default build and a `--features system-one` build
+            // compute the SAME key whenever the env var was set, so the
+            // unreranked results the default build cached were served by the
+            // feature-enabled build and the judge never ran — the rollout had no
+            // effect for already-queried inputs. Other backends are driven purely
+            // by config and stay `true`.
             rerank_backend_active: {
                 let backend = effective_rerank_backend(&cfg.search);
-                backend != "system-one" || crate::feature_flags::FeatureFlag::SystemOne.is_enabled()
+                backend != "system-one" || crate::config::system_one_rerank_available()
             },
             fragment_index_enabled: cfg.search.fragment_index_enabled,
             fragment_weight: cfg.search.fragment_weight,

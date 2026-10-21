@@ -132,11 +132,16 @@ fn print_check_search_settings(search: &crate::config::SearchConfig) {
         }
     );
     println!("Rerank backend:     {}", search.rerank_backend);
-    // A configured `system-one` backend is only constructible with the feature
-    // compiled in AND `LEINDEX_FEATURE_SYSTEM_ONE` set. Without this line the
-    // report says "backend: system-one, enabled: OFF" with no reason, or — the
-    // bug this guards — "enabled: ON" while `asker_from_config` refuses and
-    // every search silently falls open.
+    // A configured `system-one` backend only reranks when the feature is
+    // compiled in AND `LEINDEX_FEATURE_SYSTEM_ONE` is set. Without this line the
+    // report says "backend: system-one, enabled: OFF" with no reason, or —
+    // the bug this guards — "enabled: ON" on a build whose dispatch cannot even
+    // reach the backend. The guard covers exactly that: the feature and the
+    // rollout flag. A config the dispatch ALSO rejects (unknown provider, or a
+    // remote provider whose `api_key_env` is unset) is not reported here,
+    // because `rerank_effectively_enabled` does not carry `[system_one]`; such a
+    // config shows ON and then fails open at search time, like an `onnx` backend
+    // whose worker never starts.
     if search.rerank_backend == "system-one" && !crate::config::system_one_rerank_available() {
         println!(
             "  -> system-one is unavailable: {}",

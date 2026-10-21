@@ -119,7 +119,7 @@ fn platform_identity(_meta: &std::fs::Metadata) -> (i64, u64) {
 // re-exported here so `engine::list_files` stays the public path.
 #[path = "engine_inventory.rs"]
 mod inventory;
-pub use inventory::{list_files, list_files_reporting};
+pub use inventory::{list_files, list_files_matching, list_files_reporting};
 
 // ── Index building ───────────────────────────────────────────────────────────
 

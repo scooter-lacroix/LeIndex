@@ -955,12 +955,46 @@ fn run_command_phase_with_peak_support(
         seen: descendant_observation.seen || !descendants.by_name.is_empty(),
         observable: descendant_observation.observable,
     };
-    if descendant_observation.certifies_no_descendants() && lifetime_peak_kib > 0 {
-        // No descendant could have contributed to it, so ru_maxrss is this
-        // process's own peak — and unlike the 250us VmHWM poll it cannot miss
-        // an allocation made in the final tick before exit.
-        report.rss_max_kib = report.rss_max_kib.max(lifetime_peak_kib);
-        report.combined_rss_max_kib = report.combined_rss_max_kib.max(lifetime_peak_kib);
+    if lifetime_peak_kib > 0 {
+        match lifetime_fold(
+            descendant_observation,
+            report.rss_max_kib,
+            lifetime_peak_kib,
+        ) {
+            LifetimeFold::Accepted => {
+                // No descendant could have contributed to it, so ru_maxrss is
+                // this process's own peak — and unlike the 250us VmHWM poll it
+                // cannot miss an allocation made in the final tick before exit.
+                report.rss_max_kib = report.rss_max_kib.max(lifetime_peak_kib);
+                report.combined_rss_max_kib = report.combined_rss_max_kib.max(lifetime_peak_kib);
+            }
+            LifetimeFold::DescendantsSeen => {
+                // Expected for the phases that shell out (SCIP precision
+                // ingest); the peak is reported on the descendant tree instead.
+                if config.verbose {
+                    eprintln!(
+                        "memcheck: phase '{}' lifetime peak {} KiB is descendant-inclusive; not folding",
+                        phase_name, lifetime_peak_kib
+                    );
+                }
+            }
+            LifetimeFold::ExceedsObserved => {
+                // `seen == false` is NOT proof no descendant ran: `children`
+                // lists direct children only, so a reparented grandchild is
+                // invisible to the poller and its peak still lands in
+                // `ru_maxrss`. Refusing on the magnitude is what keeps a reaped
+                // indexer from being charged to leindex — the exact regression
+                // this fold exists to avoid.
+                if config.verbose {
+                    eprintln!(
+                        "memcheck: phase '{}' lifetime peak {} KiB far exceeds every observed \
+                         peak ({} KiB); a descendant was likely reaped unseen, so it is not \
+                         folded into main-process RSS",
+                        phase_name, lifetime_peak_kib, report.rss_max_kib
+                    );
+                }
+            }
+        }
     }
     // Keep the descendant-inclusive lifetime peak, but only where it cannot be
     // mistaken for main-process RSS: the budget ceilings gate on `rss_max_kib`,
@@ -1018,6 +1052,50 @@ fn wait_command_with_peak(child: &mut Child) -> Result<(std::process::ExitStatus
         if error.kind() != std::io::ErrorKind::Interrupted {
             return Err(error.into());
         }
+    }
+}
+
+/// `wait4`'s `ru_maxrss` may exceed the measured process's OWN live peak by up
+/// to this much (64 MiB) before the fold is refused.
+///
+/// `VmHWM` and `ru_maxrss` both report the high-water mark of the same process
+/// over the same lifetime, so for a childless phase they agree to within
+/// accounting noise — which makes the threshold nearly irrelevant to legitimate
+/// data and entirely about the descendant it is meant to exclude. It therefore
+/// has to sit BELOW the smallest descendant worth excluding: the regression that
+/// motivated this check folded rust-analyzer scip's ~733 MiB into `index`, and a
+/// tolerance large enough to admit that (1 GiB) would have certified it as
+/// leindex's own. 64 MiB is three orders of magnitude above the final-tick
+/// allocation the fold exists to recover (KiB) and an order of magnitude below a
+/// real folded indexer.
+const LIFETIME_FOLD_TOLERANCE_KIB: u64 = 64 * 1024;
+
+/// Why a `ru_maxrss` fold was refused, for the diagnostic line.
+#[derive(Clone, Copy)]
+enum LifetimeFold {
+    /// The lifetime mark is the measured process's own peak.
+    Accepted,
+    /// A descendant was seen live, so the fold would charge its peak to us.
+    DescendantsSeen,
+    /// Nothing observed a descendant, but the lifetime mark dwarfs every peak we
+    /// measured, which is what a folded descendant looks like once it is reaped.
+    ExceedsObserved,
+}
+
+/// Decide whether the descendant-inclusive lifetime peak may extend the
+/// main-process peak.
+fn lifetime_fold(
+    observation: DescendantObservation,
+    observed_kib: u64,
+    lifetime_kib: u64,
+) -> LifetimeFold {
+    if !observation.certifies_no_descendants() {
+        return LifetimeFold::DescendantsSeen;
+    }
+    if lifetime_kib.saturating_sub(observed_kib) <= LIFETIME_FOLD_TOLERANCE_KIB {
+        LifetimeFold::Accepted
+    } else {
+        LifetimeFold::ExceedsObserved
     }
 }
 
@@ -1853,5 +1931,5 @@ fn run_query_suite_warm_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
 // The tests live in a sibling file: this one sits at the 2000-line
 // large-file gate, and the test module alone is ~550 lines.
 #[cfg(test)]
-#[path = "workload_tests.rs"]
+#[path = "workload_test.rs"]
 mod tests;

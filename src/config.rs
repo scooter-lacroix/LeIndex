@@ -915,16 +915,23 @@ fn default_rerank_backend() -> String {
 /// Allowed values for `[search] rerank_backend`.
 pub const RERANK_BACKENDS: &[&str] = &["onnx", "system-one", "off"];
 
-/// Whether the `system-one` rerank backend can actually construct its reranker.
+/// Whether the `system-one` rerank backend is ARMED: this build carries the
+/// `system-one` feature and the `LEINDEX_FEATURE_SYSTEM_ONE` rollout flag is on.
 ///
-/// `system-one` is experimental and doubly gated: the binary must be built with
-/// the `system-one` feature, and the `LEINDEX_FEATURE_SYSTEM_ONE` rollout flag
-/// must be on. `rerank_effectively_enabled` alone cannot answer this — it reads
-/// config only, so a config asking for `system-one` on a default build reports
-/// rerank ON while `asker_from_config` refuses to construct the reranker and the
-/// rerank stage silently falls open. Every ON/OFF surface (setup status, the
-/// dispatch, over-fetch, the cache-key fold) folds this in so what is reported
-/// matches what will run.
+/// This is a necessary condition, not proof that the judge will run. The
+/// dispatch builds its asker through `asker_from_config`, which refuses a config
+/// it cannot construct a provider for — an unparseable `[system_one] provider`,
+/// or a remote provider whose `api_key_env` names an unset or empty variable.
+/// Nothing ON/OFF folds those in, and that is deliberate: `rerank_enabled` for
+/// the `onnx` backend already means "config says to try", not "the worker came
+/// up", and a provider-key check here would have to read `[system_one]` on a
+/// path that does not carry the config. So read this as "the rollout permits
+/// system-one", never as "the reranker will be constructed".
+///
+/// `Effective: rerank ON/OFF` in `setup` output inherits the same caveat: ON
+/// means the stage is armed, not that a key is present. The reason line the
+/// checker prints for an unarmed backend is what separates the two — it names
+/// the feature or the env var, so an ON with no reason line did not fail a gate.
 pub fn system_one_rerank_available() -> bool {
     if !cfg!(feature = "system-one") {
         return false;
@@ -1275,30 +1282,37 @@ mod tests {
         // the backend is constructible: the flag must be on AND the feature
         // compiled in. A config asking for it otherwise reports OFF, matching
         // the dispatch, which refuses to construct the reranker.
-        let _guard = crate::feature_flags::FLAG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        crate::feature_flags::set_flag_override_for_test(
-            crate::feature_flags::FeatureFlag::SystemOne,
-            false,
-        );
+        //
+        // Driven through `with_flag_override`, which takes the test lock and
+        // restores the previous state on unwind: a failing assertion here must
+        // not leak a `SystemOne = true` override into every later test in the
+        // crate. Not nested — the lock is not reentrant — so the two sides are
+        // sequential, and the config is mutated in between while the lock is
+        // free.
         config.search.rerank_backend = "system-one".to_string();
         config.search.rerank_enabled = false;
-        assert!(
-            !config.search.rerank_effectively_enabled(),
-            "system-one without LEINDEX_FEATURE_SYSTEM_ONE cannot rerank"
+        crate::feature_flags::with_flag_override(
+            crate::feature_flags::FeatureFlag::SystemOne,
+            false,
+            || {
+                assert!(
+                    !config.search.rerank_effectively_enabled(),
+                    "system-one without LEINDEX_FEATURE_SYSTEM_ONE cannot rerank"
+                );
+            },
         );
-        crate::feature_flags::set_flag_override_for_test(
+        crate::feature_flags::with_flag_override(
             crate::feature_flags::FeatureFlag::SystemOne,
             true,
+            || {
+                assert_eq!(
+                    config.search.rerank_effectively_enabled(),
+                    cfg!(feature = "system-one"),
+                    "available system-one reranks regardless of rerank_enabled; a build \
+                     without the feature still cannot"
+                );
+            },
         );
-        assert_eq!(
-            config.search.rerank_effectively_enabled(),
-            cfg!(feature = "system-one"),
-            "available system-one reranks regardless of rerank_enabled; a build \
-             without the feature still cannot"
-        );
-        crate::feature_flags::clear_flag_overrides_for_test();
         // off is an explicit no-rerank even with rerank_enabled set.
         config.search.rerank_backend = "off".to_string();
         config.search.rerank_enabled = true;

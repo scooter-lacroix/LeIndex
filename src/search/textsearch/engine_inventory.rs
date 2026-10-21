@@ -182,13 +182,88 @@ pub fn list_files_reporting(
     limit: usize,
     deadline: Option<Instant>,
 ) -> (Vec<String>, InventoryTruncation) {
+    list_files_matching(dir, limit, deadline, |_| true)
+}
+
+/// [`list_files_reporting`], keeping only files `admit` allows, with `limit`
+/// applied to the ADMITTED files.
+///
+/// Taking the predicate here rather than letting the caller filter afterwards is
+/// the whole point: `git ls-files` and `walk_inventory` return everything, so
+/// filtering a `limit`-truncated result silently substitutes "the first `limit`
+/// files in the tree" for "the first `limit` matching files". Language inference
+/// hit exactly that — it filtered `scope`/include/exclude out of the first
+/// `LANGUAGE_INFERENCE_FILES` paths root-wide, so a scope whose files sort after
+/// the cutoff looked empty, and the error told the caller to widen a scope that
+/// was never examined. Applying the predicate before the cut makes `limit` mean
+/// what every caller already assumes it means.
+pub fn list_files_matching(
+    dir: &Path,
+    limit: usize,
+    deadline: Option<Instant>,
+    admit: impl Fn(&str) -> bool,
+) -> (Vec<String>, InventoryTruncation) {
     let (mut files, mut truncation) = match git_inventory(dir) {
         Some(files) => (files, InventoryTruncation::default()),
         None => walk_inventory(dir, limit, deadline),
     };
+    files.retain(|rel| admit(rel));
     if files.len() > limit {
         truncation.limit = true;
     }
     files.truncate(limit);
     (files, truncation)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_list_files_matching_bounds_the_matching_files() {
+        // The regression this guard exists for: `limit` must bound the files
+        // that MATCH, not the files in the tree. Filtering a truncated listing
+        // afterwards turns `limit` into "the first N paths in the whole tree",
+        // so a scope whose files all sort past the cutoff reports nothing —
+        // which is exactly how language inference came back empty for a scope
+        // full of source, then told the caller to widen it.
+        let dir = tempfile::tempdir().unwrap();
+        // Alphabetically FIRST are files the filter rejects, so a post-hoc
+        // filter over a 2-entry listing would leave nothing.
+        for name in ["aaa.txt", "aab.txt", "zzz.rs", "zzz2.rs"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+
+        let (matched, truncation) =
+            list_files_matching(dir.path(), 2, None, |rel| rel.ends_with(".rs"));
+        assert_eq!(
+            matched,
+            vec!["zzz.rs".to_string(), "zzz2.rs".to_string()],
+            "the limit must be spent on admitted files, not consumed by rejects"
+        );
+        assert!(
+            !truncation.truncated(),
+            "both matching files fit, so nothing was cut short"
+        );
+
+        let (one, truncation) =
+            list_files_matching(dir.path(), 1, None, |rel| rel.ends_with(".rs"));
+        assert_eq!(one, vec!["zzz.rs".to_string()]);
+        assert!(
+            truncation.limit,
+            "a second matching file exists, so the listing is incomplete"
+        );
+    }
+
+    #[test]
+    fn test_list_files_reporting_admits_everything() {
+        // The no-predicate path must stay exactly what it was.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "x").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "x").unwrap();
+        assert_eq!(
+            list_files_reporting(dir.path(), 10, None).0,
+            vec!["a.rs".to_string(), "b.txt".to_string()]
+        );
+    }
 }
