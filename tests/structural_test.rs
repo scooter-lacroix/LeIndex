@@ -564,6 +564,61 @@ fn test_expired_deadline_reports_partial_not_complete() {
     assert!(output.stopped_by_deadline);
 }
 
+/// The scan-loop half of the deadline accounting, which the expired-deadline
+/// test above structurally cannot cover: its deadline is already expired when
+/// the inventory runs, so no candidate survives to reach a worker. Here the
+/// deadline is LIVE at inventory time and tight enough that it can expire
+/// while workers are still opening files — the exact shape the accounting
+/// exists for.
+///
+/// Which side of that race a run lands on is machine speed, so the assertion
+/// is the INVARIANT rather than a particular outcome: every candidate was
+/// either scanned or skipped on the deadline, and a run that did skip must
+/// say so through `stopped_by_deadline` and `has_more`. Asserting
+/// `skipped_deadline > 0` outright would re-introduce the timing flake this
+/// branch just removed from the inventory suite; a loaded CI runner lands on
+/// the skip side regularly, and the invariant is checked on both sides.
+#[test]
+fn test_scan_loop_deadline_accounting_sums_to_candidates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Enough files that a scan can plausibly outlive the deadline on a busy
+    // runner; small enough that creating them stays cheap.
+    for i in 0..4000 {
+        write(dir.path(), &format!("f{i:04}.rs"), "fn one() {}\n");
+    }
+    let pattern = CompiledPattern::new("rust", "fn $NAME() { $$$BODY }").expect("pattern");
+    let output = search_structural(
+        dir.path(),
+        &pattern,
+        &FileFilter::default(),
+        &StructuralOptions {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(200)),
+            ..options(100, NO_CAP)
+        },
+    );
+
+    assert!(
+        output.stats.candidates > 0,
+        "the live deadline must not starve the inventory"
+    );
+    assert_eq!(
+        output.stats.scanned + output.stats.skipped_deadline,
+        output.stats.candidates,
+        "every candidate is accounted for: opened and scanned, or skipped on \
+         the deadline — never silently dropped"
+    );
+    if output.stats.skipped_deadline > 0 {
+        assert!(
+            output.stopped_by_deadline,
+            "files skipped on the deadline are exactly what justifies the claim"
+        );
+        assert!(
+            output.has_more,
+            "skipped files may hold matches, so the result cannot claim completeness"
+        );
+    }
+}
+
 /// A deadline that expires while the *inventory* is being walked must also
 /// report a partial result. `walk_inventory` stops at the deadline and returns
 /// whatever it had, so a non-git tree can yield zero candidates and

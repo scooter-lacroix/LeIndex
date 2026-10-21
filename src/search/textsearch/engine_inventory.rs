@@ -91,7 +91,20 @@ fn run_captured(mut command: std::process::Command, deadline: Option<Instant>) -
             let _ = child.wait();
             break None;
         }
-        std::thread::sleep(poll);
+        // Sleep at most until the deadline, not the next full interval. The
+        // expiry check above runs BEFORE the sleep, so an unbounded sleep
+        // overshoots by a whole interval: a 5 ms budget with the backoff
+        // already at POLL_MAX was killed 20 ms late — four times the budget's
+        // own size. Waking early is harmless (the loop re-checks and kills
+        // immediately), and `saturating_duration_since` yields zero once the
+        // deadline passes, so a late arrival sleeps zero and exits on the next
+        // check rather than spinning.
+        let now = Instant::now();
+        let sleep = match deadline {
+            Some(d) => poll.min(d.saturating_duration_since(now)),
+            None => poll,
+        };
+        std::thread::sleep(sleep);
         poll = (poll * 2).min(POLL_MAX);
     };
     if !status.is_some_and(|status| status.success()) {
@@ -158,7 +171,10 @@ fn git_inventory(
             return GitInventory::Present(sorted_unique(files), truncation);
         }
         let Ok(rel) = std::str::from_utf8(entry) else {
-            truncation.skip = true;
+            // Silent, like the walk's per-entry skips: bytes git reports can
+            // never become a candidate, so the listing of matchable files is
+            // complete. Marking the listing truncated would pin `has_more`
+            // forever on any tree holding one such name.
             continue;
         };
         if rel.split('/').any(|seg| seg == ".leindex" || seg == ".git") {
@@ -193,7 +209,8 @@ fn git_inventory(
 enum GitInventory {
     /// Not a worktree, git missing, or reaped on the deadline.
     Absent,
-    /// The listing was resolved from git, with any truncation (deadline, skip) recorded.
+    /// The listing was resolved from git, with any truncation (deadline, an
+    /// unread subtree) recorded.
     Present(Vec<String>, InventoryTruncation),
 }
 
@@ -216,12 +233,14 @@ pub struct InventoryTruncation {
     pub limit: bool,
     /// The wall-clock deadline stopped the walk.
     pub deadline: bool,
-    /// A subtree was dropped because the OS would not let us read it — `read_dir`
-    /// denied, a `file_type()` failure, a non-UTF-8 name. These files were never
-    /// candidates and never will be, so this is not time pressure and not a
-    /// page limit; but it does mean the listing does not describe the whole
-    /// tree, and claiming otherwise is the `has_more: false` misreport this
-    /// type exists to prevent.
+    /// A whole subtree was dropped UNREAD because the OS would not open it —
+    /// the `read_dir` failure. Those files were candidates and may still hold
+    /// matches, so the listing does not describe the whole tree. A per-entry
+    /// skip (entry error, `file_type()` failure, non-UTF-8 name) is NOT this:
+    /// such a file can never become a candidate — every path downstream is a
+    /// `String` — so the listing still describes every matchable file, and
+    /// counting it as incomplete would pin `has_more: true` forever on any
+    /// tree holding one such name.
     pub skip: bool,
 }
 
@@ -296,17 +315,25 @@ fn walk_inventory(
             truncation.skip = true;
             continue;
         };
+        // Per-entry skips are SILENT, deliberately: an entry that errors, a
+        // `file_type()` we cannot read, or a name that is not UTF-8 can never
+        // become a candidate — every path downstream is a `String` — so this
+        // listing still describes every matchable file in the tree. `skip` is
+        // reserved for the `read_dir` failure above, where a whole UNEXAMINED
+        // subtree is dropped. Counting never-matchable files as incomplete
+        // pins `has_more: true` forever on any tree holding one non-UTF-8
+        // name, which is exactly the false alarm the structural consumer
+        // refuses to make for binaries it refuses to read.
         let mut since_check = 0usize;
         for entry in entries {
             let Ok(entry) = entry else {
-                truncation.skip = true;
                 continue;
             };
             // Polled per STRIDE entries rather than once per directory: one
-            // directory holding 100k files used to run to exhaustion long after
-            // the budget expired. `deadline: true`, not `limit: true` — the
-            // limit was never the reason the scan stopped, and blaming it sends
-            // the caller to raise a bound that is not the constraint.
+            // directory holding 100k files used to run over a budget long after
+            // it expired. `deadline: true`, not `limit: true` — the limit was
+            // never the reason the scan stopped, and blaming it sends the
+            // caller to raise a bound that is not the constraint.
             since_check += 1;
             if since_check >= DEADLINE_CHECK_STRIDE {
                 since_check = 0;
@@ -316,12 +343,10 @@ fn walk_inventory(
                 }
             }
             let Ok(kind) = entry.file_type() else {
-                truncation.skip = true;
                 continue;
             };
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
-                truncation.skip = true;
                 continue;
             };
             let rel = if prefix.is_empty() {
@@ -754,7 +779,7 @@ mod test {
 
     #[test]
     #[cfg(unix)]
-    fn test_git_inventory_non_utf8_sets_skip() {
+    fn test_git_inventory_non_utf8_name_is_never_truncation() {
         use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().unwrap();
         let ok = std::process::Command::new("git")
@@ -771,11 +796,17 @@ mod test {
 
         let (files, truncation) = list_files_matching(dir.path(), 100, None, |_| true);
         assert_eq!(files, vec!["good.txt".to_string()]);
+        // NOT `skip`: a name git reports as raw bytes can never become a
+        // candidate — every path downstream is a `String` — so the listing
+        // still describes every matchable file in the tree. Counting it as
+        // incomplete would pin `has_more: true` forever on any tree holding
+        // one such name; see the per-entry-skip comment in `walk_inventory`
+        // for the full argument, which applies identically to the git branch.
         assert!(
-            truncation.skip,
-            "non-UTF-8 git entry must record truncation.skip, not claim clean completion"
+            !truncation.truncated(),
+            "a non-UTF-8 name is never matchable, so the listing of matchable \
+             files is complete"
         );
-        assert!(truncation.truncated());
         assert!(!truncation.deadline);
     }
 
