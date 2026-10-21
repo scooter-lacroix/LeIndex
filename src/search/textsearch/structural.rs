@@ -503,9 +503,12 @@ fn clip(text: &str, max_chars: usize) -> String {
 
 /// Run `pattern` over `root`, honouring `filter` and `options`.
 ///
-/// Enumerating with [`engine::list_files`] means a directory without a trigram
-/// index is searched live and correctly, exactly like the text search: the
-/// index is a speed-up, never a correctness requirement.
+/// Enumerating with [`engine::list_files_matching`] means a directory without a
+/// trigram index is searched live and correctly, exactly like the text search:
+/// the index is a speed-up, never a correctness requirement. The filter and the
+/// pattern's language are applied inside the enumeration, so
+/// [`MAX_CANDIDATE_FILES`] bounds the files eligible to match rather than the
+/// first N paths in tree order.
 pub fn search(
     root: &Path,
     pattern: &CompiledPattern,

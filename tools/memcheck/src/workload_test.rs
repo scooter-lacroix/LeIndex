@@ -447,11 +447,12 @@ fn test_command_peak_captures_final_tick_allocation() {
     // it, which is what makes folding it into `rss_max_kib` sound.
     //
     // The allocation is what the child realistically carries: its own
-    // startup footprint plus 64 MiB. Asserting on the allocation alone is
-    // not enough — the child's baseline already clears 64 MiB, so the test
+    // startup footprint plus `ALLOCATION_KIB`. Asserting on the allocation
+    // alone is not enough — the child's baseline already clears it, so the test
     // would pass without ever touching the fold. The real witness is that
     // `rss_max_kib` now agrees with the kernel's exact lifetime mark; every
     // other peak source is sampled and under-reports it.
+    //
     // 16 MiB, deliberately WELL BELOW `LIFETIME_FOLD_TOLERANCE_KIB` (64 MiB).
     // This is the final-tick allocation the fold exists to recover: it must be
     // accepted even when the VmHWM poll misses it. At 64 MiB the margin was

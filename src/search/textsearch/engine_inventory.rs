@@ -80,7 +80,11 @@ fn git_inventory(root: &Path) -> Option<Vec<String>> {
 /// itself was cut by the limit instead.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InventoryTruncation {
-    /// The `limit` was reached with files still unlisted.
+    /// A file budget was reached with tree still unlisted — either the
+    /// `limit` that bounds the result, or the larger work budget that bounds
+    /// the traversal (see `WORK_BUDGET_PER_ADMITTED_FILE`). The two are
+    /// reported through one flag because they mean the same thing to every
+    /// caller: files remain unexamined and this is not time pressure.
     pub limit: bool,
     /// The wall-clock deadline stopped the walk.
     pub deadline: bool,
@@ -93,35 +97,63 @@ impl InventoryTruncation {
     }
 }
 
+/// How many files the walk may *see* per file it is allowed to return.
+///
+/// The result budget (`limit`) and the work budget must be separate counters.
+/// Bounding the traversal by admitted files alone means a selective predicate
+/// never reaches `limit`, so the walk reads every dirent in the tree: language
+/// inference asks for 10_000 files with `deadline: None` and a scope predicate,
+/// and structural search asks for a language-filtered listing with an optional
+/// deadline that is `None` whenever the caller passes `timeout_ms: 0`. Both
+/// would go from O(limit) work to O(tree) on every call.
+///
+/// A fixed multiple keeps the budget proportional to what the caller asked for
+/// — the traversal still stops early on a tree whose matches sort late — while
+/// leaving a selective predicate enough room to find its files. It is
+/// deliberately generous: a scope filter that admits one file in a hundred
+/// still completes, and the caller's deadline remains the real bound.
+const WORK_BUDGET_PER_ADMITTED_FILE: usize = 64;
+
 /// Walk `root`, returning the files `admit` accepts and why the walk stopped
 /// short. A truncated walk must be distinguishable from a tree with no files:
 /// otherwise an expired deadline yields "zero candidates, nothing matched".
 ///
-/// `admit` runs as each file is seen so the budget is spent on matching files.
-/// Filtering afterwards is NOT equivalent: this walk stops once `limit` files of
-/// any kind have been collected, so the matches behind an earlier wall of
-/// rejects would never be reached.
+/// `admit` runs as each file is seen, so `limit` bounds the files that MATCH
+/// rather than the first `limit` paths in tree order: filtering afterwards puts
+/// the matches behind an earlier wall of rejects out of reach entirely.
+///
+/// The traversal is separately bounded by `limit * WORK_BUDGET_PER_ADMITTED_FILE`
+/// files SEEN — see that constant for why one counter cannot serve both.
 fn walk_inventory(
     root: &Path,
     limit: usize,
     deadline: Option<Instant>,
     admit: impl Fn(&str) -> bool,
 ) -> (Vec<String>, InventoryTruncation) {
+    let work_budget = limit.saturating_mul(WORK_BUDGET_PER_ADMITTED_FILE);
+    let mut seen = 0usize;
     let mut out = Vec::new();
     let mut stack = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, prefix)) = stack.pop() {
         let expired = deadline.is_some_and(|d| Instant::now() >= d);
         let hit_limit = out.len() >= limit;
-        if hit_limit || expired {
-            // Directories are still queued (or the file budget is exhausted),
-            // so there is unexplored tree left. Sort before returning: the walk
-            // yields in stack-traversal order, and `list_files` promises a sorted
-            // listing on EVERY path, not just the complete one.
+        let hit_work = seen >= work_budget;
+        if hit_limit || hit_work || expired {
+            // Files are still unlisted, so there is unexplored tree left. Sort
+            // before returning: the walk yields in stack-traversal order, and
+            // `list_files` promises a sorted listing on EVERY path, not just
+            // the complete one.
+            //
+            // `hit_work` alone does not mean tree is left: an exhausted stack is
+            // a COMPLETE walk, and `work_budget` can fire at zero files seen
+            // (`limit == 0`). Reporting `limit: true` there would turn a clean
+            // scan into a false partial — the same misreport, in the opposite
+            // direction, that the post-batch deadline check below guards against.
             out.sort_unstable();
             return (
                 out,
                 InventoryTruncation {
-                    limit: hit_limit,
+                    limit: hit_limit || (hit_work && !stack.is_empty()),
                     deadline: expired,
                 },
             );
@@ -144,8 +176,11 @@ fn walk_inventory(
                 if !NEVER_WALK.contains(&name) {
                     stack.push((entry.path(), rel));
                 }
-            } else if kind.is_file() && admit(&rel) {
-                out.push(rel);
+            } else if kind.is_file() {
+                seen += 1;
+                if admit(&rel) {
+                    out.push(rel);
+                }
             }
         }
         // A deadline that expires exactly as the queue empties is NOT a
@@ -214,8 +249,15 @@ pub fn list_files_matching(
     admit: impl Fn(&str) -> bool,
 ) -> (Vec<String>, InventoryTruncation) {
     // `git ls-files` already honors the project's ignore rules, so its listing
-    // only needs the predicate; the walk applies it per file as it goes, so the
-    // budget is spent on admitted files there too.
+    // only needs the predicate; the walk applies it per file as it goes.
+    //
+    // The two branches are NOT symmetric on work. `git ls-files` returns the
+    // whole listing in one shot, so the predicate is applied to all of it and
+    // the work budget does not apply here — only `limit` bounds the result.
+    // That is acceptable because `git ls-files` is a single fast subprocess
+    // over an already-ignore-filtered set, not a dirent walk: the O(tree) cost
+    // `WORK_BUDGET_PER_ADMITTED_FILE` exists to bound is the non-git walk's.
+    // The walk is also the only branch that can cut short on a deadline.
     let (mut files, mut truncation) = match git_inventory(dir) {
         Some(mut files) => {
             files.retain(|rel| admit(rel));
@@ -279,6 +321,45 @@ mod test {
         assert_eq!(
             list_files_reporting(dir.path(), 10, None).0,
             vec!["a.rs".to_string(), "b.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_walk_stops_on_a_work_budget_a_selective_predicate_never_spends() {
+        // The regression this guard exists for: bounding the walk by ADMITTED
+        // files alone means a predicate that admits nothing never reaches
+        // `limit`, so the walk reads every dirent in the tree. `infer_language`
+        // asks for 10_000 files with `deadline: None` and a scope predicate, so
+        // a narrow scope used to cost a full traversal per call.
+        //
+        // Three directories each larger than the work budget, so the cutoff
+        // fires after the FIRST one regardless of the order `read_dir` returns
+        // them: with two directories left on the stack the walk cannot mistake
+        // this for a finished traversal.
+        let dir = tempfile::tempdir().unwrap();
+        let per_dir = WORK_BUDGET_PER_ADMITTED_FILE + 1;
+        for d in ["d1", "d2", "d3"] {
+            std::fs::create_dir_all(dir.path().join(d)).unwrap();
+            for i in 0..per_dir {
+                std::fs::write(dir.path().join(d).join(format!("f{i}.txt")), "x").unwrap();
+            }
+        }
+
+        // `limit: 1` gives a work budget of `WORK_BUDGET_PER_ADMITTED_FILE`, and
+        // this predicate admits nothing at all.
+        let (matched, truncation) = list_files_matching(dir.path(), 1, None, |_| false);
+        assert!(
+            matched.is_empty(),
+            "nothing is admitted, so nothing may be returned"
+        );
+        assert!(
+            truncation.limit,
+            "the work budget must cut the traversal short even though no file was admitted; \
+             without it the walk reads the whole tree"
+        );
+        assert!(
+            !truncation.deadline,
+            "no deadline was given, so this is a file budget, not time pressure"
         );
     }
 }

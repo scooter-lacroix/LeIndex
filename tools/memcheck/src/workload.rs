@@ -1928,8 +1928,8 @@ fn run_query_suite_warm_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
     Ok(report)
 }
 
-// The tests live in a sibling file: this one sits at the 2000-line
-// large-file gate, and the test module alone is ~550 lines.
+// The tests live in a sibling file to keep this one clear of the 2000-line
+// large-file gate; the split test module is ~670 lines.
 #[cfg(test)]
 #[path = "workload_test.rs"]
 mod tests;

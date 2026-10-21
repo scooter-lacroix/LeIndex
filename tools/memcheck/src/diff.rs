@@ -117,12 +117,23 @@ pub fn load_baseline(baselines_dir: &Path, fixture: &str, phase: &str) -> Option
 }
 
 /// Write a per-phase baseline file (VAL-MEASURE-008: overwrites canonical).
+///
+/// The descendant pids are stripped before writing. A pid is meaningless after
+/// the run that produced it, and a baseline is committed, so a phase that
+/// spawned a descendant would otherwise bake machine-specific pids into
+/// `docs/memory/baselines/` — noise that churns the baseline-metadata gate on
+/// every run. The rest of the tree is kept: `peak_rss_kib` and `total` are what
+/// a baseline comparison is for. Stripping `pids` here rather than
+/// `skip_serializing` on the field keeps them in the run's own report, which is
+/// the one place a failing phase can still be diagnosed from.
 pub fn write_baseline(baselines_dir: &Path, fixture: &str, phase: &PhaseReport) -> Result<()> {
     let dir = baselines_dir.join(fixture);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create baseline dir {}", dir.display()))?;
     let path = dir.join(format!("{}.json", phase.phase));
-    let json = serde_json::to_string_pretty(phase)
+    let mut portable = phase.clone();
+    portable.descendants.pids.clear();
+    let json = serde_json::to_string_pretty(&portable)
         .with_context(|| format!("failed to serialize baseline for phase {}", phase.phase))?;
     std::fs::write(&path, json)
         .with_context(|| format!("failed to write baseline {}", path.display()))?;
@@ -672,6 +683,55 @@ mod tests {
         assert_eq!(loaded.rss_max_kib, 400000);
         assert_eq!(loaded.rss_min_kib, 380000);
         assert_eq!(loaded.sample_count, 12);
+    }
+
+    #[test]
+    fn test_write_baseline_strips_machine_specific_pids() {
+        let dir = tempfile::tempdir().unwrap();
+        let baselines_dir = dir.path().join("baselines");
+
+        let mut phase = PhaseReport {
+            phase: "index".to_string(),
+            rss_min_kib: 380000,
+            rss_max_kib: 400000,
+            rss_p95_kib: 395000,
+            mapped_file_kib: 50000,
+            anon_kib: 300000,
+            sample_count: 12,
+            duration_ms: 3000,
+            worker_rss_max_kib: 0,
+            combined_rss_max_kib: 400000,
+            worker_note: None,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree {
+                total: 1,
+                peak_rss_kib: 733_000,
+                pids: vec![4242],
+                ..crate::sampler::DescendantTree::default()
+            },
+        };
+        phase
+            .descendants
+            .by_name
+            .insert("rust-analyzer".to_string(), 1);
+
+        write_baseline(&baselines_dir, "small_repo", &phase).unwrap();
+
+        // The committed file must not carry the pid, but MUST keep the peak and
+        // the count — those are what a baseline comparison is for.
+        let raw = std::fs::read_to_string(baselines_dir.join("small_repo").join("index.json"))
+            .expect("baseline written");
+        assert!(
+            !raw.contains("4242"),
+            "a pid must never reach a committed baseline: {raw}"
+        );
+        let loaded = load_baseline(&baselines_dir, "small_repo", "index").unwrap();
+        assert!(
+            loaded.descendants.pids.is_empty(),
+            "the reloaded baseline must carry no pids"
+        );
+        assert_eq!(loaded.descendants.peak_rss_kib, 733_000);
+        assert_eq!(loaded.descendants.total, 1);
     }
 
     #[test]

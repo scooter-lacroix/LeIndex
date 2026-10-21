@@ -373,20 +373,50 @@ fn streaming_neural_inputs<'a>(
                     // relativized — `node.file_path` above is still the
                     // absolute path used to READ the source.
                     //
-                    // The fallback is the FILE NAME, never the raw path. Falling
-                    // back to `node.file_path` reintroduced exactly the leak this
-                    // documents, for precisely the nodes it describes: a path that
-                    // fails `strip_prefix` (non-canonical through a symlink, or
-                    // outside `project_path` like a submodule summary) was sent in
-                    // full. The file name still carries template parity without
-                    // identifying the checkout.
+                    // The fallback is the trailing path components, never the
+                    // raw path and never an empty string. Falling back to
+                    // `node.file_path` reintroduced exactly the leak this
+                    // documents, for precisely the nodes it describes: a path
+                    // that fails `strip_prefix` (non-canonical through a
+                    // symlink, or outside `project_path` like a submodule
+                    // summary) was sent in full.
+                    //
+                    // A bare `file_name()` would fix the leak but break two
+                    // other things: `a/src/lib.rs` and `b/src/lib.rs` both
+                    // collapse to `lib.rs`, so titles stop disambiguating; and
+                    // `file_name()` is `None` for a path with no final component
+                    // (a bare root, or one ending in `..`), which sent an EMPTY
+                    // title — a shape the legacy route never produces, so the
+                    // two routes' title-conditioned embeddings diverge. Keeping
+                    // the last two components fixes the collision, and the
+                    // symbol name covers the no-component case without leaking a
+                    // path. The node ID may NOT: it is
+                    // `{file_path}:{qname}@{range}` (see `graph::extraction`), so
+                    // it carries the absolute path this fallback exists to strip.
                     title: Some(
                         match std::path::Path::new(&*node.file_path).strip_prefix(project_path) {
                             Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
-                            Err(_) => std::path::Path::new(&*node.file_path)
-                                .file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_default(),
+                            Err(_) => {
+                                let mut tail: Vec<String> = std::path::Path::new(&*node.file_path)
+                                    .components()
+                                    .rev()
+                                    .filter_map(|component| match component {
+                                        std::path::Component::Normal(name) => {
+                                            Some(name.to_string_lossy().into_owned())
+                                        }
+                                        _ => None,
+                                    })
+                                    .take(2)
+                                    .collect();
+                                // Collected right-to-left, so reverse for the
+                                // natural `dir/file` order.
+                                tail.reverse();
+                                if tail.is_empty() {
+                                    node.name.clone()
+                                } else {
+                                    tail.join("/")
+                                }
+                            }
                         },
                     ),
                 })

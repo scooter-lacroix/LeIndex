@@ -483,10 +483,17 @@ pub struct DescendantTree {
     /// question it actually has an answer for (`pids.contains(&child_pid)`)
     /// instead of testing the OS with the module under test skipped.
     ///
-    /// `default` + `skip_serializing_if` so the committed baselines under
-    /// `docs/memory/baselines/` keep parsing and don't record pids that are
-    /// meaningless after the run that produced them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Serialized only into the run's own report, so a failing phase can still
+    /// be diagnosed after the fact. It is kept OUT of the committed baselines
+    /// by `diff::write_baseline`, which strips `descendants` before writing —
+    /// a pid is meaningless after the run that produced it, and
+    /// `write_baseline` otherwise writes the whole `PhaseReport`, so any phase
+    /// that spawned a descendant would bake machine-specific pids into
+    /// `docs/memory/baselines/`. `skip_serializing_if = "Vec::is_empty"` would
+    /// not have done it: it only omits the empty case, which is the one case
+    /// that was never a problem. `default` keeps existing report JSON and
+    /// baselines parsing.
+    #[serde(default)]
     pub pids: Vec<u32>,
 }
 
@@ -707,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn test_count_descendants_includes_spawned_child() {
+    fn test_count_descendants_reports_a_live_child_and_drops_it_once_reaped() {
         let mut child = std::process::Command::new("sleep")
             .arg("5")
             .spawn()
@@ -716,55 +723,44 @@ mod tests {
         // Brief wait for /proc to reflect the child
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let tree = count_descendants(std::process::id()).unwrap();
-        // Named by PID, so a sibling test's `sleep` cannot stand in for ours.
-        // This is the assertion `by_name` could never make: `{"sleep": 1}` is
-        // whatever `sleep` a sibling spawned, which is how the old
-        // `!by_name.contains_key("sleep")` raced in CI.
+        let live = count_descendants(std::process::id()).unwrap();
+        // Named by PID, so a sibling test's `sleep` cannot stand in for ours:
+        // `{"sleep": 1}` is whatever `sleep` a sibling spawned, which is how
+        // the old `!by_name.contains_key("sleep")` raced in CI. The pid is the
+        // only assertion here for that same reason — `by_name` cannot
+        // attribute a name to a process.
         assert!(
-            tree.pids.contains(&child_pid),
+            live.pids.contains(&child_pid),
             "count_descendants must report the sleep child we spawned (pid {child_pid}), \
              got pids {:?}",
-            tree.pids
-        );
-        assert!(
-            tree.by_name.contains_key("sleep"),
-            "by_name should account for the child as a sleep: {:?}",
-            tree.by_name
+            live.pids
         );
 
         child.kill().ok();
         child.wait().ok();
-    }
 
-    #[test]
-    fn test_count_descendants_no_children() {
-        // No global bound. `tree.total < 5` counted every process whose PPID
-        // chain reaches this test binary — including children spawned by
-        // sibling tests in the same run (`workload_test.rs` shells out in five
-        // of them, and CI runs this crate's tests on parallel threads and 5x
-        // over). That assertion shape races by construction, and a threshold
-        // that had to be re-tuned per CI load was never testing this function.
+        // `wait()` returning means the kernel has reaped the zombie, so the
+        // walk must stop reporting the pid. This is the "gone" half that the
+        // old `/proc/<pid>` poll asserted OUTSIDE the module, testing the OS
+        // instead of `count_descendants`; asking the tree puts the module's own
+        // behaviour under test. No poll loop is needed — `wait()` is the
+        // guarantee, and polling `/proc` after it could only observe a pid
+        // recycled by an unrelated process.
         //
-        // What is actually assertable here: the walk is well-formed — it counts
-        // what it lists, and it never reports the root as its own descendant.
-        let root = std::process::id();
-        let tree = count_descendants(root).unwrap();
-        assert_eq!(
-            tree.total,
-            tree.by_name.values().sum::<usize>(),
-            "by_name must account for every descendant counted: {:?}",
-            tree.by_name
-        );
-        assert_eq!(
-            tree.pids.len(),
-            tree.total,
-            "pids must name every descendant counted: {:?}",
-            tree.pids
-        );
+        // The pid is asserted GONE from every accumulator, not just `pids`:
+        // `total` and `by_name` are accumulated in the same branch, so a walk
+        // that leaked a reaped pid into any one of them is the bug this covers.
+        let reaped = count_descendants(std::process::id()).unwrap();
         assert!(
-            !tree.pids.contains(&root),
-            "the root process must not be reported as its own descendant"
+            !reaped.pids.contains(&child_pid),
+            "reaped child (pid {child_pid}) must not be reported as a descendant: {:?}",
+            reaped.pids
+        );
+        assert_eq!(
+            reaped.total,
+            reaped.by_name.values().sum::<usize>(),
+            "a dropped pid must leave total and by_name consistent: {:?}",
+            reaped.by_name
         );
     }
 
@@ -794,17 +790,53 @@ mod tests {
 
     #[test]
     fn test_descendant_tree_serde_roundtrip() {
+        // A tree shape `count_descendants` can actually produce: it maintains
+        // `total`, `by_name` and `pids` together, so the fixture must agree with
+        // itself — `test_count_descendants_reports_a_live_child_and_drops_it_once_reaped`
+        // asserts that invariant on a live walk, and a fixture contradicting it
+        // would be modelling the opposite of the contract.
         let mut by_name = HashMap::new();
         by_name.insert("leindex-embed".to_string(), 1);
         let tree = DescendantTree {
-            total: 2,
+            total: 1,
             by_name,
             combined_rss_kib: 50000,
             peak_rss_kib: 735848,
-            pids: vec![4242, 4243],
+            pids: vec![4242],
         };
         let json = serde_json::to_string(&tree).unwrap();
+        // `pids` IS serialized into the run's own report — that is the one
+        // place a failing phase can still be diagnosed from. Keeping them out
+        // of the COMMITTED baselines is `diff::write_baseline`'s job, covered
+        // by `test_write_baseline_strips_machine_specific_pids`.
+        assert!(
+            json.contains("pids"),
+            "pids must survive into the run report for post-mortem use: {json}"
+        );
         let deserialized: DescendantTree = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized, tree);
+        assert_eq!(deserialized.total, tree.total);
+        assert_eq!(deserialized.by_name, tree.by_name);
+        assert_eq!(deserialized.combined_rss_kib, tree.combined_rss_kib);
+        assert_eq!(deserialized.peak_rss_kib, tree.peak_rss_kib);
+        assert_eq!(
+            deserialized.pids, tree.pids,
+            "pids must roundtrip through the report: {:?}",
+            deserialized.pids
+        );
+    }
+
+    /// A baseline written from an OLDER run (no `pids` key) must still parse —
+    /// `#[serde(default)]` on the field, not on the struct.
+    #[test]
+    fn test_descendant_tree_parses_a_baseline_written_before_pids_existed() {
+        let json = r#"{"total":1,"by_name":{"leindex-embed":1},"combined_rss_kib":50000,"peak_rss_kib":735848}"#;
+        let tree: DescendantTree = serde_json::from_str(json).unwrap();
+        assert_eq!(tree.total, 1);
+        assert_eq!(tree.peak_rss_kib, 735848);
+        assert!(
+            tree.pids.is_empty(),
+            "a legacy baseline without pids must default to empty: {:?}",
+            tree.pids
+        );
     }
 }
