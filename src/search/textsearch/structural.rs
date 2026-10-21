@@ -376,7 +376,20 @@ pub fn resolve_language(language: &str) -> Option<LanguageId> {
 }
 
 /// The structural-search language a path belongs to, if any.
+///
+/// Filename-based languages are resolved BEFORE the extension probe: an
+/// extensionless `Makefile` has no extension to read, and `CMakeLists.txt`
+/// carries a `.txt` suffix that resolves to a document flavour — both would be
+/// rejected here, so an explicit `lang: "make"` search reported no matches
+/// without ever scanning the canonical file.
 pub fn language_for_path(path: &Path) -> Option<LanguageId> {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some("Makefile") | Some("makefile") | Some("GNUmakefile") => {
+            return Some(LanguageId::Make);
+        }
+        Some("CMakeLists.txt") => return Some(LanguageId::Cmake),
+        _ => {}
+    }
     let ext = path.extension()?.to_str()?;
     LanguageId::from_extension(ext).filter(|id| !is_document_flavour(*id))
 }

@@ -153,6 +153,35 @@ fn test_document_flavours_are_not_structural_languages() {
         Some(leindex::parse::grammar::LanguageId::Rust)
     );
     assert_eq!(language_for_path(Path::new("no-extension")), None);
+    // Filename-based languages resolve before the extension probe: an
+    // extensionless Makefile has no extension to read, and CMakeLists.txt
+    // carries a .txt suffix that would otherwise resolve to a document
+    // flavour (and therefore None).
+    assert_eq!(
+        language_for_path(Path::new("Makefile")),
+        Some(leindex::parse::grammar::LanguageId::Make)
+    );
+    assert_eq!(
+        language_for_path(Path::new("build/Makefile")),
+        Some(leindex::parse::grammar::LanguageId::Make)
+    );
+    assert_eq!(
+        language_for_path(Path::new("makefile")),
+        Some(leindex::parse::grammar::LanguageId::Make)
+    );
+    assert_eq!(
+        language_for_path(Path::new("GNUmakefile")),
+        Some(leindex::parse::grammar::LanguageId::Make)
+    );
+    assert_eq!(
+        language_for_path(Path::new("CMakeLists.txt")),
+        Some(leindex::parse::grammar::LanguageId::Cmake)
+    );
+    // ...but an ordinary .txt file must NOT be hijacked by the filename probe.
+    assert_eq!(
+        language_for_path(Path::new("docs/CMakeLists.txt.bak")),
+        None
+    );
 
     let err = CompiledPattern::new("markdown", "# heading").unwrap_err();
     assert!(
