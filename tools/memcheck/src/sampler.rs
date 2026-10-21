@@ -713,18 +713,23 @@ mod tests {
         child.kill().ok();
         child.wait().ok();
 
-        // After killing, OUR child must be gone from the process table.
-        // Asserting a global total==0 races with sibling tests' transient
-        // children (chrono_now's `date`, git probes) under parallel test
-        // threads, so scope the assertion to the child we spawned.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // After killing, OUR child must be gone from the process table, and the
+        // ONLY way to name our child is by pid. `DescendantTree::by_name` is a
+        // flat name → count map (`{"sh": 1, "sleep": 1}`), so it cannot tell our
+        // `sleep` from one any sibling test spawned — asserting
+        // `!by_name.contains_key("sleep")` races with every other test in this
+        // binary that shells out, which is precisely how this failed in CI (a
+        // sibling's `sh` and `sleep` were live). A global `total == 0` races the
+        // same way. Poll `/proc/<pid>`: scoped to the pid we spawned alone.
         let child_pid = child.id();
-        let child_gone = !std::path::Path::new(&format!("/proc/{child_pid}")).exists();
-        let tree_after = count_descendants(std::process::id()).unwrap();
+        let proc_entry = format!("/proc/{child_pid}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::path::Path::new(&proc_entry).exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(
-            child_gone && !tree_after.by_name.contains_key("sleep"),
-            "after killing the child (pid {child_pid}), it must no longer be a descendant: {:?}",
-            tree_after.by_name
+            !std::path::Path::new(&proc_entry).exists(),
+            "spawned child (pid {child_pid}) must be reaped after kill + wait"
         );
     }
 
