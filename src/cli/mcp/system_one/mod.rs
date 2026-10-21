@@ -84,6 +84,7 @@ pub fn is_read_only(tool: &str) -> bool {
     matches!(
         tool,
         "leindex_search"
+            | "leindex_structural"
             | "leindex_deep_analyze"
             | "leindex_context"
             | "leindex_symbol_lookup"
@@ -544,6 +545,9 @@ mod test {
         assert!(is_read_only("leindex_edit_preview"));
         assert!(is_read_only("leindex_phase_analysis"));
         assert!(is_read_only("phase_analysis"));
+        // Structural search only reads and matches; listing it is what lets the
+        // pre-gate apply deterministic repairs instead of hints-only.
+        assert!(is_read_only("leindex_structural"));
         assert!(!is_read_only("leindex_edit_apply"));
         assert!(!is_read_only("leindex_write"));
         assert!(!is_read_only("leindex_rename_symbol"));

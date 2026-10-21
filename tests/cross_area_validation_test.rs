@@ -494,6 +494,39 @@ mod version_parity {
         );
     }
 
+    /// The installers carry shebangs and are invoked directly (`./install.sh`),
+    /// so the COMMITTED mode must stay executable. The v2.0.4 release commit
+    /// flipped both to 100644 — the third time a release bump dropped the bit
+    /// (see 74160a52, 3ceb2f14) — because the version-parity checks above
+    /// inspect file contents, never modes. Pin the mode itself: this fails on
+    /// any commit that rewrites the installers through a non-executable copy.
+    #[test]
+    #[cfg(unix)]
+    fn installers_are_committed_executable() {
+        for path in ["install.sh", "install_macos.sh"] {
+            let output = std::process::Command::new("git")
+                .args(["ls-files", "-s", path])
+                .current_dir(repo_root())
+                .output()
+                .expect("git ls-files");
+            assert!(
+                output.status.success(),
+                "git ls-files failed for {path}; this test requires a checkout"
+            );
+            let line = String::from_utf8(output.stdout).expect("utf8");
+            let mode = line
+                .split_whitespace()
+                .next()
+                .unwrap_or_else(|| panic!("no mode in git ls-files output for {path}"));
+            assert_eq!(
+                mode, "100755",
+                "{path} is committed non-executable — users running ./{path} get \
+                 permission denied. Restore with `chmod +x {path} && git update-index \
+                 --chmod=+x {path}`"
+            );
+        }
+    }
+
     /// VAL-CROSS-014: One-crate layout — worker and main binary share a single
     /// crate, so there is no subcrate version to drift.
     #[test]
