@@ -69,9 +69,15 @@ fn write(root: &Path, rel: &str, contents: &str) {
 /// Make `root` a git worktree.
 ///
 /// Inventory is `git ls-files` when a repository exists and a filesystem walk
-/// otherwise, and the two disagree about budgets: `ls-files` ignores the
-/// deadline, the walk does not. A test that cares *which* files were enumerated
-/// has to pin the repository state, or it silently exercises the other path.
+/// otherwise, so a test that cares *which* files were enumerated has to pin the
+/// repository state or it silently exercises the other path.
+///
+/// The two branches differ in what they BOUND, not in whether they honour the
+/// deadline — both do, at every stage. The walk additionally takes a work budget
+/// (`WORK_BUDGET_PER_ADMITTED_FILE` files seen per admitted file); the git branch
+/// takes only `limit`, because `git ls-files` hands over a whole sorted listing
+/// in one subprocess. So a test about the work budget must NOT be a repository,
+/// and a test about the git path must be one.
 fn git_init(root: &Path) {
     std::process::Command::new("git")
         .args(["init", "-q"])
@@ -521,24 +527,16 @@ fn test_live_deadline_keeps_git_inventory_candidates() {
     assert!(!output.stopped_by_deadline);
 }
 
-/// A deadline that has already passed must report a PARTIAL result, not a clean
-/// one — whichever stage of the inventory it stops.
-///
-/// The deadline is now enforced in BOTH inventory branches, so an expired one
-/// yields zero candidates here: `git ls-files` is reaped before it reports (it
-/// used to run to completion, which is what an earlier version of this test
-/// relied on to get candidates past an expired deadline), and the non-git walk
-/// stops before enumerating. The claims that matter are stage-independent: the
-/// result cannot claim a clean scan, and nothing may be counted as parsed.
-///
-/// The scan-loop half of the same defect — a candidate the worker declined to
-/// open — is the `skipped_deadline` accounting, which this asserts no longer
-/// double-counts into `scanned`.
+/// An already-expired deadline must not report a clean scan. The specific
+/// `skipped_deadline == candidates` shape is NOT asserted here: with the deadline
+/// expired before inventory begins, no candidates are produced at all, so that
+/// comparison is `0 == 0` and pins nothing. The scan-loop half of the accounting
+/// — a candidate the worker declines to open — needs candidates that survive the
+/// inventory, which a deadline this early cannot provide; the inventory module
+/// covers the deadline paths directly instead.
 #[test]
 fn test_expired_deadline_reports_partial_not_complete() {
     let dir = fixture();
-    // The fixture must be a repository, so the git branch is the one exercised:
-    // it is the branch that used to ignore the deadline outright.
     git_init(dir.path());
     let pattern = CompiledPattern::new("rust", "fn $NAME() { $$$BODY }").expect("pattern");
     let output = search_structural(
@@ -554,18 +552,14 @@ fn test_expired_deadline_reports_partial_not_complete() {
     assert_eq!(output.returned, 0);
     assert_eq!(
         output.stats.scanned, 0,
-        "a skipped file was not scanned, and must not be counted as if it were"
-    );
-    assert_eq!(
-        output.stats.skipped_deadline, output.stats.candidates,
-        "every candidate the inventory produced was skipped by the expired deadline"
+        "nothing was opened, and nothing may be counted as if it were"
     );
     assert!(
         output.has_more,
         "an unexamined file may hold matches, so the result cannot claim to be complete"
     );
     // `stopped_by_deadline` may only claim time pressure, and here it must: the
-    // deadline is genuinely expired at both stages. It must never be inferred
+    // deadline is genuinely expired at every stage. It must never be inferred
     // from a file-count limit — see `test_truncated_inventory_forces_has_more`.
     assert!(output.stopped_by_deadline);
 }

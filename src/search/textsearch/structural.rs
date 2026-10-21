@@ -605,7 +605,9 @@ pub fn search(
     // would hide a genuine deadline skip behind the wrong explanation.
     output.stopped_by_deadline = output.stats.skipped_deadline > 0 || truncation.deadline;
     // `has_more`, by contrast, only needs *some* tree left unexamined — a limit
-    // truncation counts, because those files were never candidates.
+    // truncation counts, because those files were never candidates, and so does
+    // a subtree the OS refused to open, because those files can never become
+    // candidates either.
     output.has_more =
         output.returned < paged || output.stopped_by_deadline || truncation.truncated();
     output.stats.millis = started.elapsed().as_millis();

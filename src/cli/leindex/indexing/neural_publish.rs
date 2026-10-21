@@ -1,5 +1,5 @@
 use super::*;
-use std::path::Path;
+use std::path::{Component, Path};
 
 struct HybridStreamingEmbedder<'a> {
     inner: &'a index_builder::GenerationNeuralEmbedder,
@@ -329,19 +329,28 @@ const TITLE_TAIL_COMPONENTS: usize = 3;
 /// Security/Privacy). Note that only the TITLE is relativized — the node's
 /// `file_path` is still the absolute path used to READ the source.
 ///
-/// Three cases where there is no relative path to send:
-/// * `strip_prefix` fails — a non-canonical path through a symlink, or one
-///   outside `project_path` like a submodule summary;
-/// * it succeeds with an EMPTY remainder — the node's path IS `project_path`,
-///   e.g. a project summary node at the checkout root; and
-/// * the path has no components at all (a bare root, or one ending in `..`).
+/// Three cases where there is no usable relative path, each with its own
+/// answer — the distinction matters, because they leak different things:
 ///
-/// The first two take the trailing-components fallback; the third has no
-/// components to take, so the symbol name stands in. The empty remainder needs
-/// the explicit `is_empty` check below rather than a plain `Ok(relative)` arm:
-/// `Ok("")` is a SUCCESS, so matching the `Result` alone sends it straight
-/// through as an empty title — a shape the legacy route never produces, which
-/// would leave the two routes' title-conditioned embeddings divergent.
+/// * it succeeds with an EMPTY remainder — the node's path IS `project_path`,
+///   e.g. a project summary node at the checkout root. The answer is the
+///   project's own directory name. Taking trailing components of the ABSOLUTE
+///   path here, which is what this used to do, sends the checkout's PARENT
+///   directories — typically a username — to the provider: exactly the leak
+///   this function exists to prevent;
+/// * it fails outright — a path outside `project_path`, like a submodule
+///   summary. Trailing components, which are relative to nothing;
+/// * the path has no components at all (a bare root, or one ending in `..`).
+///   The symbol name stands in.
+///
+/// The empty remainder needs the explicit `is_empty` check below rather than a
+/// plain `Ok(relative)` arm: `Ok("")` is a SUCCESS, so matching the `Result`
+/// alone sends it straight through as an empty title.
+///
+/// A lexical `strip_prefix` is also not a containment check: it happily returns
+/// `../private/x.rs` for a path that escapes the root, and `..` is neither empty
+/// nor an error. Such a remainder is not a relative path at all, so it takes the
+/// fallback like any other path outside the project.
 ///
 /// The node ID may NOT be the fallback: it is `{file_path}:{qname}@{range}`
 /// (see `graph::extraction`), so it carries the absolute path this exists to
@@ -349,16 +358,62 @@ const TITLE_TAIL_COMPONENTS: usize = 3;
 fn document_title(file_path: &str, project_path: &Path, node_name: &str) -> String {
     let path = Path::new(file_path);
     if let Ok(relative) = path.strip_prefix(project_path) {
-        if !relative.as_os_str().is_empty() {
-            return relative.to_string_lossy().replace('\\', "/");
+        if relative.as_os_str().is_empty() {
+            return project_title(project_path, node_name);
+        }
+        if !relative.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            // Separators normalized so both platforms emit the same title for
+            // the same file: without this a Windows-style path is one opaque
+            // `Normal` component whose text still carries `\` and its drive.
+            return relative
+                .to_string_lossy()
+                .replace('\\', "/")
+                .trim_matches('/')
+                .to_string();
         }
     }
+    trailing_title(path, node_name)
+}
+
+/// Title for a node that sits AT the project root: the project's own directory
+/// name, which is the only component of `project_path` that is not the
+/// machine-specific path above it.
+fn project_title(project_path: &Path, node_name: &str) -> String {
+    project_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| node_name.to_string())
+}
+
+/// Last [`TITLE_TAIL_COMPONENTS`] components of `path`, or `node_name` when it
+/// has none. Normalizes separators and drops any `Prefix`/`RootDir` component,
+/// so a Windows-style absolute path is relativized on a Unix host too.
+fn trailing_title(path: &Path, node_name: &str) -> String {
     let mut tail: Vec<String> = path
         .components()
         .rev()
         .filter_map(|component| match component {
-            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            Component::Normal(name) => {
+                // One component can still be a whole Windows path when parsed on
+                // a Unix host (`C:\a\b.rs` has no `\` separator there), so split
+                // it rather than trusting the component boundary.
+                Some(name.to_string_lossy().replace('\\', "/"))
+            }
             _ => None,
+        })
+        .flat_map(|segment| {
+            segment
+                .split('/')
+                .filter(|part| !part.is_empty() && *part != "..")
+                .map(str::to_string)
+                .rev()
+                .collect::<Vec<_>>()
         })
         .take(TITLE_TAIL_COMPONENTS)
         .collect();
@@ -425,12 +480,21 @@ fn streaming_neural_inputs<'a>(
                 Ok(streaming::neural::NeuralInput {
                     node_id: node.id.clone(),
                     text: index_builder::cap_neural_text(&text).to_owned(),
-                    // Legacy-route parity: the project-relative source path
-                    // rides along as the document title so the remote doc
-                    // template ({title}) receives the same input shape on both
-                    // routes (EmbeddingGemma2 trains on title+text prompts).
-                    // `document_title` relativizes it and owns the leak
-                    // guarantees; see its doc.
+                    // The project-relative source path rides along as the
+                    // document title so a title-aware provider gets a real
+                    // `{title}` instead of `none` (EmbeddingGemma2 trains on
+                    // title+text prompts).
+                    //
+                    // This is NOT parity with the legacy route, and the
+                    // difference is deliberate: `embed_pending_neural_batch`
+                    // goes through `embed_neural_batch_blocking`, which passes
+                    // no title, so `apply_doc_template` renders `{title}` as
+                    // `none` there and as a path here. Only this route has a
+                    // PDG node to derive a path from. The two routes therefore
+                    // produce different values for the same body — acceptable
+                    // only because a generation is built by ONE route, never a
+                    // mix, so no generation contains both flavours.
+                    // `document_title` owns the leak guarantees; see its doc.
                     title: Some(document_title(&node.file_path, project_path, &node.name)),
                 })
             };
@@ -1214,36 +1278,46 @@ mod tests {
     }
 
     #[test]
-    fn test_document_title_at_the_project_root_is_never_empty() {
+    fn test_document_title_at_the_project_root_uses_the_project_name() {
         // The reported bug: `strip_prefix` SUCCEEDS with an empty remainder for
         // a node whose path IS the checkout root (a project summary node), and a
         // plain `Ok(relative)` arm sent `Some("")` as the title.
-        let root = std::path::Path::new("/checkout/project");
-        let title = document_title("/checkout/project", root, "project-summary");
-        assert!(
-            !title.is_empty(),
-            "a checkout-root node must not get an empty title"
-        );
+        //
+        // The fix must NOT be the trailing-components fallback: the absolute
+        // path's last three components are the checkout's PARENT directories —
+        // `alice/work/leindex` for `/home/alice/work/leindex` — which is the
+        // local-path leak this function exists to prevent, merely moved. The
+        // answer is the project's own directory name.
+        let root = std::path::Path::new("/home/alice/work/leindex");
         assert_eq!(
-            title, "checkout/project",
-            "it falls back to trailing components, not to the raw path"
+            document_title("/home/alice/work/leindex", root, "project-summary"),
+            "leindex",
+            "a checkout-root node is titled by the project, not by its parents"
         );
     }
 
     #[test]
-    fn test_document_title_never_leaks_an_absolute_path() {
-        // A submodule summary carries a path outside `project_path`, so
-        // `strip_prefix` fails. The fallback must stay relative — this is the
-        // CodeRabbit privacy finding the whole fallback exists for.
-        let root = std::path::Path::new("/checkout/project");
-        let title = document_title("/elsewhere/sub/module/file.rs", root, "new");
-        assert!(
-            !title.starts_with('/'),
-            "the fallback must be prefix-free: {title}"
-        );
-        // `/checkout/project` is not a prefix of this path, so nothing is
-        // stripped: the title is the last three components and nothing else.
-        assert_eq!(title, "sub/module/file.rs");
+    fn test_document_title_never_carries_the_checkout_prefix() {
+        // The privacy property is that no component of the ABSOLUTE path prefix
+        // reaches the title. Asserting `!title.starts_with('/')` cannot fail:
+        // the fallback drops every non-`Normal` component, so no title can
+        // begin with a separator whatever the input. This asserts the thing
+        // that can actually break — that the machine-specific prefix is absent.
+        let root = std::path::Path::new("/home/alice/work/leindex");
+        for path in [
+            "/home/alice/work/leindex",            // empty remainder
+            "/home/alice/work/leindex/src/lib.rs", // ordinary file
+            "/elsewhere/sub/module/file.rs",       // outside the project
+            "/home/bob/other/src/lib.rs",          // a different checkout
+        ] {
+            let title = document_title(path, root, "node");
+            for leaked in ["home", "alice", "bob", "work", "elsewhere"] {
+                assert!(
+                    !title.split('/').any(|component| component == leaked),
+                    "{path} produced {title:?}, which carries the checkout component {leaked}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1260,6 +1334,55 @@ mod tests {
         );
         assert_eq!(a, "a/src/lib.rs");
         assert_eq!(b, "b/src/lib.rs");
+    }
+
+    #[test]
+    fn test_document_title_rejects_a_remainder_that_escapes_the_project() {
+        // `strip_prefix` is lexical: it does not resolve `..`, so a path that
+        // walks out of the project comes back as a SUCCESSFUL relative strip.
+        // Sending that verbatim would put `../private/x.rs` — a path outside the
+        // project — on the wire under the label "project-relative".
+        //
+        // The escaping remainder is rejected and the ABSOLUTE path takes the
+        // fallback, which drops `..` entirely and keeps real components. The
+        // result is not a resolution of the path (it reads `project/private`,
+        // where the real location is `/checkout/private`); it is a stable,
+        // prefix-free label, which is all a title has to be.
+        let root = std::path::Path::new("/checkout/project");
+        let title = document_title("/checkout/project/../private/x.rs", root, "node");
+        assert!(
+            !title.split('/').any(|component| component == ".."),
+            "an escaping remainder must not be sent as a title: {title}"
+        );
+        assert_eq!(title, "project/private/x.rs");
+    }
+
+    #[test]
+    fn test_document_title_normalizes_a_windows_path_on_a_unix_host() {
+        // On a Unix host `C:\Users\bob\a.rs` has no `/`, so it parses as ONE
+        // `Normal` component whose text still carries the drive letter and the
+        // backslashes. Joining components raw (which the fallback used to do)
+        // emitted that whole string as a "relative" title — an absolute path on
+        // the platform it came from. Splitting on the separator as well keeps
+        // the property true on both hosts.
+        //
+        // `Users` legitimately survives: it is an interior component like
+        // `/home` on Unix, not the machine-specific prefix. What must NOT
+        // survive is the drive and the separators.
+        #[cfg(unix)]
+        {
+            let root = std::path::Path::new("/checkout/project");
+            let title = document_title(r"C:\Users\bob\a.rs", root, "node");
+            assert!(
+                !title.contains('\\'),
+                "separators must be normalized: {title}"
+            );
+            assert!(
+                !title.starts_with("C:") && !title.split('/').any(|c| c.ends_with(':')),
+                "a drive prefix must not reach the title: {title}"
+            );
+            assert_eq!(title, "Users/bob/a.rs");
+        }
     }
 
     #[test]

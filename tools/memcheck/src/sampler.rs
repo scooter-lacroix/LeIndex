@@ -749,31 +749,24 @@ mod tests {
         // guarantee, and polling `/proc` after it could only observe a pid
         // recycled by an unrelated process.
         //
-        // The pid is asserted GONE from `pids`, which is the field under test,
-        // and the root is asserted ABSENT: `count_descendants` skips
-        // `pid == root_pid` in the BFS, so a walk that reported the measured
-        // process as its own descendant is the bug that guard exists for.
+        // The pid is asserted GONE from `pids`, which is the field under test.
         //
-        // Deliberately NOT asserted: `total == by_name.values().sum()`. Both are
-        // incremented in the same BFS branch, so that equality holds by
-        // construction and cannot fail for any input — it reads like coverage
-        // and is none. `pids.len() == total` is the real link between the new
-        // field and the count, and it can fail.
+        // Deliberately NOT asserted, because both hold BY CONSTRUCTION and
+        // cannot fail for any input — they read like coverage and are none:
+        //
+        //   * `total == by_name.values().sum()` — `total` and `by_name` are
+        //     incremented in the same BFS branch;
+        //   * `pids.len() == total` — `tree.pids.push(pid)` is in that SAME
+        //     branch, one line below `total += 1`.
+        //
+        // Nor is the root's absence worth asserting here: the BFS skips
+        // `pid == root_pid` before it can insert anything, so no input can put
+        // the measured process in its own descendant list. The reaped-child
+        // check above is the only assertion in this test that can fail.
         let reaped = count_descendants(std::process::id()).unwrap();
         assert!(
             !reaped.pids.contains(&child_pid),
             "reaped child (pid {child_pid}) must not be reported as a descendant: {:?}",
-            reaped.pids
-        );
-        assert!(
-            !reaped.pids.contains(&std::process::id()),
-            "the measured process must not be reported as its own descendant: {:?}",
-            reaped.pids
-        );
-        assert_eq!(
-            reaped.pids.len(),
-            reaped.total,
-            "every counted descendant must carry its pid: {:?}",
             reaped.pids
         );
     }

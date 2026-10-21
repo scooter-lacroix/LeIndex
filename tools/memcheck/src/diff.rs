@@ -118,18 +118,26 @@ pub fn load_baseline(baselines_dir: &Path, fixture: &str, phase: &str) -> Option
 
 /// Write a per-phase baseline file (VAL-MEASURE-008: overwrites canonical).
 ///
-/// The descendant pids are stripped before writing. A pid is meaningless after
-/// the run that produced it, and a baseline is committed, so a phase that
-/// spawned a descendant would otherwise bake machine-specific pids into
-/// `docs/memory/baselines/` — noise that churns the baseline-metadata gate on
-/// every run. The rest of the tree is kept — `peak_rss_kib`, `total` and
-/// `by_name` all stay — as retained diagnostic data recorded alongside the
-/// measurement. They are NOT compared: `diff_report` gates on `rss_max_kib`
-/// alone (baseline + tolerance, and the budget ceiling + tolerance), so a
-/// movement in `peak_rss_kib` or `total` is recorded for a reader to inspect
-/// rather than failing a phase. Stripping `pids` here rather than
-/// `skip_serializing` on the field keeps them in the run's own report, which is
-/// the one place a failing phase can still be diagnosed from.
+/// `descendants.pids` is cleared before writing. This protects less than it
+/// looks like it does: `PhaseReport::descendants` comes from the POST-reap
+/// `count_descendants` call, and `/proc/<pid>` is gone the instant `wait4`
+/// reaps, so the count is empty for every phase — `workload.rs` says the same
+/// where it refuses to treat that emptiness as evidence. The clearing is
+/// therefore a guard against a future caller that populates pids from a live
+/// walk, not a description of today's data.
+///
+/// What a reader of a committed baseline actually sees varying is
+/// `peak_rss_kib` — the descendant-inclusive `ru_maxrss`, retained so the
+/// fold that produced `rss_max_kib` stays inspectable. `total` and `by_name`
+/// are kept as retained diagnostic data alongside the measurement. NONE of
+/// them are compared: `diff_report` gates on `rss_max_kib` alone (baseline +
+/// tolerance, and the budget ceiling + tolerance), so movement in
+/// `peak_rss_kib` or `total` is recorded for a reader to inspect rather than
+/// failing a phase.
+///
+/// Clearing here rather than `skip_serializing` on the field keeps pids in the
+/// run's own report, which is the one place a failing phase can still be
+/// diagnosed from.
 pub fn write_baseline(baselines_dir: &Path, fixture: &str, phase: &PhaseReport) -> Result<()> {
     let dir = baselines_dir.join(fixture);
     std::fs::create_dir_all(&dir)
