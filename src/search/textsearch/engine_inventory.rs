@@ -93,13 +93,19 @@ impl InventoryTruncation {
     }
 }
 
-/// Walk `root`, returning the files seen and why the walk stopped short.
-/// A truncated walk must be distinguishable from a tree with no files:
+/// Walk `root`, returning the files `admit` accepts and why the walk stopped
+/// short. A truncated walk must be distinguishable from a tree with no files:
 /// otherwise an expired deadline yields "zero candidates, nothing matched".
+///
+/// `admit` runs as each file is seen so the budget is spent on matching files.
+/// Filtering afterwards is NOT equivalent: this walk stops once `limit` files of
+/// any kind have been collected, so the matches behind an earlier wall of
+/// rejects would never be reached.
 fn walk_inventory(
     root: &Path,
     limit: usize,
     deadline: Option<Instant>,
+    admit: impl Fn(&str) -> bool,
 ) -> (Vec<String>, InventoryTruncation) {
     let mut out = Vec::new();
     let mut stack = vec![(root.to_path_buf(), String::new())];
@@ -108,7 +114,10 @@ fn walk_inventory(
         let hit_limit = out.len() >= limit;
         if hit_limit || expired {
             // Directories are still queued (or the file budget is exhausted),
-            // so there is unexplored tree left.
+            // so there is unexplored tree left. Sort before returning: the walk
+            // yields in stack-traversal order, and `list_files` promises a sorted
+            // listing on EVERY path, not just the complete one.
+            out.sort_unstable();
             return (
                 out,
                 InventoryTruncation {
@@ -135,7 +144,7 @@ fn walk_inventory(
                 if !NEVER_WALK.contains(&name) {
                     stack.push((entry.path(), rel));
                 }
-            } else if kind.is_file() {
+            } else if kind.is_file() && admit(&rel) {
                 out.push(rel);
             }
         }
@@ -146,6 +155,7 @@ fn walk_inventory(
         // met — `stopped_by_deadline` is a claim about unexamined tree, so it may
         // only be raised when tree is actually left.
         if deadline.is_some_and(|d| Instant::now() >= d) && !stack.is_empty() {
+            out.sort_unstable();
             return (
                 out,
                 InventoryTruncation {
@@ -203,11 +213,16 @@ pub fn list_files_matching(
     deadline: Option<Instant>,
     admit: impl Fn(&str) -> bool,
 ) -> (Vec<String>, InventoryTruncation) {
+    // `git ls-files` already honors the project's ignore rules, so its listing
+    // only needs the predicate; the walk applies it per file as it goes, so the
+    // budget is spent on admitted files there too.
     let (mut files, mut truncation) = match git_inventory(dir) {
-        Some(files) => (files, InventoryTruncation::default()),
-        None => walk_inventory(dir, limit, deadline),
+        Some(mut files) => {
+            files.retain(|rel| admit(rel));
+            (files, InventoryTruncation::default())
+        }
+        None => walk_inventory(dir, limit, deadline, admit),
     };
-    files.retain(|rel| admit(rel));
     if files.len() > limit {
         truncation.limit = true;
     }

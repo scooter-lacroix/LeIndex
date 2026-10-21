@@ -30,9 +30,11 @@
 //!
 //! ## Scanning
 //!
-//! Files are enumerated with [`engine::list_files_reporting`] (gitignore-aware,
-//! live — no index required) and filtered with the same [`FileFilter`] the text
-//! search uses. Why the listing stopped short is folded into
+//! Files are enumerated with [`engine::list_files_matching`] (gitignore-aware,
+//! live — no index required), with the same [`FileFilter`] the text search uses
+//! plus the pattern's own language applied inside the walk, so
+//! [`MAX_CANDIDATE_FILES`] bounds eligible files rather than raw tree order.
+//! Why the listing stopped short is folded into
 //! [`StructuralOutput::has_more`], because a budget that expires during
 //! enumeration is as partial as one that expires during parsing; the *cause*
 //! decides [`StructuralOutput::stopped_by_deadline`], which may only cite the
@@ -40,7 +42,7 @@
 //! read through [`engine::read_scannable`], so the binary and size limits stay
 //! the engine's rather than becoming a second policy that could drift.
 
-use super::engine::{list_files_reporting, read_scannable};
+use super::engine::{list_files_matching, read_scannable};
 use super::glob::FileFilter;
 use crate::parse::grammar::LanguageId;
 use ast_grep_core::Language;
@@ -513,12 +515,16 @@ pub fn search(
     let started = Instant::now();
     let mut output = StructuralOutput::default();
 
-    let (rels, truncation) = list_files_reporting(root, MAX_CANDIDATE_FILES, options.deadline);
-    let rels: Vec<String> = rels
-        .into_iter()
-        .filter(|rel| filter.allows(rel))
-        .filter(|rel| language_for_path(Path::new(rel)) == Some(pattern.language_id()))
-        .collect();
+    // The pattern's own language and the glob filter are applied INSIDE the
+    // walk, so `MAX_CANDIDATE_FILES` bounds the files that can actually match. A
+    // post-hoc filter over a truncated listing substitutes "the first N paths in
+    // the tree" for "the first N eligible files": a large tree whose Rust files
+    // sort past the cutoff reported zero candidates for a Rust pattern. Same
+    // defect as the language-inference cutoff in `structural_handler`.
+    let (rels, truncation) =
+        list_files_matching(root, MAX_CANDIDATE_FILES, options.deadline, |rel| {
+            filter.allows(rel) && language_for_path(Path::new(rel)) == Some(pattern.language_id())
+        });
     output.stats.candidates = rels.len();
 
     // Two things

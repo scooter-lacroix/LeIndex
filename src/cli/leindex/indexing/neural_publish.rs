@@ -372,12 +372,22 @@ fn streaming_neural_inputs<'a>(
                     // checkouts (CodeRabbit Security/Privacy). Only the title is
                     // relativized — `node.file_path` above is still the
                     // absolute path used to READ the source.
+                    //
+                    // The fallback is the FILE NAME, never the raw path. Falling
+                    // back to `node.file_path` reintroduced exactly the leak this
+                    // documents, for precisely the nodes it describes: a path that
+                    // fails `strip_prefix` (non-canonical through a symlink, or
+                    // outside `project_path` like a submodule summary) was sent in
+                    // full. The file name still carries template parity without
+                    // identifying the checkout.
                     title: Some(
-                        std::path::Path::new(&*node.file_path)
-                            .strip_prefix(project_path)
-                            .unwrap_or(std::path::Path::new(&*node.file_path))
-                            .to_string_lossy()
-                            .replace('\\', "/"),
+                        match std::path::Path::new(&*node.file_path).strip_prefix(project_path) {
+                            Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
+                            Err(_) => std::path::Path::new(&*node.file_path)
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                        },
                     ),
                 })
             };
