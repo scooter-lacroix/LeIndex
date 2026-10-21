@@ -680,6 +680,48 @@ fn test_scan_loop_deadline_accounting_sums_to_candidates() {
     }
 }
 
+/// The per-candidate deadline checks run BETWEEN scans, so a worker that starts
+/// just before expiry still runs its full read + parse to completion — rayon
+/// cannot cancel it and ast-grep exposes no cancellation hook. A collect that
+/// FINISHES past the deadline is therefore the only observable proof the
+/// advertised wall-clock budget was crossed, and it must be reported even when
+/// no candidate happened to land on a skip check after expiry (Codex P2).
+///
+/// One ~6 MiB candidate against a 10 ms budget: the inventory and both
+/// per-candidate checks complete inside the budget, and the parse runs far past
+/// it. On the old code this shape reported `stopped_by_deadline: false` with
+/// `skipped_deadline == 0`. A machine whose first 6 MiB read is slow enough to
+/// blow the budget before the second check legitimately takes the skip path
+/// instead — the assertions hold either way, they just pin the unguarded-parse
+/// hole on machines fast enough to reach the parse in time.
+#[test]
+fn test_scan_finishing_past_deadline_is_reported() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let big = format!("fn seed() {{}}\n{}", "// pad\n".repeat(900_000));
+    write(dir.path(), "big.rs", &big);
+    let pattern = CompiledPattern::new("rust", "fn $NAME() { $$$BODY }").expect("pattern");
+    let output = search_structural(
+        dir.path(),
+        &pattern,
+        &FileFilter::default(),
+        &StructuralOptions {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(10)),
+            ..options(100, NO_CAP)
+        },
+    );
+
+    assert_eq!(
+        output.stats.candidates, 1,
+        "the 10 ms budget must not starve the inventory of its single candidate"
+    );
+    assert!(
+        output.stopped_by_deadline,
+        "a scan that crossed the deadline must say so — via skips, or via the \
+         finished-late collect when the parse ran unguarded past expiry"
+    );
+    assert!(output.has_more, "a partial scan cannot claim completeness");
+}
+
 /// A deadline that expires while the *inventory* is being walked must also
 /// report a partial result. `walk_inventory` stops at the deadline and returns
 /// whatever it had, so a non-git tree can yield zero candidates and

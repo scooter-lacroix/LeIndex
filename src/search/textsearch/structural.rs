@@ -576,11 +576,13 @@ pub fn search(
         });
     output.stats.candidates = rels.len();
 
-    // Two things
-    // never produce a `StructuralFile`, and only one of them means the answer is
+    // Three things
+    // never produce a `StructuralFile`, and only two of them mean the answer is
     // incomplete:
     //   * the worker hit the deadline before opening the file — that file may
-    //     still hold matches, so the result is partial; and
+    //     still hold matches, so the result is partial; the same applies to a
+    //     file that was opened but whose scan was refused because the budget
+    //     expired before its parse could start;
     //   * `read_scannable` refused the file (binary, oversized, unreadable) —
     //     legitimately not matched, and counting it as incomplete would pin
     //     `has_more` forever on any tree containing a binary.
@@ -603,6 +605,15 @@ pub fn search(
                     return None;
                 }
             };
+            // The read is done; the parse is the expensive half. Don't start one
+            // after expiry — its matches would be unknown to the caller, which is
+            // a deadline skip, not a clean scan. This check cannot interrupt a
+            // parse that is already running (ast-grep-core exposes no
+            // cancellation), so expiry DURING a scan is caught after the collect.
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                deadline_skips.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
             pattern.scan(rel, &source, options)
         })
         .collect();
@@ -645,11 +656,18 @@ pub fn search(
         output.files.push(StructuralFile { hits, ..file });
     }
     // `stopped_by_deadline` claims the TIME BUDGET cut this scan, so it may only
-    // cite deadline evidence: files the workers skipped on expiry, or a walk
-    // that stopped on expiry. A listing cut by the file count limit is not time
-    // pressure — reporting it as one makes a large tree look time-starved and
-    // would hide a genuine deadline skip behind the wrong explanation.
-    output.stopped_by_deadline = output.stats.skipped_deadline > 0 || truncation.deadline;
+    // cite deadline evidence: files the workers skipped on expiry, a walk
+    // that stopped on expiry, or a collect that FINISHED past the deadline —
+    // the per-candidate checks only run between scans, so a worker that
+    // started just before expiry runs its full read + parse to completion, and
+    // the finished-late collect is the only observable proof the advertised
+    // wall-clock budget was crossed (Codex P2). A listing cut by the file count
+    // limit is not time pressure — reporting it as one makes a large tree look
+    // time-starved and would hide a genuine deadline skip behind the wrong
+    // explanation.
+    output.stopped_by_deadline = output.stats.skipped_deadline > 0
+        || truncation.deadline
+        || deadline.is_some_and(|d| Instant::now() >= d);
     // `has_more`, by contrast, only needs *some* tree left unexamined — a limit
     // truncation counts, because those files were never candidates, and so does
     // a subtree the OS refused to open, because those files can never become
