@@ -730,7 +730,10 @@ fn resolve_query_embedder_from_decision(
             )
         }
         QueryNeuralDecision::DisableNeural => {
-            warn!("Failed to create query-time neural embedder; falling back to tfidf_only");
+            // Deliberate, not a failure: identity or dimension mismatch, or an
+            // identity-only header with slicing disabled. The cause is logged
+            // where the decision is made; this arm only carries it out.
+            warn!("Neural scoring disabled for this generation; falling back to tfidf_only");
             fallback
         }
     }
@@ -778,11 +781,40 @@ pub(crate) fn query_remote_embedder(
 ) -> QueryNeuralDecision {
     let Some(mmap) = index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path)
     else {
+        // Nothing persisted at all. That is indistinguishable from a first
+        // run, so config alone decides here; the identity-only gate below
+        // applies only when a canonical header exists.
         return build_remote_decision(tfidf, embeddings_cfg, None);
     };
 
     let persisted_identity = mmap.identity();
     let persisted_dim = mmap.dimension() as usize;
+
+    // A tier-only generation persists a ZERO-ROW canonical header that carries
+    // only the identity and native dimension. Restoring it is deliberate: the
+    // identity lets a later generation resume without re-embedding. But it is a
+    // usable NEURAL generation only when the sliced sidecars are restored
+    // alongside it — and that restore is gated on the Matryoshka rollout flag
+    // (`effective_matryoshka`, the same predicate
+    // `restore_persisted_neural_embeddings` applies to the sidecars). After
+    // LEINDEX_FEATURE_MATRYOSHKA is disabled, the sidecars are deliberately
+    // omitted, so this header is the only persisted neural state: treating its
+    // identity as a live generation would seed a query vector whose cosine
+    // against every node is zero, and the scorer would apply the configured
+    // neural weight to all-zero scores — distorting every non-exact ranking
+    // instead of providing the rollback (Codex P1). Disable neural scoring
+    // instead. The file is left untouched, so the identity metadata survives
+    // and re-enabling the flag resumes the generation.
+    if mmap.is_empty()
+        && embeddings_cfg.effective_matryoshka() == crate::config::MatryoshkaSetting::Off
+    {
+        info!(
+            dim = persisted_dim,
+            "Persisted neural canonical file carries identity only (zero rows) and \
+             Matryoshka slicing is disabled; treating it as no neural generation"
+        );
+        return QueryNeuralDecision::DisableNeural;
+    }
 
     if let Some(identity) = persisted_identity {
         if identity.starts_with("local|") {
@@ -967,6 +999,82 @@ mod tests {
                 QueryNeuralDecision::Remote(_)
             ),
             "nothing persisted: config decides"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "onnx")]
+    fn test_query_embedder_identity_only_header_disables_neural_when_mrl_off() {
+        let tfidf =
+            index_builder::TfIdfEmbedder::build(&[("sample.rs".into(), "fn sample() {}".into())]);
+        // The generation was written under a configured fixed-slice policy;
+        // only the rollout flag differs between the two halves of this test,
+        // so the kill switch alone flips the decision. The config must stay on
+        // the preset: `effective_matryoshka` requires the embeddinggemma-2
+        // preset to be active, which also PINS the remote dimension — so the
+        // flag-on arm cannot additionally assert a seeded query dimension
+        // (seeding only happens for unpinned custom endpoints, where MRL is
+        // inert by construction). The discriminating assertion is the flag-off
+        // arm below; this arm pins the gate's scoping: flag on, the header
+        // keeps the remote query embedder instead of following local.
+        let cfg = crate::config::EmbeddingConfig {
+            matryoshka: crate::config::MatryoshkaSetting::Dim128,
+            ..crate::config::EmbeddingConfig::default()
+        }; // preset, pinned 768, Dim128 policy
+
+        // A tier-only generation persists a ZERO-ROW canonical header carrying
+        // the generation identity. Restarting with LEINDEX_FEATURE_MATRYOSHKA
+        // disabled must treat that header as NO neural generation: the sidecar
+        // restore is gated off, so seeding a query vector from the identity
+        // would score every node 0.0 while the scorer still applies the
+        // configured neural weight (Codex P1).
+        let project = tempfile::tempdir().expect("identity-only generation");
+        let storage = project.path().join(".leindex");
+        std::fs::create_dir_all(&storage).expect("storage dir");
+        let identity = configured_remote_identity(&cfg, 768).expect("configured identity");
+        crate::search::vector::write_empty_mmap_embeddings_with_identity(
+            &storage.join("neural_embeddings.bin"),
+            768,
+            Some(&identity),
+        )
+        .expect("write identity-only header");
+
+        crate::feature_flags::with_flag_override(
+            crate::feature_flags::FeatureFlag::Matryoshka,
+            false,
+            || {
+                assert!(
+                    matches!(
+                        query_remote_embedder(&tfidf, &storage, &cfg),
+                        QueryNeuralDecision::DisableNeural
+                    ),
+                    "identity-only header with Matryoshka disabled must disable neural scoring"
+                );
+            },
+        );
+
+        // The gate is scoped to the disabled flag, not to emptiness: with the
+        // rollout enabled the sidecars are restored and the header is the
+        // generation's live identity again.
+        crate::feature_flags::with_flag_override(
+            crate::feature_flags::FeatureFlag::Matryoshka,
+            true,
+            || {
+                // Variant-level assert, deliberately: with a pinned preset,
+                // Remote-from-header and Remote-from-nothing are observably
+                // identical at this seam (no seeding happens), so the stronger
+                // discriminator is not expressible here. Flag-on still pins
+                // real behavior — pre-fix this branch returned FollowLocal,
+                // so Remote(_) proves the gate did not overfire AND that the
+                // identity branch was reached rather than skipped.
+                assert!(
+                    matches!(
+                        query_remote_embedder(&tfidf, &storage, &cfg),
+                        QueryNeuralDecision::Remote(_)
+                    ),
+                    "identity-only header with Matryoshka enabled remains a live generation"
+                );
+            },
         );
     }
 
