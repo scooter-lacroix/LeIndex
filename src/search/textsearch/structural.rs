@@ -485,9 +485,42 @@ fn capture_of(
     }) else {
         return (None, None);
     };
-    let captured = env
-        .get_match(&name)
-        .map(|node| clip(&node.text(), max_chars));
+    // The two capture kinds live in two different maps: `get_match` consults
+    // only the single-capture map, so a multi-variable such as `$$$ARGS` —
+    // which reports its name through `get_matched_variables` but stores its
+    // nodes separately, exposed via `get_multiple_matches` — yielded a
+    // `capture` with a permanently empty `captured` even when arguments were
+    // matched. Resolve a single capture from its map and a multi-capture by
+    // joining its nodes, so `captured` reports what was actually matched.
+    let captured = match env.get_match(&name) {
+        Some(node) => Some(clip(&node.text(), max_chars)),
+        None => {
+            let multi = env.get_multiple_matches(&name);
+            if multi.is_empty() {
+                None
+            } else {
+                // ast-grep captures punctuation alongside real content (a
+                // comma lands in the list with the arguments); the field
+                // means "what was matched", so anonymous nodes are dropped
+                // unless they are all there is. Same named-only comparison
+                // ast-grep itself uses when matching multi-variables.
+                let named: Vec<String> = multi
+                    .iter()
+                    .filter(|node| node.is_named())
+                    .map(|node| node.text().to_string())
+                    .collect();
+                let texts = if named.is_empty() {
+                    multi
+                        .iter()
+                        .map(|node| node.text().to_string())
+                        .collect::<Vec<_>>()
+                } else {
+                    named
+                };
+                Some(clip(&texts.join(", "), max_chars))
+            }
+        }
+    };
     (Some(name), captured)
 }
 

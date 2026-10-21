@@ -494,6 +494,38 @@ fn test_zero_limit_returns_totals_without_hits() {
     assert!(output.has_more, "everything is still ahead of offset 0");
 }
 
+/// A multi-variable capture must report what it captured when it is the
+/// pattern's first (here: only) capture — `alpha($$$ARGS)`. ast-grep stores
+/// multi-capture nodes in a separate map from single captures, so reading
+/// only `get_match` reported `capture: "ARGS"` with `captured` permanently
+/// `None` even when arguments were matched (Codex review, P2).
+#[test]
+fn test_multi_capture_reports_the_captured_args() {
+    let dir = fixture();
+    write(dir.path(), "calls.rs", "fn one() {\n    alpha(1, 2);\n}\n");
+    let pattern = CompiledPattern::new("rust", "alpha($$$ARGS)").expect("pattern");
+    let output = search_structural(
+        dir.path(),
+        &pattern,
+        &FileFilter::default(),
+        &options(100, NO_CAP),
+    );
+
+    let file = output
+        .files
+        .iter()
+        .find(|file| file.rel == "calls.rs")
+        .expect("calls.rs must be in the results");
+    assert_eq!(file.hits.len(), 1);
+    let hit = &file.hits[0];
+    assert_eq!(hit.capture.as_deref(), Some("ARGS"));
+    let captured = hit
+        .captured
+        .as_deref()
+        .expect("$$$ARGS matched arguments, so captured must be present");
+    assert_eq!(captured, "1, 2", "captured must hold the matched arguments");
+}
+
 /// The complement of the expired-deadline test, and the guard that catches the
 /// obvious way to break the fix: enforcing a deadline in the git branch must not
 /// cost a live search its candidates. With a deadline that has NOT expired, a
