@@ -687,13 +687,19 @@ fn test_scan_loop_deadline_accounting_sums_to_candidates() {
 /// advertised wall-clock budget was crossed, and it must be reported even when
 /// no candidate happened to land on a skip check after expiry (Codex P2).
 ///
-/// One ~6 MiB candidate against a 10 ms budget: the inventory and both
-/// per-candidate checks complete inside the budget, and the parse runs far past
-/// it. On the old code this shape reported `stopped_by_deadline: false` with
-/// `skipped_deadline == 0`. A machine whose first 6 MiB read is slow enough to
-/// blow the budget before the second check legitimately takes the skip path
-/// instead — the assertions hold either way, they just pin the unguarded-parse
-/// hole on machines fast enough to reach the parse in time.
+/// One ~5.4 MiB candidate that parses in seconds (measured ~2.8 s in a debug
+/// build) against a 200 ms budget: enumeration, the read and both per-candidate
+/// checks finish far inside the budget, and only the parse crosses it. The
+/// budget deliberately sits well ABOVE inventory cost — the earlier 10 ms budget
+/// could expire during enumeration, which yielded zero candidates and made the
+/// candidate-count assertion flake while `stopped_by_deadline` stayed true via
+/// the walk, i.e. the test passed without ever reaching the parser it exists to
+/// pin.
+///
+/// `stats.scanned == 1` is what keeps the claim honest: both per-candidate checks
+/// saw a live clock, so the file really was parsed and the assertions below can
+/// only be satisfied by the finished-late collect. A deadline skip reports
+/// `scanned == 0` and fails right there, instead of passing vacuously.
 #[test]
 fn test_scan_finishing_past_deadline_is_reported() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -705,14 +711,20 @@ fn test_scan_finishing_past_deadline_is_reported() {
         &pattern,
         &FileFilter::default(),
         &StructuralOptions {
-            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(10)),
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(200)),
             ..options(100, NO_CAP)
         },
     );
 
     assert_eq!(
         output.stats.candidates, 1,
-        "the 10 ms budget must not starve the inventory of its single candidate"
+        "the budget must not starve the inventory of its single candidate; zero \
+         candidates is an inventory truncation, which this test does not cover"
+    );
+    assert_eq!(
+        output.stats.scanned, 1,
+        "a deadline skip here means the parse never ran, so nothing below would \
+         prove the finished-late collect"
     );
     assert!(
         output.stopped_by_deadline,
