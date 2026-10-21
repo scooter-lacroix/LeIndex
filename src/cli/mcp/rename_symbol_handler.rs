@@ -115,7 +115,11 @@ async fn live_reference_files(
                     .map(|entry| entry.path().to_path_buf())
                     .collect()
             }
-            Err(_) => Vec::new(),
+            Err(error) => {
+                return Err(JsonRpcError::internal_error(format!(
+                    "could not list live source files ({error}); symbol presence is unverified"
+                )));
+            }
         };
         let mut files = std::collections::HashSet::new();
         let mut conflicts = std::collections::HashSet::new();
@@ -963,5 +967,23 @@ mod tests {
         let dot_src = reference_files(&pdg, "old_name", "brand_new", Some("./."), dir.path())
             .expect("scope './.' must normalize to the root");
         assert_eq!(dot_src.len(), 1, "got: {dot_src:?}");
+    }
+
+    /// A failed live listing must surface as an error, not as a definitive
+    /// "Symbol 'X' not found in project source" — the scan never happened, so
+    /// absence is unverified. `project_root` being a FILE forces the inventory's
+    /// first `git` spawn to fail (`current_dir` on a file), i.e. the
+    /// non-NotRepository error arm.
+    #[tokio::test]
+    async fn test_live_reference_files_listing_failure_is_not_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("phantom.rs");
+        std::fs::write(&file, "pub fn target() {}\n").unwrap();
+        let err = live_reference_files(&file, "target", "renamed", None)
+            .await
+            .unwrap_err();
+        let msg = err.message.clone();
+        assert!(msg.contains("could not list live source files"), "{msg}");
+        assert!(!msg.contains("not found"), "{msg}");
     }
 }

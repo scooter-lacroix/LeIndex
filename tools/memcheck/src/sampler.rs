@@ -32,8 +32,11 @@ pub struct MemorySample {
 
 /// GPU VRAM/utilization sample (§14 item 8, §2.1 GPU memory reporting).
 ///
-/// On a machine with ROCm (`rocm-smi`) or CUDA (`nvidia-smi`), fields are
-/// `Some`. On headless boxes (no GPU tools), all fields are `None`.
+/// `provider` identifies which tool was found (`rocm-smi` or `nvidia-smi`).
+/// The value fields are `Some` only when that tool actually reported a
+/// parseable number. On headless boxes (no GPU tools) `provider` is `None`
+/// and all value fields are `None`. A `Some` provider with `None` values
+/// therefore means "tool found, value unavailable", not "zero usage".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct GpuSample {
     /// VRAM used in MiB.
@@ -157,14 +160,16 @@ fn sample_gpu_cuda() -> Option<GpuSample> {
     })
 }
 
-/// If worker tracking is enabled, also discovers a direct child running in
-/// worker mode (VAL-CPHASE-034).
+/// Take one sample of `pid`, optionally including a worker child.
+///
+/// With `track_worker`, a failed `/proc` scan is an `Err`, never a silent
+/// `worker_rss_kib: 0` — see [`find_child_worker_rss`].
 pub fn sample(pid: u32, track_worker: bool) -> anyhow::Result<MemorySample> {
     let rss = read_vm_rss(pid)?;
     let (mapped, anon, pss) = read_smaps_breakdown(pid);
 
     let worker_rss = if track_worker {
-        find_child_worker_rss(pid)
+        find_child_worker_rss(pid)?
     } else {
         0
     };
@@ -215,14 +220,19 @@ pub fn is_worker_process(pid: u32) -> bool {
 /// Find the RSS of a direct child running in worker mode.
 ///
 /// Scans `/proc` for direct children whose NUL-separated argv contains the
-/// hidden worker token. Returns the RSS of the first matching child, or 0.
-/// Ownership is checked independently of the process name because the worker
-/// re-executes the same binary as its parent.
-fn find_child_worker_rss(parent_pid: u32) -> u64 {
-    let proc_dir = match std::fs::read_dir("/proc") {
-        Ok(d) => d,
-        Err(_) => return 0,
-    };
+/// hidden worker token. Returns the RSS of the first matching child, or 0 when
+/// there is none. Ownership is checked independently of the process name
+/// because the worker re-executes the same binary as its parent.
+///
+/// `Ok(0)` is a finding: the measured process has no worker child. `Err` means
+/// the scan itself could not run, which is the case a caller must not read as
+/// "no worker": `PhaseReport::worker_rss_max_kib` documents 0 as "no worker was
+/// active or detected", so folding a failed scan into 0 would make that
+/// documented meaning unfalsifiable. Per-pid read failures (a child exiting
+/// mid-scan) are still skipped rather than retried — they are races the scan
+/// cannot win, and surfacing them would make every sample flaky.
+fn find_child_worker_rss(parent_pid: u32) -> std::io::Result<u64> {
+    let proc_dir = std::fs::read_dir("/proc")?;
 
     for entry in proc_dir.flatten() {
         let name = entry.file_name();
@@ -238,10 +248,10 @@ fn find_child_worker_rss(parent_pid: u32) -> u64 {
         if is_worker_process(child_pid)
             && let Ok(rss) = read_vm_rss(child_pid)
         {
-            return rss;
+            return Ok(rss);
         }
     }
-    0
+    Ok(0)
 }
 
 /// Check if `child_pid` is a child of `parent_pid` by reading
@@ -536,13 +546,17 @@ fn parse_proc_stat(content: &str, page_kib: u64) -> Option<(u32, String, u64)> {
 pub fn count_descendants(root_pid: u32) -> std::io::Result<DescendantTree> {
     // Build a map of pid → (ppid, name, rss_kib) for all live processes.
     let mut all_procs: Vec<(u32, u32, String, u64)> = Vec::new();
+    let mut skipped = 0usize;
     let page_kib = page_size_kib();
     let proc_dir = std::fs::read_dir("/proc")?;
     for entry in proc_dir.flatten() {
         let name = entry.file_name();
         let name_str = match name.to_str() {
             Some(s) => s,
-            None => continue,
+            None => {
+                skipped += 1;
+                continue;
+            }
         };
         let pid: u32 = match name_str.parse() {
             Ok(p) => p,
@@ -551,12 +565,21 @@ pub fn count_descendants(root_pid: u32) -> std::io::Result<DescendantTree> {
         // Read ppid, name and RSS from /proc/<pid>/stat
         let stat_path = format!("/proc/{}/stat", pid);
         let Ok(content) = std::fs::read_to_string(&stat_path) else {
+            skipped += 1;
             continue;
         };
         let Some((ppid, comm, rss_kib)) = parse_proc_stat(&content, page_kib) else {
+            skipped += 1;
             continue;
         };
         all_procs.push((pid, ppid, comm, rss_kib));
+    }
+
+    if skipped > 0 {
+        eprintln!(
+            "memcheck: count_descendants skipped {skipped} /proc entries (stat read/parse failed); \
+             descendant totals may undercount"
+        );
     }
 
     // BFS from root_pid
@@ -655,7 +678,7 @@ mod tests {
     #[test]
     fn test_find_child_worker_rss_no_worker() {
         let pid = std::process::id();
-        let rss = find_child_worker_rss(pid);
+        let rss = find_child_worker_rss(pid).expect("the /proc scan itself must succeed");
         assert_eq!(rss, 0, "no worker child expected for memcheck process");
     }
 
@@ -667,21 +690,23 @@ mod tests {
     }
 
     #[test]
-    fn test_gpu_sample_returns_some_on_amdgpu_or_none_elsewhere() {
-        let s = sample_gpu();
-        // On a box with ROCm: vram_used_mib is Some. On headless CI: all None.
-        // Either is valid; we just assert it doesn't panic and the struct is usable.
-        let _ = s.vram_used_mib;
-        let _ = s.gpu_utilization_pct;
-        let _ = s.provider;
-    }
-
-    #[test]
-    fn test_gpu_sample_is_consistent() {
-        // Two calls should return consistent types (both Some or both None for provider).
-        let s1 = sample_gpu();
-        let s2 = sample_gpu();
-        assert_eq!(s1.provider.is_some(), s2.provider.is_some());
+    fn test_gpu_sample_reports_only_known_providers_and_sane_values() {
+        // Whether a GPU exists is a property of the host, so presence cannot be
+        // asserted here. What CAN be asserted are the invariants a parsing bug
+        // would break, on either branch: a recognised provider name, and a
+        // utilisation that is a percentage rather than whatever the probe
+        // printed. `parse::<u8>()` accepts "120" and rocm's "N/A" trimming path
+        // has to reject garbage, so `<= 100` is a real check.
+        let sample = sample_gpu();
+        if let Some(ref provider) = sample.provider {
+            assert!(
+                matches!(provider.as_str(), "rocm" | "cuda" | "migraphx"),
+                "unknown GPU provider {provider:?}"
+            );
+        }
+        if let Some(pct) = sample.gpu_utilization_pct {
+            assert!(pct <= 100, "utilization {pct} is not a percentage");
+        }
     }
 
     #[test]
@@ -704,8 +729,19 @@ mod tests {
                 .unwrap()
                 .contains("test_before")
         );
-        let metadata = std::fs::metadata(&p).unwrap();
-        assert!(metadata.len() > 0, "heap profile file should be non-empty");
+        // A non-zero length proves only that SOMETHING was written — `smaps` is
+        // never empty, so that assertion could not fail. The snapshot's whole
+        // value is being a real smaps dump, so assert the two line shapes the
+        // reader depends on.
+        let content = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            content.lines().any(is_vma_header),
+            "snapshot must contain at least one VMA header: {content:.200}"
+        );
+        assert!(
+            content.lines().any(|l| l.trim().starts_with("Rss:")),
+            "snapshot must contain Rss: detail lines"
+        );
     }
 
     #[test]

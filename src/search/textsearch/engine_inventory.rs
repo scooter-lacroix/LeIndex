@@ -118,6 +118,12 @@ fn run_captured(mut command: std::process::Command, deadline: Option<Instant>) -
 /// blows the same budget there. An expiry during post-processing yields the
 /// candidates resolved so far WITH `deadline: true` — never a clean default,
 /// which would report a scan that ran long past its budget as complete.
+fn sorted_unique(mut files: Vec<String>) -> Vec<String> {
+    files.sort_unstable();
+    files.dedup();
+    files
+}
+
 fn git_inventory(
     root: &Path,
     deadline: Option<Instant>,
@@ -141,16 +147,18 @@ fn git_inventory(
     };
     let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut files: Vec<String> = Vec::new();
+    let mut truncation = InventoryTruncation::default();
     for (index, entry) in raw
         .split(|b| *b == 0)
         .filter(|entry| !entry.is_empty())
         .enumerate()
     {
         if index % DEADLINE_CHECK_STRIDE == 0 && deadline.is_some_and(|d| Instant::now() >= d) {
-            files.sort_unstable();
-            return GitInventory::Partial(files);
+            truncation.deadline = true;
+            return GitInventory::Present(sorted_unique(files), truncation);
         }
         let Ok(rel) = std::str::from_utf8(entry) else {
+            truncation.skip = true;
             continue;
         };
         if rel.split('/').any(|seg| seg == ".leindex" || seg == ".git") {
@@ -174,9 +182,7 @@ fn git_inventory(
             files.push(rel.to_string());
         }
     }
-    files.sort_unstable();
-    files.dedup();
-    GitInventory::Complete(files)
+    GitInventory::Present(sorted_unique(files), truncation)
 }
 
 /// Result of asking git for a listing.
@@ -187,11 +193,8 @@ fn git_inventory(
 enum GitInventory {
     /// Not a worktree, git missing, or reaped on the deadline.
     Absent,
-    /// The whole listing, every candidate already resolved and admitted.
-    Complete(Vec<String>),
-    /// The deadline expired while resolving candidates; these are the ones that
-    /// made it through, and the listing is known to be incomplete.
-    Partial(Vec<String>),
+    /// The listing was resolved from git, with any truncation (deadline, skip) recorded.
+    Present(Vec<String>, InventoryTruncation),
 }
 
 /// Why a file listing stopped short of the whole tree.
@@ -243,9 +246,10 @@ impl InventoryTruncation {
 /// language inference (10_000 x 64 = 640k files, reachable) and does NOT bind
 /// structural search (300_000 x 64 = 19.2M, which no repository reaches) — that
 /// call is *meant* to enumerate the whole tree, since a match can be anywhere
-/// in it. Directories are never counted, so a tree that is mostly directories
-/// costs nothing against the budget; their traversal depth is bounded by the
-/// `NEVER_WALK` exclusions instead. Inside a git worktree the budget does not
+/// in it. Directories are never counted, so a tree that is mostly directories costs
+/// nothing against the budget; directory traversal has no depth limit, though
+/// `NEVER_WALK` skips common metadata and package caches (and symlinked
+/// directories are not followed). Inside a git worktree the budget does not
 /// apply at all — see `list_files_matching`.
 const WORK_BUDGET_PER_ADMITTED_FILE: usize = 64;
 
@@ -293,7 +297,11 @@ fn walk_inventory(
             continue;
         };
         let mut since_check = 0usize;
-        for entry in entries.flatten() {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                truncation.skip = true;
+                continue;
+            };
             // Polled per STRIDE entries rather than once per directory: one
             // directory holding 100k files used to run to exhaustion long after
             // the budget expired. `deadline: true`, not `limit: true` — the
@@ -425,14 +433,7 @@ pub fn list_files_matching(
     // `Absent` result sends the walk through with the same already-expired
     // deadline so the truncation is reported instead of the overrun hidden.
     let (mut files, mut truncation) = match git_inventory(dir, deadline, &admit) {
-        GitInventory::Complete(files) => (files, InventoryTruncation::default()),
-        GitInventory::Partial(files) => (
-            files,
-            InventoryTruncation {
-                deadline: true,
-                ..InventoryTruncation::default()
-            },
-        ),
+        GitInventory::Present(files, trunc) => (files, trunc),
         GitInventory::Absent => walk_inventory(dir, limit, deadline, admit),
     };
     if files.len() > limit {
@@ -584,14 +585,14 @@ mod test {
 
     #[test]
     fn test_list_files_reporting_admits_everything() {
-        // The no-predicate path must stay exactly what it was.
+        // Pin walk via direct walk_inventory so this test is isolated from
+        // whether TMPDIR sits inside a git checkout.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "x").unwrap();
         std::fs::write(dir.path().join("b.txt"), "x").unwrap();
-        assert_eq!(
-            list_files_reporting(dir.path(), 10, None).0,
-            vec!["a.rs".to_string(), "b.txt".to_string()]
-        );
+        let (files, truncation) = walk_inventory(dir.path(), 10, None, |_| true);
+        assert_eq!(files, vec!["a.rs".to_string(), "b.txt".to_string()]);
+        assert!(!truncation.truncated());
     }
 
     #[test]
@@ -690,5 +691,73 @@ mod test {
         let (matched, truncation) = walk_inventory(dir.path(), 0, None, |_| true);
         assert!(matched.is_empty(), "a zero limit admits nothing");
         assert!(truncation.limit, "the tree was never listed");
+    }
+
+    #[test]
+    fn test_sorted_unique_deduplicates_and_sorts() {
+        let input = vec![
+            "b.rs".to_string(),
+            "a.rs".to_string(),
+            "b.rs".to_string(),
+            "a.rs".to_string(),
+        ];
+        assert_eq!(
+            sorted_unique(input),
+            vec!["a.rs".to_string(), "b.rs".to_string()]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_git_inventory_non_utf8_sets_skip() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return;
+        }
+        let bad_name = std::ffi::OsStr::from_bytes(b"bad\xffname.txt");
+        std::fs::write(dir.path().join(bad_name), "x").unwrap();
+        std::fs::write(dir.path().join("good.txt"), "x").unwrap();
+
+        let (files, truncation) = list_files_matching(dir.path(), 100, None, |_| true);
+        assert_eq!(files, vec!["good.txt".to_string()]);
+        assert!(
+            truncation.skip,
+            "non-UTF-8 git entry must record truncation.skip, not claim clean completion"
+        );
+        assert!(truncation.truncated());
+        assert!(!truncation.deadline);
+    }
+
+    #[test]
+    fn test_git_inventory_deterministic_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return;
+        }
+        std::fs::write(dir.path().join("a.rs"), "x").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("c.rs"), "x").unwrap();
+
+        let (matched, truncation) =
+            list_files_matching(dir.path(), 10, None, |p| p.ends_with(".rs"));
+        assert_eq!(matched, vec!["a.rs".to_string(), "c.rs".to_string()]);
+        assert!(!truncation.truncated());
+
+        let (limited, truncation) =
+            list_files_matching(dir.path(), 1, None, |p| p.ends_with(".rs"));
+        assert_eq!(limited.len(), 1);
+        assert!(limited[0].ends_with(".rs"));
+        assert!(truncation.limit);
     }
 }

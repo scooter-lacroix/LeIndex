@@ -305,20 +305,6 @@ impl<W: streaming::neural::NeuralRowWriter> streaming::neural::NeuralRowWriter
     }
 }
 
-/// How many trailing path components the title fallback keeps.
-///
-/// Three, not one or two, because the collision it is reducing is a suffix
-/// collision: `a/src/lib.rs` and `b/src/lib.rs` differ only in their FIRST
-/// component, so every fixed-length suffix of the two is identical. One
-/// component (`lib.rs`) is the `file_name()` behaviour that made titles stop
-/// disambiguating; two (`src/lib.rs`) is no better. Three separates them.
-///
-/// It cannot be a guarantee — two paths three components deep that differ
-/// earlier still collide — and that is the honest contract: the fallback is
-/// prefix-free and non-empty, and it separates the layouts that actually
-/// collide in practice. Those are the properties the tests pin.
-const TITLE_TAIL_COMPONENTS: usize = 3;
-
 /// Document title for a neural node: the source path as it will be sent to a
 /// remote provider as `{title}`.
 ///
@@ -334,12 +320,11 @@ const TITLE_TAIL_COMPONENTS: usize = 3;
 ///
 /// * it succeeds with an EMPTY remainder — the node's path IS `project_path`,
 ///   e.g. a project summary node at the checkout root. The answer is the
-///   project's own directory name. Taking trailing components of the ABSOLUTE
-///   path here, which is what this used to do, sends the checkout's PARENT
-///   directories — typically a username — to the provider: exactly the leak
-///   this function exists to prevent;
+///   project's own directory name, when that name is provably the project's
+///   (see [`project_title`]);
 /// * it fails outright — a path outside `project_path`, like a submodule
-///   summary. Trailing components, which are relative to nothing;
+///   summary. Only the file name is kept; see [`leaf_title`] for why nothing
+///   above it may be;
 /// * the path has no components at all (a bare root, or one ending in `..`).
 ///   The symbol name stands in.
 ///
@@ -367,9 +352,10 @@ fn document_title(file_path: &str, project_path: &Path, node_name: &str) -> Stri
                 Component::ParentDir | Component::RootDir | Component::Prefix(_)
             )
         }) {
-            // Separators normalized so both platforms emit the same title for
-            // the same file: without this a Windows-style path is one opaque
-            // `Normal` component whose text still carries `\` and its drive.
+            // Separators normalized so the title is the same string on either
+            // host for the same file: without this a Windows-style path is one
+            // opaque `Normal` component whose text still carries `\` and its
+            // drive.
             return relative
                 .to_string_lossy()
                 .replace('\\', "/")
@@ -377,13 +363,26 @@ fn document_title(file_path: &str, project_path: &Path, node_name: &str) -> Stri
                 .to_string();
         }
     }
-    trailing_title(path, node_name)
+    leaf_title(path, node_name)
 }
 
 /// Title for a node that sits AT the project root: the project's own directory
-/// name, which is the only component of `project_path` that is not the
-/// machine-specific path above it.
+/// name.
+///
+/// Guarded on depth, because the name is only the project's when there is a
+/// path above it that could have been the machine-specific part. A one- or
+/// two-component project (`/home/alice`, `/mnt/data`, `/work`) is as likely to
+/// BE the home directory or a mount point as a checkout, and then its name is
+/// precisely the component that must not leave the machine. Below that depth the
+/// symbol name is the safer title.
 fn project_title(project_path: &Path, node_name: &str) -> String {
+    let depth = project_path
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count();
+    if depth <= 2 {
+        return node_name.to_string();
+    }
     project_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -391,39 +390,43 @@ fn project_title(project_path: &Path, node_name: &str) -> String {
         .unwrap_or_else(|| node_name.to_string())
 }
 
-/// Last [`TITLE_TAIL_COMPONENTS`] components of `path`, or `node_name` when it
-/// has none. Normalizes separators and drops any `Prefix`/`RootDir` component,
-/// so a Windows-style absolute path is relativized on a Unix host too.
-fn trailing_title(path: &Path, node_name: &str) -> String {
-    let mut tail: Vec<String> = path
+/// Title for a node whose path could not be made project-relative: the file
+/// name, or `node_name` when the path has none.
+///
+/// There is no sound way to keep a fixed-length suffix of an ABSOLUTE path.
+/// `strip_prefix` failed, so this code cannot tell which components are the
+/// checkout and which are the project — and every component above the file is a
+/// candidate for carrying a username (`/home/alice/src/main.rs`) or a mount
+/// point. Taking "the last three" therefore shipped `alice` to the remote
+/// provider, which is the leak [`document_title`] exists to prevent, merely
+/// moved.
+///
+/// So the fallback keeps ONLY the file name. Two consequences, both accepted:
+/// the title loses the directory context that used to separate `a/src/lib.rs`
+/// from `b/src/lib.rs`, and this changes the title text — and therefore the
+/// remote wire text — for out-of-project nodes relative to earlier versions.
+/// Identity does not include the title, so cached vectors stay keyed correctly;
+/// what changes is the text the provider sees. A cosmetic collision is a fair
+/// price for never putting a local username on the wire.
+fn leaf_title(path: &Path, node_name: &str) -> String {
+    let leaf = path
         .components()
         .rev()
-        .filter_map(|component| match component {
-            Component::Normal(name) => {
-                // One component can still be a whole Windows path when parsed on
-                // a Unix host (`C:\a\b.rs` has no `\` separator there), so split
-                // it rather than trusting the component boundary.
-                Some(name.to_string_lossy().replace('\\', "/"))
-            }
+        .find_map(|component| match component {
+            // One component can still be a whole Windows path when parsed on a
+            // Unix host (`C:\a\b.rs` has no `/` separator there), so split it
+            // rather than trusting the component boundary.
+            Component::Normal(name) => Some(name.to_string_lossy().replace('\\', "/")),
             _ => None,
         })
-        .flat_map(|segment| {
+        .and_then(|segment| {
             segment
                 .split('/')
-                .filter(|part| !part.is_empty() && *part != "..")
+                .rfind(|part| !part.is_empty() && *part != "..")
                 .map(str::to_string)
-                .rev()
-                .collect::<Vec<_>>()
-        })
-        .take(TITLE_TAIL_COMPONENTS)
-        .collect();
-    // Collected right-to-left, so reverse for the natural `dir/file` order.
-    tail.reverse();
-    if tail.is_empty() {
-        node_name.to_string()
-    } else {
-        tail.join("/")
-    }
+        });
+    leaf.filter(|title| !title.is_empty())
+        .unwrap_or_else(|| node_name.to_string())
 }
 
 fn streaming_neural_inputs<'a>(
@@ -490,10 +493,26 @@ fn streaming_neural_inputs<'a>(
                     // goes through `embed_neural_batch_blocking`, which passes
                     // no title, so `apply_doc_template` renders `{title}` as
                     // `none` there and as a path here. Only this route has a
-                    // PDG node to derive a path from. The two routes therefore
-                    // produce different values for the same body — acceptable
-                    // only because a generation is built by ONE route, never a
-                    // mix, so no generation contains both flavours.
+                    // PDG node to derive a path from.
+                    //
+                    // The two flavours CAN coexist in one store, and nothing
+                    // enforces otherwise. `index_project`'s lexical phase uses
+                    // the `index_nodes_tfidf_only*` routes, which pass
+                    // `_allow_neural = false` — but the public
+                    // `LeIndex::reload_vector_from_pdg` calls
+                    // `index_builder::index_nodes`, which passes `true`, so
+                    // `admit_prepared_node` builds a neural embedder and defers
+                    // to the title-less batch on the SAME resident engine this
+                    // phase later enriches. A process that rebuilds vectors that
+                    // way, then indexes, mixes both flavours in one generation.
+                    //
+                    // The risk that carries is retrieval quality, not cache
+                    // corruption: titles join the doc template, so title-aware
+                    // rows and `none` rows are embedded from different prompts
+                    // and score against each other slightly worse. Cache
+                    // identity is unaffected — the template fingerprint covers
+                    // it. Accepted, and pinned here so it is not mistaken for a
+                    // guarantee.
                     // `document_title` owns the leak guarantees; see its doc.
                     title: Some(document_title(&node.file_path, project_path, &node.name)),
                 })
@@ -683,8 +702,10 @@ impl LeIndex {
         let rows = 0;
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
         let mut rows = rows;
-        // loaded stays false until the mmap restore actually yields rows; a
-        // checkpoint with rows==0 means nothing was loaded, not a successful restore.
+        // loaded is derived from the restored row count, never from the
+        // checkpoint: a resume that yields rows is loaded even when the
+        // checkpoint recorded none, and a checkpoint that recorded rows
+        // guarantees nothing unless the mmap actually yields them.
         let loaded = false;
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
         let mut loaded = loaded;
@@ -696,8 +717,21 @@ impl LeIndex {
                 // its rows to sidecars, so accepting the checkpoint on the
                 // canonical row count alone resumed with the resident engine
                 // missing every tier-homed node — and those nodes were then
-                // skipped for re-embedding (Codex P2). Accept the checkpoint only
-                // when the restored total matches what was checkpointed.
+                // skipped for re-embedding (Codex P2).
+                //
+                // The check below runs only for a checkpoint that RECORDED rows:
+                // `checkpointed > 0 && rows != checkpointed`. A checkpoint with
+                // `rows == 0` records that nothing was embedded, so there is no
+                // count to compare and the comparison is skipped entirely. That
+                // exemption is deliberate (a zero-row checkpoint is a legitimate
+                // no-neural-work marker, and treating a nonzero restore against
+                // it as a mismatch would re-embed on every resume), but it is
+                // narrower than "the restored total matches what was
+                // checkpointed": the count is unverified whenever the checkpoint
+                // recorded none, and a generation whose checkpoint recorded rows
+                // but whose mmaps yield a different total is discarded wholesale
+                // rather than partially trusted. Changing either rule would need
+                // its own decision.
                 //
                 // Gated on the effective Matryoshka setting, like the hydration
                 // path: a generation checkpointed while MRL was armed must not
@@ -1273,7 +1307,7 @@ mod tests {
         assert_eq!(
             document_title("/checkout/project/src\\win.rs", root, "new"),
             "src/win.rs",
-            "backslashes are normalized so both routes agree on the title"
+            "backslashes are normalized so the title is separator-stable"
         );
     }
 
@@ -1303,12 +1337,21 @@ mod tests {
         // the fallback drops every non-`Normal` component, so no title can
         // begin with a separator whatever the input. This asserts the thing
         // that can actually break — that the machine-specific prefix is absent.
+        //
+        // The shallow tails are the load-bearing cases. An earlier version of
+        // this test used only paths with three or more trailing components, so
+        // the old fixed-length suffix could never expose `alice` for any of
+        // them: the assertion could not fail, whatever the fallback did. A
+        // 2-deep tail (`/home/alice/src/main.rs` -> `alice/src/main.rs`) is
+        // exactly where the leak lived.
         let root = std::path::Path::new("/home/alice/work/leindex");
         for path in [
             "/home/alice/work/leindex",            // empty remainder
             "/home/alice/work/leindex/src/lib.rs", // ordinary file
             "/elsewhere/sub/module/file.rs",       // outside the project
             "/home/bob/other/src/lib.rs",          // a different checkout
+            "/home/alice/src/main.rs",             // shallow outside-project tail
+            "/work/alice/app.go",                  // shallower still
         ] {
             let title = document_title(path, root, "node");
             for leaked in ["home", "alice", "bob", "work", "elsewhere"] {
@@ -1321,19 +1364,45 @@ mod tests {
     }
 
     #[test]
-    fn test_document_title_separates_same_named_files() {
-        // `file_name()` alone collapsed these to `lib.rs`, and the previous
-        // "last two components" version still collapsed both to `src/lib.rs`,
-        // despite claiming otherwise. Three components separate them.
+    fn test_document_title_at_a_shallow_project_root_does_not_use_the_directory_name() {
+        // `/home/alice` is a two-component project root: `file_name()` is
+        // `alice`, which is a username. The directory name is only the project's
+        // when there is a path above it that could have been the machine part.
+        let shallow = std::path::Path::new("/home/alice");
+        assert_eq!(
+            document_title("/home/alice", shallow, "project-summary"),
+            "project-summary",
+            "a two-component root is more likely a home dir than a checkout name"
+        );
+        let bare = std::path::Path::new("/work");
+        assert_eq!(document_title("/work", bare, "sym"), "sym");
+        // A normal checkout still gets its own name.
+        let nested = std::path::Path::new("/home/alice/work/leindex");
+        assert_eq!(
+            document_title("/home/alice/work/leindex", nested, "sym"),
+            "leindex"
+        );
+    }
+
+    #[test]
+    fn test_document_title_falls_back_to_the_leaf_name_not_a_path_suffix() {
+        // A fixed-length suffix of an ABSOLUTE path cannot be safe: the fallback
+        // runs precisely when `strip_prefix` failed, so it cannot tell the
+        // checkout from the project and ends up shipping `a` / `alice` / a mount
+        // point. The contract is now leaf-only. This replaces an earlier test
+        // that required `a/src/lib.rs` and `b/src/lib.rs` to differ — that
+        // separation is exactly what cost us a username on the wire, so the
+        // collision is accepted and pinned here instead.
         let root = std::path::Path::new("/checkout/project");
         let a = document_title("/outside/a/src/lib.rs", root, "new");
         let b = document_title("/outside/b/src/lib.rs", root, "new");
-        assert_ne!(
+        assert_eq!(a, "lib.rs", "only the file name may be kept");
+        assert_eq!(b, "lib.rs");
+        assert_eq!(
             a, b,
-            "same-named files in differently-named directories must not share a title"
+            "a cosmetic title collision is the accepted price of never \
+             sending a parent directory to the provider"
         );
-        assert_eq!(a, "a/src/lib.rs");
-        assert_eq!(b, "b/src/lib.rs");
     }
 
     #[test]
@@ -1342,19 +1411,17 @@ mod tests {
         // walks out of the project comes back as a SUCCESSFUL relative strip.
         // Sending that verbatim would put `../private/x.rs` — a path outside the
         // project — on the wire under the label "project-relative".
-        //
-        // The escaping remainder is rejected and the ABSOLUTE path takes the
-        // fallback, which drops `..` entirely and keeps real components. The
-        // result is not a resolution of the path (it reads `project/private`,
-        // where the real location is `/checkout/private`); it is a stable,
-        // prefix-free label, which is all a title has to be.
         let root = std::path::Path::new("/checkout/project");
         let title = document_title("/checkout/project/../private/x.rs", root, "node");
         assert!(
             !title.split('/').any(|component| component == ".."),
             "an escaping remainder must not be sent as a title: {title}"
         );
-        assert_eq!(title, "project/private/x.rs");
+        assert_eq!(
+            title, "x.rs",
+            "the escaping path takes the leaf-only fallback, so `project/` — a \
+             directory name the code cannot prove is safe — is not sent"
+        );
     }
 
     #[test]
@@ -1363,12 +1430,13 @@ mod tests {
         // `Normal` component whose text still carries the drive letter and the
         // backslashes. Joining components raw (which the fallback used to do)
         // emitted that whole string as a "relative" title — an absolute path on
-        // the platform it came from. Splitting on the separator as well keeps
-        // the property true on both hosts.
+        // the platform it came from.
         //
-        // `Users` legitimately survives: it is an interior component like
-        // `/home` on Unix, not the machine-specific prefix. What must NOT
-        // survive is the drive and the separators.
+        // `bob` is a username here. An earlier version of this test asserted
+        // `Users/bob/a.rs` and justified it by calling `Users` an "interior
+        // component like /home". That was wrong: on Windows `C:\Users\<name>` IS
+        // the home-directory layout, and the leaf-only fallback now keeps
+        // neither `Users` nor `bob`.
         #[cfg(unix)]
         {
             let root = std::path::Path::new("/checkout/project");
@@ -1381,7 +1449,7 @@ mod tests {
                 !title.starts_with("C:") && !title.split('/').any(|c| c.ends_with(':')),
                 "a drive prefix must not reach the title: {title}"
             );
-            assert_eq!(title, "Users/bob/a.rs");
+            assert_eq!(title, "a.rs", "no home-directory component may survive");
         }
     }
 

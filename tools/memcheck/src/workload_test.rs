@@ -1,6 +1,59 @@
 use super::*;
 
 #[test]
+fn test_sample_pids_for_duration_errors_when_no_samples() {
+    // A phase whose measured pids are all gone/unreadable must fail loudly,
+    // not report 0 KiB — 0 belongs only to a process that really used nothing,
+    // and a dead child would otherwise pass every budget gate as a "measured
+    // zero".
+    let err = sample_pids_for_duration(
+        &[u32::MAX],
+        "dead_pids",
+        Duration::from_millis(30),
+        Duration::from_millis(5),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("no usable samples"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[test]
+fn test_sample_pids_for_duration_rejects_empty_pid_list() {
+    let err = sample_pids_for_duration(
+        &[],
+        "no_pids",
+        Duration::from_millis(30),
+        Duration::from_millis(5),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("no pids to sample"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[test]
+fn test_sample_pid_for_duration_errors_when_the_pid_is_never_readable() {
+    // The single-pid sampler had the same 0 KiB hole as the batch one: an
+    // unreadable pid produced an empty sample set, and `build_phase_report`
+    // reports that as rss_max_kib 0 — which passes every budget gate.
+    let err = sample_pid_for_duration(
+        u32::MAX,
+        "dead_pid",
+        Duration::from_millis(30),
+        Duration::from_millis(5),
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("no usable samples"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[test]
 fn test_canonical_phases_order() {
     assert_eq!(
         CANONICAL_PHASES,

@@ -317,12 +317,35 @@ fn run_git_capped(
     args: &[String],
     cap: u64,
 ) -> Result<(Vec<u8>, bool), std::io::Error> {
-    let mut child = Command::new("git")
+    let child = Command::new("git")
         .args(args)
         .current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    drain_git_output(child, cap)
+}
+
+/// Read a spawned child's piped stdout (capped at `cap` bytes) while draining
+/// stderr on a separate thread, then reap it.
+///
+/// Both pipes must be drained concurrently: the OS pipe buffers hold only 64 KiB
+/// each, so a child that fills stderr blocks before finishing stdout — and we
+/// would block on stdout forever (`std::process::Command::output` spawns exactly
+/// these two reader threads for the same reason). The byte cap alone does not
+/// save us: we only notice overflow after seeing it on OUR side, which never
+/// happens while the child is stuck on a full stderr pipe.
+fn drain_git_output(
+    mut child: std::process::Child,
+    cap: u64,
+) -> Result<(Vec<u8>, bool), std::io::Error> {
+    let stderr_thread = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut stderr = Vec::new();
+            let _ = pipe.read_to_end(&mut stderr);
+            stderr
+        })
+    });
     let mut stdout = Vec::new();
     let mut truncated = false;
     if let Some(pipe) = child.stdout.take() {
@@ -334,12 +357,22 @@ fn run_git_capped(
             let _ = child.kill();
         }
     }
-    let output = child.wait_with_output()?;
-    if !truncated && !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let status = child.wait()?;
+    if truncated {
+        // The child was killed; its stderr pipe never hit EOF, so the reader
+        // thread may still be blocked. Abandon it (the kill path hands the
+        // dead child to the OS reaper — no join).
+        return Ok((stdout, true));
+    }
+    let stderr = match stderr_thread {
+        Some(handle) => handle.join().unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if !status.success() {
+        let message = String::from_utf8_lossy(&stderr).trim().to_string();
         return Err(std::io::Error::other(message));
     }
-    Ok((stdout, truncated))
+    Ok((stdout, false))
 }
 
 fn git_args(spec: &DiffSpec, has_head: bool, flags: &[&str]) -> Vec<String> {
@@ -548,10 +581,11 @@ impl GitDiffHandler {
             if let Some((patch, truncated)) = raw.patch.as_ref() {
                 // Re-run with context for readers: the -U0 patch drives symbol
                 // mapping, but a patch a human reads wants 3 lines of context.
-                let readable = readable_patch(&root, &spec).unwrap_or_else(|| patch.clone());
+                let (readable, readable_truncated) =
+                    readable_patch(&root, &spec).unwrap_or_else(|| (patch.clone(), false));
                 let (text, cut) = bound_chars(&readable, max_patch_chars);
                 result["patch"] = Value::String(text);
-                result["patch_truncated"] = Value::Bool(cut || *truncated);
+                result["patch_truncated"] = Value::Bool(cut || *truncated || readable_truncated);
             }
         }
         if !enrich || stat_only || files.is_empty() {
@@ -633,11 +667,11 @@ fn parse_spec(args: &Value) -> Result<DiffSpec, JsonRpcError> {
     })
 }
 
-fn readable_patch(root: &Path, spec: &DiffSpec) -> Option<String> {
+fn readable_patch(root: &Path, spec: &DiffSpec) -> Option<(String, bool)> {
     let has_head = true;
-    let (bytes, _) =
+    let (bytes, truncated) =
         run_git_capped(root, &git_args(spec, has_head, &["-M"]), MAX_DIFF_BYTES).ok()?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    Some((String::from_utf8_lossy(&bytes).into_owned(), truncated))
 }
 
 fn bound_chars(text: &str, max: usize) -> (String, bool) {
@@ -991,5 +1025,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value["is_git_repo"], false);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_drain_git_output_survives_large_stderr() {
+        // Child writes >64 KiB to stderr (fills the OS pipe buffer) before a
+        // small stdout payload. Without the concurrent stderr drain this
+        // deadlocks: the child blocks on stderr, we block on stdout forever.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("noisy-git");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nawk 'BEGIN{for(i=0;i<70000;i++)printf \"x\"}' >&2\nprintf 'ok'\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+        let child = Command::new(&fake)
+            .current_dir(dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (stdout, truncated) = drain_git_output(child, 1024 * 1024).unwrap();
+        assert_eq!(stdout, b"ok");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_readable_patch_reports_bytecap_truncation() {
+        // `readable_patch` re-runs git with -U3 context; when that output
+        // exceeds the 8 MiB cap it must SAY so, or patch_truncated lies for a
+        // cut patch (max_patch_chars up to 200k never cuts a 8 MiB patch).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join("big.txt"), "a".repeat(9 * 1024 * 1024)).unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "first"]);
+        std::fs::write(root.join("big.txt"), "b".repeat(9 * 1024 * 1024)).unwrap();
+        let (_patch, truncated) = readable_patch(root, &DiffSpec::WorkingTree).expect("patch");
+        assert!(truncated, "a >8 MiB readable re-run must report truncation");
     }
 }

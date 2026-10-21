@@ -333,6 +333,26 @@ fn parse_paging(args: &Value) -> Result<(usize, usize, usize, usize), JsonRpcErr
 #[cfg(feature = "structural-search")]
 const LANGUAGE_INFERENCE_FILES: usize = 10_000;
 
+/// Why the inference sample stopped short of the whole scope, one sentence per
+/// cause — the causes are materially different and must not be conflated:
+///
+/// * `limit` — a *result* cap: the 10k-file sample budget ran out. Not time
+///   pressure.
+/// * `deadline` — the wall-clock budget expired mid-walk.
+/// * `skip` — a subtree could not be entered (permissions, bad entries); those
+///   files were never candidates and NEVER will be, whatever the budget.
+fn truncation_reason(
+    truncation: &crate::search::textsearch::engine::InventoryTruncation,
+) -> &'static str {
+    if truncation.skip {
+        "some subtrees could not be read (e.g. permission denied) and were never examined"
+    } else if truncation.limit {
+        "the result cap was reached; further files remain unexamined"
+    } else {
+        "the time budget expired before the scope was fully examined"
+    }
+}
+
 /// Pick the language from the files in scope when the caller named none.
 ///
 /// Refuses to guess between two languages rather than searching the wrong one:
@@ -375,13 +395,20 @@ fn infer_language(
             if truncated {
                 format!(
                     "No structural-search language found in the first \
-                     {LANGUAGE_INFERENCE_FILES} files of scope; more remain unexamined"
+                     {LANGUAGE_INFERENCE_FILES} files of scope: {}",
+                    truncation_reason(&truncation)
                 )
             } else {
                 "No structural-search language found in scope".to_string()
             },
             "Pass \"lang\" explicitly (rust, python, go, typescript, …) or widen the scope",
         )),
+        // Single-language success is deliberately silent about truncation: the
+        // inference is a sample, and the caller only needs *a* language to
+        // compile the pattern, so incompleteness is actionable only when it
+        // matters — the error branches above. The skew risk a truncated sample
+        // hides (e.g. a minority language picked over a hidden majority) is
+        // noted in the shh comment above. Deliberate, not an oversight.
         1 => Ok(languages.into_iter().next().unwrap_or_default().to_string()),
         _ => Err(JsonRpcError::invalid_params_with_suggestion(
             {
@@ -395,8 +422,8 @@ fn infer_language(
                     // concluding the scope is genuinely polyglot.
                     format!(
                         "Scope holds several languages ({found}) in the first \
-                         {LANGUAGE_INFERENCE_FILES} files; more remain unexamined, so this set \
-                         may be incomplete"
+                         {LANGUAGE_INFERENCE_FILES} files: {}; the set may be incomplete",
+                        truncation_reason(&truncation)
                     )
                 } else {
                     format!(
@@ -508,7 +535,7 @@ fn shape(
 
 #[cfg(all(test, feature = "structural-search"))]
 mod tests {
-    use super::{MAX_LIMIT, parse_paging, shape};
+    use super::{MAX_LIMIT, parse_paging, shape, truncation_reason};
     use serde_json::json;
 
     #[test]
@@ -550,5 +577,31 @@ mod tests {
     fn test_per_file_cap_zero_still_means_uncapped() {
         let (_, _, cap, _) = parse_paging(&json!({ "per_file_cap": 0 })).expect("parsed");
         assert_eq!(cap, 0, "0 must survive as NO_CAP");
+    }
+
+    /// Each truncation cause must produce its own message: collapsing them into
+    /// one generic "incomplete" line would tell a caller whose walk hit a
+    /// permission-denied subtree that "more remain unexamined" (they never
+    /// will), and tell a caller whose result cap fired that the time budget cut
+    /// the scan (it did not).
+    #[test]
+    fn test_truncation_reason_distinguishes_causes() {
+        use crate::search::textsearch::engine::InventoryTruncation;
+        let limit = InventoryTruncation {
+            limit: true,
+            ..Default::default()
+        };
+        let deadline = InventoryTruncation {
+            deadline: true,
+            ..Default::default()
+        };
+        let skip = InventoryTruncation {
+            skip: true,
+            ..Default::default()
+        };
+        assert!(truncation_reason(&limit).contains("result cap"));
+        assert!(truncation_reason(&deadline).contains("time budget"));
+        assert!(truncation_reason(&skip).contains("permission denied"));
+        assert!(truncation_reason(&skip).contains("never examined"));
     }
 }

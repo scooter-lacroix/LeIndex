@@ -119,7 +119,7 @@ fn platform_identity(_meta: &std::fs::Metadata) -> (i64, u64) {
 // re-exported here so `engine::list_files` stays the public path.
 #[path = "engine_inventory.rs"]
 mod inventory;
-pub use inventory::{list_files, list_files_matching, list_files_reporting};
+pub use inventory::{InventoryTruncation, list_files, list_files_matching, list_files_reporting};
 
 // ── Index building ───────────────────────────────────────────────────────────
 
@@ -550,8 +550,9 @@ fn root_candidates(
     compiled: &Compiled,
     deadline: Option<Instant>,
     stats: &mut SearchStats,
-) -> Vec<Candidate> {
+) -> (Vec<Candidate>, InventoryTruncation) {
     let mut set: BTreeMap<String, Candidate> = BTreeMap::new();
+    let mut truncation = InventoryTruncation::default();
     let is_file_root = spec.root.is_file();
 
     if is_file_root {
@@ -613,7 +614,9 @@ fn root_candidates(
             );
         }
     } else {
-        for rel in list_files(&spec.root, 1_000_000, deadline) {
+        let (rels, trunc) = list_files_reporting(&spec.root, 1_000_000, deadline);
+        truncation = trunc;
+        for rel in rels {
             set.insert(
                 rel.clone(),
                 Candidate {
@@ -625,9 +628,11 @@ fn root_candidates(
             );
         }
     }
-    set.into_values()
+    let candidates = set
+        .into_values()
         .filter(|c| is_file_root || spec.filter.allows(&c.rel))
-        .collect()
+        .collect();
+    (candidates, truncation)
 }
 
 fn clip_line(line: &[u8], col: usize, max_chars: usize) -> String {
@@ -951,8 +956,24 @@ pub fn search(roots: &[RootSpec], compiled: &Compiled, options: &SearchOptions) 
             used_index: spec.index.is_some() && !spec.root.is_file(),
             files: Vec::new(),
         };
-        let candidates = root_candidates(spec, compiled, options.deadline, &mut output.stats);
+        let (candidates, truncation) =
+            root_candidates(spec, compiled, options.deadline, &mut output.stats);
         output.stats.candidates += candidates.len();
+        if truncation.deadline {
+            output.stopped_by_deadline = true;
+            output.complete = false;
+            output.has_more = true;
+        } else if truncation.truncated() {
+            output.complete = false;
+            output.has_more = true;
+        }
+        if options.deadline.is_some_and(|d| Instant::now() >= d) {
+            output.complete = false;
+            output.stopped_by_deadline = true;
+            output.has_more = true;
+            output.roots.push(root_out);
+            break 'roots;
+        }
         let canonical_root = std::fs::canonicalize(&spec.root).ok();
 
         for chunk in candidates.chunks(chunk_size) {
@@ -1900,6 +1921,30 @@ mod tests {
         assert!(
             dirty.contains(&"a.rs".to_string()),
             "a same-second ctime-only change must be dirty, got {dirty:?}"
+        );
+    }
+
+    #[test]
+    fn test_expired_deadline_reports_incomplete_and_stopped_by_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.txt", "needle\n");
+        let compiled = q("needle").compile().unwrap();
+        let out = search(
+            &[spec(dir.path(), None)],
+            &compiled,
+            &SearchOptions {
+                deadline: Some(Instant::now()),
+                ..Default::default()
+            },
+        );
+        assert!(!out.complete, "expired deadline must not report complete");
+        assert!(
+            out.stopped_by_deadline,
+            "expired deadline must set stopped_by_deadline"
+        );
+        assert!(
+            out.has_more,
+            "expired deadline leaves tree unexamined, so has_more must be true"
         );
     }
 }

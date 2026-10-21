@@ -10,9 +10,10 @@
 //! maintains for the process alone. The `wait4` lifetime mark is retained too,
 //! but only in `DescendantTree::peak_rss_kib`: it folds in every descendant the
 //! process reaped, so it is reported apart from the main-process metric that
-//! the budget ceilings gate on. Other targets only reap commands and retain
-//! any available periodic samples; that fallback cannot establish lifetime
-//! peaks or certify the Linux memory budget.
+//! the budget ceilings gate on. Non-Linux targets are rejected outright by
+//! [`require_linux_measurement_support`] before anything launches: the /proc
+//! sampler and wait4 lifetime peak are both Linux-only, so there is no
+//! degraded-mode fallback to misread.
 //!
 //! Worker-aware extensions (VAL-CPHASE-036): the canonical workload includes
 //! an idle pre-embed phase, a worker-active embed phase, and a phase that
@@ -114,8 +115,8 @@ pub struct WorkloadConfig {
     /// `main.rs`. Worker-active phases run regardless; this only controls
     /// whether a missing worker process produces a diagnostic.
     pub worker_capable: bool,
-    /// Directory for heap-profile snapshots (smaps). If None, profiles are
-    /// stored in a temp dir that is cleaned up after the run.
+    /// Directory for heap-profile snapshots (smaps). If None, no snapshots
+    /// are captured.
     pub heap_profile_dir: Option<PathBuf>,
 }
 
@@ -172,7 +173,7 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
     let mut reports = Vec::with_capacity(CANONICAL_PHASES.len());
 
     // Clean any pre-existing index state so the run is deterministic.
-    clean_index_state(&config.fixture);
+    clean_index_state(&config.fixture)?;
 
     // ── Phase 1: idle_warm ──────────────────────────────────────────────
     // Launch a fresh leindex MCP process and let it sit idle.
@@ -625,6 +626,9 @@ fn sample_pids_for_duration(
     dwell: Duration,
     sample_interval: Duration,
 ) -> Result<PhaseReport> {
+    if pids.is_empty() {
+        anyhow::bail!("phase '{phase_name}' has no pids to sample");
+    }
     let start = Instant::now();
     let mut samples = Vec::new();
 
@@ -632,6 +636,13 @@ fn sample_pids_for_duration(
         let mut combined = 0u64;
         let mut mapped = 0u64;
         let mut anon = 0u64;
+        let mut pss = 0u64;
+        // GPU is a host-global reading, not a per-pid one (the sampler caches it
+        // behind a TTL for exactly that reason), so the first successful
+        // sample's value is this phase's. Discarding it made this phase report
+        // `gpu_vram_mib: None` on a GPU host while every single-pid phase
+        // reported the real figure.
+        let mut gpu = None;
         let mut all_ok = true;
         for &pid in pids {
             match sampler::sample(pid, false) {
@@ -639,6 +650,8 @@ fn sample_pids_for_duration(
                     combined += s.rss_kib;
                     mapped += s.mapped_file_kib;
                     anon += s.anon_kib;
+                    pss += s.pss_kib;
+                    gpu.get_or_insert(s.gpu);
                 }
                 Err(_) => {
                     all_ok = false;
@@ -651,15 +664,21 @@ fn sample_pids_for_duration(
                 rss_kib: combined,
                 mapped_file_kib: mapped,
                 anon_kib: anon,
-                pss_kib: 0,
+                pss_kib: pss,
                 worker_rss_kib: 0,
-                gpu: sampler::GpuSample::default(),
+                gpu: gpu.unwrap_or_default(),
             });
         }
         std::thread::sleep(sample_interval);
     }
 
     let duration = start.elapsed();
+    if samples.is_empty() {
+        anyhow::bail!(
+            "phase '{phase_name}' produced no usable samples: every measured pid was gone or \
+             unreadable for the whole dwell — refusing to report 0 KiB as a measurement"
+        );
+    }
     Ok(build_phase_report(phase_name, &mut samples, duration))
 }
 
@@ -1434,15 +1453,28 @@ fn sample_pid_for_duration(
 ) -> Result<PhaseReport> {
     let start = Instant::now();
     let mut samples = Vec::new();
+    // Distinguish "one tick lost a race with process exit" from "this phase was
+    // never measured". A single failed read is normal (the pid can vanish
+    // between the read and the parse); a phase that produced NO samples at all
+    // is not a measurement, and reporting it as 0 KiB would let an unmeasured
+    // phase pass every budget gate.
+    let mut failed_reads = 0usize;
 
     while start.elapsed() < dwell {
-        if let Ok(s) = sampler::sample(pid, track_worker) {
-            samples.push(s);
+        match sampler::sample(pid, track_worker) {
+            Ok(s) => samples.push(s),
+            Err(_) => failed_reads += 1,
         }
         std::thread::sleep(sample_interval);
     }
 
     let duration = start.elapsed();
+    if samples.is_empty() {
+        anyhow::bail!(
+            "phase '{phase_name}' produced no usable samples: {failed_reads} read(s) of pid {pid} \
+             failed over {duration:?} — refusing to report 0 KiB as a measurement"
+        );
+    }
     Ok(build_phase_report(phase_name, &mut samples, duration))
 }
 
@@ -1524,11 +1556,17 @@ fn build_phase_report(
 }
 
 /// Clean any existing leindex index state from the fixture directory.
-fn clean_index_state(fixture: &Path) {
+///
+/// A leftover index silently invalidates the `index` phase (it would measure
+/// an incremental no-op instead of a cold index), so a failed removal is
+/// surfaced, not swallowed.
+fn clean_index_state(fixture: &Path) -> Result<()> {
     let leindex_dir = fixture.join(".leindex");
     if leindex_dir.exists() {
-        let _ = std::fs::remove_dir_all(&leindex_dir);
+        std::fs::remove_dir_all(&leindex_dir)
+            .with_context(|| format!("failed to remove stale index {}", leindex_dir.display()))?;
     }
+    Ok(())
 }
 
 // ─── §14 Baseline Protocol Extension Phases (WS1 Tasks 5-6) ─────────────
@@ -1791,13 +1829,14 @@ fn run_incremental_one_file_phase(config: &WorkloadConfig) -> Result<PhaseReport
     // Add one new source file before re-indexing.
     let new_file = config.fixture.join("src").join("incremental_one_file.rs");
     if let Some(parent) = new_file.parent() {
-        std::fs::create_dir_all(parent).ok();
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("incremental_one_file: create {}", parent.display()))?;
     }
     std::fs::write(
         &new_file,
         "pub fn incremental_one_file_added() -> u32 { 42 }\n",
     )
-    .ok();
+    .with_context(|| format!("incremental_one_file: write {}", new_file.display()))?;
 
     run_command_phase(config, "incremental_one_file", |bin, fixture| {
         let mut cmd = Command::new(bin);
@@ -1818,13 +1857,14 @@ fn run_incremental_burst_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
             .join("src")
             .join(format!("incremental_burst_{i}.rs"));
         if let Some(parent) = new_file.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("incremental_burst: create {}", parent.display()))?;
         }
         std::fs::write(
             &new_file,
             format!("pub fn burst_fn_{i}() -> u32 {{ {i} }}\n"),
         )
-        .ok();
+        .with_context(|| format!("incremental_burst: write {}", new_file.display()))?;
     }
 
     run_command_phase(config, "incremental_burst", |bin, fixture| {
@@ -1841,7 +1881,8 @@ fn run_incremental_delete_phase(config: &WorkloadConfig) -> Result<PhaseReport> 
     }
     // Remove the file added by incremental_one_file.
     let target = config.fixture.join("src").join("incremental_one_file.rs");
-    std::fs::remove_file(&target).ok();
+    std::fs::remove_file(&target)
+        .with_context(|| format!("incremental_delete: remove {}", target.display()))?;
 
     run_command_phase(config, "incremental_delete", |bin, fixture| {
         let mut cmd = Command::new(bin);
@@ -1874,9 +1915,10 @@ fn run_query_suite_cold_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
         cmd
     })?;
 
-    // Run remaining queries (no RSS sampling, just exercise the cold path).
+    // Run remaining queries (no RSS sampling, just exercise the cold path). A
+    // failed query must fail the phase, not let the suite claim it ran.
     for &query in &QUERY_SUITE[1..] {
-        let _ = Command::new(&config.binary)
+        let status = Command::new(&config.binary)
             .arg("search")
             .arg(query)
             .arg("--project")
@@ -1884,7 +1926,11 @@ fn run_query_suite_cold_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
             .current_dir(&config.fixture)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status()
+            .with_context(|| format!("query_suite_cold: failed to launch query '{query}'"))?;
+        if !status.success() {
+            anyhow::bail!("query_suite_cold: query '{query}' exited with {status}");
+        }
     }
 
     Ok(report)
@@ -1912,9 +1958,10 @@ fn run_query_suite_warm_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
         cmd
     })?;
 
-    // Run remaining queries.
+    // Run remaining queries. A failing query must fail the phase, not let
+    // the suite claim it ran.
     for &query in &QUERY_SUITE[1..] {
-        let _ = Command::new(&config.binary)
+        let status = Command::new(&config.binary)
             .arg("search")
             .arg(query)
             .arg("--project")
@@ -1922,7 +1969,11 @@ fn run_query_suite_warm_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
             .current_dir(&config.fixture)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status()
+            .with_context(|| format!("query_suite_warm: failed to launch query '{query}'"))?;
+        if !status.success() {
+            anyhow::bail!("query_suite_warm: query '{query}' exited with {status}");
+        }
     }
 
     Ok(report)

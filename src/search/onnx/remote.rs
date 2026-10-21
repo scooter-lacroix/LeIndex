@@ -580,26 +580,95 @@ fn apply_template<'a>(template: Option<&str>, text: &'a str) -> std::borrow::Cow
 /// model card mandates `title: none` when no title is available, so callers
 /// without a title (queries aside, the title-less doc paths, fragments)
 /// pass `None` and every `{title}` placeholder resolves to `none`.
+///
+/// Substitution is a SINGLE LEFT-TO-RIGHT PASS over the template, and neither
+/// substituted value is ever rescanned. Replacing `{title}` and then searching
+/// the already-filled string for `{text}` — which is what this used to do —
+/// let a title containing the literal `{text}` swallow the document body: a
+/// source file legitimately named `{text}.rs` produces exactly that title, and
+/// its embedding would be built from the body twice and no title at all.
 fn apply_doc_template<'a>(
     template: Option<&str>,
     title: Option<&str>,
     text: &'a str,
 ) -> std::borrow::Cow<'a, str> {
     let title = title.unwrap_or("none");
-    match template {
-        None => std::borrow::Cow::Borrowed(text),
-        Some(t) => {
-            let filled = if t.contains("{title}") {
-                t.replace("{title}", title)
-            } else {
-                t.to_string()
-            };
-            if filled.contains("{text}") {
-                std::borrow::Cow::Owned(filled.replace("{text}", text))
-            } else {
-                std::borrow::Cow::Owned(format!("{filled} {text}"))
-            }
+    let Some(template) = template else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+    if !template.contains("{text}") && !template.contains("{title}") {
+        // Prefix-only template: prepend and separate.
+        return std::borrow::Cow::Owned(format!("{template} {text}"));
+    }
+    let mut out = String::with_capacity(template.len() + text.len() + title.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open..];
+        if let Some(tail) = after.strip_prefix("{title}") {
+            out.push_str(title);
+            rest = tail;
+        } else if let Some(tail) = after.strip_prefix("{text}") {
+            out.push_str(text);
+            rest = tail;
+        } else {
+            // A literal brace that starts no placeholder.
+            out.push('{');
+            rest = &after[1..];
         }
+    }
+    out.push_str(rest);
+    // A template with `{title}` but no `{text}` still needs the body appended,
+    // matching the historical behaviour.
+    if !template.contains("{text}") {
+        out.push(' ');
+        out.push_str(text);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::apply_doc_template;
+
+    #[test]
+    fn test_title_containing_a_placeholder_does_not_swallow_the_body() {
+        // A source file named `{text}.rs` yields exactly this title. The old
+        // two-pass replace substituted the BODY into the title slot.
+        let out = apply_doc_template(
+            Some("title: {title} | text: {text}"),
+            Some("{text}.rs"),
+            "BODY",
+        );
+        assert_eq!(
+            out, "title: {text}.rs | text: BODY",
+            "a title must be inserted verbatim and never rescanned for placeholders"
+        );
+        assert!(
+            !out.contains("text: BODY |"),
+            "the body must not replace the title"
+        );
+    }
+
+    #[test]
+    fn test_missing_title_resolves_to_none() {
+        assert_eq!(
+            apply_doc_template(Some("title: {title} | text: {text}"), None, "B"),
+            "title: none | text: B"
+        );
+    }
+
+    #[test]
+    fn test_prefix_only_template_appends_the_body() {
+        assert_eq!(
+            apply_doc_template(Some("search_document:"), None, "B"),
+            "search_document: B"
+        );
+    }
+
+    #[test]
+    fn test_no_template_returns_the_raw_text() {
+        assert_eq!(apply_doc_template(None, Some("t"), "B"), "B");
     }
 }
 
@@ -953,13 +1022,18 @@ fn template_fingerprint(doc: Option<&str>, query: Option<&str>) -> Option<String
     }
     let version = TEMPLATE_SEMANTICS_VERSION.to_string();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for part in [
-        version.as_str(),
-        "\u{0}",
-        doc.unwrap_or(""),
-        "\u{0}",
-        query.unwrap_or(""),
-    ] {
+    // Each part is LENGTH-PREFIXED before it is folded in. Joining parts with a
+    // bare separator — which is what this did — is not injective: a document
+    // template ending in a separator and a query template starting with one are
+    // indistinguishable from the split one byte to the left, so two different
+    // template pairs produce the same fingerprint and reuse each other's cached
+    // vectors, in a different vector space. The length makes the encoding
+    // injective without needing an escape character at all.
+    for part in [version.as_str(), doc.unwrap_or(""), query.unwrap_or("")] {
+        for byte in part.len().to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0010_0000_01b3);
+        }
         for byte in part.as_bytes() {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x0010_0000_01b3);
@@ -1144,6 +1218,23 @@ mod tests {
             template_fingerprint(Some(doc), None),
             Some(format!("tpl{lexical:016x}")),
             "the fingerprint must vary with substitution semantics, not only the text"
+        );
+    }
+
+    #[test]
+    fn test_template_fingerprint_cannot_collide_across_part_boundaries() {
+        // `("a\0", "b")` and `("a", "\0b")` are different template pairs — the
+        // document template ends in a NUL vs the query template begins with one
+        // — but a bare-separator join is not injective: both encode to the same
+        // byte stream `a\0\0b`, so they shared a fingerprint and therefore a
+        // cache namespace. Length-prefixing each part makes the encoding
+        // injective, whatever bytes the templates contain.
+        let left = template_fingerprint(Some("a\u{0}"), Some("b"));
+        let right = template_fingerprint(Some("a"), Some("\u{0}b"));
+        assert!(left.is_some() && right.is_some());
+        assert_ne!(
+            left, right,
+            "templates that differ only in where a separator falls must not share a fingerprint"
         );
     }
 
