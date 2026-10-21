@@ -765,6 +765,29 @@ fn build_remote_decision(
     QueryNeuralDecision::Remote(Box::new(embedder))
 }
 
+/// How many neural rows the tier sidecars would actually contribute to a query
+/// under `embeddings_cfg`, counted with the SAME loader the restore paths use so
+/// the number cannot drift from the rows that are really read back.
+///
+/// Returns 0 when the effective policy is `Off` — sidecars are deliberately not
+/// restored then — and when every sidecar is rejected by the generation gates
+/// (policy mismatch, foreign identity, disagreement with the committed row count,
+/// unreadable file).
+#[cfg(all(feature = "onnx", feature = "remote-embeddings"))]
+fn admitted_neural_tier_rows(
+    artifact_path: &std::path::Path,
+    expected_identity: Option<&str>,
+    embeddings_cfg: &crate::config::EmbeddingConfig,
+) -> usize {
+    if embeddings_cfg.effective_matryoshka() == crate::config::MatryoshkaSetting::Off {
+        return 0;
+    }
+    index_builder::load_neural_tier_mmaps_from_storage(artifact_path, expected_identity)
+        .iter()
+        .map(|index| index.len())
+        .sum()
+}
+
 /// Query-time remote embedder for a hydrated generation. The generation's
 /// persisted neural rows are authoritative: when their dimension disagrees
 /// with the dimension config pins for the remote endpoint, the rows came from
@@ -805,13 +828,33 @@ pub(crate) fn query_remote_embedder(
     // instead of providing the rollback (Codex P1). Disable neural scoring
     // instead. The file is left untouched, so the identity metadata survives
     // and re-enabling the flag resumes the generation.
-    if mmap.is_empty()
-        && embeddings_cfg.effective_matryoshka() == crate::config::MatryoshkaSetting::Off
-    {
+    //
+    // The same decision applies with Matryoshka ENABLED when the sidecars are
+    // present but rejected — a policy mismatch in
+    // `load_neural_tier_mmaps_from_storage`, a generation-identity mismatch, a
+    // row-count disagreement with the committed manifest, or an unreadable tier
+    // file all yield an empty loader result. Gating on the flag alone left that
+    // shape enabled with zero admitted rows, which reorders results the same way
+    // (Codex P2). So the gate is "no rows were admitted, from either store",
+    // which is what actually decides whether a neural score can exist.
+    //
+    // An absent canonical file is NOT this case: it is indistinguishable from a
+    // first run, so config decides there (the early return above). And a
+    // zero-row header is never accompanied by a NATIVE-dimension tier — the
+    // canonical bucket always wins that dimension on persist — so on a native
+    // generation with no sidecar this check stays quiet and the identity gets
+    // its chance below.
+    let admitted_rows = if mmap.is_empty() {
+        admitted_neural_tier_rows(artifact_path, persisted_identity, embeddings_cfg)
+    } else {
+        mmap.len()
+    };
+    if admitted_rows == 0 {
         info!(
             dim = persisted_dim,
-            "Persisted neural canonical file carries identity only (zero rows) and \
-             Matryoshka slicing is disabled; treating it as no neural generation"
+            "Persisted neural canonical file advertises a generation but admits no rows \
+             (zero-row header and no loadable tier for the effective policy); treating it \
+             as no neural generation so all-zero scores cannot distort ranking"
         );
         return QueryNeuralDecision::DisableNeural;
     }
@@ -1053,9 +1096,19 @@ mod tests {
             },
         );
 
-        // The gate is scoped to the disabled flag, not to emptiness: with the
-        // rollout enabled the sidecars are restored and the header is the
-        // generation's live identity again.
+        // The gate is about ADMITTED ROWS, not about emptiness or the flag. With
+        // the flag on but no sidecar on disk there is still nothing to score, so
+        // flag-on does not by itself make the header a live generation — it
+        // returns `DisableNeural` for the same all-zero-score reason the flag-off
+        // arm does. What flag-on must NOT do is overfire once rows exist, which
+        // the sidecar added here proves: one admissible tier and the header keeps
+        // its remote query embedder.
+        crate::search::vector::write_mmap_embeddings_with_identity(
+            &storage.join("neural_embeddings_128.bin"),
+            &[("sample".to_string(), vec![0.5; 128])],
+            Some(&identity),
+        )
+        .expect("write admissible tier");
         crate::feature_flags::with_flag_override(
             crate::feature_flags::FeatureFlag::Matryoshka,
             true,
@@ -1072,7 +1125,70 @@ mod tests {
                         query_remote_embedder(&tfidf, &storage, &cfg),
                         QueryNeuralDecision::Remote(_)
                     ),
-                    "identity-only header with Matryoshka enabled remains a live generation"
+                    "an identity-only header with an ADMISSIBLE tier is a live generation"
+                );
+            },
+        );
+    }
+
+    /// Matryoshka ENABLED, header present, sidecar present but INADMISSIBLE: no
+    /// row reaches the query, so neural scoring must be disabled or the scorer
+    /// applies the configured neural weight to all-zero cosines — the same
+    /// distortion the flag-off gate prevents. Gating on the rollback flag alone
+    /// let this shape through (Codex P2).
+    ///
+    /// The sidecar is rejected on its generation identity, which is the property
+    /// this test is about: a foreign-generation tier contributes no rows and must
+    /// not be mistaken for a live generation just because a header names one.
+    #[test]
+    #[cfg(feature = "onnx")]
+    fn test_query_embedder_disables_neural_when_tiers_are_inadmissible() {
+        let tfidf =
+            index_builder::TfIdfEmbedder::build(&[("sample.rs".into(), "fn sample() {}".into())]);
+        let cfg = crate::config::EmbeddingConfig {
+            matryoshka: crate::config::MatryoshkaSetting::Dim128,
+            ..crate::config::EmbeddingConfig::default()
+        };
+
+        let project = tempfile::tempdir().expect("tier-only generation");
+        let storage = project.path().join(".leindex");
+        std::fs::create_dir_all(&storage).expect("storage dir");
+        let identity = configured_remote_identity(&cfg, 768).expect("configured identity");
+        // Zero-row header: the generation identity and native dimension survive,
+        // but no rows do.
+        crate::search::vector::write_empty_mmap_embeddings_with_identity(
+            &storage.join("neural_embeddings.bin"),
+            768,
+            Some(&identity),
+        )
+        .expect("write identity-only header");
+        // A real MRL tier from a DIFFERENT generation: the loader's identity gate
+        // rejects it, so the admitted row count is zero while the header still
+        // advertises a generation. (A native-dimension sidecar would NOT do here:
+        // the duplicate check keys off a non-empty canonical, so a zero-row header
+        // leaves it admitted.)
+        crate::search::vector::write_mmap_embeddings_with_identity(
+            &storage.join("neural_embeddings_128.bin"),
+            &[("sample".to_string(), vec![0.5; 128])],
+            Some("remote|other-provider|other-model|128"),
+        )
+        .expect("write foreign-generation tier");
+
+        crate::feature_flags::with_flag_override(
+            crate::feature_flags::FeatureFlag::Matryoshka,
+            true,
+            || {
+                assert_eq!(
+                    admitted_neural_tier_rows(&storage, Some(&identity), &cfg),
+                    0,
+                    "the foreign-generation tier must be rejected, or this test proves nothing"
+                );
+                assert!(
+                    matches!(
+                        query_remote_embedder(&tfidf, &storage, &cfg),
+                        QueryNeuralDecision::DisableNeural
+                    ),
+                    "a generation that admits no neural rows must not enable neural scoring"
                 );
             },
         );
