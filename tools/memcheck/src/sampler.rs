@@ -474,6 +474,20 @@ pub struct DescendantTree {
     /// honest. 0 when no kernel lifetime reading was available.
     #[serde(default)]
     pub peak_rss_kib: u64,
+    /// The descendant pids themselves, sorted.
+    ///
+    /// `by_name` is a flat name → count map, so it cannot tell this process's
+    /// `sleep` from one a sibling test spawned — which is why the
+    /// "child is gone" assertion used to bypass this module and poke
+    /// `/proc/<pid>` directly. Carrying the pids lets a test ask the tree the
+    /// question it actually has an answer for (`pids.contains(&child_pid)`)
+    /// instead of testing the OS with the module under test skipped.
+    ///
+    /// `default` + `skip_serializing_if` so the committed baselines under
+    /// `docs/memory/baselines/` keep parsing and don't record pids that are
+    /// meaningless after the run that produced them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pids: Vec<u32>,
 }
 
 use std::collections::HashMap;
@@ -549,10 +563,12 @@ pub fn count_descendants(root_pid: u32) -> std::io::Result<DescendantTree> {
                 tree.total += 1;
                 *tree.by_name.entry(name.clone()).or_insert(0) += 1;
                 tree.combined_rss_kib += rss;
+                tree.pids.push(pid);
                 queue.push_back(pid);
             }
         }
     }
+    tree.pids.sort_unstable();
 
     Ok(tree)
 }
@@ -696,54 +712,59 @@ mod tests {
             .arg("5")
             .spawn()
             .unwrap();
+        let child_pid = child.id();
         // Brief wait for /proc to reflect the child
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let tree = count_descendants(std::process::id()).unwrap();
+        // Named by PID, so a sibling test's `sleep` cannot stand in for ours.
+        // This is the assertion `by_name` could never make: `{"sleep": 1}` is
+        // whatever `sleep` a sibling spawned, which is how the old
+        // `!by_name.contains_key("sleep")` raced in CI.
         assert!(
-            tree.total >= 1,
-            "should find at least 1 descendant (the sleep child), got {}",
-            tree.total
+            tree.pids.contains(&child_pid),
+            "count_descendants must report the sleep child we spawned (pid {child_pid}), \
+             got pids {:?}",
+            tree.pids
         );
-        // The child should appear in by_name
         assert!(
-            tree.by_name.contains_key("sleep") || tree.by_name.values().sum::<usize>() >= 1,
-            "by_name should contain the child process"
+            tree.by_name.contains_key("sleep"),
+            "by_name should account for the child as a sleep: {:?}",
+            tree.by_name
         );
+
         child.kill().ok();
         child.wait().ok();
-
-        // After killing, OUR child must be gone from the process table, and the
-        // ONLY way to name our child is by pid. `DescendantTree::by_name` is a
-        // flat name → count map (`{"sh": 1, "sleep": 1}`), so it cannot tell our
-        // `sleep` from one any sibling test spawned — asserting
-        // `!by_name.contains_key("sleep")` races with every other test in this
-        // binary that shells out, which is precisely how this failed in CI (a
-        // sibling's `sh` and `sleep` were live). A global `total == 0` races the
-        // same way. Poll `/proc/<pid>`: scoped to the pid we spawned alone.
-        let child_pid = child.id();
-        let proc_entry = format!("/proc/{child_pid}");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::path::Path::new(&proc_entry).exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            !std::path::Path::new(&proc_entry).exists(),
-            "spawned child (pid {child_pid}) must be reaped after kill + wait"
-        );
     }
 
     #[test]
     fn test_count_descendants_no_children() {
-        // The test process might have residual children from other tests
-        // running concurrently (e.g. test_count_descendants_includes_spawned_child
-        // spawns a "sleep"). We only check that total is small (no big tree).
-        let tree = count_descendants(std::process::id()).unwrap();
-        assert!(
-            tree.total < 5,
-            "test process should have very few descendants: {} found: {:?}",
+        // No global bound. `tree.total < 5` counted every process whose PPID
+        // chain reaches this test binary — including children spawned by
+        // sibling tests in the same run (`workload_test.rs` shells out in five
+        // of them, and CI runs this crate's tests on parallel threads and 5x
+        // over). That assertion shape races by construction, and a threshold
+        // that had to be re-tuned per CI load was never testing this function.
+        //
+        // What is actually assertable here: the walk is well-formed — it counts
+        // what it lists, and it never reports the root as its own descendant.
+        let root = std::process::id();
+        let tree = count_descendants(root).unwrap();
+        assert_eq!(
             tree.total,
+            tree.by_name.values().sum::<usize>(),
+            "by_name must account for every descendant counted: {:?}",
             tree.by_name
+        );
+        assert_eq!(
+            tree.pids.len(),
+            tree.total,
+            "pids must name every descendant counted: {:?}",
+            tree.pids
+        );
+        assert!(
+            !tree.pids.contains(&root),
+            "the root process must not be reported as its own descendant"
         );
     }
 
@@ -776,10 +797,11 @@ mod tests {
         let mut by_name = HashMap::new();
         by_name.insert("leindex-embed".to_string(), 1);
         let tree = DescendantTree {
-            total: 1,
+            total: 2,
             by_name,
             combined_rss_kib: 50000,
             peak_rss_kib: 735848,
+            pids: vec![4242, 4243],
         };
         let json = serde_json::to_string(&tree).unwrap();
         let deserialized: DescendantTree = serde_json::from_str(&json).unwrap();
