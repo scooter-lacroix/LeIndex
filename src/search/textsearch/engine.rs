@@ -686,16 +686,57 @@ fn context_lines(
     (before, after)
 }
 
-fn read_scan_file(path: &Path) -> Option<Vec<u8>> {
-    let meta = std::fs::metadata(path).ok()?;
+/// Why a candidate yielded no bytes to scan.
+///
+/// The two halves mean opposite things to a caller: [`NotScannable`] input is
+/// *legitimately* unmatched — nothing a pattern could match lives in a binary
+/// or an oversized file, so it is a clean miss — while [`Unreadable`] names a
+/// file this scan never examined, whose matches are unknown rather than absent.
+/// Collapsing them into one `None` let a structural search answer
+/// `has_more: false` over a file it had failed to open (Codex P2).
+///
+/// [`NotScannable`]: ScanRefusal::NotScannable
+/// [`Unreadable`]: ScanRefusal::Unreadable
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanRefusal {
+    /// Policy says this input is not source we scan: not a regular file,
+    /// oversized, binary, or not valid UTF-8.
+    NotScannable,
+    /// The file could not be read — a stat or open failure such as denied
+    /// permissions or a transient I/O error. Its contents are unknown, so a
+    /// caller must not treat it as having been searched and come up empty.
+    Unreadable,
+}
+
+fn read_scan_file(path: &Path) -> Result<Vec<u8>, ScanRefusal> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        // A path that no longer exists has no contents to find, so it is not an
+        // unknown file: reporting it unreadable would pin a caller's
+        // "incomplete" flag forever on a broken symlink or a file that moved
+        // between the walk and this open.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ScanRefusal::NotScannable);
+        }
+        Err(_) => return Err(ScanRefusal::Unreadable),
+    };
     if !meta.is_file() || meta.len() > MAX_SCAN_FILE_BYTES {
-        return None;
+        return Err(ScanRefusal::NotScannable);
     }
-    let data = std::fs::read(path).ok()?;
+    let data = std::fs::read(path).map_err(|error| {
+        // Same race as the stat above: a file that vanished between the walk
+        // and this read has no contents to find, so it is a clean miss, not an
+        // unknown file whose absence must pin `has_more`.
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ScanRefusal::NotScannable
+        } else {
+            ScanRefusal::Unreadable
+        }
+    })?;
     if looks_binary(&data) {
-        return None;
+        return Err(ScanRefusal::NotScannable);
     }
-    Some(data)
+    Ok(data)
 }
 
 /// Read a file as text under the same policy a scan uses: regular file, no
@@ -705,8 +746,22 @@ fn read_scan_file(path: &Path) -> Option<Vec<u8>> {
 /// bytes from [`read_scan_file`] are converted here rather than duplicating the
 /// size and binary rules in a second module where they could drift.
 /// Non-UTF-8 files are skipped: they cannot be handed to ast-grep.
+///
+/// Use [`read_scannable_reason`] when the caller must tell a policy refusal
+/// from a file it failed to read.
 pub fn read_scannable(path: &Path) -> Option<String> {
-    String::from_utf8(read_scan_file(path)?).ok()
+    read_scannable_reason(path).ok()
+}
+
+/// [`read_scannable`], keeping the reason so a caller can distinguish policy
+/// refusals from files it could not open.
+pub fn read_scannable_reason(path: &Path) -> Result<String, ScanRefusal> {
+    match String::from_utf8(read_scan_file(path)?) {
+        Ok(text) => Ok(text),
+        // Valid UTF-8 is a precondition of parsing, not a read failure: the
+        // bytes were read fine and simply cannot hold an ast-grep match.
+        Err(_) => Err(ScanRefusal::NotScannable),
+    }
 }
 
 fn resolve_symbol_index<'a>(
@@ -816,7 +871,11 @@ fn scan_file(
     if !index_candidate_contained(candidate, root_canonical) {
         return None;
     }
-    let data = read_scan_file(&candidate.abs)?;
+    // Text search keeps its historical shape: a file it cannot read is a
+    // non-match, not an incomplete result. `has_more` for this axis is built
+    // from the index plan, not from per-file read outcomes, so a refusal here
+    // is dropped rather than escalated.
+    let data = read_scan_file(&candidate.abs).ok()?;
     let symbol_index = resolve_symbol_index(index, candidate, options);
     let mut result = FileResult {
         rel: candidate.rel.clone(),

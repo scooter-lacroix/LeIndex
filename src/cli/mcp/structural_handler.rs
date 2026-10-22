@@ -512,6 +512,7 @@ fn shape(
             "candidates": output.stats.candidates,
             "scanned": output.stats.scanned,
             "skipped_deadline": output.stats.skipped_deadline,
+            "unreadable": output.stats.unreadable,
             "files_matched": output.stats.files_matched,
             "files_capped": output.stats.files_capped,
             "millis": output.stats.millis,

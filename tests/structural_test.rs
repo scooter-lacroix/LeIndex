@@ -680,6 +680,125 @@ fn test_scan_loop_deadline_accounting_sums_to_candidates() {
     }
 }
 
+/// A candidate that cannot be READ is not a candidate that cannot MATCH.
+///
+/// `has_more` used to count only deadline skips and listing truncations, so a
+/// file the process could not open — denied permissions, transient I/O — was
+/// dropped from the scan and the search still answered `has_more: false`. A
+/// caller reads that as "the tree was searched and holds nothing", which is
+/// false: those contents were never examined (Codex P2).
+///
+/// The same change must NOT count policy refusals, or every tree containing a
+/// binary would pin `has_more` forever. Both halves are asserted here on one
+/// tree: one readable file with a match, one unreadable `.rs`, one binary `.rs`.
+#[test]
+#[cfg(unix)]
+fn test_unreadable_candidate_makes_the_result_incomplete() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "src/ok.rs", "fn visible() {}\n");
+    // Binary: byte 0 is NUL inside the sniff window, so the engine refuses it by
+    // POLICY. It must not contribute to completeness.
+    fs::write(dir.path().join("src/blob.rs"), b"\0binary\x01payload").expect("write blob");
+    // Readable metadata, unreadable bytes: chmod 000 means `fs::read` fails with
+    // EACCES while the walk still enumerates the path as a candidate.
+    let denied = dir.path().join("src/denied.rs");
+    fs::write(&denied, "fn hidden() {}\n").expect("write denied");
+    fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    // Prove the denial BEFORE running the search, while the mode is still 000:
+    // checking after a restore would only prove the file is readable again.
+    assert!(
+        fs::read(&denied).is_err(),
+        "chmod 000 must actually deny the read, or this test is vacuous \
+         (a privileged user ignores the permission bits)"
+    );
+
+    let pattern = CompiledPattern::new("rust", "fn $NAME() { $$$BODY }").expect("pattern");
+    let output = search_structural(
+        dir.path(),
+        &pattern,
+        &FileFilter::default(),
+        &options(100, NO_CAP),
+    );
+
+    // Restore right after the scan so a failure below cannot leave a file the
+    // test harness struggles to remove.
+    fs::set_permissions(&denied, fs::Permissions::from_mode(0o644)).expect("restore chmod");
+
+    assert_eq!(
+        output.stats.unreadable, 1,
+        "the unreadable candidate must be classified as unreadable, not as a \
+         policy refusal: stats {:?}",
+        output.stats
+    );
+    assert!(
+        output.has_more,
+        "a file the search could not open may hold matches, so the result must \
+         not claim completeness"
+    );
+    assert!(
+        !output.stopped_by_deadline,
+        "an I/O failure is not time pressure: stopped_by_deadline may only cite \
+         the deadline"
+    );
+    assert_eq!(
+        output.stats.skipped_deadline, 0,
+        "no candidate was skipped on the deadline"
+    );
+    assert_eq!(
+        output.stats.candidates, 3,
+        "readable, binary and unreadable were all enumerated"
+    );
+    // The readable file still contributes normally, so the fix did not turn the
+    // whole scan into a failure.
+    assert_eq!(output.stats.scanned, 1, "only the readable file was parsed");
+    assert_eq!(
+        hits(&output),
+        vec![("src/ok.rs".to_string(), 1)],
+        "the readable match must still be reported"
+    );
+}
+
+/// The mirror half: policy refusals alone must leave `has_more` false.
+///
+/// Without this, "count unreadable files" could be implemented as "count
+/// everything `read_scannable` refused", which pins `has_more` on any tree that
+/// contains a single binary or non-UTF-8 file.
+#[test]
+fn test_policy_refusals_do_not_claim_incompleteness() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "src/ok.rs", "fn visible() {}\n");
+    fs::write(dir.path().join("src/blob.rs"), b"\0binary\x01payload").expect("write blob");
+    // Valid bytes, invalid UTF-8: read fine, but unstoppable by ast-grep.
+    fs::write(dir.path().join("src/latin1.rs"), [0xFF, 0xFE, 0x41]).expect("write latin1");
+
+    let pattern = CompiledPattern::new("rust", "fn $NAME() { $$$BODY }").expect("pattern");
+    let output = search_structural(
+        dir.path(),
+        &pattern,
+        &FileFilter::default(),
+        &options(100, NO_CAP),
+    );
+
+    assert_eq!(
+        output.stats.unreadable, 0,
+        "policy refusals are not read failures: stats {:?}",
+        output.stats
+    );
+    assert!(
+        !output.has_more,
+        "no pattern can match a binary or non-UTF-8 file, so a clean page is \
+         complete — counting them would pin has_more on every such tree"
+    );
+    assert_eq!(
+        hits(&output),
+        vec![("src/ok.rs".to_string(), 1)],
+        "the readable match is still reported"
+    );
+}
+
 /// The per-candidate deadline checks run BETWEEN scans, so a worker that starts
 /// just before expiry still runs its full read + parse to completion — rayon
 /// cannot cancel it and ast-grep exposes no cancellation hook. A collect that

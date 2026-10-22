@@ -39,10 +39,12 @@
 //! enumeration is as partial as one that expires during parsing; the *cause*
 //! decides [`StructuralOutput::stopped_by_deadline`], which may only cite the
 //! time budget. Contents are
-//! read through [`engine::read_scannable`], so the binary and size limits stay
-//! the engine's rather than becoming a second policy that could drift.
+//! read through [`engine::read_scannable_reason`], so the binary and size
+//! limits stay the engine's rather than becoming a second policy that could
+//! drift, and a file that could not be read is told apart from a policy
+//! refusal.
 
-use super::engine::{list_files_matching, read_scannable};
+use super::engine::{ScanRefusal, list_files_matching, read_scannable_reason};
 use super::glob::FileFilter;
 use crate::parse::grammar::LanguageId;
 use ast_grep_core::Language;
@@ -153,6 +155,12 @@ pub struct StructuralStats {
     /// means the result is partial: an unexamined file may still hold matches,
     /// so `has_more` is forced true rather than reporting a clean page.
     pub skipped_deadline: usize,
+    /// Candidates that could not be read (denied permissions, transient I/O),
+    /// so their contents are unknown rather than known-empty. Like
+    /// [`StructuralStats::skipped_deadline`] this makes the result partial, but
+    /// it is reported apart from it: the scan never ran out of time, so
+    /// `stopped_by_deadline` cannot cite it.
+    pub unreadable: usize,
     /// Files with at least one match, including files paged out by `offset`.
     pub files_matched: usize,
     /// Matches found, before the per-file cap and paging.
@@ -583,13 +591,19 @@ pub fn search(
     //     still hold matches, so the result is partial; the same applies to a
     //     file that was opened but whose scan was refused because the budget
     //     expired before its parse could start;
-    //   * `read_scannable` refused the file (binary, oversized, unreadable) —
-    //     legitimately not matched, and counting it as incomplete would pin
-    //     `has_more` forever on any tree containing a binary.
+    //   * `read_scannable` refused the file on POLICY (binary, oversized, not
+    //     UTF-8, or gone) — legitimately not matched, and counting it as
+    //     incomplete would pin `has_more` forever on any tree containing a
+    //     binary;
+    //   * the file could not be READ (denied permissions, transient I/O) — it
+    //     was never examined, so its matches are unknown rather than absent,
+    //     and reporting a clean page over it is the false negative Codex P2
+    //     flagged. Only this half counts toward `has_more`.
     // They are distinguished here rather than lumped into `None`, or the
     // deadline fix becomes a permanent false alarm.
     let deadline_skips = std::sync::atomic::AtomicUsize::new(0);
-    let read_failures = std::sync::atomic::AtomicUsize::new(0);
+    let unreadable = std::sync::atomic::AtomicUsize::new(0);
+    let policy_refusals = std::sync::atomic::AtomicUsize::new(0);
     let deadline = options.deadline;
     let scanned: Vec<Option<StructuralFile>> = rels
         .par_iter()
@@ -598,10 +612,14 @@ pub fn search(
                 deadline_skips.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return None;
             }
-            let source = match read_scannable(&root.join(rel)) {
-                Some(source) => source,
-                None => {
-                    read_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let source = match read_scannable_reason(&root.join(rel)) {
+                Ok(source) => source,
+                Err(ScanRefusal::Unreadable) => {
+                    unreadable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
+                Err(ScanRefusal::NotScannable) => {
+                    policy_refusals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return None;
                 }
             };
@@ -619,10 +637,16 @@ pub fn search(
         .collect();
 
     let skipped_deadline = deadline_skips.into_inner();
+    let unreadable = unreadable.into_inner();
+    // `scanned` means PARSED, so every candidate that never reached ast-grep is
+    // subtracted: deadline skips, unreadable files AND policy refusals. Only
+    // the reason differs — a binary is a clean miss, an unreadable file is an
+    // unknown — and that difference is carried by `has_more`, not here.
     output.stats.scanned = rels
         .len()
-        .saturating_sub(skipped_deadline + read_failures.into_inner());
+        .saturating_sub(skipped_deadline + unreadable + policy_refusals.into_inner());
     output.stats.skipped_deadline = skipped_deadline;
+    output.stats.unreadable = unreadable;
 
     let mut files: Vec<StructuralFile> = scanned.into_iter().flatten().collect();
     // Deterministic order keeps `offset`/`limit` paging stable even if the
@@ -669,11 +693,21 @@ pub fn search(
         || truncation.deadline
         || deadline.is_some_and(|d| Instant::now() >= d);
     // `has_more`, by contrast, only needs *some* tree left unexamined — a limit
-    // truncation counts, because those files were never candidates, and so does
-    // a subtree the OS refused to open, because those files can never become
-    // candidates either.
-    output.has_more =
-        output.returned < paged || output.stopped_by_deadline || truncation.truncated();
+    // truncation counts, because those files were never candidates; so does a
+    // subtree the OS refused to open, because those files can never become
+    // candidates either; and so does a candidate that RESISTED READING, because
+    // its matches are unknown rather than absent. That last term is what stops
+    // a permissions or I/O failure from being answered with a clean
+    // `has_more: false` over a file that was never searched (Codex P2). Policy
+    // refusals (binary, oversized, not UTF-8, gone) are excluded on purpose —
+    // no pattern can match them, so counting them would pin `has_more` on every
+    // tree containing a binary. `stopped_by_deadline` deliberately omits
+    // `unreadable`: that flag claims the time budget cut the scan, and an I/O
+    // failure is not time pressure.
+    output.has_more = output.returned < paged
+        || output.stopped_by_deadline
+        || truncation.truncated()
+        || output.stats.unreadable > 0;
     output.stats.millis = started.elapsed().as_millis();
     output
 }
