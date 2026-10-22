@@ -315,18 +315,26 @@ fn walk_inventory(
             truncation.skip = true;
             continue;
         };
-        // Per-entry skips are SILENT, deliberately: an entry that errors, a
-        // `file_type()` we cannot read, or a name that is not UTF-8 can never
-        // become a candidate — every path downstream is a `String` — so this
-        // listing still describes every matchable file in the tree. `skip` is
-        // reserved for the `read_dir` failure above, where a whole UNEXAMINED
-        // subtree is dropped. Counting never-matchable files as incomplete
-        // pins `has_more: true` forever on any tree holding one non-UTF-8
-        // name, which is exactly the false alarm the structural consumer
-        // refuses to make for binaries it refuses to read.
+        // Per-entry skips split by what the failure reveals. A `ReadDir`
+        // iterator error or a `file_type()` error loses the entry's name or
+        // kind before it is classified: either may be a directory whose
+        // subtree is unexamined, so the listing no longer describes every
+        // matchable file and `skip` is set — the same signal as the
+        // `read_dir` failure above. A non-UTF-8 name is the one deliberate
+        // silence: the entry survived and was already classified, and a name
+        // that cannot appear in this string-based listing is dropped by policy
+        // (pinned by `test_git_inventory_non_utf8_name_is_never_truncation`);
+        // counting it would pin `has_more: true` forever on any tree holding
+        // one such name — the false alarm the structural consumer refuses to
+        // make for binaries it refuses to read.
         let mut since_check = 0usize;
         for entry in entries {
             let Ok(entry) = entry else {
+                // An iterator error loses the entry before its name or kind is
+                // known: it may be a directory whose subtree is unexamined, so
+                // the listing no longer describes every matchable file — same
+                // class as the `read_dir` failure above.
+                truncation.skip = true;
                 continue;
             };
             // Polled per STRIDE entries rather than once per directory: one
@@ -343,6 +351,10 @@ fn walk_inventory(
                 }
             }
             let Ok(kind) = entry.file_type() else {
+                // The kind decides whether this entry is a subtree; without it
+                // the entry may still be a directory whose contents are never
+                // examined, so the listing is incomplete, not clean.
+                truncation.skip = true;
                 continue;
             };
             let name = entry.file_name();
