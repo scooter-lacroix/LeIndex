@@ -25,6 +25,7 @@ pub fn trim_llm_payload(name: &str, data: &Value) -> Value {
     let normalized = normalize_tool_name(name);
     let trimmed = match normalized.as_str() {
         "leindex_search" | "search" => trim_search(data),
+        "leindex_structural" | "structural" => trim_structural(data),
         "leindex_context" | "context" => trim_context(data),
         "leindex_diagnostics" | "diagnostics" => trim_diagnostics(data),
         "leindex_impact_analysis" | "impact_analysis" => trim_impact(data),
@@ -150,6 +151,77 @@ pub(crate) fn trim_search(data: &Value) -> Value {
     if let Some(v) = data.get("top_score") {
         out.insert("top_score".to_string(), v.clone());
     }
+    Value::Object(out)
+}
+
+/// `leindex_structural` already has a lean shape (see
+/// `structural_handler::shape`); trimming drops the byte offsets that
+/// duplicate the `line`/`col` pair and caps the matched source text, which
+/// for an AST pattern can be a whole function. Everything a caller needs to
+/// act on a hit — path, line, kind, capture, totals, pagination — survives.
+pub(crate) fn trim_structural(data: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for key in [
+        "mode",
+        "pattern",
+        "lang",
+        "returned",
+        "total_matches",
+        "has_more",
+        // The machine-readable half of the deadline signal: `note` carries the
+        // prose, but a client that branches on truncation needs the boolean, and
+        // an allowlist that dropped it made the note the only evidence.
+        "stopped_by_deadline",
+        "stats",
+        "note",
+    ] {
+        if let Some(v) = data.get(key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
+    let files: Vec<Value> = data
+        .get("files")
+        .and_then(|v| v.as_array())
+        .map(|files| {
+            files
+                .iter()
+                .map(|file| {
+                    let hits: Vec<Value> = file
+                        .get("hits")
+                        .and_then(|v| v.as_array())
+                        .map(|hits| {
+                            hits.iter()
+                                .map(|hit| {
+                                    let mut entry = serde_json::Map::new();
+                                    for key in ["line", "kind", "capture", "captured"] {
+                                        if let Some(v) = hit.get(key) {
+                                            entry.insert(key.to_string(), v.clone());
+                                        }
+                                    }
+                                    let text = hit
+                                        .get("text")
+                                        .and_then(Value::as_str)
+                                        .map(|s| Value::String(truncate_chars(s, 240)))
+                                        .unwrap_or(Value::Null);
+                                    entry.insert("text".to_string(), text);
+                                    Value::Object(entry)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mut entry = serde_json::Map::new();
+                    for key in ["path", "total_matches", "capped"] {
+                        if let Some(v) = file.get(key) {
+                            entry.insert(key.to_string(), v.clone());
+                        }
+                    }
+                    entry.insert("hits".to_string(), Value::Array(hits));
+                    Value::Object(entry)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.insert("files".to_string(), Value::Array(files));
     Value::Object(out)
 }
 

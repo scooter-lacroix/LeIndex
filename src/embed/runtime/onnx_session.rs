@@ -181,18 +181,29 @@ impl WorkerRuntime {
             .env("LEINDEX_MIGRAPHX_PROBE_CHILD", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            // The child reports the exact probe failure on stderr
+            // ("migraphx probe failed: <reason>"). Capturing it is the whole
+            // reason a silent CPU fallback was previously undiagnosable: the
+            // parent could only report the bare exit status.
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|error| format!("failed to spawn MIGraphX probe child: {}", error))?;
         let deadline = Instant::now() + max_wait;
+        let stderr = ProbeStderr::capture(child.stderr.take().expect("piped probe stderr"));
         loop {
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => return Ok(()),
                 Ok(Some(status)) => {
-                    return Err(format!(
-                        "MIGraphX probe child exited with status {}",
-                        status
-                    ));
+                    let reason = stderr.reason(deadline);
+                    return Err(match reason {
+                        Some(reason) => {
+                            format!(
+                                "MIGraphX probe child exited with status {}: {}",
+                                status, reason
+                            )
+                        }
+                        None => format!("MIGraphX probe child exited with status {}", status),
+                    });
                 }
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(25));
@@ -201,14 +212,19 @@ impl WorkerRuntime {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(format!(
-                        "MIGraphX compile probe timed out after {:?}; child killed",
-                        max_wait
+                        "MIGraphX compile probe timed out after {:?}; child killed{}",
+                        max_wait,
+                        stderr.diagnostic(deadline)
                     ));
                 }
                 Err(error) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("MIGraphX probe child wait failed: {}", error));
+                    return Err(format!(
+                        "MIGraphX probe child wait failed: {}{}",
+                        error,
+                        stderr.diagnostic(deadline)
+                    ));
                 }
             }
         }
@@ -409,5 +425,154 @@ impl WorkerRuntime {
             session,
             provider_status,
         })
+    }
+}
+
+/// Drain stderr while the probe runs so provider logs cannot fill its pipe.
+/// Keep only the diagnostic tail; the child's failure reason follows provider logs.
+#[cfg(feature = "onnx")]
+struct ProbeStderr {
+    output: Arc<Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(feature = "onnx")]
+impl ProbeStderr {
+    const MAX_BYTES: usize = 64 * 1024;
+
+    /// Smallest grace granted to the reader thread before reading what it has.
+    ///
+    /// The child is reaped by the time `reason` runs, so EOF is imminent and the
+    /// drain completes in microseconds — but "imminent" is a scheduling
+    /// expectation, not a guarantee, and a fixed cap shorter than the time the
+    /// OS takes to run the reader on a loaded host drops exactly the line this
+    /// exists to keep. A floor that does not depend on the remaining budget keeps
+    /// the report deterministic without weakening the never-block-forever
+    /// property, which the deadline-vs-grace bound below still provides.
+    const MIN_DRAIN_GRACE: Duration = Duration::from_millis(250);
+
+    fn capture(mut reader: impl std::io::Read + Send + 'static) -> Self {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&output);
+        let (finished, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let mut output = captured.lock().unwrap_or_else(|p| p.into_inner());
+                        let discard = (output.len() + count).saturating_sub(Self::MAX_BYTES);
+                        output.drain(..discard);
+                        output.extend_from_slice(&chunk[..count]);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            let _ = finished.send(());
+        });
+        Self { output, done }
+    }
+
+    fn reason(&self, deadline: Instant) -> Option<String> {
+        // The probe's remaining budget bounds descendants that inherited the pipe
+        // and never close it, but it must never shrink the grace below the floor:
+        // on the timeout path `remaining` is already 0, and waiting 0 there made
+        // the diagnostic unreportable in precisely the case it is wanted.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let _ = self.done.recv_timeout(remaining.max(Self::MIN_DRAIN_GRACE));
+        let output = self.output.lock().unwrap_or_else(|p| p.into_inner());
+        String::from_utf8_lossy(&output)
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("migraphx probe failed:"))
+            .map(|reason| reason.trim().to_string())
+            .filter(|reason| !reason.is_empty())
+    }
+
+    fn diagnostic(&self, deadline: Instant) -> String {
+        self.reason(deadline)
+            .map(|reason| format!(": {reason}"))
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(all(test, feature = "onnx"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_probe_stderr_drains_large_output_and_keeps_bounded_diagnostic() {
+        let mut logs = vec![b'x'; ProbeStderr::MAX_BYTES * 4];
+        logs.extend_from_slice(b"\nmigraphx probe failed: provider failed\n");
+        let stderr = ProbeStderr::capture(std::io::Cursor::new(logs));
+        stderr.done.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(stderr.output.lock().unwrap().len(), ProbeStderr::MAX_BYTES);
+        assert_eq!(
+            stderr.reason(Instant::now()).as_deref(),
+            Some("provider failed")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_probe_stderr_does_not_block_a_verbose_child() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "head -c 262144 /dev/zero >&2; echo '\nmigraphx probe failed: verbose failure' >&2; exit 1"])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = ProbeStderr::capture(child.stderr.take().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("verbose probe blocked on stderr");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(!status.success());
+        assert_eq!(stderr.reason(deadline).as_deref(), Some("verbose failure"));
+    }
+
+    /// A reader that stays silent for `delay` before yielding its bytes, so the
+    /// drain thread is provably still blocked when `reason` is called.
+    struct SlowReader {
+        data: Vec<u8>,
+        delay: Duration,
+        slept: bool,
+    }
+
+    impl std::io::Read for SlowReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.slept {
+                std::thread::sleep(self.delay);
+                self.slept = true;
+            }
+            let count = self.data.len().min(buf.len());
+            buf[..count].copy_from_slice(&self.data[..count]);
+            self.data.drain(..count);
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn test_probe_stderr_reports_a_reason_when_the_deadline_has_already_passed() {
+        // The timeout path reports after the budget is gone, so the remaining
+        // time is zero there. Capping the wait to the remaining budget made the
+        // diagnostic unreportable in exactly the case it was added for.
+        let stderr = ProbeStderr::capture(SlowReader {
+            data: b"migraphx probe failed: compile timeout\n".to_vec(),
+            delay: Duration::from_millis(50),
+            slept: false,
+        });
+        // Captured before the call, so `reason`'s own clock read puts it in the
+        // past and `remaining` is zero — the timeout path's actual condition.
+        let expired = Instant::now();
+        assert_eq!(stderr.reason(expired).as_deref(), Some("compile timeout"));
     }
 }

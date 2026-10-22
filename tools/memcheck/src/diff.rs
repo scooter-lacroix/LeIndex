@@ -1,9 +1,12 @@
 //! Diff logic — compares memcheck reports against committed baselines and
 //! absolute budget ceilings.
 //!
-//! Regression rules (VAL-MEASURE-010):
-//! - A phase fails if its rss_max_kib exceeds (committed baseline + 5%)
-//! - A phase also fails if its rss_max_kib exceeds (budget ceiling + 10%)
+//! Regression rules (VAL-MEASURE-010): tolerances are read from the budget
+//! file's `regression_rules` — nothing here hard-codes a percentage. The
+//! committed `docs/memory/budgets/current.json` uses 10% for both baseline
+//! and ceiling; `format_diff` prints the rules that were actually applied.
+//! - A phase fails if its rss_max_kib exceeds (committed baseline + tolerance)
+//! - A phase also fails if its rss_max_kib exceeds (budget ceiling + tolerance)
 //! - Both rules are checked; passing one does not excuse failing the other.
 //!
 //! Missing baselines (VAL-MEASURE-011):
@@ -33,9 +36,11 @@ pub struct BudgetFile {
 /// Regression tolerance configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegressionRules {
-    /// Baseline tolerance as a percentage (default: 5).
+    /// Baseline tolerance as a percentage. Required: there is no built-in
+    /// default, and a budget file without it fails to parse.
     pub baseline_tolerance_pct: u64,
-    /// Ceiling tolerance as a percentage (default: 10).
+    /// Ceiling tolerance as a percentage. Required: there is no built-in
+    /// default, and a budget file without it fails to parse.
     pub ceiling_tolerance_pct: u64,
 }
 
@@ -110,22 +115,73 @@ pub fn load_budget(path: &Path) -> Result<BudgetFile> {
 ///
 /// Baseline files are at `<baselines_dir>/<fixture>/<phase>.json`.
 /// Each contains a `PhaseReport`-compatible JSON object.
-pub fn load_baseline(baselines_dir: &Path, fixture: &str, phase: &str) -> Option<PhaseReport> {
+///
+/// `Ok(None)` means the file is genuinely absent (VAL-MEASURE-011: the
+/// baseline rule is then skipped but the ceiling rule still applies). A file
+/// that exists but cannot be read or parsed is an `Err`, NOT `None`: the
+/// committed ceilings sit 3-11x above the committed baselines, so the baseline
+/// rule is the only check that ever fires in practice. Reporting a truncated or
+/// corrupt baseline as "absent" would disable the sole real regression gate
+/// while the run still printed PASS.
+pub fn load_baseline(
+    baselines_dir: &Path,
+    fixture: &str,
+    phase: &str,
+) -> Result<Option<PhaseReport>> {
     let path = baselines_dir.join(fixture).join(format!("{}.json", phase));
-    let content = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read baseline {}", path.display()));
+        }
+    };
+    let baseline = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse baseline {}", path.display()))?;
+    Ok(Some(baseline))
 }
 
 /// Write a per-phase baseline file (VAL-MEASURE-008: overwrites canonical).
+///
+/// `descendants.pids` is cleared before writing. This protects less than it
+/// looks like it does: `PhaseReport::descendants` comes from the POST-reap
+/// `count_descendants` call, and `/proc/<pid>` is gone the instant `wait4`
+/// reaps, so the count is empty for every phase — `workload.rs` says the same
+/// where it refuses to treat that emptiness as evidence. The clearing is
+/// therefore a guard against a future caller that populates pids from a live
+/// walk, not a description of today's data.
+///
+/// What a reader of a committed baseline actually sees varying is
+/// `peak_rss_kib` — the descendant-inclusive `ru_maxrss`, retained so the
+/// fold that produced `rss_max_kib` stays inspectable. `total` and `by_name`
+/// are kept as retained diagnostic data alongside the measurement. NONE of
+/// them are compared: `diff_report` gates on `rss_max_kib` alone (baseline +
+/// tolerance, and the budget ceiling + tolerance), so movement in
+/// `peak_rss_kib` or `total` is recorded for a reader to inspect rather than
+/// failing a phase.
+///
+/// Clearing here rather than `skip_serializing` on the field keeps pids in the
+/// run's own report, which is the one place a failing phase can still be
+/// diagnosed from.
 pub fn write_baseline(baselines_dir: &Path, fixture: &str, phase: &PhaseReport) -> Result<()> {
     let dir = baselines_dir.join(fixture);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create baseline dir {}", dir.display()))?;
     let path = dir.join(format!("{}.json", phase.phase));
-    let json = serde_json::to_string_pretty(phase)
+    let mut portable = phase.clone();
+    portable.descendants.pids.clear();
+    let json = serde_json::to_string_pretty(&portable)
         .with_context(|| format!("failed to serialize baseline for phase {}", phase.phase))?;
-    std::fs::write(&path, json)
-        .with_context(|| format!("failed to write baseline {}", path.display()))?;
+    // Write to a sibling temp file and rename over the destination: a plain
+    // write can truncate a committed baseline mid-write (disk full, signal),
+    // leaving a bad file that later fails to parse and quietly disables the
+    // baseline rule. Rename is atomic on the same filesystem.
+    let tmp_path = dir.join(format!("{}.json.tmp", phase.phase));
+    std::fs::write(&tmp_path, json)
+        .with_context(|| format!("failed to write baseline {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &path)
+        .with_context(|| format!("failed to commit baseline {}", path.display()))?;
     Ok(())
 }
 
@@ -153,14 +209,14 @@ pub fn diff_report(
     report: &MemcheckReport,
     baselines_dir: &Path,
     budget: &BudgetFile,
-) -> DiffResult {
+) -> Result<DiffResult> {
     let fixture_name = extract_fixture_name(&report.fixture);
     let rules = &budget.regression_rules;
 
     let mut phase_diffs = Vec::with_capacity(report.phases.len());
 
     for phase in &report.phases {
-        let baseline = load_baseline(baselines_dir, fixture_name, &phase.phase);
+        let baseline = load_baseline(baselines_dir, fixture_name, &phase.phase)?;
 
         // Baseline rule: measured <= baseline + tolerance_pct
         let (baseline_kib, baseline_threshold, baseline_passed) = match &baseline {
@@ -229,11 +285,11 @@ pub fn diff_report(
 
     let all_passed = phase_diffs.iter().all(|d| d.passed);
 
-    DiffResult {
+    Ok(DiffResult {
         phases: phase_diffs,
         all_passed,
         rules: budget.regression_rules.clone(),
-    }
+    })
 }
 
 /// Format a diff result as a human-readable summary.
@@ -506,7 +562,7 @@ mod tests {
         let budget = make_budget();
         let report = make_report(&[("idle_warm", 410000), ("index", 720000)]);
 
-        let result = diff_report(&report, &baselines_dir, &budget);
+        let result = diff_report(&report, &baselines_dir, &budget).unwrap();
 
         // idle_warm: baseline 400000 + 5% = 420000, measured 410000 → PASS
         // idle_warm: ceiling 470000 + 10% = 517000, measured 410000 → PASS
@@ -554,7 +610,7 @@ mod tests {
         // But 430000 < ceiling 470000 + 10% = 517000 → PASS ceiling
         let report = make_report(&[("idle_warm", 430000)]);
 
-        let result = diff_report(&report, &baselines_dir, &budget);
+        let result = diff_report(&report, &baselines_dir, &budget).unwrap();
 
         assert!(
             !result.phases[0].baseline_passed,
@@ -575,7 +631,7 @@ mod tests {
         // Measured 600000 > ceiling 470000 + 10% = 517000 → FAIL ceiling
         let report = make_report(&[("idle_warm", 600000)]);
 
-        let result = diff_report(&report, &baselines_dir, &budget);
+        let result = diff_report(&report, &baselines_dir, &budget).unwrap();
 
         assert!(
             result.phases[0].baseline_passed,
@@ -597,7 +653,7 @@ mod tests {
         // Measured 520000 > ceiling 470000 + 10% = 517000 → FAIL
         let report = make_report(&[("idle_warm", 520000)]);
 
-        let result = diff_report(&report, &baselines_dir, &budget);
+        let result = diff_report(&report, &baselines_dir, &budget).unwrap();
 
         assert!(result.phases[0].baseline_passed, "no baseline → passes");
         assert!(
@@ -605,6 +661,71 @@ mod tests {
             "ceiling should still fail"
         );
         assert!(!result.phases[0].passed);
+    }
+
+    #[test]
+    fn test_diff_corrupt_baseline_fails_instead_of_disabling_the_rule() {
+        // The ceilings commit 3-11x headroom over the baselines, so the
+        // baseline rule is the only gate that ever fires. A baseline that
+        // exists but does not parse must therefore be a hard error: treating it
+        // as "absent" would make `baseline_passed` true by default and let a
+        // genuine regression pass with the run still printing PASS.
+        let dir = tempfile::tempdir().unwrap();
+        let baselines_dir = dir.path().join("baselines");
+        let small_repo_dir = baselines_dir.join("small_repo");
+        std::fs::create_dir_all(&small_repo_dir).unwrap();
+        std::fs::write(small_repo_dir.join("idle_warm.json"), "{ truncated").unwrap();
+
+        let budget = make_budget();
+        let report = make_report(&[("idle_warm", 430000)]);
+
+        let error = diff_report(&report, &baselines_dir, &budget)
+            .expect_err("a corrupt baseline must fail the diff, not skip the rule");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("failed to parse baseline"),
+            "error must name the parse failure: {chain}"
+        );
+        assert!(
+            chain.contains("idle_warm.json"),
+            "error must name the offending file: {chain}"
+        );
+    }
+
+    #[test]
+    fn test_diff_absent_baseline_is_still_skipped() {
+        // The flip side of the test above: a genuinely missing file keeps
+        // VAL-MEASURE-011's behaviour (baseline skipped, ceiling enforced), so
+        // a fresh fixture with no committed baselines still runs.
+        //
+        // Asserting only that `baseline_passed` is true would be vacuous — it
+        // is true BY CONSTRUCTION whenever the baseline is `None`, so no
+        // production change could fail it. The invariant worth pinning is that
+        // "skipped" is recorded as absent rather than as a comparison against
+        // some default, and that skipping the baseline does not weaken the
+        // ceiling: the same measurement must FAIL once the ceiling is crossed.
+        let dir = tempfile::tempdir().unwrap();
+        let baselines_dir = dir.path().join("baselines");
+
+        let budget = make_budget();
+        let report = make_report(&[("idle_warm", 1000)]);
+
+        let result = diff_report(&report, &baselines_dir, &budget).unwrap();
+        assert!(
+            result.phases[0].baseline_kib.is_none()
+                && result.phases[0].baseline_threshold_kib.is_none(),
+            "a skipped baseline rule must record no baseline, not a default one"
+        );
+
+        // Same missing baseline, a measurement above the ceiling + tolerance
+        // (470000 + 10% = 517000): the ceiling must still catch it.
+        let over = make_report(&[("idle_warm", 520000)]);
+        let failed = diff_report(&over, &baselines_dir, &budget).unwrap();
+        assert!(
+            !failed.phases[0].ceiling_passed,
+            "an absent baseline must not disable the ceiling rule"
+        );
+        assert!(!failed.all_passed);
     }
 
     #[test]
@@ -637,7 +758,7 @@ mod tests {
         // Measured 600000 > ceiling 470000 + 10% = 517000 → FAIL
         let report = make_report(&[("idle_warm", 600000)]);
 
-        let result = diff_report(&report, &baselines_dir, &budget);
+        let result = diff_report(&report, &baselines_dir, &budget).unwrap();
 
         assert!(!result.phases[0].baseline_passed);
         assert!(!result.phases[0].ceiling_passed);
@@ -667,11 +788,106 @@ mod tests {
 
         write_baseline(&baselines_dir, "small_repo", &phase).unwrap();
 
-        let loaded = load_baseline(&baselines_dir, "small_repo", "idle_warm").unwrap();
+        let loaded = load_baseline(&baselines_dir, "small_repo", "idle_warm")
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.phase, "idle_warm");
         assert_eq!(loaded.rss_max_kib, 400000);
         assert_eq!(loaded.rss_min_kib, 380000);
         assert_eq!(loaded.sample_count, 12);
+    }
+
+    #[test]
+    fn test_write_baseline_strips_machine_specific_pids() {
+        let dir = tempfile::tempdir().unwrap();
+        let baselines_dir = dir.path().join("baselines");
+
+        let mut phase = PhaseReport {
+            phase: "index".to_string(),
+            rss_min_kib: 380000,
+            rss_max_kib: 400000,
+            rss_p95_kib: 395000,
+            mapped_file_kib: 50000,
+            anon_kib: 300000,
+            sample_count: 12,
+            duration_ms: 3000,
+            worker_rss_max_kib: 0,
+            combined_rss_max_kib: 400000,
+            worker_note: None,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree {
+                total: 1,
+                peak_rss_kib: 733_000,
+                pids: vec![4242],
+                ..crate::sampler::DescendantTree::default()
+            },
+        };
+        phase
+            .descendants
+            .by_name
+            .insert("rust-analyzer".to_string(), 1);
+
+        write_baseline(&baselines_dir, "small_repo", &phase).unwrap();
+
+        // The committed file must not carry the pid, but MUST keep the peak and
+        // the count — those are what a baseline comparison is for.
+        let raw = std::fs::read_to_string(baselines_dir.join("small_repo").join("index.json"))
+            .expect("baseline written");
+        assert!(
+            !raw.contains("4242"),
+            "a pid must never reach a committed baseline: {raw}"
+        );
+        let loaded = load_baseline(&baselines_dir, "small_repo", "index")
+            .unwrap()
+            .unwrap();
+        assert!(
+            loaded.descendants.pids.is_empty(),
+            "the reloaded baseline must carry no pids"
+        );
+        assert_eq!(loaded.descendants.peak_rss_kib, 733_000);
+        assert_eq!(loaded.descendants.total, 1);
+    }
+
+    #[test]
+    fn test_write_baseline_leaves_no_temp_artifacts() {
+        // The atomic write path must leave only the committed baseline in the
+        // phase directory — a leftover `.json.tmp` would mean the rename step
+        // failed or was skipped, and the file on disk is not the one we read.
+        let dir = tempfile::tempdir().unwrap();
+        let baselines_dir = dir.path().join("baselines");
+        let phase = PhaseReport {
+            phase: "index".to_string(),
+            rss_min_kib: 0,
+            rss_max_kib: 400000,
+            rss_p95_kib: 0,
+            mapped_file_kib: 0,
+            anon_kib: 0,
+            sample_count: 1,
+            duration_ms: 1000,
+            worker_rss_max_kib: 0,
+            combined_rss_max_kib: 400000,
+            worker_note: None,
+            gpu_vram_mib: None,
+            descendants: crate::sampler::DescendantTree::default(),
+        };
+        write_baseline(&baselines_dir, "small_repo", &phase).unwrap();
+
+        let phase_dir = baselines_dir.join("small_repo");
+        let entries: Vec<_> = std::fs::read_dir(&phase_dir).unwrap().collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the baseline may remain: {entries:?}"
+        );
+        assert_eq!(
+            entries[0].as_ref().unwrap().file_name(),
+            "index.json",
+            "the committed file must be named index.json"
+        );
+        let loaded = load_baseline(&baselines_dir, "small_repo", "index")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.rss_max_kib, 400000);
     }
 
     #[test]
@@ -701,9 +917,9 @@ mod tests {
 
         write_all_baselines(&baselines_dir, "small_repo", &phases).unwrap();
 
-        // Verify all 6 canonical phase files exist
+        // Verify every canonical phase file exists
         for phase_name in CANONICAL_PHASES {
-            let loaded = load_baseline(&baselines_dir, "small_repo", phase_name);
+            let loaded = load_baseline(&baselines_dir, "small_repo", phase_name).unwrap();
             assert!(
                 loaded.is_some(),
                 "baseline for '{}' should exist",
@@ -741,7 +957,7 @@ mod tests {
         let budget = make_budget();
         let report = make_report(&[("idle_warm", 410000)]);
 
-        let result = diff_report(&report, &baselines_dir, &budget);
+        let result = diff_report(&report, &baselines_dir, &budget).unwrap();
         let output = format_diff(&result);
 
         assert!(output.contains("PASS"));
@@ -777,7 +993,7 @@ mod tests {
         let budget = make_budget();
         let report = make_report(&[("idle_warm", 430000)]);
 
-        let result = diff_report(&report, &baselines_dir, &budget);
+        let result = diff_report(&report, &baselines_dir, &budget).unwrap();
         let output = format_diff(&result);
 
         assert!(output.contains("FAIL"));

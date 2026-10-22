@@ -6,8 +6,8 @@
 // is selected with a discriminator argument and every other argument is
 // forwarded unchanged to the per-feature handler:
 //
-//   leindex_explore  (mode)    search | symbol_lookup | find | read_file | read_symbol
-//                              | project_map | file_summary | context
+//   leindex_explore  (mode)    search | symbol_lookup | find | structural | read_file
+//                              | read_symbol | project_map | file_summary | context
 //   leindex_analyze  (mode)    deep | impact | diagnostics | git_status | git_diff
 //   leindex_edit     (action)  apply | preview | rename | write        (action REQUIRED)
 //   leindex_manage   (action)  index | phase
@@ -89,7 +89,7 @@ pub static GROUPS: [GroupSpec; 4] = [
     GroupSpec {
         name: "leindex_explore",
         title: "LeIndex [Explore]",
-        description: "Find and read code. mode: search (by meaning, default), find (exact text/regex/symbol names, anywhere on disk), symbol_lookup (callers/callees), read_file, read_symbol, project_map, file_summary, context.",
+        description: "Find and read code. mode: search (by meaning, default), find (exact text/regex/symbol names, anywhere on disk), structural (ast-grep AST pattern), symbol_lookup (callers/callees), read_file, read_symbol, project_map, file_summary, context.",
         discriminator: "mode",
         default_branch: Some("search"),
         branches: &[
@@ -117,6 +117,12 @@ pub static GROUPS: [GroupSpec; 4] = [
                     "rg",
                 ],
                 "Exact text/regex or symbol-name search: indexed for speed, live for correctness, any path on disk",
+            ),
+            branch(
+                "structural",
+                "leindex_structural",
+                &["ast", "ast_grep", "astgrep", "pattern"],
+                "AST-pattern search with ast-grep, e.g. `fn $NAME($$$ARGS) { $$$BODY }` (needs the structural-search feature and LEINDEX_FEATURE_STRUCTURAL_SEARCH=1)",
             ),
             branch(
                 "read_file",
@@ -1240,6 +1246,14 @@ mod tests {
             grouped * 10 < legacy * 6,
             "router listing ({grouped} bytes) must stay under 60% of the flat listing ({legacy} bytes)"
         );
-        assert!(grouped <= 13_000, "tools/list grew to {grouped} bytes");
+        // 13_000 was the ceiling before `leindex_explore` gained its
+        // `structural` branch; that branch contributes a new `lang` argument
+        // plus one more entry in the per-branch arg map that `branch_usage`
+        // builds, which put the listing at 13_251 bytes (flat listing 24_546,
+        // ratio 0.54 — the 60% assertion above is the guard that actually
+        // bounds growth; this absolute ceiling is the backstop). Raised rather
+        // than dropped, per owner decision. If this number moves again, say
+        // which branch moved it.
+        assert!(grouped <= 14_000, "tools/list grew to {grouped} bytes");
     }
 }

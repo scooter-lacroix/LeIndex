@@ -2,7 +2,7 @@
 
 > **Methodology.** Every measurement below is reproducible from the committed `cargo build --release` binary on this repository (LeIndex self-index, 481 source files, 10,513 signatures, 17,131 PDG nodes, 161,381 PDG edges). The "before" column is the immutable v1.9.5 anchor captured before any v2.0.0 architectural change. The "after" column is the same workload under the full default-on v2.0.0 build. Measurement environment: AMD Ryzen 7 7800X3D (16 threads), 64 GiB RAM, Linux 7.1.5, glibc with `MALLOC_ARENA_MAX=2`, `LEINDEX_TOKIO_WORKERS=2`, CPU ONNX execution provider. Three sequential full-index runs per measurement; mean reported unless noted.
 
-The v2.0.0 build flips every architectural flag to default-on: `DaemonClient`, `GenerationReaders`, `BoundedScheduler`, `StreamingScan`, `StreamingParse`, `StreamingPdg`, `StreamingTfidf`, `StreamingNeural`, `GlobalEmbedCache`, `ValidatedModel`. The v1.9.5 baseline is the shipped production binary with none of these changes.
+The v2.0.0 build flips every architectural flag to default-on: `DaemonClient`, `GenerationReaders`, `BoundedScheduler`, `StreamingScan`, `StreamingParse`, `StreamingPdg`, `StreamingTfidf`, `GlobalEmbedCache`, `ValidatedModel`. The v1.9.5 baseline is the shipped production binary with none of these changes. Neural publication was gated by a `StreamingNeural` flag in this measurement; it has since been folded into the always-on streaming path and the flag removed.
 
 ---
 
@@ -252,6 +252,35 @@ These results are **captured, not self-reported**: the live acceptance runs belo
 | memcheck acceptance gate (`cargo test -p memcheck -- --test-threads=1`) | PASS (55 unit + 10 diff + 13 harness integration) | `docs/baselines/2026-08-04-post-v200-memcheck-gate.txt` (gate run + measured per-phase RSS table) |
 
 Each "PASS" above is a reproduction of the exact command captured in the named evidence file with its real exit code — a genuine measured result, not a manual assertion.
+
+---
+
+## 11. Neural publication route A/B (StreamingNeural gate removal)
+
+Measured 2026-10-19 against the gate-removal diff (PR #102), all three arms on the same fixed corpus: a deterministic 428-file Megatron-LM subset (every 4th `.py` by sorted path; 426 files indexed, 7,689 indexed nodes, 7,495 neural rows published as the 23,045,593-byte f32 CAS blob at 768 dims). Embeddings served by the managed llama-server (embeddinggemma-2 Q8_0, Vulkan) over `/v1/embeddings`, batches of 256 (28 to 29 per run). Fresh `LEINDEX_HOME` per run, `MALLOC_ARENA_MAX=2`, `LEINDEX_TOKIO_WORKERS=2`, 3 runs per arm.
+
+| Arm | Binary | Route |
+|---|---|---|
+| legacy | b8d75129 release | whole-project `Vec` accumulation (default) |
+| stream-flag | b8d75129 release + `LEINDEX_FEATURE_STREAMING_NEURAL=1` | streaming writer (flagged) |
+| stream-default | gate-removal build (this PR) | streaming writer (only route) |
+
+| Metric | legacy | stream-flag | stream-default |
+|---|---:|---:|---:|
+| Wall time (3 runs) | 3:38 to 4:23 | 3:46 to 4:16 | 3:52 to 4:16 |
+| Peak RSS, process tree (`/usr/bin/time -v`) | 452 to 467 MiB | 444 to 476 MiB | 326 to 477 MiB |
+| Peak RSS, self-sampled (`--memory-report`) | 353 to 361 MiB | 353 to 385 MiB | 230 to 386 MiB |
+| Neural-phase RSS (200 ms `/proc` trace, sustained) | 37 to 44 MiB | 37 to 38 MiB | 33 to 34 MiB |
+
+Findings:
+
+1. **Wall time is embed-server-bound**, not route-bound. All arms process ~29 texts/s effective on real code text through llama-server; the three arms are indistinguishable within run-to-run spread.
+2. **Peak RSS belongs to the pre-neural phases.** A 200 ms `/proc` trace of the legacy arm shows ~299 MiB resident through scan/parse, ~309 MiB at the TF-IDF peak, then a drop to 37 to 44 MiB for the entire neural phase, climbing back to ~329 MiB only at final publish. `smaps` attributes 279.5 MiB anonymous private-dirty to the CLI process itself before the first embed batch (114 MiB `[heap]` plus 65/63/26 MiB anon mappings). This is present in every arm.
+3. **Route deltas are not resolvable at this corpus size.** Legacy's whole-project `Vec` is 7,495 rows x 3,072 B = 23.6 MiB, inside the ~40 MiB neural-phase plateau, and run-to-run variance (self-sampled peaks 230 to 386 MiB on identical configs) is larger than any route effect. No arm regressed; the gate-removal build holds parity.
+4. **Structural route bound (derived from code, not sampled):** the legacy route holds rows x 3,072 B before its single `update_neural_embeddings` call (23.6 MiB here, linear in corpus size); the streaming writer holds at most one batch, 256 x 3,072 B = 0.75 MiB, regardless of corpus size. That is ~31x at this corpus and grows linearly with it.
+5. **No embed worker or other child process was observed** at 50 ms resolution in instrumented reps (remote route active in all 9 runs: 28 to 29 remote batch warnings each, zero local-ONNX markers). The gap between tree peaks and self-sampled peaks, and the bimodal run modes (326 to 339 vs 444 to 477 MiB tree), remain unattributed; they affect all arms equally and do not change the route comparison.
+
+Reproduce: fresh `LEINDEX_HOME` seeded with `indexing.embeddings.remote_service = "gemma"` per run, wipe `.leindex/`, `/usr/bin/time -v ./target/release/leindex index <corpus> --force --progress`.
 
 ---
 

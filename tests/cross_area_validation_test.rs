@@ -494,6 +494,108 @@ mod version_parity {
         );
     }
 
+    /// Read an integer floor out of an installer's shell/PowerShell
+    /// assignment. Accepts the three spellings the installers use:
+    /// `readonly KEY=85` (sh), `KEY=85`, and `$Key = 85` (PowerShell).
+    fn installer_floor(body: &str, key: &str) -> u32 {
+        body.lines()
+            .find_map(|line| {
+                let line = line.trim();
+                let line = line.strip_prefix("readonly ").unwrap_or(line);
+                let line = line.strip_prefix('$').unwrap_or(line);
+                let rest = line.strip_prefix(key)?.trim_start();
+                let value = rest.strip_prefix('=')?.trim();
+                value.trim_end_matches(['\r', ';']).trim().parse().ok()
+            })
+            .unwrap_or_else(|| panic!("no assignment for {key} in installer"))
+    }
+
+    /// The installers refuse older compilers, so their floor must match the one
+    /// cargo enforces. It drifted: `Cargo.toml` is `edition = "2024"` (needs
+    /// rustc 1.85) while all three installers still accepted 1.75, so a user on
+    /// 1.75-1.84 passed the preflight and then failed to COMPILE — which reads
+    /// as a broken installer rather than "upgrade rustc" (CodeRabbit). Pin both
+    /// halves: the floor, and that every installer agrees with it.
+    #[test]
+    fn installers_agree_with_cargo_rust_version() {
+        let cargo = read_file("Cargo.toml");
+        let declared = cargo
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("rust-version"))
+            .and_then(|rest| rest.split('"').nth(1))
+            .expect("Cargo.toml rust-version");
+        let (major, minor) = declared
+            .split_once('.')
+            .expect("rust-version must be MAJOR.MINOR");
+        let major: u32 = major.trim().parse().expect("rust-version major");
+        let minor: u32 = minor.trim().parse().expect("rust-version minor");
+
+        for (path, major_key, minor_key) in [
+            ("install.sh", "MIN_RUST_MAJOR", "MIN_RUST_MINOR"),
+            ("install_macos.sh", "MIN_RUST_MAJOR", "MIN_RUST_MINOR"),
+            ("install.ps1", "MinRustMajor", "MinRustMinor"),
+        ] {
+            let body = read_file(path);
+            let found = (
+                installer_floor(&body, major_key),
+                installer_floor(&body, minor_key),
+            );
+            assert_eq!(
+                found,
+                (major, minor),
+                "{path} accepts rustc {}.{} but Cargo.toml requires {declared}: a compiler in \
+                 that gap passes the preflight and then fails to build",
+                found.0,
+                found.1
+            );
+        }
+    }
+
+    /// The installers carry shebangs and are invoked directly (`./install.sh`),
+    /// so the COMMITTED mode must stay executable. The branch's v2.0.4 bump
+    /// (59012060 — never published as a release) flipped both to 100644 — the third time a release bump dropped the bit
+    /// (see 74160a52, 3ceb2f14) — because the version-parity checks above
+    /// inspect file contents, never modes. Pin the mode itself: this fails on
+    /// any commit that rewrites the installers through a non-executable copy.
+    #[test]
+    #[cfg(unix)]
+    fn installers_are_committed_executable() {
+        // `tests/` ships inside the crate package (`Cargo.toml` `include`), and a
+        // source package carries no `.git`. There is no committed mode to inspect
+        // there, so skip rather than fail. `exists()` rather than `is_dir()`: in a
+        // worktree `.git` is a FILE holding the gitdir pointer.
+        //
+        // Below this point every failure is real: a missing `git`, a non-zero
+        // status, or an unusable checkout must fail loudly, or the test stops
+        // protecting the 100755 contract it exists for.
+        if !repo_root().join(".git").exists() {
+            eprintln!("skipping installers_are_committed_executable: not a git checkout");
+            return;
+        }
+        for path in ["install.sh", "install_macos.sh"] {
+            let output = std::process::Command::new("git")
+                .args(["ls-files", "-s", path])
+                .current_dir(repo_root())
+                .output()
+                .expect("git ls-files");
+            assert!(
+                output.status.success(),
+                "git ls-files failed for {path}; this test requires a checkout"
+            );
+            let line = String::from_utf8(output.stdout).expect("utf8");
+            let mode = line
+                .split_whitespace()
+                .next()
+                .unwrap_or_else(|| panic!("no mode in git ls-files output for {path}"));
+            assert_eq!(
+                mode, "100755",
+                "{path} is committed non-executable — users running ./{path} get \
+                 permission denied. Restore with `chmod +x {path} && git update-index \
+                 --chmod=+x {path}`"
+            );
+        }
+    }
+
     /// VAL-CROSS-014: One-crate layout — worker and main binary share a single
     /// crate, so there is no subcrate version to drift.
     #[test]

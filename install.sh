@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #############################################
 # LeIndex Universal Installer
-# Version: 2.0.3 - Rust Edition + Dashboard Assets
+# Version: 2.1.1 - Rust Edition + Dashboard Assets
 # Platform: Linux/Unix
 #
 # Installer:
@@ -25,12 +25,12 @@ set -euo pipefail
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-readonly SCRIPT_VERSION="2.0.3"
+readonly SCRIPT_VERSION="2.1.1"
 readonly PROJECT_NAME="LeIndex"
 readonly PROJECT_SLUG="leindex"
 readonly DAEMON_SLUG="leindexd"
 readonly MIN_RUST_MAJOR=1
-readonly MIN_RUST_MINOR=75
+readonly MIN_RUST_MINOR=85
 readonly REPO_URL="https://github.com/scooter-lacroix/LeIndex"
 NONINTERACTIVE=false
 PRESERVE_BINARY=false

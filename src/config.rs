@@ -238,6 +238,14 @@ pub struct SearchConfig {
     #[serde(default = "default_rerank_top_n")]
     pub rerank_top_n: u32,
 
+    /// Which reranker backend consumes the top-N candidates: `onnx` (default;
+    /// local cross-encoder via the neural worker), `system-one` (LLM judge
+    /// through the `[system_one]` provider; reranks regardless of
+    /// `rerank_enabled`), or `off` (rerank disabled even when `rerank_enabled`
+    /// is true).
+    #[serde(default = "default_rerank_backend")]
+    pub rerank_backend: String,
+
     /// Enable fragment-level (sub-symbol) embeddings. Off by default; the node
     /// index remains authoritative. When enabled, Tier-2/3 fragments participate
     /// in Semantic/hybrid retrieval.
@@ -370,6 +378,12 @@ pub struct EmbeddingConfig {
     /// resolved from `[neural] model_dir`/`model_name`).
     #[serde(default)]
     pub onnx_model_path: Option<String>,
+
+    /// EmbeddingGemma2 Matryoshka slicing policy (see
+    /// [`crate::search::mrl::MatryoshkaSetting`]).
+    /// `Off` (default) preserves pre-MRL behavior byte-for-byte.
+    #[serde(default)]
+    pub matryoshka: MatryoshkaSetting,
 }
 
 /// `embeddinggemma-2` preset: loopback endpoint on llama-server's standard
@@ -383,14 +397,21 @@ pub const EMBEDDINGGEMMA2_MODEL: &str = "embeddinggemma-2";
 /// `embeddinggemma-2` preset: native (untruncated) embedding dimension.
 pub const EMBEDDINGGEMMA2_DIMENSION: usize = 768;
 
-/// `embeddinggemma-2` DOCUMENT template, code-search task, no title
-/// available. Source: google/embeddinggemma-2 model card (Best Practices →
-/// Prefix Notation & Usage table, CodeRetrieval row): document instruction
-/// `title: {title or filename} | text: {code}`, with `title: none` mandated
-/// when no title is available — the provider call site receives raw text
-/// only, so `title: none` is correct here. llama.cpp applies NO server-side
+/// `[indexing.embeddings] matryoshka` policy value.
+///
+/// The type lives in `search::mrl` next to the slicing code that consumes it:
+/// that module is reachable from the `search` feature alone, whereas this
+/// module only exists under `cli`/`onnx`, so defining it here made the core
+/// search module depend on a feature-gated one and broke the minimal build.
+pub use crate::search::mrl::MatryoshkaSetting;
+
+/// `embeddinggemma-2` DOCUMENT template, code-search task. Source:
+/// google/embeddinggemma-2 model card (Best Practices → Prefix Notation &
+/// Usage table, CodeRetrieval row): document instruction `title: {title or
+/// filename} | text: {code}`. Call sites thread the file's project-relative
+/// path as `{title}` (see `apply_template`); llama.cpp applies NO server-side
 /// template (content-only passthrough in `/props`), so the client owns it.
-pub const EMBEDDINGGEMMA2_DOC_TEMPLATE: &str = "title: none | text: {text}";
+pub const EMBEDDINGGEMMA2_DOC_TEMPLATE: &str = "title: {title} | text: {text}";
 
 /// `embeddinggemma-2` QUERY template, code-search task. Same source (model
 /// card CodeRetrieval row): `task: code retrieval | query: {query}`.
@@ -433,6 +454,27 @@ impl EmbeddingConfig {
             "embeddinggemma-2"
         } else {
             "custom"
+        }
+    }
+
+    /// Effective Matryoshka slicing for this configuration. `Dynamic` and the
+    /// fixed dimensions only engage when BOTH hold:
+    ///
+    /// 1. the EmbeddingGemma2 preset is selected — its MRL training is what makes
+    ///    truncation quality-preserving; any other provider keeps full-dimension
+    ///    rows regardless of the setting, and
+    /// 2. the `LEINDEX_FEATURE_MATRYOSHKA` rollout flag is armed — the capability
+    ///    is experimental, so per AGENTS.md it defaults OFF and a configured
+    ///    policy is inert until the flag is exported. Without this gate, editing
+    ///    a config file would be enough to turn the capability on fleet-wide and
+    ///    there would be no per-deployment kill switch.
+    pub fn effective_matryoshka(&self) -> MatryoshkaSetting {
+        if self.embeddinggemma2_preset_active()
+            && crate::feature_flags::FeatureFlag::Matryoshka.is_enabled()
+        {
+            self.matryoshka
+        } else {
+            MatryoshkaSetting::Off
         }
     }
 
@@ -517,6 +559,7 @@ impl Default for EmbeddingConfig {
             remote_doc_template: None,
             remote_query_template: None,
             onnx_model_path: None,
+            matryoshka: MatryoshkaSetting::Off,
         }
     }
 }
@@ -525,6 +568,7 @@ fn default_legacy_embedding_config() -> EmbeddingConfig {
     EmbeddingConfig {
         enable_hybrid: default_enable_hybrid(),
         remote_provider: default_remote_provider(),
+        matryoshka: MatryoshkaSetting::Off,
         remote_service: None,
         remote_endpoint: None,
         remote_api_key: None,
@@ -771,6 +815,7 @@ impl Default for SearchConfig {
             neural_weight: default_neural_weight(),
             rerank_enabled: false,
             rerank_top_n: default_rerank_top_n(),
+            rerank_backend: default_rerank_backend(),
             fragment_index_enabled: false,
             fragment_max_bytes: default_fragment_max_bytes(),
             fragment_weight: default_fragment_weight(),
@@ -861,6 +906,55 @@ fn default_rerank_top_n() -> u32 {
     // Cross-encoder rerank literature plateaus ~100-200; 80 is the sweet spot.
     // Revisit if rerank latency regresses.
     80
+}
+
+fn default_rerank_backend() -> String {
+    "onnx".to_string()
+}
+
+/// Allowed values for `[search] rerank_backend`.
+pub const RERANK_BACKENDS: &[&str] = &["onnx", "system-one", "off"];
+
+/// Whether the `system-one` rerank backend is ARMED: this build carries the
+/// `system-one` feature and the `LEINDEX_FEATURE_SYSTEM_ONE` rollout flag is on.
+///
+/// This is a necessary condition, not proof that the judge will run. The
+/// dispatch builds its asker through `asker_from_config`, which refuses a config
+/// it cannot construct a provider for — an unparseable `[system_one] provider`,
+/// or a remote provider whose `api_key_env` names an unset or empty variable.
+/// Nothing ON/OFF folds those in, and that is deliberate: `rerank_enabled` for
+/// the `onnx` backend already means "config says to try", not "the worker came
+/// up", and a provider-key check here would have to read `[system_one]` on a
+/// path that does not carry the config. So read this as "the rollout permits
+/// system-one", never as "the reranker will be constructed".
+///
+/// `Effective: rerank ON/OFF` in `setup` output inherits the same caveat: ON
+/// means the stage is armed, not that a key is present. The reason line the
+/// checker prints for an unarmed backend is what separates the two — it names
+/// the feature or the env var, so an ON with no reason line did not fail a gate.
+pub fn system_one_rerank_available() -> bool {
+    if !cfg!(feature = "system-one") {
+        return false;
+    }
+    crate::feature_flags::FeatureFlag::SystemOne.is_enabled()
+}
+
+impl SearchConfig {
+    /// Whether the rerank stage runs at all under the configured backend:
+    /// `off` never reranks; `system-one` reranks regardless of
+    /// `rerank_enabled` — but only when the backend is actually constructible
+    /// (see [`system_one_rerank_available`]), otherwise it degrades to no
+    /// reranking exactly as the dispatch does; `onnx` (and any unknown string,
+    /// treated as the default) reranks only when `rerank_enabled` is true. The
+    /// single semantic bridge consumed by the rerank dispatch, the over-fetch
+    /// decision, and the search-cache key fold.
+    pub fn rerank_effectively_enabled(&self) -> bool {
+        match self.rerank_backend.as_str() {
+            "off" => false,
+            "system-one" => system_one_rerank_available(),
+            _ => self.rerank_enabled,
+        }
+    }
 }
 
 fn default_batch_size() -> u64 {
@@ -1168,9 +1262,64 @@ mod tests {
         let mut config = LeIndexConfig::default();
         config.search.rerank_enabled = true;
         config.search.rerank_top_n = 80;
+        config.search.rerank_backend = "system-one".to_string();
         let decoded: LeIndexConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
         assert!(decoded.search.rerank_enabled);
         assert_eq!(decoded.search.rerank_top_n, 80);
+        assert_eq!(decoded.search.rerank_backend, "system-one");
+    }
+
+    #[test]
+    fn test_rerank_backend_semantics() {
+        // Default: onnx, rerank off unless rerank_enabled.
+        let mut config = LeIndexConfig::default();
+        assert_eq!(config.search.rerank_backend, "onnx");
+        assert!(!config.search.rerank_effectively_enabled());
+        // onnx + rerank_enabled => rerank on.
+        config.search.rerank_enabled = true;
+        assert!(config.search.rerank_effectively_enabled());
+        // system-one implies rerank regardless of rerank_enabled — but only when
+        // the backend is constructible: the flag must be on AND the feature
+        // compiled in. A config asking for it otherwise reports OFF, matching
+        // the dispatch, which refuses to construct the reranker.
+        //
+        // Driven through `with_flag_override`, which takes the test lock and
+        // restores the previous state on unwind: a failing assertion here must
+        // not leak a `SystemOne = true` override into every later test in the
+        // crate. Not nested — the lock is not reentrant — so the two sides are
+        // sequential, and the config is mutated in between while the lock is
+        // free.
+        config.search.rerank_backend = "system-one".to_string();
+        config.search.rerank_enabled = false;
+        crate::feature_flags::with_flag_override(
+            crate::feature_flags::FeatureFlag::SystemOne,
+            false,
+            || {
+                assert!(
+                    !config.search.rerank_effectively_enabled(),
+                    "system-one without LEINDEX_FEATURE_SYSTEM_ONE cannot rerank"
+                );
+            },
+        );
+        crate::feature_flags::with_flag_override(
+            crate::feature_flags::FeatureFlag::SystemOne,
+            true,
+            || {
+                assert_eq!(
+                    config.search.rerank_effectively_enabled(),
+                    cfg!(feature = "system-one"),
+                    "available system-one reranks regardless of rerank_enabled; a build \
+                     without the feature still cannot"
+                );
+            },
+        );
+        // off is an explicit no-rerank even with rerank_enabled set.
+        config.search.rerank_backend = "off".to_string();
+        config.search.rerank_enabled = true;
+        assert!(!config.search.rerank_effectively_enabled());
+        // Unknown strings are treated as the onnx default (rerank_enabled gates).
+        config.search.rerank_backend = "bogus".to_string();
+        assert!(config.search.rerank_effectively_enabled());
     }
 
     #[test]
@@ -1254,6 +1403,7 @@ mod tests {
                 neural_weight: 0.35,
                 rerank_enabled: true,
                 rerank_top_n: 80,
+                rerank_backend: "onnx".to_string(),
                 fragment_index_enabled: false,
                 fragment_max_bytes: 12_000,
                 fragment_weight: 0.35,

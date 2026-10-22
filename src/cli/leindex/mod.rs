@@ -6,6 +6,8 @@ mod diagnostics;
 pub(crate) mod indexing;
 pub(crate) mod model_download;
 mod query;
+#[cfg(feature = "system-one")]
+mod rerank_system_one;
 pub(crate) mod setup;
 pub(crate) mod setup_config;
 mod types;
@@ -40,6 +42,57 @@ use tracing::{debug, info, warn};
 /// Find existing index storage without creating a directory or opening SQLite.
 pub(crate) fn resolve_existing_storage_path(project_path: &Path) -> Option<PathBuf> {
     LeIndex::resolve_existing_storage_path(project_path)
+}
+
+/// Process-lifetime CLI `--rerank` override for the rerank backend. CLI runs
+/// are single-shot, so installing the value before the first search is
+/// sufficient; the mutex only exists because `OnceLock` is write-once. The
+/// `&'static str` payloads copy out of the guard, so readers never hold it
+/// across a return.
+static RERANK_BACKEND_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<&'static str>>> =
+    std::sync::OnceLock::new();
+
+/// Install the CLI `--rerank` override for this process (called once by the
+/// `search` command before any query runs).
+pub(crate) fn set_rerank_backend_override(backend: &str) {
+    // Canonicalize to the literal backend names; anything else falls through
+    // to the default-onnx semantics the dispatch's catch-all arm applies.
+    let canonical: &'static str = match backend {
+        "system-one" => "system-one",
+        "off" => "off",
+        _ => "onnx",
+    };
+    if let Ok(mut guard) = RERANK_BACKEND_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+    {
+        *guard = Some(canonical);
+    }
+}
+
+/// Effective rerank backend: the CLI `--rerank` override when set, otherwise
+/// `[search] rerank_backend`. Every rerank-adjacent decision (dispatch,
+/// over-fetch, cache-key fold) reads the backend through this single seam.
+pub(crate) fn effective_rerank_backend(cfg: &crate::config::SearchConfig) -> &str {
+    let override_backend = RERANK_BACKEND_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|guard| *guard);
+    override_backend.unwrap_or(cfg.rerank_backend.as_str())
+}
+
+/// [`SearchConfig::rerank_effectively_enabled`] folded with the CLI override:
+/// the override replaces the configured backend before the enable/disable
+/// semantics are applied. `system-one` also requires the backend to be
+/// constructible, so the override cannot turn rerank ON on a build that lacks
+/// the feature or whose rollout flag is off.
+pub(crate) fn rerank_effectively_enabled_with_override(cfg: &crate::config::SearchConfig) -> bool {
+    match effective_rerank_backend(cfg) {
+        "off" => false,
+        "system-one" => crate::config::system_one_rerank_available(),
+        _ => cfg.rerank_enabled,
+    }
 }
 
 /// LeIndex - Main orchestration struct for the entire LeIndex system.
@@ -655,6 +708,23 @@ impl LeIndex {
             rerank_enabled: cfg.search.rerank_enabled,
             rerank_top_n: cfg.search.rerank_top_n,
             rerank_model: &rerank_model,
+            rerank_backend: effective_rerank_backend(&cfg.search),
+            // System-One fails open when its flag is off, so the capability to
+            // actually run the judge is result-affecting and belongs in the key
+            // (Codex P1). Fold `system_one_rerank_available()`, NOT the raw
+            // `is_enabled()`: the predicate also requires the `system-one`
+            // feature to be compiled in, and the default build does not have it
+            // (`default = ["full"]`, and `full` omits `system-one`). Folding the
+            // bare flag made a default build and a `--features system-one` build
+            // compute the SAME key whenever the env var was set, so the
+            // unreranked results the default build cached were served by the
+            // feature-enabled build and the judge never ran — the rollout had no
+            // effect for already-queried inputs. Other backends are driven purely
+            // by config and stay `true`.
+            rerank_backend_active: {
+                let backend = effective_rerank_backend(&cfg.search);
+                backend != "system-one" || crate::config::system_one_rerank_available()
+            },
             fragment_index_enabled: cfg.search.fragment_index_enabled,
             fragment_weight: cfg.search.fragment_weight,
             fragment_root_hash: &fragment_root_hash,

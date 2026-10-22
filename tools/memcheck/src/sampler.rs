@@ -32,8 +32,11 @@ pub struct MemorySample {
 
 /// GPU VRAM/utilization sample (§14 item 8, §2.1 GPU memory reporting).
 ///
-/// On a machine with ROCm (`rocm-smi`) or CUDA (`nvidia-smi`), fields are
-/// `Some`. On headless boxes (no GPU tools), all fields are `None`.
+/// `provider` identifies which tool was found (`rocm-smi` or `nvidia-smi`).
+/// The value fields are `Some` only when that tool actually reported a
+/// parseable number. On headless boxes (no GPU tools) `provider` is `None`
+/// and all value fields are `None`. A `Some` provider with `None` values
+/// therefore means "tool found, value unavailable", not "zero usage".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct GpuSample {
     /// VRAM used in MiB.
@@ -157,14 +160,16 @@ fn sample_gpu_cuda() -> Option<GpuSample> {
     })
 }
 
-/// If worker tracking is enabled, also discovers a direct child running in
-/// worker mode (VAL-CPHASE-034).
+/// Take one sample of `pid`, optionally including a worker child.
+///
+/// With `track_worker`, a failed `/proc` scan is an `Err`, never a silent
+/// `worker_rss_kib: 0` — see [`find_child_worker_rss`].
 pub fn sample(pid: u32, track_worker: bool) -> anyhow::Result<MemorySample> {
     let rss = read_vm_rss(pid)?;
     let (mapped, anon, pss) = read_smaps_breakdown(pid);
 
     let worker_rss = if track_worker {
-        find_child_worker_rss(pid)
+        find_child_worker_rss(pid)?
     } else {
         0
     };
@@ -215,14 +220,19 @@ pub fn is_worker_process(pid: u32) -> bool {
 /// Find the RSS of a direct child running in worker mode.
 ///
 /// Scans `/proc` for direct children whose NUL-separated argv contains the
-/// hidden worker token. Returns the RSS of the first matching child, or 0.
-/// Ownership is checked independently of the process name because the worker
-/// re-executes the same binary as its parent.
-fn find_child_worker_rss(parent_pid: u32) -> u64 {
-    let proc_dir = match std::fs::read_dir("/proc") {
-        Ok(d) => d,
-        Err(_) => return 0,
-    };
+/// hidden worker token. Returns the RSS of the first matching child, or 0 when
+/// there is none. Ownership is checked independently of the process name
+/// because the worker re-executes the same binary as its parent.
+///
+/// `Ok(0)` is a finding: the measured process has no worker child. `Err` means
+/// the scan itself could not run, which is the case a caller must not read as
+/// "no worker": `PhaseReport::worker_rss_max_kib` documents 0 as "no worker was
+/// active or detected", so folding a failed scan into 0 would make that
+/// documented meaning unfalsifiable. Per-pid read failures (a child exiting
+/// mid-scan) are still skipped rather than retried — they are races the scan
+/// cannot win, and surfacing them would make every sample flaky.
+fn find_child_worker_rss(parent_pid: u32) -> std::io::Result<u64> {
+    let proc_dir = std::fs::read_dir("/proc")?;
 
     for entry in proc_dir.flatten() {
         let name = entry.file_name();
@@ -238,10 +248,10 @@ fn find_child_worker_rss(parent_pid: u32) -> u64 {
         if is_worker_process(child_pid)
             && let Ok(rss) = read_vm_rss(child_pid)
         {
-            return rss;
+            return Ok(rss);
         }
     }
-    0
+    Ok(0)
 }
 
 /// Check if `child_pid` is a child of `parent_pid` by reading
@@ -275,25 +285,43 @@ fn is_child_of(child_pid: u32, parent_pid: u32) -> bool {
     false
 }
 
-/// Read VmRSS from /proc/`<pid>`/status.
-fn read_vm_rss(pid: u32) -> anyhow::Result<u64> {
+/// Read a `Key: <value> kB` field from /proc/`<pid>`/status.
+fn read_status_kib(pid: u32, key: &str) -> anyhow::Result<u64> {
     let path = PathBuf::from(format!("/proc/{}/status", pid));
     let content = std::fs::read_to_string(&path)
         .map_err(|_| anyhow::anyhow!("cannot read {}", path.display()))?;
 
+    let prefix = format!("{key}:");
     for line in content.lines() {
-        if line.starts_with("VmRSS:") {
+        if line.starts_with(&prefix) {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2 {
                 let kib: u64 = parts[1]
                     .parse()
-                    .map_err(|_| anyhow::anyhow!("invalid VmRSS value in {}", path.display()))?;
+                    .map_err(|_| anyhow::anyhow!("invalid {} value in {}", key, path.display()))?;
                 return Ok(kib);
             }
         }
     }
 
-    anyhow::bail!("VmRSS not found in {}", path.display())
+    anyhow::bail!("{} not found in {}", key, path.display())
+}
+
+/// Read VmRSS from /proc/`<pid>`/status.
+fn read_vm_rss(pid: u32) -> anyhow::Result<u64> {
+    read_status_kib(pid, "VmRSS")
+}
+
+/// Read the kernel's peak RSS high-water mark (`VmHWM`) for `pid` alone.
+///
+/// Unlike the `wait4` `ru_maxrss` returned for a reaped child, `VmHWM` counts
+/// only this process: reaped descendants contribute nothing. That is what
+/// makes it the honest main-process peak when the measured command spawns
+/// oversized subprocesses (SCIP precision ingest launches an external indexer
+/// that can dwarf the parent). It is monotonic, so callers may keep the last
+/// value read rather than tracking a maximum.
+pub fn read_vm_hwm(pid: u32) -> anyhow::Result<u64> {
+    read_status_kib(pid, "VmHWM")
 }
 
 /// Read mapped-file, anonymous, and PSS from `/proc/<pid>/smaps`.
@@ -446,6 +474,39 @@ pub struct DescendantTree {
     pub by_name: HashMap<String, usize>,
     /// Sum of RSS across all descendants, in KiB.
     pub combined_rss_kib: u64,
+    /// Descendant-inclusive peak RSS for the whole tree, in KiB, as reported by
+    /// the kernel for the measured process when it was reaped (`wait4`
+    /// `ru_maxrss`). The kernel keeps this high-water mark for the process
+    /// *and every descendant it reaped*, so it can exceed the measured
+    /// process's own peak by an arbitrary margin — one external indexer
+    /// (`rust-analyzer scip`, ~700 MiB) is enough to dominate it. Kept here,
+    /// apart from `PhaseReport::rss_max_kib`, so main-process accounting stays
+    /// honest. 0 when no kernel lifetime reading was available.
+    #[serde(default)]
+    pub peak_rss_kib: u64,
+    /// The descendant pids themselves, sorted.
+    ///
+    /// `by_name` is a flat name → count map, so it cannot tell this process's
+    /// `sleep` from one a sibling test spawned — which is why the
+    /// "child is gone" assertion used to bypass this module and poke
+    /// `/proc/<pid>` directly. Carrying the pids lets a test ask the tree the
+    /// question it actually has an answer for (`pids.contains(&child_pid)`)
+    /// instead of testing the OS with the module under test skipped.
+    ///
+    /// Serialized only into the run's own report, so a failing phase can still
+    /// be diagnosed after the fact. It is kept OUT of the committed baselines
+    /// by `diff::write_baseline`, which strips `descendants.pids` before writing
+    /// — a pid is meaningless after the run that produced it, and
+    /// `write_baseline` otherwise writes the whole `PhaseReport`, so any phase
+    /// that spawned a descendant would bake machine-specific pids into
+    /// `docs/memory/baselines/`. Only the pids go: `total`, `by_name`,
+    /// `combined_rss_kib` and `peak_rss_kib` are retained in the committed
+    /// baseline as diagnostic data. `skip_serializing_if = "Vec::is_empty"`
+    /// would not have done it: it only omits the empty case, which is the one
+    /// case that was never a problem. `default` keeps existing report JSON and
+    /// baselines parsing.
+    #[serde(default)]
+    pub pids: Vec<u32>,
 }
 
 use std::collections::HashMap;
@@ -485,13 +546,17 @@ fn parse_proc_stat(content: &str, page_kib: u64) -> Option<(u32, String, u64)> {
 pub fn count_descendants(root_pid: u32) -> std::io::Result<DescendantTree> {
     // Build a map of pid → (ppid, name, rss_kib) for all live processes.
     let mut all_procs: Vec<(u32, u32, String, u64)> = Vec::new();
+    let mut skipped = 0usize;
     let page_kib = page_size_kib();
     let proc_dir = std::fs::read_dir("/proc")?;
     for entry in proc_dir.flatten() {
         let name = entry.file_name();
         let name_str = match name.to_str() {
             Some(s) => s,
-            None => continue,
+            None => {
+                skipped += 1;
+                continue;
+            }
         };
         let pid: u32 = match name_str.parse() {
             Ok(p) => p,
@@ -500,12 +565,21 @@ pub fn count_descendants(root_pid: u32) -> std::io::Result<DescendantTree> {
         // Read ppid, name and RSS from /proc/<pid>/stat
         let stat_path = format!("/proc/{}/stat", pid);
         let Ok(content) = std::fs::read_to_string(&stat_path) else {
+            skipped += 1;
             continue;
         };
         let Some((ppid, comm, rss_kib)) = parse_proc_stat(&content, page_kib) else {
+            skipped += 1;
             continue;
         };
         all_procs.push((pid, ppid, comm, rss_kib));
+    }
+
+    if skipped > 0 {
+        eprintln!(
+            "memcheck: count_descendants skipped {skipped} /proc entries (stat read/parse failed); \
+             descendant totals may undercount"
+        );
     }
 
     // BFS from root_pid
@@ -521,10 +595,12 @@ pub fn count_descendants(root_pid: u32) -> std::io::Result<DescendantTree> {
                 tree.total += 1;
                 *tree.by_name.entry(name.clone()).or_insert(0) += 1;
                 tree.combined_rss_kib += rss;
+                tree.pids.push(pid);
                 queue.push_back(pid);
             }
         }
     }
+    tree.pids.sort_unstable();
 
     Ok(tree)
 }
@@ -602,7 +678,7 @@ mod tests {
     #[test]
     fn test_find_child_worker_rss_no_worker() {
         let pid = std::process::id();
-        let rss = find_child_worker_rss(pid);
+        let rss = find_child_worker_rss(pid).expect("the /proc scan itself must succeed");
         assert_eq!(rss, 0, "no worker child expected for memcheck process");
     }
 
@@ -614,21 +690,23 @@ mod tests {
     }
 
     #[test]
-    fn test_gpu_sample_returns_some_on_amdgpu_or_none_elsewhere() {
-        let s = sample_gpu();
-        // On a box with ROCm: vram_used_mib is Some. On headless CI: all None.
-        // Either is valid; we just assert it doesn't panic and the struct is usable.
-        let _ = s.vram_used_mib;
-        let _ = s.gpu_utilization_pct;
-        let _ = s.provider;
-    }
-
-    #[test]
-    fn test_gpu_sample_is_consistent() {
-        // Two calls should return consistent types (both Some or both None for provider).
-        let s1 = sample_gpu();
-        let s2 = sample_gpu();
-        assert_eq!(s1.provider.is_some(), s2.provider.is_some());
+    fn test_gpu_sample_reports_only_known_providers_and_sane_values() {
+        // Whether a GPU exists is a property of the host, so presence cannot be
+        // asserted here. What CAN be asserted are the invariants a parsing bug
+        // would break, on either branch: a recognised provider name, and a
+        // utilisation that is a percentage rather than whatever the probe
+        // printed. `parse::<u8>()` accepts "120" and rocm's "N/A" trimming path
+        // has to reject garbage, so `<= 100` is a real check.
+        let sample = sample_gpu();
+        if let Some(ref provider) = sample.provider {
+            assert!(
+                matches!(provider.as_str(), "rocm" | "cuda" | "migraphx"),
+                "unknown GPU provider {provider:?}"
+            );
+        }
+        if let Some(pct) = sample.gpu_utilization_pct {
+            assert!(pct <= 100, "utilization {pct} is not a percentage");
+        }
     }
 
     #[test]
@@ -651,8 +729,19 @@ mod tests {
                 .unwrap()
                 .contains("test_before")
         );
-        let metadata = std::fs::metadata(&p).unwrap();
-        assert!(metadata.len() > 0, "heap profile file should be non-empty");
+        // A non-zero length proves only that SOMETHING was written — `smaps` is
+        // never empty, so that assertion could not fail. The snapshot's whole
+        // value is being a real smaps dump, so assert the two line shapes the
+        // reader depends on.
+        let content = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            content.lines().any(is_vma_header),
+            "snapshot must contain at least one VMA header: {content:.200}"
+        );
+        assert!(
+            content.lines().any(|l| l.trim().starts_with("Rss:")),
+            "snapshot must contain Rss: detail lines"
+        );
     }
 
     #[test]
@@ -663,54 +752,58 @@ mod tests {
     }
 
     #[test]
-    fn test_count_descendants_includes_spawned_child() {
+    fn test_count_descendants_reports_a_live_child_and_drops_it_once_reaped() {
         let mut child = std::process::Command::new("sleep")
             .arg("5")
             .spawn()
             .unwrap();
+        let child_pid = child.id();
         // Brief wait for /proc to reflect the child
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let tree = count_descendants(std::process::id()).unwrap();
+        let live = count_descendants(std::process::id()).unwrap();
+        // Named by PID, so a sibling test's `sleep` cannot stand in for ours:
+        // `{"sleep": 1}` is whatever `sleep` a sibling spawned, which is how
+        // the old `!by_name.contains_key("sleep")` raced in CI. The pid is the
+        // only assertion here for that same reason — `by_name` cannot
+        // attribute a name to a process.
         assert!(
-            tree.total >= 1,
-            "should find at least 1 descendant (the sleep child), got {}",
-            tree.total
+            live.pids.contains(&child_pid),
+            "count_descendants must report the sleep child we spawned (pid {child_pid}), \
+             got pids {:?}",
+            live.pids
         );
-        // The child should appear in by_name
-        assert!(
-            tree.by_name.contains_key("sleep") || tree.by_name.values().sum::<usize>() >= 1,
-            "by_name should contain the child process"
-        );
+
         child.kill().ok();
         child.wait().ok();
 
-        // After killing, OUR child must be gone from the process table.
-        // Asserting a global total==0 races with sibling tests' transient
-        // children (chrono_now's `date`, git probes) under parallel test
-        // threads, so scope the assertion to the child we spawned.
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let child_pid = child.id();
-        let child_gone = !std::path::Path::new(&format!("/proc/{child_pid}")).exists();
-        let tree_after = count_descendants(std::process::id()).unwrap();
+        // `wait()` returning means the kernel has reaped the zombie, so the
+        // walk must stop reporting the pid. This is the "gone" half that the
+        // old `/proc/<pid>` poll asserted OUTSIDE the module, testing the OS
+        // instead of `count_descendants`; asking the tree puts the module's own
+        // behaviour under test. No poll loop is needed — `wait()` is the
+        // guarantee, and polling `/proc` after it could only observe a pid
+        // recycled by an unrelated process.
+        //
+        // The pid is asserted GONE from `pids`, which is the field under test.
+        //
+        // Deliberately NOT asserted, because both hold BY CONSTRUCTION and
+        // cannot fail for any input — they read like coverage and are none:
+        //
+        //   * `total == by_name.values().sum()` — `total` and `by_name` are
+        //     incremented in the same BFS branch;
+        //   * `pids.len() == total` — `tree.pids.push(pid)` is in that SAME
+        //     branch, one line below `total += 1`.
+        //
+        // Nor is the root's absence worth asserting here: the BFS skips
+        // `pid == root_pid` before it can insert anything, so no input can put
+        // the measured process in its own descendant list. The reaped-child
+        // check above is the only assertion in this test that can fail.
+        let reaped = count_descendants(std::process::id()).unwrap();
         assert!(
-            child_gone && !tree_after.by_name.contains_key("sleep"),
-            "after killing the child (pid {child_pid}), it must no longer be a descendant: {:?}",
-            tree_after.by_name
-        );
-    }
-
-    #[test]
-    fn test_count_descendants_no_children() {
-        // The test process might have residual children from other tests
-        // running concurrently (e.g. test_count_descendants_includes_spawned_child
-        // spawns a "sleep"). We only check that total is small (no big tree).
-        let tree = count_descendants(std::process::id()).unwrap();
-        assert!(
-            tree.total < 5,
-            "test process should have very few descendants: {} found: {:?}",
-            tree.total,
-            tree.by_name
+            !reaped.pids.contains(&child_pid),
+            "reaped child (pid {child_pid}) must not be reported as a descendant: {:?}",
+            reaped.pids
         );
     }
 
@@ -740,15 +833,53 @@ mod tests {
 
     #[test]
     fn test_descendant_tree_serde_roundtrip() {
+        // A tree shape `count_descendants` can actually produce: it maintains
+        // `total`, `by_name` and `pids` together, so the fixture must agree with
+        // itself — `test_count_descendants_reports_a_live_child_and_drops_it_once_reaped`
+        // asserts that invariant on a live walk, and a fixture contradicting it
+        // would be modelling the opposite of the contract.
         let mut by_name = HashMap::new();
         by_name.insert("leindex-embed".to_string(), 1);
         let tree = DescendantTree {
             total: 1,
             by_name,
             combined_rss_kib: 50000,
+            peak_rss_kib: 735848,
+            pids: vec![4242],
         };
         let json = serde_json::to_string(&tree).unwrap();
+        // `pids` IS serialized into the run's own report — that is the one
+        // place a failing phase can still be diagnosed from. Keeping them out
+        // of the COMMITTED baselines is `diff::write_baseline`'s job, covered
+        // by `test_write_baseline_strips_machine_specific_pids`.
+        assert!(
+            json.contains("pids"),
+            "pids must survive into the run report for post-mortem use: {json}"
+        );
         let deserialized: DescendantTree = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized, tree);
+        assert_eq!(deserialized.total, tree.total);
+        assert_eq!(deserialized.by_name, tree.by_name);
+        assert_eq!(deserialized.combined_rss_kib, tree.combined_rss_kib);
+        assert_eq!(deserialized.peak_rss_kib, tree.peak_rss_kib);
+        assert_eq!(
+            deserialized.pids, tree.pids,
+            "pids must roundtrip through the report: {:?}",
+            deserialized.pids
+        );
+    }
+
+    /// A baseline written from an OLDER run (no `pids` key) must still parse —
+    /// `#[serde(default)]` on the field, not on the struct.
+    #[test]
+    fn test_descendant_tree_parses_a_baseline_written_before_pids_existed() {
+        let json = r#"{"total":1,"by_name":{"leindex-embed":1},"combined_rss_kib":50000,"peak_rss_kib":735848}"#;
+        let tree: DescendantTree = serde_json::from_str(json).unwrap();
+        assert_eq!(tree.total, 1);
+        assert_eq!(tree.peak_rss_kib, 735848);
+        assert!(
+            tree.pids.is_empty(),
+            "a legacy baseline without pids must default to empty: {:?}",
+            tree.pids
+        );
     }
 }

@@ -1196,6 +1196,7 @@ fn render_tool_output_inner(
     let rendered = match normalized.as_str() {
         "leindex_search" | "search" => render_search(data, query, color),
         "leindex_find" | "find" => render_find(data),
+        "leindex_structural" | "structural" => render_structural(data),
         "leindex_context" | "context" => render_context(data, node_id, color),
         "leindex_diagnostics" | "diagnostics" => render_diagnostics(data, color),
         "leindex_project_map" | "project_map" => render_project_map(data, color),
@@ -1739,4 +1740,86 @@ fn render_find_hit(out: &mut String, current: &mut Option<String>, hit: &Value) 
     for line in hit["after"].as_array().into_iter().flatten() {
         let _ = writeln!(out, "   | {}", line.as_str().unwrap_or(""));
     }
+}
+
+// =============================================================================
+// leindex_structural — AST-pattern matches
+// =============================================================================
+
+/// Render a `leindex_structural` result: one header with the pattern and
+/// language, then matches grouped by file so the path is paid for once.
+fn render_structural(data: &Value) -> String {
+    use std::fmt::Write as _;
+
+    let pattern = find_text(data, "pattern");
+    let lang = find_text(data, "lang");
+    let total = find_num(data, "total_matches");
+    let returned = find_num(data, "returned");
+    let mut out = String::new();
+
+    if data["returned"] == 0 {
+        let _ = writeln!(out, "No structural matches for {pattern:?} in {lang}");
+        if let Some(note) = data.get("note").and_then(Value::as_str) {
+            let _ = writeln!(out, "{note}");
+        }
+        return out;
+    }
+
+    let _ = writeln!(
+        out,
+        "{total} structural match(es) for {pattern:?} in {lang} ({returned} shown)"
+    );
+    for file in data["files"].as_array().into_iter().flatten() {
+        let _ = writeln!(out, "{}", find_text(file, "path"));
+        for hit in file["hits"].as_array().into_iter().flatten() {
+            let capture = hit
+                .get("captured")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty());
+            let _ = match capture {
+                Some(captured) => writeln!(
+                    out,
+                    "  {}: [{}] {} — {}",
+                    find_num(hit, "line"),
+                    find_text(hit, "kind"),
+                    collapse_whitespace(&find_text(hit, "text")),
+                    captured
+                ),
+                None => writeln!(
+                    out,
+                    "  {}: [{}] {}",
+                    find_num(hit, "line"),
+                    find_text(hit, "kind"),
+                    collapse_whitespace(&find_text(hit, "text"))
+                ),
+            };
+        }
+    }
+    if data["has_more"] == true {
+        let _ = writeln!(out, "… more matches: raise limit or use offset");
+    }
+    if let Some(note) = data.get("note").and_then(Value::as_str) {
+        let _ = writeln!(out, "{note}");
+    }
+    out
+}
+
+/// Collapse newlines/indentation so a multi-line match stays on one row —
+/// ast-grep matches whole functions, which are rarely single-line.
+fn collapse_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !last_space && !out.is_empty() {
+                out.push(' ');
+            }
+            last_space = true;
+        } else {
+            out.push(ch);
+            last_space = false;
+        }
+    }
+    let trimmed = out.trim_end().to_string();
+    truncate_chars(&trimmed, 160)
 }

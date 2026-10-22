@@ -5,10 +5,15 @@
 //! is `idle_warm → index → idle_post → query → reindex → idle_final`
 //! (VAL-MEASURE-001, VAL-MEASURE-002).
 //!
-//! Linux is the supported measurement platform: command maxima also include
-//! the per-child `wait4` lifetime high-water mark. Other targets only reap
-//! commands and retain any available periodic samples; that fallback cannot
-//! establish lifetime peaks or certify the Linux memory budget.
+//! Linux is the supported measurement platform: command phases take their
+//! main-process peak from `/proc/<pid>/status` `VmHWM`, which the kernel
+//! maintains for the process alone. The `wait4` lifetime mark is retained too,
+//! but only in `DescendantTree::peak_rss_kib`: it folds in every descendant the
+//! process reaped, so it is reported apart from the main-process metric that
+//! the budget ceilings gate on. Non-Linux targets are rejected outright by
+//! [`require_linux_measurement_support`] before anything launches: the /proc
+//! sampler and wait4 lifetime peak are both Linux-only, so there is no
+//! degraded-mode fallback to misread.
 //!
 //! Worker-aware extensions (VAL-CPHASE-036): the canonical workload includes
 //! an idle pre-embed phase, a worker-active embed phase, and a phase that
@@ -110,8 +115,8 @@ pub struct WorkloadConfig {
     /// `main.rs`. Worker-active phases run regardless; this only controls
     /// whether a missing worker process produces a diagnostic.
     pub worker_capable: bool,
-    /// Directory for heap-profile snapshots (smaps). If None, profiles are
-    /// stored in a temp dir that is cleaned up after the run.
+    /// Directory for heap-profile snapshots (smaps). If None, no snapshots
+    /// are captured.
     pub heap_profile_dir: Option<PathBuf>,
 }
 
@@ -168,7 +173,7 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
     let mut reports = Vec::with_capacity(CANONICAL_PHASES.len());
 
     // Clean any pre-existing index state so the run is deterministic.
-    clean_index_state(&config.fixture);
+    clean_index_state(&config.fixture)?;
 
     // ── Phase 1: idle_warm ──────────────────────────────────────────────
     // Launch a fresh leindex MCP process and let it sit idle.
@@ -621,6 +626,9 @@ fn sample_pids_for_duration(
     dwell: Duration,
     sample_interval: Duration,
 ) -> Result<PhaseReport> {
+    if pids.is_empty() {
+        anyhow::bail!("phase '{phase_name}' has no pids to sample");
+    }
     let start = Instant::now();
     let mut samples = Vec::new();
 
@@ -628,6 +636,13 @@ fn sample_pids_for_duration(
         let mut combined = 0u64;
         let mut mapped = 0u64;
         let mut anon = 0u64;
+        let mut pss = 0u64;
+        // GPU is a host-global reading, not a per-pid one (the sampler caches it
+        // behind a TTL for exactly that reason), so the first successful
+        // sample's value is this phase's. Discarding it made this phase report
+        // `gpu_vram_mib: None` on a GPU host while every single-pid phase
+        // reported the real figure.
+        let mut gpu = None;
         let mut all_ok = true;
         for &pid in pids {
             match sampler::sample(pid, false) {
@@ -635,6 +650,8 @@ fn sample_pids_for_duration(
                     combined += s.rss_kib;
                     mapped += s.mapped_file_kib;
                     anon += s.anon_kib;
+                    pss += s.pss_kib;
+                    gpu.get_or_insert(s.gpu);
                 }
                 Err(_) => {
                     all_ok = false;
@@ -647,15 +664,21 @@ fn sample_pids_for_duration(
                 rss_kib: combined,
                 mapped_file_kib: mapped,
                 anon_kib: anon,
-                pss_kib: 0,
+                pss_kib: pss,
                 worker_rss_kib: 0,
-                gpu: sampler::GpuSample::default(),
+                gpu: gpu.unwrap_or_default(),
             });
         }
         std::thread::sleep(sample_interval);
     }
 
     let duration = start.elapsed();
+    if samples.is_empty() {
+        anyhow::bail!(
+            "phase '{phase_name}' produced no usable samples: every measured pid was gone or \
+             unreadable for the whole dwell — refusing to report 0 KiB as a measurement"
+        );
+    }
     Ok(build_phase_report(phase_name, &mut samples, duration))
 }
 
@@ -812,6 +835,40 @@ fn run_command_phase_with_peak_support(
     // Sampler thread — collects samples until the command exits.
     let done = Arc::new(AtomicBool::new(false));
     let done_clone = done.clone();
+    let done_hwm = done.clone();
+
+    // Dedicated VmHWM poller.
+    //
+    // This MUST NOT share a thread with `sampler::sample`: that call reads
+    // `smaps` and may fork a GPU probe (`cached_gpu_sample` refreshes on a 5 s
+    // TTL, costing hundreds of ms on GPU hosts). Any peak landing inside such a
+    // blocking window would be missed, and because `/proc/<pid>` disappears the
+    // instant the command exits the reading can never be recovered afterwards —
+    // a zombie retains its `/proc` entry but loses `VmHWM`/`VmRSS`. Keeping the
+    // poll on its own thread bounds the sampling gap to the sleep interval
+    // alone, independent of how slow a full sample turns out to be.
+    //
+    // VmHWM is monotonic, so the last successful read is the phase peak.
+    //
+    // # shh: a peak reached in the last ~250us before the command exits is
+    // still missed — the poller cannot outlive `done`, because `/proc/<pid>`
+    // loses `VmHWM` the moment `wait4` reaps the child. For phases that ran no
+    // descendants `ru_maxrss` closes that gap exactly (see the certified fold
+    // below); for descendant-spawning phases it cannot be used without folding
+    // the descendants' peaks in too, so the gap is genuine there and not worth
+    // closing. It only under-reports an allocation made in the final tick.
+    let hwm_handle = std::thread::spawn(move || {
+        let mut vm_hwm_kib = 0u64;
+        while !done_hwm.load(Ordering::Relaxed) {
+            if let Ok(hwm) = sampler::read_vm_hwm(pid) {
+                vm_hwm_kib = hwm;
+            }
+            std::thread::sleep(Duration::from_micros(250));
+        }
+        vm_hwm_kib
+    });
+
+    let descendants_handle = poll_descendants(pid, done.clone());
 
     let sampler_handle = std::thread::spawn(move || {
         let mut samples = Vec::new();
@@ -835,6 +892,12 @@ fn run_command_phase_with_peak_support(
     let mut samples = sampler_handle
         .join()
         .map_err(|_| anyhow::anyhow!("sampler thread panicked"))?;
+    let main_vm_hwm_kib = hwm_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("VmHWM poller thread panicked"))?;
+    let descendant_observation = descendants_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("descendant poller thread panicked"))?;
 
     let (status, lifetime_peak_kib) =
         waited.with_context(|| format!("{} command did not complete", phase_name))?;
@@ -877,22 +940,98 @@ fn run_command_phase_with_peak_support(
 
     let mut report = build_phase_report(phase_name, &mut samples, duration);
     // /proc ticks can miss an entire short command or an allocation between
-    // ticks. wait4 retains the lifetime high-water mark after process exit.
-    // Keep percentiles/breakdowns and sample_count tied to actual /proc reads.
+    // ticks, so the sample set alone can under-report the phase peak.
+    // `VmHWM` is the kernel's own high-water mark for the measured process
+    // ALONE and survives that gap, so it — not a descendant-inclusive estimate
+    // — is what extends `rss_max_kib` (documented as "main process").
+    if main_vm_hwm_kib > 0 {
+        report.rss_max_kib = report.rss_max_kib.max(main_vm_hwm_kib);
+        report.combined_rss_max_kib = report.combined_rss_max_kib.max(main_vm_hwm_kib);
+    }
     if config.verbose {
         eprintln!(
-            "memcheck: phase '{}' peak sources — sampled: {} KiB, kernel lifetime: {} KiB",
-            phase_name, report.rss_max_kib, lifetime_peak_kib
+            "memcheck: phase '{}' peak sources — sampled: {} KiB, main VmHWM: {} KiB, descendant-inclusive kernel lifetime: {} KiB",
+            phase_name, report.rss_max_kib, main_vm_hwm_kib, lifetime_peak_kib
         );
     }
-    report.rss_max_kib = report.rss_max_kib.max(lifetime_peak_kib);
-    report.combined_rss_max_kib = report.combined_rss_max_kib.max(lifetime_peak_kib);
-    report.descendants = descendants;
+    // `wait4`'s ru_maxrss is exact but descendant-inclusive, so it is only a
+    // valid main-process peak when the command ran no descendants at all. When
+    // it did — live children seen during the phase, or a descendant still
+    // running now that the command is gone — the lifetime mark would charge
+    // that descendant's peak to leindex, which is the regression the budget
+    // ceilings were fixed for.
+    //
+    // The post-reap count `sampler::count_descendants` returns must NOT count as
+    // evidence: `/proc/<pid>` is gone the instant `wait4` reaps, so it comes back
+    // empty for EVERY phase whether or not descendants ever existed. Folding that
+    // emptiness into `observable` would certify "ran no descendants" on the
+    // strength of not having looked — precisely the false positive that would
+    // charge a reaped SCIP indexer's ~700 MiB to leindex. Only the LIVE poller
+    // (`DescendantObservation::observable`, set while the command was running)
+    // may establish that, and only the live-or-still-running signals may refute
+    // it. The count is used solely to report what is running now.
+    let descendant_observation = DescendantObservation {
+        seen: descendant_observation.seen || !descendants.by_name.is_empty(),
+        observable: descendant_observation.observable,
+    };
+    if lifetime_peak_kib > 0 {
+        match lifetime_fold(
+            descendant_observation,
+            report.rss_max_kib,
+            lifetime_peak_kib,
+        ) {
+            LifetimeFold::Accepted => {
+                // No descendant could have contributed to it, so ru_maxrss is
+                // this process's own peak — and unlike the 250us VmHWM poll it
+                // cannot miss an allocation made in the final tick before exit.
+                report.rss_max_kib = report.rss_max_kib.max(lifetime_peak_kib);
+                report.combined_rss_max_kib = report.combined_rss_max_kib.max(lifetime_peak_kib);
+            }
+            LifetimeFold::DescendantsSeen => {
+                // Expected for the phases that shell out (SCIP precision
+                // ingest); the peak is reported on the descendant tree instead.
+                if config.verbose {
+                    eprintln!(
+                        "memcheck: phase '{}' lifetime peak {} KiB is descendant-inclusive; not folding",
+                        phase_name, lifetime_peak_kib
+                    );
+                }
+            }
+            LifetimeFold::ExceedsObserved => {
+                // `seen == false` is NOT proof no descendant ran: `children`
+                // lists direct children only, so a reparented grandchild is
+                // invisible to the poller and its peak still lands in
+                // `ru_maxrss`. Refusing on the magnitude is what keeps a reaped
+                // indexer from being charged to leindex — the exact regression
+                // this fold exists to avoid.
+                if config.verbose {
+                    eprintln!(
+                        "memcheck: phase '{}' lifetime peak {} KiB far exceeds every observed \
+                         peak ({} KiB); a descendant was likely reaped unseen, so it is not \
+                         folded into main-process RSS",
+                        phase_name, lifetime_peak_kib, report.rss_max_kib
+                    );
+                }
+            }
+        }
+    }
+    // Keep the descendant-inclusive lifetime peak, but only where it cannot be
+    // mistaken for main-process RSS: the budget ceilings gate on `rss_max_kib`,
+    // and a command that spawns a large external indexer (SCIP precision
+    // ingest) would otherwise charge that indexer's peak to leindex.
+    report.descendants = sampler::DescendantTree {
+        peak_rss_kib: lifetime_peak_kib,
+        ..descendants
+    };
 
     if config.verbose {
         eprintln!(
-            "memcheck: phase '{}' complete — rss_max: {} KiB, samples: {}, descendants: {}",
-            phase_name, report.rss_max_kib, report.sample_count, report.descendants.total
+            "memcheck: phase '{}' complete — rss_max: {} KiB, samples: {}, descendants: {}, tree peak: {} KiB",
+            phase_name,
+            report.rss_max_kib,
+            report.sample_count,
+            report.descendants.total,
+            report.descendants.peak_rss_kib
         );
     }
 
@@ -901,9 +1040,15 @@ fn run_command_phase_with_peak_support(
 
 /// Reap only the measured child and retain its kernel lifetime peak RSS.
 /// Linux wait4 reports KiB; unlike RUSAGE_CHILDREN it is scoped to this PID,
-/// not unrelated children previously reaped by the harness. Linux includes
-/// reaped descendants in this peak, so command phases conservatively account
-/// for their subprocesses too (periodic worker accounting is unchanged).
+/// not unrelated children previously reaped by the harness.
+///
+/// The returned peak is descendant-INCLUSIVE: Linux folds every descendant the
+/// process reaped into this high-water mark, so a phase that spawns a large
+/// subprocess (e.g. `rust-analyzer scip` for Rust precision ingestion, ~700
+/// MiB) reports THAT subprocess's peak, not the measured process's. Callers
+/// must not present the value as main-process RSS — `run_command_phase`
+/// deliberately keeps it out of `PhaseReport::rss_max_kib`, which the budget
+/// ceilings gate on, and records it in `DescendantTree::peak_rss_kib` instead.
 #[cfg(target_os = "linux")]
 fn wait_command_with_peak(child: &mut Child) -> Result<(std::process::ExitStatus, u64)> {
     use std::os::unix::process::ExitStatusExt;
@@ -927,6 +1072,134 @@ fn wait_command_with_peak(child: &mut Child) -> Result<(std::process::ExitStatus
             return Err(error.into());
         }
     }
+}
+
+/// `wait4`'s `ru_maxrss` may exceed the measured process's OWN live peak by up
+/// to this much (64 MiB) before the fold is refused.
+///
+/// `VmHWM` and `ru_maxrss` both report the high-water mark of the same process
+/// over the same lifetime, so for a childless phase they agree to within
+/// accounting noise — which makes the threshold nearly irrelevant to legitimate
+/// data and entirely about the descendant it is meant to exclude. It therefore
+/// has to sit BELOW the smallest descendant worth excluding: the regression that
+/// motivated this check folded rust-analyzer scip's ~733 MiB into `index`, and a
+/// tolerance large enough to admit that (1 GiB) would have certified it as
+/// leindex's own. 64 MiB is three orders of magnitude above the final-tick
+/// allocation the fold exists to recover (KiB) and an order of magnitude below a
+/// real folded indexer.
+const LIFETIME_FOLD_TOLERANCE_KIB: u64 = 64 * 1024;
+
+/// Why a `ru_maxrss` fold was refused, for the diagnostic line.
+#[derive(Clone, Copy)]
+enum LifetimeFold {
+    /// The lifetime mark is the measured process's own peak.
+    Accepted,
+    /// A descendant was seen live, so the fold would charge its peak to us.
+    DescendantsSeen,
+    /// Nothing observed a descendant, but the lifetime mark dwarfs every peak we
+    /// measured, which is what a folded descendant looks like once it is reaped.
+    ExceedsObserved,
+}
+
+/// Decide whether the descendant-inclusive lifetime peak may extend the
+/// main-process peak.
+fn lifetime_fold(
+    observation: DescendantObservation,
+    observed_kib: u64,
+    lifetime_kib: u64,
+) -> LifetimeFold {
+    if !observation.certifies_no_descendants() {
+        return LifetimeFold::DescendantsSeen;
+    }
+    if lifetime_kib.saturating_sub(observed_kib) <= LIFETIME_FOLD_TOLERANCE_KIB {
+        LifetimeFold::Accepted
+    } else {
+        LifetimeFold::ExceedsObserved
+    }
+}
+
+/// How often a running command is inspected for live descendants.
+///
+/// Coarser than the `VmHWM` poll on purpose: each check opens `/proc/<pid>/task`
+/// and reads one `children` file per thread, versus a single `status` line for
+/// `VmHWM`. The signal being detected is a process that allocates real memory,
+/// and that lives far longer than this interval.
+const DESCENDANT_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+/// What the descendant poller learned about one command phase.
+///
+/// `sampler::count_descendants` cannot answer this: it runs after `wait4` has
+/// reaped the measured process, so a descendant the command already waited for
+/// is gone by then and contributes nothing to the count. That blindness is
+/// exactly the shape of the `index` regression — the SCIP indexer is reaped
+/// before the phase ends — so the descendant check has to happen while the
+/// command is still running.
+#[derive(Clone, Copy, Default)]
+struct DescendantObservation {
+    /// A live child was seen while polling, or one was still running when the
+    /// phase completed.
+    seen: bool,
+    /// `/proc/<pid>/task/<tid>/children` was readable at least once, so
+    /// `seen == false` means "ran no descendants" rather than "could not look".
+    observable: bool,
+}
+
+impl DescendantObservation {
+    /// Whether `wait4`'s `ru_maxrss` can be trusted as the measured process's
+    /// own peak for this phase.
+    fn certifies_no_descendants(self) -> bool {
+        self.observable && !self.seen
+    }
+}
+
+/// Whether `pid` has at least one live child right now.
+///
+/// Reads `/proc/<pid>/task/<tid>/children` (`CONFIG_PROC_CHILDREN`). Returns
+/// `Err` when the process is gone or the kernel does not expose the file, which
+/// the caller must not mistake for "no children".
+fn has_live_child(pid: u32) -> std::io::Result<bool> {
+    let mut observable = false;
+    let mut saw_child = false;
+    for task in std::fs::read_dir(format!("/proc/{pid}/task"))?.flatten() {
+        let Ok(children) = std::fs::read_to_string(task.path().join("children")) else {
+            continue;
+        };
+        observable = true;
+        saw_child |= !children.trim().is_empty();
+    }
+    if !observable {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "kernel does not expose per-thread child lists",
+        ));
+    }
+    Ok(saw_child)
+}
+
+/// Watch `pid` for live descendants until `done` is set.
+///
+/// On its own thread, for the same reason the `VmHWM` poller has one: the
+/// regular sampler reads `smaps` and can block for hundreds of milliseconds on
+/// a GPU probe, so sharing a thread would blind the descendant check for most
+/// of the phase.
+fn poll_descendants(
+    pid: u32,
+    done: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<DescendantObservation> {
+    std::thread::spawn(move || {
+        let mut observation = DescendantObservation::default();
+        while !done.load(Ordering::Relaxed) {
+            match has_live_child(pid) {
+                Ok(true) => observation.seen = true,
+                Ok(false) => observation.observable = true,
+                // The measured process is gone, or this kernel cannot show its
+                // children: either way there is nothing further to learn.
+                Err(_) => break,
+            }
+            std::thread::sleep(DESCENDANT_POLL_INTERVAL);
+        }
+        observation
+    })
 }
 
 /// Linux-only command workload support is required to certify lifetime peaks.
@@ -1180,15 +1453,28 @@ fn sample_pid_for_duration(
 ) -> Result<PhaseReport> {
     let start = Instant::now();
     let mut samples = Vec::new();
+    // Distinguish "one tick lost a race with process exit" from "this phase was
+    // never measured". A single failed read is normal (the pid can vanish
+    // between the read and the parse); a phase that produced NO samples at all
+    // is not a measurement, and reporting it as 0 KiB would let an unmeasured
+    // phase pass every budget gate.
+    let mut failed_reads = 0usize;
 
     while start.elapsed() < dwell {
-        if let Ok(s) = sampler::sample(pid, track_worker) {
-            samples.push(s);
+        match sampler::sample(pid, track_worker) {
+            Ok(s) => samples.push(s),
+            Err(_) => failed_reads += 1,
         }
         std::thread::sleep(sample_interval);
     }
 
     let duration = start.elapsed();
+    if samples.is_empty() {
+        anyhow::bail!(
+            "phase '{phase_name}' produced no usable samples: {failed_reads} read(s) of pid {pid} \
+             failed over {duration:?} — refusing to report 0 KiB as a measurement"
+        );
+    }
     Ok(build_phase_report(phase_name, &mut samples, duration))
 }
 
@@ -1270,11 +1556,17 @@ fn build_phase_report(
 }
 
 /// Clean any existing leindex index state from the fixture directory.
-fn clean_index_state(fixture: &Path) {
+///
+/// A leftover index silently invalidates the `index` phase (it would measure
+/// an incremental no-op instead of a cold index), so a failed removal is
+/// surfaced, not swallowed.
+fn clean_index_state(fixture: &Path) -> Result<()> {
     let leindex_dir = fixture.join(".leindex");
     if leindex_dir.exists() {
-        let _ = std::fs::remove_dir_all(&leindex_dir);
+        std::fs::remove_dir_all(&leindex_dir)
+            .with_context(|| format!("failed to remove stale index {}", leindex_dir.display()))?;
     }
+    Ok(())
 }
 
 // ─── §14 Baseline Protocol Extension Phases (WS1 Tasks 5-6) ─────────────
@@ -1537,13 +1829,14 @@ fn run_incremental_one_file_phase(config: &WorkloadConfig) -> Result<PhaseReport
     // Add one new source file before re-indexing.
     let new_file = config.fixture.join("src").join("incremental_one_file.rs");
     if let Some(parent) = new_file.parent() {
-        std::fs::create_dir_all(parent).ok();
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("incremental_one_file: create {}", parent.display()))?;
     }
     std::fs::write(
         &new_file,
         "pub fn incremental_one_file_added() -> u32 { 42 }\n",
     )
-    .ok();
+    .with_context(|| format!("incremental_one_file: write {}", new_file.display()))?;
 
     run_command_phase(config, "incremental_one_file", |bin, fixture| {
         let mut cmd = Command::new(bin);
@@ -1564,13 +1857,14 @@ fn run_incremental_burst_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
             .join("src")
             .join(format!("incremental_burst_{i}.rs"));
         if let Some(parent) = new_file.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("incremental_burst: create {}", parent.display()))?;
         }
         std::fs::write(
             &new_file,
             format!("pub fn burst_fn_{i}() -> u32 {{ {i} }}\n"),
         )
-        .ok();
+        .with_context(|| format!("incremental_burst: write {}", new_file.display()))?;
     }
 
     run_command_phase(config, "incremental_burst", |bin, fixture| {
@@ -1587,7 +1881,8 @@ fn run_incremental_delete_phase(config: &WorkloadConfig) -> Result<PhaseReport> 
     }
     // Remove the file added by incremental_one_file.
     let target = config.fixture.join("src").join("incremental_one_file.rs");
-    std::fs::remove_file(&target).ok();
+    std::fs::remove_file(&target)
+        .with_context(|| format!("incremental_delete: remove {}", target.display()))?;
 
     run_command_phase(config, "incremental_delete", |bin, fixture| {
         let mut cmd = Command::new(bin);
@@ -1620,9 +1915,10 @@ fn run_query_suite_cold_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
         cmd
     })?;
 
-    // Run remaining queries (no RSS sampling, just exercise the cold path).
+    // Run remaining queries (no RSS sampling, just exercise the cold path). A
+    // failed query must fail the phase, not let the suite claim it ran.
     for &query in &QUERY_SUITE[1..] {
-        let _ = Command::new(&config.binary)
+        let status = Command::new(&config.binary)
             .arg("search")
             .arg(query)
             .arg("--project")
@@ -1630,7 +1926,11 @@ fn run_query_suite_cold_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
             .current_dir(&config.fixture)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status()
+            .with_context(|| format!("query_suite_cold: failed to launch query '{query}'"))?;
+        if !status.success() {
+            anyhow::bail!("query_suite_cold: query '{query}' exited with {status}");
+        }
     }
 
     Ok(report)
@@ -1658,9 +1958,10 @@ fn run_query_suite_warm_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
         cmd
     })?;
 
-    // Run remaining queries.
+    // Run remaining queries. A failing query must fail the phase, not let
+    // the suite claim it ran.
     for &query in &QUERY_SUITE[1..] {
-        let _ = Command::new(&config.binary)
+        let status = Command::new(&config.binary)
             .arg("search")
             .arg(query)
             .arg("--project")
@@ -1668,333 +1969,21 @@ fn run_query_suite_warm_phase(config: &WorkloadConfig) -> Result<PhaseReport> {
             .current_dir(&config.fixture)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status()
+            .with_context(|| format!("query_suite_warm: failed to launch query '{query}'"))?;
+        if !status.success() {
+            anyhow::bail!("query_suite_warm: query '{query}' exited with {status}");
+        }
     }
 
     Ok(report)
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────
-
+// The tests live in a sibling file so this one stays a readable length: the
+// module is ~670 lines, which inline would put this file at ~2 600. Note that
+// the quality workflow's 2 000-line check scans `src/` only (`find src -name
+// '*.rs'`), so nothing ENFORCES a limit on `tools/memcheck/src/` — the split is
+// for the next reader, not for a gate.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_canonical_phases_order() {
-        assert_eq!(
-            CANONICAL_PHASES,
-            &[
-                "idle_warm",
-                "index",
-                "idle_post",
-                "query",
-                "reindex",
-                "idle_final",
-                "embed_idle",
-                "embed_active",
-                "embed_teardown",
-                "mcp_idle_proliferation",
-                "worker_ort_threads",
-                "stale_artifacts",
-                "contention_3c_2p",
-                "incremental_noop",
-                "incremental_one_file",
-                "incremental_burst",
-                "incremental_delete",
-                "query_suite_cold",
-                "query_suite_warm",
-                "full_index_run2",
-                "full_index_run3",
-            ]
-        );
-    }
-
-    #[test]
-    fn test_canonical_phases_count() {
-        assert_eq!(CANONICAL_PHASES.len(), 21);
-    }
-
-    #[test]
-    fn test_copy_fixture_source_excludes_root_leindex() {
-        let source = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(source.path().join("src")).unwrap();
-        std::fs::create_dir_all(source.path().join(".leindex")).unwrap();
-        std::fs::write(source.path().join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
-        std::fs::write(source.path().join(".leindex/index.db"), "source index").unwrap();
-
-        let isolated = copy_fixture_source(source.path()).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(isolated.path().join("src/lib.rs")).unwrap(),
-            "pub fn fixture() {}\n"
-        );
-        assert!(!isolated.path().join(".leindex").exists());
-        assert_eq!(
-            std::fs::read_to_string(source.path().join(".leindex/index.db")).unwrap(),
-            "source index"
-        );
-    }
-
-    #[test]
-    fn test_build_phase_report_empty() {
-        let mut samples = Vec::new();
-        let report = build_phase_report("test", &mut samples, Duration::from_secs(1));
-        assert_eq!(report.phase, "test");
-        assert_eq!(report.sample_count, 0);
-        assert_eq!(report.rss_min_kib, 0);
-        assert_eq!(report.rss_max_kib, 0);
-        assert_eq!(report.rss_p95_kib, 0);
-        assert_eq!(report.mapped_file_kib, 0);
-        assert_eq!(report.anon_kib, 0);
-        assert_eq!(report.worker_rss_max_kib, 0);
-        assert_eq!(report.combined_rss_max_kib, 0);
-    }
-
-    #[test]
-    fn test_non_linux_command_phase_fails_before_launch_or_measurement() {
-        let fixture = tempfile::tempdir().unwrap();
-        let config = WorkloadConfig {
-            binary: PathBuf::from("missing-binary-must-not-be-launched"),
-            fixture: fixture.path().to_path_buf(),
-            sample_interval: Duration::from_millis(10),
-            verbose: false,
-            worker_capable: false,
-            heap_profile_dir: None,
-        };
-        let error = run_command_phase_with_peak_support(
-            &config,
-            "unsupported_platform",
-            |_, _| panic!("unsupported command phase must fail before building its command"),
-            false,
-        )
-        .unwrap_err();
-
-        assert!(
-            format!("{error:#}").contains("requires Linux"),
-            "unexpected error: {error:#}"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_measured_pid_rejects_wait4_selectors() {
-        assert_eq!(measured_pid(1).unwrap(), 1);
-        assert_eq!(measured_pid(i32::MAX as u32).unwrap(), i32::MAX);
-        assert!(measured_pid(0).is_err());
-        assert!(measured_pid(i32::MAX as u32 + 1).is_err());
-        assert!(measured_pid(u32::MAX).is_err());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_command_peak_child() {
-        if std::env::var_os("MEMCHECK_PEAK_CHILD").is_some() {
-            // Leave time for the startup sample, then touch and immediately
-            // free an allocation between periodic ticks.
-            std::thread::sleep(Duration::from_millis(100));
-            let mut allocation = vec![0u8; 64 * 1024 * 1024];
-            for byte in allocation.iter_mut().step_by(4096) {
-                *byte = 1;
-            }
-            std::hint::black_box(&allocation);
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_command_peak_captures_between_tick_allocation() {
-        let fixture = tempfile::tempdir().unwrap();
-        let config = WorkloadConfig {
-            binary: std::env::current_exe().unwrap(),
-            fixture: fixture.path().to_path_buf(),
-            sample_interval: Duration::from_millis(500),
-            verbose: false,
-            worker_capable: false,
-            heap_profile_dir: None,
-        };
-        let report = run_command_phase(&config, "between_ticks", |bin, _| {
-            let mut command = Command::new(bin);
-            command
-                .args(["--exact", "workload::tests::test_command_peak_child"])
-                .env("MEMCHECK_PEAK_CHILD", "1");
-            command
-        })
-        .unwrap();
-        assert!(
-            report.rss_max_kib >= 64 * 1024,
-            "lifetime peak must include the allocation, got {} KiB",
-            report.rss_max_kib
-        );
-        assert!(report.combined_rss_max_kib >= report.rss_max_kib);
-    }
-
-    #[test]
-    fn test_build_phase_report_with_samples() {
-        let mut samples = vec![
-            sampler::MemorySample {
-                rss_kib: 100,
-                mapped_file_kib: 10,
-                anon_kib: 90,
-                pss_kib: 100,
-                worker_rss_kib: 0,
-                gpu: sampler::GpuSample::default(),
-            },
-            sampler::MemorySample {
-                rss_kib: 200,
-                mapped_file_kib: 20,
-                anon_kib: 180,
-                pss_kib: 200,
-                worker_rss_kib: 50,
-                gpu: sampler::GpuSample::default(),
-            },
-            sampler::MemorySample {
-                rss_kib: 150,
-                mapped_file_kib: 15,
-                anon_kib: 135,
-                pss_kib: 150,
-                worker_rss_kib: 30,
-                gpu: sampler::GpuSample::default(),
-            },
-        ];
-        let report = build_phase_report("test", &mut samples, Duration::from_millis(500));
-        assert_eq!(report.phase, "test");
-        assert_eq!(report.sample_count, 3);
-        assert_eq!(report.rss_min_kib, 100);
-        assert_eq!(report.rss_max_kib, 200);
-        assert!(report.rss_p95_kib >= 100);
-        assert!(report.rss_p95_kib <= 200);
-        assert_eq!(report.duration_ms, 500);
-        // Peak mapped_file and anon
-        assert_eq!(report.mapped_file_kib, 20);
-        assert_eq!(report.anon_kib, 180);
-        // Worker-aware metrics
-        assert_eq!(report.worker_rss_max_kib, 50);
-        assert_eq!(report.combined_rss_max_kib, 250); // 200 + 50
-    }
-
-    #[test]
-    fn test_build_phase_report_p95() {
-        // With 20 samples, p95 should be the 19th value when sorted.
-        let mut samples: Vec<sampler::MemorySample> = (1..=20)
-            .map(|i| sampler::MemorySample {
-                rss_kib: i * 10,
-                mapped_file_kib: 0,
-                anon_kib: 0,
-                pss_kib: i * 10,
-                worker_rss_kib: 0,
-                gpu: sampler::GpuSample::default(),
-            })
-            .collect();
-        let report = build_phase_report("test", &mut samples, Duration::from_secs(1));
-        // p95 of 20 samples: index = ceil(20*0.95) = 19, so 19th value = 190
-        assert_eq!(report.rss_p95_kib, 190);
-    }
-
-    #[test]
-    fn test_build_phase_report_peak_mapped_anon() {
-        let mut samples = vec![
-            sampler::MemorySample {
-                rss_kib: 100,
-                mapped_file_kib: 50,
-                anon_kib: 50,
-                pss_kib: 100,
-                worker_rss_kib: 0,
-                gpu: sampler::GpuSample::default(),
-            },
-            sampler::MemorySample {
-                rss_kib: 120,
-                mapped_file_kib: 80,
-                anon_kib: 40,
-                pss_kib: 120,
-                worker_rss_kib: 0,
-                gpu: sampler::GpuSample::default(),
-            },
-            sampler::MemorySample {
-                rss_kib: 110,
-                mapped_file_kib: 30,
-                anon_kib: 80,
-                pss_kib: 110,
-                worker_rss_kib: 0,
-                gpu: sampler::GpuSample::default(),
-            },
-        ];
-        let report = build_phase_report("test", &mut samples, Duration::from_secs(1));
-        assert_eq!(report.mapped_file_kib, 80); // peak
-        assert_eq!(report.anon_kib, 80); // peak
-    }
-
-    #[test]
-    fn test_build_phase_report_worker_aware() {
-        // Test that worker RSS is tracked and combined correctly
-        let mut samples = vec![
-            sampler::MemorySample {
-                rss_kib: 50000,
-                mapped_file_kib: 0,
-                anon_kib: 0,
-                pss_kib: 0,
-                worker_rss_kib: 0,
-                gpu: sampler::GpuSample::default(),
-            },
-            sampler::MemorySample {
-                rss_kib: 60000,
-                mapped_file_kib: 0,
-                anon_kib: 0,
-                pss_kib: 0,
-                worker_rss_kib: 80000,
-                gpu: sampler::GpuSample::default(),
-            },
-            sampler::MemorySample {
-                rss_kib: 55000,
-                mapped_file_kib: 0,
-                anon_kib: 0,
-                pss_kib: 0,
-                worker_rss_kib: 90000,
-                gpu: sampler::GpuSample::default(),
-            },
-        ];
-        let report = build_phase_report("embed_active", &mut samples, Duration::from_secs(1));
-        assert_eq!(report.rss_max_kib, 60000);
-        assert_eq!(report.worker_rss_max_kib, 90000);
-        assert_eq!(report.combined_rss_max_kib, 145000); // 55000 + 90000
-    }
-
-    // ── Worker-reaping cleanup tests ───────────────────────────────────
-    //
-    // These tests exercise the helper functions used by `kill_child` to
-    // scan /proc for orphaned embed workers after a phase ends.
-
-    #[test]
-    fn test_read_proc_ppid_for_self() {
-        let pid = std::process::id();
-        let ppid = read_proc_ppid(pid);
-        // ppid should be a positive value (the test runner or shell).
-        assert!(ppid > 0, "ppid should be positive, got {}", ppid);
-    }
-
-    #[test]
-    fn test_read_proc_ppid_missing_pid() {
-        // A PID that almost certainly does not exist.
-        let ppid = read_proc_ppid(u32::MAX);
-        assert_eq!(ppid, 0, "missing pid should return 0 ppid");
-    }
-
-    #[test]
-    fn test_find_worker_pids_finds_no_workers_for_self() {
-        // The memcheck test process should not have any embed-worker children
-        // (a worker is only ever a `leindex` child carrying the argv token).
-        let pid = std::process::id();
-        let workers = find_worker_pids(pid);
-        assert!(
-            workers.is_empty(),
-            "expected no worker children for test process, found {:?}",
-            workers
-        );
-    }
-
-    #[test]
-    fn test_reap_worker_processes_no_crash_with_no_workers() {
-        // Ensures the reaper is a no-op when no workers are running.
-        reap_worker_processes(&[]);
-    }
-}
+#[path = "workload_test.rs"]
+mod tests;

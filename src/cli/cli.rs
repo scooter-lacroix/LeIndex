@@ -29,6 +29,10 @@ use tracing::{info, warn};
 mod storage_cleanup;
 use storage_cleanup::*;
 
+#[path = "cli/services_commands.rs"]
+mod services_commands;
+use services_commands::cmd_services_impl;
+
 const POST_INSTALL_SKIP_ENV: &str = "LEINDEX_SKIP_POST_INSTALL_HOOK";
 const POST_INSTALL_STAR_MARKER: &str = ".github-starred";
 const POST_INSTALL_VERSION_MARKER: &str = ".post-install-version";
@@ -106,6 +110,14 @@ pub enum Commands {
         /// Maximum number of results to return
         #[arg(long = "top-k", default_value = "10")]
         top_k: usize,
+
+        /// Rerank backend for this run (overrides [search] rerank_backend).
+        #[arg(
+            long = "rerank",
+            value_name = "BACKEND",
+            value_parser = ["onnx", "system-one", "off"]
+        )]
+        rerank: Option<String>,
     },
 
     /// Perform deep analysis with context expansion
@@ -500,9 +512,11 @@ impl Cli {
                 progress,
                 max_memory,
             } => cmd_index_impl(path, force, progress, max_memory).await,
-            Commands::Search { query, top_k } => {
-                cmd_search_impl(query, top_k, global_project).await
-            }
+            Commands::Search {
+                query,
+                top_k,
+                rerank,
+            } => cmd_search_impl(query, top_k, rerank, global_project).await,
             Commands::Analyze {
                 query,
                 token_budget,
@@ -641,14 +655,21 @@ impl Cli {
 /// This keeps CLI output clean and token-efficient for LLM consumers while
 /// preserving full diagnostics behind the `--verbose` flag.
 fn init_logging_impl(verbose: bool) {
-    let level = if verbose {
-        tracing::Level::DEBUG
+    // `--verbose` is an explicit opt-in and outranks the environment. Without
+    // it, honour `RUST_LOG` so the documented `RUST_LOG=debug leindex index .`
+    // (docs/CLI.md) actually takes effect; the pre-`RUST_LOG` form used
+    // `with_max_level`, which silently ignored the variable and left remote
+    // embedding failures invisible except by their coarse `warn!` summary.
+    // Default stays WARN: CLI output remains clean for LLM consumers.
+    let filter = if verbose {
+        tracing_subscriber::EnvFilter::new("debug")
     } else {
-        tracing::Level::WARN
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"))
     };
 
     let subscriber = tracing_subscriber::fmt()
-        .with_max_level(level)
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .finish();
 
@@ -965,12 +986,18 @@ async fn cmd_index_impl(
 async fn cmd_search_impl(
     query: String,
     top_k: usize,
+    rerank: Option<String>,
     project: Option<PathBuf>,
 ) -> AnyhowResult<()> {
     let project_path = get_project_path(project);
     let canonical_path = project_path
         .canonicalize()
         .context("Failed to canonicalize project path")?;
+
+    // Per-run backend override: clap already validated the allowlist.
+    if let Some(backend) = &rerank {
+        super::leindex::set_rerank_backend_override(backend);
+    }
 
     info!("Searching for: {}", query);
 
@@ -1674,6 +1701,11 @@ fn build_setup_choices(
 }
 
 /// Print the setup summary, then run the smoke test and optional MIGraphX warmup.
+///
+/// `choices` feeds only the auto-warmup decision, which exists only under the
+/// `onnx` feature; a `--features cli` build without `onnx` would otherwise flag
+/// it as an unused variable.
+#[cfg_attr(not(feature = "onnx"), allow(unused_variables))]
 fn finish_setup(
     choices: &crate::cli::leindex::setup::SetupChoices,
     result: &crate::cli::leindex::setup::SetupResult,
@@ -1748,7 +1780,7 @@ fn resolve_setup_choices(
         setup::run_interactive_flow().map_err(|e| anyhow::anyhow!("{}", e))
     } else {
         // No flags and not interactive: show guidance and exit with error
-        eprintln!("No setup options specified and stdin is not interactive (not a TTY).");
+        eprintln!("No setup options specified and stdin/stderr is not a terminal.");
         eprintln!("For non-interactive setup, use flags:");
         eprintln!("  leindex setup --neural --cpu       # CPU neural search");
         eprintln!("  leindex setup --neural --gpu amd   # AMD GPU (MIGraphX)");
@@ -1848,131 +1880,6 @@ fn check_neutral_conflicts(
         anyhow::bail!("Cannot use --cpu and --gpu together. Choose one execution provider.");
     }
     Ok(())
-}
-
-/// Only successful HTTP readiness is "up"; TCP alone may be another process
-/// or a model server that is still loading.
-fn service_row_state(st: &crate::services::ServiceStatus) -> &'static str {
-    match (st.http_ready, st.pid.is_some()) {
-        (true, _) => "up",
-        (false, true) => "starting",
-        (false, false) => "down",
-    }
-}
-
-/// Print the `services list` table (or the empty-config hint).
-fn print_services_table(
-    services: &std::collections::BTreeMap<String, crate::config::ServiceConfig>,
-) {
-    if services.is_empty() {
-        println!("No [services] sections configured.");
-        println!("Add one to ~/.leindex/config/leindex.toml, e.g.:");
-        println!();
-        println!("[services.laya]");
-        println!("model = \"/path/to/model.gguf\"");
-        println!("port = 8181");
-        return;
-    }
-    println!(
-        "{:<14} {:<7} {:<6} {:<24} {:<10} MODEL",
-        "SERVICE", "STATE", "PID", "ENDPOINT", "AUTO-START"
-    );
-    for (name, cfg) in services {
-        let st = crate::services::status(name, cfg).ok();
-        let st_ref = st.as_ref();
-        println!(
-            "{:<14} {:<7} {:<6} {:<24} {:<10} {}",
-            name,
-            st_ref.map(service_row_state).unwrap_or("error"),
-            st_ref
-                .and_then(|s| s.pid)
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "-".into()),
-            st_ref.map(|s| s.endpoint.as_str()).unwrap_or("-"),
-            st_ref
-                .map(|s| if s.auto_start { "yes" } else { "no" })
-                .unwrap_or("-"),
-            st_ref
-                .and_then(|s| s.served_model.clone())
-                .unwrap_or_else(|| "-".into())
-        );
-    }
-}
-
-/// Print the `services status <name>` detail block.
-fn print_service_detail(name: &str, st: &crate::services::ServiceStatus) {
-    println!("service:     {}", st.name);
-    println!(
-        "state:       {}",
-        match service_row_state(st) {
-            "up" => "up (HTTP health ready)",
-            "starting" => "starting (process live, HTTP health not ready)",
-            _ => "down",
-        }
-    );
-    println!(
-        "pid:         {}",
-        st.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
-    );
-    println!("endpoint:    {}", st.endpoint);
-    println!(
-        "model:       {}",
-        st.model.as_deref().unwrap_or("(none — cannot start)")
-    );
-    println!("served name: {}", st.served_model.as_deref().unwrap_or("-"));
-    println!("auto-start:  {}", if st.auto_start { "yes" } else { "no" });
-    println!("log:         ~/.leindex/logs/services/{name}.log");
-}
-
-/// `leindex services` — manage `[services.<name>]` model servers.
-async fn cmd_services_impl(action: Option<ServiceAction>) -> AnyhowResult<()> {
-    use crate::services as svc;
-    let config = crate::config::LeIndexConfig::load_cached();
-
-    let resolve = |name: &str| -> AnyhowResult<&crate::config::ServiceConfig> {
-        config
-            .services
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("no [services.{name}] section in the config"))
-    };
-
-    match action {
-        None | Some(ServiceAction::List) => {
-            print_services_table(&config.services);
-            Ok(())
-        }
-        Some(ServiceAction::Status { name }) => {
-            let cfg = resolve(&name)?;
-            print_service_detail(&name, &svc::status(&name, cfg)?);
-            Ok(())
-        }
-        Some(ServiceAction::Start { name }) => {
-            let cfg = resolve(&name)?;
-            if svc::start(&name, cfg)? {
-                println!("started {name} ({} ready)", cfg.base_url());
-            } else {
-                println!("{name} already up ({})", cfg.base_url());
-            }
-            Ok(())
-        }
-        Some(ServiceAction::Stop { name }) => {
-            let cfg = resolve(&name)?;
-            match svc::stop(&name, cfg)? {
-                svc::StopOutcome::Stopped(pid) => println!("stopped {name} (pid {pid})"),
-                svc::StopOutcome::AlreadyDown => println!("{name} already down"),
-                svc::StopOutcome::StalePidfileRemoved => {
-                    println!("{name}: stale pidfile removed (was not running)")
-                }
-            }
-            Ok(())
-        }
-        Some(ServiceAction::Restart { name }) => {
-            let cfg = resolve(&name)?;
-            svc::restart(&name, cfg)?;
-            println!("restarted {name} ({})", cfg.base_url());
-            Ok(())
-        }
-    }
 }
 
 /// Main entry point for the CLI

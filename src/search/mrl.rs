@@ -1,0 +1,334 @@
+//! Matryoshka (MRL) slicing policy for EmbeddingGemma2.
+//!
+//! EmbeddingGemma2 is trained with Matryoshka Representation Learning: any
+//! leading-dimension prefix of the 768-dim output stays usable after
+//! re-normalization (google/embeddinggemma-2 model card, "Matryoshka
+//! Dimension Truncation"). Slicing shrinks the persisted vector store and
+//! speeds similarity search at a small quality cost; the card reports
+//! near-lossless quality down to 256 dims and substantial degradation at 128.
+//!
+//! Policy: the slice dimension is a pure function of the node's source span
+//! (`NodeInfo::byte_range`), which is persisted in the search snapshot — so
+//! the same tier is computed at enrich time, at persist time, and after
+//! checkpoint resume without extra state. Short spans are small, dense
+//! symbols (getters, consts) that retrieve fine at 256 dims; page-scale
+//! spans and synthetic whole-file summaries (`(0,0)`) keep full fidelity.
+//!
+//! The engine keeps uniform full-dimension rows in memory; slicing is
+//! applied when partitioning rows into per-dimension mmap files at publish
+//! time, and mirrored on the query side by scoring each store against the
+//! correspondingly re-normalized query slice.
+
+use serde::{Deserialize, Serialize};
+
+/// Slice dimensions supported by the EmbeddingGemma2 MRL training, ascending.
+pub const MRL_TIERS: [usize; 4] = [128, 256, 512, 768];
+
+/// Source spans below this many bytes land in the smallest tier (256): short
+/// dense symbols whose retrieval signal survives aggressive slicing.
+pub const SMALL_SYMBOL_SPAN_BYTES: usize = 512;
+
+/// Source spans below this many bytes land in the middle tier (512); larger
+/// spans keep the full 768-dim vector.
+pub const MEDIUM_SYMBOL_SPAN_BYTES: usize = 4096;
+
+/// `[indexing.embeddings] matryoshka`: how EmbeddingGemma2's Matryoshka
+/// Representation Learning output is sliced. The model is trained so any
+/// leading-dimension prefix (768/512/256/128) stays usable after
+/// re-normalization; shorter vectors shrink the store and speed similarity
+/// at a small quality cost (model card: near-lossless to 256, 128 degrades).
+///
+/// Defined here rather than in `config` because slicing is search-only
+/// behavior: `config` is compiled solely under `cli`/`onnx`, while the search
+/// engine needs this type in every build that has `search`. `config`
+/// re-exports it, so `config::MatryoshkaSetting` remains a valid path for
+/// callers that load TOML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MatryoshkaSetting {
+    /// No slicing: full native dimension everywhere. Identical to pre-MRL
+    /// behavior (default; old configs deserialize to this).
+    #[default]
+    Off,
+    /// Span-based dynamic tiers, resolved per node from its source span
+    /// (`NodeInfo::byte_range`) by [`dynamic_tier_for_span`]:
+    /// spans under 512 bytes → 256, under 4096 bytes → 512, anything larger →
+    /// 768, and the `(0, 0)` span of synthetic per-file summary nodes → 768.
+    /// The span is persisted in the search snapshot, so the same tier is
+    /// recomputed at enrich, persist, and checkpoint-resume time with no extra
+    /// state. Note this is a function of SIZE ONLY, not of node kind: a large
+    /// method lands in 768 and a tiny module header lands in 256. Query embeds
+    /// once at native dimension and fans out renormalized slices per populated
+    /// tier.
+    Dynamic,
+    /// Fixed 768-dim slice (no-op vs Off, but pins the identity suffix).
+    #[serde(rename = "768")]
+    Dim768,
+    /// Fixed 512-dim slice.
+    #[serde(rename = "512")]
+    Dim512,
+    /// Fixed 256-dim slice.
+    #[serde(rename = "256")]
+    Dim256,
+    /// Fixed 128-dim slice. Model card flags substantial quality loss at
+    /// this depth; opt-in only.
+    #[serde(rename = "128")]
+    Dim128,
+}
+
+impl MatryoshkaSetting {
+    /// Per-document slice dimension under this setting (`None` = never
+    /// slice; `Some(n)` = fixed slice for every document).
+    pub fn fixed_slice(self) -> Option<usize> {
+        match self {
+            Self::Off | Self::Dynamic => None,
+            Self::Dim768 => Some(768),
+            Self::Dim512 => Some(512),
+            Self::Dim256 => Some(256),
+            Self::Dim128 => Some(128),
+        }
+    }
+
+    /// Stable identity tag for provider/cache identities and checkpoints.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Dynamic => "dynamic",
+            Self::Dim768 => "768",
+            Self::Dim512 => "512",
+            Self::Dim256 => "256",
+            Self::Dim128 => "128",
+        }
+    }
+}
+
+/// Slice `embedding` to its leading `dim` components and re-normalize to unit
+/// length.
+///
+/// The model card is explicit that slicing a unit-length vector does not
+/// preserve unit length: the shortened vector must be L2-normalized again
+/// before cosine scoring, or ranking quality degrades silently. Zero-norm
+/// inputs (all-zero slice) return the zero vector rather than NaN.
+pub fn slice_l2_normalized(embedding: &[f32], dim: usize) -> Vec<f32> {
+    let dim = dim.min(embedding.len());
+    let slice = &embedding[..dim];
+    let magnitude = slice.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if magnitude < 1e-9 {
+        return vec![0.0; dim];
+    }
+    slice.iter().map(|v| v / magnitude).collect()
+}
+
+/// Dynamic tier for a node's source span under the `Dynamic` setting.
+///
+/// `(0, 0)` spans are the synthetic per-file summary nodes (see
+/// `NodeType::FileSummary`); they represent the whole file's purpose and
+/// always keep full fidelity.
+pub fn dynamic_tier_for_span(span_bytes: usize) -> usize {
+    if span_bytes == 0 {
+        768
+    } else if span_bytes < SMALL_SYMBOL_SPAN_BYTES {
+        256
+    } else if span_bytes < MEDIUM_SYMBOL_SPAN_BYTES {
+        512
+    } else {
+        768
+    }
+}
+
+/// Slice dimension for a document under `setting` (`None` = no slicing).
+///
+/// `Off` never slices; fixed settings slice everything to their dimension;
+/// `Dynamic` resolves per document from the span. Fragment embeddings are
+/// deliberately excluded from dynamic slicing by their callers — the
+/// fragment mmap's dimension is validated against the native dimension at
+/// snapshot install, and fragment layers stay full-fidelity in v1.
+pub fn slice_dimension_for(setting: MatryoshkaSetting, span_bytes: usize) -> Option<usize> {
+    match setting {
+        MatryoshkaSetting::Off => None,
+        MatryoshkaSetting::Dynamic => Some(dynamic_tier_for_span(span_bytes)),
+        fixed => fixed.fixed_slice(),
+    }
+}
+
+/// Partition `(node_id, embedding)` rows into per-dimension buckets under
+/// `setting`.
+///
+/// Returns rows grouped by their slice dimension, each row already sliced and
+/// re-normalized. Rows whose node id has no span entry are treated as
+/// unknown-span and keep the full dimension (safe default: full fidelity).
+/// Under `Off` rows remain untouched and are grouped by their actual length,
+/// keeping already-sliced rows out of wider buckets.
+pub fn partition_rows_by_slice_dimension(
+    rows: &[(String, Vec<f32>)],
+    span_bytes: &std::collections::HashMap<String, usize>,
+    setting: MatryoshkaSetting,
+) -> Vec<(usize, Vec<(String, Vec<f32>)>)> {
+    let mut buckets: Vec<(usize, Vec<(String, Vec<f32>)>)> = Vec::new();
+    for (node_id, embedding) in rows {
+        let span = span_bytes.get(node_id).copied().unwrap_or(usize::MAX);
+        let dim = slice_dimension_for(setting, span)
+            .unwrap_or(embedding.len())
+            .min(embedding.len());
+        let row = if setting == MatryoshkaSetting::Off {
+            embedding.clone()
+        } else {
+            slice_l2_normalized(embedding, dim)
+        };
+        match buckets.iter_mut().find(|(d, _)| *d == dim) {
+            Some((_, bucket)) => bucket.push((node_id.clone(), row)),
+            None => buckets.push((dim, vec![(node_id.clone(), row)])),
+        }
+    }
+    buckets.sort_by_key(|(dim, _)| *dim);
+    buckets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn unit_vector(dim: usize, peak: usize) -> Vec<f32> {
+        let mut v = vec![0.1f32; dim];
+        v[peak % dim] = 1.0;
+        let m = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter().map(|x| x / m).collect()
+    }
+
+    #[test]
+    fn test_sliced_vector_is_unit_length() {
+        let v = unit_vector(768, 3);
+        let s = slice_l2_normalized(&v, 256);
+        assert_eq!(s.len(), 256);
+        let m: f32 = s.iter().map(|x| x * x).sum();
+        assert!((m - 1.0).abs() < 1e-5, "magnitude {m}");
+        // Leading components must be preserved up to the renormalization.
+        let scale = s[3] / v[3];
+        for (a, b) in s.iter().zip(v.iter()) {
+            assert!((a - b * scale).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_slice_dim_clamped_to_input() {
+        let v = vec![0.5f32; 8];
+        let s = slice_l2_normalized(&v, 256);
+        assert_eq!(s.len(), 8);
+        let m: f32 = s.iter().map(|x| x * x).sum();
+        assert!((m - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_zero_slice_stays_zero_not_nan() {
+        let v = vec![0.0f32; 768];
+        let s = slice_l2_normalized(&v, 256);
+        assert!(s.iter().all(|x| *x == 0.0));
+    }
+
+    #[test]
+    fn test_span_tiers_follow_thresholds() {
+        assert_eq!(dynamic_tier_for_span(0), 768);
+        assert_eq!(dynamic_tier_for_span(1), 256);
+        assert_eq!(dynamic_tier_for_span(SMALL_SYMBOL_SPAN_BYTES - 1), 256);
+        assert_eq!(dynamic_tier_for_span(SMALL_SYMBOL_SPAN_BYTES), 512);
+        assert_eq!(dynamic_tier_for_span(MEDIUM_SYMBOL_SPAN_BYTES - 1), 512);
+        assert_eq!(dynamic_tier_for_span(MEDIUM_SYMBOL_SPAN_BYTES), 768);
+        assert_eq!(dynamic_tier_for_span(usize::MAX), 768);
+    }
+
+    #[test]
+    fn test_slice_dimension_matrix() {
+        assert_eq!(slice_dimension_for(MatryoshkaSetting::Off, 0), None);
+        assert_eq!(
+            slice_dimension_for(MatryoshkaSetting::Dynamic, 100),
+            Some(256)
+        );
+        assert_eq!(
+            slice_dimension_for(MatryoshkaSetting::Dynamic, 0),
+            Some(768)
+        );
+        assert_eq!(
+            slice_dimension_for(MatryoshkaSetting::Dim512, 100),
+            Some(512)
+        );
+    }
+
+    #[test]
+    fn test_off_partition_is_identity_single_bucket() {
+        let rows = vec![("a".to_string(), vec![0.5f32; 768])];
+        let buckets =
+            partition_rows_by_slice_dimension(&rows, &HashMap::new(), MatryoshkaSetting::Off);
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].0, 768);
+        assert_eq!(buckets[0].1, rows);
+        assert!(
+            partition_rows_by_slice_dimension(&[], &HashMap::new(), MatryoshkaSetting::Dynamic)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_partition_keeps_restored_rows_in_buckets_of_their_actual_length() {
+        let rows = vec![
+            ("native".to_string(), unit_vector(768, 1)),
+            ("restored".to_string(), unit_vector(256, 2)),
+            ("short".to_string(), unit_vector(128, 3)),
+        ];
+        for setting in [
+            MatryoshkaSetting::Off,
+            MatryoshkaSetting::Dynamic,
+            MatryoshkaSetting::Dim512,
+        ] {
+            let buckets = partition_rows_by_slice_dimension(&rows, &HashMap::new(), setting);
+            let dimensions: Vec<_> = buckets.iter().map(|(dim, _)| *dim).collect();
+            assert_eq!(
+                dimensions,
+                vec![
+                    128,
+                    256,
+                    if setting == MatryoshkaSetting::Dim512 {
+                        512
+                    } else {
+                        768
+                    }
+                ]
+            );
+            for (dim, bucket) in buckets {
+                assert!(bucket.iter().all(|(_, embedding)| embedding.len() == dim));
+                if setting == MatryoshkaSetting::Off {
+                    for row in bucket {
+                        assert!(rows.contains(&row), "Off must preserve row values");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_dynamic_partition_groups_by_tier_and_slices() {
+        let rows = vec![
+            ("small".to_string(), unit_vector(768, 1)),
+            ("big".to_string(), unit_vector(768, 2)),
+            ("unknown".to_string(), unit_vector(768, 3)),
+        ];
+        let spans = HashMap::from([
+            ("small".to_string(), 100usize),
+            ("big".to_string(), 10_000usize),
+        ]);
+        let buckets = partition_rows_by_slice_dimension(&rows, &spans, MatryoshkaSetting::Dynamic);
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].0, 256);
+        assert_eq!(buckets[0].1.len(), 1);
+        assert_eq!(buckets[0].1[0].0, "small");
+        assert_eq!(buckets[0].1[0].1.len(), 256);
+        assert_eq!(buckets[1].0, 768);
+        // Unknown-span row fell back to full fidelity.
+        assert_eq!(buckets[1].1.len(), 2);
+        assert!(
+            buckets[1]
+                .1
+                .iter()
+                .any(|(id, v)| id == "unknown" && v.len() == 768)
+        );
+    }
+}

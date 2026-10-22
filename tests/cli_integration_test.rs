@@ -50,9 +50,29 @@ mod cli_workflow_tests {
 
         use leindex::cli::Commands;
         match cli.command {
-            Some(Commands::Search { query, top_k }) => {
+            Some(Commands::Search {
+                query,
+                top_k,
+                rerank,
+            }) => {
                 assert_eq!(query, "authentication");
                 assert_eq!(top_k, 20);
+                assert_eq!(rerank, None);
+            }
+            _ => panic!("Expected Search command"),
+        }
+
+        // The --rerank override parses against the backend allowlist.
+        let cli = Cli::parse_from([
+            "leindex",
+            "search",
+            "authentication",
+            "--rerank",
+            "system-one",
+        ]);
+        match cli.command {
+            Some(Commands::Search { rerank, .. }) => {
+                assert_eq!(rerank.as_deref(), Some("system-one"));
             }
             _ => panic!("Expected Search command"),
         }

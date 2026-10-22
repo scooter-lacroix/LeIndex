@@ -2,6 +2,57 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [2.1.1]
+
+### Review fixes: inventory budgets, embedding prompts, checkpoint honesty
+
+> Versioning note: 2.0.4 was never published (it lived only on this branch),
+> so the review fixes below ship in 2.1.1. 2.0.4 does not exist as a release.
+
+- File inventory no longer reports a truncated listing when nothing was
+  withheld. The result budget was checked BEFORE the predicate ran, so a walk
+  that had already admitted `limit` matching files called itself incomplete on
+  the next dirent even when the predicate rejected it. Because the last dirent
+  is `read_dir` order, the same tree reported completeness or truncation at
+  random — a CI-only flake that never reproduced locally. The check now runs on
+  an admitted file, so `limit: true` means "a match was withheld" again.
+- Streaming neural documents whose path falls outside the project no longer
+  keep a fixed-length path tail as their embedding title. `strip_prefix` having
+  failed, the code cannot tell checkout components from project ones, so
+  `/home/alice/src/main.rs` put `alice` on the wire to a remote provider. The
+  fallback is now the file name alone; identity never includes the title, so
+  cached vectors stay correctly keyed.
+- `template_fingerprint` length-prefixes its parts. A bare NUL separator is not
+  injective: a document template ending in a separator and a query template
+  starting with one produced the same fingerprint and therefore shared a cache
+  namespace across two different template pairs.
+- `apply_doc_template` substitutes in a single left-to-right pass and never
+  rescans a substituted value, so a title containing the literal `{text}`
+  (a source file named `{text}.rs`) can no longer swallow the document body.
+- Checkpoint resume restores every persisted tier before accepting a
+  checkpoint, verifies the restored total against the recorded row count, and
+  pins the Matryoshka policy tag so a checkpoint taken under a different
+  slicing policy is rejected rather than resumed into differently-shaped rows.
+  Comment corrected where it claimed the comparison ran for every checkpoint.
+- `git diff` drains stderr concurrently instead of after the fact. A child that
+  filled the 64 KiB stderr pipe blocked before finishing stdout, deadlocking
+  the handler; a truncated readable re-run is now reported as truncated.
+- Structural search distinguishes deadline skips from read failures, reports
+  inventory truncation when a deadline halts the walk, and folds an incomplete
+  listing into `has_more` instead of presenting a partial scan as complete.
+- Structural search reports multi-capture bindings (`$$$ARGS`) that ast-grep
+  stores outside its single-capture map, resolves `Makefile`/`CMakeLists.txt`
+  by filename before the extension probe, and detects a scan that finished
+  past its deadline instead of presenting an over-budget run as a clean page.
+- Disabling `LEINDEX_FEATURE_MATRYOSHKA` mid-rollout is now a real rollback:
+  a restart treats the tier-only generation's identity-only canonical header
+  as no neural state (TF-IDF-only scoring) instead of seeding a query vector
+  that scored every node 0.0 under the configured neural weight. The header
+  survives, so re-enabling the flag resumes the generation.
+- Installer scripts keep their executable bit; a committed-mode guard fails
+  CI on any release bump that drops it (third recurrence), and
+  `leindex_structural` is classified read-only for the System-One gate.
+
 ## [Unreleased]
 
 ### Setup fixes: config escape hints, hermetic hydration test, System One probe

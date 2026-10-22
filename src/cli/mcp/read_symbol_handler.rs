@@ -236,6 +236,32 @@ fn find_live_symbol(parsed: &LiveParse, symbol: &str) -> Option<CatalogSymbol> {
         .cloned()
 }
 
+/// Live source candidates for the fallback scan: git-aware inventory when the
+/// tree is a worktree, otherwise a walkdir scan of the absolute project root.
+///
+/// A listing that FAILS (git errored, spawn failure) is surfaced as an error —
+/// it must never degrade to an empty list, which would report a present symbol
+/// as "not found" on the strength of a listing that never happened. The two
+/// sources agree by construction: absolute paths, symlinks NOT followed, and
+/// SKIP_DIRS-pruned traversal.
+fn live_source_inventory(root: &Path) -> Result<Vec<PathBuf>, crate::cli::git::GitInventoryError> {
+    match crate::cli::git::source_inventory(root) {
+        Ok(paths) => Ok(paths),
+        Err(crate::cli::git::GitInventoryError::NotRepository) => Ok(walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                let name = entry.file_name().to_string_lossy();
+                !crate::skip_dirs::SKIP_DIRS.iter().any(|skip| name == *skip)
+            })
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| entry.path().to_path_buf())
+            .collect()),
+        Err(other) => Err(other),
+    }
+}
+
 async fn find_live_symbol_in_inventory(
     live: &LiveProject,
     symbol: &str,
@@ -245,25 +271,15 @@ async fn find_live_symbol_in_inventory(
     // files before applying a bounded parse cap so a symbol in a later-sorting
     // file is not reported absent.
     let root = live.root().to_path_buf();
-    let candidates =
-        tokio::task::spawn_blocking(move || match crate::cli::git::source_inventory(&root) {
-            Ok(paths) => paths,
-            Err(crate::cli::git::GitInventoryError::NotRepository) => walkdir::WalkDir::new(&root)
-                .follow_links(false)
-                .into_iter()
-                .filter_entry(|entry| {
-                    let name = entry.file_name().to_string_lossy();
-                    !crate::skip_dirs::SKIP_DIRS.iter().any(|skip| name == *skip)
-                })
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_type().is_file())
-                .map(|entry| entry.path().to_path_buf())
-                .collect(),
-            Err(_) => Vec::new(),
-        })
+    let candidates = tokio::task::spawn_blocking(move || live_source_inventory(&root))
         .await
         .map_err(|error| {
-            JsonRpcError::internal_error(format!("live symbol inventory failed: {error}"))
+            JsonRpcError::internal_error(format!("live symbol inventory task failed: {error}"))
+        })?
+        .map_err(|error| {
+            JsonRpcError::internal_error(format!(
+                "could not list live source files ({error}); symbol presence is unverified"
+            ))
         })?;
     // Content prefilter: only parse files whose bytes mention the symbol, so the
     // bounded parse cap applies to *relevant* files. `inspected` caps the number
@@ -676,5 +692,16 @@ mod tests {
             .expect("symbol must be found");
         assert_eq!(node.node_type, "class");
         assert!(node.file_path.ends_with("b_storage.rs"));
+    }
+
+    #[test]
+    fn test_live_source_inventory_failure_is_not_an_empty_list() {
+        // A listing failure must surface as an error, not as an empty inventory
+        // that reads as "symbol not found".
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("phantom.rs");
+        std::fs::write(&file, "pub fn target() {}\n").unwrap();
+        let err = live_source_inventory(&file).unwrap_err();
+        assert!(matches!(err, crate::cli::git::GitInventoryError::Io(_)));
     }
 }

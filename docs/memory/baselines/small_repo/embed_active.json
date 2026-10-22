@@ -1,19 +1,20 @@
 {
   "phase": "embed_active",
-  "rss_min_kib": 12696,
+  "rss_min_kib": 12076,
   "rss_max_kib": 25412,
   "rss_p95_kib": 25412,
-  "mapped_file_kib": 19944,
-  "anon_kib": 5468,
+  "mapped_file_kib": 19872,
+  "anon_kib": 4180,
   "sample_count": 20,
-  "duration_ms": 5219,
+  "duration_ms": 5227,
   "worker_rss_max_kib": 0,
   "combined_rss_max_kib": 25412,
   "worker_note": "no embed worker process observed during 'embed_active' despite the binary being worker-capable; likely cause: missing ONNX runtime library or model",
-  "gpu_vram_mib": 274,
+  "gpu_vram_mib": 823,
   "descendants": {
     "total": 0,
     "by_name": {},
-    "combined_rss_kib": 0
+    "combined_rss_kib": 0,
+    "peak_rss_kib": 0
   }
 }

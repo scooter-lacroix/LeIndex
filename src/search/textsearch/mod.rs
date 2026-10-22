@@ -6,6 +6,7 @@
 //! * `plan` — regex → required-trigram formula → candidate files,
 //! * `glob` — include/exclude filtering,
 //! * `engine` — inventory, freshness, scanning and result windowing.
+//! * `structural` — ast-grep AST-pattern matching (`structural-search` feature).
 //!
 //! Anything the index has not seen (files edited since, new files, whole
 //! directories outside the workspace) is scanned live, so callers never need
@@ -15,6 +16,8 @@ pub mod engine;
 pub mod glob;
 pub mod index;
 pub mod plan;
+#[cfg(feature = "structural-search")]
+pub mod structural;
 pub mod symbols;
 pub mod trigram;
 
@@ -24,4 +27,10 @@ pub use engine::{
 };
 pub use glob::FileFilter;
 pub use index::{SymbolSpan, TextIndex, kind_code};
+#[cfg(feature = "structural-search")]
+pub use structural::{
+    CompiledPattern, NO_CAP, StructuralError, StructuralFile, StructuralHit, StructuralOptions,
+    StructuralOutput, StructuralStats, language_for_path, resolve_language,
+    search as search_structural,
+};
 pub use symbols::{SymbolHit, search_symbols};

@@ -1040,7 +1040,13 @@ fn test_empty_neural_persist_removes_stale_mmap() {
     std::fs::write(&stale_path, b"stale neural data").unwrap();
 
     let engine = SearchEngine::new();
-    persist_neural_embeddings_to_mmap(&engine, temp.path(), None).unwrap();
+    persist_neural_embeddings_to_mmap(
+        &engine,
+        temp.path(),
+        None,
+        crate::config::MatryoshkaSetting::Off,
+    )
+    .unwrap();
 
     assert!(
         !stale_path.exists(),
@@ -1277,11 +1283,43 @@ fn cache_key_stats() -> IndexStats {
     }
 }
 
-/// Build a search cache key with explicit fragment knobs.
+/// Build a search cache key with explicit fragment knobs (default onnx backend).
 fn cache_key_with_fragments(
     fragment_enabled: bool,
     fragment_weight: f64,
     fragment_root_hash: &str,
+) -> String {
+    cache_key_with_rerank_backend(
+        fragment_enabled,
+        fragment_weight,
+        fragment_root_hash,
+        "onnx",
+    )
+}
+
+/// Build a search cache key with an explicit rerank backend (all other knobs fixed).
+fn cache_key_with_rerank_backend(
+    fragment_enabled: bool,
+    fragment_weight: f64,
+    fragment_root_hash: &str,
+    rerank_backend: &str,
+) -> String {
+    cache_key_with_rerank_activation(
+        fragment_enabled,
+        fragment_weight,
+        fragment_root_hash,
+        rerank_backend,
+        true,
+    )
+}
+
+/// Same, but also controls whether the rerank backend is armed at runtime.
+fn cache_key_with_rerank_activation(
+    fragment_enabled: bool,
+    fragment_weight: f64,
+    fragment_root_hash: &str,
+    rerank_backend: &str,
+    rerank_backend_active: bool,
 ) -> String {
     search_cache_key_for(&SearchCacheKeyInputs {
         project_id: "proj-a",
@@ -1296,11 +1334,49 @@ fn cache_key_with_fragments(
         rerank_enabled: true,
         rerank_top_n: 80,
         rerank_model: "qwen3-reranker-0.6b-seq-cls",
+        rerank_backend,
+        rerank_backend_active,
         fragment_index_enabled: fragment_enabled,
         fragment_weight,
         fragment_root_hash,
         embed_model: "qwen3-embed-0.6b",
     })
+}
+
+/// A rerank-backend change must produce a different key: backend choice changes
+/// result order even when rerank enable/top_n/model are identical.
+#[test]
+fn test_cache_key_rerank_backend_change_invalidates() {
+    let onnx = cache_key_with_rerank_backend(false, 0.0, "", "onnx");
+    let system_one = cache_key_with_rerank_backend(false, 0.0, "", "system-one");
+    let off = cache_key_with_rerank_backend(false, 0.0, "", "off");
+    assert_ne!(
+        onnx, system_one,
+        "onnx vs system-one must invalidate the key"
+    );
+    assert_ne!(onnx, off, "onnx vs off must invalidate the key");
+    assert_ne!(system_one, off, "system-one vs off must invalidate the key");
+}
+
+/// System-One fails open while `LEINDEX_FEATURE_SYSTEM_ONE` is off, so a search
+/// cached before the flag is armed must not be served after it, even though
+/// every config knob is identical. Activation therefore has to move the key.
+#[test]
+fn test_cache_key_rerank_activation_change_invalidates() {
+    let disabled = cache_key_with_rerank_activation(false, 0.0, "", "system-one", false);
+    let enabled = cache_key_with_rerank_activation(false, 0.0, "", "system-one", true);
+    assert_ne!(
+        disabled, enabled,
+        "arming the system-one flag must invalidate the key"
+    );
+}
+
+/// Identical rerank backends produce the identical key (deterministic).
+#[test]
+fn test_cache_key_rerank_backend_deterministic() {
+    let a = cache_key_with_rerank_backend(true, 0.10, "root-hash-A", "system-one");
+    let b = cache_key_with_rerank_backend(true, 0.10, "root-hash-A", "system-one");
+    assert_eq!(a, b, "same rerank backend must produce the same key");
 }
 
 /// A `fragment_weight` change must produce a different key (config invalidation).

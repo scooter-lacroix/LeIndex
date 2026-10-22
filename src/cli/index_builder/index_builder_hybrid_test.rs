@@ -482,6 +482,7 @@ fn test_persist_search_snapshot_writes_fragment_artifacts() {
             snapshot,
             std::sync::Arc::new(tfidf_mmap),
             None,
+            Vec::new(),
             Some(std::sync::Arc::new(frag_mmap)),
             Some(&frag_ids),
             None,
@@ -973,30 +974,6 @@ fn test_duplicate_node_ids_keep_their_own_enriched_content() {
         results.iter().any(|hit| hit.file_path.ends_with("a.rs")),
         "the surviving duplicate's tokens must come from its own file, got {:?}",
         results.iter().map(|h| &h.file_path).collect::<Vec<_>>()
-    );
-}
-
-#[test]
-#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-fn test_neural_rows_dedupe_to_first_occurrence_per_node_id() {
-    // append_nodes keeps the FIRST occurrence of a duplicate node_id while
-    // update_neural_embeddings applies rows last-wins. The rows handed to
-    // update_neural_embeddings must therefore carry the first occurrence's
-    // vector, or the retained node gets a later duplicate's embedding.
-    let mut rows = vec![
-        ("proj:new".to_string(), vec![1.0, 0.0]),
-        ("proj:other".to_string(), vec![0.5, 0.5]),
-        ("proj:new".to_string(), vec![0.0, 1.0]),
-        ("proj:new".to_string(), vec![0.25, 0.75]),
-    ];
-    super::dedupe_neural_rows_keep_first(&mut rows);
-    assert_eq!(
-        rows,
-        vec![
-            ("proj:new".to_string(), vec![1.0, 0.0]),
-            ("proj:other".to_string(), vec![0.5, 0.5]),
-        ],
-        "first occurrence per node_id kept, later duplicates dropped"
     );
 }
 

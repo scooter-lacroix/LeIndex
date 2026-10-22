@@ -30,19 +30,6 @@ pub const MAX_SCAN_FILE_BYTES: u64 = 16 << 20;
 pub const MAX_INDEX_FILES: usize = 300_000;
 const BINARY_SNIFF: usize = 8192;
 
-/// Directories never worth searching, at any depth.
-const NEVER_WALK: &[&str] = &[
-    ".git",
-    ".hg",
-    ".svn",
-    ".leindex",
-    "node_modules",
-    "__pycache__",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".tox",
-];
-
 /// Worker threads for scans: `LEINDEX_FIND_THREADS`, else `min(4, cores)`.
 pub fn worker_threads() -> usize {
     std::env::var("LEINDEX_FIND_THREADS")
@@ -128,92 +115,11 @@ fn platform_identity(_meta: &std::fs::Metadata) -> (i64, u64) {
     (0, 0)
 }
 
-// ── Inventory ────────────────────────────────────────────────────────────────
-
-fn git_inventory(root: &Path) -> Option<Vec<String>> {
-    let output = std::process::Command::new("git")
-        .args([
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ])
-        .current_dir(root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let mut files: Vec<String> = output
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|raw| !raw.is_empty())
-        .filter_map(|raw| std::str::from_utf8(raw).ok())
-        .filter(|rel| !rel.split('/').any(|seg| seg == ".leindex" || seg == ".git"))
-        // A tracked or untracked symlink can point anywhere — including
-        // outside the project — and so can an INTERMEDIATE directory
-        // component: `git ls-files --cached` still emits `dir/leak` after
-        // `dir` is replaced by a symlink to /outside, and leaf-only
-        // `symlink_metadata` follows `dir` and reports the far-side target
-        // as a plain regular file. Canonicalize EVERY candidate and require
-        // containment in the canonical root — that covers leaf symlinks,
-        // intermediate symlinks, and vanished paths with one check.
-        .filter(|rel| {
-            let path = root.join(rel);
-            std::fs::canonicalize(&path)
-                .is_ok_and(|resolved| resolved.starts_with(&canon_root) && resolved.is_file())
-        })
-        .map(str::to_string)
-        .collect();
-    files.sort_unstable();
-    files.dedup();
-    Some(files)
-}
-
-fn walk_inventory(root: &Path, limit: usize, deadline: Option<Instant>) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut stack = vec![(root.to_path_buf(), String::new())];
-    while let Some((dir, prefix)) = stack.pop() {
-        if out.len() >= limit || deadline.is_some_and(|d| Instant::now() >= d) {
-            break;
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let rel = if prefix.is_empty() {
-                name.to_string()
-            } else {
-                format!("{prefix}/{name}")
-            };
-            if kind.is_dir() {
-                if !NEVER_WALK.contains(&name) {
-                    stack.push((entry.path(), rel));
-                }
-            } else if kind.is_file() {
-                out.push(rel);
-            }
-        }
-    }
-    out.sort_unstable();
-    out
-}
-
-/// Files under `dir`, relative to it, sorted, forward slashes. Uses git's own
-/// ignore rules inside a repository; elsewhere a plain walk that skips VCS
-/// metadata and package caches.
-pub fn list_files(dir: &Path, limit: usize, deadline: Option<Instant>) -> Vec<String> {
-    let mut files = git_inventory(dir).unwrap_or_else(|| walk_inventory(dir, limit, deadline));
-    files.truncate(limit);
-    files
-}
+// Inventory (`git ls-files` / budgeted walk) lives in `engine_inventory.rs`;
+// re-exported here so `engine::list_files` stays the public path.
+#[path = "engine_inventory.rs"]
+mod inventory;
+pub use inventory::{InventoryTruncation, list_files, list_files_matching, list_files_reporting};
 
 // ── Index building ───────────────────────────────────────────────────────────
 
@@ -644,8 +550,9 @@ fn root_candidates(
     compiled: &Compiled,
     deadline: Option<Instant>,
     stats: &mut SearchStats,
-) -> Vec<Candidate> {
+) -> (Vec<Candidate>, InventoryTruncation) {
     let mut set: BTreeMap<String, Candidate> = BTreeMap::new();
+    let mut truncation = InventoryTruncation::default();
     let is_file_root = spec.root.is_file();
 
     if is_file_root {
@@ -707,7 +614,9 @@ fn root_candidates(
             );
         }
     } else {
-        for rel in list_files(&spec.root, 1_000_000, deadline) {
+        let (rels, trunc) = list_files_reporting(&spec.root, 1_000_000, deadline);
+        truncation = trunc;
+        for rel in rels {
             set.insert(
                 rel.clone(),
                 Candidate {
@@ -719,9 +628,11 @@ fn root_candidates(
             );
         }
     }
-    set.into_values()
+    let candidates = set
+        .into_values()
         .filter(|c| is_file_root || spec.filter.allows(&c.rel))
-        .collect()
+        .collect();
+    (candidates, truncation)
 }
 
 fn clip_line(line: &[u8], col: usize, max_chars: usize) -> String {
@@ -775,16 +686,82 @@ fn context_lines(
     (before, after)
 }
 
-fn read_scan_file(path: &Path) -> Option<Vec<u8>> {
-    let meta = std::fs::metadata(path).ok()?;
+/// Why a candidate yielded no bytes to scan.
+///
+/// The two halves mean opposite things to a caller: [`NotScannable`] input is
+/// *legitimately* unmatched — nothing a pattern could match lives in a binary
+/// or an oversized file, so it is a clean miss — while [`Unreadable`] names a
+/// file this scan never examined, whose matches are unknown rather than absent.
+/// Collapsing them into one `None` let a structural search answer
+/// `has_more: false` over a file it had failed to open (Codex P2).
+///
+/// [`NotScannable`]: ScanRefusal::NotScannable
+/// [`Unreadable`]: ScanRefusal::Unreadable
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanRefusal {
+    /// Policy says this input is not source we scan: not a regular file,
+    /// oversized, binary, or not valid UTF-8.
+    NotScannable,
+    /// The file could not be read — a stat or open failure such as denied
+    /// permissions or a transient I/O error. Its contents are unknown, so a
+    /// caller must not treat it as having been searched and come up empty.
+    Unreadable,
+}
+
+fn read_scan_file(path: &Path) -> Result<Vec<u8>, ScanRefusal> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        // A path that no longer exists has no contents to find, so it is not an
+        // unknown file: reporting it unreadable would pin a caller's
+        // "incomplete" flag forever on a broken symlink or a file that moved
+        // between the walk and this open.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ScanRefusal::NotScannable);
+        }
+        Err(_) => return Err(ScanRefusal::Unreadable),
+    };
     if !meta.is_file() || meta.len() > MAX_SCAN_FILE_BYTES {
-        return None;
+        return Err(ScanRefusal::NotScannable);
     }
-    let data = std::fs::read(path).ok()?;
+    let data = std::fs::read(path).map_err(|error| {
+        // Same race as the stat above: a file that vanished between the walk
+        // and this read has no contents to find, so it is a clean miss, not an
+        // unknown file whose absence must pin `has_more`.
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ScanRefusal::NotScannable
+        } else {
+            ScanRefusal::Unreadable
+        }
+    })?;
     if looks_binary(&data) {
-        return None;
+        return Err(ScanRefusal::NotScannable);
     }
-    Some(data)
+    Ok(data)
+}
+
+/// Read a file as text under the same policy a scan uses: regular file, no
+/// bigger than [`MAX_SCAN_FILE_BYTES`], not binary.
+///
+/// Structural search needs the source as `&str` (ast-grep's `StrDoc`), so the
+/// bytes from [`read_scan_file`] are converted here rather than duplicating the
+/// size and binary rules in a second module where they could drift.
+/// Non-UTF-8 files are skipped: they cannot be handed to ast-grep.
+///
+/// Use [`read_scannable_reason`] when the caller must tell a policy refusal
+/// from a file it failed to read.
+pub fn read_scannable(path: &Path) -> Option<String> {
+    read_scannable_reason(path).ok()
+}
+
+/// [`read_scannable`], keeping the reason so a caller can distinguish policy
+/// refusals from files it could not open.
+pub fn read_scannable_reason(path: &Path) -> Result<String, ScanRefusal> {
+    match String::from_utf8(read_scan_file(path)?) {
+        Ok(text) => Ok(text),
+        // Valid UTF-8 is a precondition of parsing, not a read failure: the
+        // bytes were read fine and simply cannot hold an ast-grep match.
+        Err(_) => Err(ScanRefusal::NotScannable),
+    }
 }
 
 fn resolve_symbol_index<'a>(
@@ -894,7 +871,11 @@ fn scan_file(
     if !index_candidate_contained(candidate, root_canonical) {
         return None;
     }
-    let data = read_scan_file(&candidate.abs)?;
+    // Text search keeps its historical shape: a file it cannot read is a
+    // non-match, not an incomplete result. `has_more` for this axis is built
+    // from the index plan, not from per-file read outcomes, so a refusal here
+    // is dropped rather than escalated.
+    let data = read_scan_file(&candidate.abs).ok()?;
     let symbol_index = resolve_symbol_index(index, candidate, options);
     let mut result = FileResult {
         rel: candidate.rel.clone(),
@@ -1034,8 +1015,24 @@ pub fn search(roots: &[RootSpec], compiled: &Compiled, options: &SearchOptions) 
             used_index: spec.index.is_some() && !spec.root.is_file(),
             files: Vec::new(),
         };
-        let candidates = root_candidates(spec, compiled, options.deadline, &mut output.stats);
+        let (candidates, truncation) =
+            root_candidates(spec, compiled, options.deadline, &mut output.stats);
         output.stats.candidates += candidates.len();
+        if truncation.deadline {
+            output.stopped_by_deadline = true;
+            output.complete = false;
+            output.has_more = true;
+        } else if truncation.truncated() {
+            output.complete = false;
+            output.has_more = true;
+        }
+        if options.deadline.is_some_and(|d| Instant::now() >= d) {
+            output.complete = false;
+            output.stopped_by_deadline = true;
+            output.has_more = true;
+            output.roots.push(root_out);
+            break 'roots;
+        }
         let canonical_root = std::fs::canonicalize(&spec.root).ok();
 
         for chunk in candidates.chunks(chunk_size) {
@@ -1983,6 +1980,30 @@ mod tests {
         assert!(
             dirty.contains(&"a.rs".to_string()),
             "a same-second ctime-only change must be dirty, got {dirty:?}"
+        );
+    }
+
+    #[test]
+    fn test_expired_deadline_reports_incomplete_and_stopped_by_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.txt", "needle\n");
+        let compiled = q("needle").compile().unwrap();
+        let out = search(
+            &[spec(dir.path(), None)],
+            &compiled,
+            &SearchOptions {
+                deadline: Some(Instant::now()),
+                ..Default::default()
+            },
+        );
+        assert!(!out.complete, "expired deadline must not report complete");
+        assert!(
+            out.stopped_by_deadline,
+            "expired deadline must set stopped_by_deadline"
+        );
+        assert!(
+            out.has_more,
+            "expired deadline leaves tree unexamined, so has_more must be true"
         );
     }
 }

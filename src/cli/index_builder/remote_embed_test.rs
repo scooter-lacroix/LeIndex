@@ -345,12 +345,22 @@ fn test_generation_remote_death_after_success_persists_only_remote_space() {
     let generation = GenerationNeuralEmbedder::new(
         HybridEmbedder::hybrid_remote(corpus_tfidf(), remote_config.clone(), None).expect("remote"),
     );
-    let first_batch = vec![
-        ("a".to_string(), "first document".to_string()),
-        ("b".to_string(), "second document".to_string()),
-    ];
-    let mut rows = Vec::new();
-    append_neural_batch(&generation, &first_batch, &mut rows);
+    // Batch shapes mirror the production flush: the first request carries the
+    // whole batch (so rows land), the next one survives the outage.
+    let landed = |ids: &[&str], texts: &[&str]| -> Vec<(String, Vec<f32>)> {
+        let owned: Vec<String> = texts.iter().map(|text| text.to_string()).collect();
+        let titles = vec![None; owned.len()];
+        generation
+            .embed_neural_batch_blocking_titled(&owned, titles)
+            .into_iter()
+            .zip(ids)
+            .filter_map(|(row, node_id)| {
+                row.filter(|vector| !vector.is_empty())
+                    .map(|vector| ((*node_id).to_string(), vector))
+            })
+            .collect()
+    };
+    let mut rows = landed(&["a", "b"], &["first document", "second document"]);
     assert_eq!(
         rows.len(),
         2,
@@ -358,8 +368,8 @@ fn test_generation_remote_death_after_success_persists_only_remote_space() {
     );
     // The server fails after the first batch, then recovers. This generation
     // must not retry remote or switch to 1024-dimensional Qwen.
-    append_neural_batch(&generation, &[("c".into(), "outage".into())], &mut rows);
-    append_neural_batch(&generation, &[("d".into(), "remainder".into())], &mut rows);
+    rows.extend(landed(&["c"], &["outage"]));
+    rows.extend(landed(&["d"], &["remainder"]));
     assert_eq!(
         request_count.load(std::sync::atomic::Ordering::SeqCst),
         2,
@@ -665,6 +675,38 @@ fn test_remote_document_template_is_applied_verbatim_on_wire() {
     block_on_test(provider.embed_batch(vec!["fn cache_key() {}"])).expect("document embedding");
     let request = receiver.recv().expect("captured document request");
     assert_eq!(request["input"][0], "title: none | text: fn cache_key() {}");
+}
+
+#[test]
+fn test_remote_document_template_threads_titles_on_wire() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let endpoint = spawn_mock_embeddings_server_responses(|_| 768, Some(sender), 2);
+    let provider = crate::search::onnx::GenericRemoteProvider::from_config(RemoteEmbeddingConfig {
+        provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+        model: Some("embeddinggemma-2".to_string()),
+        remote_dimension: Some(768),
+        doc_template: Some("title: {title} | text: {text}".to_string()),
+        ..RemoteEmbeddingConfig::default()
+    })
+    .expect("provider construction");
+
+    block_on_test(provider.embed_batch_titled(
+        vec!["fn cache_key() {}"],
+        vec![Some("src/lib.rs".to_string())].into_iter().peekable(),
+    ))
+    .expect("titled document embedding");
+    let request = receiver.recv().expect("captured titled document request");
+    assert_eq!(
+        request["input"][0],
+        "title: src/lib.rs | text: fn cache_key() {}"
+    );
+
+    block_on_test(
+        provider.embed_batch_titled(vec!["fn other() {}"], vec![None].into_iter().peekable()),
+    )
+    .expect("title-less document embedding");
+    let request = receiver.recv().expect("captured title-less request");
+    assert_eq!(request["input"][0], "title: none | text: fn other() {}");
 }
 
 #[test]

@@ -317,12 +317,35 @@ fn run_git_capped(
     args: &[String],
     cap: u64,
 ) -> Result<(Vec<u8>, bool), std::io::Error> {
-    let mut child = Command::new("git")
+    let child = Command::new("git")
         .args(args)
         .current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    drain_git_output(child, cap)
+}
+
+/// Read a spawned child's piped stdout (capped at `cap` bytes) while draining
+/// stderr on a separate thread, then reap it.
+///
+/// Both pipes must be drained concurrently: the OS pipe buffers hold only 64 KiB
+/// each, so a child that fills stderr blocks before finishing stdout — and we
+/// would block on stdout forever (`std::process::Command::output` spawns exactly
+/// these two reader threads for the same reason). The byte cap alone does not
+/// save us: we only notice overflow after seeing it on OUR side, which never
+/// happens while the child is stuck on a full stderr pipe.
+fn drain_git_output(
+    mut child: std::process::Child,
+    cap: u64,
+) -> Result<(Vec<u8>, bool), std::io::Error> {
+    let stderr_thread = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut stderr = Vec::new();
+            let _ = pipe.read_to_end(&mut stderr);
+            stderr
+        })
+    });
     let mut stdout = Vec::new();
     let mut truncated = false;
     if let Some(pipe) = child.stdout.take() {
@@ -334,12 +357,22 @@ fn run_git_capped(
             let _ = child.kill();
         }
     }
-    let output = child.wait_with_output()?;
-    if !truncated && !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let status = child.wait()?;
+    if truncated {
+        // The child was killed; its stderr pipe never hit EOF, so the reader
+        // thread may still be blocked. Abandon it (the kill path hands the
+        // dead child to the OS reaper — no join).
+        return Ok((stdout, true));
+    }
+    let stderr = match stderr_thread {
+        Some(handle) => handle.join().unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if !status.success() {
+        let message = String::from_utf8_lossy(&stderr).trim().to_string();
         return Err(std::io::Error::other(message));
     }
-    Ok((stdout, truncated))
+    Ok((stdout, false))
 }
 
 fn git_args(spec: &DiffSpec, has_head: bool, flags: &[&str]) -> Vec<String> {
@@ -450,21 +483,11 @@ impl GitDiffHandler {
         })?;
         let root = live.root().to_path_buf();
 
-        let spec = parse_spec(&args)?;
-        let stat_only = extract_bool(&args, "stat_only", false);
-        let include_patch = extract_bool(&args, "include_patch", true) && !stat_only;
-        let enrich = extract_bool(&args, "enrich_pdg", true);
-        let max_patch_chars =
-            extract_usize(&args, "max_patch_chars", DEFAULT_PATCH_CHARS)?.min(200_000);
-        let budget = WorkBudget {
-            max_latency_ms: extract_usize(&args, "max_latency_ms", 250)?.min(60_000) as u64,
-            allow_partial: extract_bool(&args, "allow_partial", true),
-        };
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.trim_start_matches("./").trim_end_matches('/').to_string());
+        // Parsing and the two early-exit shapes live in free functions below:
+        // this method was the orchestration AND every detail of it, which is
+        // how it crossed the CCN 15 gate without any single branch being
+        // obviously to blame.
+        let parsed = parse_args(&args)?;
 
         // Outside a repository `git diff` silently degrades to `--no-index`
         // mode and fails with a page of usage text; answer plainly instead.
@@ -474,17 +497,13 @@ impl GitDiffHandler {
                 .await
                 .unwrap_or(false);
         if !is_repo {
-            return Ok(json!({
-                "is_git_repo": false,
-                "message": "Not a git repository",
-                "pdg_status": "not_loaded",
-            }));
+            return Ok(not_a_repo());
         }
 
         let git_started = Instant::now();
         let git_root = root.clone();
-        let git_spec = spec.clone();
-        let want_patch = include_patch || (enrich && !stat_only);
+        let git_spec = parsed.spec.clone();
+        let want_patch = parsed.include_patch || (parsed.enrich && !parsed.stat_only);
         let raw =
             tokio::task::spawn_blocking(move || collect_diff(&git_root, &git_spec, want_patch))
                 .await
@@ -495,32 +514,15 @@ impl GitDiffHandler {
 
         let raw = match raw {
             Ok(raw) => raw,
-            Err(error) => {
-                // Keep the first lines only: git prints its whole usage on a bad flag.
-                let message = error
-                    .to_string()
-                    .lines()
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if message.contains("not a git repository") {
-                    return Ok(json!({
-                        "is_git_repo": false,
-                        "message": "Not a git repository",
-                        "pdg_status": "not_loaded",
-                    }));
-                }
-                return Err(JsonRpcError::invalid_params(format!(
-                    "git diff failed: {message}"
-                )));
-            }
+            Err(error) => return git_error_response(error),
         };
 
         let files: Vec<ChangedFile> = raw
             .files
             .into_iter()
             .filter(|file| {
-                scope
+                parsed
+                    .scope
                     .as_ref()
                     .is_none_or(|s| file.path == *s || file.path.starts_with(&format!("{s}/")))
             })
@@ -530,70 +532,160 @@ impl GitDiffHandler {
             .as_ref()
             .map(|(p, _)| parse_hunks(p))
             .unwrap_or_default();
+        let patch = raw.patch;
 
-        let mut result = json!({
-            "is_git_repo": true,
-            "spec": { "kind": spec.kind(), "value": spec_value(&spec) },
-            "summary": {
-                "files": files.len(),
-                "additions": files.iter().filter_map(|f| f.additions).sum::<u64>(),
-                "deletions": files.iter().filter_map(|f| f.deletions).sum::<u64>(),
-            },
-            "files": files.iter().map(file_json).collect::<Vec<_>>(),
-            "pdg_status": if enrich && !stat_only { "not_loaded" } else { "skipped" },
-            "changed_symbols": [],
-            "impact_summary": { "total_affected_symbols": 0, "affected_files": [], "pdg_enriched": false },
-        });
-        if include_patch {
-            if let Some((patch, truncated)) = raw.patch.as_ref() {
-                // Re-run with context for readers: the -U0 patch drives symbol
-                // mapping, but a patch a human reads wants 3 lines of context.
-                let readable = readable_patch(&root, &spec).unwrap_or_else(|| patch.clone());
-                let (text, cut) = bound_chars(&readable, max_patch_chars);
-                result["patch"] = Value::String(text);
-                result["patch_truncated"] = Value::Bool(cut || *truncated);
-            }
-        }
-        if !enrich || stat_only || files.is_empty() {
-            return Ok(result);
-        }
-
-        let Some(handle) = registry.try_get_loaded(&root).await else {
-            return Ok(result);
-        };
-        {
-            let mut guard = handle.write().await;
-            if guard.pdg().is_none() {
-                let _ = guard.ensure_pdg_loaded_graph_only();
-            }
-        }
-        let guard = handle.read().await;
-        let Some(pdg) = guard.pdg() else {
-            return Ok(result);
-        };
-
-        let started = Instant::now();
-        let pdg_started = Instant::now();
-        let enrichment = enrich_files(
-            pdg,
-            &root,
-            &files,
-            &hunks,
-            spec.new_side_is_worktree(),
-            budget,
-            started,
-        );
-        record_pdg_ms(pdg_started.elapsed().as_millis().min(u64::MAX as u128) as u64);
-        result["pdg_status"] = Value::String(enrichment.status.to_string());
-        result["changed_symbols"] = Value::Array(enrichment.changed_symbols);
-        result["impact_summary"] = json!({
-            "total_affected_symbols": enrichment.affected_symbols,
-            "affected_files": enrichment.affected_files,
-            "pdg_enriched": true,
-            "symbol_mapping": if spec.new_side_is_worktree() { "hunk" } else { "file" },
-        });
-        Ok(result)
+        Ok(attach_patch_and_enrich(parsed, patch, files, hunks, &root, registry).await)
     }
+}
+
+/// Everything `execute` reads out of the tool arguments before any work.
+struct DiffArgs {
+    spec: DiffSpec,
+    stat_only: bool,
+    include_patch: bool,
+    enrich: bool,
+    max_patch_chars: usize,
+    budget: WorkBudget,
+    scope: Option<String>,
+}
+
+fn parse_args(args: &Value) -> Result<DiffArgs, JsonRpcError> {
+    let spec = parse_spec(args)?;
+    let stat_only = extract_bool(args, "stat_only", false);
+    Ok(DiffArgs {
+        spec,
+        stat_only,
+        include_patch: extract_bool(args, "include_patch", true) && !stat_only,
+        enrich: extract_bool(args, "enrich_pdg", true),
+        max_patch_chars: extract_usize(args, "max_patch_chars", DEFAULT_PATCH_CHARS)?.min(200_000),
+        budget: WorkBudget {
+            max_latency_ms: extract_usize(args, "max_latency_ms", 250)?.min(60_000) as u64,
+            allow_partial: extract_bool(args, "allow_partial", true),
+        },
+        scope: args
+            .get("scope")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_start_matches("./").trim_end_matches('/').to_string()),
+    })
+}
+
+/// The answer every not-a-repository path returns, so all of them agree.
+fn not_a_repo() -> Value {
+    json!({
+        "is_git_repo": false,
+        "message": "Not a git repository",
+        "pdg_status": "not_loaded",
+    })
+}
+
+/// Map a failed `git diff` invocation to its JSON-RPC response.
+///
+/// Keep the first lines only: git prints its whole usage page on a bad flag.
+/// The one special case is `--no-index` degradation — outside a repository git
+/// no longer fails with usage text but with a diagnostic saying so, and that
+/// is an input problem, not a tool fault, so it gets the same plain answer as
+/// the pre-flight probe instead of an `invalid_params` error.
+fn git_error_response(error: std::io::Error) -> Result<Value, JsonRpcError> {
+    let message = error
+        .to_string()
+        .lines()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if message.contains("not a git repository") {
+        return Ok(not_a_repo());
+    }
+    Err(JsonRpcError::invalid_params(format!(
+        "git diff failed: {message}"
+    )))
+}
+
+/// Build the success payload: summary and per-file records, the reader-facing
+/// patch, and — when the project's PDG is resident — hunk-mapped symbol
+/// enrichment. Extracted from `execute` for the same reason as `parse_args`:
+/// the method was carrying every branch of payload assembly on top of
+/// orchestrating the git subprocess and the registry.
+async fn attach_patch_and_enrich(
+    args: DiffArgs,
+    patch: Option<(String, bool)>,
+    files: Vec<ChangedFile>,
+    hunks: BTreeMap<String, Vec<(usize, usize)>>,
+    root: &Path,
+    registry: &Arc<ProjectRegistry>,
+) -> Value {
+    let DiffArgs {
+        spec,
+        stat_only,
+        include_patch,
+        enrich,
+        max_patch_chars,
+        budget,
+        ..
+    } = args;
+    let mut result = json!({
+        "is_git_repo": true,
+        "spec": { "kind": spec.kind(), "value": spec_value(&spec) },
+        "summary": {
+            "files": files.len(),
+            "additions": files.iter().filter_map(|f| f.additions).sum::<u64>(),
+            "deletions": files.iter().filter_map(|f| f.deletions).sum::<u64>(),
+        },
+        "files": files.iter().map(file_json).collect::<Vec<_>>(),
+        "pdg_status": if enrich && !stat_only { "not_loaded" } else { "skipped" },
+        "changed_symbols": [],
+        "impact_summary": { "total_affected_symbols": 0, "affected_files": [], "pdg_enriched": false },
+    });
+    if include_patch {
+        if let Some((raw_patch, truncated)) = &patch {
+            // Re-run with context for readers: the -U0 patch drives symbol
+            // mapping, but a patch a human reads wants 3 lines of context.
+            let (readable, readable_truncated) =
+                readable_patch(root, &spec).unwrap_or_else(|| (raw_patch.clone(), false));
+            let (text, cut) = bound_chars(&readable, max_patch_chars);
+            result["patch"] = Value::String(text);
+            result["patch_truncated"] = Value::Bool(cut || *truncated || readable_truncated);
+        }
+    }
+    if !enrich || stat_only || files.is_empty() {
+        return result;
+    }
+
+    let Some(handle) = registry.try_get_loaded(root).await else {
+        return result;
+    };
+    {
+        let mut guard = handle.write().await;
+        if guard.pdg().is_none() {
+            let _ = guard.ensure_pdg_loaded_graph_only();
+        }
+    }
+    let guard = handle.read().await;
+    let Some(pdg) = guard.pdg() else {
+        return result;
+    };
+
+    let started = Instant::now();
+    let pdg_started = Instant::now();
+    let enrichment = enrich_files(
+        pdg,
+        root,
+        &files,
+        &hunks,
+        spec.new_side_is_worktree(),
+        budget,
+        started,
+    );
+    record_pdg_ms(pdg_started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+    result["pdg_status"] = Value::String(enrichment.status.to_string());
+    result["changed_symbols"] = Value::Array(enrichment.changed_symbols);
+    result["impact_summary"] = json!({
+        "total_affected_symbols": enrichment.affected_symbols,
+        "affected_files": enrichment.affected_files,
+        "pdg_enriched": true,
+        "symbol_mapping": if spec.new_side_is_worktree() { "hunk" } else { "file" },
+    });
+    result
 }
 
 fn spec_value(spec: &DiffSpec) -> Value {
@@ -633,11 +725,11 @@ fn parse_spec(args: &Value) -> Result<DiffSpec, JsonRpcError> {
     })
 }
 
-fn readable_patch(root: &Path, spec: &DiffSpec) -> Option<String> {
+fn readable_patch(root: &Path, spec: &DiffSpec) -> Option<(String, bool)> {
     let has_head = true;
-    let (bytes, _) =
+    let (bytes, truncated) =
         run_git_capped(root, &git_args(spec, has_head, &["-M"]), MAX_DIFF_BYTES).ok()?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    Some((String::from_utf8_lossy(&bytes).into_owned(), truncated))
 }
 
 fn bound_chars(text: &str, max: usize) -> (String, bool) {
@@ -991,5 +1083,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value["is_git_repo"], false);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_drain_git_output_survives_large_stderr() {
+        // Child writes >64 KiB to stderr (fills the OS pipe buffer) before a
+        // small stdout payload. Without the concurrent stderr drain this
+        // deadlocks: the child blocks on stderr, we block on stdout forever.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("noisy-git");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nawk 'BEGIN{for(i=0;i<70000;i++)printf \"x\"}' >&2\nprintf 'ok'\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+        let child = Command::new(&fake)
+            .current_dir(dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (stdout, truncated) = drain_git_output(child, 1024 * 1024).unwrap();
+        assert_eq!(stdout, b"ok");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_readable_patch_reports_bytecap_truncation() {
+        // `readable_patch` re-runs git with -U3 context; when that output
+        // exceeds the 8 MiB cap it must SAY so, or patch_truncated lies for a
+        // cut patch (max_patch_chars up to 200k never cuts a 8 MiB patch).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join("big.txt"), "a".repeat(9 * 1024 * 1024)).unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "first"]);
+        std::fs::write(root.join("big.txt"), "b".repeat(9 * 1024 * 1024)).unwrap();
+        let (_patch, truncated) = readable_patch(root, &DiffSpec::WorkingTree).expect("patch");
+        assert!(truncated, "a >8 MiB readable re-run must report truncation");
     }
 }

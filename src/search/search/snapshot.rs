@@ -100,6 +100,7 @@ impl SearchEngine {
         mut snapshot: SearchSnapshot,
         tfidf_mmap: Arc<MmapEmbeddingIndex>,
         neural_mmap: Option<Arc<MmapEmbeddingIndex>>,
+        neural_tier_mmaps: Vec<Arc<MmapEmbeddingIndex>>,
         fragment_mmap: Option<Arc<MmapEmbeddingIndex>>,
         fragment_ids: Option<&[String]>,
         expected_neural_dim: Option<usize>,
@@ -134,6 +135,39 @@ impl SearchEngine {
         );
         if let Some(mmap) = neural_mmap.as_ref() {
             Self::install_neural_vector_index(&mut staged, mmap, &node_ids);
+        }
+        // MRL sidecar tiers: subset stores, so pre-filter ids instead of
+        // from_snapshot's strict all-ids contract. Only true tier dimensions
+        // participate; anything else is skipped with a warning.
+        //
+        // Deliberately NOT nested under `neural_mmap`: tiers are independent
+        // stores, and a fixed sub-native Matryoshka policy writes no canonical
+        // file at all, so requiring one here silently discarded every tier at
+        // restart and the index lost all neural retrieval until a full re-embed
+        // (Codex P1 / CodeRabbit Major). The per-dimension sanity bound is the
+        // native width when a canonical store is present, otherwise the widest
+        // known MRL tier — a 768-dim "tier" is the canonical file, never a tier.
+        let tier_upper_bound = neural_mmap
+            .as_ref()
+            .map(|mmap| mmap.dimension() as usize)
+            .unwrap_or(crate::search::mrl::MRL_TIERS[3]);
+        for tier_mmap in neural_tier_mmaps.iter().filter(|m| {
+            let dim = m.dimension() as usize;
+            dim < tier_upper_bound && crate::search::mrl::MRL_TIERS.contains(&dim)
+        }) {
+            let tier_ids: Vec<String> = node_ids
+                .iter()
+                .filter(|id| tier_mmap.find_node_row(id).is_some())
+                .cloned()
+                .collect();
+            match MmapVectorIndex::from_snapshot(std::sync::Arc::clone(tier_mmap), &tier_ids) {
+                Ok(idx) => staged.neural_tier_indices.push(VectorIndexImpl::Mmap(idx)),
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    dim = tier_mmap.dimension(),
+                    "failed to build MRL tier vector index; tier disabled"
+                ),
+            }
         }
         Self::install_fragment_vector_index(
             &mut staged,
@@ -211,7 +245,25 @@ impl SearchEngine {
         mmap: &Arc<MmapEmbeddingIndex>,
         node_ids: &[String],
     ) {
-        match MmapVectorIndex::from_snapshot(std::sync::Arc::clone(mmap), node_ids) {
+        // Not every snapshot node necessarily has a neural row: the provider
+        // rejects some inputs individually (the batch path skips them rather
+        // than failing), and a node can be added after the neural publish.
+        // `from_snapshot` takes a strict all-ids contract, so pre-filter to the
+        // rows that exist — the same shape the MRL tier path uses below —
+        // instead of letting one orphan discard every other node's vector.
+        let present: Vec<String> = node_ids
+            .iter()
+            .filter(|id| mmap.find_node_row(id).is_some())
+            .cloned()
+            .collect();
+        if present.len() != node_ids.len() {
+            tracing::warn!(
+                missing = node_ids.len() - present.len(),
+                total = node_ids.len(),
+                "snapshot nodes without a neural row; they cannot contribute to semantic retrieval"
+            );
+        }
+        match MmapVectorIndex::from_snapshot(std::sync::Arc::clone(mmap), &present) {
             Ok(idx) => staged.neural_vector_index = Some(VectorIndexImpl::Mmap(idx)),
             Err(error) => tracing::warn!(
                 error = %error,

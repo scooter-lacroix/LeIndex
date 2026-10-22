@@ -121,66 +121,115 @@ impl LeIndex {
         exact_route: bool,
     ) {
         let rerank_cfg = &crate::config::LeIndexConfig::load_cached().search;
-        if rerank_cfg.rerank_enabled && !exact_route && !results.is_empty() {
-            if let Some(embedder) = self.embedder.as_ref() {
-                let n = (rerank_cfg.rerank_top_n as usize).min(results.len());
-                let mut docs: Vec<(String, String, f32)> = Vec::with_capacity(n);
-                for result in results[..n].iter() {
-                    let content = pdg
-                        .find_by_id(&result.node_id)
-                        .and_then(|idx| pdg.get_node(idx))
-                        .and_then(|node| {
-                            let path = self.resolve_indexed_file_path(&node.file_path);
-                            let bytes = file_cache
-                                .entry(node.file_path.to_string())
-                                .or_insert_with(|| std::fs::read(&path).ok());
-                            bytes
-                                .as_ref()
-                                .filter(|bytes| {
-                                    node.byte_range.0 < node.byte_range.1
-                                        && node.byte_range.1 <= bytes.len()
-                                })
-                                .map(|bytes| {
-                                    String::from_utf8_lossy(
-                                        &bytes[node.byte_range.0..node.byte_range.1],
-                                    )
-                                    .to_string()
-                                })
-                        })
-                        .unwrap_or_else(|| format!("{} {}", result.symbol_name, result.file_path));
-                    docs.push((result.node_id.clone(), content, result.score.overall));
-                }
+        if super::rerank_effectively_enabled_with_override(rerank_cfg)
+            && !exact_route
+            && !results.is_empty()
+        {
+            let n = (rerank_cfg.rerank_top_n as usize).min(results.len());
+            let mut docs: Vec<(String, String, f32)> = Vec::with_capacity(n);
+            for result in results[..n].iter() {
+                let content = pdg
+                    .find_by_id(&result.node_id)
+                    .and_then(|idx| pdg.get_node(idx))
+                    .and_then(|node| {
+                        let path = self.resolve_indexed_file_path(&node.file_path);
+                        let bytes = file_cache
+                            .entry(node.file_path.to_string())
+                            .or_insert_with(|| std::fs::read(&path).ok());
+                        bytes
+                            .as_ref()
+                            .filter(|bytes| {
+                                node.byte_range.0 < node.byte_range.1
+                                    && node.byte_range.1 <= bytes.len()
+                            })
+                            .map(|bytes| {
+                                String::from_utf8_lossy(
+                                    &bytes[node.byte_range.0..node.byte_range.1],
+                                )
+                                .to_string()
+                            })
+                    })
+                    .unwrap_or_else(|| format!("{} {}", result.symbol_name, result.file_path));
+                docs.push((result.node_id.clone(), content, result.score.overall));
+            }
 
-                match embedder.rerank_blocking(query, docs) {
-                    Some(Ok(reranked)) => {
-                        let by_id: std::collections::HashMap<String, SearchResult> = results[..n]
-                            .iter()
-                            .map(|result| (result.node_id.clone(), result.clone()))
-                            .collect();
-                        let mut new_top: Vec<SearchResult> = Vec::with_capacity(n);
-                        for (id, _) in &reranked {
-                            if let Some(result) = by_id.get(id) {
-                                new_top.push(result.clone());
-                            }
-                        }
-                        for result in results[..n].iter() {
-                            if !new_top.iter().any(|item| item.node_id == result.node_id) {
-                                new_top.push(result.clone());
-                            }
-                        }
-                        new_top.extend(results[n..].iter().cloned());
-                        *results = new_top;
-                        for (index, result) in results.iter_mut().enumerate() {
-                            result.rank = index + 1;
-                        }
-                        debug!("reranker re-ordered top-{} for '{}'", n, query);
+            let reranked: Option<Vec<(String, f32)>> =
+                self.rerank_backend(rerank_cfg, query, docs, &results[..n]);
+            if let Some(reranked) = reranked {
+                let by_id: std::collections::HashMap<String, SearchResult> = results[..n]
+                    .iter()
+                    .map(|result| (result.node_id.clone(), result.clone()))
+                    .collect();
+                let mut new_top: Vec<SearchResult> = Vec::with_capacity(n);
+                for (id, _) in &reranked {
+                    if let Some(result) = by_id.get(id) {
+                        new_top.push(result.clone());
                     }
-                    Some(Err(error)) => {
-                        tracing::warn!(error = %error, "reranker failed; keeping original order")
+                }
+                // Judged candidates the backend dropped (or never returned) keep
+                // their relative order but demote to the tail.
+                for result in results[..n].iter() {
+                    if !new_top.iter().any(|item| item.node_id == result.node_id) {
+                        new_top.push(result.clone());
                     }
-                    None => {}
+                }
+                new_top.extend(results[n..].iter().cloned());
+                *results = new_top;
+                for (index, result) in results.iter_mut().enumerate() {
+                    result.rank = index + 1;
+                }
+                debug!("reranker re-ordered top-{} for '{}'", n, query);
+            }
+        }
+    }
+
+    /// Dispatch to the configured rerank backend and return its ordering.
+    ///
+    /// `None` means "keep the original order": the backend is unavailable
+    /// (system-one built out), produced no scores, or failed. A backend
+    /// failure is logged and degraded to the un-reranked ordering rather than
+    /// propagated — reranking is an ordering refinement, never a correctness
+    /// gate.
+    fn rerank_backend(
+        &self,
+        rerank_cfg: &crate::config::SearchConfig,
+        query: &str,
+        docs: Vec<(String, String, f32)>,
+        candidates: &[SearchResult],
+    ) -> Option<Vec<(String, f32)>> {
+        match super::effective_rerank_backend(rerank_cfg) {
+            "system-one" => {
+                #[cfg(feature = "system-one")]
+                {
+                    super::rerank_system_one::rerank(
+                        query,
+                        candidates,
+                        &docs,
+                        &self.project_path.to_string_lossy(),
+                    )
+                }
+                #[cfg(not(feature = "system-one"))]
+                {
+                    let _ = (query, docs, candidates, &self.project_path);
+                    tracing::debug!(
+                        "rerank_backend=system-one requires the system-one feature; skipping rerank"
+                    );
+                    None
                 }
             }
+            // "onnx" (default; unknown strings are treated as the default).
+            _ => match self
+                .embedder
+                .as_ref()
+                .and_then(|e| e.rerank_blocking(query, docs))
+            {
+                Some(Ok(reranked)) => Some(reranked),
+                Some(Err(error)) => {
+                    tracing::warn!(error = %error, "reranker failed; keeping original order");
+                    None
+                }
+                None => None,
+            },
         }
     }
 
@@ -266,7 +315,8 @@ impl LeIndex {
         // When rerank is enabled, over-fetch candidates so the cross-encoder
         // sees a wider pool than the final top_k (it can only reorder what was
         // retrieved). We truncate back to top_k after reranking below.
-        let rerank_enabled = search_config.rerank_enabled && !exact_route;
+        let rerank_enabled =
+            super::rerank_effectively_enabled_with_override(search_config) && !exact_route;
         let search_top_k = if rerank_enabled {
             top_k.max(search_config.rerank_top_n as usize)
         } else {

@@ -1474,3 +1474,125 @@ fn test_set_neural_weight_preserves_cache_when_unchanged() {
         "unchanged weight + identical query must be a cache hit"
     );
 }
+
+/// An MRL sidecar tier stores vectors sliced to ITS dimension, so the engine
+/// must slice and re-normalize the native query before searching or scoring it.
+///
+/// This is the regression net for a silent correctness bug: `MmapVectorIndex`
+/// length-guards both `search` and `similarity`, so handing a tier the full
+/// native vector makes it return `Vec::new()` / `None` for every tier. Nothing
+/// errors — tier-homed nodes just stop entering the candidate pool and score 0,
+/// i.e. MRL retrieval becomes a no-op that looks like "no results".
+#[cfg(feature = "storage")]
+#[test]
+fn test_mrl_tier_indexes_are_queried_with_a_sliced_normalized_query() {
+    use crate::search::vector::{MmapEmbeddingIndex, write_mmap_embeddings};
+    use std::sync::Arc;
+
+    const NATIVE: usize = super::snapshot::NEURAL_EMBEDDING_DIMENSION;
+    const TIER: usize = 128;
+    const OWNER: &str = "tier.rs:tier_homed";
+
+    // Owned by the engine's node table; its vector lives ONLY in the 128-dim
+    // sidecar, never in memory and never in the native store — exactly the shape
+    // produced by a Dynamic-sliced persist and a restart. It shares NO token
+    // with the query, so it can only enter the candidate pool via the tier ANN.
+    let mut engine = SearchEngine::new();
+    let mut node = create_test_nodes().remove(0);
+    node.node_id = OWNER.to_string();
+    node.content = "fn unrelated_helper() {}".to_string();
+    node.pre_tokenized = None;
+    node.neural_embedding = None;
+    // The tf-idf store's width is fixed (the snapshot validator pins it).
+    node.tfidf_embedding = vec![1.0; DEFAULT_EMBEDDING_DIMENSION];
+
+    // A lexical decoy that DOES match the query. Without it every candidate set
+    // is empty and `collect_search_candidates` takes its semantic fallback
+    // ("scan all nodes"), which would let the owner through even if the tier
+    // fan-out retrieved nothing — the test would then pass on broken code.
+    let mut decoy = create_test_nodes().remove(1);
+    decoy.node_id = "decoy.rs:authenticate".to_string();
+    decoy.content = "fn authenticate() {}".to_string();
+    decoy.pre_tokenized = None;
+    decoy.neural_embedding = None;
+    decoy.tfidf_embedding = vec![1.0; DEFAULT_EMBEDDING_DIMENSION];
+    engine.index_nodes(vec![node, decoy]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let tfidf_path = dir.path().join("tfidf.bin");
+    let tier_path = dir.path().join("neural_embeddings_128.bin");
+    write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings()).unwrap();
+
+    // Native-width query: the tier row points along the leading 128 axes, so
+    // slicing + re-normalizing yields cosine 1.0. Any other handling (passing
+    // the full vector, skipping re-normalization) yields None or a lower score.
+    // The slice is L2-normalized explicitly so cosine 1.0 is reachable.
+    let mut query_neural = vec![0.0f32; NATIVE];
+    let scale = 0.1 / (TIER as f32).sqrt();
+    query_neural[..TIER].copy_from_slice(&vec![scale; TIER]);
+
+    // Persisted rows are sliced AND re-normalized, exactly like mrl's partition.
+    write_mmap_embeddings(
+        &tier_path,
+        &[(
+            OWNER.to_string(),
+            crate::search::mrl::slice_l2_normalized(&query_neural, TIER),
+        )],
+    )
+    .unwrap();
+    let tier_mmap = MmapEmbeddingIndex::open(&tier_path).unwrap();
+    assert_eq!(
+        tier_mmap.dimension() as usize,
+        TIER,
+        "sidecar must actually be {TIER}-dim for this test to mean anything"
+    );
+
+    let mut snapshot = engine.search_snapshot(1, 0, "tier-fingerprint".to_string());
+    snapshot.fragment_rows = 0;
+    let tfidf_mmap = MmapEmbeddingIndex::open(&tfidf_path).unwrap();
+    let mut restored = SearchEngine::new();
+    restored
+        .restore_from_search_snapshot(
+            snapshot,
+            Arc::new(tfidf_mmap),
+            None,
+            vec![Arc::new(tier_mmap)],
+            None,
+            None,
+            None,
+        )
+        .expect("tier sidecar must hydrate");
+    assert_eq!(
+        restored.neural_tier_indices.len(),
+        1,
+        "the {TIER}-dim sidecar must install as a tier index"
+    );
+
+    let results = restored
+        .search(SearchQuery {
+            query: "authenticate".to_string(),
+            top_k: 5,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: None,
+            query_neural_embedding: Some(query_neural),
+            threshold: None,
+            query_type: None,
+        })
+        .expect("search must succeed");
+
+    let owner = results.iter().find(|r| r.node_id == OWNER);
+    assert!(
+        owner.is_some(),
+        "a node whose vector lives only in an MRL tier must still be retrieved; \
+         an empty/absent result here means the tier was queried with an \
+         unsliced vector and silently no-opped"
+    );
+    assert!(
+        owner.unwrap().score.neural > 0.0,
+        "tier-homed node must receive a neural score (query and row are the \
+         same direction after slicing), got {}",
+        owner.unwrap().score.neural
+    );
+}

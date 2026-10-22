@@ -111,6 +111,16 @@ pub struct SearchEngine {
     /// `vector_index` — so no hand-rolled scan. None when no neural mmap is
     /// loaded (tests, tfidf-only indexes).
     neural_vector_index: Option<VectorIndexImpl>,
+    /// Per-dimension MRL sidecar ANN indices (ascending dimension, excluding
+    /// the native store). Built from `neural_embeddings_{dim}.bin` sidecars at
+    /// search-load. Each tier stores vectors sliced to ITS OWN dimension, so
+    /// both the fan-out search and `tier_similarity` slice and re-normalize the
+    /// native query to `index.dimension()` first — the mmap indices
+    /// length-guard and return nothing/`None` for a mismatched query, so passing
+    /// the full vector would make every tier a silent no-op and strand every
+    /// tier-homed node. Empty when no sidecars exist, keeping the default path
+    /// byte-identical.
+    neural_tier_indices: Vec<VectorIndexImpl>,
     /// Fragment embeddings (sub-symbol semantic chunks), hydrated from
     /// `.leindex/fragments_embeddings.bin` at search-load. Same lazy-paged
     /// MmapVectorIndex pattern as the neural index; None when the fragment
@@ -181,6 +191,7 @@ impl SearchEngine {
             search_cache_bytes: 0,
             neural_weight: 0.4,
             neural_vector_index: None,
+            neural_tier_indices: Vec::new(),
             fragment_vector_index: None,
             fragment_index_enabled: false,
             fragment_weight: 0.35,
@@ -226,6 +237,7 @@ impl SearchEngine {
             search_cache_bytes: 0,
             neural_weight: 0.4,
             neural_vector_index: None,
+            neural_tier_indices: Vec::new(),
             fragment_vector_index: None,
             fragment_index_enabled: false,
             fragment_weight: 0.35,
@@ -294,6 +306,7 @@ impl SearchEngine {
         // Also drop the lazy-paged neural ANN so a stale mmap isn't reused
         // after a full reindex rebuilds the lexical index from scratch.
         self.neural_vector_index = None;
+        self.neural_tier_indices = Vec::new();
         self.fragment_vector_index = None;
         // And drop the fragment owner refs — a full reindex rebuilds the
         // fragment layer too, so stale hash → owner mappings must not survive
@@ -654,6 +667,18 @@ impl SearchEngine {
         self.nodes.len()
     }
 
+    /// Iterate the indexed node IDs.
+    ///
+    /// Lets a caller ask what a persisted embedding store would actually reach
+    /// WITHOUT restoring it: `restore_neural_embeddings` only updates nodes it
+    /// can match by ID, so the rows it would install is this set intersected
+    /// with the store's keys. Counting the store's rows alone overstates that,
+    /// which is how a sidecar full of rows for node IDs this graph no longer
+    /// has could still enable neural scoring (CodeRabbit).
+    pub fn node_ids(&self) -> impl Iterator<Item = &str> {
+        self.nodes.iter().map(|node| node.node_id.as_str())
+    }
+
     /// Collect all (node_id, embedding) pairs from the indexed nodes.
     ///
     /// Returns only nodes that have a TF-IDF embedding. Used by the mmap
@@ -675,6 +700,20 @@ impl SearchEngine {
 
     /// Collect neural embeddings for persistence.
     ///
+    /// Source-span byte lengths per node id (`byte_range` width), used by the
+    /// MRL persist partition to pick per-row slice dimensions.
+    pub fn collect_node_span_bytes(&self) -> std::collections::HashMap<String, usize> {
+        self.nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.node_id.clone(),
+                    node.byte_range.1.saturating_sub(node.byte_range.0),
+                )
+            })
+            .collect()
+    }
+
     /// Returns `(node_id, neural_embedding)` pairs for all nodes that have
     /// non-empty neural embeddings.
     pub fn collect_neural_embeddings(&self) -> Vec<(String, Vec<f32>)> {
@@ -685,15 +724,33 @@ impl SearchEngine {
                 // hydration the neural vectors live in the mmap-backed index
                 // (no heap mirror), so fall back to it to avoid underreporting
                 // — collect is also used to persist neural embeddings.
+                // With MRL tiers active, in-memory rows at a sliced dimension
+                // must not leak into the canonical collection: only rows at the
+                // native dimension qualify (the base index is the dim oracle;
+                // absent one, keep the legacy behavior).
+                let native_dim = self.neural_vector_index.as_ref().map(|idx| idx.dimension());
                 let embedding = n
                     .neural_embedding
                     .as_ref()
                     .filter(|e| !e.is_empty())
+                    .filter(|e| native_dim.is_none_or(|dim| e.len() == dim))
                     .cloned()
                     .or_else(|| {
                         self.neural_vector_index
                             .as_ref()
                             .and_then(|idx| idx.embedding(&n.node_id))
+                    })
+                    // MRL tiers are subset stores: a restored node whose vector
+                    // lives only in a sidecar has no in-memory embedding and no
+                    // row in the native index. Without this fallback it is
+                    // invisible to collection, so the next persist writes native
+                    // rows only and `remove_neural_tier_mmaps` then deletes the
+                    // sidecars — one saved file would wipe every tier vector
+                    // until a full re-embed (CodeRabbit outside-diff finding).
+                    .or_else(|| {
+                        self.neural_tier_indices
+                            .iter()
+                            .find_map(|tier| tier.embedding(&n.node_id))
                     });
                 embedding.map(|e| (n.node_id.clone(), e))
             })
@@ -947,15 +1004,33 @@ impl SearchEngine {
         // nodes with ZERO lexical overlap but high semantic relevance enter
         // scoring. Falls back to empty when there is no neural index (tfidf-only)
         // or no query embedding (Exact route).
-        let neural_candidates: HashSet<String> =
+        let neural_top_k = query.top_k.saturating_mul(10).max(100);
+        let mut neural_candidates: HashSet<String> =
             match (&query.query_neural_embedding, &self.neural_vector_index) {
                 (Some(q_emb), Some(idx)) => idx
-                    .search(q_emb, query.top_k.saturating_mul(10).max(100))
+                    .search(q_emb, neural_top_k)
                     .into_iter()
                     .map(|(id, _)| id)
                     .collect(),
                 _ => HashSet::new(),
             };
+        // MRL fan-out: each sidecar tier holds vectors sliced to ITS dimension,
+        // so the native-dimensional query must be sliced and re-normalized to
+        // match before searching. Passing the full vector here is silently
+        // fatal: `MmapVectorIndex::search` length-guards (`query.len() !=
+        // dimension` -> empty) and `similarity` does the same, so every tier
+        // would return nothing and tier-homed nodes could never enter the
+        // candidate pool or receive a neural score (Codex P1 / CodeRabbit Major).
+        if let Some(q_emb) = query.query_neural_embedding.as_deref() {
+            for tier in &self.neural_tier_indices {
+                let tier_query = crate::search::mrl::slice_l2_normalized(q_emb, tier.dimension());
+                neural_candidates.extend(
+                    tier.search(&tier_query, neural_top_k)
+                        .into_iter()
+                        .map(|(id, _)| id),
+                );
+            }
+        }
 
         // Fragment layer (Task 6, invariant 6): query the fragment ANN with the
         // neural query embedding and map content-hash hits back to their Tier-1
@@ -1464,6 +1539,22 @@ impl SearchEngine {
         score
     }
 
+    /// Best similarity across the MRL sidecar tiers for one node. Each tier
+    /// stores vectors sliced to its own dimension, so the query is sliced and
+    /// re-normalized to that same dimension before scoring — ``similarity`` is
+    /// length-guarded and would otherwise return `None` for every tier, making
+    /// this function always `None` and every tier-homed node score 0.
+    fn tier_similarity(&self, node_id: &str, query_embedding: &[f32]) -> Option<f32> {
+        self.neural_tier_indices
+            .iter()
+            .filter_map(|index| {
+                let tier_query =
+                    crate::search::mrl::slice_l2_normalized(query_embedding, index.dimension());
+                index.similarity(node_id, &tier_query)
+            })
+            .reduce(f32::max)
+    }
+
     fn neural_score(&self, query: &SearchQuery, node: &NodeInfo) -> f32 {
         let Some(query_embedding) = query.query_neural_embedding.as_ref() else {
             return 0.0;
@@ -1471,6 +1562,7 @@ impl SearchEngine {
         self.neural_vector_index
             .as_ref()
             .and_then(|index| index.similarity(&node.node_id, query_embedding))
+            .or_else(|| self.tier_similarity(&node.node_id, query_embedding))
             .or_else(|| {
                 node.neural_embedding
                     .as_ref()

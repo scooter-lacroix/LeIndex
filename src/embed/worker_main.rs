@@ -147,9 +147,10 @@ pub fn run_from(argv: Vec<String>) -> ! {
         let result =
             WorkerRuntime::run_migraphx_probe_child(&model_path, &provider_name, ort_threads);
         if let Err(error) = &result {
-            // The parent only observes the exit status; without this line a
-            // probe failure (missing provider lib, compile crash, timeout)
-            // is completely silent and undiagnosable from the daemon log.
+            // The parent reads this line to report WHY the probe failed:
+            // without it a probe failure (missing provider lib, compile crash,
+            // shape mismatch) is completely silent and undiagnosable from the
+            // daemon log.
             eprintln!("migraphx probe failed: {error}");
         }
         process::exit(if result.is_ok() { 0 } else { 1 });

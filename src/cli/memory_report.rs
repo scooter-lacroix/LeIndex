@@ -9,7 +9,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// Global tracker instance, set once at startup.
@@ -17,9 +19,45 @@ use tracing::{debug, info, warn};
 /// explicitly write the report — Rust does NOT run `Drop` for statics.
 static GLOBAL_TRACKER: OnceLock<Mutex<Option<MemoryReportTracker>>> = OnceLock::new();
 
+/// Set once at shutdown so the background sampler stops instead of polling a
+/// tracker that has already been written and taken.
+static SAMPLER_STOP: AtomicBool = AtomicBool::new(false);
+
+/// Interval between background RSS samples.
+///
+/// A one-shot `leindex index` of a small corpus finishes in ~2.5 s and has
+/// phases that last a few hundred milliseconds. Sampling at 25 ms puts tens
+/// of observations inside every phase, so a phase's reported peak reflects
+/// its real high-water mark instead of only the two instants where an
+/// explicit `observe_rss` boundary happened to fire. One `/proc/self/status`
+/// read costs a few microseconds, so the sampling overhead is negligible.
+const SAMPLE_INTERVAL: Duration = Duration::from_millis(25);
+
 /// Store the tracker in the global slot. Call once during startup.
+///
+/// Also starts the background sampler thread. Without it the report can only
+/// report peaks at phase boundaries, which misses the transient high-water
+/// mark inside a phase — the exact number `--memory-report` exists to expose.
 pub fn init_tracker(tracker: MemoryReportTracker) {
-    let _ = GLOBAL_TRACKER.set(Mutex::new(Some(tracker)));
+    if GLOBAL_TRACKER.set(Mutex::new(Some(tracker))).is_err() {
+        // Already initialized (the flag and the env var both resolved, or a
+        // second `Cli::run` in one process). The first tracker owns the
+        // report; starting a second sampler would double-count samples.
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("mem-report-sampler".to_string())
+        .spawn(|| {
+            while !SAMPLER_STOP.load(Ordering::Relaxed) {
+                std::thread::sleep(SAMPLE_INTERVAL);
+                sample_rss();
+            }
+        });
+    if let Err(error) = spawned {
+        // The report still works from explicit observations; it just loses
+        // mid-phase peaks. Never fail startup over instrumentation.
+        warn!("Memory report sampler thread failed to start: {error}");
+    }
 }
 
 /// Record an RSS observation against the global tracker (if initialized).
@@ -32,6 +70,80 @@ pub fn observe_rss(phase: &str) {
             t.observe_rss(rss);
         }
         debug!("Memory observation: phase={}, rss={} bytes", phase, rss);
+    }
+}
+
+/// Feed one sampler reading to the active phase (if any).
+fn sample_rss() {
+    if let Some(tracker) = GLOBAL_TRACKER.get() {
+        let rss = current_rss_bytes();
+        if rss == 0 {
+            return;
+        }
+        let mut guard = tracker.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = guard.as_mut() {
+            t.sample(rss);
+        }
+    }
+}
+
+/// Enter a named phase: subsequent observations and sampler readings attribute
+/// to it until [`exit_phase`] (or the next `enter_phase`, which closes the
+/// previous phase first).
+pub fn enter_phase(name: &str) {
+    if let Some(tracker) = GLOBAL_TRACKER.get() {
+        let mut guard = tracker.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = guard.as_mut() {
+            t.enter_phase(name);
+        }
+    }
+}
+
+/// Close the active phase, pushing its summary onto the report.
+pub fn exit_phase() {
+    if let Some(tracker) = GLOBAL_TRACKER.get() {
+        let mut guard = tracker.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = guard.as_mut() {
+            t.exit_phase();
+        }
+    }
+}
+
+/// Close the active phase only if it is still `name`.
+///
+/// A phase can hand off to a later one before its own guard drops (the lexical
+/// phase opens `persist` partway through). Without this check the guard's drop
+/// would close whichever phase happens to be active at that moment and
+/// mis-attribute its peak.
+pub fn close_phase(name: &str) {
+    if let Some(tracker) = GLOBAL_TRACKER.get() {
+        let mut guard = tracker.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = guard.as_mut() {
+            if t.active_phase() == Some(name) {
+                t.exit_phase();
+            }
+        }
+    }
+}
+
+/// Scoped phase marker. Enters the phase on construction and closes it on
+/// drop, so an early `?` return still records the phase instead of silently
+/// attributing the rest of the run to it.
+pub struct PhaseScope {
+    name: &'static str,
+}
+
+impl PhaseScope {
+    /// Enter `name` for the lifetime of the returned guard.
+    pub fn enter(name: &'static str) -> Self {
+        enter_phase(name);
+        Self { name }
+    }
+}
+
+impl Drop for PhaseScope {
+    fn drop(&mut self) {
+        close_phase(self.name);
     }
 }
 
@@ -52,6 +164,7 @@ pub fn record_phase(name: &str, peak_rss_bytes: u64, sample_count: u64) {
 /// contains `None` and subsequent `observe_rss` / `record_phase` calls
 /// are no-ops.
 pub fn shutdown() {
+    SAMPLER_STOP.store(true, Ordering::Relaxed);
     if let Some(tracker) = GLOBAL_TRACKER.get() {
         let mut guard = tracker.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(mut t) = guard.take() {
@@ -104,6 +217,12 @@ pub struct MemoryReportTracker {
     peak_rss_bytes: u64,
     /// Phase summaries accumulated so far.
     phases: Vec<PhaseSummary>,
+    /// Name of the phase currently accumulating observations, if any.
+    active: Option<String>,
+    /// Peak RSS seen inside `active`.
+    active_peak: u64,
+    /// Number of observations attributed to `active`.
+    active_samples: u64,
     /// Whether a report has already been written (prevent double-write).
     written: bool,
 }
@@ -117,6 +236,9 @@ impl MemoryReportTracker {
             start: std::time::Instant::now(),
             peak_rss_bytes: 0,
             phases: Vec::new(),
+            active: None,
+            active_peak: 0,
+            active_samples: 0,
             written: false,
         }
     }
@@ -126,6 +248,67 @@ impl MemoryReportTracker {
         if rss_bytes > self.peak_rss_bytes {
             self.peak_rss_bytes = rss_bytes;
         }
+        self.sample(rss_bytes);
+    }
+
+    /// Attribute one RSS reading to the active phase. A no-op when no phase is
+    /// entered, so pre-index startup work never leaks into the first phase.
+    pub fn sample(&mut self, rss_bytes: u64) {
+        if rss_bytes > self.peak_rss_bytes {
+            self.peak_rss_bytes = rss_bytes;
+        }
+        if self.active.is_some() {
+            self.active_samples += 1;
+            if rss_bytes > self.active_peak {
+                self.active_peak = rss_bytes;
+            }
+        }
+    }
+
+    /// Name of the phase currently accumulating observations, if any.
+    pub fn active_phase(&self) -> Option<&str> {
+        self.active.as_deref()
+    }
+
+    /// Test-only mirror of the free [`close_phase`], so the handoff behavior
+    /// can be exercised without touching the process-global tracker.
+    #[cfg(test)]
+    fn close_phase_for_test(&mut self, name: &str) {
+        if self.active_phase() == Some(name) {
+            self.exit_phase();
+        }
+    }
+
+    /// Begin attributing observations to `name`. Closes any phase still open.
+    pub fn enter_phase(&mut self, name: impl Into<String>) {
+        self.exit_phase();
+        let rss = current_rss_bytes();
+        // The reading at entry is a real process observation, so it belongs in
+        // `peak_rss_bytes` as well as in the phase's own peak. Folding it into
+        // only `active_peak` let a phase report more than the whole process.
+        if rss > self.peak_rss_bytes {
+            self.peak_rss_bytes = rss;
+        }
+        self.active = Some(name.into());
+        self.active_peak = rss;
+        self.active_samples = 1;
+    }
+
+    /// Close the active phase and push its summary. Idempotent when nothing is
+    /// open, so `run_lexical` (which marks both lexical and persist) can close
+    /// lexical itself and leave `persist` to a later boundary.
+    pub fn exit_phase(&mut self) {
+        let Some(name) = self.active.take() else {
+            return;
+        };
+        let samples = self.active_samples;
+        let peak = self.active_peak;
+        self.active_samples = 0;
+        self.active_peak = 0;
+        // A phase entered but never sampled (the clock granularity beat us)
+        // still happened; report it with one observation rather than dropping
+        // it from the sequence.
+        self.push_summary(name, peak, samples.max(1));
     }
 
     /// Record a completed phase summary.
@@ -135,14 +318,22 @@ impl MemoryReportTracker {
         peak_rss_bytes: u64,
         sample_count: u64,
     ) {
-        self.phases.push(PhaseSummary {
-            name: name.into(),
-            peak_rss_bytes,
-            sample_count,
-        });
         if peak_rss_bytes > self.peak_rss_bytes {
             self.peak_rss_bytes = peak_rss_bytes;
         }
+        self.push_summary(name.into(), peak_rss_bytes, sample_count);
+    }
+
+    /// Record a completed phase summary without touching the process peak.
+    ///
+    /// `enter_phase` already folds every observation into `peak_rss_bytes`, so
+    /// replaying a phase peak that way again would be a no-op at best.
+    fn push_summary(&mut self, name: String, peak_rss_bytes: u64, sample_count: u64) {
+        self.phases.push(PhaseSummary {
+            name,
+            peak_rss_bytes,
+            sample_count,
+        });
     }
 
     /// Write the report to disk.
@@ -377,6 +568,101 @@ mod tests {
         let contents = fs::read_to_string(&path).unwrap();
         let report: MemoryReport = serde_json::from_str(&contents).unwrap();
         assert_eq!(report.peak_rss_bytes, 100_000_000);
+    }
+
+    #[test]
+    fn test_phase_entries_accumulate_in_enter_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("phases-report.json");
+        let mut tracker = MemoryReportTracker::new(path.clone());
+        tracker.enter_phase("scan");
+        tracker.sample(10_000_000);
+        tracker.sample(30_000_000);
+        tracker.enter_phase("parse");
+        tracker.sample(20_000_000);
+        tracker.exit_phase();
+        tracker.write_report().unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let report: MemoryReport = serde_json::from_str(&contents).unwrap();
+        let names: Vec<&str> = report.phases.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["scan", "parse"]);
+        // `enter_phase` seeds a phase's peak with the live RSS at entry (the
+        // entry state is part of what the phase costs) and folds that reading
+        // into the process peak, so the report can only be asserted as a lower
+        // bound over the samples injected here — the test process's own RSS is
+        // the real floor, and it may exceed any value injected above.
+        assert!(report.phases[0].peak_rss_bytes >= 30_000_000);
+        assert!(report.phases[1].peak_rss_bytes >= 20_000_000);
+        assert!(report.phases[0].sample_count >= 2);
+        assert!(report.phases[1].sample_count >= 1);
+        assert!(report.peak_rss_bytes >= report.phases[0].peak_rss_bytes);
+        assert!(report.peak_rss_bytes >= report.phases[1].peak_rss_bytes);
+    }
+
+    #[test]
+    fn test_record_phase_values_are_reported_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verbatim-report.json");
+        let mut tracker = MemoryReportTracker::new(path.clone());
+        tracker.record_phase("index", 150_000_000, 7);
+        tracker.write_report().unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let report: MemoryReport = serde_json::from_str(&contents).unwrap();
+        assert_eq!(report.phases.len(), 1);
+        assert_eq!(report.phases[0].peak_rss_bytes, 150_000_000);
+        assert_eq!(report.phases[0].sample_count, 7);
+    }
+
+    #[test]
+    fn test_observations_outside_a_phase_do_not_invent_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-phase-report.json");
+        let mut tracker = MemoryReportTracker::new(path.clone());
+        tracker.observe_rss(40_000_000);
+        tracker.write_report().unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let report: MemoryReport = serde_json::from_str(&contents).unwrap();
+        assert!(
+            report.phases.is_empty(),
+            "startup observations must not be attributed to a phase that never ran"
+        );
+        assert_eq!(report.peak_rss_bytes, 40_000_000);
+    }
+
+    #[test]
+    fn test_next_enter_closes_the_previous_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handoff-report.json");
+        let mut tracker = MemoryReportTracker::new(path.clone());
+        tracker.enter_phase("lexical");
+        tracker.enter_phase("persist");
+        tracker.exit_phase();
+        tracker.write_report().unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let report: MemoryReport = serde_json::from_str(&contents).unwrap();
+        let names: Vec<&str> = report.phases.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["lexical", "persist"],
+            "a handoff must close the previous phase exactly once"
+        );
+    }
+
+    #[test]
+    fn test_close_phase_ignores_a_phase_that_already_handed_off() {
+        let mut tracker = MemoryReportTracker::new(PathBuf::from("/tmp/unused-report.json"));
+        tracker.enter_phase("lexical");
+        tracker.enter_phase("persist");
+        // The lexical scope's guard drops after handing off to `persist`.
+        tracker.close_phase_for_test("lexical");
+        assert_eq!(tracker.active_phase(), Some("persist"));
+        tracker.exit_phase();
+        let names: Vec<&str> = tracker.phases.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["lexical", "persist"]);
     }
 
     #[test]

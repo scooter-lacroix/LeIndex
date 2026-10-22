@@ -163,7 +163,6 @@ fn test_streaming_scan_flag_indexes_fixture_and_searches() {
         crate::feature_flags::FeatureFlag::StreamingScan,
         crate::feature_flags::FeatureFlag::StreamingParse,
         crate::feature_flags::FeatureFlag::StreamingTfidf,
-        crate::feature_flags::FeatureFlag::StreamingNeural,
         crate::feature_flags::FeatureFlag::StreamingPdg,
         crate::feature_flags::FeatureFlag::BoundedScheduler,
     ] {
@@ -203,7 +202,6 @@ fn test_streaming_parse_flag_indexes_fixture_and_searches() {
         crate::feature_flags::FeatureFlag::StreamingScan,
         crate::feature_flags::FeatureFlag::StreamingParse,
         crate::feature_flags::FeatureFlag::StreamingTfidf,
-        crate::feature_flags::FeatureFlag::StreamingNeural,
         crate::feature_flags::FeatureFlag::StreamingPdg,
         crate::feature_flags::FeatureFlag::BoundedScheduler,
     ] {
@@ -243,7 +241,6 @@ fn test_streaming_tfidf_flag_indexes_fixture_and_searches() {
         crate::feature_flags::FeatureFlag::StreamingScan,
         crate::feature_flags::FeatureFlag::StreamingParse,
         crate::feature_flags::FeatureFlag::StreamingTfidf,
-        crate::feature_flags::FeatureFlag::StreamingNeural,
         crate::feature_flags::FeatureFlag::StreamingPdg,
         crate::feature_flags::FeatureFlag::BoundedScheduler,
     ] {
@@ -276,23 +273,21 @@ fn test_streaming_tfidf_flag_indexes_fixture_and_searches() {
 }
 
 #[test]
-fn test_streaming_neural_flag_keeps_fixture_searchable() {
+fn test_neural_phase_keeps_fixture_searchable() {
     let _guard = crate::feature_flags::lock_flag_tests();
     let _reset = crate::feature_flags::FlagOverrideReset;
+    // Neural publication is unconditional; this pins it to the legacy
+    // scan/parse/TF-IDF route so the assertion covers the path where the
+    // neural phase must not disturb an already-published lexical index.
     for flag in [
         crate::feature_flags::FeatureFlag::StreamingScan,
         crate::feature_flags::FeatureFlag::StreamingParse,
         crate::feature_flags::FeatureFlag::StreamingTfidf,
-        crate::feature_flags::FeatureFlag::StreamingNeural,
         crate::feature_flags::FeatureFlag::StreamingPdg,
         crate::feature_flags::FeatureFlag::BoundedScheduler,
     ] {
         crate::feature_flags::set_flag_override_for_test(flag, false);
     }
-    crate::feature_flags::set_flag_override_for_test(
-        crate::feature_flags::FeatureFlag::StreamingNeural,
-        true,
-    );
 
     let dir = tempfile::tempdir().expect("stream neural fixture");
     std::fs::create_dir_all(dir.path().join("src")).expect("source directory");
@@ -1240,5 +1235,57 @@ fn test_save_stage_gate_trips_only_over_budget() {
     assert!(
         message.contains("LEINDEX_SAVE_STAGE_GATE_MS"),
         "message: {message}"
+    );
+}
+
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+#[test]
+fn test_neural_checkpoint_mismatch_discards_resident_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut index = LeIndex::new(dir.path()).unwrap();
+    index
+        .search_engine
+        .index_nodes(vec![crate::search::search::NodeInfo {
+            node_id: "node".to_string(),
+            file_path: "test.rs".to_string(),
+            symbol_name: "node".to_string(),
+            language: "rust".to_string(),
+            content: "fn node() {}".to_string(),
+            byte_range: (0, 12),
+            tfidf_embedding: vec![1.0, 0.0],
+            neural_embedding: None,
+            complexity: 1,
+            signature: None,
+            pre_tokenized: None,
+        }]);
+    let mmap_path = index_builder::neural_mmap_embeddings_path(dir.path());
+    crate::search::vector::write_mmap_embeddings(
+        &mmap_path,
+        &[("node".to_string(), vec![1.0, 0.0])],
+    )
+    .unwrap();
+    let mut checkpoint = NeuralCheckpoint {
+        lexical_hash: "lexical".to_string(),
+        mmap_path,
+        rows: 1,
+        provider: "test".to_string(),
+        model: "model".to_string(),
+        matryoshka: None,
+    };
+    assert_eq!(
+        index.restore_neural_checkpoint(Some(&checkpoint), "lexical", "model"),
+        (1, true)
+    );
+    assert_eq!(index.search_engine.collect_neural_embeddings().len(), 1);
+
+    checkpoint.rows = 2;
+    assert_eq!(
+        index.restore_neural_checkpoint(Some(&checkpoint), "lexical", "model"),
+        (0, false),
+        "mismatch must trigger re-embedding"
+    );
+    assert!(
+        index.search_engine.collect_neural_embeddings().is_empty(),
+        "a later persist must not collect partial restored rows"
     );
 }

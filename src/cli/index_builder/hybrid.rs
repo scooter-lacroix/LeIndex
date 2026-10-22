@@ -78,10 +78,6 @@ impl GenerationNeuralEmbedder {
         generation
     }
 
-    pub(crate) fn has_neural(&self) -> bool {
-        self.selected.borrow().has_neural()
-    }
-
     pub(crate) fn identity(&self) -> String {
         match &*self.selected.borrow() {
             #[cfg(feature = "remote-embeddings")]
@@ -176,6 +172,70 @@ impl GenerationNeuralEmbedder {
                 Err(error) => tracing::warn!(
                     %error,
                     "Remote batch failed; applying generation fallback policy"
+                ),
+            }
+            if self.remote_rows_landed.get() {
+                self.stopped.set(true);
+                tracing::warn!(
+                    "Remote failed after accepted rows; neural generation frozen to TF-IDF for remaining documents"
+                );
+                return vec![None; texts.len()];
+            }
+            self.select_local_fallback();
+            return self.selected.borrow().embed_neural_batch_blocking(texts);
+        }
+        self.selected.borrow().embed_neural_batch_blocking(texts)
+    }
+
+    /// Batch embed with per-document titles (relative file paths). Remote
+    /// providers apply the titled doc template (EmbeddingGemma2 prompt
+    /// training); local backends ignore titles and embed text-only — the
+    /// vectors are dimension-identical and mix safely within a generation.
+    /// Failure/fallback semantics are identical to
+    /// `embed_neural_batch_blocking`.
+    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+    pub(crate) fn embed_neural_batch_blocking_titled<S: AsRef<str>>(
+        &self,
+        texts: &[S],
+        titles: Vec<Option<String>>,
+    ) -> Vec<Option<Vec<f32>>> {
+        if texts.is_empty() {
+            return Vec::new();
+        }
+        #[cfg(feature = "remote-embeddings")]
+        if self.stopped.get() {
+            return vec![None; texts.len()];
+        }
+        #[cfg(feature = "remote-embeddings")]
+        if matches!(*self.selected.borrow(), HybridEmbedder::HybridRemote { .. }) {
+            let remote = match &*self.selected.borrow() {
+                HybridEmbedder::HybridRemote { remote, .. } => remote.clone(),
+                _ => unreachable!(),
+            };
+            let owned: Vec<String> = texts.iter().map(|text| text.as_ref().to_string()).collect();
+            match block_on_remote(async move {
+                remote
+                    .embed_batch_optional_titled(
+                        owned.iter().map(String::as_str).collect(),
+                        titles.into_iter().peekable(),
+                    )
+                    .await
+            }) {
+                Ok(rows) if rows.len() == texts.len() => {
+                    if rows.iter().flatten().any(|row| !row.is_empty()) {
+                        // Any successful remote row pins this generation's space.
+                        self.remote_rows_landed.set(true);
+                    }
+                    return rows;
+                }
+                Ok(rows) => tracing::warn!(
+                    expected = texts.len(),
+                    got = rows.len(),
+                    "Remote optional titled batch returned wrong row count"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "Remote titled batch failed; applying generation fallback policy"
                 ),
             }
             if self.remote_rows_landed.get() {

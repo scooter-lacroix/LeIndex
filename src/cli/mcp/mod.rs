@@ -81,6 +81,8 @@ pub mod read_symbol_handler;
 pub mod rename_symbol_handler;
 /// Handler for LeIndex \[Search\] — semantic code search.
 pub mod search_handler;
+/// Handler for LeIndex [Structural] — ast-grep AST-pattern search.
+pub mod structural_handler;
 /// Handler for LeIndex [Symbol Lookup] — full call graph lookup.
 pub mod symbol_lookup_handler;
 /// Handler for LeIndex \[Write\] — atomic file creation with PDG surfacing.

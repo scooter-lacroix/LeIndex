@@ -1,9 +1,12 @@
 //! Memcheck harness for LeIndex memory measurement.
 //!
 //! This binary drives a deterministic workload against a fresh `leindex`
-//! process, samples RSS at regular intervals, and writes a JSON report.
+//! process, samples RSS at regular intervals, and (with `--output`) writes a
+//! JSON report; the pass/fail diff summary always goes to stderr.
 //!
-//! Canonical phases: idle_warm → index → idle_post → query → reindex → idle_final
+//! Canonical phases: see [`workload::CANONICAL_PHASES`] — the six original
+//! phases (`idle_warm → index → idle_post → query → reindex → idle_final`)
+//! followed by the worker-active, remediation, and §14 baseline extensions.
 
 mod diff;
 mod env_capture;
@@ -183,21 +186,17 @@ fn main() -> Result<()> {
         environment,
     };
 
-    // Write report to file or stdout
-    let json = serde_json::to_string_pretty(&full_report).context("failed to serialize report")?;
-    match args.output {
-        Some(ref path) => {
-            std::fs::write(path, &json)
-                .with_context(|| format!("failed to write report to {}", path.display()))?;
-            if args.verbose {
-                eprintln!("memcheck: report written to {}", path.display());
-            }
-        }
-        None => {
-            // Don't print JSON to stdout when doing diff — it would mix with diff output
-            if !args.update_baseline {
-                // Still write to a temp location for diff
-            }
+    // The report is only emitted when --output is given: the diff summary is
+    // printed to stderr, so mixing the JSON report into stdout would corrupt it.
+    // Without --output the report is measured and then discarded — pass
+    // --output to keep it.
+    if let Some(ref path) = args.output {
+        let json =
+            serde_json::to_string_pretty(&full_report).context("failed to serialize report")?;
+        std::fs::write(path, &json)
+            .with_context(|| format!("failed to write report to {}", path.display()))?;
+        if args.verbose {
+            eprintln!("memcheck: report written to {}", path.display());
         }
     }
 
@@ -221,7 +220,7 @@ fn main() -> Result<()> {
 
     // Diff against baselines and budget
     let budget = diff::load_budget(&budget_path)?;
-    let diff_result = diff::diff_report(&full_report, &baselines_dir, &budget);
+    let diff_result = diff::diff_report(&full_report, &baselines_dir, &budget)?;
 
     // Print diff summary
     let diff_output = diff::format_diff(&diff_result);

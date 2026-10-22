@@ -670,7 +670,7 @@ leindex dashboard --port 3001
 |----------|---------|-------------|
 | `LEINDEX_PORT` | 47500 | Override default port for `serve` command |
 | `LEINDEX_DASHBOARD_DIR` | `~/.leindex/dashboard` | Override dashboard asset directory |
-| `RUST_LOG` | info | Logging level (debug, trace, warn, error) |
+| `RUST_LOG` | warn | Logging level (debug, trace, warn, error); `-v/--verbose` forces debug |
 | `LEINDEX_FEATURE_ENGRAM` | off | Enable the Engram query-embedding phrase-book (see [MCP.md](MCP.md#engram-query-embedding-phrase-book)) |
 | `LEINDEX_ENGRAM_DIR` | `~/.leindex/engram` | Engram table location (`$LEINDEX_HOME/engram` when `LEINDEX_HOME` is set) |
 | `LEINDEX_ENGRAM_MAX_ENTRIES` | 20000 | Engram row limit (LRU eviction) |
@@ -685,8 +685,8 @@ LEINDEX_PORT=8080 leindex serve
 # Debug logging
 RUST_LOG=debug leindex index .
 
-# Combined
-RUST_LOG=trace LEINDEX_PORT=3000 leindex -v serve
+# Combined; `-v` pins the level to debug, so omit it when you need trace
+RUST_LOG=trace LEINDEX_PORT=3000 leindex serve
 ```
 
 ---

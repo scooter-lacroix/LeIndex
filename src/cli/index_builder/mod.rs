@@ -6,7 +6,7 @@ use crate::search::search::{NodeInfo, SearchEngine};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
@@ -1609,115 +1609,6 @@ fn build_neural_embedder(tfidf_embedder: TfIdfEmbedder, _allow_neural: bool) -> 
     HybridEmbedder::tfidf_only(tfidf_embedder)
 }
 
-/// Compute neural rows against an already-published TF-IDF index.
-///
-/// The mandatory TF-IDF/PDG generation is published first; this phase then
-/// actively starts the configured neural worker and appends its rows. If the
-/// provider reports a terminal failure, the core generation remains usable.
-#[cfg_attr(
-    not(any(feature = "onnx", feature = "remote-embeddings")),
-    allow(unused_variables)
-)]
-pub(crate) fn enrich_neural_embeddings(
-    pdg: &ProgramDependenceGraph,
-    embedder: &GenerationNeuralEmbedder,
-    admitted_node_ids: &HashSet<String>,
-) -> Vec<(String, Vec<f32>)> {
-    if !embedder.has_neural() {
-        return Vec::new();
-    }
-
-    #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
-    {
-        Vec::new()
-    }
-
-    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-    {
-        const NEURAL_IPC_BATCH: usize = 256;
-        let connectivity_config = crate::graph::pdg::TraversalConfig {
-            max_depth: Some(1),
-            max_nodes: Some(1000),
-            allowed_edge_types: Some(&[EdgeType::Call, EdgeType::DataDependency]),
-            excluded_node_types: Some(vec![NodeType::External]),
-            min_complexity: None,
-            min_edge_confidence: 0.0,
-        };
-        let mut pending = Vec::with_capacity(NEURAL_IPC_BATCH);
-        let mut rows = Vec::new();
-        let file_summary_ctx = FileSummaryContext::from_pdg(pdg);
-        // Per-chunk scratch buffer: only one file body resident at a time.
-        // No cross-phase cache (VAL-STREAM-012); content is recomputed per
-        // node so duplicate-ID nodes each embed their own body.
-        let mut file_cache = FileReadCache::per_chunk_scratch();
-        for node_idx in pdg.node_indices() {
-            let Some(node) = pdg.get_node(node_idx) else {
-                continue;
-            };
-            // Match prepare_indexed_node's inclusion rule: external/excluded nodes
-            // never enter the lexical index, so don't send them to the neural batch.
-            if is_external_node_excluded(node) {
-                continue;
-            }
-            // A1: Neural/lexical consistency — only embed nodes that survived
-            // the lexical admission gate (ContentPruner + IndexingAdmissionGate).
-            if !admitted_node_ids.contains(&node.id) {
-                continue;
-            }
-            let file_bytes = file_cache
-                .get_or_read(Path::new(&*node.file_path))
-                .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
-            let text = enriched_node_content(
-                pdg,
-                node_idx,
-                node,
-                &file_bytes,
-                &connectivity_config,
-                &file_summary_ctx,
-            );
-            pending.push((node.id.clone(), text));
-            if pending.len() == NEURAL_IPC_BATCH {
-                append_neural_batch(embedder, &pending, &mut rows);
-                pending.clear();
-            }
-        }
-        if !pending.is_empty() {
-            append_neural_batch(embedder, &pending, &mut rows);
-        }
-        dedupe_neural_rows_keep_first(&mut rows);
-        rows
-    }
-}
-
-#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-/// Keep the first row per node_id, in place.
-///
-/// `append_nodes` retains the FIRST occurrence of a duplicate node_id
-/// (unqualified names, e.g. two `fn new`), while `update_neural_embeddings`
-/// applies rows last-wins — an undeduped vec would hand the retained node a
-/// later duplicate's neural vector. Rows and lexical nodes both follow
-/// pdg.node_indices() order, so the first row per id is the retained node's
-/// own body.
-fn dedupe_neural_rows_keep_first(rows: &mut Vec<(String, Vec<f32>)>) {
-    let mut seen = HashSet::new();
-    rows.retain(|(node_id, _)| seen.insert(node_id.clone()));
-}
-
-#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-fn append_neural_batch(
-    embedder: &GenerationNeuralEmbedder,
-    pending: &[(String, String)],
-    rows: &mut Vec<(String, Vec<f32>)>,
-) {
-    let texts: Vec<&str> = pending.iter().map(|(_, text)| text.as_str()).collect();
-    let embeddings = embedder.embed_neural_batch_blocking(&texts);
-    for ((node_id, _), embedding) in pending.iter().zip(embeddings) {
-        if let Some(embedding) = embedding.filter(|row| !row.is_empty()) {
-            rows.push((node_id.clone(), embedding));
-        }
-    }
-}
-
 /// Compare current manifest hashes against the persisted scan's hashes.
 /// Returns the set of manifest file paths whose content has changed.
 pub(crate) fn detect_changed_manifests(
@@ -1819,6 +1710,18 @@ pub(crate) struct SearchCacheKeyInputs<'a> {
     pub(crate) rerank_enabled: bool,
     pub(crate) rerank_top_n: u32,
     pub(crate) rerank_model: &'a str,
+    /// Which reranker consumes the top-N (onnx|system-one|off). Part of the
+    /// cache key: backend choice changes result order even when rerank
+    /// enable/top_n/model are identical.
+    pub(crate) rerank_backend: &'a str,
+    /// Whether that backend is actually armed at runtime, folded in separately
+    /// from `rerank_backend`. System-One fails OPEN when
+    /// `LEINDEX_FEATURE_SYSTEM_ONE` is off, so without this a search run before
+    /// the flag is armed caches the unreranked order under the same key the
+    /// armed run computes, and `cached_search_results` returns it before the
+    /// judge ever runs — the progressive rollout would never take effect for
+    /// already-queried inputs (Codex P1).
+    pub(crate) rerank_backend_active: bool,
     pub(crate) fragment_index_enabled: bool,
     pub(crate) fragment_weight: f64,
     pub(crate) fragment_root_hash: &'a str,
@@ -1827,14 +1730,19 @@ pub(crate) struct SearchCacheKeyInputs<'a> {
 
 pub(crate) fn search_cache_key_for(inputs: &SearchCacheKeyInputs<'_>) -> String {
     // v2: widens the key to include every result-affecting config knob + model
-    // identity (search_mode, neural_weight, rerank_enabled/top_n, fragment
-    // knobs incl. the persisted content root hash, embedder + reranker model).
-    // v1 keys omitted these, so a config or model change silently served stale
-    // cached results until a re-index changed the node count. The `v2:`
-    // namespace prefix lands in the (sanitized) cache filename so legacy v1
-    // entries are identifiably stale and sweepable, not silent.
+    // identity (search_mode, neural_weight, rerank_enabled/top_n/model/backend,
+    // fragment knobs incl. the persisted content root hash, embedder + reranker
+    // model). v1 keys omitted these, so a config or model change silently
+    // served stale cached results until a re-index changed the node count. The
+    // `v2:` namespace prefix lands in the (sanitized) cache filename so legacy
+    // v1 entries are identifiably stale and sweepable, not silent.
+    // v3: folds whether the selected rerank backend is actually ARMED. System-One
+    // fails open when LEINDEX_FEATURE_SYSTEM_ONE is off, so v2 keys let an
+    // unreranked result be served from cache after the flag was armed. v2 keys
+    // land in a different (sanitized) filename, so stale entries are
+    // identifiably stale and sweepable, not silent.
     search_cache_key(&format!(
-        "v2:query:{}:{}:{}:{}:{:?}:neural={}:mode={}:nw={}:rr={}|{}|{}:frag={}|{}|{}:embed={}",
+        "v3:query:{}:{}:{}:{}:{:?}:neural={}:mode={}:nw={}:rr={}|{}|{}|rb={}:rba={}:frag={}|{}|{}:embed={}",
         stable_project_cache_id(inputs.project_id, inputs.project_path),
         index_fingerprint(inputs.stats),
         inputs.top_k,
@@ -1846,6 +1754,8 @@ pub(crate) fn search_cache_key_for(inputs: &SearchCacheKeyInputs<'_>) -> String 
         inputs.rerank_enabled,
         inputs.rerank_top_n,
         inputs.rerank_model,
+        inputs.rerank_backend,
+        inputs.rerank_backend_active,
         inputs.fragment_index_enabled,
         inputs.fragment_weight,
         inputs.fragment_root_hash,

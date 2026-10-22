@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Vector index for semantic search
@@ -904,6 +905,152 @@ fn write_matrix_rows<W: std::io::Write>(
     Ok(())
 }
 
+/// Publish the mmap artifact at `path` through a uniquely named sibling
+/// staging file, `sync_all`, and an atomic `rename`.
+///
+/// The previous shape — `File::create(path)` then `BufWriter::flush` — had two
+/// holes. `File::create` truncates the existing generation at open time, so a
+/// crash anywhere inside `fill` leaves the canonical file zero-length or
+/// half-written; and `flush` reaches the kernel page cache only, which is not
+/// durability. Losing this file is not losing rows: it is also the sole
+/// carrier of the generation identity trailer, so a torn write silently swaps
+/// query embedding into a different vector space than the tier sidecars hold.
+///
+/// `rename` within one filesystem is atomic, so a concurrent reader — including
+/// a live `MmapEmbeddingIndex` — sees either the whole old file or the whole
+/// new one. The staging name is unique per call: a fixed `.tmp` name would let
+/// two concurrent index runs (or a canonical file and its tier twin) interleave
+/// into each other's bytes.
+fn write_atomic(
+    path: &Path,
+    fill: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> Result<(), MmapError>,
+) -> Result<(), MmapError> {
+    let staging = staging_path(path)?;
+
+    let result = (|| -> Result<(), MmapError> {
+        let mut writer =
+            std::io::BufWriter::with_capacity(1024 * 1024, std::fs::File::create(&staging)?);
+        fill(&mut writer)?;
+        writer.flush()?;
+        // Page cache is not durability: sync the staging file before it takes
+        // the canonical name, or a crash right after the rename publishes a
+        // generation whose bytes never reached the device.
+        writer.get_ref().sync_all()?;
+        drop(writer);
+        replace_file_atomically(&staging, path)?;
+        sync_parent_dir(path);
+        Ok(())
+    })();
+
+    if result.is_err() {
+        // Never leave droppings behind on a failed index.
+        let _ = std::fs::remove_file(&staging);
+    }
+    result
+}
+
+/// Swap `staging` onto `target` so a reader sees wholly-old or wholly-new.
+///
+/// Unix `rename` replaces the destination atomically even while it is mapped, so
+/// a serving process keeps its pages and the next open sees the new file.
+///
+/// Windows does not: `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` refuses to
+/// replace a file that has an active mapped section, failing with a sharing
+/// violation. That is not hypothetical here — `MmapEmbeddingIndex` holds a live
+/// `memmap2::Mmap` over the very files this replaces, so a publish running
+/// beside a serving daemon would fail outright. `ReplaceFileW` performs the
+/// swap without that restriction and keeps the atomicity `rename` has, which is
+/// why it is used instead of a remove-then-rename (that sequence has a window
+/// where the canonical file, the sole carrier of the generation identity,
+/// simply does not exist).
+///
+/// Exported because the neural tier publish renames mmap files onto the same
+/// fixed paths, so it needs the identical guarantee.
+pub(crate) fn replace_file_atomically(staging: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(staging, target)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn ReplaceFileW(
+                replaced: *const u16,
+                replacement: *const u16,
+                backup: *const u16,
+                flags: u32,
+                exclude: *mut core::ffi::c_void,
+                reserved: *mut core::ffi::c_void,
+            ) -> i32;
+        }
+
+        fn wide(path: &Path) -> Vec<u16> {
+            path.as_os_str().encode_wide().chain([0]).collect()
+        }
+
+        // A destination that does not exist yet is a plain move: ReplaceFileW
+        // requires both paths to name existing files.
+        if !target.exists() {
+            return std::fs::rename(staging, target);
+        }
+        let replaced = wide(target);
+        let replacement = wide(staging);
+        // SAFETY: both paths are NUL-terminated UTF-16 buffers that outlive the
+        // call; the remaining arguments are documented as optional and null.
+        let ok = unsafe {
+            ReplaceFileW(
+                replaced.as_ptr(),
+                replacement.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+/// The unique sibling a [`write_atomic`] caller stages into, with its parent
+/// directory created so the open below cannot fail on a missing generation dir.
+fn staging_path(path: &Path) -> Result<std::path::PathBuf, MmapError> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            MmapError::Corrupt(format!(
+                "embedding path {} has no file name",
+                path.display()
+            ))
+        })?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(path.with_file_name(format!("{file_name}.tmp-{}-{seq}", std::process::id())))
+}
+
+/// Make a completed `rename` durable, best effort.
+///
+/// Some filesystems reject a directory fsync, and losing only rename-durability
+/// is acceptable for a rebuildable index artifact — hence no `?`.
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
 /// Write embeddings to a binary file in the mmap format.
 ///
 /// # Binary layout
@@ -954,53 +1101,99 @@ pub fn write_mmap_embeddings_with_identity(
     let embedding_matrix_offset = (ids_end + 3) & !3; // align to 4 bytes
     let padding_len = embedding_matrix_offset - ids_end;
 
-    // Ensure parent directory exists.
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
     // Stream the file through a BufWriter instead of materializing the whole
     // output as one heap buffer: the neural matrix alone is ~43 MB and the
     // previous `vec![0u8; total_size]` doubled the transient footprint of
     // every persist (RAM-spike trim). The byte layout is unchanged.
-    use std::io::Write;
-    let file = std::fs::File::create(path)?;
-    let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
+    write_atomic(path, |writer| {
+        write_header_and_ids(
+            writer,
+            MmapHeader {
+                magic: MMAP_MAGIC,
+                version: MMAP_VERSION,
+                node_count,
+                dimension,
+            },
+            &id_offsets,
+            &id_lengths,
+        )?;
 
-    write_header_and_ids(
-        &mut writer,
-        MmapHeader {
-            magic: MMAP_MAGIC,
-            version: MMAP_VERSION,
-            node_count,
-            dimension,
-        },
-        &id_offsets,
-        &id_lengths,
-    )?;
+        // ID strings + alignment padding
+        writer.write_all(&id_bytes)?;
+        if padding_len > 0 {
+            writer.write_all(&vec![0u8; padding_len])?;
+        }
 
-    // ID strings + alignment padding
-    writer.write_all(&id_bytes)?;
-    if padding_len > 0 {
-        writer.write_all(&vec![0u8; padding_len])?;
-    }
+        // Embedding matrix — one row (dim × 4 bytes) at a time.
+        write_matrix_rows(writer, embeddings, dimension as usize)?;
 
-    // Embedding matrix — one row (dim × 4 bytes) at a time.
-    write_matrix_rows(&mut writer, embeddings, dimension as usize)?;
-
-    if let (Some(identity), Some(identity_len)) = (identity, identity_len) {
-        writer.write_all(&identity_len.to_le_bytes())?;
-        writer.write_all(identity.as_bytes())?;
-    }
-
-    writer.flush()?;
-    Ok(())
+        if let (Some(identity), Some(identity_len)) = (identity, identity_len) {
+            writer.write_all(&identity_len.to_le_bytes())?;
+            writer.write_all(identity.as_bytes())?;
+        }
+        Ok(())
+    })
 }
 
 /// Byte length of a generation identity as the on-disk `u32` trailer length.
 fn identity_len_u32(value: &str) -> Result<u32, MmapError> {
     u32::try_from(value.len())
         .map_err(|_| MmapError::Corrupt("generation identity byte length exceeds u32::MAX".into()))
+}
+
+/// Write a zero-row neural mmap that still carries an identity and a dimension.
+///
+/// [`write_mmap_embeddings_with_identity`] hardcodes `dimension = 0` for an
+/// empty slice, which is right for the generic writer but wrong for a
+/// *tier-only* neural generation: every row was sliced to a sub-native tier, so
+/// no canonical rows exist, yet the header is the only artifact raw-read for
+/// the persisted provider identity and native dimension (see
+/// `query_remote_embedder`, which seeds the query embedder from
+/// `dimension()`). A deleted canonical file therefore makes a tier-only
+/// generation look absent, and query embedding then silently falls back to a
+/// different vector space than the sidecars hold (Codex P1).
+///
+/// The file is a pure header: zero rows, the native dimension, the identity
+/// trailer. Readers see `len() == 0` (so nothing is restored from it) while
+/// still resolving identity and dimension.
+pub fn write_empty_mmap_embeddings_with_identity(
+    path: &Path,
+    dimension: u32,
+    identity: Option<&str>,
+) -> Result<(), MmapError> {
+    let identity_len = identity.map(identity_len_u32).transpose()?;
+
+    let (id_bytes, id_offsets, id_lengths): (Vec<u8>, Vec<u64>, Vec<u32>) =
+        (Vec::new(), Vec::new(), Vec::new());
+    let header_size = MmapHeader::SIZE;
+    let ids_end = header_size + id_bytes.len();
+    let embedding_matrix_offset = (ids_end + 3) & !3; // align to 4 bytes
+    let padding_len = embedding_matrix_offset - ids_end;
+
+    write_atomic(path, |writer| {
+        write_header_and_ids(
+            writer,
+            MmapHeader {
+                magic: MMAP_MAGIC,
+                version: MMAP_VERSION,
+                node_count: 0,
+                dimension,
+            },
+            &id_offsets,
+            &id_lengths,
+        )?;
+
+        writer.write_all(&id_bytes)?;
+        if padding_len > 0 {
+            writer.write_all(&vec![0u8; padding_len])?;
+        }
+
+        if let (Some(identity), Some(identity_len)) = (identity, identity_len) {
+            writer.write_all(&identity_len.to_le_bytes())?;
+            writer.write_all(identity.as_bytes())?;
+        }
+        Ok(())
+    })
 }
 
 /// Write the fixed header followed by the offset and length tables.
@@ -1218,6 +1411,133 @@ mod tests {
         let index = MmapEmbeddingIndex::open(&path).unwrap();
         assert!(index.is_empty());
         assert_eq!(index.identity(), Some("local|onnx/model"));
+    }
+
+    /// A tier-only generation has no canonical rows but MUST still advertise its
+    /// native dimension and provider identity: `query_remote_embedder` seeds the
+    /// query embedder from both, so losing them silently swaps the query into a
+    /// different vector space than the MRL sidecars hold (Codex P1). The generic
+    /// writer hardcodes dimension 0 for an empty slice, which is exactly the bug
+    /// this separate entry point exists to avoid.
+    #[test]
+    fn test_mmap_empty_index_keeps_dimension_and_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tier-only.bin");
+
+        write_empty_mmap_embeddings_with_identity(&path, 768, Some("remote|custom|x|m")).unwrap();
+        let index = MmapEmbeddingIndex::open(&path).unwrap();
+        assert_eq!(index.len(), 0);
+        assert_eq!(index.dimension(), 768);
+        assert_eq!(index.identity(), Some("remote|custom|x|m"));
+
+        // No identity: still a valid, openable header carrying the dimension.
+        write_empty_mmap_embeddings_with_identity(&path, 768, None).unwrap();
+        let index = MmapEmbeddingIndex::open(&path).unwrap();
+        assert_eq!(index.len(), 0);
+        assert_eq!(index.dimension(), 768);
+        assert_eq!(index.identity(), None);
+    }
+
+    /// The canonical neural file is read by live mmaps (`MmapEmbeddingIndex`)
+    /// and is the sole carrier of the generation identity trailer, so a
+    /// truncate-then-rewrite publish leaves any concurrent reader holding a
+    /// half-written image — and a crash inside that window destroys the file
+    /// outright. Prove the replace is atomic from a reader's point of view: a
+    /// handle opened before the second write must keep seeing the first
+    /// generation's bytes, while the path itself resolves to the new one.
+    #[test]
+    fn test_write_mmap_embeddings_replaces_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embeddings.bin");
+
+        let two_rows: Vec<(String, Vec<f32>)> = vec![
+            ("func_a".to_string(), vec![1.0, 0.0, 0.0]),
+            ("func_b".to_string(), vec![0.0, 1.0, 0.0]),
+        ];
+        write_mmap_embeddings_with_identity(&path, &two_rows, Some("local|model|3")).unwrap();
+        let published = std::fs::read(&path).unwrap();
+
+        // A reader that opened the first generation before the second publish.
+        use std::io::Read;
+        let mut reader = std::fs::File::open(&path).unwrap();
+
+        write_mmap_embeddings_with_identity(
+            &path,
+            &[("func_a".to_string(), vec![1.0, 0.0, 0.0])],
+            Some("local|model|3"),
+        )
+        .unwrap();
+
+        // The path resolves to exactly one row...
+        let index = MmapEmbeddingIndex::open(&path).unwrap();
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.dimension(), 3);
+        assert_eq!(index.identity(), Some("local|model|3"));
+
+        // ...and the pre-existing reader still sees the complete first
+        // generation, not a truncated or half-overwritten file.
+        let mut observed = Vec::new();
+        reader.read_to_end(&mut observed).unwrap();
+        assert_eq!(
+            observed, published,
+            "an in-place rewrite truncates the file under live readers"
+        );
+    }
+
+    #[test]
+    fn test_empty_mmap_publish_preserves_open_reader_and_failed_write_preserves_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embeddings.bin");
+        write_mmap_embeddings_with_identity(
+            &path,
+            &[("node".to_string(), vec![1.0, 0.0])],
+            Some("old"),
+        )
+        .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+        write_empty_mmap_embeddings_with_identity(&path, 2, Some("new")).unwrap();
+        let mut observed = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut observed).unwrap();
+        assert_eq!(observed, original);
+        let empty = MmapEmbeddingIndex::open(&path).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.dimension(), 2);
+        assert_eq!(empty.identity(), Some("new"));
+
+        let published = std::fs::read(&path).unwrap();
+        let result = write_atomic(&path, |writer| {
+            writer.write_all(b"incomplete header")?;
+            Err(MmapError::Corrupt("injected write failure".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), published);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn test_write_mmap_embeddings_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embeddings.bin");
+
+        write_mmap_embeddings_with_identity(
+            &path,
+            &[("func_a".to_string(), vec![1.0, 0.0])],
+            Some("local|model|2"),
+        )
+        .unwrap();
+        write_empty_mmap_embeddings_with_identity(&path, 2, Some("local|model|2")).unwrap();
+
+        let mut leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "embeddings.bin")
+            .collect();
+        leftovers.sort();
+        assert!(
+            leftovers.is_empty(),
+            "atomic publish must not leave staging files behind: {leftovers:?}"
+        );
     }
 
     #[test]

@@ -128,20 +128,6 @@ pub enum FeatureFlag {
     /// `test_streaming_vocab_and_rows_match_production_embedder`, and
     /// `test_streaming_tfidf_flag_indexes_fixture_and_searches`.
     StreamingTfidf,
-    /// Enable bounded neural enrichment for the published lexical index
-    /// (WS6-9 Task 6).
-    ///
-    /// Consumer: `run_neural` in `src/cli/leindex/indexing/neural_publish.rs`
-    /// selects `enrich_neural_streaming` through
-    /// `neural_route_for_current_flag()`. The streaming route feeds the
-    /// production hybrid embedder in bounded `BatchBudget` batches and writes
-    /// accepted rows to the search engine batch-wise, retaining admission,
-    /// capped-text dedupe, cache accounting, and first-row-per-node semantics.
-    /// Default OFF keeps `enrich_neural_embeddings`. Coverage:
-    /// `test_neural_route_flag_selects_both_routes`,
-    /// `test_streaming_neural_bit_identical`, and
-    /// `test_streaming_neural_flag_keeps_fixture_searchable`.
-    StreamingNeural,
     /// Enable the global content-addressed embedding cache (WS10 Task 1-2).
     /// The cache stores embedding vectors at user-level (e.g.
     /// `~/.leindex/embed-cache/`) keyed by a 6-tuple CacheKey (model digest,
@@ -175,6 +161,25 @@ pub enum FeatureFlag {
     /// entirely (no worker spawn, no model digest, no network round trip).
     /// New capability: defaults OFF until enabled per deployment.
     Engram,
+    /// Matryoshka (MRL) dimension slicing: persist neural vectors truncated to
+    /// 128/256/512 dimensions in sidecar stores so short nodes are searched at
+    /// their own granularity instead of at the full 768-d native width.
+    ///
+    /// Experimental, so it defaults OFF per AGENTS.md progressive rollout: even
+    /// a configured `[search] matryoshka` policy stays inert until
+    /// `LEINDEX_FEATURE_MATRYOSHKA=1` is exported. The retrieval and persistence
+    /// code is written to be a no-op at the native dimension, so OFF reproduces
+    /// the pre-Matryoshka behavior byte for byte.
+    Matryoshka,
+    /// Enable structural (AST-pattern) search via ast-grep.
+    ///
+    /// Consumer: the `structural` branch of `leindex_explore`. It compiles an
+    /// ast-grep pattern for a language and matches it against LeIndex's own
+    /// tree-sitter grammars. New capability, so it defaults OFF per AGENTS.md
+    /// progressive rollout: even in a build with the `structural-search`
+    /// Cargo feature, the branch refuses to run until
+    /// `LEINDEX_FEATURE_STRUCTURAL_SEARCH=1` is exported.
+    StructuralSearch,
 }
 
 impl FeatureFlag {
@@ -196,13 +201,14 @@ impl FeatureFlag {
             Self::StreamingParse => "LEINDEX_FEATURE_STREAMING_PARSE",
             Self::StreamingPdg => "LEINDEX_FEATURE_STREAMING_PDG",
             Self::StreamingTfidf => "LEINDEX_FEATURE_STREAMING_TFIDF",
-            Self::StreamingNeural => "LEINDEX_FEATURE_STREAMING_NEURAL",
             Self::GlobalEmbedCache => "LEINDEX_FEATURE_GLOBAL_EMBED_CACHE",
             Self::CommunityDetection => "LEINDEX_FEATURE_COMMUNITY_DETECTION",
             Self::PrecisionIngest => "LEINDEX_FEATURE_PRECISION_INGEST",
             Self::DebugEscapeHatch => "LEINDEX_FEATURE_EMBED_CACHE_DEBUG",
             Self::ValidatedModel => "LEINDEX_FEATURE_VALIDATED_MODEL",
             Self::Engram => "LEINDEX_FEATURE_ENGRAM",
+            Self::Matryoshka => "LEINDEX_FEATURE_MATRYOSHKA",
+            Self::StructuralSearch => "LEINDEX_FEATURE_STRUCTURAL_SEARCH",
         }
     }
 
@@ -224,7 +230,7 @@ impl FeatureFlag {
             | Self::RemoteEmbeddings
             // Stable architecture capabilities with successful rollout gates
             // remain default ON and individually revertible. StreamingScan,
-            // StreamingParse, StreamingTfidf, and StreamingNeural intentionally
+            // StreamingParse, and StreamingTfidf intentionally
             // remain OFF until their consumers complete a separate rollout.
             | Self::DaemonClient
             | Self::GenerationReaders
@@ -298,9 +304,6 @@ impl FeatureFlag {
                 "Compact PDG persistence: per-file fragments to CAS, no whole-PDG clone"
             }
             Self::StreamingTfidf => "Streaming two-pass TF-IDF with direct CAS-staged row writes",
-            Self::StreamingNeural => {
-                "Streaming neural enrichment via NeuralRowWriter (kills Vec accumulation)"
-            }
             Self::GlobalEmbedCache => {
                 "Global content-addressed embedding cache with cross-project dedup"
             }
@@ -318,6 +321,12 @@ impl FeatureFlag {
             }
             Self::Engram => {
                 "Engram: persistent phrase-book of neural query embeddings (repeat queries skip the embedder)"
+            }
+            Self::Matryoshka => {
+                "Persist/search neural vectors at sliced MRL dimensions (128/256/512; experimental)"
+            }
+            Self::StructuralSearch => {
+                "Structural (AST-pattern) search: ast-grep patterns matched against LeIndex's tree-sitter grammars"
             }
         }
     }
@@ -370,7 +379,6 @@ const LEGACY_REVERTIBLE_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::StreamingParse,
     FeatureFlag::StreamingPdg,
     FeatureFlag::StreamingTfidf,
-    FeatureFlag::StreamingNeural,
     FeatureFlag::GlobalEmbedCache,
     FeatureFlag::CommunityDetection,
     FeatureFlag::PrecisionIngest,
@@ -406,13 +414,14 @@ impl FlagStore {
             FeatureFlag::StreamingParse,
             FeatureFlag::StreamingPdg,
             FeatureFlag::StreamingTfidf,
-            FeatureFlag::StreamingNeural,
             FeatureFlag::GlobalEmbedCache,
             FeatureFlag::DebugEscapeHatch,
             FeatureFlag::ValidatedModel,
             FeatureFlag::CommunityDetection,
             FeatureFlag::PrecisionIngest,
             FeatureFlag::Engram,
+            FeatureFlag::StructuralSearch,
+            FeatureFlag::Matryoshka,
         ] {
             let enabled = match env::var(flag.env_var()) {
                 Ok(v) => matches!(
@@ -568,13 +577,14 @@ pub fn all_flags() -> Vec<(FeatureFlag, bool)> {
         FeatureFlag::StreamingParse,
         FeatureFlag::StreamingPdg,
         FeatureFlag::StreamingTfidf,
-        FeatureFlag::StreamingNeural,
         FeatureFlag::GlobalEmbedCache,
         FeatureFlag::CommunityDetection,
         FeatureFlag::PrecisionIngest,
         FeatureFlag::DebugEscapeHatch,
         FeatureFlag::ValidatedModel,
         FeatureFlag::Engram,
+        FeatureFlag::Matryoshka,
+        FeatureFlag::StructuralSearch,
     ]
     .into_iter()
     .map(|f| (f, f.is_enabled()))
@@ -613,6 +623,24 @@ mod test {
             all_flags()
                 .iter()
                 .any(|(flag, _)| *flag == FeatureFlag::SystemOne)
+        );
+    }
+
+    /// `effective_matryoshka()` requires this flag, so an unregistered variant
+    /// means MRL can never be enabled in production: `FlagStore::get` returns
+    /// `false` for absent entries, so `LEINDEX_FEATURE_MATRYOSHKA=1` would be
+    /// silently ignored while `all_flags()` still advertised the flag.
+    #[test]
+    fn test_matryoshka_is_registered_in_production_flag_store() {
+        assert_eq!(
+            FeatureFlag::Matryoshka.env_var(),
+            "LEINDEX_FEATURE_MATRYOSHKA"
+        );
+        assert!(!FeatureFlag::Matryoshka.default_value());
+        assert!(
+            FlagStore::new()
+                .values
+                .contains_key(&FeatureFlag::Matryoshka)
         );
     }
 
@@ -769,7 +797,6 @@ mod test {
             FeatureFlag::StreamingScan,
             FeatureFlag::StreamingParse,
             FeatureFlag::StreamingTfidf,
-            FeatureFlag::StreamingNeural,
         ] {
             assert!(!flag.default_value(), "{} must default OFF", flag.env_var());
         }
@@ -846,7 +873,6 @@ mod test {
             FeatureFlag::StreamingParse,
             FeatureFlag::StreamingPdg,
             FeatureFlag::StreamingTfidf,
-            FeatureFlag::StreamingNeural,
             FeatureFlag::GlobalEmbedCache,
             FeatureFlag::ValidatedModel,
             FeatureFlag::CommunityDetection,
@@ -904,7 +930,6 @@ mod test {
             FeatureFlag::StreamingScan,
             FeatureFlag::StreamingParse,
             FeatureFlag::StreamingTfidf,
-            FeatureFlag::StreamingNeural,
         ] {
             assert!(
                 !flag.default_value(),
@@ -927,6 +952,48 @@ mod test {
                 None => env::remove_var(LEGACY_ENV),
             }
         }
+    }
+
+    #[test]
+    fn test_structural_search_is_opt_in_and_listed() {
+        // New capabilities default OFF (AGENTS.md progressive rollout): the
+        // Cargo feature compiles the code, this flag decides whether the MCP
+        // branch will run it.
+        assert_eq!(
+            FeatureFlag::StructuralSearch.env_var(),
+            "LEINDEX_FEATURE_STRUCTURAL_SEARCH"
+        );
+        assert!(!FeatureFlag::StructuralSearch.default_value());
+        assert!(
+            !FeatureFlag::StructuralSearch.description().is_empty(),
+            "every flag needs a description for log_flag_state"
+        );
+        // Both enumerations must carry the flag: `FlagStore` is what
+        // `is_enabled` reads, `all_flags` is what `leindex feature-flags`
+        // prints. A flag in one and not the other is a silent bug.
+        assert!(
+            FlagStore::new()
+                .values
+                .contains_key(&FeatureFlag::StructuralSearch),
+            "StructuralSearch missing from the production flag store"
+        );
+        assert!(
+            all_flags()
+                .iter()
+                .any(|(flag, _)| *flag == FeatureFlag::StructuralSearch),
+            "StructuralSearch missing from all_flags"
+        );
+    }
+
+    #[test]
+    fn test_structural_search_override_toggles() {
+        let _g = lock_flag_tests();
+        let _reset = FlagOverrideReset;
+        assert!(!FeatureFlag::StructuralSearch.is_enabled());
+        set_flag_override_for_test(FeatureFlag::StructuralSearch, true);
+        assert!(FeatureFlag::StructuralSearch.is_enabled());
+        set_flag_override_for_test(FeatureFlag::StructuralSearch, false);
+        assert!(!FeatureFlag::StructuralSearch.is_enabled());
     }
 
     /// `is_legacy_revertible` covers all v2.0.0 rollout flags.
