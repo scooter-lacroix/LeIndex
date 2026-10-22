@@ -667,6 +667,18 @@ impl SearchEngine {
         self.nodes.len()
     }
 
+    /// Iterate the indexed node IDs.
+    ///
+    /// Lets a caller ask what a persisted embedding store would actually reach
+    /// WITHOUT restoring it: `restore_neural_embeddings` only updates nodes it
+    /// can match by ID, so the rows it would install is this set intersected
+    /// with the store's keys. Counting the store's rows alone overstates that,
+    /// which is how a sidecar full of rows for node IDs this graph no longer
+    /// has could still enable neural scoring (CodeRabbit).
+    pub fn node_ids(&self) -> impl Iterator<Item = &str> {
+        self.nodes.iter().map(|node| node.node_id.as_str())
+    }
+
     /// Collect all (node_id, embedding) pairs from the indexed nodes.
     ///
     /// Returns only nodes that have a TF-IDF embedding. Used by the mmap

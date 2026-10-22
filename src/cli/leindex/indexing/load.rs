@@ -328,6 +328,9 @@ impl LeIndex {
             // B1: the query-time embedder follows the same ladder as index
             // construction and enrichment — remote endpoint first (helper
             // logs its own degradation), then local ONNX, never hard-failing.
+            // `self.search_engine` is already the restored engine (assigned
+            // just above), so passing it lets the gate count the sidecar rows
+            // this graph's node IDs can actually reach.
             #[cfg(feature = "remote-embeddings")]
             let decision = query_remote_embedder(
                 &tfidf_embedder,
@@ -335,6 +338,7 @@ impl LeIndex {
                 &crate::config::LeIndexConfig::load_cached()
                     .indexing
                     .embeddings,
+                &self.search_engine,
             );
             #[cfg(not(feature = "remote-embeddings"))]
             let decision = QueryNeuralDecision::FollowLocal;
@@ -445,6 +449,9 @@ impl LeIndex {
                     .ok()
                     .flatten()
             {
+                // `restore_persisted_neural_embeddings` above has already run,
+                // so `self.search_engine` holds this generation's nodes and the
+                // gate can count which sidecar rows they actually reach.
                 #[cfg(feature = "remote-embeddings")]
                 let decision = query_remote_embedder(
                     &tfidf,
@@ -452,6 +459,7 @@ impl LeIndex {
                     &crate::config::LeIndexConfig::load_cached()
                         .indexing
                         .embeddings,
+                    &self.search_engine,
                 );
                 #[cfg(not(feature = "remote-embeddings"))]
                 let decision = QueryNeuralDecision::FollowLocal;
@@ -765,27 +773,49 @@ fn build_remote_decision(
     QueryNeuralDecision::Remote(Box::new(embedder))
 }
 
-/// How many neural rows the tier sidecars would actually contribute to a query
-/// under `embeddings_cfg`, counted with the SAME loader the restore paths use so
-/// the number cannot drift from the rows that are really read back.
+/// How many persisted neural rows would actually reach a node under
+/// `embeddings_cfg`, counted with the SAME predicate `SearchEngine::
+/// restore_neural_embeddings` applies (an entry that exists and is non-empty).
 ///
-/// Returns 0 when the effective policy is `Off` — sidecars are deliberately not
-/// restored then — and when every sidecar is rejected by the generation gates
-/// (policy mismatch, foreign identity, disagreement with the committed row count,
-/// unreadable file).
+/// Counting the store's RAW rows overstates this: a sidecar is keyed by node ID
+/// and its path is fixed per dimension, so a generation written for a graph the
+/// current index no longer describes can be full of rows that map to nothing.
+/// Neural scoring would then be enabled with every cosine zero — the same
+/// distortion the zero-row gate exists to prevent (CodeRabbit).
+///
+/// Returns 0 when the effective policy is `Off` (sidecars are not restored
+/// then), when no node is indexed yet, and when every stored row belongs to a
+/// node ID this index does not have.
 #[cfg(all(feature = "onnx", feature = "remote-embeddings"))]
 fn admitted_neural_tier_rows(
     artifact_path: &std::path::Path,
     expected_identity: Option<&str>,
     embeddings_cfg: &crate::config::EmbeddingConfig,
+    nodes: &crate::search::search::SearchEngine,
 ) -> usize {
     if embeddings_cfg.effective_matryoshka() == crate::config::MatryoshkaSetting::Off {
         return 0;
     }
     index_builder::load_neural_tier_mmaps_from_storage(artifact_path, expected_identity)
         .iter()
-        .map(|index| index.len())
+        .map(|index| rows_reachable_by(index, nodes))
         .sum()
+}
+
+/// Rows in `index` that a node of `nodes` can actually be matched to.
+///
+/// The predicate is deliberately identical to `restore_neural_embeddings`'
+/// (`get_embedding` is `Some` and not empty), so the number this reports is the
+/// number the restore would install — the two cannot drift.
+#[cfg(all(feature = "onnx", feature = "remote-embeddings"))]
+fn rows_reachable_by(
+    index: &crate::search::vector::MmapEmbeddingIndex,
+    nodes: &crate::search::search::SearchEngine,
+) -> usize {
+    nodes
+        .node_ids()
+        .filter(|node_id| index.get_embedding(node_id).is_some_and(|e| !e.is_empty()))
+        .count()
 }
 
 /// Query-time remote embedder for a hydrated generation. The generation's
@@ -796,11 +826,15 @@ fn admitted_neural_tier_rows(
 /// pinned dimension (custom endpoint, measured at first embed) the persisted
 /// rows cannot be cross-checked here and remote is kept, seeded with the
 /// persisted dimension (Codex review round-3 P1 + P2).
+///
+/// `nodes` is the hydrated engine, used to count the persisted rows that can
+/// actually be matched to one of its node IDs — see `admitted_neural_tier_rows`.
 #[cfg(all(feature = "onnx", feature = "remote-embeddings"))]
 pub(crate) fn query_remote_embedder(
     tfidf: &index_builder::TfIdfEmbedder,
     artifact_path: &std::path::Path,
     embeddings_cfg: &crate::config::EmbeddingConfig,
+    nodes: &crate::search::search::SearchEngine,
 ) -> QueryNeuralDecision {
     let Some(mmap) = index_builder::try_load_neural_mmap_embeddings_from_storage(artifact_path)
     else {
@@ -844,10 +878,16 @@ pub(crate) fn query_remote_embedder(
     // canonical bucket always wins that dimension on persist — so on a native
     // generation with no sidecar this check stays quiet and the identity gets
     // its chance below.
+    //
+    // Both branches count rows by NODE ID, not by store length. The stores are
+    // keyed by node ID and live at fixed paths, so either one can be full of
+    // rows belonging to a graph this index no longer describes — `restore_
+    // neural_embeddings` skips those, and counting them here would enable
+    // neural scoring whose every cosine is zero.
     let admitted_rows = if mmap.is_empty() {
-        admitted_neural_tier_rows(artifact_path, persisted_identity, embeddings_cfg)
+        admitted_neural_tier_rows(artifact_path, persisted_identity, embeddings_cfg, nodes)
     } else {
-        mmap.len()
+        rows_reachable_by(&mmap, nodes)
     };
     if admitted_rows == 0 {
         info!(
@@ -929,18 +969,11 @@ fn configured_remote_identity(
 mod tests {
     use super::*;
 
-    /// Persist a generation whose neural rows are `neural_dim`-wide.
-    fn persist_fixture(project: &std::path::Path, neural_dim: usize) {
-        persist_fixture_with_identity(project, neural_dim, None);
-    }
-
-    fn persist_fixture_with_identity(
-        project: &std::path::Path,
-        neural_dim: usize,
-        identity: Option<&str>,
-    ) {
-        let mut engine = crate::search::search::SearchEngine::new();
-        engine.index_nodes(vec![crate::search::search::NodeInfo {
+    /// The one node every fixture generation is built from. `neural_dim` sets
+    /// the width of its neural row, which is what `persist_neural_embeddings_
+    /// to_mmap` writes the store with.
+    fn fixture_node(neural_dim: usize) -> crate::search::search::NodeInfo {
+        crate::search::search::NodeInfo {
             node_id: "sample".into(),
             file_path: "sample.rs".into(),
             symbol_name: "sample".into(),
@@ -952,7 +985,32 @@ mod tests {
             complexity: 1,
             signature: None,
             pre_tokenized: None,
-        }]);
+        }
+    }
+
+    /// An engine holding the fixture node, so the row-reachability gate sees the
+    /// node the fixtures' rows belong to. The identity/dimension tests below are
+    /// about later branches; without this they would trip the reachability gate
+    /// first and could not prove anything about the branch they name. Only the
+    /// node ID is consulted — the embedding width is arbitrary.
+    fn fixture_engine() -> crate::search::search::SearchEngine {
+        let mut engine = crate::search::search::SearchEngine::new();
+        engine.index_nodes(vec![fixture_node(768)]);
+        engine
+    }
+
+    /// Persist a generation whose neural rows are `neural_dim`-wide.
+    fn persist_fixture(project: &std::path::Path, neural_dim: usize) {
+        persist_fixture_with_identity(project, neural_dim, None);
+    }
+
+    fn persist_fixture_with_identity(
+        project: &std::path::Path,
+        neural_dim: usize,
+        identity: Option<&str>,
+    ) {
+        let mut engine = crate::search::search::SearchEngine::new();
+        engine.index_nodes(vec![fixture_node(neural_dim)]);
         index_builder::persist_embeddings_to_mmap(&engine, project).expect("lexical mmap");
         index_builder::persist_neural_embeddings_to_mmap(
             &engine,
@@ -1005,7 +1063,12 @@ mod tests {
         persist_fixture_with_identity(local.path(), 768, Some("local|onnx/model|768"));
         assert!(
             matches!(
-                query_remote_embedder(&tfidf, &local.path().join(".leindex"), &cfg),
+                query_remote_embedder(
+                    &tfidf,
+                    &local.path().join(".leindex"),
+                    &cfg,
+                    &fixture_engine()
+                ),
                 QueryNeuralDecision::FollowLocal
             ),
             "local identity must follow local pipeline"
@@ -1019,7 +1082,12 @@ mod tests {
         );
         assert!(
             matches!(
-                query_remote_embedder(&tfidf, &remote.path().join(".leindex"), &cfg),
+                query_remote_embedder(
+                    &tfidf,
+                    &remote.path().join(".leindex"),
+                    &cfg,
+                    &fixture_engine()
+                ),
                 QueryNeuralDecision::Remote(_)
             ),
             "a matching remote generation keeps the remote query embedder"
@@ -1029,7 +1097,12 @@ mod tests {
         persist_fixture(legacy.path(), 768);
         assert!(
             matches!(
-                query_remote_embedder(&tfidf, &legacy.path().join(".leindex"), &cfg),
+                query_remote_embedder(
+                    &tfidf,
+                    &legacy.path().join(".leindex"),
+                    &cfg,
+                    &fixture_engine()
+                ),
                 QueryNeuralDecision::Remote(_)
             ),
             "absent identity keeps the dimension-only legacy behavior"
@@ -1038,7 +1111,7 @@ mod tests {
         let empty = tempfile::tempdir().expect("no persisted neural rows");
         assert!(
             matches!(
-                query_remote_embedder(&tfidf, empty.path(), &cfg),
+                query_remote_embedder(&tfidf, empty.path(), &cfg, &fixture_engine()),
                 QueryNeuralDecision::Remote(_)
             ),
             "nothing persisted: config decides"
@@ -1088,7 +1161,7 @@ mod tests {
             || {
                 assert!(
                     matches!(
-                        query_remote_embedder(&tfidf, &storage, &cfg),
+                        query_remote_embedder(&tfidf, &storage, &cfg, &fixture_engine()),
                         QueryNeuralDecision::DisableNeural
                     ),
                     "identity-only header with Matryoshka disabled must disable neural scoring"
@@ -1122,7 +1195,7 @@ mod tests {
                 // identity branch was reached rather than skipped.
                 assert!(
                     matches!(
-                        query_remote_embedder(&tfidf, &storage, &cfg),
+                        query_remote_embedder(&tfidf, &storage, &cfg, &fixture_engine()),
                         QueryNeuralDecision::Remote(_)
                     ),
                     "an identity-only header with an ADMISSIBLE tier is a live generation"
@@ -1179,18 +1252,132 @@ mod tests {
             true,
             || {
                 assert_eq!(
-                    admitted_neural_tier_rows(&storage, Some(&identity), &cfg),
+                    admitted_neural_tier_rows(&storage, Some(&identity), &cfg, &fixture_engine()),
                     0,
                     "the foreign-generation tier must be rejected, or this test proves nothing"
                 );
                 assert!(
                     matches!(
-                        query_remote_embedder(&tfidf, &storage, &cfg),
+                        query_remote_embedder(&tfidf, &storage, &cfg, &fixture_engine()),
                         QueryNeuralDecision::DisableNeural
                     ),
                     "a generation that admits no neural rows must not enable neural scoring"
                 );
             },
+        );
+    }
+
+    /// A persisted store can be full of rows and still reach NOTHING: the stores
+    /// are keyed by node ID, and `restore_neural_embeddings` only updates nodes it
+    /// can match. A generation written for a graph this index no longer describes
+    /// therefore restores zero embeddings while the store looks healthy, and
+    /// gating on the store's length instead of the reachable rows enabled neural
+    /// scoring whose every cosine is zero — the same distortion the zero-row gate
+    /// exists to prevent, reached through the other door (CodeRabbit).
+    ///
+    /// Both stores are covered, because the canonical branch had the identical
+    /// bug: fixing only the sidecar branch would have left the twin.
+    #[test]
+    #[cfg(feature = "onnx")]
+    fn test_query_embedder_disables_neural_when_rows_reach_no_indexed_node() {
+        let tfidf =
+            index_builder::TfIdfEmbedder::build(&[("sample.rs".into(), "fn sample() {}".into())]);
+        let cfg = crate::config::EmbeddingConfig::default(); // preset, 768
+        let _guard = crate::feature_flags::lock_flag_tests();
+        let _reset = crate::feature_flags::FlagOverrideReset;
+        let identity = configured_remote_identity(&cfg, 768).expect("configured identity");
+
+        // An engine holding a node the stores' rows DO belong to. This is the
+        // positive control: it proves the rows load and the generation is
+        // otherwise live, so the assertions below fail for the reason they name
+        // rather than because the fixture is unreadable.
+        let mut matching = crate::search::search::SearchEngine::new();
+        let mut orphaned = fixture_node(768);
+        orphaned.node_id = "ghost".into();
+        matching.index_nodes(vec![orphaned]);
+
+        let canonical = tempfile::tempdir().expect("orphaned canonical store");
+        let canonical_storage = canonical.path().join(".leindex");
+        std::fs::create_dir_all(&canonical_storage).expect("storage dir");
+        crate::search::vector::write_mmap_embeddings_with_identity(
+            &canonical_storage.join("neural_embeddings.bin"),
+            &[("ghost".to_string(), vec![0.5; 768])],
+            Some(&identity),
+        )
+        .expect("write orphaned canonical");
+        assert!(
+            matches!(
+                query_remote_embedder(&tfidf, &canonical_storage, &cfg, &matching),
+                QueryNeuralDecision::Remote(_)
+            ),
+            "control: a row the index HAS must keep the remote query embedder"
+        );
+        assert!(
+            matches!(
+                query_remote_embedder(&tfidf, &canonical_storage, &cfg, &fixture_engine()),
+                QueryNeuralDecision::DisableNeural
+            ),
+            "a canonical store whose rows match no indexed node restores nothing and must \
+             not enable neural scoring"
+        );
+
+        // Same shape through a tier sidecar: zero-row canonical header (so the
+        // sidecar branch is the one that decides) plus a sidecar whose row
+        // belongs to a node this index does not have.
+        let tiered = tempfile::tempdir().expect("orphaned tier store");
+        let tiered_storage = tiered.path().join(".leindex");
+        std::fs::create_dir_all(&tiered_storage).expect("storage dir");
+        crate::search::vector::write_empty_mmap_embeddings_with_identity(
+            &tiered_storage.join("neural_embeddings.bin"),
+            768,
+            Some(&identity),
+        )
+        .expect("write identity-only header");
+        crate::search::vector::write_mmap_embeddings_with_identity(
+            &tiered_storage.join("neural_embeddings_128.bin"),
+            &[("ghost".to_string(), vec![0.5; 128])],
+            Some(&identity),
+        )
+        .expect("write orphaned tier");
+        let tiered_cfg = crate::config::EmbeddingConfig {
+            matryoshka: crate::config::MatryoshkaSetting::Dim128,
+            ..crate::config::EmbeddingConfig::default()
+        };
+        // `effective_matryoshka` also requires the rollout flag, so without this
+        // the policy reads `Off` and `admitted_neural_tier_rows` returns 0 for
+        // BOTH engines — the control below would fail, and neither assertion
+        // would be about reachability.
+        // Set through the lock-free setter, not `with_flag_override`: this test
+        // already holds FLAG_TEST_LOCK for its whole duration, and
+        // `with_flag_override` takes that same non-reentrant mutex — calling it
+        // here self-deadlocks the test and every sibling queued behind it.
+        // `_reset` above clears the override on drop.
+        crate::feature_flags::set_flag_override_for_test(
+            crate::feature_flags::FeatureFlag::Matryoshka,
+            true,
+        );
+        assert_eq!(
+            admitted_neural_tier_rows(&tiered_storage, Some(&identity), &tiered_cfg, &matching),
+            1,
+            "control: an admissible tier whose node IS indexed must be counted"
+        );
+        assert_eq!(
+            admitted_neural_tier_rows(
+                &tiered_storage,
+                Some(&identity),
+                &tiered_cfg,
+                &fixture_engine()
+            ),
+            0,
+            "a tier whose rows match no indexed node admits nothing"
+        );
+        assert!(
+            matches!(
+                query_remote_embedder(&tfidf, &tiered_storage, &tiered_cfg, &fixture_engine()),
+                QueryNeuralDecision::DisableNeural
+            ),
+            "a tier-only generation whose rows match no indexed node must not enable \
+             neural scoring"
         );
     }
 
@@ -1210,7 +1397,12 @@ mod tests {
         persist_fixture_with_identity(swapped.path(), 768, Some(&other_identity));
         assert!(
             matches!(
-                query_remote_embedder(&tfidf, &swapped.path().join(".leindex"), &cfg),
+                query_remote_embedder(
+                    &tfidf,
+                    &swapped.path().join(".leindex"),
+                    &cfg,
+                    &fixture_engine()
+                ),
                 QueryNeuralDecision::DisableNeural
             ),
             "same-dimension remote generation from another model must disable neural"
@@ -1247,7 +1439,12 @@ mod tests {
 
         assert!(
             matches!(
-                query_remote_embedder(&tfidf, &project.path().join(".leindex"), &cfg),
+                query_remote_embedder(
+                    &tfidf,
+                    &project.path().join(".leindex"),
+                    &cfg,
+                    &fixture_engine()
+                ),
                 QueryNeuralDecision::Remote(_)
             ),
             "unpinned custom endpoint must compare identity using the persisted dimension"
@@ -1271,7 +1468,12 @@ mod tests {
         unconfigured.enable_hybrid = false;
         assert!(
             matches!(
-                query_remote_embedder(&tfidf, &remote.path().join(".leindex"), &unconfigured),
+                query_remote_embedder(
+                    &tfidf,
+                    &remote.path().join(".leindex"),
+                    &unconfigured,
+                    &fixture_engine()
+                ),
                 QueryNeuralDecision::DisableNeural
             ),
             "remote generation when remote config is removed must disable neural"
@@ -1306,7 +1508,12 @@ mod tests {
             Some(&persisted_identity),
         );
 
-        let decision = query_remote_embedder(&tfidf, &project.path().join(".leindex"), &cfg);
+        let decision = query_remote_embedder(
+            &tfidf,
+            &project.path().join(".leindex"),
+            &cfg,
+            &fixture_engine(),
+        );
         let QueryNeuralDecision::Remote(embedder) = decision else {
             panic!("expected Remote decision, got {:?}", decision);
         };
