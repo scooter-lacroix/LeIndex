@@ -508,14 +508,17 @@ fn pip_discovery_checks_filesystem_before_python() {
 
 #[test]
 fn ort_discovery_caches_config_load() {
-    // LeIndexConfig::load_cached() should return the same &'static reference.
+    // LeIndexConfig::load_cached() must return the SAME cached snapshot, not
+    // re-parse the file. It returns a ConfigGuard (an owned Arc snapshot) so a
+    // concurrent reload cannot free the config out from under an in-flight
+    // read, so identity is asserted on the pointed-to config, not the guard.
     use leindex::config::LeIndexConfig;
 
     let cfg1 = LeIndexConfig::load_cached();
     let cfg2 = LeIndexConfig::load_cached();
     assert!(
-        std::ptr::eq(cfg1, cfg2),
-        "load_cached() must return the same &'static reference via OnceLock"
+        std::ptr::eq(&*cfg1, &*cfg2),
+        "load_cached() must return the same cached config snapshot"
     );
 }
 
