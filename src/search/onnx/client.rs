@@ -107,6 +107,117 @@ fn is_worker_dead_io_error(e: &std::io::Error) -> bool {
     )
 }
 
+/// Why a readiness wait must stop, when it can be known before the deadline.
+///
+/// The daemon writes its pid before binding the socket (`run_socket_worker`),
+/// so a missing pid file means liveness is UNKNOWN, not dead — only positive
+/// evidence of death aborts the wait.
+#[cfg(unix)]
+fn readiness_abort_reason(
+    observed_child: Option<&mut Child>,
+    socket_path: &Path,
+) -> Option<String> {
+    // A child we spawned is authoritative: the OS reports its exit directly.
+    if let Some(child) = observed_child {
+        return match child.try_wait() {
+            Ok(Some(status)) => Some(format!(
+                "worker daemon exited before reaching readiness: {status}"
+            )),
+            Ok(None) => None,
+            Err(error) => Some(format!("failed to poll worker daemon liveness: {error}")),
+        };
+    }
+    // A daemon we attached to has no child handle, so the pid file it wrote is
+    // the only death signal available: it records the pid, and the accept loop
+    // unlinks it as part of shutdown.
+    let recorded = std::fs::read_to_string(socket_path.with_extension("pid"))
+        .ok()
+        .and_then(|value| value.trim().parse::<libc::pid_t>().ok())?;
+    // EPERM means the pid exists under another user; only ESRCH is proof.
+    recorded_daemon_is_gone(recorded).then_some(format!(
+        "worker daemon (pid {recorded}) exited before reaching readiness"
+    ))
+}
+
+/// Probe a recorded daemon pid for existence without racing pid recycling.
+///
+/// `kill(pid, 0)` alone cannot see a single-threaded worker exit that the
+/// supervisor has not reaped yet, so `/proc` state is consulted instead, and a
+/// zombie counts as gone: it is dead, only its exit status is pending.
+#[cfg(unix)]
+fn recorded_daemon_is_gone(pid: libc::pid_t) -> bool {
+    use std::os::raw::c_int;
+
+    if pid <= 0 {
+        return true;
+    }
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return true;
+    };
+    // Field 3 is `state`; the comm field (2) is parenthesised and may contain
+    // spaces, so parse after the final ")".
+    let state = stat
+        .rsplit_once(") ")
+        .and_then(|(_, fields)| fields.split_whitespace().next());
+    if matches!(state, Some("Z" | "X")) {
+        return true;
+    }
+    // Reaping can clear /proc between the read and the probe; either answer
+    // now means the same thing.
+    let unreachable = unsafe { libc::kill(pid, 0 as c_int) != 0 };
+    unreachable && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Locally stat-able ORT candidates, probed without spawning Python.
+///
+/// Deliberately narrower than `ort_discovery`: the full chain falls back to a
+/// `python3` subprocess to locate a pip install (`discover_pip_lib`), which has
+/// no place on the embed request path. System directories are left to
+/// `discover_path_only`, which is reached exactly when every higher-priority
+/// source has already missed.
+#[cfg(feature = "onnx")]
+fn local_ort_candidate_exists() -> bool {
+    crate::embed::ort_discovery::last_outcome().is_some_and(|found| found.path.exists())
+        || crate::embed::ort_discovery::discover_candidates()
+            .into_iter()
+            .any(|(_, path)| path.exists())
+        || crate::embed::ort_discovery::discover_pip_lib_filesystem().is_some()
+}
+
+/// Report whether this host has no ORT runtime a worker could load.
+///
+/// The daemon binds its socket, fails ORT/model init, and shuts itself down; a
+/// wait for it can only end at the deadline. Deciding this BEFORE the spawn
+/// keeps that deadline out of the picture entirely. `last_outcome().is_some()`
+/// mirrors `provider.rs::is_ort_available`: an ORT runtime already committed in
+/// THIS process answers without touching disk.
+#[cfg(feature = "onnx")]
+fn host_lacks_onnx_runtime() -> bool {
+    if let Some(override_unavailable) = neural_preflight_override() {
+        return override_unavailable;
+    }
+    if crate::embed::ort_discovery::last_outcome().is_some() || local_ort_candidate_exists() {
+        return false;
+    }
+    crate::embed::ort_discovery::discover_path_only().is_none()
+}
+
+/// Test seam: overrides ORT availability for the current thread only.
+///
+/// Preflight runs on the caller's thread, so `None` leaves production behaviour
+/// untouched and a thread-local keeps parallel tests from fighting over it.
+#[cfg(feature = "onnx")]
+fn neural_preflight_override() -> Option<bool> {
+    NEURAL_PREFLIGHT_OVERRIDE.with(std::cell::Cell::get)
+}
+
+#[cfg(feature = "onnx")]
+thread_local! {
+    /// `Some(true)` forces "no ORT runtime", `Some(false)` forces "available".
+    static NEURAL_PREFLIGHT_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Read a response frame from the worker.
 ///
 /// This is the core I/O routine used by the persistent reader thread.
@@ -322,6 +433,20 @@ impl EmbeddingClient {
 
     fn ensure_worker_ready(&self) -> Result<(), ClientError> {
         let started = Instant::now();
+
+        // An ORT-less host cannot produce a resident neural worker: the
+        // daemon binds its socket, fails ORT/model init, then shuts itself
+        // down. Spawning it would burn the readiness deadline polling a
+        // socket that is already gone, so the preflight answers first.
+        // Memoized because this runs before every embed batch, and an
+        // unavailable verdict cannot change within a host's lifetime.
+        if *self.neural_unavailable.get_or_init(host_lacks_onnx_runtime) {
+            tracing::warn!(
+                "no loadable ONNX Runtime found; neural worker not started, \
+                 proceeding with core TF-IDF/PDG results"
+            );
+            return Ok(());
+        }
 
         // If the worker cannot be spawned or connected (daemon timeout, missing
         // binary, IPC failure), treat neural as unavailable. Indexing proceeds
@@ -631,7 +756,7 @@ impl EmbeddingClient {
                     // entered the not-ready path and would reject the first
                     // inference frame even after the lifecycle becomes ready.
                     drop(stream);
-                    match Self::wait_for_daemon_ready(&socket_path) {
+                    match Self::wait_for_daemon_ready(&socket_path, Some(&mut child)) {
                         Ok(()) => {
                             Self::spawn_daemon_reaper(child, socket_path.clone());
                             let stream = UnixStream::connect(&socket_path).map_err(|e| {
@@ -703,7 +828,7 @@ impl EmbeddingClient {
     fn connect_daemon_when_ready(
         &self,
         socket_path: &Path,
-        child: Option<Child>,
+        mut child: Option<Child>,
     ) -> Result<Option<WorkerHandle>, ClientError> {
         match UnixStream::connect(socket_path) {
             Ok(stream) => {
@@ -711,7 +836,10 @@ impl EmbeddingClient {
                 // to the server's not-ready handler. Close it, wait for the
                 // explicit Ready state, then create the inference connection.
                 drop(stream);
-                Self::wait_for_daemon_ready(socket_path)?;
+                // We did not spawn this daemon, so there is no child handle to
+                // observe; `readiness_abort_reason` falls back to the recorded
+                // pid file to decide whether it still exists.
+                Self::wait_for_daemon_ready(socket_path, child.as_mut())?;
                 let stream = UnixStream::connect(socket_path).map_err(|e| {
                     ClientError::Ipc(format!(
                         "failed to reconnect ready worker daemon {}: {}",
@@ -735,20 +863,35 @@ impl EmbeddingClient {
     }
 
     /// Wait for the daemon's explicit lifecycle transition before retaining a
-    /// socket for inference. A readiness deadline prevents an infinite hang
-    /// when the daemon is stuck in Initializing state. When the deadline fires,
-    /// the error propagates so callers can treat neural as unavailable.
+    /// socket for inference. Two things end the wait: the daemon reaches
+    /// `Ready`, or the daemon stops existing (`readiness_abort_reason`). The
+    /// deadline is only the fallback for a daemon that stays Initializing but
+    /// unresponsive; when the deadline fires, the error propagates so callers
+    /// can treat neural as unavailable.
     ///
     /// VAL-DAEMON-004: Uses one persistent Unix socket connection held in
     /// `stream: Option<UnixStream>` for the entire polling duration. Each
     /// poll writes + reads on the same socket; the connection is only
     /// dropped on error (triggering a reconnect on the next iteration).
     #[cfg(unix)]
-    fn wait_for_daemon_ready(socket_path: &Path) -> Result<(), ClientError> {
+    fn wait_for_daemon_ready(
+        socket_path: &Path,
+        mut observed_child: Option<&mut Child>,
+    ) -> Result<(), ClientError> {
         let started = Instant::now();
         let mut stream: Option<UnixStream> = None;
 
         loop {
+            // A wait must end when the thing it waits for stops existing; a
+            // deadline is only the second reason to stop waiting.
+            if let Some(reason) = readiness_abort_reason(observed_child.as_deref_mut(), socket_path)
+            {
+                return Err(ClientError::Worker(WorkerError {
+                    kind: ErrorKind::OnnxRuntime,
+                    message: reason,
+                }));
+            }
+
             if started.elapsed() >= DAEMON_READY_MAX_WAIT {
                 return Err(ClientError::Worker(WorkerError {
                     kind: ErrorKind::OnnxRuntime,
