@@ -850,6 +850,9 @@ pub struct EmbeddingClient {
     /// Cached worker config env, read from leindex.toml at most once per client.
     /// VAL-DAEMON-003: Avoids re-reading leindex.toml on every availability() poll.
     pub(super) cached_config: OnceLock<WorkerConfigEnv>,
+    /// Memoized ORT preflight: `true` when this host has no ORT runtime a worker
+    /// could load, so the readiness wait is never entered (#96).
+    pub(super) neural_unavailable: OnceLock<bool>,
 }
 
 /// Manual Debug impl — Child doesn't implement Debug.
@@ -873,6 +876,7 @@ impl Clone for EmbeddingClient {
             last_startup_report: Arc::clone(&self.last_startup_report),
             use_daemon: self.use_daemon,
             cached_config: OnceLock::new(),
+            neural_unavailable: OnceLock::new(),
         }
     }
 }
@@ -1014,6 +1018,7 @@ impl EmbeddingClient {
             last_startup_report: Arc::new(Mutex::new(None)),
             use_daemon: embed_daemon_enabled(),
             cached_config: OnceLock::new(),
+            neural_unavailable: OnceLock::new(),
         }
     }
 
@@ -1024,6 +1029,7 @@ impl EmbeddingClient {
             last_startup_report: Arc::new(Mutex::new(None)),
             use_daemon: false,
             cached_config: OnceLock::new(),
+            neural_unavailable: OnceLock::new(),
         }
     }
 
