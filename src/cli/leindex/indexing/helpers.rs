@@ -126,11 +126,23 @@ pub(super) fn progress_stderr(msg: &str) {
     }
 }
 
-/// Cumulative (hits, misses) of the client-side embed cache for this
+/// Cumulative (hits, misses) of the client-side embed caches for this
 /// process — surfaces cache effectiveness in neural-phase progress lines.
+///
+/// Both routes share one store and one progress line, so their counters are
+/// summed: a row served from the remote cache is exactly as "not embedded" as
+/// one served from the local worker cache.
 #[cfg(feature = "onnx")]
 pub(super) fn neural_cache_counters() -> (u64, u64) {
-    crate::search::onnx::embed_cache_frontend::counters()
+    #[allow(unused_mut)]
+    let (mut hits, mut misses) = crate::search::onnx::embed_cache_frontend::counters();
+    #[cfg(feature = "remote-embeddings")]
+    {
+        let (remote_hits, remote_misses, _) = crate::search::onnx::remote_cache::counters();
+        hits += remote_hits;
+        misses += remote_misses;
+    }
+    (hits, misses)
 }
 
 #[cfg(not(feature = "onnx"))]

@@ -101,6 +101,15 @@ pub struct PhaseAnalysisReport {
 
     /// Human-readable report text.
     pub formatted_output: String,
+
+    /// Wall time per pipeline stage, in milliseconds.
+    ///
+    /// Paid for the hard way: a phase call on a 40-file project once took
+    /// 518 s with every MCP sub-timing reporting 0, because nothing below
+    /// `handler_ms` was measured. Without a breakdown the only available
+    /// diagnosis was a guess, so the cold graph path and the cache path are
+    /// now timed separately.
+    pub stage_ms: std::collections::BTreeMap<String, u64>,
 }
 
 /// Run phase analysis for a project with incremental freshness and shared context.
@@ -109,7 +118,18 @@ pub fn run_phase_analysis(
     selection: PhaseSelection,
 ) -> Result<PhaseAnalysisReport> {
     let options = options.normalized();
-    let mut context = PhaseExecutionContext::prepare(&options)?;
+    // Split the pipeline's wall time into stages so a slow run is diagnosable
+    // from the response itself, without attaching a profiler to a live daemon.
+    let mut stage_ms = std::collections::BTreeMap::new();
+    macro_rules! timed {
+        ($label:literal, $body:expr) => {{
+            let started = std::time::Instant::now();
+            let value = $body;
+            stage_ms.insert($label.to_string(), started.elapsed().as_millis() as u64);
+            value
+        }};
+    }
+    let mut context = timed!("prepare", PhaseExecutionContext::prepare(&options))?;
     let cache = PhaseCache::new(&context.root);
     let mut executed_phases = Vec::new();
     let mut cache_hit = false;
@@ -121,54 +141,74 @@ pub fn run_phase_analysis(
     let mut phase5_summary = None;
 
     if should_run(1, selection) {
-        let (summary, hit) = run_phase1(&cache, &mut context)?;
+        let (summary, hit) = timed!("phase1", run_phase1(&cache, &mut context))?;
         phase1_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(1);
     }
     if should_run(2, selection) {
-        let (summary, hit) = run_phase2(&cache, &mut context)?;
+        let (summary, hit) = timed!("phase2", run_phase2(&cache, &mut context))?;
         phase2_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(2);
     }
     if should_run(3, selection) {
-        let (summary, hit) = run_phase3(&cache, &mut context, &options)?;
+        let (summary, hit) = timed!("phase3", run_phase3(&cache, &mut context, &options))?;
         phase3_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(3);
     }
     if should_run(4, selection) {
-        let (summary, hit) = run_phase4(&cache, &mut context, &options)?;
+        let (summary, hit) = timed!("phase4", run_phase4(&cache, &mut context, &options))?;
         phase4_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(4);
     }
     if should_run(5, selection) {
-        let (summary, hit) = run_phase5(
-            &cache,
-            &mut context,
-            &options,
-            phase1_summary.as_ref(),
-            phase2_summary.as_ref(),
-            phase3_summary.as_ref(),
-            phase4_summary.as_ref(),
+        let (summary, hit) = timed!(
+            "phase5",
+            run_phase5(
+                &cache,
+                &mut context,
+                &options,
+                phase1_summary.as_ref(),
+                phase2_summary.as_ref(),
+                phase3_summary.as_ref(),
+                phase4_summary.as_ref(),
+            )
         )?;
         phase5_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(5);
     }
 
-    let formatted_output = format_report(
-        &context,
-        &executed_phases,
-        phase1_summary.as_ref(),
-        phase2_summary.as_ref(),
-        phase3_summary.as_ref(),
-        phase4_summary.as_ref(),
-        phase5_summary.as_ref(),
-        options.max_output_chars,
+    // `prepare` only defers the graph; if every phase hit the cache the graph
+    // was never built, so report that honestly rather than as a 0 ms stage.
+    let graph_pending = context.graph_is_pending();
+    let mut formatted_output = timed!(
+        "format",
+        format_report(
+            &context,
+            &executed_phases,
+            phase1_summary.as_ref(),
+            phase2_summary.as_ref(),
+            phase3_summary.as_ref(),
+            phase4_summary.as_ref(),
+            phase5_summary.as_ref(),
+            options.max_output_chars,
+        )
     );
+    if graph_pending {
+        stage_ms.insert("graph".to_string(), 0);
+    }
+    // The report is the only thing a caller sees, so the breakdown has to be
+    // in it: a stage that is elided from the text is a stage nobody profiles.
+    let breakdown = stage_ms
+        .iter()
+        .map(|(stage, ms)| format!("{stage}={ms}ms"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    formatted_output.push_str(&format!("\nstage_ms: {breakdown}"));
     Ok(PhaseAnalysisReport {
         project_id: context.project_id,
         generation: context.generation_hash,
@@ -182,6 +222,7 @@ pub fn run_phase_analysis(
         phase4: phase4_summary,
         phase5: phase5_summary,
         formatted_output,
+        stage_ms,
     })
 }
 

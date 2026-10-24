@@ -310,7 +310,12 @@ fn test_cache_stats_reports_byte_accounting() {
         (ROW_HEADER_LEN + 4 * 4) as u64 * 2,
         "byte accounting must report actual disk bytes"
     );
-    assert!(stats.max_bytes > 0, "max_bytes must be set");
+    // The store reports the EFFECTIVE budget: 0 means "no eviction", which is
+    // the default and must be reported as such rather than as a pretend cap.
+    assert_eq!(
+        stats.max_bytes, 0,
+        "the default budget is unlimited; the report must say so"
+    );
     assert!(stats.max_entry_bytes > 0, "max_entry_bytes must be set");
     // model_identity should report the actual model digest hex, not a
     // fixed opaque string.
@@ -347,6 +352,7 @@ fn test_entry_size_rejection() {
     let config = CacheConfig {
         max_bytes: 0,       // unlimited budget
         max_entry_bytes: 8, // tiny: ROW_HEADER_LEN alone is 80 bytes
+        min_free_bytes: 0,  // hermetic: ignore the real disk's free space
         debug_mode: false,
     };
     let mut cache = GlobalEmbeddingCache::open_with_config(tmp.path(), config).unwrap();
@@ -362,6 +368,102 @@ fn test_entry_size_rejection() {
     assert!(telemetry.bytes_rejected > 0);
 }
 
+/// A byte budget below the corpus is a self-inflicted miss: the store evicts a
+/// row it just wrote, and recreating it costs a whole remote embed. The default
+/// must therefore not evict at all, and a cap must still be reachable.
+#[test]
+fn test_default_budget_never_evicts_and_env_can_cap_it() {
+    // Measured failure mode: a 1 GiB budget evicted 4.4 GB against 334 MB
+    // retained, because a 40k-file corpus needs ~185 GiB to stay resident.
+    assert_eq!(
+        CacheConfig::default().max_bytes,
+        0,
+        "default must be unlimited: evicting re-embeddable vectors only forces a re-embed"
+    );
+
+    // SAFETY: this test owns the variable for its duration and restores it.
+    let previous = std::env::var(MAX_BYTES_ENV).ok();
+    unsafe { std::env::set_var(MAX_BYTES_ENV, "4096") };
+    assert_eq!(
+        CacheConfig::from_env().max_bytes,
+        4096,
+        "an explicit cap must reach the store"
+    );
+
+    // A typo must not silently widen the budget to unlimited.
+    unsafe { std::env::set_var(MAX_BYTES_ENV, "not-a-number") };
+    assert_eq!(
+        CacheConfig::from_env().max_bytes,
+        0,
+        "an unparseable value keeps the default rather than inventing a cap"
+    );
+
+    // SAFETY: restoring the pre-test state.
+    match previous {
+        Some(value) => unsafe { std::env::set_var(MAX_BYTES_ENV, value) },
+        None => unsafe { std::env::remove_var(MAX_BYTES_ENV) },
+    }
+}
+
+/// The free-space floor is the only thing keeping an unlimited cache from
+/// consuming the disk, so it must be on by default, overridable, and — above
+/// all — actually veto writes. A guard that reports "no room" and writes
+/// anyway is worse than no guard, because it looks like protection.
+#[test]
+fn test_free_space_floor_vetoes_writes() {
+    assert_eq!(
+        CacheConfig::default().min_free_bytes,
+        5 * 1024 * 1024 * 1024,
+        "an unlimited cache needs a free-space floor or it eats the disk"
+    );
+
+    // SAFETY: this test owns the variable for its duration and restores it.
+    let previous = std::env::var(MIN_FREE_BYTES_ENV).ok();
+    unsafe { std::env::set_var(MIN_FREE_BYTES_ENV, "12345") };
+    assert_eq!(
+        CacheConfig::from_env().min_free_bytes,
+        12345,
+        "an explicit floor must reach the store"
+    );
+    unsafe { std::env::set_var(MIN_FREE_BYTES_ENV, "not-a-number") };
+    assert_eq!(
+        CacheConfig::from_env().min_free_bytes,
+        5 * 1024 * 1024 * 1024,
+        "an unparseable value keeps the default floor"
+    );
+    // SAFETY: restoring the pre-test state.
+    match previous {
+        Some(value) => unsafe { std::env::set_var(MIN_FREE_BYTES_ENV, value) },
+        None => unsafe { std::env::remove_var(MIN_FREE_BYTES_ENV) },
+    }
+
+    // Demand more free space than any real filesystem has: the guard must
+    // decline every write deterministically, on any machine.
+    let tmp = tempfile::tempdir().unwrap();
+    let config = CacheConfig {
+        min_free_bytes: u64::MAX,
+        ..CacheConfig::default()
+    };
+    let mut cache = GlobalEmbeddingCache::open_with_config(tmp.path(), config).unwrap();
+
+    let key = sample_key("must not be stored", 4);
+    // Declining is not an error — the caller keeps its vector in hand.
+    cache.put(&key, &[0.1, 0.2, 0.3, 0.4], None).unwrap();
+    assert_eq!(
+        cache.row_count().unwrap(),
+        0,
+        "the guard must refuse to create the row file"
+    );
+    assert!(
+        cache.get(&key).unwrap().is_none(),
+        "a declined write must not be readable as a hit"
+    );
+
+    let written = cache.put_batch(&[(key, vec![0.5, 0.6, 0.7, 0.8])]).unwrap();
+    assert_eq!(written, 0, "a declined batch must report zero rows written");
+    assert_eq!(cache.row_count().unwrap(), 0);
+}
+
 /// Task 6: Byte-budget enforcement evicts unreferenced rows.
 #[test]
 fn test_byte_budget_eviction_removes_unreferenced() {
@@ -372,6 +474,7 @@ fn test_byte_budget_eviction_removes_unreferenced() {
     let config = CacheConfig {
         max_bytes: 100,
         max_entry_bytes: u64::MAX,
+        min_free_bytes: 0, // hermetic: ignore the real disk's free space
         debug_mode: false,
     };
     let mut cache = GlobalEmbeddingCache::open_with_config(tmp.path(), config).unwrap();
@@ -409,6 +512,7 @@ fn test_byte_budget_eviction_preserves_referenced() {
     let config = CacheConfig {
         max_bytes: 100,
         max_entry_bytes: u64::MAX,
+        min_free_bytes: 0, // hermetic: ignore the real disk's free space
         debug_mode: false,
     };
     let mut cache = GlobalEmbeddingCache::open_with_config(tmp.path(), config).unwrap();
@@ -426,23 +530,30 @@ fn test_byte_budget_eviction_preserves_referenced() {
 }
 
 /// Task 6: Telemetry persists across open/reopen.
+///
+/// No manual `persist_telemetry()` here on purpose. The drop of the first
+/// handle is what must flush: `probe` records hits in memory and nothing else
+/// persists them once the default unlimited budget removes eviction from the
+/// picture. Relying on a manual save is what let a regression to zero hits go
+/// unnoticed in `retention --report`.
 #[test]
 fn test_telemetry_persists_across_reopen() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
 
-    let key = sample_key("persist telemetry", 4);
-    cache.put(&key, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
-    cache.probe(&[key]).unwrap();
-
-    let telemetry_before = cache.telemetry().clone();
+    let telemetry_before = {
+        let mut cache = GlobalEmbeddingCache::open(tmp.path()).unwrap();
+        let key = sample_key("persist telemetry", 4);
+        cache.put(&key, &[1.0, 2.0, 3.0, 4.0], None).unwrap();
+        cache.probe(&[key]).unwrap();
+        let telemetry = cache.telemetry().clone();
+        assert_eq!(telemetry.hits, 1);
+        telemetry
+        // `cache` drops here — Drop must write telemetry.json.
+    };
     assert_eq!(telemetry_before.hits, 1);
 
-    // Persist and reopen.
-    cache.persist_telemetry().unwrap();
     let cache2 = GlobalEmbeddingCache::open(tmp.path()).unwrap();
-    let telemetry_after = cache2.telemetry().clone();
-    assert_eq!(telemetry_after.hits, 1);
+    assert_eq!(cache2.telemetry().hits, 1);
 }
 
 /// Task 6: GC compaction telemetry tracks evictions with byte accounting.
@@ -495,7 +606,10 @@ fn test_cache_stats_report_includes_telemetry_and_bytes() {
     assert_eq!(stats.telemetry.hits, 2);
     assert_eq!(stats.telemetry.misses, 1);
     assert!(stats.cache_bytes > 0);
-    assert!(stats.max_bytes > 0);
+    assert_eq!(
+        stats.max_bytes, 0,
+        "the default budget is unlimited; the report must say so"
+    );
     assert!(stats.max_entry_bytes > 0);
     // model_identity reports the actual model digest hex.
     let expected_model = hex_encode(&CacheKey::model_digest(b"model-bytes"));
@@ -700,6 +814,7 @@ fn test_debug_escape_hatch_default_private_drops_source_text() {
     let tmp = tempfile::tempdir().unwrap();
     let config = CacheConfig {
         debug_mode: false,
+        min_free_bytes: 0,
         ..CacheConfig::default()
     };
     let mut cache = GlobalEmbeddingCache::open_with_config(tmp.path(), config).unwrap();
@@ -739,6 +854,7 @@ fn test_debug_escape_hatch_config_debug_mode_appends_source_text() {
     let tmp = tempfile::tempdir().unwrap();
     let config = CacheConfig {
         debug_mode: true,
+        min_free_bytes: 0,
         ..CacheConfig::default()
     };
     let mut cache = GlobalEmbeddingCache::open_with_config(tmp.path(), config).unwrap();
@@ -782,6 +898,7 @@ fn test_debug_escape_hatch_no_source_text_no_appendix() {
     let tmp = tempfile::tempdir().unwrap();
     let config = CacheConfig {
         debug_mode: true,
+        min_free_bytes: 0,
         ..CacheConfig::default()
     };
     let mut cache = GlobalEmbeddingCache::open_with_config(tmp.path(), config).unwrap();
@@ -897,6 +1014,7 @@ fn test_probe_round_trips_through_debug_row() {
     let tmp = tempfile::tempdir().unwrap();
     let config = CacheConfig {
         debug_mode: true,
+        min_free_bytes: 0,
         ..CacheConfig::default()
     };
     let mut cache = GlobalEmbeddingCache::open_with_config(tmp.path(), config).unwrap();

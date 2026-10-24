@@ -145,10 +145,10 @@ different ports (the embeddinggemma-2 preset targets 8080; a managed `laya`
 service defaults to 8181).
 
 **System One (experimental)** validates tool calls and search results with a
-small typed-decision model before/after they reach your agent. It requires a
-source build (`cargo install leindex --features system-one` — release bundles
-and default crates.io builds do not include it), a `[system_one]` config
-section (`leindex setup --system-one` writes one), and
+small typed-decision model before/after they reach your agent. It is built by
+default (`system-one` is in the `full` feature set, so `cargo install leindex`
+and the release bundles include it) and stays dormant until armed: a
+`[system_one]` config section (`leindex setup --system-one` writes one) plus
 `LEINDEX_FEATURE_SYSTEM_ONE=1` exported in every process that serves MCP or
 runs the CLI — configuring `[system_one]` alone never enables the gate. It
 fails open: any provider problem leaves calls and results untouched. The

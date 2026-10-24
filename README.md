@@ -145,7 +145,6 @@ LeIndex call replaces chains of `Grep → Read → Read → Read`.
 ```bash
 # cargo (Rust users)
 cargo install leindex
-cargo install leindex --features onnx --force   # ensure the ONNX runtime is linked
 leindex setup
 
 # npm (Cursor / Claude Code / VS Code users)
@@ -193,9 +192,10 @@ validates tool calls before they run (pre-gate) and classifies search results
 before they reach your agent (post-gate). It fails open — any provider problem
 leaves calls and results untouched — and ships off by default.
 
-1. **Build with the feature**: `cargo install leindex --features system-one`.
-   Prebuilt bundles and default crates.io builds do not include the gate;
-   `leindex setup --check` reports `build (system-one feature): yes/no`.
+1. **Build with the feature**: `cargo install leindex` already includes it —
+   `system-one` is a member of `full`, the default feature set. Explicitly
+   naming `--features system-one` is harmless if you prefer to be obvious.
+   `leindex setup --check` reports `build (system-one feature): yes`.
 2. **Provision a decision model.** `leindex setup --system-one` writes the
    `[system_one]` section and, for the default `laya` provider, asks which
    Laya backend to use: `external` (the fresh-install default) prompts for

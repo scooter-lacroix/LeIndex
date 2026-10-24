@@ -276,10 +276,11 @@ System One is a separate decision route: a small typed-decision model
 validates tool calls before they run (pre-gate) and classifies search results
 before they reach your agent (post-gate). It fails open — any provider
 problem leaves calls and results untouched — and ships off by default. It is
-**experimental** and requires a source build:
+**experimental** and compiled in by default (`system-one` is in the `full`
+feature set):
 
 ```bash
-cargo install leindex --features system-one
+cargo install leindex      # --features system-one is implied
 leindex setup --system-one   # interactive wizard; writes [system_one] (+ [services.laya] for the managed backend)
 ```
 
@@ -295,7 +296,8 @@ endpoint from that service (port 8181 by default — the embeddings service on
 
 Three things must line up before the gate runs:
 
-1. a build with `--features system-one` (`setup --check` reports
+1. a build with the `system-one` feature — included by default, so
+   `cargo install leindex` is enough (`setup --check` reports
    `build (system-one feature): yes/no`);
 2. a `[system_one]` section with `mode` other than `"off"`, or the gate stays
    dormant — `mode = "shadow"` decides and logs without applying;

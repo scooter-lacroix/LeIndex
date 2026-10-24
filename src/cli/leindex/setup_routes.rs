@@ -513,7 +513,7 @@ fn gpu_layers(args: &[String]) -> Result<Option<u32>, SetupError> {
     Ok(layers)
 }
 
-fn configure_args(
+pub(super) fn configure_args(
     args: &mut Vec<String>,
     layers: Option<u32>,
     cpu: bool,
@@ -531,6 +531,9 @@ fn configure_args(
     {
         args.push("--embedding".into());
     }
+    // EmbeddingGemma2 is mean-pooled: that is what the shipped preset and
+    // `benches/gemma_placement.py` both drive. An explicit `--pooling` always
+    // wins, so this only fills a gap.
     if !args
         .iter()
         .any(|arg| arg == "--pooling" || arg.starts_with("--pooling="))
@@ -540,80 +543,228 @@ fn configure_args(
     if layers.is_some() {
         strip_gpu_options(args);
     }
+    // Device and batch placement: the device is deliberately NOT set (see
+    // above), but the batch ceilings ARE, because they must cover the largest
+    // document the client will send or llama-server answers 500 and the caller
+    // counts that against its failure budget.
     if let Some(layers) = layers.or_else(|| existing.is_none().then_some(if cpu { 0 } else { 99 }))
     {
         args.extend(["-ngl".into(), layers.to_string()]);
     }
-    ensure_batch_args(args);
+    add_if_absent(args, &BATCH_FLAGS, &EMBEDDING_BATCH.to_string());
+    // `-ub` is the binding ceiling (llama-server rejects any single input with
+    // more tokens than the LOGICAL batch), so it is raised to the floor rather
+    // than merely filled in: a value written by an earlier LeIndex build must
+    // not survive a re-run. See `raise_flag_to_at_least`.
+    raise_flag_to_at_least(args, &UBATCH_FLAGS, EMBEDDING_UBATCH_MIN);
+    // `-b` has TWO constraints and they are not the same number:
+    //
+    //  1. llama-server refuses to start unless `-b >= -ub`. The floor is the
+    //     EFFECTIVE `-ub`, not `EMBEDDING_UBATCH_MIN` — an operator who raised
+    //     `-ub` above the floor would otherwise keep a `-b` that cannot boot.
+    //  2. A physical ceiling below `EMBEDDING_UBATCH_MIN` cannot be operator
+    //     intent (the same reasoning that makes it the floor for `-ub`), so it
+    //     is our own stale default and is raised to `EMBEDDING_BATCH`. That is
+    //     what makes a repaired install converge on a fresh one instead of
+    //     running with a smaller batch than the measured optimum.
+    let effective_ubatch = flag_value(args, &UBATCH_FLAGS)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(EMBEDDING_UBATCH_MIN);
+    let stale_batch = flag_value(args, &BATCH_FLAGS)
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|batch| batch < EMBEDDING_UBATCH_MIN);
+    let physical_floor = if stale_batch {
+        EMBEDDING_BATCH.max(effective_ubatch)
+    } else {
+        effective_ubatch
+    };
+    raise_flag_to_at_least(args, &BATCH_FLAGS, physical_floor);
     Ok(())
 }
 
-/// Batch size, in tokens, LeIndex requests for a managed embedding server.
+/// Physical/logical batch ceilings for the managed embedding server.
 ///
-/// Covers the whole [`crate::cli::index_builder::cap_neural_text`] cap with
-/// headroom. A 64 KiB body that the default server rejected was measured at
-/// 22184 tokens, so this clears the cap with margin.
-pub(super) const BATCH_TOKENS: usize = 24576;
+/// llama-server rejects any single input with more tokens than the LOGICAL
+/// batch (`-ub`), answering HTTP 500 ("input (N tokens) is too large to
+/// process. increase the physical batch size"). The client, meanwhile, admits
+/// texts up to `max_seq_len = 64 * 1024` BYTES (`BatchBudget` in
+/// neural_publish.rs). Those two ceilings were tuned independently and
+/// disagreed: measured on this corpus, a 64 KiB Rust document tokenizes to
+/// 21,846 tokens, so the previously configured `-ub 24576` left only ~12%
+/// headroom and rejected real documents — 92,605 rejections in one run. Each
+/// rejection is an HTTP 500 that the caller's failure budget counts, so
+/// oversized inputs alone could freeze the neural layer.
+///
+/// `-ub 32768` is the measured sweet spot: it accepts the full 64 KiB
+/// maximum with ~50% headroom and is FASTER than the smaller value
+/// (305-324 rows/s vs 207-213) while keeping Vulkan pinned-memory pressure to
+/// one benign warning at load. Above it, memory warnings triple and throughput
+/// stops improving, so this is not an artificial cap — it is the point where
+/// more buys nothing.
+///
+/// The physical batch ceiling (`-b`) applied to a managed embedding server,
+/// and the value a stale `-b` is raised to.
+///
+/// It is NOT a floor for a deliberate value: an operator who set `-b` at or
+/// above [`EMBEDDING_UBATCH_MIN`] keeps their number, and the only absolute
+/// requirement enforced is llama-server's `-b >= -ub` (see `configure_args`).
+/// The distinction matters — treating this as a blanket floor would silently
+/// undo a deliberate tightening.
+const EMBEDDING_BATCH: u64 = 65536;
 
-/// llama.cpp's default for `-b` and `-ub`, in tokens.
-pub(super) const LLAMA_DEFAULT_BATCH_TOKENS: usize = 2048;
+/// The logical batch ceiling (`-ub`) applied to a managed embedding server, and
+/// the smallest value one may be left with.
+///
+/// Derived from the client's admission contract, not guessed: `BatchBudget`
+/// (neural_publish.rs) admits texts up to `max_seq_len = 64 * 1024` BYTES, and a
+/// 64 KiB Rust document tokenizes to ~21,846 tokens. A server whose `-ub` sits
+/// below that rejects real documents with HTTP 500, and every rejection spends
+/// the caller's sustained-failure budget until the neural layer freezes — which
+/// is precisely what happened (92,605 rejections in one measured run).
+///
+/// 32768 leaves ~50% headroom over the measured worst case and is FASTER than
+/// the smaller 24576 it replaced (305-324 rows/s vs 207-213) while keeping
+/// Vulkan pinned-memory pressure to one benign warning at load. Above it, memory
+/// warnings triple and throughput stops improving, so this is not an arbitrary
+/// cap: it is where more stops buying anything.
+///
+/// This is deliberately a MINIMUM as well as a default, applied through
+/// [`raise_flag_to_at_least`]: a value this file wrote in an earlier release
+/// must not survive a re-run.
+const EMBEDDING_UBATCH_MIN: u64 = 32768;
 
-/// Raise `-b` and `-ub` to [`BATCH_TOKENS`] unless already set higher.
+/// Every spelling of each llama-server batch option, CANONICAL FIRST.
 ///
-/// llama-server rejects any single input larger than the *physical* batch with
-/// `HTTP 500: input (N tokens) is too large to process`. LeIndex sends whole
-/// symbol bodies (`cap_neural_text` permits 64 KiB), so on llama.cpp's default
-/// of 2048 tokens a large share of nodes 500 outright and the retry path
-/// bisects the batch until every poisoned node is isolated — the dominant cost
-/// of the neural phase.
+/// `-b`/`--batch-size` and `-ub`/`--ubatch-size` are ONE option each in
+/// llama-server (`common/arg.cpp`), and every occurrence assigns, so the LAST
+/// spelling present wins. Matching only the canonical form — which this module
+/// did — makes setup append a `-b` that silences an operator's deliberate
+/// `--batch-size`, the exact inverse of the contract below. `gpu_option` already
+/// matches three spellings for the same reason.
 ///
-/// Both flags are raised because `-ub` alone does nothing: llama.cpp clamps the
-/// effective physical batch to the logical one, so `-b 2048 -ub 24576` still
-/// rejects anything over 2048 tokens and reproduces the original failure
-/// exactly. `-b` is the binding constraint, and moving it alone would suffice
-/// today — `-ub` is raised alongside it so the pair cannot drift into that
-/// clamp again.
+/// The first entry is the spelling written when the option is absent.
+const BATCH_FLAGS: [&str; 2] = ["-b", "--batch-size"];
+const UBATCH_FLAGS: [&str; 2] = ["-ub", "--ubatch-size"];
+
+/// Append `flags[0] value` unless any spelling of the option is already present.
 ///
-/// Idempotent, and deliberately conservative: a value above the llama default is
-/// left verbatim, so a hand-edited service config is never silently resized.
-pub(super) fn ensure_batch_args(args: &mut Vec<String>) {
-    raise_batch_arg(args, "-ub", "--ubatch-size");
-    raise_batch_arg(args, "-b", "--batch-size");
+/// The operator's explicit value always wins: this only supplies a default for
+/// an option they have not expressed an opinion on, mirroring the `--pooling`
+/// contract above. An operator who wrote `--batch-size 65536` has expressed an
+/// opinion just as clearly as one who wrote `-b 65536`.
+fn add_if_absent(args: &mut Vec<String>, flags: &[&str], value: &str) {
+    let inline: Vec<String> = flags.iter().map(|flag| format!("{flag}=")).collect();
+    let present = args.iter().any(|arg| {
+        flags.contains(&arg.as_str())
+            || inline.iter().any(|prefix| arg.starts_with(prefix.as_str()))
+    });
+    if !present {
+        args.extend([flags[0].to_string(), value.to_string()]);
+    }
 }
 
-/// Raise one batch-size flag (short or long spelling) to at least [`BATCH_TOKENS`].
-fn raise_batch_arg(args: &mut Vec<String>, short: &str, long: &str) {
-    let is_flag = |arg: &str| {
-        [short, long].iter().any(|name| {
-            arg == *name
-                || arg
-                    .strip_prefix(name)
-                    .and_then(|rest| rest.strip_prefix('='))
-                    .is_some()
-        })
-    };
-    let Some(position) = args.iter().position(|arg| is_flag(arg.as_str())) else {
-        args.extend([short.to_string(), BATCH_TOKENS.to_string()]);
-        return;
-    };
-
-    let too_small = |value: usize| value <= LLAMA_DEFAULT_BATCH_TOKENS;
-
-    // `-flag=N` carries its value inline; `-flag N` in the following element.
-    if let Some((_, value)) = args[position].split_once('=') {
-        if value.parse::<usize>().is_ok_and(|value| !too_small(value)) {
-            return;
+/// The EFFECTIVE value of an option, supporting both `flag value` and
+/// `flag=value` in every spelling — the LAST occurrence wins.
+///
+/// Last, not first, because that is what llama-server does (`common/arg.cpp`
+/// assigns on every occurrence). Repairing the first of two conflicting
+/// spellings would leave the server running on the one this module never saw.
+fn flag_value<'a>(args: &'a [String], flags: &[&str]) -> Option<&'a str> {
+    let inline: Vec<String> = flags.iter().map(|flag| format!("{flag}=")).collect();
+    let mut effective = None;
+    for (index, arg) in args.iter().enumerate() {
+        let value = if flags.contains(&arg.as_str()) {
+            args.get(index + 1).map(String::as_str)
+        } else {
+            inline
+                .iter()
+                .find_map(|prefix| arg.strip_prefix(prefix.as_str()))
+        };
+        if value.is_some() {
+            effective = value;
         }
-        args[position] = format!("{short}={BATCH_TOKENS}");
+    }
+    effective
+}
+
+/// Raise an option to at least `minimum`, keeping any larger operator value.
+///
+/// [`add_if_absent`] cannot do this: it treats the presence of an option as
+/// operator intent, so a value a PREVIOUS LeIndex version wrote is preserved
+/// forever. That makes a default that was measured wrong permanently sticky —
+/// re-running setup, the one action a user takes to pick up a corrected
+/// default, would change nothing.
+///
+/// That is exactly how the embedding batch ceilings went wrong: `-b 24576
+/// -ub 24576` were written into `[services.gemma].extra_args` by an earlier
+/// build, and llama-server answers HTTP 500 for any input larger than `-ub`
+/// while this client admits documents up to 64 KiB (~21,846 tokens). The
+/// rejections spent the neural layer's sustained-failure budget and froze it.
+///
+/// Treating those numbers as sacred would strand every existing install on the
+/// broken values, so a BELOW-minimum value is raised and a warning names what
+/// changed. A value at or above `minimum` is left alone: an operator who
+/// raised it deliberately is never overridden, they simply keep their headroom.
+/// An unparseable value is also left alone — provenance is unknowable, so it is
+/// reported and never silently rewritten.
+///
+/// The value is repaired **in the spelling it was found in**, and no canonical
+/// alias is appended beside it. Every occurrence of a llama-server option
+/// assigns, so appending `-b` next to an operator's `--batch-size` would leave
+/// the operator's value silently outvoted by the LAST occurrence — the repair
+/// has to fix the argument that actually wins, not add a competitor to it.
+///
+/// Only occurrences BELOW `minimum` are rewritten. A config holding both
+/// `-ub 65536` and a stale `--ubatch-size 24576` has one occurrence that is
+/// deliberate and one that is not; blanket-rewriting both would lower the
+/// operator's headroom, which this function promises never to do.
+fn raise_flag_to_at_least(args: &mut Vec<String>, flags: &[&str], minimum: u64) {
+    let Some(current) = flag_value(args, flags) else {
+        add_if_absent(args, flags, &minimum.to_string());
+        return;
+    };
+    let Ok(parsed) = current.parse::<u64>() else {
+        tracing::warn!(
+            flags = ?flags,
+            value = current,
+            "Managed server has a non-numeric batch ceiling; leaving it unchanged"
+        );
+        return;
+    };
+    if parsed >= minimum {
         return;
     }
-    match args.get(position + 1).and_then(|v| v.parse::<usize>().ok()) {
-        Some(value) if !too_small(value) => {}
-        Some(_) => args[position + 1] = BATCH_TOKENS.to_string(),
-        // Malformed pair (`-flag` with no numeric value): add a well-formed
-        // flag rather than overwriting whatever the user put there.
-        None => args.push(format!("{short}={BATCH_TOKENS}")),
+    let raises = |value: &str| value.parse::<u64>().is_ok_and(|value| value < minimum);
+    let inline: Vec<String> = flags.iter().map(|flag| format!("{flag}=")).collect();
+    let replacement = minimum.to_string();
+    let mut index = 0;
+    while index < args.len() {
+        if flags.contains(&args[index].as_str()) {
+            // `-ub 24576`: replace the value in the following slot, replacing
+            // the SLOT rather than draining it, so arity never changes.
+            if args.get(index + 1).is_some_and(|value| raises(value)) {
+                args[index + 1] = replacement.clone();
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(prefix) = inline
+            .iter()
+            .find(|prefix| args[index].starts_with(prefix.as_str()))
+            .filter(|prefix| raises(&args[index][prefix.len()..]))
+        {
+            args[index] = format!("{prefix}{replacement}");
+        }
+        index += 1;
     }
+    tracing::warn!(
+        flags = ?flags,
+        was = parsed,
+        now = minimum,
+        "Raised a managed-server batch ceiling that was below the largest document this \
+         client sends; llama-server answers HTTP 500 for inputs over the logical batch and \
+         the caller spends its neural failure budget on them"
+    );
 }
 
 /// Rejects a `--pooling` flag that has no value (CCN-gate extraction).

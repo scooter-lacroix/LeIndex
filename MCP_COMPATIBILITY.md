@@ -23,7 +23,7 @@ If you installed the full Rust binary and want to run it directly, `leindex mcp`
 
 ### Claude Code
 
-The optional System-One gate requires a source build with `--features system-one`.
+The optional System-One gate is built by default (`system-one` is in the `full` feature set) but stays dormant until armed.
 Set `LEINDEX_FEATURE_SYSTEM_ONE=1` in the MCP server's environment (the client's
 `env` object for stdio, or the HTTP server's environment), then add this to
 `$LEINDEX_HOME/config/leindex.toml` (default `~/.leindex/config/leindex.toml`):

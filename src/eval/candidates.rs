@@ -594,12 +594,8 @@ impl<B: RetrievalBackend> RetrievalBackend for SimulatedBackend<B> {
         };
 
         // Prepend distractors (these go above the relevant results)
-        for (i, distractor) in self
-            .distractors
-            .iter()
-            .enumerate()
-            .take(num_prepend.min(num_insertions))
-        {
+        let prepend = num_prepend.min(num_insertions);
+        for (i, distractor) in self.distractors.iter().enumerate().take(prepend) {
             degraded_symbols.insert(i, distractor.clone());
         }
 

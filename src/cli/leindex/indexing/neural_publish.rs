@@ -776,6 +776,17 @@ fn streaming_neural_inputs<'a>(
         .flatten()
 }
 
+/// How many admitted nodes this neural pass failed to cover.
+///
+/// `None` means full coverage. Split out of `enrich_neural_for_route` because
+/// that function needs a live `SearchEngine` and PDG, and the policy — "a pass
+/// that covers less than it admitted is a WARN, not a clean finish" — is the
+/// part worth pinning. Zero admitted nodes is full coverage by definition: an
+/// empty slice is not a failure.
+fn neural_coverage_gap(embedded: usize, admitted: usize) -> Option<usize> {
+    (embedded < admitted).then(|| admitted - embedded)
+}
+
 fn enrich_neural_for_route(
     engine: &mut crate::search::search::SearchEngine,
     pdg: &crate::graph::pdg::ProgramDependenceGraph,
@@ -783,7 +794,7 @@ fn enrich_neural_for_route(
     admitted_node_ids: &HashSet<String>,
     project_path: &std::path::Path,
 ) -> Result<usize> {
-    let (cache_hits_before, _) = neural_cache_counters();
+    let (cache_hits_before, cache_misses_before) = neural_cache_counters();
     // The heartbeat covers the whole pass (see NeuralProgress): liveness even
     // while the first embed batch is in flight, plus the CPU-fallback watch.
     let progress = NeuralProgress::start(admitted_node_ids.len());
@@ -814,7 +825,13 @@ fn enrich_neural_for_route(
     stats.rows_written += pooling.finish()?;
     let dim_mismatch_nodes = pooling.take_dim_mismatches();
     drop(progress);
-    let (cache_hits_after, cache_misses) = neural_cache_counters();
+    let (cache_hits_after, cache_misses_after) = neural_cache_counters();
+    let cache_hits = cache_hits_after.saturating_sub(cache_hits_before);
+    // A DELTA, not the cumulative counter: `counters()` is process-wide, so
+    // reading it raw here reported every miss from every earlier phase of the
+    // same process as if this pass had embedded them. On a resumed or
+    // multi-route run "N embedded" could exceed the rows on screen.
+    let cache_misses = cache_misses_after.saturating_sub(cache_misses_before);
     // Batches that COMPLETE but write no rows are the signature of a dead
     // embedder (remote endpoint unreachable, provider 4xx/5xx, or a worker
     // answering with empty vectors). Without this, such a run shows a live
@@ -826,6 +843,23 @@ fn enrich_neural_for_route(
             "neural enrichment completed with zero rows: the embedder returned no vectors for \
              every batch. Search falls back to TF-IDF only. Check `leindex setup --check` for \
              provider/model state and ~/.leindex/logs/leindex-embed-daemon.log for worker errors."
+        );
+    } else if let Some(gap) = neural_coverage_gap(stats.rows_written, admitted_node_ids.len()) {
+        // Partial coverage is the failure mode a single blip now produces
+        // instead of a total freeze: the generation survives, the rest of the
+        // run embeds normally, and the ONLY trace is a store that is quietly
+        // missing rows — resume skips those nodes forever, because nothing
+        // ever retries them. Never let that pass as a clean finish.
+        warn!(
+            admitted = admitted_node_ids.len(),
+            embedded = stats.rows_written,
+            gap,
+            skipped = stats.rows_skipped,
+            "neural enrichment covered only {}/{} admitted nodes; the remaining nodes have no \
+             neural vector and resume will NOT re-embed them. Re-run the index (or delete \
+             .leindex/neural_embeddings.bin) to fill the gap.",
+            stats.rows_written,
+            admitted_node_ids.len(),
         );
     }
     // A partially-degraded generation must not report clean success. `rows_skipped`
@@ -849,7 +883,7 @@ fn enrich_neural_for_route(
     progress_stderr(&format!(
         "Indexing: neural done — {} rows ({} from embed cache, {} embedded, {} skipped, {} batches){}...",
         stats.rows_written,
-        cache_hits_after - cache_hits_before,
+        cache_hits,
         cache_misses,
         stats.rows_skipped,
         stats.batches,
@@ -1586,6 +1620,21 @@ impl LeIndex {
 mod tests {
     use super::*;
     use crate::cli::leindex::indexing::streaming::neural::NeuralRowWriter;
+
+    /// A neural pass that embeds fewer nodes than it admitted must be
+    /// reportable as a gap. The generation now survives a blip instead of
+    /// freezing, which means partial coverage is the ORDINARY outcome of a
+    /// transient outage — and nothing ever retries those nodes on resume, so
+    /// silence here is a permanently thinner neural layer.
+    #[test]
+    fn test_neural_coverage_gap_reports_only_missing_rows() {
+        assert_eq!(neural_coverage_gap(70, 100), Some(30));
+        assert_eq!(neural_coverage_gap(0, 100), Some(100));
+        assert_eq!(neural_coverage_gap(100, 100), None);
+        // An empty admitted set is full coverage, not a 0/0 failure: a route
+        // with nothing to embed must not warn.
+        assert_eq!(neural_coverage_gap(0, 0), None);
+    }
 
     /// The title is what a remote provider receives as `{title}`, so a leak here
     /// is a leak on the wire. These pin the two properties the previous inline

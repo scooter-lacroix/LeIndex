@@ -412,3 +412,102 @@ mod docs_packaging {
         }
     }
 }
+
+// ============================================================================
+// `full` completeness — the default feature set must not silently drop a feature
+// ============================================================================
+
+mod feature_completeness {
+    use super::*;
+
+    /// Every feature defined in the root `[features]` table, as
+    /// (name, value) with a multi-line array collapsed onto one line. The
+    /// `toml` crate is an optional dependency and is not available to
+    /// integration tests, so this reads the table structurally instead.
+    fn feature_table(cargo_toml: &str) -> Vec<(String, String)> {
+        /// Bracket depth of `value`, counting only unquoted `[` and `]`.
+        fn open_brackets(value: &str) -> usize {
+            let mut depth = 0i32;
+            let mut in_string = false;
+            for ch in value.chars() {
+                match ch {
+                    '"' => in_string = !in_string,
+                    '[' if !in_string => depth += 1,
+                    ']' if !in_string => depth -= 1,
+                    _ => {}
+                }
+            }
+            depth.max(0) as usize
+        }
+
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut in_features = false;
+        let mut current: Option<(String, String)> = None;
+
+        for line in cargo_toml.lines() {
+            let t = line.trim();
+            if t.starts_with('[') && open_brackets(t) == 0 && !t.contains('=') {
+                // A table header, not an array continuation (`full = [` ... `]`).
+                if let Some(c) = current.take() {
+                    out.push(c);
+                }
+                in_features = t == "[features]";
+                continue;
+            }
+            if !in_features || t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            let continuing = current
+                .as_ref()
+                .is_some_and(|(_, value)| open_brackets(value) > 0);
+            if continuing {
+                let (_, value) = current.as_mut().expect("checked by `continuing`");
+                value.push(' ');
+                value.push_str(t);
+            } else {
+                let (name, value) = t
+                    .split_once('=')
+                    .unwrap_or_else(|| panic!("unparsable [features] line: {t}"));
+                if let Some(c) = current.take() {
+                    out.push(c);
+                }
+                current = Some((name.trim().to_string(), value.trim().to_string()));
+            }
+        }
+        if let Some(c) = current.take() {
+            out.push(c);
+        }
+        out
+    }
+
+    /// VAL-CARGO-014: every feature the crate defines is a member of `full`.
+    ///
+    /// A feature omitted from `full` is silently compiled out of a default
+    /// build, and the failure surfaces far away as an `INACTIVE` setup check
+    /// with no `issue:` line. That is exactly how `system-one` and `onnx` were
+    /// lost. `default` selects the set, `minimal` is the deliberate opt-out,
+    /// and `full` is the umbrella itself — those three are not members.
+    #[test]
+    fn test_full_feature_set_includes_every_defined_feature() {
+        let features = feature_table(&root_cargo_toml());
+        let full = features
+            .iter()
+            .find(|(name, _)| name == "full")
+            .map(|(_, value)| value.clone())
+            .expect("root Cargo.toml must define a 'full' feature");
+
+        let exempt = ["default", "full", "minimal"];
+        let missing: Vec<&str> = features
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .filter(|name| !exempt.contains(name))
+            .filter(|name| !full.contains(&format!("\"{name}\"")))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "root 'full' feature MUST list every defined feature; missing: {missing:?}.\n\
+             full = {full}"
+        );
+    }
+}

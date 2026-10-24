@@ -6,10 +6,13 @@ use leindex::cli::cli;
 
 // When the `memprof` feature is enabled, use jemalloc with heap profiling
 // support as the global allocator. This allows engineers to generate detailed
-// heap profiles via `MALLOC_CONF` environment variables without affecting
-// default builds or CI.
+// heap profiles via `MALLOC_CONF` environment variables.
 //
-// VAL-MEASURE-025: memprof is opt-in and build-time gated.
+// `memprof` is a member of `full` (the default feature set), so every default
+// build — and CI — runs on jemalloc. Profiling itself stays opt-in at RUN time
+// via `MALLOC_CONF`; nothing is sampled unless the operator asks for it.
+//
+// VAL-MEASURE-025: memprof is build-time gated (this cfg).
 // VAL-MEASURE-026: Building with --features memprof succeeds.
 #[cfg(feature = "memprof")]
 #[global_allocator]
