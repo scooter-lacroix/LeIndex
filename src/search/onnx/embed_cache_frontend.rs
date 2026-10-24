@@ -271,7 +271,12 @@ fn ensure_frontend(
 
 /// Mirror of the worker's `default_embed_cache_root` — the SAME directory the
 /// worker-side cache uses, so both sides share one store.
-fn cache_root() -> std::path::PathBuf {
+///
+/// Also used by [`super::remote_cache`]: the remote route keys its rows on the
+/// endpoint identity instead of model file digests, so the two routes never
+/// collide, but they share one root (and therefore one budget and one
+/// `leindex cleanup`).
+pub(super) fn cache_root() -> std::path::PathBuf {
     if let Ok(home) = std::env::var("LEINDEX_HOME") {
         return std::path::PathBuf::from(home).join("embed-cache");
     }

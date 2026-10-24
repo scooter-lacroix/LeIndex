@@ -20,6 +20,15 @@ pub enum RemoteEmbeddingError {
     #[error("API request failed: {0}")]
     ApiError(String),
 
+    /// The request never produced a response the server can be held to: a
+    /// connect/read failure, a reset socket, or a closed connection before a
+    /// complete body. Distinct from [`Self::ApiError`] so the retry ladder can
+    /// tell "the transport glitched" from "the endpoint answered and the
+    /// answer was wrong" — only the former is worth retrying, and only the
+    /// former may be raised from the serving path.
+    #[error("Transport error: {0}")]
+    Transport(String),
+
     /// HTTP request returned an unsuccessful status.
     #[error("API returned HTTP {status}: {message}")]
     HttpStatus {
@@ -109,9 +118,27 @@ pub struct RemoteEmbeddingConfig {
     pub provider: RemoteProvider,
     /// API key (for providers that require authentication)
     pub api_key: Option<String>,
-    /// Request timeout in seconds
+    /// Request timeout in seconds.
+    ///
+    /// This is a dead-endpoint detector, not a batch-size ceiling. It must be
+    /// long enough that a `max_texts`-sized batch of longest-legal documents
+    /// always finishes: budgeting a request against a deadline it cannot meet
+    /// converts a slow-but-correct server into a permanent, silent fallback to
+    /// TF-IDF (measured: a 256-document batch against llama-server blew a 30s
+    /// deadline mid-generation, freezing 70% of the corpus out of the neural
+    /// layer). Prefer shrinking the batch, not this.
     pub timeout_secs: u64,
-    /// Maximum retries for failed requests
+    /// Retries per request for failures the transport can heal on its own:
+    /// connect errors, reset/closed sockets, truncated bodies, and
+    /// availability statuses (408/425/429/5xx). Definitive rejections — a 4xx
+    /// naming a bad input — are never retried; they are bisected instead.
+    ///
+    /// This does NOT bound total wall clock. A remote endpoint additionally
+    /// caps each attempt at `timeout_secs`, so a dead third-party host fails
+    /// within `(max_retries + 1) * timeout_secs`. A local endpoint has no
+    /// whole-request deadline (see [`Self::is_local_endpoint`]): attempts are
+    /// capped only by connect timeout and TCP keepalive, so what stops a dead
+    /// local server is the caller's sustained-failure budget, not a deadline.
     pub max_retries: usize,
     /// Base URL for custom providers
     pub base_url: Option<String>,
@@ -127,6 +154,14 @@ pub struct RemoteEmbeddingConfig {
     /// Template applied to QUERY texts (asymmetric retrieval prefixes).
     /// Same `{text}` contract. `None` = raw text.
     pub query_template: Option<String>,
+    /// Name of the local `[services.<name>]` entry this endpoint belongs to,
+    /// when LeIndex launched it. `None` for a third-party endpoint.
+    ///
+    /// This is what makes a managed endpoint self-healing: LeIndex owns the
+    /// process (via `auto_start`), so a sustained outage can be fixed by
+    /// restarting it instead of abandoning the neural layer. Set by the index
+    /// builder, which is the only place that knows the endpoint's origin.
+    pub service_name: Option<String>,
 }
 
 impl Default for RemoteEmbeddingConfig {
@@ -141,6 +176,7 @@ impl Default for RemoteEmbeddingConfig {
             remote_dimension: None,
             doc_template: None,
             query_template: None,
+            service_name: None,
         }
     }
 }
@@ -176,6 +212,158 @@ impl RemoteEmbeddingConfig {
             api_key,
             ..Default::default()
         }
+    }
+
+    /// True when the endpoint cannot leave this machine — the case where a
+    /// whole-request deadline buys nothing and costs correctness.
+    pub(crate) fn is_local_endpoint(&self) -> bool {
+        let endpoint = match &self.provider {
+            RemoteProvider::Custom { endpoint } => Some(endpoint.as_str()),
+            _ => None,
+        };
+        let Some(endpoint) = endpoint.or(self.base_url.as_deref()) else {
+            return false;
+        };
+        let authority = endpoint
+            .split_once("://")
+            .map_or(endpoint, |(_, rest)| rest)
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        // Strip the PORT before matching. An endpoint is written as
+        // `host:port`, so comparing the whole authority only ever matched a
+        // host with no port at all: `localhost:11434` and `[::1]:8766` fell
+        // through to the remote branch and silently regained the wall-clock
+        // deadline this predicate exists to remove. Only bare `127.x` happened
+        // to work, and only because of the `starts_with` fallback below.
+        let host = if let Some(bracketed) = authority.strip_prefix('[') {
+            // `[::1]:8766` -> `::1`
+            bracketed.split(']').next().unwrap_or_default()
+        } else {
+            // `localhost:11434` -> `localhost`
+            authority.split(':').next().unwrap_or_default()
+        };
+        matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1") || host.starts_with("127.")
+    }
+}
+
+/// Build the HTTP client every provider shares.
+///
+/// `pool_idle_timeout(Duration::ZERO)` disables idle-socket reuse on purpose.
+/// llama-server (and single-model OpenAI-compatible servers generally) drop a
+/// kept-alive connection as soon as client and server disagree about liveness,
+/// and reqwest then surfaces the NEXT request on that dead socket as
+/// `error sending request for url (...)` — a transport failure with no server
+/// answer behind it. Measured on a 523-batch index run: one stale-socket reuse
+/// aborted the batch 9 minutes in. A fresh connection per batch costs a
+/// localhost handshake against a request that takes hundreds of milliseconds
+/// anyway.
+fn build_http_client(config: &RemoteEmbeddingConfig) -> Result<Client, RemoteEmbeddingError> {
+    let timeout = std::time::Duration::from_secs(config.timeout_secs);
+    let mut builder = Client::builder()
+        .connect_timeout(timeout)
+        .pool_idle_timeout(std::time::Duration::ZERO);
+    // Local endpoints carry no whole-request deadline: the response arrives
+    // when the server has finished the batch, and the batch size is already
+    // bounded by `BatchBudget`. A wall-clock cap here is a false-negative
+    // generator — it cannot tell a dead endpoint from a big-but-valid request.
+    // Remote APIs keep theirs: an unresponsive third-party host must not hang
+    // an entire index run.
+    if !config.is_local_endpoint() {
+        builder = builder.timeout(timeout);
+    } else {
+        // Liveness without a deadline: the kernel keeps probing the connection
+        // while the server is still computing, so a host that vanished
+        // mid-batch surfaces as a socket error instead of a request that never
+        // returns. These are the bare `Duration` setters reqwest 0.12 exposes
+        // (`TcpKeepalive` is the 0.13 API); the builder rejects an idle time
+        // with no interval, so both are always set together.
+        builder = builder
+            .tcp_keepalive(timeout)
+            .tcp_keepalive_interval(timeout)
+            .tcp_keepalive_retries(3);
+    }
+    builder
+        .build()
+        .map_err(|e| RemoteEmbeddingError::HttpClient(e.to_string()))
+}
+
+/// Availability statuses that mean "the endpoint is busy or restarting", not
+/// "your input is wrong" — re-sending the identical bytes can plausibly work.
+///
+/// A definitive rejection (400/413/422 naming content, 401 naming credentials)
+/// is deliberately absent: those fail identically forever, so retrying only
+/// delays the bisect that would have isolated the offending document.
+///
+/// # shh: an oversized-input 500 is answered here before its body is read, so
+/// it is re-sent `max_retries` times plus the bisect's own sends before
+/// `is_oversized_input_rejection` finally classifies it. Those re-sends cannot
+/// succeed — the input is too big regardless of when it is sent. Harvestable by
+/// teaching `send_with_retry` to peek at the body, but only worth it once
+/// `-ub` stops being tunable below the client's admitted document size.
+fn is_retryable_status(status: u16) -> bool {
+    matches!(
+        status,
+        408 | 425 | 429 | 500 | 502 | 503 | 504 | 507 | 509 | 529
+    )
+}
+
+/// Exponential backoff with a cap: 250ms, 500ms, 1s, 2s, then 2s.
+///
+/// Deliberately small. A reset socket or a saturated queue clears in well under
+/// a second; anything larger just hides a dead endpoint behind a longer stall.
+fn retry_backoff(attempt: usize) -> std::time::Duration {
+    const BASE_MS: u64 = 250;
+    const CAP_MS: u64 = 2_000;
+    std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << attempt.min(3)).min(CAP_MS))
+}
+
+/// Send one request, retrying transient failures up to `max_retries` times.
+///
+/// This is the ladder `RemoteEmbeddingConfig::max_retries` always described and
+/// never had: before it existed, a single reset socket became a permanent
+/// neural-generation freeze (the caller's `stopped` latch fires on the first
+/// whole-batch error and never clears).
+///
+/// `build` is a closure, not a prepared `Request`, because every attempt needs
+/// its own body. When the budget is exhausted the last response is returned
+/// verbatim rather than converted to an error: the caller's status handling
+/// (availability fast-fail, oversized-input bisection) owns the verdict, so
+/// `max_retries == 0` reproduces the pre-retry behaviour exactly.
+async fn send_with_retry<F>(
+    max_retries: usize,
+    mut build: F,
+) -> Result<reqwest::Response, RemoteEmbeddingError>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    let mut attempt = 0;
+    loop {
+        let reason = match build().send().await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                if attempt >= max_retries || !is_retryable_status(status) {
+                    return Ok(response);
+                }
+                format!("HTTP {status}")
+            }
+            Err(error) => {
+                if attempt >= max_retries {
+                    return Err(RemoteEmbeddingError::Transport(error.to_string()));
+                }
+                error.to_string()
+            }
+        };
+        let delay = retry_backoff(attempt);
+        tracing::warn!(
+            attempt = attempt + 1,
+            max_retries,
+            delay_ms = delay.as_millis() as u64,
+            %reason,
+            "Remote embedding request failed transiently; retrying"
+        );
+        tokio::time::sleep(delay).await;
+        attempt += 1;
     }
 }
 
@@ -255,6 +443,12 @@ pub trait RemoteEmbeddingProvider: Send + Sync {
     /// so identity matches the one those rows were saved under (a custom
     /// endpoint only measures at its first response). No-op by default.
     fn seed_measured_dimension(&self, _dimension: usize) {}
+
+    /// Downcast hook for the one provider that keeps a client-side embedding
+    /// cache. Default `None` for every other backend.
+    fn as_custom(&self) -> Option<&CustomEmbeddingProvider> {
+        None
+    }
 }
 
 /// Reorder embedding vectors by their response index, verifying that the
@@ -311,12 +505,7 @@ impl OpenAIEmbeddingProvider {
         if config.api_key.is_none() {
             return Err(RemoteEmbeddingError::ApiKeyNotFound("OpenAI".to_string()));
         }
-
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_secs))
-            .build()
-            .map_err(|e| RemoteEmbeddingError::HttpClient(e.to_string()))?;
-
+        let client = build_http_client(&config)?;
         Ok(Self { client, config })
     }
 }
@@ -369,21 +558,20 @@ impl RemoteEmbeddingProvider for OpenAIEmbeddingProvider {
 
         let api_key = self.config.api_key.as_ref().unwrap();
 
-        let response = self
-            .client
-            .post("https://api.openai.com/v1/embeddings")
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| RemoteEmbeddingError::ApiError(e.to_string()))?;
+        let response = send_with_retry(self.config.max_retries, || {
+            self.client
+                .post("https://api.openai.com/v1/embeddings")
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("Content-Type", "application/json")
+                .json(&request)
+        })
+        .await?;
 
         let status = response.status();
         let response_text = response
             .text()
             .await
-            .map_err(|e| RemoteEmbeddingError::ApiError(e.to_string()))?;
+            .map_err(|e| RemoteEmbeddingError::Transport(e.to_string()))?;
 
         if !status.is_success() {
             if status.as_u16() == 429 {
@@ -428,10 +616,7 @@ impl CohereEmbeddingProvider {
             return Err(RemoteEmbeddingError::ApiKeyNotFound("Cohere".to_string()));
         }
 
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_secs))
-            .build()
-            .map_err(|e| RemoteEmbeddingError::HttpClient(e.to_string()))?;
+        let client = build_http_client(&config)?;
 
         Ok(Self { client, config })
     }
@@ -484,22 +669,21 @@ impl RemoteEmbeddingProvider for CohereEmbeddingProvider {
         let api_key = self.config.api_key.as_ref().unwrap();
 
         let url = format!("{}/embed", base_url);
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .header("X-Client-Name", "leindex")
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| RemoteEmbeddingError::ApiError(e.to_string()))?;
+        let response = send_with_retry(self.config.max_retries, || {
+            self.client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("Content-Type", "application/json")
+                .header("X-Client-Name", "leindex")
+                .json(&request)
+        })
+        .await?;
 
         let status = response.status();
         let response_text = response
             .text()
             .await
-            .map_err(|e| RemoteEmbeddingError::ApiError(e.to_string()))?;
+            .map_err(|e| RemoteEmbeddingError::Transport(e.to_string()))?;
 
         if !status.is_success() {
             if status.as_u16() == 429 {
@@ -554,6 +738,35 @@ pub struct CustomEmbeddingProvider {
     /// 0 = not yet measured; else the vector length observed in the first
     /// successful response.
     measured: std::sync::atomic::AtomicUsize,
+    /// Transport retry budget; carried because this provider destructures the
+    /// config instead of holding it.
+    max_retries: usize,
+    /// Embedding-cache namespace, injected by
+    /// [`GenericRemoteProvider::from_config`] from the SAME identity the
+    /// checkpoint uses (endpoint + model + base URL + template fingerprint).
+    /// `None` = uncached. Never recomputed here: a second copy of the identity
+    /// formula is a second thing that can drift out of agreement with the
+    /// checkpoint, and the template fingerprint is only known to the wrapper.
+    cache_namespace: std::sync::Mutex<Option<String>>,
+    /// The content-addressed store, opened on first use. A `Mutex` because the
+    /// store needs `&mut` to probe and write while the batch path takes
+    /// `&self`.
+    cache: std::sync::Mutex<Option<super::remote_cache::RemoteEmbedCache>>,
+    /// Latch: a failed open is not retried per batch. Without it, an
+    /// unreadable store turns every batch into another failed open attempt.
+    cache_open_failed: std::sync::atomic::AtomicBool,
+    /// Managed service this endpoint belongs to, when LeIndex launched it.
+    ///
+    /// `Some(name)` is what makes self-healing possible: LeIndex owns the
+    /// process (via `[services.<name>]` + `auto_start`), so when the endpoint
+    /// stays down across a whole failure budget it can be restarted rather
+    /// than abandoned. `None` for a third-party endpoint — OpenAI, OpenRouter,
+    /// Cohere, Google — where there is no process here to heal.
+    supervised_service: Option<String>,
+    /// Latches once a restart has been attempted for an outage. Exactly one
+    /// restart per outage: a restart that does not fix the endpoint must not
+    /// turn every subsequent batch into another full stop/start cycle.
+    restart_attempted: std::sync::atomic::AtomicBool,
 }
 
 /// Statuses that can be caused by one bad input (oversized/invalid content;
@@ -562,6 +775,23 @@ pub struct CustomEmbeddingProvider {
 /// freeze path) instead of bisecting into many doomed requests.
 fn is_bisectable_embedding_status(status: u16) -> bool {
     matches!(status, 400 | 413 | 422 | 500)
+}
+
+/// True when llama-server refused a single input for exceeding its per-input
+/// token limit (`-ub`), rather than failing to serve the request.
+///
+/// llama-server answers such an input with HTTP 500 whose body names the limit:
+/// `input (N tokens) is too large to process. increase the physical batch
+/// size`. That is a statement about the DOCUMENT, not about the endpoint, and
+/// the two must be told apart: an unclassifiable 500 is an outage that should
+/// spend the caller's sustained-failure budget, while an oversized document
+/// should simply be skipped. Conflating them is what let oversized inputs alone
+/// burn the budget and freeze the neural layer (92,605 rejections in one run).
+pub(crate) fn is_oversized_input_rejection(status: u16, message: &str) -> bool {
+    status == 500
+        && message
+            .to_ascii_lowercase()
+            .contains("too large to process")
 }
 
 /// Apply a task template to `text`: replace every `{text}` placeholder with
@@ -685,10 +915,7 @@ impl CustomEmbeddingProvider {
                 ));
             }
         };
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_secs))
-            .build()
-            .map_err(|e| RemoteEmbeddingError::HttpClient(e.to_string()))?;
+        let client = build_http_client(&config)?;
         Ok(Self {
             client,
             endpoint,
@@ -699,7 +926,78 @@ impl CustomEmbeddingProvider {
             doc_template: config.doc_template.clone(),
             bootstrap_dimension,
             measured: std::sync::atomic::AtomicUsize::new(0),
+            max_retries: config.max_retries,
+            cache_namespace: std::sync::Mutex::new(None),
+            cache: std::sync::Mutex::new(None),
+            cache_open_failed: std::sync::atomic::AtomicBool::new(false),
+            // `from_config` injects the managed service name (it is the only
+            // caller that knows the config); direct construction has none.
+            supervised_service: config.service_name.clone(),
+            restart_attempted: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Restart the managed service behind this endpoint, at most once.
+    ///
+    /// Only a service LeIndex launched (`[services.<name>]` with
+    /// `service_name` set by the index builder) can be healed here. The caller
+    /// has already spent a whole batch-failure budget over many seconds, so
+    /// this is not a reaction to one slow batch — it is the difference between
+    /// "the endpoint is busy" and "the endpoint is gone".
+    ///
+    /// `restart_attempted` latches the attempt: an endpoint that cannot be
+    /// revived (bad model path, corrupt GGUF, no VRAM) fails once instead of
+    /// cycling the server stop/start behind every subsequent batch.
+    ///
+    /// Returns `true` only when the restart actually succeeded. Everything
+    /// else leaves the caller's own fallback policy in charge.
+    #[cfg(feature = "remote-embeddings")]
+    pub(crate) fn try_revive_endpoint(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let Some(name) = self.supervised_service.as_deref() else {
+            // Third-party endpoint: no local process to heal.
+            return false;
+        };
+        if self.restart_attempted.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                service = %name,
+                "Managed embedding endpoint is still down after its restart; \
+                 not restarting again this run"
+            );
+            return false;
+        }
+        let services = &crate::config::LeIndexConfig::load_cached().services;
+        let Some(config) = services.get(name) else {
+            tracing::warn!(
+                service = %name,
+                "Managed service is absent from config; cannot restart it"
+            );
+            return false;
+        };
+        tracing::warn!(
+            service = %name,
+            endpoint = %self.endpoint,
+            "Embedding endpoint spent its whole retry budget; restarting the managed service"
+        );
+        // `restart` waits for HTTP health before returning, so `Ok` means the
+        // port answers again, not merely that a process was spawned.
+        match crate::services::restart(name, config) {
+            Ok(_) => {
+                tracing::warn!(
+                    service = %name,
+                    "Managed embedding service restarted; resuming neural embedding"
+                );
+                true
+            }
+            Err(error) => {
+                tracing::error!(
+                    service = %name,
+                    %error,
+                    "Managed embedding service restart failed"
+                );
+                false
+            }
+        }
     }
 
     /// Current dimension: measured > override > legacy bootstrap default.
@@ -762,8 +1060,10 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
             .collect())
     }
 
-    /// Shared document-batch path: template with optional titles, send, and
-    /// bisect-retry any batch the endpoint rejects wholesale.
+    /// Shared document-batch path: template with optional titles, probe the
+    /// embedding cache, send only the misses, and bisect-retry any batch the
+    /// endpoint rejects wholesale. Rows that land are stored back in the cache;
+    /// rows the endpoint skipped are not.
     async fn embed_batch_optional_titled(
         &self,
         texts: Vec<&str>,
@@ -779,57 +1079,36 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
                 apply_doc_template(self.doc_template.as_deref(), title.as_deref(), text)
             })
             .collect();
-        let mut rows = vec![None; inputs.len()];
-        let mut pending = vec![(0, inputs.len())];
-        let mut skipped = Vec::new();
-        let mut first_error = None;
+        let total = inputs.len();
+        // Index of every input still needing an embed request.
+        let mut pending_indices: Vec<usize> = (0..total).collect();
+        // Cached rows, in original position space.
+        let mut rows = vec![None; total];
+        let probe = self.probe_cache(&inputs);
 
-        while let Some((start, end)) = pending.pop() {
-            match self.embed_via_api(inputs[start..end].to_vec()).await {
-                Ok(embeddings) if embeddings.len() == end - start => {
-                    for (index, embedding) in (start..end).zip(embeddings) {
-                        rows[index] = Some(embedding);
-                    }
-                }
-                Ok(embeddings) => {
-                    return Err(RemoteEmbeddingError::InvalidResponse(format!(
-                        "Expected {} embeddings, got {}",
-                        end - start,
-                        embeddings.len()
-                    )));
-                }
-                Err(RemoteEmbeddingError::HttpStatus { status, message })
-                    if is_bisectable_embedding_status(status) =>
-                {
-                    first_error.get_or_insert((status, message));
-                    if end - start == 1 {
-                        skipped.push(start);
-                    } else {
-                        tracing::debug!(
-                            start,
-                            end,
-                            batch_len = end - start,
-                            "Bisecting failed remote embedding batch"
-                        );
-                        let middle = start + (end - start) / 2;
-                        pending.push((middle, end));
-                        pending.push((start, middle));
-                    }
-                }
-                Err(error) => return Err(error),
+        if let Some(probe) = &probe {
+            for (position, row) in probe.cached.iter().enumerate() {
+                rows[position] = row.clone();
             }
+            if probe.is_fully_cached() {
+                tracing::debug!(total, "remote batch fully served from the embed cache");
+                return Ok(rows);
+            }
+            pending_indices = probe.miss_positions.clone();
         }
 
-        let embedded = rows.iter().filter(|row| row.is_some()).count();
-        if !skipped.is_empty() && embedded == 0 {
-            let (status, _) = first_error.expect("failed leaves have an HTTP status");
-            return Err(RemoteEmbeddingError::HttpStatus {
-                status,
-                message: format!("all {} inputs failed individually", skipped.len()),
-            });
-        }
-        if !skipped.is_empty() {
-            tracing::warn!(skipped_indices = ?skipped, "Skipping remote embedding inputs rejected individually");
+        // Only the misses are sent. The embedding is identical whether the text
+        // travels in a batch of 500 or alone, so shrinking the request set is a
+        // pure win: fewer tokens, no re-embedding of unchanged documents.
+        let pending_inputs: Vec<_> = pending_indices
+            .iter()
+            .map(|&index| inputs[index].clone())
+            .collect();
+        self.embed_pending(&pending_inputs, &mut rows, &pending_indices)
+            .await?;
+
+        if let Some(probe) = &probe {
+            self.store_cache(probe, &rows);
         }
         Ok(rows)
     }
@@ -861,9 +1140,198 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
             std::sync::atomic::Ordering::Relaxed,
         );
     }
+
+    fn as_custom(&self) -> Option<&CustomEmbeddingProvider> {
+        Some(self)
+    }
 }
 
 impl CustomEmbeddingProvider {
+    /// Attach the embedding-cache namespace (the checkpoint identity minus its
+    /// dimension component). Called once by
+    /// [`GenericRemoteProvider::from_config`]; `None` disables caching.
+    pub(crate) fn set_cache_namespace(&self, namespace: Option<String>) {
+        // Set before the first batch runs, so the uncontended path is the read.
+        let mut slot = match self.cache_namespace.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *slot = namespace;
+    }
+
+    /// Bisect-retry `pending` and write results into `rows` at `indices`.
+    ///
+    /// Returns `Ok(())` when every pending input landed, `Err` when none did
+    /// (so the caller can apply its fallback policy). A partial outcome is
+    /// `Ok(())` with the remaining positions left `None`.
+    async fn embed_pending(
+        &self,
+        pending: &[std::borrow::Cow<'_, str>],
+        rows: &mut [Option<Vec<f32>>],
+        indices: &[usize],
+    ) -> Result<(), RemoteEmbeddingError> {
+        let mut pending_slices = vec![(0, pending.len())];
+        let mut skipped = Vec::new();
+        let mut oversized = Vec::new();
+        let mut first_error = None;
+        let mut aborted_mid_flight = None;
+
+        while let Some((start, end)) = pending_slices.pop() {
+            match self.embed_via_api(pending[start..end].to_vec()).await {
+                Ok(embeddings) if embeddings.len() == end - start => {
+                    for (index, embedding) in (start..end).zip(embeddings) {
+                        rows[indices[index]] = Some(embedding);
+                    }
+                }
+                Ok(embeddings) => {
+                    // Wrong row count: the endpoint answered, but not usable
+                    // for this slice. Retrying cannot fix it, so stop
+                    // bisecting and keep whatever already landed.
+                    aborted_mid_flight = Some(RemoteEmbeddingError::InvalidResponse(format!(
+                        "Expected {} embeddings, got {}",
+                        end - start,
+                        embeddings.len()
+                    )));
+                    pending_slices.clear();
+                    break;
+                }
+                Err(RemoteEmbeddingError::HttpStatus { status, message })
+                    if is_bisectable_embedding_status(status) =>
+                {
+                    if end - start == 1 {
+                        // A single rejected DOCUMENT is a document-level
+                        // verdict, never an endpoint outage: record it and move
+                        // on. Only an unclassifiable status counts toward the
+                        // caller's sustained-failure budget.
+                        if is_oversized_input_rejection(status, &message) {
+                            oversized.push(start);
+                        } else {
+                            skipped.push(start);
+                            first_error.get_or_insert((status, message));
+                        }
+                    } else {
+                        first_error.get_or_insert((status, message));
+                        tracing::debug!(
+                            start,
+                            end,
+                            batch_len = end - start,
+                            "Bisecting failed remote embedding batch"
+                        );
+                        let middle = start + (end - start) / 2;
+                        pending_slices.push((middle, end));
+                        pending_slices.push((start, middle));
+                    }
+                }
+                Err(error) => {
+                    // The endpoint went away mid-batch. Abandoning the queue
+                    // is unavoidable for the REMAINING slices, but the slices
+                    // already embedded are real vectors that were paid for:
+                    // dropping them here is what made a transient blip cost a
+                    // whole batch of documents.
+                    aborted_mid_flight = Some(error);
+                    pending_slices.clear();
+                    break;
+                }
+            }
+        }
+
+        let embedded = indices
+            .iter()
+            .filter(|&&position| rows[position].is_some())
+            .count();
+        if let Some(error) = aborted_mid_flight {
+            if embedded == 0 {
+                return Err(error);
+            }
+            tracing::warn!(
+                %error,
+                embedded,
+                total = indices.len(),
+                "Remote batch aborted mid-flight; keeping already-embedded rows and leaving the rest empty"
+            );
+            return Ok(());
+        }
+        if !skipped.is_empty() && embedded == 0 {
+            let (status, _) = first_error.expect("failed leaves have an HTTP status");
+            return Err(RemoteEmbeddingError::HttpStatus {
+                status,
+                message: format!("all {} inputs failed individually", skipped.len()),
+            });
+        }
+        if !oversized.is_empty() {
+            // Every one of these was refused as an individual DOCUMENT for
+            // exceeding the server's per-input token limit. That is not an
+            // endpoint outage, so it must not surface as an `Err`: doing so
+            // would spend the caller's sustained-failure budget on documents
+            // the server will never accept, which is exactly how oversized
+            // inputs used to freeze the whole neural layer. The rows stay
+            // `None` (those documents get no neural vector) and the batch is
+            // reported as handled.
+            tracing::warn!(
+                oversized = oversized.len(),
+                total = indices.len(),
+                "Skipping documents that exceed the server's per-input token limit; \
+                 raise the service's -ub (logical batch) to admit them"
+            );
+        }
+        if !skipped.is_empty() {
+            tracing::warn!(skipped_indices = ?skipped, "Skipping remote embedding inputs rejected individually");
+        }
+        Ok(())
+    }
+
+    /// Probe the remote embedding cache, opening it once per process.
+    ///
+    /// Every failure path returns `None`, which means "embed everything, no
+    /// cache" — a cache problem must never fail an index.
+    fn probe_cache(
+        &self,
+        inputs: &[std::borrow::Cow<'_, str>],
+    ) -> Option<super::remote_cache::ProbeOutcome> {
+        // Copy the namespace out before taking the cache lock: the two locks are
+        // never held at once, so nothing here can deadlock against the setter.
+        let namespace = {
+            let slot = self
+                .cache_namespace
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            slot.clone()?
+        };
+        // The dimension is the final identity component: a measured (or
+        // checkpoint-adopted) dimension makes warm runs hit, while an
+        // unmeasured provider correctly misses instead of guessing a width.
+        let dimension = self.measured_dimension()?;
+        let mut guard = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+        if guard.is_none() {
+            if self
+                .cache_open_failed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return None;
+            }
+            match super::remote_cache::RemoteEmbedCache::open(&namespace, dimension) {
+                Some(cache) => *guard = Some(cache),
+                None => {
+                    // Flag off, or the store cannot be opened: latch so the
+                    // next batch does not pay for another failed open.
+                    self.cache_open_failed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return None;
+                }
+            }
+        }
+        let cache = guard.as_mut()?;
+        cache.probe(inputs)
+    }
+
+    /// Store the rows that actually landed. Best effort; never fails a batch.
+    fn store_cache(&self, probe: &super::remote_cache::ProbeOutcome, rows: &[Option<Vec<f32>>]) {
+        let mut guard = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(cache) = guard.as_mut() {
+            cache.store_landed(probe, rows);
+        }
+    }
+
     /// POST one `/embeddings` request with already-templated inputs and
     /// enforce the dimension-truth contract (shared by query + document
     /// paths so both always agree on dimension semantics).
@@ -898,25 +1366,25 @@ impl CustomEmbeddingProvider {
         let expected = inputs.len();
 
         let url = format!("{}/embeddings", self.endpoint.trim_end_matches('/'));
-        let mut request_builder = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&request);
-        if let Some(api_key) = &self.api_key {
-            request_builder = request_builder.header("Authorization", format!("Bearer {api_key}"));
-        }
-
-        let response = request_builder
-            .send()
-            .await
-            .map_err(|e| RemoteEmbeddingError::ApiError(e.to_string()))?;
+        let response = send_with_retry(self.max_retries, || {
+            let mut request_builder = self
+                .client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .json(&request);
+            if let Some(api_key) = &self.api_key {
+                request_builder =
+                    request_builder.header("Authorization", format!("Bearer {api_key}"));
+            }
+            request_builder
+        })
+        .await?;
 
         let status = response.status();
         let response_text = response
             .text()
             .await
-            .map_err(|e| RemoteEmbeddingError::ApiError(e.to_string()))?;
+            .map_err(|e| RemoteEmbeddingError::Transport(e.to_string()))?;
 
         if !status.is_success() {
             if status.as_u16() == 429 {
@@ -1094,11 +1562,43 @@ impl GenericRemoteProvider {
             RemoteProvider::Custom { .. } => Arc::new(CustomEmbeddingProvider::new(config)?),
         };
 
+        // Inject the cache namespace. Custom endpoints are the route that can
+        // re-embed an unchanged corpus, so they get one; the namespace is the
+        // same identity (minus dimension) the checkpoint uses, so a model or
+        // template change can never reuse another space's vectors.
+        let backend: &dyn RemoteEmbeddingProvider = provider.as_ref();
+        if let Some(custom) = backend.as_custom() {
+            custom.set_cache_namespace(Some(identity_prefix.clone()));
+        }
+
         Ok(Self {
             provider,
             identity_prefix,
             template_fingerprint,
         })
+    }
+
+    /// One restart attempt per outage, and only for a service this process
+    /// owns.
+    ///
+    /// The caller spends a whole failure budget over many seconds before
+    /// reaching here, so this is not a knee-jerk reaction to one slow batch:
+    /// it is the difference between "the endpoint is busy" and "the endpoint
+    /// is gone". `restart_attempted` on the custom provider latches the
+    /// attempt, so an endpoint that cannot be revived (bad model path, corrupt
+    /// GGUF, no VRAM) fails once instead of cycling the server stop/start
+    /// behind every subsequent batch.
+    ///
+    /// Returns `true` only when a restart actually succeeded. Anything else —
+    /// a third-party endpoint with no local process, a managed one that cannot
+    /// be restarted — keeps the caller's own fallback policy in charge.
+    #[cfg(feature = "remote-embeddings")]
+    pub(crate) fn try_revive_endpoint(&self) -> bool {
+        let Some(custom) = self.provider.as_custom() else {
+            // Nothing local to restart (OpenAI, OpenRouter, Cohere, Google...).
+            return false;
+        };
+        custom.try_revive_endpoint()
     }
 
     /// Stable identity of this provider for embedding caches (no secrets).

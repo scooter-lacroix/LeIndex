@@ -56,6 +56,56 @@ pub(crate) struct GenerationNeuralEmbedder {
     remote_rows_landed: std::cell::Cell<bool>,
     #[cfg(feature = "remote-embeddings")]
     stopped: std::cell::Cell<bool>,
+    /// Whole-batch failures since the last successful batch. Reset by any
+    /// success, so it measures a sustained outage rather than lifetime noise.
+    #[cfg(feature = "remote-embeddings")]
+    consecutive_failures: std::cell::Cell<usize>,
+    /// Restarts already spent by this generation. Bounded by
+    /// [`MAX_GENERATION_RESTARTS`] so an unrevivable endpoint cannot be
+    /// restarted in a loop.
+    #[cfg(feature = "remote-embeddings")]
+    restarts_used: std::cell::Cell<usize>,
+}
+
+/// How many whole batches may fail IN A ROW before the generation gives up.
+///
+/// Each individual request has already spent the transport retry ladder
+/// (`RemoteEmbeddingConfig::max_retries`), so reaching this count means the
+/// endpoint is genuinely gone, not that one socket hiccuped. The old policy
+/// had this at 1: a single reset socket nine minutes into a run froze 70% of
+/// the corpus out of the neural layer and there was no way back.
+pub(crate) const MAX_CONSECUTIVE_REMOTE_FAILURES: usize = 5;
+
+/// Restarts allowed per generation.
+///
+/// A restart clears the failure budget, so without a separate cap a service
+/// that dies on every start would be restarted forever. One restart absorbs a
+/// single OOM or driver reset; exhausting a whole second budget after that is
+/// a real, unrecoverable outage.
+pub(crate) const MAX_GENERATION_RESTARTS: usize = 1;
+
+/// What to do with a remote batch that produced no usable rows.
+#[cfg(feature = "remote-embeddings")]
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteFailureOutcome {
+    /// Skip this batch only; the generation stays on the remote endpoint.
+    SkipBatch,
+    /// Rows already landed in the neural space, so falling back to a different
+    /// embedding space would mix incomparable vectors: freeze instead.
+    Freeze,
+    /// No remote row exists yet, so a coherent all-local generation is safe.
+    FallbackLocal,
+}
+
+#[cfg(feature = "remote-embeddings")]
+fn remote_failure_outcome(landed: bool, consecutive_failures: usize) -> RemoteFailureOutcome {
+    if consecutive_failures < MAX_CONSECUTIVE_REMOTE_FAILURES {
+        RemoteFailureOutcome::SkipBatch
+    } else if landed {
+        RemoteFailureOutcome::Freeze
+    } else {
+        RemoteFailureOutcome::FallbackLocal
+    }
 }
 
 impl GenerationNeuralEmbedder {
@@ -66,6 +116,10 @@ impl GenerationNeuralEmbedder {
             remote_rows_landed: std::cell::Cell::new(false),
             #[cfg(feature = "remote-embeddings")]
             stopped: std::cell::Cell::new(false),
+            #[cfg(feature = "remote-embeddings")]
+            consecutive_failures: std::cell::Cell::new(0),
+            #[cfg(feature = "remote-embeddings")]
+            restarts_used: std::cell::Cell::new(0),
         }
     }
 
@@ -133,6 +187,92 @@ impl GenerationNeuralEmbedder {
         self.selected.into_inner()
     }
 
+    /// Account for one remote batch that produced no usable rows, and return
+    /// the rows the caller must emit.
+    ///
+    /// A single failed batch is survivable: the caller gets `None` rows for
+    /// that batch only and the NEXT batch still goes to the remote endpoint, so
+    /// a transient outage costs a few documents instead of the rest of the
+    /// run. Any successful response clears the count.
+    ///
+    /// Once [`MAX_CONSECUTIVE_REMOTE_FAILURES`] batches fail in a row the
+    /// endpoint is treated as genuinely down, and the escalation prefers
+    /// HEALING over abandoning: a managed service (one LeIndex launched) is
+    /// restarted and its budget restored, so an OOM or a driver reset costs one
+    /// restart instead of the neural layer for every remaining document. Only
+    /// an endpoint that cannot be healed — a third-party API, or a managed one
+    /// whose restart failed — falls through to the freeze/fallback policy.
+    #[cfg(feature = "remote-embeddings")]
+    fn on_remote_batch_failed<S: AsRef<str>>(
+        &self,
+        texts: &[S],
+        reason: &'static str,
+    ) -> Vec<Option<Vec<f32>>> {
+        let failures = self.consecutive_failures.get() + 1;
+        self.consecutive_failures.set(failures);
+        if failures < MAX_CONSECUTIVE_REMOTE_FAILURES {
+            tracing::warn!(
+                reason,
+                failures,
+                budget = MAX_CONSECUTIVE_REMOTE_FAILURES,
+                documents = texts.len(),
+                "Remote batch produced no rows; skipping this batch and keeping the remote endpoint"
+            );
+            return vec![None; texts.len()];
+        }
+        // Budget spent: try to heal the endpoint before giving up on it.
+        if self.try_restart_endpoint() {
+            self.consecutive_failures.set(0);
+            tracing::warn!(
+                reason,
+                failures,
+                documents = texts.len(),
+                "Managed endpoint restarted; retrying this batch on the healed endpoint"
+            );
+            return self.embed_neural_batch_blocking(texts);
+        }
+        match remote_failure_outcome(self.remote_rows_landed.get(), failures) {
+            // Unreachable in practice: `remote_failure_outcome` only reports
+            // SkipBatch below the budget, which the early return handled.
+            RemoteFailureOutcome::SkipBatch => vec![None; texts.len()],
+            RemoteFailureOutcome::Freeze => {
+                self.stopped.set(true);
+                tracing::error!(
+                    reason,
+                    failures,
+                    "Remote failed repeatedly after accepted rows and could not be restarted; \
+                     neural generation frozen for remaining documents"
+                );
+                vec![None; texts.len()]
+            }
+            RemoteFailureOutcome::FallbackLocal => {
+                self.select_local_fallback();
+                self.selected.borrow().embed_neural_batch_blocking(texts)
+            }
+        }
+    }
+
+    /// Restart the managed endpoint, bounded by [`MAX_GENERATION_RESTARTS`].
+    ///
+    /// Distinct from the provider-level latch: the provider's flag prevents
+    /// restarting more than once per outage, while this bounds the total a
+    /// generation will spend, so a service that cannot stay up fails fast
+    /// instead of cycling stop/start for the rest of the run.
+    #[cfg(feature = "remote-embeddings")]
+    fn try_restart_endpoint(&self) -> bool {
+        if self.restarts_used.get() >= MAX_GENERATION_RESTARTS {
+            return false;
+        }
+        let revived = match &*self.selected.borrow() {
+            HybridEmbedder::HybridRemote { remote, .. } => remote.try_revive_endpoint(),
+            _ => false,
+        };
+        if revived {
+            self.restarts_used.set(self.restarts_used.get() + 1);
+        }
+        revived
+    }
+
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
     pub(crate) fn embed_neural_batch_blocking<S: AsRef<str>>(
         &self,
@@ -162,6 +302,8 @@ impl GenerationNeuralEmbedder {
                         // Any successful remote row pins this generation's space.
                         self.remote_rows_landed.set(true);
                     }
+                    // The endpoint answered: the outage is over.
+                    self.consecutive_failures.set(0);
                     return rows;
                 }
                 Ok(rows) => tracing::warn!(
@@ -174,15 +316,7 @@ impl GenerationNeuralEmbedder {
                     "Remote batch failed; applying generation fallback policy"
                 ),
             }
-            if self.remote_rows_landed.get() {
-                self.stopped.set(true);
-                tracing::warn!(
-                    "Remote failed after accepted rows; neural generation frozen to TF-IDF for remaining documents"
-                );
-                return vec![None; texts.len()];
-            }
-            self.select_local_fallback();
-            return self.selected.borrow().embed_neural_batch_blocking(texts);
+            return self.on_remote_batch_failed(texts, "remote_batch_no_rows");
         }
         self.selected.borrow().embed_neural_batch_blocking(texts)
     }
@@ -226,6 +360,8 @@ impl GenerationNeuralEmbedder {
                         // Any successful remote row pins this generation's space.
                         self.remote_rows_landed.set(true);
                     }
+                    // The endpoint answered: the outage is over.
+                    self.consecutive_failures.set(0);
                     return rows;
                 }
                 Ok(rows) => tracing::warn!(
@@ -238,15 +374,7 @@ impl GenerationNeuralEmbedder {
                     "Remote titled batch failed; applying generation fallback policy"
                 ),
             }
-            if self.remote_rows_landed.get() {
-                self.stopped.set(true);
-                tracing::warn!(
-                    "Remote failed after accepted rows; neural generation frozen to TF-IDF for remaining documents"
-                );
-                return vec![None; texts.len()];
-            }
-            self.select_local_fallback();
-            return self.selected.borrow().embed_neural_batch_blocking(texts);
+            return self.on_remote_batch_failed(texts, "remote_titled_batch_no_rows");
         }
         self.selected.borrow().embed_neural_batch_blocking(texts)
     }
@@ -288,12 +416,35 @@ mod generation_tests {
                     provider: crate::search::onnx::RemoteProvider::Custom {
                         endpoint: "http://127.0.0.1:1/v1".into(),
                     },
+                    // Keep the test on the generation policy, not the transport
+                    // ladder: every attempt fails in milliseconds against a
+                    // closed port, and re-sending only spends wall clock.
+                    max_retries: 0,
                     ..RemoteEmbeddingConfig::default()
                 },
                 None,
             )
             .expect("remote construction"),
         );
+        // A pinned generation must never fall back to a different embedding
+        // space, and the freeze must survive one bad batch — it takes sustained
+        // failure to stop, which is the whole point of the budget.
+        for attempt in 1..MAX_CONSECUTIVE_REMOTE_FAILURES {
+            assert!(
+                generation
+                    .embed_neural_batch_blocking(&["document"])
+                    .iter()
+                    .all(Option::is_none)
+            );
+            assert!(
+                !generation.stopped.get(),
+                "failure {attempt} of {MAX_CONSECUTIVE_REMOTE_FAILURES} must not freeze"
+            );
+            assert!(matches!(
+                *generation.selected.borrow(),
+                HybridEmbedder::HybridRemote { .. }
+            ));
+        }
         assert!(
             generation
                 .embed_neural_batch_blocking(&["document"])
@@ -305,6 +456,53 @@ mod generation_tests {
             generation.into_embedder(),
             HybridEmbedder::HybridRemote { .. }
         ));
+    }
+
+    /// The failure budget only works if a success clears it. Without the reset,
+    /// failures scattered across a long index run accumulate into a freeze even
+    /// though the endpoint answered correctly in between.
+    #[test]
+    fn test_remote_success_resets_the_consecutive_failure_budget() {
+        let tfidf = TfIdfEmbedder::build(&[("a.rs".into(), "fn a() {}".into())]);
+        let generation = GenerationNeuralEmbedder::new(
+            HybridEmbedder::hybrid_remote(
+                tfidf,
+                RemoteEmbeddingConfig {
+                    provider: crate::search::onnx::RemoteProvider::Custom {
+                        endpoint: "http://127.0.0.1:1/v1".into(),
+                    },
+                    max_retries: 0,
+                    ..RemoteEmbeddingConfig::default()
+                },
+                None,
+            )
+            .expect("remote construction"),
+        );
+        // One short of the budget, then a success, then one short again: the
+        // generation must still be alive because the success reset the count.
+        for attempt in 1..MAX_CONSECUTIVE_REMOTE_FAILURES {
+            assert!(
+                generation
+                    .embed_neural_batch_blocking(&["document"])
+                    .iter()
+                    .all(Option::is_none)
+            );
+            assert_eq!(generation.consecutive_failures.get(), attempt);
+        }
+        generation.consecutive_failures.set(0); // stands in for a successful batch
+        for attempt in 1..MAX_CONSECUTIVE_REMOTE_FAILURES {
+            assert!(
+                generation
+                    .embed_neural_batch_blocking(&["document"])
+                    .iter()
+                    .all(Option::is_none)
+            );
+            assert_eq!(generation.consecutive_failures.get(), attempt);
+        }
+        assert!(
+            !generation.stopped.get(),
+            "scattered failures must not accumulate into a freeze"
+        );
     }
 
     #[test]

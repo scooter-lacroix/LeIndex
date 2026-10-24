@@ -52,6 +52,10 @@ pub(crate) fn try_remote_neural_embedder(
         doc_template: resolved.doc_template,
         query_template: resolved.query_template,
         base_url: None,
+        // Names the `[services.*]` entry behind this endpoint, so a sustained
+        // outage can be fixed by restarting LeIndex's own server instead of
+        // abandoning the neural layer. `None` for a third-party endpoint.
+        service_name: embeddings_cfg.remote_service.clone(),
         ..crate::search::onnx::RemoteEmbeddingConfig::default()
     };
     match HybridEmbedder::hybrid_remote(

@@ -34,6 +34,11 @@ pub(crate) mod embed_cache_frontend;
 #[cfg(feature = "remote-embeddings")]
 pub mod remote;
 
+/// Client-side embedding cache for the remote route: probe the shared
+/// content-addressed store, send only misses, store what landed.
+#[cfg(feature = "remote-embeddings")]
+pub(crate) mod remote_cache;
+
 #[cfg(feature = "onnx")]
 pub use chunking::{ChunkConfig, CrossLanguageChunker, SemanticChunk};
 
