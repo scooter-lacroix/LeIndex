@@ -58,8 +58,8 @@ Outputs:
 - `target/release/leindex-embed`
 
 Use `cargo install --path . --locked` to install the checked-out source into
-Cargo's binary directory. Add `--features system-one` to include the
-experimental System-One gate.
+Cargo's binary directory. The experimental System-One gate is included by
+default (`system-one` is in the `full` feature set).
 
 ## Neural Setup
 
@@ -104,11 +104,12 @@ prompt templates changes the vector space — re-index afterwards.
 
 ### System One (experimental)
 
-The optional System-One decision gate is **experimental** and ships only in
-feature builds:
+The System-One decision gate is **experimental** and ships off by default at
+runtime — it is compiled in by default (`system-one` is in the `full` feature
+set), but `mode = "off"` keeps it dormant:
 
 ```bash
-cargo install leindex --features system-one
+cargo install leindex      # --features system-one is implied
 leindex setup --system-one   # interactive wizard; writes [system_one] (+ [services.laya] for the managed laya backend)
 ```
 
