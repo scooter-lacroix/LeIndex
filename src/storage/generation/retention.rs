@@ -809,13 +809,9 @@ fn job_is_completed(job_dir: &Path) -> bool {
         }
     }
     // Checkpoint-store layout: phase-complete markers.
-    if job_dir.join("neural.complete").exists()
+    job_dir.join("neural.complete").exists()
         && job_dir.join("pdg.complete").exists()
         && job_dir.join("lexical.complete").exists()
-    {
-        return true;
-    }
-    false
 }
 
 /// Compute total bytes of a directory recursively.

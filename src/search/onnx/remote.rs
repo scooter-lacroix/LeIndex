@@ -16,6 +16,17 @@ pub enum RemoteEmbeddingError {
     #[error("HTTP client error: {0}")]
     HttpClient(String),
 
+    /// Transport-level failure: the request never produced a usable response
+    /// (connection refused/reset, dropped mid-response, DNS failure, timeout).
+    ///
+    /// This is transient by nature and says nothing about the embedding space,
+    /// so callers retry it. A reachable-but-unhappy endpoint reports
+    /// [`Self::HttpStatus`] instead, which is the signal for a permanent
+    /// freeze. Lumping the two together as `ApiError` is what made one dropped
+    /// connection discard every remaining document in a generation.
+    #[error("transport failure: {0}")]
+    Transport(String),
+
     /// API request failed
     #[error("API request failed: {0}")]
     ApiError(String),
@@ -377,13 +388,13 @@ impl RemoteEmbeddingProvider for OpenAIEmbeddingProvider {
             .json(&request)
             .send()
             .await
-            .map_err(|e| RemoteEmbeddingError::ApiError(e.to_string()))?;
+            .map_err(|e| RemoteEmbeddingError::Transport(e.to_string()))?;
 
         let status = response.status();
         let response_text = response
             .text()
             .await
-            .map_err(|e| RemoteEmbeddingError::ApiError(e.to_string()))?;
+            .map_err(|e| RemoteEmbeddingError::Transport(e.to_string()))?;
 
         if !status.is_success() {
             if status.as_u16() == 429 {
@@ -391,10 +402,10 @@ impl RemoteEmbeddingProvider for OpenAIEmbeddingProvider {
                     "OpenAI".to_string(),
                 ));
             }
-            return Err(RemoteEmbeddingError::ApiError(format!(
-                "API returned {}: {}",
-                status, response_text
-            )));
+            return Err(RemoteEmbeddingError::HttpStatus {
+                status: status.as_u16(),
+                message: format!("OpenAI: {response_text}"),
+            });
         }
 
         let openai_response: OpenAIResponse = serde_json::from_str(&response_text)
@@ -493,13 +504,13 @@ impl RemoteEmbeddingProvider for CohereEmbeddingProvider {
             .json(&request)
             .send()
             .await
-            .map_err(|e| RemoteEmbeddingError::ApiError(e.to_string()))?;
+            .map_err(|e| RemoteEmbeddingError::Transport(e.to_string()))?;
 
         let status = response.status();
         let response_text = response
             .text()
             .await
-            .map_err(|e| RemoteEmbeddingError::ApiError(e.to_string()))?;
+            .map_err(|e| RemoteEmbeddingError::Transport(e.to_string()))?;
 
         if !status.is_success() {
             if status.as_u16() == 429 {
@@ -507,10 +518,10 @@ impl RemoteEmbeddingProvider for CohereEmbeddingProvider {
                     "Cohere".to_string(),
                 ));
             }
-            return Err(RemoteEmbeddingError::ApiError(format!(
-                "API returned {}: {}",
-                status, response_text
-            )));
+            return Err(RemoteEmbeddingError::HttpStatus {
+                status: status.as_u16(),
+                message: format!("Cohere: {response_text}"),
+            });
         }
 
         let cohere_response: CohereResponse = serde_json::from_str(&response_text)
@@ -554,6 +565,9 @@ pub struct CustomEmbeddingProvider {
     /// 0 = not yet measured; else the vector length observed in the first
     /// successful response.
     measured: std::sync::atomic::AtomicUsize,
+    /// Retries for a TRANSIENT request failure (transport error, 429,
+    /// 408/502/503/504). Bounded by the request timeout, never unbounded.
+    max_retries: usize,
 }
 
 /// Statuses that can be caused by one bad input (oversized/invalid content;
@@ -562,6 +576,167 @@ pub struct CustomEmbeddingProvider {
 /// freeze path) instead of bisecting into many doomed requests.
 fn is_bisectable_embedding_status(status: u16) -> bool {
     matches!(status, 400 | 413 | 422 | 500)
+}
+
+/// Maximum number of halvings applied to one oversized input before it is
+/// given up on (64 KiB -> 1 KiB after six).
+const MAX_OVERSIZE_SHRINKS: usize = 6;
+
+/// Whether a bisectable rejection means "this ONE input exceeds the server's
+/// per-input token limit" (llama-server answers HTTP 500 with
+/// `input (N tokens) is too large to process`; other servers use 413).
+pub(crate) fn is_oversize_rejection(status: u16, message: &str) -> bool {
+    status == 413 || message.to_ascii_lowercase().contains("too large")
+}
+
+/// The first half of `text` (by bytes), cut back to a char boundary so the
+/// endpoint never receives a partial UTF-8 sequence.
+pub(crate) fn halve_on_char_boundary(text: &str) -> &str {
+    let mut end = text.len() / 2;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// First retry delay for a transient remote failure; doubled per attempt.
+const RETRY_BASE_DELAY_MS: u64 = 100;
+/// Backoff exponent cap (100, 200, 400, 800, 800, ...): a long retry budget
+/// must never turn one flaky batch into seconds of silence.
+const RETRY_MAX_SHIFT: u32 = 3;
+
+/// Whether re-sending the SAME batch could plausibly succeed.
+///
+/// True only for failures that say "not right now": the endpoint never
+/// produced a response, or answered with a gateway/availability/timeout/rate
+/// limit status. `HTTP 500` is deliberately NOT retryable — llama-server uses
+/// it to reject one oversized input, so the batch loop bisects it instead, and
+/// retrying would multiply a deterministic failure.
+///
+/// Everything else is a contract failure (dimension/identity mismatch,
+/// malformed body, an input the endpoint rejects on its own merits). Those are
+/// permanent for this batch and must surface immediately.
+pub(crate) fn is_retryable_embedding_error(error: &RemoteEmbeddingError) -> bool {
+    match error {
+        RemoteEmbeddingError::Transport(_) | RemoteEmbeddingError::RateLimitExceeded(_) => true,
+        RemoteEmbeddingError::HttpStatus { status, .. } => {
+            matches!(status, 408 | 502 | 503 | 504)
+        }
+        _ => false,
+    }
+}
+
+/// Remaining retry allowance for ONE logical batch request.
+///
+/// A logical request fans out into many HTTP attempts: the initial batch, every
+/// bisection sub-batch, and every oversize-shrink attempt. Giving each of those
+/// its own `max_retries` budget means a single dead endpoint costs
+/// `attempts * (max_retries + 1) * timeout_secs` — the cost grows with how far
+/// the batch has to bisect, which is exactly backwards: the sicker the endpoint,
+/// the longer the stall. This struct is created once per logical batch and shared
+/// across its attempts, so the total wait per batch stays bounded by
+/// `(max_retries + 1) * timeout_secs` (plus backoff) no matter how it subdivides.
+/// A counter that must be readable across `await` points, so `Cell` is out
+/// (`!Sync` would make these futures `!Send`) and a locked type is overkill.
+type RetryCounter = std::sync::atomic::AtomicUsize;
+
+struct RetryAllowance<'a> {
+    retries_left: &'a RetryCounter,
+}
+
+impl<'a> RetryAllowance<'a> {
+    fn new(retries_left: &'a RetryCounter) -> Self {
+        Self { retries_left }
+    }
+
+    /// Consume one retry. Returns `false` when the batch's allowance is spent.
+    ///
+    /// `Ordering::Relaxed` is sufficient: the counter is private to one logical
+    /// batch running on one task, so it needs atomicity, not ordering.
+    ///
+    /// Written as an explicit compare-exchange loop rather than
+    /// `AtomicUsize::try_update`, which is only stable since Rust 1.95 — above
+    /// this crate's MSRV. `compare_exchange_weak` is free to spuriously fail, so
+    /// the loop re-reads and retries; a spurious failure simply means one extra
+    /// iteration, never a miscounted retry.
+    fn take(&self) -> bool {
+        let mut current = self.retries_left.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                return false;
+            }
+            match self.retries_left.compare_exchange_weak(
+                current,
+                current - 1,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// The shared budget has no left, so a later attempt reports why it stopped.
+    fn spent(&self) -> bool {
+        self.retries_left.load(std::sync::atomic::Ordering::Relaxed) == 0
+    }
+
+    fn remaining(&self) -> usize {
+        self.retries_left.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Run one batch request, re-sending transient failures while the batch's
+/// shared [`RetryAllowance`] permits.
+///
+/// The allowance is shared with every other attempt of the same logical batch
+/// (bisection sub-batches and oversize shrinks), so the whole batch — not each
+/// sub-attempt — is bounded by `max_retries` retries. A permanent failure is
+/// returned at once: retrying it would only multiply a deterministic error.
+async fn with_transient_retry<T, F, Fut>(
+    allowance: &RetryAllowance<'_>,
+    mut send: F,
+) -> Result<T, RemoteEmbeddingError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, RemoteEmbeddingError>>,
+{
+    let mut backoff_step: u32 = 0;
+    loop {
+        match send().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                // An availability failure is worth re-sending the same bytes for.
+                // An input-caused rejection (400/413/422/500) is not: identical
+                // input gets the identical answer, so retrying could only spend
+                // the batch's SHARED budget — the budget the bisection below needs
+                // to salvage the batch leaf by leaf. Starving it there is not a
+                // mere lost optimisation: `allowance.spent()` makes the bisection
+                // skip the remaining rows, so the caller gets a silent skip
+                // instead of the endpoint failure it is required to propagate.
+                let is_endpoint_failure = is_retryable_embedding_error(&error)
+                    && !matches!(
+                        &error,
+                        RemoteEmbeddingError::HttpStatus { status, .. }
+                            if is_bisectable_embedding_status(*status)
+                    );
+                if !is_endpoint_failure || !allowance.take() {
+                    return Err(error);
+                }
+                let delay =
+                    RETRY_BASE_DELAY_MS.saturating_mul(1u64 << backoff_step.min(RETRY_MAX_SHIFT));
+                tracing::warn!(
+                    %error,
+                    retries_left = allowance.remaining(),
+                    delay_ms = delay,
+                    "Transient remote embedding failure; retrying the same batch"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                backoff_step += 1;
+            }
+        }
+    }
 }
 
 /// Apply a task template to `text`: replace every `{text}` placeholder with
@@ -587,7 +762,7 @@ fn apply_template<'a>(template: Option<&str>, text: &'a str) -> std::borrow::Cow
 /// let a title containing the literal `{text}` swallow the document body: a
 /// source file legitimately named `{text}.rs` produces exactly that title, and
 /// its embedding would be built from the body twice and no title at all.
-fn apply_doc_template<'a>(
+pub(crate) fn apply_doc_template<'a>(
     template: Option<&str>,
     title: Option<&str>,
     text: &'a str,
@@ -699,6 +874,7 @@ impl CustomEmbeddingProvider {
             doc_template: config.doc_template.clone(),
             bootstrap_dimension,
             measured: std::sync::atomic::AtomicUsize::new(0),
+            max_retries: config.max_retries,
         })
     }
 
@@ -718,7 +894,11 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, RemoteEmbeddingError> {
         // Single-text calls are the QUERY path: apply the query template.
         let input = apply_template(self.query_template.as_deref(), text);
-        let embeddings = self.embed_via_api(vec![input]).await?;
+        // One text is one logical batch, so the allowance covers just this call.
+        let retries_left = RetryCounter::new(self.max_retries);
+        let allowance = RetryAllowance::new(&retries_left);
+        let embeddings =
+            with_transient_retry(&allowance, || self.embed_via_api(vec![input.clone()])).await?;
         embeddings.into_iter().next().ok_or_else(|| {
             RemoteEmbeddingError::InvalidResponse("No embedding returned".to_string())
         })
@@ -783,9 +963,23 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
         let mut pending = vec![(0, inputs.len())];
         let mut skipped = Vec::new();
         let mut first_error = None;
+        // ONE allowance for the whole logical batch. Bisection can fan a single
+        // request out into hundreds of sub-requests; handing each its own
+        // `max_retries` budget made a dead endpoint cost
+        // `sub_batches * (max_retries + 1) * timeout_secs`, i.e. the stall grew
+        // the harder the batch failed. Shared here, the batch is bounded no matter
+        // how far it subdivides.
+        let retries_left = RetryCounter::new(self.max_retries);
+        let allowance = RetryAllowance::new(&retries_left);
 
         while let Some((start, end)) = pending.pop() {
-            match self.embed_via_api(inputs[start..end].to_vec()).await {
+            // Retry the SUB-batch, not the whole batch: a transient failure
+            // deep in a bisection must not restart work already landed above.
+            match with_transient_retry(&allowance, || {
+                self.embed_via_api(inputs[start..end].to_vec())
+            })
+            .await
+            {
                 Ok(embeddings) if embeddings.len() == end - start => {
                     for (index, embedding) in (start..end).zip(embeddings) {
                         rows[index] = Some(embedding);
@@ -801,9 +995,24 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
                 Err(RemoteEmbeddingError::HttpStatus { status, message })
                     if is_bisectable_embedding_status(status) =>
                 {
-                    first_error.get_or_insert((status, message));
+                    first_error.get_or_insert((status, message.clone()));
                     if end - start == 1 {
-                        skipped.push(start);
+                        // A lone input the endpoint calls too large is
+                        // shrunk and re-sent rather than dropped: losing it
+                        // would leave the node without a vector, and if it
+                        // is the only input of the batch it would also look
+                        // like a dead endpoint and freeze the generation.
+                        if is_oversize_rejection(status, &message) {
+                            match self
+                                .embed_shrinking_oversized(inputs[start].as_ref(), &allowance)
+                                .await?
+                            {
+                                Some(embedding) => rows[start] = Some(embedding),
+                                None => skipped.push(start),
+                            }
+                        } else {
+                            skipped.push(start);
+                        }
                     } else {
                         tracing::debug!(
                             start,
@@ -811,6 +1020,22 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
                             batch_len = end - start,
                             "Bisecting failed remote embedding batch"
                         );
+                        // Bisection is NOT a retry and must not draw on the retry
+                        // budget. Re-sending identical bytes is a retry; splitting
+                        // the batch is deterministic progress that identifies WHICH
+                        // inputs the endpoint rejects. Charging it to
+                        // `RetryAllowance` meant that with `max_retries = 0` — a
+                        // legitimate configuration, and what several tests pin —
+                        // the budget started empty, so `allowance.spent()` was true
+                        // on the very first failure and every remaining row was
+                        // skipped without a single split. One bad input then failed
+                        // the whole batch, and the caller got a synthetic
+                        // "all N inputs failed individually" instead of the real
+                        // error propagating.
+                        //
+                        // It is bounded without a budget: each split halves the
+                        // range, so depth is <= log2(batch) and the total request
+                        // count is <= 2n-1 for an n-input batch.
                         let middle = start + (end - start) / 2;
                         pending.push((middle, end));
                         pending.push((start, middle));
@@ -864,6 +1089,56 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
 }
 
 impl CustomEmbeddingProvider {
+    /// Re-send one input the endpoint rejected as too large, halving it until
+    /// it fits (at most [`MAX_OVERSIZE_SHRINKS`] times).
+    ///
+    /// `Ok(None)` = still rejected after the last shrink, or rejected for a
+    /// reason other than size: the caller skips this single row. Non-bisectable
+    /// errors (transport, dimension, malformed body) propagate unchanged.
+    ///
+    /// `allowance` is the enclosing logical batch's shared retry budget, so the
+    /// shrink attempts cannot each start a fresh retry cycle.
+    async fn embed_shrinking_oversized(
+        &self,
+        input: &str,
+        allowance: &RetryAllowance<'_>,
+    ) -> Result<Option<Vec<f32>>, RemoteEmbeddingError> {
+        let mut current = input;
+        for attempt in 1..=MAX_OVERSIZE_SHRINKS {
+            current = halve_on_char_boundary(current);
+            if current.is_empty() {
+                return Ok(None);
+            }
+            if allowance.spent() {
+                return Ok(None);
+            }
+            match with_transient_retry(allowance, || {
+                self.embed_via_api(vec![std::borrow::Cow::Borrowed(current)])
+            })
+            .await
+            {
+                Ok(embeddings) => {
+                    tracing::warn!(
+                        attempt,
+                        kept_bytes = current.len(),
+                        original_bytes = input.len(),
+                        "Oversized remote embedding input truncated to fit the endpoint"
+                    );
+                    return Ok(embeddings.into_iter().next());
+                }
+                Err(RemoteEmbeddingError::HttpStatus { status, message })
+                    if is_bisectable_embedding_status(status) =>
+                {
+                    if !is_oversize_rejection(status, &message) {
+                        return Ok(None);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
     /// POST one `/embeddings` request with already-templated inputs and
     /// enforce the dimension-truth contract (shared by query + document
     /// paths so both always agree on dimension semantics).
@@ -910,13 +1185,13 @@ impl CustomEmbeddingProvider {
         let response = request_builder
             .send()
             .await
-            .map_err(|e| RemoteEmbeddingError::ApiError(e.to_string()))?;
+            .map_err(|e| RemoteEmbeddingError::Transport(e.to_string()))?;
 
         let status = response.status();
         let response_text = response
             .text()
             .await
-            .map_err(|e| RemoteEmbeddingError::ApiError(e.to_string()))?;
+            .map_err(|e| RemoteEmbeddingError::Transport(e.to_string()))?;
 
         if !status.is_success() {
             if status.as_u16() == 429 {
@@ -992,6 +1267,10 @@ pub struct GenericRemoteProvider {
     /// caches keyed on this identity (Engram phrase-book, embedding caches)
     /// must not share entries across template changes. `None` = raw text.
     template_fingerprint: Option<String>,
+    /// The document template this provider applies before sending. Exposed via
+    /// [`Self::doc_template`] so the embedding cache can key rows on the exact
+    /// string the endpoint embeds rather than the pre-template text.
+    doc_template: Option<String>,
 }
 
 /// Version of the *semantics* applied by [`apply_doc_template`] and
@@ -1088,6 +1367,11 @@ impl GenericRemoteProvider {
             config.doc_template.as_deref(),
             config.query_template.as_deref(),
         );
+        // Captured before the config moves into the provider: after that this
+        // struct is the only place the caller can learn which template the
+        // endpoint will apply, and the embed cache must key on the templated
+        // string, never on the raw one.
+        let doc_template = config.doc_template.clone();
         let provider: Arc<dyn RemoteEmbeddingProvider> = match &config.provider {
             RemoteProvider::OpenAI { .. } => Arc::new(OpenAIEmbeddingProvider::new(config)?),
             RemoteProvider::Cohere { .. } => Arc::new(CohereEmbeddingProvider::new(config)?),
@@ -1098,7 +1382,14 @@ impl GenericRemoteProvider {
             provider,
             identity_prefix,
             template_fingerprint,
+            doc_template,
         })
+    }
+
+    /// The document template applied to batch inputs before they are sent, if
+    /// any. `None` = raw text.
+    pub fn doc_template(&self) -> Option<&str> {
+        self.doc_template.as_deref()
     }
 
     /// Stable identity of this provider for embedding caches (no secrets).

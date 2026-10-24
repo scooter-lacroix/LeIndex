@@ -429,6 +429,258 @@ fn leaf_title(path: &Path, node_name: &str) -> String {
         .unwrap_or_else(|| node_name.to_string())
 }
 
+/// Nominal byte target for one neural chunk. Must stay far below
+/// `index_builder::cap_neural_text`'s 64 KiB truncation point, so that capping
+/// each chunk is a no-op and no chunk is ever silently truncated on its way to
+/// the embedder. The chunker's own accounting can overshoot this target by a few
+/// bytes (interior line terminators), which is why the bound that actually
+/// matters is the truncation point, not this number.
+///
+/// This is the ONE place the chunk size is defined. It is derived from
+/// [`index_builder::NEURAL_TEXT_CAP_BYTES`] rather than repeating a literal, so a
+/// future change to the cap cannot leave the chunker above it — which would
+/// silently reintroduce the truncation this splitter exists to prevent.
+///
+/// # Measured: the chunk size is NOT a speed lever — do not re-tune it
+///
+/// 2 KiB (`/32`) was tried, then reverted. Isolated server probes were
+/// encouraging — at a constant ~94k tokens, 2048-byte inputs gave 33,968 tok/s
+/// against 20,631 tok/s at 8192 bytes — because llama.cpp forms its physical
+/// batch across SEQUENCES, so many short inputs fill the batch where a single
+/// long input occupies it alone.
+///
+/// Those numbers did not survive contact with the real pipeline. An interleaved
+/// A/B over freshly-generated never-embedded corpora (so the embedding cache
+/// could not mask the effect) measured `median 29.17s` at 8 KiB against
+/// `median 30.04s` at 2 KiB — **0.97x, i.e. no gain, slightly worse**.
+///
+/// The reason is that this splitter almost never fires. Across a real tree the
+/// mean node is 882 bytes with a p90 of 1801; only 7.8% of nodes exceed 2 KiB
+/// and 0.1% exceed 8 KiB. A threshold sitting above the 90th percentile cannot
+/// move end-to-end time no matter which way it is tuned.
+///
+/// So it stays at `/8`. Do not re-tune it expecting a speedup: the threshold
+/// is above the 90th percentile of real node sizes, so it is close to inert.
+/// Measure the node-size distribution before trusting any claim about it — an
+/// earlier revision of this comment stated a token figure taken from a
+/// synthetic probe with 220-character inputs and mistook characters for
+/// tokens, understating real nodes by ~5x.
+const NEURAL_CHUNK_BYTES: usize = index_builder::NEURAL_TEXT_CAP_BYTES / 8;
+
+/// Budget for the neural streaming pass.
+///
+/// Centralised rather than spelled out at the call site so the ceilings that
+/// interact — per-text sequence length, UTF-8 bytes, estimated tokens, and the
+/// chunk size above — are checked against each other by the assertions below
+/// instead of drifting apart silently.
+fn neural_batch_budget() -> streaming::BatchBudget {
+    streaming::BatchBudget {
+        // Measured request-size curve on the managed server at 2048 chars/text,
+        // constant total tokens, median of two runs each:
+        //   64 texts -> 34,908 tok/s
+        //  128 texts -> 34,973 tok/s
+        //  256 texts -> 31,794 tok/s
+        //  512 texts -> 28,652 tok/s
+        // Throughput peaks at 128 and decays as the request grows, so the old
+        // 256 sat past the knee. `max_estimated_tokens` alone did not bound this:
+        // a 120k-node run logged 48 batches of 252 texts, i.e. the text cap was
+        // binding, not the token budget.
+        max_texts: 128,
+        // A chunk is at most NEURAL_CHUNK_BYTES plus a small terminator
+        // overshoot; 2x leaves headroom without admitting a whole 64 KiB node as
+        // a single input.
+        max_seq_len: index_builder::NEURAL_TEXT_CAP_BYTES,
+        ..streaming::BatchBudget::default()
+    }
+}
+
+/// The chunk size and the budget must agree, or a chunk is silently skipped.
+///
+/// `BatchBudget::can_accept` rejects any text longer than `max_seq_len`, and an
+/// over-length input is counted as skipped and given no row. `chunk_code` may
+/// overshoot its nominal target by a few bytes, so the only safe relationship is
+/// `NEURAL_CHUNK_BYTES` strictly below `max_seq_len` with room for that overshoot.
+/// Pinned as a compile-time assertion because both values are constants.
+const _: () = assert!(
+    NEURAL_CHUNK_BYTES * 2 <= index_builder::NEURAL_TEXT_CAP_BYTES,
+    "a chunk must have headroom under the per-text cap, or overshoot is skipped"
+);
+
+/// Split one node's bounded semantic text into embedder-sized chunks.
+///
+/// Why this exists: [`index_builder::cap_neural_text`] truncates the text at
+/// 64 KiB, so a node larger than that had its tail dropped from the neural
+/// vector — the tail was never embedded at all. Emitting the text as a sequence
+/// of chunks (each far under the cap) and mean-pooling the chunk vectors covers
+/// the whole node instead of just its head.
+///
+/// The split reuses the fragment chunker rather than inventing a byte splitter.
+/// `chunk_code` parses the text with tree-sitter when a grammar is available for
+/// the path's extension and falls back to a UTF-8-safe naive line walk otherwise.
+/// For a node's own source range the semantic fragments are contiguous slices of
+/// that range (`split_node` grows each fragment from the node start through its
+/// children), so no part of the node is skipped.
+///
+/// These chunks are NOT fragments: fragments are `owner`-addressed rows for a
+/// content-hash store, whereas these exist only to be recombined into the single
+/// vector a PDG node stores.
+fn split_neural_chunks(text: &str, path: &std::path::Path) -> Vec<String> {
+    let chunks: Vec<String> =
+        index_builder::fragment::chunk_code(text, path, NEURAL_CHUNK_BYTES, true)
+            .into_iter()
+            .map(|fragment| fragment.content.to_owned())
+            .collect();
+    if chunks.is_empty() {
+        // Nothing to split (empty source, or a path with no chunkable content):
+        // embed the text as-is so the node still gets a vector.
+        vec![text.to_owned()]
+    } else {
+        chunks
+    }
+}
+
+/// Mean-pool every chunk vector of one node into the single row that node stores.
+///
+/// Means are accumulated as running sums, so a node whose chunks straddle a batch
+/// boundary is still aggregated correctly: the partial sum carries in `open`
+/// until the node's last chunk lands.
+///
+/// Cosine scoring is norm-invariant (`search::vector::cosine_similarity` normalizes
+/// both sides), so the pooled vector is deliberately left unnormalized — no extra
+/// sqrt pass and no change in rank order. Empty chunk vectors are dropped rather
+/// than averaged in, so a chunk the embedder refused does not dilute the mean
+/// toward the origin.
+struct MeanPoolNeuralRowWriter<W: streaming::neural::NeuralRowWriter> {
+    inner: W,
+    open_node_id: Option<String>,
+    open_sum: Vec<f32>,
+    open_chunks: usize,
+    /// A chunk of the open node arrived in a different vector space, so the
+    /// running sum no longer represents the whole node.
+    open_dim_mismatch: bool,
+    /// Nodes abandoned because their chunks disagreed on dimension. Reported
+    /// once at the end of the pass rather than warned per node.
+    dim_mismatch_nodes: usize,
+}
+
+impl<W: streaming::neural::NeuralRowWriter> MeanPoolNeuralRowWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            open_node_id: None,
+            open_sum: Vec::new(),
+            open_chunks: 0,
+            open_dim_mismatch: false,
+            dim_mismatch_nodes: 0,
+        }
+    }
+
+    /// Add one chunk vector to the open node's running sum.
+    fn fold(&mut self, node_id: &str, embedding: &[f32]) -> Result<()> {
+        if embedding.is_empty() {
+            return Ok(());
+        }
+        if self.open_node_id.as_deref() != Some(node_id) {
+            // The streaming pass emits a node's chunks consecutively, so a
+            // different id means the previous node is complete.
+            self.finish_open()?;
+            self.open_node_id = Some(node_id.to_owned());
+            self.open_sum.clear();
+            self.open_chunks = 0;
+            self.open_dim_mismatch = false;
+        }
+        if self.open_sum.is_empty() {
+            self.open_sum = embedding.to_vec();
+        } else if self.open_sum.len() == embedding.len() {
+            for (slot, value) in self.open_sum.iter_mut().zip(embedding) {
+                *slot += value;
+            }
+        } else {
+            // One node must never mix vector spaces, and a mean over only the
+            // chunks that agreed would silently represent a fraction of the
+            // node's text. Abandon the whole node instead: `finish_open` then
+            // writes nothing and the miss is counted.
+            self.open_dim_mismatch = true;
+            return Ok(());
+        }
+        self.open_chunks += 1;
+        Ok(())
+    }
+
+    /// Number of nodes abandoned for a chunk dimension mismatch, consuming the
+    /// count so the caller reports it exactly once.
+    fn take_dim_mismatches(&mut self) -> usize {
+        std::mem::take(&mut self.dim_mismatch_nodes)
+    }
+
+    /// Write the open node's mean through to the wrapped writer, returning the
+    /// number of rows the wrapped writer actually ACCEPTED (0 or 1).
+    ///
+    /// The count must come back from the wrapped writer, not be assumed. Wrapped
+    /// writers may legitimately reject a row — `SearchNeuralRowWriter` dedupes on
+    /// node id and returns the accepted count from its own `write_batch`. Reporting
+    /// a hardcoded `1` for a rejected row inflates `NeuralStats::rows_written`,
+    /// which is what the phase's success/degraded checks and the checkpoint gate
+    /// read, so a discarded row would be accounted as persisted.
+    fn finish_open(&mut self) -> Result<usize> {
+        let Some(node_id) = self.open_node_id.take() else {
+            return Ok(0);
+        };
+        // A node whose chunks spanned two vector spaces has no valid mean; drop
+        // it entirely and account for it instead of persisting a partial one.
+        if self.open_dim_mismatch {
+            self.dim_mismatch_nodes += 1;
+            self.open_dim_mismatch = false;
+            self.open_sum.clear();
+            self.open_chunks = 0;
+            return Ok(0);
+        }
+        let written = if self.open_chunks > 0 {
+            let divisor = self.open_chunks as f32;
+            let mean: Vec<f32> = self.open_sum.iter().map(|sum| sum / divisor).collect();
+            self.inner.write_batch(vec![(node_id, mean)])?
+        } else {
+            0
+        };
+        self.open_sum.clear();
+        self.open_chunks = 0;
+        Ok(written)
+    }
+
+    /// Flush the still-open node. `enrich_neural_streaming` has no finish hook,
+    /// so the last node of every run is still open when it returns — without
+    /// this call that node silently loses its row.
+    fn finish(&mut self) -> Result<usize> {
+        self.finish_open()
+    }
+}
+
+impl<W: streaming::neural::NeuralRowWriter> streaming::neural::NeuralRowWriter
+    for MeanPoolNeuralRowWriter<W>
+{
+    fn write_row(&mut self, node_id: &str, embedding: &[f32]) -> Result<()> {
+        // A writer that bypasses `write_batch` still gets pooling applied.
+        self.fold(node_id, embedding)
+    }
+
+    fn write_batch(&mut self, rows: Vec<(String, Vec<f32>)>) -> Result<usize> {
+        let mut latest = None;
+        for (node_id, embedding) in rows {
+            self.fold(&node_id, &embedding)?;
+            latest = Some(node_id);
+        }
+        // The wrapped writer's `write_batch` dedupes on node id (see
+        // `SearchNeuralRowWriter`), so a partially aggregated node must NOT be
+        // written yet — doing so would make the final mean look like a duplicate
+        // and be dropped. Only fully accumulated nodes are flushed; the wrapped
+        // writer sees exactly one row per node.
+        if self.open_node_id.as_deref() != latest.as_deref() {
+            return self.finish_open();
+        }
+        Ok(0)
+    }
+}
+
 fn streaming_neural_inputs<'a>(
     pdg: &'a crate::graph::pdg::ProgramDependenceGraph,
     admitted_node_ids: &'a HashSet<String>,
@@ -449,77 +701,79 @@ fn streaming_neural_inputs<'a>(
     let mut node_indices = pdg.node_indices();
     let mut file_cache = index_builder::FileReadCache::per_chunk_scratch();
 
-    std::iter::from_fn(move || {
-        loop {
-            let node_idx = node_indices.next()?;
-            let Some(node) = pdg.get_node(node_idx) else {
-                continue;
-            };
+    // `filter_map` + `flatten`, not `from_fn`: one node now yields one input PER
+    // CHUNK (see `split_neural_chunks`), so the per-node work has to produce a
+    // sequence rather than a single item.
+    std::iter::from_fn(move || node_indices.next())
+        .filter_map(move |node_idx| {
+            let node = pdg.get_node(node_idx)?;
             if node.node_type == crate::graph::pdg::NodeType::External
                 || !admitted_node_ids.contains(&node.id)
             {
-                continue;
+                return None;
             }
-            let input = {
-                let file_bytes = file_cache
-                    .get_or_read(Path::new(&*node.file_path))
-                    .unwrap_or_else(|error| {
-                        warn!(
-                            node_id = %node.id,
-                            path = %node.file_path,
-                            %error,
-                            "Failed to read source for streaming neural node; using empty bytes"
-                        );
-                        std::sync::Arc::new(Vec::new())
-                    });
-                let text = index_builder::enriched_node_content(
-                    pdg,
-                    node_idx,
-                    node,
-                    &file_bytes,
-                    &connectivity_config,
-                    &file_summary_ctx,
-                );
+            let file_bytes = file_cache
+                .get_or_read(Path::new(&*node.file_path))
+                .unwrap_or_else(|error| {
+                    warn!(
+                        node_id = %node.id,
+                        path = %node.file_path,
+                        %error,
+                        "Failed to read source for streaming neural node; using empty bytes"
+                    );
+                    std::sync::Arc::new(Vec::new())
+                });
+            let text = index_builder::enriched_node_content(
+                pdg,
+                node_idx,
+                node,
+                &file_bytes,
+                &connectivity_config,
+                &file_summary_ctx,
+            );
+            // The project-relative source path rides along as the document title
+            // so a title-aware provider gets a real `{title}` instead of `none`
+            // (EmbeddingGemma2 trains on title+text prompts).
+            //
+            // This is NOT parity with the legacy route, and the difference is
+            // deliberate: `embed_pending_neural_batch` goes through
+            // `embed_neural_batch_blocking`, which passes no title, so
+            // `apply_doc_template` renders `{title}` as `none` there and as a
+            // path here. Only this route has a PDG node to derive a path from.
+            //
+            // The two flavours CAN coexist in one store, and nothing enforces
+            // otherwise. `index_project`'s lexical phase uses the
+            // `index_nodes_tfidf_only*` routes, which pass `_allow_neural =
+            // false` — but the public `LeIndex::reload_vector_from_pdg` calls
+            // `index_builder::index_nodes`, which passes `true`, so
+            // `admit_prepared_node` builds a neural embedder and defers to the
+            // title-less batch on the SAME resident engine this phase later
+            // enriches. A process that rebuilds vectors that way, then indexes,
+            // mixes both flavours in one generation.
+            //
+            // The risk that carries is retrieval quality, not cache corruption:
+            // titles join the doc template, so title-aware rows and `none` rows
+            // are embedded from different prompts and score against each other
+            // slightly worse. Cache identity is unaffected — the template
+            // fingerprint covers it. Accepted, and pinned here so it is not
+            // mistaken for a guarantee.
+            // `document_title` owns the leak guarantees; see its doc.
+            let title = document_title(&node.file_path, project_path, &node.name);
+            let node_id = node.id.clone();
+            // A node too large for one embedder request is split rather than
+            // truncated; `MeanPoolNeuralRowWriter` recombines the chunk vectors
+            // into the single row the node stores. Short nodes produce exactly
+            // one chunk and are unchanged from before.
+            let chunks = split_neural_chunks(&text, Path::new(&*node.file_path));
+            Some(chunks.into_iter().map(move |chunk| {
                 Ok(streaming::neural::NeuralInput {
-                    node_id: node.id.clone(),
-                    text: index_builder::cap_neural_text(&text).to_owned(),
-                    // The project-relative source path rides along as the
-                    // document title so a title-aware provider gets a real
-                    // `{title}` instead of `none` (EmbeddingGemma2 trains on
-                    // title+text prompts).
-                    //
-                    // This is NOT parity with the legacy route, and the
-                    // difference is deliberate: `embed_pending_neural_batch`
-                    // goes through `embed_neural_batch_blocking`, which passes
-                    // no title, so `apply_doc_template` renders `{title}` as
-                    // `none` there and as a path here. Only this route has a
-                    // PDG node to derive a path from.
-                    //
-                    // The two flavours CAN coexist in one store, and nothing
-                    // enforces otherwise. `index_project`'s lexical phase uses
-                    // the `index_nodes_tfidf_only*` routes, which pass
-                    // `_allow_neural = false` — but the public
-                    // `LeIndex::reload_vector_from_pdg` calls
-                    // `index_builder::index_nodes`, which passes `true`, so
-                    // `admit_prepared_node` builds a neural embedder and defers
-                    // to the title-less batch on the SAME resident engine this
-                    // phase later enriches. A process that rebuilds vectors that
-                    // way, then indexes, mixes both flavours in one generation.
-                    //
-                    // The risk that carries is retrieval quality, not cache
-                    // corruption: titles join the doc template, so title-aware
-                    // rows and `none` rows are embedded from different prompts
-                    // and score against each other slightly worse. Cache
-                    // identity is unaffected — the template fingerprint covers
-                    // it. Accepted, and pinned here so it is not mistaken for a
-                    // guarantee.
-                    // `document_title` owns the leak guarantees; see its doc.
-                    title: Some(document_title(&node.file_path, project_path, &node.name)),
+                    node_id: node_id.clone(),
+                    text: index_builder::cap_neural_text(&chunk).to_owned(),
+                    title: Some(title.clone()),
                 })
-            };
-            return Some(input);
-        }
-    })
+            }))
+        })
+        .flatten()
 }
 
 fn enrich_neural_for_route(
@@ -534,25 +788,31 @@ fn enrich_neural_for_route(
     // while the first embed batch is in flight, plus the CPU-fallback watch.
     let progress = NeuralProgress::start(admitted_node_ids.len());
     let streaming_embedder = HybridStreamingEmbedder { inner: embedder };
-    let mut writer = SearchNeuralRowWriter {
+    let writer = SearchNeuralRowWriter {
         engine,
         seen_node_ids: HashSet::new(),
     };
     let mut inputs = streaming_neural_inputs(pdg, admitted_node_ids, project_path);
-    let budget = streaming::BatchBudget {
-        max_texts: 256,
-        max_seq_len: 64 * 1024,
-        ..streaming::BatchBudget::default()
-    };
+    let budget = neural_batch_budget();
+    // Pooling wraps the row writer so every chunk vector is folded into the
+    // owning node's single mean BEFORE the id-deduping writer sees it —
+    // otherwise all but the first chunk of a node would be dropped.
+    let mut pooling = MeanPoolNeuralRowWriter::new(writer);
     let stats = streaming::neural::enrich_neural_streaming(
         &mut inputs,
         &streaming_embedder,
         &mut ProgressNeuralRowWriter {
-            inner: &mut writer,
+            inner: &mut pooling,
             rows_reported: &progress.rows,
         },
         &budget,
     )?;
+    // `enrich_neural_streaming` has no finish hook, so the last node's chunks are
+    // still pooled here when it returns. Flush it or that node silently loses its
+    // row.
+    let mut stats = stats;
+    stats.rows_written += pooling.finish()?;
+    let dim_mismatch_nodes = pooling.take_dim_mismatches();
     drop(progress);
     let (cache_hits_after, cache_misses) = neural_cache_counters();
     // Batches that COMPLETE but write no rows are the signature of a dead
@@ -568,13 +828,36 @@ fn enrich_neural_for_route(
              provider/model state and ~/.leindex/logs/leindex-embed-daemon.log for worker errors."
         );
     }
+    // A partially-degraded generation must not report clean success. `rows_skipped`
+    // counts admitted nodes the embedder refused to vectorise (empty vectors,
+    // over-length text) and `dim_mismatch_nodes` counts nodes whose chunks spanned
+    // two vector spaces and were therefore abandoned whole. Either way those nodes
+    // get NO neural row: semantic search cannot retrieve them, and because the
+    // generation still completes and writes its checkpoint, a resume will not
+    // revisit them either. Name the count so the gap is never mistaken for a
+    // complete neural layer.
+    if stats.rows_skipped > 0 || dim_mismatch_nodes > 0 {
+        warn!(
+            written = stats.rows_written,
+            skipped = stats.rows_skipped,
+            dim_mismatch = dim_mismatch_nodes,
+            "neural enrichment finished with rows it could not embed. Those nodes have no neural \
+             row, so semantic search cannot retrieve them and a resume will not retry them. Force \
+             a re-embed (`leindex index --force`) after fixing the reported provider/model error."
+        );
+    }
     progress_stderr(&format!(
-        "Indexing: neural done — {} rows ({} from embed cache, {} embedded, {} skipped, {} batches)...",
+        "Indexing: neural done — {} rows ({} from embed cache, {} embedded, {} skipped, {} batches){}...",
         stats.rows_written,
         cache_hits_after - cache_hits_before,
         cache_misses,
         stats.rows_skipped,
         stats.batches,
+        if dim_mismatch_nodes > 0 {
+            format!(", {dim_mismatch_nodes} dropped on dimension mismatch")
+        } else {
+            String::new()
+        },
     ));
     Ok(stats.rows_written)
 }
@@ -1286,6 +1569,19 @@ impl LeIndex {
     }
 }
 
+/// `neural_publish` is declared unconditionally by `indexing/mod.rs`, and the code
+/// under test here — `split_neural_chunks`, `MeanPoolNeuralRowWriter`,
+/// `neural_batch_budget` — carries no `onnx`/`remote-embeddings` gate of its own.
+/// The module is reachable whenever the `cli` feature is on, which is the only
+/// gate that matters for it.
+///
+/// So this module's tests carry `test` alone. Tying them to `onnx` claimed a gate
+/// the production code does not have: in a `cli`-enabled build without `onnx` the
+/// chunk splitter and mean-pool writer still compile and ship, and their tests
+/// would have been compiled out. A test's gate has to match its subject's, or the
+/// coverage silently disappears exactly where nobody is looking.
+///
+/// Tests needing a neural backend keep their own tighter gate.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1768,6 +2064,313 @@ mod tests {
         let rows = mmap.entries().expect("streaming stored rows");
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|(_, row)| row.len() == 768));
+    }
+
+    #[test]
+    fn test_split_neural_chunks_covers_every_byte_under_the_cap() {
+        // A node far larger than NEURAL_CHUNK_BYTES: the pre-fix path truncated
+        // it at 64 KiB, so everything past that never reached the embedder.
+        let mut source = String::new();
+        for index in 0..4_000 {
+            source.push_str(&format!("fn generated_{index}() -> i32 {{ {index} }}\n"));
+        }
+        assert!(
+            source.len() > 2 * NEURAL_CHUNK_BYTES,
+            "fixture must exceed the chunk cap"
+        );
+
+        let chunks = split_neural_chunks(&source, Path::new("generated.rs"));
+
+        assert!(chunks.len() > 1, "a large node must split into chunks");
+        // Coverage, not just count: every non-terminator character must appear
+        // exactly once, in order. Newlines are insignificant here — a fragment
+        // includes the terminators INSIDE it but not the one ending its last line,
+        // so a seam drops exactly one newline per split.
+        let joined: String = chunks.concat();
+        assert_eq!(
+            joined.replace('\n', ""),
+            source.replace('\n', ""),
+            "chunks must cover every line of the node, in order"
+        );
+        for chunk in &chunks {
+            // The bound that matters: no chunk may reach `cap_neural_text`'s
+            // 64 KiB truncation point, or the tail of that chunk is dropped and
+            // we are back to the bug this splitter exists to fix. (The chunker's
+            // nominal target can overshoot by a few bytes, so assert against the
+            // truncation point rather than NEURAL_CHUNK_BYTES.)
+            assert!(
+                chunk.len() < 64 * 1024,
+                "chunk of {} bytes reaches the 64 KiB truncation point",
+                chunk.len()
+            );
+        }
+        // The pre-fix path truncated at 64 KiB. Prove the coverage now exceeds
+        // that, i.e. the tail that used to be dropped is embedded.
+        assert!(
+            joined.len() > 64 * 1024,
+            "coverage ({}) must exceed the old 64 KiB truncation point",
+            joined.len()
+        );
+    }
+
+    #[test]
+    fn test_split_neural_chunks_keeps_small_node_as_one_input() {
+        // Short nodes must be byte-for-byte unchanged from the pre-chunking path.
+        let source = "// type:function lang:rust\n// f in a.rs\nfn f() -> i32 { 1 }\n";
+        let chunks = split_neural_chunks(source, Path::new("a.rs"));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].trim_end(), source.trim_end());
+    }
+
+    #[test]
+    fn test_split_neural_chunks_never_returns_empty() {
+        // An empty node still needs one input, or the node silently gets no row.
+        assert_eq!(
+            split_neural_chunks("", Path::new("a.rs")),
+            vec![String::new()]
+        );
+    }
+
+    #[test]
+    fn test_mean_pool_emits_one_row_per_node_across_a_batch_boundary() {
+        // The regression this guards: `SearchNeuralRowWriter` keeps only the
+        // FIRST row per node id. Without pooling, a node's later chunks would be
+        // dropped; with pooling, the mean must land exactly once even though the
+        // node's chunks were flushed in two separate batches.
+        let inputs: Vec<Result<streaming::neural::NeuralInput>> = vec![
+            Ok(streaming::neural::NeuralInput {
+                node_id: "big".to_string(),
+                text: "chunk-a".to_string(),
+                title: None,
+            }),
+            Ok(streaming::neural::NeuralInput {
+                node_id: "big".to_string(),
+                text: "chunk-b".to_string(),
+                title: None,
+            }),
+            Ok(streaming::neural::NeuralInput {
+                node_id: "big".to_string(),
+                text: "chunk-c".to_string(),
+                title: None,
+            }),
+            Ok(streaming::neural::NeuralInput {
+                node_id: "small".to_string(),
+                text: "chunk-d".to_string(),
+                title: None,
+            }),
+        ];
+        // One input per batch forces "big" to straddle three batch boundaries.
+        let budget = streaming::BatchBudget {
+            max_texts: 1,
+            ..Default::default()
+        };
+        let mut source = inputs.into_iter();
+        let mut writer = MeanPoolNeuralRowWriter::new(streaming::neural::VecNeuralRowWriter::new());
+        let embedder = streaming::neural::MockEmbedder::new(4);
+        let stats = streaming::neural::enrich_neural_streaming(
+            &mut source,
+            &embedder,
+            &mut writer,
+            &budget,
+        )
+        .expect("mean-pooled streaming");
+        // Mirrors `enrich_neural_for_route`: the streaming pass has no finish
+        // hook, so the trailing node must be flushed explicitly. Without this the
+        // last node silently loses its row.
+        writer.finish().expect("flush the trailing node");
+
+        let rows = &writer.inner.rows;
+        assert_eq!(rows.len(), 2, "one row per node, got {rows:?}");
+        assert_eq!(rows[0].0, "big");
+        assert_eq!(rows[1].0, "small");
+
+        // The pooled row must be the true mean of the three chunk vectors.
+        use streaming::neural::StreamingEmbedder as _;
+        let expected: Vec<Vec<f32>> = embedder.embed_batch(&[
+            "chunk-a".to_string(),
+            "chunk-b".to_string(),
+            "chunk-c".to_string(),
+        ]);
+        for (dim, pooled) in rows[0].1.iter().enumerate() {
+            let mean = (expected[0][dim] + expected[1][dim] + expected[2][dim]) / 3.0;
+            assert!(
+                (pooled - mean).abs() < 1e-6,
+                "dim {dim}: pooled {pooled} != mean {mean}"
+            );
+        }
+        // 4 inputs consumed, 2 rows written to the wrapped writer.
+        assert_eq!(stats.batches, 4);
+    }
+
+    /// Opt-in measurement of the chunk-split + mean-pool input stage on a fixed
+    /// synthetic corpus. No model, no network, no timing assertions — it RECORDS
+    /// numbers and guards the invariants the feature exists to provide.
+    ///
+    /// Run:
+    /// `cargo test --lib --features onnx test_neural_chunking_benchmark -- --ignored --nocapture`
+    ///
+    /// Corpus: `NODES` nodes of `NODE_BYTES` each (default 512 × 256 KiB = 128 MiB
+    /// of source) generated one node at a time, so the measurement reflects
+    /// streaming rather than a pre-built corpus.
+    ///
+    /// Guards (each fails the run):
+    /// - one stored row per node (chunk pooling must not drop or duplicate),
+    /// - no chunk reaches the 64 KiB truncation point,
+    /// - concatenated chunk coverage equals the node text (nothing skipped),
+    /// - peak RSS growth stays under `RSS_GROWTH_LIMIT` — the regression guard
+    ///   against re-introducing whole-corpus accumulation.
+    #[test]
+    #[ignore = "opt-in measurement; run explicitly with --ignored --nocapture"]
+    fn test_neural_chunking_benchmark() {
+        use std::fmt::Write as _;
+
+        /// Generous ceiling: streaming peaks a few MiB above baseline, while
+        /// accumulating this corpus would need >= the full 128 MiB.
+        const RSS_GROWTH_LIMIT: u64 = 64 * 1024 * 1024;
+
+        fn env_usize(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|value: &usize| *value > 0)
+                .unwrap_or(default)
+        }
+
+        /// Peak resident set in bytes.
+        ///
+        /// `/proc/self/status` is Linux-only, so the reader is gated rather than
+        /// relying on the `ok()?` of a failing open: an ungated version compiles
+        /// everywhere and silently reports `None` on macOS/Windows, which would
+        /// turn the RSS regression guard below into a no-op that still prints a
+        /// passing benchmark.
+        #[cfg(target_os = "linux")]
+        fn peak_rss_bytes() -> Option<u64> {
+            let status = std::fs::read_to_string("/proc/self/status").ok()?;
+            status.lines().find_map(|line| {
+                let rest = line.strip_prefix("VmHWM:")?;
+                Some(rest.split_whitespace().next()?.parse::<u64>().ok()? * 1024)
+            })
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        fn peak_rss_bytes() -> Option<u64> {
+            None
+        }
+
+        /// One node's enriched text: exactly `bytes` bytes of realistic Rust.
+        fn node_text(index: usize, bytes: usize) -> String {
+            let mut text = format!("// type:function lang:rust\n// bench_{index} in bench.rs\n");
+            let mut line = 0;
+            while text.len() < bytes {
+                let _ = writeln!(
+                    text,
+                    "fn generated_{index}_{line}(items: &[String]) -> Result<usize, Error> {{ \
+                     let mut total = 0; for item in items {{ total += item.len(); }} Ok(total) }}"
+                );
+                line += 1;
+            }
+            text
+        }
+
+        let nodes = env_usize("LEINDEX_BENCH_NODES", 512);
+        let node_bytes = env_usize("LEINDEX_BENCH_NODE_BYTES", 256 * 1024);
+
+        let baseline_rss = peak_rss_bytes();
+        let started = std::time::Instant::now();
+
+        println!(
+            "nodes,node_bytes,total_bytes,chunks,chunks_per_node,rows,bytes_covered,\
+             bytes_old_cap_kept,coverage_gain"
+        );
+
+        let mut total_chunks = 0usize;
+        let mut total_covered = 0usize;
+        let mut total_old_cap = 0usize;
+
+        // One streaming pass over lazily generated nodes: the writer sees only
+        // one node's chunks at a time, never the whole corpus.
+        let mut inputs = (0..nodes).flat_map(|index| {
+            let text = node_text(index, node_bytes);
+            // Sample the first node's shape for the per-node guards below.
+            let chunks = split_neural_chunks(&text, Path::new("bench.rs"));
+            total_chunks += chunks.len();
+            total_covered += chunks.iter().map(String::len).sum::<usize>();
+            total_old_cap += text.len().min(64 * 1024);
+            assert!(
+                chunks.len() > 1,
+                "node of {} bytes must split into multiple chunks",
+                text.len()
+            );
+            for chunk in &chunks {
+                assert!(
+                    chunk.len() < 64 * 1024,
+                    "chunk of {} bytes reaches the 64 KiB truncation point",
+                    chunk.len()
+                );
+            }
+            let joined: String = chunks.concat();
+            assert_eq!(
+                joined.replace('\n', ""),
+                text.replace('\n', ""),
+                "chunk coverage must reproduce the node text"
+            );
+            chunks.into_iter().map(move |chunk| {
+                Ok(streaming::neural::NeuralInput {
+                    node_id: format!("bench-{index}"),
+                    text: chunk,
+                    title: Some("bench.rs".to_string()),
+                })
+            })
+        });
+
+        let mut writer = MeanPoolNeuralRowWriter::new(streaming::neural::VecNeuralRowWriter::new());
+        let budget = neural_batch_budget();
+        streaming::neural::enrich_neural_streaming(
+            &mut inputs,
+            &streaming::neural::MockEmbedder::new(64),
+            &mut writer,
+            &budget,
+        )
+        .expect("benchmark streaming pass");
+        writer.finish().expect("flush trailing node");
+
+        let elapsed = started.elapsed();
+        let peak_rss = peak_rss_bytes();
+        println!(
+            "{nodes},{node_bytes},{},{total_chunks},{:.2},{},{total_covered},{total_old_cap},{}",
+            nodes * node_bytes,
+            total_chunks as f64 / nodes as f64,
+            writer.inner.rows.len(),
+            total_covered.saturating_sub(total_old_cap),
+        );
+
+        // Guard: exactly one stored row per node — chunk pooling must neither
+        // drop a node nor duplicate one.
+        assert_eq!(
+            writer.inner.rows.len(),
+            nodes,
+            "one pooled row per node required, got {} for {nodes} nodes",
+            writer.inner.rows.len()
+        );
+        // Guard: the feature's whole point — coverage now exceeds what the old
+        // 64 KiB truncation kept.
+        assert!(
+            total_covered > total_old_cap,
+            "coverage ({total_covered}) must exceed the old cap's ({total_old_cap})"
+        );
+        if let (Some(baseline), Some(peak)) = (baseline_rss, peak_rss) {
+            let growth = peak.saturating_sub(baseline);
+            println!(
+                "peak_rss_bytes={peak} baseline_rss_bytes={baseline} growth_bytes={growth} \
+                 limit_bytes={RSS_GROWTH_LIMIT} elapsed_s={:.2}",
+                elapsed.as_secs_f64()
+            );
+            assert!(
+                growth < RSS_GROWTH_LIMIT,
+                "peak RSS grew {growth} bytes (limit {RSS_GROWTH_LIMIT}): the input stage is \
+                 accumulating the corpus instead of streaming one node at a time"
+            );
+        }
     }
 
     #[test]

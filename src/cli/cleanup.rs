@@ -259,16 +259,18 @@ pub fn is_leindex_artifact_by_pattern(dir: &Path) -> bool {
 
     // Pattern: <project>-<hash> under $TMPDIR/leindex/
     // Pattern: lephase-phase<N>-<hash>
-    if name.contains('-') {
-        // Check if under a "leindex" parent directory
-        if dir
+    //
+    // The `-` branch is a full match, not an early bail: a `lephase-*` name also
+    // contains `-`, so a failure here must fall through to the prefix check below.
+    if name.contains('-')
+        && dir
             .parent()
             .map(|p| p.file_name().map(|n| n == "leindex").unwrap_or(false))
             .unwrap_or(false)
-        {
-            // Check if it contains leindex.db (strong indicator)
-            return dir.join("leindex.db").exists();
-        }
+        // Check if it contains leindex.db (strong indicator)
+        && dir.join("leindex.db").exists()
+    {
+        return true;
     }
 
     // lephase-* directories

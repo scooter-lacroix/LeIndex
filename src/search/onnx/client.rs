@@ -1264,7 +1264,11 @@ impl EmbeddingClient {
             match miss_result {
                 EmbedResult::Success(response) => {
                     let miss_vectors = response.into_vectors();
-                    super::embed_cache_frontend::store_misses(&outcome, &miss_vectors);
+                    super::embed_cache_frontend::store_misses(
+                        &outcome,
+                        &miss_vectors,
+                        expected_dim,
+                    );
                     let vectors =
                         ordered_vectors(&outcome.hits, &outcome.miss_positions, &miss_vectors);
                     EmbedResult::Success(flatten_into_response(vectors, expected_dim))

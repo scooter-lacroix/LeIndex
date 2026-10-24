@@ -83,7 +83,7 @@ fn test_gpu_arguments_preserve_and_override_without_duplicates() {
         "--ctx-size",
         "8192",
         "--batch-size",
-        "8192",
+        "2048",
         "--embedding",
         "--pooling",
         "mean",
@@ -92,12 +92,28 @@ fn test_gpu_arguments_preserve_and_override_without_duplicates() {
     .into_iter()
     .map(String::from)
     .collect();
-    let before = args.clone();
     configure_args(&mut args, None, false).unwrap();
-    assert_eq!(args, before);
+    // Unrelated args survive, and the batch pair is normalized up to the floor.
+    assert!(args.windows(2).any(|pair| pair == ["--ctx-size", "8192"]));
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--batch-size", "24576"])
+    );
+    assert!(args.windows(2).any(|pair| pair == ["-ub", "24576"]));
     configure_args(&mut args, Some(7), false).unwrap();
     assert_eq!(gpu_layers(&args).unwrap(), Some(7));
-    assert!(args.windows(2).any(|pair| pair == ["--batch-size", "8192"]));
+    // Re-running must not accumulate duplicate batch flags.
+    assert_eq!(
+        args.iter().filter(|arg| *arg == "--batch-size").count()
+            + args.iter().filter(|arg| *arg == "-b").count(),
+        1
+    );
+    assert_eq!(
+        args.iter()
+            .filter(|arg| *arg == "-ub" || *arg == "--ubatch-size")
+            .count(),
+        1
+    );
     assert_eq!(
         args.iter()
             .filter(|arg| arg.as_str() == "--embedding")
@@ -109,6 +125,52 @@ fn test_gpu_arguments_preserve_and_override_without_duplicates() {
     assert_eq!(gpu_layers(&args).unwrap(), Some(0));
     assert!(gpu_layers(&["-ngl".into()]).is_err());
     assert!(configure_args(&mut vec!["--pooling".into()], None, false).is_err());
+}
+
+#[test]
+fn test_ensure_batch_args_raises_the_default_pair_that_rejects_our_inputs() {
+    // The shipped default: llama-server clamps the effective physical batch to
+    // `-b`, so this pair rejected every node over ~2048 tokens, which is what
+    // drove the bisect storm in the neural phase.
+    let mut args: Vec<String> = ["--embedding", "-b", "2048", "-ub", "2048"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    ensure_batch_args(&mut args);
+    assert!(args.windows(2).any(|p| p == ["-b", "24576"]));
+    assert!(args.windows(2).any(|p| p == ["-ub", "24576"]));
+    assert!(args.contains(&"--embedding".to_string()));
+    let after_first = args.clone();
+    ensure_batch_args(&mut args);
+    assert_eq!(args, after_first, "re-running must not duplicate flags");
+}
+
+#[test]
+fn test_ensure_batch_args_adds_flags_when_absent() {
+    let mut args: Vec<String> = vec!["--embedding".into()];
+    ensure_batch_args(&mut args);
+    assert!(args.windows(2).any(|p| p == ["-b", "24576"]));
+    assert!(args.windows(2).any(|p| p == ["-ub", "24576"]));
+}
+
+#[test]
+fn test_ensure_batch_args_keeps_a_value_already_above_the_default() {
+    for (args, keep) in [
+        (vec!["-b", "4096"], "4096"),
+        (vec!["--batch-size=65536"], "65536"),
+        (vec!["-b=16384"], "16384"),
+    ] {
+        let mut args: Vec<String> = args.into_iter().map(String::from).collect();
+        ensure_batch_args(&mut args);
+        assert!(
+            args.iter().any(|a| a.contains(keep)),
+            "user value {keep} overwritten: {args:?}"
+        );
+        assert!(
+            !args.windows(2).any(|p| p == ["-b", "24576"]),
+            "duplicate -b added alongside the user's flag: {args:?}"
+        );
+    }
 }
 
 #[test]
@@ -181,7 +243,24 @@ fn test_managed_rerun_preserves_alias_autostart_and_extra_arguments() {
     let mut config = LeIndexConfig::default();
     config.services.insert("gemma".into(), service.clone());
     configure_gemma(&mut config, &SetupOptions::default()).unwrap();
-    assert_eq!(config.services["gemma"], service);
+    let after = &config.services["gemma"];
+    // Alias, autostart and the caller's own arguments survive the rerun.
+    assert_eq!(after.alias, service.alias);
+    assert!(!after.auto_start);
+    assert!(
+        service
+            .extra_args
+            .iter()
+            .all(|arg| after.extra_args.contains(arg))
+    );
+    // The batch fix lands on top of them without resizing the chosen batch.
+    assert!(
+        after
+            .extra_args
+            .windows(2)
+            .any(|p| p == ["--batch-size", "8192"])
+    );
+    assert!(after.extra_args.windows(2).any(|p| p == ["-ub", "24576"]));
     assert_eq!(
         config.indexing.embeddings.remote_model.as_deref(),
         Some("custom-gemma")

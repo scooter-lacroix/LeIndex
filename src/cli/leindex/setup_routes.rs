@@ -544,7 +544,76 @@ fn configure_args(
     {
         args.extend(["-ngl".into(), layers.to_string()]);
     }
+    ensure_batch_args(args);
     Ok(())
+}
+
+/// Batch size, in tokens, LeIndex requests for a managed embedding server.
+///
+/// Covers the whole [`crate::cli::index_builder::cap_neural_text`] cap with
+/// headroom. A 64 KiB body that the default server rejected was measured at
+/// 22184 tokens, so this clears the cap with margin.
+pub(super) const BATCH_TOKENS: usize = 24576;
+
+/// llama.cpp's default for `-b` and `-ub`, in tokens.
+pub(super) const LLAMA_DEFAULT_BATCH_TOKENS: usize = 2048;
+
+/// Raise `-b` and `-ub` to [`BATCH_TOKENS`] unless already set higher.
+///
+/// llama-server rejects any single input larger than the *physical* batch with
+/// `HTTP 500: input (N tokens) is too large to process`. LeIndex sends whole
+/// symbol bodies (`cap_neural_text` permits 64 KiB), so on llama.cpp's default
+/// of 2048 tokens a large share of nodes 500 outright and the retry path
+/// bisects the batch until every poisoned node is isolated — the dominant cost
+/// of the neural phase.
+///
+/// Both flags are raised because `-ub` alone does nothing: llama.cpp clamps the
+/// effective physical batch to the logical one, so `-b 2048 -ub 24576` still
+/// rejects anything over 2048 tokens and reproduces the original failure
+/// exactly. `-b` is the binding constraint, and moving it alone would suffice
+/// today — `-ub` is raised alongside it so the pair cannot drift into that
+/// clamp again.
+///
+/// Idempotent, and deliberately conservative: a value above the llama default is
+/// left verbatim, so a hand-edited service config is never silently resized.
+pub(super) fn ensure_batch_args(args: &mut Vec<String>) {
+    raise_batch_arg(args, "-ub", "--ubatch-size");
+    raise_batch_arg(args, "-b", "--batch-size");
+}
+
+/// Raise one batch-size flag (short or long spelling) to at least [`BATCH_TOKENS`].
+fn raise_batch_arg(args: &mut Vec<String>, short: &str, long: &str) {
+    let is_flag = |arg: &str| {
+        [short, long].iter().any(|name| {
+            arg == *name
+                || arg
+                    .strip_prefix(name)
+                    .and_then(|rest| rest.strip_prefix('='))
+                    .is_some()
+        })
+    };
+    let Some(position) = args.iter().position(|arg| is_flag(arg.as_str())) else {
+        args.extend([short.to_string(), BATCH_TOKENS.to_string()]);
+        return;
+    };
+
+    let too_small = |value: usize| value <= LLAMA_DEFAULT_BATCH_TOKENS;
+
+    // `-flag=N` carries its value inline; `-flag N` in the following element.
+    if let Some((_, value)) = args[position].split_once('=') {
+        if value.parse::<usize>().is_ok_and(|value| !too_small(value)) {
+            return;
+        }
+        args[position] = format!("{short}={BATCH_TOKENS}");
+        return;
+    }
+    match args.get(position + 1).and_then(|v| v.parse::<usize>().ok()) {
+        Some(value) if !too_small(value) => {}
+        Some(_) => args[position + 1] = BATCH_TOKENS.to_string(),
+        // Malformed pair (`-flag` with no numeric value): add a well-formed
+        // flag rather than overwriting whatever the user put there.
+        None => args.push(format!("{short}={BATCH_TOKENS}")),
+    }
 }
 
 /// Rejects a `--pooling` flag that has no value (CCN-gate extraction).

@@ -220,7 +220,6 @@ cli = [
 mcp-server = [
     "dep:axum",
     "dep:tower",
-    "dep:tower-http",
     "dep:tokio-stream",
     "dep:futures-util",
     "dep:bytes",
@@ -241,7 +240,6 @@ server = [
     "search",
     "dep:axum",
     "dep:tower",
-    "dep:tower-http",
     "dep:futures",
     "dep:tokio-tungstenite",
     "dep:walkdir",
@@ -455,7 +453,6 @@ sha2 = { version = "0.11", optional = true }
 # Server feature dependencies (axum 0.7)
 axum = { version = "0.8", features = ["ws"], optional = true }
 tower = { version = "0.5", features = ["full"], optional = true }
-tower-http = { version = "0.7", features = ["cors", "trace"], optional = true }
 futures = { version = "0.3", optional = true }
 tokio-tungstenite = { version = "0.29", optional = true }
 

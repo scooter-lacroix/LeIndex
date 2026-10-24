@@ -623,6 +623,10 @@ fn wire_gemma_preset(config: &mut crate::config::LeIndexConfig, gguf: &Path) {
             "-ngl".into(),
             "99".into(),
         ];
+        // The preset writes the whole arg list, so it must also carry the batch
+        // fix: llama-server's default 2048-token batch rejects every input above
+        // ~2048 tokens with HTTP 500, and LeIndex sends whole symbol bodies.
+        setup_routes::ensure_batch_args(&mut entry.extra_args);
         entry.auto_start = true;
         if entry.port == 0 {
             // 8080 = the preset's documented llama-server port; keep 8765 reserved.

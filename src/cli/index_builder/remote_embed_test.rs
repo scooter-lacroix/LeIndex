@@ -340,6 +340,10 @@ fn test_generation_remote_death_after_success_persists_only_remote_space() {
         provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
         remote_dimension: Some(768),
         model: Some("embeddinggemma-2".to_string()),
+        // Retries off: this test pins the VECTOR-SPACE contract (a dead remote
+        // after rows landed must never fall back to 1024-dim local vectors).
+        // Transient recovery is covered by the next test.
+        max_retries: 0,
         ..RemoteEmbeddingConfig::default()
     };
     let generation = GenerationNeuralEmbedder::new(
@@ -400,6 +404,71 @@ fn test_generation_remote_death_after_success_persists_only_remote_space() {
 }
 
 #[test]
+fn test_generation_survives_transient_outage_after_rows_landed() {
+    // The regression that discarded 50,368 nodes: ONE dropped connection after
+    // rows had landed froze the generation and returned None for every
+    // remaining batch. A transient failure must cost a retry, not the corpus.
+    let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_count = request_count.clone();
+    let endpoint = spawn_mock_embeddings_server_scripted(
+        |_| 768,
+        move |_| match server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            1 => 503, // one flaky response, right after the first batch landed
+            _ => 200,
+        },
+        None,
+        4,
+    );
+    let generation = GenerationNeuralEmbedder::new(
+        HybridEmbedder::hybrid_remote(
+            corpus_tfidf(),
+            RemoteEmbeddingConfig {
+                provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+                remote_dimension: Some(768),
+                max_retries: 2,
+                ..RemoteEmbeddingConfig::default()
+            },
+            None,
+        )
+        .expect("remote provider"),
+    );
+
+    assert!(
+        generation
+            .embed_neural_batch_blocking(&["first batch"])
+            .iter()
+            .all(Option::is_some)
+    );
+    assert!(!generation.document_embedding_stopped());
+
+    // Transient outage: retried, recovered, and the rows still land.
+    let rows = generation.embed_neural_batch_blocking(&["second batch", "third batch"]);
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .all(|row| row.as_ref().is_some_and(|v| v.len() == 768)),
+        "a transient outage must not discard the remaining corpus"
+    );
+    assert!(
+        !generation.document_embedding_stopped(),
+        "a transient outage must not freeze the generation"
+    );
+    assert_eq!(
+        request_count.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "one 503 must cost exactly one retry"
+    );
+
+    // And the generation keeps working afterwards.
+    assert!(
+        generation
+            .embed_neural_batch_blocking(&["after recovery"])
+            .iter()
+            .all(Option::is_some)
+    );
+}
+
+#[test]
 fn test_remote_batch_bisects_one_bad_input_without_freezing() {
     let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let server_count = request_count.clone();
@@ -449,6 +518,78 @@ fn test_remote_batch_bisects_one_bad_input_without_freezing() {
         "partial success must not freeze the generation"
     );
     assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 6);
+}
+
+#[test]
+fn test_remote_oversized_lone_input_is_shrunk_not_dropped() {
+    // A single input over the endpoint's per-input limit must be halved and
+    // re-sent until it fits: it keeps a vector, and the generation neither
+    // freezes nor falls back, even though it is the only row that failed.
+    const LIMIT: usize = 150;
+    let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_count = request_count.clone();
+    let endpoint = spawn_mock_embeddings_server_scripted(
+        |_| 8,
+        move |payload| {
+            server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let inputs = payload["input"].as_array().expect("input array");
+            if inputs
+                .iter()
+                .any(|input| input.as_str().is_some_and(|text| text.len() > LIMIT))
+            {
+                413
+            } else {
+                200
+            }
+        },
+        None,
+        8,
+    );
+    let generation = GenerationNeuralEmbedder::new(
+        HybridEmbedder::hybrid_remote(
+            corpus_tfidf(),
+            RemoteEmbeddingConfig {
+                provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+                remote_dimension: Some(8),
+                ..RemoteEmbeddingConfig::default()
+            },
+            None,
+        )
+        .expect("remote provider"),
+    );
+
+    let oversized = "x".repeat(400);
+    let batch = ["small", oversized.as_str()];
+    let rows = generation.embed_neural_batch_blocking(&batch);
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].is_some(), "small row must embed");
+    assert!(
+        rows[1].is_some(),
+        "oversized row must be shrunk and embedded, not dropped"
+    );
+    assert!(!generation.document_embedding_stopped());
+    // whole batch (413) + "small" (200) + oversized (413) + 200 chars (413)
+    // + 100 chars (200).
+    assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 5);
+}
+
+#[test]
+fn test_oversize_rejection_classifier_and_halving() {
+    use crate::search::onnx::remote::{halve_on_char_boundary, is_oversize_rejection};
+    // llama-server's real answer: HTTP 500 carrying the token-limit message.
+    assert!(is_oversize_rejection(
+        500,
+        r#"{"error":{"message":"input (80003 tokens) is too large to process."}}"#
+    ));
+    assert!(is_oversize_rejection(413, ""));
+    // A 500 or 400 with any other cause stays a plain skip.
+    assert!(!is_oversize_rejection(500, "model crashed"));
+    assert!(!is_oversize_rejection(400, "bad request"));
+    // Halving never splits a multi-byte char.
+    let text = "é".repeat(5); // 10 bytes, boundary at every even offset
+    assert_eq!(halve_on_char_boundary(&text), "éé");
+    assert_eq!(halve_on_char_boundary("ab"), "a");
+    assert_eq!(halve_on_char_boundary("a"), "");
 }
 
 #[test]
@@ -517,6 +658,8 @@ fn test_remote_batch_availability_status_fails_fast_without_bisecting() {
             crate::search::onnx::GenericRemoteProvider::from_config(RemoteEmbeddingConfig {
                 provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
                 remote_dimension: Some(8),
+                // Retries off: this test pins BISECTION, not the retry budget.
+                max_retries: 0,
                 ..RemoteEmbeddingConfig::default()
             })
             .expect("remote provider");
@@ -553,6 +696,9 @@ fn test_remote_batch_http_then_transport_error_propagates() {
     let provider = crate::search::onnx::GenericRemoteProvider::from_config(RemoteEmbeddingConfig {
         provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
         remote_dimension: Some(8),
+        // Retries off: this pins the PROPAGATION contract. The retry budget
+        // itself is covered by the transient-retry test below.
+        max_retries: 0,
         ..RemoteEmbeddingConfig::default()
     })
     .expect("remote provider");
@@ -562,9 +708,84 @@ fn test_remote_batch_http_then_transport_error_propagates() {
             .expect_err("transport failure after HTTP error must propagate");
     assert!(matches!(
         error,
-        crate::search::onnx::RemoteEmbeddingError::ApiError(_)
+        crate::search::onnx::RemoteEmbeddingError::Transport(_)
     ));
     assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[test]
+fn test_remote_batch_retries_transient_failure_then_succeeds() {
+    let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_count = request_count.clone();
+    // First request: the endpoint is briefly unavailable. Second: it serves.
+    let endpoint = spawn_mock_embeddings_server_scripted(
+        |_| 8,
+        move |_| {
+            if server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                503
+            } else {
+                200
+            }
+        },
+        None,
+        3,
+    );
+    let provider = crate::search::onnx::GenericRemoteProvider::from_config(RemoteEmbeddingConfig {
+        provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+        remote_dimension: Some(8),
+        max_retries: 3,
+        ..RemoteEmbeddingConfig::default()
+    })
+    .expect("remote provider");
+
+    let rows = block_on_test(provider.embed_batch_optional(vec!["alpha", "beta"]))
+        .expect("a transient 503 must be retried, not fatal");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .all(|row| row.as_ref().is_some_and(|v| v.len() == 8))
+    );
+    assert_eq!(
+        request_count.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "one 503 must cost exactly one extra request"
+    );
+}
+
+#[test]
+fn test_remote_batch_does_not_retry_permanent_failure() {
+    // 401 is a contract/permission failure: retrying and bisecting it would
+    // burn the entire corpus on a misconfigured API key.
+    let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_count = request_count.clone();
+    let endpoint = spawn_mock_embeddings_server_scripted(
+        |_| 8,
+        move |_| {
+            server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            401
+        },
+        None,
+        4,
+    );
+    let provider = crate::search::onnx::GenericRemoteProvider::from_config(RemoteEmbeddingConfig {
+        provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+        remote_dimension: Some(8),
+        max_retries: 3,
+        ..RemoteEmbeddingConfig::default()
+    })
+    .expect("remote provider");
+
+    let error = block_on_test(provider.embed_batch_optional(vec!["alpha", "beta"]))
+        .expect_err("a permanent failure must surface");
+    assert!(matches!(
+        error,
+        crate::search::onnx::RemoteEmbeddingError::HttpStatus { status: 401, .. }
+    ));
+    assert_eq!(
+        request_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "401 must fail immediately: no retry, no bisection"
+    );
 }
 
 #[test]

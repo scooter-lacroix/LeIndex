@@ -224,15 +224,10 @@ pub(crate) fn is_stale_fast(
     };
     let scan = ctx.project_scan.or(cached_scan.as_ref());
 
-    if scan.is_some_and(|scan| scan.source_paths.len() != indexed_files.len())
+    scan.is_some_and(|scan| scan.source_paths.len() != indexed_files.len())
         || source_directories_are_stale(ctx, scan, &indexed_files, db_time)
         || indexed_files_are_stale(ctx, &indexed_files, db_time)
         || manifests_are_stale(ctx, ctx.project_scan, scan, db_time)
-    {
-        return true;
-    }
-
-    false
 }
 
 fn load_cached_or_scan(
