@@ -30,6 +30,8 @@ use std::sync::{
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tower_http::cors::CorsLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{debug, error, info, warn};
 
 /// Global server state — multi-project registry.
@@ -444,7 +446,7 @@ impl McpServer {
         // (which would itself be a startup error worth surfacing
         // via the log).
         let bind_address = listener.local_addr().unwrap_or(self.config.bind_address);
-        let router = Self::router();
+        let router = self.router();
 
         // Spawn background task to clean up stale sessions periodically.
         // Uses 60-second interval and 5-minute idle threshold.
@@ -481,14 +483,61 @@ impl McpServer {
         Ok(())
     }
 
-    fn router() -> Router {
-        Router::new()
+    /// Build the HTTP router, applying the transport-level config.
+    ///
+    /// Both layers here exist because the config fields they read are real
+    /// contract, and reading them is the whole point: `enable_cors` and
+    /// `max_request_size_mb` were declared, defaulted (`true`, `10`), and then
+    /// never read by anything. CORS was dropped during the axum 0.6 -> 0.8 /
+    /// tower-http 0.7 migration and a TODO was left promising its return; that
+    /// promise is what this satisfies, and `tower-http` (already a dependency
+    /// of `mcp-server` and `server`) is what makes it possible.
+    ///
+    /// The `CorsLayer` sits OUTSIDE the JSON-RPC handler, so a preflight
+    /// `OPTIONS` is answered by the layer and never reaches the handler — an
+    /// unhandled preflight would surface as a spurious 405.
+    fn router(&self) -> Router {
+        let router = Router::new()
             .route("/mcp", post(json_rpc_handler))
             .route("/mcp/tools/list", get(list_tools_handler))
             .route("/health", get(health_check_handler))
-            .route("/mcp/index/stream", post(index_stream_handler))
-        // Note: CORS layer removed due to axum 0.6 / tower-http compatibility issues
-        // Can be re-added when upgrading to axum 0.7 with matching tower-http version
+            .route("/mcp/index/stream", post(index_stream_handler));
+
+        // `enable_cors` was documented as "CORS for all origins". Applying that
+        // literally on a server that executes tool calls would let any page in
+        // any tab drive the tool surface, so the wildcard is gated on the
+        // loopback bind that the field's own default already assumes. On a
+        // non-loopback bind, `enable_cors` still enables the layer but with no
+        // allowed origin, which refuses every cross-origin request: a
+        // deliberate fail-closed, since no config field names origins today.
+        let router = if !self.config.enable_cors {
+            router
+        } else if self.config.bind_address.ip().is_loopback() {
+            router.layer(CorsLayer::permissive())
+        } else {
+            warn!(
+                bind = %self.config.bind_address,
+                "MCP bound to a non-loopback address with CORS enabled: refusing all cross-origin \
+                 requests because this server executes tool calls and no allowed origins are \
+                 configured"
+            );
+            router.layer(CorsLayer::new())
+        };
+
+        // Bound body size before the JSON-RPC handler allocates: these handlers
+        // collect the whole body into a `serde_json::Value`, so an unbounded
+        // request is an unbounded allocation. A configured 0 would mean
+        // "reject everything", which is not a useful reading of the field, so
+        // it is treated as "no configured limit".
+        let limit_bytes = self
+            .config
+            .max_request_size_mb
+            .checked_mul(1024 * 1024)
+            .filter(|bytes| *bytes > 0);
+        match limit_bytes {
+            Some(bytes) => router.layer(RequestBodyLimitLayer::new(bytes)),
+            None => router,
+        }
     }
 }
 

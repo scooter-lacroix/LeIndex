@@ -102,6 +102,15 @@ impl PhaseExecutionContext {
         Ok(context)
     }
 
+    /// Whether the graph still has to be loaded or refreshed.
+    ///
+    /// A run whose phases all hit the summary cache never calls
+    /// [`Self::ensure_graph`], so the deferred graph work did not happen and
+    /// must not be reported as an instant stage.
+    pub fn graph_is_pending(&self) -> bool {
+        self.pending_graph.is_some()
+    }
+
     /// Load or refresh the graph if that has not happened yet. Phases call this
     /// before computing anything; a cached phase result never does.
     pub fn ensure_graph(&mut self) -> Result<()> {

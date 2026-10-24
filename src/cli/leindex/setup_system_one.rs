@@ -651,6 +651,16 @@ pub(super) fn print_status(config: &LeIndexConfig) -> bool {
             );
         }
     }
+    // A build compiled without the feature can never reach `active`, and no
+    // amount of config editing changes that. Name the remedy here: a failing
+    // exit code with zero `issue:` lines is an unactionable failure, and this
+    // was exactly that before `full` started including `system-one`.
+    if !build {
+        println!(
+            "  issue: System-One gate is not compiled into this build; rebuild with \
+             `--features system-one` (included in `full`)"
+        );
+    }
     for issue in &issues {
         println!("  issue: {issue}");
     }

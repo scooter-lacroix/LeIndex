@@ -180,6 +180,7 @@ mod tests {
                     phase4: None,
                     phase5: None,
                     formatted_output: "ok".to_string(),
+                    stage_ms: Default::default(),
                 })
             }
         }

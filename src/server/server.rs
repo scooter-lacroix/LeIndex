@@ -97,8 +97,10 @@ impl LeIndexServer {
         // Build application state (clone Arc<Mutex<Storage>>)
         let state = AppState::new_from_arc(Arc::clone(&self.storage), self.config.clone());
 
-        // Build router
-        let app = create_router().with_state(state);
+        // Build router. The CORS allowlist is threaded in from config here
+        // because `.layer()` runs before `.with_state()`, so `create_router`
+        // cannot read it from route state.
+        let app = create_router(&self.config.cors_origins).with_state(state);
 
         // Create server
         let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
