@@ -272,11 +272,7 @@ pub fn is_leindex_artifact_by_pattern(dir: &Path) -> bool {
     }
 
     // lephase-* directories
-    if name.starts_with("lephase-") {
-        return true;
-    }
-
-    false
+    name.starts_with("lephase-")
 }
 
 /// Get the creation/modification time of an artifact directory.

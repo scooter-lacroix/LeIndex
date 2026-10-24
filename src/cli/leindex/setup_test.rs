@@ -74,6 +74,18 @@ fn test_wire_gemma_preset_configures_service_and_preset_dimension() {
             .any(|args| args == ["-ngl", "99"])
     );
     assert!(service.extra_args.contains(&"--embedding".to_string()));
+    // The launch contract a fresh host gets must match the pooling the model
+    // actually needs. EmbeddingGemma2 is mean-pooled; a drifted value here
+    // yields semantically wrong vectors while every other check still passes,
+    // so pin it.
+    assert!(
+        service
+            .extra_args
+            .windows(2)
+            .any(|args| args == ["--pooling", "mean"]),
+        "gemma preset must launch with mean pooling, got {:?}",
+        service.extra_args
+    );
     assert!(config.indexing.embeddings.enable_hybrid);
     assert_eq!(
         config.indexing.embeddings.remote_provider,

@@ -615,14 +615,19 @@ fn wire_gemma_preset(config: &mut crate::config::LeIndexConfig, gguf: &Path) {
     if missing_model {
         entry.model = Some(gguf.display().to_string());
         entry.alias = Some(crate::config::EMBEDDINGGEMMA2_MODEL.to_string());
-        entry.extra_args = vec![
-            "--embedding".into(),
-            "--pooling".into(),
-            "mean".into(),
-            // Use llama.cpp's portable GPU offload count; device names vary by build.
-            "-ngl".into(),
-            "99".into(),
-        ];
+        // Single source of truth for the launch contract (embedding mode,
+        // pooling, offload layers). This deliberately does NOT hand-build its
+        // own argument list: a second copy of these flags is a second thing
+        // that can drift, and a drifted `--pooling` silently produces
+        // semantically wrong vectors while the index still "works".
+        //
+        // `configure_args` only fails on a CPU-vs-GPU-layer conflict, which
+        // cannot arise here (both arguments are fixed). Surface it as a warning
+        // rather than widening this infallible signature for an unreachable
+        // branch — empty `extra_args` still starts a working server.
+        if let Err(error) = setup_routes::configure_args(&mut entry.extra_args, None, false) {
+            tracing::warn!(%error, "gemma preset launch arguments not applied");
+        }
         entry.auto_start = true;
         if entry.port == 0 {
             // 8080 = the preset's documented llama-server port; keep 8765 reserved.
