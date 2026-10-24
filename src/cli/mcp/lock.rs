@@ -230,14 +230,18 @@ fn pid_is_owned(pid: u32, start_path: &Path) -> bool {
     if actual != Some(expected) {
         return false;
     }
-    // Secondary sanity: the owning process should be a leindex mcp server.
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok();
-    cmdline.is_some_and(|raw| {
-        let command = String::from_utf8_lossy(&raw);
-        command
-            .split('\0')
-            .any(|arg| arg.contains("leindex") || arg.contains("mcp"))
-    })
+    // Secondary, corroborating only: the owning process should be a leindex
+    // binary. A mismatch means the start-time agreement was coincidental (the
+    // PID was recycled onto an unrelated program), so the lock is stealable.
+    // Unknown identity counts as not-owned for the same reason as
+    // `cleanup::pid_is_alive`: these sidecars live in this user's run dir, so a
+    // process we cannot identify cannot be the server that owns them. The
+    // legitimate window where `/proc/<pid>/exe` is momentarily unreadable — our
+    // own process between `write_pid` and `write_start_time` — never reaches
+    // here, because `expected` is absent until the `.start` sidecar is written.
+    // Shares `cleanup::pid_program_identity` with `pid_is_alive` so the two
+    // ownership predicates cannot drift apart again.
+    crate::cli::cleanup::pid_program_identity(pid).unwrap_or(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -468,6 +472,55 @@ mod tests {
             std::process::id(),
             &dir.path().join("missing.start")
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pid_is_owned_shares_cleanup_identity() {
+        // Ownership must be decided by executable identity, not argv content.
+        // Guards against the two copies drifting again: this test fails if
+        // `pid_is_owned` reintroduces its own cmdline-substring search instead
+        // of delegating to `cleanup::pid_program_identity`.
+        //
+        // A non-leindex process whose arguments mention leindex/mcp must not be
+        // reported as a leindex owner. Use a two-command script so the shell
+        // stays resident (see the cleanup twin for why `-c` is unusable).
+        let dir = temp_run_dir();
+        let script = dir.path().join("bait.sh");
+        std::fs::write(&script, "sleep 30\nexit 0\n").unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg(&script)
+            .arg("leindex")
+            .arg("mcp")
+            .spawn()
+            .expect("spawn fixture shell");
+
+        // Its start time matches its own sidecar, so only the identity check
+        // can reject it — which is exactly the code path under test. Wait for
+        // the child to exec first: until then /proc still describes the parent.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::read(format!("/proc/{}/cmdline", child.id()))
+            .unwrap_or_default()
+            .is_empty()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture child never exec'd"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let start_path = dir.path().join("bait.start");
+        write_start_time(&start_path, child.id()).unwrap();
+        let owned = pid_is_owned(child.id(), &start_path);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            !owned,
+            "an unrelated process whose argv mentions leindex/mcp must not own a lock"
+        );
     }
 
     #[cfg(not(target_os = "linux"))]
