@@ -1155,15 +1155,24 @@ fn log_indexing_admission_stats(
     }
 }
 
+/// Byte cap on the text sent to the neural worker for one embed input.
+///
+/// Exposed as a module constant (not a local inside [`cap_neural_text`]) because
+/// the per-batch sequence budget and the chunker must both stay under it: a chunk
+/// larger than this is truncated here AND can be rejected by
+/// `BatchBudget::can_accept`, either of which silently drops the tail of a node.
+/// One named source of truth lets those relationships be asserted instead of
+/// copied.
+pub(crate) const NEURAL_TEXT_CAP_BYTES: usize = 64 * 1024;
+
 /// A6: cap the text sent to the neural worker so a single node's content can
 /// never approach the worker's incoming-frame guard, and to bound per-text
 /// tokenize/inference cost. TF-IDF and lexical search keep the FULL content;
 /// only the neural-embedding input is truncated. Cuts on a char boundary so
 /// the tokenizer never receives a partial UTF-8 sequence.
 pub(crate) fn cap_neural_text(text: &str) -> &str {
-    const NEURAL_TEXT_CAP: usize = 64 * 1024;
-    if text.len() > NEURAL_TEXT_CAP {
-        let mut end = NEURAL_TEXT_CAP;
+    if text.len() > NEURAL_TEXT_CAP_BYTES {
+        let mut end = NEURAL_TEXT_CAP_BYTES;
         while end > 0 && !text.is_char_boundary(end) {
             end -= 1;
         }

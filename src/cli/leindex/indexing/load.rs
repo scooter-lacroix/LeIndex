@@ -169,11 +169,11 @@ impl LeIndex {
             index_builder::TfIdfEmbedder::load_from_artifact_path(artifact_path)
                 .ok()
                 .flatten();
-        let restored = Self::restore_engine_from_snapshot(
-            artifact_path,
-            persisted_embedder.as_ref(),
-            crate::config::LeIndexConfig::load_cached(),
-        );
+        // Bind the snapshot so the restore below reads one consistent config
+        // even if a reload lands mid-operation.
+        let config = crate::config::LeIndexConfig::load_cached();
+        let restored =
+            Self::restore_engine_from_snapshot(artifact_path, persisted_embedder.as_ref(), &config);
         PreparedEngine {
             persisted_embedder,
             restored,

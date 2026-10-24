@@ -9,12 +9,24 @@
 // VAL-SETUP-030: Stale config migrated/overwritten
 // VAL-SETUP-032: LEINDEX_HOME override honored
 
+use cache::{probe_due, refresh_cached_config};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Environment variable for the LeIndex home directory override.
 pub const LEINDEX_HOME_ENV: &str = "LEINDEX_HOME";
+
+/// How often `load_cached()` may stat the config file to detect an edit.
+///
+/// The stat is the only cost of keeping a long-lived process in sync with
+/// `leindex.toml`; throttling it means the hot path pays one relaxed atomic load
+/// in the common case. Chosen well below the MCP idle timeout so an edit lands
+/// while the user is still looking at the file, and well above the per-query
+/// call rate so the stat never shows up in a profile.
+const CONFIG_REFRESH_THROTTLE: Duration = Duration::from_secs(2);
 
 /// Default model directory relative to LeIndex home.
 const DEFAULT_MODEL_DIR_SUFFIX: &str = "models";
@@ -1007,6 +1019,13 @@ pub fn model_dir_path() -> Option<PathBuf> {
     resolve_leindex_home().map(|h| h.join(DEFAULT_MODEL_DIR_SUFFIX))
 }
 
+// The cached-config machinery (statics, throttled probe, install path,
+// `ConfigGuard`) lives in `config::cache` — see that module for the reload
+// contract and the ownership rationale behind the `Arc` snapshots.
+mod cache;
+
+pub use cache::ConfigGuard;
+
 // ── Config I/O ──────────────────────────────────────────────────────────
 
 impl LeIndexConfig {
@@ -1051,25 +1070,95 @@ impl LeIndexConfig {
         self.search.neural_weight as f32
     }
 
-    /// Process-wide cached config read. Reads leindex.toml once on first access,
-    /// then serves the cached value; falls back to `Default` on error. Use this
-    /// on hot paths (query/index) so the documented `[search]` knobs are read
-    /// without re-reading the file per call.
-    pub fn load_cached() -> &'static LeIndexConfig {
-        static CACHED: std::sync::OnceLock<LeIndexConfig> = std::sync::OnceLock::new();
-        CACHED.get_or_init(|| {
-            Self::load().unwrap_or_else(|err| {
-                tracing::warn!(
-                    error = %err,
-                    "failed to load leindex.toml for caching; preserving legacy disabled defaults"
-                );
-                Self {
-                    neural: default_legacy_neural_config(),
-                    indexing: default_legacy_indexing_config(),
-                    ..Self::default()
-                }
-            })
-        })
+    /// Process-wide cached config read that stays in sync with the file.
+    ///
+    /// Reads `leindex.toml` on first access and again whenever the file's
+    /// `(mtime, size, inode)` changes, so a config edit reaches long-lived
+    /// processes (the MCP daemon lives for `[mcp] idle_timeout_secs`) instead of
+    /// being frozen at startup. Before the reload support, an edit — switching
+    /// `remote_service`, changing `remote_model`, retuning `[services.gemma]`
+    /// args — silently kept serving the old route for the life of the process.
+    ///
+    /// Use this for a short read. For a snapshot that must survive across
+    /// statements — where a concurrent reload would otherwise change the config
+    /// mid-operation — hold the handle from [`Self::load_cached_arc`] instead;
+    /// it keeps that exact snapshot alive for as long as you need it.
+    ///
+    /// Cost: one uncontended read lock plus an `Arc` clone. The stat that detects
+    /// an edit runs at most once per [`CONFIG_REFRESH_THROTTLE`].
+    pub fn load_cached() -> ConfigGuard {
+        ConfigGuard(Self::load_cached_arc())
+    }
+
+    /// The cached config as an owned, refcounted snapshot.
+    ///
+    /// Prefer this over [`Self::load_cached`] whenever the value must be read
+    /// more than once, or read across an `await`, a lock acquisition, or any
+    /// other point where a reload could install a different snapshot. Holding the
+    /// `Arc` pins the exact config seen here; the previous snapshot is freed when
+    /// its last holder drops it, so no reload leaks.
+    pub fn load_cached_arc() -> Arc<LeIndexConfig> {
+        if probe_due() {
+            if let Some(refreshed) = refresh_cached_config() {
+                return refreshed;
+            }
+        }
+        // `probe_due()` returns true while the slot is empty, so a successful
+        // `refresh_cached_config` above installs the first snapshot. The only way
+        // to reach this clone with an empty slot is a total load failure that was
+        // survived by falling back to defaults, which `refresh_cached_config`
+        // installs rather than leaves empty.
+        cache::installed_snapshot().expect("cached config installed by refresh_cached_config")
+    }
+
+    /// The keys that change which vector space an embedding belongs to, or which
+    /// endpoint produces it. Compared across a reload so a user who edits one of
+    /// these gets told that in-flight caches may now be cold.
+    fn route_identity_keys(&self) -> Vec<(&'static str, String)> {
+        let embeddings = &self.indexing.embeddings;
+        let resolved = embeddings.resolved_remote_with(&self.services);
+        vec![
+            (
+                "[indexing.embeddings] enable_hybrid",
+                embeddings.enable_hybrid.to_string(),
+            ),
+            (
+                "[indexing.embeddings] remote_service",
+                embeddings.remote_service.clone().unwrap_or_default(),
+            ),
+            (
+                "[indexing.embeddings] remote_provider",
+                embeddings.remote_provider.clone(),
+            ),
+            (
+                "[indexing.embeddings] remote_model",
+                resolved
+                    .as_ref()
+                    .and_then(|r| r.model.clone())
+                    .unwrap_or_default(),
+            ),
+            (
+                "[indexing.embeddings] endpoint",
+                resolved.map(|r| r.endpoint).unwrap_or_default(),
+            ),
+            ("[neural] model_name", self.neural.model_name.clone()),
+            (
+                "[neural] execution_provider",
+                self.neural.execution_provider.clone(),
+            ),
+            ("[neural] enabled", self.neural.enabled.to_string()),
+        ]
+    }
+
+    /// Names of the route keys whose values differ between two configs.
+    fn route_identity_changes(&self, other: &LeIndexConfig) -> Vec<&'static str> {
+        let before = self.route_identity_keys();
+        let after = other.route_identity_keys();
+        before
+            .into_iter()
+            .zip(after)
+            .filter_map(|((key, old), (_, new))| (old != new).then_some(key))
+            .collect()
     }
 
     /// Load from explicit path.
@@ -1727,5 +1816,110 @@ mod tests {
             ..ServiceConfig::default()
         };
         assert_eq!(v4.base_url(), "http://127.0.0.1:8080");
+    }
+
+    /// The reload contract: a config edit must be observed by a process that
+    /// already cached a config. This is the regression guard for the bug where
+    /// `load_cached()` was a `OnceLock` and a long-lived MCP daemon kept serving
+    /// the startup route forever after `leindex.toml` changed.
+    ///
+    /// Serialised on the module [`ENV_LOCK`] because it mutates `LEINDEX_HOME`,
+    /// which is process-global and read by every other config-path test.
+    #[test]
+    fn test_load_cached_observes_a_config_edit() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let sandbox = cache::CacheSandbox::new();
+
+        let home = tempfile::tempdir().expect("config home");
+        let config_dir = home.path().join("config");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        let config_path = config_dir.join("leindex.toml");
+
+        // SAFETY: serialised by ENV_LOCK; no other test reads LEINDEX_HOME
+        // concurrently while this guard is held.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, home.path()) };
+
+        std::fs::write(
+            &config_path,
+            "[indexing.embeddings]\nenable_hybrid = true\nremote_service = \"gemma\"\nremote_provider = \"embeddinggemma-2\"\n",
+        )
+        .expect("initial config");
+
+        let first = LeIndexConfig::load_cached();
+        assert_eq!(
+            first.indexing.embeddings.remote_service.as_deref(),
+            Some("gemma"),
+            "initial load must see the written config"
+        );
+
+        // Rewrite with a different route, then force the throttle open. Order
+        // matters: the write must land first so the stamp read during the probe
+        // sees the new file.
+        std::fs::write(
+            &config_path,
+            "[indexing.embeddings]\nenable_hybrid = true\nremote_service = \"other\"\nremote_provider = \"custom\"\n",
+        )
+        .expect("edited config");
+        sandbox.reopen_throttle();
+
+        let second = LeIndexConfig::load_cached();
+        assert_eq!(
+            second.indexing.embeddings.remote_service.as_deref(),
+            Some("other"),
+            "load_cached must observe the edit instead of serving the cached config"
+        );
+
+        // The snapshot taken before the reload must still be valid — a reload
+        // must not free a config another caller is holding — and must still
+        // carry the value it was loaded with.
+        assert_eq!(
+            first.indexing.embeddings.remote_service.as_deref(),
+            Some("gemma"),
+            "a snapshot taken before a reload must stay valid and unchanged"
+        );
+
+        // A malformed rewrite must NOT drop the process to defaults mid-session.
+        std::fs::write(&config_path, "this is not valid toml [[[").expect("broken config");
+        sandbox.reopen_throttle();
+        let third = LeIndexConfig::load_cached();
+        assert_eq!(
+            third.indexing.embeddings.remote_service.as_deref(),
+            Some("other"),
+            "a parse failure must keep the last good config, not fall back to defaults"
+        );
+    }
+
+    /// Route-affecting keys are exactly what earns the "caches may be cold" WARN.
+    #[test]
+    fn test_route_identity_changes_names_the_route_keys() {
+        let base = LeIndexConfig::default();
+        assert!(
+            base.route_identity_changes(&base).is_empty(),
+            "a config must not report changes against itself"
+        );
+
+        let mut changed = base.clone();
+        changed.indexing.embeddings.remote_service = Some("gemma".to_string());
+        let keys = base.route_identity_changes(&changed);
+        assert!(
+            keys.contains(&"[indexing.embeddings] remote_service"),
+            "changing remote_service must be reported, got {keys:?}"
+        );
+
+        let mut model_changed = base.clone();
+        model_changed.neural.model_name = "some-other-model".to_string();
+        let keys = base.route_identity_changes(&model_changed);
+        assert!(
+            keys.contains(&"[neural] model_name"),
+            "changing the local model must be reported, got {keys:?}"
+        );
+
+        // A purely cosmetic section must not look like a route change.
+        let mut unrelated = base.clone();
+        unrelated.mcp.idle_timeout_secs = unrelated.mcp.idle_timeout_secs.wrapping_add(1);
+        assert!(
+            base.route_identity_changes(&unrelated).is_empty(),
+            "unrelated edits must not be reported as route changes"
+        );
     }
 }
