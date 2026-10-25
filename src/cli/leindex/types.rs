@@ -88,6 +88,19 @@ pub struct IndexHealth {
     pub last_failure_phase: Option<IndexPhase>,
     /// Bounded failure detail.
     pub last_failure: Option<String>,
+    /// Items the current phase must process before it completes.
+    ///
+    /// `None` when the running phase's total is unknown, indivisible, or the
+    /// generation is finished — a `None` must never be rendered as "0 of
+    /// something", because "we do not know" and "there is nothing left" are
+    /// different facts. Both fields are `serde(default)` so a snapshot written
+    /// by an older build still deserializes instead of being dropped.
+    #[serde(default)]
+    pub progress_total: Option<usize>,
+    /// Items the current phase has finished. Only meaningful with a
+    /// `progress_total` from the same phase.
+    #[serde(default)]
+    pub progress_done: usize,
 }
 
 impl Default for IndexHealth {
@@ -104,6 +117,8 @@ impl Default for IndexHealth {
             indexed_at_unix_ms: None,
             last_failure_phase: None,
             last_failure: None,
+            progress_total: None,
+            progress_done: 0,
         }
     }
 }

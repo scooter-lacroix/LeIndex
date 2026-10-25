@@ -43,6 +43,13 @@ impl LeIndex {
             indexed_at_unix_ms: previous.indexed_at_unix_ms,
             last_failure_phase: previous.last_failure_phase,
             last_failure: previous.last_failure,
+            // A phase transition invalidates any intra-phase count: it belongs
+            // to the phase that produced it. `PhaseProgress::report` also
+            // refuses to write a count under a phase name it was not started
+            // for, so this is the second of two independent guards against
+            // rendering "397 of 400" beneath the wrong phase.
+            progress_total: None,
+            progress_done: 0,
         };
         let _ = crate::cli::index_freshness::save_health(self.storage_path(), &health);
     }
@@ -390,6 +397,11 @@ impl LeIndex {
             indexed_at_unix_ms: Some(now_ms),
             last_failure_phase: None,
             last_failure: None,
+            // Publishing a Complete generation ends the run: any counters a
+            // mid-flight phase left behind would otherwise survive into a
+            // finished snapshot and read as a stuck bar.
+            progress_done: 0,
+            progress_total: None,
         };
         self.publish_generation_snapshot(generation, &mut health, true)?;
         crate::cli::index_freshness::save_health(self.storage_path(), &health)?;

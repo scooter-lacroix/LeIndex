@@ -1904,6 +1904,14 @@ fn mark_index_failure(project_path: &Path, message: &str, core_published: bool) 
             previous.phase
         }),
         last_failure: Some(message.to_string()),
+        // Carried forward, not cleared: `PhaseProgress::report` refuses to
+        // write a count under a phase it was not started for, and
+        // `mark_index_phase` clears on every transition — so any counters here
+        // belong to `previous.phase`. Keeping them reports WHERE the phase
+        // died instead of discarding the only positional evidence a failure
+        // leaves behind.
+        progress_done: previous.progress_done,
+        progress_total: previous.progress_total,
     };
     let _ = crate::cli::index_freshness::save_health(&storage_path, &health);
 }

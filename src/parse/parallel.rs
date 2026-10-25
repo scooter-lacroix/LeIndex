@@ -169,6 +169,38 @@ impl ParallelParser {
         results
     }
 
+    /// Parse in parallel, reporting the running count of finished files.
+    ///
+    /// The callback exists so a caller can publish "N of M files" while this
+    /// call is still running: `into_par_iter().collect()` yields nothing until
+    /// every file is done, so a caller otherwise has no observable progress
+    /// for the whole parse. One relaxed atomic increment per file is the only
+    /// addition to the hot path — against a parse that allocates a tree.
+    ///
+    /// `on_progress` is the throttling boundary on purpose: this function
+    /// reports EVERY completion, and the caller decides how often that
+    /// becomes a durable write. Reporting here cannot skip an update that
+    /// matters, and the caller cannot forget to sample.
+    pub fn parse_files_counting(
+        &self,
+        file_paths: Vec<PathBuf>,
+        on_progress: Option<&(dyn Fn(usize) + Sync)>,
+    ) -> Vec<ParsingResult> {
+        let Some(on_progress) = on_progress else {
+            return self.parse_files(file_paths);
+        };
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        file_paths
+            .into_par_iter()
+            .map(|path| {
+                let result = self.parse_single_file(path);
+                let finished = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                on_progress(finished);
+                result
+            })
+            .collect()
+    }
+
     /// Parse multiple files in parallel and return both results and statistics
     pub fn parse_files_with_stats(
         &self,
@@ -341,5 +373,61 @@ mod tests {
             "Successful parse should include source_bytes"
         );
         assert!(!results[0].source_bytes.as_ref().unwrap().is_empty());
+    }
+
+    /// The progress callback must observe every completion, monotonically, and
+    /// end at the file count.
+    ///
+    /// This is the only signal a caller has while the parse runs:
+    /// `into_par_iter().collect()` returns nothing until every file is done, so
+    /// without this a long parse is indistinguishable from a hang. Fails if the
+    /// increment is dropped, the wiring is broken, or the count is reported
+    /// after the results (which would make it useless as live progress).
+    #[test]
+    fn test_parse_files_counting_reports_every_completion() {
+        let dir = tempdir().unwrap();
+        let mut paths = Vec::new();
+        for index in 0..8 {
+            let path = dir.path().join(format!("counted_{index}.py"));
+            let mut file = File::create(&path).unwrap();
+            writeln!(file, "def counted_{index}(): pass").unwrap();
+            paths.push(path);
+        }
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        let on_progress = |done: usize| seen.lock().unwrap().push(done);
+        let parser = ParallelParser::new();
+        let results = parser.parse_files_counting(paths, Some(&on_progress));
+
+        assert_eq!(results.len(), 8);
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(
+            seen.len(),
+            8,
+            "every finished file must report once, got {seen:?}"
+        );
+        let mut ascending = seen.clone();
+        ascending.sort_unstable();
+        ascending.dedup();
+        assert_eq!(
+            ascending,
+            (1..=8).collect::<Vec<_>>(),
+            "reports must be exactly 1..=N with no gaps or repeats, got {seen:?}"
+        );
+    }
+
+    /// `None` must take the untouched path: same results, no callback.
+    #[test]
+    fn test_parse_files_counting_without_a_callback_still_parses() {
+        let dir = tempdir().unwrap();
+        let py_path = dir.path().join("uncounted.py");
+        let mut py_file = File::create(&py_path).unwrap();
+        writeln!(py_file, "def uncounted(): pass").unwrap();
+
+        let parser = ParallelParser::new();
+        let results = parser.parse_files_counting(vec![py_path], None);
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_success());
     }
 }

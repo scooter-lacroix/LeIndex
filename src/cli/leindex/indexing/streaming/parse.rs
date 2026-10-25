@@ -339,6 +339,7 @@ fn chunk_file_inputs(files: &[(PathBuf, u64)], budget: &ParseBudget) -> Vec<Vec<
 pub fn stream_parse_parallel(
     files: Vec<(PathBuf, u64)>,
     budget: &ParseBudget,
+    on_progress: Option<&(dyn Fn(usize) + Sync)>,
 ) -> Vec<crate::parse::parallel::ParsingResult> {
     let parser = crate::parse::parallel::ParallelParser::new();
     let mut results = Vec::new();
@@ -352,6 +353,15 @@ pub fn stream_parse_parallel(
             result.source_bytes = None;
         }
         results.extend(chunk_results);
+        // Chunk granularity, not per-file: the whole point of this route is
+        // that `parse_files` is atomic per chunk, so a chunk boundary is the
+        // finest completion signal available without restructuring it. It is
+        // still far better than the nothing a caller saw before, since a
+        // default budget of 50 files per chunk ticks ~8 times on a 400-file
+        // project instead of once at the end.
+        if let Some(on_progress) = on_progress {
+            on_progress(results.len());
+        }
     }
     results
 }
@@ -545,7 +555,7 @@ mod test {
             fs::write(&path, format!("pub fn marker_{i}() -> usize {{ {i} }}\n")).unwrap();
             files.push((path, 64));
         }
-        let results = stream_parse_parallel(files, &ParseBudget::default());
+        let results = stream_parse_parallel(files, &ParseBudget::default(), None);
         assert_eq!(results.len(), 5);
         for (i, result) in results.iter().enumerate() {
             assert!(result.is_success(), "file {i} must parse successfully");
@@ -576,7 +586,7 @@ mod test {
             .unwrap();
             files.push((path, 64));
         }
-        let results = stream_parse_parallel(files, &ParseBudget::default());
+        let results = stream_parse_parallel(files, &ParseBudget::default(), None);
         assert_eq!(results.len(), 3);
         for (i, result) in results.iter().enumerate() {
             assert!(
