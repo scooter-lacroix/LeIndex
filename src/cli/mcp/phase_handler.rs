@@ -289,6 +289,12 @@ fn phase_request(args: &Value, project_root: &Path) -> Result<PhaseRequest, Json
         docs_mode,
         hotspot_keywords: PhaseOptions::default().hotspot_keywords,
         universe: Default::default(),
+        // A caller-supplied ceiling wins; otherwise the env-backed default.
+        budget_ms: extract_usize(args, "max_latency_ms", 0)
+            .ok()
+            .filter(|millis| *millis > 0)
+            .map(|millis| millis as u64)
+            .or(PhaseOptions::default().budget_ms),
     };
     Ok(PhaseRequest {
         selection,

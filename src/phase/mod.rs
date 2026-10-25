@@ -118,6 +118,8 @@ pub fn run_phase_analysis(
     selection: PhaseSelection,
 ) -> Result<PhaseAnalysisReport> {
     let options = options.normalized();
+    // Anchors both the per-stage timings and the wall-clock budget.
+    let run_started = std::time::Instant::now();
     // Split the pipeline's wall time into stages so a slow run is diagnosable
     // from the response itself, without attaching a profiler to a live daemon.
     let mut stage_ms = std::collections::BTreeMap::new();
@@ -140,31 +142,50 @@ pub fn run_phase_analysis(
     let mut phase4_summary = None;
     let mut phase5_summary = None;
 
-    if should_run(1, selection) {
+    // Say which stages ran and why any did not, rather than letting a budget
+    // truncation look like a complete report.
+    let mut budget_exhausted = false;
+    macro_rules! take_budget {
+        () => {
+            if budget_exhausted {
+                false
+            } else if options
+                .budget_ms
+                .is_some_and(|budget| run_started.elapsed().as_millis() as u64 >= budget)
+            {
+                budget_exhausted = true;
+                false
+            } else {
+                true
+            }
+        };
+    }
+
+    if should_run(1, selection) && take_budget!() {
         let (summary, hit) = timed!("phase1", run_phase1(&cache, &mut context))?;
         phase1_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(1);
     }
-    if should_run(2, selection) {
+    if should_run(2, selection) && take_budget!() {
         let (summary, hit) = timed!("phase2", run_phase2(&cache, &mut context))?;
         phase2_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(2);
     }
-    if should_run(3, selection) {
+    if should_run(3, selection) && take_budget!() {
         let (summary, hit) = timed!("phase3", run_phase3(&cache, &mut context, &options))?;
         phase3_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(3);
     }
-    if should_run(4, selection) {
+    if should_run(4, selection) && take_budget!() {
         let (summary, hit) = timed!("phase4", run_phase4(&cache, &mut context, &options))?;
         phase4_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(4);
     }
-    if should_run(5, selection) {
+    if should_run(5, selection) && take_budget!() {
         let (summary, hit) = timed!(
             "phase5",
             run_phase5(
@@ -209,6 +230,28 @@ pub fn run_phase_analysis(
         .collect::<Vec<_>>()
         .join(" ");
     formatted_output.push_str(&format!("\nstage_ms: {breakdown}"));
+    if budget_exhausted {
+        // A truncated run must never read as a complete one. Name the ceiling,
+        // the stages that actually ran, and how to lift it.
+        let skipped = (1..=5)
+            .filter(|phase| should_run(*phase, selection) && !executed_phases.contains(phase))
+            .map(|phase| phase.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        formatted_output.push_str(&format!(
+            "\nINCOMPLETE: stopped after {0}ms of a {1}ms budget; ran phases [{2}], \
+             skipped [{3}]. Raise LEINDEX_PHASE_BUDGET_MS or run the remaining phases \
+             individually with `phase`.",
+            run_started.elapsed().as_millis(),
+            options.budget_ms.unwrap_or_default(),
+            executed_phases
+                .iter()
+                .map(|phase| phase.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            skipped
+        ));
+    }
     Ok(PhaseAnalysisReport {
         project_id: context.project_id,
         generation: context.generation_hash,
@@ -582,6 +625,11 @@ mod tests {
 
     #[test]
     fn single_phase_report_contains_only_requested_phase() {
+        // Any run that reaches `ensure_graph` runs the precision ingest pass,
+        // which reads process-global `LEINDEX_SCIP_*` vars and spawns an
+        // external indexer. Hold the process-wide lock so a test that rewires
+        // those vars cannot overlap with this one (see `lock_flag_tests`).
+        let _scip_guard = crate::feature_flags::lock_flag_tests();
         let dir = tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
         std::fs::write(dir.path().join("src/lib.rs"), "pub fn f()->i32{1}\n").expect("write");
@@ -603,6 +651,9 @@ mod tests {
 
     #[test]
     fn phase3_cache_key_changes_with_top_n() {
+        // Reaches precision ingest via `ensure_graph`; see
+        // `single_phase_report_contains_only_requested_phase`.
+        let _scip_guard = crate::feature_flags::lock_flag_tests();
         let dir = tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
         std::fs::write(
@@ -636,5 +687,63 @@ mod tests {
             !second.cache_hit,
             "phase 3 cache must miss when top_n changes"
         );
+    }
+
+    #[test]
+    fn exhausted_budget_skips_remaining_phases_and_says_so() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn f()->i32{1}\n").expect("write");
+
+        // A zero-nanosecond ceiling is already spent by the time `prepare`
+        // returns, so the gate must refuse to start phase 1. This is the whole
+        // contract: no further stage starts once the ceiling is passed.
+        let report = run_phase_analysis(
+            PhaseOptions {
+                root: dir.path().to_path_buf(),
+                budget_ms: Some(0),
+                ..PhaseOptions::default()
+            },
+            PhaseSelection::All,
+        )
+        .expect("phase run");
+
+        assert!(
+            report.executed_phases.is_empty(),
+            "no phase may start once the budget is spent, got {:?}",
+            report.executed_phases
+        );
+        assert!(report.phase1.is_none());
+        assert!(
+            report.formatted_output.contains("INCOMPLETE"),
+            "a truncated run must not read as a complete one: {}",
+            report.formatted_output
+        );
+    }
+
+    #[test]
+    fn unbounded_budget_runs_every_requested_phase() {
+        // Runs all five phases, so it reaches precision ingest; see
+        // `single_phase_report_contains_only_requested_phase`.
+        let _scip_guard = crate::feature_flags::lock_flag_tests();
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn f()->i32{1}\n").expect("write");
+
+        // The default is unbounded, so all five phases run and nothing is
+        // reported as incomplete. This is the guard against a truncation
+        // sneaking into the default path.
+        let report = run_phase_analysis(
+            PhaseOptions {
+                root: dir.path().to_path_buf(),
+                budget_ms: None,
+                ..PhaseOptions::default()
+            },
+            PhaseSelection::All,
+        )
+        .expect("phase run");
+
+        assert_eq!(report.executed_phases, vec![1, 2, 3, 4, 5]);
+        assert!(!report.formatted_output.contains("INCOMPLETE"));
     }
 }
