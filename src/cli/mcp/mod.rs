@@ -63,6 +63,8 @@ pub mod file_summary_handler;
 pub mod find_handler;
 /// Handler for LeIndex [Git Diff] — PDG-enriched diff.
 pub mod git_diff_handler;
+/// Handler for LeIndex [Git] — live git reads plus preview-gated mutations.
+pub mod git_handler;
 /// Handler for LeIndex [Git Status] — PDG-aware git status.
 pub mod git_status_handler;
 /// Handler for LeIndex [Impact Analysis] — transitive dependency impact.

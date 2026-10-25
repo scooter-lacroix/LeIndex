@@ -792,7 +792,16 @@ pub(crate) fn phase_analysis_schema() -> Value {
             "mode": {
                 "type": "string",
                 "enum": ["ultra", "balanced", "verbose"],
-                "default": "balanced"
+                "default": "balanced",
+                "description": "Phase report format. Honoured on DIRECT calls only: through \
+                leindex_analyze, `mode` selects the branch, so pass `format` instead."
+            },
+            "format": {
+                "type": "string",
+                "enum": ["ultra", "balanced", "verbose"],
+                "default": "balanced",
+                "description": "Phase report format, reachable through leindex_analyze \
+                (whose `mode` argument is the branch selector). Equivalent to `mode` for direct calls."
             },
             "path": {
                 "type": "string",

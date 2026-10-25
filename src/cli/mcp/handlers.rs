@@ -13,6 +13,7 @@ pub use super::edit_preview_handler::EditPreviewHandler;
 pub use super::file_summary_handler::FileSummaryHandler;
 pub use super::find_handler::FindHandler;
 pub use super::git_diff_handler::GitDiffHandler;
+pub use super::git_handler::GitHandler;
 pub use super::git_status_handler::GitStatusHandler;
 pub use super::impact_analysis_handler::ImpactAnalysisHandler;
 pub use super::index_handler::IndexHandler;
@@ -74,6 +75,8 @@ dispatch_handler! {
     GitStatus           => GitStatusHandler,
     /// Handler for PDG-enriched git diff
     GitDiff             => GitDiffHandler,
+    /// Handler for the git router: history reads + preview-gated mutations
+    Git                 => GitHandler,
     /// Handler for ast-grep AST-pattern (structural) search
     Structural          => StructuralHandler,
 }

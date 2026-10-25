@@ -119,7 +119,7 @@ fn test_no_double_newline_in_success_response() {
 // ============================================================================
 
 #[test]
-fn test_tools_list_advertises_the_four_routers() {
+fn test_tools_list_advertises_the_five_routers() {
     let handlers = all_handlers();
     let result = list_tools_json(&handlers);
     let tools = result["tools"].as_array().expect("tools must be an array");
@@ -133,9 +133,10 @@ fn test_tools_list_advertises_the_four_routers() {
             "leindex_explore",
             "leindex_analyze",
             "leindex_edit",
-            "leindex_manage"
+            "leindex_manage",
+            "leindex_git"
         ],
-        "tools/list must advertise exactly the four routers"
+        "tools/list must advertise exactly the five routers"
     );
 }
 

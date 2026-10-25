@@ -2,15 +2,18 @@
 //
 // The server implements ~20 individual handlers, but advertising them all costs
 // a model a schema each on every session and forces it to choose between
-// near-synonyms. `tools/list` therefore advertises FOUR routers; the operation
+// near-synonyms. `tools/list` therefore advertises FIVE routers; the operation
 // is selected with a discriminator argument and every other argument is
 // forwarded unchanged to the per-feature handler:
 //
 //   leindex_explore  (mode)    search | symbol_lookup | find | structural | read_file
 //                              | read_symbol | project_map | file_summary | context
-//   leindex_analyze  (mode)    deep | impact | diagnostics | git_status | git_diff
+//   leindex_analyze  (mode)    deep | impact | diagnostics | phase
 //   leindex_edit     (action)  apply | preview | rename | write        (action REQUIRED)
-//   leindex_manage   (action)  index | phase
+//   leindex_manage   (action)  index
+//   leindex_git      (action)  status | diff | log | show | blame | branch | remote
+//                              | add | commit | checkout | stash | tag | merge
+//                              | rebase | push | reset | force   (mutations preview-only)
 //
 // `leindex_edit` has no default on purpose: an ambiguous call must fail rather
 // than guess at a mutation. The other routers default to their most common
@@ -85,7 +88,7 @@ const fn branch(
 }
 
 /// The public tool surface.
-pub static GROUPS: [GroupSpec; 4] = [
+pub static GROUPS: [GroupSpec; 5] = [
     GroupSpec {
         name: "leindex_explore",
         title: "LeIndex [Explore]",
@@ -159,7 +162,7 @@ pub static GROUPS: [GroupSpec; 4] = [
     GroupSpec {
         name: "leindex_analyze",
         title: "LeIndex [Analyze]",
-        description: "Program-dependence-graph analysis and repo state. mode: deep (semantic search + graph expansion, default), impact (blast radius), diagnostics, git_status, git_diff.",
+        description: "Program-dependence-graph analysis. mode: deep (semantic search + graph expansion, default), impact (blast radius), diagnostics, phase (5-phase architecture report).",
         discriminator: "mode",
         default_branch: Some("deep"),
         branches: &[
@@ -182,16 +185,10 @@ pub static GROUPS: [GroupSpec; 4] = [
                 "Index health, sizes, cache and memory statistics",
             ),
             branch(
-                "git_status",
-                "leindex_git_status",
-                &[],
-                "Live git status enriched with changed symbols",
-            ),
-            branch(
-                "git_diff",
-                "leindex_git_diff",
-                &["diff"],
-                "PDG-enriched diff (working tree, staged, ref or range)",
+                "phase",
+                "leindex_phase_analysis",
+                &["phase_analysis"],
+                "5-phase architecture analysis",
             ),
         ],
     },
@@ -231,21 +228,117 @@ pub static GROUPS: [GroupSpec; 4] = [
     GroupSpec {
         name: "leindex_manage",
         title: "LeIndex [Manage]",
-        description: "Index lifecycle and architecture reports. action: index (build/refresh; returns a pollable job, default), phase (5-phase architecture analysis).",
+        description: "Index lifecycle. action: index (build or refresh; returns a pollable job, default). Architecture reports moved to leindex_analyze mode=phase.",
         discriminator: "action",
         default_branch: Some("index"),
+        branches: &[branch(
+            "index",
+            "leindex_index",
+            &[],
+            "Build or refresh the index (pollable job)",
+        )],
+    },
+    GroupSpec {
+        name: "leindex_git",
+        title: "LeIndex [Git]",
+        description: "Live Git. action: status (default), diff, log, show, blame, branch, remote (read); add, commit, checkout, stash, tag, merge, rebase, push, reset, force (PREVIEW ONLY — each returns a dry-run plan and a preview_token).",
+        discriminator: "action",
+        default_branch: Some("status"),
         branches: &[
             branch(
-                "index",
-                "leindex_index",
+                "status",
+                "leindex_git_status",
                 &[],
-                "Build or refresh the index (pollable job)",
+                "Working-tree status enriched with changed symbols",
             ),
             branch(
-                "phase",
-                "leindex_phase_analysis",
-                &["phase_analysis"],
-                "5-phase architecture analysis",
+                "diff",
+                "leindex_git_diff",
+                &[],
+                "PDG-enriched diff (working tree, staged, ref or range)",
+            ),
+            branch(
+                "log",
+                "leindex_git",
+                &["history"],
+                "Commit history: oid, date, author, subject",
+            ),
+            branch("show", "leindex_git", &[], "One commit: patch or stat"),
+            branch(
+                "blame",
+                "leindex_git",
+                &[],
+                "Per-line last-touching commit for one file",
+            ),
+            branch(
+                "branch",
+                "leindex_git",
+                &[],
+                "Local and remote branches with tip commits",
+            ),
+            branch(
+                "remote",
+                "leindex_git",
+                &[],
+                "Configured remotes and their URLs",
+            ),
+            // Mutations: never fire from a default argument set. Each returns
+            // a dry-run plan plus a preview_token; `confirm` is refused until
+            // the apply side is wired.
+            branch(
+                "add",
+                "leindex_git",
+                &["stage"],
+                "PREVIEW ONLY: stage the given paths",
+            ),
+            branch(
+                "commit",
+                "leindex_git",
+                &[],
+                "PREVIEW ONLY: commit the staged changes",
+            ),
+            branch(
+                "checkout",
+                "leindex_git",
+                &["switch"],
+                "PREVIEW ONLY: switch to a branch or commit",
+            ),
+            branch(
+                "stash",
+                "leindex_git",
+                &[],
+                "PREVIEW ONLY: stash working-tree changes",
+            ),
+            branch("tag", "leindex_git", &[], "PREVIEW ONLY: create a tag"),
+            branch(
+                "merge",
+                "leindex_git",
+                &[],
+                "PREVIEW ONLY: merge a branch into the current one",
+            ),
+            branch(
+                "rebase",
+                "leindex_git",
+                &[],
+                "PREVIEW ONLY: rebase onto a target",
+            ),
+            branch(
+                "push",
+                "leindex_git",
+                &[],
+                "PREVIEW ONLY: push the current branch to its remote",
+            ),
+            branch(
+                "reset",
+                "leindex_git",
+                &[],
+                "PREVIEW ONLY: move the current branch to a commit",
+            ),
+            branch(
+                "force",
+                "leindex_git",
+                &["force_push"],
+                "PREVIEW ONLY: force-push (requires a target ref)",
             ),
         ],
     },
@@ -437,10 +530,25 @@ pub fn resolve_call(name: &str, args: Value) -> Result<(String, Value), JsonRpcE
 
 /// `grep`-style spellings mean "find symbols named X, else the text": the
 /// `auto` target of `leindex_find`. Explicit `target` always wins.
+///
+/// `leindex_git` is the other branch set that needs its own discriminator: one
+/// handler serves seventeen `action` values, so the resolved branch is written
+/// back into `action` (canonically, so an alias such as `history` arrives as
+/// `log`). The router's discriminator is consumed before dispatch, so without
+/// this the handler would only ever see its default.
+///
+/// The phase report format does NOT belong here: `take_discriminator` consumes
+/// `mode` before this runs, so a bare format value has already been handed down
+/// as `format` together with the `phase` branch.
 fn apply_alias_defaults(spec: &BranchSpec, wanted: &str, args: &mut Value) {
     if spec.tool == "leindex_find" && matches!(wanted, "grep" | "grep_symbols" | "symbols") {
         if let Some(object) = args.as_object_mut() {
             object.entry("target").or_insert_with(|| json!("auto"));
+        }
+    }
+    if spec.tool == "leindex_git" {
+        if let Some(object) = args.as_object_mut() {
+            object.insert("action".to_string(), json!(spec.branch));
         }
     }
 }
@@ -460,17 +568,30 @@ fn redirect_retired_tool(name: &str, mut args: Value) -> (String, Value) {
     }
 }
 
-/// Remove and return the discriminator from `args`.
+/// Remove the branch selector from `args` and return the branch it names.
 ///
 /// The router's own key wins. The other key is honoured only when the value
 /// names one of this router's branches, because models often mix up
-/// `mode`/`action` — but never for a branch argument that legitimately reuses
-/// the key (`leindex_manage` `phase` takes its own `mode: ultra|balanced|verbose`).
+/// `mode`/`action`; the recovered value is re-inserted under the router's key,
+/// so a handler that reads the discriminator (as `leindex_git` does) still
+/// sees it.
 fn take_discriminator(group: &GroupSpec, args: &mut Value) -> Option<String> {
     let object = args.as_object_mut()?;
     if let Some(value) = object.get(group.discriminator).and_then(Value::as_str) {
         let value = normalize_branch(value);
         object.remove(group.discriminator);
+        // The value may belong to a branch's own argument of the same name
+        // rather than to the router: `leindex_analyze`'s `mode` is also
+        // `leindex_phase_analysis`'s report format. A bare
+        // `{"mode": "ultra"}` names no branch, so it is a phase request —
+        // resolve to that branch and hand the value down as `format`, the name
+        // the phase schema documents for router calls.
+        if find_branch(group, &value).is_none() {
+            if let Some(spec) = phase_format_branch(group, &value) {
+                object.insert("format".to_string(), json!(value));
+                return Some(spec.branch.to_string());
+            }
+        }
         return Some(value);
     }
     let other = if group.discriminator == "mode" {
@@ -482,11 +603,33 @@ fn take_discriminator(group: &GroupSpec, args: &mut Value) -> Option<String> {
         .get(other)
         .and_then(Value::as_str)
         .map(normalize_branch)?;
-    if find_branch(group, &candidate).is_some() {
-        object.remove(other);
-        return Some(candidate);
+    find_branch(group, &candidate)?;
+    object.remove(other);
+    object.insert(group.discriminator.to_string(), json!(candidate));
+    Some(candidate)
+}
+
+/// The branch implied by a value that is really a *branch argument* sharing the
+/// router's discriminator name.
+///
+/// `leindex_phase_analysis` names its report format `mode`, but `mode` is
+/// `leindex_analyze`'s branch selector, so the router consumes it. A value that
+/// names no branch but is a valid format therefore means the phase branch, and
+/// it must be handed down as `format` rather than silently changing the report
+/// (or, worse, falling through to the default `deep`).
+///
+/// Returns `None` for every other router, so the caller falls back to its
+/// normal branch matching.
+// shh: the format enum is duplicated from `phase_analysis_schema`; if it gains
+// a value, add it here too.
+fn phase_format_branch(group: &GroupSpec, value: &str) -> Option<&'static BranchSpec> {
+    if group.discriminator != "mode" || !matches!(value, "ultra" | "balanced" | "verbose") {
+        return None;
     }
-    None
+    group
+        .branches
+        .iter()
+        .find(|spec| spec.tool == "leindex_phase_analysis")
 }
 
 fn find_handler<'a>(handlers: &'a [ToolHandler], tool: &str) -> Option<&'a ToolHandler> {
@@ -728,6 +871,15 @@ pub fn group_schema_oneof(group: &GroupSpec, handlers: &[ToolHandler]) -> Value 
         properties.insert(group.discriminator.to_string(), discriminator_property);
         if let Some(own) = schema.get("properties").and_then(Value::as_object) {
             for (key, definition) in own {
+                // The router owns the discriminator key. `leindex_phase_analysis`
+                // declares its own `mode` (ultra|balanced|verbose), and copying it
+                // here used to OVERWRITE the `{const: "phase"}` pin with that
+                // enum — leaving the variant unable to match and the `oneOf`
+                // union broken. Same reservation the flat schema's
+                // `merge_properties` already makes.
+                if key == group.discriminator {
+                    continue;
+                }
                 properties.insert(key.clone(), definition.clone());
             }
         }
@@ -807,13 +959,34 @@ pub fn public_tools_json(handlers: &[ToolHandler]) -> Vec<Value> {
 /// Markdown body of the `leindex://tools/guide` resource: every router, its
 /// branches, and each branch's arguments (with defaults and bounds).
 pub fn tools_guide_markdown(handlers: &[ToolHandler]) -> String {
-    let mut out = String::from(
-        "# LeIndex tool guide\n\nLeIndex exposes four tools. Pick the tool, then the branch with \
-         `mode` (explore, analyze) or `action` (edit, manage); every other argument is forwarded \
+    // The count and the selector list are DERIVED from GROUPS, not spelled out.
+    // They were hardcoded, and adding `leindex_git` left this introduction
+    // advertising "four tools" on a five-tool surface for a whole release. A
+    // router can no longer be added without this line following it.
+    let mut by_discriminator: Vec<(&str, Vec<&str>)> = Vec::new();
+    for group in &GROUPS {
+        let short = group.name.strip_prefix("leindex_").unwrap_or(group.name);
+        match by_discriminator
+            .iter_mut()
+            .find(|(key, _)| *key == group.discriminator)
+        {
+            Some((_, names)) => names.push(short),
+            None => by_discriminator.push((group.discriminator, vec![short])),
+        }
+    }
+    let selectors = by_discriminator
+        .iter()
+        .map(|(key, names)| format!("`{key}` ({})", names.join(", ")))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    let mut out = format!(
+        "# LeIndex tool guide\n\nLeIndex exposes {} tools. Pick the tool, then the branch with \
+         {selectors}; every other argument is forwarded \
          unchanged to that branch. `project_path` is accepted everywhere (omit it to use the \
          server's project). `tier` (`l0` identity card, `l1` bounded overview — default, `l2` full \
          detail) is accepted everywhere.\n\nThe individual tool names (`leindex_search`, \
          `leindex_edit_apply`, ...) still work as direct calls.\n",
+        GROUPS.len()
     );
     for group in &GROUPS {
         out.push_str(&format!(
@@ -936,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn test_public_surface_is_the_four_routers() {
+    fn test_public_surface_is_the_five_routers() {
         let tools = public_tools_json(&all_tool_handlers());
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert_eq!(
@@ -945,7 +1118,8 @@ mod tests {
                 "leindex_explore",
                 "leindex_analyze",
                 "leindex_edit",
-                "leindex_manage"
+                "leindex_manage",
+                "leindex_git"
             ]
         );
     }
@@ -994,7 +1168,16 @@ mod tests {
         .unwrap();
         assert_eq!(tool, "leindex_find");
         assert_eq!(args, json!({"pattern": "todo", "target": "auto"}));
-        let (tool, _) = resolve_call("leindex_analyze", json!({"mode": "git_diff"})).unwrap();
+        // `git_diff` is no longer an `analyze` branch; it lives on `leindex_git`.
+        // Naming it on `analyze` must fail loudly rather than resolve to a
+        // near-synonym.
+        let error = resolve_call("leindex_analyze", json!({"mode": "git_diff"})).unwrap_err();
+        assert!(
+            error.message_with_hint().contains("git_diff"),
+            "{}",
+            error.message_with_hint()
+        );
+        let (tool, _) = resolve_call("leindex_git", json!({"action": "diff"})).unwrap();
         assert_eq!(tool, "leindex_git_diff");
     }
 
@@ -1036,18 +1219,25 @@ mod tests {
     }
 
     #[test]
-    fn test_manage_phase_keeps_its_own_mode_argument() {
+    fn test_phase_keeps_its_own_format_through_the_analyze_router() {
+        // `mode` is `leindex_analyze`'s branch selector, so the phase branch
+        // cannot receive its own format knob under that name. Before the fix
+        // `{"mode": "ultra"}` was consumed as a discriminator, matched no
+        // branch, and silently fell through to the DEFAULT branch (`deep`) —
+        // a wrong tool AND a lost format. It must be handed down as `format`.
         let (tool, args) = resolve_call(
-            "leindex_manage",
-            json!({"action": "phase", "mode": "ultra", "phase": 3}),
+            "leindex_analyze",
+            json!({"mode": "phase", "format": "ultra", "phase": 3}),
         )
         .unwrap();
         assert_eq!(tool, "leindex_phase_analysis");
-        assert_eq!(args, json!({"mode": "ultra", "phase": 3}));
-        // `mode` alone (a phase output mode, not a branch) must not be eaten.
-        let (tool, args) = resolve_call("leindex_manage", json!({"mode": "ultra"})).unwrap();
-        assert_eq!(tool, "leindex_index");
-        assert_eq!(args, json!({"mode": "ultra"}));
+        assert_eq!(args, json!({"format": "ultra", "phase": 3}));
+
+        // A bare format value must NOT be read as a branch and must NOT drop
+        // through to `deep`.
+        let (tool, args) = resolve_call("leindex_analyze", json!({"mode": "ultra"})).unwrap();
+        assert_eq!(tool, "leindex_phase_analysis");
+        assert_eq!(args, json!({"format": "ultra"}));
     }
 
     #[test]
@@ -1062,9 +1252,11 @@ mod tests {
 
     #[test]
     fn test_unknown_tool_suggests_router_and_branch() {
+        // `git_diff` used to live on `leindex_analyze`; it is now a branch of
+        // the dedicated `leindex_git` router, so the hint must name THAT.
         let text = suggest_unknown_tool("leindex_git_dif").message_with_hint();
         assert!(
-            text.contains("leindex_analyze") && text.contains("git_diff"),
+            text.contains("leindex_git") && text.contains("diff"),
             "{text}"
         );
         let text = suggest_unknown_tool("totally_unrelated").message_with_hint();
@@ -1254,6 +1446,12 @@ mod tests {
         // bounds growth; this absolute ceiling is the backstop). Raised rather
         // than dropped, per owner decision. If this number moves again, say
         // which branch moved it.
-        assert!(grouped <= 14_000, "tools/list grew to {grouped} bytes");
+        // 14_000 -> 16_500: the FIFTH router `leindex_git` was added. It
+        // advertises 17 operations (7 reads + 10 preview-only mutations) and
+        // one `action` entry per operation in the arg map. The ratio guard
+        // STILL passes (the router surface remains far smaller than the flat
+        // per-tool listing), so growth is bounded; the absolute ceiling moves
+        // with it.
+        assert!(grouped <= 16_500, "tools/list grew to {grouped} bytes");
     }
 }

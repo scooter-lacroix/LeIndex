@@ -312,7 +312,13 @@ fn lines_to_bytes(starts: &[usize], total: usize, start: usize, end: usize) -> (
 }
 
 /// Run git, reading at most `cap` bytes of stdout. Returns `(stdout, truncated)`.
-fn run_git_capped(
+///
+/// Shared by every live-git handler: both pipes are drained concurrently (see
+/// [`drain_git_output`]), so a child that fills stderr cannot deadlock the read,
+/// and a runaway command is killed instead of buffered without bound.
+/// `GIT_TERMINAL_PROMPT=0` keeps a command that would ask for credentials
+/// (`push`, a `fetch` triggered by `pull`) from blocking the server forever.
+pub(crate) fn run_git_capped(
     root: &Path,
     args: &[String],
     cap: u64,
@@ -320,10 +326,25 @@ fn run_git_capped(
     let child = Command::new("git")
         .args(args)
         .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     drain_git_output(child, cap)
+}
+
+/// Run git and decode stdout as text. `cap` bounds the bytes kept; the flag
+/// reports whether the cap (and therefore the text) was cut short.
+///
+/// Empty output is NOT an error: `git remote -v` on a repository without
+/// remotes legitimately prints nothing, and the caller decides what that means.
+pub(crate) fn git_output_capped(
+    root: &Path,
+    args: &[String],
+    cap: u64,
+) -> Result<(String, bool), std::io::Error> {
+    let (stdout, truncated) = run_git_capped(root, args, cap)?;
+    Ok((String::from_utf8_lossy(&stdout).into_owned(), truncated))
 }
 
 /// Read a spawned child's piped stdout (capped at `cap` bytes) while draining

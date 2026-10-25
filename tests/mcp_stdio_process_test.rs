@@ -5,7 +5,7 @@
 //!
 //! * a slow tool call must not queue `ping` (or anything else) behind it,
 //! * semantic search must work on the very first call of a fresh session,
-//! * `tools/list` is the four routers,
+//! * `tools/list` is the five routers,
 //! * `find` searches paths outside the workspace with no index,
 //! * argument mistakes come back as `isError` results with a hint.
 
@@ -185,7 +185,7 @@ fn indexed_fixture() -> &'static (tempfile::TempDir, tempfile::TempDir) {
 }
 
 #[test]
-fn test_tools_list_is_the_four_routers_with_a_discoverable_guide() {
+fn test_tools_list_is_the_five_routers_with_a_discoverable_guide() {
     let (project, home) = indexed_fixture();
     let mut server = Server::start(project.path(), home.path());
     let listed = server.call("tools/list", json!({}));
@@ -201,11 +201,12 @@ fn test_tools_list_is_the_four_routers_with_a_discoverable_guide() {
             "leindex_explore",
             "leindex_analyze",
             "leindex_edit",
-            "leindex_manage"
+            "leindex_manage",
+            "leindex_git"
         ]
     );
     let bytes = listed["result"]["tools"].to_string().len();
-    assert!(bytes < 14_000, "tools/list is {bytes} bytes");
+    assert!(bytes < 16_500, "tools/list is {bytes} bytes");
 
     let resources = server.call("resources/list", json!({}));
     assert!(

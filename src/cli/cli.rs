@@ -426,7 +426,7 @@ pub enum ServiceAction {
 /// Subcommands for inspecting and executing MCP tools from the CLI.
 #[derive(Subcommand, Debug)]
 pub enum ToolCommands {
-    /// List the MCP tools (the four routers and their branches)
+    /// List the MCP tools (the five routers and their branches)
     List {
         /// Include descriptions and a one-line summary per branch
         #[arg(long)]
