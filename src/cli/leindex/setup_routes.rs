@@ -6,8 +6,15 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, clap::Args)]
 pub struct SetupOptions {
-    /// Embedding route: qwen3 (ONNX), embeddinggemma2 (managed GGUF), remote, or keep.
-    #[arg(long, value_parser = ["qwen3", "embeddinggemma2", "remote", "keep"])]
+    /// Embedding route: qwen3 (ONNX), embeddinggemma2 (managed GGUF), remote,
+    /// or any provider preset name (gemini, voyage, mistral, jina, together,
+    /// nomic, openai, cohere).
+    ///
+    /// Not a clap `value_parser` list: the accepted provider names come from
+    /// [`crate::config::REMOTE_PRESETS`], and duplicating them here is a second
+    /// copy that drifts the moment a provider is added. Validation happens in
+    /// [`validate_route_options`], which is reached on every path.
+    #[arg(long)]
     pub embedding: Option<String>,
     /// Absolute llama-server binary or installation directory (managed Gemma).
     #[arg(long, conflicts_with = "download_llama")]
@@ -30,10 +37,12 @@ pub struct SetupOptions {
     /// Whether the managed embedding service may start on demand.
     #[arg(long, action = clap::ArgAction::Set)]
     pub auto_start: Option<bool>,
-    /// External OpenAI-compatible embeddings base URL, including /v1 when required.
+    /// External embeddings base URL, including /v1 when required. Omit to use
+    /// the selected provider preset's documented endpoint.
     #[arg(long)]
     pub embedding_endpoint: Option<String>,
-    /// Model identifier sent to the external embeddings server.
+    /// Model identifier sent to the external embeddings server. Omit to use
+    /// the selected provider preset's documented model.
     #[arg(long)]
     pub embedding_model: Option<String>,
     /// Expected remote vector dimension; omit to preserve an existing external route or discover it.
@@ -82,32 +91,67 @@ fn error(message: impl Into<String>) -> SetupError {
     }
 }
 
+/// Local routes plus every provider preset, in menu order.
+///
+/// The picker and the `--embedding` flag are driven from this one list so a
+/// provider cannot appear in the menu while being rejected by the flag layer
+/// (which is exactly what happens when the two are written separately).
+/// `"remote"` stays as the generic OpenAI-compatible entry for endpoints that
+/// are not one of the known providers.
+fn route_names() -> Vec<&'static str> {
+    let mut names = vec!["embeddinggemma2", "qwen3", "remote"];
+    names.extend(crate::config::REMOTE_PRESETS.iter().map(|p| p.name));
+    names.push("keep");
+    names
+}
+
+/// Human label for one route, as shown in the picker.
+fn route_label(route: &str) -> String {
+    match route {
+        "embeddinggemma2" => "EmbeddingGemma2 - managed llama.cpp server (GGUF)".to_string(),
+        "qwen3" => "Qwen3 - local ONNX Runtime".to_string(),
+        "remote" => "Custom OpenAI-compatible embeddings server".to_string(),
+        "keep" => "Keep the existing embedding configuration".to_string(),
+        name => match crate::config::REMOTE_PRESETS
+            .iter()
+            .find(|p| p.name == name)
+        {
+            Some(preset) => format!(
+                "{} - {} ({}-dim)",
+                preset.name, preset.model, preset.dimension
+            ),
+            // Unreachable while `route_label` is only called with
+            // `route_names()` entries; shown if that contract ever breaks
+            // rather than panicking in the wizard.
+            None => name.to_string(),
+        },
+    }
+}
+
 pub(super) fn select_interactive() -> Result<SetupOptions, SetupError> {
     let existing = LeIndexConfig::load().map_err(|e| SetupError::ConfigRead(e.to_string()))?;
+    let routes = route_names();
+    let items: Vec<String> = routes.iter().map(|route| route_label(route)).collect();
+    // Default to "keep" when a remote route already resolves, else the first
+    // entry (the managed Gemma preset).
+    let default_index = if existing
+        .indexing
+        .embeddings
+        .resolved_remote_with(&existing.services)
+        .is_some()
+    {
+        routes.iter().position(|r| *r == "keep").unwrap_or(0)
+    } else {
+        0
+    };
     let selection = Select::new()
         .with_prompt("Embedding model / inference route")
-        .items(&[
-            "EmbeddingGemma2 — managed llama.cpp server (GGUF)",
-            "Qwen3 — local ONNX Runtime",
-            "External OpenAI-compatible embeddings server",
-            "Keep the existing embedding configuration",
-        ])
-        .default(
-            if existing
-                .indexing
-                .embeddings
-                .resolved_remote_with(&existing.services)
-                .is_some()
-            {
-                3
-            } else {
-                0
-            },
-        )
+        .items(&items)
+        .default(default_index)
         .interact()
         .map_err(|e| SetupError::Interactive(e.to_string()))?;
     Ok(SetupOptions {
-        embedding: Some(["embeddinggemma2", "qwen3", "remote", "keep"][selection].into()),
+        embedding: Some(routes[selection].into()),
         interactive: true,
         ..Default::default()
     })
@@ -135,6 +179,14 @@ pub(super) fn configure(
     configure_route(config, options, route)
 }
 
+/// True when `route` names a remote provider (the generic entry or a preset).
+fn is_remote_route(route: &str) -> bool {
+    route == "remote"
+        || crate::config::REMOTE_PRESETS
+            .iter()
+            .any(|preset| preset.name == route)
+}
+
 /// Rejects embedding option/route mismatches before neural-disable or provisioning (CCN-gate extraction).
 fn validate_route_options(choices: &SetupChoices, route: &str) -> Result<(), SetupError> {
     let options = &choices.options;
@@ -153,10 +205,16 @@ fn validate_route_options(choices: &SetupChoices, route: &str) -> Result<(), Set
             "Managed-server options require --embedding embeddinggemma2",
         ));
     }
-    if remote_options_set(options) && route != "remote" {
+    if remote_options_set(options) && !is_remote_route(route) {
         return Err(error(
-            "External embeddings options require --embedding remote",
+            "External embeddings options require --embedding remote or a provider name",
         ));
+    }
+    if !is_remote_route(route) && !matches!(route, "qwen3" | "embeddinggemma2" | "keep") {
+        let names = route_names().join(", ");
+        return Err(error(format!(
+            "Unknown embedding route {route:?}; expected one of {names}"
+        )));
     }
     Ok(())
 }
@@ -233,10 +291,23 @@ fn configure_route(
         }
         "remote" => {
             require_remote()?;
-            configure_external(config, options)?;
+            configure_external(config, "custom", options)?;
             Ok(true)
         }
-        _ => Err(error("Unknown embedding route")),
+        // Any provider preset: the same external route, but keyed on the
+        // provider name so the resolved endpoint/model/dimension come from
+        // `REMOTE_PRESETS` and the runtime selects the matching wire format.
+        provider => {
+            if !crate::config::REMOTE_PRESETS
+                .iter()
+                .any(|preset| preset.name == provider)
+            {
+                return Err(error("Unknown embedding route"));
+            }
+            require_remote()?;
+            configure_external(config, provider, options)?;
+            Ok(true)
+        }
     }
 }
 
@@ -821,9 +892,16 @@ fn external_route_from_flags(
             .embedding_endpoint
             .clone()
             .or_else(|| {
-                previous
-                    .resolved_remote_with(&config.services)
-                    .map(|r| r.endpoint)
+                // Only carry the previous ENDPOINT forward when this is the same
+                // route. The resolved ladder is not gated on `same_route`, so
+                // reading it unconditionally would inherit the fresh-config
+                // EmbeddingGemma2 loopback endpoint into an unrelated provider
+                // route and pin it at a dead local port.
+                same_route.then(|| {
+                    previous
+                        .resolved_remote_with(&config.services)
+                        .map(|r| r.endpoint)
+                })?
             })
             .unwrap_or_default(),
         model: options
@@ -938,12 +1016,25 @@ fn check_api_key_env(key_env: &str, options: &SetupOptions) -> Result<(), SetupE
 }
 
 /// Validates the resolved external route in the same order as before (CCN-gate extraction).
+///
+/// `preset_supplies_model` relaxes the model check for a known provider: the
+/// preset names the model, so demanding `--embedding-model` would make every
+/// preset route unusable without restating what the table already knows.
 fn validate_external_route(
     route: &ExternalRoute,
     options: &SetupOptions,
+    preset_supplies_model: bool,
 ) -> Result<(), SetupError> {
-    validate_external_url(&route.endpoint)?;
-    if route.model.trim().is_empty() {
+    // A preset route resolves its endpoint from the table, so an empty endpoint
+    // is only an error when nothing else can supply one.
+    if !route.endpoint.trim().is_empty() {
+        validate_external_url(&route.endpoint)?;
+    } else if !preset_supplies_model {
+        return Err(error(
+            "External embeddings require --embedding-endpoint (or a provider preset)",
+        ));
+    }
+    if route.model.trim().is_empty() && !preset_supplies_model {
         return Err(error("External embeddings require --embedding-model"));
     }
     if route.dimension == Some(0) {
@@ -953,7 +1044,14 @@ fn validate_external_route(
 }
 
 /// Builds the replacement embeddings config for the external route (CCN-gate extraction).
+///
+/// `provider` is the selected preset name or `"custom"`. The preset supplies
+/// endpoint/model/dimension/templates at RESOLVE time, so this deliberately
+/// leaves those unset when the flags did not name them: persisting the preset's
+/// values here would freeze today's model into the config and a later preset
+/// update would never reach this installation.
 fn external_embedding_config(
+    provider: &str,
     route: ExternalRoute,
     previous: &crate::config::EmbeddingConfig,
     options: &SetupOptions,
@@ -961,15 +1059,15 @@ fn external_embedding_config(
 ) -> crate::config::EmbeddingConfig {
     crate::config::EmbeddingConfig {
         enable_hybrid: true,
-        remote_provider: "custom".into(),
+        remote_provider: provider.into(),
         matryoshka: if same_route {
             previous.matryoshka
         } else {
             crate::config::MatryoshkaSetting::Off
         },
         remote_service: None,
-        remote_endpoint: Some(route.endpoint),
-        remote_model: Some(route.model),
+        remote_endpoint: (!route.endpoint.trim().is_empty()).then_some(route.endpoint),
+        remote_model: (!route.model.trim().is_empty()).then_some(route.model),
         remote_dimension: route.dimension,
         remote_api_key: if same_route
             && options.embedding_api_key_env.is_none()
@@ -979,7 +1077,17 @@ fn external_embedding_config(
         } else {
             None
         },
-        remote_api_key_env: (!route.key_env.is_empty()).then_some(route.key_env),
+        // Fall back to the preset's conventional variable (GEMINI_API_KEY, ...)
+        // so a preset route authenticates without the user spelling it out.
+        remote_api_key_env: (!route.key_env.is_empty())
+            .then_some(route.key_env)
+            .or_else(|| {
+                crate::config::REMOTE_PRESETS
+                    .iter()
+                    .find(|preset| preset.name == provider)
+                    .and_then(|preset| preset.api_key_env)
+                    .map(str::to_string)
+            }),
         remote_doc_template: (!route.doc.is_empty()).then_some(route.doc),
         remote_query_template: (!route.query.is_empty()).then_some(route.query),
         onnx_model_path: if same_route {
@@ -992,20 +1100,70 @@ fn external_embedding_config(
 
 fn configure_external(
     config: &mut LeIndexConfig,
+    provider: &str,
     options: &SetupOptions,
 ) -> Result<(), SetupError> {
     let previous = &config.indexing.embeddings;
+    // "Same route" means the user is re-running setup on the SAME external
+    // route; it is independent of which provider is now selected, because
+    // switching provider is itself a route change.
+    //
+    // The endpoint check alone is NOT sufficient: a fresh config ships with the
+    // EmbeddingGemma2 preset, whose loopback endpoint resolves, so reusing it
+    // would carry `http://127.0.0.1:8080/v1` into a Gemini or Voyage route and
+    // silently pin the new provider at a dead local port.
     let same_route = previous
         .remote_endpoint
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty())
-        && !previous.embeddinggemma2_preset_active();
+        && !previous.embeddinggemma2_preset_active()
+        && previous
+            .remote_provider
+            .trim()
+            .eq_ignore_ascii_case(provider);
     let mut route = external_route_from_flags(config, options, same_route);
+    let preset = crate::config::REMOTE_PRESETS
+        .iter()
+        .find(|preset| preset.name == provider);
+    // Seed the prompt defaults from the preset so the wizard offers the
+    // provider's documented endpoint/model/dimension instead of empty boxes
+    // the user has to look up. An explicit flag already won above.
+    if let Some(preset) = preset {
+        if route.endpoint.trim().is_empty() {
+            route.endpoint = preset.endpoint.to_string();
+        }
+        if route.model.trim().is_empty() {
+            route.model = preset.model.to_string();
+        }
+        if route.dimension.is_none() {
+            route.dimension = Some(preset.dimension);
+        }
+        if route.key_env.trim().is_empty() {
+            route.key_env = preset.api_key_env.unwrap_or_default().to_string();
+        }
+    }
     if options.interactive {
         prompt_external_route(&mut route, previous)?;
     }
-    validate_external_route(&route, options)?;
-    config.indexing.embeddings = external_embedding_config(route, previous, options, same_route);
+    // A preset route that kept the offered defaults persists NO endpoint or
+    // model: the table is the source of truth, so `remote_provider = "gemini"`
+    // alone must remain a working route, and a later correction to the table
+    // has to reach this installation. Anything the user actually changed is
+    // persisted, because that is real intent the table does not know.
+    if let Some(preset) = preset {
+        if route.endpoint == preset.endpoint {
+            route.endpoint.clear();
+        }
+        if route.model == preset.model {
+            route.model.clear();
+        }
+        if route.dimension == Some(preset.dimension) {
+            route.dimension = None;
+        }
+    }
+    validate_external_route(&route, options, preset.is_some())?;
+    config.indexing.embeddings =
+        external_embedding_config(provider, route, previous, options, same_route);
     Ok(())
 }
 

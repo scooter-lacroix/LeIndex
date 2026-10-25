@@ -159,8 +159,12 @@ fn test_all_oversized_documents_do_not_count_as_an_outage() {
             500
         },
         None,
-        // One send for the whole batch, then one per half.
-        3,
+        // Generous: this mock answers 500 to EVERY input, including the halved
+        // ones, so the shrink path exhausts its halvings instead of converging.
+        // Sized to never run dry — a dry mock surfaces as a `Transport` error
+        // that looks like an endpoint outage and hides the assertion that
+        // actually matters.
+        64,
     );
     let provider = crate::search::onnx::GenericRemoteProvider::from_config(RemoteEmbeddingConfig {
         provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
@@ -181,11 +185,24 @@ fn test_all_oversized_documents_do_not_count_as_an_outage() {
         rows.iter().all(Option::is_none),
         "a rejected document carries no vector, and none may be fabricated"
     );
-    // One request for the whole batch, then one per half: a size rejection is
-    // narrowable, so it is bisected like any other, and each leaf ends in a
-    // skip. The point of this assertion is that the leaves did NOT become
-    // whole-batch errors, not that the request count is minimal.
-    assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 3);
+    // The bisection floor is 1 batch send + 1 per leaf = 3, and NO truncation
+    // happens in that case — which is the regression this guards, because the
+    // shrink path used to be gated on the transient-retry budget and `max_retries
+    // == 0` made it decline instantly. So the assertion is on the PROPERTY
+    // (truncation actually ran, per leaf) rather than an exact request count,
+    // which depends on mock stop conditions rather than on behaviour.
+    let sent = request_count.load(std::sync::atomic::Ordering::SeqCst);
+    let bisection_only = 3;
+    let ceiling = 1 + 2 * (1 + crate::search::onnx::remote::MAX_OVERSIZE_SHRINKS);
+    assert!(
+        sent > bisection_only,
+        "each leaf must be re-sent truncated at least once; {sent} requests means the \
+         shrink path never ran (bisection alone is {bisection_only})"
+    );
+    assert!(
+        sent <= ceiling,
+        "truncation must stay bounded by MAX_OVERSIZE_SHRINKS per leaf: {sent} > {ceiling}"
+    );
 }
 
 #[test]

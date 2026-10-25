@@ -429,6 +429,130 @@ pub const EMBEDDINGGEMMA2_DOC_TEMPLATE: &str = "title: {title} | text: {text}";
 /// card CodeRetrieval row): `task: code retrieval | query: {query}`.
 pub const EMBEDDINGGEMMA2_QUERY_TEMPLATE: &str = "task: code retrieval | query: {text}";
 
+/// Wire family a remote provider's endpoint speaks.
+///
+/// Two families cover every supported provider, and the split is not cosmetic:
+/// it decides which request type the provider is built from. `OpenAiCompat` is
+/// the `/v1/embeddings` contract (`{"model","input"}` out,
+/// `{"data":[{"index","embedding"}]}` back) that Gemini's compat surface,
+/// Voyage, Mistral, Jina, Together and Nomic all implement, so those presets
+/// are pure data on the existing [`crate::search::onnx::CustomEmbeddingProvider`]
+/// path. `Gemini` is Google's native `v1beta/models/{model}:batchEmbedContents`,
+/// whose response carries no per-row `index` and whose `taskType` field is the
+/// asymmetric-retrieval lever — neither of which the compat contract can
+/// express, so it needs its own implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteWire {
+    /// OpenAI-compatible `/v1/embeddings`.
+    OpenAiCompat,
+    /// Native Google `v1beta` `embedContent` / `batchEmbedContents`.
+    Gemini,
+}
+
+/// One known remote embedding provider: the defaults a preset fills in.
+///
+/// Presets exist so a provider name alone reaches a working route:
+/// `remote_provider = "gemini"` supplies the endpoint, model, native dimension
+/// and conventional API-key variable. Every field is only a default — an
+/// explicitly configured `remote_endpoint` / `remote_model` /
+/// `remote_dimension` / `remote_api_key_env` always wins (see
+/// [`EmbeddingConfig::resolved_remote_with`]).
+#[derive(Debug, Clone, Copy)]
+pub struct RemotePreset {
+    /// Config spelling: the `remote_provider` value and `--embedding <name>`.
+    pub name: &'static str,
+    /// Wire family the endpoint speaks; selects the provider implementation.
+    pub wire: RemoteWire,
+    /// Default base URL, including any version path segment.
+    pub endpoint: &'static str,
+    /// Default model identifier.
+    pub model: &'static str,
+    /// Native (untruncated) embedding dimension.
+    ///
+    /// This is a BOOTSTRAP value, consulted only before the first successful
+    /// response: the length a provider actually returns is measured and wins
+    /// over this number, and any later response of a different length is
+    /// rejected rather than written. A stale constant therefore degrades to a
+    /// wrong starting guess, never to a corrupt vector space.
+    pub dimension: usize,
+    /// Environment variable conventionally holding this provider's API key.
+    pub api_key_env: Option<&'static str>,
+}
+
+/// Every provider `leindex setup` can configure, one row each.
+///
+/// Dimensions are each model's native (untruncated) width, so an unset
+/// `remote_dimension` boots at full fidelity instead of the generic 1536 that
+/// [`crate::search::onnx::RemoteProvider::default_dimension`] falls back to for
+/// anything it does not recognize.
+pub const REMOTE_PRESETS: &[RemotePreset] = &[
+    RemotePreset {
+        name: "gemini",
+        wire: RemoteWire::Gemini,
+        // Native v1beta surface, not the `/v1beta/openai/` compat shim.
+        endpoint: "https://generativelanguage.googleapis.com/v1beta",
+        model: "gemini-embedding-001",
+        dimension: 3072,
+        api_key_env: Some("GEMINI_API_KEY"),
+    },
+    RemotePreset {
+        name: "openai",
+        wire: RemoteWire::OpenAiCompat,
+        endpoint: "https://api.openai.com/v1",
+        model: "text-embedding-3-small",
+        dimension: 1536,
+        api_key_env: Some("OPENAI_API_KEY"),
+    },
+    RemotePreset {
+        name: "voyage",
+        wire: RemoteWire::OpenAiCompat,
+        endpoint: "https://api.voyageai.com/v1",
+        model: "voyage-code-3",
+        dimension: 1024,
+        api_key_env: Some("VOYAGE_API_KEY"),
+    },
+    RemotePreset {
+        name: "mistral",
+        wire: RemoteWire::OpenAiCompat,
+        endpoint: "https://api.mistral.ai/v1",
+        model: "codestral-embed",
+        dimension: 1536,
+        api_key_env: Some("MISTRAL_API_KEY"),
+    },
+    RemotePreset {
+        name: "jina",
+        wire: RemoteWire::OpenAiCompat,
+        endpoint: "https://api.jina.ai/v1",
+        model: "jina-embeddings-v3",
+        dimension: 1024,
+        api_key_env: Some("JINA_API_KEY"),
+    },
+    RemotePreset {
+        name: "together",
+        wire: RemoteWire::OpenAiCompat,
+        endpoint: "https://api.together.xyz/v1",
+        model: "BAAI/bge-large-en-v1.5",
+        dimension: 1024,
+        api_key_env: Some("TOGETHER_API_KEY"),
+    },
+    RemotePreset {
+        name: "nomic",
+        wire: RemoteWire::OpenAiCompat,
+        endpoint: "https://api-atlas.nomic.ai/v1",
+        model: "nomic-embed-text-v1.5",
+        dimension: 768,
+        api_key_env: Some("NOMIC_API_KEY"),
+    },
+    RemotePreset {
+        name: "cohere",
+        wire: RemoteWire::OpenAiCompat,
+        endpoint: "https://api.cohere.ai/v1",
+        model: "embed-english-v3.0",
+        dimension: 1024,
+        api_key_env: Some("COHERE_API_KEY"),
+    },
+];
+
 /// A preset-resolved remote configuration: every unset key already filled.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedRemote {
@@ -442,6 +566,10 @@ pub struct ResolvedRemote {
     pub doc_template: Option<String>,
     /// Effective query template (explicit config, or preset; None = raw).
     pub query_template: Option<String>,
+    /// Wire family the resolved endpoint speaks. Derived from the selected
+    /// preset, never from the endpoint string: an operator who explicitly
+    /// points `gemini` at a proxy still wants the native Gemini request shape.
+    pub wire: RemoteWire,
 }
 
 impl EmbeddingConfig {
@@ -459,14 +587,28 @@ impl EmbeddingConfig {
         Ok(self.remote_api_key.clone())
     }
 
-    /// Human-readable provider label for diagnostics ("embeddinggemma-2"
-    /// preset active, else "custom").
+    /// Human-readable provider label for diagnostics: the recognized preset
+    /// name (`"gemini"`, `"voyage"`, `"embeddinggemma-2"`, ...) when one is
+    /// selected, else `"custom"`.
+    ///
+    /// This used to answer `"custom"` for everything that was not the
+    /// EmbeddingGemma2 preset, which made `leindex diagnostics` report a
+    /// provider it had never inspected.
     pub fn remote_preset_label(&self) -> &str {
         if self.embeddinggemma2_preset_active() {
             "embeddinggemma-2"
         } else {
-            "custom"
+            self.remote_preset().map_or("custom", |preset| preset.name)
         }
+    }
+
+    /// The provider preset selected by `remote_provider`, if it names one.
+    ///
+    /// Case-insensitive; an unknown or empty value is `None`, which keeps the
+    /// generic OpenAI-compatible path (every key must be set explicitly).
+    pub fn remote_preset(&self) -> Option<&'static RemotePreset> {
+        let name = self.remote_provider.trim().to_ascii_lowercase();
+        REMOTE_PRESETS.iter().find(|preset| preset.name == name)
     }
 
     /// Effective Matryoshka slicing for this configuration. `Dynamic` and the
@@ -519,33 +661,61 @@ impl EmbeddingConfig {
         if !self.enable_hybrid {
             return None;
         }
-        let preset = self.embeddinggemma2_preset_active();
+        let gemma = self.embeddinggemma2_preset_active();
+        // A recognized provider preset also supplies a default endpoint, so
+        // `remote_provider = "gemini"` alone is a working route. `custom` (and
+        // any unrecognized value) deliberately resolves to no preset: a bare
+        // endpoint must be spelled out, which is what the generic route always
+        // required.
+        let preset = self.remote_preset();
         let service = self
             .remote_service
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .and_then(|name| services.get(name));
+        // Ladder: explicit endpoint > service base URL > preset default. The
+        // EmbeddingGemma2 preset is the one provider LeIndex itself spawns, so
+        // an existing `remote_service` outranks its loopback default.
         let endpoint = match self.remote_endpoint.as_deref().map(str::trim) {
             Some(e) if !e.is_empty() => Some(e.to_string()),
-            _ => service
-                .map(|s| format!("{}/v1", s.base_url()))
-                .or_else(|| preset.then(|| EMBEDDINGGEMMA2_DEFAULT_ENDPOINT.to_string())),
+            _ => service.map(|s| format!("{}/v1", s.base_url())).or_else(|| {
+                preset
+                    .map(|p| p.endpoint.to_string())
+                    .or_else(|| gemma.then(|| EMBEDDINGGEMMA2_DEFAULT_ENDPOINT.to_string()))
+            }),
         }?;
-        let fill = |value: &Option<String>, preset_value: &str| match value {
+        // Each key falls back to the preset value when unset. `gemma` is folded
+        // into `preset_model`/`preset_dimension` so the EmbeddingGemma2 preset
+        // and the provider table share one fill path instead of two.
+        let fill = |value: &Option<String>, preset_value: Option<&str>| match value {
             Some(v) if !v.trim().is_empty() => Some(v.clone()),
-            _ if preset => Some(preset_value.to_string()),
-            _ => None,
+            _ => preset_value.map(str::to_string),
         };
+        let preset_model = preset.map(|p| p.model).or(if gemma {
+            Some(EMBEDDINGGEMMA2_MODEL)
+        } else {
+            None
+        });
+        let preset_dimension = preset
+            .map(|p| p.dimension)
+            .or_else(|| gemma.then_some(EMBEDDINGGEMMA2_DIMENSION));
         Some(ResolvedRemote {
             endpoint,
-            model: fill(&self.remote_model, EMBEDDINGGEMMA2_MODEL)
+            // A managed service knows the model it actually serves, which
+            // outranks a table entry.
+            model: fill(&self.remote_model, preset_model)
                 .or_else(|| service.and_then(|s| s.served_name())),
-            doc_template: fill(&self.remote_doc_template, EMBEDDINGGEMMA2_DOC_TEMPLATE),
-            query_template: fill(&self.remote_query_template, EMBEDDINGGEMMA2_QUERY_TEMPLATE),
-            remote_dimension: self
-                .remote_dimension
-                .or_else(|| preset.then_some(EMBEDDINGGEMMA2_DIMENSION)),
+            doc_template: fill(
+                &self.remote_doc_template,
+                gemma.then_some(EMBEDDINGGEMMA2_DOC_TEMPLATE),
+            ),
+            query_template: fill(
+                &self.remote_query_template,
+                gemma.then_some(EMBEDDINGGEMMA2_QUERY_TEMPLATE),
+            ),
+            remote_dimension: self.remote_dimension.or(preset_dimension),
+            wire: preset.map_or(RemoteWire::OpenAiCompat, |p| p.wire),
         })
     }
 

@@ -225,16 +225,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_judged_order_keeps_base_order_when_relevance_is_uniform() {
+        // Fixture names are globally unique: `judge_results` caches verdicts
+        // process-wide keyed by (query, file, symbol, …), so tests sharing a
+        // fixture namespace inherit each other's verdicts in any order.
         let results = vec![
-            result("n0", "a.rs", "alpha", 0.9),
-            result("n1", "b.rs", "beta", 0.8),
-            result("n2", "c.rs", "gamma", 0.7),
+            result("u0", "uniform_a.rs", "uniform_alpha", 0.9),
+            result("u1", "uniform_b.rs", "uniform_beta", 0.8),
+            result("u2", "uniform_c.rs", "uniform_gamma", 0.7),
         ];
         let docs = docs_of(&results);
         let asker = relevance_asker(&[0.6, 0.6, 0.6]);
         let ordered = judge_with(
             &asker,
-            "query",
+            "uniform relevance",
             &results,
             &docs,
             "/root",
@@ -244,15 +247,17 @@ mod tests {
         .await
         .expect("uniform relevance should produce an order");
         let ids: Vec<&str> = ordered.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(ids, ["n0", "n1", "n2"]);
+        assert_eq!(ids, ["u0", "u1", "u2"]);
     }
 
     #[tokio::test]
     async fn test_judge_promotes_highly_relevant_candidate_over_base_leader() {
+        // Same candidate SHAPE as the uniform-relevance test, different
+        // answers — so the fixtures must live in their own cache namespace.
         let results = vec![
-            result("n0", "a.rs", "alpha", 0.9),
-            result("n1", "b.rs", "beta", 0.8),
-            result("n2", "c.rs", "gamma", 0.7),
+            result("p0", "promote_a.rs", "promote_alpha", 0.9),
+            result("p1", "promote_b.rs", "promote_beta", 0.8),
+            result("p2", "promote_c.rs", "promote_gamma", 0.7),
         ];
         let docs = docs_of(&results);
         let asker = relevance_asker(&[0.0, 0.0, 1.0]);
@@ -262,29 +267,37 @@ mod tests {
             min_keep: 1,
             ..default_params()
         };
-        let ordered = judge_with(&asker, "query", &results, &docs, "/root", 1_000, &params)
-            .await
-            .expect("complete verdicts should produce an order");
+        let ordered = judge_with(
+            &asker,
+            "promote relevant",
+            &results,
+            &docs,
+            "/root",
+            1_000,
+            &params,
+        )
+        .await
+        .expect("complete verdicts should produce an order");
         let ids: Vec<&str> = ordered.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(ids.first(), Some(&"n2"), "judged hit n2 must lead: {ids:?}");
+        assert_eq!(ids.first(), Some(&"p2"), "judged hit p2 must lead: {ids:?}");
         // Dropped (below relevant_min) candidates are ABSENT from the order —
         // the dispatch remap demotes them to the tail. Slot 0 is never dropped
-        // (`plan` rail), so n0 stays at position 2.
-        assert_eq!(ids, ["n2", "n0"], "n1 demoted by the judge: {ids:?}");
+        // (`plan` rail), so p0 stays at position 2.
+        assert_eq!(ids, ["p2", "p0"], "p1 demoted by the judge: {ids:?}");
     }
 
     #[tokio::test]
     async fn test_incomplete_verdicts_fail_open_to_original_order() {
         let results = vec![
-            result("n0", "a.rs", "alpha", 0.9),
-            result("n1", "b.rs", "beta", 0.8),
+            result("i0", "incomplete_a.rs", "incomplete_alpha", 0.9),
+            result("i1", "incomplete_b.rs", "incomplete_beta", 0.8),
         ];
         let docs = docs_of(&results);
         // Asker that answers nothing: every verdict stays None.
         let asker = FnAsker(|_request: &Request| Ok(Response::default()));
         let ordered = judge_with(
             &asker,
-            "query",
+            "incomplete verdicts",
             &results,
             &docs,
             "/root",
@@ -300,7 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_error_fails_open_to_original_order() {
-        let results = vec![result("n0", "a.rs", "alpha", 0.9)];
+        let results = vec![result("e0", "error_a.rs", "error_alpha", 0.9)];
         let docs = docs_of(&results);
         let asker = FnAsker(|_request: &Request| -> Result<Response, SystemOneError> {
             Err(SystemOneError::Transport(
@@ -309,7 +322,7 @@ mod tests {
         });
         let ordered = judge_with(
             &asker,
-            "query",
+            "provider error",
             &results,
             &docs,
             "/root",

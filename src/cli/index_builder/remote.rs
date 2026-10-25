@@ -42,22 +42,16 @@ pub(crate) fn try_remote_neural_embedder(
             return None;
         }
     };
-    let remote_cfg = crate::search::onnx::RemoteEmbeddingConfig {
-        provider: crate::search::onnx::RemoteProvider::Custom {
-            endpoint: resolved.endpoint,
-        },
+    // One resolver owns the provider choice: hardcoding `Custom` here is what
+    // made a configured `gemini` route silently run the OpenAI-compatible wire
+    // format. `service_name` names the `[services.*]` entry behind this
+    // endpoint, so a sustained outage can be fixed by restarting LeIndex's own
+    // server instead of abandoning the neural layer (`None` for third parties).
+    let remote_cfg = crate::search::onnx::RemoteEmbeddingConfig::from_resolved(
+        &resolved,
         api_key,
-        model: resolved.model,
-        remote_dimension: resolved.remote_dimension,
-        doc_template: resolved.doc_template,
-        query_template: resolved.query_template,
-        base_url: None,
-        // Names the `[services.*]` entry behind this endpoint, so a sustained
-        // outage can be fixed by restarting LeIndex's own server instead of
-        // abandoning the neural layer. `None` for a third-party endpoint.
-        service_name: embeddings_cfg.remote_service.clone(),
-        ..crate::search::onnx::RemoteEmbeddingConfig::default()
-    };
+        embeddings_cfg.remote_service.clone(),
+    );
     match HybridEmbedder::hybrid_remote(
         tfidf_embedder,
         remote_cfg,

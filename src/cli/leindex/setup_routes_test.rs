@@ -28,7 +28,7 @@ fn external() -> LeIndexConfig {
 fn test_external_rerun_preserves_unspecified_fields() {
     let mut config = external();
     let before = serde_json::to_value(&config.indexing.embeddings).unwrap();
-    configure_external(&mut config, &SetupOptions::default()).unwrap();
+    configure_external(&mut config, "custom", &SetupOptions::default()).unwrap();
     assert_eq!(
         before,
         serde_json::to_value(&config.indexing.embeddings).unwrap()
@@ -44,7 +44,7 @@ fn test_external_empty_flags_clear_templates_and_authentication() {
         embedding_query_template: Some(String::new()),
         ..Default::default()
     };
-    configure_external(&mut config, &options).unwrap();
+    configure_external(&mut config, "custom", &options).unwrap();
     assert!(config.indexing.embeddings.remote_api_key_env.is_none());
     assert!(config.indexing.embeddings.remote_api_key.is_none());
     assert!(config.indexing.embeddings.remote_doc_template.is_none());
@@ -64,12 +64,13 @@ fn test_external_rejects_url_query_fragment_and_zero_dimension() {
             embedding_endpoint: Some(endpoint.into()),
             ..Default::default()
         };
-        assert!(configure_external(&mut config, &options).is_err());
+        assert!(configure_external(&mut config, "custom", &options).is_err());
         assert_eq!(before, serde_json::to_value(&config).unwrap());
     }
     assert!(
         configure_external(
             &mut external(),
+            "custom",
             &SetupOptions {
                 embedding_dimension: Some(0),
                 ..Default::default()
@@ -505,10 +506,11 @@ fn test_external_rerun_preserves_legacy_auth_and_local_model_override() {
         Some(String::from_iter(['f', 'i', 'x', 't', 'u', 'r', 'e']));
     config.indexing.embeddings.onnx_model_path = Some("/fixture/local.onnx".into());
     let before = serde_json::to_value(&config.indexing.embeddings).unwrap();
-    configure_external(&mut config, &SetupOptions::default()).unwrap();
+    configure_external(&mut config, "custom", &SetupOptions::default()).unwrap();
     assert!(before == serde_json::to_value(&config.indexing.embeddings).unwrap());
     configure_external(
         &mut config,
+        "custom",
         &SetupOptions {
             embedding_api_key_env: Some(String::new()),
             ..Default::default()
@@ -538,4 +540,175 @@ fn test_qwen_clears_remote_resolution() {
             .resolved_remote_with(&config.services)
             .is_none()
     );
+}
+
+/// Every provider preset must be selectable end-to-end WITHOUT spelling out an
+/// endpoint, a model, or a dimension.
+///
+/// This is the regression test for the whole complaint that motivated the
+/// preset table: `leindex setup --embedding gemini` used to be an unknown route,
+/// and even a hand-written `remote_provider = "gemini"` config resolved no
+/// endpoint and ran the OpenAI-compatible wire format. Both halves are asserted
+/// here — the route configures, and the RESOLVED route selects the provider's
+/// own wire family, which is what the index path reads to pick a provider
+/// implementation.
+#[test]
+fn test_every_provider_preset_configures_without_explicit_endpoint_or_model() {
+    for preset in crate::config::REMOTE_PRESETS {
+        let mut config = LeIndexConfig::default();
+        let choices = SetupChoices {
+            neural_enabled: true,
+            provider: None,
+            remote_gemma: false,
+            options: SetupOptions {
+                embedding: Some(preset.name.into()),
+                ..Default::default()
+            },
+        };
+        configure(&mut config, &choices)
+            .unwrap_or_else(|e| panic!("preset {:?} failed to configure: {e:?}", preset.name));
+
+        let embeddings = &config.indexing.embeddings;
+        assert_eq!(
+            embeddings.remote_provider, preset.name,
+            "the preset name must be persisted as the provider"
+        );
+        // The preset fills these at resolve time, so they must NOT be frozen
+        // into the file: a later table update has to reach existing installs.
+        assert_eq!(
+            embeddings.remote_endpoint, None,
+            "preset {:?} must not persist its endpoint",
+            preset.name
+        );
+        assert_eq!(
+            embeddings.remote_model, None,
+            "preset {:?} must not persist its model",
+            preset.name
+        );
+
+        let resolved = embeddings
+            .resolved_remote_with(&config.services)
+            .unwrap_or_else(|| panic!("preset {:?} resolved no remote route", preset.name));
+        assert_eq!(
+            resolved.endpoint, preset.endpoint,
+            "preset {:?} must resolve its documented endpoint",
+            preset.name
+        );
+        assert_eq!(
+            resolved.model.as_deref(),
+            Some(preset.model),
+            "preset {:?} must resolve its documented model",
+            preset.name
+        );
+        assert_eq!(
+            resolved.remote_dimension,
+            Some(preset.dimension),
+            "preset {:?} must resolve its native dimension",
+            preset.name
+        );
+        assert_eq!(
+            resolved.wire, preset.wire,
+            "preset {:?} must resolve its own wire family, or the index path \
+             would run the wrong protocol",
+            preset.name
+        );
+        // The conventional key variable is picked up so the route can
+        // authenticate without the user naming it.
+        assert_eq!(
+            embeddings.remote_api_key_env.as_deref(),
+            preset.api_key_env,
+            "preset {:?} must fall back to its conventional API key variable",
+            preset.name
+        );
+    }
+}
+
+/// Only Gemini speaks the native protocol; every other preset rides the
+/// OpenAI-compatible `/v1/embeddings` contract.
+///
+/// Pinned as an explicit expectation rather than derived from the table, so
+/// adding a provider forces a decision here instead of silently inheriting
+/// whatever the default happens to be.
+#[test]
+fn test_native_wire_is_gemini_only() {
+    for preset in crate::config::REMOTE_PRESETS {
+        let expected = if preset.name == "gemini" {
+            crate::config::RemoteWire::Gemini
+        } else {
+            crate::config::RemoteWire::OpenAiCompat
+        };
+        assert_eq!(
+            preset.wire, expected,
+            "preset {:?} has an unexpected wire family",
+            preset.name
+        );
+    }
+}
+
+/// An unrecognized `remote_provider` keeps the generic OpenAI-compatible path
+/// and resolves no endpoint, so a bare `remote_provider` value can never
+/// silently produce a route the user did not configure.
+#[test]
+fn test_unknown_provider_still_needs_an_explicit_endpoint() {
+    let mut config = LeIndexConfig::default();
+    config.indexing.embeddings.enable_hybrid = true;
+    config.indexing.embeddings.remote_provider = "not-a-provider".into();
+    assert!(
+        config.indexing.embeddings.remote_preset().is_none(),
+        "an unknown provider name must not match a preset"
+    );
+    assert!(
+        config
+            .indexing
+            .embeddings
+            .resolved_remote_with(&config.services)
+            .is_none(),
+        "an unknown provider must not invent an endpoint"
+    );
+    assert_eq!(config.indexing.embeddings.remote_preset_label(), "custom");
+}
+
+/// The configured provider must survive into the actual provider instance.
+///
+/// `EmbeddingConfig` -> `RemoteEmbeddingConfig::from_resolved` is the one
+/// funnel the index path, the query path, and the smoke test all use. If it
+/// maps a Gemini route to the OpenAI-compatible variant, the endpoint and model
+/// still look right while the wire format is silently wrong — exactly the bug
+/// that made the preset table useless before.
+#[test]
+fn test_from_resolved_maps_the_wire_family_to_a_provider_variant() {
+    use crate::search::onnx::RemoteProvider;
+
+    let mut config = LeIndexConfig::default();
+    config.indexing.embeddings.enable_hybrid = true;
+    config.indexing.embeddings.remote_provider = "gemini".into();
+    let resolved = config
+        .indexing
+        .embeddings
+        .resolved_remote_with(&config.services)
+        .expect("gemini preset must resolve");
+    let remote = crate::search::onnx::RemoteEmbeddingConfig::from_resolved(&resolved, None, None);
+    match &remote.provider {
+        RemoteProvider::Gemini { model } => assert_eq!(model, "gemini-embedding-001"),
+        other => panic!("gemini must map to the native variant, got {other:?}"),
+    }
+    // Gemini carries its resolved endpoint as an override base URL, because the
+    // variant itself has no endpoint field.
+    assert_eq!(remote.base_url.as_deref(), Some(resolved.endpoint.as_str()));
+
+    // A preset on the compatible wire stays on the generic endpoint variant and
+    // must NOT set `base_url`: the endpoint is already the variant's identity,
+    // and setting both would key the checkpoint on the wrong string.
+    config.indexing.embeddings.remote_provider = "voyage".into();
+    let resolved = config
+        .indexing
+        .embeddings
+        .resolved_remote_with(&config.services)
+        .expect("voyage preset must resolve");
+    let remote = crate::search::onnx::RemoteEmbeddingConfig::from_resolved(&resolved, None, None);
+    match &remote.provider {
+        RemoteProvider::Custom { endpoint } => assert_eq!(endpoint, "https://api.voyageai.com/v1"),
+        other => panic!("voyage must map to the compatible variant, got {other:?}"),
+    }
+    assert_eq!(remote.base_url, None);
 }

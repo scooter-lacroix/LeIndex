@@ -949,17 +949,14 @@ fn configured_remote_identity(
     dimension: usize,
 ) -> Option<String> {
     let resolved = embeddings_cfg.resolved_remote()?;
-    let remote_cfg = crate::search::onnx::RemoteEmbeddingConfig {
-        provider: crate::search::onnx::RemoteProvider::Custom {
-            endpoint: resolved.endpoint,
-        },
-        model: resolved.model,
-        remote_dimension: resolved.remote_dimension,
-        doc_template: resolved.doc_template,
-        query_template: resolved.query_template,
-        base_url: None,
-        ..crate::search::onnx::RemoteEmbeddingConfig::default()
-    };
+    // Shared resolver: the identity must be derived from the SAME provider
+    // variant the index path constructs, or a `gemini` route would key its
+    // checkpoint on the OpenAI-compatible identity and never match its own rows.
+    let remote_cfg = crate::search::onnx::RemoteEmbeddingConfig::from_resolved(
+        &resolved,
+        None,
+        embeddings_cfg.remote_service.clone(),
+    );
     crate::search::onnx::GenericRemoteProvider::from_config(remote_cfg)
         .ok()
         .map(|provider| provider.identity_with_dimension(dimension))

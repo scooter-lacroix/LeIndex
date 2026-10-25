@@ -1172,7 +1172,7 @@ fn run_remote_smoke_test_inner(
     start_managed: bool,
 ) -> SmokeTestResult {
     use crate::cli::index_builder::{HybridEmbedder, TfIdfEmbedder};
-    use crate::search::onnx::{RemoteEmbeddingConfig, RemoteProvider};
+    use crate::search::onnx::RemoteEmbeddingConfig;
 
     const SMOKE_TEST_TEXT: &str = "hello world";
     let Some(resolved) = embeddings.resolved_remote_with(services) else {
@@ -1226,18 +1226,16 @@ fn run_remote_smoke_test_inner(
             };
         }
     };
+    // Smoke-test the route the user actually configured: resolving the provider
+    // here (instead of hardcoding the OpenAI-compatible variant) means setup
+    // cannot report a pass for a wire format the configured provider never
+    // speaks. A short 15s deadline and no re-sends keep setup from stalling on a
+    // dead endpoint; `max_retries: 0` so one clear failure is reported instead of
+    // a retry ladder.
     let remote_config = RemoteEmbeddingConfig {
-        provider: RemoteProvider::Custom {
-            endpoint: resolved.endpoint,
-        },
-        api_key,
         timeout_secs: 15,
         max_retries: 0,
-        model: resolved.model,
-        remote_dimension: resolved.remote_dimension,
-        doc_template: resolved.doc_template,
-        query_template: resolved.query_template,
-        ..RemoteEmbeddingConfig::default()
+        ..RemoteEmbeddingConfig::from_resolved(&resolved, api_key, None)
     };
     let embedder =
         match HybridEmbedder::hybrid_remote(TfIdfEmbedder::build(&[]), remote_config, None) {
