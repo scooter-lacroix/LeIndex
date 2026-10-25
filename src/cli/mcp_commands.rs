@@ -111,9 +111,9 @@ async fn tools_run(
     let parsed_args = parse_tool_args_json(args_json)?;
     let mut args = merge_tool_args(parsed_args.clone(), set, project.as_ref())?;
     apply_default_latency_budget(&mut args);
-    // The four public tools pick their operation with `action`
-    // (`--set action=text`); resolve to the underlying tool so the
-    // CLI renders exactly what the MCP transport does.
+    // The five public routers select their operation with `mode`/`action`
+    // (`--set action=text`); resolve to the underlying tool so the CLI renders
+    // exactly what the MCP transport does.
     let (name, args) = crate::cli::mcp::grouped::resolve_call(name, args)
         .map_err(|error| anyhow::anyhow!("{}", error))?;
     let mut parsed_args = parsed_args;

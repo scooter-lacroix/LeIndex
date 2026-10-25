@@ -1054,9 +1054,9 @@ async fn handle_tool_call_timed(
     // tool names, and this dispatch was previously the one place that
     // bypassed the shared normalizer (so legacy configs keep working).
     //
-    // The four public tools (`leindex_index|search|analyze|edit`) select their
-    // underlying handler with `action`; resolve that first so rendering and
-    // trimming below are keyed by the real tool.
+    // The five public routers (`leindex_explore|analyze|edit|manage|git`) select
+    // their underlying handler with `mode`/`action`; resolve that first so
+    // rendering and trimming below are keyed by the real tool.
     let (resolved_name, mut resolved_args) =
         match crate::cli::mcp::grouped::resolve_call(&tool_call.name, tool_call.arguments) {
             Ok(resolved) => resolved,
@@ -1274,10 +1274,11 @@ fn tool_error_result(
 
 /// List the public tool surface as JSON.
 ///
-/// Four grouped tools are advertised (`leindex_index`, `leindex_search`,
-/// `leindex_analyze`, `leindex_edit`), each selecting its operation with an
-/// `action` argument. The individual per-operation tools remain callable by
-/// name; set `LEINDEX_MCP_LEGACY_TOOLS=1` to advertise them too.
+/// Five grouped routers are advertised (`leindex_explore`, `leindex_analyze`,
+/// `leindex_edit`, `leindex_manage`, `leindex_git`), each selecting its
+/// operation with a `mode` or `action` argument. The individual per-operation
+/// tools remain callable by name; set `LEINDEX_MCP_LEGACY_TOOLS=1` to advertise
+/// them too.
 pub fn list_tools_json(handlers: &[ToolHandler]) -> Value {
     serde_json::json!({ "tools": crate::cli::mcp::grouped::public_tools_json(handlers) })
 }

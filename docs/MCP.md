@@ -267,7 +267,7 @@ options.
 ## Branch Reference
 
 > The sections below document each branch's arguments under the tool name it had
-> before the four-router surface; the names still work as direct calls, and each
+> before the five-router surface; the names still work as direct calls, and each
 > branch is reached as described above. **Tool names are underscore-form**
 > (`leindex_edit_apply`, `leindex_read_file`): several MCP client implementations
 > mishandle dots, so the canonical names dropped them, and historical

@@ -11,6 +11,7 @@ Use this reference when deciding which LeIndex call should replace a generic nav
 | `grep`, `rg`, `git grep` for text or a regex | `leindex_explore` `mode=find` | Millisecond trigram search, unbounded and paged, always live, enclosing symbol per hit. |
 | `grep` for a definition by name | `leindex_explore` `mode=find` `target=symbols` | Definitions, exact matches first. |
 | `grep -r` in a directory outside the project | `leindex_explore` `mode=find` `paths=[...]` | Parallel live scan; no index, no side effects. |
+| `rg` for a code SHAPE rather than text (calls with N args, unwrap in a loop) | `leindex_explore` `mode=structural` | AST pattern match via ast-grep; regex cannot express "a call with two arguments". Use `find` for literal text. |
 | Broad "where is this handled?" | `leindex_explore` `mode=search` | Ranked semantic + structural retrieval. |
 | "How does this feature work?" | `leindex_analyze` `mode=deep` | Semantic search expanded through the dependence graph. |
 | Manual caller/callee tracing | `leindex_explore` `mode=symbol_lookup` or `mode=context` | Structural relationships returned directly. |

@@ -184,16 +184,25 @@ Git reads and preview-gated mutations. `status` and `diff` are PDG-enriched
 (changed hunks mapped to symbols, callers and affected files); everything else
 is a thin, validated wrapper over the corresponding git operation.
 
-- `action=status`, `action=diff`: the enriched read paths. `diff` takes `ref`,
-  `range`, `staged`, `scope`, `stat_only`, `include_patch`.
-- `action=log`: `max_count`, `path`. `action=show`: `revision`, `path`.
-- `action=blame`: `file_path`, `range`. `action=branch`: `name`, `start_point`,
-  `force`. `action=remote`: `name`, `url`.
-- Mutating actions (`add`, `commit`, `checkout`, `stash`, `tag`, `merge`,
-  `rebase`, `push`, `reset`, `force`) return a **plan with a preview token**;
-  none of them mutate the repository. Revision arguments are validated and may
-  not contain `:` or `..`, so a revision can never be used to escape the
-  project via `rev:path` syntax.
+Argument names are SHARED across operations, not per-operation: `target` (a
+revision, ref or branch), `path` (project-relative file or directory), `paths`
+(array), `message`, `confirm`, plus `max_count`, `include_patch` and
+`max_chars` where an operation uses them.
+
+- `action=status`, `action=diff`: the enriched read paths, served by their own
+  handlers. `diff` takes `ref`, `range`, `staged`, `scope`, `stat_only`,
+  `include_patch`, `max_patch_chars`.
+- `action=log` `[target, path, max_count]`, `action=show` `[target,
+  include_patch]`, `action=blame` `[path, target]`, `action=branch` `[]`,
+  `action=remote` `[]`: the read paths.
+- Mutating actions (`add` `[paths]`, `commit` `[message]`, `checkout` `[target]`,
+  `stash` `[]`, `tag` `[target, message]`, `merge` `[target]`, `rebase`
+  `[target]`, `push` `[]`, `reset` `[target]`, `force` `[target]`) return a
+  **plan with a preview token**; none of them mutate the repository, and a
+  `confirm` is refused because the apply side is deliberately not wired.
+- Revisions are passed as a single argv entry (never a shell) and validated: a
+  leading `-` is rejected and `:` is not allowed, so `rev:path` cannot escape
+  the project. Ranges (`A..B`, `A...B`) are legal because `..` is permitted.
 
 ---
 
