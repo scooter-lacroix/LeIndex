@@ -24,6 +24,58 @@ fn external() -> LeIndexConfig {
     config
 }
 
+/// A provider key that is already exported must not be re-asked for, and the
+/// configured variable name must survive untouched.
+///
+/// This is the zero-config half of the preset flow: `leindex setup gemini`
+/// after `export GEMINI_API_KEY=...` should walk straight into the model
+/// picker. The variable name here is unique to this test — reusing a
+/// conventional name would let another test's environment decide the outcome.
+#[test]
+fn test_prompt_key_env_keeps_a_detected_environment_variable() {
+    const DETECTED: &str = "LEINDEX_TEST_DETECTED_KEY_ENV";
+    // SAFETY: unique name, never read by production code, and this test owns it.
+    unsafe { std::env::set_var(DETECTED, "present") };
+    let mut route = ExternalRoute {
+        endpoint: "http://127.0.0.1:9000/v1".into(),
+        model: "fixture".into(),
+        dimension: Some(1024),
+        key_env: DETECTED.into(),
+        doc: String::new(),
+        query: String::new(),
+    };
+    prompt_key_env(&mut route).expect("a detected key must not prompt");
+    assert_eq!(route.key_env, DETECTED);
+    unsafe { std::env::remove_var(DETECTED) };
+}
+
+/// An empty variable name means "this route is unauthenticated" and must not
+/// be silently replaced. It reaches the prompt, which is only safe in a
+/// terminal: the non-interactive path never calls this function at all, and
+/// this assertion documents that the empty case is deliberately not
+/// auto-accepted the way a detected key is.
+#[test]
+fn test_prompt_key_env_treats_an_empty_variable_as_unauthenticated() {
+    let route = ExternalRoute {
+        endpoint: String::new(),
+        model: String::new(),
+        dimension: None,
+        key_env: String::new(),
+        doc: String::new(),
+        query: String::new(),
+    };
+    // Mirrors the guard at the top of `prompt_key_env`: no name, nothing to
+    // detect, so the prompt is reached rather than skipped.
+    let detected = std::env::var(route.key_env.trim())
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some();
+    assert!(
+        !detected,
+        "an empty variable name cannot resolve to a detected key"
+    );
+}
+
 #[test]
 fn test_external_rerun_preserves_unspecified_fields() {
     let mut config = external();

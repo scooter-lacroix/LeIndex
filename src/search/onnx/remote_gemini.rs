@@ -1,0 +1,377 @@
+//! Native Google Gemini embedding provider (`v1beta`).
+//!
+//! Moved out of `remote.rs` by pure code motion (Large File Detection gate:
+//! `remote.rs` crossed 2000 lines). The type is re-exported from the parent so
+//! every existing path keeps resolving.
+
+use super::{
+    RemoteEmbeddingConfig, RemoteEmbeddingError, RemoteEmbeddingProvider, RemoteProvider,
+    build_http_client,
+};
+use async_trait::async_trait;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+
+/// Native Google Gemini embedding provider (`v1beta`).
+///
+/// Why this is not the OpenAI-compatible path: Gemini's native protocol differs
+/// from `/v1/embeddings` in three ways that the compat shim cannot express.
+///
+/// 1. **Shape.** A batch is `POST {base}/models/{model}:batchEmbedContents`
+///    with `{"requests":[{"model","content"}]}`; one text is
+///    `POST {base}/models/{model}:embedContent` with `{"content"}`.
+/// 2. **No index.** `batchEmbedContents` returns `{"embeddings":[...]}` in
+///    request order and carries NO per-row `index` field, so the
+///    `reorder_embeddings_by_index` contract that every other provider satisfies
+///    cannot be applied — order is the contract here.
+/// 3. **Task intent.** `taskType` (`RETRIEVAL_DOCUMENT` vs `RETRIEVAL_QUERY`)
+///    is how this protocol expresses asymmetric retrieval, where other
+///    providers use text prefixes. It is driven by which trait method was
+///    called: `embed` is the query path, `embed_batch` is the document path.
+///    This is why the model-side templates are NOT applied here — composing
+///    both would double-prefix every document.
+///
+/// `outputDimensionality` carries MRL truncation, so a configured
+/// `remote_dimension` smaller than the model's native width is requested from
+/// the server rather than sliced client-side.
+pub struct GeminiEmbeddingProvider {
+    client: Client,
+    /// `{base}/models` with any trailing slash removed.
+    base_url: String,
+    model: String,
+    api_key: String,
+    /// Requested `outputDimensionality`, when the operator pinned one.
+    dimension_override: Option<usize>,
+    /// Bootstrap width used only until the first response is measured.
+    bootstrap_dimension: usize,
+    /// 0 = not yet measured; else the vector length of the first successful
+    /// response. Mirrors [`super::CustomEmbeddingProvider`]'s measured width.
+    measured: std::sync::atomic::AtomicUsize,
+}
+
+/// Which side of an asymmetric retrieval pair a request is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeminiTask {
+    /// `RETRIEVAL_DOCUMENT` — the corpus side.
+    Document,
+    /// `RETRIEVAL_QUERY` — the query side.
+    Query,
+}
+
+impl GeminiTask {
+    /// The `taskType` string this protocol expects.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Document => "RETRIEVAL_DOCUMENT",
+            Self::Query => "RETRIEVAL_QUERY",
+        }
+    }
+}
+
+impl GeminiEmbeddingProvider {
+    /// Create a native Gemini embedding provider.
+    pub fn new(config: RemoteEmbeddingConfig) -> Result<Self, RemoteEmbeddingError> {
+        let model = match &config.provider {
+            RemoteProvider::Gemini { model } => model.clone(),
+            _ => {
+                return Err(RemoteEmbeddingError::ApiError(
+                    "Invalid provider".to_string(),
+                ));
+            }
+        };
+        // An explicit `base_url` wins so a proxy or a regional endpoint is
+        // reachable; otherwise the provider's documented default applies.
+        let base_url = config
+            .base_url
+            .clone()
+            .or_else(|| config.provider.default_base_url().map(str::to_string))
+            .ok_or_else(|| {
+                RemoteEmbeddingError::ApiError("Gemini requires a base URL".to_string())
+            })?;
+        let api_key = config
+            .api_key
+            .clone()
+            .ok_or_else(|| RemoteEmbeddingError::ApiKeyNotFound("Gemini".to_string()))?;
+        let client = build_http_client(&config)?;
+        Ok(Self {
+            client,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model,
+            api_key,
+            dimension_override: config.remote_dimension,
+            bootstrap_dimension: config.provider.default_dimension(),
+            measured: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Current dimension: measured > override > bootstrap default. Same
+    /// precedence as [`super::CustomEmbeddingProvider`]'s current dimension.
+    fn current_dimension(&self) -> usize {
+        let measured = self.measured.load(std::sync::atomic::Ordering::Relaxed);
+        if measured > 0 {
+            measured
+        } else {
+            self.dimension_override.unwrap_or(self.bootstrap_dimension)
+        }
+    }
+
+    /// POST one native request and return the vectors in request order.
+    ///
+    /// `texts` must be non-empty. Exactly one HTTP attempt: retrying is the
+    /// enclosing batch's shared `RetryAllowance` job (see
+    /// [`super::CustomEmbeddingProvider`]'s `embed_via_api` for the same
+    /// contract), so retrying here would multiply the budget across bisection
+    /// sub-batches.
+    async fn embed_native(
+        &self,
+        texts: Vec<&str>,
+        task: GeminiTask,
+    ) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
+        let single = texts.len() == 1;
+
+        #[derive(Deserialize)]
+        struct GeminiValues {
+            values: Vec<f32>,
+        }
+
+        #[derive(Deserialize)]
+        struct GeminiBatchResponse {
+            embeddings: Vec<GeminiValues>,
+        }
+
+        #[derive(Deserialize)]
+        struct GeminiSingleResponse {
+            embedding: GeminiValues,
+        }
+
+        let expected = texts.len();
+        let resource = format!("models/{}", self.model);
+        let task_type = task.as_str();
+        let output_dimensionality = self.dimension_override;
+        let (method, body) = if single {
+            (
+                "embedContent",
+                serde_json::to_value(GeminiSingleRequest {
+                    content: gemini_content(texts[0]),
+                    task_type,
+                    output_dimensionality,
+                }),
+            )
+        } else {
+            (
+                "batchEmbedContents",
+                serde_json::to_value(GeminiBatchRequestList {
+                    requests: texts
+                        .iter()
+                        .map(|text| GeminiBatchRequestRef {
+                            // The resource name, not the bare model id: the
+                            // batch API requires `models/<id>` per request.
+                            model: resource.clone(),
+                            content: gemini_content(text),
+                            task_type,
+                            output_dimensionality,
+                        })
+                        .collect(),
+                }),
+            )
+        };
+        let body = body.map_err(|e| RemoteEmbeddingError::InvalidResponse(e.to_string()))?;
+
+        let url = format!("{}/{resource}:{method}", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            // The native API takes the key as a header, not a Bearer token.
+            .header("x-goog-api-key", &self.api_key)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| RemoteEmbeddingError::Transport(error.to_string()))?;
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| RemoteEmbeddingError::Transport(e.to_string()))?;
+
+        if !status.is_success() {
+            if status.as_u16() == 429 {
+                return Err(RemoteEmbeddingError::RateLimitExceeded(
+                    "Gemini".to_string(),
+                ));
+            }
+            return Err(RemoteEmbeddingError::HttpStatus {
+                status: status.as_u16(),
+                message: response_text,
+            });
+        }
+
+        let embeddings: Vec<Vec<f32>> = if single {
+            let parsed: GeminiSingleResponse = serde_json::from_str(&response_text)
+                .map_err(|e| RemoteEmbeddingError::InvalidResponse(e.to_string()))?;
+            vec![parsed.embedding.values]
+        } else {
+            let parsed: GeminiBatchResponse = serde_json::from_str(&response_text)
+                .map_err(|e| RemoteEmbeddingError::InvalidResponse(e.to_string()))?;
+            parsed.embeddings.into_iter().map(|e| e.values).collect()
+        };
+
+        // Order IS the contract here: there is no `index` to verify against, so
+        // a row-count mismatch is the only evidence the response is unusable,
+        // and guessing would silently attach vectors to the wrong documents.
+        if embeddings.len() != expected {
+            return Err(RemoteEmbeddingError::InvalidResponse(format!(
+                "expected {expected} embeddings in Gemini response, got {}",
+                embeddings.len()
+            )));
+        }
+
+        // Dimension truth, identical to the OpenAI-compatible path: a known
+        // dimension (measured or pinned) is enforced on every row; otherwise the
+        // first successful length becomes the measurement and the bootstrap
+        // default is never enforced.
+        let known = {
+            let measured = self.measured.load(std::sync::atomic::Ordering::Relaxed);
+            if measured > 0 {
+                Some(measured)
+            } else {
+                self.dimension_override
+            }
+        };
+        if let Some(expected) = known.or_else(|| embeddings.first().map(Vec::len)) {
+            for embedding in &embeddings {
+                if embedding.len() != expected {
+                    return Err(RemoteEmbeddingError::InvalidDimension {
+                        expected,
+                        got: embedding.len(),
+                    });
+                }
+            }
+        }
+        if let Some(first) = embeddings
+            .first()
+            .filter(|_| self.measured.load(std::sync::atomic::Ordering::Relaxed) == 0)
+        {
+            self.measured
+                .store(first.len(), std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                dimension = first.len(),
+                model = %self.model,
+                "Measured Gemini embedding dimension from first response"
+            );
+        }
+        Ok(embeddings)
+    }
+}
+
+#[async_trait]
+impl RemoteEmbeddingProvider for GeminiEmbeddingProvider {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, RemoteEmbeddingError> {
+        // Single-text calls are the QUERY path.
+        let embeddings = self.embed_native(vec![text], GeminiTask::Query).await?;
+        embeddings.into_iter().next().ok_or_else(|| {
+            RemoteEmbeddingError::InvalidResponse("No embedding returned".to_string())
+        })
+    }
+
+    async fn embed_batch(&self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Batch calls are the DOCUMENT path. Unlike the OpenAI-compatible
+        // provider this does not bisect or retry per sub-batch: the transport
+        // retry ladder is the caller's (`RemoteEmbeddingConfig::max_retries`
+        // drives `with_transient_retry` at the hybrid-embedder layer), and a
+        // missing row here is a hard error rather than a silently empty vector.
+        self.embed_native(texts, GeminiTask::Document).await
+    }
+
+    fn dimension(&self) -> usize {
+        self.current_dimension()
+    }
+
+    fn measured_dimension(&self) -> Option<usize> {
+        let measured = self.measured.load(std::sync::atomic::Ordering::Relaxed);
+        if measured > 0 {
+            Some(measured)
+        } else {
+            self.dimension_override
+        }
+    }
+
+    fn observed_dimension(&self) -> Option<usize> {
+        let measured = self.measured.load(std::sync::atomic::Ordering::Relaxed);
+        (measured > 0).then_some(measured)
+    }
+
+    fn seed_measured_dimension(&self, dimension: usize) {
+        // Fills an unmeasured provider only; a real response always wins.
+        let _ = self.measured.compare_exchange(
+            0,
+            dimension,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// The `batchEmbedContents` body: one wrapping `requests` array.
+///
+/// Declared at module scope (not inside `embed_native`) because it borrows the
+/// per-request entries, which outlive the builder closure.
+#[derive(Serialize)]
+struct GeminiBatchRequestList<'a> {
+    requests: Vec<GeminiBatchRequestRef<'a>>,
+}
+
+/// One borrow-carrying entry of a `batchEmbedContents` request.
+#[derive(Serialize)]
+struct GeminiBatchRequestRef<'a> {
+    model: String,
+    content: GeminiContentRef<'a>,
+    #[serde(rename = "taskType")]
+    task_type: &'static str,
+    #[serde(
+        rename = "outputDimensionality",
+        skip_serializing_if = "Option::is_none"
+    )]
+    output_dimensionality: Option<usize>,
+}
+
+/// The single-text (`embedContent`) body: the same fields, one level flatter
+/// (no `model`, no wrapping `requests` array).
+#[derive(Serialize)]
+struct GeminiSingleRequest<'a> {
+    content: GeminiContentRef<'a>,
+    #[serde(rename = "taskType")]
+    task_type: &'static str,
+    #[serde(
+        rename = "outputDimensionality",
+        skip_serializing_if = "Option::is_none"
+    )]
+    output_dimensionality: Option<usize>,
+}
+
+/// The `content` object of a native Gemini request.
+#[derive(Serialize)]
+struct GeminiContentRef<'a> {
+    parts: Vec<GeminiPartRef<'a>>,
+}
+
+/// One `parts` entry: the text being embedded.
+#[derive(Serialize)]
+struct GeminiPartRef<'a> {
+    text: &'a str,
+}
+
+/// Wrap one text as a single-part Gemini `content`.
+///
+/// A free function rather than a closure so the returned value borrows only
+/// from `text` — a closure could not express that without capturing the input
+/// lifetime.
+fn gemini_content(text: &str) -> GeminiContentRef<'_> {
+    GeminiContentRef {
+        parts: vec![GeminiPartRef { text }],
+    }
+}

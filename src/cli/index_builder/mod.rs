@@ -21,7 +21,9 @@ use super::leindex::{
     DEPENDENCY_MANIFEST_NAMES, FileStats, IndexStats, ProjectFileScan, SKIP_DIRS,
     SOURCE_FILE_EXTENSIONS,
 };
-mod hybrid;
+// `pub(crate)` so the setup wizard can reuse `block_on_remote` instead of
+// growing a second async->sync bridge for its model discovery.
+pub(crate) mod hybrid;
 mod merge;
 
 pub(crate) use merge::{merge_pdgs, normalize_external_nodes, remove_file_from_pdg};

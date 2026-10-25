@@ -944,27 +944,158 @@ fn external_route_from_flags(
     }
 }
 
-/// Interactive prompts for the external route; defaults come from the resolved route (CCN-gate extraction).
-fn prompt_external_route(
+/// Offer the models the endpoint actually serves.
+///
+/// Returns the chosen identifier, or `None` when discovery could not produce a
+/// usable list — in which case the caller keeps the existing free-text prompt
+/// instead of failing. This ordering matters: discovery is a convenience, and
+/// an endpoint that hides its catalogue (or has no listing at all) must not
+/// make `leindex setup` unusable.
+///
+/// The candidates come from the provider's own response, so a model this
+/// installation has never heard of is still selectable, and an ID the preset
+/// table got wrong never is.
+#[cfg(feature = "remote-embeddings")]
+fn discover_models(
+    route: &ExternalRoute,
+    preset: Option<&crate::config::RemotePreset>,
+) -> Vec<String> {
+    use crate::cli::index_builder::hybrid::block_on_remote;
+    use crate::search::onnx::remote::{RemoteEmbeddingConfig, RemoteProvider};
+
+    let endpoint = route.endpoint.trim();
+    if endpoint.is_empty() {
+        return Vec::new();
+    }
+    // Resolve the wire from the SAME table the runtime uses, so discovery
+    // speaks the protocol the embedder will speak. Building the variant by
+    // hand here would let a native-Gemini route be listed over the
+    // OpenAI-compatible path and quietly return a different catalogue.
+    let wire = preset.map_or(crate::config::RemoteWire::OpenAiCompat, |p| p.wire);
+    let provider = match wire {
+        crate::config::RemoteWire::Gemini => RemoteProvider::Gemini {
+            model: route.model.clone(),
+        },
+        crate::config::RemoteWire::OpenAiCompat => RemoteProvider::Custom {
+            endpoint: endpoint.to_string(),
+        },
+    };
+    // An unset key is not an error to report here: the route may legitimately
+    // be unauthenticated, and the smoke test is what validates credentials.
+    let api_key = std::env::var(route.key_env.trim())
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .filter(|_| !route.key_env.trim().is_empty());
+    let config = RemoteEmbeddingConfig {
+        provider,
+        api_key,
+        // Listing is a page of metadata; a slow answer here should not stall
+        // the wizard, and the caller falls back to free text.
+        timeout_secs: 10,
+        max_retries: 0,
+        base_url: (wire == crate::config::RemoteWire::Gemini).then(|| endpoint.to_string()),
+        ..Default::default()
+    };
+    block_on_remote(async move {
+        config.list_models().await.map_err(|error| {
+            // Discovery failures are advisory; surface the reason if a caller
+            // ever wants it, but never mark the route permanent.
+            crate::cli::index_builder::hybrid::RemoteBridgeError::Transient(error)
+        })
+    })
+    .unwrap_or_default()
+}
+
+/// Prompt for the model identifier, preferring a discovered list (CCN-gate extraction).
+fn prompt_model(
     route: &mut ExternalRoute,
-    previous: &crate::config::EmbeddingConfig,
+    preset: Option<&crate::config::RemotePreset>,
+) -> Result<(), SetupError> {
+    #[cfg(feature = "remote-embeddings")]
+    {
+        let mut models = discover_models(route, preset);
+        if !models.is_empty() {
+            models.sort();
+            models.dedup();
+            // Keep the configured/preset model addressable even when the
+            // endpoint's listing omits it (some servers list only loaded
+            // models, or hide aliases): offering a list that cannot express
+            // the current value would silently change the user's route.
+            if !route.model.trim().is_empty() && !models.iter().any(|m| m == &route.model) {
+                models.insert(0, route.model.clone());
+            }
+            let default = models.iter().position(|m| m == &route.model).unwrap_or(0);
+            let chosen = Select::new()
+                .with_prompt(format!("Model ({} served)", models.len()))
+                .items(&models)
+                .default(default)
+                .interact()
+                .map_err(|e| SetupError::Interactive(e.to_string()))?;
+            route.model = models[chosen].clone();
+            return Ok(());
+        }
+    }
+    // No listing available (or built without remote-embeddings): the free-text
+    // prompt is the whole contract, so it must stay reachable.
+    route.model = prompt("Server model identifier", route.model.clone())?;
+    Ok(())
+}
+
+/// Prompt for the endpoint, model, and dimension of a free-form external route.
+fn prompt_route_details(
+    route: &mut ExternalRoute,
+    preset: Option<&crate::config::RemotePreset>,
 ) -> Result<(), SetupError> {
     route.endpoint = prompt(
         "Embeddings base URL (for example http://localhost:9000/v1)",
         route.endpoint.clone(),
     )?;
-    route.model = prompt("Server model identifier", route.model.clone())?;
+    prompt_model(route, preset)?;
+    // Default to the RESOLVED route dimension, not the previous config's: the
+    // caller has already folded flag-over-preset-over-previous precedence into
+    // `route.dimension`, so reading `previous` here would show the outgoing
+    // provider's width as the recommendation for the incoming one.
     let d: usize = prompt(
         "Expected dimension (0 = discover)",
-        previous.remote_dimension.unwrap_or(0),
+        route.dimension.unwrap_or(0),
     )?;
     route.dimension = (d != 0).then_some(d);
+    Ok(())
+}
+
+/// Prompt for the API-key variable, skipping the question when the key is
+/// already in the environment.
+///
+/// A preset names the variable it expects, so a user who has exported
+/// `GEMINI_API_KEY` should not be asked to confirm that they did. When the
+/// variable is absent the prompt stays — silently persisting a name that
+/// resolves to nothing would fail later, at ingest, with a message about
+/// authentication rather than about setup.
+fn prompt_key_env(route: &mut ExternalRoute) -> Result<(), SetupError> {
+    let key_env = route.key_env.trim().to_string();
+    let detected = std::env::var(&key_env)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some();
+    if !key_env.is_empty() && detected {
+        return Ok(());
+    }
+    let label = if key_env.is_empty() {
+        "API key environment variable (blank for none)".to_string()
+    } else {
+        format!("{key_env} is not set - API key environment variable (blank for none)")
+    };
     route.key_env = Input::<String>::new()
-        .with_prompt("API key environment variable (blank for none)")
+        .with_prompt(label)
         .with_initial_text(&route.key_env)
         .allow_empty(true)
         .interact_text()
         .map_err(|e| SetupError::Interactive(e.to_string()))?;
+    Ok(())
+}
+
+/// Prompt for the asymmetric doc/query templates, keeping resolved defaults.
+fn prompt_templates(route: &mut ExternalRoute) -> Result<(), SetupError> {
     route.doc = Input::<String>::new()
         .with_prompt("Document template (blank = raw text)")
         .with_initial_text(&route.doc)
@@ -978,6 +1109,42 @@ fn prompt_external_route(
         .interact_text()
         .map_err(|e| SetupError::Interactive(e.to_string()))?;
     Ok(())
+}
+
+/// Interactive prompts for the external route; defaults come from the resolved route.
+///
+/// A preset route is zero-config: endpoint, model, dimension, and key variable
+/// all come from the preset table, so the wizard walks straight to the model
+/// picker. Overriding is still one keystroke away, because a self-hosted
+/// gateway or a pinned catalogue is a legitimate deviation from the table —
+/// just not what most people running `leindex setup gemini` want to be asked.
+fn prompt_external_route(
+    route: &mut ExternalRoute,
+    preset: Option<&crate::config::RemotePreset>,
+) -> Result<(), SetupError> {
+    if let Some(preset) = preset {
+        let use_defaults = Confirm::new()
+            .with_prompt(format!(
+                "Use {} defaults ({} · {})?",
+                preset.name, preset.endpoint, preset.model
+            ))
+            .default(true)
+            .interact()
+            .map_err(|e| SetupError::Interactive(e.to_string()))?;
+        if !use_defaults {
+            prompt_route_details(route, Some(preset))?;
+            prompt_key_env(route)?;
+            return prompt_templates(route);
+        }
+        // Keep the table's endpoint/model/dimension and ask only what the
+        // table cannot know: which served model to use, and the templates.
+        prompt_model(route, Some(preset))?;
+        prompt_key_env(route)?;
+        return Ok(());
+    }
+    prompt_route_details(route, None)?;
+    prompt_key_env(route)?;
+    prompt_templates(route)
 }
 
 /// Requires an http(s) URL with a host and no credentials, query, or fragment (CCN-gate extraction).
@@ -1143,7 +1310,7 @@ fn configure_external(
         }
     }
     if options.interactive {
-        prompt_external_route(&mut route, previous)?;
+        prompt_external_route(&mut route, preset)?;
     }
     // A preset route that kept the offered defaults persists NO endpoint or
     // model: the table is the source of truth, so `remote_provider = "gemini"`

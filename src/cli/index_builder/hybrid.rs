@@ -1219,7 +1219,7 @@ impl Default for HybridEmbedder {
 /// answers an over-long input with HTTP 500). Escalating on the classification
 /// instead would freeze a generation over a single bad document.
 #[cfg(feature = "remote-embeddings")]
-enum RemoteBridgeError {
+pub(crate) enum RemoteBridgeError {
     /// The request failed without saying anything about the embedding space
     /// (dropped connection, gateway/availability status). Retryable.
     Transient(RemoteEmbeddingError),
@@ -1267,7 +1267,7 @@ fn bridge_error(error: RemoteEmbeddingError) -> RemoteBridgeError {
 /// it to a `String` here is what made one dropped connection indistinguishable
 /// from a contract failure.
 #[cfg(feature = "remote-embeddings")]
-fn block_on_remote<T: Send + 'static>(
+pub(crate) fn block_on_remote<T: Send + 'static>(
     fut: impl std::future::Future<Output = Result<T, RemoteBridgeError>> + Send + 'static,
 ) -> Result<T, RemoteBridgeError> {
     std::thread::Builder::new()
