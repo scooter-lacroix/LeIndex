@@ -1,10 +1,8 @@
 # LeIndex Tool Schemas
 
-Generated from the live CLI surface with `leindex tools schema <tool>`. Each tool is a router: the `mode` / `action` property selects one of the `oneOf` branches.
+Generated from the live CLI surface with `leindex tools schema <tool>`. Each tool is a router: the `mode` / `action` property selects one of the `oneOf` branches. Regenerate this file whenever a tool argument changes (see docs/AGENT_GUIDANCE.md).
 
 ## leindex_explore
-
-Find and read code. mode: search (by meaning, default), find (exact text/regex/symbol names, anywhere on disk), symbol_lookup (callers/callees), read_file, read_symbol, project_map, file_summary, context. See leindex://tools/guide for branch args.
 
 ```json
 {
@@ -28,6 +26,7 @@ Find and read code. mode: search (by meaning, default), find (exact text/regex/s
         },
         "mode": {
           "const": "search",
+          "default": "search",
           "description": "Ranked semantic + structural search"
         },
         "offset": {
@@ -83,7 +82,6 @@ Find and read code. mode: search (by meaning, default), find (exact text/regex/s
         }
       },
       "required": [
-        "mode",
         "query"
       ],
       "title": "search",
@@ -212,13 +210,6 @@ Find and read code. mode: search (by meaning, default), find (exact text/regex/s
           "minimum": 0,
           "type": "integer"
         },
-        "offset": {
-          "default": 0,
-          "description": "Hits to skip (use next_offset; clamped to the 10000 ceiling)",
-          "maximum": 10000,
-          "minimum": 0,
-          "type": "integer"
-        },
         "max_line_chars": {
           "default": 200,
           "description": "Longest line shown",
@@ -232,7 +223,8 @@ Find and read code. mode: search (by meaning, default), find (exact text/regex/s
         },
         "offset": {
           "default": 0,
-          "description": "Hits to skip (use next_offset)",
+          "description": "Hits to skip; clamped to 10000; stream ends there",
+          "maximum": 10000,
           "minimum": 0,
           "type": "integer"
         },
@@ -260,7 +252,7 @@ Find and read code. mode: search (by meaning, default), find (exact text/regex/s
         },
         "per_file_cap": {
           "default": 20,
-          "description": "Hits shown per file; matches past the cap stay counted but appear on no page; 0 = no cap",
+          "description": "Shown per file; past-cap matches appear on no page; 0 = no cap",
           "minimum": 0,
           "type": "integer"
         },
@@ -313,6 +305,86 @@ Find and read code. mode: search (by meaning, default), find (exact text/regex/s
         "pattern"
       ],
       "title": "find",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "exclude_globs": {
+          "description": "Skip these, e.g. [\"vendor/\"]",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "include_globs": {
+          "description": "Only these, e.g. [\"*.rs\"]",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "lang": {
+          "description": "Language name or extension (rust, rs, py, go); omit to infer",
+          "type": "string"
+        },
+        "limit": {
+          "default": 100,
+          "description": "Matches per page; 0 = ceiling (10000)",
+          "maximum": 10000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mode": {
+          "const": "structural",
+          "description": "AST-pattern search with ast-grep, e.g. `fn $NAME($$$ARGS) { $$$BODY }` (needs the structural-search feature and LEINDEX_FEATURE_STRUCTURAL_SEARCH=1)"
+        },
+        "offset": {
+          "default": 0,
+          "description": "Matches to skip",
+          "maximum": 10000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pattern": {
+          "description": "ast-grep pattern; $NAME one node, $$$ARGS a list",
+          "type": "string"
+        },
+        "per_file_cap": {
+          "default": 20,
+          "description": "Shown per file; 0 = no cap",
+          "maximum": 10000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "scope": {
+          "description": "Restrict to a project-relative directory or file",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 20000,
+          "description": "Time budget; partial results + has_more. 0 = none",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "mode",
+        "pattern"
+      ],
+      "title": "structural",
       "type": "object"
     },
     {
@@ -432,12 +504,12 @@ Find and read code. mode: search (by meaning, default), find (exact text/regex/s
           "type": "integer"
         },
         "focus": {
-          "description": "Semantic focus area \u2014 ranks files by relevance to this topic (e.g., 'authentication', 'database layer', 'payment flow')",
+          "description": "Semantic focus area — ranks files by relevance to this topic (e.g., 'authentication', 'database layer', 'payment flow')",
           "type": "string"
         },
         "group_by": {
           "default": "tree",
-          "description": "Grouping mode: tree (default, flat file list) or community (Leiden communities \u2014 module boundaries the codebase itself may not have named)",
+          "description": "Grouping mode: tree (default, flat file list) or community (Leiden communities — module boundaries the codebase itself may not have named)",
           "enum": [
             "tree",
             "community"
@@ -614,6 +686,7 @@ Find and read code. mode: search (by meaning, default), find (exact text/regex/s
         "search",
         "symbol_lookup",
         "find",
+        "structural",
         "read_file",
         "read_symbol",
         "project_map",
@@ -643,8 +716,6 @@ Find and read code. mode: search (by meaning, default), find (exact text/regex/s
 
 ## leindex_analyze
 
-Program-dependence-graph analysis and repo state. mode: deep (semantic search + graph expansion, default), impact (blast radius), diagnostics, git_status, git_diff. See leindex://tools/guide for branch args.
-
 ```json
 {
   "discriminator": {
@@ -667,6 +738,7 @@ Program-dependence-graph analysis and repo state. mode: deep (semantic search + 
         },
         "mode": {
           "const": "deep",
+          "default": "deep",
           "description": "Semantic retrieval expanded through the PDG"
         },
         "project_path": {
@@ -700,7 +772,6 @@ Program-dependence-graph analysis and repo state. mode: deep (semantic search + 
         }
       },
       "required": [
-        "mode",
         "query"
       ],
       "title": "deep",
@@ -783,29 +854,80 @@ Program-dependence-graph analysis and repo state. mode: deep (semantic search + 
     },
     {
       "properties": {
-        "allow_partial": {
-          "default": true,
+        "docs_mode": {
+          "default": "off",
+          "description": "Controls which documentation files to include: 'off' (default, code only), 'markdown' (*.md files like README, CHANGELOG), 'text' (*.txt, *.rst), 'all' (all doc formats). Use 'markdown' or 'all' to analyze project documentation alongside code.",
+          "enum": [
+            "off",
+            "markdown",
+            "text",
+            "all"
+          ],
+          "type": "string"
+        },
+        "format": {
+          "default": "balanced",
+          "description": "Phase report format, reachable through leindex_analyze (whose `mode` argument is the branch selector). Equivalent to `mode` for direct calls.",
+          "enum": [
+            "ultra",
+            "balanced",
+            "verbose"
+          ],
+          "type": "string"
+        },
+        "include_docs": {
+          "default": false,
+          "description": "IMPORTANT: Enable to include prose/documentation files (README, docs/, *.md) in the analysis. Without this, only source code files are analyzed. Set to true when you need architectural docs, changelogs, or project documentation. Also accepts strings: 'true'/'false'.",
           "type": "boolean"
         },
-        "enrich_pdg": {
-          "default": true,
-          "description": "Accepted for compatibility; resident PDG enrichment remains enabled.",
-          "type": "boolean"
+        "max_chars": {
+          "default": 12000,
+          "type": "integer"
+        },
+        "max_files": {
+          "default": 2000,
+          "type": "integer"
+        },
+        "max_focus_files": {
+          "default": 20,
+          "type": "integer"
         },
         "max_latency_ms": {
-          "default": 150,
+          "description": "Wall-clock ceiling for the whole run. A stage already in flight cannot be cancelled, but no further stages start once the ceiling passes, and the report is marked INCOMPLETE with the stages that ran and the ones skipped. Omit for no bound (default: LEINDEX_PHASE_BUDGET_MS).",
+          "minimum": 1,
           "type": "integer"
         },
         "mode": {
-          "const": "git_status",
-          "description": "Live git status enriched with changed symbols"
+          "const": "phase",
+          "description": "5-phase architecture analysis"
+        },
+        "path": {
+          "description": "File or directory to analyze (defaults to project root)",
+          "type": "string"
+        },
+        "phase": {
+          "default": "all",
+          "oneOf": [
+            {
+              "maximum": 5,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "enum": [
+                "all",
+                "1",
+                "2",
+                "3",
+                "4",
+                "5"
+              ],
+              "type": "string"
+            }
+          ]
         },
         "project_path": {
           "description": "Project directory (auto-indexes on first use; omit for current)",
-          "type": "string"
-        },
-        "scope": {
-          "description": "Optional project-relative scope for advisory stage candidates",
           "type": "string"
         },
         "tier": {
@@ -816,88 +938,16 @@ Program-dependence-graph analysis and repo state. mode: deep (semantic search + 
             "l2"
           ],
           "type": "string"
+        },
+        "top_n": {
+          "default": 10,
+          "type": "integer"
         }
       },
       "required": [
         "mode"
       ],
-      "title": "git_status",
-      "type": "object"
-    },
-    {
-      "properties": {
-        "allow_partial": {
-          "default": true,
-          "type": "boolean"
-        },
-        "enrich_pdg": {
-          "default": true,
-          "description": "Map changed hunks to PDG symbols and compute impact",
-          "type": "boolean"
-        },
-        "include_patch": {
-          "default": true,
-          "description": "Include the (bounded) unified patch",
-          "type": "boolean"
-        },
-        "max_latency_ms": {
-          "default": 250,
-          "description": "PDG enrichment budget",
-          "maximum": 60000,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "max_patch_chars": {
-          "default": 20000,
-          "description": "Patch size bound",
-          "maximum": 200000,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "mode": {
-          "const": "git_diff",
-          "description": "PDG-enriched diff (working tree, staged, ref or range)"
-        },
-        "project_path": {
-          "description": "Project directory (auto-indexes on first use; omit for current)",
-          "type": "string"
-        },
-        "range": {
-          "description": "Revision range, e.g. main..feature or HEAD~3..HEAD",
-          "type": "string"
-        },
-        "ref": {
-          "description": "Diff one commit against its parent (e.g. HEAD, HEAD~1, a1b2c3d)",
-          "type": "string"
-        },
-        "scope": {
-          "description": "Only report files under this project-relative path",
-          "type": "string"
-        },
-        "staged": {
-          "default": false,
-          "description": "Diff the index against HEAD instead of the working tree",
-          "type": "boolean"
-        },
-        "stat_only": {
-          "default": false,
-          "description": "Per-file statistics only; no patch, no hunk-level symbol mapping",
-          "type": "boolean"
-        },
-        "tier": {
-          "description": "Detail: l0 card, l1 overview (default), l2 full",
-          "enum": [
-            "l0",
-            "l1",
-            "l2"
-          ],
-          "type": "string"
-        }
-      },
-      "required": [
-        "mode"
-      ],
-      "title": "git_diff",
+      "title": "phase",
       "type": "object"
     }
   ],
@@ -908,8 +958,7 @@ Program-dependence-graph analysis and repo state. mode: deep (semantic search + 
         "deep",
         "impact",
         "diagnostics",
-        "git_status",
-        "git_diff"
+        "phase"
       ],
       "type": "string"
     },
@@ -933,8 +982,6 @@ Program-dependence-graph analysis and repo state. mode: deep (semantic search + 
 ```
 
 ## leindex_edit
-
-Context-aware editing. action (required, no default): apply (atomic edit), preview (dry-run diff + impact), rename (cross-file symbol rename; preview by default), write (atomic file write). See leindex://tools/guide for branch args.
 
 ```json
 {
@@ -969,7 +1016,7 @@ Context-aware editing. action (required, no default): apply (atomic edit), previ
           "type": "string"
         },
         "new_text": {
-          "description": "Simple mode: replacement text",
+          "description": "FRESH MODE: replacement text. Use only when no preview_token is sent; with a preview_token, omit this field.",
           "type": "string"
         },
         "old_str": {
@@ -977,11 +1024,11 @@ Context-aware editing. action (required, no default): apply (atomic edit), previ
           "type": "string"
         },
         "old_text": {
-          "description": "Simple mode: text to find and replace (exact match)",
+          "description": "FRESH MODE: text to find and replace (exact match). Use only when no preview_token is sent; with a preview_token, omit this field.",
           "type": "string"
         },
         "preview_token": {
-          "description": "The token returned by a previous LeIndex [Edit Preview] (tool: leindex.edit-preview) call. Required if using cached preview.",
+          "description": "TOKEN MODE: the preview_token from a previous LeIndex [Edit Preview] (tool: leindex.edit-preview). When set, the token IS the edit: send file_path + preview_token only and omit old_text/new_text/changes (any text sent with a token is ignored). Unknown or mismatched token: request a new preview, or resend the edit as FRESH MODE without preview_token.",
           "type": "string"
         },
         "project_path": {
@@ -1167,8 +1214,6 @@ Context-aware editing. action (required, no default): apply (atomic edit), previ
 
 ## leindex_manage
 
-Index lifecycle and architecture reports. action: index (build/refresh; returns a pollable job, default), phase (5-phase architecture analysis). See leindex://tools/guide for branch args.
-
 ```json
 {
   "discriminator": {
@@ -1179,15 +1224,76 @@ Index lifecycle and architecture reports. action: index (build/refresh; returns 
       "properties": {
         "action": {
           "const": "index",
+          "default": "index",
           "description": "Build or refresh the index (pollable job)"
         },
         "force_reindex": {
           "default": false,
-          "description": "If true, re-index even if already indexed (default: false). Also accepts compatibility strings: 'true'/'false', '1'/'0', 'yes'/'no'.",
+          "description": "If true, re-index even if already indexed. Also accepts '1'/'0', 'yes'/'no'.",
           "type": "boolean"
         },
         "project_path": {
           "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "status_only": {
+          "description": "Poll without starting work",
+          "type": "boolean"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        },
+        "wait": {
+          "default": false,
+          "description": "Wait for completion instead of a pollable snapshot",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "project_path"
+      ],
+      "title": "index",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "state",
+          "description": "Is the index usable? generation, phase, freshness, counts"
+        },
+        "dry_run": {
+          "default": true,
+          "description": "Report retention candidates without deleting (cleanup); defaults to true",
+          "type": "boolean"
+        },
+        "force_reindex": {
+          "default": false,
+          "description": "Re-index even if already indexed (index)",
+          "type": "boolean"
+        },
+        "max_generations": {
+          "default": 3,
+          "description": "Generations to retain: current plus this many predecessors (cleanup)",
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "status_only": {
+          "description": "Poll an existing job without starting work (index)",
+          "type": "boolean"
+        },
+        "target": {
+          "description": "Project to evict, or 'all' for every resident project",
           "type": "string"
         },
         "tier": {
@@ -1201,87 +1307,49 @@ Index lifecycle and architecture reports. action: index (build/refresh; returns 
         },
         "wait": {
           "default": false,
-          "description": "Wait for completion instead of returning a pollable job snapshot (default: false)",
+          "description": "Wait for completion instead of a pollable snapshot (index)",
           "type": "boolean"
         }
       },
       "required": [
-        "action",
-        "project_path"
+        "action"
       ],
-      "title": "index",
+      "title": "state",
       "type": "object"
     },
     {
       "properties": {
         "action": {
-          "const": "phase",
-          "description": "5-phase architecture analysis"
+          "const": "projects",
+          "description": "Projects resident in memory, with the default"
         },
-        "docs_mode": {
-          "default": "off",
-          "description": "Controls which documentation files to include: 'off' (default, code only), 'markdown' (*.md files like README, CHANGELOG), 'text' (*.txt, *.rst), 'all' (all doc formats). Use 'markdown' or 'all' to analyze project documentation alongside code.",
-          "enum": [
-            "off",
-            "markdown",
-            "text",
-            "all"
-          ],
-          "type": "string"
-        },
-        "include_docs": {
-          "default": false,
-          "description": "IMPORTANT: Enable to include prose/documentation files (README, docs/, *.md) in the analysis. Without this, only source code files are analyzed. Set to true when you need architectural docs, changelogs, or project documentation. Also accepts strings: 'true'/'false'.",
+        "dry_run": {
+          "default": true,
+          "description": "Report retention candidates without deleting (cleanup); defaults to true",
           "type": "boolean"
         },
-        "max_chars": {
-          "default": 12000,
+        "force_reindex": {
+          "default": false,
+          "description": "Re-index even if already indexed (index)",
+          "type": "boolean"
+        },
+        "max_generations": {
+          "default": 3,
+          "description": "Generations to retain: current plus this many predecessors (cleanup)",
+          "maximum": 100,
+          "minimum": 1,
           "type": "integer"
-        },
-        "max_files": {
-          "default": 2000,
-          "type": "integer"
-        },
-        "max_focus_files": {
-          "default": 20,
-          "type": "integer"
-        },
-        "mode": {
-          "default": "balanced",
-          "enum": [
-            "ultra",
-            "balanced",
-            "verbose"
-          ],
-          "type": "string"
-        },
-        "path": {
-          "description": "File or directory to analyze (defaults to project root)",
-          "type": "string"
-        },
-        "phase": {
-          "default": "all",
-          "oneOf": [
-            {
-              "maximum": 5,
-              "minimum": 1,
-              "type": "integer"
-            },
-            {
-              "enum": [
-                "all",
-                "1",
-                "2",
-                "3",
-                "4",
-                "5"
-              ],
-              "type": "string"
-            }
-          ]
         },
         "project_path": {
           "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "status_only": {
+          "description": "Poll an existing job without starting work (index)",
+          "type": "boolean"
+        },
+        "target": {
+          "description": "Project to evict, or 'all' for every resident project",
           "type": "string"
         },
         "tier": {
@@ -1293,15 +1361,184 @@ Index lifecycle and architecture reports. action: index (build/refresh; returns 
           ],
           "type": "string"
         },
-        "top_n": {
-          "default": 10,
-          "type": "integer"
+        "wait": {
+          "default": false,
+          "description": "Wait for completion instead of a pollable snapshot (index)",
+          "type": "boolean"
         }
       },
       "required": [
         "action"
       ],
-      "title": "phase",
+      "title": "projects",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "evict",
+          "description": "Release a project from memory (data stays on disk); target required"
+        },
+        "dry_run": {
+          "default": true,
+          "description": "Report retention candidates without deleting (cleanup); defaults to true",
+          "type": "boolean"
+        },
+        "force_reindex": {
+          "default": false,
+          "description": "Re-index even if already indexed (index)",
+          "type": "boolean"
+        },
+        "max_generations": {
+          "default": 3,
+          "description": "Generations to retain: current plus this many predecessors (cleanup)",
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "status_only": {
+          "description": "Poll an existing job without starting work (index)",
+          "type": "boolean"
+        },
+        "target": {
+          "description": "Project to evict, or 'all' for every resident project",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        },
+        "wait": {
+          "default": false,
+          "description": "Wait for completion instead of a pollable snapshot (index)",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "evict",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "lease",
+          "description": "Acquire a generation lease and report the pinned generation"
+        },
+        "dry_run": {
+          "default": true,
+          "description": "Report retention candidates without deleting (cleanup); defaults to true",
+          "type": "boolean"
+        },
+        "force_reindex": {
+          "default": false,
+          "description": "Re-index even if already indexed (index)",
+          "type": "boolean"
+        },
+        "max_generations": {
+          "default": 3,
+          "description": "Generations to retain: current plus this many predecessors (cleanup)",
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "status_only": {
+          "description": "Poll an existing job without starting work (index)",
+          "type": "boolean"
+        },
+        "target": {
+          "description": "Project to evict, or 'all' for every resident project",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        },
+        "wait": {
+          "default": false,
+          "description": "Wait for completion instead of a pollable snapshot (index)",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "lease",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "cleanup",
+          "description": "Retention report for the generation store (dry_run by default)"
+        },
+        "dry_run": {
+          "default": true,
+          "description": "Report retention candidates without deleting (cleanup); defaults to true",
+          "type": "boolean"
+        },
+        "force_reindex": {
+          "default": false,
+          "description": "Re-index even if already indexed (index)",
+          "type": "boolean"
+        },
+        "max_generations": {
+          "default": 3,
+          "description": "Generations to retain: current plus this many predecessors (cleanup)",
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "status_only": {
+          "description": "Poll an existing job without starting work (index)",
+          "type": "boolean"
+        },
+        "target": {
+          "description": "Project to evict, or 'all' for every resident project",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        },
+        "wait": {
+          "default": false,
+          "description": "Wait for completion instead of a pollable snapshot (index)",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "cleanup",
       "type": "object"
     }
   ],
@@ -1310,7 +1547,1201 @@ Index lifecycle and architecture reports. action: index (build/refresh; returns 
       "description": "Select the granular handler branch; branch arguments are forwarded unchanged.",
       "enum": [
         "index",
-        "phase"
+        "state",
+        "projects",
+        "evict",
+        "lease",
+        "cleanup"
+      ],
+      "type": "string"
+    },
+    "project_path": {
+      "description": "Project directory (auto-indexes on first use; omit for current)",
+      "type": "string"
+    },
+    "tier": {
+      "description": "Detail: l0 card, l1 overview (default), l2 full",
+      "enum": [
+        "l0",
+        "l1",
+        "l2"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [],
+  "type": "object"
+}
+```
+
+## leindex_git
+
+```json
+{
+  "discriminator": {
+    "propertyName": "action"
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "action": {
+          "const": "status",
+          "default": "status",
+          "description": "Working-tree status enriched with changed symbols"
+        },
+        "allow_partial": {
+          "default": true,
+          "type": "boolean"
+        },
+        "enrich_pdg": {
+          "default": true,
+          "description": "Accepted for compatibility; resident PDG enrichment remains enabled.",
+          "type": "boolean"
+        },
+        "max_latency_ms": {
+          "default": 150,
+          "type": "integer"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "scope": {
+          "description": "Optional project-relative scope for advisory stage candidates",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [],
+      "title": "status",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "diff",
+          "description": "PDG-enriched diff (working tree, staged, ref or range)"
+        },
+        "allow_partial": {
+          "default": true,
+          "type": "boolean"
+        },
+        "enrich_pdg": {
+          "default": true,
+          "description": "Map changed hunks to PDG symbols and compute impact",
+          "type": "boolean"
+        },
+        "include_patch": {
+          "default": true,
+          "description": "Include the (bounded) unified patch",
+          "type": "boolean"
+        },
+        "max_latency_ms": {
+          "default": 250,
+          "description": "PDG enrichment budget",
+          "maximum": 60000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_patch_chars": {
+          "default": 20000,
+          "description": "Patch size bound",
+          "maximum": 200000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "range": {
+          "description": "Revision range, e.g. main..feature or HEAD~3..HEAD",
+          "type": "string"
+        },
+        "ref": {
+          "description": "Diff one commit against its parent (e.g. HEAD, HEAD~1, a1b2c3d)",
+          "type": "string"
+        },
+        "scope": {
+          "description": "Only report files under this project-relative path",
+          "type": "string"
+        },
+        "staged": {
+          "default": false,
+          "description": "Diff the index against HEAD instead of the working tree",
+          "type": "boolean"
+        },
+        "stat_only": {
+          "default": false,
+          "description": "Per-file statistics only; no patch, no hunk-level symbol mapping",
+          "type": "boolean"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "diff",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "log",
+          "description": "Commit history: oid, date, author, subject"
+        },
+        "confirm": {
+          "description": "The preview_token of the plan being confirmed (mutations only)",
+          "type": "string"
+        },
+        "include_patch": {
+          "default": false,
+          "description": "Return the patch rather than a stat summary (show)",
+          "type": "boolean"
+        },
+        "max_chars": {
+          "default": 20000,
+          "description": "Bound on returned git output",
+          "maximum": 200000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_count": {
+          "default": 20,
+          "description": "History entries to return (log)",
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Commit message (commit) or tag message (tag)",
+          "type": "string"
+        },
+        "path": {
+          "description": "Project-relative file or directory (log pathspec, blame file)",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Project-relative paths to stage (add)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "target": {
+          "description": "Revision, ref or branch (log/show/blame/checkout/tag/merge/rebase/reset/force)",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "log",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "show",
+          "description": "One commit: patch or stat"
+        },
+        "confirm": {
+          "description": "The preview_token of the plan being confirmed (mutations only)",
+          "type": "string"
+        },
+        "include_patch": {
+          "default": false,
+          "description": "Return the patch rather than a stat summary (show)",
+          "type": "boolean"
+        },
+        "max_chars": {
+          "default": 20000,
+          "description": "Bound on returned git output",
+          "maximum": 200000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_count": {
+          "default": 20,
+          "description": "History entries to return (log)",
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Commit message (commit) or tag message (tag)",
+          "type": "string"
+        },
+        "path": {
+          "description": "Project-relative file or directory (log pathspec, blame file)",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Project-relative paths to stage (add)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "target": {
+          "description": "Revision, ref or branch (log/show/blame/checkout/tag/merge/rebase/reset/force)",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "show",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "blame",
+          "description": "Per-line last-touching commit for one file"
+        },
+        "confirm": {
+          "description": "The preview_token of the plan being confirmed (mutations only)",
+          "type": "string"
+        },
+        "include_patch": {
+          "default": false,
+          "description": "Return the patch rather than a stat summary (show)",
+          "type": "boolean"
+        },
+        "max_chars": {
+          "default": 20000,
+          "description": "Bound on returned git output",
+          "maximum": 200000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_count": {
+          "default": 20,
+          "description": "History entries to return (log)",
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Commit message (commit) or tag message (tag)",
+          "type": "string"
+        },
+        "path": {
+          "description": "Project-relative file or directory (log pathspec, blame file)",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Project-relative paths to stage (add)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "target": {
+          "description": "Revision, ref or branch (log/show/blame/checkout/tag/merge/rebase/reset/force)",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "blame",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "branch",
+          "description": "Local and remote branches with tip commits"
+        },
+        "confirm": {
+          "description": "The preview_token of the plan being confirmed (mutations only)",
+          "type": "string"
+        },
+        "include_patch": {
+          "default": false,
+          "description": "Return the patch rather than a stat summary (show)",
+          "type": "boolean"
+        },
+        "max_chars": {
+          "default": 20000,
+          "description": "Bound on returned git output",
+          "maximum": 200000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_count": {
+          "default": 20,
+          "description": "History entries to return (log)",
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Commit message (commit) or tag message (tag)",
+          "type": "string"
+        },
+        "path": {
+          "description": "Project-relative file or directory (log pathspec, blame file)",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Project-relative paths to stage (add)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "target": {
+          "description": "Revision, ref or branch (log/show/blame/checkout/tag/merge/rebase/reset/force)",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "branch",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "remote",
+          "description": "Configured remotes and their URLs"
+        },
+        "confirm": {
+          "description": "The preview_token of the plan being confirmed (mutations only)",
+          "type": "string"
+        },
+        "include_patch": {
+          "default": false,
+          "description": "Return the patch rather than a stat summary (show)",
+          "type": "boolean"
+        },
+        "max_chars": {
+          "default": 20000,
+          "description": "Bound on returned git output",
+          "maximum": 200000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_count": {
+          "default": 20,
+          "description": "History entries to return (log)",
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Commit message (commit) or tag message (tag)",
+          "type": "string"
+        },
+        "path": {
+          "description": "Project-relative file or directory (log pathspec, blame file)",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Project-relative paths to stage (add)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "target": {
+          "description": "Revision, ref or branch (log/show/blame/checkout/tag/merge/rebase/reset/force)",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "remote",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "add",
+          "description": "PREVIEW ONLY: stage the given paths"
+        },
+        "confirm": {
+          "description": "The preview_token of the plan being confirmed (mutations only)",
+          "type": "string"
+        },
+        "include_patch": {
+          "default": false,
+          "description": "Return the patch rather than a stat summary (show)",
+          "type": "boolean"
+        },
+        "max_chars": {
+          "default": 20000,
+          "description": "Bound on returned git output",
+          "maximum": 200000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_count": {
+          "default": 20,
+          "description": "History entries to return (log)",
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Commit message (commit) or tag message (tag)",
+          "type": "string"
+        },
+        "path": {
+          "description": "Project-relative file or directory (log pathspec, blame file)",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Project-relative paths to stage (add)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "target": {
+          "description": "Revision, ref or branch (log/show/blame/checkout/tag/merge/rebase/reset/force)",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "add",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "commit",
+          "description": "PREVIEW ONLY: commit the staged changes"
+        },
+        "confirm": {
+          "description": "The preview_token of the plan being confirmed (mutations only)",
+          "type": "string"
+        },
+        "include_patch": {
+          "default": false,
+          "description": "Return the patch rather than a stat summary (show)",
+          "type": "boolean"
+        },
+        "max_chars": {
+          "default": 20000,
+          "description": "Bound on returned git output",
+          "maximum": 200000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_count": {
+          "default": 20,
+          "description": "History entries to return (log)",
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Commit message (commit) or tag message (tag)",
+          "type": "string"
+        },
+        "path": {
+          "description": "Project-relative file or directory (log pathspec, blame file)",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Project-relative paths to stage (add)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "target": {
+          "description": "Revision, ref or branch (log/show/blame/checkout/tag/merge/rebase/reset/force)",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "commit",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "checkout",
+          "description": "PREVIEW ONLY: switch to a branch or commit"
+        },
+        "confirm": {
+          "description": "The preview_token of the plan being confirmed (mutations only)",
+          "type": "string"
+        },
+        "include_patch": {
+          "default": false,
+          "description": "Return the patch rather than a stat summary (show)",
+          "type": "boolean"
+        },
+        "max_chars": {
+          "default": 20000,
+          "description": "Bound on returned git output",
+          "maximum": 200000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_count": {
+          "default": 20,
+          "description": "History entries to return (log)",
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Commit message (commit) or tag message (tag)",
+          "type": "string"
+        },
+        "path": {
+          "description": "Project-relative file or directory (log pathspec, blame file)",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Project-relative paths to stage (add)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "target": {
+          "description": "Revision, ref or branch (log/show/blame/checkout/tag/merge/rebase/reset/force)",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "checkout",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "stash",
+          "description": "PREVIEW ONLY: stash working-tree changes"
+        },
+        "confirm": {
+          "description": "The preview_token of the plan being confirmed (mutations only)",
+          "type": "string"
+        },
+        "include_patch": {
+          "default": false,
+          "description": "Return the patch rather than a stat summary (show)",
+          "type": "boolean"
+        },
+        "max_chars": {
+          "default": 20000,
+          "description": "Bound on returned git output",
+          "maximum": 200000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_count": {
+          "default": 20,
+          "description": "History entries to return (log)",
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Commit message (commit) or tag message (tag)",
+          "type": "string"
+        },
+        "path": {
+          "description": "Project-relative file or directory (log pathspec, blame file)",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Project-relative paths to stage (add)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "target": {
+          "description": "Revision, ref or branch (log/show/blame/checkout/tag/merge/rebase/reset/force)",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "stash",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "tag",
+          "description": "PREVIEW ONLY: create a tag"
+        },
+        "confirm": {
+          "description": "The preview_token of the plan being confirmed (mutations only)",
+          "type": "string"
+        },
+        "include_patch": {
+          "default": false,
+          "description": "Return the patch rather than a stat summary (show)",
+          "type": "boolean"
+        },
+        "max_chars": {
+          "default": 20000,
+          "description": "Bound on returned git output",
+          "maximum": 200000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_count": {
+          "default": 20,
+          "description": "History entries to return (log)",
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Commit message (commit) or tag message (tag)",
+          "type": "string"
+        },
+        "path": {
+          "description": "Project-relative file or directory (log pathspec, blame file)",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Project-relative paths to stage (add)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "target": {
+          "description": "Revision, ref or branch (log/show/blame/checkout/tag/merge/rebase/reset/force)",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "tag",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "merge",
+          "description": "PREVIEW ONLY: merge a branch into the current one"
+        },
+        "confirm": {
+          "description": "The preview_token of the plan being confirmed (mutations only)",
+          "type": "string"
+        },
+        "include_patch": {
+          "default": false,
+          "description": "Return the patch rather than a stat summary (show)",
+          "type": "boolean"
+        },
+        "max_chars": {
+          "default": 20000,
+          "description": "Bound on returned git output",
+          "maximum": 200000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_count": {
+          "default": 20,
+          "description": "History entries to return (log)",
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Commit message (commit) or tag message (tag)",
+          "type": "string"
+        },
+        "path": {
+          "description": "Project-relative file or directory (log pathspec, blame file)",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Project-relative paths to stage (add)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "target": {
+          "description": "Revision, ref or branch (log/show/blame/checkout/tag/merge/rebase/reset/force)",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "merge",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "rebase",
+          "description": "PREVIEW ONLY: rebase onto a target"
+        },
+        "confirm": {
+          "description": "The preview_token of the plan being confirmed (mutations only)",
+          "type": "string"
+        },
+        "include_patch": {
+          "default": false,
+          "description": "Return the patch rather than a stat summary (show)",
+          "type": "boolean"
+        },
+        "max_chars": {
+          "default": 20000,
+          "description": "Bound on returned git output",
+          "maximum": 200000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_count": {
+          "default": 20,
+          "description": "History entries to return (log)",
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Commit message (commit) or tag message (tag)",
+          "type": "string"
+        },
+        "path": {
+          "description": "Project-relative file or directory (log pathspec, blame file)",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Project-relative paths to stage (add)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "target": {
+          "description": "Revision, ref or branch (log/show/blame/checkout/tag/merge/rebase/reset/force)",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "rebase",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "push",
+          "description": "PREVIEW ONLY: push the current branch to its remote"
+        },
+        "confirm": {
+          "description": "The preview_token of the plan being confirmed (mutations only)",
+          "type": "string"
+        },
+        "include_patch": {
+          "default": false,
+          "description": "Return the patch rather than a stat summary (show)",
+          "type": "boolean"
+        },
+        "max_chars": {
+          "default": 20000,
+          "description": "Bound on returned git output",
+          "maximum": 200000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_count": {
+          "default": 20,
+          "description": "History entries to return (log)",
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Commit message (commit) or tag message (tag)",
+          "type": "string"
+        },
+        "path": {
+          "description": "Project-relative file or directory (log pathspec, blame file)",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Project-relative paths to stage (add)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "target": {
+          "description": "Revision, ref or branch (log/show/blame/checkout/tag/merge/rebase/reset/force)",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "push",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "reset",
+          "description": "PREVIEW ONLY: move the current branch to a commit"
+        },
+        "confirm": {
+          "description": "The preview_token of the plan being confirmed (mutations only)",
+          "type": "string"
+        },
+        "include_patch": {
+          "default": false,
+          "description": "Return the patch rather than a stat summary (show)",
+          "type": "boolean"
+        },
+        "max_chars": {
+          "default": 20000,
+          "description": "Bound on returned git output",
+          "maximum": 200000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_count": {
+          "default": 20,
+          "description": "History entries to return (log)",
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Commit message (commit) or tag message (tag)",
+          "type": "string"
+        },
+        "path": {
+          "description": "Project-relative file or directory (log pathspec, blame file)",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Project-relative paths to stage (add)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "target": {
+          "description": "Revision, ref or branch (log/show/blame/checkout/tag/merge/rebase/reset/force)",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "reset",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "const": "force",
+          "description": "PREVIEW ONLY: force-push (requires a target ref)"
+        },
+        "confirm": {
+          "description": "The preview_token of the plan being confirmed (mutations only)",
+          "type": "string"
+        },
+        "include_patch": {
+          "default": false,
+          "description": "Return the patch rather than a stat summary (show)",
+          "type": "boolean"
+        },
+        "max_chars": {
+          "default": 20000,
+          "description": "Bound on returned git output",
+          "maximum": 200000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_count": {
+          "default": 20,
+          "description": "History entries to return (log)",
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Commit message (commit) or tag message (tag)",
+          "type": "string"
+        },
+        "path": {
+          "description": "Project-relative file or directory (log pathspec, blame file)",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Project-relative paths to stage (add)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project_path": {
+          "description": "Project directory (auto-indexes on first use; omit for current)",
+          "type": "string"
+        },
+        "target": {
+          "description": "Revision, ref or branch (log/show/blame/checkout/tag/merge/rebase/reset/force)",
+          "type": "string"
+        },
+        "tier": {
+          "description": "Detail: l0 card, l1 overview (default), l2 full",
+          "enum": [
+            "l0",
+            "l1",
+            "l2"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "force",
+      "type": "object"
+    }
+  ],
+  "properties": {
+    "action": {
+      "description": "Select the granular handler branch; branch arguments are forwarded unchanged.",
+      "enum": [
+        "status",
+        "diff",
+        "log",
+        "show",
+        "blame",
+        "branch",
+        "remote",
+        "add",
+        "commit",
+        "checkout",
+        "stash",
+        "tag",
+        "merge",
+        "rebase",
+        "push",
+        "reset",
+        "force"
       ],
       "type": "string"
     },

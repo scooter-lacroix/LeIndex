@@ -11,7 +11,7 @@
 
 # LeIndex
 
-**Semantic code intelligence for humans and AI agents — a Program Dependence Graph, hybrid neural search, and 18 structural tools behind one small daemon.**
+**Semantic code intelligence for humans and AI agents — a Program Dependence Graph, hybrid neural search, and 18+ structural operations behind five tools and one small daemon.**
 
 Ask LeIndex where authentication lives, what breaks if you rename a function,
 or how the indexer resumes across phases — and get the symbols, callers, and
@@ -85,17 +85,18 @@ human-annotated query/code benchmark — see the
 
 ---
 
-## What agents see: 4 MCP tools
+## What agents see: 5 MCP tools
 
-Four routers instead of twenty schemas — a `mode` / `action` argument picks the
+Five routers instead of twenty schemas — a `mode` / `action` argument picks the
 operation, every other argument passes straight through:
 
 | Tool | Selector | Branches |
 |---|---|---|
-| `leindex_explore` | `mode` | `search` (hybrid semantic, default) · `find` (exact text / regex / symbol names — indexed, always live, **any path on disk**) · `symbol_lookup` · `read_file` · `read_symbol` · `project_map` · `file_summary` · `context` |
-| `leindex_analyze` | `mode` | `deep` (semantic + PDG traversal, default) · `impact` (transitive blast radius) · `diagnostics` · `git_status` · `git_diff` (PDG-enriched) |
+| `leindex_explore` | `mode` | `search` (hybrid semantic, default) · `find` (exact text / regex / symbol names — indexed, always live, **any path on disk**) · `structural` (AST pattern) · `symbol_lookup` · `read_file` · `read_symbol` · `project_map` · `file_summary` · `context` |
+| `leindex_analyze` | `mode` | `deep` (semantic + PDG traversal, default) · `impact` (transitive blast radius) · `diagnostics` · `phase` (5-phase architectural review, bounded by `max_latency_ms`) |
 | `leindex_edit` | `action` (required) | `preview` → `apply` (dry-run supported) · `rename` (atomic multi-file, preview-first) · `write` |
-| `leindex_manage` | `action` | `index` (pollable job, default) · `phase` (5-phase architectural review) |
+| `leindex_manage` | `action` | `index` (pollable job, default) · `state` (usable? generation, phase, freshness) · `projects` · `evict` · `lease` · `cleanup` (retention, dry-run) |
+| `leindex_git` | `action` | `status` · `diff` (PDG-enriched) · `log` · `show` · `blame` · `branch` · `remote` · `add` · `commit` · `checkout` · `stash` · `tag` · `merge` · `rebase` · `push` · `reset` · `force` (mutations are **preview-only**) |
 
 `find` is a native trigram index (the technique behind Zoekt) built with each
 index run: about a millisecond on a 700-file repository, results always read from
@@ -343,7 +344,7 @@ Codebase → Tree-sitter → PDG + TF-IDF (core, always) → neural join → hyb
 
 ## Under the hood
 
-- **18 MCP tools** — search, navigation, analysis, and safe editing (preview/dry-run/preview-only defaults on every destructive path)
+- **18+ MCP operations behind 5 tools** — search, navigation, analysis, git reads, and safe editing (preview/dry-run/preview-only defaults on every destructive path)
 - **Flexible embedding backends** — TF-IDF, local ONNX models (Qwen3), a managed llama.cpp GGUF service (EmbeddingGemma2), or remote OpenAI-compatible providers
 - **System One decision gate (experimental)** — pre/post-gate validation of MCP calls and search results by a local typed-decision model, off by default, fail-open
 - **Honest degradation everywhere** — direction labels on impact figures, notes when enrichment was skipped, `signature_scope` on incremental counts, freshness footers separated from machine-readable JSON

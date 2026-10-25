@@ -14,8 +14,8 @@ When healthy, correctly scoped structured tools support the operation, do not us
 
 Before nontrivial changes: impact analysis, then preview, inspect the diff, then apply. Prefer preview/apply even for simple edits when available. Never apply a rename without reading its preview; edit action is mandatory.
 
-## Four routers
-`mode` selects explore/analyze; `action` selects edit/manage. Other arguments are forwarded to the selected branch. Common optional arguments: `project_path` (auto-indexes on first use), `tier=l0|l1|l2` (l1 default). l0 returns identity totals/paging state; start l0/l1, request l2 only for needed detail. Unknown selectors error with suggestions; omitted selectors use documented defaults, except edit requires action.
+## Five routers
+`mode` selects explore/analyze; `action` selects edit/manage/git. Other arguments are forwarded to the selected branch. Common optional arguments: `project_path` (auto-indexes on first use), `tier=l0|l1|l2` (l1 default). l0 returns identity totals/paging state; start l0/l1, request l2 only for needed detail. Unknown selectors error with suggestions; omitted selectors use documented defaults, except edit requires action.
 
 Live manifest is authoritative. Branch guide: `leindex://tools/guide`; short guide: `leindex://docs/q`. CLI discovery: `leindex tools list`, `leindex tools inspect <tool>`, `leindex tools schema <tool>`. Legacy operation names (`leindex_search`, `leindex_text_search`, `leindex_edit_apply`, etc.) are compatibility names, not advertised discovery targets; `leindex_grep_symbols`/`leindex_text_search` are folded into find.
 
@@ -35,8 +35,14 @@ Notation: `*` required; otherwise optional. Always check live schema before call
 - **deep**: end-to-end semantic retrieval plus PDG/data flow across files. `query*`, `token_budget`, `task_context`, `allow_partial`, `max_latency_ms`.
 - **impact**: transitive blast radius. `symbol*`, `change_type=modify|remove|rename|change_signature`, `depth`.
 - **diagnostics**: health, sizes, memory/cache statistics, Engram entries/bytes/limits/hits/misses and embed-cache hits/misses; counters are per process.
-- **git_status**: structured changed files with PDG symbol/impact enrichment, no pager. `scope`, `allow_partial`, `enrich_pdg`, `max_latency_ms`.
-- **git_diff**: rename-aware diff, changed hunks → PDG symbols/callers/affected files, including untracked file sizes; no pager. `ref` (commit vs parent), `range` (A..B or A...B, e.g. HEAD~2..main), `staged` (--cached), `scope`, `stat_only` (per-file numstat; --stat), `include_patch`, `max_patch_chars`, `enrich_pdg`, `allow_partial`, `max_latency_ms`. Use include_patch + scope for one-file patches; enriched diff for change blast radius.
+- **phase**: cached five-phase scan → symbols → dependencies → hotspots → recommendations. `phase=1..5|all`, `path` (file/dir), `format=ultra|balanced|verbose` (NOT `mode`, which the router consumes as its branch selector), `include_docs`, `docs_mode`, `top_n`, `max_chars`, `max_files`, `max_focus_files`, `max_latency_ms`. A stage already in flight cannot be cancelled, but no further stage starts once `max_latency_ms` passes and the report is marked INCOMPLETE with the phases that ran and the ones skipped; omitted means unbounded (`LEINDEX_PHASE_BUDGET_MS`). Module deep dive: path=src/module, format=verbose.
+
+### leindex_git (action required)
+Structured git reads and preview-gated mutations. Every revision argument is validated and may not contain `:` or `..`, so a revision can never escape the project via `rev:path`.
+- **status**: structured changed files with PDG symbol/impact enrichment, no pager. `scope`, `allow_partial`, `enrich_pdg`, `max_latency_ms`.
+- **diff**: rename-aware diff, changed hunks → PDG symbols/callers/affected files, including untracked file sizes; no pager. `ref` (commit vs parent), `range` (A..B or A...B, e.g. HEAD~2..main), `staged` (--cached), `scope`, `stat_only` (per-file numstat; --stat), `include_patch`, `max_patch_chars`, `enrich_pdg`, `allow_partial`, `max_latency_ms`. Use include_patch + scope for one-file patches; enriched diff for change blast radius.
+- **log** (`max_count`, `path`), **show** (`revision`, `path`), **blame** (`file_path`, `range`), **branch** (`name`, `start_point`, `force`), **remote** (`name`, `url`): read paths.
+- **add**, **commit**, **checkout**, **stash**, **tag**, **merge**, **rebase**, **push**, **reset**, **force**: these MUTATE, so they return a plan with a preview token and change nothing. Do not use them to perform a mutation; use native git for that.
 
 ### leindex_edit (action REQUIRED)
 - **preview**: dry-run unified diff, affected symbols, risk and preview_token. `file_path*`, `old_text` + `new_text` OR `changes[]`.
@@ -46,7 +52,11 @@ Notation: `*` required; otherwise optional. Always check live schema before call
 
 ### leindex_manage (action defaults to index)
 - **index**: incremental build/refresh, pollable job; `project_path` (identify intended repository), `force_reindex`, `wait` (true blocks), `status_only` (poll without starting work). Force only when required after branch switch/major refactor; never re-index an already warm/current index merely to navigate, or when user prohibits it.
-- **phase**: cached five-phase scan → symbols → dependencies → hotspots → recommendations. `phase=1..5|all`, `path` (file/dir), `mode=ultra|balanced|verbose`, `include_docs`, `docs_mode`, `top_n`, `max_chars`, `max_files`, `max_focus_files`. Module deep dive: path=src/module, mode=verbose.
+- **state**: is the index usable? Generation, phase, freshness and counts, without starting work. `project_path`.
+- **projects**: projects resident in memory, with the default one.
+- **evict**: release a project from memory; data stays on disk and reloads on the next call. Target required.
+- **lease**: hold or release a project lease.
+- **cleanup**: retention sweep over old generations; dry-run unless applied.
 
 ## Failure/empty-result policy
 1. Check intended project_path; for suspicious emptiness also check index count, scope filters and regex/literal mode.

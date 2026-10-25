@@ -23,7 +23,7 @@ LeIndex provides high-performance semantic search and deep code analysis by buil
 
 ## MCP tools
 
-When the LeIndex MCP server is connected, four tools cover the same ground: `leindex_explore` (`mode`: find, search, symbol_lookup, read_file, read_symbol, project_map, file_summary, context), `leindex_analyze` (`mode`: deep, impact, diagnostics, git_status, git_diff), `leindex_edit` (`action`: preview, apply, rename, write) and `leindex_manage` (`action`: index, phase). Use `mode=find` for exact text, regex and symbol names, including directories outside the project (`paths`). See `integrations/skills/leindex-code-intelligence/` for the full guide.
+When the LeIndex MCP server is connected, five tools cover the same ground: `leindex_explore` (`mode`: find, search, symbol_lookup, read_file, read_symbol, project_map, file_summary, context), `leindex_analyze` (`mode`: deep, impact, diagnostics, phase), `leindex_edit` (`action`: preview, apply, rename, write), `leindex_manage` (`action`: index, state, projects, evict, lease, cleanup) and `leindex_git` (`action`: status, diff, log, show, blame, branch, remote, and preview-only mutations). Use `mode=find` for exact text, regex and symbol names, including directories outside the project (`paths`). See `integrations/skills/leindex-code-intelligence/` for the full guide.
 
 ## Integration
 This skill works by calling the `leindex` CLI binary.

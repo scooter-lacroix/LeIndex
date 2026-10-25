@@ -4,7 +4,7 @@
  * LeIndex MCP Local Test Script
  * 
  * Tests the LeIndex MCP server using the locally built binary.
- * This validates all 18+ MCP tools are working correctly.
+ * This validates the five advertised routers are working correctly.
  * 
  * Usage:
  *   LEINDEX_BINARY_PATH=../../target/release/leindex node test-local.js
@@ -125,13 +125,14 @@ async function testToolsList() {
         setTimeout(() => {
           proc.kill();
           
-          // tools/list advertises four routers; the individual operations
+          // tools/list advertises five routers; the individual operations
           // are branches selected with `mode` / `action`.
           const tools = [
             'leindex_explore',
             'leindex_analyze',
             'leindex_edit',
-            'leindex_manage'
+            'leindex_manage',
+            'leindex_git'
           ];
           
           const missing = tools.filter(t => !stdout.includes(t));

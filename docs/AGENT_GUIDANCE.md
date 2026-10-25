@@ -10,7 +10,7 @@ Canonical skill location in this repo:
 
 What it contains:
 
-- `SKILL.md`: when to prefer LeIndex, the four tools (`leindex_explore`, `leindex_analyze`, `leindex_edit`, `leindex_manage`) and the operation each discriminator value selects.
+- `SKILL.md`: when to prefer LeIndex, the five tools (`leindex_explore`, `leindex_analyze`, `leindex_edit`, `leindex_manage`, `leindex_git`) and the operation each discriminator value selects.
 - `references/tool-selection.md`: replacement map for `Read`, `Grep`, `Glob`, `rg`, `find`, `ls`, `cat`, and related workflows.
 - `references/tool-schemas.md`: per-tool JSON schemas (the `oneOf` form) exported from the live CLI surface with `leindex tools schema <tool>`. Regenerate it whenever a tool argument changes.
 
