@@ -394,6 +394,18 @@ pub enum Commands {
         #[command(subcommand)]
         action: crate::cli::leindex::setup_config::ConfigAction,
     },
+
+    /// Terminal UI: browse the project map, search, and index state
+    ///
+    /// Reads through the same `LeIndex` engine entry points as the CLI
+    /// subcommands, so nothing here is a second source of truth. Requires the
+    /// `tui` feature.
+    #[cfg(feature = "tui")]
+    Tui {
+        /// Project directory to inspect (defaults to the current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
 }
 
 /// Actions for `leindex services`.
@@ -631,6 +643,8 @@ impl Cli {
             }
             Commands::Services { action } => cmd_services_impl(action).await,
             Commands::Config { action } => crate::cli::leindex::setup_config::run(action),
+            #[cfg(feature = "tui")]
+            Commands::Tui { path } => crate::cli::tui::run(path.or(global_project)).await,
         };
 
         // Write the memory report (if tracking was enabled) before returning.
