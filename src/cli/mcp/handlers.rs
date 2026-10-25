@@ -17,6 +17,7 @@ pub use super::git_handler::GitHandler;
 pub use super::git_status_handler::GitStatusHandler;
 pub use super::impact_analysis_handler::ImpactAnalysisHandler;
 pub use super::index_handler::IndexHandler;
+pub use super::manage_handler::ManageHandler;
 pub use super::phase_handler::{PhaseAnalysisAliasHandler, PhaseAnalysisHandler};
 pub use super::project_map_handler::ProjectMapHandler;
 pub use super::read_file_handler::ReadFileHandler;
@@ -77,6 +78,8 @@ dispatch_handler! {
     GitDiff             => GitDiffHandler,
     /// Handler for the git router: history reads + preview-gated mutations
     Git                 => GitHandler,
+    /// Handler for index lifecycle and state management
+    Manage              => ManageHandler,
     /// Handler for ast-grep AST-pattern (structural) search
     Structural          => StructuralHandler,
 }

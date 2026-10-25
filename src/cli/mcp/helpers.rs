@@ -123,31 +123,22 @@ pub(crate) fn wrap_with_meta(result: Value, index: &crate::cli::leindex::LeIndex
     // Git porcelain is the cheapest authoritative live delta for a worktree;
     // use it once per response to avoid turning a persisted health snapshot
     // into a stale Boolean that survives an editor save.
-    let live_dirty = crate::cli::git::status(index.project_path())
-        .ok()
-        .map(|status| {
-            status.modified.len()
-                + status.staged.len()
-                + status.untracked.len()
-                + status.deleted.len()
-        })
-        .unwrap_or(0);
-    wrap_live_with_meta_dirty(result, index.project_path(), live_dirty)
+    let live_status = crate::cli::git::status(index.project_path()).ok();
+    let live_dirty = live_status.as_ref().map(dirty_count).unwrap_or(0);
+    wrap_live_with_meta_status(result, index.project_path(), live_status, live_dirty)
 }
 
 /// Attach the same compact freshness badge to a live-only response. This path
 /// reads the tiny health snapshot but never constructs a `LeIndex`.
 pub(crate) fn wrap_live_with_meta(result: Value, project_root: &std::path::Path) -> Value {
-    let live_dirty = crate::cli::git::status(project_root)
-        .ok()
-        .map(|status| {
-            status.modified.len()
-                + status.staged.len()
-                + status.untracked.len()
-                + status.deleted.len()
-        })
-        .unwrap_or(0);
-    wrap_live_with_meta_dirty(result, project_root, live_dirty)
+    let live_status = crate::cli::git::status(project_root).ok();
+    let live_dirty = live_status.as_ref().map(dirty_count).unwrap_or(0);
+    wrap_live_with_meta_status(result, project_root, live_status, live_dirty)
+}
+
+/// Number of files a worktree delta touches, in every dirty category.
+fn dirty_count(status: &crate::cli::git::GitStatus) -> usize {
+    status.modified.len() + status.staged.len() + status.untracked.len() + status.deleted.len()
 }
 
 /// Determine whether the index is genuinely stale by checking if dirty files
@@ -160,7 +151,18 @@ pub(crate) fn wrap_live_with_meta(result: Value, project_root: &std::path::Path)
 ///
 /// Returns `true` only when dirty files include tracked source files that
 /// differ from what was indexed.
-pub(crate) fn is_index_genuinely_stale(health: &Option<IndexHealth>, project_root: &Path) -> bool {
+///
+/// `status` is the worktree delta the caller already obtained, and
+/// `status_known` distinguishes "git said nothing is dirty" from "we could not
+/// ask git". One `git status` per MCP response is already expensive on a large
+/// worktree; taking it here as a parameter is what keeps a single call from
+/// forking it twice.
+pub(crate) fn is_index_genuinely_stale(
+    health: &Option<IndexHealth>,
+    project_root: &Path,
+    status: Option<&crate::cli::git::GitStatus>,
+    status_known: bool,
+) -> bool {
     let Some(health) = health else {
         // No health info at all means we can't confirm freshness.
         return true;
@@ -187,15 +189,11 @@ pub(crate) fn is_index_genuinely_stale(health: &Option<IndexHealth>, project_roo
         }
     }
 
-    // Check whether the dirty files actually affect source files that were
-    // previously indexed. Get the git status to inspect individual paths.
-    let git_status = match crate::cli::git::status(project_root) {
-        Ok(status) => status,
-        Err(_) => {
-            // If we can't get git status, fall back to the dirty count from
-            // health.
-            return health.dirty_file_count > 0;
-        }
+    let Some(git_status) = status else {
+        // No usable worktree delta. Only the persisted count can speak, and
+        // only when git never answered: `status_known` false means "we could
+        // not ask", not "git said clean".
+        return !status_known && health.dirty_file_count > 0;
     };
 
     // Collect all dirty paths (modified, staged, deleted, conflicted).
@@ -248,8 +246,23 @@ fn is_in_skip_dir(path: &Path) -> bool {
 }
 
 pub(crate) fn wrap_live_with_meta_dirty(
+    result: Value,
+    project_root: &std::path::Path,
+    live_dirty: usize,
+) -> Value {
+    wrap_live_with_meta_status(result, project_root, None, live_dirty)
+}
+
+/// `wrap_live_with_meta_dirty`, also taking the worktree delta the caller
+/// already paid for.
+///
+/// `live_status` is reused for the staleness decision instead of running
+/// `git status` a second time. `None` means the caller has no usable delta, in
+/// which case the staleness check falls back to the persisted health count.
+pub(crate) fn wrap_live_with_meta_status(
     mut result: Value,
     project_root: &std::path::Path,
+    live_status: Option<crate::cli::git::GitStatus>,
     live_dirty: usize,
 ) -> Value {
     let storage_path = crate::cli::leindex::resolve_existing_storage_path(project_root)
@@ -294,8 +307,10 @@ pub(crate) fn wrap_live_with_meta_dirty(
                 "last_failure": Value::Null,
             })
         });
+    let status_known = live_status.is_some();
     if let Some(obj) = result.as_object_mut() {
-        let stale = is_index_genuinely_stale(&health, project_root);
+        let stale =
+            is_index_genuinely_stale(&health, project_root, live_status.as_ref(), status_known);
         {
             let mut freshness = freshness;
             if stale {
@@ -823,6 +838,14 @@ pub(crate) fn phase_analysis_schema() -> Value {
                 "type": "integer",
                 "default": 12000
             },
+            "max_latency_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Wall-clock ceiling for the whole run. A stage already in flight \
+    cannot be cancelled, but no further stages start once the ceiling passes, and the report is \
+    marked INCOMPLETE with the stages that ran and the ones skipped. Omit for no bound \
+    (default: LEINDEX_PHASE_BUDGET_MS)."
+            },
             "include_docs": {
                 "type": "boolean",
                 "description": "IMPORTANT: Enable to include prose/documentation files (README, docs/, *.md) \
@@ -858,6 +881,45 @@ pub(crate) fn test_registry_for(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// A worktree delta with no source-file changes must clear the staleness
+    /// flag. This is the case that makes threading the caller's `git status`
+    /// into `is_index_genuinely_stale` observable: if the supplied status is
+    /// ignored in favour of the persisted dirty count, a clean source tree
+    /// whose only dirt is `.leindex/` churn reports a stale index.
+    #[test]
+    fn test_genuinely_stale_uses_the_supplied_worktree_delta() {
+        let directory = tempdir().unwrap();
+        let health = Some(IndexHealth {
+            dirty_file_count: 7,
+            ..Default::default()
+        });
+        // Dirt confined to a skipped directory: not a source change.
+        let only_skipped = crate::cli::git::GitStatus {
+            modified: vec![PathBuf::from(".leindex/index.pdg")],
+            ..Default::default()
+        };
+        assert!(
+            !is_index_genuinely_stale(&health, directory.path(), Some(&only_skipped), true),
+            "dirt inside a skipped dir must not mark the index stale"
+        );
+        // With no delta available the persisted count still speaks.
+        assert!(
+            is_index_genuinely_stale(&health, directory.path(), None, false),
+            "without a worktree delta the persisted dirty count decides"
+        );
+        // A source file change does mark it stale.
+        let source_change = crate::cli::git::GitStatus {
+            modified: vec![PathBuf::from("src/main.rs")],
+            ..Default::default()
+        };
+        assert!(is_index_genuinely_stale(
+            &health,
+            directory.path(),
+            Some(&source_change),
+            true
+        ));
+    }
 
     #[test]
     fn test_extract_string() {

@@ -27,12 +27,14 @@ pub mod lock;
 /// Dispatch macro for `ToolHandler` enum and match-arm generation.
 #[macro_use]
 pub mod macros;
-/// Grouped four-tool public surface (`action`-selected sub-tools).
+/// Grouped five-router public surface (`mode`/`action`-selected sub-tools).
 pub mod grouped;
 /// Request handlers for MCP tools.
 pub mod handlers;
 /// Shared helpers for MCP request processing.
 pub mod helpers;
+/// Index lifecycle and state management (`leindex_manage`).
+pub mod manage_handler;
 /// Beautiful output formatting for LeIndex tools.
 pub mod output;
 /// MCP protocol definitions and JSON-RPC types.

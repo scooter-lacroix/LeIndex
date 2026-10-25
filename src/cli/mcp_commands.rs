@@ -1043,7 +1043,7 @@ async fn handle_mcp_request(
                     "serverInfo": {
                         "name": "leindex",
                         "version": env!("CARGO_PKG_VERSION"),
-                        "description": "LeIndex MCP Server - Semantic code indexing and analysis with PDG-based tools. Provides 18+ specialized tools for code comprehension: semantic search, symbol lookup, impact analysis, structural code queries, and intelligent editing. Uses Program Dependence Graphs for superior code understanding compared to traditional text-based tools."
+                        "description": "LeIndex MCP Server - Semantic code indexing and analysis with PDG-based tools. Advertises five routers (leindex_explore, leindex_analyze, leindex_edit, leindex_manage, leindex_git) whose mode/action argument selects one of 18+ operations: semantic search, symbol lookup, impact analysis, structural code queries, git reads and intelligent editing. Uses Program Dependence Graphs for superior code understanding compared to traditional text-based tools."
                     }
                 }),
             )));

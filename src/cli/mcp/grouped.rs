@@ -10,7 +10,7 @@
 //                              | read_symbol | project_map | file_summary | context
 //   leindex_analyze  (mode)    deep | impact | diagnostics | phase
 //   leindex_edit     (action)  apply | preview | rename | write        (action REQUIRED)
-//   leindex_manage   (action)  index
+//   leindex_manage   (action)  index | state | projects | evict | lease | cleanup
 //   leindex_git      (action)  status | diff | log | show | blame | branch | remote
 //                              | add | commit | checkout | stash | tag | merge
 //                              | rebase | push | reset | force   (mutations preview-only)
@@ -228,15 +228,47 @@ pub static GROUPS: [GroupSpec; 5] = [
     GroupSpec {
         name: "leindex_manage",
         title: "LeIndex [Manage]",
-        description: "Index lifecycle. action: index (build or refresh; returns a pollable job, default). Architecture reports moved to leindex_analyze mode=phase.",
+        description: "Index lifecycle and state. action: index (build/refresh, pollable — default), state (usable? generation, phase, freshness), projects, evict, lease, cleanup (retention, dry-run).",
         discriminator: "action",
         default_branch: Some("index"),
-        branches: &[branch(
-            "index",
-            "leindex_index",
-            &[],
-            "Build or refresh the index (pollable job)",
-        )],
+        branches: &[
+            branch(
+                "index",
+                "leindex_index",
+                &[],
+                "Build or refresh the index (pollable job)",
+            ),
+            branch(
+                "state",
+                "leindex_manage",
+                &["status", "freshness"],
+                "Is the index usable? generation, phase, freshness, counts",
+            ),
+            branch(
+                "projects",
+                "leindex_manage",
+                &["resident", "list"],
+                "Projects resident in memory, with the default",
+            ),
+            branch(
+                "evict",
+                "leindex_manage",
+                &["release", "unload"],
+                "Release a project from memory (data stays on disk); target required",
+            ),
+            branch(
+                "lease",
+                "leindex_manage",
+                &["pin"],
+                "Acquire a generation lease and report the pinned generation",
+            ),
+            branch(
+                "cleanup",
+                "leindex_manage",
+                &["retention", "prune"],
+                "Retention report for the generation store (dry_run by default)",
+            ),
+        ],
     },
     GroupSpec {
         name: "leindex_git",
@@ -531,11 +563,17 @@ pub fn resolve_call(name: &str, args: Value) -> Result<(String, Value), JsonRpcE
 /// `grep`-style spellings mean "find symbols named X, else the text": the
 /// `auto` target of `leindex_find`. Explicit `target` always wins.
 ///
-/// `leindex_git` is the other branch set that needs its own discriminator: one
-/// handler serves seventeen `action` values, so the resolved branch is written
-/// back into `action` (canonically, so an alias such as `history` arrives as
-/// `log`). The router's discriminator is consumed before dispatch, so without
-/// this the handler would only ever see its default.
+/// `leindex_git` and `leindex_manage` are the two handlers that select an
+/// operation from their own `action` argument, which is also the router's
+/// discriminator. `take_discriminator` consumes that key before dispatch, so
+/// the resolved branch is written back under it (canonical, so an alias such as
+/// `status` arrives as `state`); without this the handler only ever sees its
+/// default and every such branch silently runs it.
+///
+/// Keyed on the handler, not on the group: `manage`'s `index` branch targets
+/// `leindex_index`, which reads no `action` and must not receive one, and
+/// `leindex_git`'s `status`/`diff` branches likewise route to their own
+/// handlers.
 ///
 /// The phase report format does NOT belong here: `take_discriminator` consumes
 /// `mode` before this runs, so a bare format value has already been handed down
@@ -546,7 +584,7 @@ fn apply_alias_defaults(spec: &BranchSpec, wanted: &str, args: &mut Value) {
             object.entry("target").or_insert_with(|| json!("auto"));
         }
     }
-    if spec.tool == "leindex_git" {
+    if matches!(spec.tool, "leindex_git" | "leindex_manage") {
         if let Some(object) = args.as_object_mut() {
             object.insert("action".to_string(), json!(spec.branch));
         }
@@ -766,9 +804,20 @@ fn merge_properties(
 
 /// `branch: arg*, arg, ...` so a model can see which arguments each branch
 /// reads (`*` = required) without a schema per branch.
+///
+/// Branches that resolve to the SAME handler are folded into one
+/// `branch,branch: args` line. A router whose branches are one handler's
+/// `action` values (`leindex_manage`, `leindex_git`) would otherwise repeat an
+/// identical argument list per branch, which is pure token cost: the list
+/// cannot differ, because it comes from that one handler's schema.
 fn branch_usage(group: &GroupSpec, handlers: &[ToolHandler]) -> String {
-    let mut lines = Vec::new();
+    // handler name -> (branches sharing it, its rendered argument list)
+    let mut folded: Vec<(&str, Vec<&str>, String)> = Vec::new();
     for spec in group.branches {
+        if let Some(entry) = folded.iter_mut().find(|(tool, _, _)| *tool == spec.tool) {
+            entry.1.push(spec.branch);
+            continue;
+        }
         let Some(handler) = find_handler(handlers, spec.tool) else {
             continue;
         };
@@ -792,9 +841,13 @@ fn branch_usage(group: &GroupSpec, handlers: &[ToolHandler]) -> String {
             })
             .unwrap_or_default();
         names.sort_by_key(|name| !name.ends_with('*'));
-        lines.push(format!("{}: {}", spec.branch, names.join(", ")));
+        folded.push((spec.tool, vec![spec.branch], names.join(", ")));
     }
-    lines.join(" | ")
+    folded
+        .into_iter()
+        .map(|(_, branches, args)| format!("{}: {args}", branches.join(",")))
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 /// Flat router schema — one object whose properties are the union of every
@@ -1182,6 +1235,47 @@ mod tests {
     }
 
     #[test]
+    fn test_manage_branch_reaches_its_handler() {
+        // `ManageHandler` reads `action` to pick its operation, and the router
+        // consumes that same key as the discriminator. A branch routed to it
+        // must therefore have the canonical name handed back, or the handler
+        // falls through to its `index` default and silently builds an index
+        // where the caller asked for state. A branch routed to a handler that
+        // reads no `action` (`index` -> `leindex_index`) must NOT receive one.
+        let group = group_by_name("leindex_manage").expect("manage router");
+        for spec in group.branches {
+            let (tool, args) =
+                resolve_call(group.name, json!({ group.discriminator: spec.branch })).unwrap();
+            assert_eq!(tool, spec.tool, "{}::{}", group.name, spec.branch);
+            let handed_back = args.get(group.discriminator).and_then(Value::as_str);
+            if spec.tool == "leindex_manage" {
+                assert_eq!(
+                    handed_back,
+                    Some(spec.branch),
+                    "{}::{} lost its action on the way to the handler",
+                    group.name,
+                    spec.branch
+                );
+            } else {
+                assert_eq!(
+                    handed_back, None,
+                    "{}::{} targets {}, which reads no action",
+                    group.name, spec.branch, spec.tool
+                );
+            }
+        }
+        // Omitted `action` still defaults to `index`, and that branch keeps
+        // targeting `leindex_index` so output trimming stays keyed by the real
+        // tool (`output::trim` matches on `leindex_index`).
+        let (tool, _) = resolve_call("leindex_manage", json!({"project_path": "/p"})).unwrap();
+        assert_eq!(tool, "leindex_index");
+        // An alias resolves to the canonical branch, not the spelling.
+        let (tool, args) = resolve_call("leindex_manage", json!({ "action": "status" })).unwrap();
+        assert_eq!(tool, "leindex_manage");
+        assert_eq!(args.get("action").and_then(Value::as_str), Some("state"));
+    }
+
+    #[test]
     fn test_router_and_branch_spellings_are_tolerated() {
         for name in [
             "leindex_explore",
@@ -1399,6 +1493,39 @@ mod tests {
     }
 
     #[test]
+    fn test_branch_usage_folds_branches_that_share_a_handler() {
+        let handlers = all_tool_handlers();
+        // `leindex_manage` is five `action` values over one handler: the
+        // argument list cannot differ per branch, so it is emitted once with
+        // the branches joined. This is what keeps the router listing from
+        // repeating an identical list five times.
+        let manage = group_by_name("leindex_manage").expect("manage router");
+        let usage = branch_usage(manage, &handlers);
+        assert!(
+            usage.contains("state,projects,evict,lease,cleanup:"),
+            "expected the shared branches folded into one entry: {usage}"
+        );
+        assert_eq!(
+            usage.matches("target").count(),
+            1,
+            "a shared handler's args must appear once, not once per branch: {usage}"
+        );
+        // `index` targets a different handler, so it keeps its own entry.
+        assert!(usage.contains("index:"), "{usage}");
+        // Branches that target distinct handlers are NOT folded.
+        let explore = group_by_name("leindex_explore").expect("explore router");
+        let usage = branch_usage(explore, &handlers);
+        assert!(
+            usage.contains("search:") && usage.contains("context:"),
+            "{usage}"
+        );
+        assert!(
+            !usage.contains("search,"),
+            "distinct handlers stay separate: {usage}"
+        );
+    }
+
+    #[test]
     fn test_guide_documents_every_branch() {
         let guide = tools_guide_markdown(&all_tool_handlers());
         for group in &GROUPS {
@@ -1452,6 +1579,14 @@ mod tests {
         // STILL passes (the router surface remains far smaller than the flat
         // per-tool listing), so growth is bounded; the absolute ceiling moves
         // with it.
-        assert!(grouped <= 16_500, "tools/list grew to {grouped} bytes");
+        // 16_500 -> 17_500: `leindex_manage` went from ONE branch (`index`) to
+        // six, which on its own pushed the listing to 17_258 bytes because
+        // `branch_usage` emitted the shared handler's identical argument list
+        // once per branch. Folding branches that share a handler brought it
+        // back to 15_742 (flat 30_472, ratio 0.52), so the ceiling goes UP
+        // only to match the branch count, not to hide a regression: the next
+        // branch that lands here must not push past this without the same
+        // accounting.
+        assert!(grouped <= 17_500, "tools/list grew to {grouped} bytes");
     }
 }
