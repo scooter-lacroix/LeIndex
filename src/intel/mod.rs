@@ -4,11 +4,11 @@
 //! is unavailable or a run is refused by its resource rails, callers retain the
 //! existing tree-sitter PDG unchanged.
 
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
+use std::time::{Duration, Instant};
 
 use crate::graph::pdg::ProgramDependenceGraph;
 
@@ -22,8 +22,30 @@ pub use scip_ingest::{
     CompactScipFacts, DefinitionFact, RelationshipFact, ScipIngestError, ingest_bytes,
 };
 
-static PRECISION_RUN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+/// Per-project precision-run guards.
+///
+/// The guard must be per PROJECT, not process-global. The pass holds the
+/// project write lock for the whole index, so the only run it can deadlock
+/// against is one on the *same* project. A single global mutex serialized
+/// unrelated projects: a second project's index would skip precision entirely
+/// whenever any other project happened to be running it, and every test that
+/// indexes a scratch repo contended with every other one.
+static PRECISION_RUN_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
 static PRECISION_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Guard serializing precision runs for one project root.
+///
+/// Entries are deliberately never pruned: a project needs a fresh mutex only
+/// once, the map holds one small allocation per distinct root a process ever
+/// runs precision for, and never dropping a live entry is what makes the
+/// unheld-mutex invariant safe.
+fn precision_run_lock(project_root: &Path) -> Arc<Mutex<()>> {
+    let mut locks = PRECISION_RUN_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(locks.entry(project_root.to_path_buf()).or_default())
+}
 
 /// Marker recording the last precision attempt (unix seconds) so repeated
 /// tool-driven invocations do not re-spawn external indexers back to back.
@@ -90,15 +112,34 @@ fn record_precision_attempt(project_root: &Path) {
 /// per project (default once per 15 minutes; `LEINDEX_SCIP_FORCE=1` or
 /// `LEINDEX_SCIP_MIN_ATTEMPT_INTERVAL_SECS=0` overrides) so interactive
 /// tool paths never spawn external indexers back to back.
+///
+/// Two bounds keep this pass from ever blocking a caller indefinitely:
+/// `LEINDEX_SCIP_TIMEOUT_SECS` caps a single indexer and
+/// `LEINDEX_SCIP_TOTAL_TIMEOUT_SECS` caps the whole pass across languages. A
+/// concurrent run skips (try-lock) rather than queueing, because this pass
+/// executes under the project write lock.
 pub fn run_precision_ingest(
     pdg: &mut ProgramDependenceGraph,
     project_root: &Path,
 ) -> PrecisionReport {
     let mut total = PrecisionReport::default();
-    let _run_guard = PRECISION_RUN_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("SCIP precision run lock poisoned");
+    // Try-lock, never block, on THIS project's guard. The pass runs under the
+    // project write lock, so a caller that parked here would wait for another
+    // precision run on the same project to finish while holding a lock that
+    // run needs to progress — the deadlock that wedged indexing until
+    // `leindexd` was killed. Precision is additive by design, so a busy run
+    // means "skip, keep Tier-0".
+    let run_lock = precision_run_lock(project_root);
+    let _run_guard = match run_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::WouldBlock) => {
+            tracing::info!(
+                "SCIP precision run already in progress; keeping the Tier-0 PDG for this project"
+            );
+            return total;
+        }
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+    };
     if !precision_attempt_allowed(project_root) {
         return total;
     }
@@ -134,6 +175,17 @@ pub fn run_precision_ingest(
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(600);
+    // `timeout_secs` bounds ONE indexer. A repo with many languages would run
+    // N x timeout back to back while holding the project write lock, so the
+    // pass needs its own ceiling too. Both defaults are 600s for now: the
+    // aggregate budget must not change current behaviour on a normal repo, and
+    // `LEINDEX_SCIP_TIMEOUT_SECS` must keep meaning what it always meant. A
+    // tight budget is opt-in via `LEINDEX_SCIP_TOTAL_TIMEOUT_SECS`.
+    let total_budget_secs = std::env::var("LEINDEX_SCIP_TOTAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(timeout_secs);
+    let deadline = Instant::now() + Duration::from_secs(total_budget_secs);
     let run_id = PRECISION_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
     let job_dir = project_root
         .join(".leindex")
@@ -149,13 +201,21 @@ pub fn run_precision_ingest(
         let Some(spec) = discover_indexer(&language) else {
             continue;
         };
+        // Each indexer gets the smaller of its own timeout and what is left of
+        // the aggregate budget, so one slow language cannot consume the whole
+        // pass. Whatever is left when the budget runs out stays Tier-0, which
+        // is the documented degradation for this pass.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracing::info!(
+                total_budget_secs,
+                "SCIP precision aggregate budget exhausted; remaining languages stay Tier-0"
+            );
+            break;
+        }
+        let language_timeout = remaining.min(Duration::from_secs(timeout_secs));
         let output = output_dir.join(format!("{language}.scip"));
-        let result = run_indexer(
-            &spec,
-            project_root,
-            &output,
-            Duration::from_secs(timeout_secs),
-        );
+        let result = run_indexer(&spec, project_root, &output, language_timeout);
         let run_ok = result.is_ok();
         if let Err(error) = result {
             tracing::info!(language = %language, %error, "SCIP indexer unavailable or failed; using Tier-0");
@@ -217,6 +277,78 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
         (directory, executable)
+    }
+
+    /// Repro for the post-index hang: `run_precision_ingest` executes with the
+    /// project write lock held, so if it parked on a precision mutex instead of
+    /// trying it, a second index of the SAME project would block for as long as
+    /// the first precision pass ran — indefinitely when that pass was itself
+    /// stuck in an indexer. The caller must skip and keep Tier-0.
+    ///
+    /// The scope is the project, not the process: a different project must not
+    /// be refused precision just because another project is running it.
+    #[test]
+    fn test_precision_run_skips_when_the_same_project_already_has_one_in_flight() {
+        let _guard = crate::feature_flags::lock_flag_tests();
+        // Simulate a precision run already in flight on THIS project.
+        let project_lock = precision_run_lock(Path::new("/fixture/project"));
+        let held = project_lock
+            .try_lock()
+            .expect("no other test or thread may hold this project's precision lock here");
+
+        let mut pdg = ProgramDependenceGraph::new();
+        pdg.add_node(Node {
+            id: "src/main.py:main".to_owned(),
+            node_type: NodeType::Function,
+            name: "main".to_owned(),
+            file_path: Arc::from("src/main.py"),
+            byte_range: (0, 4),
+            complexity: 1,
+            language: "python".to_owned(),
+        });
+
+        let started = Instant::now();
+        let report = run_precision_ingest(&mut pdg, Path::new("/fixture/project"));
+        let elapsed = started.elapsed();
+        drop(held);
+
+        // Blocking would deadlock the test; the 5s ceiling turns that into a
+        // failure instead of a hung suite.
+        assert_eq!(report, PrecisionReport::default());
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "precision pass waited {elapsed:?} on a lock held by another run"
+        );
+    }
+
+    /// The other half of the invariant: the guards are keyed per project, so a
+    /// run on one project must not be refused because a *different* project is
+    /// mid-pass. A single process-global mutex made every unrelated index and
+    /// every test that indexes a scratch repo contend with all the others.
+    #[test]
+    fn test_precision_run_guard_is_per_project_not_process_global() {
+        let _guard = crate::feature_flags::lock_flag_tests();
+        // Bind the Arcs: a guard borrows the mutex, so the Arc owning it must
+        // outlive the guard.
+        let one = precision_run_lock(Path::new("/fixture/one"));
+        let two = precision_run_lock(Path::new("/fixture/two"));
+        let held = one
+            .try_lock()
+            .expect("no other test or thread may hold this project's precision lock here");
+
+        // Same project: a second run must be refused, or it would queue behind
+        // the first while holding that project's write lock.
+        assert!(
+            one.try_lock().is_err(),
+            "a second precision run on the same project must be refused"
+        );
+        // Different project: must be acquirable. A process-global mutex failed
+        // exactly here, serializing unrelated projects and starving them.
+        assert!(
+            two.try_lock().is_ok(),
+            "an unrelated project must not be blocked by another project's precision run"
+        );
+        drop(held);
     }
 
     #[cfg(unix)]
