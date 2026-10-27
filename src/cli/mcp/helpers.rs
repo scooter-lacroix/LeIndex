@@ -125,7 +125,12 @@ pub(crate) fn wrap_with_meta(result: Value, index: &crate::cli::leindex::LeIndex
     // into a stale Boolean that survives an editor save.
     let live_status = crate::cli::git::status(index.project_path()).ok();
     let live_dirty = live_status.as_ref().map(dirty_count).unwrap_or(0);
-    wrap_live_with_meta_status(result, index.project_path(), live_status, live_dirty)
+    wrap_live_with_meta_status(
+        result,
+        index.project_path(),
+        live_status.as_ref(),
+        live_dirty,
+    )
 }
 
 /// Attach the same compact freshness badge to a live-only response. This path
@@ -133,7 +138,7 @@ pub(crate) fn wrap_with_meta(result: Value, index: &crate::cli::leindex::LeIndex
 pub(crate) fn wrap_live_with_meta(result: Value, project_root: &std::path::Path) -> Value {
     let live_status = crate::cli::git::status(project_root).ok();
     let live_dirty = live_status.as_ref().map(dirty_count).unwrap_or(0);
-    wrap_live_with_meta_status(result, project_root, live_status, live_dirty)
+    wrap_live_with_meta_status(result, project_root, live_status.as_ref(), live_dirty)
 }
 
 /// Number of files a worktree delta touches, in every dirty category.
@@ -245,24 +250,16 @@ fn is_in_skip_dir(path: &Path) -> bool {
     })
 }
 
-pub(crate) fn wrap_live_with_meta_dirty(
-    result: Value,
-    project_root: &std::path::Path,
-    live_dirty: usize,
-) -> Value {
-    wrap_live_with_meta_status(result, project_root, None, live_dirty)
-}
-
-/// `wrap_live_with_meta_dirty`, also taking the worktree delta the caller
+/// Attach the same freshness badge, reusing the worktree delta the caller
 /// already paid for.
 ///
-/// `live_status` is reused for the staleness decision instead of running
-/// `git status` a second time. `None` means the caller has no usable delta, in
+/// `live_status` is reused for the staleness decision instead of running `git
+/// status` a second time. `None` means the caller has no usable delta, in
 /// which case the staleness check falls back to the persisted health count.
 pub(crate) fn wrap_live_with_meta_status(
     mut result: Value,
     project_root: &std::path::Path,
-    live_status: Option<crate::cli::git::GitStatus>,
+    live_status: Option<&crate::cli::git::GitStatus>,
     live_dirty: usize,
 ) -> Value {
     let storage_path = crate::cli::leindex::resolve_existing_storage_path(project_root)
@@ -309,8 +306,7 @@ pub(crate) fn wrap_live_with_meta_status(
         });
     let status_known = live_status.is_some();
     if let Some(obj) = result.as_object_mut() {
-        let stale =
-            is_index_genuinely_stale(&health, project_root, live_status.as_ref(), status_known);
+        let stale = is_index_genuinely_stale(&health, project_root, live_status, status_known);
         {
             let mut freshness = freshness;
             if stale {
@@ -802,7 +798,7 @@ pub(crate) fn phase_analysis_schema() -> Value {
             },
             "project_path": {
                 "type": "string",
-                "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                "description": "Project directory (omit to use current project). Indexing is NOT automatic: an unindexed project answers with a 'project not indexed' error until you run the index action."
             },
             "mode": {
                 "type": "string",

@@ -234,28 +234,11 @@ impl ParallelParser {
     /// Parse a single file
     fn parse_single_file(&self, file_path: PathBuf) -> ParsingResult {
         let start_time = Instant::now();
-
-        // Detect language from file extension
         let extension = file_path
             .extension()
             .and_then(|ext| ext.to_str())
-            .unwrap_or("");
-
-        let language_id = match LanguageId::from_extension(extension) {
-            Some(id) => id,
-            None => {
-                let ext = extension.to_string();
-                return ParsingResult::failure(
-                    file_path,
-                    format!("Unsupported file extension: {}", ext),
-                );
-            }
-        };
-
-        // Get language name for result
-        let language_name = language_id.config().name.clone();
-
-        // Read file contents
+            .map(str::to_owned)
+            .unwrap_or_default();
         let source = match std::fs::read(&file_path) {
             Ok(contents) => contents,
             Err(e) => {
@@ -263,7 +246,48 @@ impl ParallelParser {
             }
         };
 
-        // Get the language-specific parser factory
+        if crate::parse::binary::classify(&file_path, &source).is_some() {
+            let binary = crate::parse::binary::extract(&file_path, &source);
+            let end = binary.text.len();
+            let signature = SignatureInfo {
+                name: file_path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("binary")
+                    .to_string(),
+                qualified_name: file_path.display().to_string(),
+                parameters: Vec::new(),
+                return_type: None,
+                visibility: crate::parse::traits::Visibility::Public,
+                is_async: false,
+                is_method: false,
+                docstring: Some(binary.text.clone()),
+                calls: Vec::new(),
+                imports: Vec::new(),
+                byte_range: (0, end),
+                cyclomatic_complexity: 0,
+                flow_facts: Vec::new(),
+            };
+            return ParsingResult::success(
+                file_path,
+                binary.language.to_string(),
+                vec![signature],
+                source,
+                start_time.elapsed().as_millis() as u64,
+            );
+        }
+
+        let language_id = match LanguageId::from_extension(&extension) {
+            Some(id) => id,
+            None => {
+                return ParsingResult::failure(
+                    file_path,
+                    format!("Unsupported file extension: {}", extension),
+                );
+            }
+        };
+
+        let language_name = language_id.config().name.clone();
         let lang_parser = match parser_for_language(&language_name) {
             Some(p) => p,
             None => {
@@ -274,15 +298,12 @@ impl ParallelParser {
             }
         };
 
-        // Use thread-local pooled parser
         let result = THREAD_PARSER.with(|parser_cell| {
             let mut parser = parser_cell.borrow_mut();
             lang_parser.get_signatures_with_parser(&source, &mut parser)
         });
 
-        // Process result
         let parse_time_ms = start_time.elapsed().as_millis() as u64;
-
         match result {
             Ok(signatures) => {
                 ParsingResult::success(file_path, language_name, signatures, source, parse_time_ms)
@@ -308,6 +329,23 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use tempfile::tempdir;
+
+    #[test]
+    fn binary_results_retain_full_source_for_pdg_hashing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("large.dll");
+        let source = vec![b'Z'; crate::parse::binary::MAX_BINARY_BYTES + 1024];
+        std::fs::write(&path, &source).unwrap();
+
+        let result = ParallelParser::new().parse_files(vec![path]).remove(0);
+
+        assert!(result.is_success());
+        assert_eq!(result.source_bytes.as_deref(), Some(source.as_slice()));
+        assert_eq!(
+            blake3::hash(result.source_bytes.as_deref().unwrap()),
+            blake3::hash(&source)
+        );
+    }
 
     #[test]
     fn test_parallel_parser_multiple_files() {

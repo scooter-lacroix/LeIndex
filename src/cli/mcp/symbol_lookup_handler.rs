@@ -59,7 +59,7 @@ For the exact source implementation use LeIndex [Read Symbol]."
                 },
                 "project_path": {
                     "type": "string",
-                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                    "description": "Project directory (omit to use current project). Indexing is NOT automatic: an unindexed project answers with a 'project not indexed' error until you run the index action."
                 },
                 "token_budget": {
                     "type": "integer",

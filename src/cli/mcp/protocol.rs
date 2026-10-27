@@ -401,10 +401,10 @@ impl JsonRpcError {
     pub fn project_not_indexed(project: String) -> Self {
         Self::with_data(
             error_codes::PROJECT_NOT_INDEXED,
-            "Project not indexed — call LeIndex [Index] or pass project_path to auto-index",
+            "Project not indexed — call LeIndex [Index] first",
             serde_json::json!({
                 "project": project,
-                "suggestion": "Pass project_path to any tool to auto-index on first use, or call LeIndex [Index] explicitly. If a first-use index is already building in the background, retry shortly; LeIndex [Index] reports its progress without starting a second job.",
+                "suggestion": "Call LeIndex [Manage] action=index (or `leindex index`) to build the index, then retry. LeIndex does NOT index on first use by default: a tool call is not consent to spend minutes of CPU and disk, so `LEINDEX_AUTO_INDEX=1` (or `[mcp] auto_index = true`) is required to opt into first-use indexing. LeIndex [Index] reports progress without starting a second job.",
                 "error_type": "project_not_indexed"
             }),
         )

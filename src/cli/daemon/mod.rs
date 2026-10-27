@@ -12,6 +12,9 @@
 /// Synchronous, `std`-only stdio shim used by `leindex mcp` (wire v2).
 #[cfg(all(feature = "daemon-client", unix))]
 pub mod client;
+/// User-facing daemon lifecycle controls.
+#[cfg(unix)]
+pub mod control;
 /// Daemon endpoint discovery + liveness checking.
 pub mod endpoint;
 /// Protocol-version handshake (spec §12.1).

@@ -109,19 +109,21 @@ async fn tools_run(
     project: Option<PathBuf>,
 ) -> AnyhowResult<()> {
     let parsed_args = parse_tool_args_json(args_json)?;
-    let mut args = merge_tool_args(parsed_args.clone(), set, project.as_ref())?;
+    let mut args = merge_tool_args(parsed_args, set, project.as_ref())?;
     apply_default_latency_budget(&mut args);
     // The five public routers select their operation with `mode`/`action`
     // (`--set action=text`); resolve to the underlying tool so the CLI renders
     // exactly what the MCP transport does.
     let (name, args) = crate::cli::mcp::grouped::resolve_call(name, args)
         .map_err(|error| anyhow::anyhow!("{}", error))?;
-    let mut parsed_args = parsed_args;
-    if let Some(object) = parsed_args.as_object_mut() {
-        object.remove("action");
-    }
+    // Render from the MERGED args (`--args` + `--set` + `project_path`), not the
+    // raw `--args` JSON. The renderer reads things like `query` and `node_id` off
+    // its args to label output; handing it `parsed_args` meant every `--set`-only
+    // invocation rendered a blank label (`Search: ""`) while the handler received
+    // the real value. The MCP transport already passes the args it executed with.
+    let render_args = args.clone();
     let value = execute_tool_handler(&name, args, project).await?;
-    emit_rendered_tool_output(&name, &value, &parsed_args)
+    emit_rendered_tool_output(&name, &value, &render_args)
 }
 
 /// MCP stdio command implementation - Run MCP server in stdio mode

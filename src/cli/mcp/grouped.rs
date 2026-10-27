@@ -315,8 +315,8 @@ pub static GROUPS: [GroupSpec; 5] = [
                 "Configured remotes and their URLs",
             ),
             // Mutations: never fire from a default argument set. Each returns
-            // a dry-run plan plus a preview_token; `confirm` is refused until
-            // the apply side is wired.
+            // a dry-run plan plus a preview_token that identifies the plan.
+            // There is no `confirm` argument and no apply side.
             branch(
                 "add",
                 "leindex_git",
@@ -755,7 +755,7 @@ fn tier_property() -> Value {
 fn project_path_property() -> Value {
     json!({
         "type": "string",
-        "description": "Project directory (auto-indexes on first use; omit for current)"
+        "description": "Project directory (omit for current). Indexing is NOT automatic: an unindexed project answers with a 'project not indexed' error until you run the index action."
     })
 }
 

@@ -88,6 +88,21 @@ pub struct PhaseAnalysisReport {
     /// Deleted file count.
     pub deleted_files: usize,
 
+    /// Whether every requested phase actually ran.
+    ///
+    /// A wall-clock ceiling stops stages from *starting*, so a truncated run
+    /// still produces a report that is a truthful summary of the phases that
+    /// ran and a silent lie about the rest. The human-readable `INCOMPLETE`
+    /// line in `formatted_output` does not help a machine consumer that
+    /// deserializes this payload and sees `Ok` plus a normal report. So the
+    /// truncation has to be a field.
+    ///
+    /// `serde(default)` gives `false` to a payload that predates this field,
+    /// which is the only safe direction: "unknown" must never read as
+    /// "complete".
+    #[serde(default)]
+    pub complete: bool,
+
     /// Phase 1 summary.
     pub phase1: Option<Phase1Summary>,
     /// Phase 2 summary.
@@ -259,6 +274,7 @@ pub fn run_phase_analysis(
         cache_hit,
         changed_files: context.changed_files.len(),
         deleted_files: context.deleted_files.len(),
+        complete: !budget_exhausted,
         phase1: phase1_summary,
         phase2: phase2_summary,
         phase3: phase3_summary,
@@ -715,6 +731,12 @@ mod tests {
         );
         assert!(report.phase1.is_none());
         assert!(
+            !report.complete,
+            "an exhausted budget must set the structured `complete` flag, not only \
+             bury a marker in formatted_output: a machine consumer that reads the \
+             payload would otherwise see Ok plus a normal report"
+        );
+        assert!(
             report.formatted_output.contains("INCOMPLETE"),
             "a truncated run must not read as a complete one: {}",
             report.formatted_output
@@ -744,6 +766,11 @@ mod tests {
         .expect("phase run");
 
         assert_eq!(report.executed_phases, vec![1, 2, 3, 4, 5]);
+        assert!(
+            report.complete,
+            "a run that executed every requested phase must report complete, or the \
+             flag is useless as a signal"
+        );
         assert!(!report.formatted_output.contains("INCOMPLETE"));
     }
 }

@@ -24,6 +24,9 @@ mod ast_tests;
 /// Parallel parsing implementation.
 pub mod parallel;
 
+/// Bounded metadata extraction for PE/DLL and game assets.
+pub mod binary;
+
 /// Language-specific parsers.
 pub mod languages;
 

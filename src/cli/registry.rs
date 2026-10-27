@@ -66,6 +66,55 @@ pub const STALE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// reindex on the next call after the window elapses.
 pub const INDEX_ATTEMPT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Environment variable that turns first-use auto-indexing ON.
+///
+/// Default OFF. An index is an expensive, stateful side effect, and a read (git
+/// status, a file read, a text search) should not silently start one: it costs
+/// CPU and disk the caller did not ask for, it can take minutes on a large
+/// repository, and it made "just look at this with git status" indistinguishable
+/// from "index this repo". Tools that REQUIRE an index report their own
+/// "not indexed" error with remediation; starting the index is an explicit act
+/// (`leindex index`, `leindex_manage action=index`, or `LEINDEX_AUTO_INDEX=1`).
+pub const AUTO_INDEX_ENABLE_ENV: &str = "LEINDEX_AUTO_INDEX";
+
+/// Whether first-use auto-indexing is enabled for this process.
+///
+/// Two deliberate opt-ins: the `LEINDEX_AUTO_INDEX` environment variable, and
+/// `[mcp] auto_index = true` in the project config. Everything else — including
+/// a malformed value — is OFF, because the failure mode of mistakenly enabling
+/// an index is far worse than the failure mode of mistakenly skipping one.
+pub fn auto_index_enabled() -> bool {
+    if std::env::var(AUTO_INDEX_ENABLE_ENV)
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes"))
+    {
+        return true;
+    }
+    crate::config::LeIndexConfig::load()
+        .map(|config| config.mcp.auto_index)
+        .unwrap_or(false)
+}
+
+/// Mutex serializing tests that mutate `LEINDEX_AUTO_INDEX`.
+///
+/// The variable is process-global and `auto_index_enabled()` reads it, so a test
+/// that sets it while another asserts the default would flake. (`std::env::var`
+/// racing `std::env::set_var` is a data race.) Two modules observe this setting —
+/// `registry_test` and the project-map handler test — so the guard lives here
+/// rather than in either test module.
+///
+/// A `tokio::sync::Mutex` rather than a `std::sync` one: both call sites are
+/// async tests that legitimately hold the guard across an `await`, and a
+/// blocking guard there is `clippy::await_holding_lock` — a warning this repo
+/// treats as an error.
+#[cfg(test)]
+pub(crate) fn auto_index_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .try_lock()
+        .unwrap_or_else(|_| panic!("LEINDEX_AUTO_INDEX test lock must not already be held"))
+}
+
 /// Environment variable overriding how long a tool call waits for a cold
 /// first-use index before continuing in the background (milliseconds).
 pub const AUTO_INDEX_WAIT_ENV: &str = "LEINDEX_AUTO_INDEX_WAIT_MS";
@@ -730,7 +779,10 @@ impl ProjectRegistry {
         self.create_and_insert(canonical).await
     }
 
-    /// Get or create a project, auto-indexing if it has no stored index.
+    /// Get or create a project, auto-indexing if it has no stored index AND
+    /// auto-indexing is enabled (see [`auto_index_enabled`]; it is off by
+    /// default, in which case the project is served unindexed and tools that
+    /// need an index report their own `project_not_indexed` error).
     pub async fn get_or_create(
         self: &Arc<Self>,
         project_path: Option<&str>,
@@ -780,13 +832,12 @@ impl ProjectRegistry {
         };
 
         if needs_index {
-            // Auto-index is best-effort: a failed index attempt (degraded
-            // storage, transient lock contention, disk pressure) must not turn
-            // every subsequent tool call into a hard error. Tools that can
-            // operate without an index (read, edit, text search, git status)
-            // degrade gracefully; tools that need the index report their own
-            // "not indexed" errors with remediation guidance.
-            let skip_attempt = {
+            // Auto-index is best-effort AND opt-in (see `auto_index_enabled`).
+            // With it disabled — the default — the project is served as-is and
+            // tools that need an index report their own "not indexed" error,
+            // which names how to start one. A read must not silently begin a
+            // multi-minute index the caller never asked for.
+            let skip_attempt = !auto_index_enabled() || {
                 let cache = self.failed_index_attempts.read().await;
                 cache
                     .get(&canonical)
@@ -795,7 +846,8 @@ impl ProjectRegistry {
             if skip_attempt {
                 debug!(
                     project = %canonical.display(),
-                    "Skipping auto-index within cooldown after a recent failure"
+                    enabled = auto_index_enabled(),
+                    "Skipping auto-index (disabled, or within cooldown after a recent failure)"
                 );
             } else if let Err(error) = self.auto_index(&handle, &canonical).await {
                 warn!(

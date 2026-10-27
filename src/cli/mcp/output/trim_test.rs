@@ -1166,3 +1166,39 @@ fn test_trim_git_status_pdg_unavailable() {
     assert_eq!(t["pdg_enrichment"]["error"], "database error");
     assert_eq!(t["impact_summary"]["pdg_enriched"], false);
 }
+
+#[test]
+fn test_trim_git_status_preserves_the_pdg_status_the_handlers_emit() {
+    // Regression: `git_status_handler` / `git_diff_handler` write a plain
+    // `pdg_status` string (plus `pdg_error` when enrichment fails) and neither
+    // emits `pdg_enrichment`. The trim preserved the phantom object shape and
+    // DROPPED `pdg_status`, so on the real transport path the renderer's
+    // enrichment line always saw "field absent" and rendered nothing — even
+    // though `render_git_status` had already been fixed to read `pdg_status`.
+    let input = v(r#"{
+            "is_git_repo": true,
+            "branch": "main",
+            "summary": {"modified": 1, "staged": 0, "untracked": 0},
+            "modified_files": ["src/main.rs"],
+            "staged_files": [],
+            "untracked_files": [],
+            "changed_symbols": [],
+            "pdg_status": "fresh",
+            "impact_summary": {"total_affected_symbols": 3, "pdg_enriched": true}
+        }"#);
+    let t = trim_git_status(&input);
+    assert_eq!(
+        t["pdg_status"], "fresh",
+        "trim must keep the field the handlers actually emit: {t}"
+    );
+
+    // The failure path carries its reason alongside it.
+    let failed = v(r#"{
+            "branch": "main",
+            "pdg_status": "failed",
+            "pdg_error": "no nodes"
+        }"#);
+    let t = trim_git_status(&failed);
+    assert_eq!(t["pdg_status"], "failed");
+    assert_eq!(t["pdg_error"], "no nodes");
+}

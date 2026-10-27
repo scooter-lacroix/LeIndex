@@ -39,7 +39,7 @@ data flow, and impact radius. Use for broad codebase understanding queries."
                 },
                 "project_path": {
                     "type": "string",
-                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                    "description": "Project directory (omit to use current project). Indexing is NOT automatic: an unindexed project answers with a 'project not indexed' error until you run the index action."
                 },
                 "token_budget": {
                     "type": "integer",

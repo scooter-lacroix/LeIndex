@@ -87,7 +87,7 @@ context (symbols, types) immediately so the model knows how the new file fits in
                 },
                 "project_path": {
                     "type": "string",
-                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                    "description": "Project directory (omit to use current project). Indexing is NOT automatic: an unindexed project answers with a 'project not indexed' error until you run the index action."
                 }
             },
             "required": ["file_path", "content"]

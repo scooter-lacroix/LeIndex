@@ -1,6 +1,6 @@
 use super::helpers::{
     extract_bool, extract_usize, get_direct_callers, node_type_str, wrap_live_with_meta,
-    wrap_live_with_meta_dirty,
+    wrap_live_with_meta_status,
 };
 use super::protocol::JsonRpcError;
 use super::request_meta::{WorkBudget, record_git_ms, record_pdg_ms};
@@ -97,11 +97,12 @@ impl GitStatusHandler {
             + status.staged.len()
             + status.untracked.len()
             + status.deleted.len();
-        let mut result = wrap_live_with_meta_dirty(
-            base_result(&status, &root, scope.as_deref()),
-            &root,
-            live_dirty,
-        );
+        // Hand the delta we already paid for to the staleness check. Passing
+        // `None` here makes `status_known` false even though git answered, which
+        // sends `is_index_genuinely_stale` down its persisted-count fallback and
+        // reports a clean tree as stale off an old snapshot.
+        let base = base_result(&status, &root, scope.as_deref());
+        let mut result = wrap_live_with_meta_status(base, &root, Some(&status), live_dirty);
         let started = Instant::now();
 
         // This lookup is deliberately after the complete live Git response is built.
@@ -156,6 +157,7 @@ impl GitStatusHandler {
                 result["changed_symbols"] = Value::Array(enrichment.changed_symbols);
                 result["impact_summary"] = json!({
                     "total_affected_symbols": enrichment.affected.len(),
+                    "affected_symbols_capped": enrichment.affected_symbols_capped,
                     "affected_files": enrichment.affected_files,
                     "pdg_enriched": true,
                 });
@@ -200,7 +202,7 @@ fn base_result(status: &GitStatus, root: &Path, scope: Option<&Path>) -> Value {
         })).collect::<Vec<_>>(),
         "safe_to_stage": safe_to_stage,
         "changed_symbols": [],
-        "impact_summary": { "total_affected_symbols": 0, "affected_files": [], "pdg_enriched": false },
+        "impact_summary": { "total_affected_symbols": 0, "affected_symbols_capped": false, "affected_files": [], "pdg_enriched": false },
         "pdg_status": "not_loaded",
         "retrieval": { "tfidf_status": "not_used_live_status", "neural_status": "not_used_live_status" },
     })
@@ -290,6 +292,9 @@ struct PdgEnrichment {
     status: &'static str,
     changed_symbols: Vec<Value>,
     affected: Vec<NodeId>,
+    /// Whether the impact traversal hit its node cap, so `affected.len()` is a
+    /// floor rather than the real count. Same field name as the diff handler.
+    affected_symbols_capped: bool,
     affected_files: Vec<String>,
 }
 
@@ -336,10 +341,10 @@ fn enrich_pdg(
         }
     }
 
-    let affected = if partial || roots.is_empty() {
-        Vec::new()
+    let (affected, affected_symbols_capped) = if partial || roots.is_empty() {
+        (Vec::new(), false)
     } else {
-        pdg.forward_impact_multi_source(
+        pdg.forward_impact_multi_source_capped(
             &roots,
             &TraversalConfig {
                 max_depth: Some(2),
@@ -358,6 +363,7 @@ fn enrich_pdg(
         status: if partial { "partial" } else { "fresh" },
         changed_symbols,
         affected,
+        affected_symbols_capped,
         affected_files,
     })
 }

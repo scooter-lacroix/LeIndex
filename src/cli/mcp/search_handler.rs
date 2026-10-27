@@ -336,7 +336,7 @@ impl SearchHandler {
     pub fn description(&self) -> &str {
         "Semantic code search. Finds symbols by meaning, not just name. Returns ranked \
 results with composite scores (semantic + text + structural). Accepts project_path \
-to auto-switch/auto-index projects."
+to switch between projects."
     }
 
     /// Returns the JSON schema for the arguments of this RPC method
@@ -350,7 +350,7 @@ to auto-switch/auto-index projects."
                 },
                 "project_path": {
                     "type": "string",
-                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                    "description": "Project directory (omit to use current project). Indexing is NOT automatic: an unindexed project answers with a 'project not indexed' error until you run the index action."
                 },
                 "top_k": {
                     "type": "integer",

@@ -39,12 +39,19 @@ static PRECISION_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// once, the map holds one small allocation per distinct root a process ever
 /// runs precision for, and never dropping a live entry is what makes the
 /// unheld-mutex invariant safe.
+///
+/// The key is canonicalised first. Two paths to the same project — a symlink,
+/// a relative path, `/repo` vs `/repo/` — would otherwise get two locks, and
+/// the whole point of this guard is that two runs on ONE project cannot
+/// overlap. `canonicalize` fails on a path that does not exist, so fall back to
+/// the given path: a bogus root has no runs to serialize anyway.
 fn precision_run_lock(project_root: &Path) -> Arc<Mutex<()>> {
+    let key = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let mut locks = PRECISION_RUN_LOCKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Arc::clone(locks.entry(project_root.to_path_buf()).or_default())
+    Arc::clone(locks.entry(key).or_default())
 }
 
 /// Marker recording the last precision attempt (unix seconds) so repeated
@@ -136,6 +143,7 @@ pub fn run_precision_ingest(
             tracing::info!(
                 "SCIP precision run already in progress; keeping the Tier-0 PDG for this project"
             );
+            total.skipped_concurrent_run = true;
             return total;
         }
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -314,7 +322,11 @@ mod tests {
 
         // Blocking would deadlock the test; the 5s ceiling turns that into a
         // failure instead of a hung suite.
-        assert_eq!(report, PrecisionReport::default());
+        assert!(
+            report.skipped_concurrent_run,
+            "a refused pass must say it was skipped, not report an empty run"
+        );
+        assert_eq!(report.definitions_seen, 0);
         assert!(
             elapsed < Duration::from_secs(5),
             "precision pass waited {elapsed:?} on a lock held by another run"

@@ -154,12 +154,29 @@ impl ProgramDependenceGraph {
         starts: &HashSet<NodeId>,
         config: &TraversalConfig,
     ) -> Vec<NodeId> {
+        self.forward_impact_multi_source_capped(starts, config).0
+    }
+
+    /// [`Self::forward_impact_multi_source`], but also reporting whether
+    /// `config.max_nodes` cut the traversal short.
+    ///
+    /// The boolean exists because the capped count is indistinguishable from a
+    /// complete one: `for_impact_analysis` caps at 500 nodes, so a caller that
+    /// reports "500 affected symbols" is reporting the cap as if it were a
+    /// measurement. A consumer that needs to say which one it has must be able
+    /// to ask.
+    pub fn forward_impact_multi_source_capped(
+        &self,
+        starts: &HashSet<NodeId>,
+        config: &TraversalConfig,
+    ) -> (Vec<NodeId>, bool) {
         let mut visited = starts.clone();
         let mut ordered_starts = starts.iter().copied().collect::<Vec<_>>();
         ordered_starts.sort_by_key(|id| id.index());
         let mut queue: VecDeque<(NodeId, usize)> =
             ordered_starts.into_iter().map(|id| (id, 0)).collect();
         let mut result = Vec::new();
+        let mut capped = false;
         // Neighbour buffer reused across levels. It was a `Mutex` field shared
         // by every traversal, which serialized the parallel indexing passes
         // (two traversals per symbol across all cores) on one lock.
@@ -168,6 +185,8 @@ impl ProgramDependenceGraph {
         while let Some((current, depth)) = queue.pop_front() {
             if let Some(max_nodes) = config.max_nodes {
                 if result.len() >= max_nodes {
+                    // There is work left in the queue, so the answer is partial.
+                    capped = true;
                     break;
                 }
             }
@@ -196,7 +215,7 @@ impl ProgramDependenceGraph {
                 }
             }
         }
-        result
+        (result, capped)
     }
 
     /// Backward impact: nodes that can reach `start` following incoming edges.

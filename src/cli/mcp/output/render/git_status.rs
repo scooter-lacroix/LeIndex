@@ -104,22 +104,44 @@ fn render_git_impact_summary(data: &Value, color: bool) -> String {
         .and_then(|v| v.as_array())
         .map(Vec::len)
         .unwrap_or(0);
-    let (bold, reset) = if color { (BOLD, RESET) } else { ("", "") };
+    // The traversal caps at 500 nodes, so a bare "500 affected symbols" would
+    // report the cap as if it were a measurement. Say which one it is.
+    let capped = impact
+        .get("affected_symbols_capped")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let (bold, dim, reset) = if color {
+        (BOLD, DIM, RESET)
+    } else {
+        ("", "", "")
+    };
+    if capped {
+        return format!(
+            "\n  {bold}Impact:{reset} {total}+ affected symbols across {affected} files \
+             {dim}(traversal capped at {total}; the real count is higher){reset}\n"
+        );
+    }
     format!("\n  {bold}Impact:{reset} {total} affected symbols across {affected} files\n")
 }
 
+/// PDG enrichment status.
+///
+/// This used to read `data["pdg_enrichment"]["available"]`, but NO handler ever
+/// emitted that object — both git handlers write a plain `pdg_status` string —
+/// so the line silently rendered nothing for every real response. The field the
+/// handlers actually emit is the one read here.
 fn render_git_pdg_enrichment(data: &Value, color: bool) -> String {
-    let Some(pdg) = data.get("pdg_enrichment") else {
+    let Some(status) = data.get("pdg_status").and_then(|v| v.as_str()) else {
         return String::new();
     };
-    let available = pdg
-        .get("available")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let (icon, icon_color, status) = if available {
-        ("✓", LIGHT_GREEN, "available")
-    } else {
-        ("⚠", LIGHT_YELLOW, "unavailable")
+    let (icon, icon_color) = match status {
+        "fresh" => ("✓", LIGHT_GREEN),
+        "partial" => ("◐", LIGHT_YELLOW),
+        "stale" => ("⚠", LIGHT_YELLOW),
+        "failed" => ("✗", LIGHT_RED),
+        // "skipped" / "not_loaded": enrichment was not attempted, which is not
+        // a health claim either way.
+        _ => ("·", DIM),
     };
     let (bold, dim, reset, displayed_icon_color) = if color {
         (BOLD, DIM, RESET, icon_color)
@@ -128,10 +150,8 @@ fn render_git_pdg_enrichment(data: &Value, color: bool) -> String {
     };
     let mut out =
         format!("\n  {bold}PDG Enrichment:{reset} {displayed_icon_color}{icon}{reset} {status}\n");
-    if !available {
-        if let Some(reason) = pdg.get("reason").and_then(|v| v.as_str()) {
-            out.push_str(&format!("    {dim}Reason:{reset} {reason}\n"));
-        }
+    if let Some(reason) = data.get("pdg_error").and_then(|v| v.as_str()) {
+        out.push_str(&format!("    {dim}Reason:{reset} {reason}\n"));
     }
     out
 }

@@ -174,6 +174,7 @@ mod tests {
                     cache_hit: false,
                     changed_files: 0,
                     deleted_files: 0,
+                    complete: true,
                     phase1: Some(Phase1Summary::default()),
                     phase2: None,
                     phase3: None,

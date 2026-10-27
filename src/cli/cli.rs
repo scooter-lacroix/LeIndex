@@ -31,6 +31,8 @@ use storage_cleanup::*;
 
 #[path = "cli/services_commands.rs"]
 mod services_commands;
+#[cfg(unix)]
+use crate::cli::daemon::control::{self as daemon_control, DaemonState};
 use services_commands::cmd_services_impl;
 
 const POST_INSTALL_SKIP_ENV: &str = "LEINDEX_SKIP_POST_INSTALL_HOOK";
@@ -371,9 +373,33 @@ pub enum Commands {
         #[arg(long = "remote-gemma")]
         remote_gemma: bool,
 
+        /// Use the alternate-screen fullscreen setup editor. Without this flag,
+        /// setup renders inline and leaves the terminal scrollback intact.
+        #[arg(long = "fs")]
+        fs: bool,
+
         /// Model route, managed runtime, and external endpoint options.
+        ///
+        /// Boxed because this variant is by far the largest in the clap enum:
+        /// `SetupOptions` is a flattened bag of every setup flag, so the variant
+        /// crosses clippy's 200-byte `large_enum_variant` threshold and would
+        /// make EVERY `Commands` value pay for the setup surface even when the
+        /// user runs `leindex search`. `Box` keeps one indirection on the setup
+        /// path only. Note this must be built as `Box::new(..)`/`Box::default()`
+        /// at the call sites — `#[command(flatten)]` itself is unaffected.
         #[command(flatten)]
-        options: crate::cli::leindex::setup::SetupOptions,
+        options: Box<crate::cli::leindex::setup::SetupOptions>,
+    },
+
+    /// Manage the user-scoped leindexd daemon.
+    ///
+    /// Use `status` to inspect endpoint liveness, `start` to launch it,
+    /// `stop` to request graceful shutdown, or `restart` to do both. The
+    /// daemon stores its endpoint sidecar under `$LEINDEX_HOME/run`.
+    Daemon {
+        /// Lifecycle action (status when omitted): status, start, stop, restart
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
     },
 
     /// Manage managed model-server services ([services.<name>] sections)
@@ -406,6 +432,21 @@ pub enum Commands {
         #[arg(value_name = "PATH")]
         path: Option<PathBuf>,
     },
+}
+
+/// Actions for `leindex daemon`.
+#[derive(Subcommand, Debug)]
+pub enum DaemonAction {
+    /// Show whether leindexd is running, its verified PID, and socket endpoint.
+    /// Returns `stopped` when no endpoint sidecar exists and `stale` when the
+    /// sidecar does not match a live daemon or the current protocol.
+    Status,
+    /// Start leindexd in the background using the user-scoped run directory.
+    Start,
+    /// Ask the running leindexd process to shut down, then remove its sidecars.
+    Stop,
+    /// Stop leindexd if needed and start a fresh background instance.
+    Restart,
 }
 
 /// Actions for `leindex services`.
@@ -627,6 +668,7 @@ impl Cli {
                 check,
                 warmup,
                 remote_gemma,
+                fs,
                 options,
             } => {
                 cmd_setup_impl(
@@ -637,11 +679,14 @@ impl Cli {
                     check,
                     warmup,
                     remote_gemma,
-                    options,
+                    fs,
+                    *options,
                 )
                 .await
             }
             Commands::Services { action } => cmd_services_impl(action).await,
+            #[cfg(unix)]
+            Commands::Daemon { action } => cmd_daemon_impl(action),
             Commands::Config { action } => crate::cli::leindex::setup_config::run(action),
             #[cfg(feature = "tui")]
             Commands::Tui { path } => crate::cli::tui::run(path.or(global_project)).await,
@@ -656,6 +701,45 @@ impl Cli {
         crate::cli::cleanup::flush_registered_temp_cleanups();
 
         result
+    }
+}
+
+#[cfg(unix)]
+fn cmd_daemon_impl(action: Option<DaemonAction>) -> AnyhowResult<()> {
+    let run_dir = daemon_control::run_dir()?;
+    let action = action.unwrap_or(DaemonAction::Status);
+    match action {
+        DaemonAction::Status => {
+            let (state, endpoint) = daemon_control::state(&run_dir)?;
+            match (state, endpoint) {
+                (DaemonState::Running, Some(endpoint)) => println!(
+                    "running (pid {}, socket {})",
+                    endpoint.pid,
+                    endpoint.socket_path.display()
+                ),
+                (DaemonState::Stale, Some(endpoint)) => println!(
+                    "stale (pid {}, socket {})",
+                    endpoint.pid,
+                    endpoint.socket_path.display()
+                ),
+                _ => println!("stopped"),
+            }
+            Ok(())
+        }
+        DaemonAction::Start => daemon_control::start(&run_dir),
+        DaemonAction::Stop => {
+            if daemon_control::stop(&run_dir)? {
+                println!("stopped leindexd");
+            } else {
+                println!("leindexd already stopped");
+            }
+            Ok(())
+        }
+        DaemonAction::Restart => {
+            daemon_control::restart(&run_dir)?;
+            println!("restarted leindexd");
+            Ok(())
+        }
     }
 }
 
@@ -1635,6 +1719,7 @@ async fn cmd_setup_impl(
     check: bool,
     warmup: bool,
     remote_gemma: bool,
+    fs: bool,
     options: crate::cli::leindex::setup::SetupOptions,
 ) -> AnyhowResult<()> {
     use crate::cli::leindex::setup;
@@ -1660,7 +1745,7 @@ async fn cmd_setup_impl(
         return Ok(());
     }
 
-    let choices = build_setup_choices(neural, no_neural, cpu, gpu, remote_gemma, options)?;
+    let choices = build_setup_choices(neural, no_neural, cpu, gpu, remote_gemma, fs, options)?;
     let result = setup::execute_setup(&choices).map_err(|e| anyhow::anyhow!("{}", e))?;
     finish_setup(&choices, &result, warmup)
 }
@@ -1673,6 +1758,7 @@ fn build_setup_choices(
     cpu: bool,
     gpu: Option<String>,
     remote_gemma: bool,
+    fs: bool,
     options: crate::cli::leindex::setup::SetupOptions,
 ) -> AnyhowResult<crate::cli::leindex::setup::SetupChoices> {
     use crate::cli::leindex::setup;
@@ -1697,8 +1783,14 @@ fn build_setup_choices(
     // --remote-gemma implies the neural path (mirrors --cpu/--gpu implication
     // inside resolve_from_flags) so it works standalone on a fresh install.
     let embedding_requested = neural || remote_gemma || options.embedding.is_some();
-    let mut choices =
-        resolve_setup_choices(embedding_requested, no_neural, cpu, gpu_vendor, has_flags)?;
+    let mut choices = resolve_setup_choices(
+        embedding_requested,
+        no_neural,
+        cpu,
+        gpu_vendor,
+        has_flags,
+        fs,
+    )?;
     choices.remote_gemma = remote_gemma;
     if has_flags {
         choices.options = options;
@@ -1782,6 +1874,7 @@ fn resolve_setup_choices(
     cpu: bool,
     gpu_vendor: Option<crate::cli::leindex::setup::GpuVendor>,
     has_flags: bool,
+    fs: bool,
 ) -> AnyhowResult<crate::cli::leindex::setup::SetupChoices> {
     use crate::cli::leindex::setup;
     if has_flags {
@@ -1791,7 +1884,7 @@ fn resolve_setup_choices(
     } else if setup::is_interactive() {
         // Interactive mode: show prompts
         // VAL-SETUP-002: prompts neural? -> CPU/GPU -> AMD/NVIDIA
-        setup::run_interactive_flow().map_err(|e| anyhow::anyhow!("{}", e))
+        setup::run_interactive_flow(fs).map_err(|e| anyhow::anyhow!("{}", e))
     } else {
         // No flags and not interactive: show guidance and exit with error
         eprintln!("No setup options specified and stdin/stderr is not a terminal.");

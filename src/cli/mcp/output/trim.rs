@@ -498,6 +498,14 @@ fn trim_git_status(data: &Value) -> Value {
         "staged_files": take_n(staged_files.unwrap_or(&Value::Null), 50),
         "untracked_files": take_n(untracked_files.unwrap_or(&Value::Null), 50),
         "changed_symbols": changed_symbols,
+        // Both git handlers emit a plain `pdg_status` string (plus `pdg_error`
+        // on failure) and neither emits `pdg_enrichment`. Preserving the phantom
+        // field here while dropping the real one is what made the renderer's
+        // enrichment line silent end to end — the render pass only ever saw
+        // "not present". `pdg_enrichment` is kept for callers that still send
+        // the object shape.
+        "pdg_status": data.get("pdg_status").unwrap_or(&Value::Null),
+        "pdg_error": data.get("pdg_error").unwrap_or(&Value::Null),
         "pdg_enrichment": data.get("pdg_enrichment").unwrap_or(&Value::Null),
         "impact_summary": data.get("impact_summary").unwrap_or(&Value::Null),
     })

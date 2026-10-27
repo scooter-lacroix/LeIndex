@@ -7,19 +7,22 @@
 //!
 //! ## Mutation policy (this is the security-relevant part)
 //!
-//! A mutating operation never runs from a default argument set. Issuing one
-//! returns a *plan*: whether the operation mutates, the exact argv that would
-//! run, what a read-only probe says about the current state, and a
-//! `preview_token` derived from `(repository, operation, argv)`.
+//! A mutating operation never runs. Issuing one returns a *plan*: whether the
+//! operation mutates, the exact argv that would run, what a read-only probe
+//! says about the current state, and a `preview_token` derived from
+//! `(repository, operation, argv)`.
 //!
-//! Executing requires echoing that token back in `confirm`. A token minted for
-//! one argv therefore cannot authorise a different one.
+//! The token is an IDENTITY, not an authorisation. There is no `confirm`
+//! argument and no apply side: an MCP surface should not commit, push or rewrite
+//! history until its executor has been reviewed on its own. Advertising a
+//! `confirm` that could only ever refuse was worse than advertising nothing —
+//! it made a permanent limitation look like a transient failure to retry.
 //!
-//! The applying half is deliberately NOT wired in this pass: an MCP surface
-//! should not commit, push or rewrite history until its executor has been
-//! reviewed on its own. A `confirm` carrying the matching token is refused with
-//! an explicit message naming that gap, so no mutation can fire and nothing
-//! silently reports success for work it did not do.
+//! ## Ref validation
+//!
+//! Every operation that takes a revision goes through [`super::git_ref`], which
+//! is also what `leindex_git`'s diff branch uses for ranges. One gate, so a new
+//! operation cannot pick up a weaker variant.
 
 use super::git_diff_handler::git_output_capped;
 use super::helpers::{validate_file_within_project, wrap_live_with_meta};
@@ -91,8 +94,8 @@ const OPS: [Op; 17] = [
     },
     Op {
         name: "branch",
-        summary: "Local and remote branches with tip commits",
-        args: &[],
+        summary: "Branches with tip commits; local-only by default, filterable by name_prefix",
+        args: &["max_count", "local_only", "name_prefix"],
         mutating: false,
     },
     Op {
@@ -197,8 +200,9 @@ impl GitHandler {
     /// Tool description.
     pub fn description(&self) -> &str {
         "Live Git: status, diff, log, show, blame, branch and remote (read); add, commit, \
-         checkout, stash, tag, merge, rebase, push, reset and force NEVER run unconfirmed — \
-         each returns a dry-run plan and a preview_token."
+         checkout, stash, tag, merge, rebase, push, reset and force NEVER run — each returns a \
+         dry-run plan (argv + read-only probe) and a preview_token that identifies the plan. \
+         There is no confirm argument and no apply side."
     }
 
     /// Argument schema: every git argument plus the `action` selector.
@@ -210,7 +214,7 @@ impl GitHandler {
                     "type": "string",
                     "enum": OPS.iter().map(|op| op.name).collect::<Vec<_>>(),
                     "description": format!(
-                        "Git operation. Mutating operations are preview-only until confirmed. \
+                        "Git operation. Mutating operations never apply: they return a plan. \
                          Args per operation: {}",
                         OPS.iter().map(Op::usage).collect::<Vec<_>>().join(" | ")
                     ),
@@ -221,11 +225,11 @@ impl GitHandler {
                 },
                 "target": {
                     "type": "string",
-                    "description": "Revision, ref or branch (log/show/blame/checkout/tag/merge/rebase/reset/force)"
+                    "description": "One ref, exactly as `git branch` / `git log --oneline` writes it: a branch ('cw32/30b-admission'), a tag, or a commit oid, with optional ~N / ^N / @{N} suffixes. A '-' is allowed INSIDE a name but not as the first character. ':' is refused (it is `rev:path`, which escapes the repository). NOT a range: use action=diff with `range` for 'a..b'. Used by: log, show, blame, checkout, tag, merge, rebase, reset, force — for `tag` it is the NEW TAG NAME, not a commit."
                 },
                 "path": {
                     "type": "string",
-                    "description": "Project-relative file or directory (log pathspec, blame file)"
+                    "description": "One project-relative PATH, not a ref and not a git pathspec magic: a file for blame, a file or directory to narrow log. Must not start with '-'."
                 },
                 "paths": {
                     "type": "array",
@@ -241,7 +245,16 @@ impl GitHandler {
                     "default": DEFAULT_COUNT,
                     "minimum": 1,
                     "maximum": MAX_COUNT,
-                    "description": "History entries to return (log)"
+                    "description": "Entries to return: commits for log, branches for branch. Clamped to 1..=200. `log` silently stops at the commit count; `branch` reports `total` and sets `truncated` so a cut tail is never invisible."
+                },
+                "local_only": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "branch only: local branches only (default) or, with false, local plus remote-tracking branches"
+                },
+                "name_prefix": {
+                    "type": "string",
+                    "description": "branch only: keep names that START WITH this string — 'cw32/' selects cw32/30b-admission, '30b' does not"
                 },
                 "include_patch": {
                     "type": "boolean",
@@ -253,11 +266,7 @@ impl GitHandler {
                     "default": DEFAULT_MAX_CHARS,
                     "minimum": 0,
                     "maximum": MAX_MAX_CHARS,
-                    "description": "Bound on returned git output"
-                },
-                "confirm": {
-                    "type": "string",
-                    "description": "The preview_token of the plan being confirmed (mutations only)"
+                    "description": "Bound on the length of returned text fields (patch, blame text)"
                 }
             },
             "required": []
@@ -307,9 +316,105 @@ impl GitHandler {
             ));
         }
 
+        let warnings = argument_warnings(op, &args)?;
         let payload = read_operation(op, &root, &args).await?;
-        Ok(wrap_live_with_meta(payload, &root))
+        Ok(with_warnings(
+            wrap_live_with_meta(payload, &root),
+            &warnings,
+        ))
     }
+}
+
+/// Keys the router or transport legitimately adds, so an operation must accept
+/// them even when it does not read them.
+const SHARED_KEYS: [&str; 2] = ["project_path", "max_latency_ms"];
+
+/// Keys hoisted to the top level of the router's advertised schema from a
+/// sub-tool's schema, and therefore seen by every git operation.
+const ROUTER_KEYS: [&str; 3] = ["allow_partial", "max_chars", "token_budget"];
+
+/// Keys this operation does not read but whose effect the caller can still
+/// observe somewhere else, so a warning — not an error — is right.
+///
+/// `max_chars` truncates every returned text field regardless of operation, so
+/// a caller bounding `show` output is doing something real even though the
+/// operation-specific key would be `include_patch`.
+const SILENTLY_HONORED: [&str; 1] = ["max_chars"];
+
+/// Whether some git operation reads `key`.
+///
+/// A key outside this set is a typo the caller needs told about. A key INSIDE
+/// it is a real git argument that simply belongs to a different operation — the
+/// caller asked for something the router understands, so it is reported rather
+/// than refused.
+fn any_op_reads(key: &str) -> bool {
+    OPS.iter().any(|op| op.args.contains(&key))
+}
+
+/// Refuse unknown keys, and name the known-but-ignored ones.
+///
+/// Nothing used to look at unrecognized arguments: `{"max_chars": 10}` on
+/// `show` and `{"max_chr": 10}` (a typo) both took the same path, and the caller
+/// had no way to tell a bound that applied from a typo that silently did
+/// nothing.
+///
+/// Three outcomes, in order:
+///   * honored — the key this operation reads, or a transport key the server
+///     consumes before dispatch: no output at all;
+///   * known-but-ignored — a key a DIFFERENT git operation reads: a warning,
+///     because the caller asked for something real that will not apply here;
+///   * unknown — a warning is too weak: a returned payload would look like it
+///     obeyed, so this is an error naming what the operation accepts.
+fn argument_warnings(op: &Op, args: &Value) -> Result<Vec<String>, JsonRpcError> {
+    let Some(object) = args.as_object() else {
+        return Ok(Vec::new());
+    };
+    // Transport/router keys are consumed by the server before the operation
+    // ever runs, so they are never "ignored" — warning about them would train
+    // the caller to ignore warnings.
+    let is_transport = |key: &str| {
+        SHARED_KEYS.contains(&key) || ROUTER_KEYS.contains(&key) || SILENTLY_HONORED.contains(&key)
+    };
+    let mut warnings = Vec::new();
+    for key in object.keys() {
+        if op.args.contains(&key.as_str()) || is_transport(key) {
+            continue;
+        }
+        if any_op_reads(key) {
+            warnings.push(format!("git {} ignores '{key}'", op.name));
+            continue;
+        }
+        return Err(JsonRpcError::invalid_params_with_suggestion(
+            format!("git {} does not take '{key}'", op.name),
+            format!(
+                "git {} accepts: {}{}{}. Omit '{key}'.",
+                op.name,
+                if op.args.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} ", op.args.join(", "))
+                },
+                SHARED_KEYS.join(", "),
+                ROUTER_KEYS
+                    .iter()
+                    .map(|key| format!(", {key}"))
+                    .collect::<String>()
+            ),
+        ));
+    }
+    warnings.sort();
+    Ok(warnings)
+}
+
+/// Attach the warnings array to a payload, only when non-empty.
+fn with_warnings(mut payload: Value, warnings: &[String]) -> Value {
+    if warnings.is_empty() {
+        return payload;
+    }
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("warnings".to_string(), json!(warnings));
+    }
+    payload
 }
 
 /// Resolve the project root, defaulting to the registry's configured project.
@@ -338,7 +443,7 @@ async fn read_operation(op: &Op, root: &Path, args: &Value) -> Result<Value, Jso
         "log" => git_log(&root, &owned_args),
         "show" => git_show(&root, &owned_args),
         "blame" => git_blame(&root, &owned_args),
-        "branch" => git_branch(&root),
+        "branch" => git_branch(&root, &owned_args),
         "remote" => git_remote(&root),
         other => Err(JsonRpcError::internal_error(format!(
             "unhandled git action '{other}'"
@@ -429,9 +534,16 @@ fn git_blame(root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
         )));
     }
     let target = optional_rev(args)?;
+    // `--no-color` is NOT a git-blame option: git reads it as an ambiguous
+    // prefix of `--no-color-lines` / `--no-color-by-age` and exits 129 with a
+    // usage page, so every blame call failed. Color is suppressed through the
+    // config override instead (`-c color.ui=false`), which every command
+    // honors and which cannot collide with an option name. Measured: `git
+    // blame --no-color` exits 129, `git -c color.ui=false blame` exits 0.
     let mut argv = vec![
+        "-c".to_string(),
+        "color.ui=false".to_string(),
         "blame".to_string(),
-        "--no-color".to_string(),
         "-w".to_string(),
     ];
     if let Some(target) = target.clone() {
@@ -451,18 +563,45 @@ fn git_blame(root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
     }))
 }
 
-/// `git branch -a -vv` as structured rows.
-fn git_branch(root: &Path) -> Result<Value, JsonRpcError> {
-    let argv = vec![
+/// `git branch -vv` as structured rows, honouring `max_count`, `local_only`
+/// and `name_prefix`.
+///
+/// Truncation is reported, never silent: `total` is how many branches existed
+/// AFTER filtering and `truncated` says whether `max_count` cut the tail, so a
+/// caller can neither mistake a capped list for the whole set nor miss that it
+/// lost entries.
+fn git_branch(root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
+    let max_count = extract_bounded_u64(args, "max_count", DEFAULT_COUNT, MAX_COUNT)? as usize;
+    let local_only = args
+        .get("local_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let name_prefix = args
+        .get("name_prefix")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty());
+
+    // `--all` lists remote-tracking entries and a `remotes/HEAD` symref line;
+    // local-only is the default because that is the set a caller can act on.
+    // `-c color.ui=false` avoids the same option collision that broke blame.
+    let mut argv = vec![
+        "-c".to_string(),
+        "color.ui=false".to_string(),
         "branch".to_string(),
-        "--all".to_string(),
-        "--no-color".to_string(),
-        "-vv".to_string(),
     ];
-    let (text, truncated) = run_text(root, &argv)?;
-    let branches = text
+    if !local_only {
+        argv.push("--all".to_string());
+    }
+    argv.push("-vv".to_string());
+
+    let (text, text_truncated) = run_text(root, &argv)?;
+    let all = text
         .lines()
         .filter(|line| !line.trim().is_empty())
+        // `--all` prints `remotes/origin/HEAD -> origin/master`; that is a
+        // pointer, not a branch.
+        .filter(|line| !line.contains(" -> "))
         .map(|line| {
             let current = line.starts_with('*');
             let body = line.trim_start_matches(['*', ' ', '+']).trim();
@@ -477,12 +616,26 @@ fn git_branch(root: &Path) -> Result<Value, JsonRpcError> {
                 "detail": rest,
             })
         })
+        .filter(|branch| {
+            name_prefix.is_none_or(|prefix| {
+                branch["name"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+        })
         .collect::<Vec<_>>();
+
+    let total = all.len();
+    let truncated = total > max_count || text_truncated;
+    let branches = all.into_iter().take(max_count).collect::<Vec<_>>();
     Ok(json!({
         "action": "branch",
         "count": branches.len(),
+        "total": total,
         "branches": branches,
         "truncated": truncated,
+        "local_only": local_only,
+        "name_prefix": name_prefix,
     }))
 }
 
@@ -530,55 +683,38 @@ const PLAN_NEXT_HINT: &str = "Nothing was changed. This build cannot apply git m
 ///
 /// Nothing here spawns a mutating git command: [`plan_argv`] only *describes*
 /// the argv, and every probe it runs is read-only.
+///
+/// There is deliberately no `confirm` argument. It used to exist and could only
+/// ever refuse — the apply side is not wired — so it advertised a capability
+/// that did not exist and turned one guaranteed error into a second one. A
+/// schema that names an argument the server refuses is a lie; the argument is
+/// gone, and `preview_token` is documented as an identity hash rather than an
+/// authorisation.
 async fn mutation_plan(op: &Op, root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
     let argv = plan_argv(op, root, args)?;
     let token = preview_token(root, op.name, &argv);
+    let warnings = argument_warnings(op, args)?;
     let root = root.to_path_buf();
-    let confirm = args
-        .get("confirm")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
     let probe_args = args.clone();
     let op_name = op.name;
-
-    if let Some(confirm) = confirm {
-        // Token mode: the token must match THIS operation and target.
-        if confirm != token {
-            return Err(JsonRpcError::invalid_params_with_suggestion(
-                format!(
-                    "preview token mismatch for git {op_name}: the token does not match this \
-                     operation and target, so it does not authorise it"
-                ),
-                "Re-issue the operation without 'confirm' to get a fresh plan and token"
-                    .to_string(),
-            ));
-        }
-        return Err(JsonRpcError::invalid_params_with_suggestion(
-            format!(
-                "NOTHING WAS CHANGED: git {op_name} is preview-only in this build because the \
-                 confirmed apply side is not wired. This is not a permissions or plumbing \
-                 problem — the capability does not exist yet, and retrying will not help"
-            ),
-            "Review the plan (read-only) and run the equivalent git command yourself if you \
-             want it performed; this server will not perform it"
-                .to_string(),
-        ));
-    }
 
     let probe = tokio::task::spawn_blocking(move || probe_state(op_name, &root, &probe_args))
         .await
         .map_err(|error| JsonRpcError::internal_error(format!("git task failed: {error}")))?;
 
-    Ok(json!({
-        "action": op.name,
-        "mutating": true,
-        "applied": false,
-        "dry_run": true,
-        "argv": argv,
-        "preview_token": token,
-        "probe": probe,
-        "next": PLAN_NEXT_HINT,
-    }))
+    Ok(with_warnings(
+        json!({
+            "action": op.name,
+            "mutating": true,
+            "applied": false,
+            "dry_run": true,
+            "argv": argv,
+            "preview_token": token,
+            "probe": probe,
+            "next": PLAN_NEXT_HINT,
+        }),
+        &warnings,
+    ))
 }
 
 /// Describe the argv a mutation would run, validating every argument first.
@@ -588,7 +724,7 @@ async fn mutation_plan(op: &Op, root: &Path, args: &Value) -> Result<Value, Json
 fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> {
     let target = args.get("target").and_then(Value::as_str);
     let target = match target {
-        Some(target) => Some(validated_rev(target)?),
+        Some(target) => Some(super::git_ref::validate_ref_or_error(target)?),
         None => None,
     };
     let require_target = |field: &str| -> Result<String, JsonRpcError> {
@@ -750,18 +886,11 @@ fn probe_state(op: &str, root: &Path, args: &Value) -> Value {
 
 /// argv for the read-only "does this revision resolve?" probe.
 ///
-/// Validation lives here rather than at the call site so a rejected revision
-/// cannot reach the process at all, and so the rejection is directly testable
-/// (a probe against a missing repository fails for an unrelated reason and
-/// would hide a missing guard).
+/// The argv is built by [`super::git_ref::probe_argv`], which validates first:
+/// a rejected revision cannot reach the process at all, and `rev-parse` still
+/// parses a leading `-` as a flag.
 fn probe_rev_argv(raw: &str) -> Result<Vec<String>, JsonRpcError> {
-    let target = validated_rev(raw)?;
-    Ok(vec![
-        "rev-parse".to_string(),
-        "--verify".to_string(),
-        "--quiet".to_string(),
-        format!("{target}^{{commit}}"),
-    ])
+    super::git_ref::probe_argv(raw).map_err(|error| super::git_ref::rpc_error(raw, error))
 }
 
 /// Validate and normalise the `paths` argument for `add`.
@@ -794,7 +923,11 @@ fn staged_paths(root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> 
     Ok(validated)
 }
 
-/// Token that authorises exactly one `(repository, operation, argv)` triple.
+/// Token that identifies exactly one `(repository, operation, argv)` triple.
+///
+/// An IDENTITY, not an authorisation: it lets a caller tell two plans apart and
+/// detect that the plan it reviewed is not the plan it would run. Nothing
+/// consumes it to permit an execution — there is no apply side.
 fn preview_token(root: &Path, op: &str, argv: &[String]) -> String {
     blake3::hash(format!("{}\u{0}{op}\u{0}{}", root.display(), argv.join("\u{0}")).as_bytes())
         .to_hex()
@@ -838,10 +971,10 @@ fn clip_payload(payload: Value, max_chars: usize) -> Value {
     Value::Object(clipped)
 }
 
-/// Optional revision argument, rejected if it could be read as an option.
+/// Optional revision argument, validated by the shared ref gate.
 fn optional_rev(args: &Value) -> Result<Option<String>, JsonRpcError> {
     match args.get("target").and_then(Value::as_str) {
-        Some(target) => Ok(Some(validated_rev(target)?)),
+        Some(target) => Ok(Some(super::git_ref::validate_ref_or_error(target)?)),
         None => Ok(None),
     }
 }
@@ -863,26 +996,6 @@ fn optional_path(args: &Value) -> Result<Option<String>, JsonRpcError> {
         }
         None => Ok(None),
     }
-}
-
-/// Reject a revision that could be parsed as a git option or escape the repo.
-///
-/// Revisions are passed as a single argv entry (never through a shell), so the
-/// remaining exposure is a leading `-` being read as a flag and `rev:path`
-/// syntax reaching outside the repository. `:` is therefore NOT allowed: no
-/// revision syntax needs it (ranges use `..`, the reflog uses `@{0}`), and
-/// allowing it is what let `HEAD:../../etc/passwd` through to `git show`.
-fn validated_rev(raw: &str) -> Result<String, JsonRpcError> {
-    let rev = raw.trim();
-    let allowed = |c: char| c.is_ascii_alphanumeric() || "._/~^@{}+=,%".contains(c);
-    if rev.is_empty() || rev.len() > 200 || rev.starts_with('-') || !rev.chars().all(allowed) {
-        return Err(JsonRpcError::invalid_params_with_suggestion(
-            format!("'{raw}' is not a usable revision"),
-            "Use a branch name, tag, or commit oid (letters, digits, . _ / ~ ^ @ { } , + = %)"
-                .to_string(),
-        ));
-    }
-    Ok(rev.to_string())
 }
 
 /// Read a bounded integer argument. JSON numbers arrive as `f64` (the schema
@@ -1001,7 +1114,10 @@ mod tests {
     #[test]
     fn test_revisions_cannot_smuggle_options_or_paths() {
         for bad in ["-u", "--upload-pack=x", "HEAD:../../etc/passwd", "", "a b"] {
-            assert!(validated_rev(bad).is_err(), "{bad} must be rejected");
+            assert!(
+                super::super::git_ref::validate_ref(bad).is_err(),
+                "{bad} must be rejected"
+            );
         }
         for good in [
             "HEAD",
@@ -1010,8 +1126,12 @@ mod tests {
             "v1.2.3",
             "HEAD~3",
             "a1b2c3d^",
+            "cw32/30b-admission",
         ] {
-            assert!(validated_rev(good).is_ok(), "{good} must be accepted");
+            assert!(
+                super::super::git_ref::validate_ref(good).is_ok(),
+                "{good} must be accepted"
+            );
         }
     }
 
@@ -1026,7 +1146,7 @@ mod tests {
     fn test_probe_validates_the_revision_before_building_argv() {
         let error = probe_rev_argv("-u").expect_err("a leading '-' must be rejected");
         assert!(
-            error.message_with_hint().contains("not a usable revision"),
+            error.message_with_hint().contains("not valid ref syntax"),
             "{error}"
         );
         assert!(
@@ -1036,6 +1156,57 @@ mod tests {
         assert_eq!(
             probe_rev_argv("HEAD").unwrap(),
             ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]
+        );
+    }
+
+    /// The schema must not name an argument the server cannot honour.
+    ///
+    /// `confirm` was advertised while its only possible outcome was a refusal,
+    /// so a model that followed the schema hit a guaranteed error.
+    #[test]
+    fn test_schema_does_not_advertise_confirm() {
+        let schema = GitHandler.argument_schema();
+        let properties = schema["properties"].as_object().expect("properties");
+        assert!(
+            !properties.contains_key("confirm"),
+            "confirm is not implemented and must not be advertised: {properties:?}"
+        );
+        assert_eq!(schema["required"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// Unknown keys are refused; known-but-ignored ones are reported.
+    ///
+    /// Nothing used to look at unrecognized arguments, so a typo and a bound
+    /// that applied were indistinguishable.
+    #[test]
+    fn test_argument_hygiene_refuses_unknown_and_warns_on_ignored() {
+        let branch = Op::parse("branch").unwrap();
+        // A typo must not be silently dropped.
+        let error = argument_warnings(branch, &json!({ "max_cnt": 5 })).unwrap_err();
+        assert!(error.message_with_hint().contains("max_cnt"), "{error}");
+        assert!(
+            error.message_with_hint().contains("name_prefix"),
+            "the hint must list what branch accepts: {error}"
+        );
+
+        // A key another operation reads is reported, not obeyed silently.
+        let warnings = argument_warnings(branch, &json!({ "target": "HEAD" })).unwrap();
+        assert_eq!(warnings, vec!["git branch ignores 'target'".to_string()]);
+
+        // Router/transport keys are legitimate and produce nothing.
+        assert!(
+            argument_warnings(
+                branch,
+                &json!({ "project_path": "/x", "max_latency_ms": 5, "token_budget": 10 })
+            )
+            .unwrap()
+            .is_empty()
+        );
+        // `max_chars` truncates every response, so it is honored everywhere.
+        assert!(
+            argument_warnings(Op::parse("show").unwrap(), &json!({ "max_chars": 10 }))
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -1061,5 +1232,135 @@ mod tests {
         // A repo with no remotes prints nothing; that is an answer, not a failure.
         let parsed = "".lines().filter(|line| !line.trim().is_empty()).count();
         assert_eq!(parsed, 0);
+    }
+
+    /// Helper: a scratch repository with one commit on branch `master`.
+    fn scratch_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .expect("git available");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "master"]);
+        std::fs::write(dir.path().join("f.txt"), "a\nb\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "one"]);
+        dir
+    }
+
+    /// Regression: blame passed `--no-color`, which git-blame reads as an
+    /// ambiguous option prefix and rejects with exit 129 — so every blame call
+    /// failed. Color is now suppressed with `-c color.ui=false`.
+    ///
+    /// Both shapes are exercised: with a `target` (argv carries the rev before
+    /// `--`) and without (no rev at all).
+    #[test]
+    fn test_blame_works_with_and_without_a_target() {
+        let repo = scratch_repo();
+        for args in [
+            json!({ "path": "f.txt" }),
+            json!({ "path": "f.txt", "target": "HEAD" }),
+        ] {
+            let value =
+                git_blame(repo.path(), &args).unwrap_or_else(|error| panic!("{args}: {error}"));
+            assert_eq!(value["line_count"], 2, "{args}: {value}");
+            // Each blamed line carries the abbreviated commit oid and the
+            // blamed source text. `git blame` prints no commit SUBJECT, so
+            // asserting on one tests a feature blame does not have. A boundary
+            // commit (the root, which every line here is) is prefixed with
+            // `^`, so that marker is part of valid output.
+            let text = value["text"].as_str().unwrap_or_default();
+            for line in text.lines() {
+                let oid = line
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .trim_start_matches('^');
+                assert!(
+                    oid.len() >= 7 && oid.chars().all(|c| c.is_ascii_hexdigit()),
+                    "each line must name its last-touching commit: {line}"
+                );
+            }
+            assert!(text.contains(") a"), "line 1 content missing: {value}");
+            assert!(text.contains(") b"), "line 2 content missing: {value}");
+            // The reported target defaults to HEAD when none was supplied.
+            assert_eq!(value["target"], "HEAD");
+        }
+    }
+
+    /// Regression: `branch` returned every entry it found, ignoring `max_count`,
+    /// with a `truncated` flag that only tracked the byte cap — so a capped list
+    /// looked complete.
+    #[test]
+    fn test_branch_honours_max_count_and_reports_the_dropped_tail() {
+        let repo = scratch_repo();
+        for name in ["cw32/30b-admission", "cw32/31c-other", "feature/x"] {
+            let status = std::process::Command::new("git")
+                .args(["branch", name])
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        let value = git_branch(repo.path(), &json!({ "max_count": 2 })).unwrap();
+        assert_eq!(value["count"], 2, "{value}");
+        assert_eq!(value["total"], 4, "master + three branches: {value}");
+        assert_eq!(value["truncated"], true);
+        assert_eq!(
+            value["branches"].as_array().map(Vec::len),
+            Some(2),
+            "max_count is a real bound: {value}"
+        );
+
+        // A generous bound is not truncated.
+        let full = git_branch(repo.path(), &json!({ "max_count": 20 })).unwrap();
+        assert_eq!(full["total"], 4);
+        assert_eq!(full["truncated"], false);
+
+        // The prefix filter is a prefix, not a substring.
+        let filtered = git_branch(
+            repo.path(),
+            &json!({ "name_prefix": "cw32/", "max_count": 20 }),
+        )
+        .unwrap();
+        let names: Vec<&str> = filtered["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|branch| branch["name"].as_str())
+            .collect();
+        assert_eq!(names.len(), 2, "{filtered}");
+        assert!(names.iter().all(|name| name.starts_with("cw32/")));
+        assert_eq!(filtered["total"], 2);
+
+        let substring = git_branch(
+            repo.path(),
+            &json!({ "name_prefix": "30b", "max_count": 20 }),
+        )
+        .unwrap();
+        assert_eq!(
+            substring["count"], 0,
+            "'30b' is not a prefix of cw32/30b-admission: {substring}"
+        );
+
+        // Local-only is the default; `local_only: false` adds remote-tracking
+        // refs, so the default must NOT be `--all`.
+        let local = git_branch(repo.path(), &json!({ "max_count": 20 })).unwrap();
+        assert_eq!(local["local_only"], true);
+        assert!(local["branches"].as_array().unwrap().iter().all(|branch| {
+            !branch["name"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("remotes/")
+        }));
     }
 }
