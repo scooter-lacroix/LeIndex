@@ -828,7 +828,11 @@ async fn test_auto_index_is_off_by_default_so_a_read_does_not_build_an_index() {
     {
         let _env = auto_index_env_lock();
         let previous = std::env::var(AUTO_INDEX_ENABLE_ENV).ok();
-        unsafe { std::env::remove_var(AUTO_INDEX_ENABLE_ENV) };
+        let previous_home = std::env::var("LEINDEX_HOME").ok();
+        unsafe {
+            std::env::remove_var(AUTO_INDEX_ENABLE_ENV);
+            std::env::set_var("LEINDEX_HOME", dir.path());
+        }
         assert!(
             !auto_index_enabled(),
             "auto-index must be off with no env opt-in and no [mcp] auto_index = true"
@@ -850,6 +854,10 @@ async fn test_auto_index_is_off_by_default_so_a_read_does_not_build_an_index() {
         match previous {
             Some(value) => unsafe { std::env::set_var(AUTO_INDEX_ENABLE_ENV, value) },
             None => unsafe { std::env::remove_var(AUTO_INDEX_ENABLE_ENV) },
+        }
+        match previous_home {
+            Some(value) => unsafe { std::env::set_var("LEINDEX_HOME", value) },
+            None => unsafe { std::env::remove_var("LEINDEX_HOME") },
         }
     }
 }
