@@ -506,7 +506,7 @@ mod tests {
         // it explicitly: it exercises the indexing path, not the default. The
         // default-off behaviour has its own test in `registry_test`, and both
         // serialize on the same lock because the variable is process-global.
-        let _env = crate::cli::registry::auto_index_env_lock();
+        let _env = crate::cli::registry::auto_index_env_lock().await;
         let previous = std::env::var(crate::cli::registry::AUTO_INDEX_ENABLE_ENV).ok();
         unsafe { std::env::set_var(crate::cli::registry::AUTO_INDEX_ENABLE_ENV, "1") };
         let dir = tempdir().unwrap();

@@ -10,8 +10,9 @@ use crate::cli::registry::{Hydration, ProjectRegistry};
 use anyhow::Context;
 use axum::{
     Router,
-    extract::Json,
-    http::{HeaderMap, HeaderValue, StatusCode},
+    extract::{Json, Request},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -135,6 +136,13 @@ pub const DEFAULT_MAX_HTTP_SESSIONS: usize = 1000;
 /// Environment variable that overrides `DEFAULT_MAX_HTTP_SESSIONS`.
 pub const MAX_SESSIONS_ENV: &str = "LEINDEX_MAX_SESSIONS";
 
+/// Environment variable listing comma-separated browser origins allowed to talk
+/// to the MCP HTTP server. Defaults to empty: with CORS enabled (the default),
+/// any request carrying an `Origin` header that is not listed here is rejected
+/// with `403 Forbidden` before it reaches a handler. Non-browser clients (which
+/// send no `Origin` header) are never affected by this policy.
+pub const CORS_ALLOWED_ORIGINS_ENV: &str = "LEINDEX_CORS_ALLOWED_ORIGINS";
+
 /// Resolved cap on concurrent HTTP sessions.
 pub fn max_http_sessions() -> usize {
     match std::env::var(MAX_SESSIONS_ENV) {
@@ -154,7 +162,12 @@ pub struct McpServerConfig {
     /// Address to bind the server to
     pub bind_address: SocketAddr,
 
-    /// Whether to enable CORS for all origins
+    /// Whether to enable the cross-origin origin guard on the HTTP transport.
+    ///
+    /// When enabled (the default), requests carrying an `Origin` header are
+    /// rejected unless the origin is allowlisted via
+    /// [`CORS_ALLOWED_ORIGINS_ENV`]. Non-browser clients, which send no
+    /// `Origin` header, are unaffected.
     pub enable_cors: bool,
 
     /// Maximum request size in megabytes
@@ -200,6 +213,37 @@ pub struct McpServer {
     /// The compact freshness badge remains on every response; only the
     /// verbose advisory is emitted once per session and generation.
     pub(crate) freshness_advisories: Arc<DashMap<(Arc<str>, std::path::PathBuf), u64>>,
+}
+
+/// Parse [`CORS_ALLOWED_ORIGINS_ENV`] into a list of exact origin strings.
+fn cors_allowed_origins_from_env() -> Vec<String> {
+    std::env::var(CORS_ALLOWED_ORIGINS_ENV)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Reject any request whose `Origin` header is not in the allowlist. This is a
+/// server-side defense, not just a missing CORS header: browsers enforce CORS
+/// by hiding responses, but the request still executes server-side, so an
+/// untrusted page could otherwise trigger expensive tool calls (e.g.
+/// `/mcp/index/stream`) even if it never read the response.
+async fn reject_untrusted_origins(allowed: Arc<[String]>, req: Request, next: Next) -> Response {
+    if let Some(origin) = req.headers().get(header::ORIGIN) {
+        let trusted = origin
+            .to_str()
+            .is_ok_and(|origin| allowed.iter().any(|allowed| allowed == origin));
+        if !trusted {
+            return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
+        }
+    }
+    next.run(req).await
 }
 
 impl McpServer {
@@ -497,31 +541,59 @@ impl McpServer {
     /// `OPTIONS` is answered by the layer and never reaches the handler — an
     /// unhandled preflight would surface as a spurious 405.
     fn router(&self) -> Router {
+        self.router_with_allowed_origins(cors_allowed_origins_from_env())
+    }
+
+    /// Build the router, applying transport-level config and the origin policy
+    /// for the given allowlist (derived from [`CORS_ALLOWED_ORIGINS_ENV`] by
+    /// [`Self::router`]; parameterized so tests can exercise the policy without
+    /// touching process environment).
+    fn router_with_allowed_origins(&self, allowed_origins: Vec<String>) -> Router {
         let router = Router::new()
             .route("/mcp", post(json_rpc_handler))
             .route("/mcp/tools/list", get(list_tools_handler))
             .route("/health", get(health_check_handler))
             .route("/mcp/index/stream", post(index_stream_handler));
 
-        // `enable_cors` was documented as "CORS for all origins". Applying that
-        // literally on a server that executes tool calls would let any page in
-        // any tab drive the tool surface, so the wildcard is gated on the
-        // loopback bind that the field's own default already assumes. On a
-        // non-loopback bind, `enable_cors` still enables the layer but with no
-        // allowed origin, which refuses every cross-origin request: a
-        // deliberate fail-closed, since no config field names origins today.
+        // `enable_cors` is applied as an *origin guard*: requests carrying an
+        // `Origin` header are rejected unless the origin is explicitly
+        // allowlisted (via `CORS_ALLOWED_ORIGINS_ENV`). This is a server-side
+        // rejection, not merely a missing CORS header — browsers enforce CORS
+        // by hiding the response, but the request still executes server-side,
+        // so a permissive layer on the loopback bind would let any page in any
+        // tab trigger expensive tool calls (e.g. `/mcp/index/stream`). Binding
+        // to loopback is transport reachability, not an origin restriction.
+        // Non-browser local clients send no `Origin` header and are unaffected.
         let router = if !self.config.enable_cors {
             router
-        } else if self.config.bind_address.ip().is_loopback() {
-            router.layer(CorsLayer::permissive())
         } else {
-            warn!(
-                bind = %self.config.bind_address,
-                "MCP bound to a non-loopback address with CORS enabled: refusing all cross-origin \
-                 requests because this server executes tool calls and no allowed origins are \
-                 configured"
-            );
-            router.layer(CorsLayer::new())
+            let allowed: Vec<HeaderValue> = allowed_origins
+                .iter()
+                .filter_map(|origin| HeaderValue::try_from(origin.as_str()).ok())
+                .collect();
+            let invalid = allowed_origins.len() - allowed.len();
+            if invalid > 0 {
+                warn!(
+                    invalid,
+                    "ignoring {invalid} invalid allowed origin(s) from {CORS_ALLOWED_ORIGINS_ENV}"
+                );
+            }
+            let router = if allowed.is_empty() {
+                warn!(
+                    bind = %self.config.bind_address,
+                    "MCP has CORS enabled but no allowed origins are configured \
+                     (set {CORS_ALLOWED_ORIGINS_ENV}); refusing every browser cross-origin request — \
+                     non-browser local clients (no Origin header) are unaffected"
+                );
+                router.layer(CorsLayer::new())
+            } else {
+                router.layer(CorsLayer::new().allow_origin(allowed))
+            };
+            let allowed: Arc<[String]> = Arc::from(allowed_origins);
+            router.layer(middleware::from_fn(move |req, next| {
+                let allowed = allowed.clone();
+                async move { reject_untrusted_origins(allowed, req, next).await }
+            }))
         };
 
         // Bound body size before the JSON-RPC handler allocates: these handlers

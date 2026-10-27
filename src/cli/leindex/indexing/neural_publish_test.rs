@@ -601,9 +601,10 @@ fn test_mean_pool_emits_one_row_per_node_across_a_batch_boundary() {
         streaming::neural::enrich_neural_streaming(&mut source, &embedder, &mut writer, &budget)
             .expect("mean-pooled streaming");
     // Mirrors `enrich_neural_for_route`: the streaming pass has no finish
-    // hook, so the trailing node must be flushed explicitly. Without this the
-    // last node silently loses its row.
-    writer.finish().expect("flush the trailing node");
+    // hook, so the trailing node must be flushed explicitly and its accepted
+    // count folded into the stats. Without this the last node silently loses
+    // its row.
+    let trailing = writer.finish().expect("flush the trailing node");
 
     let rows = &writer.inner.rows;
     assert_eq!(rows.len(), 2, "one row per node, got {rows:?}");
@@ -624,8 +625,108 @@ fn test_mean_pool_emits_one_row_per_node_across_a_batch_boundary() {
             "dim {dim}: pooled {pooled} != mean {mean}"
         );
     }
-    // 4 inputs consumed, 2 rows written to the wrapped writer.
+    // 4 inputs consumed, 2 rows written to the wrapped writer, and both
+    // counted — one per stored node, not one per run (PR #105).
     assert_eq!(stats.batches, 4);
+    assert_eq!(
+        stats.rows_written + trailing,
+        2,
+        "every stored node must be counted"
+    );
+}
+
+/// Regression for PR #105: accepted counts from `finish_open` were discarded,
+/// so a run of N nodes reported ~1 accepted row overall — the checkpoint count
+/// was wrong and resume re-embedded everything. Each `write_batch` must return
+/// the rows its folding flushed, including mid-batch node transitions.
+#[test]
+fn test_mean_pool_writer_accumulates_accepted_counts_per_batch() {
+    let sink = streaming::neural::VecNeuralRowWriter::new();
+    let mut pooling = MeanPoolNeuralRowWriter::new(sink);
+
+    // One batch whose chunks span three nodes: two flushes happen while
+    // folding, one trailing flush happens at `finish`.
+    assert_eq!(
+        pooling
+            .write_batch(vec![
+                ("n1".to_string(), vec![1.0, 0.0]),
+                ("n2".to_string(), vec![0.0, 1.0]),
+                ("n3".to_string(), vec![0.5, 0.5]),
+            ])
+            .expect("multi-node batch"),
+        2,
+        "the two completed nodes must be counted in this batch"
+    );
+    assert_eq!(
+        pooling.finish().expect("trailing flush"),
+        1,
+        "the still-open node is counted by finish"
+    );
+
+    assert_eq!(pooling.inner.rows.len(), 3, "all three nodes stored");
+    assert_eq!(pooling.inner.rows[0].0, "n1");
+    assert_eq!(pooling.inner.rows[1].0, "n2");
+    assert_eq!(pooling.inner.rows[2].0, "n3");
+}
+
+/// End-to-end mirror of the PR #105 report: three nodes embedded through the
+/// streaming pass with mean pooling must land in `rows_written` exactly once
+/// each — not just once for the whole run.
+#[test]
+fn test_streaming_pooled_pass_counts_every_stored_node_in_rows_written() {
+    let inputs: Vec<Result<streaming::neural::NeuralInput>> = vec![
+        Ok(streaming::neural::NeuralInput {
+            node_id: "n1".to_string(),
+            text: "n1 chunk a".to_string(),
+            title: None,
+        }),
+        Ok(streaming::neural::NeuralInput {
+            node_id: "n1".to_string(),
+            text: "n1 chunk b".to_string(),
+            title: None,
+        }),
+        Ok(streaming::neural::NeuralInput {
+            node_id: "n2".to_string(),
+            text: "n2 chunk a".to_string(),
+            title: None,
+        }),
+        Ok(streaming::neural::NeuralInput {
+            node_id: "n2".to_string(),
+            text: "n2 chunk b".to_string(),
+            title: None,
+        }),
+        Ok(streaming::neural::NeuralInput {
+            node_id: "n3".to_string(),
+            text: "n3 chunk a".to_string(),
+            title: None,
+        }),
+        Ok(streaming::neural::NeuralInput {
+            node_id: "n3".to_string(),
+            text: "n3 chunk b".to_string(),
+            title: None,
+        }),
+    ];
+    let budget = streaming::BatchBudget {
+        max_texts: 4,
+        ..Default::default()
+    };
+    let mut source = inputs.into_iter();
+    let mut writer = MeanPoolNeuralRowWriter::new(streaming::neural::VecNeuralRowWriter::new());
+    let embedder = streaming::neural::MockEmbedder::new(8);
+    let stats =
+        streaming::neural::enrich_neural_streaming(&mut source, &embedder, &mut writer, &budget)
+            .expect("mean-pooled streaming");
+    // Mirrors `enrich_neural_for_route`: no finish hook, so flush the trailing
+    // node and add its accepted count to the stats.
+    let stats = streaming::neural::NeuralStats {
+        rows_written: stats.rows_written + writer.finish().expect("flush trailing node"),
+        ..stats
+    };
+    assert_eq!(writer.inner.rows.len(), 3, "three nodes stored");
+    assert_eq!(
+        stats.rows_written, 3,
+        "every stored node must be counted in rows_written"
+    );
 }
 
 /// Opt-in measurement of the chunk-split + mean-pool input stage on a fixed

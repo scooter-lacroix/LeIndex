@@ -108,11 +108,9 @@ pub fn auto_index_enabled() -> bool {
 /// blocking guard there is `clippy::await_holding_lock` — a warning this repo
 /// treats as an error.
 #[cfg(test)]
-pub(crate) fn auto_index_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+pub(crate) async fn auto_index_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .try_lock()
-        .unwrap_or_else(|_| panic!("LEINDEX_AUTO_INDEX test lock must not already be held"))
+    LOCK.get_or_init(|| Mutex::new(())).lock().await
 }
 
 /// Environment variable overriding how long a tool call waits for a cold

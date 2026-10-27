@@ -713,14 +713,13 @@ fn load_table_at(path: &Path) -> Result<toml::Table> {
             )
         });
     }
-    let config: LeIndexConfig = serde_yaml::from_str(&contents).with_context(|| {
+    let config: toml::Table = serde_yaml::from_str(&contents).with_context(|| {
         format!(
             "failed to parse {} as YAML: fix or remove the file (config set never recovers silently)",
             path.display()
         )
     })?;
-    let rendered = toml::to_string(&config).context("failed to render the YAML config")?;
-    toml::from_str(&rendered).context("failed to build the editable config table")
+    Ok(config)
 }
 
 fn ensure_table_path<'a>(

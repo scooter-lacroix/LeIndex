@@ -586,6 +586,12 @@ struct MeanPoolNeuralRowWriter<W: streaming::neural::NeuralRowWriter> {
     /// Nodes abandoned because their chunks disagreed on dimension. Reported
     /// once at the end of the pass rather than warned per node.
     dim_mismatch_nodes: usize,
+    /// Rows the wrapped writer has accepted since the previous `write_batch`
+    /// call (or `finish`). `write_batch` returns this accumulated count —
+    /// including the mid-batch flushes `fold` triggers — so the streaming
+    /// stats and the checkpoint see every stored node, not just the trailing
+    /// flush.
+    accepted: usize,
 }
 
 impl<W: streaming::neural::NeuralRowWriter> MeanPoolNeuralRowWriter<W> {
@@ -597,6 +603,7 @@ impl<W: streaming::neural::NeuralRowWriter> MeanPoolNeuralRowWriter<W> {
             open_chunks: 0,
             open_dim_mismatch: false,
             dim_mismatch_nodes: 0,
+            accepted: 0,
         }
     }
 
@@ -663,7 +670,12 @@ impl<W: streaming::neural::NeuralRowWriter> MeanPoolNeuralRowWriter<W> {
         let written = if self.open_chunks > 0 {
             let divisor = self.open_chunks as f32;
             let mean: Vec<f32> = self.open_sum.iter().map(|sum| sum / divisor).collect();
-            self.inner.write_batch(vec![(node_id, mean)])?
+            let written = self.inner.write_batch(vec![(node_id, mean)])?;
+            // Count it toward the next `write_batch`/`finish` return, so an
+            // accepted row is never discarded just because the flush happened
+            // mid-batch rather than at the batch's end (PR #105).
+            self.accepted += written;
+            written
         } else {
             0
         };
@@ -676,7 +688,8 @@ impl<W: streaming::neural::NeuralRowWriter> MeanPoolNeuralRowWriter<W> {
     /// so the last node of every run is still open when it returns — without
     /// this call that node silently loses its row.
     fn finish(&mut self) -> Result<usize> {
-        self.finish_open()
+        self.finish_open()?;
+        Ok(std::mem::take(&mut self.accepted))
     }
 }
 
@@ -700,9 +713,14 @@ impl<W: streaming::neural::NeuralRowWriter> streaming::neural::NeuralRowWriter
         // and be dropped. Only fully accumulated nodes are flushed; the wrapped
         // writer sees exactly one row per node.
         if self.open_node_id.as_deref() != latest.as_deref() {
-            return self.finish_open();
+            self.finish_open()?;
         }
-        Ok(0)
+        // Return every row accepted since the previous call, including the
+        // flush(s) that happened while folding this batch. Discarding those
+        // counts made a run of N nodes report ~1 accepted row overall, which
+        // poisoned the checkpoint count and forced re-embedding on resume
+        // (PR #105).
+        Ok(std::mem::take(&mut self.accepted))
     }
 }
 
