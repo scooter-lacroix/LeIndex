@@ -279,19 +279,23 @@ impl GitHandler {
         registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
-        let raw_action = args
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("status");
-        let op = Op::parse(raw_action).ok_or_else(|| {
-            JsonRpcError::invalid_params_with_suggestion(
-                format!("Unknown git action '{raw_action}'"),
-                format!(
-                    "Set action to one of: {}",
-                    OPS.iter().map(|op| op.name).collect::<Vec<_>>().join(", ")
-                ),
-            )
-        })?;
+        let raw_action = args.get("action").and_then(Value::as_str);
+        let op = match raw_action {
+            None => {
+                return crate::cli::mcp::git_status_handler::GitStatusHandler
+                    .execute(registry, args)
+                    .await;
+            }
+            Some(action) => Op::parse(action).ok_or_else(|| {
+                JsonRpcError::invalid_params_with_suggestion(
+                    format!("Unknown git action '{action}'"),
+                    format!(
+                        "Set action to one of: {}",
+                        OPS.iter().map(|op| op.name).collect::<Vec<_>>().join(", ")
+                    ),
+                )
+            })?,
+        };
         let root = resolve_root(registry, &args).await?;
 
         if op.mutating {

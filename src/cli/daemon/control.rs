@@ -83,7 +83,9 @@ pub fn stop(run_dir: &Path) -> Result<bool> {
     match (current, endpoint) {
         (DaemonState::Running, Some(endpoint)) => {
             signal_term(endpoint.pid)?;
-            wait_for_exit(endpoint.pid, std::time::Duration::from_secs(5));
+            if !wait_for_exit(endpoint.pid, std::time::Duration::from_secs(5)) {
+                bail!("leindexd did not exit within 5 seconds");
+            }
             cleanup_sidecars(run_dir)?;
             Ok(true)
         }
@@ -135,14 +137,15 @@ fn signal_term(pid: u32) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn wait_for_exit(pid: u32, timeout: std::time::Duration) {
+fn wait_for_exit(pid: u32, timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
-            return;
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    false
 }
 
 #[cfg(unix)]
@@ -156,7 +159,8 @@ fn pid_is_daemon(endpoint: &DaemonEndpoint) -> bool {
         let expected_name = expected
             .as_deref()
             .and_then(Path::file_name)
-            .and_then(|n| n.to_str());
+            .and_then(|n| n.to_str())
+            .map(|name| name.strip_suffix(" (deleted)").unwrap_or(name));
         expected_name == Some("leindexd")
     }
     #[cfg(not(target_os = "linux"))]

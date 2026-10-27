@@ -1253,6 +1253,25 @@ pub use cache::ConfigGuard;
 
 const V2_CONFIG_TEMPLATE: &str = include_str!("../config.yaml");
 
+fn remove_nulls(value: &mut YamlValue) {
+    match value {
+        YamlValue::Mapping(map) => {
+            let keys: Vec<_> = map
+                .iter_mut()
+                .filter_map(|(key, value)| {
+                    remove_nulls(value);
+                    value.is_null().then_some(key.clone())
+                })
+                .collect();
+            for key in keys {
+                map.remove(&key);
+            }
+        }
+        YamlValue::Sequence(values) => values.iter_mut().for_each(remove_nulls),
+        _ => {}
+    }
+}
+
 fn merge_yaml(base: &mut YamlValue, overlay: YamlValue) {
     match (base, overlay) {
         (YamlValue::Mapping(base_map), YamlValue::Mapping(overlay_map)) => {
@@ -1299,8 +1318,9 @@ fn migrate_legacy_toml() -> Result<Option<PathBuf>, ConfigError> {
         .map_err(|e| ConfigError::Parse(legacy_path.clone(), e.to_string()))?;
     let mut document: YamlValue = serde_yaml::from_str(V2_CONFIG_TEMPLATE)
         .map_err(|e| ConfigError::Parse(yaml_path.clone(), e.to_string()))?;
-    let legacy_yaml =
+    let mut legacy_yaml =
         serde_yaml::to_value(legacy).map_err(|e| ConfigError::Serialize(e.to_string()))?;
+    remove_nulls(&mut legacy_yaml);
     merge_yaml(&mut document, legacy_yaml);
     write_yaml_atomic(&yaml_path, &document)?;
 

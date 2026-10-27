@@ -150,7 +150,7 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn classifies_pe_game_and_source() {
+    fn test_classifies_pe_game_and_source() {
         assert_eq!(classify(Path::new("x.dll"), b"MZ"), Some(BinaryKind::Pe));
         assert_eq!(
             classify(Path::new("x.uasset"), b"garbage"),
@@ -160,14 +160,14 @@ mod tests {
     }
 
     #[test]
-    fn malformed_pe_is_safe_and_deterministic() {
+    fn test_malformed_pe_is_safe_and_deterministic() {
         let record = extract(Path::new("bad.dll"), b"MZhello_asset");
         assert!(record.text.contains("pe_valid=false"));
         assert_eq!(record, extract(Path::new("bad.dll"), b"MZhello_asset"));
     }
 
     #[test]
-    fn extraction_is_bounded() {
+    fn test_extraction_is_bounded() {
         let bytes = vec![b'a'; MAX_BINARY_BYTES + 1024];
         let record = extract(Path::new("x.pak"), &bytes);
         assert!(record.text.len() < MAX_STRINGS * (MAX_STRING_LEN + 8));
