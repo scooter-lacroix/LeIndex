@@ -51,6 +51,15 @@ pub struct SetupOptions {
     /// Environment variable containing the embeddings API key (not the key itself); empty clears authentication.
     #[arg(long)]
     pub embedding_api_key_env: Option<String>,
+    /// The embeddings API key ITSELF, stored in the config as `remote_api_key`.
+    ///
+    /// Prefer `--embedding-api-key-env` when the key already lives in the
+    /// environment: a literal token is written to disk in plain text. This flag
+    /// exists because a user whose key is in a password manager otherwise had to
+    /// leave setup and run `leindex config set` — the manual step setup removes.
+    /// The wizard offers the same choice as a prompt.
+    #[arg(long)]
+    pub embedding_api_key: Option<String>,
     /// Document prefix/template; {text} is substituted, omission preserves, empty clears.
     #[arg(long)]
     pub embedding_doc_template: Option<String>,
@@ -63,6 +72,93 @@ pub struct SetupOptions {
     /// Whether setup is running the interactive wizard.
     #[arg(skip)]
     pub interactive: bool,
+    /// Search mode: hybrid, text, or neural.
+    #[arg(long)]
+    pub search_mode: Option<String>,
+    /// Hybrid neural score weight.
+    #[arg(long)]
+    pub neural_weight: Option<f64>,
+    /// Enable cross-encoder reranking.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub rerank_enabled: Option<bool>,
+    /// Reranking backend: onnx, system-one, or off.
+    #[arg(long)]
+    pub rerank_backend: Option<String>,
+    /// Number of candidates to rerank.
+    #[arg(long)]
+    pub rerank_top_n: Option<u32>,
+    /// Enable fragment indexing.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub fragment_index_enabled: Option<bool>,
+    /// Maximum fragment size in bytes.
+    #[arg(long)]
+    pub fragment_max_bytes: Option<u64>,
+    /// Fragment fusion weight.
+    #[arg(long)]
+    pub fragment_weight: Option<f64>,
+    /// Include orphan fragments.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub fragment_orphan_enabled: Option<bool>,
+    /// Use naive fragment fallback.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub fragment_naive_fallback: Option<bool>,
+    /// Embedding/index batch size.
+    #[arg(long)]
+    pub batch_size: Option<u64>,
+    /// Maximum files to index.
+    #[arg(long)]
+    pub max_files: Option<u64>,
+    /// MCP idle exit timeout in seconds.
+    #[arg(long)]
+    pub mcp_idle_timeout_secs: Option<u64>,
+    /// MCP engine unload timeout in seconds.
+    #[arg(long)]
+    pub mcp_engine_max_idle_secs: Option<u64>,
+    /// MCP prewarm mode.
+    #[arg(long)]
+    pub mcp_prewarm: Option<String>,
+    /// Enable automatic indexing on first tool use.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub mcp_auto_index: Option<bool>,
+    /// System One mode.
+    #[arg(long)]
+    pub system_one_mode: Option<String>,
+    /// System One provider.
+    #[arg(long)]
+    pub system_one_provider: Option<String>,
+    /// System One endpoint.
+    #[arg(long)]
+    pub system_one_endpoint: Option<String>,
+    /// System One model.
+    #[arg(long)]
+    pub system_one_model: Option<String>,
+    /// System One API-key environment variable.
+    #[arg(long)]
+    pub system_one_api_key_env: Option<String>,
+    /// System One timeout in milliseconds.
+    #[arg(long)]
+    pub system_one_timeout_ms: Option<u64>,
+    /// System One pre-gate switch.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub system_one_pre_gate: Option<bool>,
+    /// System One post-gate switch.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub system_one_post_gate: Option<bool>,
+    /// System One relevance threshold.
+    #[arg(long)]
+    pub system_one_relevant_min: Option<f32>,
+    /// System One instruction threshold.
+    #[arg(long)]
+    pub system_one_instructions_max: Option<f32>,
+    /// System One top-N limit.
+    #[arg(long)]
+    pub system_one_top_n: Option<usize>,
+    /// System One auto-apply threshold.
+    #[arg(long)]
+    pub system_one_tau_apply: Option<f32>,
+    /// Managed service startup timeout in seconds.
+    #[arg(long)]
+    pub service_start_timeout_secs: Option<u64>,
 }
 
 impl SetupOptions {
@@ -79,9 +175,39 @@ impl SetupOptions {
             || self.embedding_model.is_some()
             || self.embedding_dimension.is_some()
             || self.embedding_api_key_env.is_some()
+            || self.embedding_api_key.is_some()
             || self.embedding_doc_template.is_some()
             || self.embedding_query_template.is_some()
             || self.system_one
+            || self.search_mode.is_some()
+            || self.neural_weight.is_some()
+            || self.rerank_enabled.is_some()
+            || self.rerank_backend.is_some()
+            || self.rerank_top_n.is_some()
+            || self.fragment_index_enabled.is_some()
+            || self.fragment_max_bytes.is_some()
+            || self.fragment_weight.is_some()
+            || self.fragment_orphan_enabled.is_some()
+            || self.fragment_naive_fallback.is_some()
+            || self.batch_size.is_some()
+            || self.max_files.is_some()
+            || self.mcp_idle_timeout_secs.is_some()
+            || self.mcp_engine_max_idle_secs.is_some()
+            || self.mcp_prewarm.is_some()
+            || self.mcp_auto_index.is_some()
+            || self.system_one_mode.is_some()
+            || self.system_one_provider.is_some()
+            || self.system_one_endpoint.is_some()
+            || self.system_one_model.is_some()
+            || self.system_one_api_key_env.is_some()
+            || self.system_one_timeout_ms.is_some()
+            || self.system_one_pre_gate.is_some()
+            || self.system_one_post_gate.is_some()
+            || self.system_one_relevant_min.is_some()
+            || self.system_one_instructions_max.is_some()
+            || self.system_one_top_n.is_some()
+            || self.system_one_tau_apply.is_some()
+            || self.service_start_timeout_secs.is_some()
     }
 }
 
@@ -98,7 +224,7 @@ fn error(message: impl Into<String>) -> SetupError {
 /// (which is exactly what happens when the two are written separately).
 /// `"remote"` stays as the generic OpenAI-compatible entry for endpoints that
 /// are not one of the known providers.
-fn route_names() -> Vec<&'static str> {
+pub(super) fn route_names() -> Vec<&'static str> {
     let mut names = vec!["embeddinggemma2", "qwen3", "remote"];
     names.extend(crate::config::REMOTE_PRESETS.iter().map(|p| p.name));
     names.push("keep");
@@ -106,7 +232,7 @@ fn route_names() -> Vec<&'static str> {
 }
 
 /// Human label for one route, as shown in the picker.
-fn route_label(route: &str) -> String {
+pub(super) fn route_label(route: &str) -> String {
     match route {
         "embeddinggemma2" => "EmbeddingGemma2 - managed llama.cpp server (GGUF)".to_string(),
         "qwen3" => "Qwen3 - local ONNX Runtime".to_string(),
@@ -176,7 +302,154 @@ pub(super) fn configure(
     if options.llama_server.is_some() && options.download_llama.is_some() {
         return Err(error("--llama-server conflicts with --download-llama"));
     }
-    configure_route(config, options, route)
+    let remote = configure_route(config, options, route)?;
+    apply_general_options(config, options)?;
+    Ok(remote)
+}
+
+/// Apply non-route setup values to the shared config model.
+fn apply_general_options(
+    config: &mut LeIndexConfig,
+    options: &SetupOptions,
+) -> Result<(), SetupError> {
+    if let Some(mode) = options.search_mode.as_deref() {
+        if !matches!(mode, "hybrid" | "text" | "neural") {
+            return Err(error("search mode must be hybrid, text, or neural"));
+        }
+        config.search.search_mode = mode.to_string();
+    }
+    if let Some(weight) = options.neural_weight {
+        if !(0.0..=1.0).contains(&weight) {
+            return Err(error("neural weight must be between 0 and 1"));
+        }
+        config.search.neural_weight = weight;
+    }
+    if let Some(enabled) = options.rerank_enabled {
+        config.search.rerank_enabled = enabled;
+    }
+    if let Some(backend) = options.rerank_backend.as_deref() {
+        if !matches!(backend, "onnx" | "system-one" | "off") {
+            return Err(error("rerank backend must be onnx, system-one, or off"));
+        }
+        config.search.rerank_backend = backend.to_string();
+    }
+    if let Some(top_n) = options.rerank_top_n {
+        if top_n == 0 {
+            return Err(error("rerank top-n must be nonzero"));
+        }
+        config.search.rerank_top_n = top_n;
+    }
+    if let Some(enabled) = options.fragment_index_enabled {
+        config.search.fragment_index_enabled = enabled;
+    }
+    if let Some(bytes) = options.fragment_max_bytes {
+        config.search.fragment_max_bytes = bytes;
+    }
+    if let Some(weight) = options.fragment_weight {
+        if !(0.0..=1.0).contains(&weight) {
+            return Err(error("fragment weight must be between 0 and 1"));
+        }
+        config.search.fragment_weight = weight;
+    }
+    if let Some(enabled) = options.fragment_orphan_enabled {
+        config.search.fragment_orphan_enabled = enabled;
+    }
+    if let Some(enabled) = options.fragment_naive_fallback {
+        config.search.fragment_naive_fallback = enabled;
+    }
+    if let Some(batch_size) = options.batch_size {
+        if batch_size == 0 {
+            return Err(error("batch size must be nonzero"));
+        }
+        config.indexing.batch_size = batch_size;
+    }
+    if let Some(max_files) = options.max_files {
+        config.indexing.max_files = max_files;
+    }
+    if let Some(value) = options.mcp_idle_timeout_secs {
+        config.mcp.idle_timeout_secs = value;
+    }
+    if let Some(value) = options.mcp_engine_max_idle_secs {
+        config.mcp.engine_max_idle_secs = value;
+    }
+    if let Some(value) = options.mcp_prewarm.as_deref() {
+        if !matches!(value, "full" | "graph" | "off" | "false" | "none" | "0") {
+            return Err(error("MCP prewarm must be full, graph, or off"));
+        }
+        config.mcp.prewarm = value.to_string();
+    }
+    if let Some(value) = options.mcp_auto_index {
+        config.mcp.auto_index = value;
+    }
+
+    let system_one = &mut config.system_one;
+    if let Some(value) = options.system_one_mode.as_deref() {
+        if !matches!(value, "off" | "shadow" | "enforce") {
+            return Err(error("System One mode must be off, shadow, or enforce"));
+        }
+        system_one.mode = value.to_string();
+    }
+    if let Some(value) = options.system_one_provider.as_deref() {
+        system_one.provider = value.to_string();
+    }
+    if let Some(value) = options.system_one_endpoint.as_deref() {
+        system_one.base_url = (!value.trim().is_empty()).then(|| value.to_string());
+    }
+    if let Some(value) = options.system_one_model.as_deref() {
+        system_one.model = (!value.trim().is_empty()).then(|| value.to_string());
+    }
+    if let Some(value) = options.system_one_api_key_env.as_deref() {
+        system_one.api_key_env = (!value.trim().is_empty()).then(|| value.to_string());
+    }
+    if let Some(value) = options.system_one_timeout_ms {
+        if value == 0 {
+            return Err(error("System One timeout must be nonzero"));
+        }
+        system_one.timeout_ms = value;
+    }
+    if let Some(value) = options.system_one_pre_gate {
+        system_one.pre_gate = value;
+    }
+    if let Some(value) = options.system_one_post_gate {
+        system_one.post_gate = value;
+    }
+    if let Some(value) = options.system_one_relevant_min {
+        if !(0.0..=1.0).contains(&value) {
+            return Err(error(
+                "System One relevance threshold must be between 0 and 1",
+            ));
+        }
+        system_one.relevant_min = value;
+    }
+    if let Some(value) = options.system_one_instructions_max {
+        if !(0.0..=1.0).contains(&value) {
+            return Err(error(
+                "System One instruction threshold must be between 0 and 1",
+            ));
+        }
+        system_one.instructions_max = value;
+    }
+    if let Some(value) = options.system_one_top_n {
+        if value < 2 {
+            return Err(error("System One top-n must be at least 2"));
+        }
+        system_one.top_n = value;
+    }
+    if let Some(value) = options.system_one_tau_apply {
+        if !(0.0..=1.0).contains(&value) {
+            return Err(error("System One apply threshold must be between 0 and 1"));
+        }
+        system_one.tau_apply = value;
+    }
+    if let Some(value) = options.service_start_timeout_secs {
+        if value == 0 {
+            return Err(error("managed service startup timeout must be nonzero"));
+        }
+        if let Some(service) = config.services.get_mut("gemma") {
+            service.start_timeout_secs = value;
+        }
+    }
+    Ok(())
 }
 
 /// True when `route` names a remote provider (the generic entry or a preset).
@@ -250,6 +523,7 @@ fn remote_options_set(options: &SetupOptions) -> bool {
         || options.embedding_model.is_some()
         || options.embedding_dimension.is_some()
         || options.embedding_api_key_env.is_some()
+        || options.embedding_api_key.is_some()
         || options.embedding_doc_template.is_some()
         || options.embedding_query_template.is_some()
 }
@@ -334,7 +608,7 @@ fn require_remote() -> Result<(), SetupError> {
     Ok(())
 }
 
-fn prompt<T>(label: &str, default: T) -> Result<T, SetupError>
+pub(super) fn prompt<T>(label: &str, default: T) -> Result<T, SetupError>
 where
     T: Clone + std::fmt::Display + std::str::FromStr,
     T::Err: std::fmt::Display,
@@ -876,6 +1150,16 @@ struct ExternalRoute {
     model: String,
     dimension: Option<usize>,
     key_env: String,
+    /// A bearer token pasted into the wizard, distinct from [`Self::key_env`].
+    ///
+    /// `config.indexing.embeddings.remote_api_key` is a LITERAL token and has
+    /// always been honoured at request time, but setup could only ever preserve
+    /// or clear it (see the `remote_api_key` assignment in `build_embedding_config`).
+    /// A user with a key in hand — a password manager, an invoice email — had no
+    /// way to enter it: the only prompt asked for a VARIABLE NAME, so the
+    /// documented path was "run `leindex config set indexing.embeddings.remote_api_key`",
+    /// which is exactly the manual step setup exists to remove.
+    key_literal: String,
     doc: String,
     query: String,
 }
@@ -923,6 +1207,12 @@ fn external_route_from_flags(
                     .flatten()
             })
             .unwrap_or_default(),
+        // ONLY what was given this run. The "keep the stored token" case is the
+        // third branch of `remote_api_key` below; carrying `previous` here as
+        // well duplicated that rule and then outranked an explicit
+        // `--embedding-api-key-env ""`, turning a deliberate clear into a
+        // silent re-store.
+        key_literal: options.embedding_api_key.clone().unwrap_or_default(),
         doc: options
             .embedding_doc_template
             .clone()
@@ -1003,7 +1293,36 @@ fn discover_models(
             crate::cli::index_builder::hybrid::RemoteBridgeError::Transient(error)
         })
     })
-    .unwrap_or_default()
+    .unwrap_or_else(|error| {
+        // Say WHY the listing is empty before falling back to free text. A
+        // silent fallback is indistinguishable from an endpoint that serves no
+        // catalogue, and that ambiguity is what makes an unauthenticated
+        // listing (HTTP 401) look like normal setup. `tracing` rather than
+        // `eprintln!`: it is this tree's logging convention, it honours the log
+        // filter, and it cannot interleave with a transport that owns the raw
+        // stdio stream. The setup wizard still falls through to the free-text
+        // prompt either way.
+        tracing::warn!(
+            endpoint = %endpoint,
+            %error,
+            "Model list unavailable; falling back to manual model entry"
+        );
+        Vec::new()
+    })
+}
+
+/// Nothing to discover in a build without remote embeddings.
+///
+/// The stub keeps [`prompt_model`] single-path: it always consults discovery and
+/// always falls back to free text, so the feature gate exists in exactly one
+/// place instead of wrapping the caller's body in `#[cfg]` and leaving a dead
+/// `preset` parameter behind in the other build.
+#[cfg(not(feature = "remote-embeddings"))]
+fn discover_models(
+    _route: &ExternalRoute,
+    _preset: Option<&crate::config::RemotePreset>,
+) -> Vec<String> {
+    Vec::new()
 }
 
 /// Prompt for the model identifier, preferring a discovered list (CCN-gate extraction).
@@ -1011,33 +1330,23 @@ fn prompt_model(
     route: &mut ExternalRoute,
     preset: Option<&crate::config::RemotePreset>,
 ) -> Result<(), SetupError> {
-    #[cfg(feature = "remote-embeddings")]
-    {
-        let mut models = discover_models(route, preset);
-        if !models.is_empty() {
-            models.sort();
-            models.dedup();
-            // Keep the configured/preset model addressable even when the
-            // endpoint's listing omits it (some servers list only loaded
-            // models, or hide aliases): offering a list that cannot express
-            // the current value would silently change the user's route.
-            if !route.model.trim().is_empty() && !models.iter().any(|m| m == &route.model) {
-                models.insert(0, route.model.clone());
-            }
-            let default = models.iter().position(|m| m == &route.model).unwrap_or(0);
-            let chosen = Select::new()
-                .with_prompt(format!("Model ({} served)", models.len()))
-                .items(&models)
-                .default(default)
-                .interact()
-                .map_err(|e| SetupError::Interactive(e.to_string()))?;
-            route.model = models[chosen].clone();
-            return Ok(());
+    let mut models = discover_models(route, preset);
+    if !models.is_empty() {
+        models.sort();
+        models.dedup();
+        // Keep the configured/preset model addressable even when the
+        // endpoint's listing omits it (some servers list only loaded
+        // models, or hide aliases): offering a list that cannot express
+        // the current value would silently change the user's route.
+        if !route.model.trim().is_empty() && !models.iter().any(|m| m == &route.model) {
+            models.insert(0, route.model.clone());
         }
+        route.model = super::setup_picker::pick_model(&models, &route.model)?;
+        return Ok(());
     }
     // No listing available (or built without remote-embeddings): the free-text
     // prompt is the whole contract, so it must stay reachable.
-    route.model = prompt("Server model identifier", route.model.clone())?;
+    route.model = super::setup_picker::prompt_free_text(&route.model)?;
     Ok(())
 }
 
@@ -1050,6 +1359,9 @@ fn prompt_route_details(
         "Embeddings base URL (for example http://localhost:9000/v1)",
         route.endpoint.clone(),
     )?;
+    // The model listing is authenticated with the key named here, so the name
+    // must be known before discovery runs.
+    prompt_key_env(route)?;
     prompt_model(route, preset)?;
     // Default to the RESOLVED route dimension, not the previous config's: the
     // caller has already folded flag-over-preset-over-previous precedence into
@@ -1072,6 +1384,70 @@ fn prompt_route_details(
 /// resolves to nothing would fail later, at ingest, with a message about
 /// authentication rather than about setup.
 fn prompt_key_env(route: &mut ExternalRoute) -> Result<(), SetupError> {
+    let key_env = route.key_env.trim().to_string();
+    let detected = std::env::var(&key_env)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some();
+    // A key already in the environment (or one the user just pasted) needs no
+    // question: only ask when there is genuinely nothing to work with. A preset
+    // names the variable it expects, and a user who exported it must not be made
+    // to answer a menu about it.
+    if detected || !route.key_literal.trim().is_empty() {
+        return Ok(());
+    }
+    const STORE: &str = "Store the key in the config (plain text)";
+    const VAR: &str = "Use an environment variable";
+    const NONE: &str = "No authentication";
+    let items = [STORE, VAR, NONE];
+    // Default to the env var when one is already configured (a re-run must not
+    // silently rewrite anyone's credential strategy), otherwise store.
+    let default = if detected || !key_env.is_empty() {
+        1
+    } else {
+        0
+    };
+    let selection = Select::new()
+        .with_prompt("Embeddings API key")
+        .items(&items)
+        .default(default)
+        .interact()
+        .map_err(|e| SetupError::Interactive(e.to_string()))?;
+    match selection {
+        // One key, one source of truth: clear the variable name so the literal
+        // actually wins. `remote_api_key` takes precedence at request time, but
+        // leaving `remote_api_key_env` set would make `leindex config show` and
+        // a later re-run disagree about where the credential comes from.
+        0 => {
+            route.key_env.clear();
+            route.key_literal = Input::<String>::new()
+                .with_prompt("Paste the API key (saved to the config in plain text)")
+                .with_initial_text(&route.key_literal)
+                .allow_empty(true)
+                .interact_text()
+                .map_err(|e| SetupError::Interactive(e.to_string()))?;
+        }
+        1 => {
+            route.key_literal.clear();
+            prompt_key_var(route)?;
+        }
+        _ => {
+            route.key_literal.clear();
+            route.key_env.clear();
+        }
+    }
+    Ok(())
+}
+
+/// Prompt for the API-key variable name, skipping the question when the key is
+/// already in the environment.
+///
+/// A preset names the variable it expects, so a user who has exported
+/// `GEMINI_API_KEY` should not be asked to confirm that they did. When the
+/// variable is absent the prompt stays — silently persisting a name that
+/// resolves to nothing would fail later, at ingest, with a message about
+/// authentication rather than about setup.
+fn prompt_key_var(route: &mut ExternalRoute) -> Result<(), SetupError> {
     let key_env = route.key_env.trim().to_string();
     let detected = std::env::var(&key_env)
         .ok()
@@ -1133,17 +1509,15 @@ fn prompt_external_route(
             .map_err(|e| SetupError::Interactive(e.to_string()))?;
         if !use_defaults {
             prompt_route_details(route, Some(preset))?;
-            prompt_key_env(route)?;
             return prompt_templates(route);
         }
         // Keep the table's endpoint/model/dimension and ask only what the
         // table cannot know: which served model to use, and the templates.
-        prompt_model(route, Some(preset))?;
         prompt_key_env(route)?;
+        prompt_model(route, Some(preset))?;
         return Ok(());
     }
     prompt_route_details(route, None)?;
-    prompt_key_env(route)?;
     prompt_templates(route)
 }
 
@@ -1224,6 +1598,7 @@ fn external_embedding_config(
     options: &SetupOptions,
     same_route: bool,
 ) -> crate::config::EmbeddingConfig {
+    let has_literal_token = !route.key_literal.trim().is_empty();
     crate::config::EmbeddingConfig {
         enable_hybrid: true,
         remote_provider: provider.into(),
@@ -1236,27 +1611,62 @@ fn external_embedding_config(
         remote_endpoint: (!route.endpoint.trim().is_empty()).then_some(route.endpoint),
         remote_model: (!route.model.trim().is_empty()).then_some(route.model),
         remote_dimension: route.dimension,
-        remote_api_key: if same_route
-            && options.embedding_api_key_env.is_none()
-            && !options.interactive
+        // A literal token, written only when the user gave one (`--embedding-api-key`
+        // or the wizard prompt). It MUST outrank both the previous value and the
+        // preset's `remote_api_key_env` fallback below: a key the user just typed
+        // is the more specific intent, and storing it here is what lets a pasted
+        // token work without `leindex config set`. An empty flag clears it, which
+        // is how a user drops a stored secret.
+        remote_api_key: if !route.key_literal.trim().is_empty() {
+            Some(route.key_literal.trim().to_string())
+        } else if options.embedding_api_key.is_some()
+            || options
+                .embedding_api_key_env
+                .as_deref()
+                .is_some_and(str::is_empty)
         {
+            // An explicit empty `--embedding-api-key-env ""` is how a user drops
+            // authentication, so it must outrank "keep what was stored".
+            None
+        } else if same_route && options.embedding_api_key_env.is_none() && !options.interactive {
             previous.remote_api_key.clone()
         } else {
             None
         },
         // Fall back to the preset's conventional variable (GEMINI_API_KEY, ...)
         // so a preset route authenticates without the user spelling it out.
-        remote_api_key_env: (!route.key_env.is_empty())
-            .then_some(route.key_env)
-            .or_else(|| {
-                crate::config::REMOTE_PRESETS
-                    .iter()
-                    .find(|preset| preset.name == provider)
-                    .and_then(|preset| preset.api_key_env)
-                    .map(str::to_string)
-            }),
+        //
+        // A literal token suppresses the fallback entirely. `remote_api_key`
+        // outranks `remote_api_key_env` at request time, so keeping a variable
+        // name beside a pasted token leaves two sources of truth that disagree
+        // the moment the variable is exported, and `config show` reports a
+        // credential location that is not the one in use.
+        remote_api_key_env: if has_literal_token {
+            None
+        } else {
+            (!route.key_env.is_empty())
+                .then_some(route.key_env)
+                .or_else(|| {
+                    crate::config::REMOTE_PRESETS
+                        .iter()
+                        .find(|preset| preset.name == provider)
+                        .and_then(|preset| preset.api_key_env)
+                        .map(str::to_string)
+                })
+        },
         remote_doc_template: (!route.doc.is_empty()).then_some(route.doc),
         remote_query_template: (!route.query.is_empty()).then_some(route.query),
+        // Deliberately NOT persisted: the preset owns the provider's per-request
+        // ceiling and resolves it at call time, so writing today's number here
+        // would freeze it exactly the way the other preset fields are avoided.
+        //
+        // The token limits are skipped for the same reason, and one step
+        // further: `leindex setup` never asks about them, so writing None would
+        // be harmless but writing anything would be inventing a value. Preset
+        // (or the EmbeddingGemma family default) fills them during resolution.
+        remote_batch_limit: None,
+        remote_max_input_tokens: None,
+        remote_request_token_budget: None,
         onnx_model_path: if same_route {
             previous.onnx_model_path.clone()
         } else {

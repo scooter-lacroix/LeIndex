@@ -41,6 +41,7 @@ fn test_prompt_key_env_keeps_a_detected_environment_variable() {
         model: "fixture".into(),
         dimension: Some(1024),
         key_env: DETECTED.into(),
+        key_literal: String::new(),
         doc: String::new(),
         query: String::new(),
     };
@@ -61,6 +62,7 @@ fn test_prompt_key_env_treats_an_empty_variable_as_unauthenticated() {
         model: String::new(),
         dimension: None,
         key_env: String::new(),
+        key_literal: String::new(),
         doc: String::new(),
         query: String::new(),
     };
@@ -727,6 +729,12 @@ fn test_unknown_provider_still_needs_an_explicit_endpoint() {
 /// maps a Gemini route to the OpenAI-compatible variant, the endpoint and model
 /// still look right while the wire format is silently wrong — exactly the bug
 /// that made the preset table useless before.
+///
+/// Gated on `remote-embeddings` because the wire types it asserts over only
+/// exist under that feature: `src/search/onnx/mod.rs` gates `pub mod remote`
+/// and its `RemoteEmbeddingConfig` re-export behind the same `cfg`. Without the
+/// gate, `--no-default-features` builds fail to resolve the symbols.
+#[cfg(feature = "remote-embeddings")]
 #[test]
 fn test_from_resolved_maps_the_wire_family_to_a_provider_variant() {
     use crate::search::onnx::RemoteProvider;
@@ -763,4 +771,134 @@ fn test_from_resolved_maps_the_wire_family_to_a_provider_variant() {
         other => panic!("voyage must map to the compatible variant, got {other:?}"),
     }
     assert_eq!(remote.base_url, None);
+}
+
+/// A preset's model must be able to embed ONE document per vector.
+///
+/// `gemini-embedding-2` aggregates several inputs into a single vector and
+/// rejects `taskType`, which is why the preset itself uses `embedding-001` and
+/// says so in a comment above `REMOTE_PRESETS`. A comment is not a guard: a live
+/// config was nevertheless set to `gemini-embedding-2`, which would have embedded
+/// a whole batch into one vector and collapsed the per-node vector space. The
+/// failure is quiet — well-shaped vectors of the right width — so nothing
+/// downstream catches it, and the model name is the only signal available before
+/// a request is paid for.
+#[test]
+fn test_no_preset_uses_an_aggregating_embedding_model() {
+    // Models documented to collapse multiple inputs into one vector.
+    const AGGREGATING: &[&str] = &["gemini-embedding-2"];
+    for preset in crate::config::REMOTE_PRESETS {
+        assert!(
+            !AGGREGATING.contains(&preset.model),
+            "preset `{}` uses `{}`, which aggregates a batch into one vector",
+            preset.name,
+            preset.model
+        );
+    }
+    let gemini = crate::config::REMOTE_PRESETS
+        .iter()
+        .find(|preset| preset.name == "gemini")
+        .expect("the gemini preset must exist");
+    assert_eq!(
+        gemini.model, "gemini-embedding-001",
+        "the gemini preset must name a per-document model"
+    );
+}
+
+/// A key the user PASTES must reach the config, not just be accepted by the UI.
+///
+/// `remote_api_key` is the literal-token field and the runtime honours it, but
+/// setup could previously only preserve or clear it — the docs' only path was
+/// `leindex config set indexing.embeddings.remote_api_key`. A user with the key
+/// in a password manager had no way to enter it through setup at all.
+///
+/// This pins the whole hand-off, because the three parts fail independently:
+/// the flag must be recorded, it must be stored, and it must NOT leave a
+/// `remote_api_key_env` behind — one key, one source of truth, or the next
+/// `config show` and `setup` re-run disagree about where the credential lives.
+#[test]
+fn test_pasted_api_key_is_stored_as_the_literal_token() {
+    let mut config = external();
+    let options = SetupOptions {
+        embedding_api_key: Some("ci-pasted-token".into()),
+        ..Default::default()
+    };
+    configure_external(&mut config, "custom", &options).unwrap();
+    assert_eq!(
+        config.indexing.embeddings.remote_api_key.as_deref(),
+        Some("ci-pasted-token"),
+        "a pasted key must be persisted as the literal token"
+    );
+    assert!(
+        config.indexing.embeddings.remote_api_key_env.is_none(),
+        "a pasted key must clear remote_api_key_env so one source of truth remains"
+    );
+}
+
+/// A literal key must not survive a route change that names a different variable.
+///
+/// The stored token outranks `remote_api_key_env` at request time, so a leftover
+/// token from a previous provider would silently authenticate the NEW route with
+/// the OLD provider's credential — a cross-provider credential leak.
+#[test]
+fn test_switching_to_an_env_var_drops_the_stored_literal_token() {
+    const NEW_VAR: &str = "LEINDEX_TEST_SWITCHED_PROVIDER_KEY";
+    // SAFETY: unique name, never read by production code, and this test owns it.
+    // It must EXIST: `check_api_key_env` deliberately rejects a configured name
+    // that resolves to nothing, and that rejection is correct — a name pointing
+    // at an unset variable fails later at ingest with an authentication error.
+    unsafe { std::env::set_var(NEW_VAR, "present") };
+    let mut config = external();
+    config.indexing.embeddings.remote_api_key = Some("old-provider-token".into());
+    let options = SetupOptions {
+        embedding_api_key_env: Some(NEW_VAR.into()),
+        ..Default::default()
+    };
+    configure_external(&mut config, "custom", &options).unwrap();
+    assert!(
+        config.indexing.embeddings.remote_api_key.is_none(),
+        "the previous provider's token must not authenticate the new route"
+    );
+    assert_eq!(
+        config.indexing.embeddings.remote_api_key_env.as_deref(),
+        Some(NEW_VAR)
+    );
+    unsafe { std::env::remove_var(NEW_VAR) };
+}
+
+/// An external route must CLEAR `remote_service`, not inherit it.
+///
+/// The endpoint resolution ladder is explicit endpoint > service base URL >
+/// preset default, so a leftover `remote_service` is not inert: the moment the
+/// explicit endpoint is absent (a preset route, or a later `config unset`) the
+/// managed service silently takes over the route. Worse, setup's own readiness
+/// check prints "external endpoint takes precedence; no managed service checked
+/// or started" — it acts on the promise that this field is None.
+///
+/// This was previously asserted only in prose, which is how the companion
+/// behaviour drifted: `remote_service` is still DROPPED here rather than
+/// validated, so the assertion below is what keeps the two in step.
+#[test]
+fn test_external_route_clears_the_managed_service_reference() {
+    let mut config = external();
+    // A config that had been wired to a managed server, which is exactly the
+    // state `leindex setup --embedding embeddinggemma2` leaves behind.
+    config.indexing.embeddings.remote_service = Some("gemma".into());
+    let options = SetupOptions {
+        embedding_endpoint: Some("https://api.example.test/v1".into()),
+        embedding_model: Some("fixture-model".into()),
+        embedding_dimension: Some(1024),
+        ..Default::default()
+    };
+    configure_external(&mut config, "custom", &options).unwrap();
+    assert!(
+        config.indexing.embeddings.remote_service.is_none(),
+        "an external route must not keep a managed-service reference: it outranks \
+         the preset default and would hijack the route once the explicit endpoint is gone"
+    );
+    assert_eq!(
+        config.indexing.embeddings.remote_endpoint.as_deref(),
+        Some("https://api.example.test/v1"),
+        "the explicit endpoint is what must carry the external route instead"
+    );
 }

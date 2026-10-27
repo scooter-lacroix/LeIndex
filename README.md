@@ -168,6 +168,9 @@ services (`leindex services list|start|stop`) own the llama-server process on
 Linux; `auto_start = true` brings them up on demand for runtime embedding
 calls (`--check` never starts services).
 
+For the long-lived `leindexd` process, use the user-facing lifecycle commands:
+see [`docs/DAEMON.md`](docs/DAEMON.md), or run `leindex daemon --help`.
+
 ```bash
 leindex setup --embedding qwen3 --cpu
 # Linux managed service: explicit compatible runtime, or verified official download

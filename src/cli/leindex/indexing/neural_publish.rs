@@ -1448,11 +1448,25 @@ impl LeIndex {
             .as_ref()
             .map(index_builder::GenerationNeuralEmbedder::identity)
             .unwrap_or_else(|| "unavailable".to_string());
-        let (mut neural_rows, neural_resume_loaded) = self.restore_neural_checkpoint(
+        let (mut neural_rows, mut neural_resume_loaded) = self.restore_neural_checkpoint(
             state.resumed_neural.as_ref(),
             &lexical_hash,
             &current_embed_model,
         );
+        // A checkpoint can be internally consistent yet still cover only a
+        // fraction of the lexical admission set (for example, a killed or
+        // degraded 1/866 pass). Never treat that partial layer as reusable:
+        // clear it and run enrichment again so missing nodes are retried.
+        if neural_resume_loaded && neural_rows < state.admitted_node_ids.len() {
+            warn!(
+                restored = neural_rows,
+                admitted = state.admitted_node_ids.len(),
+                "discarding partial neural checkpoint; re-embedding admitted nodes"
+            );
+            self.search_engine.clear_neural_embeddings();
+            neural_rows = 0;
+            neural_resume_loaded = false;
+        }
         if let Some(neural_embedder) = neural_embedder
             .as_ref()
             .filter(|_| neural_rows == 0 && !neural_resume_loaded)

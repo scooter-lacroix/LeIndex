@@ -21,7 +21,7 @@ readonly SCRIPT_VERSION="2.1.1"
 readonly PROJECT_NAME="LeIndex"
 readonly PROJECT_SLUG="leindex"
 readonly MIN_RUST_MAJOR=1
-readonly MIN_RUST_MINOR=85
+readonly MIN_RUST_MINOR=88
 readonly REPO_URL="https://github.com/scooter-lacroix/LeIndex"
 
 # Installation paths

@@ -12,6 +12,15 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+/// Inputs per `batchEmbedContents` request when no limit was resolved.
+///
+/// Google's documented ceiling: the API answers anything larger with
+/// `BatchEmbedContentsRequest.requests: at most 100 requests can be in one
+/// batch`. Kept here as well as in the `gemini` preset because a `custom` route
+/// can still reach this provider, and the ceiling belongs to the PROTOCOL, not
+/// to the preset that happens to spell the name.
+pub(crate) const DEFAULT_GEMINI_BATCH_LIMIT: usize = 100;
+
 /// Native Google Gemini embedding provider (`v1beta`).
 ///
 /// Why this is not the OpenAI-compatible path: Gemini's native protocol differs
@@ -47,6 +56,20 @@ pub struct GeminiEmbeddingProvider {
     /// 0 = not yet measured; else the vector length of the first successful
     /// response. Mirrors [`super::CustomEmbeddingProvider`]'s measured width.
     measured: std::sync::atomic::AtomicUsize,
+    /// Hard cap on inputs per request (`None` = no cap).
+    ///
+    /// `batchEmbedContents` rejects any request above the provider's documented
+    /// ceiling with a 400 naming it — `at most 100 requests can be in one
+    /// batch` — and this path has no bisection to fall back on, so the cap must
+    /// be honoured before the request is built rather than recovered from
+    /// afterwards.
+    batch_limit: Option<usize>,
+    /// Retry budget for transient failures (429, 5xx, transport).
+    ///
+    /// This provider does not share `CustomEmbeddingProvider`'s bisection
+    /// machinery, so it must own its retry ladder: without it a single 429
+    /// permanently freezes the neural generation.
+    max_retries: usize,
 }
 
 /// Which side of an asymmetric retrieval pair a request is for.
@@ -101,6 +124,8 @@ impl GeminiEmbeddingProvider {
             dimension_override: config.remote_dimension,
             bootstrap_dimension: config.provider.default_dimension(),
             measured: std::sync::atomic::AtomicUsize::new(0),
+            batch_limit: config.batch_limit.filter(|limit| *limit > 0),
+            max_retries: config.max_retries,
         })
     }
 
@@ -115,16 +140,64 @@ impl GeminiEmbeddingProvider {
         }
     }
 
+    /// Inputs per request to actually send.
+    ///
+    /// Falls back to [`DEFAULT_GEMINI_BATCH_LIMIT`] rather than to "no limit"
+    /// when no cap was resolved: reaching this provider at all means the wire is
+    /// Gemini, so the API's ceiling applies whether or not a preset was
+    /// consulted (a `custom` route pointed at Gemini has no preset). Sending an
+    /// unlimited batch there is a guaranteed 400.
+    fn effective_batch_limit(&self) -> usize {
+        self.batch_limit
+            .unwrap_or(DEFAULT_GEMINI_BATCH_LIMIT)
+            .max(1)
+    }
+
     /// POST one native request and return the vectors in request order.
     ///
-    /// `texts` must be non-empty. Exactly one HTTP attempt: retrying is the
-    /// enclosing batch's shared `RetryAllowance` job (see
-    /// [`super::CustomEmbeddingProvider`]'s `embed_via_api` for the same
-    /// contract), so retrying here would multiply the budget across bisection
-    /// sub-batches.
+    /// `texts` must be non-empty and at or below [`Self::batch_limit`]; sizing
+    /// is the caller's job because only it knows the whole run.
+    ///
+    /// Transient failures (429, 5xx, transport) are re-sent on the shared
+    /// backoff ladder. Unlike [`super::CustomEmbeddingProvider`] this provider
+    /// has no bisection layer above it, so it must own the retry itself:
+    /// without it a single rate-limit response froze the whole neural
+    /// generation after five consecutive failures.
     async fn embed_native(
         &self,
         texts: Vec<&str>,
+        task: GeminiTask,
+    ) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
+        let mut backoff_step: usize = 0;
+        loop {
+            match self.embed_native_once(&texts, task).await {
+                Ok(embeddings) => return Ok(embeddings),
+                Err(error) => {
+                    if !super::is_retryable_embedding_error(&error)
+                        || backoff_step >= self.max_retries
+                    {
+                        return Err(error);
+                    }
+                    let delay = super::retry_backoff(backoff_step);
+                    tracing::warn!(
+                        %error,
+                        attempt = backoff_step + 1,
+                        max_retries = self.max_retries,
+                        delay_ms = delay.as_millis() as u64,
+                        model = %self.model,
+                        "Transient Gemini embedding failure; retrying the same request"
+                    );
+                    tokio::time::sleep(delay).await;
+                    backoff_step += 1;
+                }
+            }
+        }
+    }
+
+    /// POST one native request. Exactly one HTTP attempt.
+    async fn embed_native_once(
+        &self,
+        texts: &[&str],
         task: GeminiTask,
     ) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
         let single = texts.len() == 1;
@@ -279,12 +352,19 @@ impl RemoteEmbeddingProvider for GeminiEmbeddingProvider {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        // Batch calls are the DOCUMENT path. Unlike the OpenAI-compatible
-        // provider this does not bisect or retry per sub-batch: the transport
-        // retry ladder is the caller's (`RemoteEmbeddingConfig::max_retries`
-        // drives `with_transient_retry` at the hybrid-embedder layer), and a
-        // missing row here is a hard error rather than a silently empty vector.
-        self.embed_native(texts, GeminiTask::Document).await
+        // Batch calls are the DOCUMENT path. Split into requests the provider
+        // will actually accept: `batchEmbedContents` rejects anything above its
+        // documented ceiling with a 400 and there is no bisection below this
+        // provider to recover from one, so the split has to happen here.
+        let chunk = self.effective_batch_limit();
+        let mut rows = Vec::with_capacity(texts.len());
+        for window in texts.chunks(chunk) {
+            rows.extend(
+                self.embed_native(window.to_vec(), GeminiTask::Document)
+                    .await?,
+            );
+        }
+        Ok(rows)
     }
 
     fn dimension(&self) -> usize {

@@ -649,7 +649,7 @@ fn scan_git_project_files(project_path: &Path) -> Result<ProjectFileScan> {
 }
 
 fn scan_non_git_project_files(project_path: &Path) -> Result<ProjectFileScan> {
-    let project_config = crate::cli::config::ProjectConfig::load(project_path).unwrap_or_default();
+    let project_config = crate::cli::config::ProjectConfig::load(project_path)?;
     let limits = &project_config.indexing;
 
     let mut source_paths = Vec::new();

@@ -276,7 +276,14 @@ impl LeIndex {
             return;
         }
         let report = crate::intel::run_precision_ingest(pdg, &self.project_path);
-        if report.definitions_seen > 0 || report.relationships_seen > 0 {
+        if report.skipped_concurrent_run {
+            // Say so. An empty report from a skipped pass is not the same fact
+            // as an empty report from a pass that ran and matched nothing, and
+            // only one of them is worth retrying.
+            tracing::info!(
+                "SCIP precision ingest skipped: another run holds this project's precision guard"
+            );
+        } else if report.definitions_seen > 0 || report.relationships_seen > 0 {
             tracing::info!(
                 definitions_seen = report.definitions_seen,
                 definitions_matched = report.definitions_matched,

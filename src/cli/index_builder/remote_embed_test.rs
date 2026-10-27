@@ -5,6 +5,8 @@
 #[cfg(feature = "remote-embeddings")]
 use crate::search::onnx::RemoteEmbeddingConfig;
 #[cfg(feature = "remote-embeddings")]
+use crate::search::onnx::remote::CustomEmbeddingProvider;
+#[cfg(feature = "remote-embeddings")]
 use crate::search::onnx::remote::RemoteEmbeddingProvider;
 
 use super::*;
@@ -296,6 +298,50 @@ fn test_remote_kill_switch_flag_off_skips_remote_despite_config() {
     assert!(
         try_remote_neural_embedder(corpus_tfidf(), &EmbeddingConfig::default()).is_none(),
         "flag off must also disable the fresh preset"
+    );
+}
+
+// ============================================================================
+// Behavior: configured per-request input cap (OpenAI-compatible path)
+// ============================================================================
+
+/// A configured `batch_limit` must reach the wire on the OpenAI-compatible
+/// path, not just on Gemini.
+///
+/// Regression: `RemoteEmbeddingConfig::batch_limit` is documented as the
+/// endpoint's hard per-request input cap and is filled from the provider preset
+/// (or `remote_batch_limit`), but `CustomEmbeddingProvider` never read it — only
+/// `GeminiEmbeddingProvider` chunked. The caller's `BatchBudget` is
+/// throughput-tuned (128) and knows nothing about an endpoint that accepts 64,
+/// so a capped endpoint received the whole batch at once, rejected it
+/// wholesale, and recovered only by bisecting into ~2n-1 doomed requests.
+///
+/// Seven inputs under a limit of three must arrive as 3/3/1, and every input
+/// must still come back with its own vector — chunking must not lose or reorder
+/// rows.
+#[test]
+fn test_custom_endpoint_honours_the_configured_batch_limit() {
+    // Exactly three responses, so an unchunked 7-input request cannot be
+    // satisfied by accident.
+    let endpoint = spawn_mock_embeddings_server_responses(|_| 8, None, 3);
+    let config = RemoteEmbeddingConfig {
+        provider: crate::search::onnx::RemoteProvider::Custom {
+            endpoint: format!("{}/v1/embeddings", endpoint.trim_end_matches('/')),
+        },
+        model: Some("mock".to_string()),
+        remote_dimension: Some(8),
+        timeout_secs: 30,
+        max_retries: 0,
+        batch_limit: Some(3),
+        ..RemoteEmbeddingConfig::default()
+    };
+    let provider = CustomEmbeddingProvider::new(config).expect("custom provider");
+    let rows = block_on_test(provider.embed_batch(vec!["a", "b", "c", "d", "e", "f", "g"]))
+        .expect("chunked batch must succeed");
+    assert_eq!(rows.len(), 7, "every input must get a row back");
+    assert!(
+        rows.iter().all(|row| row.len() == 8),
+        "every row must carry a real vector, not a default/empty one: {rows:?}"
     );
 }
 
@@ -1438,4 +1484,243 @@ fn test_remote_batch_is_reembedded_only_once() {
             "row {index} must be byte-identical to the endpoint's original vector"
         );
     }
+}
+
+// ============================================================================
+// Concurrency-counting mock server + dispatch-width regression tests
+// ============================================================================
+
+/// Mock /v1/embeddings server that counts in-flight requests.
+///
+/// Returns `(base_url, current_in_flight, max_in_flight)`. Each request is
+/// handled on its own thread after a 200ms stall so overlapping requests are
+/// observable, and the listener binds `0.0.0.0` so both loopback and
+/// hostname-resolved addresses reach it.
+fn spawn_mock_embeddings_server_counting() -> (
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
+
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind counting mock server");
+    let addr = listener
+        .local_addr()
+        .expect("counting mock server local addr");
+
+    let current = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let max_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let server_current = current.clone();
+    let server_max_seen = max_seen.clone();
+    std::thread::spawn(move || {
+        for _ in 0..64 {
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(_) => return,
+            };
+            let current = server_current.clone();
+            let max_seen = server_max_seen.clone();
+            std::thread::spawn(move || {
+                let now = current.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(200));
+
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let header_end = loop {
+                    let read = stream.read(&mut chunk).unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        break index + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let read = stream.read(&mut chunk).unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let payload: serde_json::Value = serde_json::from_slice(
+                    &request
+                        [header_end..header_end + content_length.min(request.len() - header_end)],
+                )
+                .unwrap_or(serde_json::json!({}));
+                let input_count = payload["input"].as_array().map(|a| a.len()).unwrap_or(1);
+                let dim = 8usize;
+                let data: Vec<String> = (0..input_count)
+                    .map(|i| {
+                        let vector: Vec<String> = (0..dim)
+                            .map(|j| (0.5 + i as f32 * 0.001 + j as f32 * 0.0001).to_string())
+                            .collect();
+                        format!(
+                            r#"{{"object":"embedding","index":{i},"embedding":[{}]}}"#,
+                            vector.join(",")
+                        )
+                    })
+                    .collect();
+                let body = format!(r#"{{"object":"list","data":[{}]}}"#, data.join(","));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                current.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+
+    (format!("http://{addr}/v1"), current, max_seen)
+}
+
+/// Machine hostname for a non-loopback-looking URL that still resolves to
+/// loopback (glibc nss-myhostname maps the local hostname to 127.0.0.1).
+///
+/// Returns `None` rather than panicking: this relies on glibc's nss-myhostname,
+/// and on macOS neither `/etc/hostname` nor `HOSTNAME` exists. A test that
+/// cannot build the address it needs must SKIP — an `expect()` here turned a
+/// platform difference into a failing suite on every Mac dev machine, which
+/// says nothing about the code under test.
+fn test_hostname() -> Option<String> {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+}
+
+/// Remote endpoints are round-trip-limited, so chunks must overlap in flight.
+/// A 128-input batch under a limit of 32 is 4 chunks; with the remote
+/// concurrency arm enabled the mock must observe at least 2 requests in flight
+/// at once, and all 128 rows must come back complete and in order.
+#[test]
+fn test_remote_batch_dispatches_chunks_concurrently() {
+    let (endpoint, _current, max_seen) = spawn_mock_embeddings_server_counting();
+    // The hostname is not classified local, so the endpoint exercises the
+    // concurrent arm, while still resolving to loopback for the mock.
+    let Some(hostname) = test_hostname() else {
+        eprintln!("skipping: no machine hostname on this platform (needs nss-myhostname)");
+        return;
+    };
+    let endpoint = endpoint.replacen("0.0.0.0", &hostname, 1);
+
+    let config = RemoteEmbeddingConfig {
+        provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+        model: Some("mock".to_string()),
+        remote_dimension: Some(8),
+        timeout_secs: 30,
+        max_retries: 0,
+        batch_limit: Some(32),
+        ..RemoteEmbeddingConfig::default()
+    };
+    let provider = CustomEmbeddingProvider::new(config).expect("custom provider");
+
+    let texts: Vec<String> = (0..128).map(|i| format!("remote-text-{i}")).collect();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let rows = block_on_test(provider.embed_batch(refs)).expect("concurrent batch must succeed");
+
+    assert_eq!(rows.len(), 128, "every input must get a row back");
+    assert!(
+        rows.iter().all(|row| row.len() == 8),
+        "every row must carry a real 8-dim vector"
+    );
+    let max = max_seen.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        max >= 2,
+        "remote endpoint must overlap requests: max in-flight {max} < 2"
+    );
+}
+
+/// Local endpoints are compute-bound, so dispatch must stay serial: the
+/// 127.0.0.1 mock must never see two requests in flight.
+#[test]
+fn test_local_endpoint_dispatch_stays_serial() {
+    let (endpoint, _current, max_seen) = spawn_mock_embeddings_server_counting();
+    // Loopback host => is_local_endpoint() => the serial arm must run.
+    let endpoint = endpoint.replacen("0.0.0.0", "127.0.0.1", 1);
+
+    let config = RemoteEmbeddingConfig {
+        provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+        model: Some("mock".to_string()),
+        remote_dimension: Some(8),
+        timeout_secs: 30,
+        max_retries: 0,
+        batch_limit: Some(32),
+        ..RemoteEmbeddingConfig::default()
+    };
+    let provider = CustomEmbeddingProvider::new(config).expect("custom provider");
+
+    let rows =
+        block_on_test(provider.embed_batch(vec!["local"; 128])).expect("local batch must succeed");
+    assert_eq!(rows.len(), 128);
+    assert!(rows.iter().all(|row| row.len() == 8));
+    assert_eq!(
+        max_seen.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "local endpoints must never overlap embedding requests"
+    );
+}
+
+/// The live custom config has NO `batch_limit` (provider preset is unset). The
+/// remote width must kick in anyway, or every real batch collapses into one
+/// serial request. Same 128 inputs, no cap configured: chunks must still
+/// overlap.
+#[test]
+fn test_remote_batch_without_batch_limit_still_dispatches_concurrently() {
+    let (endpoint, _current, max_seen) = spawn_mock_embeddings_server_counting();
+    let Some(hostname) = test_hostname() else {
+        eprintln!("skipping: no machine hostname on this platform (needs nss-myhostname)");
+        return;
+    };
+    let endpoint = endpoint.replacen("0.0.0.0", &hostname, 1);
+
+    let config = RemoteEmbeddingConfig {
+        provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
+        model: Some("mock".to_string()),
+        remote_dimension: Some(8),
+        timeout_secs: 30,
+        max_retries: 0,
+        batch_limit: None,
+        ..RemoteEmbeddingConfig::default()
+    };
+    let provider = CustomEmbeddingProvider::new(config).expect("custom provider");
+
+    let texts: Vec<String> = (0..128)
+        .map(|i| format!("remote-text-no-limit-{i}"))
+        .collect();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let rows = block_on_test(provider.embed_batch(refs)).expect("concurrent batch must succeed");
+
+    assert_eq!(rows.len(), 128, "every input must get a row back");
+    assert!(
+        rows.iter().all(|row| row.len() == 8),
+        "every row must carry a real 8-dim vector"
+    );
+    let max = max_seen.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        max >= 2,
+        "remote endpoint without batch_limit must still overlap requests: max in-flight {max} < 2"
+    );
 }

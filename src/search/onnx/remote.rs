@@ -12,6 +12,11 @@ use std::sync::Arc;
 #[path = "remote_models.rs"]
 mod remote_models;
 
+/// Served-model modality heuristic, re-exported for the setup picker, which
+/// filters a listing to the embedding models a user actually wants to choose
+/// from without ever hiding the unfiltered list.
+pub(crate) use remote_models::looks_like_embedding_model;
+
 /// Error and provider-selector types (pure code motion; see the module docs).
 #[path = "remote_types.rs"]
 mod remote_types;
@@ -80,6 +85,44 @@ pub struct RemoteEmbeddingConfig {
     /// restarting it instead of abandoning the neural layer. Set by the index
     /// builder, which is the only place that knows the endpoint's origin.
     pub service_name: Option<String>,
+    /// Hard cap on inputs per request, or `None` for no cap.
+    ///
+    /// Distinct from the caller's `BatchBudget`: that decides how many texts a
+    /// batch SHOULD carry for throughput, this decides how many the endpoint
+    /// will ACCEPT. The two were conflated, so the throughput-tuned 128 went
+    /// straight into a 100-cap API and every batch was rejected with
+    /// `at most 100 requests can be in one batch`. Filled from the provider
+    /// preset and overridable via `remote_batch_limit`.
+    ///
+    /// A cap above the endpoint's real limit is still fatal to the batch, and
+    /// a cap below it only costs throughput — which is why the presets
+    /// undershoot rather than gamble.
+    pub batch_limit: Option<usize>,
+    /// Value for the provider's `input_type` field on DOCUMENT requests.
+    ///
+    /// Cohere states `input_type` is "Required for embedding models v3 and
+    /// higher", so omitting it is a hard failure there; Voyage and Jina use it
+    /// to opt into their retrieval prompts / task LoRAs, where omitting it
+    /// silently costs accuracy instead. `None` omits the field from the wire.
+    pub input_type_document: Option<String>,
+    /// Value for the same field on QUERY requests.
+    pub input_type_query: Option<String>,
+    /// Token ceiling for ONE input, or `None` for no limit.
+    ///
+    /// Distinct from `batch_limit`, which counts DOCUMENTS. A single input can
+    /// exceed a model's window on its own, and the endpoint then rejects the
+    /// whole request; knowing the ceiling lets the client truncate that document
+    /// deliberately instead of losing the round trip.
+    pub max_input_tokens: Option<usize>,
+    /// Token ceiling for ONE REQUEST (all inputs summed), or `None` for no
+    /// limit.
+    ///
+    /// This is the constraint `batch_limit` cannot express, and it is what
+    /// request width must actually be packed against. Hosted EmbeddingGemma
+    /// rejects anything over 2,048 tokens TOTAL, so a 32-document batch of
+    /// ~882 B documents (~7k tokens) fails even though 32 is under the count
+    /// cap. Without this the only way to discover the ceiling is a rejection.
+    pub request_token_budget: Option<usize>,
 }
 
 impl Default for RemoteEmbeddingConfig {
@@ -95,6 +138,11 @@ impl Default for RemoteEmbeddingConfig {
             doc_template: None,
             query_template: None,
             service_name: None,
+            batch_limit: None,
+            input_type_document: None,
+            input_type_query: None,
+            max_input_tokens: None,
+            request_token_budget: None,
         }
     }
 }
@@ -171,6 +219,11 @@ impl RemoteEmbeddingConfig {
             base_url: matches!(resolved.wire, crate::config::RemoteWire::Gemini)
                 .then(|| resolved.endpoint.clone()),
             service_name,
+            batch_limit: resolved.batch_limit,
+            input_type_document: resolved.input_type_document.clone(),
+            input_type_query: resolved.input_type_query.clone(),
+            max_input_tokens: resolved.max_input_tokens,
+            request_token_budget: resolved.request_token_budget,
             ..Self::default()
         }
     }
@@ -210,22 +263,56 @@ impl RemoteEmbeddingConfig {
     }
 }
 
+/// How long an idle keep-alive socket may be reused, per endpoint class.
+///
+/// Local endpoints keep `ZERO`. llama-server (and single-model
+/// OpenAI-compatible servers generally) drop a kept-alive connection as soon as
+/// client and server disagree about liveness, and reqwest then surfaces the NEXT
+/// request on that dead socket as `error sending request for url (...)` — a
+/// transport failure with no server answer behind it. Measured on a 523-batch
+/// index run: one stale-socket reuse aborted the batch 9 minutes in. A fresh
+/// connection per batch costs a localhost handshake — sub-millisecond — against
+/// a request that takes hundreds of milliseconds anyway.
+///
+/// A REMOTE endpoint is the opposite trade. A TLS handshake to another host is
+/// 2-4 round trips plus real CPU, paid once per batch: 7,495 rows at 128
+/// texts/batch is ~59 batches, so reuse removes ~59 handshakes from the critical
+/// path. The stale-socket hazard that forces `ZERO` locally does not carry over —
+/// a general HTTP server honours its keep-alive contract, and a reset socket is
+/// absorbed by `with_transient_retry` (`Transport` is retryable), so the failure
+/// degrades to one retry instead of a frozen run.
+fn pool_idle_timeout_for(config: &RemoteEmbeddingConfig) -> std::time::Duration {
+    if config.is_local_endpoint() {
+        std::time::Duration::ZERO
+    } else {
+        // Comfortably longer than one batch's compute so consecutive batches
+        // reuse the socket, short enough that a finished run releases its
+        // connections promptly.
+        std::time::Duration::from_secs(90)
+    }
+}
+
+/// Idle sockets kept per host.
+///
+/// `0` for local endpoints, matching the disabled idle timeout above. Remote
+/// endpoints keep enough for the neural path's in-flight batches: a single idle
+/// socket would funnel every request back onto one connection and throw away
+/// reuse as soon as two batches overlap.
+fn pool_max_idle_per_host_for(config: &RemoteEmbeddingConfig) -> usize {
+    if config.is_local_endpoint() { 0 } else { 4 }
+}
+
 /// Build the HTTP client every provider shares.
 ///
-/// `pool_idle_timeout(Duration::ZERO)` disables idle-socket reuse on purpose.
-/// llama-server (and single-model OpenAI-compatible servers generally) drop a
-/// kept-alive connection as soon as client and server disagree about liveness,
-/// and reqwest then surfaces the NEXT request on that dead socket as
-/// `error sending request for url (...)` — a transport failure with no server
-/// answer behind it. Measured on a 523-batch index run: one stale-socket reuse
-/// aborted the batch 9 minutes in. A fresh connection per batch costs a
-/// localhost handshake against a request that takes hundreds of milliseconds
-/// anyway.
+/// Connection lifetime is decided by [`pool_idle_timeout_for`]: disabled for
+/// local endpoints (stale-socket hazard above), enabled for remote ones
+/// (handshake cost dominates). Everything else here is shared.
 fn build_http_client(config: &RemoteEmbeddingConfig) -> Result<Client, RemoteEmbeddingError> {
     let timeout = std::time::Duration::from_secs(config.timeout_secs);
     let mut builder = Client::builder()
         .connect_timeout(timeout)
-        .pool_idle_timeout(std::time::Duration::ZERO);
+        .pool_idle_timeout(pool_idle_timeout_for(config))
+        .pool_max_idle_per_host(pool_max_idle_per_host_for(config));
     // Local endpoints carry no whole-request deadline: the response arrives
     // when the server has finished the batch, and the batch size is already
     // bounded by `BatchBudget`. A wall-clock cap here is a false-negative
@@ -270,7 +357,7 @@ fn is_retryable_status(status: u16) -> bool {
 ///
 /// Deliberately small. A reset socket or a saturated queue clears in well under
 /// a second; anything larger just hides a dead endpoint behind a longer stall.
-fn retry_backoff(attempt: usize) -> std::time::Duration {
+pub(crate) fn retry_backoff(attempt: usize) -> std::time::Duration {
     const BASE_MS: u64 = 250;
     const CAP_MS: u64 = 2_000;
     std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << attempt.min(3)).min(CAP_MS))
@@ -583,13 +670,40 @@ impl CohereEmbeddingProvider {
 #[async_trait]
 impl RemoteEmbeddingProvider for CohereEmbeddingProvider {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, RemoteEmbeddingError> {
-        let embeddings = self.embed_batch(vec![text]).await?;
+        let embeddings = self
+            .embed_with_input_type(vec![text], self.config.input_type_query.as_deref())
+            .await?;
         embeddings.into_iter().next().ok_or_else(|| {
             RemoteEmbeddingError::InvalidResponse("No embedding returned".to_string())
         })
     }
 
     async fn embed_batch(&self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
+        self.embed_with_input_type(texts, self.config.input_type_document.as_deref())
+            .await
+    }
+
+    fn dimension(&self) -> usize {
+        self.config.provider.default_dimension()
+    }
+}
+
+impl CohereEmbeddingProvider {
+    /// POST `/embed` for one batch with an explicit `input_type`.
+    ///
+    /// Cohere's `input_type` selects the retrieval side the vectors are tuned
+    /// for, so the document and query paths MUST send different values. This
+    /// used to hardcode `search_document` on both, which put queries in the
+    /// document subspace and quietly degraded recall.
+    ///
+    /// `None` omits the field: only an operator-supplied `input_type: none`-ish
+    /// config can produce that, and inventing a value is worse than letting the
+    /// API reject the request loudly.
+    async fn embed_with_input_type(
+        &self,
+        texts: Vec<&str>,
+        input_type: Option<&str>,
+    ) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
         let model_name = match &self.config.provider {
             RemoteProvider::Cohere { model } => model.clone(),
             _ => {
@@ -605,7 +719,8 @@ impl RemoteEmbeddingProvider for CohereEmbeddingProvider {
         struct CohereRequest<'a> {
             model: String,
             texts: Vec<&'a str>,
-            input_type: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            input_type: Option<&'a str>,
         }
 
         #[derive(Deserialize)]
@@ -621,7 +736,7 @@ impl RemoteEmbeddingProvider for CohereEmbeddingProvider {
         let request = CohereRequest {
             model: model_name,
             texts,
-            input_type: "search_document".to_string(),
+            input_type,
         };
 
         let api_key = self.config.api_key.as_ref().unwrap();
@@ -664,10 +779,6 @@ impl RemoteEmbeddingProvider for CohereEmbeddingProvider {
             .map(|e| e.embedding)
             .collect())
     }
-
-    fn dimension(&self) -> usize {
-        self.config.provider.default_dimension()
-    }
 }
 
 /// OpenAI-compatible embedding provider for user-configured endpoints
@@ -701,6 +812,27 @@ pub struct CustomEmbeddingProvider {
     ///
     /// Bounded by the request timeout, never unbounded.
     max_retries: usize,
+    /// Hard cap on inputs per request, from the provider preset (or
+    /// `remote_batch_limit`). `None`/`0` = one request per batch.
+    ///
+    /// Held on the STRUCT, not read from the config at call time, because this
+    /// provider destructures the config and never keeps it — which is exactly
+    /// why the cap was silently dropped: the config had it, the Gemini provider
+    /// chunked on it, and this path had no way to see it. A capped endpoint
+    /// received the throughput-tuned 128, was rejected wholesale, and recovered
+    /// only by bisecting into ~2n-1 doomed requests.
+    batch_limit: Option<usize>,
+    /// Token ceiling for ONE input, or `None`. Carried on the struct for the
+    /// same reason as `batch_limit`: this provider destructures the config, so
+    /// a limit left in the config is a limit this path cannot see.
+    max_input_tokens: Option<usize>,
+    /// Token ceiling for ONE REQUEST (all inputs summed), or `None`.
+    ///
+    /// Request width is packed against this. Counting documents alone is not
+    /// sufficient: a handful of long documents can overflow a model's window
+    /// while sitting far under any document cap, and the endpoint then rejects
+    /// the entire request.
+    request_token_budget: Option<usize>,
     /// Embedding-cache namespace, injected by
     /// [`GenericRemoteProvider::from_config`] from the SAME identity the
     /// checkpoint uses (endpoint + model + base URL + template fingerprint).
@@ -727,6 +859,13 @@ pub struct CustomEmbeddingProvider {
     /// restart per outage: a restart that does not fix the endpoint must not
     /// turn every subsequent batch into another full stop/start cycle.
     restart_attempted: std::sync::atomic::AtomicBool,
+    /// `input_type` values for the two sides, when the provider takes one.
+    ///
+    /// Sent as a single `"input_type"` field chosen per call site: document
+    /// batches use `document`, single-text queries use `query`. `None` omits
+    /// the field, which is what endpoints like llama-server expect.
+    input_type_document: Option<String>,
+    input_type_query: Option<String>,
 }
 
 /// Statuses that can be caused by one bad input (oversized/invalid content;
@@ -747,8 +886,38 @@ pub(crate) const MAX_OVERSIZE_SHRINKS: usize = 6;
 /// Same verdict as [`is_oversized_input_rejection`], kept as the narrower
 /// entry point for the truncation path: it also accepts HTTP 413, which
 /// generic OpenAI-compatible servers use for a body over the payload limit.
+///
+/// A 400 whose message names a length problem is also a size verdict, not a
+/// content verdict: hosted proxies answer an over-window request with 400 and
+/// `The prompt is too long ...`, and treating that as unclassifiable dropped
+/// the row instead of truncating it.
 pub(crate) fn is_oversize_rejection(status: u16, message: &str) -> bool {
-    status == 413 || is_oversized_input_rejection(status, message)
+    status == 413
+        || is_oversized_input_rejection(status, message)
+        || (status == 400 && is_too_long_message(message))
+}
+
+/// Whether `message` says the input is too long for the model's window.
+///
+/// Three provider dialects say the same thing, and only the first was
+/// recognized before:
+///
+/// * llama-server (HTTP 500): `input (N tokens) is too large to process.
+///   increase the physical batch size`.
+/// * Hosted OpenAI-compatible proxies (HTTP 400): `The prompt is too long for
+///   <model> on the routes that remain. Shorten it and retry.`
+/// * OpenAI itself (HTTP 400): `maximum context length is N tokens`.
+///
+/// Matching only the llama-server wording meant a 400 from a hosted proxy was
+/// classified as a document-level verdict and skipped outright, so the shrink
+/// path never ran and the row was silently dropped. The phrases are matched
+/// case-insensitively on meaning, not on one exact sentence.
+pub(crate) fn is_too_long_message(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("too large to process")
+        || lowered.contains("prompt is too long")
+        || lowered.contains("maximum context length")
+        || lowered.contains("reduce the length of the messages")
 }
 
 /// The first half of `text` (by bytes), cut back to a char boundary so the
@@ -1008,6 +1177,152 @@ mod template_tests {
     }
 }
 
+/// In-flight requests per batch for a remote endpoint.
+///
+/// Measured against the live hosted endpoint with the configured model
+/// `embeddinggemma-2` (768-dim, 32 x 882 B per request, n >= 6 requests per
+/// arm, echoed model verified on every response):
+///
+/// | K | rows/s | speedup | median round |
+/// |---|--------|---------|--------------|
+/// | 1 |  17.41 |   1.00x |        1.84s |
+/// | 2 |  19.76 |   1.13x |        3.24s |
+/// | 4 |  47.65 |   2.74x |        2.69s |
+///
+/// K=2 is a plateau, not a smooth ramp: its median request rose to 2.17s and
+/// one round took 3.70s for the same 64 rows, so a second request largely
+/// queues. Width pays off between 2 and 4, where median request growth stays
+/// sub-linear, so 4 is the smallest width that actually banks a speedup. Do not
+/// read the K=2 row as "concurrency barely helps" — it is a shallow point on an
+/// otherwise steep curve. K=8 was not measured here and is not claimed.
+///
+/// Local endpoints stay at 1: the managed llama-server is compute-bound rather
+/// than round-trip-bound (it must actually run the model), and it carries the
+/// documented stale-socket hazard that pool reuse is disabled for. Paying
+/// queueing complexity for a small gain against a sub-millisecond RTT is not
+/// worth it, and the serial arm keeps that path byte-identical.
+///
+/// `REMOTE_CHUNK` is a separate constant: the request WIDTH. With 32 rows per
+/// request, a fixed round-trip of ~1.8s is amortised over fewer rows than a
+/// larger request would manage, so this pair (width 32, width 4) is where the
+/// 2.74x above was measured — not a proven optimum for either.
+fn remote_max_in_flight(endpoint: &str) -> usize {
+    if endpoint_is_local(endpoint) { 1 } else { 4 }
+}
+
+/// True when `endpoint` cannot leave this machine (see
+/// [`RemoteEmbeddingConfig::is_local_endpoint`]).
+fn endpoint_is_local(endpoint: &str) -> bool {
+    let config = RemoteEmbeddingConfig {
+        provider: RemoteProvider::Custom {
+            endpoint: endpoint.to_string(),
+        },
+        ..RemoteEmbeddingConfig::default()
+    };
+    config.is_local_endpoint()
+}
+
+/// Rough token count for `text`, for BUDGETING only.
+///
+/// Deliberately a cheap byte-divisor, not a real tokenizer. This is used to
+/// decide how many documents fit in one request, and it is compared against a
+/// budget that is itself conservative: over-estimating costs a slightly
+/// narrower request (cheap, more round trips), while under-estimating costs a
+/// rejected request (the whole point of the exercise). Source and JSON are
+/// token-dense — roughly 3 bytes per token — so dividing by 3 is the safe
+/// direction. An exact tokenizer would need a
+/// per-model vocabulary shipped and versioned alongside the config, which is
+/// far more machinery than a width decision needs.
+pub(crate) fn estimate_tokens(text: &str) -> usize {
+    text.len().div_ceil(3).max(1)
+}
+
+/// Truncate `input` so `estimate_tokens` fits `limit`, cutting at a char
+/// boundary near the byte budget.
+///
+/// Keeps the HEAD of the document: for code, the signature, imports and
+/// enclosing definition come before the body, so a head-truncated symbol still
+/// carries most of its meaning, while a tail-truncated one keeps closing braces
+/// and loses the thing being defined.
+///
+/// Returns the input unchanged when it already fits, so the common path
+/// allocates nothing. The approximation is `3 * limit` bytes — the same
+/// divisor `estimate_tokens` uses, so the two cannot disagree about whether a
+/// text fits.
+pub(crate) fn truncate_to_token_budget<'a>(
+    input: std::borrow::Cow<'a, str>,
+    limit: usize,
+) -> std::borrow::Cow<'a, str> {
+    if limit == 0 || estimate_tokens(&input) <= limit {
+        return input;
+    }
+    let mut end = (limit.saturating_mul(3)).min(input.len());
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    match input {
+        // Already owned: truncate in place instead of re-allocating a copy.
+        std::borrow::Cow::Owned(mut owned) => {
+            owned.truncate(end);
+            std::borrow::Cow::Owned(owned)
+        }
+        std::borrow::Cow::Borrowed(borrowed) => std::borrow::Cow::Borrowed(&borrowed[..end]),
+    }
+}
+
+/// Request width for one batch, packed against BOTH the document cap and the
+/// request TOKEN budget.
+///
+/// `batch_limit` only counts DOCUMENTS, and a document cap alone cannot keep a
+/// request inside a model's window: 32 documents of ~882 B is ~7k tokens, which
+/// a 2,048-token endpoint rejects wholesale (`The prompt is too long ...
+/// Shorten it and retry`). So after applying the document cap, the inputs are
+/// accumulated against `token_budget` and the window ends at the first document
+/// that would overflow it. One document always goes in, even if it alone
+/// exceeds the budget — a request of one is the smallest legal unit, and
+/// dropping it silently would lose a row instead of reporting the problem.
+///
+/// `pending` carries the ALREADY-TEMPLATED text, so the estimate reflects what
+/// actually goes on the wire.
+///
+/// Local endpoints with no `batch_limit` and no `token_budget` keep today's
+/// behaviour exactly: one request for the whole batch.
+fn request_width_for(
+    pending: &[std::borrow::Cow<'_, str>],
+    batch_limit: Option<usize>,
+    token_budget: Option<usize>,
+    local: bool,
+) -> usize {
+    let total = pending.len();
+    if total == 0 {
+        return 1;
+    }
+    // The document-count ceiling for this request.
+    let count_cap = match batch_limit.filter(|limit| *limit > 0) {
+        Some(limit) => limit.min(total),
+        None if local => total,
+        None => REMOTE_CHUNK.min(total).max(1),
+    };
+    let Some(budget) = token_budget.filter(|budget| *budget > 0) else {
+        return count_cap;
+    };
+    let mut used = 0usize;
+    for (index, text) in pending.iter().take(count_cap).enumerate() {
+        let cost = estimate_tokens(text);
+        // At least one document per request, even when it alone overfills.
+        if index > 0 && used.saturating_add(cost) > budget {
+            return index;
+        }
+        used = used.saturating_add(cost);
+    }
+    count_cap
+}
+
+/// Concurrency-friendly request size for remote endpoints with no configured
+/// hard cap. 32 x 882 B is far below any endpoint's token ceiling, and each of
+/// the 4 in-flight requests stays small enough to overlap cleanly.
+const REMOTE_CHUNK: usize = 32;
+
 impl CustomEmbeddingProvider {
     /// Create a custom OpenAI-compatible embedding provider.
     pub fn new(config: RemoteEmbeddingConfig) -> Result<Self, RemoteEmbeddingError> {
@@ -1033,6 +1348,9 @@ impl CustomEmbeddingProvider {
             bootstrap_dimension,
             measured: std::sync::atomic::AtomicUsize::new(0),
             max_retries: config.max_retries,
+            // Carried onto the struct because this provider never retains the
+            // config — see the field's own doc comment.
+            batch_limit: config.batch_limit.filter(|limit| *limit > 0),
             cache_namespace: std::sync::Mutex::new(None),
             cache: std::sync::Mutex::new(None),
             cache_open_failed: std::sync::atomic::AtomicBool::new(false),
@@ -1040,6 +1358,10 @@ impl CustomEmbeddingProvider {
             // caller that knows the config); direct construction has none.
             supervised_service: config.service_name.clone(),
             restart_attempted: std::sync::atomic::AtomicBool::new(false),
+            input_type_document: config.input_type_document.clone(),
+            input_type_query: config.input_type_query.clone(),
+            max_input_tokens: config.max_input_tokens.filter(|limit| *limit > 0),
+            request_token_budget: config.request_token_budget.filter(|limit| *limit > 0),
         })
     }
 
@@ -1125,8 +1447,10 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
         // One text is one logical batch, so the allowance covers just this call.
         let retries_left = RetryCounter::new(self.max_retries);
         let allowance = RetryAllowance::new(&retries_left);
-        let embeddings =
-            with_transient_retry(&allowance, || self.embed_via_api(vec![input.clone()])).await?;
+        let embeddings = with_transient_retry(&allowance, || {
+            self.embed_via_api_for(vec![input.clone()], self.input_type_query.as_deref())
+        })
+        .await?;
         embeddings.into_iter().next().ok_or_else(|| {
             RemoteEmbeddingError::InvalidResponse("No embedding returned".to_string())
         })
@@ -1189,6 +1513,26 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
                 apply_doc_template(self.doc_template.as_deref(), title.as_deref(), text)
             })
             .collect();
+        // Enforce the endpoint's per-INPUT token ceiling up front.
+        //
+        // One document can exceed a model's window on its own, and the request
+        // carrying it is then rejected wholesale. Truncating deliberately is
+        // strictly better than the alternative the shrink path offers later:
+        // it costs no rejected round trip, and the truncation is ours to
+        // choose rather than reactive. `estimate_tokens` is deliberately an
+        // over-estimate, so this trims slightly early rather than too late.
+        //
+        // Truncation keeps the HEAD of the document, which is what a code
+        // embedding should see: signatures, imports and the enclosing
+        // definition come before the body. A tail-truncated symbol would keep
+        // the closing braces and lose the thing being defined.
+        let inputs: Vec<_> = match self.max_input_tokens.filter(|limit| *limit > 0) {
+            Some(limit) => inputs
+                .into_iter()
+                .map(|input| truncate_to_token_budget(input, limit))
+                .collect(),
+            None => inputs,
+        };
         let total = inputs.len();
         // Index of every input still needing an embed request.
         let mut pending_indices: Vec<usize> = (0..total).collect();
@@ -1214,8 +1558,101 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
             .iter()
             .map(|&index| inputs[index].clone())
             .collect();
-        self.embed_pending(&pending_inputs, &mut rows, &pending_indices)
-            .await?;
+        // Enforce the endpoint's hard per-request input cap.
+        //
+        // `batch_limit` is filled from the provider preset (or `remote_batch_limit`)
+        // and was never read on this path — only Gemini chunked. The caller's
+        // `BatchBudget` is throughput-tuned (128) and knows nothing about an
+        // endpoint that accepts 64, so a custom OpenAI-compatible endpoint was
+        // sent 128 inputs, rejected wholesale, and recovered only by bisecting
+        // the batch into ~2n-1 doomed requests. Chunking here is the fix: cap
+        // crossed, the response is rejected outright, never bisected.
+        //
+        // A missing or zero limit keeps today's single-request behaviour for
+        // LOCAL endpoints (the byte-identical safety net for the managed
+        // llama-server). For remote endpoints, where the round trip dominates,
+        // a missing cap falls back to `REMOTE_CHUNK` so the batch still splits
+        // into several overlapping requests instead of collapsing into one
+        // serial request; a configured cap below that width still wins, since
+        // the endpoint rejects anything above its documented limit.
+        //
+        // Width is also packed against `request_token_budget`: the document cap
+        // alone cannot keep a request inside a model's window, and a rejected
+        // request costs the whole batch. Width is therefore re-derived at each
+        // step rather than computed once, because documents differ in size — a
+        // fixed stride would either overflow on a run of long documents or
+        // waste the budget on short ones.
+        let local = endpoint_is_local(&self.endpoint);
+        let mut slices: Vec<(usize, usize)> = Vec::new();
+        let mut start = 0usize;
+        while start < pending_inputs.len() {
+            let width = request_width_for(
+                &pending_inputs[start..],
+                self.batch_limit,
+                self.request_token_budget,
+                local,
+            )
+            .max(1);
+            let end = (start + width).min(pending_inputs.len());
+            slices.push((start, end));
+            start = end;
+        }
+        let max_in_flight = remote_max_in_flight(&self.endpoint);
+        if max_in_flight <= 1 || slices.len() <= 1 {
+            // Serial arm — byte-identical to today's behaviour for local endpoints.
+            for (start, end) in slices {
+                self.embed_pending(
+                    &pending_inputs[start..end],
+                    &mut rows,
+                    &pending_indices[start..end],
+                )
+                .await?;
+            }
+        } else {
+            // Each worker embeds ONE slice and returns its rows.
+            //
+            // Waves of `max_in_flight` are what actually enforce the endpoint
+            // width. The previous `join_all` over EVERY slice fired the whole
+            // corpus at the endpoint at once — `max_in_flight` was only ever
+            // read as a `<= 1` on/off gate, so the "4 in flight" this file
+            // documents was not enforced anywhere. Against a hosted endpoint
+            // that is an unbounded burst the server queues (or 429s) on its own
+            // terms, and local timing then measures those queues rather than
+            // the client.
+            //
+            // A wave, not a semaphore: `buffer_unordered` would express the
+            // same width but its stream borrows `slices` across the await, and
+            // the `async_trait` boxed future below cannot satisfy that
+            // lifetime. Chunking the borrowed slice list keeps every future
+            // owned and equivalent in effect.
+            //
+            // The scratch is sized to the SLICE, not to `total`: indices are
+            // rebased to slice-local positions before the call, so a worker
+            // never allocates or scans the whole batch. `embed_pending` writes
+            // through the indices it is given, so local indices are all it
+            // needs; the merge below translates them back.
+            for wave in slices.chunks(max_in_flight) {
+                let futures = wave.iter().map(|&(start, end)| {
+                    let pending_inputs = &pending_inputs;
+                    async move {
+                        let width = end - start;
+                        let mut worker_rows = vec![None; width];
+                        let local: Vec<usize> = (0..width).collect();
+                        self.embed_pending(&pending_inputs[start..end], &mut worker_rows, &local)
+                            .await
+                            .map(|()| (start, worker_rows))
+                    }
+                });
+                for result in futures::future::join_all(futures).await {
+                    let (start, worker_rows) = result?;
+                    for (offset, row) in worker_rows.into_iter().enumerate() {
+                        if let Some(row) = row {
+                            rows[pending_indices[start + offset]] = Some(row);
+                        }
+                    }
+                }
+            }
+        }
 
         if let Some(probe) = &probe {
             self.store_cache(probe, &rows);
@@ -1533,10 +1970,27 @@ impl CustomEmbeddingProvider {
         &self,
         inputs: Vec<std::borrow::Cow<'_, str>>,
     ) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
+        self.embed_via_api_for(inputs, self.input_type_document.as_deref())
+            .await
+    }
+
+    /// [`Self::embed_via_api`] with an explicit `input_type`, so the query path
+    /// can send the provider's query-side value instead of its document one.
+    ///
+    /// `input_type` is omitted from the wire entirely when `None`: providers
+    /// that do not define the field (and every local llama-server) reject or
+    /// ignore it, so it must never be sent speculatively.
+    async fn embed_via_api_for(
+        &self,
+        inputs: Vec<std::borrow::Cow<'_, str>>,
+        input_type: Option<&str>,
+    ) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
         #[derive(Serialize)]
         struct CustomRequest<'a> {
             model: String,
             input: Vec<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            input_type: Option<&'a str>,
         }
 
         #[derive(Deserialize)]
@@ -1556,6 +2010,7 @@ impl CustomEmbeddingProvider {
         let request = CustomRequest {
             model: self.model.clone().unwrap_or_default(),
             input: inputs.iter().map(|i| i.as_ref()).collect(),
+            input_type,
         };
         let expected = inputs.len();
 

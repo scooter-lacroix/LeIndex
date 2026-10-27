@@ -161,8 +161,16 @@ pub(super) fn read_worker_config_env_from_config() -> WorkerConfigEnv {
     // keeps the config-reading test helpers honest — they write a fresh
     // leindex.toml into a temp LEINDEX_HOME and expect to read it back
     // regardless of which test initialized the global cache first.
-    let config = crate::config::LeIndexConfig::load()
-        .unwrap_or_else(|_| crate::config::LeIndexConfig::default());
+    let config = if cfg!(test) {
+        crate::config::legacy_config_file_path()
+            .filter(|path| path.exists())
+            .map(|path| crate::config::LeIndexConfig::load_from_path(&path))
+            .unwrap_or_else(|| crate::config::LeIndexConfig::load())
+            .unwrap_or_else(|_| crate::config::LeIndexConfig::default())
+    } else {
+        crate::config::LeIndexConfig::load()
+            .unwrap_or_else(|_| crate::config::LeIndexConfig::default())
+    };
     let provider = config.neural.execution_provider.trim().to_ascii_lowercase();
     WorkerConfigEnv {
         ort_dylib_path: config.neural.ort_dylib_path.clone(),

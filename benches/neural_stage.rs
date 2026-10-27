@@ -7,6 +7,20 @@
 //! LEINDEX_ONNX_INFERENCE_BATCH_SIZE. Worker stderr logs remain under /tmp.
 //! BATCHES/WORKERS/ROWS/REPEATS/TEXT_REPEATS use the LEINDEX_PERF_ prefix.
 //! Timings include transport, tokenization and output validation, not model load.
+//!
+//! HTTP target selection reads the REAL config: the endpoint, model, dimension
+//! and credential come from `[indexing.embeddings]` — the same route the indexer
+//! uses — so measuring needs NO environment at all. Configure once with
+//! `leindex setup`, including the API key (the wizard can store it), then run
+//! the bench. `LEINDEX_PERF_URL` / `LEINDEX_PERF_MODEL` / `LEINDEX_PERF_API_KEY_ENV`
+//! exist only as OVERRIDES for pointing at a different endpoint without editing
+//! the config; `LEINDEX_PERF_API_KEY_ENV` names a variable rather than carrying a
+//! secret, so no credential is written to this file, a command line, or the CSV.
+//!
+//! Every HTTP response's `model` field is asserted against the configured model:
+//! a proxy that silently routes elsewhere still returns well-shaped vectors of
+//! the right width, so the shape checks below cannot distinguish the two. That
+//! missing assertion is what made an earlier 128-row measurement unusable.
 
 use std::io::{BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -183,6 +197,8 @@ enum Backend {
         runtime: tokio::runtime::Runtime,
         client: reqwest::Client,
         url: String,
+        model: String,
+        api_key: Option<String>,
     },
     Worker(Worker),
 }
@@ -193,6 +209,37 @@ impl Backend {
             return Ok(Self::Worker(Worker::new(label, index)?));
         }
         ensure!(name == "http", "backend must be http or worker");
+        // The target comes from the REAL config — the same `[indexing.embeddings]`
+        // route the indexer uses — so a measurement needs no environment at all.
+        // That is the point: the endpoint, model and credential are things the
+        // user configures through `leindex setup`, and a benchmark that demanded
+        // an env export for each was measuring a configuration no user has.
+        //
+        // `LEINDEX_PERF_*` stays as an OVERRIDE for targeting a different endpoint
+        // without touching the config, and only then is a model expected there.
+        let cfg = leindex::config::LeIndexConfig::load().context("load leindex config")?;
+        let resolved = cfg
+            .indexing
+            .embeddings
+            .resolved_remote_with(&cfg.services)
+            .context(
+                "no remote embedding route resolves; configure one with `leindex setup` \
+                 (or set LEINDEX_PERF_URL to override)",
+            )?;
+        let config_key = cfg
+            .indexing
+            .embeddings
+            .resolved_api_key()
+            .map_err(anyhow::Error::msg)?;
+        // `resolved_api_key` is the config's OWN resolution (env NAME first,
+        // literal token second), so the bench and the indexer cannot disagree
+        // about which credential is in force.
+        let api_key = match std::env::var("LEINDEX_PERF_API_KEY_ENV") {
+            Ok(var) => Some(std::env::var(&var).with_context(|| {
+                format!("LEINDEX_PERF_API_KEY_ENV names {var}, which is unset")
+            })?),
+            Err(_) => config_key,
+        };
         Ok(Self::Http {
             runtime: tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -206,8 +253,12 @@ impl Backend {
                     usize::MAX
                 })
                 .build()?,
-            url: std::env::var("LEINDEX_PERF_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8080/v1/embeddings".into()),
+            url: std::env::var("LEINDEX_PERF_URL").unwrap_or(resolved.endpoint),
+            model: std::env::var("LEINDEX_PERF_MODEL")
+                .ok()
+                .or(resolved.model)
+                .context("the configured route names no model; set LEINDEX_PERF_MODEL")?,
+            api_key,
         })
     }
 
@@ -218,17 +269,28 @@ impl Backend {
                 runtime,
                 client,
                 url,
+                model,
+                api_key,
             } => {
                 ensure!(!rerank, "HTTP harness is embedding-only");
                 runtime.block_on(async {
-                    let response: serde_json::Value = client
+                    let mut request = client
                         .post(url.as_str())
-                        .json(&serde_json::json!({"model": "embeddinggemma-2", "input": texts}))
-                        .send()
-                        .await?
-                        .error_for_status()?
-                        .json()
-                        .await?;
+                        .json(&serde_json::json!({"model": model, "input": texts}));
+                    if let Some(key) = api_key {
+                        request = request.bearer_auth(key);
+                    }
+                    let response: serde_json::Value =
+                        request.send().await?.error_for_status()?.json().await?;
+                    // A proxy that routed elsewhere still returns well-shaped
+                    // vectors, so shape checks alone cannot tell which model
+                    // answered. Assert it per response.
+                    ensure!(
+                        response["model"].as_str() == Some(model.as_str()),
+                        "endpoint echoed model {:?}, expected {:?}",
+                        response["model"].as_str(),
+                        model
+                    );
                     let data = response["data"].as_array().context("missing data array")?;
                     ensure!(data.len() == texts.len(), "short HTTP output");
                     let mut seen = vec![false; texts.len()];
@@ -255,13 +317,33 @@ impl Backend {
     }
 }
 
+/// Configured vector width for the HTTP route.
+///
+/// The shape check below asserts that every returned vector has this width, so a
+/// hardcoded guess would fail the run on any route configured for a different
+/// dimension — the `gemini` preset declares 3072, a local llama-server 768.
+/// Ask the config instead of guessing, and let `LEINDEX_PERF_DIM` override.
+fn config_dim() -> Result<usize> {
+    let cfg = leindex::config::LeIndexConfig::load().context("load leindex config")?;
+    cfg.indexing
+        .embeddings
+        .resolved_remote_with(&cfg.services)
+        .and_then(|resolved| resolved.remote_dimension)
+        .context("the configured route names no dimension; set LEINDEX_PERF_DIM")
+}
+
 #[test]
 #[ignore = "real model/endpoint performance run; explicitly opt in during a quiet window"]
 fn test_neural_stage() -> Result<()> {
     let backend = std::env::var("LEINDEX_PERF_BACKEND").context("set LEINDEX_PERF_BACKEND")?;
     let rows = setting("ROWS", 512);
     let repeats = setting("REPEATS", 3);
-    let dim = setting("DIM", if backend == "http" { 768 } else { 1024 });
+    let default_dim = if backend == "http" {
+        config_dim()?
+    } else {
+        1024
+    };
+    let dim = setting("DIM", default_dim);
     let rerank = std::env::var("LEINDEX_PERF_RERANK").is_ok_and(|v| v == "1");
     ensure!(
         rows > 0 && repeats > 0 && dim > 0,

@@ -303,20 +303,48 @@ impl ParseProgressHeartbeat {
         Self { done, stop, thread }
     }
 
-    /// The closure to hand a parser. It only stores — see the type docs.
+    /// The closure to hand a parser. It only counts — see the type docs.
     ///
     /// `use<>` promises the returned closure captures nothing from `&self`:
     /// it clones the `Arc`, so the caller can hand out a callback and then
     /// still move the heartbeat into `finish`.
+    ///
+    /// Monotonic on purpose. `parse_files_counting` hands out a unique ordinal
+    /// per finished file, but rayon has no ordering guarantee — file 7 can call
+    /// back before file 3. A plain `store` would then write 3 over 7 and the
+    /// published count could go BACKWARDS or finish below the file total.
+    /// `fetch_max` keeps the highest ordinal seen, so the number only ever
+    /// climbs toward `total`.
     pub(super) fn callback(&self) -> impl Fn(usize) + Sync + use<> {
         let counter = self.done.clone();
-        move |finished: usize| counter.store(finished, std::sync::atomic::Ordering::Relaxed)
+        move |finished: usize| {
+            counter.fetch_max(finished, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Stop and join the sampler. Consumes `self` so it cannot be skipped.
-    pub(super) fn finish(self) {
+    ///
+    /// `mut self` because `Drop` forbids moving a field out; the handle is
+    /// taken instead, which also leaves `drop` with nothing to join twice.
+    pub(super) fn finish(mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(thread) = self.thread {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for ParseProgressHeartbeat {
+    /// Last-resort join for a heartbeat dropped without [`Self::finish`].
+    ///
+    /// `finish` takes `self` by value, so the happy path cannot forget the
+    /// sampler. A `?` between `start` and `finish` would still drop this
+    /// value, and a sampler outliving the phase keeps writing into a snapshot
+    /// the next run now owns. Dropping without joining must therefore stop and
+    /// join here rather than depend on every caller being careful.
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }

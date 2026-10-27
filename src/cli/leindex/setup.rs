@@ -18,6 +18,8 @@
 // VAL-SETUP-024: Idempotent re-runs
 // VAL-SETUP-034: Surfaces full configuration status
 
+#[cfg(feature = "tui")]
+use crate::config::LeIndexConfig;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -31,10 +33,21 @@ mod setup_models;
 mod setup_ort;
 #[path = "setup_routes.rs"]
 mod setup_routes;
+
+/// Model picker for the external-embeddings route (kept beside its siblings so
+/// `setup_routes.rs` stays closer to the module line budget).
+#[path = "setup_picker.rs"]
+mod setup_picker;
 #[path = "setup_status.rs"]
 mod setup_status;
 #[path = "setup_system_one.rs"]
 mod setup_system_one;
+/// Full-screen interactive setup. Gated on `tui` because ratatui is: `setup`
+/// itself needs only `cli`, and a headless build must still configure neural
+/// search. When the feature is off the dialoguer flow below is used instead.
+#[cfg(feature = "tui")]
+#[path = "setup_ui.rs"]
+mod setup_ui;
 pub use setup_check::run_check;
 use setup_models::*;
 pub(crate) use setup_ort::discover_ort_path;
@@ -375,7 +388,23 @@ pub fn resolve_from_flags(
 ///
 /// VAL-SETUP-002: Prompts neural? with Y default
 /// VAL-SETUP-003-008: Branching logic
-pub fn run_interactive_flow() -> Result<SetupChoices, SetupError> {
+pub fn run_interactive_flow(fullscreen: bool) -> Result<SetupChoices, SetupError> {
+    // Full-screen surface first. It presents every parameter in one place and
+    // validates inline; the prompt chain below is the fallback for builds
+    // without `tui` and is no longer the primary experience.
+    #[cfg(feature = "tui")]
+    {
+        // `load_or_recover` rather than `load`: a corrupt config must not be a
+        // dead end for the one command that repairs configuration. It backs the
+        // bad file up before returning defaults.
+        let existing = LeIndexConfig::load_or_recover()
+            .map(|(config, _action)| config)
+            .map_err(|error| SetupError::ConfigRead(error.to_string()))?;
+        if setup_ui::available() {
+            return setup_ui::run(&existing, fullscreen);
+        }
+    }
+
     use dialoguer::{Confirm, Select};
 
     // VAL-SETUP-002: "Do you want neural embeddings / enhanced semantic search?"
@@ -816,6 +845,12 @@ fn print_recovery_notice(recovery: Option<RecoveryNotice>) {
         match action {
             RecoveryNotice::Migrated => {
                 println!("  -> Existing config migrated to current schema.");
+            }
+            RecoveryNotice::MigratedFromLegacy(legacy) => {
+                println!(
+                    "  -> Legacy TOML migrated to v2 YAML; preserved at {}.",
+                    legacy.display()
+                );
             }
             RecoveryNotice::RecoveredFromCorrupt(backup) => {
                 println!(
@@ -1461,6 +1496,10 @@ fn merge_with_existing(
                         None
                     }
                 }
+                crate::config::RecoveryAction::MigratedFromLegacy(legacy) => {
+                    new_config = preserve_existing_sections(new_config, &existing);
+                    Some(RecoveryNotice::MigratedFromLegacy(legacy))
+                }
                 crate::config::RecoveryAction::CreatedDefault => None,
             };
             Ok((new_config, notice))
@@ -1474,6 +1513,8 @@ fn merge_with_existing(
 enum RecoveryNotice {
     /// Config from older version was migrated.
     Migrated,
+    /// Legacy TOML was moved aside after YAML migration.
+    MigratedFromLegacy(PathBuf),
     /// Corrupted config was backed up.
     RecoveredFromCorrupt(PathBuf),
 }

@@ -12,6 +12,49 @@ fn test_remote_provider_default_dimension() {
     assert_eq!(provider.default_dimension(), 1536);
 }
 
+/// Connection reuse is a per-endpoint-class decision, not a global one.
+///
+/// A remote endpoint pays a TLS handshake per batch when the pool is disabled:
+/// negligible against localhost, pure cross-internet latency against a hosted
+/// endpoint — once per batch, so ~59 times for a 7,495-row project. This pins
+/// BOTH halves, because the local stale-socket rule must never silently become
+/// the rule for hosted endpoints again.
+#[test]
+fn test_pool_reuse_is_disabled_locally_and_enabled_remotely() {
+    let mut local = RemoteEmbeddingConfig::openai("sk-not-used".to_string(), None);
+    local.provider = RemoteProvider::Custom {
+        endpoint: "http://127.0.0.1:8080/v1/embeddings".to_string(),
+    };
+    assert!(
+        local.is_local_endpoint(),
+        "127.0.0.1 must classify as local"
+    );
+    assert_eq!(
+        pool_idle_timeout_for(&local),
+        std::time::Duration::ZERO,
+        "a local endpoint must not reuse idle sockets: one stale-socket reuse "
+    );
+    assert_eq!(
+        pool_max_idle_per_host_for(&local),
+        0,
+        "no idle socket may be retained for a local endpoint"
+    );
+
+    let mut remote = RemoteEmbeddingConfig::openai("sk-not-used".to_string(), None);
+    remote.provider = RemoteProvider::Custom {
+        endpoint: "https://api.example.com/v1/embeddings".to_string(),
+    };
+    assert!(!remote.is_local_endpoint(), "a public host is not local");
+    assert!(
+        pool_idle_timeout_for(&remote) > std::time::Duration::ZERO,
+        "a remote endpoint that never reuses a socket pays a TLS handshake per batch"
+    );
+    assert!(
+        pool_max_idle_per_host_for(&remote) > 0,
+        "a remote endpoint needs at least one retainable idle socket"
+    );
+}
+
 #[test]
 fn test_template_fingerprint_covers_substitution_semantics() {
     // A template-string-only hash is not enough: `apply_doc_template`
@@ -154,4 +197,192 @@ fn test_reorder_embeddings_length_mismatch() {
     let err = reorder_embeddings_by_index(entries, 2).unwrap_err();
     assert!(matches!(err, RemoteEmbeddingError::InvalidResponse(_)));
     assert!(err.to_string().contains("expected 2"));
+}
+
+/// A request's width must respect the endpoint's TOKEN budget, not just its
+/// document count.
+///
+/// Regression: hosted EmbeddingGemma answers a request over 2,048 tokens with
+/// `The prompt is too long for embeddinggemma-300m on the routes that remain.
+/// Shorten it and retry.` even when the document count is far under
+/// `batch_limit`. Sizing by documents alone sent 32 x 882 B (~7k tokens) and
+/// every batch was rejected.
+#[test]
+fn test_request_width_packs_against_the_token_budget() {
+    // ~7 tokens each (20 bytes / 3, floored at 1).
+    let row = std::borrow::Cow::Borrowed("01234567890123456789");
+    let pending: Vec<_> = (0..32).map(|_| row.clone()).collect();
+
+    // 2048 budget / 7 tokens-per-row => 292 rows fit, so the DOCUMENT cap binds.
+    assert_eq!(
+        request_width_for(&pending, Some(32), Some(2048), false),
+        32,
+        "a generous token budget must not narrow the document cap"
+    );
+
+    // A 100-token budget fits 14 of these rows (14 * 7 = 98, adding a 15th
+    // would reach 105 and overflow).
+    assert_eq!(
+        request_width_for(&pending, Some(32), Some(100), false),
+        14,
+        "the token budget must narrow the request below the document cap"
+    );
+
+    // Without a budget the document cap still applies unchanged.
+    assert_eq!(request_width_for(&pending, Some(32), None, false), 32);
+}
+
+/// A single oversized document must still be sent rather than dropped.
+///
+/// When one input alone exceeds the budget there is no smaller legal request:
+/// width 1 is the floor, and the shrink path is what makes it fit. Returning 0
+/// here would stall the batching loop or silently lose the row.
+#[test]
+fn test_request_width_never_returns_zero_for_an_oversized_input() {
+    let huge = std::borrow::Cow::Borrowed(&"x".repeat(9_000)[..]);
+    let pending = vec![huge];
+    assert_eq!(request_width_for(&pending, Some(32), Some(2048), false), 1);
+}
+
+/// Local endpoints with no configured limits keep the whole batch in one
+/// request. This is the byte-identical safety net for the managed llama-server
+/// the concurrency work deliberately leaves untouched.
+#[test]
+fn test_local_without_limits_keeps_one_request() {
+    let row = std::borrow::Cow::Borrowed("01234567890123456789");
+    let pending: Vec<_> = (0..200).map(|_| row.clone()).collect();
+    assert_eq!(
+        request_width_for(&pending, None, None, true),
+        200,
+        "local endpoints keep today's single-request behaviour"
+    );
+}
+
+/// A 400 whose message names a length problem is a SIZE verdict, so the shrink
+/// path runs instead of the row being written off as a content rejection.
+#[test]
+fn test_400_too_long_message_is_a_size_rejection() {
+    assert!(is_oversize_rejection(
+        400,
+        "The prompt is too long for embeddinggemma-300m on the routes that remain. Shorten it and retry."
+    ));
+    assert!(is_oversize_rejection(
+        400,
+        "This model's maximum context length is 8192 tokens"
+    ));
+    // llama-server's 500 dialect must keep working.
+    assert!(is_oversize_rejection(
+        500,
+        "input (5000 tokens) is too large to process. increase the physical batch size"
+    ));
+    // A genuine content rejection must NOT be treated as size.
+    assert!(!is_oversize_rejection(400, "invalid model identifier"));
+}
+
+/// `is_too_long_message` owns the phrase table that decides whether a rejection
+/// is a SIZE verdict. The test above proves three of its four dialects are
+/// reachable, but only through `is_oversize_rejection`; what nothing pinned
+/// before is:
+///
+/// * the Azure `reduce the length of the messages` dialect, which no test
+///   exercised anywhere;
+/// * case folding — every caller above feeds correctly cased input, so
+///   deleting the `to_ascii_lowercase()` call would have broken no test while
+///   silently un-shrinking every host that capitalizes;
+/// * the negatives at the classifier layer, so the phrase table cannot drift
+///   into matching a 401 or a rate-limit body and trigger a useless
+///   shrink-and-resend loop.
+#[test]
+fn test_is_too_long_message_classifies_every_dialect_and_nothing_else() {
+    for message in [
+        // llama-server (HTTP 500), verbatim shape.
+        "input (21846 tokens) is too large to process. increase the physical batch size",
+        // Hosted OpenAI-compatible proxy.
+        "The prompt is too long for embeddinggemma-300m on the routes that remain. Shorten it and retry.",
+        // OpenAI itself.
+        "This model's maximum context length is 8192 tokens",
+        // Azure-style: the one dialect that had no coverage.
+        "Please reduce the length of the messages",
+        // Case must not matter: hosts capitalize inconsistently.
+        "INPUT IS TOO LARGE TO PROCESS",
+        "PROMPT IS TOO LONG",
+    ] {
+        assert!(
+            is_too_long_message(message),
+            "must recognize this size dialect: {message}"
+        );
+    }
+
+    for message in [
+        // A bad KEY is not a long document: shrinking wastes a cycle and still fails.
+        "Incorrect API key provided",
+        // Rate limiting is transient, not a document verdict.
+        "Rate limit reached for requests",
+        // A model the route cannot use must not be shrunk.
+        "The model `embed-v5.0-fast` does not exist",
+        "",
+    ] {
+        assert!(
+            !is_too_long_message(message),
+            "must not classify this as too-long: {message}"
+        );
+    }
+}
+
+/// The estimate is used only for budgeting, so it must at least be
+/// monotonically increasing and never zero (a zero would let infinitely many
+/// documents into one request).
+#[test]
+fn test_estimate_tokens_is_never_zero() {
+    assert_eq!(estimate_tokens(""), 1);
+    assert_eq!(estimate_tokens("ab"), 1);
+    assert!(estimate_tokens(&"a".repeat(300)) > estimate_tokens(&"a".repeat(30)));
+}
+
+/// Truncation keeps the HEAD and actually lands within the budget.
+///
+/// Head, not tail: for code the signature and enclosing definition come first,
+/// so a tail-truncated symbol would keep closing braces and lose the thing
+/// being defined.
+#[test]
+fn test_truncate_to_token_budget_keeps_the_head() {
+    // HEAD is longer than the whole byte budget, so nothing from TAIL may
+    // survive. A budget of 100 tokens is 300 bytes; HEAD alone is 400.
+    let original = format!("{}{}", "HEAD".repeat(100), "TAIL".repeat(100));
+    let truncated = truncate_to_token_budget(std::borrow::Cow::Borrowed(&original), 100);
+    assert!(truncated.starts_with("HEAD"), "the head must survive");
+    assert!(!truncated.contains("TAIL"), "the tail must be dropped");
+    assert_eq!(truncated.len(), 300);
+    assert!(estimate_tokens(&truncated) <= 100);
+}
+
+/// A text that already fits is returned untouched, borrowing rather than
+/// copying — the common path for a short node.
+#[test]
+fn test_truncate_to_token_budget_is_a_no_op_when_it_fits() {
+    let input = std::borrow::Cow::Borrowed("short");
+    let out = truncate_to_token_budget(input, 2048);
+    assert_eq!(out, "short");
+    assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+}
+
+/// Truncation must land on a char boundary: slicing mid-codepoint panics.
+#[test]
+fn test_truncate_to_token_budget_respects_char_boundaries() {
+    // Multibyte everywhere, so a naive byte cut would split a codepoint.
+    let original = "é".repeat(400);
+    let truncated = truncate_to_token_budget(std::borrow::Cow::Borrowed(&original), 50);
+    assert!(truncated.is_char_boundary(truncated.len()));
+    assert!(estimate_tokens(&truncated) <= 50);
+    // Every surviving character is still a whole 'é'.
+    assert!(truncated.chars().all(|c| c == 'é'));
+}
+
+/// Truncation is skipped entirely when no limit is configured, so a local
+/// endpoint sees the exact document text it always did.
+#[test]
+fn test_truncate_with_zero_limit_is_a_no_op() {
+    let original = "x".repeat(10_000);
+    let out = truncate_to_token_budget(std::borrow::Cow::Borrowed(&original), 0);
+    assert_eq!(out.len(), 10_000);
 }

@@ -99,7 +99,16 @@ const EMBEDDINGS_FIELDS: &[&str] = &[
     "onnx_model_path",
     "matryoshka",
 ];
-const MCP_FIELDS: &[&str] = &["idle_timeout_secs", "engine_max_idle_secs", "prewarm"];
+// `auto_index` must be listed: `McpConfig::auto_index` is a plain
+// `#[serde(default)] bool` (no `skip_serializing_if`), so it appears in the
+// serialized default TOML and the unknown-key guard rejects it unless it is
+// known here. It is read by `cli::registry::auto_index_enabled`.
+const MCP_FIELDS: &[&str] = &[
+    "idle_timeout_secs",
+    "engine_max_idle_secs",
+    "prewarm",
+    "auto_index",
+];
 const SYSTEM_ONE_FIELDS: &[&str] = &[
     "mode",
     "provider",
@@ -145,6 +154,12 @@ fn optional_keys_at(path: &str) -> &'static [&'static str] {
             "remote_doc_template",
             "remote_query_template",
             "onnx_model_path",
+            // The three remote limits are all skip_serializing_if = None, so
+            // they never appear in the serialized default and must be listed
+            // here for `config set` to accept them.
+            "remote_batch_limit",
+            "remote_max_input_tokens",
+            "remote_request_token_budget",
         ],
         "system_one" => &[
             "base_url",

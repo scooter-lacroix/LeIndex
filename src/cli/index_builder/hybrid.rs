@@ -1219,6 +1219,7 @@ impl Default for HybridEmbedder {
 /// answers an over-long input with HTTP 500). Escalating on the classification
 /// instead would freeze a generation over a single bad document.
 #[cfg(feature = "remote-embeddings")]
+#[derive(Debug)]
 pub(crate) enum RemoteBridgeError {
     /// The request failed without saying anything about the embedding space
     /// (dropped connection, gateway/availability status). Retryable.
@@ -1257,31 +1258,62 @@ fn bridge_error(error: RemoteEmbeddingError) -> RemoteBridgeError {
 
 /// Bridge a remote-embeddings future onto the synchronous pipeline.
 ///
-/// The CLI indexing/query paths never run inside a tokio runtime, so a
-/// scratch single-thread reactor is safe here (`block_on` panics only when
-/// called from within an async context, which cannot happen on these paths).
-/// One runtime per call keeps no global state and no background threads.
+/// The future is driven on a SPAWNED thread, never the caller's. That is not
+/// incidental: `src/bin/leindex.rs` runs `rt.block_on(cli::main())`, so every
+/// CLI subcommand — `leindex setup`, `leindex index`, and the daemon paths —
+/// executes inside the outer runtime's context. `Runtime::block_on` panics
+/// ("Cannot start a runtime from within a runtime") when called from inside a
+/// runtime, so calling it on the caller's thread would abort the setup wizard
+/// the moment model discovery ran. The spawn is what makes that impossible.
+///
+/// The runtime is PROCESS-WIDE, not scratch-per-call, and it lives on its own
+/// thread. A runtime owns everything reqwest parks on it — the connection pool
+/// included — so a fresh runtime per batch dropped the pool every time and the
+/// next batch paid a full TCP connect + TLS handshake for every in-flight
+/// request. That is pure overhead on top of the endpoint's own latency, and the
+/// larger the corpus the more of it was paid. One long-lived runtime keeps the
+/// keep-alive sockets owned by `pool_idle_timeout_for` alive across batches,
+/// which is the entire point of enabling that pool for remote endpoints.
+///
+/// Multi-threaded rather than `new_current_thread`, and the reason is NOT
+/// "overlapping requests": `join_all` over non-blocking reqwest futures already
+/// progresses every request concurrently on a single-threaded reactor, because
+/// the runtime's I/O driver wakes them as their sockets become ready. Worker
+/// threads only matter for work that BLOCKS or is `spawn`ed. Two are kept as
+/// headroom for exactly that: hyper performs its own connection setup work, and
+/// a reactor with no spare worker serialises that against polling. The measured
+/// 2.74x at K=4 came from overlapping round trips, which one thread would also
+/// deliver — so do not read this thread count as the source of that speedup.
+///
 /// The future must be `'static` + `Send` (ours hold only the `Arc`-based
 /// `GenericRemoteProvider`) and resolve to a [`RemoteBridgeError`], whose
 /// transient/permanent split the generation fallback policy needs: flattening
 /// it to a `String` here is what made one dropped connection indistinguishable
 /// from a contract failure.
 #[cfg(feature = "remote-embeddings")]
+fn remote_runtime() -> Result<&'static tokio::runtime::Runtime, RemoteBridgeError> {
+    static RUNTIME: std::sync::OnceLock<Result<tokio::runtime::Runtime, String>> =
+        std::sync::OnceLock::new();
+    match RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("remote-embed-bridge")
+            .build()
+            .map_err(|e| e.to_string())
+    }) {
+        Ok(runtime) => Ok(runtime),
+        Err(error) => Err(RemoteBridgeError::Permanent(error.clone())),
+    }
+}
+
+#[cfg(feature = "remote-embeddings")]
 pub(crate) fn block_on_remote<T: Send + 'static>(
     fut: impl std::future::Future<Output = Result<T, RemoteBridgeError>> + Send + 'static,
 ) -> Result<T, RemoteBridgeError> {
     std::thread::Builder::new()
-        .name("remote-embed-bridge".to_string())
-        .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| RemoteBridgeError::Permanent(e.to_string()))
-                .and_then(|rt| {
-                    rt.block_on(fut)
-                        .map_err(|e| RemoteBridgeError::Permanent(e.to_string()))
-                })
-        })
+        .name("remote-embed-bridge-caller".to_string())
+        .spawn(move || remote_runtime()?.block_on(fut))
         .map_err(|e| {
             RemoteBridgeError::Permanent(format!("failed to spawn remote-embed bridge thread: {e}"))
         })?
@@ -1289,6 +1321,53 @@ pub(crate) fn block_on_remote<T: Send + 'static>(
         .map_err(|_| {
             RemoteBridgeError::Permanent("remote-embed bridge thread panicked".to_string())
         })?
+}
+
+#[cfg(all(test, feature = "remote-embeddings"))]
+mod bridge_test {
+    use super::*;
+
+    /// The bridge must work from INSIDE a runtime.
+    ///
+    /// `src/bin/leindex.rs` runs `rt.block_on(cli::main())`, so the setup wizard
+    /// and the indexer both call this from within the outer runtime's context.
+    /// A bridge that ran `Runtime::block_on` on the caller's thread would panic
+    /// with "Cannot start a runtime from within a runtime" here — which is
+    /// exactly the regression this test exists to catch.
+    #[test]
+    fn test_block_on_remote_is_callable_from_inside_a_runtime() {
+        let outer = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("outer runtime");
+        let value = outer.block_on(async {
+            // Called on the runtime's thread, in async context: the shape the
+            // CLI actually uses.
+            block_on_remote(async { Ok::<u32, RemoteBridgeError>(7) })
+                .expect("bridge must not panic")
+        });
+        assert_eq!(value, 7);
+    }
+
+    /// A panicking future must surface as an error, not unwind the caller.
+    ///
+    /// The bridge runs the future on its own thread, and `join()` converts that
+    /// thread's panic into an `Err`. Losing the join would turn a provider bug
+    /// into a process abort mid-index.
+    #[test]
+    fn test_block_on_remote_contains_a_panicking_future() {
+        let error = block_on_remote(async {
+            panic!("provider blew up");
+            #[allow(unreachable_code)]
+            Ok::<u32, RemoteBridgeError>(0)
+        })
+        .expect_err("a panicking future must become an error");
+        assert!(
+            matches!(error, RemoteBridgeError::Permanent(_)),
+            "a panic is not a transient condition; got a transient classification"
+        );
+    }
 }
 
 /// Resolved provider cache identity for one remote batch.

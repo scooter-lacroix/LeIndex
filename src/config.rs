@@ -1,16 +1,12 @@
-// User-level neural search configuration schema for ~/.leindex/config/leindex.toml
-//
-// Canonical TOML schema for the user-level neural search configuration written
-// by the `leindex setup` command. Shared by the CLI and the ONNX worker.
-//
-// VAL-SETUP-023: Config written with correct schema
-// VAL-SETUP-024: Idempotent re-runs
-// VAL-SETUP-029: Corrupted config recovered gracefully
-// VAL-SETUP-030: Stale config migrated/overwritten
-// VAL-SETUP-032: LEINDEX_HOME override honored
+//! User-level neural search configuration schema for `~/.leindex/config/config.yaml`.
+//!
+//! The YAML document is the v2 source of truth. The typed Rust fields below are
+//! the runtime-owned subset; unknown v2 sections are preserved during migration
+//! and every subsequent save.
 
 use cache::{probe_due, refresh_cached_config};
 use serde::{Deserialize, Serialize};
+use serde_yaml::Value as YamlValue;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -386,6 +382,40 @@ pub struct EmbeddingConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_query_template: Option<String>,
 
+    /// Hard cap on inputs per request for the remote endpoint. Unset = the
+    /// provider preset's documented limit (see [`RemotePreset::batch_limit`]),
+    /// else no cap.
+    ///
+    /// Exists because the caller's batch size is tuned for throughput on a
+    /// LOCAL server and knows nothing about a remote provider's protocol
+    /// limits. Left unset with a known preset, the preset wins; set it
+    /// explicitly to override a preset you know better than, or to bound a
+    /// `custom` endpoint that has no preset to consult.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_batch_limit: Option<usize>,
+
+    /// Largest token count ONE input may occupy. Unset = the provider preset's
+    /// documented window, else no limit.
+    ///
+    /// A count cap (`remote_batch_limit`) cannot express this: one enormous
+    /// document can exceed a model's window on its own. Set it for a `custom`
+    /// endpoint whose model window is known, so oversized documents are
+    /// truncated deliberately instead of costing a rejected round trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_max_input_tokens: Option<usize>,
+
+    /// Largest token count ONE REQUEST may carry in total. Unset = the
+    /// provider preset's documented budget, else no limit.
+    ///
+    /// This is the limit that row counts miss entirely, and its absence was a
+    /// real outage: a hosted EmbeddingGemma route rejected every 32-document
+    /// batch with `The prompt is too long ... Shorten it and retry` because
+    /// ~7k tokens of input overflowed a 2,048-token request window, even though
+    /// 32 was comfortably under the count cap. Without it the client can only
+    /// learn the ceiling by having requests rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_request_token_budget: Option<usize>,
+
     /// Local ONNX model path override (reserved; the local model is normally
     /// resolved from `[neural] model_dir`/`model_name`).
     #[serde(default)]
@@ -405,6 +435,19 @@ pub const EMBEDDINGGEMMA2_DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8080/v1";
 
 /// `embeddinggemma-2` preset: model name sent in the embeddings payload.
 pub const EMBEDDINGGEMMA2_MODEL: &str = "embeddinggemma-2";
+
+/// EmbeddingGemma family token window.
+///
+/// 2,048 is the documented sequence length for the whole EmbeddingGemma
+/// family, and the hosted OpenAI-compatible proxies enforce it as a REQUEST
+/// total as well as a per-input limit: a 32-document batch of ~882 B documents
+/// (~7k tokens) is rejected wholesale with `The prompt is too long for
+/// embeddinggemma-300m on the routes that remain. Shorten it and retry`.
+///
+/// This is NOT the same quantity as `batch_limit`. `batch_limit` counts
+/// DOCUMENTS; this counts TOKENS. A route can be far under the document cap and
+/// still be rejected here, so request width has to be packed against this.
+pub const EMBEDDINGGEMMA_REQUEST_TOKEN_BUDGET: usize = 2048;
 
 /// `embeddinggemma-2` preset: native (untruncated) embedding dimension.
 pub const EMBEDDINGGEMMA2_DIMENSION: usize = 768;
@@ -429,6 +472,24 @@ pub const EMBEDDINGGEMMA2_DOC_TEMPLATE: &str = "title: {title} | text: {text}";
 /// card CodeRetrieval row): `task: code retrieval | query: {query}`.
 pub const EMBEDDINGGEMMA2_QUERY_TEMPLATE: &str = "task: code retrieval | query: {text}";
 
+/// Whether a model identifier names an EmbeddingGemma2 model.
+///
+/// Hosts spell it `text-embedding-embeddinggemma-2`, `embeddinggemma-2`,
+/// `embeddinggemma2`, or a quantized file stem (`embeddinggemma-2-Q8_0`), so
+/// compare on the normalized substring instead of enumerating spellings. Used by
+/// [`EmbeddingConfig::embeddinggemma2_preset_active`] to recognize a `custom`
+/// provider that serves this model, where the provider name carries no
+/// information and `remote_model` is the only identification available.
+fn is_embeddinggemma2_model_name(model: &str) -> bool {
+    let normalized: String = model
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    normalized.contains("embeddinggemma")
+}
+
 // Remote provider presets (`RemoteWire`, `RemotePreset`, `REMOTE_PRESETS`) live
 // in `config::remote_presets`; re-exported so `crate::config::REMOTE_PRESETS`
 // and friends keep their paths.
@@ -452,6 +513,24 @@ pub struct ResolvedRemote {
     /// preset, never from the endpoint string: an operator who explicitly
     /// points `gemini` at a proxy still wants the native Gemini request shape.
     pub wire: RemoteWire,
+    /// Hard cap on inputs per request, or `None` when neither the config nor
+    /// the preset knows one. Consumed by the index builder to size remote
+    /// batches, and enforced again inside the provider.
+    pub batch_limit: Option<usize>,
+    /// Asymmetric-retrieval field values (`input_type`) for the document and
+    /// query sides, from the preset. `None` means the provider does not take
+    /// one and the field is omitted from the request entirely.
+    pub input_type_document: Option<String>,
+    /// Query-side `input_type` (e.g. Cohere's `search_query`, Voyage's `query`),
+    /// from the preset; `None` omits the field from query requests.
+    pub input_type_query: Option<String>,
+    /// Token ceiling for ONE input, or `None` when neither the config nor the
+    /// preset knows one. Used to truncate a document before sending rather than
+    /// discovering the limit from a rejection.
+    pub max_input_tokens: Option<usize>,
+    /// Token ceiling for ONE REQUEST (all inputs summed), or `None` when
+    /// unknown. Used to pack request width; a row-count cap cannot express it.
+    pub request_token_budget: Option<usize>,
 }
 
 impl EmbeddingConfig {
@@ -516,11 +595,35 @@ impl EmbeddingConfig {
 
     /// Whether the `embeddinggemma-2` preset is selected (spelling variants
     /// accepted; case-insensitive).
+    ///
+    /// The provider name is not the only way to select it. A `custom` provider
+    /// pointed at a hosted OpenAI-compatible EmbeddingGemma2 endpoint must name
+    /// its model in `remote_model` (there is no preset to fill it), and that
+    /// spelling is just as authoritative: `remote_provider = "custom"` +
+    /// `remote_model = "embeddinggemma-2"` is how a third-party host running this
+    /// model is reached. Reading only the provider name left
+    /// `doc_template`/`query_template` as `None` on that route, so the corpus and
+    /// every query were embedded with NO task prefixes — the inputs the model
+    /// card says produce degraded vectors. It also made
+    /// [`Self::remote_preset_label`] report `"embeddinggemma-2"` while the
+    /// templates stayed `None`, i.e. the config disagreed with itself.
+    ///
+    /// Only an otherwise-unknown provider gets the model-name fallback: a
+    /// recognized preset (`openai`, `voyage`, ...) already defines the wire and
+    /// its own templating, so a contradictory `remote_model` there is an operator
+    /// error that must not silently switch templates underneath it.
     pub fn embeddinggemma2_preset_active(&self) -> bool {
-        matches!(
+        if matches!(
             self.remote_provider.trim().to_ascii_lowercase().as_str(),
-            "embeddinggemma-2" | "embeddinggemma2"
-        )
+            "embeddinggemma-2" | "embeddinggemma2" | "embeddinggemma-300m" | "embeddinggemma300m"
+        ) {
+            return true;
+        }
+        self.remote_preset().is_none()
+            && self
+                .remote_model
+                .as_deref()
+                .is_some_and(is_embeddinggemma2_model_name)
     }
 
     /// Resolve the remote ladder configuration: preset fills unset keys,
@@ -598,6 +701,37 @@ impl EmbeddingConfig {
             ),
             remote_dimension: self.remote_dimension.or(preset_dimension),
             wire: preset.map_or(RemoteWire::OpenAiCompat, |p| p.wire),
+            // Explicit config > preset. `custom`/unknown providers have no
+            // preset, so an unset override leaves the cap unknown rather than
+            // inventing one: a wrong cap that is too high fails whole batches,
+            // so the safer default is "no opinion" (the caller then relies on
+            // error-driven bisection, which is slow but correct).
+            batch_limit: self.remote_batch_limit.or(preset.map(|p| p.batch_limit)),
+            // Preset-only: these name the provider's own vocabulary
+            // (`search_document`, `retrieval.passage`, ...), so there is nothing
+            // for an operator to override with without inventing a mapping.
+            input_type_document: preset
+                .and_then(|p| p.input_type_document)
+                .map(str::to_string),
+            input_type_query: preset.and_then(|p| p.input_type_query).map(str::to_string),
+            // Token limits: explicit config > preset > gemma family default.
+            //
+            // `gemma` is folded in so a `custom` provider naming an
+            // EmbeddingGemma model gets the 2,048-token window even with no
+            // preset row. Without this a custom route had no limits at all, and
+            // request width was decided purely by document count — which is how
+            // a 32-document batch of ~7k tokens was sent to an endpoint that
+            // accepts 2,048 and rejected every time.
+            max_input_tokens: self.remote_max_input_tokens.or_else(|| {
+                preset
+                    .map(|p| p.max_input_tokens)
+                    .or(gemma.then_some(EMBEDDINGGEMMA_REQUEST_TOKEN_BUDGET))
+            }),
+            request_token_budget: self.remote_request_token_budget.or_else(|| {
+                preset
+                    .map(|p| p.request_token_budget)
+                    .or(gemma.then_some(EMBEDDINGGEMMA_REQUEST_TOKEN_BUDGET))
+            }),
         })
     }
 
@@ -622,6 +756,9 @@ impl Default for EmbeddingConfig {
             remote_dimension: None,
             remote_doc_template: None,
             remote_query_template: None,
+            remote_batch_limit: None,
+            remote_max_input_tokens: None,
+            remote_request_token_budget: None,
             onnx_model_path: None,
             matryoshka: MatryoshkaSetting::Off,
         }
@@ -641,6 +778,9 @@ fn default_legacy_embedding_config() -> EmbeddingConfig {
         remote_dimension: None,
         remote_doc_template: None,
         remote_query_template: None,
+        remote_batch_limit: None,
+        remote_max_input_tokens: None,
+        remote_request_token_budget: None,
         onnx_model_path: None,
     }
 }
@@ -686,6 +826,17 @@ pub struct McpConfig {
     /// think-time after the handshake is long enough to hide it.
     #[serde(default = "default_mcp_prewarm")]
     pub prewarm: String,
+
+    /// Index a project on first use from a tool call.
+    ///
+    /// Default `false`: a tool call is not consent to spend minutes of CPU and
+    /// disk, and a read (`git status`, `read_file`, text search) is not a
+    /// request to index. Tools that REQUIRE an index answer with their own
+    /// "not indexed" error and remediation; indexing is an explicit act.
+    ///
+    /// `LEINDEX_AUTO_INDEX=1` overrides this to `true`.
+    #[serde(default)]
+    pub auto_index: bool,
 }
 
 // ── Defaults ─────────────────────────────────────────────────────────────
@@ -913,6 +1064,7 @@ impl Default for McpConfig {
             idle_timeout_secs: default_mcp_idle_timeout_secs(),
             engine_max_idle_secs: default_mcp_engine_max_idle_secs(),
             prewarm: default_mcp_prewarm(),
+            auto_index: false,
         }
     }
 }
@@ -1061,8 +1213,29 @@ pub fn resolve_leindex_home() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".leindex"))
 }
 
-/// Get the path to the config file.
+/// Read the global per-file admission limit from canonical v2 YAML.
+///
+/// This is deliberately a best-effort fallback for projects without a local
+/// `.leindex/config.toml`; malformed or missing global config leaves the safe
+/// project default in place.
+pub fn global_max_file_size() -> Option<u64> {
+    let path = config_file_path()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let document: YamlValue = serde_yaml::from_str(&contents).ok()?;
+    document
+        .get("file_filtering")
+        .or_else(|| document.get("size_limits"))
+        .and_then(|section| section.get("max_file_size"))
+        .and_then(YamlValue::as_u64)
+}
+
+/// Get the canonical v2 YAML config path.
 pub fn config_file_path() -> Option<PathBuf> {
+    resolve_leindex_home().map(|h| h.join("config").join("config.yaml"))
+}
+
+/// Get the legacy Rust TOML config path used by pre-v2.1.1 installs.
+pub fn legacy_config_file_path() -> Option<PathBuf> {
     resolve_leindex_home().map(|h| h.join("config").join("leindex.toml"))
 }
 
@@ -1078,40 +1251,89 @@ mod cache;
 
 pub use cache::ConfigGuard;
 
-// ── Config I/O ──────────────────────────────────────────────────────────
+const V2_CONFIG_TEMPLATE: &str = include_str!("../config.yaml");
+
+fn merge_yaml(base: &mut YamlValue, overlay: YamlValue) {
+    match (base, overlay) {
+        (YamlValue::Mapping(base_map), YamlValue::Mapping(overlay_map)) => {
+            for (key, value) in overlay_map {
+                match base_map.get_mut(&key) {
+                    Some(existing) => merge_yaml(existing, value),
+                    None => {
+                        base_map.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+fn write_yaml_atomic(path: &Path, value: &YamlValue) -> Result<(), ConfigError> {
+    let parent = path.parent().ok_or(ConfigError::NoHomeDir)?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| ConfigError::Io(path.to_path_buf(), e.to_string()))?;
+    let yaml = serde_yaml::to_string(value).map_err(|e| ConfigError::Serialize(e.to_string()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| ConfigError::Io(path.to_path_buf(), e.to_string()))?;
+    temporary
+        .write_all(yaml.as_bytes())
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|e| ConfigError::Io(path.to_path_buf(), e.to_string()))?;
+    temporary
+        .persist(path)
+        .map_err(|e| ConfigError::Io(path.to_path_buf(), e.error.to_string()))?;
+    Ok(())
+}
+
+fn migrate_legacy_toml() -> Result<Option<PathBuf>, ConfigError> {
+    let yaml_path = config_file_path().ok_or(ConfigError::NoHomeDir)?;
+    let legacy_path = legacy_config_file_path().ok_or(ConfigError::NoHomeDir)?;
+    if yaml_path.exists() || !legacy_path.exists() {
+        return Ok(None);
+    }
+
+    let contents = std::fs::read_to_string(&legacy_path)
+        .map_err(|e| ConfigError::Io(legacy_path.clone(), e.to_string()))?;
+    let legacy: toml::Value = toml::from_str(&contents)
+        .map_err(|e| ConfigError::Parse(legacy_path.clone(), e.to_string()))?;
+    let mut document: YamlValue = serde_yaml::from_str(V2_CONFIG_TEMPLATE)
+        .map_err(|e| ConfigError::Parse(yaml_path.clone(), e.to_string()))?;
+    let legacy_yaml =
+        serde_yaml::to_value(legacy).map_err(|e| ConfigError::Serialize(e.to_string()))?;
+    merge_yaml(&mut document, legacy_yaml);
+    write_yaml_atomic(&yaml_path, &document)?;
+
+    let migrated_path = legacy_path.with_extension("toml.migrated");
+    std::fs::rename(&legacy_path, &migrated_path)
+        .map_err(|e| ConfigError::Io(legacy_path, e.to_string()))?;
+    Ok(Some(migrated_path))
+}
 
 impl LeIndexConfig {
-    /// Write config to TOML file.
-    ///
-    /// VAL-SETUP-023: Creates config directory if missing.
-    /// VAL-SETUP-024: Overwrites safely (idempotent).
+    /// Write the canonical v2 YAML document, preserving every section that the
+    /// typed Rust runtime does not own.
     pub fn save(&self) -> Result<PathBuf, ConfigError> {
         let config_path = config_file_path().ok_or(ConfigError::NoHomeDir)?;
-
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)
+        let mut document = if config_path.exists() {
+            let contents = std::fs::read_to_string(&config_path)
                 .map_err(|e| ConfigError::Io(config_path.clone(), e.to_string()))?;
-        }
-
-        let toml_str =
-            toml::to_string_pretty(self).map_err(|e| ConfigError::Serialize(e.to_string()))?;
-
-        let parent = config_path.parent().ok_or(ConfigError::NoHomeDir)?;
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|e| ConfigError::Io(config_path.clone(), e.to_string()))?;
-        temporary
-            .write_all(toml_str.as_bytes())
-            .and_then(|_| temporary.as_file().sync_all())
-            .map_err(|e| ConfigError::Io(config_path.clone(), e.to_string()))?;
-        temporary
-            .persist(&config_path)
-            .map_err(|e| ConfigError::Io(config_path.clone(), e.error.to_string()))?;
-
+            serde_yaml::from_str(&contents)
+                .map_err(|e| ConfigError::Parse(config_path.clone(), e.to_string()))?
+        } else {
+            serde_yaml::from_str(V2_CONFIG_TEMPLATE)
+                .map_err(|e| ConfigError::Parse(config_path.clone(), e.to_string()))?
+        };
+        let typed =
+            serde_yaml::to_value(self).map_err(|e| ConfigError::Serialize(e.to_string()))?;
+        merge_yaml(&mut document, typed);
+        write_yaml_atomic(&config_path, &document)?;
         Ok(config_path)
     }
 
-    /// Read config from TOML file. Returns Default if not present.
+    /// Read the canonical v2 YAML config, migrating a legacy TOML install first.
     pub fn load() -> Result<Self, ConfigError> {
+        migrate_legacy_toml()?;
         Self::load_from_path(&config_file_path().ok_or(ConfigError::NoHomeDir)?)
     }
 
@@ -1222,7 +1444,14 @@ impl LeIndexConfig {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Io(path.to_path_buf(), e.to_string()))?;
 
-        Self::parse_toml(&contents).map_err(|e| ConfigError::Parse(path.to_path_buf(), e))
+        if path.extension().and_then(|extension| extension.to_str()) == Some("yaml")
+            || path.extension().and_then(|extension| extension.to_str()) == Some("yml")
+        {
+            serde_yaml::from_str(&contents)
+                .map_err(|e| ConfigError::Parse(path.to_path_buf(), e.to_string()))
+        } else {
+            Self::parse_toml(&contents).map_err(|e| ConfigError::Parse(path.to_path_buf(), e))
+        }
     }
 
     fn parse_toml(toml_str: &str) -> Result<Self, String> {
@@ -1233,54 +1462,61 @@ impl LeIndexConfig {
     ///
     /// VAL-SETUP-029: Backs up corrupt config and returns defaults.
     pub fn load_or_recover() -> Result<(Self, RecoveryAction), ConfigError> {
-        let config_path = match config_file_path() {
-            Some(p) => p,
-            None => return Ok((Self::default(), RecoveryAction::CreatedDefault)),
-        };
-
+        match migrate_legacy_toml() {
+            Ok(Some(migrated)) => {
+                let path = config_file_path().ok_or(ConfigError::NoHomeDir)?;
+                let config = Self::load_from_path(&path)?;
+                return Ok((config, RecoveryAction::MigratedFromLegacy(migrated)));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if !matches!(error, ConfigError::Parse(_, _)) {
+                    return Err(error);
+                }
+                let legacy_path = legacy_config_file_path().ok_or(ConfigError::NoHomeDir)?;
+                if legacy_path.exists() {
+                    let backup_path = legacy_path.with_extension("toml.bak");
+                    std::fs::rename(&legacy_path, &backup_path).map_err(|rename_error| {
+                        ConfigError::Io(
+                            legacy_path.clone(),
+                            format!(
+                                "config corrupted ({error}); backup rename failed: {rename_error}"
+                            ),
+                        )
+                    })?;
+                    return Ok((
+                        Self {
+                            neural: default_legacy_neural_config(),
+                            indexing: default_legacy_indexing_config(),
+                            ..Self::default()
+                        },
+                        RecoveryAction::RecoveredFromCorrupt(backup_path),
+                    ));
+                }
+                return Err(error);
+            }
+        }
+        let config_path = config_file_path().ok_or(ConfigError::NoHomeDir)?;
         if !config_path.exists() {
             return Ok((Self::default(), RecoveryAction::CreatedDefault));
         }
-
-        let contents = match std::fs::read_to_string(&config_path) {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(ConfigError::Io(
-                    config_path,
-                    format!("Cannot read config file: {}", e),
-                ));
-            }
-        };
-
-        match Self::parse_toml(&contents) {
+        match Self::load_from_path(&config_path) {
             Ok(config) => Ok((config, RecoveryAction::Loaded)),
             Err(parse_err) => {
-                let backup_path = config_path.with_extension("toml.bak");
-                // Propagate a backup-rename failure instead of discarding it: the
-                // old `let _ =` would report RecoveredFromCorrupt while the corrupt
-                // original is still in place (no backup was actually written), so a
-                // later setup could overwrite the corrupt file without preserving it.
-                // (Codex P2 review.)
-                if let Err(e) = std::fs::rename(&config_path, &backup_path) {
-                    return Err(ConfigError::Io(
-                        config_path,
-                        format!(
-                            "config corrupted ({parse_err}); backup rename to {} failed: {e}",
-                            backup_path.display()
-                        ),
-                    ));
-                }
+                let backup_path = config_path.with_extension("yaml.bak");
+                std::fs::rename(&config_path, &backup_path).map_err(|e| {
+                    ConfigError::Io(
+                        config_path.clone(),
+                        format!("config corrupted ({parse_err}); backup rename failed: {e}"),
+                    )
+                })?;
                 tracing::warn!(
                     "Config corrupted: {}. Backed up to {}",
                     parse_err,
                     backup_path.display()
                 );
                 Ok((
-                    Self {
-                        neural: default_legacy_neural_config(),
-                        indexing: default_legacy_indexing_config(),
-                        ..Self::default()
-                    },
+                    Self::default(),
                     RecoveryAction::RecoveredFromCorrupt(backup_path),
                 ))
             }
@@ -1293,6 +1529,8 @@ impl LeIndexConfig {
 pub enum RecoveryAction {
     /// Config loaded successfully.
     Loaded,
+    /// Legacy TOML was migrated to the canonical YAML document.
+    MigratedFromLegacy(PathBuf),
     /// No config file existed.
     CreatedDefault,
     /// Config was corrupt; backed up. Contains backup path.
@@ -1560,6 +1798,7 @@ mod tests {
                 idle_timeout_secs: 3600,
                 engine_max_idle_secs: 1200,
                 prewarm: "graph".to_string(),
+                auto_index: false,
             },
             system_one: SystemOneConfig::default(),
             services: std::collections::BTreeMap::new(),
@@ -1629,6 +1868,39 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_toml_migrates_to_v2_yaml_without_dropping_sections() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let legacy_path = config_dir.join("leindex.toml");
+        std::fs::write(
+            &legacy_path,
+            "[neural]\nenabled = false\n\n[indexing.embeddings]\nremote_provider = \"custom\"\n",
+        )
+        .unwrap();
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
+
+        let (config, action) = LeIndexConfig::load_or_recover().unwrap();
+        assert!(!config.neural.enabled);
+        assert!(matches!(action, RecoveryAction::MigratedFromLegacy(_)));
+        let yaml_path = config_dir.join("config.yaml");
+        assert!(yaml_path.exists());
+        assert!(!legacy_path.exists());
+        assert!(legacy_path.with_extension("toml.migrated").exists());
+        let yaml = std::fs::read_to_string(&yaml_path).unwrap();
+        assert!(yaml.contains("dal_settings:"));
+        assert!(yaml.contains("vector_store:"));
+        assert!(yaml.contains("services:"));
+        assert!(yaml.contains("  laya:"));
+        assert!(yaml.contains("  gemma:"));
+        assert!(yaml.contains("remote_provider: custom"));
+
+        let (_, second_action) = LeIndexConfig::load_or_recover().unwrap();
+        assert!(matches!(second_action, RecoveryAction::Loaded));
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
+    }
+    #[test]
     fn test_config_load_returns_default_when_missing() {
         let _g = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var(LEINDEX_HOME_ENV, "/nonexistent/path/for/testing") };
@@ -1682,6 +1954,49 @@ mod tests {
         assert_eq!(laya.served_name().as_deref(), Some("laya-bf16"));
         let (_, aliased) = service("e", "127.0.0.1", 8080, None, Some("embeddinggemma-2"));
         assert_eq!(aliased.served_name().as_deref(), Some("embeddinggemma-2"));
+    }
+
+    /// A resolved route must carry the provider's per-request input ceiling, or
+    /// the index builder sends a throughput-tuned batch into an API that rejects
+    /// it: Gemini answers anything over 100 with
+    /// `BatchEmbedContentsRequest.requests: at most 100 requests can be in one
+    /// batch`, which 128-document batches hit on every request.
+    #[test]
+    fn test_resolved_remote_carries_the_preset_batch_limit() {
+        let services = std::collections::BTreeMap::new();
+        let gemini = EmbeddingConfig {
+            enable_hybrid: true,
+            remote_provider: "gemini".into(),
+            ..EmbeddingConfig::default()
+        };
+        assert_eq!(
+            gemini.resolved_remote_with(&services).unwrap().batch_limit,
+            Some(100),
+            "the gemini preset must cap a request at the API's documented maximum"
+        );
+        // An explicit override wins over the preset either way.
+        let lowered = EmbeddingConfig {
+            enable_hybrid: true,
+            remote_provider: "gemini".into(),
+            remote_batch_limit: Some(25),
+            ..EmbeddingConfig::default()
+        };
+        assert_eq!(
+            lowered.resolved_remote_with(&services).unwrap().batch_limit,
+            Some(25)
+        );
+        // A provider with no preset and no override resolves no cap rather than
+        // inventing one: an over-large guess fails whole batches.
+        let custom = EmbeddingConfig {
+            enable_hybrid: true,
+            remote_provider: "custom".into(),
+            remote_endpoint: Some("http://127.0.0.1:9/v1".into()),
+            ..EmbeddingConfig::default()
+        };
+        assert_eq!(
+            custom.resolved_remote_with(&services).unwrap().batch_limit,
+            None
+        );
     }
 
     #[test]
@@ -1756,6 +2071,80 @@ mod tests {
                 .as_deref(),
             Some("embeddinggemma-2-Q8_0")
         );
+    }
+
+    /// A `custom` provider that names an EmbeddingGemma2 model must get the
+    /// task templates. It has no preset row, so `remote_model` is the only
+    /// identification available; reading only `remote_provider` left both
+    /// templates `None` and embedded the whole corpus with no task prefix.
+    #[test]
+    fn test_custom_provider_serving_embeddinggemma2_gets_task_templates() {
+        let cfg = EmbeddingConfig {
+            enable_hybrid: true,
+            remote_provider: "custom".into(),
+            remote_endpoint: Some("https://api.example.com/v1".into()),
+            remote_model: Some("embeddinggemma-2".into()),
+            ..EmbeddingConfig::default()
+        };
+        let resolved = cfg.resolved_remote_with(&Default::default()).unwrap();
+        assert_eq!(
+            resolved.doc_template.as_deref(),
+            Some(EMBEDDINGGEMMA2_DOC_TEMPLATE)
+        );
+        assert_eq!(
+            resolved.query_template.as_deref(),
+            Some(EMBEDDINGGEMMA2_QUERY_TEMPLATE)
+        );
+        // The label and the templates now agree instead of contradicting.
+        assert_eq!(cfg.remote_preset_label(), "embeddinggemma-2");
+
+        // Host spellings: vendor prefix and a quantized file stem.
+        for model in [
+            "text-embedding-embeddinggemma-2",
+            "embeddinggemma2",
+            "embeddinggemma-2-Q8_0",
+        ] {
+            let spelled = EmbeddingConfig {
+                remote_model: Some(model.into()),
+                ..cfg.clone()
+            };
+            assert!(
+                spelled.embeddinggemma2_preset_active(),
+                "expected {model} to select the embeddinggemma-2 templates"
+            );
+        }
+    }
+
+    /// A recognized preset owns its own templating. A contradictory
+    /// `remote_model` on it must NOT silently swap in Gemma templates.
+    #[test]
+    fn test_known_preset_is_not_overridden_by_model_name() {
+        let cfg = EmbeddingConfig {
+            enable_hybrid: true,
+            remote_provider: "openai".into(),
+            remote_model: Some("embeddinggemma-2".into()),
+            ..EmbeddingConfig::default()
+        };
+        assert!(!cfg.embeddinggemma2_preset_active());
+        let resolved = cfg.resolved_remote_with(&Default::default()).unwrap();
+        assert!(resolved.doc_template.is_none());
+        assert!(resolved.query_template.is_none());
+    }
+
+    /// A `custom` provider serving some other model stays untemplated.
+    #[test]
+    fn test_custom_provider_with_unrelated_model_stays_untemplated() {
+        let cfg = EmbeddingConfig {
+            enable_hybrid: true,
+            remote_provider: "custom".into(),
+            remote_endpoint: Some("https://api.example.com/v1".into()),
+            remote_model: Some("some-other-embedder".into()),
+            ..EmbeddingConfig::default()
+        };
+        assert!(!cfg.embeddinggemma2_preset_active());
+        let resolved = cfg.resolved_remote_with(&Default::default()).unwrap();
+        assert!(resolved.doc_template.is_none());
+        assert!(resolved.query_template.is_none());
     }
 
     #[test]
@@ -1885,7 +2274,7 @@ mod tests {
         let home = tempfile::tempdir().expect("config home");
         let config_dir = home.path().join("config");
         std::fs::create_dir_all(&config_dir).expect("config dir");
-        let config_path = config_dir.join("leindex.toml");
+        let config_path = config_dir.join("config.yaml");
 
         // SAFETY: serialised by ENV_LOCK; no other test reads LEINDEX_HOME
         // concurrently while this guard is held.
@@ -1893,7 +2282,7 @@ mod tests {
 
         std::fs::write(
             &config_path,
-            "[indexing.embeddings]\nenable_hybrid = true\nremote_service = \"gemma\"\nremote_provider = \"embeddinggemma-2\"\n",
+            "indexing:\n  embeddings:\n    enable_hybrid: true\n    remote_service: gemma\n    remote_provider: embeddinggemma-2\n",
         )
         .expect("initial config");
 
@@ -1909,7 +2298,7 @@ mod tests {
         // sees the new file.
         std::fs::write(
             &config_path,
-            "[indexing.embeddings]\nenable_hybrid = true\nremote_service = \"other\"\nremote_provider = \"custom\"\n",
+            "indexing:\n  embeddings:\n    enable_hybrid: true\n    remote_service: other\n    remote_provider: custom\n",
         )
         .expect("edited config");
         sandbox.reopen_throttle();
@@ -1931,7 +2320,7 @@ mod tests {
         );
 
         // A malformed rewrite must NOT drop the process to defaults mid-session.
-        std::fs::write(&config_path, "this is not valid toml [[[").expect("broken config");
+        std::fs::write(&config_path, "not: [valid yaml").expect("broken config");
         sandbox.reopen_throttle();
         let third = LeIndexConfig::load_cached();
         assert_eq!(

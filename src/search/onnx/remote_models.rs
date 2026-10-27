@@ -190,9 +190,98 @@ impl RemoteEmbeddingConfig {
     }
 }
 
+/// Whether a served model identifier looks like an embedding model.
+///
+/// The listing API carries no modality field: an OpenAI-compatible server
+/// answers `{"id": "..."}` and nothing else, so the identifier is the only
+/// signal available. Matching is therefore a name heuristic, and it is
+/// deliberately generous in the SAFE direction — a family it wrongly accepts
+/// only adds an extra row to a picker, while a family it wrongly rejects hides
+/// a model the user is looking for.
+///
+/// The needles are families rather than a single `embed` check because several
+/// common embedding models never spell the word:
+/// `bge-m3`, `gte-base`, `nomic-embed-text`,
+/// `text-embedding-3-small`, `voyage-3`, `jina-embeddings-v3`, `e5-large`,
+/// `mxbai-embed-large`, `multilingual-e5`. A `false` from this function means
+/// "not obviously an embedding model", never "definitely not one", so callers
+/// must keep the unfiltered list reachable.
+///
+/// Rerankers are deliberately NOT a family here. They are not embedding models
+/// and do not answer `/embeddings` at all: they take a query/document pair and
+/// score relevance over a different endpoint. Accepting `rerank` would put
+/// `rerank-v3.5` in an embedding-first picker, the user would select it, the
+/// route would be configured, and the smoke test would fail — the exact
+/// broken-route outcome this filter exists to prevent. The "wrongly accepting
+/// only costs an extra row" argument does not hold for a model the route
+/// cannot use at all.
+pub(crate) fn looks_like_embedding_model(id: &str) -> bool {
+    let normalized = id.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    const FAMILIES: [&str; 10] = [
+        "embed",
+        "bge",
+        "gte",
+        "e5",
+        "nomic",
+        "voyage",
+        "jina",
+        "instructor",
+        "mxbai",
+        "text-similarity",
+    ];
+    FAMILIES.iter().any(|needle| normalized.contains(needle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The listing API reports no modality, so the picker's filter is a name
+    /// heuristic. These are the spellings real hosts serve: every embedding
+    /// family here must be accepted even when it never says "embed", and a
+    /// chat model must not be, or the picker offers routes that cannot work.
+    #[test]
+    fn test_looks_like_embedding_model_covers_families_that_omit_the_word() {
+        for id in [
+            "text-embedding-3-small",
+            "embeddinggemma-2",
+            "embeddinggemma-2-Q8_0",
+            "bge-m3",
+            "gte-large",
+            "nomic-embed-text",
+            "voyage-3-large",
+            "jina-embeddings-v3",
+            "e5-large-v2",
+            "multilingual-e5-base",
+            "mxbai-embed-large",
+            "BAAI/bge-small-en-v1.5",
+        ] {
+            assert!(
+                looks_like_embedding_model(id),
+                "{id} is an embedding model and must be offered"
+            );
+        }
+        for id in [
+            "gpt-4o",
+            "llama-3.3-70b-instruct",
+            "qwen2.5-coder-32b-instruct",
+            "whisper-1",
+            // A reranker answers /rerank, not /embeddings: offering it in an
+            // embedding-first picker configures a route that cannot work.
+            "rerank-v3.5",
+            "cohere-rerank-3",
+            "",
+            "   ",
+        ] {
+            assert!(
+                !looks_like_embedding_model(id),
+                "{id} is not an embedding model"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_models_page_accepts_both_wire_shapes() {

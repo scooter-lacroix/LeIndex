@@ -137,6 +137,9 @@ pub(crate) const SOURCE_FILE_EXTENSIONS: &[&str] = &[
     "jl", "d", "di", "glsl", "vert", "frag", "comp", "ejs", "erb", "liquid",
     // Docs tier: markdown/rest/asciidoc/plain-text heading sections
     "md", "markdown", "rst", "adoc", "asciidoc", "txt",
+    // Bounded binary metadata tier; these bypass tree-sitter.
+    "dll", "exe", "ocx", "sys", "pak", "wad", "uasset", "umap", "unity3d", "assets", "bundle",
+    "res", "scn", "rpak",
 ];
 
 // Directories to always skip during source collection
