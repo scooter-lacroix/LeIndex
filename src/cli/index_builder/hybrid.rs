@@ -513,7 +513,10 @@ impl GenerationNeuralEmbedder {
     fn select_local_fallback(&self) {
         // No remote rows exist in this generation: a coherent all-Qwen
         // generation is safe. Construction/worker failures retain TF-IDF.
-        let tfidf = self.selected.borrow().tfidf().clone();
+        let tfidf = {
+            let selected = self.selected.borrow();
+            selected.tfidf().clone()
+        };
         #[cfg(feature = "onnx")]
         let fallback = HybridEmbedder::hybrid_local(
             tfidf.clone(),

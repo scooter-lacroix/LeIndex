@@ -220,7 +220,9 @@ fn test_tools_list_is_the_five_routers_with_a_discoverable_guide() {
         .as_str()
         .unwrap_or_default();
     assert!(
-        text.contains("`leindex_explore` = `find`") && text.contains("git_diff"),
+        text.contains("`leindex_explore` = `find`")
+            && text.contains("leindex_git")
+            && text.contains("diff"),
         "{text}"
     );
 }

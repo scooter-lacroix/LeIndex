@@ -84,7 +84,7 @@ pub fn stop(run_dir: &Path) -> Result<bool> {
         (DaemonState::Running, Some(endpoint)) => {
             signal_term(endpoint.pid)?;
             if !wait_for_exit(endpoint.pid, std::time::Duration::from_secs(5)) {
-                bail!("leindexd did not exit within 5 seconds");
+                bail!("leindexd did not exit within 5 seconds; sidecars retained");
             }
             cleanup_sidecars(run_dir)?;
             Ok(true)

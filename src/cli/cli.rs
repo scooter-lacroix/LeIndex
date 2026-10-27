@@ -396,6 +396,7 @@ pub enum Commands {
     /// Use `status` to inspect endpoint liveness, `start` to launch it,
     /// `stop` to request graceful shutdown, or `restart` to do both. The
     /// daemon stores its endpoint sidecar under `$LEINDEX_HOME/run`.
+    #[cfg(unix)]
     Daemon {
         /// Lifecycle action (status when omitted): status, start, stop, restart
         #[command(subcommand)]

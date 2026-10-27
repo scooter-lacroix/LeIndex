@@ -529,11 +529,10 @@ impl McpServer {
         // request is an unbounded allocation. A configured 0 would mean
         // "reject everything", which is not a useful reading of the field, so
         // it is treated as "no configured limit".
-        let limit_bytes = self.config.max_request_size_mb.checked_mul(1024 * 1024);
+        let limit_bytes = self.config.max_request_size_mb.saturating_mul(1024 * 1024);
         match limit_bytes {
-            Some(0) => router,
-            Some(bytes) => router.layer(RequestBodyLimitLayer::new(bytes)),
-            None => router.layer(RequestBodyLimitLayer::new(usize::MAX)),
+            0 => router,
+            bytes => router.layer(RequestBodyLimitLayer::new(bytes)),
         }
     }
 }
