@@ -2,6 +2,20 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [2.1.5]
+
+### Added
+
+- Rebuilt `leindex setup` as inline-by-default, with explicit `--fs` fullscreen mode.
+- Added daemon lifecycle commands: `status`, `start`, `stop`, and `restart`.
+
+### Changed
+
+- Migrated canonical setup configuration to v2 YAML while preserving documented configuration families, including `services.*`.
+- Added atomic migration of legacy auto-generated TOML to `config.yaml`, retaining the source as `.toml.migrated`.
+- Kept local EmbeddingGemma2 llama-server exempt from external-embedding validation.
+- Updated package metadata and installers for the 2.1.5 release.
+
 ## [2.1.1]
 
 ### Review fixes: inventory budgets, embedding prompts, checkpoint honesty
