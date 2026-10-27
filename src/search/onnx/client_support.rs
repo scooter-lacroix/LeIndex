@@ -104,7 +104,7 @@ pub(super) fn readiness_abort_reason(
 /// `kill(pid, 0)` alone cannot see a single-threaded worker exit that the
 /// supervisor has not reaped yet, so `/proc` state is consulted instead, and a
 /// zombie counts as gone: it is dead, only its exit status is pending.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(super) fn recorded_daemon_is_gone(pid: libc::pid_t) -> bool {
     use std::os::raw::c_int;
 
@@ -126,6 +126,11 @@ pub(super) fn recorded_daemon_is_gone(pid: libc::pid_t) -> bool {
     // now means the same thing.
     let unreachable = unsafe { libc::kill(pid, 0 as c_int) != 0 };
     unreachable && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(super) fn recorded_daemon_is_gone(pid: libc::pid_t) -> bool {
+    pid <= 0 || unsafe { libc::kill(pid, 0) != 0 }
 }
 
 /// Locally stat-able ORT candidates, probed without spawning Python.

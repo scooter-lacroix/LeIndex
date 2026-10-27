@@ -705,12 +705,22 @@ fn load_table_at(path: &Path) -> Result<toml::Table> {
     }
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    toml::from_str(&contents).with_context(|| {
+    if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+        return toml::from_str(&contents).with_context(|| {
+            format!(
+                "failed to parse {}: fix or remove the file (config set never recovers silently)",
+                path.display()
+            )
+        });
+    }
+    let config: LeIndexConfig = serde_yaml::from_str(&contents).with_context(|| {
         format!(
-            "failed to parse {}: fix or remove the file (config set never recovers silently)",
+            "failed to parse {} as YAML: fix or remove the file (config set never recovers silently)",
             path.display()
         )
-    })
+    })?;
+    let rendered = toml::to_string(&config).context("failed to render the YAML config")?;
+    toml::from_str(&rendered).context("failed to build the editable config table")
 }
 
 fn ensure_table_path<'a>(
@@ -970,7 +980,11 @@ fn save_config_at(path: &Path, config: &LeIndexConfig) -> Result<PathBuf> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let rendered = toml::to_string_pretty(config).context("failed to serialize config")?;
+    let rendered = if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+        toml::to_string_pretty(config).context("failed to serialize config")?
+    } else {
+        serde_yaml::to_string(config).context("failed to serialize config")?
+    };
     let mut temp = tempfile::NamedTempFile::new_in(path.parent().unwrap_or_else(|| Path::new(".")))
         .with_context(|| format!("failed to create a temp file next to {}", path.display()))?;
     temp.write_all(rendered.as_bytes())

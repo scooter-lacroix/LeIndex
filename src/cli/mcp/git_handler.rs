@@ -335,7 +335,7 @@ const SHARED_KEYS: [&str; 2] = ["project_path", "max_latency_ms"];
 
 /// Keys hoisted to the top level of the router's advertised schema from a
 /// sub-tool's schema, and therefore seen by every git operation.
-const ROUTER_KEYS: [&str; 3] = ["allow_partial", "max_chars", "token_budget"];
+const ROUTER_KEYS: [&str; 4] = ["action", "allow_partial", "max_chars", "token_budget"];
 
 /// Keys this operation does not read but whose effect the caller can still
 /// observe somewhere else, so a warning — not an error — is right.
