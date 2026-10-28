@@ -253,7 +253,9 @@ mod setup_command {
     use super::*;
 
     /// VAL-CARGO-006: `leindex --help` lists `setup` and `leindex setup --help`
-    /// exits 0. We statically verify the Setup variant is declared in cli.rs.
+    /// exits 0. We statically verify the Setup variant is declared. The clap
+    /// derive surface lives in cli_commands.rs (extracted from cli.rs by the
+    /// large-file gate); the dispatch match arm remains in cli.rs.
     #[test]
     fn setup_command_declared_in_cli() {
         let cli_path = repo_root().join("src").join("cli").join("cli.rs");
@@ -261,16 +263,34 @@ mod setup_command {
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", cli_path.display()));
 
         assert!(
-            src.contains("Setup {") || src.contains("Setup{"),
-            "cli.rs must declare a Setup subcommand variant"
+            src.contains("Commands::Setup {"),
+            "cli.rs must dispatch a Setup subcommand"
         );
 
-        // VAL-CARGO-006 evidence: flags must include --neural, --cpu, --gpu, --no-neural, --check
+        // VAL-CARGO-006 evidence: flags must include --neural, --cpu, --gpu, --no-neural, --check.
+        // The declarations live in cli_commands.rs since the derive-surface extraction.
+        let commands_path = repo_root().join("src").join("cli").join("cli_commands.rs");
+        let commands_src = std::fs::read_to_string(&commands_path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", commands_path.display()));
+
+        assert!(
+            commands_src.contains("Setup {"),
+            "cli_commands.rs must declare a Setup subcommand variant"
+        );
+
+        // Restrict the flag check to the Setup variant's body (the variant
+        // begins at `Setup {` and ends at the next top-level variant or the
+        // closing of the enum, whichever comes first).
+        let setup_body = commands_src
+            .split("Setup {")
+            .nth(1)
+            .and_then(|rest| rest.split("    }").next())
+            .unwrap_or("");
         for flag in ["--neural", "--cpu", "--gpu", "--no-neural", "--check"] {
             let as_long = format!("long = \"{}\"", flag.trim_start_matches("--"));
             assert!(
-                src.contains(&as_long),
-                "cli.rs setup must declare flag '{}' (as '{}')",
+                setup_body.contains(&as_long),
+                "cli setup must declare flag '{}' (as '{}')",
                 flag,
                 as_long
             );

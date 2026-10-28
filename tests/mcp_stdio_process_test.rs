@@ -206,7 +206,16 @@ fn test_tools_list_is_the_five_routers_with_a_discoverable_guide() {
         ]
     );
     let bytes = listed["result"]["tools"].to_string().len();
-    assert!(bytes < 16_500, "tools/list is {bytes} bytes");
+    // Wire-bytes backstop, aligned with the unit-side ledger in
+    // `grouped.rs::test_grouped_listing_stays_small` (the RATIO guard there is
+    // the real bound; this absolute ceiling only catches runaway growth).
+    // Ledger: 14_000 -> 16_500 when the fifth router `leindex_git` landed;
+    // 16_500 -> 17_500 here because the PR-review remediation of the
+    // git/manage handler descriptions pushed the wire listing to exactly
+    // 16_500 bytes (in-crate grouped listing 15_742, ratio 0.52 — well under
+    // the 60% bound). The wire includes JSON-RPC framing, so it runs ~750
+    // bytes above the in-crate figure the unit ledger measures.
+    assert!(bytes <= 17_500, "tools/list is {bytes} bytes");
 
     let resources = server.call("resources/list", json!({}));
     assert!(
