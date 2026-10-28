@@ -4,12 +4,13 @@ use crate::storage::Storage;
 use axum::{
     Json, Router,
     extract::{Path, Query, State, ws::WebSocketUpgrade},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     response::IntoResponse,
 };
 use futures::stream::StreamExt;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
+use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
 use crate::server::config::ServerConfig;
@@ -875,7 +876,27 @@ pub async fn websocket_handler(
 }
 
 /// Create router with all API endpoints
-pub fn create_router() -> Router<AppState> {
+///
+/// `cors_origins` is a parameter, not a lookup: the allowlist lives on
+/// `ServerConfig`, and `create_router` has no `State` yet — `.layer()` runs
+/// before `.with_state()`, so reaching into route state here is not possible.
+/// Passing it in is what makes the field live. It had been declared, defaulted
+/// to the loopback dev origins, and never read: the `CorsLayer` was lost in the
+/// axum 0.6 -> 0.8 / tower-http 0.7 migration, leaving browser clients unable
+/// to call a server that still promised them an allowlist.
+///
+/// An origin that does not parse is skipped with a warning rather than failing
+/// the router: one bad entry must not take the whole API down, and the skip is
+/// loud in the log.
+pub fn create_router(cors_origins: &[String]) -> Router<AppState> {
+    let mut cors = CorsLayer::new();
+    for origin in cors_origins {
+        match origin.parse::<HeaderValue>() {
+            Ok(value) => cors = cors.allow_origin(value),
+            Err(error) => tracing::warn!(%origin, %error, "Skipping invalid CORS origin"),
+        }
+    }
+
     Router::new()
         .route("/api/health", axum::routing::get(health_check))
         .route(
@@ -895,6 +916,7 @@ pub fn create_router() -> Router<AppState> {
         .route("/api/search", axum::routing::get(search))
         .route("/ws", axum::routing::get(websocket_handler))
         .route("/ws/events", axum::routing::get(websocket_handler))
+        .layer(cors)
 }
 
 #[cfg(test)]

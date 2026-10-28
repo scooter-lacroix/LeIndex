@@ -10,8 +10,9 @@ use crate::cli::registry::{Hydration, ProjectRegistry};
 use anyhow::Context;
 use axum::{
     Router,
-    extract::Json,
-    http::{HeaderMap, HeaderValue, StatusCode},
+    extract::{Json, Request},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -30,6 +31,8 @@ use std::sync::{
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tower_http::cors::CorsLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{debug, error, info, warn};
 
 /// Global server state — multi-project registry.
@@ -133,6 +136,13 @@ pub const DEFAULT_MAX_HTTP_SESSIONS: usize = 1000;
 /// Environment variable that overrides `DEFAULT_MAX_HTTP_SESSIONS`.
 pub const MAX_SESSIONS_ENV: &str = "LEINDEX_MAX_SESSIONS";
 
+/// Environment variable listing comma-separated browser origins allowed to talk
+/// to the MCP HTTP server. Defaults to empty: with CORS enabled (the default),
+/// any request carrying an `Origin` header that is not listed here is rejected
+/// with `403 Forbidden` before it reaches a handler. Non-browser clients (which
+/// send no `Origin` header) are never affected by this policy.
+pub const CORS_ALLOWED_ORIGINS_ENV: &str = "LEINDEX_CORS_ALLOWED_ORIGINS";
+
 /// Resolved cap on concurrent HTTP sessions.
 pub fn max_http_sessions() -> usize {
     match std::env::var(MAX_SESSIONS_ENV) {
@@ -152,7 +162,12 @@ pub struct McpServerConfig {
     /// Address to bind the server to
     pub bind_address: SocketAddr,
 
-    /// Whether to enable CORS for all origins
+    /// Whether to enable the cross-origin origin guard on the HTTP transport.
+    ///
+    /// When enabled (the default), requests carrying an `Origin` header are
+    /// rejected unless the origin is allowlisted via
+    /// [`CORS_ALLOWED_ORIGINS_ENV`]. Non-browser clients, which send no
+    /// `Origin` header, are unaffected.
     pub enable_cors: bool,
 
     /// Maximum request size in megabytes
@@ -198,6 +213,37 @@ pub struct McpServer {
     /// The compact freshness badge remains on every response; only the
     /// verbose advisory is emitted once per session and generation.
     pub(crate) freshness_advisories: Arc<DashMap<(Arc<str>, std::path::PathBuf), u64>>,
+}
+
+/// Parse [`CORS_ALLOWED_ORIGINS_ENV`] into a list of exact origin strings.
+fn cors_allowed_origins_from_env() -> Vec<String> {
+    std::env::var(CORS_ALLOWED_ORIGINS_ENV)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Reject any request whose `Origin` header is not in the allowlist. This is a
+/// server-side defense, not just a missing CORS header: browsers enforce CORS
+/// by hiding responses, but the request still executes server-side, so an
+/// untrusted page could otherwise trigger expensive tool calls (e.g.
+/// `/mcp/index/stream`) even if it never read the response.
+async fn reject_untrusted_origins(allowed: Arc<[String]>, req: Request, next: Next) -> Response {
+    if let Some(origin) = req.headers().get(header::ORIGIN) {
+        let trusted = origin
+            .to_str()
+            .is_ok_and(|origin| allowed.iter().any(|allowed| allowed == origin));
+        if !trusted {
+            return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
+        }
+    }
+    next.run(req).await
 }
 
 impl McpServer {
@@ -444,7 +490,7 @@ impl McpServer {
         // (which would itself be a startup error worth surfacing
         // via the log).
         let bind_address = listener.local_addr().unwrap_or(self.config.bind_address);
-        let router = Self::router();
+        let router = self.router();
 
         // Spawn background task to clean up stale sessions periodically.
         // Uses 60-second interval and 5-minute idle threshold.
@@ -481,14 +527,85 @@ impl McpServer {
         Ok(())
     }
 
-    fn router() -> Router {
-        Router::new()
+    /// Build the HTTP router, applying the transport-level config.
+    ///
+    /// Both layers here exist because the config fields they read are real
+    /// contract, and reading them is the whole point: `enable_cors` and
+    /// `max_request_size_mb` were declared, defaulted (`true`, `10`), and then
+    /// never read by anything. CORS was dropped during the axum 0.6 -> 0.8 /
+    /// tower-http 0.7 migration and a TODO was left promising its return; that
+    /// promise is what this satisfies, and `tower-http` (already a dependency
+    /// of `mcp-server` and `server`) is what makes it possible.
+    ///
+    /// The `CorsLayer` sits OUTSIDE the JSON-RPC handler, so a preflight
+    /// `OPTIONS` is answered by the layer and never reaches the handler — an
+    /// unhandled preflight would surface as a spurious 405.
+    fn router(&self) -> Router {
+        self.router_with_allowed_origins(cors_allowed_origins_from_env())
+    }
+
+    /// Build the router, applying transport-level config and the origin policy
+    /// for the given allowlist (derived from [`CORS_ALLOWED_ORIGINS_ENV`] by
+    /// [`Self::router`]; parameterized so tests can exercise the policy without
+    /// touching process environment).
+    fn router_with_allowed_origins(&self, allowed_origins: Vec<String>) -> Router {
+        let router = Router::new()
             .route("/mcp", post(json_rpc_handler))
             .route("/mcp/tools/list", get(list_tools_handler))
             .route("/health", get(health_check_handler))
-            .route("/mcp/index/stream", post(index_stream_handler))
-        // Note: CORS layer removed due to axum 0.6 / tower-http compatibility issues
-        // Can be re-added when upgrading to axum 0.7 with matching tower-http version
+            .route("/mcp/index/stream", post(index_stream_handler));
+
+        // `enable_cors` is applied as an *origin guard*: requests carrying an
+        // `Origin` header are rejected unless the origin is explicitly
+        // allowlisted (via `CORS_ALLOWED_ORIGINS_ENV`). This is a server-side
+        // rejection, not merely a missing CORS header — browsers enforce CORS
+        // by hiding the response, but the request still executes server-side,
+        // so a permissive layer on the loopback bind would let any page in any
+        // tab trigger expensive tool calls (e.g. `/mcp/index/stream`). Binding
+        // to loopback is transport reachability, not an origin restriction.
+        // Non-browser local clients send no `Origin` header and are unaffected.
+        let router = if !self.config.enable_cors {
+            router
+        } else {
+            let allowed: Vec<HeaderValue> = allowed_origins
+                .iter()
+                .filter_map(|origin| HeaderValue::try_from(origin.as_str()).ok())
+                .collect();
+            let invalid = allowed_origins.len() - allowed.len();
+            if invalid > 0 {
+                warn!(
+                    invalid,
+                    "ignoring {invalid} invalid allowed origin(s) from {CORS_ALLOWED_ORIGINS_ENV}"
+                );
+            }
+            let router = if allowed.is_empty() {
+                warn!(
+                    bind = %self.config.bind_address,
+                    "MCP has CORS enabled but no allowed origins are configured \
+                     (set {CORS_ALLOWED_ORIGINS_ENV}); refusing every browser cross-origin request — \
+                     non-browser local clients (no Origin header) are unaffected"
+                );
+                router.layer(CorsLayer::new())
+            } else {
+                router.layer(CorsLayer::new().allow_origin(allowed))
+            };
+            let allowed: Arc<[String]> = Arc::from(allowed_origins);
+            router.layer(middleware::from_fn(move |req, next| {
+                let allowed = allowed.clone();
+                async move { reject_untrusted_origins(allowed, req, next).await }
+            }))
+        };
+
+        // Bound body size before the JSON-RPC handler allocates: these handlers
+        // collect the whole body into a `serde_json::Value`, so an unbounded
+        // request is an unbounded allocation. A configured 0 would mean
+        // "reject everything", which is not a useful reading of the field, so
+        // it is treated as "no configured limit".
+        let limit_bytes = self.config.max_request_size_mb.saturating_mul(1024 * 1024);
+        match limit_bytes {
+            0 => router,
+            bytes => router.layer(RequestBodyLimitLayer::new(bytes)),
+        }
     }
 }
 
@@ -1005,9 +1122,9 @@ async fn handle_tool_call_timed(
     // tool names, and this dispatch was previously the one place that
     // bypassed the shared normalizer (so legacy configs keep working).
     //
-    // The four public tools (`leindex_index|search|analyze|edit`) select their
-    // underlying handler with `action`; resolve that first so rendering and
-    // trimming below are keyed by the real tool.
+    // The five public routers (`leindex_explore|analyze|edit|manage|git`) select
+    // their underlying handler with `mode`/`action`; resolve that first so
+    // rendering and trimming below are keyed by the real tool.
     let (resolved_name, mut resolved_args) =
         match crate::cli::mcp::grouped::resolve_call(&tool_call.name, tool_call.arguments) {
             Ok(resolved) => resolved,
@@ -1225,10 +1342,11 @@ fn tool_error_result(
 
 /// List the public tool surface as JSON.
 ///
-/// Four grouped tools are advertised (`leindex_index`, `leindex_search`,
-/// `leindex_analyze`, `leindex_edit`), each selecting its operation with an
-/// `action` argument. The individual per-operation tools remain callable by
-/// name; set `LEINDEX_MCP_LEGACY_TOOLS=1` to advertise them too.
+/// Five grouped routers are advertised (`leindex_explore`, `leindex_analyze`,
+/// `leindex_edit`, `leindex_manage`, `leindex_git`), each selecting its
+/// operation with a `mode` or `action` argument. The individual per-operation
+/// tools remain callable by name; set `LEINDEX_MCP_LEGACY_TOOLS=1` to advertise
+/// them too.
 pub fn list_tools_json(handlers: &[ToolHandler]) -> Value {
     serde_json::json!({ "tools": crate::cli::mcp::grouped::public_tools_json(handlers) })
 }

@@ -1,7 +1,11 @@
 //! Hybrid embedding backend (unified TF-IDF + neural/remote).
 
 #[cfg(feature = "remote-embeddings")]
-use crate::search::onnx::remote::RemoteEmbeddingProvider;
+use crate::embed::cache::{Normalization, Pooling};
+#[cfg(feature = "remote-embeddings")]
+use crate::search::onnx::embed_cache_frontend::{CacheProbeOutcome, KeySpec};
+#[cfg(feature = "remote-embeddings")]
+use crate::search::onnx::remote::{RemoteEmbeddingProvider, is_retryable_embedding_error};
 #[cfg(feature = "remote-embeddings")]
 use crate::search::onnx::{GenericRemoteProvider, RemoteEmbeddingConfig, RemoteEmbeddingError};
 
@@ -56,6 +60,56 @@ pub(crate) struct GenerationNeuralEmbedder {
     remote_rows_landed: std::cell::Cell<bool>,
     #[cfg(feature = "remote-embeddings")]
     stopped: std::cell::Cell<bool>,
+    /// Whole-batch failures since the last successful batch. Reset by any
+    /// success, so it measures a sustained outage rather than lifetime noise.
+    #[cfg(feature = "remote-embeddings")]
+    consecutive_failures: std::cell::Cell<usize>,
+    /// Restarts already spent by this generation. Bounded by
+    /// [`MAX_GENERATION_RESTARTS`] so an unrevivable endpoint cannot be
+    /// restarted in a loop.
+    #[cfg(feature = "remote-embeddings")]
+    restarts_used: std::cell::Cell<usize>,
+}
+
+/// How many whole batches may fail IN A ROW before the generation gives up.
+///
+/// Each individual request has already spent the transport retry ladder
+/// (`RemoteEmbeddingConfig::max_retries`), so reaching this count means the
+/// endpoint is genuinely gone, not that one socket hiccuped. The old policy
+/// had this at 1: a single reset socket nine minutes into a run froze 70% of
+/// the corpus out of the neural layer and there was no way back.
+pub(crate) const MAX_CONSECUTIVE_REMOTE_FAILURES: usize = 5;
+
+/// Restarts allowed per generation.
+///
+/// A restart clears the failure budget, so without a separate cap a service
+/// that dies on every start would be restarted forever. One restart absorbs a
+/// single OOM or driver reset; exhausting a whole second budget after that is
+/// a real, unrecoverable outage.
+pub(crate) const MAX_GENERATION_RESTARTS: usize = 1;
+
+/// What to do with a remote batch that produced no usable rows.
+#[cfg(feature = "remote-embeddings")]
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteFailureOutcome {
+    /// Skip this batch only; the generation stays on the remote endpoint.
+    SkipBatch,
+    /// Rows already landed in the neural space, so falling back to a different
+    /// embedding space would mix incomparable vectors: freeze instead.
+    Freeze,
+    /// No remote row exists yet, so a coherent all-local generation is safe.
+    FallbackLocal,
+}
+
+#[cfg(feature = "remote-embeddings")]
+fn remote_failure_outcome(landed: bool, consecutive_failures: usize) -> RemoteFailureOutcome {
+    if consecutive_failures < MAX_CONSECUTIVE_REMOTE_FAILURES {
+        RemoteFailureOutcome::SkipBatch
+    } else if landed {
+        RemoteFailureOutcome::Freeze
+    } else {
+        RemoteFailureOutcome::FallbackLocal
+    }
 }
 
 impl GenerationNeuralEmbedder {
@@ -66,6 +120,10 @@ impl GenerationNeuralEmbedder {
             remote_rows_landed: std::cell::Cell::new(false),
             #[cfg(feature = "remote-embeddings")]
             stopped: std::cell::Cell::new(false),
+            #[cfg(feature = "remote-embeddings")]
+            consecutive_failures: std::cell::Cell::new(0),
+            #[cfg(feature = "remote-embeddings")]
+            restarts_used: std::cell::Cell::new(0),
         }
     }
 
@@ -133,6 +191,109 @@ impl GenerationNeuralEmbedder {
         self.selected.into_inner()
     }
 
+    /// Cache identity for the remote provider, or `None` until its output
+    /// dimension is measured. A cold provider reports the bootstrap dimension
+    /// while the server may serve another; keying on that writes rows into a
+    /// namespace no later run ever hits.
+    #[cfg(feature = "remote-embeddings")]
+    fn cache_brief(&self, remote: &GenericRemoteProvider) -> Option<CacheBrief> {
+        let dimension = remote.measured_dimension()?;
+        Some(CacheBrief {
+            spec: KeySpec::for_provider(
+                &remote.identity_with_dimension(dimension),
+                Pooling::Mean,
+                Normalization::L2,
+                dimension,
+            ),
+        })
+    }
+
+    /// Account for one remote batch that produced no usable rows, and return
+    /// the rows the caller must emit.
+    ///
+    /// A single failed batch is survivable: the caller gets `None` rows for
+    /// that batch only and the NEXT batch still goes to the remote endpoint, so
+    /// a transient outage costs a few documents instead of the rest of the
+    /// run. Any successful response clears the count.
+    ///
+    /// Once [`MAX_CONSECUTIVE_REMOTE_FAILURES`] batches fail in a row the
+    /// endpoint is treated as genuinely down, and the escalation prefers
+    /// HEALING over abandoning: a managed service (one LeIndex launched) is
+    /// restarted and its budget restored, so an OOM or a driver reset costs one
+    /// restart instead of the neural layer for every remaining document. Only
+    /// an endpoint that cannot be healed — a third-party API, or a managed one
+    /// whose restart failed — falls through to the freeze/fallback policy.
+    #[cfg(feature = "remote-embeddings")]
+    fn on_remote_batch_failed<S: AsRef<str>>(
+        &self,
+        texts: &[S],
+        reason: &'static str,
+    ) -> Vec<Option<Vec<f32>>> {
+        let failures = self.consecutive_failures.get() + 1;
+        self.consecutive_failures.set(failures);
+        if failures < MAX_CONSECUTIVE_REMOTE_FAILURES {
+            tracing::warn!(
+                reason,
+                failures,
+                budget = MAX_CONSECUTIVE_REMOTE_FAILURES,
+                documents = texts.len(),
+                "Remote batch produced no rows; skipping this batch and keeping the remote endpoint"
+            );
+            return vec![None; texts.len()];
+        }
+        // Budget spent: try to heal the endpoint before giving up on it.
+        if self.try_restart_endpoint() {
+            self.consecutive_failures.set(0);
+            tracing::warn!(
+                reason,
+                failures,
+                documents = texts.len(),
+                "Managed endpoint restarted; retrying this batch on the healed endpoint"
+            );
+            return self.embed_neural_batch_blocking(texts);
+        }
+        match remote_failure_outcome(self.remote_rows_landed.get(), failures) {
+            // Unreachable in practice: `remote_failure_outcome` only reports
+            // SkipBatch below the budget, which the early return handled.
+            RemoteFailureOutcome::SkipBatch => vec![None; texts.len()],
+            RemoteFailureOutcome::Freeze => {
+                self.stopped.set(true);
+                tracing::error!(
+                    reason,
+                    failures,
+                    "Remote failed repeatedly after accepted rows and could not be restarted; \
+                     neural generation frozen for remaining documents"
+                );
+                vec![None; texts.len()]
+            }
+            RemoteFailureOutcome::FallbackLocal => {
+                self.select_local_fallback();
+                self.selected.borrow().embed_neural_batch_blocking(texts)
+            }
+        }
+    }
+
+    /// Restart the managed endpoint, bounded by [`MAX_GENERATION_RESTARTS`].
+    ///
+    /// Distinct from the provider-level latch: the provider's flag prevents
+    /// restarting more than once per outage, while this bounds the total a
+    /// generation will spend, so a service that cannot stay up fails fast
+    /// instead of cycling stop/start for the rest of the run.
+    #[cfg(feature = "remote-embeddings")]
+    fn try_restart_endpoint(&self) -> bool {
+        if self.restarts_used.get() >= MAX_GENERATION_RESTARTS {
+            return false;
+        }
+        let revived = match &*self.selected.borrow() {
+            HybridEmbedder::HybridRemote { remote, .. } => remote.try_revive_endpoint(),
+            _ => false,
+        };
+        if revived {
+            self.restarts_used.set(self.restarts_used.get() + 1);
+        }
+        revived
+    }
+
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
     pub(crate) fn embed_neural_batch_blocking<S: AsRef<str>>(
         &self,
@@ -152,37 +313,77 @@ impl GenerationNeuralEmbedder {
                 _ => unreachable!(),
             };
             let owned: Vec<String> = texts.iter().map(|text| text.as_ref().to_string()).collect();
+            // Remote runs were the one embedding path with no cache: every
+            // reindex re-sent the whole corpus even though the store already
+            // held those vectors. Probe first and dispatch only misses.
+            let brief = self.cache_brief(&remote);
+            let probe = brief.and_then(|brief| {
+                crate::search::onnx::embed_cache_frontend::probe_provider(&brief.spec, &owned)
+            });
+            if let Some(outcome) = probe.as_ref() {
+                if outcome.miss_positions.is_empty() {
+                    tracing::debug!(
+                        hits = outcome.hits.len(),
+                        "Remote embed cache: every row hit; endpoint not contacted"
+                    );
+                    self.remote_rows_landed.set(true);
+                    return merge_cached_rows(texts.len(), Some(outcome), Vec::new());
+                }
+            }
+            let miss_texts: Vec<String> = match probe.as_ref() {
+                Some(outcome) => outcome
+                    .miss_positions
+                    .iter()
+                    .map(|&position| texts[position].as_ref().to_string())
+                    .collect(),
+                None => owned,
+            };
+            let expected_rows = miss_texts.len();
             match block_on_remote(async move {
+                let refs: Vec<&str> = miss_texts.iter().map(String::as_str).collect();
                 remote
-                    .embed_batch_optional(owned.iter().map(String::as_str).collect())
+                    .embed_batch_optional(refs)
                     .await
+                    .map_err(bridge_error)
             }) {
-                Ok(rows) if rows.len() == texts.len() => {
-                    if rows.iter().flatten().any(|row| !row.is_empty()) {
+                Ok(miss_rows) if miss_rows.len() == expected_rows => {
+                    if miss_rows.iter().flatten().any(|row| !row.is_empty()) {
                         // Any successful remote row pins this generation's space.
                         self.remote_rows_landed.set(true);
+                        // Progress was made, so the dead-endpoint streak is over.
+                        self.consecutive_failures.set(0);
                     }
-                    return rows;
+                    if let (Some(brief), Some(outcome)) = (&brief, probe.as_ref()) {
+                        // `computed` is positional with `outcome.miss_keys`, so a
+                        // skipped row has to keep its slot rather than be filtered
+                        // out here. `store_vectors` drops empty and wrong-dimension
+                        // vectors while preserving that alignment — which is what
+                        // stops a skipped or shrink-truncated row from ever being
+                        // cached under a full-length key.
+                        let computed: Vec<Vec<f32>> = miss_rows
+                            .iter()
+                            .map(|row| row.clone().unwrap_or_default())
+                            .collect();
+                        crate::search::onnx::embed_cache_frontend::store_provider_misses(
+                            &brief.spec,
+                            outcome,
+                            &computed,
+                        );
+                    }
+                    return merge_cached_rows(texts.len(), probe.as_ref(), miss_rows);
                 }
-                Ok(rows) => tracing::warn!(
-                    expected = texts.len(),
-                    got = rows.len(),
+                Ok(miss_rows) => tracing::warn!(
+                    expected = expected_rows,
+                    got = miss_rows.len(),
                     "Remote optional batch returned wrong row count"
                 ),
                 Err(error) => tracing::warn!(
                     %error,
-                    "Remote batch failed; applying generation fallback policy"
+                    transient = error.is_transient(),
+                    "Remote batch failed; applying the remote failure policy"
                 ),
             }
-            if self.remote_rows_landed.get() {
-                self.stopped.set(true);
-                tracing::warn!(
-                    "Remote failed after accepted rows; neural generation frozen to TF-IDF for remaining documents"
-                );
-                return vec![None; texts.len()];
-            }
-            self.select_local_fallback();
-            return self.selected.borrow().embed_neural_batch_blocking(texts);
+            return self.on_remote_batch_failed(texts, "remote_batch_no_rows");
         }
         self.selected.borrow().embed_neural_batch_blocking(texts)
     }
@@ -213,40 +414,97 @@ impl GenerationNeuralEmbedder {
                 _ => unreachable!(),
             };
             let owned: Vec<String> = texts.iter().map(|text| text.as_ref().to_string()).collect();
+            // Same cache path as the untitled variant, but keyed on the
+            // TEMPLATED input: the endpoint embeds `template(title, text)`, not
+            // `text`, so two nodes with identical snippets under different file
+            // paths must not share a row.
+            let brief = self.cache_brief(&remote);
+            let probe = brief.and_then(|brief| {
+                let inputs: Vec<String> = owned
+                    .iter()
+                    .zip(titles.iter())
+                    .map(|(text, title)| {
+                        crate::search::onnx::remote::apply_doc_template(
+                            remote.doc_template(),
+                            title.as_deref(),
+                            text,
+                        )
+                        .into_owned()
+                    })
+                    .collect();
+                crate::search::onnx::embed_cache_frontend::probe_provider_inputs(
+                    &brief.spec,
+                    &inputs,
+                )
+            });
+            if let Some(outcome) = probe.as_ref() {
+                if outcome.miss_positions.is_empty() {
+                    tracing::debug!(
+                        hits = outcome.hits.len(),
+                        "Remote titled embed cache: every row hit; endpoint not contacted"
+                    );
+                    self.remote_rows_landed.set(true);
+                    return merge_cached_rows(texts.len(), Some(outcome), Vec::new());
+                }
+            }
+            let miss_rows_request: Vec<(Option<String>, String)> = match probe.as_ref() {
+                Some(outcome) => outcome
+                    .miss_positions
+                    .iter()
+                    .map(|&position| (titles[position].clone(), owned[position].clone()))
+                    .collect(),
+                None => owned
+                    .iter()
+                    .zip(titles.iter())
+                    .map(|(text, title)| (title.clone(), text.clone()))
+                    .collect(),
+            };
+            let expected_rows = miss_rows_request.len();
+            let (miss_titles, miss_texts): (Vec<Option<String>>, Vec<String>) =
+                miss_rows_request.into_iter().unzip();
             match block_on_remote(async move {
+                let refs: Vec<&str> = miss_texts.iter().map(String::as_str).collect();
                 remote
-                    .embed_batch_optional_titled(
-                        owned.iter().map(String::as_str).collect(),
-                        titles.into_iter().peekable(),
-                    )
+                    .embed_batch_optional_titled(refs, miss_titles.into_iter().peekable())
                     .await
+                    .map_err(bridge_error)
             }) {
-                Ok(rows) if rows.len() == texts.len() => {
-                    if rows.iter().flatten().any(|row| !row.is_empty()) {
+                Ok(miss_rows) if miss_rows.len() == expected_rows => {
+                    if miss_rows.iter().flatten().any(|row| !row.is_empty()) {
                         // Any successful remote row pins this generation's space.
                         self.remote_rows_landed.set(true);
+                        // Progress was made, so the dead-endpoint streak is over.
+                        self.consecutive_failures.set(0);
                     }
-                    return rows;
+                    if let (Some(brief), Some(outcome)) = (&brief, probe.as_ref()) {
+                        // Same positional contract as the title-less path above:
+                        // keep every slot so `miss_keys` stays aligned and
+                        // `store_vectors` stays the single place that decides
+                        // what is cacheable.
+                        let computed: Vec<Vec<f32>> = miss_rows
+                            .iter()
+                            .map(|row| row.clone().unwrap_or_default())
+                            .collect();
+                        crate::search::onnx::embed_cache_frontend::store_provider_misses(
+                            &brief.spec,
+                            outcome,
+                            &computed,
+                        );
+                    }
+                    return merge_cached_rows(texts.len(), probe.as_ref(), miss_rows);
                 }
-                Ok(rows) => tracing::warn!(
-                    expected = texts.len(),
-                    got = rows.len(),
+                Ok(miss_rows) => tracing::warn!(
+                    expected = expected_rows,
+                    got = miss_rows.len(),
                     "Remote optional titled batch returned wrong row count"
                 ),
                 Err(error) => tracing::warn!(
                     %error,
-                    "Remote titled batch failed; applying generation fallback policy"
+                    transient = error.is_transient(),
+                    "Remote titled batch failed; applying the remote failure policy"
                 ),
             }
-            if self.remote_rows_landed.get() {
-                self.stopped.set(true);
-                tracing::warn!(
-                    "Remote failed after accepted rows; neural generation frozen to TF-IDF for remaining documents"
-                );
-                return vec![None; texts.len()];
-            }
-            self.select_local_fallback();
-            return self.selected.borrow().embed_neural_batch_blocking(texts);
+            return self.on_remote_batch_failed(texts, "remote_titled_batch_no_rows");
         }
         self.selected.borrow().embed_neural_batch_blocking(texts)
     }
@@ -255,7 +513,10 @@ impl GenerationNeuralEmbedder {
     fn select_local_fallback(&self) {
         // No remote rows exist in this generation: a coherent all-Qwen
         // generation is safe. Construction/worker failures retain TF-IDF.
-        let tfidf = self.selected.borrow().tfidf().clone();
+        let tfidf = {
+            let selected = self.selected.borrow();
+            selected.tfidf().clone()
+        };
         #[cfg(feature = "onnx")]
         let fallback = HybridEmbedder::hybrid_local(
             tfidf.clone(),
@@ -288,12 +549,35 @@ mod generation_tests {
                     provider: crate::search::onnx::RemoteProvider::Custom {
                         endpoint: "http://127.0.0.1:1/v1".into(),
                     },
+                    // Keep the test on the generation policy, not the transport
+                    // ladder: every attempt fails in milliseconds against a
+                    // closed port, and re-sending only spends wall clock.
+                    max_retries: 0,
                     ..RemoteEmbeddingConfig::default()
                 },
                 None,
             )
             .expect("remote construction"),
         );
+        // A pinned generation must never fall back to a different embedding
+        // space, and the freeze must survive one bad batch — it takes sustained
+        // failure to stop, which is the whole point of the budget.
+        for attempt in 1..MAX_CONSECUTIVE_REMOTE_FAILURES {
+            assert!(
+                generation
+                    .embed_neural_batch_blocking(&["document"])
+                    .iter()
+                    .all(Option::is_none)
+            );
+            assert!(
+                !generation.stopped.get(),
+                "failure {attempt} of {MAX_CONSECUTIVE_REMOTE_FAILURES} must not freeze"
+            );
+            assert!(matches!(
+                *generation.selected.borrow(),
+                HybridEmbedder::HybridRemote { .. }
+            ));
+        }
         assert!(
             generation
                 .embed_neural_batch_blocking(&["document"])
@@ -305,6 +589,53 @@ mod generation_tests {
             generation.into_embedder(),
             HybridEmbedder::HybridRemote { .. }
         ));
+    }
+
+    /// The failure budget only works if a success clears it. Without the reset,
+    /// failures scattered across a long index run accumulate into a freeze even
+    /// though the endpoint answered correctly in between.
+    #[test]
+    fn test_remote_success_resets_the_consecutive_failure_budget() {
+        let tfidf = TfIdfEmbedder::build(&[("a.rs".into(), "fn a() {}".into())]);
+        let generation = GenerationNeuralEmbedder::new(
+            HybridEmbedder::hybrid_remote(
+                tfidf,
+                RemoteEmbeddingConfig {
+                    provider: crate::search::onnx::RemoteProvider::Custom {
+                        endpoint: "http://127.0.0.1:1/v1".into(),
+                    },
+                    max_retries: 0,
+                    ..RemoteEmbeddingConfig::default()
+                },
+                None,
+            )
+            .expect("remote construction"),
+        );
+        // One short of the budget, then a success, then one short again: the
+        // generation must still be alive because the success reset the count.
+        for attempt in 1..MAX_CONSECUTIVE_REMOTE_FAILURES {
+            assert!(
+                generation
+                    .embed_neural_batch_blocking(&["document"])
+                    .iter()
+                    .all(Option::is_none)
+            );
+            assert_eq!(generation.consecutive_failures.get(), attempt);
+        }
+        generation.consecutive_failures.set(0); // stands in for a successful batch
+        for attempt in 1..MAX_CONSECUTIVE_REMOTE_FAILURES {
+            assert!(
+                generation
+                    .embed_neural_batch_blocking(&["document"])
+                    .iter()
+                    .all(Option::is_none)
+            );
+            assert_eq!(generation.consecutive_failures.get(), attempt);
+        }
+        assert!(
+            !generation.stopped.get(),
+            "scattered failures must not accumulate into a freeze"
+        );
     }
 
     #[test]
@@ -732,9 +1063,11 @@ impl HybridEmbedder {
                 // TF-IDF); they never hard-fail the search.
                 let remote = remote.clone();
                 let owned_text = text.to_string();
-                match block_on_remote(async move { remote.embed(&owned_text).await }) {
+                match block_on_remote(async move {
+                    remote.embed(&owned_text).await.map_err(bridge_error)
+                }) {
                     Ok(embedding) => Some(Ok(embedding)),
-                    Err(e) => Some(Err(e)),
+                    Err(e) => Some(Err(e.to_string())),
                 }
             }
         }
@@ -797,6 +1130,7 @@ impl HybridEmbedder {
                     remote
                         .embed_batch(owned.iter().map(|s| s.as_str()).collect())
                         .await
+                        .map_err(bridge_error)
                 }) {
                     Ok(embeddings) if embeddings.len() == texts.len() => {
                         embeddings.into_iter().map(Some).collect()
@@ -872,32 +1206,229 @@ impl Default for HybridEmbedder {
     }
 }
 
+/// Why a bridged remote call failed.
+///
+/// [`block_on_remote`] flattens errors to `String` for `Display`, which would
+/// destroy the one distinction worth carrying to the caller: a transient
+/// endpoint blip versus a permanent contract failure. The classification is
+/// therefore computed where the typed error still exists (inside the async
+/// block) and carried across the thread boundary, so every failure log can name
+/// which kind it was.
+///
+/// It is a DIAGNOSTIC, not a control input. The batch policy
+/// (`on_remote_batch_failed`) drives every whole-batch failure through one
+/// consecutive-failure budget plus endpoint healing, because a provider can
+/// report a permanent-looking status for a restart-fixable fault (llama-server
+/// answers an over-long input with HTTP 500). Escalating on the classification
+/// instead would freeze a generation over a single bad document.
+#[cfg(feature = "remote-embeddings")]
+#[derive(Debug)]
+pub(crate) enum RemoteBridgeError {
+    /// The request failed without saying anything about the embedding space
+    /// (dropped connection, gateway/availability status). Retryable.
+    Transient(RemoteEmbeddingError),
+    /// Contract or environment failure: the endpoint rejected the payload on
+    /// its merits, or the bridge itself could not run.
+    Permanent(String),
+}
+
+#[cfg(feature = "remote-embeddings")]
+impl RemoteBridgeError {
+    fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient(_))
+    }
+}
+
+#[cfg(feature = "remote-embeddings")]
+impl std::fmt::Display for RemoteBridgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient(error) => f.write_str(&error.to_string()),
+            Self::Permanent(message) => f.write_str(message),
+        }
+    }
+}
+
+/// Classify a provider error for the generation fallback policy.
+#[cfg(feature = "remote-embeddings")]
+fn bridge_error(error: RemoteEmbeddingError) -> RemoteBridgeError {
+    if is_retryable_embedding_error(&error) {
+        RemoteBridgeError::Transient(error)
+    } else {
+        RemoteBridgeError::Permanent(error.to_string())
+    }
+}
+
 /// Bridge a remote-embeddings future onto the synchronous pipeline.
 ///
-/// The CLI indexing/query paths never run inside a tokio runtime, so a
-/// scratch single-thread reactor is safe here (`block_on` panics only when
-/// called from within an async context, which cannot happen on these paths).
-/// One runtime per call keeps no global state and no background threads.
+/// The future is driven on a SPAWNED thread, never the caller's. That is not
+/// incidental: `src/bin/leindex.rs` runs `rt.block_on(cli::main())`, so every
+/// CLI subcommand — `leindex setup`, `leindex index`, and the daemon paths —
+/// executes inside the outer runtime's context. `Runtime::block_on` panics
+/// ("Cannot start a runtime from within a runtime") when called from inside a
+/// runtime, so calling it on the caller's thread would abort the setup wizard
+/// the moment model discovery ran. The spawn is what makes that impossible.
+///
+/// The runtime is PROCESS-WIDE, not scratch-per-call, and it lives on its own
+/// thread. A runtime owns everything reqwest parks on it — the connection pool
+/// included — so a fresh runtime per batch dropped the pool every time and the
+/// next batch paid a full TCP connect + TLS handshake for every in-flight
+/// request. That is pure overhead on top of the endpoint's own latency, and the
+/// larger the corpus the more of it was paid. One long-lived runtime keeps the
+/// keep-alive sockets owned by `pool_idle_timeout_for` alive across batches,
+/// which is the entire point of enabling that pool for remote endpoints.
+///
+/// Multi-threaded rather than `new_current_thread`, and the reason is NOT
+/// "overlapping requests": `join_all` over non-blocking reqwest futures already
+/// progresses every request concurrently on a single-threaded reactor, because
+/// the runtime's I/O driver wakes them as their sockets become ready. Worker
+/// threads only matter for work that BLOCKS or is `spawn`ed. Two are kept as
+/// headroom for exactly that: hyper performs its own connection setup work, and
+/// a reactor with no spare worker serialises that against polling. The measured
+/// 2.74x at K=4 came from overlapping round trips, which one thread would also
+/// deliver — so do not read this thread count as the source of that speedup.
+///
 /// The future must be `'static` + `Send` (ours hold only the `Arc`-based
-/// `GenericRemoteProvider`) and resolve to a `Result` whose error is
-/// `Display`; every failure mode collapses to `String`.
+/// `GenericRemoteProvider`) and resolve to a [`RemoteBridgeError`], whose
+/// transient/permanent split the generation fallback policy needs: flattening
+/// it to a `String` here is what made one dropped connection indistinguishable
+/// from a contract failure.
 #[cfg(feature = "remote-embeddings")]
-fn block_on_remote<T: Send + 'static, E>(
-    fut: impl std::future::Future<Output = Result<T, E>> + Send + 'static,
-) -> Result<T, String>
-where
-    E: std::fmt::Display,
-{
+fn remote_runtime() -> Result<&'static tokio::runtime::Runtime, RemoteBridgeError> {
+    static RUNTIME: std::sync::OnceLock<Result<tokio::runtime::Runtime, String>> =
+        std::sync::OnceLock::new();
+    match RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("remote-embed-bridge")
+            .build()
+            .map_err(|e| e.to_string())
+    }) {
+        Ok(runtime) => Ok(runtime),
+        Err(error) => Err(RemoteBridgeError::Permanent(error.clone())),
+    }
+}
+
+#[cfg(feature = "remote-embeddings")]
+pub(crate) fn block_on_remote<T: Send + 'static>(
+    fut: impl std::future::Future<Output = Result<T, RemoteBridgeError>> + Send + 'static,
+) -> Result<T, RemoteBridgeError> {
     std::thread::Builder::new()
-        .name("remote-embed-bridge".to_string())
-        .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())
-                .and_then(|rt| rt.block_on(fut).map_err(|e| e.to_string()))
-        })
-        .map_err(|e| format!("failed to spawn remote-embed bridge thread: {e}"))?
+        .name("remote-embed-bridge-caller".to_string())
+        .spawn(move || remote_runtime()?.block_on(fut))
+        .map_err(|e| {
+            RemoteBridgeError::Permanent(format!("failed to spawn remote-embed bridge thread: {e}"))
+        })?
         .join()
-        .map_err(|_| "remote-embed bridge thread panicked".to_string())?
+        .map_err(|_| {
+            RemoteBridgeError::Permanent("remote-embed bridge thread panicked".to_string())
+        })?
+}
+
+#[cfg(all(test, feature = "remote-embeddings"))]
+mod bridge_test {
+    use super::*;
+
+    /// The bridge must work from INSIDE a runtime.
+    ///
+    /// `src/bin/leindex.rs` runs `rt.block_on(cli::main())`, so the setup wizard
+    /// and the indexer both call this from within the outer runtime's context.
+    /// A bridge that ran `Runtime::block_on` on the caller's thread would panic
+    /// with "Cannot start a runtime from within a runtime" here — which is
+    /// exactly the regression this test exists to catch.
+    #[test]
+    fn test_block_on_remote_is_callable_from_inside_a_runtime() {
+        let outer = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("outer runtime");
+        let value = outer.block_on(async {
+            // Called on the runtime's thread, in async context: the shape the
+            // CLI actually uses.
+            block_on_remote(async { Ok::<u32, RemoteBridgeError>(7) })
+                .expect("bridge must not panic")
+        });
+        assert_eq!(value, 7);
+    }
+
+    /// A panicking future must surface as an error, not unwind the caller.
+    ///
+    /// The bridge runs the future on its own thread, and `join()` converts that
+    /// thread's panic into an `Err`. Losing the join would turn a provider bug
+    /// into a process abort mid-index.
+    #[test]
+    fn test_block_on_remote_contains_a_panicking_future() {
+        let error = block_on_remote(async {
+            panic!("provider blew up");
+            #[allow(unreachable_code)]
+            Ok::<u32, RemoteBridgeError>(0)
+        })
+        .expect_err("a panicking future must become an error");
+        assert!(
+            matches!(error, RemoteBridgeError::Permanent(_)),
+            "a panic is not a transient condition; got a transient classification"
+        );
+    }
+}
+
+/// Resolved provider cache identity for one remote batch.
+#[derive(Clone, Copy)]
+#[cfg(feature = "remote-embeddings")]
+struct CacheBrief {
+    spec: KeySpec,
+}
+
+/// Reassemble one batch in ORIGINAL order: cache hits at their positions,
+/// `miss_rows[i]` at `miss_positions[i]`. A skipped row (`None` or an empty
+/// vector) stays `None`; it is never turned into `Some(empty)`.
+#[cfg(feature = "remote-embeddings")]
+fn merge_cached_rows(
+    total: usize,
+    probe: Option<&CacheProbeOutcome>,
+    miss_rows: Vec<Option<Vec<f32>>>,
+) -> Vec<Option<Vec<f32>>> {
+    let Some(outcome) = probe else {
+        return miss_rows;
+    };
+    debug_assert_eq!(miss_rows.len(), outcome.miss_positions.len());
+    let mut merged: Vec<Option<Vec<f32>>> = vec![None; total];
+    for (&position, vector) in &outcome.hits {
+        merged[position] = Some(vector.clone());
+    }
+    for (&position, row) in outcome.miss_positions.iter().zip(miss_rows) {
+        merged[position] = row.filter(|vector| !vector.is_empty());
+    }
+    merged
+}
+
+#[cfg(all(test, feature = "remote-embeddings"))]
+mod merge_tests {
+    use super::*;
+
+    #[test]
+    fn merge_places_hits_and_misses_at_original_positions() {
+        // 0 hit, 1 skipped miss, 2 empty-vector miss, 3 hit, 4 real miss.
+        let outcome = CacheProbeOutcome {
+            hits: std::collections::HashMap::from([(0, vec![1.0]), (3, vec![3.0])]),
+            miss_positions: vec![1, 2, 4],
+            miss_keys: Vec::new(),
+        };
+        let merged = merge_cached_rows(
+            5,
+            Some(&outcome),
+            vec![None, Some(Vec::new()), Some(vec![4.0])],
+        );
+        assert_eq!(
+            merged,
+            vec![
+                Some(vec![1.0]),
+                None,
+                None,
+                Some(vec![3.0]),
+                Some(vec![4.0])
+            ]
+        );
+    }
 }

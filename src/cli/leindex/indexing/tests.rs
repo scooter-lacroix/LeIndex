@@ -100,8 +100,8 @@ fn test_missing_lexical_checkpoint_restores_empty_admission_set() {
 /// Serializes tests that index Rust projects while `LEINDEX_SCIP_RUST_BIN`
 /// may be set: env is process-global, so a concurrent full-index in another
 /// watcher test would otherwise discover (and invoke) another test's
-/// indexer fixture.
-static WATCHER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// indexer fixture. Shared across the whole test binary via [`EnvLock`].
+use crate::test_env::EnvLock as WATCHER_ENV_LOCK;
 
 #[test]
 fn test_watcher_delta_publishes_current_generation() {
@@ -1287,5 +1287,44 @@ fn test_neural_checkpoint_mismatch_discards_resident_rows() {
     assert!(
         index.search_engine.collect_neural_embeddings().is_empty(),
         "a later persist must not collect partial restored rows"
+    );
+}
+
+/// `ParseProgressHeartbeat::finish` must actually stop the sampler thread.
+///
+/// The sampler loops on `while !stop { sleep(INTERVAL) }`, so the join in
+/// `finish` can only return once that flag is set. This test would otherwise
+/// hang the suite rather than fail it, which is why it asserts on elapsed time
+/// from a separate thread instead of just calling `finish` inline: a broken
+/// stop signal must surface as a failed assertion, not a wedged run.
+#[test]
+fn test_parse_progress_heartbeat_stops_and_joins_its_sampler() {
+    let dir = tempfile::tempdir().expect("heartbeat fixture");
+    let storage = dir.path().to_path_buf();
+    let heartbeat = super::helpers::ParseProgressHeartbeat::start(
+        storage,
+        crate::cli::leindex::IndexPhase::Parse,
+        7,
+    );
+
+    // The callback reports a running count and must not block the caller.
+    let callback = heartbeat.callback();
+    callback(3);
+    callback(7);
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        heartbeat.finish();
+        let _ = sender.send(std::time::Instant::now());
+    });
+    let finished_at = receiver
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("finish must stop and join the sampler, not block on it");
+
+    // Joining proves the loop observed the stop flag; it does not prove the
+    // flag was set before the last sleep, so this only has to be finite.
+    assert!(
+        finished_at <= std::time::Instant::now(),
+        "sampler join must complete"
     );
 }

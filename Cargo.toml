@@ -1,8 +1,8 @@
 [package]
 name = "leindex"
-version = "2.1.1"
+version = "2.1.5"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["LeIndex Contributors"]
 description = "LeIndex MCP and semantic code search engine for AI tools and large codebases"
 documentation = "https://docs.rs/leindex"
@@ -52,6 +52,7 @@ include = [
     "/build.rs",
     "/Cargo.toml",
     "/Cargo.lock",
+    "/config.yaml",
     "/README.md",
     "/CHANGELOG.md",
     "/LICENSE",
@@ -69,7 +70,12 @@ include = [
 [features]
 default = ["full"]
 
-# Full feature set - everything included
+# Full feature set - everything included. This list must stay COMPLETE: every
+# feature defined in this table is a member, enforced by
+# tests/cargo_install_layout_test.rs. Omitting one is a silent, high-cost
+# defect: `system-one` and `onnx` were both missing here, so a default build
+# compiled the System-One gate out while `leindex setup --check` reported
+# `INACTIVE` with no `issue:` line naming the cause.
 full = [
     "parse",
     "graph",
@@ -77,6 +83,7 @@ full = [
     "search",
     "phase",
     "cli",
+    "mcp-server",
     "global",
     "server",
     "edit",
@@ -85,8 +92,14 @@ full = [
     "community",
     "precision",
     "daemon-client",
+    "system-one",
     "remote-embeddings",
+    "onnx",
+    "onnx-migraphx",
+    "turso",
+    "memprof",
     "structural-search",
+    "tui",
 ]
 
 # Minimal feature set (parsing and search only)
@@ -267,8 +280,17 @@ bounded-scheduler = [
     "global",
 ]
 
-# Turso/libsql remote storage support (opt-in, off by default)
-# Use with: cargo build --features "full turso"
+# Terminal UI (`leindex tui`). Member of `full` so a default install has it.
+#
+# Separate from `cli` only so a headless build can drop the ratatui tree; the
+# TUI calls the same `LeIndex` library entry points the CLI does, so it adds no
+# behaviour of its own.
+tui = ["cli", "dep:ratatui", "dep:crossterm"]
+
+# Turso/libsql remote storage support.
+#
+# This is a member of `full` (the default feature set): `cargo build --features
+# turso` still works, but a default build already has it.
 #
 # The `libsql` driver crate was removed as an (unused) dependency: no module
 # referenced its API — `src/storage/turso_config.rs` models Turso configuration
@@ -277,10 +299,17 @@ bounded-scheduler = [
 # patched line is h2 >= 0.4.16 (RUSTSEC-2026-0258), into every
 # `--all-features` dependency scan even though no code could reach it.
 # Re-add the driver together with the first real Turso connection implementation.
-turso = ["dep:rusqlite_migration"]
+#
+# `rusqlite_migration` was removed for the same reason: its only consumer would
+# have been `HybridStorage::migrate_to_remote`, which is still an unimplemented
+# stub. The feature therefore gates a module and no dependency — that is
+# deliberate, so the configuration surface keeps compiling while the bridge is
+# missing, and `migrate_to_remote` returns `Err(MigrationFailed)` instead of
+# silently reporting a zero-node success.
+turso = []
 
 # Neural embeddings with ONNX Runtime and tokenizers.
-# Opt-in feature: cargo build --features onnx (also installs the worker binary).
+# Member of `full`, so a default `cargo install leindex` has real inference.
 # Default model: Qwen3-Embedding-0.6B (~300MB); Reranker: Qwen3-Reranker-0.6B.
 #
 # The onnx feature compiles every runtime-selectable execution-provider API
@@ -288,8 +317,8 @@ turso = ["dep:rusqlite_migration"]
 # are ort-sys marker/API features — they do NOT link vendor SDKs at build time;
 # the worker dlopens libonnxruntime and selects an EP at runtime.
 #
-# VAL-CARGO-002/005: `cargo install leindex --features onnx` installs both the
-# main binary and the worker binary with real ONNX inference support.
+# VAL-CARGO-002/005: `cargo install leindex` installs the binary with real ONNX
+# inference support; `--features onnx` remains a no-op alias for older docs.
 onnx = ["search", "dep:ort", "ort/half", "ort/cuda", "ort/migraphx", "ort/rocm", "ort/coreml", "dep:tokenizers", "dep:ndarray", "dep:half", "dep:which", "dep:toml", "dep:dirs", "dep:tempfile"]
 
 # Legacy build-command alias; onnx now compiles every runtime-selectable EP.
@@ -301,16 +330,14 @@ onnx-migraphx = ["onnx"]
 # Requires the onnx interface for remote embedding providers.
 remote-embeddings = ["search", "onnx", "dep:reqwest", "dep:async-trait"]
 
-# Deep heap profiling support (opt-in, build-time gated).
+# Deep heap profiling support (build-time gated).
 #
 # Enables jemalloc heap profiling via the `jemalloc` allocator with profiling
-# enabled. Default builds and CI are unaffected when this feature is not
-# requested.
+# enabled. Member of `full`, so default builds and CI run on jemalloc;
+# profiling itself is triggered at RUN time via `MALLOC_CONF`.
 #
-# Use with: cargo build --features memprof
-# VAL-MEASURE-025: memprof is opt-in and build-time gated.
+# VAL-MEASURE-025: memprof is build-time gated.
 # VAL-MEASURE-026: Building with --features memprof succeeds.
-# VAL-MEASURE-027: memprof is excluded from CI gating.
 memprof = ["dep:tikv-jemallocator"]
 
 # Daemon-client: enables the stdio shim that serves `leindex mcp` through the
@@ -323,6 +350,7 @@ daemon-client = ["dep:which"]
 # Core dependencies (used by most modules)
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
@@ -397,7 +425,11 @@ tar = { version = "=0.4.45", optional = true, default-features = false }
 # Storage feature dependencies
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 # NOTE: `libsql` is intentionally absent — see the `turso` feature comment above.
-rusqlite_migration = { version = "1.0.0", optional = true }
+# `rusqlite_migration` is absent for the same reason: the feature edge existed
+# but no module referenced the crate, because the migration bridge it was added
+# for (`HybridStorage::migrate_to_remote`) is still an unimplemented stub that
+# now fails loudly instead of reporting a no-op success. Re-add the crate in the
+# same commit that implements the bridge.
 
 # Search feature dependencies
 regex = { version = "1.10", optional = true }
@@ -448,6 +480,21 @@ sysinfo = { version = "0.36.1", default-features = false, features = ["system"],
 diffy = { version = "0.5", optional = true }
 dialoguer = { version = "0.11", optional = true }
 
+# Terminal UI (`leindex tui`). Default features are kept: ratatui 0.30 defaults
+# to the Crossterm 0.29 backend, which is exactly the version pinned below.
+#
+# NOTE: ratatui 0.30 depends on `instability`, which requires Rust 1.88. That is
+# what raised this crate's rust-version floor from 1.85 to 1.88 — if the floor
+# ever needs to come back down, `tui` is the feature to drop, not ratatui to
+# patch.
+ratatui = { version = "0.30.2", optional = true }
+
+# The application owns terminal modes (raw mode, alternate screen) and event
+# reading, so crossterm is a direct dependency. The version MUST match what
+# ratatui's backend was compiled against: two semver-incompatible crossterm
+# majors keep separate event queues and cannot exchange types.
+crossterm = { version = "0.29", optional = true }
+
 # SHA256 verification for downloaded model files during `leindex setup`.
 # VAL-SETUP-017/018: checksum verification of ~/.leindex/models/* artifacts.
 sha2 = { version = "0.11", optional = true }
@@ -455,7 +502,7 @@ sha2 = { version = "0.11", optional = true }
 # Server feature dependencies (axum 0.7)
 axum = { version = "0.8", features = ["ws"], optional = true }
 tower = { version = "0.5", features = ["full"], optional = true }
-tower-http = { version = "0.7", features = ["cors", "trace"], optional = true }
+tower-http = { version = "0.7", features = ["cors", "trace", "limit"], optional = true }
 futures = { version = "0.3", optional = true }
 tokio-tungstenite = { version = "0.29", optional = true }
 

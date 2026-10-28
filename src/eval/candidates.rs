@@ -594,8 +594,9 @@ impl<B: RetrievalBackend> RetrievalBackend for SimulatedBackend<B> {
         };
 
         // Prepend distractors (these go above the relevant results)
-        for i in 0..num_prepend.min(num_insertions) {
-            degraded_symbols.insert(i, self.distractors[i].clone());
+        let prepend = num_prepend.min(num_insertions);
+        for (i, distractor) in self.distractors.iter().enumerate().take(prepend) {
+            degraded_symbols.insert(i, distractor.clone());
         }
 
         // Insert remaining distractors within the list
@@ -1003,6 +1004,89 @@ mod tests {
             results
                 .ranked_symbols
                 .contains(&"distractor_sym_a".to_string())
+        );
+    }
+
+    /// The distractor-insertion contract, pinned exactly.
+    ///
+    /// `SimulatedBackend::query` degrades a ranking by splicing distractors into
+    /// it. The insertion loop indexes with arithmetic-derived positions, so the
+    /// contract that has to hold is precise: insert exactly
+    /// `min(round(degradation * 10), distractors.len())` symbols, never panic on
+    /// an out-of-range position, and never disturb the relative order of the base
+    /// results — that ordering is what the MRR/recall gates measure, so silently
+    /// reshuffling it would fake precision changes that the model never caused.
+    ///
+    /// The sibling test above only asserts `len() > 2`, which would still pass if
+    /// the count drifted to 3 or 5. This one fails on any count drift.
+    #[test]
+    fn test_simulated_backend_distractor_insertion_contract() {
+        use crate::eval::harness::{MockBackend, RankedResults};
+        use std::time::Duration;
+
+        fn backend_with(quality: f64, symbols: &[&str]) -> SimulatedBackend<MockBackend> {
+            let mut mock = MockBackend::new();
+            mock.register(
+                "test",
+                RankedResults {
+                    ranked_symbols: symbols.iter().map(|s| s.to_string()).collect(),
+                    ranked_files: vec![],
+                    latency: Duration::from_micros(100),
+                },
+            );
+            SimulatedBackend::new(mock, quality)
+        }
+
+        let profile = FusedProfile::default();
+
+        // quality 0.8 => degradation 0.2 => round(2.0) = 2 insertions, capped by
+        // the 3 default distractors. Nothing is dropped at this degradation.
+        let degraded = backend_with(0.8, &["a", "b"])
+            .query("test", &profile)
+            .expect("query");
+        assert_eq!(
+            degraded.ranked_symbols.len(),
+            4,
+            "quality 0.8 must insert exactly 2 distractors into 2 base results"
+        );
+        let inserted: Vec<&String> = degraded
+            .ranked_symbols
+            .iter()
+            .filter(|s| s.starts_with("distractor_sym_"))
+            .collect();
+        assert_eq!(
+            inserted.len(),
+            2,
+            "exactly two distractors must be inserted"
+        );
+        // Base order is preserved: a still ranks above b.
+        let pos_a = degraded.ranked_symbols.iter().position(|s| s == "a");
+        let pos_b = degraded.ranked_symbols.iter().position(|s| s == "b");
+        assert!(
+            pos_a < pos_b,
+            "degradation must push base results down, never reorder them"
+        );
+
+        // Worst case exercises every position branch: quality 0.0 requests
+        // round(10.0) = 10 insertions against a 1-symbol ranking, so the count is
+        // capped at the distractor pool and the loop hits both the `insert` and
+        // `push` paths. It must not panic.
+        let worst = backend_with(0.0, &["only"])
+            .query("test", &profile)
+            .expect("query");
+        assert_eq!(
+            worst.ranked_symbols.len(),
+            4,
+            "insertion count is capped by the 3-item distractor pool, not by degradation"
+        );
+        assert!(
+            worst
+                .ranked_symbols
+                .iter()
+                .filter(|s| s.starts_with("distractor_sym_"))
+                .count()
+                <= 3,
+            "a distractor must never be inserted twice"
         );
     }
 

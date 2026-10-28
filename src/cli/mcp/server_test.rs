@@ -8,8 +8,10 @@ use super::*;
 /// `max_http_sessions()` (which reads the same variable), which
 /// is an active data race under POSIX. Holding this mutex for the
 /// entire test body guarantees only one test at a time touches
-/// the env.
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// the env. It is the process-wide [`EnvLock`] rather than a local
+/// mutex, so it also serializes against every other module's
+/// env-mutating tests.
+use crate::test_env::EnvLock as ENV_LOCK;
 
 #[test]
 fn test_server_config_default() {
@@ -688,5 +690,201 @@ async fn test_run_socket_refuses_to_steal_live_socket() {
     assert!(
         socket_path.exists(),
         "the live daemon's socket file must survive the refused bind"
+    );
+}
+
+// ---- CORS origin-guard policy (PR review: harden loopback HTTP CORS) ----
+
+/// Helper: build an `McpServer` for router-policy tests without touching the
+/// process-global `OnceLock`s (`McpServer::new` would collide with other
+/// tests in this binary).
+fn router_for_allowed_origins(allowed: Vec<String>) -> Router {
+    let server = McpServer {
+        config: McpServerConfig::default(),
+        _registry: Arc::new(ProjectRegistry::new(2)),
+        handshake_complete: Arc::new(AtomicBool::new(false)),
+        session_handshakes: Arc::new(DashMap::new()),
+        in_flight: Arc::new(DashMap::new()),
+        freshness_advisories: Arc::new(DashMap::new()),
+    };
+    server.router_with_allowed_origins(allowed)
+}
+
+async fn cors_request(router: Router, method: &str, uri: &str, origin: Option<&str>) -> StatusCode {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(origin) = origin {
+        builder = builder.header(header::ORIGIN, origin);
+    }
+    let response = router
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    response.status()
+}
+
+#[tokio::test]
+async fn test_cors_default_loopback_rejects_untrusted_browser_origin() {
+    let router = router_for_allowed_origins(vec![]);
+    // An arbitrary page's origin is refused before it can reach any handler.
+    assert_eq!(
+        cors_request(router, "GET", "/health", Some("https://evil.example")).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn test_cors_rejects_untrusted_origins_on_any_route() {
+    let router = router_for_allowed_origins(vec![]);
+    // The guard is outermost: it rejects before routing, even on routes that
+    // would otherwise execute expensive tool calls or 404.
+    assert_eq!(
+        cors_request(
+            router.clone(),
+            "POST",
+            "/mcp/index/stream",
+            Some("http://evil.example")
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        cors_request(router, "GET", "/no-such-route", Some("http://evil.example")).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn test_cors_rejects_null_and_non_utf8_origins() {
+    let router = router_for_allowed_origins(vec![]);
+    assert_eq!(
+        cors_request(router.clone(), "GET", "/health", Some("null")).await,
+        StatusCode::FORBIDDEN
+    );
+    // Non-UTF8 origin bytes cannot be compared against the allowlist.
+    let response = {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(
+                        header::ORIGIN,
+                        HeaderValue::from_bytes(b"http://\xFF").unwrap(),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    };
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_cors_allows_configured_origin_with_acao_header() {
+    let router = router_for_allowed_origins(vec!["http://trusted.local".to_string()]);
+    let response = {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::ORIGIN, "http://trusted.local")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("access-control-allow-origin"),
+        Some(&HeaderValue::from_static("http://trusted.local"))
+    );
+}
+
+#[tokio::test]
+async fn test_cors_non_loopback_bind_also_rejects_untrusted_origins() {
+    // Fail-closed across bind addresses, not just loopback.
+    let config = McpServerConfig {
+        bind_address: SocketAddr::from(([0, 0, 0, 0], DEFAULT_MCP_PORT)),
+        ..Default::default()
+    };
+    let server = McpServer {
+        config,
+        _registry: Arc::new(ProjectRegistry::new(2)),
+        handshake_complete: Arc::new(AtomicBool::new(false)),
+        session_handshakes: Arc::new(DashMap::new()),
+        in_flight: Arc::new(DashMap::new()),
+        freshness_advisories: Arc::new(DashMap::new()),
+    };
+    let router = server.router_with_allowed_origins(vec![]);
+    assert_eq!(
+        cors_request(router, "GET", "/health", Some("http://evil.example")).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn test_cors_passes_requests_without_origin_header() {
+    // Non-browser / local clients (curl, MCP SDKs, the Unix-socket shim) send
+    // no Origin header and must be unaffected by the policy.
+    let router = router_for_allowed_origins(vec![]);
+    assert_eq!(
+        cors_request(router, "GET", "/health", None).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn test_cors_preflight_from_disallowed_origin_is_rejected() {
+    let router = router_for_allowed_origins(vec![]);
+    let response = {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        router
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/mcp")
+                    .header(header::ORIGIN, "http://evil.example")
+                    .header("access-control-request-method", "POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    };
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_cors_disabled_skips_origin_guard() {
+    // Explicit opt-out keeps the old behavior: no origin guard, no CORS layer.
+    let config = McpServerConfig {
+        enable_cors: false,
+        ..Default::default()
+    };
+    let server = McpServer {
+        config,
+        _registry: Arc::new(ProjectRegistry::new(2)),
+        handshake_complete: Arc::new(AtomicBool::new(false)),
+        session_handshakes: Arc::new(DashMap::new()),
+        in_flight: Arc::new(DashMap::new()),
+        freshness_advisories: Arc::new(DashMap::new()),
+    };
+    let router = server.router_with_allowed_origins(vec![]);
+    assert_eq!(
+        cors_request(router, "GET", "/health", Some("http://evil.example")).await,
+        StatusCode::OK
     );
 }

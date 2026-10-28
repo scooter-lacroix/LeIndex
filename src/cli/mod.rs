@@ -121,6 +121,10 @@ pub mod textindex;
 #[cfg(feature = "mcp-server")]
 pub mod watcher;
 
+/// Terminal UI (`leindex tui`).
+#[cfg(feature = "tui")]
+pub mod tui;
+
 /// Model Context Protocol (MCP) server implementation.
 #[cfg(feature = "mcp-server")]
 pub mod mcp;

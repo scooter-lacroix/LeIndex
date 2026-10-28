@@ -18,6 +18,8 @@
 // VAL-SETUP-024: Idempotent re-runs
 // VAL-SETUP-034: Surfaces full configuration status
 
+#[cfg(feature = "tui")]
+use crate::config::LeIndexConfig;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -31,10 +33,21 @@ mod setup_models;
 mod setup_ort;
 #[path = "setup_routes.rs"]
 mod setup_routes;
+
+/// Model picker for the external-embeddings route (kept beside its siblings so
+/// `setup_routes.rs` stays closer to the module line budget).
+#[path = "setup_picker.rs"]
+mod setup_picker;
 #[path = "setup_status.rs"]
 mod setup_status;
 #[path = "setup_system_one.rs"]
 mod setup_system_one;
+/// Full-screen interactive setup. Gated on `tui` because ratatui is: `setup`
+/// itself needs only `cli`, and a headless build must still configure neural
+/// search. When the feature is off the dialoguer flow below is used instead.
+#[cfg(feature = "tui")]
+#[path = "setup_ui.rs"]
+mod setup_ui;
 pub use setup_check::run_check;
 use setup_models::*;
 pub(crate) use setup_ort::discover_ort_path;
@@ -375,7 +388,23 @@ pub fn resolve_from_flags(
 ///
 /// VAL-SETUP-002: Prompts neural? with Y default
 /// VAL-SETUP-003-008: Branching logic
-pub fn run_interactive_flow() -> Result<SetupChoices, SetupError> {
+pub fn run_interactive_flow(fullscreen: bool) -> Result<SetupChoices, SetupError> {
+    // Full-screen surface first. It presents every parameter in one place and
+    // validates inline; the prompt chain below is the fallback for builds
+    // without `tui` and is no longer the primary experience.
+    #[cfg(feature = "tui")]
+    {
+        // `load_or_recover` rather than `load`: a corrupt config must not be a
+        // dead end for the one command that repairs configuration. It backs the
+        // bad file up before returning defaults.
+        let existing = LeIndexConfig::load_or_recover()
+            .map(|(config, _action)| config)
+            .map_err(|error| SetupError::ConfigRead(error.to_string()))?;
+        if setup_ui::available() {
+            return setup_ui::run(&existing, fullscreen);
+        }
+    }
+
     use dialoguer::{Confirm, Select};
 
     // VAL-SETUP-002: "Do you want neural embeddings / enhanced semantic search?"
@@ -524,76 +553,10 @@ fn default_gpu_vendor_index(detected: DetectedGpu) -> usize {
     }
 }
 
-/// Check for AMD GPU presence (ROCm / MIGraphX).
-fn detect_amd_gpu() -> bool {
-    // ROCm root and MIGraphX shared libraries / tooling.
-    #[cfg(unix)]
-    {
-        let candidates = [
-            "/opt/rocm",
-            "/opt/rocm/lib/libmigraphx_c.so",
-            "/opt/rocm/lib/libamdhip64.so",
-            "/opt/rocm/bin/migraphx-driver",
-            "/opt/rocm/bin/rocm-smi",
-        ];
-        if candidates.iter().any(|p| std::path::Path::new(p).exists()) {
-            return true;
-        }
-    }
-    // Honor the ROCM_PATH env var the same way the worker does.
-    if let Ok(rocm_path) = std::env::var("ROCM_PATH") {
-        if std::path::Path::new(&rocm_path).exists() {
-            return true;
-        }
-    }
-    false
-}
-
-/// Check for NVIDIA GPU presence (CUDA toolkit / driver).
-fn detect_nvidia_gpu() -> bool {
-    #[cfg(unix)]
-    {
-        let candidates = [
-            "/usr/bin/nvidia-smi",
-            "/usr/local/cuda/bin/nvidia-smi",
-            "/usr/local/cuda",
-            "/usr/lib/x86_64-linux-gnu/libcuda.so",
-            "/usr/lib/x86_64-linux-gnu/libcudart.so",
-        ];
-        if candidates.iter().any(|p| std::path::Path::new(p).exists()) {
-            return true;
-        }
-    }
-    #[cfg(windows)]
-    {
-        let candidates = [
-            "C:\\Windows\\System32\\nvidia-smi.exe",
-            "C:\\Program Files\\NVIDIA Corporation",
-            "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA",
-        ];
-        if candidates.iter().any(|p| std::path::Path::new(p).exists()) {
-            return true;
-        }
-    }
-    if std::env::var("CUDA_PATH").is_ok() {
-        return true;
-    }
-    // Last resort: check if nvidia-smi is on PATH and runnable.
-    #[cfg(unix)]
-    if std::process::Command::new("nvidia-smi")
-        .arg("--query-gpu=name")
-        .arg("--format=csv,noheader")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    false
-}
+/// GPU-vendor filesystem probes (`detect_amd_gpu` / `detect_nvidia_gpu`).
+#[path = "setup_gpu_detect.rs"]
+mod setup_gpu_detect;
+pub(crate) use setup_gpu_detect::{detect_amd_gpu, detect_nvidia_gpu};
 
 /// Check if the streams the interactive wizard needs are terminals.
 ///
@@ -615,14 +578,19 @@ fn wire_gemma_preset(config: &mut crate::config::LeIndexConfig, gguf: &Path) {
     if missing_model {
         entry.model = Some(gguf.display().to_string());
         entry.alias = Some(crate::config::EMBEDDINGGEMMA2_MODEL.to_string());
-        entry.extra_args = vec![
-            "--embedding".into(),
-            "--pooling".into(),
-            "mean".into(),
-            // Use llama.cpp's portable GPU offload count; device names vary by build.
-            "-ngl".into(),
-            "99".into(),
-        ];
+        // Single source of truth for the launch contract (embedding mode,
+        // pooling, offload layers). This deliberately does NOT hand-build its
+        // own argument list: a second copy of these flags is a second thing
+        // that can drift, and a drifted `--pooling` silently produces
+        // semantically wrong vectors while the index still "works".
+        //
+        // `configure_args` only fails on a CPU-vs-GPU-layer conflict, which
+        // cannot arise here (both arguments are fixed). Surface it as a warning
+        // rather than widening this infallible signature for an unreachable
+        // branch — empty `extra_args` still starts a working server.
+        if let Err(error) = setup_routes::configure_args(&mut entry.extra_args, None, false) {
+            tracing::warn!(%error, "gemma preset launch arguments not applied");
+        }
         entry.auto_start = true;
         if entry.port == 0 {
             // 8080 = the preset's documented llama-server port; keep 8765 reserved.
@@ -811,6 +779,12 @@ fn print_recovery_notice(recovery: Option<RecoveryNotice>) {
         match action {
             RecoveryNotice::Migrated => {
                 println!("  -> Existing config migrated to current schema.");
+            }
+            RecoveryNotice::MigratedFromLegacy(legacy) => {
+                println!(
+                    "  -> Legacy TOML migrated to v2 YAML; preserved at {}.",
+                    legacy.display()
+                );
             }
             RecoveryNotice::RecoveredFromCorrupt(backup) => {
                 println!(
@@ -1167,7 +1141,7 @@ fn run_remote_smoke_test_inner(
     start_managed: bool,
 ) -> SmokeTestResult {
     use crate::cli::index_builder::{HybridEmbedder, TfIdfEmbedder};
-    use crate::search::onnx::{RemoteEmbeddingConfig, RemoteProvider};
+    use crate::search::onnx::RemoteEmbeddingConfig;
 
     const SMOKE_TEST_TEXT: &str = "hello world";
     let Some(resolved) = embeddings.resolved_remote_with(services) else {
@@ -1221,18 +1195,16 @@ fn run_remote_smoke_test_inner(
             };
         }
     };
+    // Smoke-test the route the user actually configured: resolving the provider
+    // here (instead of hardcoding the OpenAI-compatible variant) means setup
+    // cannot report a pass for a wire format the configured provider never
+    // speaks. A short 15s deadline and no re-sends keep setup from stalling on a
+    // dead endpoint; `max_retries: 0` so one clear failure is reported instead of
+    // a retry ladder.
     let remote_config = RemoteEmbeddingConfig {
-        provider: RemoteProvider::Custom {
-            endpoint: resolved.endpoint,
-        },
-        api_key,
         timeout_secs: 15,
         max_retries: 0,
-        model: resolved.model,
-        remote_dimension: resolved.remote_dimension,
-        doc_template: resolved.doc_template,
-        query_template: resolved.query_template,
-        ..RemoteEmbeddingConfig::default()
+        ..RemoteEmbeddingConfig::from_resolved(&resolved, api_key, None)
     };
     let embedder =
         match HybridEmbedder::hybrid_remote(TfIdfEmbedder::build(&[]), remote_config, None) {
@@ -1458,6 +1430,10 @@ fn merge_with_existing(
                         None
                     }
                 }
+                crate::config::RecoveryAction::MigratedFromLegacy(legacy) => {
+                    new_config = preserve_existing_sections(new_config, &existing);
+                    Some(RecoveryNotice::MigratedFromLegacy(legacy))
+                }
                 crate::config::RecoveryAction::CreatedDefault => None,
             };
             Ok((new_config, notice))
@@ -1471,6 +1447,8 @@ fn merge_with_existing(
 enum RecoveryNotice {
     /// Config from older version was migrated.
     Migrated,
+    /// Legacy TOML was moved aside after YAML migration.
+    MigratedFromLegacy(PathBuf),
     /// Corrupted config was backed up.
     RecoveredFromCorrupt(PathBuf),
 }

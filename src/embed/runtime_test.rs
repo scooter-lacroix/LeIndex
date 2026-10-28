@@ -8,9 +8,10 @@ use crate::embed::runtime_env::{
     ONNX_SEQUENCE_LEN_ENV,
 };
 use std::io::Cursor;
-use std::sync::Mutex as StdMutex;
 
-static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+/// Shared process-wide env lock: module-local locks do not serialize across
+/// modules, and these tests mutate `LEINDEX_HOME` and other process-global vars.
+use crate::test_env::EnvLock as ENV_LOCK;
 
 /// RAII guard that restores an environment variable to its original value on drop.
 struct EnvVarGuard {

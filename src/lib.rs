@@ -80,6 +80,13 @@ pub mod skip_dirs;
 #[cfg(any(feature = "cli", feature = "onnx"))]
 pub mod config;
 
+/// Single process-wide mutex shared by every test that mutates environment
+/// state. Module-local locks do not serialize across modules, and `cargo test`
+/// runs tests on parallel threads, so env mutation needs one lock for the whole
+/// binary. Compiled out of release builds.
+#[cfg(test)]
+pub mod test_env;
+
 /// Managed model-server service lifecycle (`[services.<name>]` sections).
 #[cfg(any(feature = "cli", feature = "onnx"))]
 pub mod services;

@@ -25,6 +25,10 @@ mod tests {
 
     #[test]
     fn default_runner_executes_phase_analysis() {
+        // The default runner executes a real phase, which reaches precision
+        // ingest and therefore the process-global `LEINDEX_SCIP_*` vars.
+        // Serialize with the tests that rewire them (see `lock_flag_tests`).
+        let _scip_guard = crate::feature_flags::lock_flag_tests();
         let dir = tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
         std::fs::write(dir.path().join("src/lib.rs"), "pub fn run()->bool{true}\n").expect("write");

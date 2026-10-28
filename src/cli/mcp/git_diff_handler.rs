@@ -62,19 +62,6 @@ impl DiffSpec {
     }
 }
 
-/// Reject anything that could be read as an option or shell/format injection.
-/// Revisions are passed as a single argv entry, never through a shell, but a
-/// leading `-` would still be parsed by git as a flag.
-fn is_safe_rev(rev: &str) -> bool {
-    !rev.is_empty()
-        && rev.len() <= 200
-        && !rev.starts_with('-')
-        && !rev.contains("..\\")
-        && rev
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._/~^@{}:,-+#".contains(c))
-}
-
 /// Parsed `--name-status` letter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileState {
@@ -312,7 +299,13 @@ fn lines_to_bytes(starts: &[usize], total: usize, start: usize, end: usize) -> (
 }
 
 /// Run git, reading at most `cap` bytes of stdout. Returns `(stdout, truncated)`.
-fn run_git_capped(
+///
+/// Shared by every live-git handler: both pipes are drained concurrently (see
+/// [`drain_git_output`]), so a child that fills stderr cannot deadlock the read,
+/// and a runaway command is killed instead of buffered without bound.
+/// `GIT_TERMINAL_PROMPT=0` keeps a command that would ask for credentials
+/// (`push`, a `fetch` triggered by `pull`) from blocking the server forever.
+pub(crate) fn run_git_capped(
     root: &Path,
     args: &[String],
     cap: u64,
@@ -320,10 +313,25 @@ fn run_git_capped(
     let child = Command::new("git")
         .args(args)
         .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     drain_git_output(child, cap)
+}
+
+/// Run git and decode stdout as text. `cap` bounds the bytes kept; the flag
+/// reports whether the cap (and therefore the text) was cut short.
+///
+/// Empty output is NOT an error: `git remote -v` on a repository without
+/// remotes legitimately prints nothing, and the caller decides what that means.
+pub(crate) fn git_output_capped(
+    root: &Path,
+    args: &[String],
+    cap: u64,
+) -> Result<(String, bool), std::io::Error> {
+    let (stdout, truncated) = run_git_capped(root, args, cap)?;
+    Ok((String::from_utf8_lossy(&stdout).into_owned(), truncated))
 }
 
 /// Read a spawned child's piped stdout (capped at `cap` bytes) while draining
@@ -634,7 +642,7 @@ async fn attach_patch_and_enrich(
         "files": files.iter().map(file_json).collect::<Vec<_>>(),
         "pdg_status": if enrich && !stat_only { "not_loaded" } else { "skipped" },
         "changed_symbols": [],
-        "impact_summary": { "total_affected_symbols": 0, "affected_files": [], "pdg_enriched": false },
+        "impact_summary": { "total_affected_symbols": 0, "affected_symbols_capped": false, "affected_files": [], "pdg_enriched": false },
     });
     if include_patch {
         if let Some((raw_patch, truncated)) = &patch {
@@ -681,6 +689,7 @@ async fn attach_patch_and_enrich(
     result["changed_symbols"] = Value::Array(enrichment.changed_symbols);
     result["impact_summary"] = json!({
         "total_affected_symbols": enrichment.affected_symbols,
+        "affected_symbols_capped": enrichment.affected_symbols_capped,
         "affected_files": enrichment.affected_files,
         "pdg_enriched": true,
         "symbol_mapping": if spec.new_side_is_worktree() { "hunk" } else { "file" },
@@ -710,11 +719,16 @@ fn parse_spec(args: &Value) -> Result<DiffSpec, JsonRpcError> {
     }
     for (key, value) in [("ref", reference), ("range", range)] {
         if let Some(value) = value {
-            if !is_safe_rev(value) {
-                return Err(JsonRpcError::invalid_params(format!(
-                    "'{key}' is not a valid revision expression: {value}"
-                )));
-            }
+            // The SAME gate every other git operation uses. Diff is where a
+            // range is legal, and `validate_ref` accepts `a..b` / `a...b` while
+            // validating each side, so a range cannot smuggle what a single ref
+            // could not.
+            super::git_ref::validate_ref_or_error(value).map_err(|error| {
+                JsonRpcError::invalid_params_with_suggestion(
+                    format!("'{key}': {}", error.message),
+                    super::git_ref::REF_HINT,
+                )
+            })?;
         }
     }
     Ok(match (reference, range) {
@@ -756,6 +770,9 @@ struct Enrichment {
     status: &'static str,
     changed_symbols: Vec<Value>,
     affected_symbols: usize,
+    /// Whether the impact traversal hit its node cap, so `affected_symbols` is
+    /// a floor rather than the real count.
+    affected_symbols_capped: bool,
     affected_files: Vec<String>,
 }
 
@@ -832,10 +849,10 @@ fn enrich_files(
         }
     }
 
-    let affected = if partial || roots.is_empty() {
-        Vec::new()
+    let (affected, affected_symbols_capped) = if partial || roots.is_empty() {
+        (Vec::new(), false)
     } else {
-        pdg.forward_impact_multi_source(
+        pdg.forward_impact_multi_source_capped(
             &roots,
             &TraversalConfig {
                 max_depth: Some(2),
@@ -854,6 +871,7 @@ fn enrich_files(
         status: if partial { "partial" } else { "fresh" },
         changed_symbols,
         affected_symbols: affected.len(),
+        affected_symbols_capped,
         affected_files,
     }
 }
@@ -1000,12 +1018,16 @@ mod tests {
 
     #[test]
     fn test_revisions_cannot_smuggle_options() {
-        assert!(is_safe_rev("HEAD~3"));
-        assert!(is_safe_rev("main..feature/x"));
-        assert!(is_safe_rev("v1.2.3^{commit}"));
-        assert!(!is_safe_rev("--output=/tmp/x"));
-        assert!(!is_safe_rev("HEAD; rm -rf /"));
-        assert!(!is_safe_rev(""));
+        // Diff shares the one ref gate, so its ranges accept a slash-and-dash
+        // branch name and reject option injection on either side.
+        assert!(super::super::git_ref::validate_ref("HEAD~3").is_ok());
+        assert!(super::super::git_ref::validate_ref("main..feature/x").is_ok());
+        assert!(super::super::git_ref::validate_ref("cw32/30b-admission..HEAD").is_ok());
+        assert!(super::super::git_ref::validate_ref("v1.2.3^{commit}").is_ok());
+        assert!(super::super::git_ref::validate_ref("--output=/tmp/x").is_err());
+        assert!(super::super::git_ref::validate_ref("HEAD; rm -rf /").is_err());
+        assert!(super::super::git_ref::validate_ref("").is_err());
+        assert!(super::super::git_ref::validate_ref("HEAD..-x").is_err());
         assert!(parse_spec(&json!({"ref": "-p"})).is_err());
         assert!(parse_spec(&json!({"ref": "HEAD", "range": "a..b"})).is_err());
     }

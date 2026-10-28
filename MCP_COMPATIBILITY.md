@@ -23,7 +23,7 @@ If you installed the full Rust binary and want to run it directly, `leindex mcp`
 
 ### Claude Code
 
-The optional System-One gate requires a source build with `--features system-one`.
+The optional System-One gate is built by default (`system-one` is in the `full` feature set) but stays dormant until armed.
 Set `LEINDEX_FEATURE_SYSTEM_ONE=1` in the MCP server's environment (the client's
 `env` object for stdio, or the HTTP server's environment), then add this to
 `$LEINDEX_HOME/config/leindex.toml` (default `~/.leindex/config/leindex.toml`):
@@ -103,21 +103,22 @@ Add to Windsurf MCP configuration:
 
 ## Available MCP Tools
 
-LeIndex advertises **four** tools. A discriminator argument (`mode` for explore
-and analyze, `action` for edit and manage) picks the operation and every other
-argument is forwarded to it, which keeps the tool list small enough for every
-client below and leaves the model one decision per call. `tools/list` returns a
-flat union schema by default (some LLM APIs reject a top-level `oneOf`);
-`LEINDEX_MCP_SCHEMA=oneof` switches to per-branch `oneOf` schemas, and
+LeIndex advertises **five** tools. A discriminator argument (`mode` for explore
+and analyze, `action` for edit, manage and git) picks the operation and every
+other argument is forwarded to it, which keeps the tool list small enough for
+every client below and leaves the model one decision per call. `tools/list`
+returns a flat union schema by default (some LLM APIs reject a top-level
+`oneOf`); `LEINDEX_MCP_SCHEMA=oneof` switches to per-branch `oneOf` schemas, and
 `leindex tools schema <tool>` prints that form. The per-branch argument
 reference is the `leindex://tools/guide` resource.
 
 | Tool | Discriminator | Operations |
 |------|---------------|------------|
-| `leindex_explore` | `mode` | `search` (by meaning), `find` (exact text / regex / symbol names, any path), `symbol_lookup`, `read_file`, `read_symbol`, `project_map`, `file_summary`, `context` |
-| `leindex_analyze` | `mode` | `deep`, `impact`, `diagnostics`, `git_status`, `git_diff` |
+| `leindex_explore` | `mode` | `search` (by meaning), `find` (exact text / regex / symbol names, any path), `structural` (AST pattern), `symbol_lookup`, `read_file`, `read_symbol`, `project_map`, `file_summary`, `context` |
+| `leindex_analyze` | `mode` | `deep`, `impact`, `diagnostics`, `phase` (5-phase review, bounded by `max_latency_ms`) |
 | `leindex_edit` | `action` (required) | `preview`, `apply`, `rename`, `write` |
-| `leindex_manage` | `action` | `index`, `phase` |
+| `leindex_manage` | `action` | `index`, `state`, `projects`, `evict`, `lease`, `cleanup` |
+| `leindex_git` | `action` | `status`, `diff`, `log`, `show`, `blame`, `branch`, `remote`, `add`, `commit`, `checkout`, `stash`, `tag`, `merge`, `rebase`, `push`, `reset`, `force` (mutations are preview-only) |
 
 Every tool accepts `tier` (`l0` identity card, `l1` overview, `l2` full).
 The original per-operation names (`leindex_search`, `leindex_deep_analyze`, ...)
@@ -150,9 +151,14 @@ them.
 - `mode=deep`: `query` (required), `token_budget`.
 - `mode=impact`: `symbol` (required), `change_type`, `depth`.
 - `mode=diagnostics`: index health, sizes, cache and memory statistics.
-- `mode=git_status`: repository state enriched with structural impact.
-- `mode=git_diff`: `ref`, `range`, `staged`, `scope`, `stat_only`,
-  `include_patch`; changed hunks mapped to symbols, callers and affected files.
+- `mode=phase`: 5-phase architecture analysis: `phase`, `format`, `path`,
+  `include_docs`, `max_latency_ms`. A stage already running cannot be
+  cancelled, but no further stages start once `max_latency_ms` passes; the
+  report is then marked `INCOMPLETE` with the phases that ran and the ones
+  skipped. Omit it to run unbounded (default: `LEINDEX_PHASE_BUDGET_MS`).
+
+Note that `phase` names its report format `format`, not `mode` — `mode` is the
+router's branch selector, so it is consumed before the branch sees it.
 
 ### leindex_edit
 
@@ -166,18 +172,48 @@ them.
 ### leindex_manage
 
 - `action=index`: `project_path` (required), `force_reindex`, `wait`. Returns a pollable job unless `wait=true`.
-- `action=phase`: 5-phase architecture analysis: `phase`, `mode`, `path`, `include_docs`.
+- `action=state`: is the index usable? Generation, phase, freshness and counts.
+- `action=projects`: projects resident in memory, with the default one.
+- `action=evict`: release a project from memory (data stays on disk); target required.
+- `action=lease`: hold or release a project lease.
+- `action=cleanup`: retention sweep over old generations; dry-run by default.
+
+### leindex_git
+
+Git reads and preview-gated mutations. `status` and `diff` are PDG-enriched
+(changed hunks mapped to symbols, callers and affected files); everything else
+is a thin, validated wrapper over the corresponding git operation.
+
+Argument names are SHARED across operations, not per-operation: `target` (a
+revision, ref or branch), `path` (project-relative file or directory), `paths`
+(array), `message`, `confirm`, plus `max_count`, `include_patch` and
+`max_chars` where an operation uses them.
+
+- `action=status`, `action=diff`: the enriched read paths, served by their own
+  handlers. `diff` takes `ref`, `range`, `staged`, `scope`, `stat_only`,
+  `include_patch`, `max_patch_chars`.
+- `action=log` `[target, path, max_count]`, `action=show` `[target,
+  include_patch]`, `action=blame` `[path, target]`, `action=branch` `[]`,
+  `action=remote` `[]`: the read paths.
+- Mutating actions (`add` `[paths]`, `commit` `[message]`, `checkout` `[target]`,
+  `stash` `[]`, `tag` `[target, message]`, `merge` `[target]`, `rebase`
+  `[target]`, `push` `[]`, `reset` `[target]`, `force` `[target]`) return a
+  **plan with a preview token**; none of them mutate the repository, and a
+  `confirm` is refused because the apply side is deliberately not wired.
+- Revisions are passed as a single argv entry (never a shell) and validated: a
+  leading `-` is rejected and `:` is not allowed, so `rev:path` cannot escape
+  the project. Ranges (`A..B`, `A...B`) are legal because `..` is permitted.
 
 ---
 
 ## Tool Compatibility Matrix
 
-| AI Tool | leindex_explore | leindex_analyze | leindex_edit | leindex_manage |
-|---------|-----------------|-----------------|--------------|----------------|
-| **Claude Code** | ✅ Verified | ✅ Verified | ✅ Verified | ✅ Verified |
-| **Cursor** | ✅ Verified | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending |
-| **Windsurf** | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending |
-| **Cline** | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending |
+| AI Tool | leindex_explore | leindex_analyze | leindex_edit | leindex_manage | leindex_git |
+|---------|-----------------|-----------------|--------------|----------------|-------------|
+| **Claude Code** | ✅ Verified | ✅ Verified | ✅ Verified | ✅ Verified | ✅ Verified |
+| **Cursor** | ✅ Verified | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending |
+| **Windsurf** | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending |
+| **Cline** | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending | ⚠️ Pending |
 
 **Legend:**
 - ✅ Verified - Tested and confirmed working

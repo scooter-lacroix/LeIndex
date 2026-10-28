@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #############################################
 # LeIndex Universal Installer
-# Version: 2.1.1 - Rust Edition
+# Version: 2.1.5 - Rust Edition
 # Platform: macOS
 #
 # Installer:
@@ -17,11 +17,11 @@ set -euo pipefail
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-readonly SCRIPT_VERSION="2.1.1"
+readonly SCRIPT_VERSION="2.1.5"
 readonly PROJECT_NAME="LeIndex"
 readonly PROJECT_SLUG="leindex"
 readonly MIN_RUST_MAJOR=1
-readonly MIN_RUST_MINOR=85
+readonly MIN_RUST_MINOR=88
 readonly REPO_URL="https://github.com/scooter-lacroix/LeIndex"
 
 # Installation paths

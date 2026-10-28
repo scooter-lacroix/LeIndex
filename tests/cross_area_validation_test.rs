@@ -315,28 +315,45 @@ mod setup_idempotency_and_preservation {
     use super::*;
 
     /// VAL-CROSS-011 / VAL-SETUP-024: Setup must be idempotent. The config
-    /// writer uses `toml::to_string_pretty` and a single `save()` overwriting
-    /// the file; there is no append path that could duplicate fields.
+    /// writer serializes to YAML and overwrites the file through
+    /// `write_yaml_atomic` (create-dir + temp-file + persist); there is no
+    /// append path that could duplicate fields.
     #[test]
     fn config_save_overwrites_in_place_without_duplicating() {
         let src = read_file("src/config.rs");
+
+        // save() reads the existing document (or the v2 template), merges the
+        // typed sections over it, and delegates the write to the atomic helper.
         let save_fn = src
             .split("pub fn save(&self) -> Result<PathBuf, ConfigError>")
             .nth(1)
             .and_then(|s| s.split("\n    }\n\n    /// Read config").next())
             .expect("LeIndexConfig::save() must exist");
+        assert!(
+            save_fn.contains("write_yaml_atomic"),
+            "save() must write through the atomic YAML helper (no partial writes)"
+        );
 
+        // The atomic helper itself: creates the config dir when missing
+        // (idempotent first run / re-run after upgrade) and lands the file via
+        // a temp-file + rename, so concurrent readers never see a torn file
+        // and repeated saves overwrite rather than duplicate.
+        let atomic_fn = src
+            .split("fn write_yaml_atomic")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("write_yaml_atomic helper must exist");
         assert!(
-            save_fn.contains("create_dir_all"),
-            "save() must create the config dir if missing (idempotent re-run after upgrade)"
+            atomic_fn.contains("create_dir_all"),
+            "the atomic writer must create the config dir if missing (idempotent re-run after upgrade)"
         );
         assert!(
-            save_fn.contains(".persist("),
-            "save() must atomically overwrite via temp-file + persist (no append path that duplicates keys)"
+            atomic_fn.contains(".persist("),
+            "the atomic writer must overwrite via temp-file + persist (no append path that duplicates keys)"
         );
         assert!(
-            !save_fn.contains("append"),
-            "save() must NOT use append mode (would duplicate keys across runs)"
+            !atomic_fn.contains("append"),
+            "the atomic writer must NOT use append mode (would duplicate keys across runs)"
         );
     }
 

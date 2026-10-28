@@ -17,6 +17,14 @@ fn write_config(dir: &tempfile::TempDir, contents: &str) -> PathBuf {
     path
 }
 
+/// Write YAML contents to `<dir>/config/config.yaml` and return the path.
+fn write_yaml_config(dir: &tempfile::TempDir, contents: &str) -> PathBuf {
+    let path = dir.path().join("config").join("config.yaml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, contents).unwrap();
+    path
+}
+
 fn service(port: u16) -> ServiceConfig {
     ServiceConfig {
         port,
@@ -487,15 +495,31 @@ fn test_set_rejects_value_that_fails_validate_and_keeps_file_intact() {
 }
 
 #[test]
-fn test_set_sweeps_unknown_keys_already_in_the_file() {
+fn test_set_preserves_untyped_sections_and_sweeps_runtime_keys() {
     let dir = tempfile::tempdir().unwrap();
-    let original = "totally_unknown = 1\n\n[search]\nsearch_mode = \"text\"\n";
-    let path = write_config(&dir, original);
+    let path = write_config(
+        &dir,
+        "totally_unknown = 1\n\n[search]\nsearch_mode = \"text\"\n",
+    );
 
+    // An untyped top-level section rides through the edit untouched...
+    apply_set_at(&path, "mcp.prewarm", "\"off\"").unwrap();
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        raw.contains("totally_unknown"),
+        "untyped section dropped: {raw}"
+    );
+    assert!(raw.contains("prewarm = \"off\""), "edit lost: {raw}");
+
+    // ...but an unknown key INSIDE a runtime-owned section would be dropped
+    // by the typed save, so it is still rejected before writing.
+    let dir = tempfile::tempdir().unwrap();
+    let original = "[search]\nsearch_mode = \"text\"\nnope = 1\n";
+    let path = write_config(&dir, original);
     let err = apply_set_at(&path, "mcp.prewarm", "\"off\"")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("totally_unknown"), "got: {err}");
+    assert!(err.contains("search.nope"), "got: {err}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }
 
@@ -909,4 +933,115 @@ fn test_unset_repair_refuses_when_scrubbed_document_still_invalid() {
         "must surface the masked violation, not the reference error: {err}"
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+#[test]
+fn test_set_on_yaml_preserves_untyped_sections() {
+    // PR 105 (Codex P1/P2): `config set` edits the YAML document in place.
+    // The bundled v2 template carries untyped sections (vector_store,
+    // file_filtering, ...), YAML nulls (`model: null`), and template service
+    // entries — all of which must survive a set that touches one runtime key.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_yaml_config(
+        &dir,
+        concat!(
+            "vector_store:\n",
+            "  backend_type: leann\n",
+            "file_filtering:\n",
+            "  max_file_size: 1073741824\n",
+            "services:\n",
+            "  laya:\n",
+            "    binary: llama-server\n",
+            "    model: null\n",
+            "    alias: laya\n",
+            "    host: 127.0.0.1\n",
+            "    port: 8181\n",
+            "    extra_args: []\n",
+            "    auto_start: false\n",
+            "    start_timeout_secs: 120\n",
+            "indexing:\n",
+            "  embeddings:\n",
+            "    enable_hybrid: true\n",
+            "    remote_provider: embeddinggemma-2\n",
+            "    remote_api_key_env: GEMMA_KEY_ENV\n",
+        ),
+    );
+
+    apply_set_at(&path, "search.neural_weight", "0.9").unwrap();
+
+    // Untyped sections survive the edit verbatim...
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        raw.contains("vector_store"),
+        "untyped section dropped: {raw}"
+    );
+    assert!(
+        raw.contains("backend_type: leann"),
+        "untyped section emptied: {raw}"
+    );
+    assert!(
+        raw.contains("max_file_size"),
+        "untyped section emptied: {raw}"
+    );
+    // ...the edit landed...
+    assert!(raw.contains("neural_weight: 0.9"), "edit lost: {raw}");
+    // ...and runtime keys outside the edit are untouched.
+    assert!(
+        raw.contains("GEMMA_KEY_ENV"),
+        "unrelated runtime key dropped: {raw}"
+    );
+
+    let config = LeIndexConfig::load_from_path(&path).unwrap();
+    assert_eq!(config.search.neural_weight, 0.9);
+    assert_eq!(
+        config.services.get("laya").unwrap().port,
+        8181,
+        "template services dropped"
+    );
+}
+
+#[test]
+fn test_unset_on_yaml_preserves_untyped_sections() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_yaml_config(
+        &dir,
+        "vector_store:\n  backend_type: leann\nindexing:\n  embeddings:\n    remote_api_key_env: GEMMA_KEY_ENV\n",
+    );
+
+    apply_unset_at(&path, "indexing.embeddings.remote_api_key_env").unwrap();
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        raw.contains("vector_store"),
+        "untyped section dropped: {raw}"
+    );
+    assert!(!raw.contains("GEMMA_KEY_ENV"), "key not removed: {raw}");
+    assert!(
+        LeIndexConfig::load_from_path(&path)
+            .unwrap()
+            .indexing
+            .embeddings
+            .remote_api_key_env
+            .is_none()
+    );
+}
+
+#[test]
+fn test_set_on_empty_yaml_file_starts_from_defaults() {
+    // An empty (or all-null) YAML file loads as the empty document, not a
+    // parse error — matching the TOML path's empty-file behavior.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_yaml_config(&dir, "");
+
+    apply_set_at(&path, "search.search_mode", "\"text\"").unwrap();
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("search_mode: text"), "not YAML: {raw}");
+    assert_eq!(
+        LeIndexConfig::load_from_path(&path)
+            .unwrap()
+            .search
+            .search_mode,
+        "text"
+    );
 }

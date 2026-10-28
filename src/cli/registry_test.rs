@@ -808,3 +808,89 @@ async fn test_concurrent_cold_start_creations_join_one_build() {
     }
     assert_eq!(registry.len().await, 1, "exactly one project resident");
 }
+
+/// First-use indexing is OPT-IN, and the default is OFF.
+///
+/// A tool call is not consent to spend minutes of CPU and disk. Before the
+/// gate, a single `leindex_git_status` on an unindexed repository silently
+/// started a full index — indistinguishable, from the caller's side, from a
+/// read that took 170 seconds for no stated reason.
+#[tokio::test]
+async fn test_auto_index_is_off_by_default_so_a_read_does_not_build_an_index() {
+    // The environment is process-wide; serialize against the other test that
+    // touches it and leave it exactly as we found it. The guard is scoped to
+    // the assertions that touch the variable rather than the whole body, so
+    // the lock is not held across the test's remaining setup.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.rs"), "fn not_indexed() {}\n").unwrap();
+    let root = dir.path().canonicalize().unwrap();
+
+    {
+        let _env = auto_index_env_lock().await;
+        let previous = std::env::var(AUTO_INDEX_ENABLE_ENV).ok();
+        let previous_home = std::env::var("LEINDEX_HOME").ok();
+        unsafe {
+            std::env::remove_var(AUTO_INDEX_ENABLE_ENV);
+            std::env::set_var("LEINDEX_HOME", dir.path());
+        }
+        assert!(
+            !auto_index_enabled(),
+            "auto-index must be off with no env opt-in and no [mcp] auto_index = true"
+        );
+
+        let registry = Arc::new(ProjectRegistry::new(5));
+        let handle = registry
+            .get_or_create(Some(root.to_str().unwrap()))
+            .await
+            .expect("an unindexed project must still be served, just not indexed");
+        assert!(
+            !handle.read().await.is_indexed(),
+            "a tool call must not silently index the project"
+        );
+
+        // The explicit opt-in turns it on.
+        unsafe { std::env::set_var(AUTO_INDEX_ENABLE_ENV, "1") };
+        assert!(auto_index_enabled(), "LEINDEX_AUTO_INDEX=1 must enable it");
+        match previous {
+            Some(value) => unsafe { std::env::set_var(AUTO_INDEX_ENABLE_ENV, value) },
+            None => unsafe { std::env::remove_var(AUTO_INDEX_ENABLE_ENV) },
+        }
+        match previous_home {
+            Some(value) => unsafe { std::env::set_var("LEINDEX_HOME", value) },
+            None => unsafe { std::env::remove_var("LEINDEX_HOME") },
+        }
+    }
+}
+
+/// The shared environment lock must SERIALIZE concurrent acquisition instead of
+/// panicking. PR #105: `auto_index_env_lock` used `try_lock()` and panicked
+/// when the standard parallel runner overlapped the two tests that mutate
+/// `LEINDEX_AUTO_INDEX`, intermittently failing the workspace suite.
+#[tokio::test]
+async fn test_auto_index_env_lock_waits_instead_of_panicking_on_contention() {
+    let _first = auto_index_env_lock().await;
+
+    let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let waiter = tokio::spawn(async move {
+        let _second = auto_index_env_lock().await;
+        let _ = started_tx.send(());
+        let _ = done_rx.await;
+    });
+
+    // While the first guard is held, a second acquisition must block — the
+    // pre-fix `try_lock` path panicked here instead.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut started_rx)
+            .await
+            .is_err(),
+        "second acquisition must wait while the first guard is held"
+    );
+
+    drop(_first);
+    started_rx
+        .await
+        .expect("second acquisition proceeds after release");
+    let _ = done_tx.send(());
+    waiter.await.expect("waiter completes cleanly");
+}

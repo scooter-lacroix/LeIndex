@@ -428,16 +428,16 @@ fn read_rss_sysinfo_bytes() -> Option<u64> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::{Mutex, OnceLock};
 
     /// `LEINDEX_MEMORY_REPORT` is process-global state: parallel tests in this
-    /// module that set/remove it race each other's reads. Every env-mutating
-    /// test holds this lock across its arrange/act/cleanup window.
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    /// module that set/remove it would race each other's reads, and a
+    /// module-local lock would still race every other module. Every
+    /// env-mutating test holds the shared lock across its arrange/act/cleanup
+    /// window.
+    use crate::test_env::EnvLock as ENV_LOCK;
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }

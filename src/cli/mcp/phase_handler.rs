@@ -108,8 +108,14 @@ fn parse_phase_selection(value: Option<&Value>) -> Result<PhaseSelection, JsonRp
 }
 
 fn phase_modes(args: &Value) -> Result<(FormatMode, DocsMode, bool), JsonRpcError> {
+    // `mode` is the phase branch's own format selector when this tool is called
+    // DIRECTLY, but `mode` is also `leindex_analyze`'s branch discriminator, so
+    // a grouped call can never carry it (the router consumes it). The router
+    // therefore hands the format down as `format`; `mode` stays honoured here
+    // for direct calls. Never read both: the router's value would win silently.
     let mode = args
-        .get("mode")
+        .get("format")
+        .or_else(|| args.get("mode"))
         .and_then(Value::as_str)
         .unwrap_or("balanced");
     let mode = FormatMode::parse(mode).ok_or_else(|| {
@@ -283,6 +289,12 @@ fn phase_request(args: &Value, project_root: &Path) -> Result<PhaseRequest, Json
         docs_mode,
         hotspot_keywords: PhaseOptions::default().hotspot_keywords,
         universe: Default::default(),
+        // A caller-supplied ceiling wins; otherwise the env-backed default.
+        budget_ms: extract_usize(args, "max_latency_ms", 0)
+            .ok()
+            .filter(|millis| *millis > 0)
+            .map(|millis| millis as u64)
+            .or(PhaseOptions::default().budget_ms),
     };
     Ok(PhaseRequest {
         selection,

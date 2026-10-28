@@ -74,6 +74,18 @@ fn test_wire_gemma_preset_configures_service_and_preset_dimension() {
             .any(|args| args == ["-ngl", "99"])
     );
     assert!(service.extra_args.contains(&"--embedding".to_string()));
+    // The launch contract a fresh host gets must match the pooling the model
+    // actually needs. EmbeddingGemma2 is mean-pooled; a drifted value here
+    // yields semantically wrong vectors while every other check still passes,
+    // so pin it.
+    assert!(
+        service
+            .extra_args
+            .windows(2)
+            .any(|args| args == ["--pooling", "mean"]),
+        "gemma preset must launch with mean pooling, got {:?}",
+        service.extra_args
+    );
     assert!(config.indexing.embeddings.enable_hybrid);
     assert_eq!(
         config.indexing.embeddings.remote_provider,
@@ -920,9 +932,11 @@ fn test_build_config_without_version() {
     assert!(cfg.neural.ort_dylib_path.is_none());
 }
 
-// Use a process-shared lock so env-mutating tests serialize within the module.
-use std::sync::Mutex;
-static PIPE_ENV_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes env-var-mutating tests across the whole test binary, not just
+/// this module: the setup paths read process-global `LEINDEX_HOME` and the
+/// process-global config cache, so a module-local lock would still race
+/// `config.rs` and every other env-mutating module.
+use crate::test_env::EnvLock as PIPE_ENV_LOCK;
 
 /// RAII guard that restores an environment variable to its original value on drop.
 struct EnvVarGuard {

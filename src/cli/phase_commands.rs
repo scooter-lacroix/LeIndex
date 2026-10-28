@@ -80,6 +80,9 @@ pub(crate) async fn cmd_phase_impl(args: PhaseCommandArgs) -> AnyhowResult<()> {
         docs_mode: parsed_docs_mode,
         hotspot_keywords: PhaseOptions::default().hotspot_keywords,
         universe: Default::default(),
+        // Inherits LEINDEX_PHASE_BUDGET_MS rather than silently meaning
+        // "unbounded" whenever the CLI is the entry point.
+        ..PhaseOptions::default()
     };
 
     let report = tokio::task::spawn_blocking(move || {

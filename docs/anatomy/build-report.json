@@ -1,0 +1,27 @@
+{
+  "out": "/mnt/WD-SSD/Prod/LeIndex/docs/anatomy/leindex-anatomy.html",
+  "drawn": 94,
+  "vb": [
+    1180,
+    760
+  ],
+  "scale": 1.9271,
+  "model": {
+    "version": "2.1.1",
+    "files": 581,
+    "modules": 21,
+    "gated": 4,
+    "parsers": 17,
+    "gateSites": 458,
+    "gateFiles": 64,
+    "features": 23,
+    "layers": 8,
+    "testFiles": 39,
+    "tests": 312,
+    "routers": 5,
+    "handlers": 20,
+    "publicItems": 1269,
+    "edition": "2024",
+    "msrv": "1.88"
+  }
+}

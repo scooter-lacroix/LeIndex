@@ -217,9 +217,9 @@ fn test_batch_id_monotonic() {
 
 // ── VAL-SETUP-020/VAL-ORT-006: config-driven ORT_DYLIB_PATH injection ──
 
-// Use a process-shared lock so env-mutating tests serialize within the module.
-use std::sync::Mutex;
-static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+// Env-mutating tests serialize on the process-wide lock: a module-local mutex
+// would still race every other module, and `LEINDEX_HOME` is process-global.
+use crate::test_env::EnvLock as TEST_ENV_LOCK;
 
 #[test]
 fn test_read_ort_dylib_path_from_config_returns_value() {
@@ -506,4 +506,124 @@ fn test_content_digest_forged_swap_is_a_memo_hit_without_unix_metadata() {
         digest1, digest2,
         "non-Unix guard is size+mtime: a forged-metadata swap is a memo hit"
     );
+}
+
+// ── #96: a readiness wait must end when the daemon it waits for is gone ──
+
+/// `#96`: waiting for a daemon that has already died must abort on the death,
+/// not poll the dead socket until `DAEMON_READY_MAX_WAIT`. The fixture is a
+/// child that exited without binding anything — the ORT-less failure shape.
+#[cfg(unix)]
+#[test]
+fn test_readiness_wait_aborts_when_the_spawned_daemon_already_exited() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("leindex-embed.sock");
+    let mut child = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn exited-child fixture");
+    child.wait().expect("reap exited-child fixture");
+
+    let started = Instant::now();
+    let result = EmbeddingClient::wait_for_daemon_ready(&socket_path, Some(&mut child));
+    let elapsed = started.elapsed();
+
+    let error = result.expect_err("a dead daemon must abort the readiness wait");
+    assert!(
+        error
+            .to_string()
+            .contains("exited before reaching readiness"),
+        "abort must name the dead daemon, got: {error}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "the wait must end on daemon death, not on the {DAEMON_READY_MAX_WAIT:?} deadline \
+         (took {elapsed:?})"
+    );
+}
+
+/// Only positive evidence of death may abort a wait: a daemon that has not
+/// recorded a pid yet is *unknown*, and a live pid must never be reported gone.
+#[cfg(unix)]
+#[test]
+fn test_recorded_daemon_liveness_requires_positive_evidence_of_death() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("leindex-embed.sock");
+
+    assert!(
+        readiness_abort_reason(None, &socket_path).is_none(),
+        "an unrecorded daemon is unknown, not dead"
+    );
+
+    let live_pid = std::process::id() as libc::pid_t;
+    std::fs::write(
+        socket_path.with_extension("pid"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+    assert!(
+        !recorded_daemon_is_gone(live_pid),
+        "a running pid is not gone"
+    );
+    assert!(
+        readiness_abort_reason(None, &socket_path).is_none(),
+        "a live recorded daemon must not abort the wait"
+    );
+
+    // Above `pid_max`, so it can never be allocated: deterministic death
+    // evidence without racing pid recycling.
+    std::fs::write(socket_path.with_extension("pid"), i32::MAX.to_string()).unwrap();
+    assert!(recorded_daemon_is_gone(i32::MAX));
+    let reason = readiness_abort_reason(None, &socket_path)
+        .expect("a recorded dead daemon must abort the wait");
+    assert!(reason.contains(&i32::MAX.to_string()), "got: {reason}");
+}
+
+// ── #96: an ORT preflight keeps an ORT-less host out of the wait entirely ──
+
+/// An unavailable ORT is answered before any daemon spawn, and the answer is
+/// soft: `ensure_worker_ready` stays `Ok` so indexing continues on TF-IDF.
+#[test]
+fn test_ort_preflight_skips_daemon_spawn_and_stays_soft() {
+    NEURAL_PREFLIGHT_OVERRIDE.with(|value| value.set(Some(true)));
+    let client = EmbeddingClient::new();
+
+    assert!(
+        client.ensure_worker_ready().is_ok(),
+        "neural unavailability must degrade softly, never error"
+    );
+    assert!(
+        client.worker.lock().unwrap().is_none(),
+        "the preflight must skip the daemon spawn and its readiness wait"
+    );
+    assert_eq!(
+        client.neural_unavailable.get().copied(),
+        Some(true),
+        "the verdict is memoized so a doomed host does not re-probe per batch"
+    );
+
+    // End-to-end: an absent worker must surface as the soft TF-IDF fallback
+    // that indexing already handles, never as a hard error or a panic.
+    // A unique text keeps this out of the content-addressed embed cache, which
+    // would otherwise answer the batch without consulting a worker at all.
+    let text = format!("issue-96-preflight-{}", std::process::id());
+    assert!(
+        matches!(
+            client.embed_with_fallback(&[text], 8),
+            EmbedResult::Fallback { .. }
+        ),
+        "an unstarted worker must degrade to the TF-IDF fallback"
+    );
+
+    NEURAL_PREFLIGHT_OVERRIDE.with(|value| value.set(None));
+}
+
+/// The preflight must not gate an ORT-capable host: only absence short-circuits.
+#[test]
+fn test_ort_preflight_does_not_block_an_ort_capable_host() {
+    NEURAL_PREFLIGHT_OVERRIDE.with(|value| value.set(Some(false)));
+    assert!(
+        !host_lacks_onnx_runtime(),
+        "an available ORT must not trip the preflight"
+    );
+    NEURAL_PREFLIGHT_OVERRIDE.with(|value| value.set(None));
 }

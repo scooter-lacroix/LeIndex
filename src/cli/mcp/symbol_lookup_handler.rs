@@ -59,7 +59,7 @@ For the exact source implementation use LeIndex [Read Symbol]."
                 },
                 "project_path": {
                     "type": "string",
-                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                    "description": "Project directory (omit to use current project). Indexing is NOT automatic: an unindexed project answers with a 'project not indexed' error until you run the index action."
                 },
                 "token_budget": {
                     "type": "integer",
@@ -164,7 +164,16 @@ For the exact source implementation use LeIndex [Read Symbol]."
         let storage_root = crate::cli::leindex::resolve_existing_storage_path(&project_root)
             .unwrap_or_else(|| project_root.join(".leindex"));
         let health = crate::cli::index_freshness::load_health(&storage_root);
-        let index_stale = super::helpers::is_index_genuinely_stale(&health, &project_root);
+        // One worktree delta, threaded into the staleness check, so this
+        // response does not fork `git status` separately from the meta wrapper.
+        let live_status = crate::cli::git::status(&project_root).ok();
+        let status_known = live_status.is_some();
+        let index_stale = super::helpers::is_index_genuinely_stale(
+            &health,
+            &project_root,
+            live_status.as_ref(),
+            status_known,
+        );
         let index_freshness = match health.as_ref().map(|h| h.status) {
             Some(crate::cli::leindex::ComponentStatus::Fresh) => "fresh",
             Some(crate::cli::leindex::ComponentStatus::Stale) => "stale",

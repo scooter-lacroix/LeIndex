@@ -396,29 +396,54 @@ impl std::fmt::Display for GitStatusError {
 
 impl std::error::Error for GitStatusError {}
 
-/// Run the one status command used by live status consumers.
-pub fn status(root: &Path) -> Result<GitStatus, GitStatusError> {
-    let output = Command::new("git")
-        .args([
-            "status",
-            "--porcelain=v2",
-            "-z",
-            "--branch",
-            "--untracked-files=all",
-        ])
-        .current_dir(root)
-        .output()
-        .map_err(GitStatusError::Io)?;
-    if output.status.success() {
-        return Ok(parse_status(&output.stdout));
-    }
+/// Ceiling on the porcelain dump read for one status call.
+const MAX_STATUS_BYTES: u64 = 64 * 1024 * 1024;
 
-    let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    if message.contains("not a git repository") {
-        Err(GitStatusError::NotRepository)
-    } else {
-        Err(GitStatusError::Failed(message))
+/// Run the one status command used by live status consumers.
+///
+/// The porcelain dump of a very large worktree is unbounded, so it goes through
+/// the same cap-and-drain runner as every other git call: an over-cap dump
+/// fails loudly instead of handing back a truncated listing that would silently
+/// misreport the working tree.
+pub fn status(root: &Path) -> Result<GitStatus, GitStatusError> {
+    match crate::cli::mcp::git_diff_handler::run_git_capped(root, &status_args(), MAX_STATUS_BYTES)
+    {
+        Ok((stdout, false)) => Ok(parse_status(&stdout)),
+        Ok((_, true)) => Err(GitStatusError::Failed(format!(
+            "git status output exceeded {MAX_STATUS_BYTES} bytes"
+        ))),
+        // The runner reports a non-zero exit as `Error::other(<trimmed stderr>)`
+        // and a spawn/pipe failure as its own kind: only the former is Git
+        // talking, so only that branch can be classified by message.
+        Err(error) => match error.kind() {
+            std::io::ErrorKind::Other => {
+                let message = error.to_string();
+                if message.contains("not a git repository") {
+                    Err(GitStatusError::NotRepository)
+                } else if message.trim().is_empty() {
+                    Err(GitStatusError::Failed(
+                        "git status failed without reporting a reason".to_owned(),
+                    ))
+                } else {
+                    Err(GitStatusError::Failed(message))
+                }
+            }
+            _ => Err(GitStatusError::Io(error)),
+        },
     }
+}
+
+fn status_args() -> Vec<String> {
+    [
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--branch",
+        "--untracked-files=all",
+    ]
+    .iter()
+    .map(|argument| (*argument).to_string())
+    .collect()
 }
 
 /// Parse `git status --porcelain=v2 -z --branch` output.

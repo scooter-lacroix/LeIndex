@@ -49,6 +49,19 @@ struct CrossFileCallIndexes {
     suffix_map: HashMap<String, Vec<crate::graph::pdg::NodeId>>,
 }
 
+/// Whether a node can ever be the CALLEE of a call edge.
+///
+/// Documentation sections and per-file summary nodes are RETRIEVAL units, not
+/// code: nothing calls them. Indexing them as call targets produced phantom
+/// `init` caller edges on Markdown doc sections — a heading named `init` has the
+/// bare qualified name `init`, so `exact_map["init"]` returned it alongside the
+/// real `fn init()`, and every `fn init()` in the project resolved a call edge
+/// into a doc node. Their qnames are also free text (heading titles), which
+/// makes them collide with real symbol names far more often than not.
+fn is_callable_target(node: &Node) -> bool {
+    !matches!(node.node_type, NodeType::DocSection | NodeType::FileSummary)
+}
+
 fn build_cross_file_call_indexes(pdg: &ProgramDependenceGraph) -> CrossFileCallIndexes {
     let mut indexes = CrossFileCallIndexes {
         qname_to_node: HashMap::default(),
@@ -62,7 +75,7 @@ fn build_cross_file_call_indexes(pdg: &ProgramDependenceGraph) -> CrossFileCallI
         let Some(node) = pdg.get_node(nid) else {
             continue;
         };
-        if node.node_type == NodeType::External {
+        if node.node_type == NodeType::External || !is_callable_target(node) {
             continue;
         }
         let Some(qname) = qualified_name_from_node(node) else {

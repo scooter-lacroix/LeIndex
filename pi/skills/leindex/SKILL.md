@@ -23,10 +23,10 @@ LeIndex provides high-performance semantic search and deep code analysis by buil
 
 ## MCP tools
 
-When the LeIndex MCP server is connected, four tools cover the same ground: `leindex_explore` (`mode`: find, search, symbol_lookup, read_file, read_symbol, project_map, file_summary, context), `leindex_analyze` (`mode`: deep, impact, diagnostics, git_status, git_diff), `leindex_edit` (`action`: preview, apply, rename, write) and `leindex_manage` (`action`: index, phase). Use `mode=find` for exact text, regex and symbol names, including directories outside the project (`paths`). See `integrations/skills/leindex-code-intelligence/` for the full guide.
+When the LeIndex MCP server is connected, five routers cover the same ground: `leindex_explore` (`mode`: search, find, structural, symbol_lookup, read_file, read_symbol, project_map, file_summary, context), `leindex_analyze` (`mode`: deep, impact, diagnostics, phase), `leindex_edit` (`action`: preview, apply, rename, write), `leindex_manage` (`action`: index, state, projects, evict, lease, cleanup, all index lifecycle) and `leindex_git` (`action`: status, diff, log, show, blame, branch, remote, plus preview-only mutations that never apply). Use `mode=find` for exact text, regex and symbol names, including directories outside the project (`paths`); use `mode=structural` for AST patterns. See `integrations/skills/leindex-code-intelligence/` for the full guide.
 
 ## Integration
 This skill works by calling the `leindex` CLI binary.
 
 ## Documentation
-For more information, see the LeIndex repository at `/mnt/e0f7c1a8-b834-4827-b579-0251b006bc1f/code_index_update/LeIndexer`.
+For more information, see the LeIndex repository at `https://github.com/scooter-lacroix/LeIndex`, and the shared skill pack at `integrations/skills/leindex-code-intelligence/`.

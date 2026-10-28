@@ -667,3 +667,79 @@ async fn test_find_sees_edits_made_after_indexing_without_hydration() {
     assert_eq!(PDG_LOADS.load(Ordering::Relaxed), 0);
     assert_eq!(NEURAL_REQUESTS.load(Ordering::Relaxed), 0);
 }
+
+/// Every `leindex_analyze` branch must be reachable end to end: resolution is
+/// well covered, but resolution alone would not notice a branch that resolves
+/// to a handler which then rejects its own arguments at dispatch time.
+///
+/// `deep` is deliberately absent — it needs a semantic search path and opts
+/// out of no-indexing, so it is covered by the phase/search suites instead.
+#[tokio::test]
+async fn test_analyze_router_branches_dispatch_end_to_end() {
+    let _lock = counter_test_lock();
+    let temp = TempDir::new().expect("create analyze fixture");
+    let project = temp.path().join("project");
+    fs::create_dir_all(project.join("src")).expect("create analyze source dir");
+    fs::write(project.join("src/lib.rs"), "pub struct Askpass;\n").expect("write analyze source");
+    let project_path = project.display().to_string();
+
+    // `diagnostics` returns a status report for an unindexed project rather
+    // than failing (it must not auto-index on the diagnostics path).
+    let response = handle_tool_call(
+        &Arc::new(ProjectRegistry::new(2)),
+        &all_tool_handlers(),
+        &tool_request(
+            "leindex_analyze",
+            json!({ "mode": "diagnostics", "project_path": project_path }),
+        ),
+    )
+    .await
+    .expect("diagnostics branch must dispatch");
+    let text = tool_text(&response);
+    assert!(
+        text.contains("Diagnostics") && text.contains("Indexed files:"),
+        "diagnostics branch returned an unexpected payload: {text}"
+    );
+
+    // `phase` on one cheap phase with the budget gate wide open. It analyses
+    // only the fixture tree, so this stays a fast, exact check that the
+    // branch's own arguments survive the router.
+    let response = handle_tool_call(
+        &Arc::new(ProjectRegistry::new(2)),
+        &all_tool_handlers(),
+        &tool_request(
+            "leindex_analyze",
+            json!({
+                "mode": "phase",
+                "phase": 1,
+                "project_path": project_path,
+                "max_latency_ms": 120_000u64,
+            }),
+        ),
+    )
+    .await
+    .expect("phase branch must dispatch");
+    let text = tool_text(&response);
+    assert!(
+        text.contains("phases=[1]"),
+        "phase branch did not report running only phase 1: {text}"
+    );
+    assert!(
+        !text.contains("INCOMPLETE"),
+        "a generous budget must not truncate the run: {text}"
+    );
+}
+
+/// The rendered text of an MCP tool result — what a model actually reads.
+fn tool_text(response: &Value) -> String {
+    response["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}

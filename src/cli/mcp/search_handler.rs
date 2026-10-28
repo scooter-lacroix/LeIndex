@@ -336,7 +336,7 @@ impl SearchHandler {
     pub fn description(&self) -> &str {
         "Semantic code search. Finds symbols by meaning, not just name. Returns ranked \
 results with composite scores (semantic + text + structural). Accepts project_path \
-to auto-switch/auto-index projects."
+to switch between projects."
     }
 
     /// Returns the JSON schema for the arguments of this RPC method
@@ -350,7 +350,7 @@ to auto-switch/auto-index projects."
                 },
                 "project_path": {
                     "type": "string",
-                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                    "description": "Project directory (omit to use current project). Indexing is NOT automatic: an unindexed project answers with a 'project not indexed' error until you run the index action."
                 },
                 "top_k": {
                     "type": "integer",
@@ -471,18 +471,38 @@ to auto-switch/auto-index projects."
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::mcp::helpers::test_registry_for;
     use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_search_handler_zero_results_includes_suggestion() {
         // Test that semantic search with no matches returns helpful suggestion.
         // Uses a source file with content unrelated to the query.
+        //
+        // Hermetic (this test used to be environment-sensitive): the project
+        // is indexed here instead of relying on auto-index, and `project_path`
+        // is passed explicitly so resolution cannot fall back to the process
+        // CWD — on a CI runner that is the repo checkout, whose ambient
+        // indexed/unindexed state decided the outcome.
         let dir = tempdir().unwrap();
         let src = dir.path().join("lib.rs");
         std::fs::write(&src, "pub fn alpha_beta_gamma() {}\n").unwrap();
-        let registry = test_registry_for(dir.path());
-        let args = serde_json::json!({ "query": "zzz_nonexistent_qqq_12345" });
+
+        // Index the fixture the same way the indexing tests do, then hand the
+        // already-indexed handle to the registry: `get_or_create` then sees
+        // `is_indexed() == true` and never enters the (default-off) auto-index
+        // path, so the search either way succeeds regardless of ambient config.
+        let mut index = crate::cli::leindex::LeIndex::new(dir.path()).expect("leindex");
+        index
+            .index_project(true)
+            .expect("fixture project indexes lexically");
+
+        let registry = std::sync::Arc::new(
+            crate::cli::registry::ProjectRegistry::with_initial_project(5, index),
+        );
+        let args = serde_json::json!({
+            "query": "zzz_nonexistent_qqq_12345",
+            "project_path": dir.path().display().to_string(),
+        });
         let result = SearchHandler.execute(&registry, args).await;
         // Should succeed
         assert!(result.is_ok(), "search should succeed");

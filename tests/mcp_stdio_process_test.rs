@@ -5,7 +5,7 @@
 //!
 //! * a slow tool call must not queue `ping` (or anything else) behind it,
 //! * semantic search must work on the very first call of a fresh session,
-//! * `tools/list` is the four routers,
+//! * `tools/list` is the five routers,
 //! * `find` searches paths outside the workspace with no index,
 //! * argument mistakes come back as `isError` results with a hint.
 
@@ -185,7 +185,7 @@ fn indexed_fixture() -> &'static (tempfile::TempDir, tempfile::TempDir) {
 }
 
 #[test]
-fn test_tools_list_is_the_four_routers_with_a_discoverable_guide() {
+fn test_tools_list_is_the_five_routers_with_a_discoverable_guide() {
     let (project, home) = indexed_fixture();
     let mut server = Server::start(project.path(), home.path());
     let listed = server.call("tools/list", json!({}));
@@ -201,11 +201,21 @@ fn test_tools_list_is_the_four_routers_with_a_discoverable_guide() {
             "leindex_explore",
             "leindex_analyze",
             "leindex_edit",
-            "leindex_manage"
+            "leindex_manage",
+            "leindex_git"
         ]
     );
     let bytes = listed["result"]["tools"].to_string().len();
-    assert!(bytes < 14_000, "tools/list is {bytes} bytes");
+    // Wire-bytes backstop, aligned with the unit-side ledger in
+    // `grouped.rs::test_grouped_listing_stays_small` (the RATIO guard there is
+    // the real bound; this absolute ceiling only catches runaway growth).
+    // Ledger: 14_000 -> 16_500 when the fifth router `leindex_git` landed;
+    // 16_500 -> 17_500 here because the PR-review remediation of the
+    // git/manage handler descriptions pushed the wire listing to exactly
+    // 16_500 bytes (in-crate grouped listing 15_742, ratio 0.52 — well under
+    // the 60% bound). The wire includes JSON-RPC framing, so it runs ~750
+    // bytes above the in-crate figure the unit ledger measures.
+    assert!(bytes <= 17_500, "tools/list is {bytes} bytes");
 
     let resources = server.call("resources/list", json!({}));
     assert!(
@@ -219,7 +229,9 @@ fn test_tools_list_is_the_four_routers_with_a_discoverable_guide() {
         .as_str()
         .unwrap_or_default();
     assert!(
-        text.contains("`leindex_explore` = `find`") && text.contains("git_diff"),
+        text.contains("`leindex_explore` = `find`")
+            && text.contains("leindex_git")
+            && text.contains("diff"),
         "{text}"
     );
 }

@@ -56,8 +56,11 @@ impl ProjectConfig {
         let config_path = project_path.as_ref().join(DEFAULT_CONFIG_FILE);
 
         if !config_path.exists() {
-            // Return default configuration if file doesn't exist
-            return Ok(ProjectConfig::default());
+            let mut config = ProjectConfig::default();
+            if let Some(global_limit) = crate::config::global_max_file_size() {
+                config.indexing.max_file_size = global_limit;
+            }
+            return Ok(config);
         }
 
         // Read and parse TOML file

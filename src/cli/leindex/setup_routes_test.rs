@@ -1,5 +1,16 @@
 use super::*;
 
+/// Read the value of a batch-ceiling option that setup pinned into `args`.
+///
+/// Returns `None` when no spelling of the option is present, so a test can
+/// assert that the ceiling contract is actually in force rather than silently
+/// skipped. Delegates to the production `flag_value` so every spelling
+/// (`-flag value`, `--flag value`, `-flag=value`, `--flag=value`) is read the
+/// same way the repair code writes them.
+fn batch_value(args: &[String], flags: &[&str]) -> Option<u64> {
+    flag_value(args, flags)?.parse().ok()
+}
+
 fn external() -> LeIndexConfig {
     let mut config = LeIndexConfig::default();
     let embedding = &mut config.indexing.embeddings;
@@ -13,11 +24,65 @@ fn external() -> LeIndexConfig {
     config
 }
 
+/// A provider key that is already exported must not be re-asked for, and the
+/// configured variable name must survive untouched.
+///
+/// This is the zero-config half of the preset flow: `leindex setup gemini`
+/// after `export GEMINI_API_KEY=...` should walk straight into the model
+/// picker. The variable name here is unique to this test — reusing a
+/// conventional name would let another test's environment decide the outcome.
+#[test]
+fn test_prompt_key_env_keeps_a_detected_environment_variable() {
+    const DETECTED: &str = "LEINDEX_TEST_DETECTED_KEY_ENV";
+    // SAFETY: unique name, never read by production code, and this test owns it.
+    unsafe { std::env::set_var(DETECTED, "present") };
+    let mut route = ExternalRoute {
+        endpoint: "http://127.0.0.1:9000/v1".into(),
+        model: "fixture".into(),
+        dimension: Some(1024),
+        key_env: DETECTED.into(),
+        key_literal: String::new(),
+        doc: String::new(),
+        query: String::new(),
+    };
+    prompt_key_env(&mut route).expect("a detected key must not prompt");
+    assert_eq!(route.key_env, DETECTED);
+    unsafe { std::env::remove_var(DETECTED) };
+}
+
+/// An empty variable name means "this route is unauthenticated" and must not
+/// be silently replaced. It reaches the prompt, which is only safe in a
+/// terminal: the non-interactive path never calls this function at all, and
+/// this assertion documents that the empty case is deliberately not
+/// auto-accepted the way a detected key is.
+#[test]
+fn test_prompt_key_env_treats_an_empty_variable_as_unauthenticated() {
+    let route = ExternalRoute {
+        endpoint: String::new(),
+        model: String::new(),
+        dimension: None,
+        key_env: String::new(),
+        key_literal: String::new(),
+        doc: String::new(),
+        query: String::new(),
+    };
+    // Mirrors the guard at the top of `prompt_key_env`: no name, nothing to
+    // detect, so the prompt is reached rather than skipped.
+    let detected = std::env::var(route.key_env.trim())
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some();
+    assert!(
+        !detected,
+        "an empty variable name cannot resolve to a detected key"
+    );
+}
+
 #[test]
 fn test_external_rerun_preserves_unspecified_fields() {
     let mut config = external();
     let before = serde_json::to_value(&config.indexing.embeddings).unwrap();
-    configure_external(&mut config, &SetupOptions::default()).unwrap();
+    configure_external(&mut config, "custom", &SetupOptions::default()).unwrap();
     assert_eq!(
         before,
         serde_json::to_value(&config.indexing.embeddings).unwrap()
@@ -33,7 +98,7 @@ fn test_external_empty_flags_clear_templates_and_authentication() {
         embedding_query_template: Some(String::new()),
         ..Default::default()
     };
-    configure_external(&mut config, &options).unwrap();
+    configure_external(&mut config, "custom", &options).unwrap();
     assert!(config.indexing.embeddings.remote_api_key_env.is_none());
     assert!(config.indexing.embeddings.remote_api_key.is_none());
     assert!(config.indexing.embeddings.remote_doc_template.is_none());
@@ -53,12 +118,13 @@ fn test_external_rejects_url_query_fragment_and_zero_dimension() {
             embedding_endpoint: Some(endpoint.into()),
             ..Default::default()
         };
-        assert!(configure_external(&mut config, &options).is_err());
+        assert!(configure_external(&mut config, "custom", &options).is_err());
         assert_eq!(before, serde_json::to_value(&config).unwrap());
     }
     assert!(
         configure_external(
             &mut external(),
+            "custom",
             &SetupOptions {
                 embedding_dimension: Some(0),
                 ..Default::default()
@@ -83,7 +149,7 @@ fn test_gpu_arguments_preserve_and_override_without_duplicates() {
         "--ctx-size",
         "8192",
         "--batch-size",
-        "8192",
+        "2048",
         "--embedding",
         "--pooling",
         "mean",
@@ -94,10 +160,36 @@ fn test_gpu_arguments_preserve_and_override_without_duplicates() {
     .collect();
     let before = args.clone();
     configure_args(&mut args, None, false).unwrap();
-    assert_eq!(args, before);
+    // The operator's arguments keep their order, arity and spelling. The only
+    // thing that changes is the stale ceiling VALUE, repaired in the spelling it
+    // was found in: `-b` and `--batch-size` are ONE llama-server option and the
+    // LAST occurrence wins, so appending `-b` beside `--batch-size 2048` would
+    // outvote the operator instead of repairing them.
+    assert_eq!(
+        &args[..before.len()],
+        [
+            "--ctx-size",
+            "8192",
+            "--batch-size",
+            &EMBEDDING_BATCH.to_string(),
+            "--embedding",
+            "--pooling",
+            "mean",
+            "--gpu-layers=0",
+        ]
+    );
+    // Only the logical ceiling is appended; the physical one was repaired in
+    // place rather than duplicated.
+    assert_eq!(
+        &args[before.len()..],
+        ["-ub", &EMBEDDING_UBATCH_MIN.to_string()]
+    );
+    // Idempotent: a rerun must not append a second copy.
+    let after_once = args.clone();
+    configure_args(&mut args, None, false).unwrap();
+    assert_eq!(args, after_once);
     configure_args(&mut args, Some(7), false).unwrap();
     assert_eq!(gpu_layers(&args).unwrap(), Some(7));
-    assert!(args.windows(2).any(|pair| pair == ["--batch-size", "8192"]));
     assert_eq!(
         args.iter()
             .filter(|arg| arg.as_str() == "--embedding")
@@ -109,6 +201,215 @@ fn test_gpu_arguments_preserve_and_override_without_duplicates() {
     assert_eq!(gpu_layers(&args).unwrap(), Some(0));
     assert!(gpu_layers(&["-ngl".into()]).is_err());
     assert!(configure_args(&mut vec!["--pooling".into()], None, false).is_err());
+}
+
+#[test]
+fn test_launch_arguments_never_guess_a_host_specific_device() {
+    // `--device` names are per-host (`Vulkan1` is one machine's discrete GPU and
+    // names nothing on a CUDA or CPU llama build), so setup must never invent
+    // one: a wrong name makes the managed server fail to start at all.
+    let mut args = Vec::new();
+    configure_args(&mut args, None, false).unwrap();
+    assert!(
+        !args.iter().any(|arg| arg.starts_with("--device")),
+        "setup must not pin a device it cannot know: {args:?}"
+    );
+    // Batch ceilings ARE pinned — but for a different reason than the device.
+    // A batch ceiling is not an inference about the host: it is the other half
+    // of a contract with this client. The client admits documents up to 64 KiB
+    // (`BatchBudget`), a 64 KiB Rust document tokenizes to ~21,846 tokens, and
+    // llama-server answers HTTP 500 for any input larger than its logical batch
+    // — which the caller's failure budget then counts. Leaving `-ub` at the
+    // server default is what produced 92,605 rejections in one measured run.
+    let ubatch =
+        batch_value(&args, &UBATCH_FLAGS).expect("setup must pin the logical batch ceiling");
+    let batch =
+        batch_value(&args, &BATCH_FLAGS).expect("setup must pin the physical batch ceiling");
+    assert!(
+        ubatch >= 21_846,
+        "-ub must cover the largest legal 64 KiB document (~21,846 tokens): {ubatch}"
+    );
+    assert!(
+        batch >= ubatch,
+        "llama-server requires the physical batch to be at least the logical batch: \
+         -b {batch} < -ub {ubatch}"
+    );
+    // Every pinned ceiling stays operator-overridable (see `add_if_absent`).
+    assert!(args.windows(2).any(|pair| pair == ["-ngl", "99"]));
+
+    // A CPU launch gets no GPU offload at all.
+    let mut cpu = Vec::new();
+    configure_args(&mut cpu, Some(0), true).unwrap();
+    assert!(cpu.windows(2).any(|pair| pair == ["-ngl", "0"]));
+    assert!(!cpu.iter().any(|arg| arg.starts_with("--device")));
+}
+
+/// A stale ceiling written by an EARLIER LeIndex build must be raised, not
+/// preserved. `add_if_absent` treats any present option as operator intent,
+/// which would strand every existing install on `-ub 24576` forever — re-running
+/// setup, the one action a user takes to pick up a corrected default, would
+/// change nothing while the server kept answering HTTP 500 for documents this
+/// client admits.
+#[test]
+fn test_stale_batch_ceilings_are_raised_but_larger_operator_values_survive() {
+    // Exactly what the live managed service was running (measured via ps).
+    let mut stale: Vec<String> = ["-ngl", "99", "-b", "24576", "-ub", "24576"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    configure_args(&mut stale, None, false).unwrap();
+    assert_eq!(
+        batch_value(&stale, &UBATCH_FLAGS),
+        Some(EMBEDDING_UBATCH_MIN),
+        "a stale -ub below the largest document must be raised, got {stale:?}"
+    );
+    assert!(
+        batch_value(&stale, &BATCH_FLAGS).is_some_and(|batch| batch >= EMBEDDING_UBATCH_MIN),
+        "-b must be raised with -ub so llama-server still starts: {stale:?}"
+    );
+    // A repaired install must converge on what a FRESH install gets, or it runs
+    // with a smaller physical batch than the measured optimum forever.
+    assert_eq!(
+        batch_value(&stale, &BATCH_FLAGS),
+        Some(EMBEDDING_BATCH),
+        "a repaired -b must converge on a fresh install's value, got {stale:?}"
+    );
+    // The existing offload layer must not be disturbed by the repair.
+    assert_eq!(gpu_layers(&stale).unwrap(), Some(99));
+
+    // An operator who deliberately configured MORE headroom keeps it.
+    let mut generous: Vec<String> = ["-ub", "65536", "-b"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    configure_args(&mut generous, None, false).unwrap();
+    assert_eq!(
+        batch_value(&generous, &UBATCH_FLAGS),
+        Some(65536),
+        "a larger operator value is never lowered: {generous:?}"
+    );
+
+    // The `-flag=value` spelling is repaired too, not just the split form.
+    let mut equals_form: Vec<String> = ["-ub=24576"].into_iter().map(String::from).collect();
+    configure_args(&mut equals_form, None, false).unwrap();
+    assert_eq!(
+        batch_value(&equals_form, &UBATCH_FLAGS),
+        Some(EMBEDDING_UBATCH_MIN)
+    );
+}
+
+/// The operator's spelling of a ceiling is the one that must be repaired.
+///
+/// `-b`/`--batch-size` are ONE llama-server option and every occurrence assigns,
+/// so a later `-b` outvotes an earlier `--batch-size`. Appending the canonical
+/// short form beside an operator's long form therefore overrode their
+/// deliberate value — the exact opposite of the "operator's explicit value
+/// always wins" contract. Repair in place, in the spelling found, and stay put.
+#[test]
+fn test_long_form_ceiling_is_repaired_in_the_spelling_the_operator_used() {
+    // A long-form ceiling the API server would accept, next to nothing else.
+    let mut args: Vec<String> = ["--batch-size", "32768"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    configure_args(&mut args, None, false).unwrap();
+    // Still exactly ONE occurrence: no `-b` was appended to outvote it.
+    assert_eq!(
+        args.iter()
+            .filter(|arg| BATCH_FLAGS.contains(&arg.as_str()))
+            .count(),
+        1,
+        "a canonically-spelled duplicate must not be appended: {args:?}"
+    );
+    // The operator's value and spelling both survive.
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--batch-size", "32768"]),
+        "the operator's argument is preserved verbatim: {args:?}"
+    );
+    // The ceiling setup owns is still supplied, exactly once.
+    assert_eq!(
+        args.iter()
+            .filter(|arg| UBATCH_FLAGS.contains(&arg.as_str()))
+            .count(),
+        1,
+        "the absent logical ceiling is appended once: {args:?}"
+    );
+    assert_eq!(
+        batch_value(&args, &UBATCH_FLAGS),
+        Some(EMBEDDING_UBATCH_MIN),
+        "setup must still pin the logical ceiling it owns: {args:?}"
+    );
+
+    // A long-form `--ubatch-size` below the floor is repaired in place too.
+    let mut long_ubatch: Vec<String> = ["--ubatch-size", "24576"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    configure_args(&mut long_ubatch, None, false).unwrap();
+    assert_eq!(
+        batch_value(&long_ubatch, &UBATCH_FLAGS),
+        Some(EMBEDDING_UBATCH_MIN),
+        "a stale long-form logical ceiling must be raised: {long_ubatch:?}"
+    );
+    assert!(
+        long_ubatch
+            .windows(2)
+            .any(|pair| pair == ["--ubatch-size", "32768"]),
+        "repaired in the spelling it was found in: {long_ubatch:?}"
+    );
+
+    // Two spellings of the SAME option with conflicting values: the effective
+    // one is the LAST, and that is the one repaired.
+    let mut conflicting: Vec<String> = ["-ub", "65536", "--ubatch-size", "24576"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    configure_args(&mut conflicting, None, false).unwrap();
+    let raised = EMBEDDING_UBATCH_MIN.to_string();
+    assert_eq!(
+        flag_value(&conflicting, &UBATCH_FLAGS),
+        Some(raised.as_str()),
+        "the LAST occurrence is what llama-server runs on, so it is what is repaired: \
+         {conflicting:?}"
+    );
+    // The operator's deliberate 65536 is not clobbered by the repair.
+    assert!(
+        conflicting.windows(2).any(|pair| pair == ["-ub", "65536"]),
+        "an unrelated larger value is untouched: {conflicting:?}"
+    );
+}
+
+/// Repairing the ceiling must be idempotent: the second run is a no-op.
+#[test]
+fn test_batch_ceiling_repair_is_idempotent() {
+    let mut args = vec!["-ub".to_string(), "24576".to_string()];
+    configure_args(&mut args, None, false).unwrap();
+    let repaired = args.clone();
+    configure_args(&mut args, None, false).unwrap();
+    assert_eq!(args, repaired, "a repaired ceiling must not keep changing");
+}
+
+/// llama-server refuses to START when `-b < -ub`, so the repair must never leave
+/// that state behind — even when the operator's `-ub` is far above the floor and
+/// the `-b` sitting next to it is a stale default.
+#[test]
+fn test_repaired_physical_batch_always_covers_the_effective_logical_batch() {
+    // A stale `-b` next to a deliberately raised `-ub`: raising `-b` only to the
+    // floor constant would produce `-b 32768 < -ub 65536`, a server that will
+    // not boot.
+    let mut args: Vec<String> = ["-b", "24576", "-ub", "65536"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    configure_args(&mut args, None, false).unwrap();
+    let batch = batch_value(&args, &BATCH_FLAGS).expect("-b present");
+    let ubatch = batch_value(&args, &UBATCH_FLAGS).expect("-ub present");
+    assert_eq!(ubatch, 65536, "the operator's logical batch is preserved");
+    assert!(
+        batch >= ubatch,
+        "llama-server would refuse to start: -b {batch} < -ub {ubatch} ({args:?})"
+    );
 }
 
 #[test]
@@ -181,7 +482,71 @@ fn test_managed_rerun_preserves_alias_autostart_and_extra_arguments() {
     let mut config = LeIndexConfig::default();
     config.services.insert("gemma".into(), service.clone());
     configure_gemma(&mut config, &SetupOptions::default()).unwrap();
-    assert_eq!(config.services["gemma"], service);
+    let configured = &config.services["gemma"];
+    // Operator identity is preserved across a rerun...
+    assert_eq!(configured.binary, service.binary);
+    assert_eq!(configured.model, service.model);
+    assert_eq!(configured.alias, service.alias);
+    assert_eq!(configured.host, service.host);
+    assert_eq!(configured.port, service.port);
+    assert_eq!(configured.auto_start, service.auto_start);
+    assert_eq!(configured.start_timeout_secs, service.start_timeout_secs);
+    // ...their explicit arguments survive untouched (no duplicate flags)...
+    // Strip each ceiling as a flag/value PAIR, in ANY spelling: a ceiling the
+    // operator already expressed is repaired in place, so it keeps its position,
+    // its spelling and its arity — only its value may change. Matching the flag
+    // alone would leave a repaired value behind and compare it as if it were one
+    // of the operator's own arguments.
+    let ceiling_flag = |arg: &str| BATCH_FLAGS.contains(&arg) || UBATCH_FLAGS.contains(&arg);
+    let without_ceilings = |args: &[String]| -> Vec<String> {
+        let mut kept = Vec::new();
+        let mut skip_value = false;
+        for arg in args {
+            if skip_value {
+                skip_value = false;
+            } else if ceiling_flag(arg) {
+                skip_value = true;
+            } else {
+                kept.push(arg.clone());
+            }
+        }
+        kept
+    };
+    assert_eq!(
+        without_ceilings(&configured.extra_args),
+        without_ceilings(&service.extra_args),
+        "a rerun must preserve the operator's arguments exactly"
+    );
+    // ...the ceilings end up present exactly once, in the operator's spelling...
+    for (flags, value) in [
+        (
+            &BATCH_FLAGS[..],
+            batch_value(&configured.extra_args, &BATCH_FLAGS),
+        ),
+        (
+            &UBATCH_FLAGS[..],
+            batch_value(&configured.extra_args, &UBATCH_FLAGS),
+        ),
+    ] {
+        assert_eq!(
+            configured
+                .extra_args
+                .iter()
+                .filter(|arg| flags.contains(&arg.as_str()))
+                .count(),
+            1,
+            "a rerun must not duplicate {flags:?}"
+        );
+        assert!(value.is_some(), "setup must pin {flags:?}");
+    }
+    // ...the stale 8192 the operator was carrying is repaired, not preserved...
+    assert_eq!(
+        batch_value(&configured.extra_args, &BATCH_FLAGS),
+        Some(EMBEDDING_BATCH),
+        "a stale ceiling must converge on a fresh install's value: {:?}",
+        configured.extra_args
+    );
+    // ...and the resolved model still drives the embedding route.
     assert_eq!(
         config.indexing.embeddings.remote_model.as_deref(),
         Some("custom-gemma")
@@ -195,10 +560,11 @@ fn test_external_rerun_preserves_legacy_auth_and_local_model_override() {
         Some(String::from_iter(['f', 'i', 'x', 't', 'u', 'r', 'e']));
     config.indexing.embeddings.onnx_model_path = Some("/fixture/local.onnx".into());
     let before = serde_json::to_value(&config.indexing.embeddings).unwrap();
-    configure_external(&mut config, &SetupOptions::default()).unwrap();
+    configure_external(&mut config, "custom", &SetupOptions::default()).unwrap();
     assert!(before == serde_json::to_value(&config.indexing.embeddings).unwrap());
     configure_external(
         &mut config,
+        "custom",
         &SetupOptions {
             embedding_api_key_env: Some(String::new()),
             ..Default::default()
@@ -227,5 +593,312 @@ fn test_qwen_clears_remote_resolution() {
             .embeddings
             .resolved_remote_with(&config.services)
             .is_none()
+    );
+}
+
+/// Every provider preset must be selectable end-to-end WITHOUT spelling out an
+/// endpoint, a model, or a dimension.
+///
+/// This is the regression test for the whole complaint that motivated the
+/// preset table: `leindex setup --embedding gemini` used to be an unknown route,
+/// and even a hand-written `remote_provider = "gemini"` config resolved no
+/// endpoint and ran the OpenAI-compatible wire format. Both halves are asserted
+/// here — the route configures, and the RESOLVED route selects the provider's
+/// own wire family, which is what the index path reads to pick a provider
+/// implementation.
+#[test]
+fn test_every_provider_preset_configures_without_explicit_endpoint_or_model() {
+    for preset in crate::config::REMOTE_PRESETS {
+        let mut config = LeIndexConfig::default();
+        let choices = SetupChoices {
+            neural_enabled: true,
+            provider: None,
+            remote_gemma: false,
+            options: SetupOptions {
+                embedding: Some(preset.name.into()),
+                ..Default::default()
+            },
+        };
+        configure(&mut config, &choices)
+            .unwrap_or_else(|e| panic!("preset {:?} failed to configure: {e:?}", preset.name));
+
+        let embeddings = &config.indexing.embeddings;
+        assert_eq!(
+            embeddings.remote_provider, preset.name,
+            "the preset name must be persisted as the provider"
+        );
+        // The preset fills these at resolve time, so they must NOT be frozen
+        // into the file: a later table update has to reach existing installs.
+        assert_eq!(
+            embeddings.remote_endpoint, None,
+            "preset {:?} must not persist its endpoint",
+            preset.name
+        );
+        assert_eq!(
+            embeddings.remote_model, None,
+            "preset {:?} must not persist its model",
+            preset.name
+        );
+
+        let resolved = embeddings
+            .resolved_remote_with(&config.services)
+            .unwrap_or_else(|| panic!("preset {:?} resolved no remote route", preset.name));
+        assert_eq!(
+            resolved.endpoint, preset.endpoint,
+            "preset {:?} must resolve its documented endpoint",
+            preset.name
+        );
+        assert_eq!(
+            resolved.model.as_deref(),
+            Some(preset.model),
+            "preset {:?} must resolve its documented model",
+            preset.name
+        );
+        assert_eq!(
+            resolved.remote_dimension,
+            Some(preset.dimension),
+            "preset {:?} must resolve its native dimension",
+            preset.name
+        );
+        assert_eq!(
+            resolved.wire, preset.wire,
+            "preset {:?} must resolve its own wire family, or the index path \
+             would run the wrong protocol",
+            preset.name
+        );
+        // The conventional key variable is picked up so the route can
+        // authenticate without the user naming it.
+        assert_eq!(
+            embeddings.remote_api_key_env.as_deref(),
+            preset.api_key_env,
+            "preset {:?} must fall back to its conventional API key variable",
+            preset.name
+        );
+    }
+}
+
+/// Only Gemini speaks the native protocol; every other preset rides the
+/// OpenAI-compatible `/v1/embeddings` contract.
+///
+/// Pinned as an explicit expectation rather than derived from the table, so
+/// adding a provider forces a decision here instead of silently inheriting
+/// whatever the default happens to be.
+#[test]
+fn test_native_wire_is_gemini_only() {
+    for preset in crate::config::REMOTE_PRESETS {
+        let expected = if preset.name == "gemini" {
+            crate::config::RemoteWire::Gemini
+        } else {
+            crate::config::RemoteWire::OpenAiCompat
+        };
+        assert_eq!(
+            preset.wire, expected,
+            "preset {:?} has an unexpected wire family",
+            preset.name
+        );
+    }
+}
+
+/// An unrecognized `remote_provider` keeps the generic OpenAI-compatible path
+/// and resolves no endpoint, so a bare `remote_provider` value can never
+/// silently produce a route the user did not configure.
+#[test]
+fn test_unknown_provider_still_needs_an_explicit_endpoint() {
+    let mut config = LeIndexConfig::default();
+    config.indexing.embeddings.enable_hybrid = true;
+    config.indexing.embeddings.remote_provider = "not-a-provider".into();
+    assert!(
+        config.indexing.embeddings.remote_preset().is_none(),
+        "an unknown provider name must not match a preset"
+    );
+    assert!(
+        config
+            .indexing
+            .embeddings
+            .resolved_remote_with(&config.services)
+            .is_none(),
+        "an unknown provider must not invent an endpoint"
+    );
+    assert_eq!(config.indexing.embeddings.remote_preset_label(), "custom");
+}
+
+/// The configured provider must survive into the actual provider instance.
+///
+/// `EmbeddingConfig` -> `RemoteEmbeddingConfig::from_resolved` is the one
+/// funnel the index path, the query path, and the smoke test all use. If it
+/// maps a Gemini route to the OpenAI-compatible variant, the endpoint and model
+/// still look right while the wire format is silently wrong — exactly the bug
+/// that made the preset table useless before.
+///
+/// Gated on `remote-embeddings` because the wire types it asserts over only
+/// exist under that feature: `src/search/onnx/mod.rs` gates `pub mod remote`
+/// and its `RemoteEmbeddingConfig` re-export behind the same `cfg`. Without the
+/// gate, `--no-default-features` builds fail to resolve the symbols.
+#[cfg(feature = "remote-embeddings")]
+#[test]
+fn test_from_resolved_maps_the_wire_family_to_a_provider_variant() {
+    use crate::search::onnx::RemoteProvider;
+
+    let mut config = LeIndexConfig::default();
+    config.indexing.embeddings.enable_hybrid = true;
+    config.indexing.embeddings.remote_provider = "gemini".into();
+    let resolved = config
+        .indexing
+        .embeddings
+        .resolved_remote_with(&config.services)
+        .expect("gemini preset must resolve");
+    let remote = crate::search::onnx::RemoteEmbeddingConfig::from_resolved(&resolved, None, None);
+    match &remote.provider {
+        RemoteProvider::Gemini { model } => assert_eq!(model, "gemini-embedding-001"),
+        other => panic!("gemini must map to the native variant, got {other:?}"),
+    }
+    // Gemini carries its resolved endpoint as an override base URL, because the
+    // variant itself has no endpoint field.
+    assert_eq!(remote.base_url.as_deref(), Some(resolved.endpoint.as_str()));
+
+    // A preset on the compatible wire stays on the generic endpoint variant and
+    // must NOT set `base_url`: the endpoint is already the variant's identity,
+    // and setting both would key the checkpoint on the wrong string.
+    config.indexing.embeddings.remote_provider = "voyage".into();
+    let resolved = config
+        .indexing
+        .embeddings
+        .resolved_remote_with(&config.services)
+        .expect("voyage preset must resolve");
+    let remote = crate::search::onnx::RemoteEmbeddingConfig::from_resolved(&resolved, None, None);
+    match &remote.provider {
+        RemoteProvider::Custom { endpoint } => assert_eq!(endpoint, "https://api.voyageai.com/v1"),
+        other => panic!("voyage must map to the compatible variant, got {other:?}"),
+    }
+    assert_eq!(remote.base_url, None);
+}
+
+/// A preset's model must be able to embed ONE document per vector.
+///
+/// `gemini-embedding-2` aggregates several inputs into a single vector and
+/// rejects `taskType`, which is why the preset itself uses `embedding-001` and
+/// says so in a comment above `REMOTE_PRESETS`. A comment is not a guard: a live
+/// config was nevertheless set to `gemini-embedding-2`, which would have embedded
+/// a whole batch into one vector and collapsed the per-node vector space. The
+/// failure is quiet — well-shaped vectors of the right width — so nothing
+/// downstream catches it, and the model name is the only signal available before
+/// a request is paid for.
+#[test]
+fn test_no_preset_uses_an_aggregating_embedding_model() {
+    // Models documented to collapse multiple inputs into one vector.
+    const AGGREGATING: &[&str] = &["gemini-embedding-2"];
+    for preset in crate::config::REMOTE_PRESETS {
+        assert!(
+            !AGGREGATING.contains(&preset.model),
+            "preset `{}` uses `{}`, which aggregates a batch into one vector",
+            preset.name,
+            preset.model
+        );
+    }
+    let gemini = crate::config::REMOTE_PRESETS
+        .iter()
+        .find(|preset| preset.name == "gemini")
+        .expect("the gemini preset must exist");
+    assert_eq!(
+        gemini.model, "gemini-embedding-001",
+        "the gemini preset must name a per-document model"
+    );
+}
+
+/// A key the user PASTES must reach the config, not just be accepted by the UI.
+///
+/// `remote_api_key` is the literal-token field and the runtime honours it, but
+/// setup could previously only preserve or clear it — the docs' only path was
+/// `leindex config set indexing.embeddings.remote_api_key`. A user with the key
+/// in a password manager had no way to enter it through setup at all.
+///
+/// This pins the whole hand-off, because the three parts fail independently:
+/// the flag must be recorded, it must be stored, and it must NOT leave a
+/// `remote_api_key_env` behind — one key, one source of truth, or the next
+/// `config show` and `setup` re-run disagree about where the credential lives.
+#[test]
+fn test_pasted_api_key_is_stored_as_the_literal_token() {
+    let mut config = external();
+    let options = SetupOptions {
+        embedding_api_key: Some("ci-pasted-token".into()),
+        ..Default::default()
+    };
+    configure_external(&mut config, "custom", &options).unwrap();
+    assert_eq!(
+        config.indexing.embeddings.remote_api_key.as_deref(),
+        Some("ci-pasted-token"),
+        "a pasted key must be persisted as the literal token"
+    );
+    assert!(
+        config.indexing.embeddings.remote_api_key_env.is_none(),
+        "a pasted key must clear remote_api_key_env so one source of truth remains"
+    );
+}
+
+/// A literal key must not survive a route change that names a different variable.
+///
+/// The stored token outranks `remote_api_key_env` at request time, so a leftover
+/// token from a previous provider would silently authenticate the NEW route with
+/// the OLD provider's credential — a cross-provider credential leak.
+#[test]
+fn test_switching_to_an_env_var_drops_the_stored_literal_token() {
+    const NEW_VAR: &str = "LEINDEX_TEST_SWITCHED_PROVIDER_KEY";
+    // SAFETY: unique name, never read by production code, and this test owns it.
+    // It must EXIST: `check_api_key_env` deliberately rejects a configured name
+    // that resolves to nothing, and that rejection is correct — a name pointing
+    // at an unset variable fails later at ingest with an authentication error.
+    unsafe { std::env::set_var(NEW_VAR, "present") };
+    let mut config = external();
+    config.indexing.embeddings.remote_api_key = Some("old-provider-token".into());
+    let options = SetupOptions {
+        embedding_api_key_env: Some(NEW_VAR.into()),
+        ..Default::default()
+    };
+    configure_external(&mut config, "custom", &options).unwrap();
+    assert!(
+        config.indexing.embeddings.remote_api_key.is_none(),
+        "the previous provider's token must not authenticate the new route"
+    );
+    assert_eq!(
+        config.indexing.embeddings.remote_api_key_env.as_deref(),
+        Some(NEW_VAR)
+    );
+    unsafe { std::env::remove_var(NEW_VAR) };
+}
+
+/// An external route must CLEAR `remote_service`, not inherit it.
+///
+/// The endpoint resolution ladder is explicit endpoint > service base URL >
+/// preset default, so a leftover `remote_service` is not inert: the moment the
+/// explicit endpoint is absent (a preset route, or a later `config unset`) the
+/// managed service silently takes over the route. Worse, setup's own readiness
+/// check prints "external endpoint takes precedence; no managed service checked
+/// or started" — it acts on the promise that this field is None.
+///
+/// This was previously asserted only in prose, which is how the companion
+/// behaviour drifted: `remote_service` is still DROPPED here rather than
+/// validated, so the assertion below is what keeps the two in step.
+#[test]
+fn test_external_route_clears_the_managed_service_reference() {
+    let mut config = external();
+    // A config that had been wired to a managed server, which is exactly the
+    // state `leindex setup --embedding embeddinggemma2` leaves behind.
+    config.indexing.embeddings.remote_service = Some("gemma".into());
+    let options = SetupOptions {
+        embedding_endpoint: Some("https://api.example.test/v1".into()),
+        embedding_model: Some("fixture-model".into()),
+        embedding_dimension: Some(1024),
+        ..Default::default()
+    };
+    configure_external(&mut config, "custom", &options).unwrap();
+    assert!(
+        config.indexing.embeddings.remote_service.is_none(),
+        "an external route must not keep a managed-service reference: it outranks \
+         the preset default and would hijack the route once the explicit endpoint is gone"
+    );
+    assert_eq!(
+        config.indexing.embeddings.remote_endpoint.as_deref(),
+        Some("https://api.example.test/v1"),
+        "the explicit endpoint is what must carry the external route instead"
     );
 }

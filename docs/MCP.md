@@ -177,19 +177,20 @@ code navigation tasks. The table below shows the token efficiency advantage:
 
 ---
 
-## The Four Tools
+## The Five Tools
 
-`tools/list` advertises **four tools** instead of twenty. Each is a router: a
+`tools/list` advertises **five tools** instead of twenty. Each is a router: a
 discriminator argument selects the operation ("branch") and every other argument
 is forwarded unchanged to it. This roughly halves the tool-description overhead a
 model pays on every session and removes the choice between near-synonyms.
 
 | Tool | Selector | Branches |
 |---|---|---|
-| `leindex_explore` | `mode` | `search` (default), `find`, `symbol_lookup`, `read_file`, `read_symbol`, `project_map`, `file_summary`, `context` |
-| `leindex_analyze` | `mode` | `deep` (default), `impact`, `diagnostics`, `git_status`, `git_diff` |
+| `leindex_explore` | `mode` | `search` (default), `find`, `structural`, `symbol_lookup`, `read_file`, `read_symbol`, `project_map`, `file_summary`, `context` |
+| `leindex_analyze` | `mode` | `deep` (default), `impact`, `diagnostics`, `phase` |
 | `leindex_edit` | `action` (**required**) | `preview`, `apply`, `rename`, `write` |
-| `leindex_manage` | `action` | `index` (default), `phase` |
+| `leindex_manage` | `action` | `index` (default), `state`, `projects`, `evict`, `lease`, `cleanup` |
+| `leindex_git` | `action` | `status`, `diff`, `log`, `show`, `blame`, `branch`, `remote`, `add`, `commit`, `checkout`, `stash`, `tag`, `merge`, `rebase`, `push`, `reset`, `force` (mutations are preview-only) |
 
 `leindex_edit` has no default on purpose: an ambiguous call must fail rather than
 guess at a mutation. The read-only routers default to their most common branch,
@@ -197,7 +198,8 @@ so a call with no selector behaves like the old single tool.
 
 ```json
 { "name": "leindex_explore", "arguments": { "mode": "find", "pattern": "TODO", "limit": 20 } }
-{ "name": "leindex_analyze", "arguments": { "mode": "git_diff", "range": "HEAD~3..HEAD" } }
+{ "name": "leindex_analyze", "arguments": { "mode": "phase", "phase": 3, "max_latency_ms": 60000 } }
+{ "name": "leindex_git",     "arguments": { "action": "diff", "range": "HEAD~3..HEAD" } }
 { "name": "leindex_edit",    "arguments": { "action": "preview", "file_path": "src/a.rs", "old_text": "a", "new_text": "b" } }
 { "name": "leindex_manage",  "arguments": { "action": "index", "project_path": "/repo", "wait": false } }
 ```
@@ -239,12 +241,16 @@ tool's semantic mode is gone; use `mode=search`.
 | `leindex_search` | `leindex_explore` `mode=search` |
 | `leindex_text_search`, `leindex_grep_symbols` | `leindex_explore` `mode=find` |
 | `leindex_symbol_lookup`, `_read_file`, `_read_symbol`, `_project_map`, `_file_summary`, `_context` | `leindex_explore` `mode=…` |
-| `leindex_deep_analyze`, `_impact_analysis`, `_diagnostics`, `_git_status` | `leindex_analyze` `mode=deep` / `impact` / `diagnostics` / `git_status` |
-| *(new)* | `leindex_analyze` `mode=git_diff` |
+| `leindex_deep_analyze`, `_impact_analysis`, `_diagnostics` | `leindex_analyze` `mode=deep` / `impact` / `diagnostics` |
+| `leindex_phase_analysis`, `phase_analysis` | `leindex_analyze` `mode=phase` |
 | `leindex_edit_preview`, `_edit_apply`, `_rename_symbol`, `_write` | `leindex_edit` `action=preview` / `apply` / `rename` / `write` |
-| `leindex_index`, `leindex_phase_analysis` | `leindex_manage` `action=index` / `phase` |
+| `leindex_index` | `leindex_manage` `action=index` |
+| *(new)* | `leindex_manage` `action=state` / `projects` / `evict` / `lease` / `cleanup` |
+| `leindex_git_status` | `leindex_git` `action=status` |
+| `leindex_git_diff` | `leindex_git` `action=diff` |
+| *(new)* | `leindex_git` `action=log` / `show` / `blame` / `branch` / `remote` / `add` / `commit` / `checkout` / `stash` / `tag` / `merge` / `rebase` / `push` / `reset` / `force` |
 
-### `git_diff` (`leindex_analyze` `mode=git_diff`)
+### `git_diff` (`leindex_git` `action=diff`)
 
 A PDG-enriched diff: the working tree (default), the index (`staged=true`), one
 commit against its parent (`ref="HEAD~1"`), or a range (`range="main..feature"`).
@@ -261,7 +267,7 @@ options.
 ## Branch Reference
 
 > The sections below document each branch's arguments under the tool name it had
-> before the four-router surface; the names still work as direct calls, and each
+> before the five-router surface; the names still work as direct calls, and each
 > branch is reached as described above. **Tool names are underscore-form**
 > (`leindex_edit_apply`, `leindex_read_file`): several MCP client implementations
 > mishandle dots, so the canonical names dropped them, and historical
@@ -1202,7 +1208,7 @@ data: {"type":"complete","stage":"indexing","current":0,"total":0,"message":"Don
 
 ## Integration Guides
 
-The optional System-One gate requires a source build with `--features system-one`.
+The optional System-One gate is built by default (`system-one` is in the `full` feature set) but stays dormant until armed.
 Set `LEINDEX_FEATURE_SYSTEM_ONE=1` in the MCP server's environment (the client's
 `env` object for stdio, or the HTTP server's environment), then add this to
 `$LEINDEX_HOME/config/leindex.toml` (default `~/.leindex/config/leindex.toml`):

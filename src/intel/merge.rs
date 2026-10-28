@@ -8,6 +8,14 @@ use std::path::Path;
 /// Accounting returned by one precision merge.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrecisionReport {
+    /// A run on this project was already in flight, so this pass did nothing
+    /// and left the Tier-0 PDG alone.
+    ///
+    /// Distinct from all-zero counts, which mean "ran, matched nothing". A
+    /// caller that cannot tell those apart reports a skipped pass as a
+    /// completed one, which reads as "precision found nothing here" when in
+    /// truth precision never ran.
+    pub skipped_concurrent_run: bool,
     /// Number of SCIP definitions inspected.
     pub definitions_seen: usize,
     /// Number of definitions matched to canonical Tier-0 nodes.

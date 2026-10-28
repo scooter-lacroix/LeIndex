@@ -25,6 +25,15 @@ pub enum Pooling {
     Max,
     /// Last token pooling.
     LastToken,
+    /// Pooling is decided by the remote endpoint, not by this client.
+    ///
+    /// The client cannot observe how a remote server aggregates token states,
+    /// so recording a concrete variant would be a guess written into a key
+    /// field that is supposed to be a fact. The value is honest, and it is a
+    /// safe namespace salt: it can only ever *separate* namespaces, never merge
+    /// two different vector spaces. Correctness for such a route does not rest
+    /// on this field — it rests on the endpoint identity being part of the key.
+    Unspecified,
 }
 
 impl Pooling {
@@ -35,6 +44,7 @@ impl Pooling {
             Self::Mean => 1,
             Self::Max => 2,
             Self::LastToken => 3,
+            Self::Unspecified => 4,
         }
     }
 }
@@ -50,6 +60,14 @@ pub enum Normalization {
     None,
     /// L2 normalization.
     L2,
+    /// Normalization is decided by the remote endpoint, not by this client.
+    ///
+    /// See [`Pooling::Unspecified`]: the client does not normalize remote
+    /// vectors (nothing in the index path does), so it cannot claim `L2`. Rows
+    /// are stored exactly as the endpoint returned them, and the endpoint's
+    /// identity is part of the key, so a namespace never mixes two
+    /// normalizations.
+    Unspecified,
 }
 
 impl Normalization {
@@ -58,6 +76,7 @@ impl Normalization {
         match self {
             Self::None => 0,
             Self::L2 => 1,
+            Self::Unspecified => 2,
         }
     }
 }

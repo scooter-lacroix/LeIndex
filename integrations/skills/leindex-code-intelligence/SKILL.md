@@ -14,8 +14,8 @@ When healthy, correctly scoped structured tools support the operation, do not us
 
 Before nontrivial changes: impact analysis, then preview, inspect the diff, then apply. Prefer preview/apply even for simple edits when available. Never apply a rename without reading its preview; edit action is mandatory.
 
-## Four routers
-`mode` selects explore/analyze; `action` selects edit/manage. Other arguments are forwarded to the selected branch. Common optional arguments: `project_path` (auto-indexes on first use), `tier=l0|l1|l2` (l1 default). l0 returns identity totals/paging state; start l0/l1, request l2 only for needed detail. Unknown selectors error with suggestions; omitted selectors use documented defaults, except edit requires action.
+## Five routers
+`mode` selects explore/analyze; `action` selects edit/manage/git. Other arguments are forwarded to the selected branch. Common optional arguments: `project_path` (auto-indexes on first use), `tier=l0|l1|l2` (l1 default). l0 returns identity totals/paging state; start l0/l1, request l2 only for needed detail. Default branch when the selector is omitted: explore→`search`, analyze→`deep`, manage→`index`, git→`status`. **`leindex_edit` has NO default: an ambiguous edit must fail rather than guess at a mutation, so `action` is required there.** Unknown selectors error with suggestions naming the router and branch to use instead.
 
 Live manifest is authoritative. Branch guide: `leindex://tools/guide`; short guide: `leindex://docs/q`. CLI discovery: `leindex tools list`, `leindex tools inspect <tool>`, `leindex tools schema <tool>`. Legacy operation names (`leindex_search`, `leindex_text_search`, `leindex_edit_apply`, etc.) are compatibility names, not advertised discovery targets; `leindex_grep_symbols`/`leindex_text_search` are folded into find.
 
@@ -23,11 +23,12 @@ Notation: `*` required; otherwise optional. Always check live schema before call
 
 ### leindex_explore (mode defaults to search)
 - **find**: live exact/regex/symbol search, including anywhere on disk. `pattern*`, `regex`, `word`, `case=smart|sensitive|insensitive` (smart default: insensitive unless pattern has uppercase), `target=text|symbols|auto` (text lines; symbols definitions, exact first; auto symbols then text), `output=matches|files|count|symbols` (matches default; symbols enclosing definitions ranked by hits), `scope` (project-relative dir/file), `paths` (extra files/dirs; no index or indexing side effects), `include_globs`, `exclude_globs`, `kind` (function/class/struct/etc. for symbols), `context_lines`, `max_line_chars`, `limit` (per page; 0 requests ceiling, currently 10000, NOT unlimited), `offset`, `per_file_cap` (0 disables; matches beyond cap appear on no page), `timeout_ms` (partial results + has_more). Follow returned next_offset; do not grow limit to re-fetch earlier pages. Live file reads reflect recent edits and respect index ignore rules, skip dirs and gitlinks. Use output=files for “which files mention X?”; paths for outside-project search.
-- **search**: ranked semantic/structural concept search. `query*`, `top_k`, `offset`, `scope`, `search_mode=code|prose|auto|exact|semantic`, `task_context`, `allow_partial`, `max_latency_ms`. Repeated queries use a result cache. Optional persistent, content-addressed Engram phrase-book (`LEINDEX_FEATURE_ENGRAM=1`) reuses neural embeddings across processes/projects/reindexes without waking the embedder; enable only with permission to change environment.
+- **structural**: AST-pattern search (ast-grep style) for code shapes regex cannot express. `pattern*`, `lang`, `scope`, `include_globs`, `exclude_globs`, `limit`, `offset`, `per_file_cap`, `timeout_ms`. Use for "every place that calls X with two arguments", not for literal text (use find).
+- **search**: ranked semantic/structural concept search. `query*`, `top_k` (default 10, max 100), `offset`, `scope`, `search_mode=code|prose|auto|exact|semantic` (default `code`), `task_context`, `allow_partial`, `max_latency_ms`. Repeated queries use a result cache. Optional persistent, content-addressed Engram phrase-book (`LEINDEX_FEATURE_ENGRAM=1`) reuses neural embeddings across processes/projects/reindexes without waking the embedder; enable only with permission to change environment.
 - **symbol_lookup**: PDG callers/callees, data dependencies and impact. `symbol` OR `symbols` (batch ≤20), `depth`, `include_callers`, `include_callees`, `include_source`, `scope`, `token_budget`, `allow_partial`, `max_latency_ms`.
 - **read_file**: primary indexed reader; exact numbered contents with optional symbol map. `file_path*`, `start_line`, `end_line`, `max_lines`, `include_symbol_map`.
 - **read_symbol**: exact function/class/method source, doc comments and dependency signatures. `symbol*`, `file_path` (disambiguation), `include_dependencies`, `token_budget`, `allow_partial`, `max_latency_ms`.
-- **project_map**: tree/layout, complexity hotspots and dependencies; replaces supported Glob/find/ls/tree navigation. `path`, `depth`, `focus` (topic relevance), `group_by=tree|community` (community = module boundaries), `sort_by`, `include_symbols`, `limit`, `offset`, `token_budget`. Example layout request: depth=2. Never call when user prohibits project maps.
+- **project_map**: tree/layout, complexity hotspots and dependencies; replaces supported Glob/find/ls/tree navigation. `path`, `depth` (default 3, max 10), `focus` (topic relevance), `group_by=tree|community` (community = module boundaries), `sort_by=complexity|name|dependencies|size` (default complexity), `include_symbols`, `limit`, `offset`, `token_budget`. Never call when user prohibits project maps.
 - **file_summary**: symbols, complexity and cross-file dependencies without full-source noise. `file_path*`, `focus_symbol`, `include_source`, `token_budget`, `allow_partial`, `max_latency_ms`.
 - **context**: PDG callers/callees, data dependencies and siblings. `node_id*` (short name or full ID), `token_budget`, `allow_partial`, `max_latency_ms`.
 
@@ -35,8 +36,16 @@ Notation: `*` required; otherwise optional. Always check live schema before call
 - **deep**: end-to-end semantic retrieval plus PDG/data flow across files. `query*`, `token_budget`, `task_context`, `allow_partial`, `max_latency_ms`.
 - **impact**: transitive blast radius. `symbol*`, `change_type=modify|remove|rename|change_signature`, `depth`.
 - **diagnostics**: health, sizes, memory/cache statistics, Engram entries/bytes/limits/hits/misses and embed-cache hits/misses; counters are per process.
-- **git_status**: structured changed files with PDG symbol/impact enrichment, no pager. `scope`, `allow_partial`, `enrich_pdg`, `max_latency_ms`.
-- **git_diff**: rename-aware diff, changed hunks → PDG symbols/callers/affected files, including untracked file sizes; no pager. `ref` (commit vs parent), `range` (A..B or A...B, e.g. HEAD~2..main), `staged` (--cached), `scope`, `stat_only` (per-file numstat; --stat), `include_patch`, `max_patch_chars`, `enrich_pdg`, `allow_partial`, `max_latency_ms`. Use include_patch + scope for one-file patches; enriched diff for change blast radius.
+- **phase**: cached five-phase scan → symbols → dependencies → hotspots → recommendations. `phase=1..5|all`, `path` (file/dir), `format=ultra|balanced|verbose` (NOT `mode`, which the router consumes as its branch selector), `include_docs`, `docs_mode`, `top_n`, `max_chars`, `max_files`, `max_focus_files`, `max_latency_ms`. A stage already in flight cannot be cancelled, but no further stage starts once `max_latency_ms` passes and the report is marked INCOMPLETE with the phases that ran and the ones skipped; omitted means unbounded (`LEINDEX_PHASE_BUDGET_MS`). Module deep dive: path=src/module, format=verbose.
+
+### leindex_git (action defaults to status)
+Structured git reads and preview-gated mutations. `status` and `diff` are served by their own PDG-enriched handlers; `GitHandler` refuses a direct call to either and names the right one. Revisions are passed as one argv entry (never a shell) and validated: no leading `-`, and `:` is rejected, so `rev:path` cannot reach outside the repo. Ranges are legal because `..` is allowed.
+
+Argument names are shared across operations, not per-operation: `target` (a revision, ref or branch), `path` (project-relative file or directory), `paths` (array of project-relative paths), `message`, `confirm`, plus `max_count`, `include_patch` and `max_chars` where noted.
+- **status**: changed files with symbol/impact enrichment, no pager. `scope`, `allow_partial`, `enrich_pdg`, `max_latency_ms`.
+- **diff**: rename-aware diff, changed hunks → PDG symbols/callers/affected files, including untracked file sizes; no pager. `ref` (one commit vs its parent), `range` (`A..B` or `A...B`), `staged`, `scope`, `stat_only`, `include_patch`, `max_patch_chars`, `enrich_pdg`, `allow_partial`, `max_latency_ms`. Use `include_patch` + `scope` for one-file patches.
+- **log** `[target, path, max_count]`, **show** `[target, include_patch]`, **blame** `[path, target]`, **branch** `[]`, **remote** `[]`: read paths. `log` returns oid/date/author/subject.
+- **add** `[paths]`, **commit** `[message]`, **checkout** `[target]`, **stash** `[]`, **tag** `[target, message]`, **merge** `[target]`, **rebase** `[target]`, **push** `[]`, **reset** `[target]`, **force** `[target]`: these MUTATE, so they return a plan with a preview token and change nothing. A `confirm` is refused because the apply side is deliberately not wired. Do not use them to perform a mutation; use native git for that.
 
 ### leindex_edit (action REQUIRED)
 - **preview**: dry-run unified diff, affected symbols, risk and preview_token. `file_path*`, `old_text` + `new_text` OR `changes[]`.
@@ -46,7 +55,11 @@ Notation: `*` required; otherwise optional. Always check live schema before call
 
 ### leindex_manage (action defaults to index)
 - **index**: incremental build/refresh, pollable job; `project_path` (identify intended repository), `force_reindex`, `wait` (true blocks), `status_only` (poll without starting work). Force only when required after branch switch/major refactor; never re-index an already warm/current index merely to navigate, or when user prohibits it.
-- **phase**: cached five-phase scan → symbols → dependencies → hotspots → recommendations. `phase=1..5|all`, `path` (file/dir), `mode=ultra|balanced|verbose`, `include_docs`, `docs_mode`, `top_n`, `max_chars`, `max_files`, `max_focus_files`. Module deep dive: path=src/module, mode=verbose.
+- **state**: is the index usable? Generation, phase, freshness and counts, without starting work. `project_path`.
+- **projects**: projects resident in memory, with the default one.
+- **evict**: release a project from memory; data stays on disk and reloads on the next call. Target required.
+- **lease**: hold or release a project lease.
+- **cleanup**: retention sweep over old generations; dry-run unless applied.
 
 ## Failure/empty-result policy
 1. Check intended project_path; for suspicious emptiness also check index count, scope filters and regex/literal mode.

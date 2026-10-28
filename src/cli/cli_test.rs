@@ -1,18 +1,20 @@
 use super::services_commands::service_row_state;
 use super::*;
 
-#[tokio::test]
-async fn test_standalone_system_one_reaches_wizard_without_neural_flags() {
+#[test]
+fn test_standalone_system_one_requires_terminal_without_embedding_flags() {
     let options = crate::cli::leindex::setup::SetupOptions {
         system_one: true,
         ..Default::default()
     };
-    let error = cmd_setup_impl(false, false, false, None, false, false, false, options)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("requires a terminal"), "{error}");
-    assert!(!error.contains("NoFlags"), "{error}");
+    let error =
+        crate::cli::leindex::setup::configure_system_one_if_standalone(&options, false, true)
+            .unwrap_err()
+            .to_string();
+    assert!(
+        error.contains("--warmup requires an embedding setup option"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -287,9 +289,7 @@ fn test_setup_command_parsing() {
             cpu,
             gpu,
             check,
-            warmup: _,
-            remote_gemma: _,
-            options: _,
+            ..
         }) => {
             assert!(neural);
             assert!(!no_neural);
@@ -342,9 +342,7 @@ fn test_setup_command_no_neural() {
             cpu,
             gpu,
             check,
-            warmup: _,
-            remote_gemma: _,
-            options: _,
+            ..
         }) => {
             assert!(!neural);
             assert!(no_neural);

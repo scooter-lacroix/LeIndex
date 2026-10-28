@@ -7,11 +7,14 @@
 //   `leindex setup --check`'s job, not this module's).
 // - Config reads are pure: `LeIndexConfig::load_from_path` (config.rs:935)
 //   only. This module never calls `load_or_recover`.
-// - Set/Unset edit the TOML document generically, then deserialize it into
-//   the typed config and run [`validate`] BEFORE writing. Unknown keys are
-//   rejected by an explicit schema map (never silently ignored), so the
-//   typed re-serialization in `save` can never silently drop parts of a
-//   user's file. `config unset` is the repair path: when the edited
+// - Set/Unset edit the loaded document generically (YAML or TOML), then
+//   deserialize it into the typed config and run [`validate`] BEFORE
+//   writing. Sections the typed runtime does not own (the bundled v2
+//   template's storage/vector_store/file_filtering/...) are carried through
+//   the edit and written back verbatim; unknown keys INSIDE runtime-owned
+//   sections are still rejected by an explicit schema map, because the typed
+//   `save` replaces those sections wholesale and would drop them.
+//   `config unset` is the repair path: when the edited
 //   document still fails validation only because of dangling
 //   cross-references that predate the edit, strict validation is deferred
 //   (see `commit_table_at`) so the documented escape hatch cannot dead-end
@@ -99,7 +102,16 @@ const EMBEDDINGS_FIELDS: &[&str] = &[
     "onnx_model_path",
     "matryoshka",
 ];
-const MCP_FIELDS: &[&str] = &["idle_timeout_secs", "engine_max_idle_secs", "prewarm"];
+// `auto_index` must be listed: `McpConfig::auto_index` is a plain
+// `#[serde(default)] bool` (no `skip_serializing_if`), so it appears in the
+// serialized default TOML and the unknown-key guard rejects it unless it is
+// known here. It is read by `cli::registry::auto_index_enabled`.
+const MCP_FIELDS: &[&str] = &[
+    "idle_timeout_secs",
+    "engine_max_idle_secs",
+    "prewarm",
+    "auto_index",
+];
 const SYSTEM_ONE_FIELDS: &[&str] = &[
     "mode",
     "provider",
@@ -145,6 +157,12 @@ fn optional_keys_at(path: &str) -> &'static [&'static str] {
             "remote_doc_template",
             "remote_query_template",
             "onnx_model_path",
+            // The three remote limits are all skip_serializing_if = None, so
+            // they never appear in the serialized default and must be listed
+            // here for `config set` to accept them.
+            "remote_batch_limit",
+            "remote_max_input_tokens",
+            "remote_request_token_budget",
         ],
         "system_one" => &[
             "base_url",
@@ -690,9 +708,30 @@ fn load_table_at(path: &Path) -> Result<toml::Table> {
     }
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    toml::from_str(&contents).with_context(|| {
+    if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+        return toml::from_str(&contents).with_context(|| {
+            format!(
+                "failed to parse {}: fix or remove the file (config set never recovers silently)",
+                path.display()
+            )
+        });
+    }
+    let mut document: serde_yaml::Value = serde_yaml::from_str(&contents).with_context(|| {
         format!(
-            "failed to parse {}: fix or remove the file (config set never recovers silently)",
+            "failed to parse {} as YAML: fix or remove the file (config set never recovers silently)",
+            path.display()
+        )
+    })?;
+    // YAML nulls (the bundled template's `model: null`) have no TOML
+    // representation; strip them — serde reads an absent optional key and a
+    // null one identically, so the typed view is unchanged.
+    crate::config::remove_nulls(&mut document);
+    if document.is_null() {
+        return Ok(toml::Table::new());
+    }
+    serde_yaml::from_value(document).with_context(|| {
+        format!(
+            "failed to parse {} as YAML: fix or remove the file (config set never recovers silently)",
             path.display()
         )
     })
@@ -766,7 +805,7 @@ fn commit_table_at(
             return Err(scrubbed.into());
         }
     }
-    save_config_at(path, &config)
+    save_document_at(path, root)
 }
 
 /// Validate `config` with the given dangling references blanked out, so a
@@ -864,12 +903,20 @@ fn dangling_references(config: &LeIndexConfig) -> Vec<CrossRef> {
         .collect()
 }
 
-/// Reject every unknown section/field anywhere in the document BEFORE saving:
-/// `save` re-serializes the typed config, which would otherwise silently drop
-/// keys serde ignores. Explicit error beats silent data loss.
+/// Reject unknown fields inside runtime-owned sections BEFORE saving: the
+/// typed `save` replaces those sections wholesale and would silently drop
+/// keys serde ignores. Untyped top-level sections are not swept — they are
+/// preserved verbatim through the edit (see `commit_table_at`).
 fn sweep_table_schema<'a>(table: &'a toml::Table, prefix: &mut Vec<&'a str>) -> Result<()> {
     for (name, value) in table {
         prefix.push(name);
+        // An untyped top-level section (the v2 template's storage,
+        // vector_store, file_filtering, ...) is preserved verbatim; only
+        // keys inside runtime-owned sections are swept.
+        if prefix.len() == 1 && !is_known_path(prefix) {
+            prefix.pop();
+            continue;
+        }
         if !is_known_path(prefix) {
             bail!(
                 "unknown config key '{}' in leindex.toml; move or remove it first \
@@ -946,16 +993,23 @@ fn redacted_value(config: &LeIndexConfig) -> Result<toml::Value> {
     Ok(value)
 }
 
-/// Write the typed config to `path` atomically: same NamedTempFile-persist
+/// Write the edited document to `path` atomically: same NamedTempFile-persist
 /// mechanism as `LeIndexConfig::save`, but against an explicit path so tests
 /// can exercise it inside an isolated tempdir without touching LEINDEX_HOME
 /// (a direct `config.save()` call here would write the user's real file).
-fn save_config_at(path: &Path, config: &LeIndexConfig) -> Result<PathBuf> {
+/// Writes the EDITED DOCUMENT, never a typed re-serialization: sections the
+/// typed runtime does not own must survive the edit. `.toml` paths keep the
+/// v1 TOML shape.
+fn save_document_at(path: &Path, root: &toml::Table) -> Result<PathBuf> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let rendered = toml::to_string_pretty(config).context("failed to serialize config")?;
+    let rendered = if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+        toml::to_string_pretty(root).context("failed to serialize the edited document")?
+    } else {
+        serde_yaml::to_string(root).context("failed to serialize the edited document")?
+    };
     let mut temp = tempfile::NamedTempFile::new_in(path.parent().unwrap_or_else(|| Path::new(".")))
         .with_context(|| format!("failed to create a temp file next to {}", path.display()))?;
     temp.write_all(rendered.as_bytes())

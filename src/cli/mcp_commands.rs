@@ -109,19 +109,21 @@ async fn tools_run(
     project: Option<PathBuf>,
 ) -> AnyhowResult<()> {
     let parsed_args = parse_tool_args_json(args_json)?;
-    let mut args = merge_tool_args(parsed_args.clone(), set, project.as_ref())?;
+    let mut args = merge_tool_args(parsed_args, set, project.as_ref())?;
     apply_default_latency_budget(&mut args);
-    // The four public tools pick their operation with `action`
-    // (`--set action=text`); resolve to the underlying tool so the
-    // CLI renders exactly what the MCP transport does.
+    // The five public routers select their operation with `mode`/`action`
+    // (`--set action=text`); resolve to the underlying tool so the CLI renders
+    // exactly what the MCP transport does.
     let (name, args) = crate::cli::mcp::grouped::resolve_call(name, args)
         .map_err(|error| anyhow::anyhow!("{}", error))?;
-    let mut parsed_args = parsed_args;
-    if let Some(object) = parsed_args.as_object_mut() {
-        object.remove("action");
-    }
+    // Render from the MERGED args (`--args` + `--set` + `project_path`), not the
+    // raw `--args` JSON. The renderer reads things like `query` and `node_id` off
+    // its args to label output; handing it `parsed_args` meant every `--set`-only
+    // invocation rendered a blank label (`Search: ""`) while the handler received
+    // the real value. The MCP transport already passes the args it executed with.
+    let render_args = args.clone();
     let value = execute_tool_handler(&name, args, project).await?;
-    emit_rendered_tool_output(&name, &value, &parsed_args)
+    emit_rendered_tool_output(&name, &value, &render_args)
 }
 
 /// MCP stdio command implementation - Run MCP server in stdio mode
@@ -1043,7 +1045,7 @@ async fn handle_mcp_request(
                     "serverInfo": {
                         "name": "leindex",
                         "version": env!("CARGO_PKG_VERSION"),
-                        "description": "LeIndex MCP Server - Semantic code indexing and analysis with PDG-based tools. Provides 18+ specialized tools for code comprehension: semantic search, symbol lookup, impact analysis, structural code queries, and intelligent editing. Uses Program Dependence Graphs for superior code understanding compared to traditional text-based tools."
+                        "description": "LeIndex MCP Server - Semantic code indexing and analysis with PDG-based tools. Advertises five routers (leindex_explore, leindex_analyze, leindex_edit, leindex_manage, leindex_git) whose mode/action argument selects one of 18+ operations: semantic search, symbol lookup, impact analysis, structural code queries, git reads and intelligent editing. Uses Program Dependence Graphs for superior code understanding compared to traditional text-based tools."
                     }
                 }),
             )));

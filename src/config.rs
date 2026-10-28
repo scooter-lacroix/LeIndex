@@ -1,20 +1,28 @@
-// User-level neural search configuration schema for ~/.leindex/config/leindex.toml
-//
-// Canonical TOML schema for the user-level neural search configuration written
-// by the `leindex setup` command. Shared by the CLI and the ONNX worker.
-//
-// VAL-SETUP-023: Config written with correct schema
-// VAL-SETUP-024: Idempotent re-runs
-// VAL-SETUP-029: Corrupted config recovered gracefully
-// VAL-SETUP-030: Stale config migrated/overwritten
-// VAL-SETUP-032: LEINDEX_HOME override honored
+//! User-level neural search configuration schema for `~/.leindex/config/config.yaml`.
+//!
+//! The YAML document is the v2 source of truth. The typed Rust fields below are
+//! the runtime-owned subset; unknown v2 sections are preserved during migration
+//! and every subsequent save.
 
+use cache::{probe_due, refresh_cached_config};
 use serde::{Deserialize, Serialize};
+use serde_yaml::Value as YamlValue;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Environment variable for the LeIndex home directory override.
 pub const LEINDEX_HOME_ENV: &str = "LEINDEX_HOME";
+
+/// How often `load_cached()` may stat the config file to detect an edit.
+///
+/// The stat is the only cost of keeping a long-lived process in sync with
+/// `leindex.toml`; throttling it means the hot path pays one relaxed atomic load
+/// in the common case. Chosen well below the MCP idle timeout so an edit lands
+/// while the user is still looking at the file, and well above the per-query
+/// call rate so the stat never shows up in a profile.
+const CONFIG_REFRESH_THROTTLE: Duration = Duration::from_secs(2);
 
 /// Default model directory relative to LeIndex home.
 const DEFAULT_MODEL_DIR_SUFFIX: &str = "models";
@@ -374,6 +382,40 @@ pub struct EmbeddingConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_query_template: Option<String>,
 
+    /// Hard cap on inputs per request for the remote endpoint. Unset = the
+    /// provider preset's documented limit (see [`RemotePreset::batch_limit`]),
+    /// else no cap.
+    ///
+    /// Exists because the caller's batch size is tuned for throughput on a
+    /// LOCAL server and knows nothing about a remote provider's protocol
+    /// limits. Left unset with a known preset, the preset wins; set it
+    /// explicitly to override a preset you know better than, or to bound a
+    /// `custom` endpoint that has no preset to consult.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_batch_limit: Option<usize>,
+
+    /// Largest token count ONE input may occupy. Unset = the provider preset's
+    /// documented window, else no limit.
+    ///
+    /// A count cap (`remote_batch_limit`) cannot express this: one enormous
+    /// document can exceed a model's window on its own. Set it for a `custom`
+    /// endpoint whose model window is known, so oversized documents are
+    /// truncated deliberately instead of costing a rejected round trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_max_input_tokens: Option<usize>,
+
+    /// Largest token count ONE REQUEST may carry in total. Unset = the
+    /// provider preset's documented budget, else no limit.
+    ///
+    /// This is the limit that row counts miss entirely, and its absence was a
+    /// real outage: a hosted EmbeddingGemma route rejected every 32-document
+    /// batch with `The prompt is too long ... Shorten it and retry` because
+    /// ~7k tokens of input overflowed a 2,048-token request window, even though
+    /// 32 was comfortably under the count cap. Without it the client can only
+    /// learn the ceiling by having requests rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_request_token_budget: Option<usize>,
+
     /// Local ONNX model path override (reserved; the local model is normally
     /// resolved from `[neural] model_dir`/`model_name`).
     #[serde(default)]
@@ -393,6 +435,19 @@ pub const EMBEDDINGGEMMA2_DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8080/v1";
 
 /// `embeddinggemma-2` preset: model name sent in the embeddings payload.
 pub const EMBEDDINGGEMMA2_MODEL: &str = "embeddinggemma-2";
+
+/// EmbeddingGemma family token window.
+///
+/// 2,048 is the documented sequence length for the whole EmbeddingGemma
+/// family, and the hosted OpenAI-compatible proxies enforce it as a REQUEST
+/// total as well as a per-input limit: a 32-document batch of ~882 B documents
+/// (~7k tokens) is rejected wholesale with `The prompt is too long for
+/// embeddinggemma-300m on the routes that remain. Shorten it and retry`.
+///
+/// This is NOT the same quantity as `batch_limit`. `batch_limit` counts
+/// DOCUMENTS; this counts TOKENS. A route can be far under the document cap and
+/// still be rejected here, so request width has to be packed against this.
+pub const EMBEDDINGGEMMA_REQUEST_TOKEN_BUDGET: usize = 2048;
 
 /// `embeddinggemma-2` preset: native (untruncated) embedding dimension.
 pub const EMBEDDINGGEMMA2_DIMENSION: usize = 768;
@@ -417,6 +472,30 @@ pub const EMBEDDINGGEMMA2_DOC_TEMPLATE: &str = "title: {title} | text: {text}";
 /// card CodeRetrieval row): `task: code retrieval | query: {query}`.
 pub const EMBEDDINGGEMMA2_QUERY_TEMPLATE: &str = "task: code retrieval | query: {text}";
 
+/// Whether a model identifier names an EmbeddingGemma2 model.
+///
+/// Hosts spell it `text-embedding-embeddinggemma-2`, `embeddinggemma-2`,
+/// `embeddinggemma2`, or a quantized file stem (`embeddinggemma-2-Q8_0`), so
+/// compare on the normalized substring instead of enumerating spellings. Used by
+/// [`EmbeddingConfig::embeddinggemma2_preset_active`] to recognize a `custom`
+/// provider that serves this model, where the provider name carries no
+/// information and `remote_model` is the only identification available.
+fn is_embeddinggemma2_model_name(model: &str) -> bool {
+    let normalized: String = model
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    normalized.contains("embeddinggemma")
+}
+
+// Remote provider presets (`RemoteWire`, `RemotePreset`, `REMOTE_PRESETS`) live
+// in `config::remote_presets`; re-exported so `crate::config::REMOTE_PRESETS`
+// and friends keep their paths.
+mod remote_presets;
+pub use remote_presets::{REMOTE_PRESETS, RemotePreset, RemoteWire};
+
 /// A preset-resolved remote configuration: every unset key already filled.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedRemote {
@@ -430,6 +509,28 @@ pub struct ResolvedRemote {
     pub doc_template: Option<String>,
     /// Effective query template (explicit config, or preset; None = raw).
     pub query_template: Option<String>,
+    /// Wire family the resolved endpoint speaks. Derived from the selected
+    /// preset, never from the endpoint string: an operator who explicitly
+    /// points `gemini` at a proxy still wants the native Gemini request shape.
+    pub wire: RemoteWire,
+    /// Hard cap on inputs per request, or `None` when neither the config nor
+    /// the preset knows one. Consumed by the index builder to size remote
+    /// batches, and enforced again inside the provider.
+    pub batch_limit: Option<usize>,
+    /// Asymmetric-retrieval field values (`input_type`) for the document and
+    /// query sides, from the preset. `None` means the provider does not take
+    /// one and the field is omitted from the request entirely.
+    pub input_type_document: Option<String>,
+    /// Query-side `input_type` (e.g. Cohere's `search_query`, Voyage's `query`),
+    /// from the preset; `None` omits the field from query requests.
+    pub input_type_query: Option<String>,
+    /// Token ceiling for ONE input, or `None` when neither the config nor the
+    /// preset knows one. Used to truncate a document before sending rather than
+    /// discovering the limit from a rejection.
+    pub max_input_tokens: Option<usize>,
+    /// Token ceiling for ONE REQUEST (all inputs summed), or `None` when
+    /// unknown. Used to pack request width; a row-count cap cannot express it.
+    pub request_token_budget: Option<usize>,
 }
 
 impl EmbeddingConfig {
@@ -447,14 +548,28 @@ impl EmbeddingConfig {
         Ok(self.remote_api_key.clone())
     }
 
-    /// Human-readable provider label for diagnostics ("embeddinggemma-2"
-    /// preset active, else "custom").
+    /// Human-readable provider label for diagnostics: the recognized preset
+    /// name (`"gemini"`, `"voyage"`, `"embeddinggemma-2"`, ...) when one is
+    /// selected, else `"custom"`.
+    ///
+    /// This used to answer `"custom"` for everything that was not the
+    /// EmbeddingGemma2 preset, which made `leindex diagnostics` report a
+    /// provider it had never inspected.
     pub fn remote_preset_label(&self) -> &str {
         if self.embeddinggemma2_preset_active() {
             "embeddinggemma-2"
         } else {
-            "custom"
+            self.remote_preset().map_or("custom", |preset| preset.name)
         }
+    }
+
+    /// The provider preset selected by `remote_provider`, if it names one.
+    ///
+    /// Case-insensitive; an unknown or empty value is `None`, which keeps the
+    /// generic OpenAI-compatible path (every key must be set explicitly).
+    pub fn remote_preset(&self) -> Option<&'static RemotePreset> {
+        let name = self.remote_provider.trim().to_ascii_lowercase();
+        REMOTE_PRESETS.iter().find(|preset| preset.name == name)
     }
 
     /// Effective Matryoshka slicing for this configuration. `Dynamic` and the
@@ -480,11 +595,35 @@ impl EmbeddingConfig {
 
     /// Whether the `embeddinggemma-2` preset is selected (spelling variants
     /// accepted; case-insensitive).
+    ///
+    /// The provider name is not the only way to select it. A `custom` provider
+    /// pointed at a hosted OpenAI-compatible EmbeddingGemma2 endpoint must name
+    /// its model in `remote_model` (there is no preset to fill it), and that
+    /// spelling is just as authoritative: `remote_provider = "custom"` +
+    /// `remote_model = "embeddinggemma-2"` is how a third-party host running this
+    /// model is reached. Reading only the provider name left
+    /// `doc_template`/`query_template` as `None` on that route, so the corpus and
+    /// every query were embedded with NO task prefixes — the inputs the model
+    /// card says produce degraded vectors. It also made
+    /// [`Self::remote_preset_label`] report `"embeddinggemma-2"` while the
+    /// templates stayed `None`, i.e. the config disagreed with itself.
+    ///
+    /// Only an otherwise-unknown provider gets the model-name fallback: a
+    /// recognized preset (`openai`, `voyage`, ...) already defines the wire and
+    /// its own templating, so a contradictory `remote_model` there is an operator
+    /// error that must not silently switch templates underneath it.
     pub fn embeddinggemma2_preset_active(&self) -> bool {
-        matches!(
+        if matches!(
             self.remote_provider.trim().to_ascii_lowercase().as_str(),
-            "embeddinggemma-2" | "embeddinggemma2"
-        )
+            "embeddinggemma-2" | "embeddinggemma2" | "embeddinggemma-300m" | "embeddinggemma300m"
+        ) {
+            return true;
+        }
+        self.remote_preset().is_none()
+            && self
+                .remote_model
+                .as_deref()
+                .is_some_and(is_embeddinggemma2_model_name)
     }
 
     /// Resolve the remote ladder configuration: preset fills unset keys,
@@ -507,33 +646,92 @@ impl EmbeddingConfig {
         if !self.enable_hybrid {
             return None;
         }
-        let preset = self.embeddinggemma2_preset_active();
+        let gemma = self.embeddinggemma2_preset_active();
+        // A recognized provider preset also supplies a default endpoint, so
+        // `remote_provider = "gemini"` alone is a working route. `custom` (and
+        // any unrecognized value) deliberately resolves to no preset: a bare
+        // endpoint must be spelled out, which is what the generic route always
+        // required.
+        let preset = self.remote_preset();
         let service = self
             .remote_service
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .and_then(|name| services.get(name));
+        // Ladder: explicit endpoint > service base URL > preset default. The
+        // EmbeddingGemma2 preset is the one provider LeIndex itself spawns, so
+        // an existing `remote_service` outranks its loopback default.
         let endpoint = match self.remote_endpoint.as_deref().map(str::trim) {
             Some(e) if !e.is_empty() => Some(e.to_string()),
-            _ => service
-                .map(|s| format!("{}/v1", s.base_url()))
-                .or_else(|| preset.then(|| EMBEDDINGGEMMA2_DEFAULT_ENDPOINT.to_string())),
+            _ => service.map(|s| format!("{}/v1", s.base_url())).or_else(|| {
+                preset
+                    .map(|p| p.endpoint.to_string())
+                    .or_else(|| gemma.then(|| EMBEDDINGGEMMA2_DEFAULT_ENDPOINT.to_string()))
+            }),
         }?;
-        let fill = |value: &Option<String>, preset_value: &str| match value {
+        // Each key falls back to the preset value when unset. `gemma` is folded
+        // into `preset_model`/`preset_dimension` so the EmbeddingGemma2 preset
+        // and the provider table share one fill path instead of two.
+        let fill = |value: &Option<String>, preset_value: Option<&str>| match value {
             Some(v) if !v.trim().is_empty() => Some(v.clone()),
-            _ if preset => Some(preset_value.to_string()),
-            _ => None,
+            _ => preset_value.map(str::to_string),
         };
+        let preset_model = preset.map(|p| p.model).or(if gemma {
+            Some(EMBEDDINGGEMMA2_MODEL)
+        } else {
+            None
+        });
+        let preset_dimension = preset
+            .map(|p| p.dimension)
+            .or_else(|| gemma.then_some(EMBEDDINGGEMMA2_DIMENSION));
         Some(ResolvedRemote {
             endpoint,
-            model: fill(&self.remote_model, EMBEDDINGGEMMA2_MODEL)
+            // A managed service knows the model it actually serves, which
+            // outranks a table entry.
+            model: fill(&self.remote_model, preset_model)
                 .or_else(|| service.and_then(|s| s.served_name())),
-            doc_template: fill(&self.remote_doc_template, EMBEDDINGGEMMA2_DOC_TEMPLATE),
-            query_template: fill(&self.remote_query_template, EMBEDDINGGEMMA2_QUERY_TEMPLATE),
-            remote_dimension: self
-                .remote_dimension
-                .or_else(|| preset.then_some(EMBEDDINGGEMMA2_DIMENSION)),
+            doc_template: fill(
+                &self.remote_doc_template,
+                gemma.then_some(EMBEDDINGGEMMA2_DOC_TEMPLATE),
+            ),
+            query_template: fill(
+                &self.remote_query_template,
+                gemma.then_some(EMBEDDINGGEMMA2_QUERY_TEMPLATE),
+            ),
+            remote_dimension: self.remote_dimension.or(preset_dimension),
+            wire: preset.map_or(RemoteWire::OpenAiCompat, |p| p.wire),
+            // Explicit config > preset. `custom`/unknown providers have no
+            // preset, so an unset override leaves the cap unknown rather than
+            // inventing one: a wrong cap that is too high fails whole batches,
+            // so the safer default is "no opinion" (the caller then relies on
+            // error-driven bisection, which is slow but correct).
+            batch_limit: self.remote_batch_limit.or(preset.map(|p| p.batch_limit)),
+            // Preset-only: these name the provider's own vocabulary
+            // (`search_document`, `retrieval.passage`, ...), so there is nothing
+            // for an operator to override with without inventing a mapping.
+            input_type_document: preset
+                .and_then(|p| p.input_type_document)
+                .map(str::to_string),
+            input_type_query: preset.and_then(|p| p.input_type_query).map(str::to_string),
+            // Token limits: explicit config > preset > gemma family default.
+            //
+            // `gemma` is folded in so a `custom` provider naming an
+            // EmbeddingGemma model gets the 2,048-token window even with no
+            // preset row. Without this a custom route had no limits at all, and
+            // request width was decided purely by document count — which is how
+            // a 32-document batch of ~7k tokens was sent to an endpoint that
+            // accepts 2,048 and rejected every time.
+            max_input_tokens: self.remote_max_input_tokens.or_else(|| {
+                preset
+                    .map(|p| p.max_input_tokens)
+                    .or(gemma.then_some(EMBEDDINGGEMMA_REQUEST_TOKEN_BUDGET))
+            }),
+            request_token_budget: self.remote_request_token_budget.or_else(|| {
+                preset
+                    .map(|p| p.request_token_budget)
+                    .or(gemma.then_some(EMBEDDINGGEMMA_REQUEST_TOKEN_BUDGET))
+            }),
         })
     }
 
@@ -558,6 +756,9 @@ impl Default for EmbeddingConfig {
             remote_dimension: None,
             remote_doc_template: None,
             remote_query_template: None,
+            remote_batch_limit: None,
+            remote_max_input_tokens: None,
+            remote_request_token_budget: None,
             onnx_model_path: None,
             matryoshka: MatryoshkaSetting::Off,
         }
@@ -577,6 +778,9 @@ fn default_legacy_embedding_config() -> EmbeddingConfig {
         remote_dimension: None,
         remote_doc_template: None,
         remote_query_template: None,
+        remote_batch_limit: None,
+        remote_max_input_tokens: None,
+        remote_request_token_budget: None,
         onnx_model_path: None,
     }
 }
@@ -622,6 +826,17 @@ pub struct McpConfig {
     /// think-time after the handshake is long enough to hide it.
     #[serde(default = "default_mcp_prewarm")]
     pub prewarm: String,
+
+    /// Index a project on first use from a tool call.
+    ///
+    /// Default `false`: a tool call is not consent to spend minutes of CPU and
+    /// disk, and a read (`git status`, `read_file`, text search) is not a
+    /// request to index. Tools that REQUIRE an index answer with their own
+    /// "not indexed" error and remediation; indexing is an explicit act.
+    ///
+    /// `LEINDEX_AUTO_INDEX=1` overrides this to `true`.
+    #[serde(default)]
+    pub auto_index: bool,
 }
 
 // ── Defaults ─────────────────────────────────────────────────────────────
@@ -849,6 +1064,7 @@ impl Default for McpConfig {
             idle_timeout_secs: default_mcp_idle_timeout_secs(),
             engine_max_idle_secs: default_mcp_engine_max_idle_secs(),
             prewarm: default_mcp_prewarm(),
+            auto_index: false,
         }
     }
 }
@@ -997,8 +1213,29 @@ pub fn resolve_leindex_home() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".leindex"))
 }
 
-/// Get the path to the config file.
+/// Read the global per-file admission limit from canonical v2 YAML.
+///
+/// This is deliberately a best-effort fallback for projects without a local
+/// `.leindex/config.toml`; malformed or missing global config leaves the safe
+/// project default in place.
+pub fn global_max_file_size() -> Option<u64> {
+    let path = config_file_path()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let document: YamlValue = serde_yaml::from_str(&contents).ok()?;
+    document
+        .get("file_filtering")
+        .or_else(|| document.get("size_limits"))
+        .and_then(|section| section.get("max_file_size"))
+        .and_then(YamlValue::as_u64)
+}
+
+/// Get the canonical v2 YAML config path.
 pub fn config_file_path() -> Option<PathBuf> {
+    resolve_leindex_home().map(|h| h.join("config").join("config.yaml"))
+}
+
+/// Get the legacy Rust TOML config path used by pre-v2.1.1 installs.
+pub fn legacy_config_file_path() -> Option<PathBuf> {
     resolve_leindex_home().map(|h| h.join("config").join("leindex.toml"))
 }
 
@@ -1007,40 +1244,137 @@ pub fn model_dir_path() -> Option<PathBuf> {
     resolve_leindex_home().map(|h| h.join(DEFAULT_MODEL_DIR_SUFFIX))
 }
 
-// ── Config I/O ──────────────────────────────────────────────────────────
+// The cached-config machinery (statics, throttled probe, install path,
+// `ConfigGuard`) lives in `config::cache` — see that module for the reload
+// contract and the ownership rationale behind the `Arc` snapshots.
+mod cache;
+
+pub use cache::ConfigGuard;
+
+const V2_CONFIG_TEMPLATE: &str = include_str!("../config.yaml");
+
+pub(crate) fn remove_nulls(value: &mut YamlValue) {
+    match value {
+        YamlValue::Mapping(map) => {
+            let keys: Vec<_> = map
+                .iter_mut()
+                .filter_map(|(key, value)| {
+                    remove_nulls(value);
+                    value.is_null().then_some(key.clone())
+                })
+                .collect();
+            for key in keys {
+                map.remove(&key);
+            }
+        }
+        YamlValue::Sequence(values) => values.iter_mut().for_each(remove_nulls),
+        _ => {}
+    }
+}
+
+fn merge_yaml(base: &mut YamlValue, overlay: YamlValue) {
+    match (base, overlay) {
+        (YamlValue::Mapping(base_map), YamlValue::Mapping(overlay_map)) => {
+            for (key, value) in overlay_map {
+                match base_map.get_mut(&key) {
+                    Some(existing) => merge_yaml(existing, value),
+                    None => {
+                        base_map.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+/// Merge the typed runtime overlay the way [`LeIndexConfig::save`] owns the
+/// document: every top-level section the typed config serializes REPLACES
+/// the document's section wholesale, so a field the runtime cleared (a
+/// `skip_serializing_if` option set to `None` — e.g. switching
+/// `remote_api_key_env` auth to a stored key) is removed instead of
+/// resurrecting its stale on-disk value. Sections the runtime does not own
+/// are absent from the overlay and survive untouched. A non-mapping document
+/// (empty file, scalar) is replaced entirely.
+fn replace_owned_sections(document: &mut YamlValue, typed: YamlValue) {
+    match (document, typed) {
+        (YamlValue::Mapping(base), YamlValue::Mapping(overlay)) => {
+            for (key, value) in overlay {
+                base.insert(key, value);
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+fn write_yaml_atomic(path: &Path, value: &YamlValue) -> Result<(), ConfigError> {
+    let parent = path.parent().ok_or(ConfigError::NoHomeDir)?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| ConfigError::Io(path.to_path_buf(), e.to_string()))?;
+    let yaml = serde_yaml::to_string(value).map_err(|e| ConfigError::Serialize(e.to_string()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| ConfigError::Io(path.to_path_buf(), e.to_string()))?;
+    temporary
+        .write_all(yaml.as_bytes())
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|e| ConfigError::Io(path.to_path_buf(), e.to_string()))?;
+    temporary
+        .persist(path)
+        .map_err(|e| ConfigError::Io(path.to_path_buf(), e.error.to_string()))?;
+    Ok(())
+}
+
+fn migrate_legacy_toml() -> Result<Option<PathBuf>, ConfigError> {
+    let yaml_path = config_file_path().ok_or(ConfigError::NoHomeDir)?;
+    let legacy_path = legacy_config_file_path().ok_or(ConfigError::NoHomeDir)?;
+    if yaml_path.exists() || !legacy_path.exists() {
+        return Ok(None);
+    }
+
+    let contents = std::fs::read_to_string(&legacy_path)
+        .map_err(|e| ConfigError::Io(legacy_path.clone(), e.to_string()))?;
+    let legacy: toml::Value = toml::from_str(&contents)
+        .map_err(|e| ConfigError::Parse(legacy_path.clone(), e.to_string()))?;
+    let mut document: YamlValue = serde_yaml::from_str(V2_CONFIG_TEMPLATE)
+        .map_err(|e| ConfigError::Parse(yaml_path.clone(), e.to_string()))?;
+    let mut legacy_yaml =
+        serde_yaml::to_value(legacy).map_err(|e| ConfigError::Serialize(e.to_string()))?;
+    remove_nulls(&mut legacy_yaml);
+    merge_yaml(&mut document, legacy_yaml);
+    write_yaml_atomic(&yaml_path, &document)?;
+
+    let migrated_path = legacy_path.with_extension("toml.migrated");
+    std::fs::rename(&legacy_path, &migrated_path)
+        .map_err(|e| ConfigError::Io(legacy_path, e.to_string()))?;
+    Ok(Some(migrated_path))
+}
 
 impl LeIndexConfig {
-    /// Write config to TOML file.
-    ///
-    /// VAL-SETUP-023: Creates config directory if missing.
-    /// VAL-SETUP-024: Overwrites safely (idempotent).
+    /// Write the canonical v2 YAML document, preserving every section that the
+    /// typed Rust runtime does not own. Runtime-owned sections are replaced
+    /// wholesale, so a cleared optional field (`skip_serializing_if` = `None`)
+    /// is removed from the file instead of resurrecting its stale value.
     pub fn save(&self) -> Result<PathBuf, ConfigError> {
         let config_path = config_file_path().ok_or(ConfigError::NoHomeDir)?;
-
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)
+        let mut document = if config_path.exists() {
+            let contents = std::fs::read_to_string(&config_path)
                 .map_err(|e| ConfigError::Io(config_path.clone(), e.to_string()))?;
-        }
-
-        let toml_str =
-            toml::to_string_pretty(self).map_err(|e| ConfigError::Serialize(e.to_string()))?;
-
-        let parent = config_path.parent().ok_or(ConfigError::NoHomeDir)?;
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|e| ConfigError::Io(config_path.clone(), e.to_string()))?;
-        temporary
-            .write_all(toml_str.as_bytes())
-            .and_then(|_| temporary.as_file().sync_all())
-            .map_err(|e| ConfigError::Io(config_path.clone(), e.to_string()))?;
-        temporary
-            .persist(&config_path)
-            .map_err(|e| ConfigError::Io(config_path.clone(), e.error.to_string()))?;
-
+            serde_yaml::from_str(&contents)
+                .map_err(|e| ConfigError::Parse(config_path.clone(), e.to_string()))?
+        } else {
+            serde_yaml::from_str(V2_CONFIG_TEMPLATE)
+                .map_err(|e| ConfigError::Parse(config_path.clone(), e.to_string()))?
+        };
+        let typed =
+            serde_yaml::to_value(self).map_err(|e| ConfigError::Serialize(e.to_string()))?;
+        replace_owned_sections(&mut document, typed);
+        write_yaml_atomic(&config_path, &document)?;
         Ok(config_path)
     }
 
-    /// Read config from TOML file. Returns Default if not present.
+    /// Read the canonical v2 YAML config, migrating a legacy TOML install first.
     pub fn load() -> Result<Self, ConfigError> {
+        migrate_legacy_toml()?;
         Self::load_from_path(&config_file_path().ok_or(ConfigError::NoHomeDir)?)
     }
 
@@ -1051,25 +1385,95 @@ impl LeIndexConfig {
         self.search.neural_weight as f32
     }
 
-    /// Process-wide cached config read. Reads leindex.toml once on first access,
-    /// then serves the cached value; falls back to `Default` on error. Use this
-    /// on hot paths (query/index) so the documented `[search]` knobs are read
-    /// without re-reading the file per call.
-    pub fn load_cached() -> &'static LeIndexConfig {
-        static CACHED: std::sync::OnceLock<LeIndexConfig> = std::sync::OnceLock::new();
-        CACHED.get_or_init(|| {
-            Self::load().unwrap_or_else(|err| {
-                tracing::warn!(
-                    error = %err,
-                    "failed to load leindex.toml for caching; preserving legacy disabled defaults"
-                );
-                Self {
-                    neural: default_legacy_neural_config(),
-                    indexing: default_legacy_indexing_config(),
-                    ..Self::default()
-                }
-            })
-        })
+    /// Process-wide cached config read that stays in sync with the file.
+    ///
+    /// Reads `leindex.toml` on first access and again whenever the file's
+    /// `(mtime, size, inode)` changes, so a config edit reaches long-lived
+    /// processes (the MCP daemon lives for `[mcp] idle_timeout_secs`) instead of
+    /// being frozen at startup. Before the reload support, an edit — switching
+    /// `remote_service`, changing `remote_model`, retuning `[services.gemma]`
+    /// args — silently kept serving the old route for the life of the process.
+    ///
+    /// Use this for a short read. For a snapshot that must survive across
+    /// statements — where a concurrent reload would otherwise change the config
+    /// mid-operation — hold the handle from [`Self::load_cached_arc`] instead;
+    /// it keeps that exact snapshot alive for as long as you need it.
+    ///
+    /// Cost: one uncontended read lock plus an `Arc` clone. The stat that detects
+    /// an edit runs at most once per [`CONFIG_REFRESH_THROTTLE`].
+    pub fn load_cached() -> ConfigGuard {
+        ConfigGuard(Self::load_cached_arc())
+    }
+
+    /// The cached config as an owned, refcounted snapshot.
+    ///
+    /// Prefer this over [`Self::load_cached`] whenever the value must be read
+    /// more than once, or read across an `await`, a lock acquisition, or any
+    /// other point where a reload could install a different snapshot. Holding the
+    /// `Arc` pins the exact config seen here; the previous snapshot is freed when
+    /// its last holder drops it, so no reload leaks.
+    pub fn load_cached_arc() -> Arc<LeIndexConfig> {
+        if probe_due() {
+            if let Some(refreshed) = refresh_cached_config() {
+                return refreshed;
+            }
+        }
+        // `probe_due()` returns true while the slot is empty, so a successful
+        // `refresh_cached_config` above installs the first snapshot. The only way
+        // to reach this clone with an empty slot is a total load failure that was
+        // survived by falling back to defaults, which `refresh_cached_config`
+        // installs rather than leaves empty.
+        cache::installed_snapshot().expect("cached config installed by refresh_cached_config")
+    }
+
+    /// The keys that change which vector space an embedding belongs to, or which
+    /// endpoint produces it. Compared across a reload so a user who edits one of
+    /// these gets told that in-flight caches may now be cold.
+    fn route_identity_keys(&self) -> Vec<(&'static str, String)> {
+        let embeddings = &self.indexing.embeddings;
+        let resolved = embeddings.resolved_remote_with(&self.services);
+        vec![
+            (
+                "[indexing.embeddings] enable_hybrid",
+                embeddings.enable_hybrid.to_string(),
+            ),
+            (
+                "[indexing.embeddings] remote_service",
+                embeddings.remote_service.clone().unwrap_or_default(),
+            ),
+            (
+                "[indexing.embeddings] remote_provider",
+                embeddings.remote_provider.clone(),
+            ),
+            (
+                "[indexing.embeddings] remote_model",
+                resolved
+                    .as_ref()
+                    .and_then(|r| r.model.clone())
+                    .unwrap_or_default(),
+            ),
+            (
+                "[indexing.embeddings] endpoint",
+                resolved.map(|r| r.endpoint).unwrap_or_default(),
+            ),
+            ("[neural] model_name", self.neural.model_name.clone()),
+            (
+                "[neural] execution_provider",
+                self.neural.execution_provider.clone(),
+            ),
+            ("[neural] enabled", self.neural.enabled.to_string()),
+        ]
+    }
+
+    /// Names of the route keys whose values differ between two configs.
+    fn route_identity_changes(&self, other: &LeIndexConfig) -> Vec<&'static str> {
+        let before = self.route_identity_keys();
+        let after = other.route_identity_keys();
+        before
+            .into_iter()
+            .zip(after)
+            .filter_map(|((key, old), (_, new))| (old != new).then_some(key))
+            .collect()
     }
 
     /// Load from explicit path.
@@ -1081,7 +1485,14 @@ impl LeIndexConfig {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Io(path.to_path_buf(), e.to_string()))?;
 
-        Self::parse_toml(&contents).map_err(|e| ConfigError::Parse(path.to_path_buf(), e))
+        if path.extension().and_then(|extension| extension.to_str()) == Some("yaml")
+            || path.extension().and_then(|extension| extension.to_str()) == Some("yml")
+        {
+            serde_yaml::from_str(&contents)
+                .map_err(|e| ConfigError::Parse(path.to_path_buf(), e.to_string()))
+        } else {
+            Self::parse_toml(&contents).map_err(|e| ConfigError::Parse(path.to_path_buf(), e))
+        }
     }
 
     fn parse_toml(toml_str: &str) -> Result<Self, String> {
@@ -1092,54 +1503,61 @@ impl LeIndexConfig {
     ///
     /// VAL-SETUP-029: Backs up corrupt config and returns defaults.
     pub fn load_or_recover() -> Result<(Self, RecoveryAction), ConfigError> {
-        let config_path = match config_file_path() {
-            Some(p) => p,
-            None => return Ok((Self::default(), RecoveryAction::CreatedDefault)),
-        };
-
+        match migrate_legacy_toml() {
+            Ok(Some(migrated)) => {
+                let path = config_file_path().ok_or(ConfigError::NoHomeDir)?;
+                let config = Self::load_from_path(&path)?;
+                return Ok((config, RecoveryAction::MigratedFromLegacy(migrated)));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if !matches!(error, ConfigError::Parse(_, _)) {
+                    return Err(error);
+                }
+                let legacy_path = legacy_config_file_path().ok_or(ConfigError::NoHomeDir)?;
+                if legacy_path.exists() {
+                    let backup_path = legacy_path.with_extension("toml.bak");
+                    std::fs::rename(&legacy_path, &backup_path).map_err(|rename_error| {
+                        ConfigError::Io(
+                            legacy_path.clone(),
+                            format!(
+                                "config corrupted ({error}); backup rename failed: {rename_error}"
+                            ),
+                        )
+                    })?;
+                    return Ok((
+                        Self {
+                            neural: default_legacy_neural_config(),
+                            indexing: default_legacy_indexing_config(),
+                            ..Self::default()
+                        },
+                        RecoveryAction::RecoveredFromCorrupt(backup_path),
+                    ));
+                }
+                return Err(error);
+            }
+        }
+        let config_path = config_file_path().ok_or(ConfigError::NoHomeDir)?;
         if !config_path.exists() {
             return Ok((Self::default(), RecoveryAction::CreatedDefault));
         }
-
-        let contents = match std::fs::read_to_string(&config_path) {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(ConfigError::Io(
-                    config_path,
-                    format!("Cannot read config file: {}", e),
-                ));
-            }
-        };
-
-        match Self::parse_toml(&contents) {
+        match Self::load_from_path(&config_path) {
             Ok(config) => Ok((config, RecoveryAction::Loaded)),
             Err(parse_err) => {
-                let backup_path = config_path.with_extension("toml.bak");
-                // Propagate a backup-rename failure instead of discarding it: the
-                // old `let _ =` would report RecoveredFromCorrupt while the corrupt
-                // original is still in place (no backup was actually written), so a
-                // later setup could overwrite the corrupt file without preserving it.
-                // (Codex P2 review.)
-                if let Err(e) = std::fs::rename(&config_path, &backup_path) {
-                    return Err(ConfigError::Io(
-                        config_path,
-                        format!(
-                            "config corrupted ({parse_err}); backup rename to {} failed: {e}",
-                            backup_path.display()
-                        ),
-                    ));
-                }
+                let backup_path = config_path.with_extension("yaml.bak");
+                std::fs::rename(&config_path, &backup_path).map_err(|e| {
+                    ConfigError::Io(
+                        config_path.clone(),
+                        format!("config corrupted ({parse_err}); backup rename failed: {e}"),
+                    )
+                })?;
                 tracing::warn!(
                     "Config corrupted: {}. Backed up to {}",
                     parse_err,
                     backup_path.display()
                 );
                 Ok((
-                    Self {
-                        neural: default_legacy_neural_config(),
-                        indexing: default_legacy_indexing_config(),
-                        ..Self::default()
-                    },
+                    Self::default(),
                     RecoveryAction::RecoveredFromCorrupt(backup_path),
                 ))
             }
@@ -1152,6 +1570,8 @@ impl LeIndexConfig {
 pub enum RecoveryAction {
     /// Config loaded successfully.
     Loaded,
+    /// Legacy TOML was migrated to the canonical YAML document.
+    MigratedFromLegacy(PathBuf),
     /// No config file existed.
     CreatedDefault,
     /// Config was corrupt; backed up. Contains backup path.
@@ -1198,534 +1618,5 @@ impl std::error::Error for ConfigError {}
 // Alias for use in setup.rs as `crate::config_schema`.
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_default_config_round_trip() {
-        let config = LeIndexConfig::default();
-        let toml_str = toml::to_string(&config).unwrap();
-        let parsed: LeIndexConfig = toml::from_str(&toml_str).unwrap();
-        assert_eq!(config, parsed);
-    }
-
-    #[test]
-    fn test_fresh_neural_default_and_legacy_toml_boundary() {
-        let fresh = LeIndexConfig::default();
-        assert!(fresh.neural.enabled);
-        assert!(fresh.indexing.embeddings.enable_hybrid);
-        assert_eq!(
-            fresh.indexing.embeddings.remote_preset_label(),
-            "embeddinggemma-2"
-        );
-        for existing in [
-            "",
-            "[neural]\nexecution_provider = \"cpu\"\n",
-            "[neural]\nenabled = false\n",
-        ] {
-            let parsed: LeIndexConfig = toml::from_str(existing).expect("existing TOML");
-            assert!(!parsed.neural.enabled);
-        }
-        let explicit: LeIndexConfig =
-            toml::from_str("[neural]\nenabled = true\n").expect("opt-in TOML");
-        assert!(explicit.neural.enabled);
-    }
-
-    #[test]
-    fn test_neural_config_schema() {
-        let config = NeuralConfig {
-            enabled: true,
-            execution_provider: "cpu".to_string(),
-            ort_dylib_path: Some("/usr/local/lib/libonnxruntime.so".to_string()),
-            ort_version: Some("1.25.0".to_string()),
-            model_dir: "/home/user/.leindex/models".to_string(),
-            model_name: "qwen3-embed-0.6b-dynamic-uint8".to_string(),
-        };
-
-        let toml_str = toml::to_string(&config).unwrap();
-        assert!(toml_str.contains("enabled = true"));
-        assert!(toml_str.contains("execution_provider = \"cpu\""));
-        assert!(toml_str.contains("ort_dylib_path"));
-        assert!(toml_str.contains("ort_version"));
-        assert!(toml_str.contains("model_dir"));
-    }
-
-    #[test]
-    fn test_parse_malformed_returns_error() {
-        let bad_toml = "[neural\nenabled = true\n";
-        let result = LeIndexConfig::parse_toml(bad_toml);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_config_roundtrip_preserves_rerank_fields() {
-        let mut config = LeIndexConfig::default();
-        config.search.rerank_enabled = true;
-        config.search.rerank_top_n = 80;
-        config.search.rerank_backend = "system-one".to_string();
-        let decoded: LeIndexConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
-        assert!(decoded.search.rerank_enabled);
-        assert_eq!(decoded.search.rerank_top_n, 80);
-        assert_eq!(decoded.search.rerank_backend, "system-one");
-    }
-
-    #[test]
-    fn test_rerank_backend_semantics() {
-        // Default: onnx, rerank off unless rerank_enabled.
-        let mut config = LeIndexConfig::default();
-        assert_eq!(config.search.rerank_backend, "onnx");
-        assert!(!config.search.rerank_effectively_enabled());
-        // onnx + rerank_enabled => rerank on.
-        config.search.rerank_enabled = true;
-        assert!(config.search.rerank_effectively_enabled());
-        // system-one implies rerank regardless of rerank_enabled — but only when
-        // the backend is constructible: the flag must be on AND the feature
-        // compiled in. A config asking for it otherwise reports OFF, matching
-        // the dispatch, which refuses to construct the reranker.
-        //
-        // Driven through `with_flag_override`, which takes the test lock and
-        // restores the previous state on unwind: a failing assertion here must
-        // not leak a `SystemOne = true` override into every later test in the
-        // crate. Not nested — the lock is not reentrant — so the two sides are
-        // sequential, and the config is mutated in between while the lock is
-        // free.
-        config.search.rerank_backend = "system-one".to_string();
-        config.search.rerank_enabled = false;
-        crate::feature_flags::with_flag_override(
-            crate::feature_flags::FeatureFlag::SystemOne,
-            false,
-            || {
-                assert!(
-                    !config.search.rerank_effectively_enabled(),
-                    "system-one without LEINDEX_FEATURE_SYSTEM_ONE cannot rerank"
-                );
-            },
-        );
-        crate::feature_flags::with_flag_override(
-            crate::feature_flags::FeatureFlag::SystemOne,
-            true,
-            || {
-                assert_eq!(
-                    config.search.rerank_effectively_enabled(),
-                    cfg!(feature = "system-one"),
-                    "available system-one reranks regardless of rerank_enabled; a build \
-                     without the feature still cannot"
-                );
-            },
-        );
-        // off is an explicit no-rerank even with rerank_enabled set.
-        config.search.rerank_backend = "off".to_string();
-        config.search.rerank_enabled = true;
-        assert!(!config.search.rerank_effectively_enabled());
-        // Unknown strings are treated as the onnx default (rerank_enabled gates).
-        config.search.rerank_backend = "bogus".to_string();
-        assert!(config.search.rerank_effectively_enabled());
-    }
-
-    #[test]
-    fn test_default_execution_provider_is_auto() {
-        assert_eq!(LeIndexConfig::default().neural.execution_provider, "auto");
-    }
-
-    #[test]
-    fn test_default_neural_weight_is_0_4() {
-        // VAL-CONFIG: config default must match the scorer-side defaults
-        // (HybridScorer::for_code / HybridScoringWeights both use 0.40).
-        assert_eq!(LeIndexConfig::default().search.neural_weight, 0.4);
-    }
-
-    #[test]
-    fn test_config_missing_keys_uses_defaults() {
-        // VAL-SETUP-030: stale config from older version gets defaults for new keys
-        let toml_str = "[neural]\nenabled = true\n";
-        let config: LeIndexConfig = toml::from_str(toml_str).unwrap();
-        assert!(config.neural.enabled);
-        assert_eq!(config.search.search_mode, "hybrid");
-        assert_eq!(config.search.neural_weight, 0.4);
-        assert_eq!(config.indexing.batch_size, 500);
-        assert_eq!(config.neural.model_name, "qwen3-embed-0.6b-dynamic-uint8");
-    }
-
-    #[test]
-    fn test_config_empty_uses_defaults() {
-        let config: LeIndexConfig = toml::from_str("").unwrap();
-        assert!(!config.neural.enabled);
-        assert_eq!(config.search.search_mode, "hybrid");
-        assert_eq!(config.search.neural_weight, 0.4);
-    }
-
-    #[test]
-    fn test_fragment_config_defaults() {
-        let config = LeIndexConfig::default();
-        assert!(!config.search.fragment_index_enabled);
-        assert_eq!(config.search.fragment_max_bytes, 12_000);
-        assert_eq!(config.search.fragment_weight, 0.35);
-        assert!(config.search.fragment_orphan_enabled);
-        assert!(config.search.fragment_naive_fallback);
-
-        // Existing TOML retains legacy embeddings; search defaults are unchanged.
-        let parsed: LeIndexConfig = toml::from_str("").unwrap();
-        assert_eq!(parsed.search, config.search);
-        assert!(!parsed.indexing.embeddings.enable_hybrid);
-        assert_eq!(parsed.indexing.embeddings.remote_preset_label(), "custom");
-        assert!(config.indexing.embeddings.enable_hybrid);
-        assert_eq!(
-            config.indexing.embeddings.remote_preset_label(),
-            "embeddinggemma-2"
-        );
-    }
-
-    #[test]
-    fn test_fragment_config_round_trip() {
-        let mut config = LeIndexConfig::default();
-        config.search.fragment_index_enabled = true;
-        config.search.fragment_max_bytes = 24_000;
-        config.search.fragment_weight = 0.20;
-        config.search.fragment_orphan_enabled = false;
-        config.search.fragment_naive_fallback = false;
-        let decoded: LeIndexConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
-        assert_eq!(config, decoded);
-    }
-
-    #[test]
-    fn test_full_config_round_trip() {
-        let config = LeIndexConfig {
-            neural: NeuralConfig {
-                enabled: true,
-                execution_provider: "migraphx".to_string(),
-                ort_dylib_path: Some("/usr/local/lib/libonnxruntime.so.1.25.0".to_string()),
-                ort_version: Some("1.25.0".to_string()),
-                model_dir: "/home/user/.leindex/models".to_string(),
-                model_name: "qwen3-embed-0.6b".to_string(),
-            },
-            search: SearchConfig {
-                search_mode: "hybrid".to_string(),
-                neural_weight: 0.35,
-                rerank_enabled: true,
-                rerank_top_n: 80,
-                rerank_backend: "onnx".to_string(),
-                fragment_index_enabled: false,
-                fragment_max_bytes: 12_000,
-                fragment_weight: 0.35,
-                fragment_orphan_enabled: true,
-                fragment_naive_fallback: true,
-            },
-            indexing: IndexingConfig {
-                batch_size: 1000,
-                max_files: 100_000,
-                embeddings: EmbeddingConfig::default(),
-            },
-            mcp: McpConfig {
-                idle_timeout_secs: 3600,
-                engine_max_idle_secs: 1200,
-                prewarm: "graph".to_string(),
-            },
-            system_one: SystemOneConfig::default(),
-            services: std::collections::BTreeMap::new(),
-        };
-        let toml_str = toml::to_string_pretty(&config).unwrap();
-        let parsed: LeIndexConfig = toml::from_str(&toml_str).unwrap();
-        assert_eq!(config, parsed);
-    }
-
-    #[test]
-    fn test_mcp_config_defaults() {
-        // Memory-pressure remediation 1.11.0 (D-1/D-2).
-        let config = LeIndexConfig::default();
-        assert_eq!(config.mcp.idle_timeout_secs, 1800);
-        assert_eq!(config.mcp.engine_max_idle_secs, 600);
-        assert_eq!(config.mcp.prewarm, "full");
-
-        // Parse from empty TOML -> same defaults (backward compatible: existing
-        // configs without an [mcp] section keep working).
-        let parsed: LeIndexConfig = toml::from_str("").unwrap();
-        assert_eq!(parsed.mcp, McpConfig::default());
-        let legacy = "[neural]\nenabled = true\n";
-        let parsed_legacy: LeIndexConfig = toml::from_str(legacy).unwrap();
-        assert_eq!(parsed_legacy.mcp, McpConfig::default());
-    }
-
-    #[test]
-    fn test_mcp_config_round_trip() {
-        let mut config = LeIndexConfig::default();
-        config.mcp.idle_timeout_secs = 60;
-        config.mcp.engine_max_idle_secs = 0;
-        let decoded: LeIndexConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
-        assert_eq!(config.mcp, decoded.mcp);
-    }
-
-    #[test]
-    fn test_ort_dylib_path_skip_serializing_if_none() {
-        let config = NeuralConfig {
-            enabled: true,
-            execution_provider: "cpu".to_string(),
-            ort_dylib_path: None,
-            ort_version: None,
-            model_dir: "/models".to_string(),
-            model_name: "qwen3-embed-0.6b".to_string(),
-        };
-        let toml_str = toml::to_string(&config).unwrap();
-        assert!(!toml_str.contains("ort_dylib_path"));
-    }
-
-    /// Serialize env-var-mutating tests within the lib test binary.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn test_load_or_recover_corrupt_file() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config").join("leindex.toml");
-        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(&config_path, "[neural\nbroken toml").unwrap();
-        // SAFETY: env mutation serialized by ENV_LOCK; single-threaded under the lock.
-        unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
-        let (config, action) = LeIndexConfig::load_or_recover().unwrap();
-        assert!(matches!(action, RecoveryAction::RecoveredFromCorrupt(_)));
-        assert!(!config.neural.enabled);
-        assert!(config_path.with_extension("toml.bak").exists());
-        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
-    }
-
-    #[test]
-    fn test_config_load_returns_default_when_missing() {
-        let _g = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var(LEINDEX_HOME_ENV, "/nonexistent/path/for/testing") };
-        let (config, action) = LeIndexConfig::load_or_recover().unwrap();
-        assert!(matches!(action, RecoveryAction::CreatedDefault));
-        assert!(config.neural.enabled);
-        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
-    }
-
-    #[test]
-    fn test_resolve_leindex_home_env_override() {
-        let _g = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var(LEINDEX_HOME_ENV, "/custom/leindex") };
-        assert_eq!(
-            resolve_leindex_home(),
-            Some(PathBuf::from("/custom/leindex"))
-        );
-        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
-    }
-
-    fn service(
-        name: &str,
-        host: &str,
-        port: u16,
-        model: Option<&str>,
-        alias: Option<&str>,
-    ) -> (String, ServiceConfig) {
-        (
-            name.to_string(),
-            ServiceConfig {
-                host: host.to_string(),
-                port,
-                model: model.map(str::to_string),
-                alias: alias.map(str::to_string),
-                ..ServiceConfig::default()
-            },
-        )
-    }
-
-    #[test]
-    fn test_service_base_url_and_served_name() {
-        let (_, laya) = service(
-            "laya",
-            "127.0.0.1",
-            8181,
-            Some("/models/laya-bf16.gguf"),
-            None,
-        );
-        assert_eq!(laya.base_url(), "http://127.0.0.1:8181");
-        // No alias: served name falls back to the model file stem.
-        assert_eq!(laya.served_name().as_deref(), Some("laya-bf16"));
-        let (_, aliased) = service("e", "127.0.0.1", 8080, None, Some("embeddinggemma-2"));
-        assert_eq!(aliased.served_name().as_deref(), Some("embeddinggemma-2"));
-    }
-
-    #[test]
-    fn test_resolved_remote_endpoint_ladder() {
-        let mut services: std::collections::BTreeMap<String, ServiceConfig> =
-            std::collections::BTreeMap::new();
-        services.insert(
-            "embed".to_string(),
-            ServiceConfig {
-                port: 8123,
-                ..ServiceConfig::default()
-            },
-        );
-        // Service derives the endpoint when no explicit one is set.
-        let via_service = EmbeddingConfig {
-            enable_hybrid: true,
-            remote_service: Some("embed".into()),
-            ..EmbeddingConfig::default()
-        };
-        let resolved = via_service.resolved_remote_with(&services).unwrap();
-        assert_eq!(resolved.endpoint, "http://127.0.0.1:8123/v1");
-        // Explicit endpoint beats the service.
-        let explicit_wins = EmbeddingConfig {
-            enable_hybrid: true,
-            remote_service: Some("embed".into()),
-            remote_endpoint: Some("http://explicit:9/v1".into()),
-            ..EmbeddingConfig::default()
-        };
-        assert_eq!(
-            explicit_wins
-                .resolved_remote_with(&services)
-                .unwrap()
-                .endpoint,
-            "http://explicit:9/v1"
-        );
-        // Preset default applies when neither is set.
-        let preset_only = EmbeddingConfig {
-            enable_hybrid: true,
-            ..EmbeddingConfig::default()
-        };
-        assert_eq!(
-            preset_only
-                .resolved_remote_with(&services)
-                .unwrap()
-                .endpoint,
-            EMBEDDINGGEMMA2_DEFAULT_ENDPOINT
-        );
-    }
-
-    #[test]
-    fn test_resolved_remote_model_falls_back_to_service() {
-        let mut services: std::collections::BTreeMap<String, ServiceConfig> =
-            std::collections::BTreeMap::new();
-        services.insert(
-            "embed".to_string(),
-            ServiceConfig {
-                model: Some("/models/embeddinggemma-2-Q8_0.gguf".into()),
-                ..ServiceConfig::default()
-            },
-        );
-        let cfg = EmbeddingConfig {
-            enable_hybrid: true,
-            remote_service: Some("embed".into()),
-            remote_provider: "custom".into(),
-            ..EmbeddingConfig::default()
-        };
-        // Custom preset (no model fill) + no remote_model -> service stem.
-        assert_eq!(
-            cfg.resolved_remote_with(&services)
-                .unwrap()
-                .model
-                .as_deref(),
-            Some("embeddinggemma-2-Q8_0")
-        );
-    }
-
-    #[test]
-    fn test_system_one_preset_overlay_swaps_provider() {
-        let mut cfg = SystemOneConfig {
-            provider: "laya".into(),
-            mode: "enforce".into(),
-            ..SystemOneConfig::default()
-        };
-        cfg.presets.insert(
-            "openai-prod".into(),
-            SystemOnePreset {
-                provider: Some("openai".into()),
-                model: Some("gpt-6-luna".into()),
-                api_key_env: Some("OPENAI_API_KEY".into()),
-                ..SystemOnePreset::default()
-            },
-        );
-        cfg.active_preset = Some("openai-prod".into());
-        let effective = cfg.effective();
-        assert_eq!(effective.provider, "openai");
-        assert_eq!(effective.model.as_deref(), Some("gpt-6-luna"));
-        // Section-level fields survive when the preset leaves them unset.
-        assert_eq!(effective.mode, "enforce");
-        // Clearing the preset (or naming a missing one) reverts to laya.
-        cfg.active_preset = Some("nope".into());
-        assert_eq!(cfg.effective().provider, "laya");
-    }
-
-    #[test]
-    fn test_system_one_provider_change_clears_unset_provider_fields() {
-        let mut cfg = SystemOneConfig {
-            provider: "laya".into(),
-            model: Some("local-model".into()),
-            base_url: Some("http://127.0.0.1:8000".into()),
-            service: Some("laya".into()),
-            api_key_env: Some("LOCAL_API_KEY".into()),
-            mode: "enforce".into(),
-            active_preset: Some("remote".into()),
-            ..SystemOneConfig::default()
-        };
-        cfg.presets.insert(
-            "remote".into(),
-            SystemOnePreset {
-                provider: Some("openai".into()),
-                ..SystemOnePreset::default()
-            },
-        );
-        let effective = cfg.effective();
-        assert_eq!(effective.provider, "openai");
-        assert_eq!(effective.model, None);
-        assert_eq!(effective.base_url, None);
-        assert_eq!(effective.service, None);
-        assert_eq!(effective.api_key_env, None);
-        assert_eq!(effective.mode, "enforce");
-
-        let preset = cfg.presets.get_mut("remote").unwrap();
-        preset.model = Some("remote-model".into());
-        preset.base_url = Some("https://remote.example".into());
-        preset.service = Some("remote-service".into());
-        preset.api_key_env = Some("REMOTE_API_KEY".into());
-        let effective = cfg.effective();
-        assert_eq!(effective.model.as_deref(), Some("remote-model"));
-        assert_eq!(
-            effective.base_url.as_deref(),
-            Some("https://remote.example")
-        );
-        assert_eq!(effective.service.as_deref(), Some("remote-service"));
-        assert_eq!(effective.api_key_env.as_deref(), Some("REMOTE_API_KEY"));
-    }
-
-    #[test]
-    fn test_system_one_same_provider_presets_inherit_unset_fields() {
-        let mut cfg = SystemOneConfig {
-            provider: "jev".into(),
-            model: Some("base-model".into()),
-            base_url: Some("https://base.example".into()),
-            service: Some("base-service".into()),
-            api_key_env: Some("BASE_API_KEY".into()),
-            active_preset: Some("same".into()),
-            ..SystemOneConfig::default()
-        };
-        for provider in [None, Some("jev"), Some(" JEV "), Some("typesafe")] {
-            cfg.presets.insert(
-                "same".into(),
-                SystemOnePreset {
-                    provider: provider.map(str::to_string),
-                    ..SystemOnePreset::default()
-                },
-            );
-            let effective = cfg.effective();
-            assert_eq!(effective.model, cfg.model);
-            assert_eq!(effective.base_url, cfg.base_url);
-            assert_eq!(effective.service, cfg.service);
-            assert_eq!(effective.api_key_env, cfg.api_key_env);
-        }
-    }
-
-    #[test]
-    fn test_service_base_url_brackets_ipv6_host() {
-        let v6 = ServiceConfig {
-            host: "::1".into(),
-            port: 8080,
-            ..ServiceConfig::default()
-        };
-        assert_eq!(v6.base_url(), "http://[::1]:8080");
-        let v4 = ServiceConfig {
-            host: "127.0.0.1".into(),
-            port: 8080,
-            ..ServiceConfig::default()
-        };
-        assert_eq!(v4.base_url(), "http://127.0.0.1:8080");
-    }
-}
+#[path = "config_test.rs"]
+mod tests;

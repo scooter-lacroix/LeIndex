@@ -538,21 +538,23 @@ impl HybridStorage {
     ///
     /// This is a placeholder for migration functionality.
     /// The actual implementation will be provided in Task 8.3 (Vector Migration Bridge).
-    /// For now, this returns empty migration stats to allow compilation.
     ///
     /// # Returns
     ///
-    /// `Ok(MigrationStats)` with migration statistics (empty for now)
+    /// Always `Err(MigrationFailed)`: the bridge is not implemented.
     ///
-    /// # Example
+    /// This used to return `Ok(MigrationStats::default())`, which reported a
+    /// successful migration of zero nodes for a migration that never ran. There
+    /// is no honest success value for "nothing happened", so the stub fails
+    /// loudly instead, and `LeIndexConfig`-driven callers will see it.
     ///
     /// ```ignore
-    /// let stats = storage.migrate_to_remote()?;
-    /// println!("Migrated {} nodes", stats.nodes_migrated);
+    /// storage.migrate_to_remote()?; // Err(MigrationFailed) until implemented
     /// ```
     pub fn migrate_to_remote(&self) -> Result<MigrationStats, StorageError> {
-        // Placeholder implementation - actual migration will be in Task 8.3
-        Ok(MigrationStats::default())
+        Err(StorageError::MigrationFailed(
+            "the Turso/local migration bridge (Task 8.3) is not implemented".to_string(),
+        ))
     }
 
     /// Check if local storage is available
@@ -652,6 +654,25 @@ mod tests {
         assert_eq!(stats.edges_migrated, 0);
         assert_eq!(stats.embeddings_migrated, 0);
         assert_eq!(stats.migration_time_ms, 0);
+    }
+
+    /// The unimplemented migration must fail, never report a fake success.
+    ///
+    /// This stub previously returned `Ok(MigrationStats::default())`, which is
+    /// indistinguishable from a real migration of an empty database: a caller
+    /// asking "did my data reach Turso?" was told yes. The honest failure is
+    /// what lets `migrate_to_remote` be wired into a real code path without
+    /// silently corrupting a user's expectations.
+    #[test]
+    fn test_migrate_to_remote_fails_instead_of_reporting_a_noop_success() {
+        let storage = HybridStorage::new(TursoConfig::local_only()).expect("local hybrid storage");
+        let error = storage
+            .migrate_to_remote()
+            .expect_err("an unimplemented migration must not report success");
+        assert!(
+            matches!(error, StorageError::MigrationFailed(_)),
+            "expected MigrationFailed, got {error:?}"
+        );
     }
 
     #[test]

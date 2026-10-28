@@ -161,8 +161,16 @@ pub(super) fn read_worker_config_env_from_config() -> WorkerConfigEnv {
     // keeps the config-reading test helpers honest — they write a fresh
     // leindex.toml into a temp LEINDEX_HOME and expect to read it back
     // regardless of which test initialized the global cache first.
-    let config = crate::config::LeIndexConfig::load()
-        .unwrap_or_else(|_| crate::config::LeIndexConfig::default());
+    let config = if cfg!(test) {
+        crate::config::legacy_config_file_path()
+            .filter(|path| path.exists())
+            .map(|path| crate::config::LeIndexConfig::load_from_path(&path))
+            .unwrap_or_else(crate::config::LeIndexConfig::load)
+            .unwrap_or_else(|_| crate::config::LeIndexConfig::default())
+    } else {
+        crate::config::LeIndexConfig::load()
+            .unwrap_or_else(|_| crate::config::LeIndexConfig::default())
+    };
     let provider = config.neural.execution_provider.trim().to_ascii_lowercase();
     WorkerConfigEnv {
         ort_dylib_path: config.neural.ort_dylib_path.clone(),
@@ -850,6 +858,9 @@ pub struct EmbeddingClient {
     /// Cached worker config env, read from leindex.toml at most once per client.
     /// VAL-DAEMON-003: Avoids re-reading leindex.toml on every availability() poll.
     pub(super) cached_config: OnceLock<WorkerConfigEnv>,
+    /// Memoized ORT preflight: `true` when this host has no ORT runtime a worker
+    /// could load, so the readiness wait is never entered (#96).
+    pub(super) neural_unavailable: OnceLock<bool>,
 }
 
 /// Manual Debug impl — Child doesn't implement Debug.
@@ -873,6 +884,7 @@ impl Clone for EmbeddingClient {
             last_startup_report: Arc::clone(&self.last_startup_report),
             use_daemon: self.use_daemon,
             cached_config: OnceLock::new(),
+            neural_unavailable: OnceLock::new(),
         }
     }
 }
@@ -1014,6 +1026,7 @@ impl EmbeddingClient {
             last_startup_report: Arc::new(Mutex::new(None)),
             use_daemon: embed_daemon_enabled(),
             cached_config: OnceLock::new(),
+            neural_unavailable: OnceLock::new(),
         }
     }
 
@@ -1024,6 +1037,7 @@ impl EmbeddingClient {
             last_startup_report: Arc::new(Mutex::new(None)),
             use_daemon: false,
             cached_config: OnceLock::new(),
+            neural_unavailable: OnceLock::new(),
         }
     }
 

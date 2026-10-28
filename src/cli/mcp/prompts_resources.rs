@@ -129,7 +129,7 @@ pub fn get_prompt(
             PromptMessage {
                 role: "user".to_string(),
                 content: PromptContent::Text {
-                    text: "Welcome to LeIndex! Here's how to get started:\n\n1. **Indexing**: First, index your project with `leindex_manage action=index`\n2. **Searching**: Use `leindex_explore mode=search` for semantic code search\n3. **Analysis**: Use `leindex_analyze mode=deep` for comprehensive code analysis\n4. **Context**: Use `leindex_explore mode=context` to expand around specific symbols\n\nPro tip: LeIndex auto-indexes on first use, so you can start searching immediately!".to_string(),
+                    text: "Welcome to LeIndex! Here's how to get started:\n\n1. **Indexing**: First, index your project with `leindex_manage action=index`\n2. **Searching**: Use `leindex_explore mode=search` for semantic code search\n3. **Analysis**: Use `leindex_analyze mode=deep` for comprehensive code analysis\n4. **Context**: Use `leindex_explore mode=context` to expand around specific symbols\n\nNote: indexing is explicit, not automatic — a tool call never starts one.".to_string(),
                 },
             },
         ]),
@@ -271,7 +271,7 @@ pub fn get_resource(uri: &str) -> Result<ResourceContent, JsonRpcError> {
 /// One-screen cheat sheet (`leindex://docs/q`).
 const QUICK_REFERENCE: &str = r#"# LeIndex quick reference
 
-Four tools. Pick the tool, then the branch (`mode` or `action`). `project_path` is optional
+Five tools. Pick the tool, then the branch (`mode` or `action`). `project_path` is optional
 everywhere; `tier` = `l0` card / `l1` overview (default) / `l2` full detail.
 Full arguments: `leindex://tools/guide`.
 
@@ -284,12 +284,15 @@ Full arguments: `leindex://tools/guide`.
 | see the layout of the project | `leindex_explore` mode=project_map |
 | understand how something works | `leindex_analyze` mode=deep query=... |
 | know what breaks if I change X | `leindex_analyze` mode=impact symbol=X |
-| see what my working tree changes | `leindex_analyze` mode=git_diff (or git_status) |
+| architecture report | `leindex_analyze` mode=phase (bound it with max_latency_ms) |
+| see what my working tree changes | `leindex_git` action=diff (or action=status) |
+| check a commit, file or branch | `leindex_git` action=log / show / blame / branch |
+| stage, commit or push | `leindex_git` action=add / commit / push (preview-only: returns the plan) |
 | check index health | `leindex_analyze` mode=diagnostics |
 | change code safely | `leindex_edit` action=preview, then action=apply |
 | rename across files | `leindex_edit` action=rename old_name=... new_name=... (preview by default) |
 | (re)build the index | `leindex_manage` action=index |
-| architecture report | `leindex_manage` action=phase |
+| inspect or evict resident projects | `leindex_manage` action=state / projects / evict |
 "#;
 
 /// Quickstart guide content

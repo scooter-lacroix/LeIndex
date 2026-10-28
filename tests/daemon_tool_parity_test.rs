@@ -140,7 +140,7 @@ fn test_daemon_serves_same_tool_set_as_inline() {
     let tools_response = list_tools(&mut stream);
     let daemon_tools = parse_tool_names(&tools_response);
 
-    // The inline server advertises the public tool surface (the four routers).
+    // The inline server advertises the public tool surface (the five routers).
     let inline_tools: Vec<String> = leindex::cli::mcp::server::list_tools_json(
         &leindex::cli::mcp::handlers::all_tool_handlers(),
     )["tools"]
@@ -173,16 +173,17 @@ fn test_daemon_serves_same_tool_set_as_inline() {
         "daemon and inline tool sets must be identical"
     );
 
-    // Anti-cheat: the four routers, none omitted.
+    // Anti-cheat: the five routers, none omitted.
     assert_eq!(
         daemon_sorted,
         [
             "leindex_analyze",
             "leindex_edit",
             "leindex_explore",
+            "leindex_git",
             "leindex_manage"
         ],
-        "daemon must serve the four routers"
+        "daemon must serve the five routers"
     );
 }
 

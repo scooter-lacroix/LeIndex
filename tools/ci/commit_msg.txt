@@ -1,0 +1,27 @@
+fix(pr105): land CCN, size-gate and test-convention remediation
+
+Commit the work that was previously only in the working tree, which is why
+three required CI gates were red against 9166c6c:
+
+- Cyclomatic complexity: decompose apply_general_options/has_flags
+  (setup_routes.rs), run_phase_analysis (phase/mod.rs), validate, plan_argv,
+  embed_native_once, embed_pending, embed_batch_optional_titled and
+  run_neural back to CCN <= 15. `lizard src/ -C 15 -i 0` is clean (8654
+  functions, 0 warnings).
+- Large file detection: split oversized sources below the 2000-line gate by
+  extracting cli_commands.rs, setup_gpu_detect.rs, config_test.rs,
+  remote_template.rs, remote_budget.rs, remote_cloud.rs and test_env.rs.
+- Test convention (AGENTS.md L66-L67): rename `#[cfg(test)] mod tests` to
+  `mod test` and add the mandatory `test_` prefix to the new unit tests in
+  src/parse/binary.rs and src/cli/daemon/control.rs.
+
+Also fixes the `leindex_git` action discriminator: the handler now accepts
+`action` via ROUTER_KEYS instead of rejecting every routed git call with
+"git <op> does not take 'action'".
+
+Verified locally:
+  cargo fmt --all --check                      -> clean
+  cargo clippy --workspace --all-targets -D warnings -> exit 0
+  cargo test --lib                            -> 3025 passed, 0 failed
+  lizard src/ -C 15 -x"*/tests/*" -x"*/target/*" -m -i 0 -> no thresholds exceeded
+  bash tools/ci/repro_large_files.sh (src/ loop) -> no .rs file over 2000 lines

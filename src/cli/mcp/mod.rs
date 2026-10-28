@@ -27,12 +27,14 @@ pub mod lock;
 /// Dispatch macro for `ToolHandler` enum and match-arm generation.
 #[macro_use]
 pub mod macros;
-/// Grouped four-tool public surface (`action`-selected sub-tools).
+/// Grouped five-router public surface (`mode`/`action`-selected sub-tools).
 pub mod grouped;
 /// Request handlers for MCP tools.
 pub mod handlers;
 /// Shared helpers for MCP request processing.
 pub mod helpers;
+/// Index lifecycle and state management (`leindex_manage`).
+pub mod manage_handler;
 /// Beautiful output formatting for LeIndex tools.
 pub mod output;
 /// MCP protocol definitions and JSON-RPC types.
@@ -63,6 +65,10 @@ pub mod file_summary_handler;
 pub mod find_handler;
 /// Handler for LeIndex [Git Diff] — PDG-enriched diff.
 pub mod git_diff_handler;
+/// Handler for LeIndex [Git] — live git reads plus preview-gated mutations.
+pub mod git_handler;
+/// The single revision/ref gate shared by every git operation.
+pub mod git_ref;
 /// Handler for LeIndex [Git Status] — PDG-aware git status.
 pub mod git_status_handler;
 /// Handler for LeIndex [Impact Analysis] — transitive dependency impact.

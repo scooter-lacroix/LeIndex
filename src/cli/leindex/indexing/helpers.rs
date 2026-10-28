@@ -126,11 +126,23 @@ pub(super) fn progress_stderr(msg: &str) {
     }
 }
 
-/// Cumulative (hits, misses) of the client-side embed cache for this
+/// Cumulative (hits, misses) of the client-side embed caches for this
 /// process — surfaces cache effectiveness in neural-phase progress lines.
+///
+/// Both routes share one store and one progress line, so their counters are
+/// summed: a row served from the remote cache is exactly as "not embedded" as
+/// one served from the local worker cache.
 #[cfg(feature = "onnx")]
 pub(super) fn neural_cache_counters() -> (u64, u64) {
-    crate::search::onnx::embed_cache_frontend::counters()
+    #[allow(unused_mut)]
+    let (mut hits, mut misses) = crate::search::onnx::embed_cache_frontend::counters();
+    #[cfg(feature = "remote-embeddings")]
+    {
+        let (remote_hits, remote_misses, _) = crate::search::onnx::remote_cache::counters();
+        hits += remote_hits;
+        misses += remote_misses;
+    }
+    (hits, misses)
 }
 
 #[cfg(not(feature = "onnx"))]
@@ -146,6 +158,236 @@ pub(super) fn progress_clear() {
         let mut handle = stderr.lock();
         let _ = write!(handle, "\r\x1b[K");
         let _ = handle.flush();
+    }
+}
+
+/// Throttled writer for intra-phase progress into `index-state.json`.
+///
+/// A phase can run for over a minute (the parse and neural phases own ~98% of
+/// a cold run's wall time), and `mark_index_phase` only fires when a phase
+/// *starts*. Without this, a status reader sees one phase name for the whole
+/// duration and cannot tell forward progress from a hang.
+///
+/// Why a reported count cannot simply be written per file: `save_health` is an
+/// atomic write that fsyncs both the file and its directory. Doing that
+/// thousands of times per parse would turn a progress indicator into a
+/// measurable share of the run. Writes here are therefore gated on
+/// [`Self::INTERVAL`] and on the reported value actually changing.
+///
+/// Writes are also best-effort: a failed status write must never fail an
+/// index. The snapshot is advisory until the final publish replaces it.
+pub(super) struct PhaseProgress {
+    storage_path: PathBuf,
+    phase: crate::cli::leindex::IndexPhase,
+    total: usize,
+    last_write: std::cell::Cell<std::time::Instant>,
+    last_done: std::cell::Cell<usize>,
+}
+
+impl PhaseProgress {
+    /// Begin reporting for `phase` out of `total` items.
+    ///
+    /// Writes immediately so the total reaches readers before the first
+    /// interval elapses — otherwise a reader polling right after the phase
+    /// starts sees the previous phase's stale count.
+    pub(super) fn start(
+        storage_path: PathBuf,
+        phase: crate::cli::leindex::IndexPhase,
+        total: usize,
+    ) -> Self {
+        let progress = Self {
+            storage_path,
+            phase,
+            total,
+            // Long enough ago that the first `report(0)` always writes.
+            last_write: std::cell::Cell::new(
+                std::time::Instant::now() - Self::INTERVAL - std::time::Duration::from_secs(1),
+            ),
+            last_done: std::cell::Cell::new(usize::MAX),
+        };
+        progress.report(0);
+        progress
+    }
+
+    /// Record that `done` items have finished. Cheap: usually a no-op.
+    pub(super) fn report(&self, done: usize) {
+        if done == self.last_done.get() || self.last_write.get().elapsed() < Self::INTERVAL {
+            return;
+        }
+        self.last_done.set(done);
+        self.last_write.set(std::time::Instant::now());
+        // `load_health` can return None for a project that has never published
+        // (a cold first index). In that case there is no generation to attach
+        // progress to and `mark_index_phase` already wrote a default snapshot
+        // with no total, so skip rather than fabricate a zero generation.
+        let Some(mut health) = crate::cli::index_freshness::load_health(&self.storage_path) else {
+            return;
+        };
+        // Do not attribute a count to a phase the snapshot no longer reports:
+        // a concurrent publish may have moved on, and "42 of 900" under the
+        // wrong phase name is worse than no number at all.
+        if health.phase != self.phase {
+            return;
+        }
+        health.progress_total = Some(self.total);
+        health.progress_done = done;
+        let _ = crate::cli::index_freshness::save_health(&self.storage_path, &health);
+    }
+
+    /// Clear the counters once the phase is over, so a finished generation
+    /// never shows a frozen "900 of 900" bar.
+    pub(super) fn finish(&self) {
+        let Some(mut health) = crate::cli::index_freshness::load_health(&self.storage_path) else {
+            return;
+        };
+        if health.phase != self.phase {
+            return;
+        }
+        health.progress_total = None;
+        health.progress_done = 0;
+        let _ = crate::cli::index_freshness::save_health(&self.storage_path, &health);
+    }
+}
+
+impl PhaseProgress {
+    /// Minimum gap between durable writes for one phase.
+    pub(super) const INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+}
+
+/// Drives a [`PhaseProgress`] from a parser's per-file completion callback.
+///
+/// Two constraints shape this, and they are why it is not just an `Arc`:
+///
+/// 1. `PhaseProgress::report` uses non-`Sync` interior mutability for its
+///    throttle, while the parse callback runs on rayon worker threads. So the
+///    workers may only bump a counter; exactly ONE other thread samples it and
+///    performs the write. That keeps the snapshot single-writer.
+/// 2. The sampler must never outlive the phase, so [`Self::finish`] takes
+///    `self` by value — the thread is stopped and joined by construction, and a
+///    caller cannot forget it while still holding the handle.
+///
+/// The result is a handful of atomic fsync writes for a several-hundred-file
+/// parse, instead of one per file.
+pub(super) struct ParseProgressHeartbeat {
+    done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ParseProgressHeartbeat {
+    /// Begin reporting for `phase` out of `total`, with a sampler thread that
+    /// wakes every [`PhaseProgress::INTERVAL`].
+    pub(super) fn start(
+        storage_path: PathBuf,
+        phase: crate::cli::leindex::IndexPhase,
+        total: usize,
+    ) -> Self {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reporter = PhaseProgress::start(storage_path, phase, total);
+        let (counter, stop_thread) = (done.clone(), stop.clone());
+        let thread = std::thread::Builder::new()
+            .name("index-parse-progress".to_owned())
+            .spawn(move || {
+                while !stop_thread.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(PhaseProgress::INTERVAL);
+                    reporter.report(counter.load(std::sync::atomic::Ordering::Relaxed));
+                }
+                // Final sample, then close. The last interval may have ended
+                // just short of the total, and a bar frozen at "397 of 400"
+                // reads as a truncated run.
+                reporter.report(counter.load(std::sync::atomic::Ordering::Relaxed));
+                reporter.finish();
+            })
+            .ok();
+        Self { done, stop, thread }
+    }
+
+    /// The closure to hand a parser. It only counts — see the type docs.
+    ///
+    /// `use<>` promises the returned closure captures nothing from `&self`:
+    /// it clones the `Arc`, so the caller can hand out a callback and then
+    /// still move the heartbeat into `finish`.
+    ///
+    /// Monotonic on purpose. `parse_files_counting` hands out a unique ordinal
+    /// per finished file, but rayon has no ordering guarantee — file 7 can call
+    /// back before file 3. A plain `store` would then write 3 over 7 and the
+    /// published count could go BACKWARDS or finish below the file total.
+    /// `fetch_max` keeps the highest ordinal seen, so the number only ever
+    /// climbs toward `total`.
+    pub(super) fn callback(&self) -> impl Fn(usize) + Sync + use<> {
+        let counter = self.done.clone();
+        move |finished: usize| {
+            counter.fetch_max(finished, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Stop and join the sampler. Consumes `self` so it cannot be skipped.
+    ///
+    /// `mut self` because `Drop` forbids moving a field out; the handle is
+    /// taken instead, which also leaves `drop` with nothing to join twice.
+    pub(super) fn finish(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for ParseProgressHeartbeat {
+    /// Last-resort join for a heartbeat dropped without [`Self::finish`].
+    ///
+    /// `finish` takes `self` by value, so the happy path cannot forget the
+    /// sampler. A `?` between `start` and `finish` would still drop this
+    /// value, and a sampler outliving the phase keeps writing into a snapshot
+    /// the next run now owns. Dropping without joining must therefore stop and
+    /// join here rather than depend on every caller being careful.
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Dispatch a parse over the requested route.
+///
+/// `on_progress` is called with the running count of files that have finished
+/// parsing; `None` keeps every caller (and the tests) unchanged. Lives here
+/// rather than beside the pipeline because it is a pure function of its
+/// arguments — no `LeIndex` state — and the pipeline module has a line budget.
+pub(super) fn parse_files_for_route(
+    files: Vec<PathBuf>,
+    scan: &ScanCheckpoint,
+    route: super::streaming::routes::ParseRoute,
+    on_progress: Option<&(dyn Fn(usize) + Sync)>,
+) -> Vec<crate::parse::parallel::ParsingResult> {
+    use super::streaming;
+    match route {
+        streaming::routes::ParseRoute::Streaming => {
+            // Byte sizes come from the scan inventory (single hashing
+            // authority); anything missing sizes to 0 and still parses.
+            let file_sizes: HashMap<PathBuf, u64> = scan
+                .files
+                .iter()
+                .map(|file| (file.canonical_path.clone(), file.bytes))
+                .collect();
+            let bounded = files
+                .into_iter()
+                .map(|path| {
+                    let bytes = file_sizes.get(&path).copied().unwrap_or(0);
+                    (path, bytes)
+                })
+                .collect();
+            streaming::parse::stream_parse_parallel(
+                bounded,
+                &streaming::parse::ParseBudget::default(),
+                on_progress,
+            )
+        }
+        streaming::routes::ParseRoute::Legacy => {
+            crate::parse::parallel::ParallelParser::new().parse_files_counting(files, on_progress)
+        }
     }
 }
 

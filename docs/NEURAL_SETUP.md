@@ -252,6 +252,55 @@ same-route reruns are retained; explicit empty template or key-variable flags cl
 Code and query text are sent to the configured endpoint. The preset stays on
 loopback; overriding it to a hosted service is an explicit data-sharing choice.
 
+## Hosted provider presets
+
+Eight hosted providers ship as named presets. Selecting one is a complete
+route: the endpoint, model, native dimension, wire protocol, and API-key
+variable all come from the preset table, so no URL has to be looked up or
+typed.
+
+```bash
+export GEMINI_API_KEY=...            # the preset names the variable it reads
+leindex setup --embedding gemini
+```
+
+| Preset | Default model | Dimension |
+|---|---|---|
+| `gemini` | `gemini-embedding-001` | 3072 |
+| `voyage` | `voyage-code-3` | 1024 |
+| `mistral` | `codestral-embed` | 1536 |
+| `jina` | `jina-embeddings-v3` | 1024 |
+| `together` | `BAAI/bge-large-en-v1.5` | 1024 |
+| `nomic` | `nomic-embed-text-v1.5` | 768 |
+| `openai` | `text-embedding-3-small` | 1536 |
+| `cohere` | `embed-english-v3.0` | 1024 |
+
+`gemini` speaks Google's native `v1beta` `batchEmbedContents` surface;
+every other preset uses the OpenAI-compatible `/v1/embeddings` contract.
+A preset persists only its NAME (`remote_provider = "gemini"`), never the
+endpoint, model, or dimension the table supplied, so a later correction to
+the table reaches existing installations. Anything you override is persisted,
+because that is intent the table cannot know.
+
+The interactive wizard treats a preset as zero-config: it offers the table
+defaults, asks only which served model to use, and skips the API-key prompt
+when the named variable is already exported. Deviating is still available —
+answer "no" to the defaults prompt to edit the endpoint, model, and dimension
+by hand, which is what a self-hosted gateway or a pinned catalogue needs.
+
+During setup the wizard queries the endpoint's model listing (`GET /models`
+on the configured base URL, which exists on OpenAI-compatible servers and on
+the native Gemini surface) and offers what the endpoint reports, so a model
+this build has never heard of is still selectable and an ID the table got
+wrong never is. The configured model is always kept in the list even when the
+endpoint omits it, because some servers list only loaded models. When listing
+is unavailable the wizard falls back to free text.
+
+Dimension is a bootstrap value: the length of the first successful response is
+measured and wins, and any later response of a different length is rejected
+rather than written. An endpoint that cannot authenticate the listing still
+configures; the smoke test is what validates credentials.
+
 ## Configuration and System One
 
 ```bash
@@ -276,10 +325,11 @@ System One is a separate decision route: a small typed-decision model
 validates tool calls before they run (pre-gate) and classifies search results
 before they reach your agent (post-gate). It fails open — any provider
 problem leaves calls and results untouched — and ships off by default. It is
-**experimental** and requires a source build:
+**experimental** and compiled in by default (`system-one` is in the `full`
+feature set):
 
 ```bash
-cargo install leindex --features system-one
+cargo install leindex      # --features system-one is implied
 leindex setup --system-one   # interactive wizard; writes [system_one] (+ [services.laya] for the managed backend)
 ```
 
@@ -295,7 +345,8 @@ endpoint from that service (port 8181 by default — the embeddings service on
 
 Three things must line up before the gate runs:
 
-1. a build with `--features system-one` (`setup --check` reports
+1. a build with the `system-one` feature — included by default, so
+   `cargo install leindex` is enough (`setup --check` reports
    `build (system-one feature): yes/no`);
 2. a `[system_one]` section with `mode` other than `"off"`, or the gate stays
    dormant — `mode = "shadow"` decides and logs without applying;

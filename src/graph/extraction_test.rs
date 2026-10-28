@@ -556,6 +556,59 @@ fn has_call_edge_between_files(
     }
 }
 
+/// A documentation heading must never be the target of a call edge.
+///
+/// Regression: a Markdown heading named `init` becomes a `DocSection` node whose
+/// qualified name is the bare heading text, so the cross-file call index exposed
+/// it under `exact_map["init"]` next to the real `fn init()`. Every `fn init()`
+/// in the project then resolved a "call" into the doc section, and renders showed
+/// a Markdown section with an `init` CALLER — a section nobody can call.
+#[test]
+fn doc_section_is_never_a_call_target() {
+    let mut caller = sig("init", "init", false);
+    caller.calls.push("init".to_string());
+
+    let mut doc = sig("init", "init", false);
+    doc.return_type = Some("doc_section".to_string());
+
+    let pdg_caller = extract_pdg_from_signatures(vec![caller.clone()], b"", "src/lib.rs", "rust");
+    let pdg_doc = extract_pdg_from_signatures(vec![doc.clone()], b"", "README.md", "markdown");
+
+    let mut merged = ProgramDependenceGraph::new();
+    for source in [&pdg_caller, &pdg_doc] {
+        for nid in source.node_indices() {
+            if let Some(node) = source.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+    }
+
+    resolve_cross_file_call_edges_for_files(
+        &mut merged,
+        &[
+            ("src/lib.rs".to_string(), caller),
+            ("README.md".to_string(), doc),
+        ],
+    );
+
+    let doc_nid = merged
+        .node_indices()
+        .find(|&nid| {
+            merged
+                .get_node(nid)
+                .is_some_and(|node| node.node_type == NodeType::DocSection)
+        })
+        .expect("the doc section node must exist");
+    let callers: Vec<_> = merged
+        .neighbors_by_edge_type(doc_nid, EdgeType::Call, petgraph::Direction::Incoming)
+        .into_iter()
+        .collect();
+    assert!(
+        callers.is_empty(),
+        "a doc section must have no call edges into it, found {callers:?}"
+    );
+}
+
 /// Tier 1: Exact match - caller references callee by exact qualified name
 #[test]
 fn cross_file_exact_match() {

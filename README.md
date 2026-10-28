@@ -11,7 +11,7 @@
 
 # LeIndex
 
-**Semantic code intelligence for humans and AI agents — a Program Dependence Graph, hybrid neural search, and 18 structural tools behind one small daemon.**
+**Semantic code intelligence for humans and AI agents — a Program Dependence Graph, hybrid neural search, and 18+ structural operations behind five tools and one small daemon.**
 
 Ask LeIndex where authentication lives, what breaks if you rename a function,
 or how the indexer resumes across phases — and get the symbols, callers, and
@@ -86,17 +86,18 @@ human-annotated query/code benchmark — see
 
 ---
 
-## What agents see: 4 MCP tools
+## What agents see: 5 MCP tools
 
-Four routers instead of twenty schemas — a `mode` / `action` argument picks the
+Five routers instead of twenty schemas — a `mode` / `action` argument picks the
 operation, every other argument passes straight through:
 
 | Tool | Selector | Branches |
 |---|---|---|
-| `leindex_explore` | `mode` | `search` (hybrid semantic, default) · `find` (exact text / regex / symbol names — indexed, always live, **any path on disk**) · `symbol_lookup` · `read_file` · `read_symbol` · `project_map` · `file_summary` · `context` |
-| `leindex_analyze` | `mode` | `deep` (semantic + PDG traversal, default) · `impact` (transitive blast radius) · `diagnostics` · `git_status` · `git_diff` (PDG-enriched) |
+| `leindex_explore` | `mode` | `search` (hybrid semantic, default) · `find` (exact text / regex / symbol names — indexed, always live, **any path on disk**) · `structural` (AST pattern) · `symbol_lookup` · `read_file` · `read_symbol` · `project_map` · `file_summary` · `context` |
+| `leindex_analyze` | `mode` | `deep` (semantic + PDG traversal, default) · `impact` (transitive blast radius) · `diagnostics` · `phase` (5-phase architectural review, bounded by `max_latency_ms`) |
 | `leindex_edit` | `action` (required) | `preview` → `apply` (dry-run supported) · `rename` (atomic multi-file, preview-first) · `write` |
-| `leindex_manage` | `action` | `index` (pollable job, default) · `phase` (5-phase architectural review) |
+| `leindex_manage` | `action` | `index` (pollable job, default) · `state` (usable? generation, phase, freshness) · `projects` · `evict` · `lease` · `cleanup` (retention, dry-run) |
+| `leindex_git` | `action` | `status` · `diff` (PDG-enriched) · `log` · `show` · `blame` · `branch` · `remote` · `add` · `commit` · `checkout` · `stash` · `tag` · `merge` · `rebase` · `push` · `reset` · `force` (mutations are **preview-only**) |
 
 `find` is a native trigram index (the technique behind Zoekt) built with each
 index run: about a millisecond on a 700-file repository, results always read from
@@ -145,7 +146,6 @@ LeIndex call replaces chains of `Grep → Read → Read → Read`.
 ```bash
 # cargo (Rust users)
 cargo install leindex
-cargo install leindex --features onnx --force   # ensure the ONNX runtime is linked
 leindex setup
 
 # npm (Cursor / Claude Code / VS Code users)
@@ -167,6 +167,9 @@ local Qwen3; use `--embedding keep` to retain an existing route. Managed
 services (`leindex services list|start|stop`) own the llama-server process on
 Linux; `auto_start = true` brings them up on demand for runtime embedding
 calls (`--check` never starts services).
+
+For the long-lived `leindexd` process, use the user-facing lifecycle commands:
+see [`docs/DAEMON.md`](docs/DAEMON.md), or run `leindex daemon --help`.
 
 ```bash
 leindex setup --embedding qwen3 --cpu
@@ -193,9 +196,10 @@ validates tool calls before they run (pre-gate) and classifies search results
 before they reach your agent (post-gate). It fails open — any provider problem
 leaves calls and results untouched — and ships off by default.
 
-1. **Build with the feature**: `cargo install leindex --features system-one`.
-   Prebuilt bundles and default crates.io builds do not include the gate;
-   `leindex setup --check` reports `build (system-one feature): yes/no`.
+1. **Build with the feature**: `cargo install leindex` already includes it —
+   `system-one` is a member of `full`, the default feature set. Explicitly
+   naming `--features system-one` is harmless if you prefer to be obvious.
+   `leindex setup --check` reports `build (system-one feature): yes`.
 2. **Provision a decision model.** `leindex setup --system-one` writes the
    `[system_one]` section and, for the default `laya` provider, asks which
    Laya backend to use: `external` (the fresh-install default) prompts for
@@ -338,7 +342,7 @@ Codebase → Tree-sitter → PDG + TF-IDF (core, always) → neural join → hyb
 
 ## Under the hood
 
-- **18 MCP tools** — search, navigation, analysis, and safe editing (preview/dry-run/preview-only defaults on every destructive path)
+- **18+ MCP operations behind 5 tools** — search, navigation, analysis, git reads, and safe editing (preview/dry-run/preview-only defaults on every destructive path)
 - **Flexible embedding backends** — TF-IDF, local ONNX models (Qwen3), a managed llama.cpp GGUF service (EmbeddingGemma2), or remote OpenAI-compatible providers
 - **System One decision gate (experimental)** — pre/post-gate validation of MCP calls and search results by a local typed-decision model, off by default, fail-open
 - **Honest degradation everywhere** — direction labels on impact figures, notes when enrichment was skipped, `signature_scope` on incremental counts, freshness footers separated from machine-readable JSON

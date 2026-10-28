@@ -5,6 +5,90 @@ fn v(s: &str) -> Value {
     serde_json::from_str(s).unwrap()
 }
 
+/// The impact line must not report the traversal CAP as a measurement.
+///
+/// The forward-impact traversal stops at 500 nodes, so a bare
+/// "500 affected symbols" reads as a precise answer when it is only a floor.
+/// The handlers now report `affected_symbols_capped`, and the renderer has to
+/// say so.
+#[test]
+fn test_render_git_impact_says_capped_instead_of_a_bare_count() {
+    let capped = v(r#"{
+            "impact_summary": {
+                "total_affected_symbols": 500,
+                "affected_symbols_capped": true,
+                "affected_files": ["a.rs", "b.rs"]
+            }
+        }"#);
+    let s = render_git_status(&capped, false);
+    assert!(s.contains("500+"), "the count must read as a floor: {s}");
+    assert!(s.contains("capped"), "the cap must be stated: {s}");
+
+    let exact = v(r#"{
+            "impact_summary": {
+                "total_affected_symbols": 7,
+                "affected_symbols_capped": false,
+                "affected_files": ["a.rs"]
+            }
+        }"#);
+    let s = render_git_status(&exact, false);
+    assert!(s.contains("7 affected symbols"), "unexpected line: {s}");
+    assert!(
+        !s.contains("capped"),
+        "an uncapped count must not mention a cap: {s}"
+    );
+}
+
+/// PDG enrichment status must come from the field the handlers actually emit.
+///
+/// Regression: the renderer read `data["pdg_enrichment"]["available"]`, which
+/// NOTHING emits — both git handlers write a plain `pdg_status` string — so the
+/// enrichment line never rendered for any real response.
+#[test]
+fn test_render_git_pdg_enrichment_reads_pdg_status() {
+    let fresh = v(r#"{ "pdg_status": "fresh" }"#);
+    let s = render_git_status(&fresh, false);
+    assert!(s.contains("PDG Enrichment"), "missing section: {s}");
+    assert!(s.contains("fresh"), "missing status: {s}");
+
+    // A failure carries its reason.
+    let failed = v(r#"{ "pdg_status": "failed", "pdg_error": "no nodes" }"#);
+    let s = render_git_status(&failed, false);
+    assert!(s.contains("failed"), "missing status: {s}");
+    assert!(s.contains("no nodes"), "missing reason: {s}");
+}
+
+/// The enrichment line must survive the transport, not just a direct render.
+///
+/// Regression: `render_git_status` was fixed to read `pdg_status`, but
+/// `trim_git_status` — which runs on every payload the MCP transport hands to
+/// the model — preserved the phantom `pdg_enrichment` object and dropped
+/// `pdg_status`. The renderer therefore still saw "field absent" in production
+/// while its own unit test, which fed the renderer directly, passed. This test
+/// goes through the real entry point so the two halves cannot drift apart again.
+#[test]
+fn test_pdg_enrichment_line_survives_the_transport_trim() {
+    use crate::cli::mcp::output::trim::trim_llm_payload;
+    let raw = v(r#"{
+            "is_git_repo": true,
+            "branch": "main",
+            "summary": {"modified": 1, "staged": 0, "untracked": 0},
+            "modified_files": ["src/main.rs"],
+            "staged_files": [],
+            "untracked_files": [],
+            "changed_symbols": [],
+            "pdg_status": "fresh",
+            "impact_summary": {"total_affected_symbols": 3, "pdg_enriched": true}
+        }"#);
+    let trimmed = trim_llm_payload("leindex_git_status", &raw);
+    assert_eq!(trimmed["pdg_status"], "fresh", "trim dropped it: {trimmed}");
+    let s = render_git_status(&trimmed, false);
+    assert!(
+        s.contains("PDG Enrichment"),
+        "the enrichment line vanishes on the transport path: {s}"
+    );
+}
+
 #[test]
 fn test_render_tree_basic() {
     let tree = v(r#"[

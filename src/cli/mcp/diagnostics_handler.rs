@@ -328,6 +328,22 @@ fn engram_json() -> Value {
                 "embed_cache".to_string(),
                 serde_json::json!({ "hits": hits, "misses": misses }),
             );
+            // The remote route keeps its own counters but writes into the same
+            // store; report them so a remote index's cache effectiveness is
+            // visible here too instead of looking like a cache that never runs.
+            #[cfg(feature = "remote-embeddings")]
+            {
+                let (remote_hits, remote_misses, remote_stored) =
+                    crate::search::onnx::remote_cache::counters();
+                engram_map.insert(
+                    "remote_embed_cache".to_string(),
+                    serde_json::json!({
+                        "hits": remote_hits,
+                        "misses": remote_misses,
+                        "stored": remote_stored,
+                    }),
+                );
+            }
         }
         engram
     };

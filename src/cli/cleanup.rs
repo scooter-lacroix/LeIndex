@@ -259,24 +259,22 @@ pub fn is_leindex_artifact_by_pattern(dir: &Path) -> bool {
 
     // Pattern: <project>-<hash> under $TMPDIR/leindex/
     // Pattern: lephase-phase<N>-<hash>
-    if name.contains('-') {
-        // Check if under a "leindex" parent directory
-        if dir
+    //
+    // The `-` branch is a full match, not an early bail: a `lephase-*` name also
+    // contains `-`, so a failure here must fall through to the prefix check below.
+    if name.contains('-')
+        && dir
             .parent()
             .map(|p| p.file_name().map(|n| n == "leindex").unwrap_or(false))
             .unwrap_or(false)
-        {
-            // Check if it contains leindex.db (strong indicator)
-            return dir.join("leindex.db").exists();
-        }
-    }
-
-    // lephase-* directories
-    if name.starts_with("lephase-") {
+        // Check if it contains leindex.db (strong indicator)
+        && dir.join("leindex.db").exists()
+    {
         return true;
     }
 
-    false
+    // lephase-* directories
+    name.starts_with("lephase-")
 }
 
 /// Get the creation/modification time of an artifact directory.
@@ -354,23 +352,107 @@ pub(crate) fn pid_is_alive(pid: u32) -> Option<bool> {
         if !proc_dir.exists() {
             return Some(false);
         }
-        // PID-recycling guard (Kilo): the process must actually be a leindex
-        // daemon (worker or MCP server) — an unrelated process that reused a
-        // dead daemon's PID must not keep that daemon's stale sidecars
-        // protected forever. Mirrors `lock.rs::pid_is_owned`'s cmdline check.
-        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok();
-        Some(cmdline.is_some_and(|raw| {
-            let command = String::from_utf8_lossy(&raw);
-            command
-                .split('\0')
-                .any(|arg| arg.contains("leindex") || arg.contains("mcp"))
-        }))
+        // PID-recycling guard: the process must actually be a leindex daemon
+        // (worker or MCP server), decided by executable identity. An unrelated
+        // process that reused a dead daemon's PID must not keep that daemon's
+        // stale sidecars protected forever.
+        //
+        // Deliberately NOT an argument search. The previous check matched any
+        // argv element containing "leindex"/"mcp", which is content, not
+        // identity: `vim ~/leindex/src/lib.rs`, `grep mcp notes.md`, or
+        // `ssh host leindex-status` all kept a recycled PID's sidecars
+        // protected indefinitely. Matching the program name instead means only
+        // a process that *is* a leindex binary can hold a daemon's sidecars.
+        //
+        // Undeterminable identity counts as NOT ours. The sidecars live in this
+        // user's `~/.leindex/run/`, so a process we cannot identify — typically
+        // another user's, whose `/proc/<pid>/exe` is unreadable — cannot be the
+        // daemon that owns them.
+        Some(pid_program_identity(pid).unwrap_or(false))
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = pid;
         None
     }
+}
+
+/// Executable names that may own a daemon sidecar. These are the binaries this
+/// workspace ships (`src/bin/`); a packaged copy renamed on disk is not matched
+/// and will be treated as dead.
+#[cfg(target_os = "linux")]
+const LEINDEX_PROGRAM_NAMES: &[&str] = &["leindex", "leindexd", "leindex-embed"];
+
+/// Wait until a freshly spawned child has `exec`'d away from this test binary.
+///
+/// `Command::spawn` returns after `fork` but before `exec`, and on the
+/// vfork/posix_spawn path Rust std uses, `/proc/<pid>/cmdline` is NON-empty
+/// in that window — it still describes the parent's argv — so polling for a
+/// non-empty cmdline proves nothing. Meanwhile `/proc/<pid>/exe` still points
+/// at THIS test binary, which [`pid_program_identity`] deliberately accepts
+/// (the `current_exe` fallback exists so sibling leindex processes — including
+/// the test harness — are recognised). Sampling identity pre-exec therefore
+/// reads the harness, not the fixture, and whether the test passes becomes a
+/// scheduling race. Exec is reliably observable as the exe link no longer
+/// resolving to this binary's path; on success the child's cmdline is
+/// returned so callers can assert their bait words survived the exec.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn wait_for_child_exec(pid: u32) -> String {
+    let harness_exe = std::env::current_exe().ok();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .ok()
+            .filter(|raw| !raw.is_empty());
+        // Two signals, both required: the exe link no longer resolves to this
+        // binary (the exec happened), AND the new image's argv is installed
+        // (cmdline non-empty again — it is empty for a moment mid-exec while
+        // the old argv is torn down and the new one not yet written).
+        let execd = match (&harness_exe, &exe) {
+            (Some(harness), Some(child)) if harness != child => cmdline.is_some(),
+            _ => false,
+        };
+        if let Some(raw) = cmdline.filter(|_| execd) {
+            return String::from_utf8_lossy(&raw).into_owned();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture child {pid} never exec'd"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Whether `name` is the file name of a leindex binary.
+///
+/// Also accepts this process's own executable name, so that a live sibling of
+/// whatever binary is running (a second `leindex` install, or the `cargo test`
+/// harness binary, which is named `leindex-<hash>`) is still recognised.
+#[cfg(target_os = "linux")]
+fn is_leindex_program_name(name: &str) -> bool {
+    // A running process whose binary was replaced on disk (an upgrade) reports
+    // "/path/to/leindex (deleted)". The process is still that binary.
+    let name = name.strip_suffix(" (deleted)").unwrap_or(name);
+    if LEINDEX_PROGRAM_NAMES.contains(&name) {
+        return true;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.file_name().map(|n| n == name))
+        .unwrap_or(false)
+}
+
+/// Identify whether `pid` is a leindex binary from its executable, never from
+/// its arguments. `None` means the identity could not be determined (no `/proc`
+/// entry, or an executable link this user may not read).
+#[cfg(target_os = "linux")]
+pub(crate) fn pid_program_identity(pid: u32) -> Option<bool> {
+    // /proc/<pid>/exe resolves every symlink chain, so a launcher installed
+    // under an alias still reports the real binary's name.
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let name = exe.file_name()?.to_str()?;
+    Some(is_leindex_program_name(name))
 }
 
 /// True when `name` is one of the sidecar files the daemon worker or the MCP
@@ -1350,6 +1432,93 @@ mod tests {
         assert!(dir.path().join("other-app.pid").exists());
     }
 
+    /// Wait for a just-spawned child to `exec` before inspecting `/proc/<pid>`.
+    ///
+    /// Module-level [`wait_for_child_exec`]: in the fork→exec window the exe
+    /// link still points at this harness binary, which identity checks
+    /// deliberately accept, so polling cmdline (non-empty from birth on the
+    /// posix_spawn path) would test the harness rather than the fixture.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pid_is_alive_ignores_argument_content() {
+        // The bug this guards: identity was decided by searching argv for
+        // "leindex"/"mcp". Any ordinary process that merely *mentions* those
+        // words — an editor editing this file, a grep, a shell script — then
+        // kept a recycled PID's sidecars protected forever.
+        //
+        // The fixture needs the words in argv while the executable is NOT a
+        // leindex binary, and it must stay alive long enough to inspect.
+        // `sh -c 'sleep 30' leindex mcp` is not usable: `sleep` rejects extra
+        // operands, and many shells exec-optimise a single-command `-c` script,
+        // replacing argv (and the exe) with `sleep` itself. A two-command
+        // script file defeats both problems: the interpreter stays resident
+        // with the bait in its argv, and its exe is `/bin/sh` or dash.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("bait.sh");
+        std::fs::write(&script, "sleep 30\nexit 0\n").expect("write fixture script");
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg(&script)
+            .arg("leindex")
+            .arg("mcp")
+            .spawn()
+            .expect("spawn fixture shell");
+
+        // Sanity: the fixture really is carrying the bait words in argv, so a
+        // pass cannot come from the words being absent.
+        let cmdline = wait_for_child_exec(child.id());
+        assert!(
+            cmdline.contains("leindex") && cmdline.contains("mcp"),
+            "fixture must carry the bait words in argv; got {cmdline:?}"
+        );
+
+        let verdict = pid_is_alive(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(
+            verdict,
+            Some(false),
+            "a non-leindex executable must not be treated as a daemon owner just \
+             because its arguments mention leindex/mcp"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pid_is_alive_recognises_own_process() {
+        // Positive control: the fix must not degrade into "everything is dead".
+        // This process is not named `leindex` (the cargo test harness is
+        // `leindex-<hash>`), so this exercises the current_exe clause.
+        assert_eq!(
+            pid_is_alive(std::process::id()),
+            Some(true),
+            "the running process must be recognised via its own executable name"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_is_leindex_program_name_accepts_replaced_binary() {
+        // A running daemon whose binary was upgraded in place reports
+        // "/path/to/leindex (deleted)" from /proc/<pid>/exe, because the inode it
+        // is executing no longer has that name. The kernel appends the marker to
+        // the symlink target, so a naive basename comparison sees
+        // "leindex (deleted)" and concludes the process is not leindex — which
+        // would make a live daemon's own sidecars look stale.
+        for name in ["leindex", "leindexd", "leindex-embed"] {
+            assert!(
+                is_leindex_program_name(&format!("{name} (deleted)")),
+                "{name} (deleted) must still be recognised as a leindex binary"
+            );
+        }
+        // The marker is stripped as a suffix only: it must not turn an unrelated
+        // name into a leindex binary.
+        assert!(!is_leindex_program_name("vim (deleted)"));
+        assert!(!is_leindex_program_name("leindex (deleted) extra"));
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_sweep_keeps_live_pid_stem() {
         let dir = tempfile::tempdir().unwrap();

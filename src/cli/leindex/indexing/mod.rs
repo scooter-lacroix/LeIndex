@@ -222,32 +222,9 @@ fn parse_files_for_route(
     files: Vec<PathBuf>,
     scan: &ScanCheckpoint,
     route: streaming::routes::ParseRoute,
+    on_progress: Option<&(dyn Fn(usize) + Sync)>,
 ) -> Vec<crate::parse::parallel::ParsingResult> {
-    match route {
-        streaming::routes::ParseRoute::Streaming => {
-            // Byte sizes come from the scan inventory (single hashing
-            // authority); anything missing sizes to 0 and still parses.
-            let file_sizes: HashMap<PathBuf, u64> = scan
-                .files
-                .iter()
-                .map(|file| (file.canonical_path.clone(), file.bytes))
-                .collect();
-            let bounded = files
-                .into_iter()
-                .map(|path| {
-                    let bytes = file_sizes.get(&path).copied().unwrap_or(0);
-                    (path, bytes)
-                })
-                .collect();
-            streaming::parse::stream_parse_parallel(
-                bounded,
-                &streaming::parse::ParseBudget::default(),
-            )
-        }
-        streaming::routes::ParseRoute::Legacy => {
-            crate::parse::parallel::ParallelParser::new().parse_files(files)
-        }
-    }
+    helpers::parse_files_for_route(files, scan, route, on_progress)
 }
 
 impl LeIndex {
@@ -695,6 +672,16 @@ impl LeIndex {
         // what that phase actually costs the process.
         let neural = {
             let _phase = memory_report::PhaseScope::enter(super::IndexPhase::Neural.as_str());
+            // Publish the phase before entering it. Without this the snapshot
+            // keeps saying `persist` for the entire neural pass — on this
+            // project that is ~98% of a cold run's wall time — so a status
+            // reader attributes the longest phase in the pipeline to a phase
+            // that already finished, and `PhaseProgress`'s phase guard would
+            // discard every neural count as belonging to the wrong phase.
+            self.mark_index_phase(
+                super::IndexPhase::Neural,
+                super::ComponentStatus::Initializing,
+            );
             let neural = self.run_neural(job, lexical);
             // Never leave the builder running past this run, even on failure.
             if text_index_job.join().is_err() {
@@ -705,6 +692,10 @@ impl LeIndex {
         let neural = neural?;
         let _enhanced = {
             let _phase = memory_report::PhaseScope::enter(IndexPhaseId::PublishEnhanced.as_str());
+            self.mark_index_phase(
+                super::IndexPhase::Persist,
+                super::ComponentStatus::Initializing,
+            );
             self.publish_generation(job, Some(&neural))?
         };
         Ok(())
@@ -1044,11 +1035,27 @@ impl LeIndex {
                 streaming::routes::ParseRoute::Legacy => "legacy",
             }
         );
+        // Publish "N of M files" while the parse runs. See
+        // `ParseProgressHeartbeat`: the parse callback only bumps a counter
+        // (rayon threads cannot touch `PhaseProgress`'s non-`Sync` throttle) and
+        // one sampler thread turns that into a handful of atomic writes rather
+        // than one fsync per file.
+        let parse_progress = ParseProgressHeartbeat::start(
+            self.storage_path().to_path_buf(),
+            super::IndexPhase::Parse,
+            plan.files_to_parse.len(),
+        );
         let mut parsing_results = if plan.files_to_parse.is_empty() {
             Vec::new()
         } else {
-            parse_files_for_route(std::mem::take(&mut plan.files_to_parse), scan, parse_route)
+            parse_files_for_route(
+                std::mem::take(&mut plan.files_to_parse),
+                scan,
+                parse_route,
+                Some(&parse_progress.callback()),
+            )
         };
+        parse_progress.finish();
         parsing_results.extend(resumed_parse_results);
         // Streaming route (PR #90 round 2, cluster B): resumed results are
         // reconstructed with re-read source buffers; strip them exactly like

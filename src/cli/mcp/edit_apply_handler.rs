@@ -32,12 +32,12 @@ fn apply_request_args(
 fn cached_edit(entry: Option<EditCacheEntry>, token: &str) -> Result<PreparedEdit, JsonRpcError> {
     let entry = entry.ok_or_else(|| {
         JsonRpcError::invalid_params(
-            "No cached preview found for this file — request a new preview",
+            "No cached preview found for this file — either request a new LeIndex [Edit Preview], or resend the edit as FRESH MODE (file_path + old_text + new_text, without preview_token)",
         )
     })?;
     if entry.preview_token != token {
         return Err(JsonRpcError::invalid_params(
-            "preview token mismatch — request a new preview",
+            "preview token mismatch — the token does not match the cached preview for this file. Either request a new LeIndex [Edit Preview] and apply with its token, or resend the edit as FRESH MODE (file_path + old_text + new_text, without preview_token)",
         ));
     }
     Ok((entry.original_text, entry.modified_text, entry.changes))
@@ -331,9 +331,12 @@ impl EditApplyHandler {
     }
 
     pub fn description(&self) -> &str {
-        "PRIMARY file editor — use instead of edit_file. Simple mode: provide file_path + \
-old_text + new_text for exact replacement. Advanced mode: use changes[] array for \
-multiple or byte-offset edits. Supports dry_run=true for preview."
+        "PRIMARY file editor — use instead of edit_file. Two mutually exclusive modes: \
+(1) TOKEN MODE — after a LeIndex [Edit Preview], pass file_path + preview_token ONLY. \
+The token replaces the edit: do NOT repeat old_text/new_text/changes. Any text sent \
+alongside a token is ignored. (2) FRESH MODE — with no preview, pass file_path + \
+old_text + new_text for exact replacement (or changes[] for multiple or byte-offset \
+edits). Supports dry_run=true for preview."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -346,7 +349,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                 },
                 "old_text": {
                     "type": "string",
-                    "description": "Simple mode: text to find and replace (exact match)"
+                    "description": "FRESH MODE: text to find and replace (exact match). Use only when no preview_token is sent; with a preview_token, omit this field."
                 },
                 "old_str": {
                     "type": "string",
@@ -354,7 +357,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                 },
                 "new_text": {
                     "type": "string",
-                    "description": "Simple mode: replacement text"
+                    "description": "FRESH MODE: replacement text. Use only when no preview_token is sent; with a preview_token, omit this field."
                 },
                 "new_str": {
                     "type": "string",
@@ -362,7 +365,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                 },
                 "project_path": {
                     "type": "string",
-                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                    "description": "Project directory (omit to use current project). Indexing is NOT automatic: an unindexed project answers with a 'project not indexed' error until you run the index action."
                 },
                 "changes": {
                     "type": "array",
@@ -377,7 +380,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                 },
                 "preview_token": {
                     "type": "string",
-                    "description": "The token returned by a previous LeIndex [Edit Preview] (tool: leindex.edit-preview) call. Required if using cached preview."
+                    "description": "TOKEN MODE: the preview_token from a previous LeIndex [Edit Preview] (tool: leindex.edit-preview). When set, the token IS the edit: send file_path + preview_token only and omit old_text/new_text/changes (any text sent with a token is ignored). Unknown or mismatched token: request a new preview, or resend the edit as FRESH MODE without preview_token."
                 }
             },
             "required": ["file_path"]

@@ -75,6 +75,18 @@ pub struct PhaseOptions {
     /// Empty means "walk the tree" (a standalone phase run).
     #[serde(skip)]
     pub universe: std::sync::Arc<Vec<PathBuf>>,
+    /// Wall-clock ceiling for the whole run, in milliseconds. `None` (or zero)
+    /// means unbounded.
+    ///
+    /// Phase stages are synchronous and run inside `spawn_blocking`, so an
+    /// in-flight stage cannot be cancelled. What a bound CAN do is stop the
+    /// pipeline from starting further stages once the ceiling is passed, and
+    /// report which stages actually ran. That is the difference between a call
+    /// that eventually returns honest partial output and one with no upper
+    /// bound at all — the 518 s call documented on
+    /// `PhaseAnalysisReport::stage_ms` is the failure mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_ms: Option<u64>,
 }
 
 impl Default for PhaseOptions {
@@ -92,8 +104,22 @@ impl Default for PhaseOptions {
             docs_mode: DocsMode::Off,
             hotspot_keywords: default_hotspot_keywords(),
             universe: std::sync::Arc::default(),
+            budget_ms: default_budget_ms(),
         }
     }
+}
+
+/// `LEINDEX_PHASE_BUDGET_MS`, or unbounded when unset/zero.
+///
+/// Unbounded by default on purpose: the bound stops the pipeline between
+/// stages, so it cannot rescue a single stage already in flight. Making an
+/// unset value mean "some number" would silently truncate legitimate long
+/// runs; making it opt-in keeps current behaviour identical.
+fn default_budget_ms() -> Option<u64> {
+    std::env::var("LEINDEX_PHASE_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
 }
 
 fn default_hotspot_keywords() -> Vec<String> {

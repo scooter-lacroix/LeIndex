@@ -40,7 +40,8 @@ use crate::embed::protocol::{
 
 #[path = "client_config.rs"]
 mod client_config;
-// Unix-only re-export: the fn is #[cfg(unix)] (reaping walks /proc + sockets).
+// Unix-only (superseded-daemon reaping walks /proc + Unix sockets); callers
+// are likewise gated so the re-export must be too or Windows builds break.
 #[cfg(unix)]
 pub(crate) use client_config::terminate_superseded_daemons;
 use client_config::*;
@@ -49,63 +50,11 @@ pub use client_config::{
     migraphx_cache_path, prune_stale_migraphx_profiles,
 };
 
-/// Classify a `std::io::Error` as one that indicates the worker process has
-/// died (closed the connection or crashed).
-///
-/// VAL-DEADWORKER-001: When the worker process dies, `read_exact` on the
-/// `UnixStream` returns one of these error kinds. This is a deterministic
-/// transport-level signal, not an arbitrary wall-clock timeout.
-/// ROCm/MIGraphX library directories that must be on the worker's loader
-/// path for the MIGraphX execution provider to load.
-///
-/// ORT's `libonnxruntime_providers_migraphx.so` links against
-/// `libmigraphx*.so` variant libraries that ROCm installs under
-/// `<rocm>/lib/migraphx/lib` — a directory the dynamic loader does not
-/// search by default. When the worker is spawned without that directory on
-/// `LD_LIBRARY_PATH`, provider registration fails with
-/// "libmigraphx_tf.so.<ver>: cannot open shared object file" and the worker
-/// silently falls back to CPU inference (100-1000x slower than GPU).
-/// Returning the existing dirs here lets the spawn path prepend them so
-/// provider loading matches a working shell setup. The MIGraphX compile
-/// probe child inherits the worker environment and benefits identically.
-fn migraphx_loader_dirs() -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    for key in ["ROCM_PATH", "HIP_PATH"] {
-        if let Ok(value) = std::env::var(key) {
-            if !value.is_empty() {
-                let root = PathBuf::from(value);
-                if !roots.contains(&root) {
-                    roots.push(root);
-                }
-            }
-        }
-    }
-    let default_rocm = PathBuf::from("/opt/rocm");
-    if !roots.contains(&default_rocm) {
-        roots.push(default_rocm);
-    }
-
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    for root in roots {
-        for sub in ["lib/migraphx/lib", "lib"] {
-            let dir = root.join(sub);
-            if dir.is_dir() && !dirs.contains(&dir) {
-                dirs.push(dir);
-            }
-        }
-    }
-    dirs
-}
-
-fn is_worker_dead_io_error(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::UnexpectedEof
-            | std::io::ErrorKind::BrokenPipe
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-    )
-}
+// Process-environment, liveness and ORT-preflight helpers (no `EmbeddingClient`
+// state) live in `client_support.rs`; glob-imported so call sites keep their paths.
+#[path = "client_support.rs"]
+mod client_support;
+use client_support::*;
 
 /// Read a response frame from the worker.
 ///
@@ -322,6 +271,20 @@ impl EmbeddingClient {
 
     fn ensure_worker_ready(&self) -> Result<(), ClientError> {
         let started = Instant::now();
+
+        // An ORT-less host cannot produce a resident neural worker: the
+        // daemon binds its socket, fails ORT/model init, then shuts itself
+        // down. Spawning it would burn the readiness deadline polling a
+        // socket that is already gone, so the preflight answers first.
+        // Memoized because this runs before every embed batch, and an
+        // unavailable verdict cannot change within a host's lifetime.
+        if *self.neural_unavailable.get_or_init(host_lacks_onnx_runtime) {
+            tracing::warn!(
+                "no loadable ONNX Runtime found; neural worker not started, \
+                 proceeding with core TF-IDF/PDG results"
+            );
+            return Ok(());
+        }
 
         // If the worker cannot be spawned or connected (daemon timeout, missing
         // binary, IPC failure), treat neural as unavailable. Indexing proceeds
@@ -631,7 +594,7 @@ impl EmbeddingClient {
                     // entered the not-ready path and would reject the first
                     // inference frame even after the lifecycle becomes ready.
                     drop(stream);
-                    match Self::wait_for_daemon_ready(&socket_path) {
+                    match Self::wait_for_daemon_ready(&socket_path, Some(&mut child)) {
                         Ok(()) => {
                             Self::spawn_daemon_reaper(child, socket_path.clone());
                             let stream = UnixStream::connect(&socket_path).map_err(|e| {
@@ -703,7 +666,7 @@ impl EmbeddingClient {
     fn connect_daemon_when_ready(
         &self,
         socket_path: &Path,
-        child: Option<Child>,
+        mut child: Option<Child>,
     ) -> Result<Option<WorkerHandle>, ClientError> {
         match UnixStream::connect(socket_path) {
             Ok(stream) => {
@@ -711,7 +674,10 @@ impl EmbeddingClient {
                 // to the server's not-ready handler. Close it, wait for the
                 // explicit Ready state, then create the inference connection.
                 drop(stream);
-                Self::wait_for_daemon_ready(socket_path)?;
+                // We did not spawn this daemon, so there is no child handle to
+                // observe; `readiness_abort_reason` falls back to the recorded
+                // pid file to decide whether it still exists.
+                Self::wait_for_daemon_ready(socket_path, child.as_mut())?;
                 let stream = UnixStream::connect(socket_path).map_err(|e| {
                     ClientError::Ipc(format!(
                         "failed to reconnect ready worker daemon {}: {}",
@@ -735,20 +701,35 @@ impl EmbeddingClient {
     }
 
     /// Wait for the daemon's explicit lifecycle transition before retaining a
-    /// socket for inference. A readiness deadline prevents an infinite hang
-    /// when the daemon is stuck in Initializing state. When the deadline fires,
-    /// the error propagates so callers can treat neural as unavailable.
+    /// socket for inference. Two things end the wait: the daemon reaches
+    /// `Ready`, or the daemon stops existing (`readiness_abort_reason`). The
+    /// deadline is only the fallback for a daemon that stays Initializing but
+    /// unresponsive; when the deadline fires, the error propagates so callers
+    /// can treat neural as unavailable.
     ///
     /// VAL-DAEMON-004: Uses one persistent Unix socket connection held in
     /// `stream: Option<UnixStream>` for the entire polling duration. Each
     /// poll writes + reads on the same socket; the connection is only
     /// dropped on error (triggering a reconnect on the next iteration).
     #[cfg(unix)]
-    fn wait_for_daemon_ready(socket_path: &Path) -> Result<(), ClientError> {
+    fn wait_for_daemon_ready(
+        socket_path: &Path,
+        mut observed_child: Option<&mut Child>,
+    ) -> Result<(), ClientError> {
         let started = Instant::now();
         let mut stream: Option<UnixStream> = None;
 
         loop {
+            // A wait must end when the thing it waits for stops existing; a
+            // deadline is only the second reason to stop waiting.
+            if let Some(reason) = readiness_abort_reason(observed_child.as_deref_mut(), socket_path)
+            {
+                return Err(ClientError::Worker(WorkerError {
+                    kind: ErrorKind::OnnxRuntime,
+                    message: reason,
+                }));
+            }
+
             if started.elapsed() >= DAEMON_READY_MAX_WAIT {
                 return Err(ClientError::Worker(WorkerError {
                     kind: ErrorKind::OnnxRuntime,
@@ -1264,7 +1245,11 @@ impl EmbeddingClient {
             match miss_result {
                 EmbedResult::Success(response) => {
                     let miss_vectors = response.into_vectors();
-                    super::embed_cache_frontend::store_misses(&outcome, &miss_vectors);
+                    super::embed_cache_frontend::store_misses(
+                        &outcome,
+                        &miss_vectors,
+                        expected_dim,
+                    );
                     let vectors =
                         ordered_vectors(&outcome.hits, &outcome.miss_positions, &miss_vectors);
                     EmbedResult::Success(flatten_into_response(vectors, expected_dim))

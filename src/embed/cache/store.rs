@@ -166,6 +166,17 @@ pub struct CacheConfig {
     /// Maximum bytes for a single cache entry. Entries exceeding this are
     /// rejected (not stored) and counted in telemetry.
     pub max_entry_bytes: u64,
+    /// Free space that must remain on the cache's filesystem before a row is
+    /// written. `0` disables the guard.
+    ///
+    /// [`Self::max_bytes`] is deliberately unlimited, so this is the backstop
+    /// that keeps the cache from filling the disk it shares with the build
+    /// tree, the daemon socket, and the sqlite stores. A full filesystem
+    /// breaks far more than the cache, while a skipped cache write costs only
+    /// a miss: the remote route already swallows write failures, so the guard
+    /// trades a hit for a working machine.
+    #[serde(default)]
+    pub min_free_bytes: u64,
     /// When `true`, `put` calls that supply `Some(source_text)` will append the
     /// source text after the vector payload in the row file. Privacy gate:
     /// defaults to `false`. This can also be toggled at runtime via the
@@ -179,14 +190,97 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            // 1 GiB default max cache size.
-            max_bytes: 1024 * 1024 * 1024,
+            // Unlimited by default. A byte budget is the wrong tool for this
+            // cache: its entries are content-addressed embeddings whose entire
+            // value is being present when the same document is seen again, and
+            // its unit cost is only ~4.6 KiB. Any budget below the whole
+            // corpus is therefore a self-inflicted miss: evicting a row costs a
+            // full remote embed to recreate.
+            //
+            // Measured on a 40k-file corpus with the previous 1 GiB default:
+            // 4,436,071,008 bytes evicted against 334 MB retained, i.e. the
+            // store spent its time deleting rows it had just written and the
+            // next run re-embedded them. A 40k-file corpus needs ~185 GB to be
+            // fully resident, so a 1 GiB budget retains 0.5% of it.
+            //
+            // Operators who genuinely need a cap set
+            // `LEINDEX_EMBED_CACHE_MAX_BYTES`; `0` (the default) means no
+            // eviction at all.
+            max_bytes: 0,
             // 1 MiB max per entry (dim=8192 * 4 bytes = 32KiB, so this is generous).
             max_entry_bytes: 1024 * 1024,
+            // Keep 5 GiB free. Unlimited `max_bytes` makes this the only thing
+            // standing between the cache and a full filesystem, and a full
+            // filesystem takes the build tree, the daemon, and the sqlite
+            // stores down with it.
+            min_free_bytes: 5 * 1024 * 1024 * 1024,
             // Privacy default: never persist source text.
             debug_mode: false,
         }
     }
+}
+
+/// Environment override for [`CacheConfig::max_bytes`].
+///
+/// Read here rather than in the caller so every construction path — the
+/// indexing route, the search route, and their tests — honours one knob.
+const MAX_BYTES_ENV: &str = "LEINDEX_EMBED_CACHE_MAX_BYTES";
+/// Environment override for [`CacheConfig::min_free_bytes`], in bytes.
+const MIN_FREE_BYTES_ENV: &str = "LEINDEX_EMBED_CACHE_MIN_FREE_BYTES";
+
+impl CacheConfig {
+    /// Defaults with the environment overrides applied.
+    ///
+    /// An unparseable value keeps the default and warns: silently falling back
+    /// would hide an operator's intent, and for `max_bytes` it would quietly
+    /// widen a budget they meant to cap.
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+        if let Ok(raw) = std::env::var(MAX_BYTES_ENV) {
+            match raw.trim().parse::<u64>() {
+                Ok(bytes) => config.max_bytes = bytes,
+                Err(_) => tracing::warn!(
+                    value = %raw,
+                    "{MAX_BYTES_ENV} is not a byte count; keeping the default budget"
+                ),
+            }
+        }
+        if let Ok(raw) = std::env::var(MIN_FREE_BYTES_ENV) {
+            match raw.trim().parse::<u64>() {
+                Ok(bytes) => config.min_free_bytes = bytes,
+                Err(_) => tracing::warn!(
+                    value = %raw,
+                    "{MIN_FREE_BYTES_ENV} is not a byte count; keeping the default free-space floor"
+                ),
+            }
+        }
+        config
+    }
+}
+
+/// Bytes available to an unprivileged writer on the filesystem holding `path`.
+///
+/// `None` when the platform or path cannot answer. Callers must treat that as
+/// "unknown", not as "no space": a cache that refuses to write because a
+/// syscall failed is worse than a cache that writes.
+#[cfg(unix)]
+fn available_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statvfs` only writes into the provided struct on success, and
+    // `c_path` is a valid NUL-terminated string for the call's duration.
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stats) } != 0 {
+        return None;
+    }
+    // `f_bavail` is blocks available to unprivileged users, which is the
+    // number that actually governs whether our write will succeed.
+    Some(stats.f_bavail as u64 * stats.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn available_bytes(_path: &Path) -> Option<u64> {
+    None
 }
 
 /// Stats report for `leindex retention --report` cache section (spec 10.3).
@@ -395,6 +489,23 @@ pub struct GlobalEmbeddingCache {
     model_index: ModelIndex,
 }
 
+impl Drop for GlobalEmbeddingCache {
+    /// Flush telemetry counters when the handle goes away.
+    ///
+    /// `probe()` records hits/misses in memory, but the only other persistence
+    /// points are `compact()` and `evict_unreferenced()`. With the default
+    /// unlimited byte budget (0) eviction never runs, so without this the
+    /// counters were written once at open and never again: `retention --report`
+    /// served a frozen snapshot, and a regression to zero hits would have been
+    /// invisible. Failure is logged, never propagated — `Drop` cannot report an
+    /// error and losing counters must never fail an index.
+    fn drop(&mut self) {
+        if let Err(error) = self.persist_telemetry() {
+            tracing::warn!(%error, "failed to persist embed-cache telemetry on drop");
+        }
+    }
+}
+
 impl GlobalEmbeddingCache {
     /// Open (or initialise) the embedding cache at `root` with default config.
     ///
@@ -402,7 +513,7 @@ impl GlobalEmbeddingCache {
     /// persisted project references from `refs.json` and telemetry from
     /// `telemetry.json`.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, CacheError> {
-        Self::open_with_config(root, CacheConfig::default())
+        Self::open_with_config(root, CacheConfig::from_env())
     }
 
     /// Open (or initialise) the embedding cache at `root` with a custom config.
@@ -534,8 +645,11 @@ impl GlobalEmbeddingCache {
             return Ok(()); // Rejection is not an error; just don't store.
         }
 
-        // Byte-budget enforcement: evict unreferenced rows if over budget.
-        self.enforce_byte_budget(entry_size)?;
+        // Byte-budget + free-space admission: skip the write when the disk
+        // cannot afford it.
+        if !self.admit_write(entry_size)? {
+            return Ok(());
+        }
 
         self.publish_row(&final_path, &row_bytes)?;
 
@@ -548,19 +662,45 @@ impl GlobalEmbeddingCache {
         Ok(())
     }
 
-    /// Enforce the cache byte budget before a new row of `entry_size` bytes
-    /// is written: evict oldest unreferenced rows until the projected total
-    /// fits within `max_bytes` (spec section 10.3). A limit of `0` means
-    /// unlimited and is a no-op.
-    fn enforce_byte_budget(&mut self, entry_size: u64) -> Result<(), CacheError> {
+    /// Decide whether a write of `entry_size` bytes may proceed, evicting
+    /// oldest unreferenced rows when a byte budget is set (spec section 10.3).
+    ///
+    /// Returns `false` when the write must be skipped. Two conditions cause
+    /// that: the free-space guard (free space would fall below
+    /// `min_free_bytes`) and nothing else — an over-budget cache evicts rather
+    /// than refuses, because a row it cannot keep is not a row it cannot
+    /// afford to write.
+    ///
+    /// Skipping is not an error: the callers already treat a cache write
+    /// failure as "leave it uncached", and a miss costs less than a full disk.
+    fn admit_write(&mut self, entry_size: u64) -> Result<bool, CacheError> {
+        if self.config.min_free_bytes > 0 {
+            if let Some(free) = available_bytes(&self.root) {
+                if free.saturating_sub(entry_size) < self.config.min_free_bytes {
+                    // Warn once per process, not once per batch: a full disk
+                    // would otherwise emit a warning per embedding batch and
+                    // bury the rest of the log.
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        tracing::warn!(
+                            free_bytes = free,
+                            min_free_bytes = self.config.min_free_bytes,
+                            root = %self.root.display(),
+                            "embedding cache is out of free space; skipping writes until space is reclaimed"
+                        );
+                    });
+                    return Ok(false);
+                }
+            }
+        }
         if self.config.max_bytes == 0 {
-            return Ok(());
+            return Ok(true);
         }
         let current = self.total_bytes()?;
         if current + entry_size > self.config.max_bytes {
             self.evict_unreferenced(current + entry_size - self.config.max_bytes)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Atomically publish a prepared row: staging write + `sync_all` + rename.
@@ -638,9 +778,12 @@ impl GlobalEmbeddingCache {
             return Ok(0);
         }
 
-        // Byte-budget enforcement once for the whole batch.
+        // Byte-budget + free-space admission once for the whole batch. A
+        // declined batch stores nothing and reports zero rows written.
         let batch_bytes: u64 = encoded.iter().map(|(_, bytes, _)| bytes.len() as u64).sum();
-        self.enforce_byte_budget(batch_bytes)?;
+        if !self.admit_write(batch_bytes)? {
+            return Ok(0);
+        }
 
         let written = self.write_batch_rows(&encoded)?;
 

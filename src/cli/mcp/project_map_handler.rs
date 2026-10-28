@@ -45,7 +45,7 @@ scoping to subdirectories, sorting, and pagination."
                 },
                 "project_path": {
                     "type": "string",
-                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                    "description": "Project directory (omit to use current project). Must already be indexed: an unindexed project returns a 'not indexed' error telling you to run the index action."
                 },
                 "depth": {
                     "type": "integer",
@@ -502,7 +502,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_project_map_auto_indexes_empty_project() {
-        // With auto-indexing, an empty project returns an empty file list (not an error)
+        // First-use indexing is OPT-IN (`LEINDEX_AUTO_INDEX`), so this test sets
+        // it explicitly: it exercises the indexing path, not the default. The
+        // default-off behaviour has its own test in `registry_test`, and both
+        // serialize on the same lock because the variable is process-global.
+        let _env = crate::cli::registry::auto_index_env_lock().await;
+        let previous = std::env::var(crate::cli::registry::AUTO_INDEX_ENABLE_ENV).ok();
+        unsafe { std::env::set_var(crate::cli::registry::AUTO_INDEX_ENABLE_ENV, "1") };
         let dir = tempdir().unwrap();
         // Create a minimal source file so indexing has something to find
         let src = dir.path().join("main.rs");
@@ -510,7 +516,16 @@ mod tests {
         let registry = test_registry_for(dir.path());
         let args = serde_json::json!({});
         let result = ProjectMapHandler.execute(&registry, args).await;
-        assert!(result.is_ok(), "auto-indexing should succeed");
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var(crate::cli::registry::AUTO_INDEX_ENABLE_ENV, value)
+            },
+            None => unsafe { std::env::remove_var(crate::cli::registry::AUTO_INDEX_ENABLE_ENV) },
+        }
+        assert!(
+            result.is_ok(),
+            "an explicitly enabled auto-index should succeed"
+        );
     }
 
     #[tokio::test]

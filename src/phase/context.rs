@@ -102,6 +102,15 @@ impl PhaseExecutionContext {
         Ok(context)
     }
 
+    /// Whether the graph still has to be loaded or refreshed.
+    ///
+    /// A run whose phases all hit the summary cache never calls
+    /// [`Self::ensure_graph`], so the deferred graph work did not happen and
+    /// must not be reported as an instant stage.
+    pub fn graph_is_pending(&self) -> bool {
+        self.pending_graph.is_some()
+    }
+
     /// Load or refresh the graph if that has not happened yet. Phases call this
     /// before computing anything; a cached phase result never does.
     pub fn ensure_graph(&mut self) -> Result<()> {
@@ -959,6 +968,12 @@ mod tests {
 
     #[test]
     fn persisted_refresh_replaces_changed_file_graph_and_updates_index() {
+        // This refresh reaches the precision ingest pass, which discovers
+        // indexers through process-global `LEINDEX_SCIP_*` variables and runs
+        // every external indexer under one global mutex. Tests that point
+        // those variables at a fake indexer must not overlap with it, or one
+        // test's fake indexer writes the SCIP output of another's project.
+        let _scip_guard = crate::feature_flags::lock_flag_tests();
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
         let file = root.join("src/lib.rs");
@@ -1228,6 +1243,10 @@ mod tests {
     /// deleted files and re-treated the graph as changed, forever.
     #[test]
     fn test_deletions_only_run_persists_indexed_file_removals() {
+        // See `persisted_refresh_replaces_changed_file_graph_and_updates_index`:
+        // this path also reaches the precision ingest pass, so it must not run
+        // concurrently with a test that rewires the global SCIP env vars.
+        let _scip_guard = crate::feature_flags::lock_flag_tests();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
         std::fs::write(dir.path().join("src/keep.rs"), "pub fn keep() {}\n").expect("write");

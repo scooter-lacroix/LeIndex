@@ -180,7 +180,20 @@ impl NeuralProgress {
 timeout_secs × max_retries before falling back]"
     }
 
-    fn start(total: usize) -> Self {
+    /// Start the heartbeat, optionally mirroring the row count into the
+    /// durable `index-state.json` snapshot on every tick.
+    ///
+    /// The stderr heartbeat is invisible to any other process: an MCP status
+    /// call, the TUI Status pane, or a second terminal all read the snapshot,
+    /// and during a neural pass they otherwise see one unchanging phase name
+    /// for the entire duration. Reusing this heartbeat rather than starting a
+    /// second thread is deliberate — it already ticks at [`Self::INTERVAL`],
+    /// which is the throttle `PhaseProgress` wants, and already tracks the
+    /// same counter.
+    ///
+    /// `progress: None` is the caller that has no snapshot to attribute rows
+    /// to (and is what the heartbeat's own test drives).
+    fn start_reporting(total: usize, progress: Option<super::PhaseProgress>) -> Self {
         let rows = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (rows_t, stop_t) = (rows.clone(), stop.clone());
@@ -258,8 +271,20 @@ timeout_secs × max_retries before falling back]"
                         total,
                         started.elapsed().as_secs()
                     ));
+                    // Mirror the same count into the durable snapshot so other
+                    // processes see the phase advancing, not just this stderr.
+                    if let Some(progress) = &progress {
+                        progress
+                            .report(rows_t.load(std::sync::atomic::Ordering::Relaxed));
+                    }
                     for _ in 0..(Self::INTERVAL.as_millis() / 100) {
                         if stop_t.load(std::sync::atomic::Ordering::Relaxed) {
+                            // Close the counters on the way out: a finished
+                            // pass must not leave the snapshot frozen at a
+                            // mid-flight count.
+                            if let Some(progress) = &progress {
+                                progress.finish();
+                            }
                             return;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -429,6 +454,276 @@ fn leaf_title(path: &Path, node_name: &str) -> String {
         .unwrap_or_else(|| node_name.to_string())
 }
 
+/// Nominal byte target for one neural chunk. Must stay far below
+/// `index_builder::cap_neural_text`'s 64 KiB truncation point, so that capping
+/// each chunk is a no-op and no chunk is ever silently truncated on its way to
+/// the embedder. The chunker's own accounting can overshoot this target by a few
+/// bytes (interior line terminators), which is why the bound that actually
+/// matters is the truncation point, not this number.
+///
+/// This is the ONE place the chunk size is defined. It is derived from
+/// [`index_builder::NEURAL_TEXT_CAP_BYTES`] rather than repeating a literal, so a
+/// future change to the cap cannot leave the chunker above it — which would
+/// silently reintroduce the truncation this splitter exists to prevent.
+///
+/// # Measured: the chunk size is NOT a speed lever — do not re-tune it
+///
+/// 2 KiB (`/32`) was tried, then reverted. Isolated server probes were
+/// encouraging — at a constant ~94k tokens, 2048-byte inputs gave 33,968 tok/s
+/// against 20,631 tok/s at 8192 bytes — because llama.cpp forms its physical
+/// batch across SEQUENCES, so many short inputs fill the batch where a single
+/// long input occupies it alone.
+///
+/// Those numbers did not survive contact with the real pipeline. An interleaved
+/// A/B over freshly-generated never-embedded corpora (so the embedding cache
+/// could not mask the effect) measured `median 29.17s` at 8 KiB against
+/// `median 30.04s` at 2 KiB — **0.97x, i.e. no gain, slightly worse**.
+///
+/// The reason is that this splitter almost never fires. Across a real tree the
+/// mean node is 882 bytes with a p90 of 1801; only 7.8% of nodes exceed 2 KiB
+/// and 0.1% exceed 8 KiB. A threshold sitting above the 90th percentile cannot
+/// move end-to-end time no matter which way it is tuned.
+///
+/// So it stays at `/8`. Do not re-tune it expecting a speedup: the threshold
+/// is above the 90th percentile of real node sizes, so it is close to inert.
+/// Measure the node-size distribution before trusting any claim about it — an
+/// earlier revision of this comment stated a token figure taken from a
+/// synthetic probe with 220-character inputs and mistook characters for
+/// tokens, understating real nodes by ~5x.
+const NEURAL_CHUNK_BYTES: usize = index_builder::NEURAL_TEXT_CAP_BYTES / 8;
+
+/// Budget for the neural streaming pass.
+///
+/// Centralised rather than spelled out at the call site so the ceilings that
+/// interact — per-text sequence length, UTF-8 bytes, estimated tokens, and the
+/// chunk size above — are checked against each other by the assertions below
+/// instead of drifting apart silently.
+fn neural_batch_budget() -> streaming::BatchBudget {
+    streaming::BatchBudget {
+        // Measured request-size curve on the managed server at 2048 chars/text,
+        // constant total tokens, median of two runs each:
+        //   64 texts -> 34,908 tok/s
+        //  128 texts -> 34,973 tok/s
+        //  256 texts -> 31,794 tok/s
+        //  512 texts -> 28,652 tok/s
+        // Throughput peaks at 128 and decays as the request grows, so the old
+        // 256 sat past the knee. `max_estimated_tokens` alone did not bound this:
+        // a 120k-node run logged 48 batches of 252 texts, i.e. the text cap was
+        // binding, not the token budget.
+        max_texts: 128,
+        // A chunk is at most NEURAL_CHUNK_BYTES plus a small terminator
+        // overshoot; 2x leaves headroom without admitting a whole 64 KiB node as
+        // a single input.
+        max_seq_len: index_builder::NEURAL_TEXT_CAP_BYTES,
+        ..streaming::BatchBudget::default()
+    }
+}
+
+/// The chunk size and the budget must agree, or a chunk is silently skipped.
+///
+/// `BatchBudget::can_accept` rejects any text longer than `max_seq_len`, and an
+/// over-length input is counted as skipped and given no row. `chunk_code` may
+/// overshoot its nominal target by a few bytes, so the only safe relationship is
+/// `NEURAL_CHUNK_BYTES` strictly below `max_seq_len` with room for that overshoot.
+/// Pinned as a compile-time assertion because both values are constants.
+const _: () = assert!(
+    NEURAL_CHUNK_BYTES * 2 <= index_builder::NEURAL_TEXT_CAP_BYTES,
+    "a chunk must have headroom under the per-text cap, or overshoot is skipped"
+);
+
+/// Split one node's bounded semantic text into embedder-sized chunks.
+///
+/// Why this exists: [`index_builder::cap_neural_text`] truncates the text at
+/// 64 KiB, so a node larger than that had its tail dropped from the neural
+/// vector — the tail was never embedded at all. Emitting the text as a sequence
+/// of chunks (each far under the cap) and mean-pooling the chunk vectors covers
+/// the whole node instead of just its head.
+///
+/// The split reuses the fragment chunker rather than inventing a byte splitter.
+/// `chunk_code` parses the text with tree-sitter when a grammar is available for
+/// the path's extension and falls back to a UTF-8-safe naive line walk otherwise.
+/// For a node's own source range the semantic fragments are contiguous slices of
+/// that range (`split_node` grows each fragment from the node start through its
+/// children), so no part of the node is skipped.
+///
+/// These chunks are NOT fragments: fragments are `owner`-addressed rows for a
+/// content-hash store, whereas these exist only to be recombined into the single
+/// vector a PDG node stores.
+fn split_neural_chunks(text: &str, path: &std::path::Path) -> Vec<String> {
+    let chunks: Vec<String> =
+        index_builder::fragment::chunk_code(text, path, NEURAL_CHUNK_BYTES, true)
+            .into_iter()
+            .map(|fragment| fragment.content.to_owned())
+            .collect();
+    if chunks.is_empty() {
+        // Nothing to split (empty source, or a path with no chunkable content):
+        // embed the text as-is so the node still gets a vector.
+        vec![text.to_owned()]
+    } else {
+        chunks
+    }
+}
+
+/// Mean-pool every chunk vector of one node into the single row that node stores.
+///
+/// Means are accumulated as running sums, so a node whose chunks straddle a batch
+/// boundary is still aggregated correctly: the partial sum carries in `open`
+/// until the node's last chunk lands.
+///
+/// Cosine scoring is norm-invariant (`search::vector::cosine_similarity` normalizes
+/// both sides), so the pooled vector is deliberately left unnormalized — no extra
+/// sqrt pass and no change in rank order. Empty chunk vectors are dropped rather
+/// than averaged in, so a chunk the embedder refused does not dilute the mean
+/// toward the origin.
+struct MeanPoolNeuralRowWriter<W: streaming::neural::NeuralRowWriter> {
+    inner: W,
+    open_node_id: Option<String>,
+    open_sum: Vec<f32>,
+    open_chunks: usize,
+    /// A chunk of the open node arrived in a different vector space, so the
+    /// running sum no longer represents the whole node.
+    open_dim_mismatch: bool,
+    /// Nodes abandoned because their chunks disagreed on dimension. Reported
+    /// once at the end of the pass rather than warned per node.
+    dim_mismatch_nodes: usize,
+    /// Rows the wrapped writer has accepted since the previous `write_batch`
+    /// call (or `finish`). `write_batch` returns this accumulated count —
+    /// including the mid-batch flushes `fold` triggers — so the streaming
+    /// stats and the checkpoint see every stored node, not just the trailing
+    /// flush.
+    accepted: usize,
+}
+
+impl<W: streaming::neural::NeuralRowWriter> MeanPoolNeuralRowWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            open_node_id: None,
+            open_sum: Vec::new(),
+            open_chunks: 0,
+            open_dim_mismatch: false,
+            dim_mismatch_nodes: 0,
+            accepted: 0,
+        }
+    }
+
+    /// Add one chunk vector to the open node's running sum.
+    fn fold(&mut self, node_id: &str, embedding: &[f32]) -> Result<()> {
+        if embedding.is_empty() {
+            return Ok(());
+        }
+        if self.open_node_id.as_deref() != Some(node_id) {
+            // The streaming pass emits a node's chunks consecutively, so a
+            // different id means the previous node is complete.
+            self.finish_open()?;
+            self.open_node_id = Some(node_id.to_owned());
+            self.open_sum.clear();
+            self.open_chunks = 0;
+            self.open_dim_mismatch = false;
+        }
+        if self.open_sum.is_empty() {
+            self.open_sum = embedding.to_vec();
+        } else if self.open_sum.len() == embedding.len() {
+            for (slot, value) in self.open_sum.iter_mut().zip(embedding) {
+                *slot += value;
+            }
+        } else {
+            // One node must never mix vector spaces, and a mean over only the
+            // chunks that agreed would silently represent a fraction of the
+            // node's text. Abandon the whole node instead: `finish_open` then
+            // writes nothing and the miss is counted.
+            self.open_dim_mismatch = true;
+            return Ok(());
+        }
+        self.open_chunks += 1;
+        Ok(())
+    }
+
+    /// Number of nodes abandoned for a chunk dimension mismatch, consuming the
+    /// count so the caller reports it exactly once.
+    fn take_dim_mismatches(&mut self) -> usize {
+        std::mem::take(&mut self.dim_mismatch_nodes)
+    }
+
+    /// Write the open node's mean through to the wrapped writer, returning the
+    /// number of rows the wrapped writer actually ACCEPTED (0 or 1).
+    ///
+    /// The count must come back from the wrapped writer, not be assumed. Wrapped
+    /// writers may legitimately reject a row — `SearchNeuralRowWriter` dedupes on
+    /// node id and returns the accepted count from its own `write_batch`. Reporting
+    /// a hardcoded `1` for a rejected row inflates `NeuralStats::rows_written`,
+    /// which is what the phase's success/degraded checks and the checkpoint gate
+    /// read, so a discarded row would be accounted as persisted.
+    fn finish_open(&mut self) -> Result<usize> {
+        let Some(node_id) = self.open_node_id.take() else {
+            return Ok(0);
+        };
+        // A node whose chunks spanned two vector spaces has no valid mean; drop
+        // it entirely and account for it instead of persisting a partial one.
+        if self.open_dim_mismatch {
+            self.dim_mismatch_nodes += 1;
+            self.open_dim_mismatch = false;
+            self.open_sum.clear();
+            self.open_chunks = 0;
+            return Ok(0);
+        }
+        let written = if self.open_chunks > 0 {
+            let divisor = self.open_chunks as f32;
+            let mean: Vec<f32> = self.open_sum.iter().map(|sum| sum / divisor).collect();
+            let written = self.inner.write_batch(vec![(node_id, mean)])?;
+            // Count it toward the next `write_batch`/`finish` return, so an
+            // accepted row is never discarded just because the flush happened
+            // mid-batch rather than at the batch's end (PR #105).
+            self.accepted += written;
+            written
+        } else {
+            0
+        };
+        self.open_sum.clear();
+        self.open_chunks = 0;
+        Ok(written)
+    }
+
+    /// Flush the still-open node. `enrich_neural_streaming` has no finish hook,
+    /// so the last node of every run is still open when it returns — without
+    /// this call that node silently loses its row.
+    fn finish(&mut self) -> Result<usize> {
+        self.finish_open()?;
+        Ok(std::mem::take(&mut self.accepted))
+    }
+}
+
+impl<W: streaming::neural::NeuralRowWriter> streaming::neural::NeuralRowWriter
+    for MeanPoolNeuralRowWriter<W>
+{
+    fn write_row(&mut self, node_id: &str, embedding: &[f32]) -> Result<()> {
+        // A writer that bypasses `write_batch` still gets pooling applied.
+        self.fold(node_id, embedding)
+    }
+
+    fn write_batch(&mut self, rows: Vec<(String, Vec<f32>)>) -> Result<usize> {
+        let mut latest = None;
+        for (node_id, embedding) in rows {
+            self.fold(&node_id, &embedding)?;
+            latest = Some(node_id);
+        }
+        // The wrapped writer's `write_batch` dedupes on node id (see
+        // `SearchNeuralRowWriter`), so a partially aggregated node must NOT be
+        // written yet — doing so would make the final mean look like a duplicate
+        // and be dropped. Only fully accumulated nodes are flushed; the wrapped
+        // writer sees exactly one row per node.
+        if self.open_node_id.as_deref() != latest.as_deref() {
+            self.finish_open()?;
+        }
+        // Return every row accepted since the previous call, including the
+        // flush(s) that happened while folding this batch. Discarding those
+        // counts made a run of N nodes report ~1 accepted row overall, which
+        // poisoned the checkpoint count and forced re-embedding on resume
+        // (PR #105).
+        Ok(std::mem::take(&mut self.accepted))
+    }
+}
+
 fn streaming_neural_inputs<'a>(
     pdg: &'a crate::graph::pdg::ProgramDependenceGraph,
     admitted_node_ids: &'a HashSet<String>,
@@ -449,77 +744,90 @@ fn streaming_neural_inputs<'a>(
     let mut node_indices = pdg.node_indices();
     let mut file_cache = index_builder::FileReadCache::per_chunk_scratch();
 
-    std::iter::from_fn(move || {
-        loop {
-            let node_idx = node_indices.next()?;
-            let Some(node) = pdg.get_node(node_idx) else {
-                continue;
-            };
+    // `filter_map` + `flatten`, not `from_fn`: one node now yields one input PER
+    // CHUNK (see `split_neural_chunks`), so the per-node work has to produce a
+    // sequence rather than a single item.
+    std::iter::from_fn(move || node_indices.next())
+        .filter_map(move |node_idx| {
+            let node = pdg.get_node(node_idx)?;
             if node.node_type == crate::graph::pdg::NodeType::External
                 || !admitted_node_ids.contains(&node.id)
             {
-                continue;
+                return None;
             }
-            let input = {
-                let file_bytes = file_cache
-                    .get_or_read(Path::new(&*node.file_path))
-                    .unwrap_or_else(|error| {
-                        warn!(
-                            node_id = %node.id,
-                            path = %node.file_path,
-                            %error,
-                            "Failed to read source for streaming neural node; using empty bytes"
-                        );
-                        std::sync::Arc::new(Vec::new())
-                    });
-                let text = index_builder::enriched_node_content(
-                    pdg,
-                    node_idx,
-                    node,
-                    &file_bytes,
-                    &connectivity_config,
-                    &file_summary_ctx,
-                );
+            let file_bytes = file_cache
+                .get_or_read(Path::new(&*node.file_path))
+                .unwrap_or_else(|error| {
+                    warn!(
+                        node_id = %node.id,
+                        path = %node.file_path,
+                        %error,
+                        "Failed to read source for streaming neural node; using empty bytes"
+                    );
+                    std::sync::Arc::new(Vec::new())
+                });
+            let text = index_builder::enriched_node_content(
+                pdg,
+                node_idx,
+                node,
+                &file_bytes,
+                &connectivity_config,
+                &file_summary_ctx,
+            );
+            // The project-relative source path rides along as the document title
+            // so a title-aware provider gets a real `{title}` instead of `none`
+            // (EmbeddingGemma2 trains on title+text prompts).
+            //
+            // This is NOT parity with the legacy route, and the difference is
+            // deliberate: `embed_pending_neural_batch` goes through
+            // `embed_neural_batch_blocking`, which passes no title, so
+            // `apply_doc_template` renders `{title}` as `none` there and as a
+            // path here. Only this route has a PDG node to derive a path from.
+            //
+            // The two flavours CAN coexist in one store, and nothing enforces
+            // otherwise. `index_project`'s lexical phase uses the
+            // `index_nodes_tfidf_only*` routes, which pass `_allow_neural =
+            // false` — but the public `LeIndex::reload_vector_from_pdg` calls
+            // `index_builder::index_nodes`, which passes `true`, so
+            // `admit_prepared_node` builds a neural embedder and defers to the
+            // title-less batch on the SAME resident engine this phase later
+            // enriches. A process that rebuilds vectors that way, then indexes,
+            // mixes both flavours in one generation.
+            //
+            // The risk that carries is retrieval quality, not cache corruption:
+            // titles join the doc template, so title-aware rows and `none` rows
+            // are embedded from different prompts and score against each other
+            // slightly worse. Cache identity is unaffected — the template
+            // fingerprint covers it. Accepted, and pinned here so it is not
+            // mistaken for a guarantee.
+            // `document_title` owns the leak guarantees; see its doc.
+            let title = document_title(&node.file_path, project_path, &node.name);
+            let node_id = node.id.clone();
+            // A node too large for one embedder request is split rather than
+            // truncated; `MeanPoolNeuralRowWriter` recombines the chunk vectors
+            // into the single row the node stores. Short nodes produce exactly
+            // one chunk and are unchanged from before.
+            let chunks = split_neural_chunks(&text, Path::new(&*node.file_path));
+            Some(chunks.into_iter().map(move |chunk| {
                 Ok(streaming::neural::NeuralInput {
-                    node_id: node.id.clone(),
-                    text: index_builder::cap_neural_text(&text).to_owned(),
-                    // The project-relative source path rides along as the
-                    // document title so a title-aware provider gets a real
-                    // `{title}` instead of `none` (EmbeddingGemma2 trains on
-                    // title+text prompts).
-                    //
-                    // This is NOT parity with the legacy route, and the
-                    // difference is deliberate: `embed_pending_neural_batch`
-                    // goes through `embed_neural_batch_blocking`, which passes
-                    // no title, so `apply_doc_template` renders `{title}` as
-                    // `none` there and as a path here. Only this route has a
-                    // PDG node to derive a path from.
-                    //
-                    // The two flavours CAN coexist in one store, and nothing
-                    // enforces otherwise. `index_project`'s lexical phase uses
-                    // the `index_nodes_tfidf_only*` routes, which pass
-                    // `_allow_neural = false` — but the public
-                    // `LeIndex::reload_vector_from_pdg` calls
-                    // `index_builder::index_nodes`, which passes `true`, so
-                    // `admit_prepared_node` builds a neural embedder and defers
-                    // to the title-less batch on the SAME resident engine this
-                    // phase later enriches. A process that rebuilds vectors that
-                    // way, then indexes, mixes both flavours in one generation.
-                    //
-                    // The risk that carries is retrieval quality, not cache
-                    // corruption: titles join the doc template, so title-aware
-                    // rows and `none` rows are embedded from different prompts
-                    // and score against each other slightly worse. Cache
-                    // identity is unaffected — the template fingerprint covers
-                    // it. Accepted, and pinned here so it is not mistaken for a
-                    // guarantee.
-                    // `document_title` owns the leak guarantees; see its doc.
-                    title: Some(document_title(&node.file_path, project_path, &node.name)),
+                    node_id: node_id.clone(),
+                    text: index_builder::cap_neural_text(&chunk).to_owned(),
+                    title: Some(title.clone()),
                 })
-            };
-            return Some(input);
-        }
-    })
+            }))
+        })
+        .flatten()
+}
+
+/// How many admitted nodes this neural pass failed to cover.
+///
+/// `None` means full coverage. Split out of `enrich_neural_for_route` because
+/// that function needs a live `SearchEngine` and PDG, and the policy — "a pass
+/// that covers less than it admitted is a WARN, not a clean finish" — is the
+/// part worth pinning. Zero admitted nodes is full coverage by definition: an
+/// empty slice is not a failure.
+fn neural_coverage_gap(embedded: usize, admitted: usize) -> Option<usize> {
+    (embedded < admitted).then(|| admitted - embedded)
 }
 
 fn enrich_neural_for_route(
@@ -529,32 +837,54 @@ fn enrich_neural_for_route(
     admitted_node_ids: &HashSet<String>,
     project_path: &std::path::Path,
 ) -> Result<usize> {
-    let (cache_hits_before, _) = neural_cache_counters();
+    let (cache_hits_before, cache_misses_before) = neural_cache_counters();
     // The heartbeat covers the whole pass (see NeuralProgress): liveness even
     // while the first embed batch is in flight, plus the CPU-fallback watch.
-    let progress = NeuralProgress::start(admitted_node_ids.len());
+    // It also mirrors its row counter into `index-state.json`, which is the
+    // only surface a DIFFERENT process (MCP status, TUI Status pane) can read.
+    let progress = NeuralProgress::start_reporting(
+        admitted_node_ids.len(),
+        Some(super::PhaseProgress::start(
+            crate::cli::leindex::resolve_existing_storage_path(project_path)
+                .unwrap_or_else(|| project_path.join(".leindex")),
+            crate::cli::leindex::IndexPhase::Neural,
+            admitted_node_ids.len(),
+        )),
+    );
     let streaming_embedder = HybridStreamingEmbedder { inner: embedder };
-    let mut writer = SearchNeuralRowWriter {
+    let writer = SearchNeuralRowWriter {
         engine,
         seen_node_ids: HashSet::new(),
     };
     let mut inputs = streaming_neural_inputs(pdg, admitted_node_ids, project_path);
-    let budget = streaming::BatchBudget {
-        max_texts: 256,
-        max_seq_len: 64 * 1024,
-        ..streaming::BatchBudget::default()
-    };
+    let budget = neural_batch_budget();
+    // Pooling wraps the row writer so every chunk vector is folded into the
+    // owning node's single mean BEFORE the id-deduping writer sees it —
+    // otherwise all but the first chunk of a node would be dropped.
+    let mut pooling = MeanPoolNeuralRowWriter::new(writer);
     let stats = streaming::neural::enrich_neural_streaming(
         &mut inputs,
         &streaming_embedder,
         &mut ProgressNeuralRowWriter {
-            inner: &mut writer,
+            inner: &mut pooling,
             rows_reported: &progress.rows,
         },
         &budget,
     )?;
+    // `enrich_neural_streaming` has no finish hook, so the last node's chunks are
+    // still pooled here when it returns. Flush it or that node silently loses its
+    // row.
+    let mut stats = stats;
+    stats.rows_written += pooling.finish()?;
+    let dim_mismatch_nodes = pooling.take_dim_mismatches();
     drop(progress);
-    let (cache_hits_after, cache_misses) = neural_cache_counters();
+    let (cache_hits_after, cache_misses_after) = neural_cache_counters();
+    let cache_hits = cache_hits_after.saturating_sub(cache_hits_before);
+    // A DELTA, not the cumulative counter: `counters()` is process-wide, so
+    // reading it raw here reported every miss from every earlier phase of the
+    // same process as if this pass had embedded them. On a resumed or
+    // multi-route run "N embedded" could exceed the rows on screen.
+    let cache_misses = cache_misses_after.saturating_sub(cache_misses_before);
     // Batches that COMPLETE but write no rows are the signature of a dead
     // embedder (remote endpoint unreachable, provider 4xx/5xx, or a worker
     // answering with empty vectors). Without this, such a run shows a live
@@ -567,14 +897,54 @@ fn enrich_neural_for_route(
              every batch. Search falls back to TF-IDF only. Check `leindex setup --check` for \
              provider/model state and ~/.leindex/logs/leindex-embed-daemon.log for worker errors."
         );
+    } else if let Some(gap) = neural_coverage_gap(stats.rows_written, admitted_node_ids.len()) {
+        // Partial coverage is the failure mode a single blip now produces
+        // instead of a total freeze: the generation survives, the rest of the
+        // run embeds normally, and the ONLY trace is a store that is quietly
+        // missing rows — resume skips those nodes forever, because nothing
+        // ever retries them. Never let that pass as a clean finish.
+        warn!(
+            admitted = admitted_node_ids.len(),
+            embedded = stats.rows_written,
+            gap,
+            skipped = stats.rows_skipped,
+            "neural enrichment covered only {}/{} admitted nodes; the remaining nodes have no \
+             neural vector and resume will NOT re-embed them. Re-run the index (or delete \
+             .leindex/neural_embeddings.bin) to fill the gap.",
+            stats.rows_written,
+            admitted_node_ids.len(),
+        );
+    }
+    // A partially-degraded generation must not report clean success. `rows_skipped`
+    // counts admitted nodes the embedder refused to vectorise (empty vectors,
+    // over-length text) and `dim_mismatch_nodes` counts nodes whose chunks spanned
+    // two vector spaces and were therefore abandoned whole. Either way those nodes
+    // get NO neural row: semantic search cannot retrieve them, and because the
+    // generation still completes and writes its checkpoint, a resume will not
+    // revisit them either. Name the count so the gap is never mistaken for a
+    // complete neural layer.
+    if stats.rows_skipped > 0 || dim_mismatch_nodes > 0 {
+        warn!(
+            written = stats.rows_written,
+            skipped = stats.rows_skipped,
+            dim_mismatch = dim_mismatch_nodes,
+            "neural enrichment finished with rows it could not embed. Those nodes have no neural \
+             row, so semantic search cannot retrieve them and a resume will not retry them. Force \
+             a re-embed (`leindex index --force`) after fixing the reported provider/model error."
+        );
     }
     progress_stderr(&format!(
-        "Indexing: neural done — {} rows ({} from embed cache, {} embedded, {} skipped, {} batches)...",
+        "Indexing: neural done — {} rows ({} from embed cache, {} embedded, {} skipped, {} batches){}...",
         stats.rows_written,
-        cache_hits_after - cache_hits_before,
+        cache_hits,
         cache_misses,
         stats.rows_skipped,
         stats.batches,
+        if dim_mismatch_nodes > 0 {
+            format!(", {dim_mismatch_nodes} dropped on dimension mismatch")
+        } else {
+            String::new()
+        },
     ));
     Ok(stats.rows_written)
 }
@@ -1096,30 +1466,17 @@ impl LeIndex {
             .as_ref()
             .map(index_builder::GenerationNeuralEmbedder::identity)
             .unwrap_or_else(|| "unavailable".to_string());
-        let (mut neural_rows, neural_resume_loaded) = self.restore_neural_checkpoint(
+        let (mut neural_rows, mut neural_resume_loaded) = self.restore_neural_checkpoint(
             state.resumed_neural.as_ref(),
             &lexical_hash,
             &current_embed_model,
         );
+        self.validate_neural_resume(&mut neural_rows, &mut neural_resume_loaded, &state);
         if let Some(neural_embedder) = neural_embedder
             .as_ref()
             .filter(|_| neural_rows == 0 && !neural_resume_loaded)
         {
-            let pdg = self
-                .pdg
-                .as_ref()
-                .context("PDG is resident before neural enrichment")?;
-            progress_stderr(&format!(
-                "Indexing: neural embedding {} admitted nodes...",
-                state.admitted_node_ids.len()
-            ));
-            neural_rows = enrich_neural_for_route(
-                &mut self.search_engine,
-                pdg,
-                neural_embedder,
-                &state.admitted_node_ids,
-                &self.project_path,
-            )?;
+            neural_rows = self.enrich_admitted_nodes(&state, neural_embedder)?;
         }
         let (selected_model, selected_provider) = self.persist_neural_outputs(
             &state,
@@ -1146,6 +1503,53 @@ impl LeIndex {
         state.neural_checkpoint = Some(neural_checkpoint.clone());
         self.pipeline = Some(state);
         Ok(neural_checkpoint)
+    }
+
+    /// A checkpoint can be internally consistent yet still cover only a
+    /// fraction of the lexical admission set (for example, a killed or degraded
+    /// 1/866 pass). Never treat that partial layer as reusable: clear it and
+    /// run enrichment again so missing nodes are retried.
+    fn validate_neural_resume(
+        &mut self,
+        neural_rows: &mut usize,
+        neural_resume_loaded: &mut bool,
+        state: &IndexPipelineState,
+    ) {
+        if !*neural_resume_loaded || *neural_rows >= state.admitted_node_ids.len() {
+            return;
+        }
+        warn!(
+            restored = *neural_rows,
+            admitted = state.admitted_node_ids.len(),
+            "discarding partial neural checkpoint; re-embedding admitted nodes"
+        );
+        self.search_engine.clear_neural_embeddings();
+        *neural_rows = 0;
+        *neural_resume_loaded = false;
+    }
+
+    /// Embed every admitted node through the configured embedder, returning the
+    /// number of neural rows produced.
+    fn enrich_admitted_nodes(
+        &mut self,
+        state: &IndexPipelineState,
+        neural_embedder: &index_builder::GenerationNeuralEmbedder,
+    ) -> Result<usize> {
+        let pdg = self
+            .pdg
+            .as_ref()
+            .context("PDG is resident before neural enrichment")?;
+        progress_stderr(&format!(
+            "Indexing: neural embedding {} admitted nodes...",
+            state.admitted_node_ids.len()
+        ));
+        enrich_neural_for_route(
+            &mut self.search_engine,
+            pdg,
+            neural_embedder,
+            &state.admitted_node_ids,
+            &self.project_path,
+        )
     }
 
     /// Assemble the neural checkpoint from the phase outcome. Kept out of
@@ -1243,6 +1647,11 @@ impl LeIndex {
                 indexed_at_unix_ms: Some(now_ms),
                 last_failure_phase: None,
                 last_failure: None,
+                // Publishing a Complete generation ends the run: any counters
+                // a mid-flight phase left behind would otherwise survive into
+                // a finished snapshot and read as a stuck bar.
+                progress_done: 0,
+                progress_total: None,
             };
             let core_published =
                 self.publish_generation_snapshot(generation, &mut health, false)?;
@@ -1286,519 +1695,19 @@ impl LeIndex {
     }
 }
 
+/// `neural_publish` is declared unconditionally by `indexing/mod.rs`, and the code
+/// under test here — `split_neural_chunks`, `MeanPoolNeuralRowWriter`,
+/// `neural_batch_budget` — carries no `onnx`/`remote-embeddings` gate of its own.
+/// The module is reachable whenever the `cli` feature is on, which is the only
+/// gate that matters for it.
+///
+/// So this module's tests carry `test` alone. Tying them to `onnx` claimed a gate
+/// the production code does not have: in a `cli`-enabled build without `onnx` the
+/// chunk splitter and mean-pool writer still compile and ship, and their tests
+/// would have been compiled out. A test's gate has to match its subject's, or the
+/// coverage silently disappears exactly where nobody is looking.
+///
+/// Tests needing a neural backend keep their own tighter gate.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cli::leindex::indexing::streaming::neural::NeuralRowWriter;
-
-    /// The title is what a remote provider receives as `{title}`, so a leak here
-    /// is a leak on the wire. These pin the two properties the previous inline
-    /// match got wrong: an empty remainder after `strip_prefix` must NOT become
-    /// an empty title, and the fallback must actually separate the paths the
-    /// "last two components" version claimed to separate.
-    #[test]
-    fn test_document_title_relativizes_inside_the_project() {
-        let root = std::path::Path::new("/checkout/project");
-        assert_eq!(
-            document_title("/checkout/project/src/lib.rs", root, "new"),
-            "src/lib.rs",
-            "a path inside the project becomes project-relative"
-        );
-        assert_eq!(
-            document_title("/checkout/project/src\\win.rs", root, "new"),
-            "src/win.rs",
-            "backslashes are normalized so the title is separator-stable"
-        );
-    }
-
-    #[test]
-    fn test_document_title_at_the_project_root_uses_the_project_name() {
-        // The reported bug: `strip_prefix` SUCCEEDS with an empty remainder for
-        // a node whose path IS the checkout root (a project summary node), and a
-        // plain `Ok(relative)` arm sent `Some("")` as the title.
-        //
-        // The fix must NOT be the trailing-components fallback: the absolute
-        // path's last three components are the checkout's PARENT directories —
-        // `alice/work/leindex` for `/home/alice/work/leindex` — which is the
-        // local-path leak this function exists to prevent, merely moved. The
-        // answer is the project's own directory name.
-        let root = std::path::Path::new("/home/alice/work/leindex");
-        assert_eq!(
-            document_title("/home/alice/work/leindex", root, "project-summary"),
-            "leindex",
-            "a checkout-root node is titled by the project, not by its parents"
-        );
-    }
-
-    #[test]
-    fn test_document_title_never_carries_the_checkout_prefix() {
-        // The privacy property is that no component of the ABSOLUTE path prefix
-        // reaches the title. Asserting `!title.starts_with('/')` cannot fail:
-        // the fallback drops every non-`Normal` component, so no title can
-        // begin with a separator whatever the input. This asserts the thing
-        // that can actually break — that the machine-specific prefix is absent.
-        //
-        // The shallow tails are the load-bearing cases. An earlier version of
-        // this test used only paths with three or more trailing components, so
-        // the old fixed-length suffix could never expose `alice` for any of
-        // them: the assertion could not fail, whatever the fallback did. A
-        // 2-deep tail (`/home/alice/src/main.rs` -> `alice/src/main.rs`) is
-        // exactly where the leak lived.
-        let root = std::path::Path::new("/home/alice/work/leindex");
-        for path in [
-            "/home/alice/work/leindex",            // empty remainder
-            "/home/alice/work/leindex/src/lib.rs", // ordinary file
-            "/elsewhere/sub/module/file.rs",       // outside the project
-            "/home/bob/other/src/lib.rs",          // a different checkout
-            "/home/alice/src/main.rs",             // shallow outside-project tail
-            "/work/alice/app.go",                  // shallower still
-        ] {
-            let title = document_title(path, root, "node");
-            for leaked in ["home", "alice", "bob", "work", "elsewhere"] {
-                assert!(
-                    !title.split('/').any(|component| component == leaked),
-                    "{path} produced {title:?}, which carries the checkout component {leaked}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_document_title_at_a_shallow_project_root_does_not_use_the_directory_name() {
-        // `/home/alice` is a two-component project root: `file_name()` is
-        // `alice`, which is a username. The directory name is only the project's
-        // when there is a path above it that could have been the machine part.
-        let shallow = std::path::Path::new("/home/alice");
-        assert_eq!(
-            document_title("/home/alice", shallow, "project-summary"),
-            "project-summary",
-            "a two-component root is more likely a home dir than a checkout name"
-        );
-        let bare = std::path::Path::new("/work");
-        assert_eq!(document_title("/work", bare, "sym"), "sym");
-        // A normal checkout still gets its own name.
-        let nested = std::path::Path::new("/home/alice/work/leindex");
-        assert_eq!(
-            document_title("/home/alice/work/leindex", nested, "sym"),
-            "leindex"
-        );
-    }
-
-    #[test]
-    fn test_document_title_falls_back_to_the_leaf_name_not_a_path_suffix() {
-        // A fixed-length suffix of an ABSOLUTE path cannot be safe: the fallback
-        // runs precisely when `strip_prefix` failed, so it cannot tell the
-        // checkout from the project and ends up shipping `a` / `alice` / a mount
-        // point. The contract is now leaf-only. This replaces an earlier test
-        // that required `a/src/lib.rs` and `b/src/lib.rs` to differ — that
-        // separation is exactly what cost us a username on the wire, so the
-        // collision is accepted and pinned here instead.
-        let root = std::path::Path::new("/checkout/project");
-        let a = document_title("/outside/a/src/lib.rs", root, "new");
-        let b = document_title("/outside/b/src/lib.rs", root, "new");
-        assert_eq!(a, "lib.rs", "only the file name may be kept");
-        assert_eq!(b, "lib.rs");
-        assert_eq!(
-            a, b,
-            "a cosmetic title collision is the accepted price of never \
-             sending a parent directory to the provider"
-        );
-    }
-
-    #[test]
-    fn test_document_title_rejects_a_remainder_that_escapes_the_project() {
-        // `strip_prefix` is lexical: it does not resolve `..`, so a path that
-        // walks out of the project comes back as a SUCCESSFUL relative strip.
-        // Sending that verbatim would put `../private/x.rs` — a path outside the
-        // project — on the wire under the label "project-relative".
-        let root = std::path::Path::new("/checkout/project");
-        let title = document_title("/checkout/project/../private/x.rs", root, "node");
-        assert!(
-            !title.split('/').any(|component| component == ".."),
-            "an escaping remainder must not be sent as a title: {title}"
-        );
-        assert_eq!(
-            title, "x.rs",
-            "the escaping path takes the leaf-only fallback, so `project/` — a \
-             directory name the code cannot prove is safe — is not sent"
-        );
-    }
-
-    #[test]
-    fn test_document_title_normalizes_a_windows_path_on_a_unix_host() {
-        // On a Unix host `C:\Users\bob\a.rs` has no `/`, so it parses as ONE
-        // `Normal` component whose text still carries the drive letter and the
-        // backslashes. Joining components raw (which the fallback used to do)
-        // emitted that whole string as a "relative" title — an absolute path on
-        // the platform it came from.
-        //
-        // `bob` is a username here. An earlier version of this test asserted
-        // `Users/bob/a.rs` and justified it by calling `Users` an "interior
-        // component like /home". That was wrong: on Windows `C:\Users\<name>` IS
-        // the home-directory layout, and the leaf-only fallback now keeps
-        // neither `Users` nor `bob`.
-        #[cfg(unix)]
-        {
-            let root = std::path::Path::new("/checkout/project");
-            let title = document_title(r"C:\Users\bob\a.rs", root, "node");
-            assert!(
-                !title.contains('\\'),
-                "separators must be normalized: {title}"
-            );
-            assert!(
-                !title.starts_with("C:") && !title.split('/').any(|c| c.ends_with(':')),
-                "a drive prefix must not reach the title: {title}"
-            );
-            assert_eq!(title, "a.rs", "no home-directory component may survive");
-        }
-    }
-
-    #[test]
-    fn test_document_title_falls_back_to_the_symbol_name() {
-        // A path with no `Normal` components at all: nothing to take, and the
-        // symbol name is the only non-leaking stand-in available.
-        let root = std::path::Path::new("/checkout/project");
-        assert_eq!(document_title("/", root, "root-symbol"), "root-symbol");
-        assert_eq!(document_title("..", root, "parent-symbol"), "parent-symbol");
-    }
-
-    #[test]
-    fn test_stuck_hint_only_after_quiet_timeout_window() {
-        use std::time::Duration;
-        // Fresh phase: nothing to report.
-        assert!(NeuralProgress::stuck_hint(0, Duration::from_secs(0)).is_empty());
-        // Still inside the pre-fallback window (30s timeout x 3 retries).
-        assert!(NeuralProgress::stuck_hint(0, Duration::from_secs(44)).is_empty());
-        // Past it with zero rows: the provider is slow or unreachable.
-        assert!(!NeuralProgress::stuck_hint(0, Duration::from_secs(45)).is_empty());
-        // Rows landing means the provider is fine; never cry wolf.
-        assert!(NeuralProgress::stuck_hint(1, Duration::from_secs(600)).is_empty());
-    }
-
-    /// A checkpoint whose recorded row count disagrees with what the mmap
-    /// actually restored must report ZERO rows. The mismatch is the only
-    /// signal that the persisted store is partial, and the caller's
-    /// re-embed gate is `neural_rows == 0 && !neural_resume_loaded` — handing
-    /// it the partial count closes that gate and publishes the partial store
-    /// over the good artifacts, committing the exact corruption the row-count
-    /// check exists to reject.
-    #[test]
-    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-    fn test_checkpoint_row_mismatch_reports_no_rows() {
-        use crate::search::search::{DEFAULT_EMBEDDING_DIMENSION, NodeInfo};
-
-        let dir = tempfile::tempdir().expect("checkpoint fixture");
-        let storage = dir.path().join(".leindex");
-        std::fs::create_dir_all(&storage).expect("storage dir");
-        let mmap_path = storage.join("neural_embeddings.bin");
-
-        let node = |node_id: &str| {
-            let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
-            tfidf_embedding[0] = 1.0;
-            NodeInfo {
-                node_id: node_id.to_string(),
-                file_path: "fixture.rs".to_string(),
-                symbol_name: "new".to_string(),
-                language: "rust".to_string(),
-                content: "fn new() {}".to_string(),
-                byte_range: (0, 11),
-                tfidf_embedding,
-                neural_embedding: None,
-                complexity: 1,
-                signature: None,
-                pre_tokenized: None,
-            }
-        };
-
-        // 2 rows on disk, 2 matching nodes in the resident engine, but the
-        // checkpoint claims 5 — the partial-store case.
-        let rows = vec![
-            ("fixture.rs:new".to_string(), vec![1.0, 0.0]),
-            ("fixture.rs:other".to_string(), vec![0.0, 1.0]),
-        ];
-        crate::search::vector::write_mmap_embeddings(&mmap_path, &rows).expect("persist fixture");
-
-        let mut index = LeIndex::new(dir.path()).expect("checkpoint index");
-        index
-            .search_engine
-            .index_nodes(vec![node("fixture.rs:new"), node("fixture.rs:other")]);
-
-        let checkpoint = NeuralCheckpoint {
-            lexical_hash: "lexical".to_string(),
-            mmap_path: mmap_path.clone(),
-            rows: 5,
-            provider: "remote".to_string(),
-            model: "model".to_string(),
-            matryoshka: None,
-        };
-
-        assert_eq!(
-            index.restore_neural_checkpoint(Some(&checkpoint), "lexical", "model"),
-            (0, false),
-            "a partial restore must report zero rows so the caller re-embeds"
-        );
-    }
-
-    #[test]
-    fn test_neural_progress_writer_counts_rows_and_passes_through() {
-        let rows = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut inner = streaming::neural::VecNeuralRowWriter::new();
-        {
-            let mut writer = ProgressNeuralRowWriter {
-                inner: &mut inner,
-                rows_reported: &rows,
-            };
-            let batch =
-                |w: &mut ProgressNeuralRowWriter<'_, streaming::neural::VecNeuralRowWriter>,
-                 base: usize,
-                 n: usize| {
-                    let batch: Vec<_> = (base..base + n)
-                        .map(|i| (format!("node-{i}"), vec![i as f32, (i + 1) as f32]))
-                        .collect();
-                    w.write_batch(batch).expect("write_batch");
-                };
-            batch(&mut writer, 0, 2);
-            assert_eq!(rows.load(std::sync::atomic::Ordering::Relaxed), 2);
-            batch(&mut writer, 2, 3);
-            assert_eq!(rows.load(std::sync::atomic::Ordering::Relaxed), 5);
-        }
-        assert_eq!(inner.rows.len(), 5, "all rows must reach the inner writer");
-        assert_eq!(
-            inner.rows[0],
-            ("node-0".to_owned(), vec![0.0, 1.0]),
-            "rows must pass through unmodified"
-        );
-        // Single-row path forwards too.
-        let mut writer = ProgressNeuralRowWriter {
-            inner: &mut inner,
-            rows_reported: &rows,
-        };
-        writer
-            .write_row("solo", &[9.0])
-            .expect("write_row forwards");
-        assert!(inner.rows.iter().any(|(id, _)| id == "solo"));
-    }
-
-    #[test]
-    fn test_neural_progress_heartbeat_starts_and_stops() {
-        // The heartbeat thread must start, print at least once, and exit on
-        // drop — proving the phase can report liveness even while the first
-        // embed batch is still in flight.
-        let progress = NeuralProgress::start(10);
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let observed = progress
-            .rows
-            .fetch_add(0, std::sync::atomic::Ordering::Relaxed);
-        drop(progress);
-        assert_eq!(observed, 0, "no rows reported by the heartbeat itself");
-    }
-
-    #[test]
-    fn test_all_batches_empty_is_distinguishable_from_no_work() {
-        // enrich_neural_for_route warns only when batches ran and produced no
-        // rows. Pin the stats contract that condition reads: an embedder that
-        // answers with only empty vectors must land in rows_skipped with
-        // batches > 0, never be mistaken for "no nodes to embed".
-        struct DeadEmbedder;
-        impl streaming::neural::StreamingEmbedder for DeadEmbedder {
-            fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
-                vec![Vec::new(); texts.len()]
-            }
-        }
-        let mut inputs = (0..4).map(|i| {
-            Ok(streaming::neural::NeuralInput {
-                node_id: format!("node-{i}"),
-                text: format!("document-{i}"),
-                title: None,
-            })
-        });
-        let mut writer = streaming::neural::VecNeuralRowWriter::new();
-        let budget = streaming::BatchBudget {
-            max_texts: 2,
-            ..Default::default()
-        };
-        let dead = streaming::neural::enrich_neural_streaming(
-            &mut inputs,
-            &DeadEmbedder,
-            &mut writer,
-            &budget,
-        )
-        .expect("empty vectors are a skip, not an error");
-        assert!(dead.batches > 0, "batches ran");
-        assert_eq!(dead.rows_written, 0, "no rows landed");
-        assert_eq!(dead.rows_skipped, 4, "every input accounted for");
-        assert!(writer.rows.is_empty());
-
-        // Zero inputs is the other side of the same condition: no batches, so
-        // the dead-embedder warning must not fire.
-        let mut none = std::iter::empty();
-        let idle = streaming::neural::enrich_neural_streaming(
-            &mut none,
-            &DeadEmbedder,
-            &mut streaming::neural::VecNeuralRowWriter::new(),
-            &budget,
-        )
-        .expect("empty input");
-        assert_eq!(idle.batches, 0);
-        assert_eq!(idle.rows_written, 0);
-    }
-
-    #[test]
-    fn test_search_neural_row_writer_keeps_first_row_per_node_id() {
-        use crate::search::search::{DEFAULT_EMBEDDING_DIMENSION, NodeInfo, SearchEngine};
-
-        // append_nodes keeps the FIRST occurrence of a duplicate node_id while
-        // update_neural_embeddings applies rows last-wins. A late duplicate row
-        // must therefore not overwrite the retained node's own body.
-        let node = |node_id: &str, file_path: &str| {
-            let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
-            tfidf_embedding[0] = 1.0;
-            NodeInfo {
-                node_id: node_id.to_string(),
-                file_path: file_path.to_string(),
-                symbol_name: "new".to_string(),
-                language: "rust".to_string(),
-                content: "fn new() {}".to_string(),
-                byte_range: (0, 11),
-                tfidf_embedding,
-                neural_embedding: None,
-                complexity: 1,
-                signature: None,
-                pre_tokenized: None,
-            }
-        };
-        let mut engine = SearchEngine::new();
-        engine.index_nodes(vec![node("a.rs:new", "a.rs"), node("b.rs:new", "b.rs")]);
-
-        let mut writer = SearchNeuralRowWriter {
-            engine: &mut engine,
-            seen_node_ids: HashSet::new(),
-        };
-        writer
-            .write_batch(vec![
-                ("a.rs:new".to_string(), vec![1.0, 0.0]),
-                ("a.rs:new".to_string(), vec![0.0, 1.0]),
-            ])
-            .expect("first batch");
-        writer
-            .write_batch(vec![("a.rs:new".to_string(), vec![0.25, 0.75])])
-            .expect("second batch");
-        drop(writer);
-
-        assert_eq!(
-            engine.collect_neural_embeddings(),
-            vec![("a.rs:new".to_string(), vec![1.0, 0.0])],
-            "first occurrence per node_id kept, later duplicates dropped"
-        );
-    }
-
-    #[test]
-    fn test_fragment_provider_identity_prevents_old_space_merge() {
-        let mut manifest = index_builder::fragment::sync::FragmentFileManifest::new();
-        manifest.extraction_identity.model_name = "remote|old-template|768".into();
-        let old_rows = HashMap::from([("content-hash".into(), vec![0.5; 768])]);
-        assert_eq!(
-            reusable_fragment_rows(old_rows.clone(), Some(&manifest), "remote|old-template|768")
-                .len(),
-            1
-        );
-        assert!(
-            reusable_fragment_rows(old_rows.clone(), Some(&manifest), "remote|new-template|768")
-                .is_empty()
-        );
-        assert!(
-            reusable_fragment_rows(old_rows.clone(), Some(&manifest), "local|qwen|1024").is_empty()
-        );
-        assert!(reusable_fragment_rows(old_rows, None, "remote|old-template|768").is_empty());
-    }
-
-    #[test]
-    #[cfg(feature = "remote-embeddings")]
-    fn test_streaming_generation_remote_outage_persists_single_space() {
-        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let server_requests = requests.clone();
-        let endpoint = index_builder::remote_embed_test::spawn_mock_embeddings_server_responses(
-            move |_| {
-                if server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                    768
-                } else {
-                    0
-                }
-            },
-            None,
-            2,
-        );
-        let tfidf = index_builder::TfIdfEmbedder::build(&[("a.rs".into(), "fn a() {}".into())]);
-        let generation = index_builder::GenerationNeuralEmbedder::new(
-            index_builder::HybridEmbedder::hybrid_remote(
-                tfidf,
-                crate::search::onnx::RemoteEmbeddingConfig {
-                    provider: crate::search::onnx::RemoteProvider::Custom { endpoint },
-                    remote_dimension: Some(768),
-                    ..crate::search::onnx::RemoteEmbeddingConfig::default()
-                },
-                None,
-            )
-            .expect("remote generation"),
-        );
-        let adapter = HybridStreamingEmbedder { inner: &generation };
-        let mut inputs = (0..6).map(|i| {
-            Ok(streaming::neural::NeuralInput {
-                node_id: format!("node-{i}"),
-                text: format!("document-{i}"),
-                title: Some(format!("src/file-{i}.rs")),
-            })
-        });
-        let mut writer = streaming::neural::VecNeuralRowWriter::new();
-        let budget = streaming::BatchBudget {
-            max_texts: 2,
-            ..Default::default()
-        };
-        let stats =
-            streaming::neural::enrich_neural_streaming(&mut inputs, &adapter, &mut writer, &budget)
-                .expect("streaming generation");
-        assert_eq!(stats.rows_written, 2);
-        assert_eq!(stats.rows_skipped, 4);
-        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
-        let dir = tempfile::tempdir().expect("streaming mmap");
-        let path = dir.path().join("neural_embeddings.bin");
-        crate::search::vector::write_mmap_embeddings(&path, &writer.rows)
-            .expect("persist streaming");
-        let mmap = crate::search::vector::MmapEmbeddingIndex::open(&path).expect("open streaming");
-        let rows = mmap.entries().expect("streaming stored rows");
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|(_, row)| row.len() == 768));
-    }
-
-    #[test]
-    fn test_streaming_neural_inputs_missing_source_uses_empty_bytes() {
-        let dir = tempfile::tempdir().expect("neural source fixture");
-        let project_path = dir.path().join("checkout");
-        std::fs::create_dir_all(&project_path).expect("project root fixture");
-        let file_path = project_path.join("missing.rs").display().to_string();
-        let node_id = format!("{file_path}:missing_source");
-        let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
-        pdg.add_node(crate::graph::pdg::Node {
-            id: node_id.clone(),
-            node_type: crate::graph::pdg::NodeType::Function,
-            name: "missing_source".to_string(),
-            file_path: std::sync::Arc::from(file_path),
-            byte_range: (0, 1),
-            complexity: 1,
-            language: "rust".to_string(),
-        });
-        let admitted = HashSet::from([node_id.clone()]);
-
-        let mut inputs = streaming_neural_inputs(&pdg, &admitted, &project_path);
-        let input = inputs
-            .next()
-            .expect("admitted node should produce a neural input")
-            .expect("missing source uses the empty-byte fallback");
-        assert_eq!(input.node_id, node_id);
-        // The title is the PROJECT-RELATIVE path: an absolute one would leak the
-        // local checkout path to a remote provider and make title-aware
-        // embeddings differ between identical checkouts.
-        assert_eq!(input.title.as_deref(), Some("missing.rs"));
-        assert!(inputs.next().is_none());
-    }
-}
+#[path = "neural_publish_test.rs"]
+mod tests;
