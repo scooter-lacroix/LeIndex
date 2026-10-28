@@ -497,18 +497,16 @@ mod tests {
 
         // Its start time matches its own sidecar, so only the identity check
         // can reject it — which is exactly the code path under test. Wait for
-        // the child to exec first: until then /proc still describes the parent.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::fs::read(format!("/proc/{}/cmdline", child.id()))
-            .unwrap_or_default()
-            .is_empty()
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "fixture child never exec'd"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        // the child to exec first: until then /proc/<pid>/exe still names this
+        // test harness, which the identity check deliberately accepts, so
+        // sampling early would pass for the wrong reason. A non-empty cmdline
+        // proves nothing here — it is non-empty from fork on the posix_spawn
+        // path — hence the exe-link comparison in the shared helper.
+        let cmdline = crate::cli::cleanup::wait_for_child_exec(child.id());
+        assert!(
+            cmdline.contains("leindex") && cmdline.contains("mcp"),
+            "fixture must carry the bait words in argv; got {cmdline:?}"
+        );
 
         let start_path = dir.path().join("bait.start");
         write_start_time(&start_path, child.id()).unwrap();

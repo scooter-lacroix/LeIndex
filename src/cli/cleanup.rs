@@ -383,6 +383,47 @@ pub(crate) fn pid_is_alive(pid: u32) -> Option<bool> {
 #[cfg(target_os = "linux")]
 const LEINDEX_PROGRAM_NAMES: &[&str] = &["leindex", "leindexd", "leindex-embed"];
 
+/// Wait until a freshly spawned child has `exec`'d away from this test binary.
+///
+/// `Command::spawn` returns after `fork` but before `exec`, and on the
+/// vfork/posix_spawn path Rust std uses, `/proc/<pid>/cmdline` is NON-empty
+/// in that window — it still describes the parent's argv — so polling for a
+/// non-empty cmdline proves nothing. Meanwhile `/proc/<pid>/exe` still points
+/// at THIS test binary, which [`pid_program_identity`] deliberately accepts
+/// (the `current_exe` fallback exists so sibling leindex processes — including
+/// the test harness — are recognised). Sampling identity pre-exec therefore
+/// reads the harness, not the fixture, and whether the test passes becomes a
+/// scheduling race. Exec is reliably observable as the exe link no longer
+/// resolving to this binary's path; on success the child's cmdline is
+/// returned so callers can assert their bait words survived the exec.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn wait_for_child_exec(pid: u32) -> String {
+    let harness_exe = std::env::current_exe().ok();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .ok()
+            .filter(|raw| !raw.is_empty());
+        // Two signals, both required: the exe link no longer resolves to this
+        // binary (the exec happened), AND the new image's argv is installed
+        // (cmdline non-empty again — it is empty for a moment mid-exec while
+        // the old argv is torn down and the new one not yet written).
+        let execd = match (&harness_exe, &exe) {
+            (Some(harness), Some(child)) if harness != child => cmdline.is_some(),
+            _ => false,
+        };
+        if let Some(raw) = cmdline.filter(|_| execd) {
+            return String::from_utf8_lossy(&raw).into_owned();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture child {pid} never exec'd"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// Whether `name` is the file name of a leindex binary.
 ///
 /// Also accepts this process's own executable name, so that a live sibling of
@@ -1393,28 +1434,10 @@ mod tests {
 
     /// Wait for a just-spawned child to `exec` before inspecting `/proc/<pid>`.
     ///
-    /// `Command::spawn` returns after `fork` but possibly before `exec`, and in
-    /// that window `/proc/<pid>/cmdline` is empty and `/proc/<pid>/exe` still
-    /// points at the *parent's* binary. Reading identity there would test the
-    /// harness rather than the fixture. A non-empty cmdline means exec happened.
-    #[cfg(target_os = "linux")]
-    fn wait_for_child_exec(pid: u32) -> String {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
-                .map(|raw| String::from_utf8_lossy(&raw).into_owned())
-                .unwrap_or_default();
-            if !cmdline.is_empty() {
-                return cmdline;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "fixture child {pid} never exec'd"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-
+    /// Module-level [`wait_for_child_exec`]: in the fork→exec window the exe
+    /// link still points at this harness binary, which identity checks
+    /// deliberately accept, so polling cmdline (non-empty from birth on the
+    /// posix_spawn path) would test the harness rather than the fixture.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_pid_is_alive_ignores_argument_content() {

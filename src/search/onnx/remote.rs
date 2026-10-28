@@ -743,6 +743,10 @@ struct PendingOutcome<'rows, 'batch, 'allowance> {
     skipped: Vec<usize>,
     /// Single inputs rejected as larger than the server's per-input limit.
     oversized: Vec<usize>,
+    /// Positions whose landed vector embeds a SHRUNK PREFIX of the input
+    /// (oversize-shrink path). Kept out of the embedding cache: a later run
+    /// must never reuse a truncated vector under the full input's key.
+    shrunk: Vec<usize>,
     /// First HTTP status/message behind `skipped`, used to report a batch where
     /// nothing at all landed.
     first_error: Option<(u16, String)>,
@@ -763,6 +767,7 @@ impl<'rows, 'batch, 'allowance> PendingOutcome<'rows, 'batch, 'allowance> {
             allowance,
             skipped: Vec::new(),
             oversized: Vec::new(),
+            shrunk: Vec::new(),
             first_error: None,
             aborted_mid_flight: None,
         }
@@ -800,16 +805,21 @@ impl<'rows, 'batch, 'allowance> PendingOutcome<'rows, 'batch, 'allowance> {
     }
 
     /// Apply the batch's fallback policy once the queue is exhausted.
-    fn finish(self) -> Result<(), RemoteEmbeddingError> {
+    ///
+    /// Returns the oversize-shrink positions (indices-mapped) so the caller
+    /// can exclude them from embedding-cache writes.
+    fn finish(self) -> Result<Vec<usize>, RemoteEmbeddingError> {
         let Self {
             rows,
             indices,
             skipped,
             oversized,
+            shrunk,
             first_error,
             aborted_mid_flight,
             ..
         } = self;
+        let shrunk: Vec<usize> = shrunk.iter().map(|&local| indices[local]).collect();
         let embedded = indices
             .iter()
             .filter(|&&position| rows[position].is_some())
@@ -824,7 +834,7 @@ impl<'rows, 'batch, 'allowance> PendingOutcome<'rows, 'batch, 'allowance> {
                 total = indices.len(),
                 "Remote batch aborted mid-flight; keeping already-embedded rows and leaving the rest empty"
             );
-            return Ok(());
+            return Ok(shrunk);
         }
         if !skipped.is_empty() && embedded == 0 {
             let (status, _) = first_error.expect("failed leaves have an HTTP status");
@@ -852,7 +862,7 @@ impl<'rows, 'batch, 'allowance> PendingOutcome<'rows, 'batch, 'allowance> {
         if !skipped.is_empty() {
             tracing::warn!(skipped_indices = ?skipped, "Skipping remote embedding inputs rejected individually");
         }
-        Ok(())
+        Ok(shrunk)
     }
 }
 
@@ -1179,10 +1189,10 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
         // waste the budget on short ones.
         let slices = self.plan_request_slices(&pending_inputs);
         let max_in_flight = remote_max_in_flight(&self.endpoint);
-        if max_in_flight <= 1 || slices.len() <= 1 {
+        let shrunk: Vec<usize> = if max_in_flight <= 1 || slices.len() <= 1 {
             // Serial arm — byte-identical to today's behaviour for local endpoints.
             self.embed_slices_serial(&slices, &pending_inputs, &mut rows, &pending_indices)
-                .await?;
+                .await?
         } else {
             // Each worker embeds ONE slice and returns its rows.
             //
@@ -1207,11 +1217,11 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
                 &pending_indices,
                 max_in_flight,
             )
-            .await?;
-        }
+            .await?
+        };
 
         if let Some(probe) = &probe {
-            self.store_cache(probe, &rows);
+            self.store_cache(probe, &rows, &shrunk);
         }
         Ok(rows)
     }
@@ -1278,22 +1288,27 @@ impl CustomEmbeddingProvider {
     }
 
     /// Send every slice in turn on one connection.
+    ///
+    /// Returns the oversize-shrink positions (see [`PendingOutcome::finish`]).
     async fn embed_slices_serial(
         &self,
         slices: &[(usize, usize)],
         pending_inputs: &[std::borrow::Cow<'_, str>],
         rows: &mut [Option<Vec<f32>>],
         pending_indices: &[usize],
-    ) -> Result<(), RemoteEmbeddingError> {
+    ) -> Result<Vec<usize>, RemoteEmbeddingError> {
+        let mut shrunk = Vec::new();
         for &(start, end) in slices {
-            self.embed_pending(
-                &pending_inputs[start..end],
-                rows,
-                &pending_indices[start..end],
-            )
-            .await?;
+            shrunk.extend(
+                self.embed_pending(
+                    &pending_inputs[start..end],
+                    rows,
+                    &pending_indices[start..end],
+                )
+                .await?,
+            );
         }
-        Ok(())
+        Ok(shrunk)
     }
 
     /// Send slices in waves of `max_in_flight`, merging each wave's rows back
@@ -1304,6 +1319,9 @@ impl CustomEmbeddingProvider {
     /// allocates or scans everything. [`Self::embed_pending`] writes through
     /// the indices it is given, so local indices are all it needs; the merge
     /// here translates them back.
+    ///
+    /// Like the serial arm, returns oversize-shrink positions (mapped back
+    /// through `pending_indices`).
     async fn embed_slices_concurrent(
         &self,
         slices: &[(usize, usize)],
@@ -1311,7 +1329,8 @@ impl CustomEmbeddingProvider {
         rows: &mut [Option<Vec<f32>>],
         pending_indices: &[usize],
         max_in_flight: usize,
-    ) -> Result<(), RemoteEmbeddingError> {
+    ) -> Result<Vec<usize>, RemoteEmbeddingError> {
+        let mut shrunk = Vec::new();
         for wave in slices.chunks(max_in_flight) {
             let futures = wave.iter().map(|&(start, end)| async move {
                 let width = end - start;
@@ -1319,18 +1338,25 @@ impl CustomEmbeddingProvider {
                 let local: Vec<usize> = (0..width).collect();
                 self.embed_pending(&pending_inputs[start..end], &mut worker_rows, &local)
                     .await
-                    .map(|()| (start, worker_rows))
+                    .map(|shrunk_local| (start, worker_rows, shrunk_local))
             });
             for result in futures::future::join_all(futures).await {
-                let (start, worker_rows) = result?;
+                let (start, worker_rows, shrunk_local) = result?;
                 for (offset, row) in worker_rows.into_iter().enumerate() {
                     if let Some(row) = row {
                         rows[pending_indices[start + offset]] = Some(row);
                     }
                 }
+                // `finish` reported slice-local positions; rebase them the
+                // same way the rows above were rebased.
+                shrunk.extend(
+                    shrunk_local
+                        .into_iter()
+                        .map(|local| pending_indices[start + local]),
+                );
             }
         }
-        Ok(())
+        Ok(shrunk)
     }
     /// Attach the embedding-cache namespace (the checkpoint identity minus its
     /// dimension component). Called once by
@@ -1403,15 +1429,15 @@ impl CustomEmbeddingProvider {
 
     /// Bisect-retry `pending` and write results into `rows` at `indices`.
     ///
-    /// Returns `Ok(())` when every pending input landed, `Err` when none did
-    /// (so the caller can apply its fallback policy). A partial outcome is
-    /// `Ok(())` with the remaining positions left `None`.
+    /// Returns `Ok(shrunk)` — the oversize-shrink positions — when the batch
+    /// is handled, `Err` when nothing landed. Partial outcomes leave the
+    /// remaining positions `None`.
     async fn embed_pending(
         &self,
         pending: &[std::borrow::Cow<'_, str>],
         rows: &mut [Option<Vec<f32>>],
         indices: &[usize],
-    ) -> Result<(), RemoteEmbeddingError> {
+    ) -> Result<Vec<usize>, RemoteEmbeddingError> {
         // ONE allowance for the whole logical batch. Bisection can fan a single
         // request out into hundreds of sub-requests; giving each its own
         // `max_retries` budget makes a dead endpoint cost
@@ -1498,7 +1524,12 @@ impl CustomEmbeddingProvider {
                 .embed_shrinking_oversized(text, outcome.allowance)
                 .await?
             {
-                Some(embedding) => outcome.rows[outcome.indices[start]] = Some(embedding),
+                Some(embedding) => {
+                    // Landed in `rows` for the generation, but embeds only a
+                    // PREFIX: record it so the batch keeps it out of the cache.
+                    outcome.rows[outcome.indices[start]] = Some(embedding);
+                    outcome.shrunk.push(start);
+                }
                 None => outcome.oversized.push(start),
             }
         } else {
@@ -1553,10 +1584,18 @@ impl CustomEmbeddingProvider {
     }
 
     /// Store the rows that actually landed. Best effort; never fails a batch.
-    fn store_cache(&self, probe: &super::remote_cache::ProbeOutcome, rows: &[Option<Vec<f32>>]) {
+    ///
+    /// `shrunk` positions embed a PREFIX of their input and are excluded so a
+    /// truncated vector is never served under the full input's key.
+    fn store_cache(
+        &self,
+        probe: &super::remote_cache::ProbeOutcome,
+        rows: &[Option<Vec<f32>>],
+        shrunk: &[usize],
+    ) {
         let mut guard = self.cache.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(cache) = guard.as_mut() {
-            cache.store_landed(probe, rows);
+            cache.store_landed(probe, rows, shrunk);
         }
     }
 

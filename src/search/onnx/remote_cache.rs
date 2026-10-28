@@ -219,13 +219,26 @@ impl RemoteEmbedCache {
     ///
     /// `rows` is aligned with the caller's batch. Positions holding `None`
     /// (inputs the endpoint skipped or a bisect gave up on) are deliberately
-    /// not stored: a degraded vector must never enter the cache.
-    pub(crate) fn store_landed(&mut self, probe: &ProbeOutcome, rows: &[Option<Vec<f32>>]) {
+    /// not stored: a degraded vector must never enter the cache. Positions in
+    /// `shrunk` carry a vector for a truncated PREFIX of the input (the
+    /// oversize-shrink retry path); storing it under the full input's key
+    /// would pin the truncated representation forever, so those are skipped
+    /// too — the next run re-embeds and, if the endpoint now accepts the whole
+    /// document, lands the complete vector.
+    pub(crate) fn store_landed(
+        &mut self,
+        probe: &ProbeOutcome,
+        rows: &[Option<Vec<f32>>],
+        shrunk: &[usize],
+    ) {
         let entries: Vec<(CacheKey, Vec<f32>)> = probe
             .miss_keys
             .iter()
             .zip(probe.miss_positions.iter())
             .filter_map(|(key, &position)| {
+                if shrunk.contains(&position) {
+                    return None;
+                }
                 let vector = rows.get(position)?.as_ref()?;
                 (vector.len() == self.dimension as usize && !vector.is_empty())
                     .then(|| (key.clone(), vector.clone()))
@@ -255,7 +268,7 @@ impl RemoteEmbedCache {
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
 
     /// Point the shared store at a scratch directory for one test.
@@ -324,7 +337,7 @@ mod tests {
 
         // Store exactly what the endpoint returned for those positions.
         let rows: Vec<Option<Vec<f32>>> = (0..3).map(|i| Some(vec![i as f32; 8])).collect();
-        cache.store_landed(&first, &rows);
+        cache.store_landed(&first, &rows, &[]);
 
         let second = cache.probe(&batch).expect("probe");
         assert!(
@@ -348,7 +361,7 @@ mod tests {
 
         // Position 1 was skipped by the endpoint / given up on by a bisect.
         let rows = vec![Some(vec![1.0f32; 8]), None];
-        cache.store_landed(&probe, &rows);
+        cache.store_landed(&probe, &rows, &[]);
 
         let again = cache.probe(&batch).expect("probe");
         assert_eq!(
@@ -359,6 +372,39 @@ mod tests {
         assert!(again.cached[0].is_some());
     }
 
+    /// Codex P2: the oversize-shrink path lands a vector for a truncated
+    /// PREFIX of the input into the batch's rows. That row must NOT be stored
+    /// under the full input's key: the next run would serve the truncated
+    /// vector from the cache even if its endpoint now accepts the whole
+    /// document, pinning the degraded representation forever.
+    #[test]
+    fn test_shrunk_prefix_rows_are_excluded_from_cache_writes() {
+        let (_home, _root) = ScratchHome::new("shrunk");
+        let mut cache = RemoteEmbedCache::open("remote|custom|http://x/v1||m1|8", 8)
+            .expect("cache opens with the feature flag on");
+
+        let batch = inputs(&["full", "whole"]);
+        let probe = cache.probe(&batch).expect("probe");
+        assert_eq!(probe.miss_positions, vec![0, 1]);
+
+        // Both rows "landed" (the batch returned vectors for them), but row 0
+        // came from the shrink-retry path: its vector embeds only a prefix of
+        // "full". Row 1 embedded its input whole.
+        let rows = vec![Some(vec![9.0f32; 8]), Some(vec![1.0f32; 8])];
+        cache.store_landed(&probe, &rows, &[0]);
+
+        let again = cache.probe(&batch).expect("probe");
+        assert_eq!(
+            again.miss_positions,
+            vec![0],
+            "a shrunk-prefix vector must never be served under the full input's key"
+        );
+        assert!(
+            again.cached[1].is_some(),
+            "the whole-input row is unaffected and must be served"
+        );
+    }
+
     #[test]
     fn test_a_different_dimension_is_a_different_namespace() {
         let (_home, _root) = ScratchHome::new("dimension");
@@ -366,7 +412,7 @@ mod tests {
         let mut small = RemoteEmbedCache::open(identity, 8).expect("cache opens");
         let batch = inputs(&["same text"]);
         let probe = small.probe(&batch).expect("probe");
-        small.store_landed(&probe, &[Some(vec![1.0f32; 8])]);
+        small.store_landed(&probe, &[Some(vec![1.0f32; 8])], &[]);
 
         let mut large = RemoteEmbedCache::open(identity, 16).expect("cache opens");
         let probe = large.probe(&batch).expect("probe");
@@ -384,7 +430,7 @@ mod tests {
         let mut base =
             RemoteEmbedCache::open("remote|custom|http://x/v1||m1|8", 8).expect("cache opens");
         let probe = base.probe(&batch).expect("probe");
-        base.store_landed(&probe, &[Some(vec![1.0f32; 8])]);
+        base.store_landed(&probe, &[Some(vec![1.0f32; 8])], &[]);
 
         for other in [
             // Same endpoint, different served model.
