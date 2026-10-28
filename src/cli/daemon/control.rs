@@ -203,17 +203,17 @@ pub fn unsupported() -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
 
     #[test]
-    fn missing_endpoint_is_stopped() {
+    fn test_missing_endpoint_is_stopped() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(state(dir.path()).unwrap().0, DaemonState::Stopped);
     }
 
     #[test]
-    fn normalize_exe_name_strips_deleted_suffix() {
+    fn test_normalize_exe_name_strips_deleted_suffix() {
         assert_eq!(normalize_exe_name("leindexd"), "leindexd");
         assert_eq!(normalize_exe_name("leindexd (deleted)"), "leindexd");
         assert_eq!(
@@ -225,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_exe_matches_plain_and_deleted_binary_names() {
+    fn test_daemon_exe_matches_plain_and_deleted_binary_names() {
         use std::path::Path;
         assert!(is_leindex_daemon_exe(Some(Path::new(
             "/usr/local/bin/leindexd"
@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_exit_reports_live_process_as_not_exited_then_exited_after_reap() {
+    fn test_wait_for_exit_reports_live_process_as_not_exited_then_exited_after_reap() {
         let mut child = spawn_sleep_child();
         let pid = child.id();
         // Alive: must NOT report exit within a short window.
@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_running_retains_sidecars_when_daemon_ignores_sigterm() {
+    fn test_stop_running_retains_sidecars_when_daemon_ignores_sigterm() {
         use std::process::{Command, Stdio};
 
         let dir = tempfile::tempdir().unwrap();
@@ -317,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_running_removes_sidecars_after_daemon_exits() {
+    fn test_stop_running_removes_sidecars_after_daemon_exits() {
         use std::process::{Command, Stdio};
 
         let dir = tempfile::tempdir().unwrap();

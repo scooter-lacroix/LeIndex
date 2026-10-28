@@ -721,101 +721,115 @@ async fn mutation_plan(op: &Op, root: &Path, args: &Value) -> Result<Value, Json
     ))
 }
 
+/// Validate the optional `target` argument once, before any op-specific work.
+fn plan_target(args: &Value) -> Result<Option<String>, JsonRpcError> {
+    match args.get("target").and_then(Value::as_str) {
+        Some(target) => Ok(Some(super::git_ref::validate_ref_or_error(target)?)),
+        None => Ok(None),
+    }
+}
+
+/// Error for an op that cannot run without a target.
+fn require_target(
+    target: &Option<String>,
+    op_name: &str,
+    field: &str,
+) -> Result<String, JsonRpcError> {
+    target.clone().ok_or_else(|| {
+        JsonRpcError::invalid_params_with_suggestion(
+            format!("git {op_name} requires '{field}'"),
+            format!("Provide {field}: a branch name, tag or commit oid"),
+        )
+    })
+}
+
+/// `<subcommand> [flag] <target>` — the shape every single-target op shares.
+fn target_argv(subcommand: &str, flag: Option<&str>, target: String) -> Vec<String> {
+    let mut argv = vec![subcommand.to_string()];
+    if let Some(flag) = flag {
+        argv.push(flag.to_string());
+    }
+    argv.push(target);
+    argv
+}
+
+/// `commit --no-gpg-sign -m <message>`, rejecting an empty or oversized subject.
+fn commit_argv(args: &Value) -> Result<Vec<String>, JsonRpcError> {
+    let message = args
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty() && message.len() <= 10_000)
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params_with_suggestion(
+                "git commit requires a non-empty 'message' (max 10000 chars)".to_string(),
+                "Provide message: the commit subject and body".to_string(),
+            )
+        })?;
+    Ok(vec![
+        "commit".to_string(),
+        "--no-gpg-sign".to_string(),
+        "-m".to_string(),
+        message.to_string(),
+    ])
+}
+
+/// `tag <name>`, annotated only when a non-blank message is supplied.
+fn tag_argv(args: &Value, name: String) -> Vec<String> {
+    let mut argv = vec!["tag".to_string()];
+    match args.get("message").and_then(Value::as_str) {
+        Some(message) if !message.trim().is_empty() => {
+            argv.push("-a".to_string());
+            argv.push(name);
+            argv.push("-m".to_string());
+            argv.push(message.to_string());
+        }
+        _ => argv.push(name),
+    }
+    argv
+}
+
 /// Describe the argv a mutation would run, validating every argument first.
 ///
 /// This is the only place a mutation's command line is decided; the plan, the
 /// token and the (future) executor all consume this one definition.
 fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> {
-    let target = args.get("target").and_then(Value::as_str);
-    let target = match target {
-        Some(target) => Some(super::git_ref::validate_ref_or_error(target)?),
-        None => None,
-    };
-    let require_target = |field: &str| -> Result<String, JsonRpcError> {
-        target.clone().ok_or_else(|| {
-            JsonRpcError::invalid_params_with_suggestion(
-                format!("git {} requires '{field}'", op.name),
-                format!("Provide {field}: a branch name, tag or commit oid"),
-            )
-        })
-    };
+    let target = plan_target(args)?;
+    let required = |field: &str| require_target(&target, op.name, field);
 
-    let argv = match op.name {
+    match op.name {
         "add" => {
-            let paths = staged_paths(root, args)?;
             let mut argv = vec!["add".to_string(), "--".to_string()];
-            argv.extend(paths);
-            argv
+            argv.extend(staged_paths(root, args)?);
+            Ok(argv)
         }
-        "commit" => {
-            let message = args
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|message| !message.is_empty() && message.len() <= 10_000)
-                .ok_or_else(|| {
-                    JsonRpcError::invalid_params_with_suggestion(
-                        "git commit requires a non-empty 'message' (max 10000 chars)".to_string(),
-                        "Provide message: the commit subject and body".to_string(),
-                    )
-                })?;
-            vec![
-                "commit".to_string(),
-                "--no-gpg-sign".to_string(),
-                "-m".to_string(),
-                message.to_string(),
-            ]
-        }
-        "checkout" => vec![
-            "checkout".to_string(),
-            "--no-guess".to_string(),
-            require_target("target")?,
-        ],
-        "stash" => vec![
+        "commit" => commit_argv(args),
+        "checkout" => Ok(target_argv(
+            "checkout",
+            Some("--no-guess"),
+            required("target")?,
+        )),
+        "stash" => Ok(vec![
             "stash".to_string(),
             "push".to_string(),
             "--include-untracked".to_string(),
-        ],
-        "tag" => {
-            let name = require_target("target")?;
-            let mut argv = vec!["tag".to_string()];
-            match args.get("message").and_then(Value::as_str) {
-                Some(message) if !message.trim().is_empty() => {
-                    argv.push("-a".to_string());
-                    argv.push(name);
-                    argv.push("-m".to_string());
-                    argv.push(message.to_string());
-                }
-                _ => argv.push(name),
-            }
-            argv
-        }
-        "merge" => vec![
-            "merge".to_string(),
-            "--no-edit".to_string(),
-            require_target("target")?,
-        ],
-        "rebase" => vec!["rebase".to_string(), require_target("target")?],
-        "push" => vec!["push".to_string(), "--porcelain".to_string()],
-        "reset" => vec![
-            "reset".to_string(),
-            "--mixed".to_string(),
-            require_target("target")?,
-        ],
+        ]),
+        "tag" => Ok(tag_argv(args, required("target")?)),
+        "merge" => Ok(target_argv("merge", Some("--no-edit"), required("target")?)),
+        "rebase" => Ok(target_argv("rebase", None, required("target")?)),
+        "push" => Ok(vec!["push".to_string(), "--porcelain".to_string()]),
+        "reset" => Ok(target_argv("reset", Some("--mixed"), required("target")?)),
         // `force` is a force-push; naming it in the plan makes the destructive
         // shape explicit instead of hiding it behind `push`.
-        "force" => vec![
-            "push".to_string(),
-            "--force-with-lease".to_string(),
-            require_target("target")?,
-        ],
-        other => {
-            return Err(JsonRpcError::internal_error(format!(
-                "git operation '{other}' has no plan"
-            )));
-        }
-    };
-    Ok(argv)
+        "force" => Ok(target_argv(
+            "push",
+            Some("--force-with-lease"),
+            required("target")?,
+        )),
+        other => Err(JsonRpcError::internal_error(format!(
+            "git operation '{other}' has no plan"
+        ))),
+    }
 }
 
 /// Read-only probe run alongside a plan, so the plan describes the real state.

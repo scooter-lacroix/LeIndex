@@ -137,16 +137,10 @@ pub fn run_phase_analysis(
     let run_started = std::time::Instant::now();
     // Split the pipeline's wall time into stages so a slow run is diagnosable
     // from the response itself, without attaching a profiler to a live daemon.
-    let mut stage_ms = std::collections::BTreeMap::new();
-    macro_rules! timed {
-        ($label:literal, $body:expr) => {{
-            let started = std::time::Instant::now();
-            let value = $body;
-            stage_ms.insert($label.to_string(), started.elapsed().as_millis() as u64);
-            value
-        }};
-    }
-    let mut context = timed!("prepare", PhaseExecutionContext::prepare(&options))?;
+    let mut stage_ms = StageTimings::default();
+    let mut context = PhaseExecutionContext::prepare(&options)?;
+    stage_ms.record("prepare", run_started);
+
     let cache = PhaseCache::new(&context.root);
     let mut executed_phases = Vec::new();
     let mut cache_hit = false;
@@ -160,59 +154,51 @@ pub fn run_phase_analysis(
     // Say which stages ran and why any did not, rather than letting a budget
     // truncation look like a complete report.
     let mut budget_exhausted = false;
-    macro_rules! take_budget {
-        () => {
-            if budget_exhausted {
-                false
-            } else if options
-                .budget_ms
-                .is_some_and(|budget| run_started.elapsed().as_millis() as u64 >= budget)
-            {
-                budget_exhausted = true;
-                false
-            } else {
-                true
-            }
-        };
-    }
 
-    if should_run(1, selection) && take_budget!() {
-        let (summary, hit) = timed!("phase1", run_phase1(&cache, &mut context))?;
+    if phase_starts(1, selection, &options, run_started, &mut budget_exhausted) {
+        let started = std::time::Instant::now();
+        let (summary, hit) = run_phase1(&cache, &mut context)?;
+        stage_ms.record("phase1", started);
         phase1_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(1);
     }
-    if should_run(2, selection) && take_budget!() {
-        let (summary, hit) = timed!("phase2", run_phase2(&cache, &mut context))?;
+    if phase_starts(2, selection, &options, run_started, &mut budget_exhausted) {
+        let started = std::time::Instant::now();
+        let (summary, hit) = run_phase2(&cache, &mut context)?;
+        stage_ms.record("phase2", started);
         phase2_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(2);
     }
-    if should_run(3, selection) && take_budget!() {
-        let (summary, hit) = timed!("phase3", run_phase3(&cache, &mut context, &options))?;
+    if phase_starts(3, selection, &options, run_started, &mut budget_exhausted) {
+        let started = std::time::Instant::now();
+        let (summary, hit) = run_phase3(&cache, &mut context, &options)?;
+        stage_ms.record("phase3", started);
         phase3_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(3);
     }
-    if should_run(4, selection) && take_budget!() {
-        let (summary, hit) = timed!("phase4", run_phase4(&cache, &mut context, &options))?;
+    if phase_starts(4, selection, &options, run_started, &mut budget_exhausted) {
+        let started = std::time::Instant::now();
+        let (summary, hit) = run_phase4(&cache, &mut context, &options)?;
+        stage_ms.record("phase4", started);
         phase4_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(4);
     }
-    if should_run(5, selection) && take_budget!() {
-        let (summary, hit) = timed!(
-            "phase5",
-            run_phase5(
-                &cache,
-                &mut context,
-                &options,
-                phase1_summary.as_ref(),
-                phase2_summary.as_ref(),
-                phase3_summary.as_ref(),
-                phase4_summary.as_ref(),
-            )
+    if phase_starts(5, selection, &options, run_started, &mut budget_exhausted) {
+        let started = std::time::Instant::now();
+        let (summary, hit) = run_phase5(
+            &cache,
+            &mut context,
+            &options,
+            phase1_summary.as_ref(),
+            phase2_summary.as_ref(),
+            phase3_summary.as_ref(),
+            phase4_summary.as_ref(),
         )?;
+        stage_ms.record("phase5", started);
         phase5_summary = Some(summary);
         cache_hit |= hit;
         executed_phases.push(5);
@@ -221,50 +207,28 @@ pub fn run_phase_analysis(
     // `prepare` only defers the graph; if every phase hit the cache the graph
     // was never built, so report that honestly rather than as a 0 ms stage.
     let graph_pending = context.graph_is_pending();
-    let mut formatted_output = timed!(
-        "format",
-        format_report(
-            &context,
-            &executed_phases,
-            phase1_summary.as_ref(),
-            phase2_summary.as_ref(),
-            phase3_summary.as_ref(),
-            phase4_summary.as_ref(),
-            phase5_summary.as_ref(),
-            options.max_output_chars,
-        )
+    let format_started = std::time::Instant::now();
+    let mut formatted_output = format_report(
+        &context,
+        &executed_phases,
+        phase1_summary.as_ref(),
+        phase2_summary.as_ref(),
+        phase3_summary.as_ref(),
+        phase4_summary.as_ref(),
+        phase5_summary.as_ref(),
+        options.max_output_chars,
     );
+    stage_ms.record("format", format_started);
     if graph_pending {
-        stage_ms.insert("graph".to_string(), 0);
+        stage_ms.0.insert("graph".to_string(), 0);
     }
-    // The report is the only thing a caller sees, so the breakdown has to be
-    // in it: a stage that is elided from the text is a stage nobody profiles.
-    let breakdown = stage_ms
-        .iter()
-        .map(|(stage, ms)| format!("{stage}={ms}ms"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    formatted_output.push_str(&format!("\nstage_ms: {breakdown}"));
+    formatted_output.push_str(&stage_breakdown(&stage_ms.0));
     if budget_exhausted {
-        // A truncated run must never read as a complete one. Name the ceiling,
-        // the stages that actually ran, and how to lift it.
-        let skipped = (1..=5)
-            .filter(|phase| should_run(*phase, selection) && !executed_phases.contains(phase))
-            .map(|phase| phase.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        formatted_output.push_str(&format!(
-            "\nINCOMPLETE: stopped after {0}ms of a {1}ms budget; ran phases [{2}], \
-             skipped [{3}]. Raise LEINDEX_PHASE_BUDGET_MS or run the remaining phases \
-             individually with `phase`.",
+        formatted_output.push_str(&incomplete_notice(
             run_started.elapsed().as_millis(),
             options.budget_ms.unwrap_or_default(),
-            executed_phases
-                .iter()
-                .map(|phase| phase.to_string())
-                .collect::<Vec<_>>()
-                .join(","),
-            skipped
+            &executed_phases,
+            selection,
         ));
     }
     Ok(PhaseAnalysisReport {
@@ -281,8 +245,94 @@ pub fn run_phase_analysis(
         phase4: phase4_summary,
         phase5: phase5_summary,
         formatted_output,
-        stage_ms,
+        stage_ms: stage_ms.0,
     })
+}
+
+/// Wall-clock per pipeline stage, in milliseconds.
+///
+/// Replaces a `macro_rules! timed` that used to live inside `run_phase_analysis`.
+/// A macro declared inside a function is still attributed to that function by
+/// the complexity gate, so the measuring logic counted against the pipeline
+/// even though it was not part of it.
+///
+/// Deliberately takes the start instant instead of measuring a closure: the
+/// complexity gate counts a closure as a branch, so wrapping each phase in one
+/// would have traded a macro for eight new decision points.
+#[derive(Debug, Default)]
+struct StageTimings(std::collections::BTreeMap<String, u64>);
+
+impl StageTimings {
+    /// Record how long `started` took to reach here, under `label`.
+    fn record(&mut self, label: &str, started: std::time::Instant) {
+        self.0
+            .insert(label.to_string(), started.elapsed().as_millis() as u64);
+    }
+}
+
+/// Whether a phase may start: it must be selected, and within the budget.
+///
+/// One `&&` at the single call-site predicate instead of two nested conditions,
+/// and it latches `exhausted` so a later phase cannot run after a truncation.
+fn phase_starts(
+    phase: u8,
+    selection: PhaseSelection,
+    options: &PhaseOptions,
+    started: std::time::Instant,
+    exhausted: &mut bool,
+) -> bool {
+    if *exhausted {
+        return false;
+    }
+    let over_budget = options
+        .budget_ms
+        .is_some_and(|budget| started.elapsed().as_millis() as u64 >= budget);
+    if over_budget {
+        *exhausted = true;
+    }
+    should_run(phase, selection) && !over_budget
+}
+
+/// Render the `stage_ms: …` line that makes a slow run diagnosable from the
+/// report alone.
+///
+/// The report is the only thing a caller sees, so the breakdown has to be in
+/// it: a stage elided from the text is a stage nobody profiles.
+fn stage_breakdown(stage_ms: &std::collections::BTreeMap<String, u64>) -> String {
+    let breakdown = stage_ms
+        .iter()
+        .map(|(stage, ms)| format!("{stage}={ms}ms"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("\nstage_ms: {breakdown}")
+}
+
+/// The truncation notice for a run that stopped at its wall-clock budget.
+///
+/// A truncated run must never read as a complete one: name the ceiling, the
+/// phases that actually ran, the ones skipped, and how to lift it.
+fn incomplete_notice(
+    elapsed_ms: u128,
+    budget_ms: u64,
+    executed_phases: &[u8],
+    selection: PhaseSelection,
+) -> String {
+    let executed = executed_phases
+        .iter()
+        .map(|phase| phase.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let skipped = (1..=5)
+        .filter(|phase| should_run(*phase, selection) && !executed_phases.contains(phase))
+        .map(|phase| phase.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "\nINCOMPLETE: stopped after {0}ms of a {1}ms budget; ran phases [{2}], \
+         skipped [{3}]. Raise LEINDEX_PHASE_BUDGET_MS or run the remaining phases \
+         individually with `phase`.",
+        elapsed_ms, budget_ms, executed, skipped
+    )
 }
 
 fn run_phase1(

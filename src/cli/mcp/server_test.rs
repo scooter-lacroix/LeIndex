@@ -8,8 +8,10 @@ use super::*;
 /// `max_http_sessions()` (which reads the same variable), which
 /// is an active data race under POSIX. Holding this mutex for the
 /// entire test body guarantees only one test at a time touches
-/// the env.
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// the env. It is the process-wide [`EnvLock`] rather than a local
+/// mutex, so it also serializes against every other module's
+/// env-mutating tests.
+use crate::test_env::EnvLock as ENV_LOCK;
 
 #[test]
 fn test_server_config_default() {

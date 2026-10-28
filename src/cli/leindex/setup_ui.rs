@@ -441,55 +441,10 @@ impl Draft {
                 Ok(_) => None,
                 Err(_) => Some("not a port number".to_string()),
             },
-            Field::Dimension => {
-                let value = self.dimension.trim();
-                if value.is_empty() {
-                    return None;
-                }
-                match value.parse::<usize>() {
-                    Ok(0) => Some("dimension must be nonzero".to_string()),
-                    Ok(_) => None,
-                    Err(_) => Some("not a number".to_string()),
-                }
-            }
-            Field::GpuLayers => {
-                let value = self.gpu_layers.trim();
-                if value.is_empty() || value.eq_ignore_ascii_case("auto") || value == "all" {
-                    return None;
-                }
-                match value.parse::<u32>() {
-                    Ok(_) => None,
-                    Err(_) => Some("expected an integer, 'auto', or 'all'".to_string()),
-                }
-            }
-            Field::Endpoint => {
-                let value = self.endpoint.trim();
-                if value.is_empty() {
-                    return None;
-                }
-                // Setup refuses query strings and fragments: they leak into
-                // logs and indicate a copy-pasted URL carrying a credential.
-                if value.contains('?') {
-                    return Some("drop the query string".to_string());
-                }
-                if value.contains('#') {
-                    return Some("drop the fragment".to_string());
-                }
-                if !value.starts_with("http://") && !value.starts_with("https://") {
-                    return Some("must start with http:// or https://".to_string());
-                }
-                None
-            }
-            Field::KeyEnv => {
-                let value = self.key_env.trim();
-                if value.is_empty() {
-                    return None;
-                }
-                if value.contains(|c: char| c.is_whitespace() || c == '=') {
-                    return Some("a variable NAME cannot contain spaces or '='".to_string());
-                }
-                None
-            }
+            Field::Dimension => validate_dimension(&self.dimension),
+            Field::GpuLayers => validate_gpu_layers(&self.gpu_layers),
+            Field::Endpoint => validate_endpoint(&self.endpoint),
+            Field::KeyEnv => validate_key_env(&self.key_env),
             _ => None,
         }
     }
@@ -601,6 +556,61 @@ impl Draft {
             options: self.to_options()?,
         })
     }
+}
+
+/// Row validators, one per editable text field. Split out of
+/// [`Draft::validate`] so each rule reads on its own; `None` means "accept".
+fn validate_dimension(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+    match value.parse::<usize>() {
+        Ok(0) => Some("dimension must be nonzero".to_string()),
+        Ok(_) => None,
+        Err(_) => Some("not a number".to_string()),
+    }
+}
+
+fn validate_gpu_layers(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("auto") || value == "all" {
+        return None;
+    }
+    match value.parse::<u32>() {
+        Ok(_) => None,
+        Err(_) => Some("expected an integer, 'auto', or 'all'".to_string()),
+    }
+}
+
+fn validate_endpoint(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+    // Setup refuses query strings and fragments: they leak into logs and
+    // indicate a copy-pasted URL carrying a credential.
+    if value.contains('?') {
+        return Some("drop the query string".to_string());
+    }
+    if value.contains('#') {
+        return Some("drop the fragment".to_string());
+    }
+    if !value.starts_with("http://") && !value.starts_with("https://") {
+        return Some("must start with http:// or https://".to_string());
+    }
+    None
+}
+
+fn validate_key_env(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.contains(|c: char| c.is_whitespace() || c == '=') {
+        return Some("a variable NAME cannot contain spaces or '='".to_string());
+    }
+    None
 }
 
 fn step(current: usize, count: usize, forward: bool) -> usize {

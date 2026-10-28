@@ -100,8 +100,8 @@ fn test_missing_lexical_checkpoint_restores_empty_admission_set() {
 /// Serializes tests that index Rust projects while `LEINDEX_SCIP_RUST_BIN`
 /// may be set: env is process-global, so a concurrent full-index in another
 /// watcher test would otherwise discover (and invoke) another test's
-/// indexer fixture.
-static WATCHER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// indexer fixture. Shared across the whole test binary via [`EnvLock`].
+use crate::test_env::EnvLock as WATCHER_ENV_LOCK;
 
 #[test]
 fn test_watcher_delta_publishes_current_generation() {

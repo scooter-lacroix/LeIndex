@@ -145,7 +145,7 @@ fn printable_strings(bytes: &[u8]) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
     use std::path::Path;
 

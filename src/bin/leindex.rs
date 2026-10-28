@@ -103,11 +103,12 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::sync::Mutex;
 
     /// Serialize env-var tests so that concurrent test threads do not race
     /// on set/remove of `LEINDEX_TOKIO_WORKERS`. Env mutation is process-global.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// A local mutex is correct here: `cargo test` runs each target in its own
+    /// process, so these tests never share a process with the lib's tests.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// VAL-BASE-008: When the env var is unset, the default worker count is 2.
     #[test]

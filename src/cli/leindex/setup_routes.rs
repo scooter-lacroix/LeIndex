@@ -163,6 +163,22 @@ pub struct SetupOptions {
 
 impl SetupOptions {
     pub fn has_flags(&self) -> bool {
+        self.has_embedding_flags()
+            || self.has_embedding_format_flags()
+            || self.has_search_flags()
+            || self.has_indexing_flags()
+            || self.has_mcp_flags()
+            || self.has_system_one_flags()
+    }
+
+    /// Provider and managed-server knobs for the embedding route.
+    ///
+    /// Grouped out of [`Self::has_flags`] so each predicate stays readable and
+    /// under the cyclomatic-complexity gate. Splitting the disjunction is safe
+    /// because every term is a side-effect-free `is_some()`, so `||` order is
+    /// unobservable. `service_start_timeout_secs` lives here because the timed
+    /// service is the managed Gemma server that serves this route.
+    fn has_embedding_flags(&self) -> bool {
         self.embedding.is_some()
             || self.llama_server.is_some()
             || self.download_llama.is_some()
@@ -172,13 +188,22 @@ impl SetupOptions {
             || self.gpu_layers.is_some()
             || self.auto_start.is_some()
             || self.embedding_endpoint.is_some()
-            || self.embedding_model.is_some()
+            || self.service_start_timeout_secs.is_some()
+    }
+
+    /// How the remote model is addressed and formatted.
+    fn has_embedding_format_flags(&self) -> bool {
+        self.embedding_model.is_some()
             || self.embedding_dimension.is_some()
             || self.embedding_api_key_env.is_some()
             || self.embedding_api_key.is_some()
             || self.embedding_doc_template.is_some()
             || self.embedding_query_template.is_some()
-            || self.system_one
+    }
+
+    /// Search ranking plus the fragment index that feeds it.
+    fn has_search_flags(&self) -> bool {
+        self.system_one
             || self.search_mode.is_some()
             || self.neural_weight.is_some()
             || self.rerank_enabled.is_some()
@@ -187,15 +212,27 @@ impl SetupOptions {
             || self.fragment_index_enabled.is_some()
             || self.fragment_max_bytes.is_some()
             || self.fragment_weight.is_some()
-            || self.fragment_orphan_enabled.is_some()
+    }
+
+    /// Fragment fallback behaviour and ordinary indexing limits.
+    fn has_indexing_flags(&self) -> bool {
+        self.fragment_orphan_enabled.is_some()
             || self.fragment_naive_fallback.is_some()
             || self.batch_size.is_some()
             || self.max_files.is_some()
-            || self.mcp_idle_timeout_secs.is_some()
+    }
+
+    /// MCP server lifecycle knobs.
+    fn has_mcp_flags(&self) -> bool {
+        self.mcp_idle_timeout_secs.is_some()
             || self.mcp_engine_max_idle_secs.is_some()
             || self.mcp_prewarm.is_some()
             || self.mcp_auto_index.is_some()
-            || self.system_one_mode.is_some()
+    }
+
+    /// System One gate and scoring knobs.
+    fn has_system_one_flags(&self) -> bool {
+        self.system_one_mode.is_some()
             || self.system_one_provider.is_some()
             || self.system_one_endpoint.is_some()
             || self.system_one_model.is_some()
@@ -207,7 +244,6 @@ impl SetupOptions {
             || self.system_one_instructions_max.is_some()
             || self.system_one_top_n.is_some()
             || self.system_one_tau_apply.is_some()
-            || self.service_start_timeout_secs.is_some()
     }
 }
 
@@ -312,6 +348,53 @@ fn apply_general_options(
     config: &mut LeIndexConfig,
     options: &SetupOptions,
 ) -> Result<(), SetupError> {
+    apply_search_options(config, options)?;
+    apply_indexing_options(config, options)?;
+    apply_mcp_options(config, options)?;
+    apply_system_one_options(config, options)?;
+    Ok(())
+}
+
+/// Treat a blank CLI string as "unset".
+///
+/// `--system-one-endpoint ""` clears the endpoint; storing an empty string
+/// instead would later resolve to a bogus URL.
+fn non_blank(value: &str) -> Option<String> {
+    (!value.trim().is_empty()).then(|| value.to_string())
+}
+
+/// Validate that `value` is a unit-interval threshold, then store it.
+///
+/// Five options share this shape, so they share the validation rather than
+/// repeating the range check and the message plumbing five times. Generic in
+/// the float width because search weights are `f64` while System One
+/// thresholds are `f32`, and both must accept exactly `[0, 1]`.
+fn set_unit_interval<T>(target: &mut T, value: T, message: &'static str) -> Result<(), SetupError>
+where
+    T: PartialOrd + Copy + From<f32>,
+{
+    if value < T::from(0.0) || value > T::from(1.0) {
+        return Err(error(message));
+    }
+    *target = value;
+    Ok(())
+}
+
+/// Search ranking and fragment-index knobs.
+fn apply_search_options(
+    config: &mut LeIndexConfig,
+    options: &SetupOptions,
+) -> Result<(), SetupError> {
+    apply_ranking_options(config, options)?;
+    apply_fragment_options(config, options)?;
+    Ok(())
+}
+
+/// Ranking mode, hybrid weight, and reranker selection.
+fn apply_ranking_options(
+    config: &mut LeIndexConfig,
+    options: &SetupOptions,
+) -> Result<(), SetupError> {
     if let Some(mode) = options.search_mode.as_deref() {
         if !matches!(mode, "hybrid" | "text" | "neural") {
             return Err(error("search mode must be hybrid, text, or neural"));
@@ -319,10 +402,11 @@ fn apply_general_options(
         config.search.search_mode = mode.to_string();
     }
     if let Some(weight) = options.neural_weight {
-        if !(0.0..=1.0).contains(&weight) {
-            return Err(error("neural weight must be between 0 and 1"));
-        }
-        config.search.neural_weight = weight;
+        set_unit_interval(
+            &mut config.search.neural_weight,
+            weight,
+            "neural weight must be between 0 and 1",
+        )?;
     }
     if let Some(enabled) = options.rerank_enabled {
         config.search.rerank_enabled = enabled;
@@ -339,6 +423,14 @@ fn apply_general_options(
         }
         config.search.rerank_top_n = top_n;
     }
+    Ok(())
+}
+
+/// Fragment index knobs feeding hybrid search.
+fn apply_fragment_options(
+    config: &mut LeIndexConfig,
+    options: &SetupOptions,
+) -> Result<(), SetupError> {
     if let Some(enabled) = options.fragment_index_enabled {
         config.search.fragment_index_enabled = enabled;
     }
@@ -346,10 +438,11 @@ fn apply_general_options(
         config.search.fragment_max_bytes = bytes;
     }
     if let Some(weight) = options.fragment_weight {
-        if !(0.0..=1.0).contains(&weight) {
-            return Err(error("fragment weight must be between 0 and 1"));
-        }
-        config.search.fragment_weight = weight;
+        set_unit_interval(
+            &mut config.search.fragment_weight,
+            weight,
+            "fragment weight must be between 0 and 1",
+        )?;
     }
     if let Some(enabled) = options.fragment_orphan_enabled {
         config.search.fragment_orphan_enabled = enabled;
@@ -357,6 +450,14 @@ fn apply_general_options(
     if let Some(enabled) = options.fragment_naive_fallback {
         config.search.fragment_naive_fallback = enabled;
     }
+    Ok(())
+}
+
+/// Indexing limits and the timeout for the managed embedding service.
+fn apply_indexing_options(
+    config: &mut LeIndexConfig,
+    options: &SetupOptions,
+) -> Result<(), SetupError> {
     if let Some(batch_size) = options.batch_size {
         if batch_size == 0 {
             return Err(error("batch size must be nonzero"));
@@ -366,6 +467,19 @@ fn apply_general_options(
     if let Some(max_files) = options.max_files {
         config.indexing.max_files = max_files;
     }
+    if let Some(value) = options.service_start_timeout_secs {
+        if value == 0 {
+            return Err(error("managed service startup timeout must be nonzero"));
+        }
+        if let Some(service) = config.services.get_mut("gemma") {
+            service.start_timeout_secs = value;
+        }
+    }
+    Ok(())
+}
+
+/// MCP server lifecycle knobs.
+fn apply_mcp_options(config: &mut LeIndexConfig, options: &SetupOptions) -> Result<(), SetupError> {
     if let Some(value) = options.mcp_idle_timeout_secs {
         config.mcp.idle_timeout_secs = value;
     }
@@ -381,25 +495,46 @@ fn apply_general_options(
     if let Some(value) = options.mcp_auto_index {
         config.mcp.auto_index = value;
     }
+    Ok(())
+}
 
+/// System One gate and scoring knobs.
+fn apply_system_one_options(
+    config: &mut LeIndexConfig,
+    options: &SetupOptions,
+) -> Result<(), SetupError> {
+    apply_system_one_identity(config, options);
+    apply_system_one_gates(config, options)
+}
+
+/// System One endpoint, model, and key-variable strings.
+fn apply_system_one_identity(config: &mut LeIndexConfig, options: &SetupOptions) {
+    let system_one = &mut config.system_one;
+    if let Some(value) = options.system_one_provider.as_deref() {
+        system_one.provider = value.to_string();
+    }
+    if let Some(value) = options.system_one_endpoint.as_deref() {
+        system_one.base_url = non_blank(value);
+    }
+    if let Some(value) = options.system_one_model.as_deref() {
+        system_one.model = non_blank(value);
+    }
+    if let Some(value) = options.system_one_api_key_env.as_deref() {
+        system_one.api_key_env = non_blank(value);
+    }
+}
+
+/// System One mode, gates, and scoring thresholds.
+fn apply_system_one_gates(
+    config: &mut LeIndexConfig,
+    options: &SetupOptions,
+) -> Result<(), SetupError> {
     let system_one = &mut config.system_one;
     if let Some(value) = options.system_one_mode.as_deref() {
         if !matches!(value, "off" | "shadow" | "enforce") {
             return Err(error("System One mode must be off, shadow, or enforce"));
         }
         system_one.mode = value.to_string();
-    }
-    if let Some(value) = options.system_one_provider.as_deref() {
-        system_one.provider = value.to_string();
-    }
-    if let Some(value) = options.system_one_endpoint.as_deref() {
-        system_one.base_url = (!value.trim().is_empty()).then(|| value.to_string());
-    }
-    if let Some(value) = options.system_one_model.as_deref() {
-        system_one.model = (!value.trim().is_empty()).then(|| value.to_string());
-    }
-    if let Some(value) = options.system_one_api_key_env.as_deref() {
-        system_one.api_key_env = (!value.trim().is_empty()).then(|| value.to_string());
     }
     if let Some(value) = options.system_one_timeout_ms {
         if value == 0 {
@@ -414,40 +549,31 @@ fn apply_general_options(
         system_one.post_gate = value;
     }
     if let Some(value) = options.system_one_relevant_min {
-        if !(0.0..=1.0).contains(&value) {
-            return Err(error(
-                "System One relevance threshold must be between 0 and 1",
-            ));
-        }
-        system_one.relevant_min = value;
+        set_unit_interval(
+            &mut system_one.relevant_min,
+            value,
+            "System One relevance threshold must be between 0 and 1",
+        )?;
     }
     if let Some(value) = options.system_one_instructions_max {
-        if !(0.0..=1.0).contains(&value) {
-            return Err(error(
-                "System One instruction threshold must be between 0 and 1",
-            ));
-        }
-        system_one.instructions_max = value;
+        set_unit_interval(
+            &mut system_one.instructions_max,
+            value,
+            "System One instruction threshold must be between 0 and 1",
+        )?;
+    }
+    if let Some(value) = options.system_one_tau_apply {
+        set_unit_interval(
+            &mut system_one.tau_apply,
+            value,
+            "System One apply threshold must be between 0 and 1",
+        )?;
     }
     if let Some(value) = options.system_one_top_n {
         if value < 2 {
             return Err(error("System One top-n must be at least 2"));
         }
         system_one.top_n = value;
-    }
-    if let Some(value) = options.system_one_tau_apply {
-        if !(0.0..=1.0).contains(&value) {
-            return Err(error("System One apply threshold must be between 0 and 1"));
-        }
-        system_one.tau_apply = value;
-    }
-    if let Some(value) = options.service_start_timeout_secs {
-        if value == 0 {
-            return Err(error("managed service startup timeout must be nonzero"));
-        }
-        if let Some(service) = config.services.get_mut("gemma") {
-            service.start_timeout_secs = value;
-        }
     }
     Ok(())
 }

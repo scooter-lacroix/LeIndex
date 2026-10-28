@@ -3,6 +3,10 @@
 //! still reaches every private item.
 
 use super::*;
+// Request shaping now lives in `remote_budget`; it is reached through the
+// parent's `super::*` only for the three names `remote.rs` itself re-exports,
+// so the rest are imported at their new home.
+use super::remote_budget::{estimate_tokens, request_width_for, truncate_to_token_budget};
 
 #[test]
 fn test_remote_provider_default_dimension() {

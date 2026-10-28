@@ -194,6 +194,155 @@ impl GeminiEmbeddingProvider {
         }
     }
 
+    /// The `:method` URL and JSON body for one native request.
+    ///
+    /// The resource name, not the bare model id: the batch API requires
+    /// `models/<id>` per request.
+    fn native_request(
+        &self,
+        texts: &[&str],
+        task: GeminiTask,
+        single: bool,
+    ) -> Result<(String, serde_json::Value), RemoteEmbeddingError> {
+        let resource = format!("models/{}", self.model);
+        let task_type = task.as_str();
+        let output_dimensionality = self.dimension_override;
+        let (method, body) = if single {
+            let body = serde_json::to_value(GeminiSingleRequest {
+                content: gemini_content(texts[0]),
+                task_type,
+                output_dimensionality,
+            });
+            ("embedContent", body)
+        } else {
+            let body = serde_json::to_value(GeminiBatchRequestList {
+                requests: texts
+                    .iter()
+                    .map(|text| GeminiBatchRequestRef {
+                        model: resource.clone(),
+                        content: gemini_content(text),
+                        task_type,
+                        output_dimensionality,
+                    })
+                    .collect(),
+            });
+            ("batchEmbedContents", body)
+        };
+        let body = body.map_err(|e| RemoteEmbeddingError::InvalidResponse(e.to_string()))?;
+        Ok((format!("{}/{resource}:{method}", self.base_url), body))
+    }
+
+    /// POST one native request and return the raw response body.
+    ///
+    /// Exactly one HTTP attempt: the retry ladder lives in the caller.
+    async fn send_native_request(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<String, RemoteEmbeddingError> {
+        let response = self
+            .client
+            .post(url)
+            // The native API takes the key as a header, not a Bearer token.
+            .header("x-goog-api-key", &self.api_key)
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| RemoteEmbeddingError::Transport(error.to_string()))?;
+
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| RemoteEmbeddingError::Transport(e.to_string()))?;
+
+        if status.is_success() {
+            return Ok(text);
+        }
+        if status.as_u16() == 429 {
+            return Err(RemoteEmbeddingError::RateLimitExceeded(
+                "Gemini".to_string(),
+            ));
+        }
+        Err(RemoteEmbeddingError::HttpStatus {
+            status: status.as_u16(),
+            message: text,
+        })
+    }
+
+    /// Decode the single or batch native response into vectors, in request
+    /// order.
+    fn parse_native_embeddings(
+        single: bool,
+        response_text: &str,
+    ) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
+        if single {
+            let parsed: GeminiSingleResponse = serde_json::from_str(response_text)
+                .map_err(|e| RemoteEmbeddingError::InvalidResponse(e.to_string()))?;
+            return Ok(vec![parsed.embedding.values]);
+        }
+        let parsed: GeminiBatchResponse = serde_json::from_str(response_text)
+            .map_err(|e| RemoteEmbeddingError::InvalidResponse(e.to_string()))?;
+        Ok(parsed.embeddings.into_iter().map(|e| e.values).collect())
+    }
+
+    /// The width a response must match: the measured width once one has been
+    /// seen, else the operator's pin.
+    ///
+    /// Deliberately narrower than [`Self::current_dimension`], which falls back
+    /// to the bootstrap default. That default must never be enforced on a
+    /// response — see [`Self::enforce_dimensions`].
+    fn enforced_dimension(&self) -> Option<usize> {
+        let measured = self.measured.load(std::sync::atomic::Ordering::Relaxed);
+        if measured > 0 {
+            Some(measured)
+        } else {
+            self.dimension_override
+        }
+    }
+
+    /// Dimension truth, identical to the OpenAI-compatible path: a known
+    /// dimension (measured or pinned) is enforced on every row; otherwise the
+    /// first successful length becomes the measurement and the bootstrap
+    /// default is never enforced.
+    fn enforce_dimensions(&self, embeddings: &[Vec<f32>]) -> Result<(), RemoteEmbeddingError> {
+        let expected = match self.enforced_dimension() {
+            Some(expected) => expected,
+            None => match embeddings.first() {
+                Some(first) => first.len(),
+                None => return Ok(()),
+            },
+        };
+        for embedding in embeddings {
+            if embedding.len() != expected {
+                return Err(RemoteEmbeddingError::InvalidDimension {
+                    expected,
+                    got: embedding.len(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The first successful response establishes the measured width; every
+    /// later one is checked against it by [`Self::enforce_dimensions`].
+    fn record_measured_dimension(&self, embeddings: &[Vec<f32>]) {
+        use std::sync::atomic::Ordering;
+        if self.measured.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        let Some(first) = embeddings.first() else {
+            return;
+        };
+        self.measured.store(first.len(), Ordering::Relaxed);
+        tracing::info!(
+            dimension = first.len(),
+            model = %self.model,
+            "Measured Gemini embedding dimension from first response"
+        );
+    }
+
     /// POST one native request. Exactly one HTTP attempt.
     async fn embed_native_once(
         &self,
@@ -201,94 +350,10 @@ impl GeminiEmbeddingProvider {
         task: GeminiTask,
     ) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
         let single = texts.len() == 1;
-
-        #[derive(Deserialize)]
-        struct GeminiValues {
-            values: Vec<f32>,
-        }
-
-        #[derive(Deserialize)]
-        struct GeminiBatchResponse {
-            embeddings: Vec<GeminiValues>,
-        }
-
-        #[derive(Deserialize)]
-        struct GeminiSingleResponse {
-            embedding: GeminiValues,
-        }
-
         let expected = texts.len();
-        let resource = format!("models/{}", self.model);
-        let task_type = task.as_str();
-        let output_dimensionality = self.dimension_override;
-        let (method, body) = if single {
-            (
-                "embedContent",
-                serde_json::to_value(GeminiSingleRequest {
-                    content: gemini_content(texts[0]),
-                    task_type,
-                    output_dimensionality,
-                }),
-            )
-        } else {
-            (
-                "batchEmbedContents",
-                serde_json::to_value(GeminiBatchRequestList {
-                    requests: texts
-                        .iter()
-                        .map(|text| GeminiBatchRequestRef {
-                            // The resource name, not the bare model id: the
-                            // batch API requires `models/<id>` per request.
-                            model: resource.clone(),
-                            content: gemini_content(text),
-                            task_type,
-                            output_dimensionality,
-                        })
-                        .collect(),
-                }),
-            )
-        };
-        let body = body.map_err(|e| RemoteEmbeddingError::InvalidResponse(e.to_string()))?;
-
-        let url = format!("{}/{resource}:{method}", self.base_url);
-        let response = self
-            .client
-            .post(&url)
-            // The native API takes the key as a header, not a Bearer token.
-            .header("x-goog-api-key", &self.api_key)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| RemoteEmbeddingError::Transport(error.to_string()))?;
-
-        let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| RemoteEmbeddingError::Transport(e.to_string()))?;
-
-        if !status.is_success() {
-            if status.as_u16() == 429 {
-                return Err(RemoteEmbeddingError::RateLimitExceeded(
-                    "Gemini".to_string(),
-                ));
-            }
-            return Err(RemoteEmbeddingError::HttpStatus {
-                status: status.as_u16(),
-                message: response_text,
-            });
-        }
-
-        let embeddings: Vec<Vec<f32>> = if single {
-            let parsed: GeminiSingleResponse = serde_json::from_str(&response_text)
-                .map_err(|e| RemoteEmbeddingError::InvalidResponse(e.to_string()))?;
-            vec![parsed.embedding.values]
-        } else {
-            let parsed: GeminiBatchResponse = serde_json::from_str(&response_text)
-                .map_err(|e| RemoteEmbeddingError::InvalidResponse(e.to_string()))?;
-            parsed.embeddings.into_iter().map(|e| e.values).collect()
-        };
+        let (url, body) = self.native_request(texts, task, single)?;
+        let response_text = self.send_native_request(&url, &body).await?;
+        let embeddings = Self::parse_native_embeddings(single, &response_text)?;
 
         // Order IS the contract here: there is no `index` to verify against, so
         // a row-count mismatch is the only evidence the response is unusable,
@@ -300,42 +365,29 @@ impl GeminiEmbeddingProvider {
             )));
         }
 
-        // Dimension truth, identical to the OpenAI-compatible path: a known
-        // dimension (measured or pinned) is enforced on every row; otherwise the
-        // first successful length becomes the measurement and the bootstrap
-        // default is never enforced.
-        let known = {
-            let measured = self.measured.load(std::sync::atomic::Ordering::Relaxed);
-            if measured > 0 {
-                Some(measured)
-            } else {
-                self.dimension_override
-            }
-        };
-        if let Some(expected) = known.or_else(|| embeddings.first().map(Vec::len)) {
-            for embedding in &embeddings {
-                if embedding.len() != expected {
-                    return Err(RemoteEmbeddingError::InvalidDimension {
-                        expected,
-                        got: embedding.len(),
-                    });
-                }
-            }
-        }
-        if let Some(first) = embeddings
-            .first()
-            .filter(|_| self.measured.load(std::sync::atomic::Ordering::Relaxed) == 0)
-        {
-            self.measured
-                .store(first.len(), std::sync::atomic::Ordering::Relaxed);
-            tracing::info!(
-                dimension = first.len(),
-                model = %self.model,
-                "Measured Gemini embedding dimension from first response"
-            );
-        }
+        self.enforce_dimensions(&embeddings)?;
+        self.record_measured_dimension(&embeddings);
         Ok(embeddings)
     }
+}
+
+/// `{"embedding":{"values":[...]}}` — the `embedContent` (single text) reply.
+///
+/// These stay at module scope rather than inside `embed_native_once` because
+/// decoding was split into [`GeminiEmbeddingProvider::parse_native_embeddings`].
+#[derive(Deserialize)]
+struct GeminiValues {
+    values: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+struct GeminiBatchResponse {
+    embeddings: Vec<GeminiValues>,
+}
+
+#[derive(Deserialize)]
+struct GeminiSingleResponse {
+    embedding: GeminiValues,
 }
 
 #[async_trait]

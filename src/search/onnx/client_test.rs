@@ -217,9 +217,9 @@ fn test_batch_id_monotonic() {
 
 // ── VAL-SETUP-020/VAL-ORT-006: config-driven ORT_DYLIB_PATH injection ──
 
-// Use a process-shared lock so env-mutating tests serialize within the module.
-use std::sync::Mutex;
-static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+// Env-mutating tests serialize on the process-wide lock: a module-local mutex
+// would still race every other module, and `LEINDEX_HOME` is process-global.
+use crate::test_env::EnvLock as TEST_ENV_LOCK;
 
 #[test]
 fn test_read_ort_dylib_path_from_config_returns_value() {

@@ -1471,39 +1471,12 @@ impl LeIndex {
             &lexical_hash,
             &current_embed_model,
         );
-        // A checkpoint can be internally consistent yet still cover only a
-        // fraction of the lexical admission set (for example, a killed or
-        // degraded 1/866 pass). Never treat that partial layer as reusable:
-        // clear it and run enrichment again so missing nodes are retried.
-        if neural_resume_loaded && neural_rows < state.admitted_node_ids.len() {
-            warn!(
-                restored = neural_rows,
-                admitted = state.admitted_node_ids.len(),
-                "discarding partial neural checkpoint; re-embedding admitted nodes"
-            );
-            self.search_engine.clear_neural_embeddings();
-            neural_rows = 0;
-            neural_resume_loaded = false;
-        }
+        self.validate_neural_resume(&mut neural_rows, &mut neural_resume_loaded, &state);
         if let Some(neural_embedder) = neural_embedder
             .as_ref()
             .filter(|_| neural_rows == 0 && !neural_resume_loaded)
         {
-            let pdg = self
-                .pdg
-                .as_ref()
-                .context("PDG is resident before neural enrichment")?;
-            progress_stderr(&format!(
-                "Indexing: neural embedding {} admitted nodes...",
-                state.admitted_node_ids.len()
-            ));
-            neural_rows = enrich_neural_for_route(
-                &mut self.search_engine,
-                pdg,
-                neural_embedder,
-                &state.admitted_node_ids,
-                &self.project_path,
-            )?;
+            neural_rows = self.enrich_admitted_nodes(&state, neural_embedder)?;
         }
         let (selected_model, selected_provider) = self.persist_neural_outputs(
             &state,
@@ -1530,6 +1503,53 @@ impl LeIndex {
         state.neural_checkpoint = Some(neural_checkpoint.clone());
         self.pipeline = Some(state);
         Ok(neural_checkpoint)
+    }
+
+    /// A checkpoint can be internally consistent yet still cover only a
+    /// fraction of the lexical admission set (for example, a killed or degraded
+    /// 1/866 pass). Never treat that partial layer as reusable: clear it and
+    /// run enrichment again so missing nodes are retried.
+    fn validate_neural_resume(
+        &mut self,
+        neural_rows: &mut usize,
+        neural_resume_loaded: &mut bool,
+        state: &IndexPipelineState,
+    ) {
+        if !*neural_resume_loaded || *neural_rows >= state.admitted_node_ids.len() {
+            return;
+        }
+        warn!(
+            restored = *neural_rows,
+            admitted = state.admitted_node_ids.len(),
+            "discarding partial neural checkpoint; re-embedding admitted nodes"
+        );
+        self.search_engine.clear_neural_embeddings();
+        *neural_rows = 0;
+        *neural_resume_loaded = false;
+    }
+
+    /// Embed every admitted node through the configured embedder, returning the
+    /// number of neural rows produced.
+    fn enrich_admitted_nodes(
+        &mut self,
+        state: &IndexPipelineState,
+        neural_embedder: &index_builder::GenerationNeuralEmbedder,
+    ) -> Result<usize> {
+        let pdg = self
+            .pdg
+            .as_ref()
+            .context("PDG is resident before neural enrichment")?;
+        progress_stderr(&format!(
+            "Indexing: neural embedding {} admitted nodes...",
+            state.admitted_node_ids.len()
+        ));
+        enrich_neural_for_route(
+            &mut self.search_engine,
+            pdg,
+            neural_embedder,
+            &state.admitted_node_ids,
+            &self.project_path,
+        )
     }
 
     /// Assemble the neural checkpoint from the phase outcome. Kept out of

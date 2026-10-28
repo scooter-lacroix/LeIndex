@@ -27,6 +27,36 @@ pub use remote_types::{RemoteEmbeddingError, RemoteProvider};
 mod remote_gemini;
 pub use remote_gemini::GeminiEmbeddingProvider;
 
+/// Task-template rendering (`{text}` / `{title}`) and its tests.
+#[path = "remote_template.rs"]
+mod remote_template;
+pub(crate) use remote_template::{apply_doc_template, apply_template};
+
+/// Hosted providers (OpenAI, Cohere) and the retry ladder only they use.
+#[path = "remote_cloud.rs"]
+mod remote_cloud;
+pub use remote_cloud::{CohereEmbeddingProvider, OpenAIEmbeddingProvider};
+
+/// Request shaping (token estimate, truncation, request width).
+#[path = "remote_budget.rs"]
+mod remote_budget;
+pub(crate) use remote_budget::{
+    endpoint_is_local, remote_max_in_flight, request_width_for, truncate_to_token_budget,
+};
+
+/// Exponential backoff with a cap: 250ms, 500ms, 1s, 2s, then 2s.
+///
+/// Deliberately small. A reset socket or a saturated queue clears in well under
+/// a second; anything larger just hides a dead endpoint behind a longer stall.
+///
+/// Lives here rather than beside its callers because both the hosted retry
+/// ladder (`remote_cloud`) and the custom/Gemini ladders use it.
+pub(crate) fn retry_backoff(attempt: usize) -> std::time::Duration {
+    const BASE_MS: u64 = 250;
+    const CAP_MS: u64 = 2_000;
+    std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << attempt.min(3)).min(CAP_MS))
+}
+
 /// Remote embedding provider configuration
 #[derive(Debug, Clone)]
 pub struct RemoteEmbeddingConfig {
@@ -338,80 +368,6 @@ fn build_http_client(config: &RemoteEmbeddingConfig) -> Result<Client, RemoteEmb
         .map_err(|e| RemoteEmbeddingError::HttpClient(e.to_string()))
 }
 
-/// Availability statuses that mean "the endpoint is busy or restarting", not
-/// "your input is wrong" — re-sending the identical bytes can plausibly work.
-///
-/// A definitive rejection (400/413/422 naming content, 401 naming credentials)
-/// is deliberately absent: those fail identically forever, so retrying only
-/// delays the bisect that would have isolated the offending document.
-fn is_retryable_status(status: u16) -> bool {
-    // 500 is deliberately absent: llama-server answers an input over its
-    // per-input token limit with HTTP 500, and every other provider's 500 is
-    // equally deterministic for identical bytes. Re-sending it would multiply
-    // the failure and starve the bisection that narrows it to the one bad
-    // document. A 500 is BISECTED instead (see `is_bisectable_embedding_status`).
-    matches!(status, 408 | 425 | 429 | 502 | 503 | 504 | 507 | 509 | 529)
-}
-
-/// Exponential backoff with a cap: 250ms, 500ms, 1s, 2s, then 2s.
-///
-/// Deliberately small. A reset socket or a saturated queue clears in well under
-/// a second; anything larger just hides a dead endpoint behind a longer stall.
-pub(crate) fn retry_backoff(attempt: usize) -> std::time::Duration {
-    const BASE_MS: u64 = 250;
-    const CAP_MS: u64 = 2_000;
-    std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << attempt.min(3)).min(CAP_MS))
-}
-
-/// Send one request, retrying transient failures up to `max_retries` times.
-///
-/// This is the ladder `RemoteEmbeddingConfig::max_retries` always described and
-/// never had: before it existed, a single reset socket became a permanent
-/// neural-generation freeze (the caller's `stopped` latch fires on the first
-/// whole-batch error and never clears).
-///
-/// `build` is a closure, not a prepared `Request`, because every attempt needs
-/// its own body. When the budget is exhausted the last response is returned
-/// verbatim rather than converted to an error: the caller's status handling
-/// (availability fast-fail, oversized-input bisection) owns the verdict, so
-/// `max_retries == 0` reproduces the pre-retry behaviour exactly.
-async fn send_with_retry<F>(
-    max_retries: usize,
-    mut build: F,
-) -> Result<reqwest::Response, RemoteEmbeddingError>
-where
-    F: FnMut() -> reqwest::RequestBuilder,
-{
-    let mut attempt = 0;
-    loop {
-        let reason = match build().send().await {
-            Ok(response) => {
-                let status = response.status().as_u16();
-                if attempt >= max_retries || !is_retryable_status(status) {
-                    return Ok(response);
-                }
-                format!("HTTP {status}")
-            }
-            Err(error) => {
-                if attempt >= max_retries {
-                    return Err(RemoteEmbeddingError::Transport(error.to_string()));
-                }
-                error.to_string()
-            }
-        };
-        let delay = retry_backoff(attempt);
-        tracing::warn!(
-            attempt = attempt + 1,
-            max_retries,
-            delay_ms = delay.as_millis() as u64,
-            %reason,
-            "Remote embedding request failed transiently; retrying"
-        );
-        tokio::time::sleep(delay).await;
-        attempt += 1;
-    }
-}
-
 /// Trait for remote embedding providers
 // `async_trait` (0.1.91) unconditionally stamps a bare `#[must_use]` on every
 // generated trait method whose return type is `Pin<Box<dyn Future>>`, which is
@@ -536,249 +492,6 @@ pub(crate) fn reorder_embeddings_by_index(
             })
         })
         .collect()
-}
-
-/// OpenAI embedding provider implementation
-pub struct OpenAIEmbeddingProvider {
-    client: Client,
-    config: RemoteEmbeddingConfig,
-}
-
-impl OpenAIEmbeddingProvider {
-    /// Create a new OpenAI embedding provider
-    pub fn new(config: RemoteEmbeddingConfig) -> Result<Self, RemoteEmbeddingError> {
-        if config.api_key.is_none() {
-            return Err(RemoteEmbeddingError::ApiKeyNotFound("OpenAI".to_string()));
-        }
-        let client = build_http_client(&config)?;
-        Ok(Self { client, config })
-    }
-}
-
-#[async_trait]
-impl RemoteEmbeddingProvider for OpenAIEmbeddingProvider {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, RemoteEmbeddingError> {
-        let embeddings = self.embed_batch(vec![text]).await?;
-        embeddings.into_iter().next().ok_or_else(|| {
-            RemoteEmbeddingError::InvalidResponse("No embedding returned".to_string())
-        })
-    }
-
-    async fn embed_batch(&self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
-        let model_name = match &self.config.provider {
-            RemoteProvider::OpenAI { model } => model.clone(),
-            _ => {
-                return Err(RemoteEmbeddingError::ApiError(
-                    "Invalid provider".to_string(),
-                ));
-            }
-        };
-
-        #[derive(Serialize)]
-        struct OpenAIRequest<'a> {
-            model: String,
-            input: Vec<&'a str>,
-            encoding_format: String,
-        }
-
-        #[derive(Deserialize)]
-        struct OpenAIResponse {
-            data: Vec<OpenAIEmbedding>,
-        }
-
-        // `index` is required: OpenAI-compatible endpoints may return `data`
-        // out of request order, and a missing index is a contract violation.
-        #[derive(Deserialize)]
-        struct OpenAIEmbedding {
-            index: usize,
-            embedding: Vec<f32>,
-        }
-
-        let texts_len = texts.len();
-        let request = OpenAIRequest {
-            model: model_name,
-            input: texts,
-            encoding_format: "float".to_string(),
-        };
-
-        let api_key = self.config.api_key.as_ref().unwrap();
-
-        let response = send_with_retry(self.config.max_retries, || {
-            self.client
-                .post("https://api.openai.com/v1/embeddings")
-                .header("Authorization", format!("Bearer {}", api_key))
-                .header("Content-Type", "application/json")
-                .json(&request)
-        })
-        .await?;
-
-        let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| RemoteEmbeddingError::Transport(e.to_string()))?;
-
-        if !status.is_success() {
-            if status.as_u16() == 429 {
-                return Err(RemoteEmbeddingError::RateLimitExceeded(
-                    "OpenAI".to_string(),
-                ));
-            }
-            return Err(RemoteEmbeddingError::HttpStatus {
-                status: status.as_u16(),
-                message: format!("OpenAI: {response_text}"),
-            });
-        }
-
-        let openai_response: OpenAIResponse = serde_json::from_str(&response_text)
-            .map_err(|e| RemoteEmbeddingError::InvalidResponse(e.to_string()))?;
-
-        reorder_embeddings_by_index(
-            openai_response
-                .data
-                .into_iter()
-                .map(|e| (e.index, e.embedding))
-                .collect(),
-            texts_len,
-        )
-    }
-
-    fn dimension(&self) -> usize {
-        self.config.provider.default_dimension()
-    }
-}
-
-/// Cohere embedding provider implementation
-pub struct CohereEmbeddingProvider {
-    client: Client,
-    config: RemoteEmbeddingConfig,
-}
-
-impl CohereEmbeddingProvider {
-    /// Create a new Cohere embedding provider
-    pub fn new(config: RemoteEmbeddingConfig) -> Result<Self, RemoteEmbeddingError> {
-        if config.api_key.is_none() {
-            return Err(RemoteEmbeddingError::ApiKeyNotFound("Cohere".to_string()));
-        }
-
-        let client = build_http_client(&config)?;
-
-        Ok(Self { client, config })
-    }
-}
-
-#[async_trait]
-impl RemoteEmbeddingProvider for CohereEmbeddingProvider {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, RemoteEmbeddingError> {
-        let embeddings = self
-            .embed_with_input_type(vec![text], self.config.input_type_query.as_deref())
-            .await?;
-        embeddings.into_iter().next().ok_or_else(|| {
-            RemoteEmbeddingError::InvalidResponse("No embedding returned".to_string())
-        })
-    }
-
-    async fn embed_batch(&self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
-        self.embed_with_input_type(texts, self.config.input_type_document.as_deref())
-            .await
-    }
-
-    fn dimension(&self) -> usize {
-        self.config.provider.default_dimension()
-    }
-}
-
-impl CohereEmbeddingProvider {
-    /// POST `/embed` for one batch with an explicit `input_type`.
-    ///
-    /// Cohere's `input_type` selects the retrieval side the vectors are tuned
-    /// for, so the document and query paths MUST send different values. This
-    /// used to hardcode `search_document` on both, which put queries in the
-    /// document subspace and quietly degraded recall.
-    ///
-    /// `None` omits the field: only an operator-supplied `input_type: none`-ish
-    /// config can produce that, and inventing a value is worse than letting the
-    /// API reject the request loudly.
-    async fn embed_with_input_type(
-        &self,
-        texts: Vec<&str>,
-        input_type: Option<&str>,
-    ) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
-        let model_name = match &self.config.provider {
-            RemoteProvider::Cohere { model } => model.clone(),
-            _ => {
-                return Err(RemoteEmbeddingError::ApiError(
-                    "Invalid provider".to_string(),
-                ));
-            }
-        };
-
-        let base_url = self.config.base_url.as_ref().unwrap();
-
-        #[derive(Serialize)]
-        struct CohereRequest<'a> {
-            model: String,
-            texts: Vec<&'a str>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            input_type: Option<&'a str>,
-        }
-
-        #[derive(Deserialize)]
-        struct CohereResponse {
-            embeddings: Vec<CohereEmbedding>,
-        }
-
-        #[derive(Deserialize)]
-        struct CohereEmbedding {
-            embedding: Vec<f32>,
-        }
-
-        let request = CohereRequest {
-            model: model_name,
-            texts,
-            input_type,
-        };
-
-        let api_key = self.config.api_key.as_ref().unwrap();
-
-        let url = format!("{}/embed", base_url);
-        let response = send_with_retry(self.config.max_retries, || {
-            self.client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", api_key))
-                .header("Content-Type", "application/json")
-                .header("X-Client-Name", "leindex")
-                .json(&request)
-        })
-        .await?;
-
-        let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| RemoteEmbeddingError::Transport(e.to_string()))?;
-
-        if !status.is_success() {
-            if status.as_u16() == 429 {
-                return Err(RemoteEmbeddingError::RateLimitExceeded(
-                    "Cohere".to_string(),
-                ));
-            }
-            return Err(RemoteEmbeddingError::HttpStatus {
-                status: status.as_u16(),
-                message: format!("Cohere: {response_text}"),
-            });
-        }
-
-        let cohere_response: CohereResponse = serde_json::from_str(&response_text)
-            .map_err(|e| RemoteEmbeddingError::InvalidResponse(e.to_string()))?;
-
-        Ok(cohere_response
-            .embeddings
-            .into_iter()
-            .map(|e| e.embedding)
-            .collect())
-    }
 }
 
 /// OpenAI-compatible embedding provider for user-configured endpoints
@@ -1007,6 +720,142 @@ impl<'a> RetryAllowance<'a> {
     }
 }
 
+/// Accumulated state of one bisect-retrying remote batch.
+///
+/// Split out of [`CustomEmbeddingProvider::embed_pending`] so the bisection
+/// loop, the single-input verdict and the final fallback policy each read on
+/// their own. The fields are the loop's whole working set: which ranges are
+/// still queued, which inputs the endpoint rejected individually, and the
+/// error that stopped the run early (if any).
+struct PendingOutcome<'rows, 'batch, 'allowance> {
+    /// Write-through target, indexed by the ORIGINAL position in the batch.
+    rows: &'rows mut [Option<Vec<f32>>],
+    /// Map from a slice-local position back to that original position.
+    indices: &'batch [usize],
+    /// The batch-wide retry budget, shared with every sub-request and oversize
+    /// shrink. Held here so the single-input verdict can shrink-and-retry
+    /// without the caller threading it through.
+    allowance: &'allowance RetryAllowance<'allowance>,
+    /// Ranges still to send. Popped from the tail, so a bisection's halves are
+    /// depth-first and a landed sub-batch is never re-sent.
+    pending_slices: Vec<(usize, usize)>,
+    /// Single inputs the endpoint rejected for a document-level reason.
+    skipped: Vec<usize>,
+    /// Single inputs rejected as larger than the server's per-input limit.
+    oversized: Vec<usize>,
+    /// First HTTP status/message behind `skipped`, used to report a batch where
+    /// nothing at all landed.
+    first_error: Option<(u16, String)>,
+    /// Set when the run must stop but already-embedded vectors are kept.
+    aborted_mid_flight: Option<RemoteEmbeddingError>,
+}
+
+impl<'rows, 'batch, 'allowance> PendingOutcome<'rows, 'batch, 'allowance> {
+    fn new(
+        rows: &'rows mut [Option<Vec<f32>>],
+        indices: &'batch [usize],
+        allowance: &'allowance RetryAllowance<'allowance>,
+    ) -> Self {
+        Self {
+            pending_slices: vec![(0, indices.len())],
+            rows,
+            indices,
+            allowance,
+            skipped: Vec::new(),
+            oversized: Vec::new(),
+            first_error: None,
+            aborted_mid_flight: None,
+        }
+    }
+
+    /// Write a fully-answered range's vectors into their original positions.
+    fn land(&mut self, start: usize, end: usize, embeddings: Vec<Vec<f32>>) {
+        for (index, embedding) in (start..end).zip(embeddings) {
+            self.rows[self.indices[index]] = Some(embedding);
+        }
+    }
+
+    /// Split a rejected range in half and requeue both halves.
+    ///
+    /// Bisection is NOT a retry: each split halves the range, so depth is
+    /// `<= log2(batch)` and the total request count is `<= 2n-1` for an n-input
+    /// batch. It needs no budget.
+    fn bisect(&mut self, start: usize, end: usize, status: u16, message: String) {
+        self.first_error.get_or_insert((status, message));
+        tracing::debug!(
+            start,
+            end,
+            batch_len = end - start,
+            "Bisecting failed remote embedding batch"
+        );
+        let middle = start + (end - start) / 2;
+        self.pending_slices.push((middle, end));
+        self.pending_slices.push((start, middle));
+    }
+
+    /// Stop the run, keeping whatever already landed.
+    fn abort(&mut self, error: RemoteEmbeddingError) {
+        self.aborted_mid_flight = Some(error);
+        self.pending_slices.clear();
+    }
+
+    /// Apply the batch's fallback policy once the queue is exhausted.
+    fn finish(self) -> Result<(), RemoteEmbeddingError> {
+        let Self {
+            rows,
+            indices,
+            skipped,
+            oversized,
+            first_error,
+            aborted_mid_flight,
+            ..
+        } = self;
+        let embedded = indices
+            .iter()
+            .filter(|&&position| rows[position].is_some())
+            .count();
+        if let Some(error) = aborted_mid_flight {
+            if embedded == 0 {
+                return Err(error);
+            }
+            tracing::warn!(
+                %error,
+                embedded,
+                total = indices.len(),
+                "Remote batch aborted mid-flight; keeping already-embedded rows and leaving the rest empty"
+            );
+            return Ok(());
+        }
+        if !skipped.is_empty() && embedded == 0 {
+            let (status, _) = first_error.expect("failed leaves have an HTTP status");
+            return Err(RemoteEmbeddingError::HttpStatus {
+                status,
+                message: format!("all {} inputs failed individually", skipped.len()),
+            });
+        }
+        if !oversized.is_empty() {
+            // Every one of these was refused as an individual DOCUMENT for
+            // exceeding the server's per-input token limit. That is not an
+            // endpoint outage, so it must not surface as an `Err`: doing so
+            // would spend the caller's sustained-failure budget on documents
+            // the server will never accept, which is exactly how oversized
+            // inputs used to freeze the whole neural layer. The rows stay
+            // `None` (those documents get no neural vector) and the batch is
+            // reported as handled.
+            tracing::warn!(
+                oversized = oversized.len(),
+                total = indices.len(),
+                "Skipping documents that exceed the server's per-input token limit; \
+                 raise the service's -ub (logical batch) to admit them"
+            );
+        }
+        if !skipped.is_empty() {
+            tracing::warn!(skipped_indices = ?skipped, "Skipping remote embedding inputs rejected individually");
+        }
+        Ok(())
+    }
+}
+
 /// Run one batch request, re-sending transient failures while the batch's
 /// shared [`RetryAllowance`] permits.
 ///
@@ -1068,260 +917,6 @@ pub(crate) fn is_oversized_input_rejection(status: u16, message: &str) -> bool {
             .to_ascii_lowercase()
             .contains("too large to process")
 }
-
-/// Apply a task template to `text`: replace every `{text}` placeholder with
-/// the text (prefix-only templates — no placeholder — prepend + space).
-fn apply_template<'a>(template: Option<&str>, text: &'a str) -> std::borrow::Cow<'a, str> {
-    match template {
-        None => std::borrow::Cow::Borrowed(text),
-        Some(t) if t.contains("{text}") => std::borrow::Cow::Owned(t.replace("{text}", text)),
-        Some(t) => std::borrow::Cow::Owned(format!("{t} {text}")),
-    }
-}
-
-/// Apply the DOCUMENT task template with a title.
-///
-/// EmbeddingGemma2 document inputs are `title: {title} | text: {text}`; the
-/// model card mandates `title: none` when no title is available, so callers
-/// without a title (queries aside, the title-less doc paths, fragments)
-/// pass `None` and every `{title}` placeholder resolves to `none`.
-///
-/// Substitution is a SINGLE LEFT-TO-RIGHT PASS over the template, and neither
-/// substituted value is ever rescanned. Replacing `{title}` and then searching
-/// the already-filled string for `{text}` — which is what this used to do —
-/// let a title containing the literal `{text}` swallow the document body: a
-/// source file legitimately named `{text}.rs` produces exactly that title, and
-/// its embedding would be built from the body twice and no title at all.
-pub(crate) fn apply_doc_template<'a>(
-    template: Option<&str>,
-    title: Option<&str>,
-    text: &'a str,
-) -> std::borrow::Cow<'a, str> {
-    let title = title.unwrap_or("none");
-    let Some(template) = template else {
-        return std::borrow::Cow::Borrowed(text);
-    };
-    if !template.contains("{text}") && !template.contains("{title}") {
-        // Prefix-only template: prepend and separate.
-        return std::borrow::Cow::Owned(format!("{template} {text}"));
-    }
-    let mut out = String::with_capacity(template.len() + text.len() + title.len());
-    let mut rest = template;
-    while let Some(open) = rest.find('{') {
-        out.push_str(&rest[..open]);
-        let after = &rest[open..];
-        if let Some(tail) = after.strip_prefix("{title}") {
-            out.push_str(title);
-            rest = tail;
-        } else if let Some(tail) = after.strip_prefix("{text}") {
-            out.push_str(text);
-            rest = tail;
-        } else {
-            // A literal brace that starts no placeholder.
-            out.push('{');
-            rest = &after[1..];
-        }
-    }
-    out.push_str(rest);
-    // A template with `{title}` but no `{text}` still needs the body appended,
-    // matching the historical behaviour.
-    if !template.contains("{text}") {
-        out.push(' ');
-        out.push_str(text);
-    }
-    std::borrow::Cow::Owned(out)
-}
-
-#[cfg(test)]
-mod template_tests {
-    use super::apply_doc_template;
-
-    #[test]
-    fn test_title_containing_a_placeholder_does_not_swallow_the_body() {
-        // A source file named `{text}.rs` yields exactly this title. The old
-        // two-pass replace substituted the BODY into the title slot.
-        let out = apply_doc_template(
-            Some("title: {title} | text: {text}"),
-            Some("{text}.rs"),
-            "BODY",
-        );
-        assert_eq!(
-            out, "title: {text}.rs | text: BODY",
-            "a title must be inserted verbatim and never rescanned for placeholders"
-        );
-        assert!(
-            !out.contains("text: BODY |"),
-            "the body must not replace the title"
-        );
-    }
-
-    #[test]
-    fn test_missing_title_resolves_to_none() {
-        assert_eq!(
-            apply_doc_template(Some("title: {title} | text: {text}"), None, "B"),
-            "title: none | text: B"
-        );
-    }
-
-    #[test]
-    fn test_prefix_only_template_appends_the_body() {
-        assert_eq!(
-            apply_doc_template(Some("search_document:"), None, "B"),
-            "search_document: B"
-        );
-    }
-
-    #[test]
-    fn test_no_template_returns_the_raw_text() {
-        assert_eq!(apply_doc_template(None, Some("t"), "B"), "B");
-    }
-}
-
-/// In-flight requests per batch for a remote endpoint.
-///
-/// Measured against the live hosted endpoint with the configured model
-/// `embeddinggemma-2` (768-dim, 32 x 882 B per request, n >= 6 requests per
-/// arm, echoed model verified on every response):
-///
-/// | K | rows/s | speedup | median round |
-/// |---|--------|---------|--------------|
-/// | 1 |  17.41 |   1.00x |        1.84s |
-/// | 2 |  19.76 |   1.13x |        3.24s |
-/// | 4 |  47.65 |   2.74x |        2.69s |
-///
-/// K=2 is a plateau, not a smooth ramp: its median request rose to 2.17s and
-/// one round took 3.70s for the same 64 rows, so a second request largely
-/// queues. Width pays off between 2 and 4, where median request growth stays
-/// sub-linear, so 4 is the smallest width that actually banks a speedup. Do not
-/// read the K=2 row as "concurrency barely helps" — it is a shallow point on an
-/// otherwise steep curve. K=8 was not measured here and is not claimed.
-///
-/// Local endpoints stay at 1: the managed llama-server is compute-bound rather
-/// than round-trip-bound (it must actually run the model), and it carries the
-/// documented stale-socket hazard that pool reuse is disabled for. Paying
-/// queueing complexity for a small gain against a sub-millisecond RTT is not
-/// worth it, and the serial arm keeps that path byte-identical.
-///
-/// `REMOTE_CHUNK` is a separate constant: the request WIDTH. With 32 rows per
-/// request, a fixed round-trip of ~1.8s is amortised over fewer rows than a
-/// larger request would manage, so this pair (width 32, width 4) is where the
-/// 2.74x above was measured — not a proven optimum for either.
-fn remote_max_in_flight(endpoint: &str) -> usize {
-    if endpoint_is_local(endpoint) { 1 } else { 4 }
-}
-
-/// True when `endpoint` cannot leave this machine (see
-/// [`RemoteEmbeddingConfig::is_local_endpoint`]).
-fn endpoint_is_local(endpoint: &str) -> bool {
-    let config = RemoteEmbeddingConfig {
-        provider: RemoteProvider::Custom {
-            endpoint: endpoint.to_string(),
-        },
-        ..RemoteEmbeddingConfig::default()
-    };
-    config.is_local_endpoint()
-}
-
-/// Rough token count for `text`, for BUDGETING only.
-///
-/// Deliberately a cheap byte-divisor, not a real tokenizer. This is used to
-/// decide how many documents fit in one request, and it is compared against a
-/// budget that is itself conservative: over-estimating costs a slightly
-/// narrower request (cheap, more round trips), while under-estimating costs a
-/// rejected request (the whole point of the exercise). Source and JSON are
-/// token-dense — roughly 3 bytes per token — so dividing by 3 is the safe
-/// direction. An exact tokenizer would need a
-/// per-model vocabulary shipped and versioned alongside the config, which is
-/// far more machinery than a width decision needs.
-pub(crate) fn estimate_tokens(text: &str) -> usize {
-    text.len().div_ceil(3).max(1)
-}
-
-/// Truncate `input` so `estimate_tokens` fits `limit`, cutting at a char
-/// boundary near the byte budget.
-///
-/// Keeps the HEAD of the document: for code, the signature, imports and
-/// enclosing definition come before the body, so a head-truncated symbol still
-/// carries most of its meaning, while a tail-truncated one keeps closing braces
-/// and loses the thing being defined.
-///
-/// Returns the input unchanged when it already fits, so the common path
-/// allocates nothing. The approximation is `3 * limit` bytes — the same
-/// divisor `estimate_tokens` uses, so the two cannot disagree about whether a
-/// text fits.
-pub(crate) fn truncate_to_token_budget<'a>(
-    input: std::borrow::Cow<'a, str>,
-    limit: usize,
-) -> std::borrow::Cow<'a, str> {
-    if limit == 0 || estimate_tokens(&input) <= limit {
-        return input;
-    }
-    let mut end = (limit.saturating_mul(3)).min(input.len());
-    while end > 0 && !input.is_char_boundary(end) {
-        end -= 1;
-    }
-    match input {
-        // Already owned: truncate in place instead of re-allocating a copy.
-        std::borrow::Cow::Owned(mut owned) => {
-            owned.truncate(end);
-            std::borrow::Cow::Owned(owned)
-        }
-        std::borrow::Cow::Borrowed(borrowed) => std::borrow::Cow::Borrowed(&borrowed[..end]),
-    }
-}
-
-/// Request width for one batch, packed against BOTH the document cap and the
-/// request TOKEN budget.
-///
-/// `batch_limit` only counts DOCUMENTS, and a document cap alone cannot keep a
-/// request inside a model's window: 32 documents of ~882 B is ~7k tokens, which
-/// a 2,048-token endpoint rejects wholesale (`The prompt is too long ...
-/// Shorten it and retry`). So after applying the document cap, the inputs are
-/// accumulated against `token_budget` and the window ends at the first document
-/// that would overflow it. One document always goes in, even if it alone
-/// exceeds the budget — a request of one is the smallest legal unit, and
-/// dropping it silently would lose a row instead of reporting the problem.
-///
-/// `pending` carries the ALREADY-TEMPLATED text, so the estimate reflects what
-/// actually goes on the wire.
-///
-/// Local endpoints with no `batch_limit` and no `token_budget` keep today's
-/// behaviour exactly: one request for the whole batch.
-fn request_width_for(
-    pending: &[std::borrow::Cow<'_, str>],
-    batch_limit: Option<usize>,
-    token_budget: Option<usize>,
-    local: bool,
-) -> usize {
-    let total = pending.len();
-    if total == 0 {
-        return 1;
-    }
-    // The document-count ceiling for this request.
-    let count_cap = match batch_limit.filter(|limit| *limit > 0) {
-        Some(limit) => limit.min(total),
-        None if local => total,
-        None => REMOTE_CHUNK.min(total).max(1),
-    };
-    let Some(budget) = token_budget.filter(|budget| *budget > 0) else {
-        return count_cap;
-    };
-    let mut used = 0usize;
-    for (index, text) in pending.iter().take(count_cap).enumerate() {
-        let cost = estimate_tokens(text);
-        // At least one document per request, even when it alone overfills.
-        if index > 0 && used.saturating_add(cost) > budget {
-            return index;
-        }
-        used = used.saturating_add(cost);
-    }
-    count_cap
-}
-
-/// Concurrency-friendly request size for remote endpoints with no configured
-/// hard cap. 32 x 882 B is far below any endpoint's token ceiling, and each of
-/// the 4 in-flight requests stays small enough to overlap cleanly.
-const REMOTE_CHUNK: usize = 32;
 
 impl CustomEmbeddingProvider {
     /// Create a custom OpenAI-compatible embedding provider.
@@ -1582,32 +1177,12 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
         // step rather than computed once, because documents differ in size — a
         // fixed stride would either overflow on a run of long documents or
         // waste the budget on short ones.
-        let local = endpoint_is_local(&self.endpoint);
-        let mut slices: Vec<(usize, usize)> = Vec::new();
-        let mut start = 0usize;
-        while start < pending_inputs.len() {
-            let width = request_width_for(
-                &pending_inputs[start..],
-                self.batch_limit,
-                self.request_token_budget,
-                local,
-            )
-            .max(1);
-            let end = (start + width).min(pending_inputs.len());
-            slices.push((start, end));
-            start = end;
-        }
+        let slices = self.plan_request_slices(&pending_inputs);
         let max_in_flight = remote_max_in_flight(&self.endpoint);
         if max_in_flight <= 1 || slices.len() <= 1 {
             // Serial arm — byte-identical to today's behaviour for local endpoints.
-            for (start, end) in slices {
-                self.embed_pending(
-                    &pending_inputs[start..end],
-                    &mut rows,
-                    &pending_indices[start..end],
-                )
+            self.embed_slices_serial(&slices, &pending_inputs, &mut rows, &pending_indices)
                 .await?;
-            }
         } else {
             // Each worker embeds ONE slice and returns its rows.
             //
@@ -1625,33 +1200,14 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
             // the `async_trait` boxed future below cannot satisfy that
             // lifetime. Chunking the borrowed slice list keeps every future
             // owned and equivalent in effect.
-            //
-            // The scratch is sized to the SLICE, not to `total`: indices are
-            // rebased to slice-local positions before the call, so a worker
-            // never allocates or scans the whole batch. `embed_pending` writes
-            // through the indices it is given, so local indices are all it
-            // needs; the merge below translates them back.
-            for wave in slices.chunks(max_in_flight) {
-                let futures = wave.iter().map(|&(start, end)| {
-                    let pending_inputs = &pending_inputs;
-                    async move {
-                        let width = end - start;
-                        let mut worker_rows = vec![None; width];
-                        let local: Vec<usize> = (0..width).collect();
-                        self.embed_pending(&pending_inputs[start..end], &mut worker_rows, &local)
-                            .await
-                            .map(|()| (start, worker_rows))
-                    }
-                });
-                for result in futures::future::join_all(futures).await {
-                    let (start, worker_rows) = result?;
-                    for (offset, row) in worker_rows.into_iter().enumerate() {
-                        if let Some(row) = row {
-                            rows[pending_indices[start + offset]] = Some(row);
-                        }
-                    }
-                }
-            }
+            self.embed_slices_concurrent(
+                &slices,
+                &pending_inputs,
+                &mut rows,
+                &pending_indices,
+                max_in_flight,
+            )
+            .await?;
         }
 
         if let Some(probe) = &probe {
@@ -1694,6 +1250,88 @@ impl RemoteEmbeddingProvider for CustomEmbeddingProvider {
 }
 
 impl CustomEmbeddingProvider {
+    /// Pack the pending inputs into per-request slices.
+    ///
+    /// Width is re-derived at each step rather than computed once, because
+    /// documents differ in size — a fixed stride would either overflow on a run
+    /// of long documents or waste the budget on short ones.
+    fn plan_request_slices(
+        &self,
+        pending_inputs: &[std::borrow::Cow<'_, str>],
+    ) -> Vec<(usize, usize)> {
+        let local = endpoint_is_local(&self.endpoint);
+        let mut slices: Vec<(usize, usize)> = Vec::new();
+        let mut start = 0usize;
+        while start < pending_inputs.len() {
+            let width = request_width_for(
+                &pending_inputs[start..],
+                self.batch_limit,
+                self.request_token_budget,
+                local,
+            )
+            .max(1);
+            let end = (start + width).min(pending_inputs.len());
+            slices.push((start, end));
+            start = end;
+        }
+        slices
+    }
+
+    /// Send every slice in turn on one connection.
+    async fn embed_slices_serial(
+        &self,
+        slices: &[(usize, usize)],
+        pending_inputs: &[std::borrow::Cow<'_, str>],
+        rows: &mut [Option<Vec<f32>>],
+        pending_indices: &[usize],
+    ) -> Result<(), RemoteEmbeddingError> {
+        for &(start, end) in slices {
+            self.embed_pending(
+                &pending_inputs[start..end],
+                rows,
+                &pending_indices[start..end],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Send slices in waves of `max_in_flight`, merging each wave's rows back
+    /// into their original positions.
+    ///
+    /// The scratch is sized to the SLICE, not to the whole batch: indices are
+    /// rebased to slice-local positions before the call, so a worker never
+    /// allocates or scans everything. [`Self::embed_pending`] writes through
+    /// the indices it is given, so local indices are all it needs; the merge
+    /// here translates them back.
+    async fn embed_slices_concurrent(
+        &self,
+        slices: &[(usize, usize)],
+        pending_inputs: &[std::borrow::Cow<'_, str>],
+        rows: &mut [Option<Vec<f32>>],
+        pending_indices: &[usize],
+        max_in_flight: usize,
+    ) -> Result<(), RemoteEmbeddingError> {
+        for wave in slices.chunks(max_in_flight) {
+            let futures = wave.iter().map(|&(start, end)| async move {
+                let width = end - start;
+                let mut worker_rows = vec![None; width];
+                let local: Vec<usize> = (0..width).collect();
+                self.embed_pending(&pending_inputs[start..end], &mut worker_rows, &local)
+                    .await
+                    .map(|()| (start, worker_rows))
+            });
+            for result in futures::future::join_all(futures).await {
+                let (start, worker_rows) = result?;
+                for (offset, row) in worker_rows.into_iter().enumerate() {
+                    if let Some(row) = row {
+                        rows[pending_indices[start + offset]] = Some(row);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
     /// Attach the embedding-cache namespace (the checkpoint identity minus its
     /// dimension component). Called once by
     /// [`GenericRemoteProvider::from_config`]; `None` disables caching.
@@ -1774,11 +1412,6 @@ impl CustomEmbeddingProvider {
         rows: &mut [Option<Vec<f32>>],
         indices: &[usize],
     ) -> Result<(), RemoteEmbeddingError> {
-        let mut pending_slices = vec![(0, pending.len())];
-        let mut skipped = Vec::new();
-        let mut oversized = Vec::new();
-        let mut first_error = None;
-        let mut aborted_mid_flight = None;
         // ONE allowance for the whole logical batch. Bisection can fan a single
         // request out into hundreds of sub-requests; giving each its own
         // `max_retries` budget makes a dead endpoint cost
@@ -1787,8 +1420,9 @@ impl CustomEmbeddingProvider {
         // how far it subdivides.
         let retries_left = RetryCounter::new(self.max_retries);
         let allowance = RetryAllowance::new(&retries_left);
+        let mut outcome = PendingOutcome::new(rows, indices, &allowance);
 
-        while let Some((start, end)) = pending_slices.pop() {
+        while let Some((start, end)) = outcome.pending_slices.pop() {
             // Retry the SUB-batch, not the whole batch: a transient failure
             // deep in a bisection must not restart work already landed above.
             match with_transient_retry(&allowance, || {
@@ -1797,60 +1431,33 @@ impl CustomEmbeddingProvider {
             .await
             {
                 Ok(embeddings) if embeddings.len() == end - start => {
-                    for (index, embedding) in (start..end).zip(embeddings) {
-                        rows[indices[index]] = Some(embedding);
-                    }
+                    outcome.land(start, end, embeddings);
                 }
                 Ok(embeddings) => {
                     // Wrong row count: the endpoint answered, but not usable
                     // for this slice. Retrying cannot fix it, so stop
                     // bisecting and keep whatever already landed.
-                    aborted_mid_flight = Some(RemoteEmbeddingError::InvalidResponse(format!(
+                    outcome.abort(RemoteEmbeddingError::InvalidResponse(format!(
                         "Expected {} embeddings, got {}",
                         end - start,
                         embeddings.len()
                     )));
-                    pending_slices.clear();
                     break;
                 }
                 Err(RemoteEmbeddingError::HttpStatus { status, message })
                     if is_bisectable_embedding_status(status) =>
                 {
                     if end - start == 1 {
-                        // A lone input the endpoint calls too large is shrunk
-                        // and re-sent rather than dropped: losing it would leave
-                        // the node without a vector, and if it is the only input
-                        // of the batch it would also look like a dead endpoint
-                        // and freeze the generation. Every other single-input
-                        // rejection is a document-level verdict: record it and
-                        // move on, because only an unclassifiable status counts
-                        // toward the caller's sustained-failure budget.
-                        if is_oversize_rejection(status, &message) {
-                            match self
-                                .embed_shrinking_oversized(pending[start].as_ref(), &allowance)
-                                .await?
-                            {
-                                Some(embedding) => rows[indices[start]] = Some(embedding),
-                                None => oversized.push(start),
-                            }
-                        } else {
-                            skipped.push(start);
-                            first_error.get_or_insert((status, message));
-                        }
-                    } else {
-                        first_error.get_or_insert((status, message));
-                        tracing::debug!(
+                        self.handle_single_rejection(
+                            &mut outcome,
+                            pending[start].as_ref(),
+                            status,
+                            message,
                             start,
-                            end,
-                            batch_len = end - start,
-                            "Bisecting failed remote embedding batch"
-                        );
-                        // Bisection is NOT a retry: each split halves the range,
-                        // so depth is <= log2(batch) and the total request count
-                        // is <= 2n-1 for an n-input batch. It needs no budget.
-                        let middle = start + (end - start) / 2;
-                        pending_slices.push((middle, end));
-                        pending_slices.push((start, middle));
+                        )
+                        .await?;
+                    } else {
+                        outcome.bisect(start, end, status, message);
                     }
                 }
                 Err(error) => {
@@ -1859,54 +1466,44 @@ impl CustomEmbeddingProvider {
                     // already embedded are real vectors that were paid for:
                     // dropping them here is what made a transient blip cost a
                     // whole batch of documents.
-                    aborted_mid_flight = Some(error);
-                    pending_slices.clear();
+                    outcome.abort(error);
                     break;
                 }
             }
         }
 
-        let embedded = indices
-            .iter()
-            .filter(|&&position| rows[position].is_some())
-            .count();
-        if let Some(error) = aborted_mid_flight {
-            if embedded == 0 {
-                return Err(error);
+        outcome.finish()
+    }
+
+    /// Resolve one rejected single input: shrink an oversize document and retry
+    /// it, or record it as skipped.
+    ///
+    /// A lone input the endpoint calls too large is shrunk and re-sent rather
+    /// than dropped: losing it would leave the node without a vector, and if it
+    /// is the only input of the batch it would also look like a dead endpoint
+    /// and freeze the generation. Every other single-input rejection is a
+    /// document-level verdict: record it and move on, because only an
+    /// unclassifiable status counts toward the caller's sustained-failure
+    /// budget.
+    async fn handle_single_rejection(
+        &self,
+        outcome: &mut PendingOutcome<'_, '_, '_>,
+        text: &str,
+        status: u16,
+        message: String,
+        start: usize,
+    ) -> Result<(), RemoteEmbeddingError> {
+        if is_oversize_rejection(status, &message) {
+            match self
+                .embed_shrinking_oversized(text, outcome.allowance)
+                .await?
+            {
+                Some(embedding) => outcome.rows[outcome.indices[start]] = Some(embedding),
+                None => outcome.oversized.push(start),
             }
-            tracing::warn!(
-                %error,
-                embedded,
-                total = indices.len(),
-                "Remote batch aborted mid-flight; keeping already-embedded rows and leaving the rest empty"
-            );
-            return Ok(());
-        }
-        if !skipped.is_empty() && embedded == 0 {
-            let (status, _) = first_error.expect("failed leaves have an HTTP status");
-            return Err(RemoteEmbeddingError::HttpStatus {
-                status,
-                message: format!("all {} inputs failed individually", skipped.len()),
-            });
-        }
-        if !oversized.is_empty() {
-            // Every one of these was refused as an individual DOCUMENT for
-            // exceeding the server's per-input token limit. That is not an
-            // endpoint outage, so it must not surface as an `Err`: doing so
-            // would spend the caller's sustained-failure budget on documents
-            // the server will never accept, which is exactly how oversized
-            // inputs used to freeze the whole neural layer. The rows stay
-            // `None` (those documents get no neural vector) and the batch is
-            // reported as handled.
-            tracing::warn!(
-                oversized = oversized.len(),
-                total = indices.len(),
-                "Skipping documents that exceed the server's per-input token limit; \
-                 raise the service's -ub (logical batch) to admit them"
-            );
-        }
-        if !skipped.is_empty() {
-            tracing::warn!(skipped_indices = ?skipped, "Skipping remote embedding inputs rejected individually");
+        } else {
+            outcome.skipped.push(start);
+            outcome.first_error.get_or_insert((status, message));
         }
         Ok(())
     }

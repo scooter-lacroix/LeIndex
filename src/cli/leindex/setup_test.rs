@@ -932,9 +932,11 @@ fn test_build_config_without_version() {
     assert!(cfg.neural.ort_dylib_path.is_none());
 }
 
-// Use a process-shared lock so env-mutating tests serialize within the module.
-use std::sync::Mutex;
-static PIPE_ENV_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes env-var-mutating tests across the whole test binary, not just
+/// this module: the setup paths read process-global `LEINDEX_HOME` and the
+/// process-global config cache, so a module-local lock would still race
+/// `config.rs` and every other env-mutating module.
+use crate::test_env::EnvLock as PIPE_ENV_LOCK;
 
 /// RAII guard that restores an environment variable to its original value on drop.
 struct EnvVarGuard {
