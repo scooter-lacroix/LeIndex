@@ -111,7 +111,7 @@ pub fn build_index(
                 if !meta.is_file() {
                     return None;
                 }
-                let ident = identity(&meta);
+                let ident = identity(&path, &meta);
                 let mut input = FileInput {
                     rel_path: rel.clone(),
                     size: ident.size,
@@ -210,7 +210,7 @@ pub fn dirty_files(root: &Path, index: &TextIndex) -> Arc<Vec<String>> {
                     // part of the comparison wherever the platform records
                     // them (0 = not available on either side, a no-op term).
                     Ok(meta) => {
-                        identity(&meta)
+                        identity(&root.join(rel.as_str()), &meta)
                             != FileIdentity {
                                 size: known.size,
                                 mtime_ns: known.mtime_ns,
