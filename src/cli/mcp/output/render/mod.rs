@@ -1183,6 +1183,56 @@ fn render_tool_output_with_color(name: &str, data: &Value, args: &Value, color: 
     rendered
 }
 
+/// Tool identifier → renderer (#87: data over an 18-arm match, which lizard
+/// 1.24.x scores CCN 24). Each identifier is the tool's SHORT name; a
+/// normalized name matches when it equals the identifier or its
+/// `leindex_`-prefixed form — exactly the pair every old match arm carried.
+type ToolRenderer = fn(&Value, &str, &str, bool) -> String;
+const TOOL_RENDERERS: &[(&str, ToolRenderer)] = &[
+    ("search", |data, query, _, color| {
+        render_search(data, query, color)
+    }),
+    ("find", |data, _, _, _| render_find(data)),
+    ("structural", |data, _, _, _| render_structural(data)),
+    ("context", |data, _, node_id, color| {
+        render_context(data, node_id, color)
+    }),
+    ("diagnostics", |data, _, _, color| {
+        render_diagnostics(data, color)
+    }),
+    ("project_map", |data, _, _, color| {
+        render_project_map(data, color)
+    }),
+    ("impact_analysis", |data, _, _, color| {
+        render_impact(data, color)
+    }),
+    ("symbol_lookup", |data, _, _, color| {
+        render_symbol_lookup(data, color)
+    }),
+    ("phase_analysis", |data, _, _, color| {
+        render_phase(data, color)
+    }),
+    ("git_status", |data, _, _, color| {
+        render_git_status(data, color)
+    }),
+    ("file_summary", |data, _, _, color| {
+        render_file_summary(data, color)
+    }),
+    ("read_file", |data, _, _, color| {
+        render_read_file(data, color)
+    }),
+    ("edit_preview", |data, _, _, color| {
+        render_edit_preview(data, color)
+    }),
+    ("edit_apply", |data, _, _, color| {
+        render_edit_apply(data, color)
+    }),
+    ("write", |data, _, _, color| render_write(data, color)),
+    ("rename_symbol", |data, _, _, color| {
+        render_rename_symbol(data, color)
+    }),
+];
+
 fn render_tool_output_inner(
     name: &str,
     data: &Value,
@@ -1193,33 +1243,20 @@ fn render_tool_output_inner(
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let node_id = args.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
 
-    let rendered = match normalized.as_str() {
-        "leindex_search" | "search" => render_search(data, query, color),
-        "leindex_find" | "find" => render_find(data),
-        "leindex_structural" | "structural" => render_structural(data),
-        "leindex_context" | "context" => render_context(data, node_id, color),
-        "leindex_diagnostics" | "diagnostics" => render_diagnostics(data, color),
-        "leindex_project_map" | "project_map" => render_project_map(data, color),
-        "leindex_impact_analysis" | "impact_analysis" => render_impact(data, color),
-        "leindex_symbol_lookup" | "symbol_lookup" => render_symbol_lookup(data, color),
-        "leindex_phase_analysis" | "phase_analysis" => render_phase(data, color),
-        "leindex_git_status" | "git_status" => render_git_status(data, color),
-        "leindex_file_summary" | "file_summary" => render_file_summary(data, color),
-        "leindex_read_file" | "read_file" => render_read_file(data, color),
-        "leindex_edit_preview" | "edit_preview" => render_edit_preview(data, color),
-        // `EditApplyHandler` returns a confirmation payload
-        // (`success, changes_applied, file_path, edit_region, …`)
-        // not a diff, so `render_diff_value` returns an empty
-        // string for the apply response. Use the dedicated
-        // confirmation renderer instead.
-        "leindex_edit_apply" | "edit_apply" => render_edit_apply(data, color),
-        // `WriteHandler` returns a confirmation payload
-        // (`{success, file_path, language, symbols}`) not a diff, so
-        // `render_diff_value` would return an empty string here.
-        "leindex_write" | "write" => render_write(data, color),
-        "leindex_rename_symbol" | "rename_symbol" => render_rename_symbol(data, color),
-        _ => render_default(data, color),
-    };
+    let rendered = TOOL_RENDERERS
+        .iter()
+        .find(|(id, _)| normalized == *id || normalized == format!("leindex_{id}"))
+        .map_or_else(
+            || render_default(data, color),
+            |(_, render)| render(data, query, node_id, color),
+        );
+    (rendered, render_footer(data))
+}
+
+/// Freshness and System-One footer lines appended beneath the rendered tool
+/// output (#87: split from `render_tool_output_inner`). `None` when neither
+/// produced anything, so no extra tokens are spent.
+fn render_footer(data: &Value) -> Option<String> {
     let mut footer = String::new();
     if let Some(freshness) = data
         .get("_meta")
@@ -1250,9 +1287,9 @@ fn render_tool_output_inner(
         footer.push_str(&gate);
     }
     if footer.is_empty() {
-        (rendered, None)
+        None
     } else {
-        (rendered, Some(footer))
+        Some(footer)
     }
 }
 

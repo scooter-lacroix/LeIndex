@@ -271,6 +271,18 @@ fn ingest_project_graph_layer(target: &mut Storage, project_db: &Path) -> Result
         return Ok(());
     }
 
+    ingest_graph_layer_nodes(conn, &pdg, &project_id)?;
+    ingest_graph_layer_edges(conn, &pdg, &project_id)
+}
+
+/// Insert every PDG node of the decoded layer into the cross-project store
+/// (#87: split from `ingest_project_graph_layer`, which scored CCN 25 under
+/// lizard 1.24.x with the node and edge ingestion in one body).
+fn ingest_graph_layer_nodes(
+    conn: &rusqlite::Connection,
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    project_id: &str,
+) -> Result<(), ApiError> {
     let mut insert = conn
         .prepare_cached(
             "INSERT OR IGNORE INTO intel_nodes (id, project_id, file_path, node_id, symbol_name, \
@@ -309,7 +321,16 @@ fn ingest_project_graph_layer(target: &mut Storage, project_db: &Path) -> Result
             ])
             .map_err(|e| ApiError::internal(format!("Graph materialize failed: {e}")))?;
     }
+    Ok(())
+}
 
+/// Insert every PDG edge of the decoded layer, resolving endpoint nodes to
+/// the `intel_nodes` rows the node pass just wrote.
+fn ingest_graph_layer_edges(
+    conn: &rusqlite::Connection,
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    project_id: &str,
+) -> Result<(), ApiError> {
     let mut edge_insert = conn
         .prepare_cached(
             "INSERT OR IGNORE INTO intel_edges (caller_id, callee_id, edge_type, metadata) \

@@ -103,6 +103,42 @@ fn source_priority(file_name: &str) -> u8 {
     }
 }
 
+/// Parse every manifest in one workspace into a fresh registry (#87: split
+/// from `from_manifest_paths`, which scored CCN 21 under lizard 1.24.x with
+/// workspace grouping and parser dispatch in one body).
+fn parse_manifest_set(paths: &[PathBuf]) -> ExternalDependencyRegistry {
+    let mut local = ExternalDependencyRegistry::new();
+    for path in paths {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+
+        match file_name {
+            "Cargo.lock" => local.parse_cargo_lock(&content),
+            "Cargo.toml" => local.parse_cargo_toml(&content),
+            "package-lock.json" | "npm-shrinkwrap.json" => local.parse_package_lock_json(&content),
+            "package.json" => local.parse_package_json(&content),
+            "yarn.lock" => local.parse_yarn_lock(&content),
+            "pnpm-lock.yaml" => local.parse_pnpm_lock(&content),
+            "bun.lock" => local.parse_bun_lock(&content),
+            "bun.lockb" => {} // Binary format, skip
+            "requirements.txt" => local.parse_requirements_txt(&content),
+            "Pipfile.lock" => local.parse_pipfile_lock(&content),
+            "pyproject.toml" => local.parse_pyproject_toml(&content),
+            "poetry.lock" => local.parse_poetry_lock(&content),
+            "go.mod" => local.parse_go_mod(&content),
+            "go.sum" => local.parse_go_sum(&content),
+            "Gemfile.lock" => local.parse_gemfile_lock(&content),
+            "composer.lock" => local.parse_composer_lock(&content),
+            _ => {}
+        }
+    }
+    local
+}
+
 impl ExternalDependencyRegistry {
     /// Build the registry from an already-discovered manifest list.
     /// Build a dependency registry from manifest/lockfile paths.
@@ -140,37 +176,7 @@ impl ExternalDependencyRegistry {
         for (_ws_root, paths) in workspaces {
             // Parse each workspace's manifests into a local registry,
             // then merge into the global one.
-            let mut local = Self::new();
-            for path in &paths {
-                let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-                let Ok(content) = std::fs::read_to_string(path) else {
-                    continue;
-                };
-
-                match file_name {
-                    "Cargo.lock" => local.parse_cargo_lock(&content),
-                    "Cargo.toml" => local.parse_cargo_toml(&content),
-                    "package-lock.json" | "npm-shrinkwrap.json" => {
-                        local.parse_package_lock_json(&content)
-                    }
-                    "package.json" => local.parse_package_json(&content),
-                    "yarn.lock" => local.parse_yarn_lock(&content),
-                    "pnpm-lock.yaml" => local.parse_pnpm_lock(&content),
-                    "bun.lock" => local.parse_bun_lock(&content),
-                    "bun.lockb" => {} // Binary format, skip
-                    "requirements.txt" => local.parse_requirements_txt(&content),
-                    "Pipfile.lock" => local.parse_pipfile_lock(&content),
-                    "pyproject.toml" => local.parse_pyproject_toml(&content),
-                    "poetry.lock" => local.parse_poetry_lock(&content),
-                    "go.mod" => local.parse_go_mod(&content),
-                    "go.sum" => local.parse_go_sum(&content),
-                    "Gemfile.lock" => local.parse_gemfile_lock(&content),
-                    "composer.lock" => local.parse_composer_lock(&content),
-                    _ => {}
-                }
-            }
+            let local = parse_manifest_set(&paths);
             // Merge local workspace into the global registry.
             // Each workspace's lockfile entries override earlier entries for
             // the same package name, which is correct within-workspace.

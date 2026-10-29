@@ -214,56 +214,198 @@ pub enum LanguageId {
 }
 
 impl LanguageId {
+    /// Every variant, in discriminant order. Drives the table-coverage tests
+    /// and any caller that needs the full language enumeration.
+    pub const ALL: [LanguageId; 41] = [
+        LanguageId::Python,
+        LanguageId::JavaScript,
+        LanguageId::TypeScript,
+        LanguageId::Go,
+        LanguageId::Rust,
+        LanguageId::Java,
+        LanguageId::Cpp,
+        LanguageId::CSharp,
+        LanguageId::Ruby,
+        LanguageId::Php,
+        LanguageId::Lua,
+        LanguageId::Scala,
+        LanguageId::C,
+        LanguageId::Bash,
+        LanguageId::Json,
+        LanguageId::Swift,
+        LanguageId::Kotlin,
+        LanguageId::Dart,
+        LanguageId::Html,
+        LanguageId::Css,
+        LanguageId::Scss,
+        LanguageId::Yaml,
+        LanguageId::Cmake,
+        LanguageId::Elixir,
+        LanguageId::Erlang,
+        LanguageId::Haskell,
+        LanguageId::Perl,
+        LanguageId::R,
+        LanguageId::Zig,
+        LanguageId::Graphql,
+        LanguageId::Hcl,
+        LanguageId::Make,
+        LanguageId::Elisp,
+        LanguageId::Julia,
+        LanguageId::D,
+        LanguageId::Glsl,
+        LanguageId::EmbeddedTemplate,
+        LanguageId::Markdown,
+        LanguageId::Rst,
+        LanguageId::Adoc,
+        LanguageId::PlainText,
+    ];
+}
+
+/// Extension → language mapping (#87: data over a 41-arm match, which lizard
+/// 1.24.x scores CCN 43). Keys are LOWERCASED extensions; lookup is a linear
+/// scan, which is fine at this size. Two invariants hold by construction:
+/// keys are unique (the compiler rejects duplicate match patterns — this
+/// table replaced them verbatim), and appending a variant WITHOUT adding its
+/// rows here is caught by `test_extension_table_covers_every_variant`.
+const EXT_TABLE: &[(&str, LanguageId)] = &[
+    ("py", LanguageId::Python),
+    ("js", LanguageId::JavaScript),
+    ("mjs", LanguageId::JavaScript),
+    ("cjs", LanguageId::JavaScript),
+    ("jsx", LanguageId::JavaScript),
+    ("ts", LanguageId::TypeScript),
+    ("tsx", LanguageId::TypeScript),
+    ("mts", LanguageId::TypeScript),
+    ("cts", LanguageId::TypeScript),
+    ("go", LanguageId::Go),
+    ("rs", LanguageId::Rust),
+    ("java", LanguageId::Java),
+    ("cpp", LanguageId::Cpp),
+    ("cc", LanguageId::Cpp),
+    ("cxx", LanguageId::Cpp),
+    ("hpp", LanguageId::Cpp),
+    ("h", LanguageId::C),
+    ("c", LanguageId::C),
+    ("cs", LanguageId::CSharp),
+    ("rb", LanguageId::Ruby),
+    ("php", LanguageId::Php),
+    ("swift", LanguageId::Swift),
+    ("kt", LanguageId::Kotlin),
+    ("kts", LanguageId::Kotlin),
+    ("dart", LanguageId::Dart),
+    ("html", LanguageId::Html),
+    ("htm", LanguageId::Html),
+    ("css", LanguageId::Css),
+    ("scss", LanguageId::Scss),
+    ("yaml", LanguageId::Yaml),
+    ("yml", LanguageId::Yaml),
+    ("cmake", LanguageId::Cmake),
+    ("ex", LanguageId::Elixir),
+    ("exs", LanguageId::Elixir),
+    ("erl", LanguageId::Erlang),
+    ("hrl", LanguageId::Erlang),
+    ("hs", LanguageId::Haskell),
+    ("pl", LanguageId::Perl),
+    ("pm", LanguageId::Perl),
+    ("r", LanguageId::R),
+    ("zig", LanguageId::Zig),
+    ("graphql", LanguageId::Graphql),
+    ("gql", LanguageId::Graphql),
+    ("hcl", LanguageId::Hcl),
+    ("tf", LanguageId::Hcl),
+    ("tfvars", LanguageId::Hcl),
+    ("makefile", LanguageId::Make),
+    ("mak", LanguageId::Make),
+    ("mk", LanguageId::Make),
+    ("el", LanguageId::Elisp),
+    ("jl", LanguageId::Julia),
+    ("d", LanguageId::D),
+    ("di", LanguageId::D),
+    ("glsl", LanguageId::Glsl),
+    ("vert", LanguageId::Glsl),
+    ("frag", LanguageId::Glsl),
+    ("comp", LanguageId::Glsl),
+    ("ejs", LanguageId::EmbeddedTemplate),
+    ("erb", LanguageId::EmbeddedTemplate),
+    ("liquid", LanguageId::EmbeddedTemplate),
+    ("md", LanguageId::Markdown),
+    ("markdown", LanguageId::Markdown),
+    ("rst", LanguageId::Rst),
+    ("adoc", LanguageId::Adoc),
+    ("asciidoc", LanguageId::Adoc),
+    ("txt", LanguageId::PlainText),
+    ("lua", LanguageId::Lua),
+    ("scala", LanguageId::Scala),
+    ("sc", LanguageId::Scala),
+    ("sh", LanguageId::Bash),
+    ("bash", LanguageId::Bash),
+    ("json", LanguageId::Json),
+];
+
+/// LanguageId → LanguageConfig accessor, indexed by discriminant (#87: data
+/// over a 41-arm match, which lizard 1.24.x scores CCN 41). Rows are
+/// closures because the underlying CONFIG statics are `once_cell::Lazy` —
+/// const context cannot deref-coerce them directly. Row 23 is a RETIRED
+/// cache slot no variant carries — the enum's numbering history explains
+/// why it must stay vacant. A variant appended without extending this
+/// table panics on first config lookup — and
+/// `test_config_table_covers_every_variant` fails in CI first.
+const CONFIG_TABLE: [Option<fn() -> &'static crate::parse::traits::LanguageConfig>; 42] = [
+    Some(|| &*crate::parse::traits::languages::python::CONFIG),
+    Some(|| &*crate::parse::traits::languages::javascript::CONFIG),
+    Some(|| &*crate::parse::traits::languages::typescript::CONFIG),
+    Some(|| &*crate::parse::traits::languages::go::CONFIG),
+    Some(|| &*crate::parse::traits::languages::rust::CONFIG),
+    Some(|| &*crate::parse::traits::languages::java::CONFIG),
+    Some(|| &*crate::parse::traits::languages::cpp::CONFIG),
+    Some(|| &*crate::parse::traits::languages::csharp::CONFIG),
+    Some(|| &*crate::parse::traits::languages::ruby::CONFIG),
+    Some(|| &*crate::parse::traits::languages::php::CONFIG),
+    Some(|| &*crate::parse::traits::languages::lua::CONFIG),
+    Some(|| &*crate::parse::traits::languages::scala::CONFIG),
+    Some(|| &*crate::parse::traits::languages::c::CONFIG),
+    Some(|| &*crate::parse::traits::languages::bash::CONFIG),
+    Some(|| &*crate::parse::traits::languages::json::CONFIG),
+    Some(|| &*crate::parse::traits::languages::swift::CONFIG),
+    Some(|| &*crate::parse::traits::languages::kotlin::CONFIG),
+    Some(|| &*crate::parse::traits::languages::dart::CONFIG),
+    Some(|| &*crate::parse::traits::languages::html::CONFIG),
+    Some(|| &*crate::parse::traits::languages::css::CONFIG),
+    Some(|| &*crate::parse::traits::languages::scss::CONFIG),
+    Some(|| &*crate::parse::traits::languages::yaml::CONFIG),
+    Some(|| &*crate::parse::traits::languages::cmake::CONFIG),
+    None, // retired discriminant 23: no variant carries it
+    Some(|| &*crate::parse::traits::languages::elixir::CONFIG),
+    Some(|| &*crate::parse::traits::languages::erlang::CONFIG),
+    Some(|| &*crate::parse::traits::languages::haskell::CONFIG),
+    Some(|| &*crate::parse::traits::languages::perl::CONFIG),
+    Some(|| &*crate::parse::traits::languages::r::CONFIG),
+    Some(|| &*crate::parse::traits::languages::zig::CONFIG),
+    Some(|| &*crate::parse::traits::languages::graphql::CONFIG),
+    Some(|| &*crate::parse::traits::languages::hcl::CONFIG),
+    Some(|| &*crate::parse::traits::languages::make::CONFIG),
+    Some(|| &*crate::parse::traits::languages::elisp::CONFIG),
+    Some(|| &*crate::parse::traits::languages::julia::CONFIG),
+    Some(|| &*crate::parse::traits::languages::d::CONFIG),
+    Some(|| &*crate::parse::traits::languages::glsl::CONFIG),
+    Some(|| &*crate::parse::traits::languages::embedded_template::CONFIG),
+    Some(|| &*crate::parse::traits::languages::markdown::CONFIG),
+    Some(|| &*crate::parse::traits::languages::rst::CONFIG),
+    Some(|| &*crate::parse::traits::languages::adoc::CONFIG),
+    Some(|| &*crate::parse::traits::languages::plaintext::CONFIG),
+];
+
+impl LanguageId {
     /// Get the LanguageId for a file extension
     ///
     /// This is the unified entry point for language detection.
     /// Delegates to LanguageConfig::from_extension for consistency.
     pub fn from_extension(ext: &str) -> Option<Self> {
-        match ext.to_lowercase().as_str() {
-            "py" => Some(LanguageId::Python),
-            "js" | "mjs" | "cjs" | "jsx" => Some(LanguageId::JavaScript),
-            "ts" | "tsx" | "mts" | "cts" => Some(LanguageId::TypeScript),
-            "go" => Some(LanguageId::Go),
-            "rs" => Some(LanguageId::Rust),
-            "java" => Some(LanguageId::Java),
-            "cpp" | "cc" | "cxx" | "hpp" => Some(LanguageId::Cpp),
-            "h" => Some(LanguageId::C), // Default .h to C (Cpp override handles .hpp)
-            "c" => Some(LanguageId::C),
-            "cs" => Some(LanguageId::CSharp),
-            "rb" => Some(LanguageId::Ruby),
-            "php" => Some(LanguageId::Php),
-            "swift" => Some(LanguageId::Swift),
-            "kt" | "kts" => Some(LanguageId::Kotlin),
-            "dart" => Some(LanguageId::Dart),
-            "html" | "htm" => Some(LanguageId::Html),
-            "css" => Some(LanguageId::Css),
-            "scss" => Some(LanguageId::Scss),
-            "yaml" | "yml" => Some(LanguageId::Yaml),
-            "cmake" => Some(LanguageId::Cmake),
-            "ex" | "exs" => Some(LanguageId::Elixir),
-            "erl" | "hrl" => Some(LanguageId::Erlang),
-            "hs" => Some(LanguageId::Haskell),
-            "pl" | "pm" => Some(LanguageId::Perl),
-            "r" => Some(LanguageId::R),
-            "zig" => Some(LanguageId::Zig),
-            "graphql" | "gql" => Some(LanguageId::Graphql),
-            "hcl" | "tf" | "tfvars" => Some(LanguageId::Hcl),
-            "makefile" | "mak" | "mk" => Some(LanguageId::Make),
-            "el" => Some(LanguageId::Elisp),
-            "jl" => Some(LanguageId::Julia),
-            "d" | "di" => Some(LanguageId::D),
-            "glsl" | "vert" | "frag" | "comp" => Some(LanguageId::Glsl),
-            "ejs" | "erb" | "liquid" => Some(LanguageId::EmbeddedTemplate),
-            "md" | "markdown" => Some(LanguageId::Markdown),
-            "rst" => Some(LanguageId::Rst),
-            "adoc" | "asciidoc" => Some(LanguageId::Adoc),
-            "txt" => Some(LanguageId::PlainText),
-            "lua" => Some(LanguageId::Lua),
-            "scala" | "sc" => Some(LanguageId::Scala),
-            "sh" | "bash" => Some(LanguageId::Bash),
-            "json" => Some(LanguageId::Json),
-            _ => None,
-        }
+        let ext = ext.to_lowercase();
+        EXT_TABLE
+            .iter()
+            .find(|(key, _)| *key == ext)
+            .map(|(_, id)| *id)
     }
 
     /// Get the LanguageConfig for this language
@@ -271,51 +413,11 @@ impl LanguageId {
     /// Provides access to the full language configuration including
     /// extensions and query patterns.
     pub fn config(&self) -> &'static crate::parse::traits::LanguageConfig {
-        match self {
-            LanguageId::Python => &crate::parse::traits::languages::python::CONFIG,
-            LanguageId::JavaScript => &crate::parse::traits::languages::javascript::CONFIG,
-            LanguageId::TypeScript => &crate::parse::traits::languages::typescript::CONFIG,
-            LanguageId::Go => &crate::parse::traits::languages::go::CONFIG,
-            LanguageId::Rust => &crate::parse::traits::languages::rust::CONFIG,
-            LanguageId::Java => &crate::parse::traits::languages::java::CONFIG,
-            LanguageId::Cpp => &crate::parse::traits::languages::cpp::CONFIG,
-            LanguageId::CSharp => &crate::parse::traits::languages::csharp::CONFIG,
-            LanguageId::Ruby => &crate::parse::traits::languages::ruby::CONFIG,
-            LanguageId::Php => &crate::parse::traits::languages::php::CONFIG,
-            LanguageId::Lua => &crate::parse::traits::languages::lua::CONFIG,
-            LanguageId::Scala => &crate::parse::traits::languages::scala::CONFIG,
-            LanguageId::C => &crate::parse::traits::languages::c::CONFIG,
-            LanguageId::Bash => &crate::parse::traits::languages::bash::CONFIG,
-            LanguageId::Json => &crate::parse::traits::languages::json::CONFIG,
-            LanguageId::Swift => &crate::parse::traits::languages::swift::CONFIG,
-            LanguageId::Kotlin => &crate::parse::traits::languages::kotlin::CONFIG,
-            LanguageId::Dart => &crate::parse::traits::languages::dart::CONFIG,
-            LanguageId::Html => &crate::parse::traits::languages::html::CONFIG,
-            LanguageId::Css => &crate::parse::traits::languages::css::CONFIG,
-            LanguageId::Scss => &crate::parse::traits::languages::scss::CONFIG,
-            LanguageId::Yaml => &crate::parse::traits::languages::yaml::CONFIG,
-            LanguageId::Cmake => &crate::parse::traits::languages::cmake::CONFIG,
-            LanguageId::Elixir => &crate::parse::traits::languages::elixir::CONFIG,
-            LanguageId::Erlang => &crate::parse::traits::languages::erlang::CONFIG,
-            LanguageId::Haskell => &crate::parse::traits::languages::haskell::CONFIG,
-            LanguageId::Perl => &crate::parse::traits::languages::perl::CONFIG,
-            LanguageId::R => &crate::parse::traits::languages::r::CONFIG,
-            LanguageId::Zig => &crate::parse::traits::languages::zig::CONFIG,
-            LanguageId::Graphql => &crate::parse::traits::languages::graphql::CONFIG,
-            LanguageId::Hcl => &crate::parse::traits::languages::hcl::CONFIG,
-            LanguageId::Make => &crate::parse::traits::languages::make::CONFIG,
-            LanguageId::Elisp => &crate::parse::traits::languages::elisp::CONFIG,
-            LanguageId::Julia => &crate::parse::traits::languages::julia::CONFIG,
-            LanguageId::D => &crate::parse::traits::languages::d::CONFIG,
-            LanguageId::Glsl => &crate::parse::traits::languages::glsl::CONFIG,
-            LanguageId::EmbeddedTemplate => {
-                &crate::parse::traits::languages::embedded_template::CONFIG
-            }
-            LanguageId::Markdown => &crate::parse::traits::languages::markdown::CONFIG,
-            LanguageId::Rst => &crate::parse::traits::languages::rst::CONFIG,
-            LanguageId::Adoc => &crate::parse::traits::languages::adoc::CONFIG,
-            LanguageId::PlainText => &crate::parse::traits::languages::plaintext::CONFIG,
-        }
+        // Indexed by discriminant; row 23 is a RETIRED cache slot no variant
+        // carries (see the enum's numbering history). A variant appended
+        // without extending this table panics on first config lookup — and
+        // test_config_table_covers_every_variant fails in CI first.
+        CONFIG_TABLE[*self as usize].expect("LanguageId variant without a CONFIG_TABLE row")()
     }
 
     /// Load the tree-sitter Language for this LanguageId
@@ -323,53 +425,57 @@ impl LanguageId {
     /// Uses the centralized language loading functions from traits::languages
     /// to avoid duplicate unsafe FFI declarations.
     fn load_language(&self) -> Language {
-        match self {
-            LanguageId::Python => crate::parse::traits::languages::python::language(),
-            LanguageId::JavaScript => crate::parse::traits::languages::javascript::language(),
-            LanguageId::TypeScript => crate::parse::traits::languages::typescript::language(),
-            LanguageId::Go => crate::parse::traits::languages::go::language(),
-            LanguageId::Rust => crate::parse::traits::languages::rust::language(),
-            LanguageId::Java => crate::parse::traits::languages::java::language(),
-            LanguageId::Cpp => crate::parse::traits::languages::cpp::language(),
-            LanguageId::CSharp => crate::parse::traits::languages::csharp::language(),
-            LanguageId::Ruby => crate::parse::traits::languages::ruby::language(),
-            LanguageId::Php => crate::parse::traits::languages::php::language(),
-            LanguageId::Lua => crate::parse::traits::languages::lua::language(),
-            LanguageId::Scala => crate::parse::traits::languages::scala::language(),
-            LanguageId::C => crate::parse::traits::languages::c::language(),
-            LanguageId::Bash => crate::parse::traits::languages::bash::language(),
-            LanguageId::Json => crate::parse::traits::languages::json::language(),
-            LanguageId::Swift => crate::parse::traits::languages::swift::language(),
-            LanguageId::Kotlin => crate::parse::traits::languages::kotlin::language(),
-            LanguageId::Dart => crate::parse::traits::languages::dart::language(),
-            LanguageId::Html => crate::parse::traits::languages::html::language(),
-            LanguageId::Css => crate::parse::traits::languages::css::language(),
-            LanguageId::Scss => crate::parse::traits::languages::scss::language(),
-            LanguageId::Yaml => crate::parse::traits::languages::yaml::language(),
-            LanguageId::Cmake => crate::parse::traits::languages::cmake::language(),
-            LanguageId::Elixir => crate::parse::traits::languages::elixir::language(),
-            LanguageId::Erlang => crate::parse::traits::languages::erlang::language(),
-            LanguageId::Haskell => crate::parse::traits::languages::haskell::language(),
-            LanguageId::Perl => crate::parse::traits::languages::perl::language(),
-            LanguageId::R => crate::parse::traits::languages::r::language(),
-            LanguageId::Zig => crate::parse::traits::languages::zig::language(),
-            LanguageId::Graphql => crate::parse::traits::languages::graphql::language(),
-            LanguageId::Hcl => crate::parse::traits::languages::hcl::language(),
-            LanguageId::Make => crate::parse::traits::languages::make::language(),
-            LanguageId::Elisp => crate::parse::traits::languages::elisp::language(),
-            LanguageId::Julia => crate::parse::traits::languages::julia::language(),
-            LanguageId::D => crate::parse::traits::languages::d::language(),
-            LanguageId::Glsl => crate::parse::traits::languages::glsl::language(),
-            LanguageId::EmbeddedTemplate => {
-                crate::parse::traits::languages::embedded_template::language()
-            }
-            // Doc flavors do not load a tree-sitter grammar; the DocParser
-            // never reaches load_language (it ignores the parser handle).
-            // Return a stand-in that is never installed: config-level only.
-            LanguageId::Markdown | LanguageId::Rst | LanguageId::Adoc | LanguageId::PlainText => {
-                crate::parse::traits::languages::json::language()
-            }
-        }
+        // Indexed by discriminant; `None` rows: the RETIRED slot 23, and the
+        // doc flavors (38..=41) which never install a grammar — they get the
+        // json stand-in, exactly as the match this table replaced did.
+        const LOADERS: [Option<fn() -> Language>; 42] = [
+            Some(crate::parse::traits::languages::python::language),
+            Some(crate::parse::traits::languages::javascript::language),
+            Some(crate::parse::traits::languages::typescript::language),
+            Some(crate::parse::traits::languages::go::language),
+            Some(crate::parse::traits::languages::rust::language),
+            Some(crate::parse::traits::languages::java::language),
+            Some(crate::parse::traits::languages::cpp::language),
+            Some(crate::parse::traits::languages::csharp::language),
+            Some(crate::parse::traits::languages::ruby::language),
+            Some(crate::parse::traits::languages::php::language),
+            Some(crate::parse::traits::languages::lua::language),
+            Some(crate::parse::traits::languages::scala::language),
+            Some(crate::parse::traits::languages::c::language),
+            Some(crate::parse::traits::languages::bash::language),
+            Some(crate::parse::traits::languages::json::language),
+            Some(crate::parse::traits::languages::swift::language),
+            Some(crate::parse::traits::languages::kotlin::language),
+            Some(crate::parse::traits::languages::dart::language),
+            Some(crate::parse::traits::languages::html::language),
+            Some(crate::parse::traits::languages::css::language),
+            Some(crate::parse::traits::languages::scss::language),
+            Some(crate::parse::traits::languages::yaml::language),
+            Some(crate::parse::traits::languages::cmake::language),
+            None, // retired discriminant 23: no variant carries it
+            Some(crate::parse::traits::languages::elixir::language),
+            Some(crate::parse::traits::languages::erlang::language),
+            Some(crate::parse::traits::languages::haskell::language),
+            Some(crate::parse::traits::languages::perl::language),
+            Some(crate::parse::traits::languages::r::language),
+            Some(crate::parse::traits::languages::zig::language),
+            Some(crate::parse::traits::languages::graphql::language),
+            Some(crate::parse::traits::languages::hcl::language),
+            Some(crate::parse::traits::languages::make::language),
+            Some(crate::parse::traits::languages::elisp::language),
+            Some(crate::parse::traits::languages::julia::language),
+            Some(crate::parse::traits::languages::d::language),
+            Some(crate::parse::traits::languages::glsl::language),
+            Some(crate::parse::traits::languages::embedded_template::language),
+            None, // doc flavor: stand-in below
+            None, // doc flavor: stand-in below
+            None, // doc flavor: stand-in below
+            None, // doc flavor: stand-in below
+        ];
+        LOADERS[*self as usize].map_or_else(
+            || crate::parse::traits::languages::json::language(),
+            |loader| loader(),
+        )
     }
 
     /// Get the language from the global cache (lazy-loaded)
@@ -384,6 +490,58 @@ impl LanguageId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #87 table guards: every variant must have an extension row and a
+    /// config-table row, and the extension keys must stay unique (the match
+    /// this table replaced guaranteed that at compile time).
+    #[test]
+    fn test_extension_table_covers_every_variant() {
+        for id in LanguageId::ALL {
+            assert!(
+                EXT_TABLE.iter().any(|(_, mapped)| *mapped == id),
+                "{id:?} has no extension row in EXT_TABLE"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extension_table_keys_are_unique() {
+        for (i, (key, _)) in EXT_TABLE.iter().enumerate() {
+            assert!(
+                EXT_TABLE.iter().take(i).all(|(other, _)| other != key),
+                "duplicate extension key: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_table_covers_every_variant() {
+        for id in LanguageId::ALL {
+            assert!(
+                !id.config().name.is_empty(),
+                "{id:?} has no config-table row (index = its discriminant)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_language_ids_keep_their_frozen_discriminants() {
+        // GLOBAL_GRAMMAR_CACHE keys on `id as usize`; discriminants are a
+        // storage ABI. Row 23 is a retired slot and must stay vacant: no
+        // variant may claim it, and every variant after the gap is offset
+        // by exactly one (Cmake=22 → Elixir=24).
+        for (i, id) in LanguageId::ALL.iter().enumerate() {
+            let expected = if i >= 23 { i + 1 } else { i };
+            assert_eq!(
+                *id as usize, expected,
+                "{id:?} moved; discriminants are frozen"
+            );
+        }
+        assert!(
+            !LanguageId::ALL.iter().any(|id| *id as usize == 23),
+            "discriminant 23 is the retired slot and must stay vacant"
+        );
+    }
 
     #[test]
     fn test_grammar_cache_creation() {
