@@ -226,12 +226,15 @@ fn test_gate_quality_model_identity_reproducible() {
 
 /// Phase 8 gate: all rollout flags are default ON (rollout-KILL semantics).
 /// The flip happened after all section 16 acceptance gates passed.
+///
+/// #86 amputated the unconsumed limbs: flags with no production consumer no
+/// longer sit in this list. The consumer-presence audit below enforces the
+/// pairing going forward.
 #[test]
 fn test_gate_phase8_all_flags_default_on() {
     let rollout_flags = [
         FeatureFlag::DaemonClient,
         FeatureFlag::GenerationReaders,
-        FeatureFlag::BoundedScheduler,
         FeatureFlag::StreamingPdg,
         FeatureFlag::GlobalEmbedCache,
         FeatureFlag::ValidatedModel,
@@ -256,4 +259,127 @@ fn test_gate_phase8_all_flags_default_on() {
         let desc = flag.description();
         assert!(!desc.is_empty(), "flag must have description");
     }
+}
+
+/// #86 gate: a default-ON rollout flag must have a production consumer.
+///
+/// A flag that defaults ON but is read by no production code advertises a
+/// kill switch that does nothing — the exact defect #86 was filed for
+/// (BoundedScheduler, StreamingMcp, GlobalAutoSync). This test scans the
+/// crate source — excluding feature_flags.rs itself and every `#[cfg(test)]`
+/// module body — for a read of the flag, and fails for any default-ON flag
+/// that has none.
+///
+/// Source-scan rather than an in-process registry because consumption is a
+/// property of the code as written, not of runtime state.
+#[test]
+fn test_gate_default_on_flags_have_production_consumers() {
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    // Pre-read every crate source file once, with its cfg(test) regions
+    // blanked so embedded test modules cannot fake consumption.
+    let mut sources: Vec<(String, String)> = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = vec![src_root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                sources.push((
+                    path.display().to_string(),
+                    strip_cfg_test_module_bodies(&text),
+                ));
+            }
+        }
+    }
+    assert!(
+        sources.len() > 100,
+        "source scan must have walked the crate (found {} files)",
+        sources.len()
+    );
+
+    for (flag, default_on) in leindex::feature_flags::all_flags() {
+        if !default_on {
+            continue;
+        }
+        let name = format!("FeatureFlag::{flag:?}");
+        let consumed = sources
+            .iter()
+            .filter(|(path, _)| !path.ends_with("feature_flags.rs"))
+            .any(|(_, body)| body.contains(&name));
+        assert!(
+            consumed,
+            "{} defaults ON but no production code reads it (#86): \
+             wire a consumer or flip the default OFF",
+            flag.env_var()
+        );
+    }
+}
+
+/// Blank `#[cfg(test)] mod … { … }` bodies so embedded tests cannot count as
+/// production consumers. Depth-tracking brace matcher over the source; on
+/// anything unexpected it errs on the side of keeping text (which can only
+/// make the audit stricter, never laxer).
+fn strip_cfg_test_module_bodies(text: &str) -> String {
+    const MARKER: &str = "#[cfg(test)]";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find(MARKER) {
+        out.push_str(&rest[..idx]);
+        let mut cursor = &rest[idx + MARKER.len()..];
+        // Skip additional attributes stacked after #[cfg(test)].
+        loop {
+            let trimmed = cursor.trim_start();
+            if trimmed.starts_with("#[") {
+                match trimmed.find(']') {
+                    Some(end) => cursor = &trimmed[end + 1..],
+                    None => break,
+                }
+            } else {
+                cursor = trimmed;
+                break;
+            }
+        }
+        if let Some(after_mod) = cursor.strip_prefix("mod") {
+            let after_mod = after_mod.trim_start();
+            if let Some(brace) = after_mod.find('{') {
+                out.push_str("mod { /* cfg(test) body stripped */ }");
+                let body = &after_mod[brace + 1..];
+                let mut depth = 1usize;
+                let mut consumed = 0usize;
+                for (offset, ch) in body.char_indices() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                consumed = offset + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if consumed == 0 {
+                    // Unbalanced braces (invalid Rust): keep the remainder.
+                    out.push_str(&rest[idx..]);
+                    return out;
+                }
+                rest = &body[consumed..];
+                continue;
+            }
+        }
+        // The attribute did not introduce a module: keep it and move on.
+        out.push_str(MARKER);
+        rest = &rest[idx + MARKER.len()..];
+    }
+    out.push_str(rest);
+    out
 }

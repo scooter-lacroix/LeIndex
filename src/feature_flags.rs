@@ -35,8 +35,21 @@ pub enum FeatureFlag {
     /// Enable experimental HNSW algorithm parameters.
     ExperimentalHnsw,
     /// Enable streaming MCP notifications.
+    ///
+    /// Declared but not consumed: no production code reads this flag (the
+    /// GA-era streaming-notification route was superseded before it gained a
+    /// consumer). Default OFF so the advertised switch matches reality —
+    /// flipping it ON does nothing. Tracked by the consumer-presence audit
+    /// test in `tests/gate_audit_test.rs`: it cannot return to default ON
+    /// until a production consumer exists.
     StreamingMcp,
     /// Enable global index auto-sync.
+    ///
+    /// Declared but not consumed: no production code reads this flag (the
+    /// GA-era global auto-sync route was superseded before it gained a
+    /// consumer). Default OFF so the advertised switch matches reality.
+    /// Tracked by the consumer-presence audit test in
+    /// `tests/gate_audit_test.rs`.
     GlobalAutoSync,
     /// Enable the daemon-client MIME protocol path (WS3).
     ///
@@ -77,10 +90,12 @@ pub enum FeatureFlag {
     /// Route indexing through the fair bounded scheduler (WS5): heavy work is
     /// executed as stepped [`BoundedJob`](crate::scheduler::budget::BoundedJob)s
     /// behind the DRR queues and admission gate instead of one unstepped
-    /// `spawn_blocking` call. The compiled default is ON; disabling it keeps
-    /// the legacy spawn_blocking + error-at-cap indexing path.
+    /// `spawn_blocking` call. Disabling it keeps the legacy spawn_blocking +
+    /// error-at-cap indexing path (currently the only path — see Status).
     ///
-    /// **Status:** declared but NOT consumed — blocked, by design. There is no
+    /// **Status:** declared but NOT consumed — blocked, by design, so it
+    /// defaults OFF (#86): defaulting an unconsumed flag ON advertised a kill
+    /// switch that did nothing. There is no
     /// honest consumer: `IndexJob::step` invokes `PhaseExecutor::run_phase`
     /// wholesale and ignores `WorkBudget`, and the LeIndex pipeline phases
     /// (`run_scan`, `run_parse`, `run_lexical`, `run_neural`) are monolithic
@@ -224,17 +239,19 @@ impl FeatureFlag {
             // revertible through their flags. New consumer routes are listed only
             // after their own rollout gates pass; the PR-86 scan, parse, TF-IDF,
             // and neural consumers intentionally remain opt-in below.
-            Self::StreamingMcp
-            | Self::GlobalAutoSync
-            | Self::NeuralSearch
+            Self::NeuralSearch
             | Self::RemoteEmbeddings
             // Stable architecture capabilities with successful rollout gates
             // remain default ON and individually revertible. StreamingScan,
-            // StreamingParse, and StreamingTfidf intentionally
-            // remain OFF until their consumers complete a separate rollout.
+            // StreamingParse, and StreamingTfidf intentionally remain OFF
+            // until their consumers complete a separate rollout.
+            // BoundedScheduler, StreamingMcp, and GlobalAutoSync have NO
+            // production consumer (#86): defaulting them ON advertised kill
+            // switches that did nothing. They cannot rejoin this list until
+            // the consumer-presence audit test in tests/gate_audit_test.rs
+            // passes for them.
             | Self::DaemonClient
             | Self::GenerationReaders
-            | Self::BoundedScheduler
             | Self::StreamingPdg
             | Self::GlobalEmbedCache
             | Self::CommunityDetection
@@ -650,7 +667,12 @@ mod test {
         // per-deployment rollout-KILL (explicit `false` disables; unset follows
         // normal config) rather than gating a not-yet-released capability.
         assert!(FeatureFlag::NeuralSearch.default_value());
-        assert!(FeatureFlag::StreamingMcp.default_value());
+        // StreamingMcp, GlobalAutoSync, and BoundedScheduler have no production
+        // consumer (#86): they must NOT default ON. The consumer-presence
+        // audit in tests/gate_audit_test.rs enforces this pairing.
+        assert!(!FeatureFlag::StreamingMcp.default_value());
+        assert!(!FeatureFlag::GlobalAutoSync.default_value());
+        assert!(!FeatureFlag::BoundedScheduler.default_value());
     }
 
     #[test]
@@ -759,6 +781,9 @@ mod test {
 
     /// Selected stable rollout flags default ON after their gates pass. Each
     /// flag acts as a rollout-KILL: explicit "false" reverts that capability.
+    /// BoundedScheduler is absent (#86): no production consumer, so it cannot
+    /// default ON until one exists (enforced by the consumer-presence audit
+    /// in tests/gate_audit_test.rs).
     #[test]
     fn test_rollout_flags_default_on_after_gates_passed() {
         let _g = lock_flag_tests();
@@ -767,7 +792,6 @@ mod test {
             FeatureFlag::RemoteEmbeddings,
             FeatureFlag::DaemonClient,
             FeatureFlag::GenerationReaders,
-            FeatureFlag::BoundedScheduler,
             FeatureFlag::StreamingPdg,
             FeatureFlag::GlobalEmbedCache,
             FeatureFlag::ValidatedModel,
@@ -840,7 +864,6 @@ mod test {
         for flag in [
             FeatureFlag::DaemonClient,
             FeatureFlag::GenerationReaders,
-            FeatureFlag::BoundedScheduler,
             FeatureFlag::StreamingPdg,
             FeatureFlag::GlobalEmbedCache,
             FeatureFlag::ValidatedModel,
@@ -912,7 +935,6 @@ mod test {
             FeatureFlag::RemoteEmbeddings,
             FeatureFlag::DaemonClient,
             FeatureFlag::GenerationReaders,
-            FeatureFlag::BoundedScheduler,
             FeatureFlag::StreamingPdg,
             FeatureFlag::GlobalEmbedCache,
             FeatureFlag::ValidatedModel,
@@ -923,6 +945,19 @@ mod test {
             assert!(
                 flag.is_enabled(),
                 "{} should be enabled with no override",
+                flag.env_var()
+            );
+        }
+        // #86: unconsumed rollout switches must stay OFF (BoundedScheduler,
+        // StreamingMcp, GlobalAutoSync — see the consumer-presence audit).
+        for flag in [
+            FeatureFlag::BoundedScheduler,
+            FeatureFlag::StreamingMcp,
+            FeatureFlag::GlobalAutoSync,
+        ] {
+            assert!(
+                !flag.default_value(),
+                "{} must remain OFF until it has a production consumer",
                 flag.env_var()
             );
         }

@@ -544,7 +544,9 @@ mod tests {
         std::fs::write(nested_dir.join("mod.rs"), "pub fn helper() {}\n").unwrap();
 
         let mut index = crate::cli::leindex::LeIndex::new(dir.path()).expect("leindex");
-        index.index_project(true).expect("fixture project indexes lexically");
+        index
+            .index_project(true)
+            .expect("fixture project indexes lexically");
         let registry = std::sync::Arc::new(
             crate::cli::registry::ProjectRegistry::with_initial_project(5, index),
         );
