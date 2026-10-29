@@ -39,31 +39,31 @@ impl CParser {
                     }
                 }
                 "struct_specifier" | "enum_specifier" | "union_specifier" => {
-                    if let Some(name_node) = node.child_by_field_name("name") {
-                        if let Ok(name) = name_node.utf8_text(source) {
-                            let qualified_name = if parent_path.is_empty() {
-                                name.to_string()
-                            } else {
-                                format!("{}.{}", parent_path.join("."), name)
-                            };
+                    if let Some(name_node) = node.child_by_field_name("name")
+                        && let Ok(name) = name_node.utf8_text(source)
+                    {
+                        let qualified_name = if parent_path.is_empty() {
+                            name.to_string()
+                        } else {
+                            format!("{}.{}", parent_path.join("."), name)
+                        };
 
-                            signatures.push(SignatureInfo {
-                                name: name.to_string(),
-                                qualified_name,
-                                parameters: vec![],
-                                return_type: Some(node.kind().replace("_specifier", "")),
-                                visibility: Visibility::Public,
-                                is_async: false,
-                                is_method: false,
-                                docstring: extract_docstring(&node, source),
-                                calls: vec![],
-                                imports: vec![],
-                                byte_range: (node.start_byte(), node.end_byte()),
-                                flow_facts: vec![],
+                        signatures.push(SignatureInfo {
+                            name: name.to_string(),
+                            qualified_name,
+                            parameters: vec![],
+                            return_type: Some(node.kind().replace("_specifier", "")),
+                            visibility: Visibility::Public,
+                            is_async: false,
+                            is_method: false,
+                            docstring: extract_docstring(&node, source),
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
+                            flow_facts: vec![],
 
-                                cyclomatic_complexity: 0,
-                            });
-                        }
+                            cyclomatic_complexity: 0,
+                        });
                     }
                 }
                 _ => push_children_with_path(&mut stack, node, &parent_path),
@@ -245,12 +245,12 @@ fn extract_c_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportIn
 
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if node.kind() == "preproc_include" {
-            if let Ok(text) = node.utf8_text(source) {
-                let parts: Vec<_> = text.split_whitespace().collect();
-                if let Some(last) = parts.last() {
-                    add_import(&mut imports, last, None);
-                }
+        if node.kind() == "preproc_include"
+            && let Ok(text) = node.utf8_text(source)
+        {
+            let parts: Vec<_> = text.split_whitespace().collect();
+            if let Some(last) = parts.last() {
+                add_import(&mut imports, last, None);
             }
         }
 
@@ -271,14 +271,13 @@ fn extract_c_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
 
     let mut stack = vec![*node];
     while let Some(current) = stack.pop() {
-        if current.kind() == "call_expression" {
-            if let Some(func) = current.child_by_field_name("function") {
-                if let Ok(text) = func.utf8_text(source) {
-                    let name = clean_call_text(text);
-                    if !name.is_empty() {
-                        calls.push(name);
-                    }
-                }
+        if current.kind() == "call_expression"
+            && let Some(func) = current.child_by_field_name("function")
+            && let Ok(text) = func.utf8_text(source)
+        {
+            let name = clean_call_text(text);
+            if !name.is_empty() {
+                calls.push(name);
             }
         }
 
@@ -296,19 +295,18 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
         return Default::default();
     }
     let prev_sibling = node.prev_sibling();
-    if let Some(sibling) = prev_sibling {
-        if sibling.kind() == "comment" {
-            if let Ok(text) = sibling.utf8_text(source) {
-                return Some(
-                    text.trim()
-                        .trim_start_matches("/*")
-                        .trim_start_matches("//")
-                        .trim_end_matches("*/")
-                        .trim()
-                        .to_string(),
-                );
-            }
-        }
+    if let Some(sibling) = prev_sibling
+        && sibling.kind() == "comment"
+        && let Ok(text) = sibling.utf8_text(source)
+    {
+        return Some(
+            text.trim()
+                .trim_start_matches("/*")
+                .trim_start_matches("//")
+                .trim_end_matches("*/")
+                .trim()
+                .to_string(),
+        );
     }
     None
 }

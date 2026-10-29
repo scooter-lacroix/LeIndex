@@ -118,10 +118,10 @@ impl Client {
         let (tx, replies) = channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                    if tx.send((Instant::now(), value)).is_err() {
-                        break;
-                    }
+                if let Ok(value) = serde_json::from_str::<Value>(&line)
+                    && tx.send((Instant::now(), value)).is_err()
+                {
+                    break;
                 }
             }
         });

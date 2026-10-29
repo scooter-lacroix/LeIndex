@@ -231,10 +231,10 @@ fn extract_php_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Import
     }
 
     fn visit(node: &tree_sitter::Node<'_>, source: &[u8], imports: &mut Vec<ImportInfo>) {
-        if node.kind().contains("namespace_use") || node.kind() == "namespace_use_declaration" {
-            if let Ok(text) = node.utf8_text(source) {
-                parse_use_text(imports, text);
-            }
+        if (node.kind().contains("namespace_use") || node.kind() == "namespace_use_declaration")
+            && let Ok(text) = node.utf8_text(source)
+        {
+            parse_use_text(imports, text);
         }
 
         let mut cursor = node.walk();
@@ -303,12 +303,11 @@ fn extract_php_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String>
                 if let Some(name_node) = node
                     .child_by_field_name("name")
                     .or_else(|| node.child_by_field_name("function"))
+                    && let Ok(text) = name_node.utf8_text(source)
                 {
-                    if let Ok(text) = name_node.utf8_text(source) {
-                        let name = clean_call_text(text);
-                        if !name.is_empty() {
-                            calls.push(name);
-                        }
+                    let name = clean_call_text(text);
+                    if !name.is_empty() {
+                        calls.push(name);
                     }
                 }
             }
@@ -316,12 +315,11 @@ fn extract_php_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String>
                 if let Some(name_node) = node
                     .child_by_field_name("class")
                     .or_else(|| node.child_by_field_name("type"))
+                    && let Ok(text) = name_node.utf8_text(source)
                 {
-                    if let Ok(text) = name_node.utf8_text(source) {
-                        let name = clean_call_text(text);
-                        if !name.is_empty() {
-                            calls.push(name);
-                        }
+                    let name = clean_call_text(text);
+                    if !name.is_empty() {
+                        calls.push(name);
                     }
                 }
             }
@@ -386,15 +384,15 @@ fn find_closest_comment(
         let byte_range = node.byte_range();
         if byte_range.end <= target_byte {
             let distance = target_byte.saturating_sub(byte_range.start);
-            if distance <= max_distance {
-                if let Ok(comment) = node.utf8_text(source) {
-                    match closest {
-                        Some((existing_dist, _)) if distance < *existing_dist => {
-                            *closest = Some((distance, comment.to_string()));
-                        }
-                        None => *closest = Some((distance, comment.to_string())),
-                        _ => {}
+            if distance <= max_distance
+                && let Ok(comment) = node.utf8_text(source)
+            {
+                match closest {
+                    Some((existing_dist, _)) if distance < *existing_dist => {
+                        *closest = Some((distance, comment.to_string()));
                     }
+                    None => *closest = Some((distance, comment.to_string())),
+                    _ => {}
                 }
             }
         }

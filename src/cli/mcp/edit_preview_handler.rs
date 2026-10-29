@@ -170,25 +170,23 @@ LeIndex [Edit Apply] to understand the blast radius of your change."
             "risk_level": risk,
             "change_count": changes.len()
         });
-        if !pdg_available {
-            if let Some(obj) = response.as_object_mut() {
-                obj.insert("pdg_status".to_string(), serde_json::json!("not_loaded"));
-                obj.insert(
-                    "warning".to_string(),
-                    serde_json::json!(
-                        "Index unavailable — this preview shows the exact diff only, without \
-                        PDG impact analysis or syntax validation. Reindex (LeIndex [Index] with \
-                        force_reindex=true) to restore full preview capabilities."
-                    ),
-                );
-            }
+        if !pdg_available && let Some(obj) = response.as_object_mut() {
+            obj.insert("pdg_status".to_string(), serde_json::json!("not_loaded"));
+            obj.insert(
+                "warning".to_string(),
+                serde_json::json!(
+                    "Index unavailable — this preview shows the exact diff only, without \
+                    PDG impact analysis or syntax validation. Reindex (LeIndex [Index] with \
+                    force_reindex=true) to restore full preview capabilities."
+                ),
+            );
         }
 
         // Include validation results
-        if let Some(validation) = validation_json {
-            if let Some(obj) = response.as_object_mut() {
-                obj.insert("validation".to_string(), validation);
-            }
+        if let Some(validation) = validation_json
+            && let Some(obj) = response.as_object_mut()
+        {
+            obj.insert("validation".to_string(), validation);
         }
 
         let guard = handle.read().await;

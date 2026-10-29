@@ -155,22 +155,22 @@ pub fn capture_sample_for_pid(pid: u32) -> TelemetrySample {
 
     // CPU time from /proc/<pid>/stat (fields 14+15: utime + stime in clock ticks)
     let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
-    if let Ok(content) = std::fs::read_to_string(&stat_path) {
-        if let Some(close_paren) = content.rfind(')') {
-            let rest = &content[close_paren + 1..];
-            let fields: Vec<&str> = rest.split_whitespace().collect();
-            // Field 14 (utime) = index 11 after the state/ppid/pgrp/session/tty/tpgid/flags/minflt/cminflt/majflt/cmajflt
-            // state=0, ppid=1, pgrp=2, session=3, tty=4, tpgid=5, flags=6, minflt=7, cminflt=8, majflt=9, cmajflt=10, utime=11, stime=12
-            let utime: u64 = fields.get(11).and_then(|s| s.parse().ok()).unwrap_or(0);
-            let stime: u64 = fields.get(12).and_then(|s| s.parse().ok()).unwrap_or(0);
-            let clock_tick_hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
-            let total_ticks = utime.saturating_add(stime);
-            // CPU time in microseconds = total_ticks * 1_000_000 / clock_tick_hz
-            sample.cpu_time_us = total_ticks
-                .saturating_mul(1_000_000)
-                .checked_div(clock_tick_hz)
-                .unwrap_or(0);
-        }
+    if let Ok(content) = std::fs::read_to_string(&stat_path)
+        && let Some(close_paren) = content.rfind(')')
+    {
+        let rest = &content[close_paren + 1..];
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        // Field 14 (utime) = index 11 after the state/ppid/pgrp/session/tty/tpgid/flags/minflt/cminflt/majflt/cmajflt
+        // state=0, ppid=1, pgrp=2, session=3, tty=4, tpgid=5, flags=6, minflt=7, cminflt=8, majflt=9, cmajflt=10, utime=11, stime=12
+        let utime: u64 = fields.get(11).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let stime: u64 = fields.get(12).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let clock_tick_hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+        let total_ticks = utime.saturating_add(stime);
+        // CPU time in microseconds = total_ticks * 1_000_000 / clock_tick_hz
+        sample.cpu_time_us = total_ticks
+            .saturating_mul(1_000_000)
+            .checked_div(clock_tick_hz)
+            .unwrap_or(0);
     }
 
     // GPU: try rocm-smi or nvidia-smi on the current process.
@@ -226,37 +226,26 @@ fn sample_gpu_vram() -> u64 {
             "--format=csv,noheader,nounits",
         ])
         .output()
+        && output.status.success()
+        && let Some(first_line) = String::from_utf8_lossy(&output.stdout).lines().next()
+        && let Ok(v) = first_line.trim().parse::<u64>()
     {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            if let Some(first_line) = text.lines().next() {
-                if let Ok(v) = first_line.trim().parse::<u64>() {
-                    return v;
-                }
-            }
-        }
+        return v;
     }
     // Try rocm-smi.
     if let Ok(output) = std::process::Command::new("rocm-smi")
         .args(["--showmeminfo", "vram", "--json"])
         .output()
+        && output.status.success()
+        && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        && let Some(obj) = parsed.as_object()
+        && let Some((_, dev_data)) = obj.iter().next()
+        && let Some(vram_b) = dev_data
+            .get("VRAM Total Used (B)")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u64>().ok())
     {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(obj) = parsed.as_object() {
-                    if let Some((_, dev_data)) = obj.iter().next() {
-                        if let Some(vram_b) = dev_data
-                            .get("VRAM Total Used (B)")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.parse::<u64>().ok())
-                        {
-                            return vram_b / (1024 * 1024);
-                        }
-                    }
-                }
-            }
-        }
+        return vram_b / (1024 * 1024);
     }
     0
 }
@@ -269,15 +258,11 @@ fn sample_gpu_util() -> u8 {
             "--format=csv,noheader,nounits",
         ])
         .output()
+        && output.status.success()
+        && let Some(first_line) = String::from_utf8_lossy(&output.stdout).lines().next()
+        && let Ok(v) = first_line.trim().parse::<u8>()
     {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            if let Some(first_line) = text.lines().next() {
-                if let Ok(v) = first_line.trim().parse::<u8>() {
-                    return v;
-                }
-            }
-        }
+        return v;
     }
     0
 }

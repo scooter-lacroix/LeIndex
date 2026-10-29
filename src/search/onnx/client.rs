@@ -442,17 +442,16 @@ impl EmbeddingClient {
             configured_provider,
             Some("migraphx" | "rocm" | "auto") | None
         ) && std::env::var_os("ORT_MIGRAPHX_MODEL_CACHE_PATH").is_none()
+            && let Some(cache_path) = migraphx_model_cache_path(config_env.model_name.as_deref())
         {
-            if let Some(cache_path) = migraphx_model_cache_path(config_env.model_name.as_deref()) {
-                if let Err(e) = std::fs::create_dir_all(&cache_path) {
-                    tracing::warn!(
-                        path = %cache_path.display(),
-                        error = %e,
-                        "failed to create MIGraphX model cache directory"
-                    );
-                } else {
-                    cmd.env("ORT_MIGRAPHX_MODEL_CACHE_PATH", cache_path);
-                }
+            if let Err(e) = std::fs::create_dir_all(&cache_path) {
+                tracing::warn!(
+                    path = %cache_path.display(),
+                    error = %e,
+                    "failed to create MIGraphX model cache directory"
+                );
+            } else {
+                cmd.env("ORT_MIGRAPHX_MODEL_CACHE_PATH", cache_path);
             }
         }
         // ORT_DYLIB_PATH is an explicit user override only. Do not promote the
@@ -972,10 +971,10 @@ impl EmbeddingClient {
                     Ok(_) => {
                         let line = line.trim_end_matches(['\r', '\n']);
                         eprintln!("{}", line);
-                        if line.contains("startup_report") {
-                            if let Ok(mut report) = last_startup_report.lock() {
-                                *report = Some(line.to_string());
-                            }
+                        if line.contains("startup_report")
+                            && let Ok(mut report) = last_startup_report.lock()
+                        {
+                            *report = Some(line.to_string());
                         }
                     }
                     Err(e) => {
@@ -995,10 +994,10 @@ impl EmbeddingClient {
     /// Resident daemon ownership stays with its reaper; a client never
     /// deletes a persistent daemon socket or kills a process it did not own.
     pub fn kill_worker(&self) {
-        if let Ok(mut guard) = self.worker.lock() {
-            if let Some(mut handle) = guard.take() {
-                Self::shutdown_worker_handle(&mut handle, true);
-            }
+        if let Ok(mut guard) = self.worker.lock()
+            && let Some(mut handle) = guard.take()
+        {
+            Self::shutdown_worker_handle(&mut handle, true);
         }
     }
 
@@ -1015,10 +1014,10 @@ impl EmbeddingClient {
     /// This is a no-op if no worker was ever spawned or the worker has already
     /// been shut down.
     pub fn force_shutdown_daemon(&self) {
-        if let Ok(mut guard) = self.worker.lock() {
-            if let Some(mut handle) = guard.take() {
-                Self::shutdown_worker_handle(&mut handle, true);
-            }
+        if let Ok(mut guard) = self.worker.lock()
+            && let Some(mut handle) = guard.take()
+        {
+            Self::shutdown_worker_handle(&mut handle, true);
         }
     }
 
@@ -1037,21 +1036,20 @@ impl EmbeddingClient {
             // The socket_path on the WorkerHandle pinpoints which daemon to
             // reap. For persistent daemons the client does not own the child
             // (the reaper thread does), so we kill it directly by PID.
-            if let Ok(guard) = self.worker.lock() {
-                if let Some(handle) = guard.as_ref() {
-                    if let Some(socket_path) = handle.socket_path.as_ref() {
-                        kill_stale_daemon_by_pid(socket_path);
-                        cleanup_daemon_paths(socket_path);
-                    }
-                }
+            if let Ok(guard) = self.worker.lock()
+                && let Some(handle) = guard.as_ref()
+                && let Some(socket_path) = handle.socket_path.as_ref()
+            {
+                kill_stale_daemon_by_pid(socket_path);
+                cleanup_daemon_paths(socket_path);
             }
         }
 
         // Clear the local worker handle so the next call spawns fresh.
-        if let Ok(mut guard) = self.worker.lock() {
-            if let Some(mut handle) = guard.take() {
-                Self::shutdown_worker_handle(&mut handle, true);
-            }
+        if let Ok(mut guard) = self.worker.lock()
+            && let Some(mut handle) = guard.take()
+        {
+            Self::shutdown_worker_handle(&mut handle, true);
         }
     }
 
@@ -1962,10 +1960,10 @@ fn content_digest(path: &Path, meta: &std::fs::Metadata) -> Option<String> {
         let digests = digests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((cached_key, digest)) = digests.get(path) {
-            if *cached_key == key {
-                return Some(digest.clone());
-            }
+        if let Some((cached_key, digest)) = digests.get(path)
+            && *cached_key == key
+        {
+            return Some(digest.clone());
         }
     }
 

@@ -110,13 +110,13 @@ impl ProjectConfig {
         let path = path.as_ref();
 
         // Check directory exclusions
-        if let Some(parent) = path.parent() {
-            if let Some(dir_name) = parent.file_name() {
-                let dir = dir_name.to_string_lossy();
-                for pattern in &self.exclusions.directory_patterns {
-                    if pattern.matches(&dir) {
-                        return true;
-                    }
+        if let Some(parent) = path.parent()
+            && let Some(dir_name) = parent.file_name()
+        {
+            let dir = dir_name.to_string_lossy();
+            for pattern in &self.exclusions.directory_patterns {
+                if pattern.matches(&dir) {
+                    return true;
                 }
             }
         }

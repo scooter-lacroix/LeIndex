@@ -644,16 +644,14 @@ async fn attach_patch_and_enrich(
         "changed_symbols": [],
         "impact_summary": { "total_affected_symbols": 0, "affected_symbols_capped": false, "affected_files": [], "pdg_enriched": false },
     });
-    if include_patch {
-        if let Some((raw_patch, truncated)) = &patch {
-            // Re-run with context for readers: the -U0 patch drives symbol
-            // mapping, but a patch a human reads wants 3 lines of context.
-            let (readable, readable_truncated) =
-                readable_patch(root, &spec).unwrap_or_else(|| (raw_patch.clone(), false));
-            let (text, cut) = bound_chars(&readable, max_patch_chars);
-            result["patch"] = Value::String(text);
-            result["patch_truncated"] = Value::Bool(cut || *truncated || readable_truncated);
-        }
+    if include_patch && let Some((raw_patch, truncated)) = &patch {
+        // Re-run with context for readers: the -U0 patch drives symbol
+        // mapping, but a patch a human reads wants 3 lines of context.
+        let (readable, readable_truncated) =
+            readable_patch(root, &spec).unwrap_or_else(|| (raw_patch.clone(), false));
+        let (text, cut) = bound_chars(&readable, max_patch_chars);
+        result["patch"] = Value::String(text);
+        result["patch_truncated"] = Value::Bool(cut || *truncated || readable_truncated);
     }
     if !enrich || stat_only || files.is_empty() {
         return result;
@@ -796,10 +794,10 @@ fn enrich_files(
         let absolute = root.join(&file.path);
         let key = absolute.to_string_lossy().into_owned();
         let mut nodes = pdg.nodes_in_file(&key);
-        if nodes.is_empty() {
-            if let Ok(canonical) = absolute.canonicalize() {
-                nodes = pdg.nodes_in_file(&canonical.to_string_lossy());
-            }
+        if nodes.is_empty()
+            && let Ok(canonical) = absolute.canonicalize()
+        {
+            nodes = pdg.nodes_in_file(&canonical.to_string_lossy());
         }
         let ranges = if map_hunks {
             file_byte_ranges(&absolute, hunks.get(&file.path))

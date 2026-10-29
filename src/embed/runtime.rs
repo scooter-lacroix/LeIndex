@@ -192,21 +192,18 @@ fn sample_gpu_vram() -> Option<u64> {
         if let Ok(output) = std::process::Command::new("rocm-smi")
             .args(["--showmeminfo", "vram", "--json"])
             .output()
+            && output.status.success()
+            && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
         {
-            if output.status.success() {
-                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                    // ROCm JSON: { "card0": { "VRAM Total Memory (B)": N, "VRAM Total Used Memory (B)": M } }
-                    for (_card, info) in json.as_object().iter().flat_map(|o| o.iter()) {
-                        if let Some(used_str) = info.get("VRAM Total Used Memory (B)") {
-                            if let Some(used_b) = used_str
-                                .as_str()
-                                .and_then(|s| s.trim().parse::<u64>().ok())
-                                .or_else(|| used_str.as_u64())
-                            {
-                                return Some(used_b / (1024 * 1024));
-                            }
-                        }
-                    }
+            // ROCm JSON: { "card0": { "VRAM Total Memory (B)": N, "VRAM Total Used Memory (B)": M } }
+            for (_card, info) in json.as_object().iter().flat_map(|o| o.iter()) {
+                if let Some(used_str) = info.get("VRAM Total Used Memory (B)")
+                    && let Some(used_b) = used_str
+                        .as_str()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .or_else(|| used_str.as_u64())
+                {
+                    return Some(used_b / (1024 * 1024));
                 }
             }
         }
@@ -214,16 +211,12 @@ fn sample_gpu_vram() -> Option<u64> {
         if let Ok(output) = std::process::Command::new("nvidia-smi")
             .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
             .output()
+            && output.status.success()
+            && let Ok(text) = std::str::from_utf8(&output.stdout)
+            && let Some(first_line) = text.lines().next()
+            && let Ok(mib) = first_line.trim().parse::<u64>()
         {
-            if output.status.success() {
-                if let Ok(text) = std::str::from_utf8(&output.stdout) {
-                    if let Some(first_line) = text.lines().next() {
-                        if let Ok(mib) = first_line.trim().parse::<u64>() {
-                            return Some(mib);
-                        }
-                    }
-                }
-            }
+            return Some(mib);
         }
     }
     None
@@ -1031,17 +1024,17 @@ impl WorkerRuntime {
             // but the worker fell back to CPU. A deliberate `cpu` configuration
             // has provider_available=true and no fallback_reason, so it stays
             // silent here — the CPU path is fully operational by user choice.
-            if !self.provider_runtime_status.provider_available {
-                if let Some(reason) = &self.provider_runtime_status.fallback_reason {
-                    tracing::warn!(
-                        reason = %reason,
-                        provider = %self.provider_runtime_status.execution_provider,
-                        "neural worker is on CPU after a GPU provider was requested; \
-                         inference will be 100-1000x slower than GPU. Point ORT_DYLIB_PATH at \
-                         a migraphx-enabled libonnxruntime, or set execution_provider=\"cpu\" to \
-                         use CPU embeddings deliberately."
-                    );
-                }
+            if !self.provider_runtime_status.provider_available
+                && let Some(reason) = &self.provider_runtime_status.fallback_reason
+            {
+                tracing::warn!(
+                    reason = %reason,
+                    provider = %self.provider_runtime_status.execution_provider,
+                    "neural worker is on CPU after a GPU provider was requested; \
+                     inference will be 100-1000x slower than GPU. Point ORT_DYLIB_PATH at \
+                     a migraphx-enabled libonnxruntime, or set execution_provider=\"cpu\" to \
+                     use CPU embeddings deliberately."
+                );
             }
         }
         #[cfg(not(feature = "onnx"))]

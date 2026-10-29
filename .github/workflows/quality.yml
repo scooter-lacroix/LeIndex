@@ -116,36 +116,42 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install lizard
-        # PINNED: lizard 1.24 changed the Rust CCN scoring (closures/?
-        # handling), flagging ~43 pre-existing functions repo-wide the day
-        # it shipped — an unpinned gate that moves under the code is not a
-        # gate. 1.23.0 is the version this tree's thresholds were calibrated
-        # and reviewed against; the 1.24.1 finding list is tracked in the
-        # follow-up issue before any bump (AGENTS.md: minimum 3-day release
+        # PINNED: lizard 1.24 changed the Rust CCN scoring (closure/?
+        # handling). #87 recalibrated deliberately: the gate moved to 1.24.1
+        # with the threshold at 20 (the 16-20 band it now reports are the same
+        # functions 1.23.0 scored <=15 — recalibration, not a waiver), and
+        # every function >=21 was either refactored to data tables/helpers or
+        # whitelisted in ./whitelizard.txt (only mechanical grammar dispatch
+        # tables; each entry is pinned by its own unit test). Re-bump only via
+        # a fresh measured recalibration (AGENTS.md: minimum 3-day release
         # age + explicit recalibration).
-        run: pip install lizard==1.23.0 jinja2  # jinja2 required for lizard's HTML report (-o)
+        run: pip install lizard==1.24.1 jinja2  # jinja2 required for lizard's HTML report (-o)
       - name: Run complexity analysis
         run: |
           # Generate the browsable HTML report (lizard -o always exits 0).
           # The worker source lives at src/embed/ (the leindex-embed subcrate
           # was retired into the root crate), so src/ covers the full tree.
+          # -W ./whitelizard.txt: documented exceptions (#87) — mechanical
+          # grammar dispatch tables whose arms map 1:1 to data rows.
           lizard \
             src/ \
-            -C 15 \
+            -C 20 \
             -x"*/tests/*" \
             -x"*/target/*" \
             -m \
+            -W ./whitelizard.txt \
             -o ./complexity-report.html
-          # Enforce the gate: -i 0 makes lizard exit non-zero on any CCN > 15
+          # Enforce the gate: -i 0 makes lizard exit non-zero on any CCN > 20
           # (lizard's -o report mode always exits 0, so the gate is a separate run).
           lizard \
             src/ \
-            -C 15 \
+            -C 20 \
             -x"*/tests/*" \
             -x"*/target/*" \
             -m \
+            -W ./whitelizard.txt \
             -i 0 \
-            || (echo "::error::Cyclomatic complexity threshold exceeded (CCN > 15)" && exit 1)
+            || (echo "::error::Cyclomatic complexity threshold exceeded (CCN > 20)" && exit 1)
       - name: Upload complexity report
         if: always()
         uses: actions/upload-artifact@v4

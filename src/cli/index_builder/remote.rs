@@ -26,12 +26,11 @@ pub(crate) fn try_remote_neural_embedder(
     // provider construction below fails on its own if the port stays down).
     if let Some(name) = embeddings_cfg.remote_service.as_deref() {
         let services = &crate::config::LeIndexConfig::load_cached().services;
-        if let Some(svc) = services.get(name) {
-            if svc.auto_start {
-                if let Err(e) = crate::services::ensure_running(name, svc) {
-                    tracing::warn!(service = %name, %e, "could not start managed embedding service");
-                }
-            }
+        if let Some(svc) = services.get(name)
+            && svc.auto_start
+            && let Err(e) = crate::services::ensure_running(name, svc)
+        {
+            tracing::warn!(service = %name, %e, "could not start managed embedding service");
         }
     }
     let resolved = embeddings_cfg.resolved_remote()?;

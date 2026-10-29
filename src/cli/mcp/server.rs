@@ -910,7 +910,37 @@ fn handle_ping() -> Value {
     serde_json::json!({})
 }
 
-/// JSON-RPC request handler
+/// Builds a JSON-RPC error response body for the given id, code, and message.
+/// A `None` id serializes as JSON `null` (notification semantics).
+fn jsonrpc_error_response(id: Option<Value>, code: i64, message: &str) -> Response {
+    Json(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message
+        }
+    }))
+    .into_response()
+}
+
+/// Per-session handshake check for the HTTP transport: returns whether the
+/// presented session id (if any) has completed `initialize`, refreshing its
+/// last-access time as a side effect.
+fn session_is_handshaked(server: &McpServer, incoming_session_id: Option<&String>) -> bool {
+    let Some(sid) = incoming_session_id else {
+        return false;
+    };
+    match server.session_handshakes.get_mut(sid.as_str()) {
+        Some(mut entry) => {
+            // Update last access time
+            entry.1 = Instant::now();
+            entry.0
+        }
+        None => false,
+    }
+}
+
 async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Response {
     let transport_started = Instant::now();
     // Extract Mcp-Session-Id header (if present)
@@ -924,15 +954,7 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
         Ok(r) => r,
         Err(e) => {
             warn!("Failed to parse JSON-RPC request: {}", e);
-            return Json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": null,
-                "error": {
-                    "code": -32700,
-                    "message": "Invalid JSON"
-                }
-            }))
-            .into_response();
+            return jsonrpc_error_response(None, -32700, "Invalid JSON");
         }
     };
 
@@ -940,15 +962,11 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
         Some(s) => s,
         None => {
             warn!("Server instance not initialized");
-            return Json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": json_req.id,
-                "error": {
-                    "code": -32603,
-                    "message": "Server instance not initialized"
-                }
-            }))
-            .into_response();
+            return jsonrpc_error_response(
+                json_req.id.clone(),
+                -32603,
+                "Server instance not initialized",
+            );
         }
     };
 
@@ -958,15 +976,7 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
         Some(h) => h,
         None => {
             warn!("Handlers not initialized");
-            return Json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": json_req.id,
-                "error": {
-                    "code": -32603,
-                    "message": "Handlers not initialized"
-                }
-            }))
-            .into_response();
+            return jsonrpc_error_response(json_req.id.clone(), -32603, "Handlers not initialized");
         }
     };
 
@@ -996,30 +1006,12 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
         // Health probe — no session required.
     } else {
         // All other methods require a valid handshaked session.
-        let session_ok = match &incoming_session_id {
-            Some(sid) => {
-                match server_instance.session_handshakes.get_mut(sid.as_str()) {
-                    Some(mut entry) => {
-                        // Update last access time
-                        entry.1 = Instant::now();
-                        entry.0
-                    }
-                    _ => false,
-                }
-            }
-            None => false,
-        };
-
-        if !session_ok {
-            return Json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": json_req.id,
-                "error": {
-                    "code": -32000,
-                    "message": "Server not initialized. Call 'initialize' first."
-                }
-            }))
-            .into_response();
+        if !session_is_handshaked(server_instance, incoming_session_id.as_ref()) {
+            return jsonrpc_error_response(
+                json_req.id,
+                -32000,
+                "Server not initialized. Call 'initialize' first.",
+            );
         }
     }
 
@@ -1358,19 +1350,18 @@ pub fn list_tools_json(handlers: &[ToolHandler]) -> Value {
 /// the endpoint still functions without one.
 async fn list_tools_handler(headers: HeaderMap) -> Json<Value> {
     // Validate session ID if present, but don't require one
-    if let Some(sid) = headers.get("Mcp-Session-Id").and_then(|v| v.to_str().ok()) {
-        if let Some(server) = SERVER_INSTANCE.get() {
-            if let Some(mut entry) = server.session_handshakes.get_mut(sid) {
-                // Update last access time
-                entry.1 = Instant::now();
-                if !entry.0 {
-                    return Json(serde_json::json!({
-                        "error": "Invalid session. Call 'initialize' first."
-                    }));
-                }
-            }
-            // Unknown session ID on a discovery endpoint — allow it (client may be probing)
+    if let Some(sid) = headers.get("Mcp-Session-Id").and_then(|v| v.to_str().ok())
+        && let Some(server) = SERVER_INSTANCE.get()
+        && let Some(mut entry) = server.session_handshakes.get_mut(sid)
+    {
+        // Update last access time
+        entry.1 = Instant::now();
+        if !entry.0 {
+            return Json(serde_json::json!({
+                "error": "Invalid session. Call 'initialize' first."
+            }));
         }
+        // Unknown session ID on a discovery endpoint — allow it (client may be probing)
     }
 
     // Only verify that the server instance exists.

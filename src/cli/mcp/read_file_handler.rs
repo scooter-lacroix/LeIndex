@@ -276,32 +276,31 @@ fn build_pdg_enrichment(
             }
 
             for &did in &pdg.neighbors(nid) {
-                if let Some(dep) = pdg.get_node(did) {
-                    if dep.file_path != node.file_path {
-                        let dep_offsets = dep_line_offsets_cache
-                            .entry(dep.file_path.clone())
-                            .or_insert_with(|| {
-                                std::fs::read_to_string(&*dep.file_path)
-                                    .map(|c| line_byte_offsets(&c))
-                                    .unwrap_or_default()
-                            });
-                        if dep_offsets.is_empty() {
-                            continue;
-                        }
-                        let dep_total_lines = dep_offsets.len().saturating_sub(1);
-                        let dep_line =
-                            byte_to_line_start(dep_offsets, dep.byte_range.0, dep_total_lines);
-                        imports_from
-                            .insert(format!("{}:{} (L{})", dep.file_path, dep.name, dep_line));
+                if let Some(dep) = pdg.get_node(did)
+                    && dep.file_path != node.file_path
+                {
+                    let dep_offsets = dep_line_offsets_cache
+                        .entry(dep.file_path.clone())
+                        .or_insert_with(|| {
+                            std::fs::read_to_string(&*dep.file_path)
+                                .map(|c| line_byte_offsets(&c))
+                                .unwrap_or_default()
+                        });
+                    if dep_offsets.is_empty() {
+                        continue;
                     }
+                    let dep_total_lines = dep_offsets.len().saturating_sub(1);
+                    let dep_line =
+                        byte_to_line_start(dep_offsets, dep.byte_range.0, dep_total_lines);
+                    imports_from.insert(format!("{}:{} (L{})", dep.file_path, dep.name, dep_line));
                 }
             }
 
             for &cid in &get_direct_callers(pdg, nid) {
-                if let Some(caller) = pdg.get_node(cid) {
-                    if caller.file_path != node.file_path {
-                        used_by.insert(format!("{}:{}", caller.file_path, caller.name));
-                    }
+                if let Some(caller) = pdg.get_node(cid)
+                    && caller.file_path != node.file_path
+                {
+                    used_by.insert(format!("{}:{}", caller.file_path, caller.name));
                 }
             }
         }

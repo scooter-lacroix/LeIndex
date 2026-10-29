@@ -131,23 +131,23 @@ impl GitStatusHandler {
         let Some(pdg) = guard.pdg() else {
             return Ok(result);
         };
-        if let Some(health) = crate::cli::index_freshness::load_health(guard.storage_path()) {
-            if matches!(
+        if let Some(health) = crate::cli::index_freshness::load_health(guard.storage_path())
+            && matches!(
                 health.status,
                 crate::cli::leindex::ComponentStatus::Stale
                     | crate::cli::leindex::ComponentStatus::Partial
                     | crate::cli::leindex::ComponentStatus::Failed
-            ) {
-                result["pdg_status"] = Value::String(
-                    match health.status {
-                        crate::cli::leindex::ComponentStatus::Partial => "partial",
-                        crate::cli::leindex::ComponentStatus::Failed => "failed",
-                        _ => "stale",
-                    }
-                    .to_string(),
-                );
-                return Ok(result);
-            }
+            )
+        {
+            result["pdg_status"] = Value::String(
+                match health.status {
+                    crate::cli::leindex::ComponentStatus::Partial => "partial",
+                    crate::cli::leindex::ComponentStatus::Failed => "failed",
+                    _ => "stale",
+                }
+                .to_string(),
+            );
+            return Ok(result);
         }
 
         let pdg_started = Instant::now();
@@ -312,10 +312,10 @@ fn enrich_pdg(
     for (path, state) in changed_paths(status) {
         let absolute = root.join(&path);
         let mut nodes = pdg.nodes_in_file(&absolute.to_string_lossy());
-        if nodes.is_empty() {
-            if let Ok(canonical) = absolute.canonicalize() {
-                nodes = pdg.nodes_in_file(&canonical.to_string_lossy());
-            }
+        if nodes.is_empty()
+            && let Ok(canonical) = absolute.canonicalize()
+        {
+            nodes = pdg.nodes_in_file(&canonical.to_string_lossy());
         }
         let symbols = nodes
             .iter()

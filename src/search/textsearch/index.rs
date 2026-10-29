@@ -36,7 +36,11 @@ const TRAILER: &[u8; 8] = b"LETXEND1";
 // an in-place same-length edit whose mtime was restored within the same
 // clock second (only ctime_nsec moved), which the stale plan excluded
 // forever. v2 files fail the version check and rebuild transparently.
-const VERSION: u32 = 3;
+// v4: Windows identity switched from creation time (which does not advance
+// on an in-place write) to the NTFS change time + file index (#88), so a
+// same-length mtime-restored edit is detected on Windows too. v3 files fail
+// the version check and rebuild transparently.
+const VERSION: u32 = 4;
 const HEADER_LEN: usize = 96;
 const FILE_ENTRY: usize = 56;
 const SYM_ENTRY: usize = 16;
@@ -137,7 +141,7 @@ fn read_varint(bytes: &[u8], pos: &mut usize) -> Option<u32> {
 }
 
 fn align8(buf: &mut Vec<u8>) {
-    while buf.len() % 8 != 0 {
+    while !buf.len().is_multiple_of(8) {
         buf.push(0);
     }
 }

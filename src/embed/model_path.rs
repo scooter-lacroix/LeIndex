@@ -30,18 +30,18 @@ pub struct ModelResolver;
 impl ModelResolver {
     fn bundled_model_dirs() -> Vec<PathBuf> {
         let mut dirs = Vec::new();
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(parent) = exe_path.parent() {
-                // 1. exe_parent/models (e.g., target/release/models)
-                dirs.push(parent.join("models"));
-                if let Some(grandparent) = parent.parent() {
-                    // 2. exe_parent/../models (e.g., target/models)
-                    dirs.push(grandparent.join("models"));
-                    // VAL-ONNX-004: 3. exe_parent/../../models (e.g., workspace root models)
-                    // When running from target/release/, models are at ../../models/
-                    if let Some(great_grandparent) = grandparent.parent() {
-                        dirs.push(great_grandparent.join("models"));
-                    }
+        if let Ok(exe_path) = std::env::current_exe()
+            && let Some(parent) = exe_path.parent()
+        {
+            // 1. exe_parent/models (e.g., target/release/models)
+            dirs.push(parent.join("models"));
+            if let Some(grandparent) = parent.parent() {
+                // 2. exe_parent/../models (e.g., target/models)
+                dirs.push(grandparent.join("models"));
+                // VAL-ONNX-004: 3. exe_parent/../../models (e.g., workspace root models)
+                // When running from target/release/, models are at ../../models/
+                if let Some(great_grandparent) = grandparent.parent() {
+                    dirs.push(great_grandparent.join("models"));
                 }
             }
         }
@@ -167,20 +167,18 @@ impl ModelResolver {
         // Check env override first — if the env var is set and the path is
         // rooted under it, report as env_override regardless of whether the
         // file also happens to live near the binary.
-        if let Ok(env_path) = std::env::var("LEINDEX_MODEL_PATH") {
-            let env_dir = PathBuf::from(env_path);
-            if path.starts_with(&env_dir) {
-                return "env_override";
-            }
+        if let Ok(env_path) = std::env::var("LEINDEX_MODEL_PATH")
+            && path.starts_with(PathBuf::from(env_path))
+        {
+            return "env_override";
         }
 
         // Check if it's near the binary
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(parent) = exe_path.parent() {
-                if path.starts_with(parent) {
-                    return "bundled";
-                }
-            }
+        if let Ok(exe_path) = std::env::current_exe()
+            && let Some(parent) = exe_path.parent()
+            && path.starts_with(parent)
+        {
+            return "bundled";
         }
 
         "user_cache"

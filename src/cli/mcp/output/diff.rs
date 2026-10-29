@@ -631,10 +631,10 @@ fn classify_diff_payload(data: &Value) -> Option<DiffPayload<'_>> {
         }
     }
     // (c) top-level list of per-file diffs
-    if let Some(arr) = data.get("diffs").and_then(|v| v.as_array()) {
-        if !arr.is_empty() {
-            return Some(DiffPayload::List { entries: arr });
-        }
+    if let Some(arr) = data.get("diffs").and_then(|v| v.as_array())
+        && !arr.is_empty()
+    {
+        return Some(DiffPayload::List { entries: arr });
     }
     // (e) `diff_text` echo
     if let Some(s) = data.get("diff_text").and_then(|v| v.as_str()) {

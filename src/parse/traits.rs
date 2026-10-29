@@ -779,35 +779,43 @@ pub mod languages {
     );
     tier0_language!(plaintext, "Plain Text", ["txt"], tree_sitter_json::LANGUAGE);
 
+    /// Tier-0 grammar registry (#87: data over a 23-arm match, which lizard
+    /// 1.24.x scores CCN 23). Names are the registry names the generic
+    /// Tier-0 parser passes; they are compile-time verified by the registry
+    /// test in parse::generic.
+    const REGISTRY: &[(&str, fn() -> Language)] = &[
+        ("swift", swift::language),
+        ("kotlin", kotlin::language),
+        ("dart", dart::language),
+        ("html", html::language),
+        ("css", css::language),
+        ("scss", scss::language),
+        ("yaml", yaml::language),
+        ("cmake", cmake::language),
+        ("elixir", elixir::language),
+        ("erlang", erlang::language),
+        ("haskell", haskell::language),
+        ("perl", perl::language),
+        ("r", r::language),
+        ("zig", zig::language),
+        ("graphql", graphql::language),
+        ("hcl", hcl::language),
+        ("make", make::language),
+        ("elisp", elisp::language),
+        ("julia", julia::language),
+        ("d", d::language),
+        ("glsl", glsl::language),
+        ("embedded_template", embedded_template::language),
+    ];
+
     /// Resolve a tree-sitter language by registry name (used by the generic
     /// Tier-0 parser). Panics on unknown names — callers pass table-driven
     /// names that are compile-time verified by the registry test.
     pub fn language_by_name(name: &str) -> Language {
-        match name {
-            "swift" => swift::language(),
-            "kotlin" => kotlin::language(),
-            "dart" => dart::language(),
-            "html" => html::language(),
-            "css" => css::language(),
-            "scss" => scss::language(),
-            "yaml" => yaml::language(),
-            "cmake" => cmake::language(),
-            "elixir" => elixir::language(),
-            "erlang" => erlang::language(),
-            "haskell" => haskell::language(),
-            "perl" => perl::language(),
-            "r" => r::language(),
-            "zig" => zig::language(),
-            "graphql" => graphql::language(),
-            "hcl" => hcl::language(),
-            "make" => make::language(),
-            "elisp" => elisp::language(),
-            "julia" => julia::language(),
-            "d" => d::language(),
-            "glsl" => glsl::language(),
-            "embedded_template" => embedded_template::language(),
-            _ => panic!("language_by_name: unknown language {name}"),
-        }
+        REGISTRY.iter().find(|(key, _)| *key == name).map_or_else(
+            || panic!("language_by_name: unknown language {name}"),
+            |(_, loader)| loader(),
+        )
     }
 
     /// Whether `name` has a Tier-0 language module (registry test helper).

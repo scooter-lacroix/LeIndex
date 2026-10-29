@@ -74,10 +74,10 @@ mod imp {
                 return Some((val.to_string(), 1));
             }
             // --key value
-            if arg == prefix {
-                if let Some(val) = args.get(i + 1) {
-                    return Some((val.clone(), 2));
-                }
+            if arg == prefix
+                && let Some(val) = args.get(i + 1)
+            {
+                return Some((val.clone(), 2));
             }
         }
         None
@@ -107,12 +107,12 @@ mod imp {
             use std::os::unix::fs::MetadataExt;
             (m.dev(), m.ino())
         });
-        if let (Some((dev, ino)), Some((pdev, pino))) = (held, at_path) {
-            if (dev, ino) != (pdev, pino) {
-                return Err(std::io::Error::other(
-                    "daemon lock file was replaced during acquisition; retrying would race two daemons",
-                ));
-            }
+        if let (Some((dev, ino)), Some((pdev, pino))) = (held, at_path)
+            && (dev, ino) != (pdev, pino)
+        {
+            return Err(std::io::Error::other(
+                "daemon lock file was replaced during acquisition; retrying would race two daemons",
+            ));
         }
         Ok(file)
     }

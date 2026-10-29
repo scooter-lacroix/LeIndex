@@ -464,15 +464,15 @@ fn extract_js_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportI
                 .split(',')
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty());
-            if let Some(default) = parts.next() {
-                if !module.is_empty() {
-                    add_import(imports, module, Some(default.to_string()));
-                }
+            if let Some(default) = parts.next()
+                && !module.is_empty()
+            {
+                add_import(imports, module, Some(default.to_string()));
             }
-            if let Some(named) = parts.next() {
-                if named.starts_with('{') {
-                    parse_named_imports(imports, module, named);
-                }
+            if let Some(named) = parts.next()
+                && named.starts_with('{')
+            {
+                parse_named_imports(imports, module, named);
             }
         }
     }
@@ -507,10 +507,10 @@ fn extract_js_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportI
     }
 
     fn visit(node: &tree_sitter::Node<'_>, source: &[u8], imports: &mut Vec<ImportInfo>) {
-        if node.kind() == "import_statement" {
-            if let Ok(text) = node.utf8_text(source) {
-                parse_import_text(imports, text);
-            }
+        if node.kind() == "import_statement"
+            && let Ok(text) = node.utf8_text(source)
+        {
+            parse_import_text(imports, text);
         }
 
         let mut cursor = node.walk();
@@ -665,21 +665,19 @@ fn extract_js_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> 
     fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {
         match node.kind() {
             "call_expression" | "optional_call_expression" => {
-                if let Some(func) = node.child_by_field_name("function") {
-                    if let Some(name) = extract_callee(&func, source) {
-                        if !name.is_empty() {
-                            calls.push(name);
-                        }
-                    }
+                if let Some(func) = node.child_by_field_name("function")
+                    && let Some(name) = extract_callee(&func, source)
+                    && !name.is_empty()
+                {
+                    calls.push(name);
                 }
             }
             "new_expression" => {
-                if let Some(ctor) = node.child_by_field_name("constructor") {
-                    if let Some(name) = extract_callee(&ctor, source) {
-                        if !name.is_empty() {
-                            calls.push(name);
-                        }
-                    }
+                if let Some(ctor) = node.child_by_field_name("constructor")
+                    && let Some(name) = extract_callee(&ctor, source)
+                    && !name.is_empty()
+                {
+                    calls.push(name);
                 }
             }
             _ => {}
@@ -710,16 +708,15 @@ fn extract_parameters(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<Parame
                         default_value: None,
                     });
                 }
-            } else if child.kind() == "rest_parameter" {
-                if let Some(name) = child.child_by_field_name("name") {
-                    if let Ok(n) = name.utf8_text(source) {
-                        parameters.push(Parameter {
-                            name: format!("...{}", n),
-                            type_annotation: None,
-                            default_value: None,
-                        });
-                    }
-                }
+            } else if child.kind() == "rest_parameter"
+                && let Some(name) = child.child_by_field_name("name")
+                && let Ok(n) = name.utf8_text(source)
+            {
+                parameters.push(Parameter {
+                    name: format!("...{}", n),
+                    type_annotation: None,
+                    default_value: None,
+                });
             }
         }
     }
@@ -824,37 +821,36 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
     let prev_sibling = node.prev_sibling();
 
     // Check for comment_block or comment_line
-    if let Some(sibling) = prev_sibling {
-        if sibling.kind() == "comment" || sibling.kind() == "comment_block" {
-            if let Ok(text) = sibling.utf8_text(source) {
-                return Some(
-                    text.trim()
-                        .trim_start_matches("/*")
-                        .trim_start_matches("//")
-                        .trim_start_matches("/**")
-                        .trim_start_matches("*")
-                        .trim_end_matches("*/")
-                        .trim()
-                        .to_string(),
-                );
-            }
-        }
+    if let Some(sibling) = prev_sibling
+        && matches!(sibling.kind(), "comment" | "comment_block")
+        && let Ok(text) = sibling.utf8_text(source)
+    {
+        return Some(
+            text.trim()
+                .trim_start_matches("/*")
+                .trim_start_matches("//")
+                .trim_start_matches("/**")
+                .trim_start_matches("*")
+                .trim_end_matches("*/")
+                .trim()
+                .to_string(),
+        );
     }
 
     // Check for JSDoc comment
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "comment" {
-            if let Ok(text) = child.utf8_text(source) {
-                let cleaned = text
-                    .trim()
-                    .trim_start_matches("/**")
-                    .trim_start_matches("/*")
-                    .trim_start_matches("//")
-                    .trim_end_matches("*/")
-                    .trim();
-                return Some(cleaned.to_string());
-            }
+        if child.kind() == "comment"
+            && let Ok(text) = child.utf8_text(source)
+        {
+            let cleaned = text
+                .trim()
+                .trim_start_matches("/**")
+                .trim_start_matches("/*")
+                .trim_start_matches("//")
+                .trim_end_matches("*/")
+                .trim();
+            return Some(cleaned.to_string());
         }
     }
 

@@ -262,15 +262,15 @@ fn cache_get(key: &VerdictKey) -> Option<RawVerdict> {
 }
 
 fn cache_put(key: VerdictKey, verdict: RawVerdict) {
-    if let Ok(mut guard) = verdict_cache().lock() {
-        if guard.0.insert(key.clone(), verdict).is_none() {
-            guard.1.push_back(key);
-            while guard.0.len() > VERDICT_CACHE_CAP {
-                if let Some(evicted) = guard.1.pop_front() {
-                    guard.0.remove(&evicted);
-                } else {
-                    break;
-                }
+    if let Ok(mut guard) = verdict_cache().lock()
+        && guard.0.insert(key.clone(), verdict).is_none()
+    {
+        guard.1.push_back(key);
+        while guard.0.len() > VERDICT_CACHE_CAP {
+            if let Some(evicted) = guard.1.pop_front() {
+                guard.0.remove(&evicted);
+            } else {
+                break;
             }
         }
     }

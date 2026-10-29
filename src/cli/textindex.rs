@@ -31,12 +31,11 @@ fn cache() -> &'static Cache {
 pub fn load(storage: &Path) -> Option<Arc<TextIndex>> {
     let path = index_path(storage);
     let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
-    if let Ok(guard) = cache().lock() {
-        if let Some((seen, index)) = guard.get(&path) {
-            if *seen == modified {
-                return Some(Arc::clone(index));
-            }
-        }
+    if let Ok(guard) = cache().lock()
+        && let Some((seen, index)) = guard.get(&path)
+        && *seen == modified
+    {
+        return Some(Arc::clone(index));
     }
     match TextIndex::open(&path) {
         Ok(index) => {

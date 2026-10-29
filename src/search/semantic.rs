@@ -43,13 +43,13 @@ impl SemanticProcessor {
         let mut formatted_context = String::new();
 
         for id in expanded_ids {
-            if let Some(graph_node) = pdg.get_node(id) {
-                if let Some(node_info) = content_lookup.get(&graph_node.id) {
-                    formatted_context.push_str(&format!("// File: {}\n", node_info.file_path));
-                    formatted_context.push_str(&format!("// Symbol: {}\n", node_info.symbol_name));
-                    formatted_context.push_str(&node_info.content);
-                    formatted_context.push_str("\n\n");
-                }
+            if let Some(graph_node) = pdg.get_node(id)
+                && let Some(node_info) = content_lookup.get(&graph_node.id)
+            {
+                formatted_context.push_str(&format!("// File: {}\n", node_info.file_path));
+                formatted_context.push_str(&format!("// Symbol: {}\n", node_info.symbol_name));
+                formatted_context.push_str(&node_info.content);
+                formatted_context.push_str("\n\n");
             }
         }
 

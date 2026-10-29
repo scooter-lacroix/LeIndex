@@ -31,10 +31,10 @@ fn sample_gpu_busy(duration: Duration) -> Option<f64> {
     let mut sysfs_value = None;
     for card in 0..8 {
         let path = format!("/sys/class/drm/card{card}/device/gpu_busy_percent");
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Ok(pct) = contents.trim().parse::<f64>() {
-                sysfs_value = Some(sysfs_value.map_or(pct, |v: f64| v.max(pct)));
-            }
+        if let Ok(contents) = std::fs::read_to_string(&path)
+            && let Ok(pct) = contents.trim().parse::<f64>()
+        {
+            sysfs_value = Some(sysfs_value.map_or(pct, |v: f64| v.max(pct)));
         }
     }
     if let Some(pct) = sysfs_value {
@@ -64,16 +64,14 @@ fn sample_gpu_busy(duration: Duration) -> Option<f64> {
                         let trimmed = line.trim();
                         // Only accept lines that begin with "GPU[<n>]" and
                         // contain "GPU use (%):" — never headers/summaries.
-                        if trimmed.starts_with("GPU[") {
-                            if let Some(idx) = trimmed.find("GPU use (%):") {
-                                if let Ok(pct) = trimmed[idx + "GPU use (%):".len()..]
-                                    .trim()
-                                    .trim_end_matches('%')
-                                    .parse::<f64>()
-                                {
-                                    sample.push(pct);
-                                }
-                            }
+                        if trimmed.starts_with("GPU[")
+                            && let Some(idx) = trimmed.find("GPU use (%):")
+                            && let Ok(pct) = trimmed[idx + "GPU use (%):".len()..]
+                                .trim()
+                                .trim_end_matches('%')
+                                .parse::<f64>()
+                        {
+                            sample.push(pct);
                         }
                     }
                     if !sample.is_empty() {

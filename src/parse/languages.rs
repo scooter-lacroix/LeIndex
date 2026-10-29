@@ -20,59 +20,128 @@ pub use crate::parse::rust::RustParser;
 pub use crate::parse::scala::ScalaParser;
 pub use crate::parse::swift::SwiftParser;
 
+/// Language name → parser constructor (#87: data over a 47-arm match, which
+/// lizard 1.24.x scores CCN 42). Keys are LOWERCASED names, including every
+/// alias and display form the old match accepted. Keys must stay unique:
+/// the match this table replaced guaranteed that at compile time, and
+/// `test_parser_table_keys_are_unique` keeps the property.
+const PARSER_TABLE: &[(
+    &str,
+    fn() -> Box<dyn crate::parse::traits::CodeIntelligence>,
+)] = &[
+    ("python", || Box::new(PythonParser::new())),
+    ("py", || Box::new(PythonParser::new())),
+    ("javascript", || Box::new(JavaScriptParser::new())),
+    ("js", || Box::new(JavaScriptParser::new())),
+    ("typescript", || Box::new(TypeScriptParser::new())),
+    ("ts", || Box::new(TypeScriptParser::new())),
+    ("rust", || Box::new(RustParser::new())),
+    ("rs", || Box::new(RustParser::new())),
+    ("go", || Box::new(GoParser::new())),
+    ("java", || Box::new(JavaParser::new())),
+    ("cpp", || Box::new(CppParser::new())),
+    ("c++", || Box::new(CppParser::new())),
+    ("csharp", || Box::new(CSharpParser::new())),
+    ("c#", || Box::new(CSharpParser::new())),
+    ("ruby", || Box::new(RubyParser::new())),
+    ("rb", || Box::new(RubyParser::new())),
+    ("php", || Box::new(PhpParser::new())),
+    ("lua", || Box::new(LuaParser::new())),
+    ("scala", || Box::new(ScalaParser::new())),
+    ("c", || Box::new(CParser::new())),
+    ("bash", || Box::new(BashParser::new())),
+    ("sh", || Box::new(BashParser::new())),
+    ("json", || Box::new(JsonParser::new())),
+    ("swift", || Box::new(SwiftParser::new())),
+    ("kotlin", || Box::new(KotlinParser::new())),
+    ("kt", || Box::new(KotlinParser::new())),
+    ("dart", || Box::new(DartParser::new())),
+    ("html", || Box::new(GenericParser::new("html"))),
+    ("htm", || Box::new(GenericParser::new("html"))),
+    ("css", || Box::new(GenericParser::new("css"))),
+    ("scss", || Box::new(GenericParser::new("scss"))),
+    ("yaml", || Box::new(GenericParser::new("yaml"))),
+    ("yml", || Box::new(GenericParser::new("yaml"))),
+    ("cmake", || Box::new(GenericParser::new("cmake"))),
+    ("elixir", || Box::new(GenericParser::new("elixir"))),
+    ("ex", || Box::new(GenericParser::new("elixir"))),
+    ("exs", || Box::new(GenericParser::new("elixir"))),
+    ("erlang", || Box::new(GenericParser::new("erlang"))),
+    ("erl", || Box::new(GenericParser::new("erlang"))),
+    ("haskell", || Box::new(GenericParser::new("haskell"))),
+    ("hs", || Box::new(GenericParser::new("haskell"))),
+    ("perl", || Box::new(GenericParser::new("perl"))),
+    ("pl", || Box::new(GenericParser::new("perl"))),
+    ("pm", || Box::new(GenericParser::new("perl"))),
+    ("r", || Box::new(GenericParser::new("r"))),
+    ("zig", || Box::new(GenericParser::new("zig"))),
+    ("graphql", || Box::new(GenericParser::new("graphql"))),
+    ("gql", || Box::new(GenericParser::new("graphql"))),
+    ("hcl", || Box::new(GenericParser::new("hcl"))),
+    ("terraform", || Box::new(GenericParser::new("hcl"))),
+    ("tf", || Box::new(GenericParser::new("hcl"))),
+    ("make", || Box::new(GenericParser::new("make"))),
+    ("makefile", || Box::new(GenericParser::new("make"))),
+    ("elisp", || Box::new(GenericParser::new("elisp"))),
+    ("emacs-lisp", || Box::new(GenericParser::new("elisp"))),
+    ("emacs lisp", || Box::new(GenericParser::new("elisp"))),
+    ("julia", || Box::new(GenericParser::new("julia"))),
+    ("jl", || Box::new(GenericParser::new("julia"))),
+    ("d", || Box::new(GenericParser::new("d"))),
+    ("glsl", || Box::new(GenericParser::new("glsl"))),
+    ("embedded-template", || {
+        Box::new(GenericParser::new("embedded_template"))
+    }),
+    ("embedded template", || {
+        Box::new(GenericParser::new("embedded_template"))
+    }),
+    ("ejs", || Box::new(GenericParser::new("embedded_template"))),
+    ("erb", || Box::new(GenericParser::new("embedded_template"))),
+    ("liquid", || {
+        Box::new(GenericParser::new("embedded_template"))
+    }),
+    ("markdown", || Box::new(DocParser::new(DocFlavor::Markdown))),
+    ("md", || Box::new(DocParser::new(DocFlavor::Markdown))),
+    ("rst", || Box::new(DocParser::new(DocFlavor::Rst))),
+    ("restructuredtext", || {
+        Box::new(DocParser::new(DocFlavor::Rst))
+    }),
+    ("asciidoc", || Box::new(DocParser::new(DocFlavor::Adoc))),
+    ("adoc", || Box::new(DocParser::new(DocFlavor::Adoc))),
+    // `parallel.rs` resolves parsers by the language's DISPLAY name, so
+    // the label forms ("Plain Text", "Emacs Lisp") must resolve too.
+    ("text", || Box::new(DocParser::new(DocFlavor::Plain))),
+    ("txt", || Box::new(DocParser::new(DocFlavor::Plain))),
+    ("plaintext", || Box::new(DocParser::new(DocFlavor::Plain))),
+    ("plain text", || Box::new(DocParser::new(DocFlavor::Plain))),
+    ("plain", || Box::new(DocParser::new(DocFlavor::Plain))),
+];
+
 /// Type-specific parser factory
 pub fn parser_for_language(
     language: &str,
 ) -> Option<Box<dyn crate::parse::traits::CodeIntelligence>> {
-    match language.to_lowercase().as_str() {
-        "python" | "py" => Some(Box::new(PythonParser::new())),
-        "javascript" | "js" => Some(Box::new(JavaScriptParser::new())),
-        "typescript" | "ts" => Some(Box::new(TypeScriptParser::new())),
-        "rust" | "rs" => Some(Box::new(RustParser::new())),
-        "go" => Some(Box::new(GoParser::new())),
-        "java" => Some(Box::new(JavaParser::new())),
-        "cpp" | "c++" => Some(Box::new(CppParser::new())),
-        "csharp" | "c#" => Some(Box::new(CSharpParser::new())),
-        "ruby" | "rb" => Some(Box::new(RubyParser::new())),
-        "php" => Some(Box::new(PhpParser::new())),
-        "lua" => Some(Box::new(LuaParser::new())),
-        "scala" => Some(Box::new(ScalaParser::new())),
-        "c" => Some(Box::new(CParser::new())),
-        "bash" | "sh" => Some(Box::new(BashParser::new())),
-        "json" => Some(Box::new(JsonParser::new())),
-        "swift" => Some(Box::new(SwiftParser::new())),
-        "kotlin" | "kt" => Some(Box::new(KotlinParser::new())),
-        "dart" => Some(Box::new(DartParser::new())),
-        "html" | "htm" => Some(Box::new(GenericParser::new("html"))),
-        "css" => Some(Box::new(GenericParser::new("css"))),
-        "scss" => Some(Box::new(GenericParser::new("scss"))),
-        "yaml" | "yml" => Some(Box::new(GenericParser::new("yaml"))),
-        "cmake" => Some(Box::new(GenericParser::new("cmake"))),
-        "elixir" | "ex" | "exs" => Some(Box::new(GenericParser::new("elixir"))),
-        "erlang" | "erl" => Some(Box::new(GenericParser::new("erlang"))),
-        "haskell" | "hs" => Some(Box::new(GenericParser::new("haskell"))),
-        "perl" | "pl" | "pm" => Some(Box::new(GenericParser::new("perl"))),
-        "r" => Some(Box::new(GenericParser::new("r"))),
-        "zig" => Some(Box::new(GenericParser::new("zig"))),
-        "graphql" | "gql" => Some(Box::new(GenericParser::new("graphql"))),
-        "hcl" | "terraform" | "tf" => Some(Box::new(GenericParser::new("hcl"))),
-        "make" | "makefile" => Some(Box::new(GenericParser::new("make"))),
-        "elisp" | "emacs-lisp" | "emacs lisp" => Some(Box::new(GenericParser::new("elisp"))),
-        "julia" | "jl" => Some(Box::new(GenericParser::new("julia"))),
-        "d" => Some(Box::new(GenericParser::new("d"))),
-        "glsl" => Some(Box::new(GenericParser::new("glsl"))),
-        "embedded-template" | "embedded template" | "ejs" | "erb" | "liquid" => {
-            Some(Box::new(GenericParser::new("embedded_template")))
+    let key = language.to_lowercase();
+    PARSER_TABLE
+        .iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, build)| build())
+}
+
+#[cfg(test)]
+mod parser_table_tests {
+    use super::*;
+
+    /// #87 guard: parser keys stay unique — the match this table replaced
+    /// guaranteed that at compile time via unreachable patterns.
+    #[test]
+    fn test_parser_table_keys_are_unique() {
+        for (i, (key, _)) in PARSER_TABLE.iter().enumerate() {
+            assert!(
+                PARSER_TABLE.iter().take(i).all(|(other, _)| other != key),
+                "duplicate parser key: {key}"
+            );
         }
-        "markdown" | "md" => Some(Box::new(DocParser::new(DocFlavor::Markdown))),
-        "rst" | "restructuredtext" => Some(Box::new(DocParser::new(DocFlavor::Rst))),
-        "asciidoc" | "adoc" => Some(Box::new(DocParser::new(DocFlavor::Adoc))),
-        // `parallel.rs` resolves parsers by the language's DISPLAY name, so
-        // the label forms ("Plain Text", "Emacs Lisp") must resolve too.
-        "text" | "txt" | "plaintext" | "plain text" | "plain" => {
-            Some(Box::new(DocParser::new(DocFlavor::Plain)))
-        }
-        _ => None,
     }
 }
 

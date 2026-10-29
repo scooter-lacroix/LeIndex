@@ -54,23 +54,23 @@ pub(super) fn check_model_present_for_name(model_name: &str) -> bool {
     let model_filename = format!("{}.onnx", model_name);
 
     // Check via config module's model_dir_path
-    if let Some(model_dir) = crate::config::model_dir_path() {
-        if model_assets_present(&model_dir, &model_filename) {
-            return true;
-        }
+    if let Some(model_dir) = crate::config::model_dir_path()
+        && model_assets_present(&model_dir, &model_filename)
+    {
+        return true;
     }
 
     // Also check bundled models relative to the binary
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            if model_assets_present(&parent.join("models"), &model_filename) {
-                return true;
-            }
-            if let Some(gp) = parent.parent() {
-                if model_assets_present(&gp.join("models"), &model_filename) {
-                    return true;
-                }
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        if model_assets_present(&parent.join("models"), &model_filename) {
+            return true;
+        }
+        if let Some(gp) = parent.parent()
+            && model_assets_present(&gp.join("models"), &model_filename)
+        {
+            return true;
         }
     }
 
@@ -189,10 +189,10 @@ pub(super) fn model_checksum_status_for_name(model_name: &str) -> ModelChecksumS
 /// Locate a Hugging Face CLI executable, honoring `HF_BIN` first.
 pub(super) fn find_hugging_face_cli() -> Option<String> {
     let mut candidates = Vec::new();
-    if let Ok(path) = std::env::var("HF_BIN") {
-        if !path.trim().is_empty() {
-            candidates.push(path);
-        }
+    if let Ok(path) = std::env::var("HF_BIN")
+        && !path.trim().is_empty()
+    {
+        candidates.push(path);
     }
     candidates.extend(["hf".to_string(), "huggingface-cli".to_string()]);
 

@@ -417,14 +417,11 @@ impl SemanticDriftAnalyzer {
 
         // Check for modified symbols
         for name in original_map.keys() {
-            if let Some(new_sig) = new_map.get(name) {
-                if let Some(original_sig) = original_map.get(name) {
-                    if let Some(drift) =
-                        self.detect_signature_drift(change, original_sig, new_sig)?
-                    {
-                        drift_items.push(drift);
-                    }
-                }
+            if let Some(new_sig) = new_map.get(name)
+                && let Some(original_sig) = original_map.get(name)
+                && let Some(drift) = self.detect_signature_drift(change, original_sig, new_sig)?
+            {
+                drift_items.push(drift);
             }
         }
 
@@ -513,15 +510,15 @@ impl SemanticDriftAnalyzer {
 
     /// Check if a symbol is part of the public API
     pub fn is_public_api(&self, symbol_name: &str) -> bool {
-        if let Some(node_id) = self.pdg.find_by_symbol(symbol_name) {
-            if let Some(node) = self.pdg.get_node(node_id) {
-                // For now, consider all functions and classes as potential API
-                // In a full implementation, this would check visibility modifiers
-                return matches!(
-                    node.node_type,
-                    NodeType::Function | NodeType::Method | NodeType::Class
-                );
-            }
+        if let Some(node_id) = self.pdg.find_by_symbol(symbol_name)
+            && let Some(node) = self.pdg.get_node(node_id)
+        {
+            // For now, consider all functions and classes as potential API
+            // In a full implementation, this would check visibility modifiers
+            return matches!(
+                node.node_type,
+                NodeType::Function | NodeType::Method | NodeType::Class
+            );
         }
         false
     }

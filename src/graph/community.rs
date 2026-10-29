@@ -107,17 +107,18 @@ pub fn detect_communities(pdg: &ProgramDependenceGraph) -> (HashMap<NodeId, u32>
     // Leiden over the compact CSR projection; drop it immediately after.
     let started = std::time::Instant::now();
     let mut result: Option<(Vec<usize>, f64)> = None;
-    if graph.node_count() >= 2 && edge_count >= 1 {
-        if let Ok(data) = leiden_rs::convert::petgraph::from_petgraph(&graph) {
-            let config = leiden_rs::leiden::LeidenConfig::builder()
-                .quality(leiden_rs::leiden::QualityType::Modularity)
-                .resolution(COMMUNITY_RESOLUTION)
-                .seed(COMMUNITY_SEED)
-                .build();
-            let leiden = leiden_rs::leiden::Leiden::new(config);
-            if let Ok(output) = leiden.run(&data) {
-                result = Some((output.partition.as_slice().to_vec(), output.quality));
-            }
+    if graph.node_count() >= 2
+        && edge_count >= 1
+        && let Ok(data) = leiden_rs::convert::petgraph::from_petgraph(&graph)
+    {
+        let config = leiden_rs::leiden::LeidenConfig::builder()
+            .quality(leiden_rs::leiden::QualityType::Modularity)
+            .resolution(COMMUNITY_RESOLUTION)
+            .seed(COMMUNITY_SEED)
+            .build();
+        let leiden = leiden_rs::leiden::Leiden::new(config);
+        if let Ok(output) = leiden.run(&data) {
+            result = Some((output.partition.as_slice().to_vec(), output.quality));
         }
     }
     drop(graph);

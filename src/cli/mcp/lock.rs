@@ -104,10 +104,10 @@ impl McpProjectLock {
         let start_path = run_dir.join(format!("{stem}.start"));
 
         // Fast path: a live sibling already owns the lock.
-        if let Some(pid) = read_lock_owner(&lock_path) {
-            if pid_is_owned(pid, &start_path) {
-                return (LockOutcome::AlreadyOwned { pid }, None);
-            }
+        if let Some(pid) = read_lock_owner(&lock_path)
+            && pid_is_owned(pid, &start_path)
+        {
+            return (LockOutcome::AlreadyOwned { pid }, None);
         }
 
         // Atomic arbitration (Codex P2): exclusive-create the lock file so two

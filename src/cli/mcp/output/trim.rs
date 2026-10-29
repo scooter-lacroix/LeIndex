@@ -348,23 +348,23 @@ fn trim_symbol_lookup(data: &Value) -> Value {
     // results — without this branch, the top-level field
     // whitelist below finds nothing and the LLM-visible
     // payload becomes an empty object.
-    if data.get("batch").and_then(|v| v.as_bool()).unwrap_or(false) {
-        if let Some(arr) = data.get("results").and_then(|v| v.as_array()) {
-            let mut trimmed_results: Vec<Value> = Vec::with_capacity(arr.len());
-            for entry in arr {
-                trimmed_results.push(trim_symbol_lookup_single(entry));
-            }
-            let mut out = serde_json::Map::new();
-            out.insert("batch".to_string(), Value::Bool(true));
-            out.insert(
-                "count".to_string(),
-                data.get("count")
-                    .cloned()
-                    .unwrap_or(Value::from(trimmed_results.len())),
-            );
-            out.insert("results".to_string(), Value::Array(trimmed_results));
-            return Value::Object(out);
+    if data.get("batch").and_then(|v| v.as_bool()).unwrap_or(false)
+        && let Some(arr) = data.get("results").and_then(|v| v.as_array())
+    {
+        let mut trimmed_results: Vec<Value> = Vec::with_capacity(arr.len());
+        for entry in arr {
+            trimmed_results.push(trim_symbol_lookup_single(entry));
         }
+        let mut out = serde_json::Map::new();
+        out.insert("batch".to_string(), Value::Bool(true));
+        out.insert(
+            "count".to_string(),
+            data.get("count")
+                .cloned()
+                .unwrap_or(Value::from(trimmed_results.len())),
+        );
+        out.insert("results".to_string(), Value::Array(trimmed_results));
+        return Value::Object(out);
     }
     trim_symbol_lookup_single(data)
 }
@@ -541,21 +541,21 @@ fn trim_read_file(data: &Value) -> Value {
         "content".to_string(),
         data.get("content").cloned().unwrap_or(Value::Null),
     );
-    if let Some(ctx) = data.get("context") {
-        if let Some(obj) = ctx.as_object() {
-            let mut trimmed_ctx = serde_json::Map::new();
-            if let Some(v) = obj.get("imports_from") {
-                trimmed_ctx.insert("imports_from".to_string(), take_n(v, 10));
-            }
-            if let Some(v) = obj.get("used_by") {
-                trimmed_ctx.insert("used_by".to_string(), take_n(v, 10));
-            }
-            if let Some(v) = obj.get("symbols_on_visible_lines") {
-                trimmed_ctx.insert("symbols_on_visible_lines".to_string(), take_n(v, 20));
-            }
-            if !trimmed_ctx.is_empty() {
-                out.insert("context".to_string(), Value::Object(trimmed_ctx));
-            }
+    if let Some(ctx) = data.get("context")
+        && let Some(obj) = ctx.as_object()
+    {
+        let mut trimmed_ctx = serde_json::Map::new();
+        if let Some(v) = obj.get("imports_from") {
+            trimmed_ctx.insert("imports_from".to_string(), take_n(v, 10));
+        }
+        if let Some(v) = obj.get("used_by") {
+            trimmed_ctx.insert("used_by".to_string(), take_n(v, 10));
+        }
+        if let Some(v) = obj.get("symbols_on_visible_lines") {
+            trimmed_ctx.insert("symbols_on_visible_lines".to_string(), take_n(v, 20));
+        }
+        if !trimmed_ctx.is_empty() {
+            out.insert("context".to_string(), Value::Object(trimmed_ctx));
         }
     }
     if let Some(sm) = data.get("symbol_map") {

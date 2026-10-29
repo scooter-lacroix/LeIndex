@@ -35,8 +35,21 @@ pub enum FeatureFlag {
     /// Enable experimental HNSW algorithm parameters.
     ExperimentalHnsw,
     /// Enable streaming MCP notifications.
+    ///
+    /// Declared but not consumed: no production code reads this flag (the
+    /// GA-era streaming-notification route was superseded before it gained a
+    /// consumer). Default OFF so the advertised switch matches reality —
+    /// flipping it ON does nothing. Tracked by the consumer-presence audit
+    /// test in `tests/gate_audit_test.rs`: it cannot return to default ON
+    /// until a production consumer exists.
     StreamingMcp,
     /// Enable global index auto-sync.
+    ///
+    /// Declared but not consumed: no production code reads this flag (the
+    /// GA-era global auto-sync route was superseded before it gained a
+    /// consumer). Default OFF so the advertised switch matches reality.
+    /// Tracked by the consumer-presence audit test in
+    /// `tests/gate_audit_test.rs`.
     GlobalAutoSync,
     /// Enable the daemon-client MIME protocol path (WS3).
     ///
@@ -77,10 +90,12 @@ pub enum FeatureFlag {
     /// Route indexing through the fair bounded scheduler (WS5): heavy work is
     /// executed as stepped [`BoundedJob`](crate::scheduler::budget::BoundedJob)s
     /// behind the DRR queues and admission gate instead of one unstepped
-    /// `spawn_blocking` call. The compiled default is ON; disabling it keeps
-    /// the legacy spawn_blocking + error-at-cap indexing path.
+    /// `spawn_blocking` call. Disabling it keeps the legacy spawn_blocking +
+    /// error-at-cap indexing path (currently the only path — see Status).
     ///
-    /// **Status:** declared but NOT consumed — blocked, by design. There is no
+    /// **Status:** declared but NOT consumed — blocked, by design, so it
+    /// defaults OFF (#86): defaulting an unconsumed flag ON advertised a kill
+    /// switch that did nothing. There is no
     /// honest consumer: `IndexJob::step` invokes `PhaseExecutor::run_phase`
     /// wholesale and ignores `WorkBudget`, and the LeIndex pipeline phases
     /// (`run_scan`, `run_parse`, `run_lexical`, `run_neural`) are monolithic
@@ -183,33 +198,53 @@ pub enum FeatureFlag {
 }
 
 impl FeatureFlag {
+    /// Flag → env-var table (#87: data over a 23-arm match, which lizard
+    /// 1.24.x scores CCN 23). One row per variant — `test_flag_tables_agree`
+    /// (below) fails if a variant is missing here or in DESCRIPTIONS.
+    const ENV_NAMES: [(FeatureFlag, &'static str); 23] = [
+        (Self::NeuralSearch, "LEINDEX_FEATURE_NEURAL_SEARCH"),
+        (Self::SystemOne, "LEINDEX_FEATURE_SYSTEM_ONE"),
+        (Self::RemoteEmbeddings, "LEINDEX_FEATURE_REMOTE_EMBEDDINGS"),
+        (
+            Self::CrossLanguageResolution,
+            "LEINDEX_FEATURE_CROSS_LANGUAGE",
+        ),
+        (Self::ExperimentalHnsw, "LEINDEX_FEATURE_EXPERIMENTAL_HNSW"),
+        (Self::StreamingMcp, "LEINDEX_FEATURE_STREAMING_MCP"),
+        (Self::GlobalAutoSync, "LEINDEX_FEATURE_GLOBAL_AUTO_SYNC"),
+        (Self::DaemonClient, "LEINDEX_FEATURE_DAEMON_CLIENT"),
+        (
+            Self::GenerationMigration,
+            "LEINDEX_FEATURE_GENERATION_MIGRATION",
+        ),
+        (
+            Self::GenerationReaders,
+            "LEINDEX_FEATURE_GENERATION_READERS",
+        ),
+        (Self::BoundedScheduler, "LEINDEX_FEATURE_BOUNDED_SCHEDULER"),
+        (Self::StreamingScan, "LEINDEX_FEATURE_STREAMING_SCAN"),
+        (Self::StreamingParse, "LEINDEX_FEATURE_STREAMING_PARSE"),
+        (Self::StreamingPdg, "LEINDEX_FEATURE_STREAMING_PDG"),
+        (Self::StreamingTfidf, "LEINDEX_FEATURE_STREAMING_TFIDF"),
+        (Self::GlobalEmbedCache, "LEINDEX_FEATURE_GLOBAL_EMBED_CACHE"),
+        (
+            Self::CommunityDetection,
+            "LEINDEX_FEATURE_COMMUNITY_DETECTION",
+        ),
+        (Self::PrecisionIngest, "LEINDEX_FEATURE_PRECISION_INGEST"),
+        (Self::DebugEscapeHatch, "LEINDEX_FEATURE_EMBED_CACHE_DEBUG"),
+        (Self::ValidatedModel, "LEINDEX_FEATURE_VALIDATED_MODEL"),
+        (Self::Engram, "LEINDEX_FEATURE_ENGRAM"),
+        (Self::Matryoshka, "LEINDEX_FEATURE_MATRYOSHKA"),
+        (Self::StructuralSearch, "LEINDEX_FEATURE_STRUCTURAL_SEARCH"),
+    ];
+
     /// Returns the environment variable name for this flag.
     pub fn env_var(&self) -> &'static str {
-        match self {
-            Self::NeuralSearch => "LEINDEX_FEATURE_NEURAL_SEARCH",
-            Self::SystemOne => "LEINDEX_FEATURE_SYSTEM_ONE",
-            Self::RemoteEmbeddings => "LEINDEX_FEATURE_REMOTE_EMBEDDINGS",
-            Self::CrossLanguageResolution => "LEINDEX_FEATURE_CROSS_LANGUAGE",
-            Self::ExperimentalHnsw => "LEINDEX_FEATURE_EXPERIMENTAL_HNSW",
-            Self::StreamingMcp => "LEINDEX_FEATURE_STREAMING_MCP",
-            Self::GlobalAutoSync => "LEINDEX_FEATURE_GLOBAL_AUTO_SYNC",
-            Self::DaemonClient => "LEINDEX_FEATURE_DAEMON_CLIENT",
-            Self::GenerationMigration => "LEINDEX_FEATURE_GENERATION_MIGRATION",
-            Self::GenerationReaders => "LEINDEX_FEATURE_GENERATION_READERS",
-            Self::BoundedScheduler => "LEINDEX_FEATURE_BOUNDED_SCHEDULER",
-            Self::StreamingScan => "LEINDEX_FEATURE_STREAMING_SCAN",
-            Self::StreamingParse => "LEINDEX_FEATURE_STREAMING_PARSE",
-            Self::StreamingPdg => "LEINDEX_FEATURE_STREAMING_PDG",
-            Self::StreamingTfidf => "LEINDEX_FEATURE_STREAMING_TFIDF",
-            Self::GlobalEmbedCache => "LEINDEX_FEATURE_GLOBAL_EMBED_CACHE",
-            Self::CommunityDetection => "LEINDEX_FEATURE_COMMUNITY_DETECTION",
-            Self::PrecisionIngest => "LEINDEX_FEATURE_PRECISION_INGEST",
-            Self::DebugEscapeHatch => "LEINDEX_FEATURE_EMBED_CACHE_DEBUG",
-            Self::ValidatedModel => "LEINDEX_FEATURE_VALIDATED_MODEL",
-            Self::Engram => "LEINDEX_FEATURE_ENGRAM",
-            Self::Matryoshka => "LEINDEX_FEATURE_MATRYOSHKA",
-            Self::StructuralSearch => "LEINDEX_FEATURE_STRUCTURAL_SEARCH",
-        }
+        Self::ENV_NAMES
+            .iter()
+            .find(|(flag, _)| flag == self)
+            .map_or("UNNAMED_FEATURE", |(_, name)| name)
     }
 
     /// Returns whether this flag is enabled by default (without env override).
@@ -224,17 +259,19 @@ impl FeatureFlag {
             // revertible through their flags. New consumer routes are listed only
             // after their own rollout gates pass; the PR-86 scan, parse, TF-IDF,
             // and neural consumers intentionally remain opt-in below.
-            Self::StreamingMcp
-            | Self::GlobalAutoSync
-            | Self::NeuralSearch
+            Self::NeuralSearch
             | Self::RemoteEmbeddings
             // Stable architecture capabilities with successful rollout gates
             // remain default ON and individually revertible. StreamingScan,
-            // StreamingParse, and StreamingTfidf intentionally
-            // remain OFF until their consumers complete a separate rollout.
+            // StreamingParse, and StreamingTfidf intentionally remain OFF
+            // until their consumers complete a separate rollout.
+            // BoundedScheduler, StreamingMcp, and GlobalAutoSync have NO
+            // production consumer (#86): defaulting them ON advertised kill
+            // switches that did nothing. They cannot rejoin this list until
+            // the consumer-presence audit test in tests/gate_audit_test.rs
+            // passes for them.
             | Self::DaemonClient
             | Self::GenerationReaders
-            | Self::BoundedScheduler
             | Self::StreamingPdg
             | Self::GlobalEmbedCache
             | Self::CommunityDetection
@@ -261,10 +298,9 @@ impl FeatureFlag {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
+            && let Some(v) = map.get(self)
         {
-            if let Some(v) = map.get(self) {
-                return *v;
-            }
+            return *v;
         }
         // Phase-9 legacy fallback: when LEINDEX_LEGACY=1 is active, all
         // v2.0.0 rollout flags revert to OFF (legacy behavior). This allows
@@ -278,57 +314,101 @@ impl FeatureFlag {
 
     /// Returns a human-readable description of the flag.
     pub fn description(&self) -> &'static str {
-        match self {
-            Self::NeuralSearch => "Enable neural (ONNX) embedding search at runtime",
-            Self::SystemOne => "Enable the System-One typed-decision MCP gate (experimental)",
-            Self::RemoteEmbeddings => "Enable remote embedding API (OpenAI, etc.)",
-            Self::CrossLanguageResolution => "Enable cross-language symbol resolution",
-            Self::ExperimentalHnsw => "Enable experimental HNSW algorithm parameters",
-            Self::StreamingMcp => "Enable streaming MCP notifications",
-            Self::GlobalAutoSync => "Enable global index auto-sync",
-            Self::DaemonClient => "Stdio MCP shim forwards to user-scoped leindexd daemon (WS3)",
-            Self::GenerationMigration => "Enable the one-time legacy→CAS store migration sweep",
-            Self::GenerationReaders => {
-                "Read-path handlers use leased mmap generations instead of heap mirrors"
-            }
-            Self::BoundedScheduler => {
-                "Route heavy work through the fair bounded scheduler (DRR + admission)"
-            }
-            Self::StreamingScan => {
-                "Streaming scan stage: lazy file walk, 64KiB hash buffer, no source retention"
-            }
-            Self::StreamingParse => {
-                "Streaming parse stage: bounded chunks, per-file persist, tree drop"
-            }
-            Self::StreamingPdg => {
-                "Compact PDG persistence: per-file fragments to CAS, no whole-PDG clone"
-            }
-            Self::StreamingTfidf => "Streaming two-pass TF-IDF with direct CAS-staged row writes",
-            Self::GlobalEmbedCache => {
-                "Global content-addressed embedding cache with cross-project dedup"
-            }
-            Self::CommunityDetection => {
-                "Leiden community detection over the PDG (project_map grouping, impact boundaries)"
-            }
-            Self::PrecisionIngest => {
-                "SCIP precision ingestion (default on) with silent Tier-0 fallback when no indexer is available; set LEINDEX_FEATURE_PRECISION_INGEST=false to disable"
-            }
-            Self::DebugEscapeHatch => {
-                "Embedding-cache debug escape hatch: store source text alongside rows"
-            }
-            Self::ValidatedModel => {
-                "Use WS11 validated model profile (CodeRankEmbed-INT8, no reranker)"
-            }
-            Self::Engram => {
-                "Engram: persistent phrase-book of neural query embeddings (repeat queries skip the embedder)"
-            }
-            Self::Matryoshka => {
-                "Persist/search neural vectors at sliced MRL dimensions (128/256/512; experimental)"
-            }
-            Self::StructuralSearch => {
-                "Structural (AST-pattern) search: ast-grep patterns matched against LeIndex's tree-sitter grammars"
-            }
-        }
+        const DESCRIPTIONS: [(FeatureFlag, &str); 23] = [
+            (
+                FeatureFlag::NeuralSearch,
+                "Enable neural (ONNX) embedding search at runtime",
+            ),
+            (
+                FeatureFlag::SystemOne,
+                "Enable the System-One typed-decision MCP gate (experimental)",
+            ),
+            (
+                FeatureFlag::RemoteEmbeddings,
+                "Enable remote embedding API (OpenAI, etc.)",
+            ),
+            (
+                FeatureFlag::CrossLanguageResolution,
+                "Enable cross-language symbol resolution",
+            ),
+            (
+                FeatureFlag::ExperimentalHnsw,
+                "Enable experimental HNSW algorithm parameters",
+            ),
+            (
+                FeatureFlag::StreamingMcp,
+                "Enable streaming MCP notifications",
+            ),
+            (FeatureFlag::GlobalAutoSync, "Enable global index auto-sync"),
+            (
+                FeatureFlag::DaemonClient,
+                "Stdio MCP shim forwards to user-scoped leindexd daemon (WS3)",
+            ),
+            (
+                FeatureFlag::GenerationMigration,
+                "Enable the one-time legacy→CAS store migration sweep",
+            ),
+            (
+                FeatureFlag::GenerationReaders,
+                "Read-path handlers use leased mmap generations instead of heap mirrors",
+            ),
+            (
+                FeatureFlag::BoundedScheduler,
+                "Route heavy work through the fair bounded scheduler (DRR + admission)",
+            ),
+            (
+                FeatureFlag::StreamingScan,
+                "Streaming scan stage: lazy file walk, 64KiB hash buffer, no source retention",
+            ),
+            (
+                FeatureFlag::StreamingParse,
+                "Streaming parse stage: bounded chunks, per-file persist, tree drop",
+            ),
+            (
+                FeatureFlag::StreamingPdg,
+                "Compact PDG persistence: per-file fragments to CAS, no whole-PDG clone",
+            ),
+            (
+                FeatureFlag::StreamingTfidf,
+                "Streaming two-pass TF-IDF with direct CAS-staged row writes",
+            ),
+            (
+                FeatureFlag::GlobalEmbedCache,
+                "Global content-addressed embedding cache with cross-project dedup",
+            ),
+            (
+                FeatureFlag::CommunityDetection,
+                "Leiden community detection over the PDG (project_map grouping, impact boundaries)",
+            ),
+            (
+                FeatureFlag::PrecisionIngest,
+                "SCIP precision ingestion (default on) with silent Tier-0 fallback when no indexer is available; set LEINDEX_FEATURE_PRECISION_INGEST=false to disable",
+            ),
+            (
+                FeatureFlag::DebugEscapeHatch,
+                "Embedding-cache debug escape hatch: store source text alongside rows",
+            ),
+            (
+                FeatureFlag::ValidatedModel,
+                "Use WS11 validated model profile (CodeRankEmbed-INT8, no reranker)",
+            ),
+            (
+                FeatureFlag::Engram,
+                "Engram: persistent phrase-book of neural query embeddings (repeat queries skip the embedder)",
+            ),
+            (
+                FeatureFlag::Matryoshka,
+                "Persist/search neural vectors at sliced MRL dimensions (128/256/512; experimental)",
+            ),
+            (
+                FeatureFlag::StructuralSearch,
+                "Structural (AST-pattern) search: ast-grep patterns matched against LeIndex's tree-sitter grammars",
+            ),
+        ];
+        DESCRIPTIONS
+            .iter()
+            .find(|(flag, _)| flag == self)
+            .map_or("", |(_, text)| text)
     }
 }
 
@@ -650,7 +730,12 @@ mod test {
         // per-deployment rollout-KILL (explicit `false` disables; unset follows
         // normal config) rather than gating a not-yet-released capability.
         assert!(FeatureFlag::NeuralSearch.default_value());
-        assert!(FeatureFlag::StreamingMcp.default_value());
+        // StreamingMcp, GlobalAutoSync, and BoundedScheduler have no production
+        // consumer (#86): they must NOT default ON. The consumer-presence
+        // audit in tests/gate_audit_test.rs enforces this pairing.
+        assert!(!FeatureFlag::StreamingMcp.default_value());
+        assert!(!FeatureFlag::GlobalAutoSync.default_value());
+        assert!(!FeatureFlag::BoundedScheduler.default_value());
     }
 
     #[test]
@@ -759,6 +844,9 @@ mod test {
 
     /// Selected stable rollout flags default ON after their gates pass. Each
     /// flag acts as a rollout-KILL: explicit "false" reverts that capability.
+    /// BoundedScheduler is absent (#86): no production consumer, so it cannot
+    /// default ON until one exists (enforced by the consumer-presence audit
+    /// in tests/gate_audit_test.rs).
     #[test]
     fn test_rollout_flags_default_on_after_gates_passed() {
         let _g = lock_flag_tests();
@@ -767,7 +855,6 @@ mod test {
             FeatureFlag::RemoteEmbeddings,
             FeatureFlag::DaemonClient,
             FeatureFlag::GenerationReaders,
-            FeatureFlag::BoundedScheduler,
             FeatureFlag::StreamingPdg,
             FeatureFlag::GlobalEmbedCache,
             FeatureFlag::ValidatedModel,
@@ -840,7 +927,6 @@ mod test {
         for flag in [
             FeatureFlag::DaemonClient,
             FeatureFlag::GenerationReaders,
-            FeatureFlag::BoundedScheduler,
             FeatureFlag::StreamingPdg,
             FeatureFlag::GlobalEmbedCache,
             FeatureFlag::ValidatedModel,
@@ -912,7 +998,6 @@ mod test {
             FeatureFlag::RemoteEmbeddings,
             FeatureFlag::DaemonClient,
             FeatureFlag::GenerationReaders,
-            FeatureFlag::BoundedScheduler,
             FeatureFlag::StreamingPdg,
             FeatureFlag::GlobalEmbedCache,
             FeatureFlag::ValidatedModel,
@@ -923,6 +1008,19 @@ mod test {
             assert!(
                 flag.is_enabled(),
                 "{} should be enabled with no override",
+                flag.env_var()
+            );
+        }
+        // #86: unconsumed rollout switches must stay OFF (BoundedScheduler,
+        // StreamingMcp, GlobalAutoSync — see the consumer-presence audit).
+        for flag in [
+            FeatureFlag::BoundedScheduler,
+            FeatureFlag::StreamingMcp,
+            FeatureFlag::GlobalAutoSync,
+        ] {
+            assert!(
+                !flag.default_value(),
+                "{} must remain OFF until it has a production consumer",
                 flag.env_var()
             );
         }
@@ -1005,5 +1103,23 @@ mod test {
         assert!(!is_legacy_revertible(&FeatureFlag::NeuralSearch));
         // Debug escape hatch is not a rollout flag.
         assert!(!is_legacy_revertible(&FeatureFlag::DebugEscapeHatch));
+    }
+
+    /// #87 table guards: every flag resolves to a real env var and a
+    /// non-empty description. A variant appended without rows in ENV_NAMES /
+    /// DESCRIPTIONS falls back to sentinels — this makes that loud.
+    #[test]
+    fn test_flag_tables_agree() {
+        for flag in all_flags().into_iter().map(|(flag, _)| flag) {
+            let env = flag.env_var();
+            assert!(
+                env.starts_with("LEINDEX_FEATURE_"),
+                "{flag:?} has no ENV_NAMES row (resolved to {env})"
+            );
+            assert!(
+                !flag.description().is_empty(),
+                "{flag:?} has no DESCRIPTIONS row"
+            );
+        }
     }
 }

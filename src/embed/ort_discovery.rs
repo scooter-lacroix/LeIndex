@@ -337,10 +337,10 @@ fn write_ort_pip_cache(path: &Path) {
     let Some(cache_path) = ort_pip_cache_path() else {
         return;
     };
-    if let Some(parent) = cache_path.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
+    if let Some(parent) = cache_path.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return;
     }
     let _ = std::fs::write(&cache_path, path.display().to_string());
 }
@@ -551,10 +551,10 @@ pub fn discover_candidates() -> Vec<(DiscoverySource, PathBuf)> {
     let mut out: Vec<(DiscoverySource, PathBuf)> = Vec::new();
 
     // 1. ORT_DYLIB_PATH env var
-    if let Ok(path) = std::env::var(ORT_DYLIB_ENV) {
-        if !path.is_empty() {
-            out.push((DiscoverySource::EnvVar, PathBuf::from(path)));
-        }
+    if let Ok(path) = std::env::var(ORT_DYLIB_ENV)
+        && !path.is_empty()
+    {
+        out.push((DiscoverySource::EnvVar, PathBuf::from(path)));
     }
 
     // 2. config file ort_dylib_path
@@ -763,10 +763,10 @@ pub fn discover_and_init() -> InitResult {
     // 5. pip site-packages (lazy Python lookup so unit tests can skip it).
     //    Tried BEFORE system paths so a setup-installed pip runtime wins over a
     //    stale system library.
-    if let Some(path) = discover_pip_lib() {
-        if let Some(outcome) = try_path(DiscoverySource::Pip, path, true) {
-            return InitResult::Initialized(outcome);
-        }
+    if let Some(path) = discover_pip_lib()
+        && let Some(outcome) = try_path(DiscoverySource::Pip, path, true)
+    {
+        return InitResult::Initialized(outcome);
     }
 
     // 6. system paths (final ordered fallback, after pip).
@@ -829,13 +829,13 @@ pub fn discover_path_only() -> Option<DiscoveryOutcome> {
     //    shells out to Python when no higher-priority source is available).
     //    Checked BEFORE system paths to mirror `discover_and_init()`.
     #[cfg(feature = "onnx")]
-    if let Some(path) = discover_pip_lib() {
-        if path.exists() {
-            return Some(DiscoveryOutcome {
-                source: DiscoverySource::Pip,
-                path,
-            });
-        }
+    if let Some(path) = discover_pip_lib()
+        && path.exists()
+    {
+        return Some(DiscoveryOutcome {
+            source: DiscoverySource::Pip,
+            path,
+        });
     }
 
     // 6. system paths (final ordered fallback, after pip).
@@ -926,15 +926,15 @@ mod tests {
 
         let candidates = discover_candidates();
 
-        if let Some(bin_dir) = binary_dir() {
-            if let Some(bundle_root) = bin_dir.parent() {
-                let expected = bundle_root.join("lib").join(ort_lib_names()[0]);
-                assert!(
-                    candidates
-                        .iter()
-                        .any(|(s, p)| *s == DiscoverySource::Sibling && p == &expected)
-                );
-            }
+        if let Some(bin_dir) = binary_dir()
+            && let Some(bundle_root) = bin_dir.parent()
+        {
+            let expected = bundle_root.join("lib").join(ort_lib_names()[0]);
+            assert!(
+                candidates
+                    .iter()
+                    .any(|(s, p)| *s == DiscoverySource::Sibling && p == &expected)
+            );
         }
     }
 

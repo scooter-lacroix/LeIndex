@@ -364,14 +364,13 @@ fn visit_generic(
 /// Read a definition's name from the configured field, falling back to the
 /// first named child of a common identifier kind.
 fn extract_name(node: tree_sitter::Node<'_>, source: &[u8], name_field: &str) -> Option<String> {
-    if !name_field.is_empty() {
-        if let Some(field_node) = node.child_by_field_name(name_field) {
-            if let Ok(text) = field_node.utf8_text(source) {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
+    if !name_field.is_empty()
+        && let Some(field_node) = node.child_by_field_name(name_field)
+        && let Ok(text) = field_node.utf8_text(source)
+    {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
         }
     }
     let mut cursor = node.walk();
@@ -379,10 +378,9 @@ fn extract_name(node: tree_sitter::Node<'_>, source: &[u8], name_field: &str) ->
         if matches!(
             child.kind(),
             "identifier" | "name" | "variable" | "tag_name" | "atom" | "function" | "defun"
-        ) {
-            if let Ok(text) = child.utf8_text(source) {
-                return Some(text.trim().to_string());
-            }
+        ) && let Ok(text) = child.utf8_text(source)
+        {
+            return Some(text.trim().to_string());
         }
     }
     None

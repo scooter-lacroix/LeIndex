@@ -132,10 +132,11 @@ fn mode_provider_issues(section: &SystemOneConfig) -> Vec<String> {
         }
         Some(_) => {}
     }
-    if let Some(name) = section.api_key_env.as_deref() {
-        if !name.is_empty() && !is_env_name(name) {
-            issues.push("api_key_env must be an environment variable NAME, not a key".to_string());
-        }
+    if let Some(name) = section.api_key_env.as_deref()
+        && !name.is_empty()
+        && !is_env_name(name)
+    {
+        issues.push("api_key_env must be an environment variable NAME, not a key".to_string());
     }
     issues
 }
@@ -164,10 +165,10 @@ fn threshold_issues(section: &SystemOneConfig) -> Vec<String> {
 /// CCN-gate extraction from `section_issues`: base_url scheme.
 fn url_issues(section: &SystemOneConfig) -> Vec<String> {
     let mut issues = Vec::new();
-    if let Some(url) = section.base_url.as_deref() {
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            issues.push("base_url must start with http:// or https://".to_string());
-        }
+    if let Some(url) = section.base_url.as_deref()
+        && !(url.starts_with("http://") || url.starts_with("https://"))
+    {
+        issues.push("base_url must start with http:// or https://".to_string());
     }
     issues
 }
@@ -640,16 +641,16 @@ pub(super) fn print_status(config: &LeIndexConfig) -> bool {
             if set { "set" } else { "unset" }
         );
     }
-    if let Some(name) = section.service.as_deref() {
-        if let Some(service) = config.services.get(name) {
-            println!(
-                "  service {name}: binary={} model={} port={} auto_start={}",
-                service.binary,
-                service.model.as_deref().unwrap_or("(none)"),
-                service.port,
-                service.auto_start
-            );
-        }
+    if let Some(name) = section.service.as_deref()
+        && let Some(service) = config.services.get(name)
+    {
+        println!(
+            "  service {name}: binary={} model={} port={} auto_start={}",
+            service.binary,
+            service.model.as_deref().unwrap_or("(none)"),
+            service.port,
+            service.auto_start
+        );
     }
     // A build compiled without the feature can never reach `active`, and no
     // amount of config editing changes that. Name the remedy here: a failing
@@ -734,10 +735,10 @@ fn resolve_service<'a>(
         // recover: report it as the precise config defect it is, before
         // dialing a port that will not answer. The start path instead
         // lets `ensure_running` → `wait_healthy` surface the failure.
-        if let Some(model) = svc.model.as_deref() {
-            if !Path::new(model).is_file() {
-                return Err(conflict(format!("service '{name}' model file not found")));
-            }
+        if let Some(model) = svc.model.as_deref()
+            && !Path::new(model).is_file()
+        {
+            return Err(conflict(format!("service '{name}' model file not found")));
         }
     } else {
         // ensure_running only spawns when auto_start and model are both set.
