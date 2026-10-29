@@ -12,9 +12,12 @@ use leindex::cli::cli;
 // build — and CI — runs on jemalloc. Profiling itself stays opt-in at RUN time
 // via `MALLOC_CONF`; nothing is sampled unless the operator asks for it.
 //
-// VAL-MEASURE-025: memprof is build-time gated (this cfg).
-// VAL-MEASURE-026: Building with --features memprof succeeds.
-#[cfg(feature = "memprof")]
+// Unix-only by target: the tikv-jemallocator dependency lives under
+// `[target.'cfg(unix)'.dependencies]` (jemalloc's configure cannot build under
+// MSVC — the Windows release leg failed on exactly that), so on Windows
+// `memprof` compiles but keeps the system allocator. VAL-MEASURE-025/026
+// references below are unix-scoped facts.
+#[cfg(all(feature = "memprof", unix))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
