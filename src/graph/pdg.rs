@@ -1319,10 +1319,10 @@ impl ProgramDependenceGraph {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some((revision, corpus)) = cached.as_ref()
-            && *revision == self.revision
-        {
-            return Arc::clone(corpus);
+        if let Some((revision, corpus)) = cached.as_ref() {
+            if *revision == self.revision {
+                return Arc::clone(corpus);
+            }
         }
         let mut names: HashSet<String> = HashSet::default();
         let mut files: HashSet<String> = HashSet::default();

@@ -457,10 +457,8 @@ impl HybridStorage {
 
             // Convert bytes back to f32 vector
             let stored_embedding: Vec<f32> = embedding_bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|chunk| f32::from_le_bytes(*chunk))
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect();
 
             // Calculate cosine similarity

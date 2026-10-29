@@ -16,12 +16,12 @@ pub fn get_ort_version() -> Option<String> {
             .stderr(std::process::Stdio::null())
             .output();
 
-        if let Ok(out) = result
-            && out.status.success()
-        {
-            let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !v.is_empty() {
-                return Some(v);
+        if let Ok(out) = result {
+            if out.status.success() {
+                let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
             }
         }
     }
@@ -151,12 +151,12 @@ pub(super) fn check_provider_available(provider: ExecutionProvider) -> bool {
             .stderr(std::process::Stdio::null())
             .output();
 
-        if let Ok(out) = result
-            && out.status.success()
-        {
-            let output = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if output == "True" {
-                return true;
+        if let Ok(out) = result {
+            if out.status.success() {
+                let output = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if output == "True" {
+                    return true;
+                }
             }
         }
     }
@@ -318,32 +318,32 @@ pub(super) fn truncate_for_error(s: &str) -> String {
 /// `python3 -m pip`).
 pub(super) fn find_pip() -> Option<(String, Vec<String>)> {
     // VAL-SETUP-021: Honor PIP_BIN first so users can point at a non-default pip.
-    if let Ok(value) = std::env::var("PIP_BIN")
-        && !value.trim().is_empty()
-    {
-        if let Some((program, prefix)) = parse_pip_bin_override(&value) {
-            if Command::new(&program)
-                .args(&prefix)
-                .arg("--version")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-            {
-                return Some((program, prefix));
+    if let Ok(value) = std::env::var("PIP_BIN") {
+        if !value.trim().is_empty() {
+            if let Some((program, prefix)) = parse_pip_bin_override(&value) {
+                if Command::new(&program)
+                    .args(&prefix)
+                    .arg("--version")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+                {
+                    return Some((program, prefix));
+                }
+                // PIP_BIN was set but the binary it points at is broken/missing.
+                // Fall through to discovery but log a hint to stderr.
+                eprintln!(
+                    "warning: PIP_BIN is set to '{}' but invoking it failed; falling back to PATH discovery.",
+                    value
+                );
+            } else {
+                eprintln!(
+                    "warning: PIP_BIN is set to an unsupported command shape; use /path/to/pip or \"python3 -m pip\". Falling back to PATH discovery."
+                );
             }
-            // PIP_BIN was set but the binary it points at is broken/missing.
-            // Fall through to discovery but log a hint to stderr.
-            eprintln!(
-                "warning: PIP_BIN is set to '{}' but invoking it failed; falling back to PATH discovery.",
-                value
-            );
-        } else {
-            eprintln!(
-                "warning: PIP_BIN is set to an unsupported command shape; use /path/to/pip or \"python3 -m pip\". Falling back to PATH discovery."
-            );
         }
     }
 
@@ -447,17 +447,20 @@ pub(crate) fn discover_ort_path() -> Option<PathBuf> {
 /// resolver. This preserves the documented priority before falling back to
 /// Python/system probes.
 fn discover_ort_path_fallback() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("ORT_DYLIB_PATH")
-        && PathBuf::from(&path).exists()
-    {
-        return Some(PathBuf::from(path));
+    if let Ok(path) = std::env::var("ORT_DYLIB_PATH") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
     }
 
-    if let Ok(config) = crate::config::LeIndexConfig::load()
-        && let Some(path) = config.neural.ort_dylib_path
-        && PathBuf::from(&path).exists()
-    {
-        return Some(PathBuf::from(path));
+    if let Ok(config) = crate::config::LeIndexConfig::load() {
+        if let Some(path) = config.neural.ort_dylib_path {
+            let path = PathBuf::from(path);
+            if path.exists() {
+                return Some(path);
+            }
+        }
     }
 
     let leindex_home = std::env::var("LEINDEX_HOME")
@@ -475,11 +478,12 @@ fn discover_ort_path_fallback() -> Option<PathBuf> {
         }
     }
 
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-        && let Some(found) = find_ort_lib_in_dir(dir)
-    {
-        return Some(found);
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Some(found) = find_ort_lib_in_dir(dir) {
+                return Some(found);
+            }
+        }
     }
 
     // Try to find onnxruntime's capi directory via Python
@@ -508,15 +512,15 @@ fn find_ort_lib_via_python() -> Option<PathBuf> {
             .stderr(std::process::Stdio::null())
             .output();
 
-        if let Ok(out) = result
-            && out.status.success()
-        {
-            let capi_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let dir = PathBuf::from(capi_dir);
-            if dir.is_dir()
-                && let Some(path) = find_ort_lib_in_dir(&dir)
-            {
-                return Some(path);
+        if let Ok(out) = result {
+            if out.status.success() {
+                let capi_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let dir = PathBuf::from(capi_dir);
+                if dir.is_dir() {
+                    if let Some(path) = find_ort_lib_in_dir(&dir) {
+                        return Some(path);
+                    }
+                }
             }
         }
     }

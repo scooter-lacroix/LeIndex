@@ -77,10 +77,10 @@ impl DiscoveryEngine {
 
             // First, check if the search path itself is a git repo
             let git_dir = search_path.join(".git");
-            if git_dir.exists()
-                && let Some(project) = scan_project(search_path)
-            {
-                discovered.push(project);
+            if git_dir.exists() {
+                if let Some(project) = scan_project(search_path) {
+                    discovered.push(project);
+                }
             }
 
             // Then, recursively scan subdirectories for projects

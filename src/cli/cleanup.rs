@@ -281,10 +281,10 @@ pub fn is_leindex_artifact_by_pattern(dir: &Path) -> bool {
 /// Prefers the marker file mtime (creation timestamp), falls back to dir mtime.
 pub fn artifact_age(dir: &Path) -> SystemTime {
     let marker = dir.join(LEINDEX_MARKER_FILE);
-    if let Ok(meta) = fs::metadata(&marker)
-        && let Ok(modified) = meta.modified()
-    {
-        return modified;
+    if let Ok(meta) = fs::metadata(&marker) {
+        if let Ok(modified) = meta.modified() {
+            return modified;
+        }
     }
     // Fall back to directory modification time
     fs::metadata(dir)

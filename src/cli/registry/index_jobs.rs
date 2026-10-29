@@ -302,25 +302,25 @@ impl ProjectRegistry {
     ) {
         // The core snapshot is published before neural enrichment. Preserve
         // those layer flags if the optional follow-up fails afterward.
-        if let Some(health) = crate::cli::index_freshness::load_health(storage_root)
-            && health.generation > previous_generation
-        {
-            let core_loaded = if health.generation > resident_core_generation {
-                match self.refresh_loaded_from_active_generation(path).await {
-                    Ok(()) => true,
-                    Err(refresh_error) => {
-                        warn!(
-                            project = %path.display(),
-                            "Core generation remains durable but resident hydration failed: {refresh_error}"
-                        );
-                        false
+        if let Some(health) = crate::cli::index_freshness::load_health(storage_root) {
+            if health.generation > previous_generation {
+                let core_loaded = if health.generation > resident_core_generation {
+                    match self.refresh_loaded_from_active_generation(path).await {
+                        Ok(()) => true,
+                        Err(refresh_error) => {
+                            warn!(
+                                project = %path.display(),
+                                "Core generation remains durable but resident hydration failed: {refresh_error}"
+                            );
+                            false
+                        }
                     }
+                } else {
+                    true
+                };
+                if core_loaded {
+                    state.mark_core_published(health.generation).await;
                 }
-            } else {
-                true
-            };
-            if core_loaded {
-                state.mark_core_published(health.generation).await;
             }
         }
         state.fail(error.to_string()).await;

@@ -126,10 +126,10 @@ impl ServerConfig {
             config.host = host;
         }
 
-        if let Ok(port_str) = std::env::var("LESERVE_PORT")
-            && let Ok(port) = port_str.parse::<u16>()
-        {
-            config.port = port;
+        if let Ok(port_str) = std::env::var("LESERVE_PORT") {
+            if let Ok(port) = port_str.parse::<u16>() {
+                config.port = port;
+            }
         }
 
         if let Ok(db_path) = std::env::var("LESERVE_DB_PATH") {

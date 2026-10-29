@@ -983,8 +983,8 @@ pub(crate) fn encode_tfidf_layer(
     let mut entries: Vec<(u32, u32, f32)> = Vec::new();
     for (&node, &row) in &rows {
         let vector = &matrix[row * dim * 4..(row + 1) * dim * 4];
-        for (term, chunk) in vector.as_chunks::<4>().0.iter().enumerate() {
-            let value = f32::from_le_bytes(*chunk);
+        for (term, chunk) in vector.chunks_exact(4).enumerate() {
+            let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             if value != 0.0 {
                 entries.push((node, term as u32, value));
             }
@@ -1433,11 +1433,10 @@ fn job_is_completed(job_dir: &Path) -> bool {
         return true;
     }
     // state.json last_reusable_phase == "complete" (the final phase).
-    if let Ok(content) = fs::read_to_string(job_dir.join("state.json"))
-        && content.contains("\"complete\"")
-        && content.contains("last_reusable_phase")
-    {
-        return true;
+    if let Ok(content) = fs::read_to_string(job_dir.join("state.json")) {
+        if content.contains("\"complete\"") && content.contains("last_reusable_phase") {
+            return true;
+        }
     }
     // A published generation dir with this job's number signals the job's
     // generation was published (full-copy legacy or manifest layout).
@@ -1446,12 +1445,14 @@ fn job_is_completed(job_dir: &Path) -> bool {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
         .parse::<u64>()
-        && let Some(parent) = job_dir.parent()
-        && let Some(root) = parent.parent()
     {
-        let gd = root.join(GENERATIONS_DIR).join(num.to_string());
-        if gd.join(MANIFEST_FILE).is_file() || gd.join("leindex.db").is_file() {
-            return true;
+        if let Some(parent) = job_dir.parent() {
+            if let Some(root) = parent.parent() {
+                let gd = root.join(GENERATIONS_DIR).join(num.to_string());
+                if gd.join(MANIFEST_FILE).is_file() || gd.join("leindex.db").is_file() {
+                    return true;
+                }
+            }
         }
     }
     false
@@ -1531,10 +1532,10 @@ fn compute_cas_bytes(store: &CasStore) -> u64 {
             }
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
                 total += dir_total_bytes(&entry.path());
-            } else if entry.file_type().is_ok_and(|t| t.is_file())
-                && let Ok(meta) = entry.metadata()
-            {
-                total += meta.len();
+            } else if entry.file_type().is_ok_and(|t| t.is_file()) {
+                if let Ok(meta) = entry.metadata() {
+                    total += meta.len();
+                }
             }
         }
     }

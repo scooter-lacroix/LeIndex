@@ -404,12 +404,13 @@ fn render_context_metadata(data: &Value, color: bool) -> String {
     } else if let Some(range) = anchor
         .and_then(|result| result.get("byte_range"))
         .and_then(|v| v.as_array())
-        && range.len() == 2
     {
-        let start = range[0].as_u64().unwrap_or(0);
-        let end = range[1].as_u64().unwrap_or(0);
-        if end > start {
-            out.push_str(&field("Range", &format!("bytes {start}-{end}"), color));
+        if range.len() == 2 {
+            let start = range[0].as_u64().unwrap_or(0);
+            let end = range[1].as_u64().unwrap_or(0);
+            if end > start {
+                out.push_str(&field("Range", &format!("bytes {start}-{end}"), color));
+            }
         }
     }
     out
@@ -668,14 +669,16 @@ fn render_diagnostics_provider(data: &Value, color: bool) -> String {
     if let Some(active) = data
         .get("execution_provider_active")
         .and_then(|v| v.as_str())
-        && let Some(requested) = data.get("execution_provider").and_then(|v| v.as_str())
-        && active != requested
     {
-        out.push_str(&field(
-            "Provider fallback",
-            &format!("{requested} requested, {active} ACTIVE"),
-            color,
-        ));
+        if let Some(requested) = data.get("execution_provider").and_then(|v| v.as_str()) {
+            if active != requested {
+                out.push_str(&field(
+                    "Provider fallback",
+                    &format!("{requested} requested, {active} ACTIVE"),
+                    color,
+                ));
+            }
+        }
     }
     out
 }
@@ -933,21 +936,21 @@ fn append_meta_lines(mut out: String, meta_lines: &[String]) -> String {
 fn render_edit_preview(data: &Value, color: bool) -> String {
     let mut meta_lines = Vec::new();
 
-    if let Some(symbols) = data.get("affected_symbols").and_then(|v| v.as_array())
-        && !symbols.is_empty()
-    {
-        let names: Vec<&str> = symbols.iter().filter_map(|v| v.as_str()).collect();
-        meta_lines.push(render_meta_line(
-            "Affected symbols",
-            &names.join(", "),
-            color,
-        ));
+    if let Some(symbols) = data.get("affected_symbols").and_then(|v| v.as_array()) {
+        if !symbols.is_empty() {
+            let names: Vec<&str> = symbols.iter().filter_map(|v| v.as_str()).collect();
+            meta_lines.push(render_meta_line(
+                "Affected symbols",
+                &names.join(", "),
+                color,
+            ));
+        }
     }
-    if let Some(files) = data.get("affected_files").and_then(|v| v.as_array())
-        && !files.is_empty()
-    {
-        let names: Vec<&str> = files.iter().filter_map(|v| v.as_str()).collect();
-        meta_lines.push(render_meta_line("Affected files", &names.join(", "), color));
+    if let Some(files) = data.get("affected_files").and_then(|v| v.as_array()) {
+        if !files.is_empty() {
+            let names: Vec<&str> = files.iter().filter_map(|v| v.as_str()).collect();
+            meta_lines.push(render_meta_line("Affected files", &names.join(", "), color));
+        }
     }
     if let Some(risk) = data.get("risk_level").and_then(|v| v.as_str()) {
         meta_lines.push(render_meta_line("Risk level", risk, color));
@@ -1089,20 +1092,20 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
     if let Some(msg) = data.get("message").and_then(|v| v.as_str()) {
         out.push_str(&field("Message", msg, color));
     }
-    if let Some(arr) = data.get("affected_symbols").and_then(|v| v.as_array())
-        && !arr.is_empty()
-    {
-        out.push_str(&field("Affected symbols", &arr.len().to_string(), color));
+    if let Some(arr) = data.get("affected_symbols").and_then(|v| v.as_array()) {
+        if !arr.is_empty() {
+            out.push_str(&field("Affected symbols", &arr.len().to_string(), color));
+        }
     }
-    if let Some(arr) = data.get("affected_files").and_then(|v| v.as_array())
-        && !arr.is_empty()
-    {
-        out.push_str(&field("Affected files", &arr.len().to_string(), color));
+    if let Some(arr) = data.get("affected_files").and_then(|v| v.as_array()) {
+        if !arr.is_empty() {
+            out.push_str(&field("Affected files", &arr.len().to_string(), color));
+        }
     }
-    if let Some(bc) = data.get("breaking_changes").and_then(|v| v.as_array())
-        && !bc.is_empty()
-    {
-        out.push_str(&field("Breaking changes", &bc.len().to_string(), color));
+    if let Some(bc) = data.get("breaking_changes").and_then(|v| v.as_array()) {
+        if !bc.is_empty() {
+            out.push_str(&field("Breaking changes", &bc.len().to_string(), color));
+        }
     }
     out.push_str(
         &data
@@ -1180,56 +1183,6 @@ fn render_tool_output_with_color(name: &str, data: &Value, args: &Value, color: 
     rendered
 }
 
-/// Tool identifier → renderer (#87: data over an 18-arm match, which lizard
-/// 1.24.x scores CCN 24). Each identifier is the tool's SHORT name; a
-/// normalized name matches when it equals the identifier or its
-/// `leindex_`-prefixed form — exactly the pair every old match arm carried.
-type ToolRenderer = fn(&Value, &str, &str, bool) -> String;
-const TOOL_RENDERERS: &[(&str, ToolRenderer)] = &[
-    ("search", |data, query, _, color| {
-        render_search(data, query, color)
-    }),
-    ("find", |data, _, _, _| render_find(data)),
-    ("structural", |data, _, _, _| render_structural(data)),
-    ("context", |data, _, node_id, color| {
-        render_context(data, node_id, color)
-    }),
-    ("diagnostics", |data, _, _, color| {
-        render_diagnostics(data, color)
-    }),
-    ("project_map", |data, _, _, color| {
-        render_project_map(data, color)
-    }),
-    ("impact_analysis", |data, _, _, color| {
-        render_impact(data, color)
-    }),
-    ("symbol_lookup", |data, _, _, color| {
-        render_symbol_lookup(data, color)
-    }),
-    ("phase_analysis", |data, _, _, color| {
-        render_phase(data, color)
-    }),
-    ("git_status", |data, _, _, color| {
-        render_git_status(data, color)
-    }),
-    ("file_summary", |data, _, _, color| {
-        render_file_summary(data, color)
-    }),
-    ("read_file", |data, _, _, color| {
-        render_read_file(data, color)
-    }),
-    ("edit_preview", |data, _, _, color| {
-        render_edit_preview(data, color)
-    }),
-    ("edit_apply", |data, _, _, color| {
-        render_edit_apply(data, color)
-    }),
-    ("write", |data, _, _, color| render_write(data, color)),
-    ("rename_symbol", |data, _, _, color| {
-        render_rename_symbol(data, color)
-    }),
-];
-
 fn render_tool_output_inner(
     name: &str,
     data: &Value,
@@ -1240,20 +1193,33 @@ fn render_tool_output_inner(
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let node_id = args.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
 
-    let rendered = TOOL_RENDERERS
-        .iter()
-        .find(|(id, _)| normalized == *id || normalized == format!("leindex_{id}"))
-        .map_or_else(
-            || render_default(data, color),
-            |(_, render)| render(data, query, node_id, color),
-        );
-    (rendered, render_footer(data))
-}
-
-/// Freshness and System-One footer lines appended beneath the rendered tool
-/// output (#87: split from `render_tool_output_inner`). `None` when neither
-/// produced anything, so no extra tokens are spent.
-fn render_footer(data: &Value) -> Option<String> {
+    let rendered = match normalized.as_str() {
+        "leindex_search" | "search" => render_search(data, query, color),
+        "leindex_find" | "find" => render_find(data),
+        "leindex_structural" | "structural" => render_structural(data),
+        "leindex_context" | "context" => render_context(data, node_id, color),
+        "leindex_diagnostics" | "diagnostics" => render_diagnostics(data, color),
+        "leindex_project_map" | "project_map" => render_project_map(data, color),
+        "leindex_impact_analysis" | "impact_analysis" => render_impact(data, color),
+        "leindex_symbol_lookup" | "symbol_lookup" => render_symbol_lookup(data, color),
+        "leindex_phase_analysis" | "phase_analysis" => render_phase(data, color),
+        "leindex_git_status" | "git_status" => render_git_status(data, color),
+        "leindex_file_summary" | "file_summary" => render_file_summary(data, color),
+        "leindex_read_file" | "read_file" => render_read_file(data, color),
+        "leindex_edit_preview" | "edit_preview" => render_edit_preview(data, color),
+        // `EditApplyHandler` returns a confirmation payload
+        // (`success, changes_applied, file_path, edit_region, …`)
+        // not a diff, so `render_diff_value` returns an empty
+        // string for the apply response. Use the dedicated
+        // confirmation renderer instead.
+        "leindex_edit_apply" | "edit_apply" => render_edit_apply(data, color),
+        // `WriteHandler` returns a confirmation payload
+        // (`{success, file_path, language, symbols}`) not a diff, so
+        // `render_diff_value` would return an empty string here.
+        "leindex_write" | "write" => render_write(data, color),
+        "leindex_rename_symbol" | "rename_symbol" => render_rename_symbol(data, color),
+        _ => render_default(data, color),
+    };
     let mut footer = String::new();
     if let Some(freshness) = data
         .get("_meta")
@@ -1284,9 +1250,9 @@ fn render_footer(data: &Value) -> Option<String> {
         footer.push_str(&gate);
     }
     if footer.is_empty() {
-        None
+        (rendered, None)
     } else {
-        Some(footer)
+        (rendered, Some(footer))
     }
 }
 

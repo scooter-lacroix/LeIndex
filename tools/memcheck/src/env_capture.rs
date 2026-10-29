@@ -84,10 +84,10 @@ fn read_hardware_info() -> HardwareInfo {
 fn read_cpuinfo_model() -> std::io::Result<String> {
     let content = std::fs::read_to_string("/proc/cpuinfo")?;
     for line in content.lines() {
-        if line.starts_with("model name")
-            && let Some(colon) = line.find(':')
-        {
-            return Ok(line[colon + 1..].trim().to_string());
+        if line.starts_with("model name") {
+            if let Some(colon) = line.find(':') {
+                return Ok(line[colon + 1..].trim().to_string());
+            }
         }
     }
     Ok(String::new())
@@ -109,10 +109,10 @@ fn read_meminfo_total() -> std::io::Result<u64> {
     for line in content.lines() {
         if line.starts_with("MemTotal:") {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2
-                && let Ok(v) = parts[1].parse::<u64>()
-            {
-                return Ok(v);
+            if parts.len() >= 2 {
+                if let Ok(v) = parts[1].parse::<u64>() {
+                    return Ok(v);
+                }
             }
         }
     }

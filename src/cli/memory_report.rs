@@ -118,10 +118,10 @@ pub fn exit_phase() {
 pub fn close_phase(name: &str) {
     if let Some(tracker) = GLOBAL_TRACKER.get() {
         let mut guard = tracker.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(t) = guard.as_mut()
-            && t.active_phase() == Some(name)
-        {
-            t.exit_phase();
+        if let Some(t) = guard.as_mut() {
+            if t.active_phase() == Some(name) {
+                t.exit_phase();
+            }
         }
     }
 }
@@ -167,10 +167,10 @@ pub fn shutdown() {
     SAMPLER_STOP.store(true, Ordering::Relaxed);
     if let Some(tracker) = GLOBAL_TRACKER.get() {
         let mut guard = tracker.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(mut t) = guard.take()
-            && let Err(e) = t.write_report()
-        {
-            warn!("Failed to write memory report on shutdown: {}", e);
+        if let Some(mut t) = guard.take() {
+            if let Err(e) = t.write_report() {
+                warn!("Failed to write memory report on shutdown: {}", e);
+            }
         }
     }
 }
@@ -355,10 +355,10 @@ impl MemoryReportTracker {
         };
 
         // Create parent directory if needed.
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
 
         let json = serde_json::to_string_pretty(&report)?;

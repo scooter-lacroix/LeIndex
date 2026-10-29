@@ -216,31 +216,31 @@ fn git_status_file_list(
     color: bool,
     out: &mut String,
 ) {
-    if let Some(arr) = data.get(key).and_then(|v| v.as_array())
-        && !arr.is_empty()
-    {
-        out.push('\n');
-        out.push_str(&format!("  {} ({}):\n", label, arr.len(),));
-        for f in arr.iter().take(30) {
-            // Files are plain strings in the handler output
-            let path = f
-                .as_str()
-                .unwrap_or_else(|| f.get("path").and_then(|v| v.as_str()).unwrap_or("?"));
-            out.push_str(&format!(
-                "    {}{}{} {}\n",
-                if color { marker_color } else { "" },
-                marker,
-                if color { RESET } else { "" },
-                path,
-            ));
-        }
-        if arr.len() > 30 {
-            out.push_str(&format!(
-                "    {}… {} more{}\n",
-                if color { DIM } else { "" },
-                arr.len() - 30,
-                if color { RESET } else { "" },
-            ));
+    if let Some(arr) = data.get(key).and_then(|v| v.as_array()) {
+        if !arr.is_empty() {
+            out.push('\n');
+            out.push_str(&format!("  {} ({}):\n", label, arr.len(),));
+            for f in arr.iter().take(30) {
+                // Files are plain strings in the handler output
+                let path = f
+                    .as_str()
+                    .unwrap_or_else(|| f.get("path").and_then(|v| v.as_str()).unwrap_or("?"));
+                out.push_str(&format!(
+                    "    {}{}{} {}\n",
+                    if color { marker_color } else { "" },
+                    marker,
+                    if color { RESET } else { "" },
+                    path,
+                ));
+            }
+            if arr.len() > 30 {
+                out.push_str(&format!(
+                    "    {}… {} more{}\n",
+                    if color { DIM } else { "" },
+                    arr.len() - 30,
+                    if color { RESET } else { "" },
+                ));
+            }
         }
     }
 }

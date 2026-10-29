@@ -174,10 +174,10 @@ fn merge_pdgs_with_keys(
 ) {
     // Add nodes not already present (by symbol id)
     for node_idx in source.node_indices() {
-        if let Some(node) = source.get_node(node_idx)
-            && target.find_by_symbol(&node.id).is_none()
-        {
-            target.add_node(node.clone());
+        if let Some(node) = source.get_node(node_idx) {
+            if target.find_by_symbol(&node.id).is_none() {
+                target.add_node(node.clone());
+            }
         }
     }
 
@@ -374,11 +374,11 @@ fn resolve_import_candidates_ranked(
     }
 
     // Last segment
-    if let Some(last) = normalized.split('.').next_back()
-        && let Some(values) = symbol_map.get(last)
-    {
-        for id in values {
-            *scored.entry(*id).or_insert(0) += config.last_seg_score;
+    if let Some(last) = normalized.split('.').next_back() {
+        if let Some(values) = symbol_map.get(last) {
+            for id in values {
+                *scored.entry(*id).or_insert(0) += config.last_seg_score;
+            }
         }
     }
 

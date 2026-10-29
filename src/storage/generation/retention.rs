@@ -797,16 +797,16 @@ fn job_is_completed(job_dir: &Path) -> bool {
         return true;
     }
     // Check for a `status` file containing "completed".
-    if let Ok(content) = fs::read_to_string(job_dir.join("status"))
-        && content.trim().eq_ignore_ascii_case("completed")
-    {
-        return true;
+    if let Ok(content) = fs::read_to_string(job_dir.join("status")) {
+        if content.trim().eq_ignore_ascii_case("completed") {
+            return true;
+        }
     }
     // Check for `checkpoint.json` with a "completed" status.
-    if let Ok(content) = fs::read_to_string(job_dir.join("checkpoint.json"))
-        && (content.contains("\"completed\"") || content.contains("\"status\":\"completed\""))
-    {
-        return true;
+    if let Ok(content) = fs::read_to_string(job_dir.join("checkpoint.json")) {
+        if content.contains("\"completed\"") || content.contains("\"status\":\"completed\"") {
+            return true;
+        }
     }
     // Checkpoint-store layout: phase-complete markers.
     job_dir.join("neural.complete").exists()
@@ -875,11 +875,10 @@ fn compute_cas_bytes(store: &CasStore) -> Result<u64, RetentionError> {
             }
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
                 total += dir_total_bytes(&path);
-            } else if entry.file_type().is_ok_and(|t| t.is_file())
-                && name != "refs.json"
-                && let Ok(meta) = entry.metadata()
-            {
-                total += meta.len();
+            } else if entry.file_type().is_ok_and(|t| t.is_file()) && name != "refs.json" {
+                if let Ok(meta) = entry.metadata() {
+                    total += meta.len();
+                }
             }
         }
     }
@@ -904,12 +903,12 @@ fn compute_dedup_ratio(gens_dir: &Path, _store: &CasStore) -> Result<f64, Retent
             continue;
         }
         let manifest_path = entry.path().join(MANIFEST_FILE);
-        if let Ok(bytes) = fs::read(&manifest_path)
-            && let Ok(manifest) = Manifest::from_bytes(&bytes)
-        {
-            for hash in manifest.layer_hashes() {
-                total_refs += 1;
-                unique.insert(hash);
+        if let Ok(bytes) = fs::read(&manifest_path) {
+            if let Ok(manifest) = Manifest::from_bytes(&bytes) {
+                for hash in manifest.layer_hashes() {
+                    total_refs += 1;
+                    unique.insert(hash);
+                }
             }
         }
     }

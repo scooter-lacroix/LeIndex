@@ -149,13 +149,13 @@ fn match_definition(pdg: &ProgramDependenceGraph, definition: &DefinitionFact) -
     // A source range is the authoritative identity when it is available. Do
     // not make a range match compete with the weaker name fallback: generated
     // graphs can contain duplicate names (and, defensively, duplicate ranges).
-    if let Some(range) = definition.byte_range
-        && let Some(node_id) = candidates.iter().copied().find(|&node_id| {
+    if let Some(range) = definition.byte_range {
+        if let Some(node_id) = candidates.iter().copied().find(|&node_id| {
             pdg.get_node(node_id)
                 .is_some_and(|node| node.byte_range == range)
-        })
-    {
-        return Some(node_id);
+        }) {
+            return Some(node_id);
+        }
     }
 
     // SCIP display names are often only the short name. A qualified-name

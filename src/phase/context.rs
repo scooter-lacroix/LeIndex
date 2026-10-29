@@ -263,14 +263,15 @@ impl PhaseExecutionContext {
 
         for file_path in self.signatures_by_file.keys() {
             let normalized = normalize_file_key(&self.root, file_path);
-            if let Some(hash) = inventory_hashes.get(&normalized)
-                && let Err(e) =
+            if let Some(hash) = inventory_hashes.get(&normalized) {
+                if let Err(e) =
                     update_indexed_file(&mut self.storage, &self.project_id, &normalized, hash)
-            {
-                warn!(
-                    "Phase context: failed to update indexed file record for '{}' (cold path): {}",
-                    normalized, e
-                );
+                {
+                    warn!(
+                        "Phase context: failed to update indexed file record for '{}' (cold path): {}",
+                        normalized, e
+                    );
+                }
             }
         }
 
@@ -334,18 +335,20 @@ impl PhaseExecutionContext {
         project_id: &str,
     ) -> Result<ProgramDependenceGraph> {
         let storage_root = root.join(".leindex");
-        if crate::storage::generation::lease::read_current_generation(&storage_root).is_some()
-            && let Ok(snapshot) =
+        if crate::storage::generation::lease::read_current_generation(&storage_root).is_some() {
+            if let Ok(snapshot) =
                 crate::storage::generation::GenerationSnapshot::open(&storage_root)
-            && let Some(reader) = snapshot.pdg()
-        {
-            match reader.to_program_dependence_graph() {
-                Ok(pdg) => return Ok(pdg),
-                Err(error) => {
-                    warn!(
-                        %error,
-                        "phase graph: Pdg layer decode failed; using SQL fallback"
-                    );
+            {
+                if let Some(reader) = snapshot.pdg() {
+                    match reader.to_program_dependence_graph() {
+                        Ok(pdg) => return Ok(pdg),
+                        Err(error) => {
+                            warn!(
+                                %error,
+                                "phase graph: Pdg layer decode failed; using SQL fallback"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -554,23 +557,23 @@ impl PhaseExecutionContext {
                 return;
             }
         };
-        if !files_to_delete.is_empty()
-            && let Err(e) = delete_files_data_tx(&tx, &self.project_id, files_to_delete)
-        {
-            warn!(
-                "Phase context: failed to batch-delete file data for {} files: {}",
-                files_to_delete.len(),
-                e
-            );
+        if !files_to_delete.is_empty() {
+            if let Err(e) = delete_files_data_tx(&tx, &self.project_id, files_to_delete) {
+                warn!(
+                    "Phase context: failed to batch-delete file data for {} files: {}",
+                    files_to_delete.len(),
+                    e
+                );
+            }
         }
-        if !file_updates.is_empty()
-            && let Err(e) = update_indexed_files_tx(&tx, &self.project_id, file_updates)
-        {
-            warn!(
-                "Phase context: failed to batch-update {} indexed file records: {}",
-                file_updates.len(),
-                e
-            );
+        if !file_updates.is_empty() {
+            if let Err(e) = update_indexed_files_tx(&tx, &self.project_id, file_updates) {
+                warn!(
+                    "Phase context: failed to batch-update {} indexed file records: {}",
+                    file_updates.len(),
+                    e
+                );
+            }
         }
         if let Err(e) = tx.commit() {
             warn!("Phase context: failed to commit batch transaction: {}", e);

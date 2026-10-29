@@ -318,17 +318,17 @@ fn require_non_empty_reference_set(
     if !filtered.is_empty() {
         return Ok(filtered);
     }
-    if let Some(scope) = resolved_scope
-        && pre_filter_count > 0
-    {
-        return Err(JsonRpcError::invalid_params(format!(
-            "Scope '{}' matches none of the {} indexed file(s) that reference '{}'. \
+    if let Some(scope) = resolved_scope {
+        if pre_filter_count > 0 {
+            return Err(JsonRpcError::invalid_params(format!(
+                "Scope '{}' matches none of the {} indexed file(s) that reference '{}'. \
                  Index paths are absolute and follow the canonical project root — spell \
                  the scope the way the inventory does (e.g. 'src', not a symlinked path).",
-            scope.display(),
-            pre_filter_count,
-            old_name
-        )));
+                scope.display(),
+                pre_filter_count,
+                old_name
+            )));
+        }
     }
     Err(JsonRpcError::invalid_params(format!(
         "Symbol '{}' resolves to no indexed files to rename. \
@@ -547,16 +547,18 @@ Grep + multi-file Edit with a single atomic operation."
             diffs,
             validation_json,
         );
-        if !pdg_available && let Some(obj) = response_data.as_object_mut() {
-            obj.insert("pdg_status".to_string(), serde_json::json!("not_loaded"));
-            obj.insert(
-                "warning".to_string(),
-                serde_json::json!(
-                    "Index unavailable — reference sites were found by a live whole-word scan \
-                    instead of the PDG call graph. Reindex (LeIndex [Index] with \
-                    force_reindex=true) to restore exact reference discovery."
-                ),
-            );
+        if !pdg_available {
+            if let Some(obj) = response_data.as_object_mut() {
+                obj.insert("pdg_status".to_string(), serde_json::json!("not_loaded"));
+                obj.insert(
+                    "warning".to_string(),
+                    serde_json::json!(
+                        "Index unavailable — reference sites were found by a live whole-word scan \
+                        instead of the PDG call graph. Reindex (LeIndex [Index] with \
+                        force_reindex=true) to restore exact reference discovery."
+                    ),
+                );
+            }
         }
 
         // Re-acquire the lock for wrap_with_meta (released before spawn_blocking)

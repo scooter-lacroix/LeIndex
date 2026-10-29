@@ -160,14 +160,14 @@ pub fn validate(schema: &Value, args: &Value) -> Vec<Issue> {
             });
             continue;
         }
-        if let Some(options) = spec.get("enum").and_then(Value::as_array)
-            && !options.contains(value)
-        {
-            issues.push(Issue {
-                param: key.clone(),
-                kind: IssueKind::NotInEnum,
-            });
-            continue;
+        if let Some(options) = spec.get("enum").and_then(Value::as_array) {
+            if !options.contains(value) {
+                issues.push(Issue {
+                    param: key.clone(),
+                    kind: IssueKind::NotInEnum,
+                });
+                continue;
+            }
         }
         if let Some(n) = value.as_f64() {
             let below = spec

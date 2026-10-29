@@ -337,30 +337,31 @@ pub fn format_diff(diff: &DiffResult) -> String {
         ));
 
         // Add detail lines for failures — identify main vs combined (VAL-CPHASE-041)
-        if !pd.baseline_passed
-            && let (Some(bl), Some(_thr)) = (pd.baseline_kib, pd.baseline_threshold_kib)
-        {
-            lines.push(format!(
-                "  ⚠ MAIN RSS baseline regression: {} KiB > baseline({} KiB) + {}%",
-                pd.measured_kib, bl, diff.rules.baseline_tolerance_pct
-            ));
+        if !pd.baseline_passed {
+            if let (Some(bl), Some(_thr)) = (pd.baseline_kib, pd.baseline_threshold_kib) {
+                lines.push(format!(
+                    "  ⚠ MAIN RSS baseline regression: {} KiB > baseline({} KiB) + {}%",
+                    pd.measured_kib, bl, diff.rules.baseline_tolerance_pct
+                ));
+            }
         }
-        if !pd.ceiling_passed
-            && let (Some(ce), Some(_thr)) = (pd.ceiling_kib, pd.ceiling_threshold_kib)
-        {
-            lines.push(format!(
-                "  ⚠ MAIN RSS ceiling regression: {} KiB > ceiling({} KiB) + {}%",
-                pd.measured_kib, ce, diff.rules.ceiling_tolerance_pct
-            ));
+        if !pd.ceiling_passed {
+            if let (Some(ce), Some(_thr)) = (pd.ceiling_kib, pd.ceiling_threshold_kib) {
+                lines.push(format!(
+                    "  ⚠ MAIN RSS ceiling regression: {} KiB > ceiling({} KiB) + {}%",
+                    pd.measured_kib, ce, diff.rules.ceiling_tolerance_pct
+                ));
+            }
         }
-        if !pd.combined_ceiling_passed
-            && let (Some(ce), Some(_thr)) =
+        if !pd.combined_ceiling_passed {
+            if let (Some(ce), Some(_thr)) =
                 (pd.combined_ceiling_kib, pd.combined_ceiling_threshold_kib)
-        {
-            lines.push(format!(
-                "  ⚠ COMBINED RSS ceiling regression: {} KiB > combined ceiling({} KiB) + {}%",
-                pd.combined_measured_kib, ce, diff.rules.ceiling_tolerance_pct
-            ));
+            {
+                lines.push(format!(
+                    "  ⚠ COMBINED RSS ceiling regression: {} KiB > combined ceiling({} KiB) + {}%",
+                    pd.combined_measured_kib, ce, diff.rules.ceiling_tolerance_pct
+                ));
+            }
         }
     }
 
@@ -426,11 +427,12 @@ pub fn find_workspace_root(start: &Path) -> Result<PathBuf> {
     let mut dir = start;
     loop {
         let cargo_toml = dir.join("Cargo.toml");
-        if cargo_toml.exists()
-            && let Ok(contents) = std::fs::read_to_string(&cargo_toml)
-            && contents.contains("[workspace]")
-        {
-            return Ok(dir.to_path_buf());
+        if cargo_toml.exists() {
+            if let Ok(contents) = std::fs::read_to_string(&cargo_toml) {
+                if contents.contains("[workspace]") {
+                    return Ok(dir.to_path_buf());
+                }
+            }
         }
         dir = dir.parent().ok_or_else(|| {
             anyhow::anyhow!("could not find workspace root from {}", start.display())

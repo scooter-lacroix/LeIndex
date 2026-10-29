@@ -626,7 +626,7 @@ impl MmapEmbeddingIndex {
         let ptr = self.mmap[byte_offset..end].as_ptr() as *const f32;
         // Verify alignment (embedding_matrix_offset is 4-byte aligned by construction)
         assert!(
-            (ptr as usize).is_multiple_of(std::mem::align_of::<f32>()),
+            (ptr as usize) % std::mem::align_of::<f32>() == 0,
             "embedding matrix not aligned for f32 access"
         );
         Some(unsafe { std::slice::from_raw_parts(ptr, dim) })
@@ -1044,10 +1044,10 @@ fn staging_path(path: &Path) -> Result<std::path::PathBuf, MmapError> {
 /// Some filesystems reject a directory fsync, and losing only rename-durability
 /// is acceptable for a rebuildable index artifact — hence no `?`.
 fn sync_parent_dir(path: &Path) {
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = std::fs::File::open(parent)
-    {
-        let _ = dir.sync_all();
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
     }
 }
 

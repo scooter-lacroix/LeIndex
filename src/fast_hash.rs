@@ -60,11 +60,12 @@ impl FastHasher {
 impl Hasher for FastHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        let (chunks, tail) = bytes.as_chunks::<8>();
-        for chunk in chunks {
-            let word = u64::from_le_bytes(*chunk);
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            let word = u64::from_le_bytes(chunk.try_into().expect("chunk of 8"));
             self.state = fold_mul(self.state ^ word, K1);
         }
+        let tail = chunks.remainder();
         if !tail.is_empty() {
             // Pack up to 7 tail bytes plus the tail length so that "a" and
             // "a\0" (and prefixes of longer inputs) cannot collide by padding.

@@ -390,16 +390,17 @@ impl SearchEngine {
         // All other node content is moved via ownership, avoiding a full Vec clone
         for node in nodes.iter_mut() {
             // Use tfidf_embedding (always present) instead of optional embedding
-            if !node.tfidf_embedding.is_empty()
-                && let Err(e) = self
+            if !node.tfidf_embedding.is_empty() {
+                if let Err(e) = self
                     .vector_index
                     .insert(node.node_id.clone(), node.tfidf_embedding.clone())
-            {
-                tracing::warn!(
-                    "Failed to insert TF-IDF embedding for node {}: {:?}",
-                    node.node_id,
-                    e
-                );
+                {
+                    tracing::warn!(
+                        "Failed to insert TF-IDF embedding for node {}: {:?}",
+                        node.node_id,
+                        e
+                    );
+                }
             }
         }
 
@@ -436,11 +437,11 @@ impl SearchEngine {
     ) -> usize {
         let mut updated = 0;
         for node in &mut self.nodes {
-            if let Some(embedding) = mmap_index.get_embedding(&node.node_id)
-                && !embedding.is_empty()
-            {
-                node.neural_embedding = Some(embedding);
-                updated += 1;
+            if let Some(embedding) = mmap_index.get_embedding(&node.node_id) {
+                if !embedding.is_empty() {
+                    node.neural_embedding = Some(embedding);
+                    updated += 1;
+                }
             }
         }
         tracing::info!(
@@ -465,11 +466,11 @@ impl SearchEngine {
             if embedding.is_empty() {
                 continue;
             }
-            if let Some(&idx) = self.node_id_to_idx.get(&node_id)
-                && let Some(node) = self.nodes.get_mut(idx)
-            {
-                node.neural_embedding = Some(embedding);
-                updated += 1;
+            if let Some(&idx) = self.node_id_to_idx.get(&node_id) {
+                if let Some(node) = self.nodes.get_mut(idx) {
+                    node.neural_embedding = Some(embedding);
+                    updated += 1;
+                }
             }
         }
         if updated > 0 {
@@ -629,16 +630,17 @@ impl SearchEngine {
             .insert(node_id.clone(), node.complexity);
 
         // Insert TF-IDF embedding into vector index (always present)
-        if !node.tfidf_embedding.is_empty()
-            && let Err(e) = self
+        if !node.tfidf_embedding.is_empty() {
+            if let Err(e) = self
                 .vector_index
                 .insert(node_id.clone(), node.tfidf_embedding.clone())
-        {
-            tracing::warn!(
-                "Failed to insert TF-IDF embedding for node {}: {:?}",
-                node_id,
-                e
-            );
+            {
+                tracing::warn!(
+                    "Failed to insert TF-IDF embedding for node {}: {:?}",
+                    node_id,
+                    e
+                );
+            }
         }
 
         // Extract signature before clearing content (same as index_nodes does).
@@ -1368,10 +1370,10 @@ impl SearchEngine {
         }
 
         // Apply relevance threshold if specified.
-        if let Some(threshold) = query.threshold
-            && score.overall < threshold
-        {
-            return None;
+        if let Some(threshold) = query.threshold {
+            if score.overall < threshold {
+                return None;
+            }
         }
 
         let signature = node.signature.clone();

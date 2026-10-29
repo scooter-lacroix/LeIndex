@@ -82,10 +82,10 @@ pub fn cached_gpu_sample() -> GpuSample {
     let mut guard = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some((sampled_at, sample)) = guard.as_ref()
-        && sampled_at.elapsed() < GPU_SAMPLE_TTL
-    {
-        return sample.clone();
+    if let Some((sampled_at, sample)) = guard.as_ref() {
+        if sampled_at.elapsed() < GPU_SAMPLE_TTL {
+            return sample.clone();
+        }
     }
     let fresh = sample_gpu();
     *guard = Some((std::time::Instant::now(), fresh.clone()));
@@ -276,10 +276,10 @@ fn is_child_of(child_pid: u32, parent_pid: u32) -> bool {
     fields.next(); // state
 
     // ppid is field 4
-    if let Some(ppid_str) = fields.next()
-        && let Ok(ppid) = ppid_str.parse::<u32>()
-    {
-        return ppid == parent_pid;
+    if let Some(ppid_str) = fields.next() {
+        if let Ok(ppid) = ppid_str.parse::<u32>() {
+            return ppid == parent_pid;
+        }
     }
 
     false
@@ -351,11 +351,10 @@ fn read_pss_from_rollup(pid: u32) -> u64 {
 
     for line in content.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2
-            && parts[0] == "Pss:"
-            && let Ok(v) = parts[1].parse::<u64>()
-        {
-            return v;
+        if parts.len() >= 2 && parts[0] == "Pss:" {
+            if let Ok(v) = parts[1].parse::<u64>() {
+                return v;
+            }
         }
     }
     0
@@ -399,13 +398,13 @@ fn read_mapped_anon_smaps(pid: u32) -> (u64, u64) {
             continue;
         }
 
-        if let Some(rest) = trimmed.strip_prefix("Rss:")
-            && let Ok(value) = rest.split_whitespace().next().unwrap_or("0").parse::<u64>()
-        {
-            if is_file_mapped {
-                mapped_file += value;
-            } else {
-                anon += value;
+        if let Some(rest) = trimmed.strip_prefix("Rss:") {
+            if let Ok(value) = rest.split_whitespace().next().unwrap_or("0").parse::<u64>() {
+                if is_file_mapped {
+                    mapped_file += value;
+                } else {
+                    anon += value;
+                }
             }
         }
     }

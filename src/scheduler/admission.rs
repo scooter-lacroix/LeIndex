@@ -131,11 +131,12 @@ fn read_mmap_resident_mb() -> u64 {
             in_file_mapping = fields.len() > 5 && !fields[5].starts_with('[');
             continue;
         }
-        if let Some(rest) = trimmed.strip_prefix("Rss:")
-            && in_file_mapping
-            && let Ok(kb) = rest.split_whitespace().next().unwrap_or("0").parse::<u64>()
-        {
-            rss_kb += kb;
+        if let Some(rest) = trimmed.strip_prefix("Rss:") {
+            if in_file_mapping {
+                if let Ok(kb) = rest.split_whitespace().next().unwrap_or("0").parse::<u64>() {
+                    rss_kb += kb;
+                }
+            }
         }
     }
     rss_kb / 1024

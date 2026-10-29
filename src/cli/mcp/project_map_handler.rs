@@ -299,11 +299,12 @@ scoping to subdirectories, sorting, and pagination."
     ) -> Result<(String, PathBuf, PathBuf), JsonRpcError> {
         // Allow legacy "path" param; map it into "scope" for resolution.
         let mut args_with_scope = args.clone();
-        if let Some(obj) = args_with_scope.as_object_mut()
-            && !obj.contains_key("scope")
-            && let Some(path) = obj.get("path").cloned()
-        {
-            obj.insert("scope".to_string(), path);
+        if let Some(obj) = args_with_scope.as_object_mut() {
+            if !obj.contains_key("scope") {
+                if let Some(path) = obj.get("path").cloned() {
+                    obj.insert("scope".to_string(), path);
+                }
+            }
         }
         let scope = resolve_scope(&args_with_scope, project_path)?;
         let scope_str = scope.unwrap_or_else(|| {
@@ -529,12 +530,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_project_map_cache_preserves_nested_and_symbol_less_files_with_directory_depth() {
-        // Hermetic (this test used to be environment-sensitive): the fixture
-        // is indexed here instead of relying on auto-index, so the handler's
-        // `get_or_create` sees `is_indexed() == true` and never consults the
-        // ambient `LEINDEX_AUTO_INDEX` env var or `mcp.auto_index` config —
-        // on the Release runner the outcome depended on whether a sibling
-        // test's env mutation happened to be in force when this test ran.
         let dir = tempdir().unwrap();
         let nested_dir = dir.path().join("src").join("nested");
         std::fs::create_dir_all(&nested_dir).unwrap();
@@ -542,13 +537,7 @@ mod tests {
         std::fs::write(dir.path().join("src").join("empty.rs"), "\n").unwrap();
         std::fs::write(nested_dir.join("mod.rs"), "pub fn helper() {}\n").unwrap();
 
-        let mut index = crate::cli::leindex::LeIndex::new(dir.path()).expect("leindex");
-        index
-            .index_project(true)
-            .expect("fixture project indexes lexically");
-        let registry = std::sync::Arc::new(
-            crate::cli::registry::ProjectRegistry::with_initial_project(5, index),
-        );
+        let registry = test_registry_for(dir.path());
         let args = serde_json::json!({
             "depth": 2,
             "sort_by": "name",

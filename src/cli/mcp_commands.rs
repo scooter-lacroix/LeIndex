@@ -731,14 +731,14 @@ pub(super) fn merge_tool_args(
         object.insert(key.to_string(), value);
     }
 
-    if let Some(project) = project
-        && !object.contains_key("project_path")
-    {
-        let canonical = project.canonicalize().unwrap_or_else(|_| project.clone());
-        object.insert(
-            "project_path".to_string(),
-            Value::String(canonical.display().to_string()),
-        );
+    if let Some(project) = project {
+        if !object.contains_key("project_path") {
+            let canonical = project.canonicalize().unwrap_or_else(|_| project.clone());
+            object.insert(
+                "project_path".to_string(),
+                Value::String(canonical.display().to_string()),
+            );
+        }
     }
 
     Ok(Value::Object(object))
@@ -891,11 +891,11 @@ pub(super) fn find_tool_handler(name: &str) -> Option<ToolHandler> {
 /// For "leindex_foo" returns "foo", for "leindex [foo bar]" returns "foo_bar", for "leindex.foo-bar" returns "foo_bar".
 fn extract_short_name(name: &str) -> String {
     // Handle "leindex [foo bar]" format (normalized to "leindex [foo bar]")
-    if let Some(inside) = name.strip_prefix("leindex [")
-        && let Some(inside) = inside.strip_suffix(']')
-    {
-        let with_underscores = inside.replace(' ', "_");
-        return normalize_tool_name(&with_underscores);
+    if let Some(inside) = name.strip_prefix("leindex [") {
+        if let Some(inside) = inside.strip_suffix(']') {
+            let with_underscores = inside.replace(' ', "_");
+            return normalize_tool_name(&with_underscores);
+        }
     }
     // Handle "leindex.foo-bar" format (MCP-compliant: leindex.search, leindex.project-map)
     if let Some(inside) = name.strip_prefix("leindex.") {

@@ -313,10 +313,10 @@ fn write_tmp_and_rename(path: &Path, tmp_path: &Path, data: &[u8]) -> Result<()>
     }
 
     // Best-effort dir fsync.
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = fs::File::open(parent)
-    {
-        let _ = fsync_file(&dir);
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = fsync_file(&dir);
+        }
     }
     Ok(())
 }
@@ -884,10 +884,10 @@ impl RefcountStore for JsonSidecarStore {
                 continue;
             }
             for (generation, count) in &holds.generations {
-                if *count > 0
-                    && let Ok(generation) = generation.parse::<u64>()
-                {
-                    generations.insert(generation);
+                if *count > 0 {
+                    if let Ok(generation) = generation.parse::<u64>() {
+                        generations.insert(generation);
+                    }
                 }
             }
         }
@@ -932,13 +932,13 @@ impl RefcountStore for JsonSidecarStore {
                     // the sidecar keeps matching reality (the count entries
                     // were already dropped above), and surface both the
                     // error and what was swept.
-                    if !removed.is_empty()
-                        && let Err(write_error) = write_sidecar_atomic(&self.sidecar_path, &file)
-                    {
-                        tracing::warn!(
-                            %write_error,
-                            "refs: failed to persist partial GC sweep; sidecar may hold entries for deleted blobs"
-                        );
+                    if !removed.is_empty() {
+                        if let Err(write_error) = write_sidecar_atomic(&self.sidecar_path, &file) {
+                            tracing::warn!(
+                                %write_error,
+                                "refs: failed to persist partial GC sweep; sidecar may hold entries for deleted blobs"
+                            );
+                        }
                     }
                     tracing::warn!(
                         %error,

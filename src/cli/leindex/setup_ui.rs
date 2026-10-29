@@ -705,10 +705,10 @@ impl App {
             match key.code {
                 KeyCode::Enter => {
                     let text = buffer.clone();
-                    if let Some(field) = self.selected_field()
-                        && let Some(slot) = self.draft.text_mut(field)
-                    {
-                        *slot = text;
+                    if let Some(field) = self.selected_field() {
+                        if let Some(slot) = self.draft.text_mut(field) {
+                            *slot = text;
+                        }
                     }
                     self.editing = None;
                     self.refresh_fields();
@@ -993,9 +993,11 @@ struct Guard {
 impl Guard {
     fn enter(fullscreen: bool) -> Result<Self, SetupError> {
         enable_raw_mode().map_err(|error| SetupError::Interactive(error.to_string()))?;
-        if fullscreen && let Err(error) = execute!(std::io::stdout(), EnterAlternateScreen) {
-            let _ = disable_raw_mode();
-            return Err(SetupError::Interactive(error.to_string()));
+        if fullscreen {
+            if let Err(error) = execute!(std::io::stdout(), EnterAlternateScreen) {
+                let _ = disable_raw_mode();
+                return Err(SetupError::Interactive(error.to_string()));
+            }
         }
         Ok(Self { fullscreen })
     }

@@ -149,10 +149,10 @@ impl SyntaxValidator {
             match self.parse_content(&change.new_content, language_id) {
                 Ok(_) => {
                     // Check for common issues even if parsing succeeded
-                    if self.strict_mode
-                        && let Some(warning) = self.check_style_issues(change, language_id)
-                    {
-                        errors.push(warning);
+                    if self.strict_mode {
+                        if let Some(warning) = self.check_style_issues(change, language_id) {
+                            errors.push(warning);
+                        }
                     }
                 }
                 Err(parse_error) => {

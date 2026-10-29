@@ -25,12 +25,12 @@ use super::*;
 pub(super) fn migraphx_loader_dirs() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     for key in ["ROCM_PATH", "HIP_PATH"] {
-        if let Ok(value) = std::env::var(key)
-            && !value.is_empty()
-        {
-            let root = PathBuf::from(value);
-            if !roots.contains(&root) {
-                roots.push(root);
+        if let Ok(value) = std::env::var(key) {
+            if !value.is_empty() {
+                let root = PathBuf::from(value);
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
             }
         }
     }

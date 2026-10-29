@@ -1075,19 +1075,20 @@ fn local_call_targets(
         // project namesake shared the method name (N-03). These fallbacks
         // now only fire when the name is UNAMBIGUOUS project-wide; an
         // ambiguous short name resolves to none of the namesakes.
-        if let Some(last) = segments.last()
-            && let Some(ids) = last_map.get(*last)
-            && ids.len() == 1
-        {
-            targets.extend(ids);
+        if let Some(last) = segments.last() {
+            if let Some(ids) = last_map.get(*last) {
+                if ids.len() == 1 {
+                    targets.extend(ids);
+                }
+            }
         }
         for len in 2..=3_usize.min(segments.len()) {
             let start = segments.len() - len;
             let suffix = segments[start..].join(".");
-            if let Some(ids) = suffix_map.get(&suffix)
-                && ids.len() == 1
-            {
-                targets.extend(ids);
+            if let Some(ids) = suffix_map.get(&suffix) {
+                if ids.len() == 1 {
+                    targets.extend(ids);
+                }
             }
         }
     }

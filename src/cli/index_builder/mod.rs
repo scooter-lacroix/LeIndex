@@ -263,13 +263,13 @@ impl FileSummaryContext {
     pub(crate) fn from_pdg(pdg: &ProgramDependenceGraph) -> Self {
         let mut file_symbols: HashMap<String, Vec<String>> = HashMap::new();
         for ni in pdg.node_indices() {
-            if let Some(n) = pdg.get_node(ni)
-                && !matches!(n.node_type, NodeType::FileSummary)
-            {
-                file_symbols
-                    .entry(n.file_path.to_string())
-                    .or_default()
-                    .push(n.name.clone());
+            if let Some(n) = pdg.get_node(ni) {
+                if !matches!(n.node_type, NodeType::FileSummary) {
+                    file_symbols
+                        .entry(n.file_path.to_string())
+                        .or_default()
+                        .push(n.name.clone());
+                }
             }
         }
         // Canonical order. Node insertion order follows PARALLEL parse
@@ -485,10 +485,10 @@ impl FileReadCache {
             self.touch(&path);
             return;
         }
-        if self.entries.len() >= self.capacity
-            && let Some(old) = self.order.pop_front()
-        {
-            self.entries.remove(&old);
+        if self.entries.len() >= self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
+            }
         }
         self.order.push_back(path.clone());
         self.entries.insert(path, bytes);
@@ -1589,15 +1589,15 @@ pub(crate) use remote::try_remote_neural_embedder;
 fn build_neural_embedder(tfidf_embedder: TfIdfEmbedder, _allow_neural: bool) -> HybridEmbedder {
     #[cfg(feature = "remote-embeddings")]
     {
-        if _allow_neural
-            && let Some(hybrid) = try_remote_neural_embedder(
+        if _allow_neural {
+            if let Some(hybrid) = try_remote_neural_embedder(
                 tfidf_embedder.clone(),
                 &crate::config::LeIndexConfig::load_cached()
                     .indexing
                     .embeddings,
-            )
-        {
-            return hybrid;
+            ) {
+                return hybrid;
+            }
         }
     }
     #[cfg(feature = "onnx")]

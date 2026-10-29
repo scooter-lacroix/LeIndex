@@ -389,10 +389,10 @@ fn command_matches(args: &[String], cfg: &ServiceConfig) -> bool {
         args.windows(2)
             .any(|pair| pair[0] == flag && pair[1] == value)
     };
-    if let Some(model) = &cfg.model
-        && !has_option("-m", model)
-    {
-        return false;
+    if let Some(model) = &cfg.model {
+        if !has_option("-m", model) {
+            return false;
+        }
     }
     has_option("--host", &cfg.host) && has_option("--port", &cfg.port.to_string())
 }
@@ -427,11 +427,11 @@ fn clean_stale_pidfile(name: &str, _cfg: &ServiceConfig) -> Result<bool, Service
     if !cfg!(any(target_os = "linux", target_os = "macos")) {
         return Ok(false);
     }
-    if let Some(pid) = read_pidfile(name)?
-        && !proc_exists(pid)
-    {
-        remove_pidfile(name);
-        return Ok(true);
+    if let Some(pid) = read_pidfile(name)? {
+        if !proc_exists(pid) {
+            remove_pidfile(name);
+            return Ok(true);
+        }
     }
     Ok(false)
 }

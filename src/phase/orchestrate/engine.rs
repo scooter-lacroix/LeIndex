@@ -69,12 +69,12 @@ impl<R: PhaseRunner> OrchestrationEngine<R> {
         for attempt in 1..=orchestration.max_retries.max(1) {
             self.state.attempts = attempt;
 
-            if let Some(timeout_ms) = orchestration.timeout_ms
-                && start.elapsed().as_millis() >= timeout_ms as u128
-            {
-                self.state.last_error =
-                    Some(format!("timeout budget exceeded after {} ms", timeout_ms));
-                break;
+            if let Some(timeout_ms) = orchestration.timeout_ms {
+                if start.elapsed().as_millis() >= timeout_ms as u128 {
+                    self.state.last_error =
+                        Some(format!("timeout budget exceeded after {} ms", timeout_ms));
+                    break;
+                }
             }
 
             let mut options = orchestration.options.clone();

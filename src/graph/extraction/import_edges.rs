@@ -271,10 +271,12 @@ pub(super) fn collapse_multiline(source: &str, prefix: &str, terminator: char) -
             current.push_str(trimmed);
         }
 
-        if in_stmt && let Some(end) = current.find(terminator) {
-            results.push(current[..=end].to_string());
-            in_stmt = false;
-            current = String::new();
+        if in_stmt {
+            if let Some(end) = current.find(terminator) {
+                results.push(current[..=end].to_string());
+                in_stmt = false;
+                current = String::new();
+            }
         }
     }
 
@@ -498,11 +500,12 @@ pub(super) fn resolve_import_targets(
         }
     }
 
-    if targets.is_empty()
-        && let Some(last) = normalized.split('.').next_back()
-        && let Some(ids) = symbol_map.get(last)
-    {
-        targets.extend(ids);
+    if targets.is_empty() {
+        if let Some(last) = normalized.split('.').next_back() {
+            if let Some(ids) = symbol_map.get(last) {
+                targets.extend(ids);
+            }
+        }
     }
 
     targets.sort_by_key(|id| id.index());

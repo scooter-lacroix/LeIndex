@@ -288,10 +288,10 @@ impl ErrorTracker {
                 "Error captured (no remote tracker configured)"
             );
         }
-        if let Ok(mut events) = self.events.lock()
-            && events.len() < 1000
-        {
-            events.push(event);
+        if let Ok(mut events) = self.events.lock() {
+            if events.len() < 1000 {
+                events.push(event);
+            }
         }
     }
 }
@@ -441,10 +441,10 @@ impl ProductAnalytics {
                 .as_nanos(),
             properties,
         };
-        if let Ok(mut events) = self.events.lock()
-            && events.len() < 5000
-        {
-            events.push(event);
+        if let Ok(mut events) = self.events.lock() {
+            if events.len() < 5000 {
+                events.push(event);
+            }
         }
     }
 
@@ -520,11 +520,11 @@ impl CircuitBreaker {
                     .last_failure_time
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                if let Some(t) = *last
-                    && t.elapsed().as_secs() >= self.reset_timeout_secs
-                {
-                    *state = CircuitState::HalfOpen;
-                    return true;
+                if let Some(t) = *last {
+                    if t.elapsed().as_secs() >= self.reset_timeout_secs {
+                        *state = CircuitState::HalfOpen;
+                        return true;
+                    }
                 }
                 false
             }

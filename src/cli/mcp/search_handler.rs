@@ -297,16 +297,16 @@ fn low_signal_json(page: &[crate::search::search::SearchResult]) -> Value {
 /// Without this hint agents timeout-and-retry on the first call of every
 /// session (session-5 §5.1). Also merges the low-signal fields.
 fn annotate_search_payload(payload: &mut Value, low_signal_json: &Value, started: Instant) {
-    if started.elapsed().as_millis() > 5000
-        && let Some(obj) = payload.as_object_mut()
-    {
-        obj.insert("cold_start".to_string(), serde_json::json!(true));
-        obj.insert(
-            "note".to_string(),
-            serde_json::json!(
-                "This call included a one-time neural model load; subsequent searches are milliseconds"
-            ),
-        );
+    if started.elapsed().as_millis() > 5000 {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("cold_start".to_string(), serde_json::json!(true));
+            obj.insert(
+                "note".to_string(),
+                serde_json::json!(
+                    "This call included a one-time neural model load; subsequent searches are milliseconds"
+                ),
+            );
+        }
     }
     if let (Some(obj), Some(target)) = (payload.as_object_mut(), low_signal_json.as_object()) {
         for (key, value) in target {

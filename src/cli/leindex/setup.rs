@@ -258,34 +258,34 @@ impl SmokeTestResult {
             ))
         };
 
-        if error.is_none()
-            && let Some(configured) = configured_provider_label.as_deref()
-        {
-            let active = execution_provider.as_deref();
-            // VAL-SETUP smoke match: the configured label must agree with
-            // the provider the worker actually loaded.
-            //   cpu→cpu, cuda→cuda, migraphx→migraphx, legacy rocm→migraphx,
-            //   coreml→coreml, auto→any concrete provider (incl. CPU).
-            let provider_matches = matches!(
-                (configured, active),
-                ("cpu", Some("cpu"))
-                    | ("cuda", Some("cuda"))
-                    | ("migraphx", Some("migraphx"))
-                    | ("rocm", Some("migraphx" | "rocm"))
-                    | ("coreml", Some("coreml"))
-                    | ("auto", Some("cpu" | "cuda" | "migraphx" | "coreml"))
-            );
-            // Only flag a mismatch for labels that assert a concrete shape.
-            // `cpu` is permissive (CPU is always a valid outcome), so it is
-            // excluded from the needs-match set just like the original.
-            let needs_match =
-                matches!(configured, "migraphx" | "rocm" | "cuda" | "coreml" | "auto");
-            if needs_match && !provider_matches {
-                error = Some(format!(
-                    "configured execution provider {} but worker reported {}",
-                    configured,
-                    active.unwrap_or("none")
-                ));
+        if error.is_none() {
+            if let Some(configured) = configured_provider_label.as_deref() {
+                let active = execution_provider.as_deref();
+                // VAL-SETUP smoke match: the configured label must agree with
+                // the provider the worker actually loaded.
+                //   cpu→cpu, cuda→cuda, migraphx→migraphx, legacy rocm→migraphx,
+                //   coreml→coreml, auto→any concrete provider (incl. CPU).
+                let provider_matches = matches!(
+                    (configured, active),
+                    ("cpu", Some("cpu"))
+                        | ("cuda", Some("cuda"))
+                        | ("migraphx", Some("migraphx"))
+                        | ("rocm", Some("migraphx" | "rocm"))
+                        | ("coreml", Some("coreml"))
+                        | ("auto", Some("cpu" | "cuda" | "migraphx" | "coreml"))
+                );
+                // Only flag a mismatch for labels that assert a concrete shape.
+                // `cpu` is permissive (CPU is always a valid outcome), so it is
+                // excluded from the needs-match set just like the original.
+                let needs_match =
+                    matches!(configured, "migraphx" | "rocm" | "cuda" | "coreml" | "auto");
+                if needs_match && !provider_matches {
+                    error = Some(format!(
+                        "configured execution provider {} but worker reported {}",
+                        configured,
+                        active.unwrap_or("none")
+                    ));
+                }
             }
         }
 
@@ -1163,19 +1163,22 @@ fn run_remote_smoke_test_inner(
                 .remote_endpoint
                 .as_deref()
                 .is_none_or(|endpoint| endpoint.trim().is_empty())
-    }) && let Some(service) = services.get(name)
-        && service.auto_start
-        && let Err(error) = crate::services::ensure_running(name, service)
-    {
-        return SmokeTestResult {
-            passed: false,
-            skipped: false,
-            dimension: None,
-            execution_provider: Some("remote".to_string()),
-            configured_provider_label: Some(provider_label),
-            error: Some(format!("could not start managed service {name}: {error}")),
-            note: None,
-        };
+    }) {
+        if let Some(service) = services.get(name) {
+            if service.auto_start {
+                if let Err(error) = crate::services::ensure_running(name, service) {
+                    return SmokeTestResult {
+                        passed: false,
+                        skipped: false,
+                        dimension: None,
+                        execution_provider: Some("remote".to_string()),
+                        configured_provider_label: Some(provider_label),
+                        error: Some(format!("could not start managed service {name}: {error}")),
+                        note: None,
+                    };
+                }
+            }
+        }
     }
 
     let api_key = match embeddings.resolved_api_key() {
@@ -1579,10 +1582,10 @@ fn print_smoke_summary(smoke: &SmokeTestResult) {
         if let Some(ref note) = smoke.note {
             println!("Note:         {}", truncate_for_display(note, 200));
         }
-    } else if let Some(ref err) = smoke.error
-        && !smoke.passed
-    {
-        println!("Worker error: {}", truncate_for_display(err, 200));
+    } else if let Some(ref err) = smoke.error {
+        if !smoke.passed {
+            println!("Worker error: {}", truncate_for_display(err, 200));
+        }
     }
 }
 

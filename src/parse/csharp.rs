@@ -262,16 +262,16 @@ fn extract_csharp_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Imp
     }
 
     fn visit(node: &tree_sitter::Node<'_>, source: &[u8], imports: &mut Vec<ImportInfo>) {
-        if node.kind() == "using_directive"
-            && let Ok(text) = node.utf8_text(source)
-        {
-            let text = text.trim().trim_end_matches(';').trim();
-            let text = text.trim_start_matches("using ");
-            if let Some((alias, path)) = text.split_once('=') {
-                add_import(imports, path.trim(), Some(alias.trim().to_string()));
-            } else {
-                let alias = text.split('.').next_back().map(|s| s.to_string());
-                add_import(imports, text, alias);
+        if node.kind() == "using_directive" {
+            if let Ok(text) = node.utf8_text(source) {
+                let text = text.trim().trim_end_matches(';').trim();
+                let text = text.trim_start_matches("using ");
+                if let Some((alias, path)) = text.split_once('=') {
+                    add_import(imports, path.trim(), Some(alias.trim().to_string()));
+                } else {
+                    let alias = text.split('.').next_back().map(|s| s.to_string());
+                    add_import(imports, text, alias);
+                }
             }
         }
 
@@ -338,12 +338,13 @@ fn extract_method_signature(
         let mut cursor = node.walk();
         let mut found = false;
         for child in node.children(&mut cursor) {
-            if child.kind() == "modifier"
-                && let Ok(text) = child.utf8_text(source)
-                && text.trim() == "async"
-            {
-                found = true;
-                break;
+            if child.kind() == "modifier" {
+                if let Ok(text) = child.utf8_text(source) {
+                    if text.trim() == "async" {
+                        found = true;
+                        break;
+                    }
+                }
             }
         }
         found
@@ -380,22 +381,22 @@ fn extract_csharp_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<Stri
     fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {
         match node.kind() {
             "invocation_expression" => {
-                if let Some(expr) = node.child_by_field_name("expression")
-                    && let Ok(text) = expr.utf8_text(source)
-                {
-                    let name = clean_call_text(text);
-                    if !name.is_empty() {
-                        calls.push(name);
+                if let Some(expr) = node.child_by_field_name("expression") {
+                    if let Ok(text) = expr.utf8_text(source) {
+                        let name = clean_call_text(text);
+                        if !name.is_empty() {
+                            calls.push(name);
+                        }
                     }
                 }
             }
             "object_creation_expression" => {
-                if let Some(typ) = node.child_by_field_name("type")
-                    && let Ok(text) = typ.utf8_text(source)
-                {
-                    let name = clean_call_text(text);
-                    if !name.is_empty() {
-                        calls.push(name);
+                if let Some(typ) = node.child_by_field_name("type") {
+                    if let Ok(text) = typ.utf8_text(source) {
+                        let name = clean_call_text(text);
+                        if !name.is_empty() {
+                            calls.push(name);
+                        }
                     }
                 }
             }

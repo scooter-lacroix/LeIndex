@@ -211,10 +211,10 @@ impl TrigramIndex {
 
         // Remove the node_idx only from posting lists that could contain it
         for trigram in &trigrams_to_clean {
-            if let Some(posting_list) = self.postings.get_mut(trigram)
-                && let Ok(pos) = posting_list.binary_search(&node_idx)
-            {
-                posting_list.remove(pos);
+            if let Some(posting_list) = self.postings.get_mut(trigram) {
+                if let Ok(pos) = posting_list.binary_search(&node_idx) {
+                    posting_list.remove(pos);
+                }
             }
         }
     }

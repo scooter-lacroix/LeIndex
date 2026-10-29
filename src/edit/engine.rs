@@ -130,11 +130,11 @@ pub fn replace_near_definitions(
     // Merge overlapping windows
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for w in windows {
-        if let Some(last) = merged.last_mut()
-            && w.0 <= last.1
-        {
-            last.1 = last.1.max(w.1);
-            continue;
+        if let Some(last) = merged.last_mut() {
+            if w.0 <= last.1 {
+                last.1 = last.1.max(w.1);
+                continue;
+            }
         }
         merged.push(w);
     }
@@ -1384,40 +1384,38 @@ impl WorktreeSession {
     }
 
     fn restore_merge_backup(original: &Path, backup_path: &Path, file_existed: bool) {
-        if file_existed
-            && backup_path.exists()
-            && let Err(error) = std::fs::rename(backup_path, original)
-        {
-            tracing::error!(
-                "CRITICAL: Failed to restore '{}' from backup during rollback: {}",
-                original.display(),
-                error
-            );
+        if file_existed && backup_path.exists() {
+            if let Err(error) = std::fs::rename(backup_path, original) {
+                tracing::error!(
+                    "CRITICAL: Failed to restore '{}' from backup during rollback: {}",
+                    original.display(),
+                    error
+                );
+            }
         }
     }
 
     fn cleanup_merged_files(backups: &[(PathBuf, PathBuf, bool)], path: &Path) {
         for (_, backup_path, file_existed) in backups {
-            if *file_existed
-                && backup_path.exists()
-                && let Err(error) = std::fs::remove_file(backup_path)
-            {
-                tracing::warn!(
-                    "Failed to remove backup file '{}': {}",
-                    backup_path.display(),
-                    error
-                );
+            if *file_existed && backup_path.exists() {
+                if let Err(error) = std::fs::remove_file(backup_path) {
+                    tracing::warn!(
+                        "Failed to remove backup file '{}': {}",
+                        backup_path.display(),
+                        error
+                    );
+                }
             }
         }
 
-        if path.exists()
-            && let Err(error) = std::fs::remove_dir_all(path)
-        {
-            tracing::warn!(
-                "Failed to clean up worktree '{}': {}",
-                path.display(),
-                error
-            );
+        if path.exists() {
+            if let Err(error) = std::fs::remove_dir_all(path) {
+                tracing::warn!(
+                    "Failed to clean up worktree '{}': {}",
+                    path.display(),
+                    error
+                );
+            }
         }
     }
 
@@ -1532,10 +1530,10 @@ impl Impact {
         for &start_id in &node_ids {
             let forward = pdg.forward_impact(start_id, &config);
             for nid in forward {
-                if seen.insert(nid)
-                    && let Some(node) = pdg.get_node(nid)
-                {
-                    impacted.push(format!("{}:{}", node.file_path, node.name));
+                if seen.insert(nid) {
+                    if let Some(node) = pdg.get_node(nid) {
+                        impacted.push(format!("{}:{}", node.file_path, node.name));
+                    }
                 }
             }
         }
@@ -1573,10 +1571,10 @@ impl Impact {
         for &start_id in &node_ids {
             let backward = pdg.backward_impact(start_id, &config);
             for nid in backward {
-                if seen.insert(nid)
-                    && let Some(node) = pdg.get_node(nid)
-                {
-                    impacted.push(format!("{}:{}", node.file_path, node.name));
+                if seen.insert(nid) {
+                    if let Some(node) = pdg.get_node(nid) {
+                        impacted.push(format!("{}:{}", node.file_path, node.name));
+                    }
                 }
             }
         }

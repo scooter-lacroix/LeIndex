@@ -36,28 +36,28 @@ impl BashParser {
         ) {
             match node.kind() {
                 "function_definition" => {
-                    if let Some(name_node) = node.child_by_field_name("name")
-                        && let Ok(name) = name_node.utf8_text(source)
-                    {
-                        let calls = extract_bash_calls(node, source);
+                    if let Some(name_node) = node.child_by_field_name("name") {
+                        if let Ok(name) = name_node.utf8_text(source) {
+                            let calls = extract_bash_calls(node, source);
 
-                        signatures.push(SignatureInfo {
-                            name: name.to_string(),
-                            qualified_name: name.to_string(),
-                            parameters: vec![],
-                            return_type: None,
-                            visibility: Visibility::Public,
-                            is_async: false,
-                            is_method: false,
-                            docstring: extract_docstring(node, source),
-                            calls,
+                            signatures.push(SignatureInfo {
+                                name: name.to_string(),
+                                qualified_name: name.to_string(),
+                                parameters: vec![],
+                                return_type: None,
+                                visibility: Visibility::Public,
+                                is_async: false,
+                                is_method: false,
+                                docstring: extract_docstring(node, source),
+                                calls,
 
-                            imports: vec![],
-                            byte_range: (node.start_byte(), node.end_byte()),
-                            flow_facts: vec![],
+                                imports: vec![],
+                                byte_range: (node.start_byte(), node.end_byte()),
+                                flow_facts: vec![],
 
-                            cyclomatic_complexity: 0,
-                        });
+                                cyclomatic_complexity: 0,
+                            });
+                        }
                     }
                 }
                 _ => {
@@ -169,19 +169,25 @@ fn extract_bash_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Impor
     }
 
     fn visit(node: &tree_sitter::Node<'_>, source: &[u8], imports: &mut Vec<ImportInfo>) {
-        if matches!(node.kind(), "command" | "simple_command")
-            && let Some(name_node) = node
+        if node.kind() == "command" || node.kind() == "simple_command" {
+            if let Some(name_node) = node
                 .child_by_field_name("name")
                 .or_else(|| node.child_by_field_name("command"))
                 .or_else(|| node.child_by_field_name("command_name"))
-            && let Ok(name) = name_node.utf8_text(source)
-            && matches!(name, "source" | ".")
-            && let Some(arg) = node
-                .child_by_field_name("argument")
-                .or_else(|| node.child_by_field_name("arguments"))
-            && let Ok(text) = arg.utf8_text(source)
-        {
-            add_import(imports, text);
+            {
+                if let Ok(name) = name_node.utf8_text(source) {
+                    if name == "source" || name == "." {
+                        if let Some(arg) = node
+                            .child_by_field_name("argument")
+                            .or_else(|| node.child_by_field_name("arguments"))
+                        {
+                            if let Ok(text) = arg.utf8_text(source) {
+                                add_import(imports, text);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         let mut cursor = node.walk();
@@ -207,11 +213,12 @@ fn extract_bash_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
                     .child_by_field_name("name")
                     .or_else(|| node.child_by_field_name("command"))
                     .or_else(|| node.child_by_field_name("command_name"))
-                    && let Ok(text) = name_node.utf8_text(source)
                 {
-                    let name = text.trim().to_string();
-                    if !name.is_empty() {
-                        calls.push(name);
+                    if let Ok(text) = name_node.utf8_text(source) {
+                        let name = text.trim().to_string();
+                        if !name.is_empty() {
+                            calls.push(name);
+                        }
                     }
                 }
             }
@@ -233,11 +240,12 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
         return Default::default();
     }
     let prev_sibling = node.prev_sibling();
-    if let Some(sibling) = prev_sibling
-        && sibling.kind() == "comment"
-        && let Ok(text) = sibling.utf8_text(source)
-    {
-        return Some(text.trim().trim_start_matches('#').trim().to_string());
+    if let Some(sibling) = prev_sibling {
+        if sibling.kind() == "comment" {
+            if let Ok(text) = sibling.utf8_text(source) {
+                return Some(text.trim().trim_start_matches('#').trim().to_string());
+            }
+        }
     }
     None
 }

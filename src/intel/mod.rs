@@ -168,15 +168,15 @@ pub fn run_precision_ingest(
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(4096);
-    if let Some(available_kib) = mem_available_kib()
-        && available_kib < minimum_mb.saturating_mul(1024)
-    {
-        tracing::info!(
-            available_mb = available_kib / 1024,
-            minimum_mb,
-            "SCIP precision skipped below MemAvailable floor"
-        );
-        return total;
+    if let Some(available_kib) = mem_available_kib() {
+        if available_kib < minimum_mb.saturating_mul(1024) {
+            tracing::info!(
+                available_mb = available_kib / 1024,
+                minimum_mb,
+                "SCIP precision skipped below MemAvailable floor"
+            );
+            return total;
+        }
     }
 
     let timeout_secs = std::env::var("LEINDEX_SCIP_TIMEOUT_SECS")

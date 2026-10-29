@@ -506,10 +506,8 @@ fn decode_row(bytes: &[u8], dim: usize) -> Option<Vec<f32>> {
         return None;
     }
     let vector: Vec<f32> = payload
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|chunk| f32::from_le_bytes(*chunk))
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("chunk of 4")))
         .collect();
     vector.iter().all(|v| v.is_finite()).then_some(vector)
 }

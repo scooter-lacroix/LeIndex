@@ -183,12 +183,12 @@ impl ProgramDependenceGraph {
         let mut scratch: Vec<NodeId> = Vec::new();
 
         while let Some((current, depth)) = queue.pop_front() {
-            if let Some(max_nodes) = config.max_nodes
-                && result.len() >= max_nodes
-            {
-                // There is work left in the queue, so the answer is partial.
-                capped = true;
-                break;
+            if let Some(max_nodes) = config.max_nodes {
+                if result.len() >= max_nodes {
+                    // There is work left in the queue, so the answer is partial.
+                    capped = true;
+                    break;
+                }
             }
             if !starts.contains(&current)
                 && self
@@ -249,23 +249,24 @@ impl ProgramDependenceGraph {
         queue.push_back((start, 0));
 
         while let Some((current, depth)) = queue.pop_front() {
-            if let Some(max_n) = config.max_nodes
-                && result.len() >= max_n
-            {
-                break;
+            if let Some(max_n) = config.max_nodes {
+                if result.len() >= max_n {
+                    break;
+                }
             }
 
-            if current != start
-                && let Some(node) = self.graph.node_weight(current)
-                && config.node_should_collect(node)
-            {
-                result.push(current);
+            if current != start {
+                if let Some(node) = self.graph.node_weight(current) {
+                    if config.node_should_collect(node) {
+                        result.push(current);
+                    }
+                }
             }
 
-            if let Some(max_d) = config.max_depth
-                && depth >= max_d
-            {
-                continue;
+            if let Some(max_d) = config.max_depth {
+                if depth >= max_d {
+                    continue;
+                }
             }
 
             // Reuse the scratch buffer instead of allocating a new Vec per level.

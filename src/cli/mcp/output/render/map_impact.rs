@@ -325,11 +325,11 @@ pub(super) fn build_tree_from_files(files: &[Value]) -> Vec<Value> {
                 .into_iter()
                 .map(|(child_name, child)| child.into_value(&child_name))
                 .collect();
-            if let Some(mut entry) = self.entry
-                && let Some(obj) = entry.as_object_mut()
-            {
-                if !children.is_empty() {
-                    obj.insert("children".to_string(), Value::Array(children));
+            if let Some(mut entry) = self.entry {
+                if let Some(obj) = entry.as_object_mut() {
+                    if !children.is_empty() {
+                        obj.insert("children".to_string(), Value::Array(children));
+                    }
                 }
                 entry
             } else {

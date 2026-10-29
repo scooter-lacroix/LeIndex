@@ -674,23 +674,24 @@ impl GlobalEmbeddingCache {
     /// Skipping is not an error: the callers already treat a cache write
     /// failure as "leave it uncached", and a miss costs less than a full disk.
     fn admit_write(&mut self, entry_size: u64) -> Result<bool, CacheError> {
-        if self.config.min_free_bytes > 0
-            && let Some(free) = available_bytes(&self.root)
-            && free.saturating_sub(entry_size) < self.config.min_free_bytes
-        {
-            // Warn once per process, not once per batch: a full disk
-            // would otherwise emit a warning per embedding batch and
-            // bury the rest of the log.
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                tracing::warn!(
-                    free_bytes = free,
-                    min_free_bytes = self.config.min_free_bytes,
-                    root = %self.root.display(),
-                    "embedding cache is out of free space; skipping writes until space is reclaimed"
-                );
-            });
-            return Ok(false);
+        if self.config.min_free_bytes > 0 {
+            if let Some(free) = available_bytes(&self.root) {
+                if free.saturating_sub(entry_size) < self.config.min_free_bytes {
+                    // Warn once per process, not once per batch: a full disk
+                    // would otherwise emit a warning per embedding batch and
+                    // bury the rest of the log.
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        tracing::warn!(
+                            free_bytes = free,
+                            min_free_bytes = self.config.min_free_bytes,
+                            root = %self.root.display(),
+                            "embedding cache is out of free space; skipping writes until space is reclaimed"
+                        );
+                    });
+                    return Ok(false);
+                }
+            }
         }
         if self.config.max_bytes == 0 {
             return Ok(true);
@@ -808,10 +809,10 @@ impl GlobalEmbeddingCache {
         let mut written = 0usize;
         for (fingerprint, row_bytes, _) in encoded {
             let final_path = self.row_path(fingerprint);
-            if let Some(parent) = final_path.parent()
-                && created_dirs.insert(parent.to_path_buf())
-            {
-                fs::create_dir_all(parent)?;
+            if let Some(parent) = final_path.parent() {
+                if created_dirs.insert(parent.to_path_buf()) {
+                    fs::create_dir_all(parent)?;
+                }
             }
             let staging_path = staging_path_for(&final_path);
             {
@@ -1006,10 +1007,10 @@ impl GlobalEmbeddingCache {
         let tracked: Vec<String> = self.refs.refs.keys().cloned().collect();
         let mut still_existing = HashSet::new();
         for hex in tracked {
-            if let Some(fp) = hex_decode(&hex)
-                && self.row_path(&fp).exists()
-            {
-                still_existing.insert(hex);
+            if let Some(fp) = hex_decode(&hex) {
+                if self.row_path(&fp).exists() {
+                    still_existing.insert(hex);
+                }
             }
         }
         self.refs.refs.retain(|k, _| still_existing.contains(k));
@@ -1434,8 +1435,10 @@ fn f32_slice_to_bytes(slice: &[f32]) -> Vec<u8> {
 /// Convert raw bytes back to Vec<f32>.
 fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
     let mut result = Vec::with_capacity(bytes.len() / std::mem::size_of::<f32>());
-    for chunk in bytes.as_chunks::<4>().0 {
-        result.push(f32::from_le_bytes(*chunk));
+    for chunk in bytes.chunks_exact(4) {
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(chunk);
+        result.push(f32::from_le_bytes(buf));
     }
     result
 }

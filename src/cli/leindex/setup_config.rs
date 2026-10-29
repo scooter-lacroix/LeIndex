@@ -310,13 +310,13 @@ fn validate_embeddings(config: &LeIndexConfig) -> Result<(), SetupError> {
     if let Some(name) = embeddings.remote_api_key_env.as_deref() {
         check_env_var_name("indexing.embeddings.remote_api_key_env", name)?;
     }
-    if let Some(service) = non_empty(embeddings.remote_service.as_deref())
-        && CrossRef::EmbeddingService(service.to_string()).is_dangling(config)
-    {
-        return Err(invalid(format!(
-            "indexing.embeddings.remote_service references missing [services.{service}] \
-             (add it, or run `leindex config unset indexing.embeddings.remote_service`)"
-        )));
+    if let Some(service) = non_empty(embeddings.remote_service.as_deref()) {
+        if CrossRef::EmbeddingService(service.to_string()).is_dangling(config) {
+            return Err(invalid(format!(
+                "indexing.embeddings.remote_service references missing [services.{service}] \
+                 (add it, or run `leindex config unset indexing.embeddings.remote_service`)"
+            )));
+        }
     }
     Ok(())
 }
@@ -352,21 +352,21 @@ fn validate_system_one_refs(config: &LeIndexConfig) -> Result<(), SetupError> {
     if let Some(name) = config.system_one.api_key_env.as_deref() {
         check_env_var_name("system_one.api_key_env", name)?;
     }
-    if let Some(service) = non_empty(config.system_one.service.as_deref())
-        && CrossRef::SystemService(service.to_string()).is_dangling(config)
-    {
-        return Err(invalid(format!(
-            "system_one.service references missing [services.{service}] \
-             (add it, or run `leindex config unset system_one.service`)"
-        )));
+    if let Some(service) = non_empty(config.system_one.service.as_deref()) {
+        if CrossRef::SystemService(service.to_string()).is_dangling(config) {
+            return Err(invalid(format!(
+                "system_one.service references missing [services.{service}] \
+                 (add it, or run `leindex config unset system_one.service`)"
+            )));
+        }
     }
-    if let Some(preset) = non_empty(config.system_one.active_preset.as_deref())
-        && CrossRef::ActivePreset(preset.to_string()).is_dangling(config)
-    {
-        return Err(invalid(format!(
-            "system_one.active_preset references missing [system_one.presets.{preset}] \
-             (add it, or run `leindex config unset system_one.active_preset`)"
-        )));
+    if let Some(preset) = non_empty(config.system_one.active_preset.as_deref()) {
+        if CrossRef::ActivePreset(preset.to_string()).is_dangling(config) {
+            return Err(invalid(format!(
+                "system_one.active_preset references missing [system_one.presets.{preset}] \
+                 (add it, or run `leindex config unset system_one.active_preset`)"
+            )));
+        }
     }
     Ok(())
 }
@@ -398,23 +398,23 @@ fn validate_presets(config: &LeIndexConfig) -> Result<(), SetupError> {
         if let Some(env_name) = preset.api_key_env.as_deref() {
             check_env_var_name(&format!("system_one.presets.{name}.api_key_env"), env_name)?;
         }
-        if let Some(service) = non_empty(preset.service.as_deref())
-            && CrossRef::PresetService(service.to_string()).is_dangling(config)
-        {
-            return Err(invalid(format!(
-                "system_one.presets.{name}.service references missing [services.{service}] \
-                 (add it, or run `leindex config unset system_one.presets.{name}.service`)"
-            )));
+        if let Some(service) = non_empty(preset.service.as_deref()) {
+            if CrossRef::PresetService(service.to_string()).is_dangling(config) {
+                return Err(invalid(format!(
+                    "system_one.presets.{name}.service references missing [services.{service}] \
+                     (add it, or run `leindex config unset system_one.presets.{name}.service`)"
+                )));
+            }
         }
         #[cfg(feature = "system-one")]
         {
-            if let Some(provider) = non_empty(preset.provider.as_deref())
-                && crate::cli::mcp::system_one::types::Provider::parse(provider).is_none()
-            {
-                return Err(invalid(format!(
-                    "system_one.presets.{name}.provider {provider:?} is not one of \
-                     laya/jev/typesafe/openai"
-                )));
+            if let Some(provider) = non_empty(preset.provider.as_deref()) {
+                if crate::cli::mcp::system_one::types::Provider::parse(provider).is_none() {
+                    return Err(invalid(format!(
+                        "system_one.presets.{name}.provider {provider:?} is not one of \
+                         laya/jev/typesafe/openai"
+                    )));
+                }
             }
         }
     }

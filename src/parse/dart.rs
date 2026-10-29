@@ -179,14 +179,14 @@ fn extract_dart_parameters(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Pa
     let mut parameters = Vec::new();
     if let Some(params_node) = node.child_by_field_name("parameters") {
         for child in params_node.children(&mut params_node.walk()) {
-            if child.kind() == "formal_parameter"
-                && let Some(name_node) = child.child_by_field_name("name")
-            {
-                parameters.push(Parameter {
-                    name: name_node.utf8_text(source).unwrap_or("unknown").to_string(),
-                    type_annotation: None,
-                    default_value: None,
-                });
+            if child.kind() == "formal_parameter" {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    parameters.push(Parameter {
+                        name: name_node.utf8_text(source).unwrap_or("unknown").to_string(),
+                        type_annotation: None,
+                        default_value: None,
+                    });
+                }
             }
         }
     }

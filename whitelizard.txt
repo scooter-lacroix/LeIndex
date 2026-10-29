@@ -1,4 +1,0 @@
-parser_for_language
-from_extension
-config
-load_language

@@ -161,7 +161,7 @@ impl MemoryCapGuard {
     /// `check_interval` calls to avoid excessive `/proc` reads.
     pub fn check(&mut self) -> CapStatus {
         self.check_counter += 1;
-        if !self.check_counter.is_multiple_of(self.check_interval) {
+        if self.check_counter % self.check_interval != 0 {
             return CapStatus::Ok;
         }
         self.check_now()

@@ -432,10 +432,10 @@ fn extract_rust_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Impor
 
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if node.kind() == "use_declaration"
-            && let Ok(text) = node.utf8_text(source)
-        {
-            parse_use_text(&mut imports, text);
+        if node.kind() == "use_declaration" {
+            if let Ok(text) = node.utf8_text(source) {
+                parse_use_text(&mut imports, text);
+            }
         }
 
         let mut cursor = node.walk();
@@ -590,15 +590,16 @@ fn extract_rust_call_flow_facts(
         return;
     };
 
-    let is_command_new = callee == "Command::new" || callee.ends_with("::Command::new");
-    if is_command_new && let Some(arg) = expression_arguments(node, source).first() {
-        facts.push(FlowFact {
-            channel: FlowChannel::CommandArgument,
-            source: clean_flow_label(arg.utf8_text(source).unwrap_or("")),
-            target: "command".to_string(),
-            position: Some(0),
-            byte_range: (arg.start_byte(), arg.end_byte()),
-        });
+    if callee == "Command::new" || callee.ends_with("::Command::new") {
+        if let Some(arg) = expression_arguments(node, source).first() {
+            facts.push(FlowFact {
+                channel: FlowChannel::CommandArgument,
+                source: clean_flow_label(arg.utf8_text(source).unwrap_or("")),
+                target: "command".to_string(),
+                position: Some(0),
+                byte_range: (arg.start_byte(), arg.end_byte()),
+            });
+        }
     }
 
     let args = expression_arguments(node, source);
@@ -904,12 +905,14 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
             }
 
             // Extract the type prefix from scoped calls like Foo::new().
-            if func.kind() == "scoped_identifier"
-                && let Some(path_node) = func.child_by_field_name("path")
-                && let Ok(path_text) = path_node.utf8_text(source)
-                && let Some(type_name) = normalize_type_ref(path_text)
-            {
-                calls.push(type_name);
+            if func.kind() == "scoped_identifier" {
+                if let Some(path_node) = func.child_by_field_name("path") {
+                    if let Ok(path_text) = path_node.utf8_text(source) {
+                        if let Some(type_name) = normalize_type_ref(path_text) {
+                            calls.push(type_name);
+                        }
+                    }
+                }
             }
         }
     }
@@ -944,20 +947,22 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
                 if let Some(name_node) = current
                     .child_by_field_name("macro")
                     .or_else(|| current.child_by_field_name("name"))
-                    && let Ok(text) = name_node.utf8_text(source)
                 {
-                    let name = clean_call_text(text);
-                    if !name.is_empty() {
-                        calls.push(name);
+                    if let Ok(text) = name_node.utf8_text(source) {
+                        let name = clean_call_text(text);
+                        if !name.is_empty() {
+                            calls.push(name);
+                        }
                     }
                 }
             }
             "struct_expression" => {
-                if let Some(name_node) = current.child_by_field_name("name")
-                    && let Ok(name) = name_node.utf8_text(source)
-                    && let Some(type_name) = normalize_type_ref(name)
-                {
-                    calls.push(type_name);
+                if let Some(name_node) = current.child_by_field_name("name") {
+                    if let Ok(name) = name_node.utf8_text(source) {
+                        if let Some(type_name) = normalize_type_ref(name) {
+                            calls.push(type_name);
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1022,14 +1027,16 @@ fn extract_import_signature(
 fn extract_visibility(node: &tree_sitter::Node<'_>, source: &[u8]) -> Visibility {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "visibility_modifier"
-            && let Ok(text) = child.utf8_text(source)
-        {
-            if text.contains("pub") && !text.contains("pub(crate)") && !text.contains("pub(super)")
-            {
-                return Visibility::Public;
-            } else if text.contains("pub(crate)") || text.contains("pub(super)") {
-                return Visibility::Protected; // Use protected for restricted visibility
+        if child.kind() == "visibility_modifier" {
+            if let Ok(text) = child.utf8_text(source) {
+                if text.contains("pub")
+                    && !text.contains("pub(crate)")
+                    && !text.contains("pub(super)")
+                {
+                    return Visibility::Public;
+                } else if text.contains("pub(crate)") || text.contains("pub(super)") {
+                    return Visibility::Protected; // Use protected for restricted visibility
+                }
             }
         }
     }
@@ -1104,25 +1111,26 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
     let prev_sibling = node.prev_sibling();
 
     // Check for doc comment (line or block)
-    if let Some(sibling) = prev_sibling
-        && matches!(sibling.kind(), "line_comment" | "block_comment")
-        && let Ok(text) = sibling.utf8_text(source)
-    {
-        let is_doc = text.starts_with("///")
-            || text.starts_with("//!")
-            || text.starts_with("/**")
-            || text.starts_with("/*!");
-        if is_doc {
-            return Some(
-                text.trim()
-                    .trim_start_matches("///")
-                    .trim_start_matches("//!")
-                    .trim_start_matches("/**")
-                    .trim_start_matches("/*!")
-                    .trim_end_matches("*/")
-                    .trim()
-                    .to_string(),
-            );
+    if let Some(sibling) = prev_sibling {
+        if sibling.kind() == "line_comment" || sibling.kind() == "block_comment" {
+            if let Ok(text) = sibling.utf8_text(source) {
+                let is_doc = text.starts_with("///")
+                    || text.starts_with("//!")
+                    || text.starts_with("/**")
+                    || text.starts_with("/*!");
+                if is_doc {
+                    return Some(
+                        text.trim()
+                            .trim_start_matches("///")
+                            .trim_start_matches("//!")
+                            .trim_start_matches("/**")
+                            .trim_start_matches("/*!")
+                            .trim_end_matches("*/")
+                            .trim()
+                            .to_string(),
+                    );
+                }
+            }
         }
     }
 

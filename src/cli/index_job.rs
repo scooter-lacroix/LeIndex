@@ -319,17 +319,19 @@ impl CheckpointStore {
     ) -> Result<Option<ParsedFileCheckpoint>> {
         if let Some(bytes) =
             read_bytes_verified(&self.paths.parsed_bucket(source_hash), expected_hash)?
-            && let Ok(files) =
-                bincode::deserialize::<BTreeMap<String, Vec<ParsedFileCheckpoint>>>(&bytes)
         {
-            return Ok(files
-                .get(source_hash)
-                .and_then(|entries| {
-                    entries
-                        .iter()
-                        .find(|entry| entry.file_path == expected_path)
-                })
-                .cloned());
+            if let Ok(files) =
+                bincode::deserialize::<BTreeMap<String, Vec<ParsedFileCheckpoint>>>(&bytes)
+            {
+                return Ok(files
+                    .get(source_hash)
+                    .and_then(|entries| {
+                        entries
+                            .iter()
+                            .find(|entry| entry.file_path == expected_path)
+                    })
+                    .cloned());
+            }
         }
         Ok(self
             .read_parsed_verified(source_hash, expected_hash)?

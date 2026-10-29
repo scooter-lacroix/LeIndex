@@ -66,18 +66,19 @@ impl LeIndex {
     /// the health snapshot and advances the `leindex.db` reference time to when
     /// the scan began (changes made after that still count as stale).
     pub(super) fn record_clean_scan(&self, scanned_at: std::time::SystemTime) {
-        if let Some(mut health) = crate::cli::index_freshness::load_health(self.storage_path())
-            && let Some(tree_oid) = git_tree_oid(&self.project_path)
-            && health.tree_oid.as_deref() != Some(tree_oid.as_str())
-        {
-            health.tree_oid = Some(tree_oid);
-            if let Some(head_oid) = crate::cli::git::status(&self.project_path)
-                .ok()
-                .and_then(|status| status.head_oid)
-            {
-                health.head_oid = Some(head_oid);
+        if let Some(mut health) = crate::cli::index_freshness::load_health(self.storage_path()) {
+            if let Some(tree_oid) = git_tree_oid(&self.project_path) {
+                if health.tree_oid.as_deref() != Some(tree_oid.as_str()) {
+                    health.tree_oid = Some(tree_oid);
+                    if let Some(head_oid) = crate::cli::git::status(&self.project_path)
+                        .ok()
+                        .and_then(|status| status.head_oid)
+                    {
+                        health.head_oid = Some(head_oid);
+                    }
+                    let _ = crate::cli::index_freshness::save_health(self.storage_path(), &health);
+                }
             }
-            let _ = crate::cli::index_freshness::save_health(self.storage_path(), &health);
         }
         let db = self.storage_path().join("leindex.db");
         if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&db) {
@@ -493,18 +494,18 @@ impl LeIndex {
             index_builder::merge_pdgs(pdg, file_pdg);
             restore_cross_file_edges(pdg, preserved);
             resolve_file_cross_file_edges(pdg, &file_path, file_signatures);
-            if let Some(hash) = source_file_hashes.get(&file_path)
-                && let Err(e) = crate::storage::pdg_store::update_indexed_file(
+            if let Some(hash) = source_file_hashes.get(&file_path) {
+                if let Err(e) = crate::storage::pdg_store::update_indexed_file(
                     &mut self.storage,
                     &self.project_id,
                     &file_path,
                     hash,
-                )
-            {
-                warn!(
-                    "Failed to update indexed file record for '{}' during incremental reindex: {}",
-                    file_path, e
-                );
+                ) {
+                    warn!(
+                        "Failed to update indexed file record for '{}' during incremental reindex: {}",
+                        file_path, e
+                    );
+                }
             }
         }
         Ok(removed_node_ids)

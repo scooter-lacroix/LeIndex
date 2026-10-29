@@ -662,10 +662,10 @@ impl ProjectRegistry {
         // every other tool call latency-free during dev work; users who
         // want hot auto-reindex set `LEINDEX_WATCHER=1`.
         let mut watchers = HashMap::new();
-        if watcher_enabled()
-            && let Ok(w) = IndexWatcher::start(path.clone(), handle.clone())
-        {
-            watchers.insert(path.clone(), w);
+        if watcher_enabled() {
+            if let Ok(w) = IndexWatcher::start(path.clone(), handle.clone()) {
+                watchers.insert(path.clone(), w);
+            }
         }
 
         let mut last_used = HashMap::new();
@@ -1041,14 +1041,14 @@ impl ProjectRegistry {
             let mut projects = self.projects.write().await;
             match projects.remove(path) {
                 Some(handle) => {
-                    if let Ok(mut idx) = handle.try_write()
-                        && let Err(e) = idx.close()
-                    {
-                        warn!(
-                            "Failed to close storage for evicted project {}: {}",
-                            path.display(),
-                            e
-                        );
+                    if let Ok(mut idx) = handle.try_write() {
+                        if let Err(e) = idx.close() {
+                            warn!(
+                                "Failed to close storage for evicted project {}: {}",
+                                path.display(),
+                                e
+                            );
+                        }
                     }
                     info!("Evicted project: {}", path.display());
                     true
@@ -1245,10 +1245,10 @@ impl ProjectRegistry {
         // is actually needed.
         if watcher_enabled() {
             let mut watchers = self.watchers.lock().await;
-            if !watchers.contains_key(&canonical)
-                && let Ok(w) = IndexWatcher::start(canonical.clone(), handle.clone())
-            {
-                watchers.insert(canonical.clone(), w);
+            if !watchers.contains_key(&canonical) {
+                if let Ok(w) = IndexWatcher::start(canonical.clone(), handle.clone()) {
+                    watchers.insert(canonical.clone(), w);
+                }
             }
         }
 
@@ -1338,8 +1338,10 @@ impl ProjectRegistry {
         let slot = self.index_slot_for(&project_path).await;
         let _slot_guard = slot.lock().await;
 
-        if !force_reindex && let Some(stats) = Self::cached_index_stats(handle).await {
-            return Ok(stats);
+        if !force_reindex {
+            if let Some(stats) = Self::cached_index_stats(handle).await {
+                return Ok(stats);
+            }
         }
 
         debug!(
@@ -1736,14 +1738,14 @@ impl ProjectRegistry {
                 let mut projects = self.projects.write().await;
                 match projects.remove(&path) {
                     Some(handle) => {
-                        if let Ok(mut idx) = handle.try_write()
-                            && let Err(e) = idx.close()
-                        {
-                            warn!(
-                                "Failed to close storage for LRU-evicted project {}: {}",
-                                path.display(),
-                                e
-                            );
+                        if let Ok(mut idx) = handle.try_write() {
+                            if let Err(e) = idx.close() {
+                                warn!(
+                                    "Failed to close storage for LRU-evicted project {}: {}",
+                                    path.display(),
+                                    e
+                                );
+                            }
                         }
                         true
                     }

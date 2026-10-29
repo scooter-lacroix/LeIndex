@@ -105,12 +105,12 @@ pub async fn spawn_and_wait(run_dir: &Path) -> Result<DaemonEndpoint> {
 ///    executable (cargo install / packaged deployment).
 /// 2. Fall back to `leindexd` on `PATH`.
 fn resolve_leindexd_path() -> Result<PathBuf> {
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let sibling = dir.join("leindexd");
-        if sibling.exists() {
-            return Ok(sibling);
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("leindexd");
+            if sibling.exists() {
+                return Ok(sibling);
+            }
         }
     }
 

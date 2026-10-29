@@ -204,10 +204,10 @@ impl ReferenceChecker {
                 }
             } else if let Some(rest) = line.strip_prefix("import ") {
                 // Side-effect / bare import: import './polyfill' (no 'from').
-                if !rest.contains(" from ")
-                    && let Some(path) = Self::first_quoted(rest)
-                {
-                    imports.push(path);
+                if !rest.contains(" from ") {
+                    if let Some(path) = Self::first_quoted(rest) {
+                        imports.push(path);
+                    }
                 }
             }
         }
@@ -231,10 +231,10 @@ impl ReferenceChecker {
         let mut i = 0;
         while i < bytes.len() {
             let q = bytes[i];
-            if (q == b'"' || q == b'\'')
-                && let Some(end) = s[i + 1..].find(char::from(q))
-            {
-                return Some(s[i + 1..i + 1 + end].to_string());
+            if q == b'"' || q == b'\'' {
+                if let Some(end) = s[i + 1..].find(char::from(q)) {
+                    return Some(s[i + 1..i + 1 + end].to_string());
+                }
             }
             i += 1;
         }
@@ -471,13 +471,13 @@ impl ReferenceChecker {
 
         // Check for cycles using DFS
         for node in deps.keys() {
-            if !visited.contains(node)
-                && let Some(cycle) = self.detect_cycle(node, &deps, &mut visited, &mut rec_stack)
-            {
-                issues.push(ReferenceIssue::cyclic_dependency(
-                    cycle,
-                    PathBuf::from(node),
-                ));
+            if !visited.contains(node) {
+                if let Some(cycle) = self.detect_cycle(node, &deps, &mut visited, &mut rec_stack) {
+                    issues.push(ReferenceIssue::cyclic_dependency(
+                        cycle,
+                        PathBuf::from(node),
+                    ));
+                }
             }
         }
 

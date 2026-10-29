@@ -103,42 +103,6 @@ fn source_priority(file_name: &str) -> u8 {
     }
 }
 
-/// Parse every manifest in one workspace into a fresh registry (#87: split
-/// from `from_manifest_paths`, which scored CCN 21 under lizard 1.24.x with
-/// workspace grouping and parser dispatch in one body).
-fn parse_manifest_set(paths: &[PathBuf]) -> ExternalDependencyRegistry {
-    let mut local = ExternalDependencyRegistry::new();
-    for path in paths {
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Ok(content) = std::fs::read_to_string(path) else {
-            continue;
-        };
-
-        match file_name {
-            "Cargo.lock" => local.parse_cargo_lock(&content),
-            "Cargo.toml" => local.parse_cargo_toml(&content),
-            "package-lock.json" | "npm-shrinkwrap.json" => local.parse_package_lock_json(&content),
-            "package.json" => local.parse_package_json(&content),
-            "yarn.lock" => local.parse_yarn_lock(&content),
-            "pnpm-lock.yaml" => local.parse_pnpm_lock(&content),
-            "bun.lock" => local.parse_bun_lock(&content),
-            "bun.lockb" => {} // Binary format, skip
-            "requirements.txt" => local.parse_requirements_txt(&content),
-            "Pipfile.lock" => local.parse_pipfile_lock(&content),
-            "pyproject.toml" => local.parse_pyproject_toml(&content),
-            "poetry.lock" => local.parse_poetry_lock(&content),
-            "go.mod" => local.parse_go_mod(&content),
-            "go.sum" => local.parse_go_sum(&content),
-            "Gemfile.lock" => local.parse_gemfile_lock(&content),
-            "composer.lock" => local.parse_composer_lock(&content),
-            _ => {}
-        }
-    }
-    local
-}
-
 impl ExternalDependencyRegistry {
     /// Build the registry from an already-discovered manifest list.
     /// Build a dependency registry from manifest/lockfile paths.
@@ -176,7 +140,37 @@ impl ExternalDependencyRegistry {
         for (_ws_root, paths) in workspaces {
             // Parse each workspace's manifests into a local registry,
             // then merge into the global one.
-            let local = parse_manifest_set(&paths);
+            let mut local = Self::new();
+            for path in &paths {
+                let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let Ok(content) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+
+                match file_name {
+                    "Cargo.lock" => local.parse_cargo_lock(&content),
+                    "Cargo.toml" => local.parse_cargo_toml(&content),
+                    "package-lock.json" | "npm-shrinkwrap.json" => {
+                        local.parse_package_lock_json(&content)
+                    }
+                    "package.json" => local.parse_package_json(&content),
+                    "yarn.lock" => local.parse_yarn_lock(&content),
+                    "pnpm-lock.yaml" => local.parse_pnpm_lock(&content),
+                    "bun.lock" => local.parse_bun_lock(&content),
+                    "bun.lockb" => {} // Binary format, skip
+                    "requirements.txt" => local.parse_requirements_txt(&content),
+                    "Pipfile.lock" => local.parse_pipfile_lock(&content),
+                    "pyproject.toml" => local.parse_pyproject_toml(&content),
+                    "poetry.lock" => local.parse_poetry_lock(&content),
+                    "go.mod" => local.parse_go_mod(&content),
+                    "go.sum" => local.parse_go_sum(&content),
+                    "Gemfile.lock" => local.parse_gemfile_lock(&content),
+                    "composer.lock" => local.parse_composer_lock(&content),
+                    _ => {}
+                }
+            }
             // Merge local workspace into the global registry.
             // Each workspace's lockfile entries override earlier entries for
             // the same package name, which is correct within-workspace.
@@ -238,16 +232,16 @@ impl ExternalDependencyRegistry {
 
         // 3. Hyphen/underscore normalisation
         let alt = normalised.replace('-', "_");
-        if alt != normalised
-            && let Some(canonical) = self.prefix_map.get(&alt)
-        {
-            return self.by_name.get(canonical);
+        if alt != normalised {
+            if let Some(canonical) = self.prefix_map.get(&alt) {
+                return self.by_name.get(canonical);
+            }
         }
         let alt2 = normalised.replace('_', "-");
-        if alt2 != normalised
-            && let Some(canonical) = self.prefix_map.get(&alt2)
-        {
-            return self.by_name.get(canonical);
+        if alt2 != normalised {
+            if let Some(canonical) = self.prefix_map.get(&alt2) {
+                return self.by_name.get(canonical);
+            }
         }
 
         None
@@ -478,16 +472,16 @@ impl ExternalDependencyRegistry {
                 continue;
             }
 
-            if let Some(rest) = trimmed.strip_prefix("version ")
-                && let Some(ref name) = current_name
-            {
-                let version = unquote(rest);
-                self.insert(ExternalDependency {
-                    name: name.clone(),
-                    version,
-                    ecosystem: Ecosystem::Npm,
-                });
-                current_name = None;
+            if let Some(rest) = trimmed.strip_prefix("version ") {
+                if let Some(ref name) = current_name {
+                    let version = unquote(rest);
+                    self.insert(ExternalDependency {
+                        name: name.clone(),
+                        version,
+                        ecosystem: Ecosystem::Npm,
+                    });
+                    current_name = None;
+                }
             }
         }
     }
@@ -545,25 +539,25 @@ impl ExternalDependencyRegistry {
         if let Some(packages) = parsed.get("packages").and_then(|v| v.as_object()) {
             for (key, val) in packages {
                 // Each value is an array: ["name@version", "", {dependencies}, "integrity"]
-                if let Some(arr) = val.as_array()
-                    && let Some(spec) = arr.first().and_then(|v| v.as_str())
-                {
-                    // Extract version from "name@version" string.
-                    // For scoped packages like "@babel/core@7.29.0", we need
-                    // to find the last '@' after the scope.
-                    let version = if let Some(stripped) = spec.strip_prefix('@') {
-                        stripped
-                            .rfind('@')
-                            .map(|pos| stripped[pos + 1..].to_string())
-                    } else {
-                        spec.rfind('@').map(|pos| spec[pos + 1..].to_string())
-                    };
-                    let version = version.unwrap_or_else(|| "*".to_string());
-                    self.insert(ExternalDependency {
-                        name: key.clone(),
-                        version,
-                        ecosystem: Ecosystem::Npm,
-                    });
+                if let Some(arr) = val.as_array() {
+                    if let Some(spec) = arr.first().and_then(|v| v.as_str()) {
+                        // Extract version from "name@version" string.
+                        // For scoped packages like "@babel/core@7.29.0", we need
+                        // to find the last '@' after the scope.
+                        let version = if let Some(stripped) = spec.strip_prefix('@') {
+                            stripped
+                                .rfind('@')
+                                .map(|pos| stripped[pos + 1..].to_string())
+                        } else {
+                            spec.rfind('@').map(|pos| spec[pos + 1..].to_string())
+                        };
+                        let version = version.unwrap_or_else(|| "*".to_string());
+                        self.insert(ExternalDependency {
+                            name: key.clone(),
+                            version,
+                            ecosystem: Ecosystem::Npm,
+                        });
+                    }
                 }
             }
         }
@@ -862,14 +856,14 @@ impl ExternalDependencyRegistry {
                 continue;
             }
 
-            if let Some(rest) = line.strip_prefix("require ")
-                && let Some((name, version)) = parse_go_requirement(rest.trim())
-            {
-                self.insert(ExternalDependency {
-                    name,
-                    version,
-                    ecosystem: Ecosystem::GoModules,
-                });
+            if let Some(rest) = line.strip_prefix("require ") {
+                if let Some((name, version)) = parse_go_requirement(rest.trim()) {
+                    self.insert(ExternalDependency {
+                        name,
+                        version,
+                        ecosystem: Ecosystem::GoModules,
+                    });
+                }
             }
         }
     }
@@ -903,18 +897,17 @@ impl ExternalDependencyRegistry {
                 // Top-level gem: "    gemname (version)"
                 // Sub-dependency: "      gemname (version)" — deeper indent
                 let indent = line.len() - line.trim_start().len();
-                if indent <= 6
-                    && trimmed.contains('(')
-                    && let Some((name, rest)) = trimmed.split_once('(')
-                {
-                    let version = rest.trim_end_matches(')').trim().to_string();
-                    let name = name.trim().to_string();
-                    if !name.is_empty() {
-                        self.insert(ExternalDependency {
-                            name,
-                            version,
-                            ecosystem: Ecosystem::RubyGems,
-                        });
+                if indent <= 6 && trimmed.contains('(') {
+                    if let Some((name, rest)) = trimmed.split_once('(') {
+                        let version = rest.trim_end_matches(')').trim().to_string();
+                        let name = name.trim().to_string();
+                        if !name.is_empty() {
+                            self.insert(ExternalDependency {
+                                name,
+                                version,
+                                ecosystem: Ecosystem::RubyGems,
+                            });
+                        }
                     }
                 }
             }
@@ -978,7 +971,7 @@ fn strip_jsonc_comments(content: &str) -> String {
                         break;
                     }
                 }
-                if backslashes.is_multiple_of(2) {
+                if backslashes % 2 == 0 {
                     in_string = false;
                 }
             }
@@ -1091,10 +1084,10 @@ fn parse_python_dependency_list(raw: &str) -> Vec<ExternalDependency> {
             }
             ',' if !in_quotes => {
                 let parsed = item.trim();
-                if !parsed.is_empty()
-                    && let Some(dep) = parse_python_requirement_spec(parsed)
-                {
-                    deps.push(dep);
+                if !parsed.is_empty() {
+                    if let Some(dep) = parse_python_requirement_spec(parsed) {
+                        deps.push(dep);
+                    }
                 }
                 item.clear();
             }
@@ -1104,10 +1097,10 @@ fn parse_python_dependency_list(raw: &str) -> Vec<ExternalDependency> {
     }
 
     let parsed = item.trim();
-    if !parsed.is_empty()
-        && let Some(dep) = parse_python_requirement_spec(parsed)
-    {
-        deps.push(dep);
+    if !parsed.is_empty() {
+        if let Some(dep) = parse_python_requirement_spec(parsed) {
+            deps.push(dep);
+        }
     }
 
     deps
@@ -1518,8 +1511,8 @@ pub fn discover_dependency_manifests(
                 continue;
             }
             // Also skip any caller-provided exclusion patterns
-            if let Some(excluded) = exclude_dirs
-                && excluded.iter().any(|p| {
+            if let Some(excluded) = exclude_dirs {
+                if excluded.iter().any(|p| {
                     // Match the directory name against the pattern's leaf segment.
                     // For patterns like "target/debug", only match if the relative path
                     // from root starts with the pattern — not if any segment equals the leaf.
@@ -1543,10 +1536,10 @@ pub fn discover_dependency_manifests(
                         || trimmed == relative.trim_end_matches('/')
                         // Prefix match: this directory is inside the excluded pattern
                         || dir_relative.starts_with(&format!("{}/", trimmed))
-                })
-            {
-                walker.skip_current_dir();
-                continue;
+                }) {
+                    walker.skip_current_dir();
+                    continue;
+                }
             }
             continue;
         }

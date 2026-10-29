@@ -127,18 +127,18 @@ impl LeIndex {
         } = prepared;
 
         // Fast path: adopt the restored engine when it matches the current PDG.
-        if let Some(restored) = restored
-            && self.install_restored_engine(
+        if let Some(restored) = restored {
+            if self.install_restored_engine(
                 restored,
                 &artifact_path,
                 pdg_node_count,
                 pdg_edge_count,
                 &current_pdg_fingerprint,
                 persisted_embedder.as_ref(),
-            )
-        {
-            self.pdg = Some(std::sync::Arc::new(pdg));
-            return Ok(());
+            ) {
+                self.pdg = Some(std::sync::Arc::new(pdg));
+                return Ok(());
+            }
         }
 
         // Slow path: rebuild the TF-IDF index from the PDG, then finalize.
@@ -476,16 +476,18 @@ impl LeIndex {
             self.embedder = Some(embedder);
         }
 
-        if persist_artifacts && let Some(embedder) = &self.embedder {
-            // The rebuild path only runs when the snapshot identity
-            // mismatched; persist the corrected identity (the graph as
-            // the layer reconstructs it) so the NEXT hydration takes the
-            // fast path instead of looping on the same mismatch.
-            let persisted_identity =
-                Some(index_builder::persisted_search_identity_from_graph(&pdg));
-            embedder
-                .persist_to_storage(&self.project_path, &pdg, persisted_identity)
-                .context("Failed to persist TF-IDF embedder during hydration")?;
+        if persist_artifacts {
+            if let Some(embedder) = &self.embedder {
+                // The rebuild path only runs when the snapshot identity
+                // mismatched; persist the corrected identity (the graph as
+                // the layer reconstructs it) so the NEXT hydration takes the
+                // fast path instead of looping on the same mismatch.
+                let persisted_identity =
+                    Some(index_builder::persisted_search_identity_from_graph(&pdg));
+                embedder
+                    .persist_to_storage(&self.project_path, &pdg, persisted_identity)
+                    .context("Failed to persist TF-IDF embedder during hydration")?;
+            }
         }
         let indexed_count = self.search_engine.node_count();
 
@@ -763,8 +765,10 @@ fn build_remote_decision(
         .resolved_remote()
         .and_then(|r| r.remote_dimension)
         .is_none();
-    if is_unpinned && let Some(dim) = persisted_dim {
-        embedder.seed_measured_dimension(dim);
+    if is_unpinned {
+        if let Some(dim) = persisted_dim {
+            embedder.seed_measured_dimension(dim);
+        }
     }
     QueryNeuralDecision::Remote(Box::new(embedder))
 }
@@ -921,16 +925,16 @@ pub(crate) fn query_remote_embedder(
     let configured_pinned_dim = embeddings_cfg
         .resolved_remote()
         .and_then(|r| r.remote_dimension);
-    if let Some(configured_dim) = configured_pinned_dim
-        && configured_dim != persisted_dim
-    {
-        info!(
-            configured_dim,
-            persisted_dim,
-            "Persisted neural rows were not produced by the configured remote; \
-             disabling neural search"
-        );
-        return QueryNeuralDecision::DisableNeural;
+    if let Some(configured_dim) = configured_pinned_dim {
+        if configured_dim != persisted_dim {
+            info!(
+                configured_dim,
+                persisted_dim,
+                "Persisted neural rows were not produced by the configured remote; \
+                 disabling neural search"
+            );
+            return QueryNeuralDecision::DisableNeural;
+        }
     }
 
     build_remote_decision(tfidf, embeddings_cfg, Some(persisted_dim))

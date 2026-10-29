@@ -320,15 +320,15 @@ impl GenerationNeuralEmbedder {
             let probe = brief.and_then(|brief| {
                 crate::search::onnx::embed_cache_frontend::probe_provider(&brief.spec, &owned)
             });
-            if let Some(outcome) = probe.as_ref()
-                && outcome.miss_positions.is_empty()
-            {
-                tracing::debug!(
-                    hits = outcome.hits.len(),
-                    "Remote embed cache: every row hit; endpoint not contacted"
-                );
-                self.remote_rows_landed.set(true);
-                return merge_cached_rows(texts.len(), Some(outcome), Vec::new());
+            if let Some(outcome) = probe.as_ref() {
+                if outcome.miss_positions.is_empty() {
+                    tracing::debug!(
+                        hits = outcome.hits.len(),
+                        "Remote embed cache: every row hit; endpoint not contacted"
+                    );
+                    self.remote_rows_landed.set(true);
+                    return merge_cached_rows(texts.len(), Some(outcome), Vec::new());
+                }
             }
             let miss_texts: Vec<String> = match probe.as_ref() {
                 Some(outcome) => outcome
@@ -437,15 +437,15 @@ impl GenerationNeuralEmbedder {
                     &inputs,
                 )
             });
-            if let Some(outcome) = probe.as_ref()
-                && outcome.miss_positions.is_empty()
-            {
-                tracing::debug!(
-                    hits = outcome.hits.len(),
-                    "Remote titled embed cache: every row hit; endpoint not contacted"
-                );
-                self.remote_rows_landed.set(true);
-                return merge_cached_rows(texts.len(), Some(outcome), Vec::new());
+            if let Some(outcome) = probe.as_ref() {
+                if outcome.miss_positions.is_empty() {
+                    tracing::debug!(
+                        hits = outcome.hits.len(),
+                        "Remote titled embed cache: every row hit; endpoint not contacted"
+                    );
+                    self.remote_rows_landed.set(true);
+                    return merge_cached_rows(texts.len(), Some(outcome), Vec::new());
+                }
             }
             let miss_rows_request: Vec<(Option<String>, String)> = match probe.as_ref() {
                 Some(outcome) => outcome

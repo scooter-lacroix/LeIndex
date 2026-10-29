@@ -372,10 +372,10 @@ fn pooled_connection(path: &Path) -> Result<Arc<Mutex<Connection>>> {
         return Ok(connection.clone());
     }
     let connection = Arc::new(Mutex::new(open_read_only(path)?));
-    if pool.len() >= MAX_POOLED_CATALOG_CONNECTIONS
-        && let Some(oldest) = pool.keys().next().cloned()
-    {
-        pool.remove(&oldest);
+    if pool.len() >= MAX_POOLED_CATALOG_CONNECTIONS {
+        if let Some(oldest) = pool.keys().next().cloned() {
+            pool.remove(&oldest);
+        }
     }
     pool.insert(path.to_path_buf(), connection.clone());
     Ok(connection)
