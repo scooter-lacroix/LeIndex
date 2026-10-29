@@ -516,7 +516,15 @@ tempfile = { version = "3.13", optional = true }
 # Search mmap embedding persistence
 memmap2 = { version = "0.9", optional = true }
 
-# Heap profiling allocator (opt-in memprof feature)
+# Heap profiling allocator (opt-in memprof feature).
+# Unix-only by target: tikv-jemalloc-sys builds jemalloc from source via its
+# configure script, which cannot produce executables under the MSVC toolchain
+# ("C compiler cannot create executables", exit 77) — that is what broke the
+# windows-x86_64 release leg of the v2.1.5 release workflow. On Windows the
+# global allocator stays the system default (see src/bin/leindex.rs); memprof
+# remains compilable there but the jemalloc allocator and MALLOC_CONF profiling
+# are unix capabilities.
+[target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { version = "0.7", features = ["profiling", "unprefixed_malloc_on_supported_platforms"], optional = true }
 
 [dev-dependencies]
