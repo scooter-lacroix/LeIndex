@@ -24,29 +24,12 @@ categories = [
     "algorithms",
 ]
 include = [
-    "/src/lib.rs",
-    "/src/feature_flags.rs",
-    "/src/observability.rs",
-    "/src/fast_hash.rs",
-    "/src/bin/**",
-    "/src/cli/**",
-    "/src/config.rs",
-    "/src/services.rs",
-    "/src/edit/**",
-    "/src/eval/**",
-    "/src/embed/**",
-    "/src/global/**",
-    "/src/graph/**",
-    "/src/intel/**",
-    "/src/migration/**",
-    "/src/parse/**",
-    "/src/phase/**",
-    "/src/scheduler/**",
-    "/src/search/**",
-    "/src/server/**",
-    "/src/skip_dirs.rs",
-    "/src/storage/**",
-    "/src/validation/**",
+    # Whole-tree glob, not a per-file manifest. The explicit list rotted: it
+    # named `/src/config.rs` but never `/src/config/**`, so `cargo publish`
+    # shipped a tarball whose `mod remote_presets;`/`mod cache;` had no files
+    # behind them (E0583) and the v2.1.5 release died at the crates.io verify
+    # step. A glob cannot forget a new module or test file.
+    "/src/**",
     "/tests/**",
     "/benches/**",
     "/build.rs",
