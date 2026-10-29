@@ -120,7 +120,7 @@ fn write_liee(path: &Path, variant: u64) {
         buf.extend_from_slice(&(id.len() as u32).to_le_bytes());
     }
     buf.extend_from_slice(&id_bytes);
-    while buf.len() % 4 != 0 {
+    while !buf.len().is_multiple_of(4) {
         buf.push(0);
     }
     for i in 0..node_count {

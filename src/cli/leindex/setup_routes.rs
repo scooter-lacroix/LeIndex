@@ -1240,13 +1240,12 @@ fn raise_flag_to_at_least(args: &mut Vec<String>, flags: &[&str], minimum: u64) 
 
 /// Rejects a `--pooling` flag that has no value (CCN-gate extraction).
 fn validate_pooling_value(args: &[String]) -> Result<(), SetupError> {
-    if let Some(index) = args.iter().position(|arg| arg == "--pooling") {
-        if args
+    if let Some(index) = args.iter().position(|arg| arg == "--pooling")
+        && args
             .get(index + 1)
             .is_none_or(|value| value.starts_with('-'))
-        {
-            return Err(error("Pooling argument requires a value"));
-        }
+    {
+        return Err(error("Pooling argument requires a value"));
     }
     Ok(())
 }

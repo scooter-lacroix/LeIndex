@@ -1472,10 +1472,11 @@ fn handle_smoke_and_warmup(
 ) -> AnyhowResult<()> {
     // VAL-SETUP-026: a failed smoke test means the install produced no working
     // neural configuration — exit non-zero so CI/scripts detect the failure.
-    if let Some(smoke) = &result.smoke_test {
-        if !smoke.passed && !smoke.skipped {
-            anyhow::bail!("setup smoke test failed");
-        }
+    if let Some(smoke) = &result.smoke_test
+        && !smoke.passed
+        && !smoke.skipped
+    {
+        anyhow::bail!("setup smoke test failed");
     }
 
     // VAL-DAEMON-007: MIGraphX warmup pre-compilation.
@@ -1485,11 +1486,9 @@ fn handle_smoke_and_warmup(
     // trigger MIGraphX compilation, and shut down gracefully. This populates
     // the cache so subsequent index runs skip the multi-minute compile step.
     #[cfg(feature = "onnx")]
-    if do_warmup {
-        if let Err(e) = crate::cli::leindex::setup::run_warmup() {
-            eprintln!("  -> MIGraphX warmup warning: {}", e);
-            // Warmup failure is non-fatal; indexing will still work.
-        }
+    if do_warmup && let Err(e) = crate::cli::leindex::setup::run_warmup() {
+        eprintln!("  -> MIGraphX warmup warning: {}", e);
+        // Warmup failure is non-fatal; indexing will still work.
     }
     #[cfg(not(feature = "onnx"))]
     if do_warmup {

@@ -404,13 +404,12 @@ fn render_context_metadata(data: &Value, color: bool) -> String {
     } else if let Some(range) = anchor
         .and_then(|result| result.get("byte_range"))
         .and_then(|v| v.as_array())
+        && range.len() == 2
     {
-        if range.len() == 2 {
-            let start = range[0].as_u64().unwrap_or(0);
-            let end = range[1].as_u64().unwrap_or(0);
-            if end > start {
-                out.push_str(&field("Range", &format!("bytes {start}-{end}"), color));
-            }
+        let start = range[0].as_u64().unwrap_or(0);
+        let end = range[1].as_u64().unwrap_or(0);
+        if end > start {
+            out.push_str(&field("Range", &format!("bytes {start}-{end}"), color));
         }
     }
     out
@@ -669,16 +668,14 @@ fn render_diagnostics_provider(data: &Value, color: bool) -> String {
     if let Some(active) = data
         .get("execution_provider_active")
         .and_then(|v| v.as_str())
+        && let Some(requested) = data.get("execution_provider").and_then(|v| v.as_str())
+        && active != requested
     {
-        if let Some(requested) = data.get("execution_provider").and_then(|v| v.as_str()) {
-            if active != requested {
-                out.push_str(&field(
-                    "Provider fallback",
-                    &format!("{requested} requested, {active} ACTIVE"),
-                    color,
-                ));
-            }
-        }
+        out.push_str(&field(
+            "Provider fallback",
+            &format!("{requested} requested, {active} ACTIVE"),
+            color,
+        ));
     }
     out
 }
@@ -936,21 +933,21 @@ fn append_meta_lines(mut out: String, meta_lines: &[String]) -> String {
 fn render_edit_preview(data: &Value, color: bool) -> String {
     let mut meta_lines = Vec::new();
 
-    if let Some(symbols) = data.get("affected_symbols").and_then(|v| v.as_array()) {
-        if !symbols.is_empty() {
-            let names: Vec<&str> = symbols.iter().filter_map(|v| v.as_str()).collect();
-            meta_lines.push(render_meta_line(
-                "Affected symbols",
-                &names.join(", "),
-                color,
-            ));
-        }
+    if let Some(symbols) = data.get("affected_symbols").and_then(|v| v.as_array())
+        && !symbols.is_empty()
+    {
+        let names: Vec<&str> = symbols.iter().filter_map(|v| v.as_str()).collect();
+        meta_lines.push(render_meta_line(
+            "Affected symbols",
+            &names.join(", "),
+            color,
+        ));
     }
-    if let Some(files) = data.get("affected_files").and_then(|v| v.as_array()) {
-        if !files.is_empty() {
-            let names: Vec<&str> = files.iter().filter_map(|v| v.as_str()).collect();
-            meta_lines.push(render_meta_line("Affected files", &names.join(", "), color));
-        }
+    if let Some(files) = data.get("affected_files").and_then(|v| v.as_array())
+        && !files.is_empty()
+    {
+        let names: Vec<&str> = files.iter().filter_map(|v| v.as_str()).collect();
+        meta_lines.push(render_meta_line("Affected files", &names.join(", "), color));
     }
     if let Some(risk) = data.get("risk_level").and_then(|v| v.as_str()) {
         meta_lines.push(render_meta_line("Risk level", risk, color));
@@ -1092,20 +1089,20 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
     if let Some(msg) = data.get("message").and_then(|v| v.as_str()) {
         out.push_str(&field("Message", msg, color));
     }
-    if let Some(arr) = data.get("affected_symbols").and_then(|v| v.as_array()) {
-        if !arr.is_empty() {
-            out.push_str(&field("Affected symbols", &arr.len().to_string(), color));
-        }
+    if let Some(arr) = data.get("affected_symbols").and_then(|v| v.as_array())
+        && !arr.is_empty()
+    {
+        out.push_str(&field("Affected symbols", &arr.len().to_string(), color));
     }
-    if let Some(arr) = data.get("affected_files").and_then(|v| v.as_array()) {
-        if !arr.is_empty() {
-            out.push_str(&field("Affected files", &arr.len().to_string(), color));
-        }
+    if let Some(arr) = data.get("affected_files").and_then(|v| v.as_array())
+        && !arr.is_empty()
+    {
+        out.push_str(&field("Affected files", &arr.len().to_string(), color));
     }
-    if let Some(bc) = data.get("breaking_changes").and_then(|v| v.as_array()) {
-        if !bc.is_empty() {
-            out.push_str(&field("Breaking changes", &bc.len().to_string(), color));
-        }
+    if let Some(bc) = data.get("breaking_changes").and_then(|v| v.as_array())
+        && !bc.is_empty()
+    {
+        out.push_str(&field("Breaking changes", &bc.len().to_string(), color));
     }
     out.push_str(
         &data

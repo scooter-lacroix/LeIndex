@@ -63,35 +63,34 @@ impl GoParser {
                     for child in node.children(&mut cursor) {
                         if child.kind() == "type_spec" {
                             // Extract the type name and type definition
-                            if let Some(name_node) = child.child_by_field_name("name") {
-                                if let Ok(name) = name_node.utf8_text(source) {
-                                    let qualified_name = if parent_path.is_empty() {
-                                        name.to_string()
-                                    } else {
-                                        format!("{}.{}", parent_path.join("."), name)
-                                    };
+                            if let Some(name_node) = child.child_by_field_name("name")
+                                && let Ok(name) = name_node.utf8_text(source)
+                            {
+                                let qualified_name = if parent_path.is_empty() {
+                                    name.to_string()
+                                } else {
+                                    format!("{}.{}", parent_path.join("."), name)
+                                };
 
-                                    // Determine the kind of type
-                                    let type_kind =
-                                        child.child_by_field_name("type").map(|t| t.kind());
+                                // Determine the kind of type
+                                let type_kind = child.child_by_field_name("type").map(|t| t.kind());
 
-                                    signatures.push(SignatureInfo {
-                                        name: name.to_string(),
-                                        qualified_name,
-                                        parameters: vec![],
-                                        return_type: type_kind.map(|k| k.to_string()),
-                                        visibility: Visibility::Public,
-                                        is_async: false,
-                                        is_method: false,
-                                        docstring: extract_docstring(&child, source),
-                                        calls: vec![],
-                                        imports: vec![],
-                                        byte_range: (child.start_byte(), child.end_byte()),
-                                        flow_facts: vec![],
+                                signatures.push(SignatureInfo {
+                                    name: name.to_string(),
+                                    qualified_name,
+                                    parameters: vec![],
+                                    return_type: type_kind.map(|k| k.to_string()),
+                                    visibility: Visibility::Public,
+                                    is_async: false,
+                                    is_method: false,
+                                    docstring: extract_docstring(&child, source),
+                                    calls: vec![],
+                                    imports: vec![],
+                                    byte_range: (child.start_byte(), child.end_byte()),
+                                    flow_facts: vec![],
 
-                                        cyclomatic_complexity: 0,
-                                    });
-                                }
+                                    cyclomatic_complexity: 0,
+                                });
                             }
                         }
                     }
@@ -338,14 +337,13 @@ fn extract_go_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> 
     let mut calls = Vec::new();
 
     fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {
-        if node.kind() == "call_expression" {
-            if let Some(func) = node.child_by_field_name("function") {
-                if let Ok(text) = func.utf8_text(source) {
-                    let name = clean_call_text(text);
-                    if !name.is_empty() {
-                        calls.push(name);
-                    }
-                }
+        if node.kind() == "call_expression"
+            && let Some(func) = node.child_by_field_name("function")
+            && let Ok(text) = func.utf8_text(source)
+        {
+            let name = clean_call_text(text);
+            if !name.is_empty() {
+                calls.push(name);
             }
         }
 
@@ -453,19 +451,18 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
     let prev_sibling = node.prev_sibling();
 
     // Check for comment
-    if let Some(sibling) = prev_sibling {
-        if sibling.kind() == "comment" {
-            if let Ok(text) = sibling.utf8_text(source) {
-                return Some(
-                    text.trim()
-                        .trim_start_matches("/*")
-                        .trim_start_matches("//")
-                        .trim_end_matches("*/")
-                        .trim()
-                        .to_string(),
-                );
-            }
-        }
+    if let Some(sibling) = prev_sibling
+        && sibling.kind() == "comment"
+        && let Ok(text) = sibling.utf8_text(source)
+    {
+        return Some(
+            text.trim()
+                .trim_start_matches("/*")
+                .trim_start_matches("//")
+                .trim_end_matches("*/")
+                .trim()
+                .to_string(),
+        );
     }
 
     None

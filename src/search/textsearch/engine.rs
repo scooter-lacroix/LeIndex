@@ -186,12 +186,12 @@ pub fn invalidate_freshness(root: &Path) {
 
 /// Relative paths that are new, or differ in size/mtime from the index.
 pub fn dirty_files(root: &Path, index: &TextIndex) -> Arc<Vec<String>> {
-    if let Ok(guard) = dirty_cache().lock() {
-        if let Some(entry) = guard.get(root) {
-            if entry.cost >= DIRTY_CACHE_MIN_COST && entry.at.elapsed() < DIRTY_CACHE_TTL {
-                return Arc::clone(&entry.files);
-            }
-        }
+    if let Ok(guard) = dirty_cache().lock()
+        && let Some(entry) = guard.get(root)
+        && entry.cost >= DIRTY_CACHE_MIN_COST
+        && entry.at.elapsed() < DIRTY_CACHE_TTL
+    {
+        return Arc::clone(&entry.files);
     }
     let started = Instant::now();
     let rels = list_files(root, MAX_INDEX_FILES * 2, None);
@@ -520,18 +520,18 @@ fn root_candidates(
     } else if let Some(index) = &spec.index {
         let narrowed = plan::candidates(index, &compiled.expr);
         let add = |id: u32, set: &mut BTreeMap<String, Candidate>| {
-            if let Some(meta) = index.file(id) {
-                if meta.flags & FLAG_BINARY == 0 {
-                    set.insert(
-                        meta.path.to_string(),
-                        Candidate {
-                            rel: meta.path.to_string(),
-                            abs: spec.root.join(meta.path),
-                            id: Some(id),
-                            dirty: false,
-                        },
-                    );
-                }
+            if let Some(meta) = index.file(id)
+                && meta.flags & FLAG_BINARY == 0
+            {
+                set.insert(
+                    meta.path.to_string(),
+                    Candidate {
+                        rel: meta.path.to_string(),
+                        abs: spec.root.join(meta.path),
+                        id: Some(id),
+                        dirty: false,
+                    },
+                );
             }
         };
         match narrowed {

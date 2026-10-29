@@ -333,24 +333,23 @@ fn resolve_cross_file_call_targets(
                 targets.extend(ids);
             }
         }
-        if segments.len() == 1 {
-            if let Some(ids) = indexes.last_map.get(&normalized) {
-                targets.extend(ids);
-            }
+        if segments.len() == 1
+            && let Some(ids) = indexes.last_map.get(&normalized)
+        {
+            targets.extend(ids);
         }
         if last_segment_fallback.is_none() {
             last_segment_fallback = segments.last().map(|segment| (*segment).to_string());
         }
     }
 
-    if targets.is_empty() {
-        if let Some(last) = last_segment_fallback {
-            if last.len() > 2 && !COMMON_CALL_NAMES.contains(&last.as_str()) {
-                if let Some(ids) = indexes.last_map.get(&last) {
-                    targets.extend(ids);
-                }
-            }
-        }
+    if targets.is_empty()
+        && let Some(last) = last_segment_fallback
+        && last.len() > 2
+        && !COMMON_CALL_NAMES.contains(&last.as_str())
+        && let Some(ids) = indexes.last_map.get(&last)
+    {
+        targets.extend(ids);
     }
     targets.sort_unstable();
     targets.dedup();

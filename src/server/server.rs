@@ -216,16 +216,13 @@ fn discover_leindex_dbs() -> Vec<PathBuf> {
             .filter_map(Result::ok)
         {
             let path = entry.path();
-            if path.file_name().map(|n| n == "leindex.db").unwrap_or(false) {
-                if let Some(parent) = path.parent() {
-                    if parent.file_name().map(|n| n == ".leindex").unwrap_or(false) {
-                        if let Ok(canon) = path.canonicalize() {
-                            if seen.insert(canon.clone()) {
-                                found.push(canon);
-                            }
-                        }
-                    }
-                }
+            if path.file_name().map(|n| n == "leindex.db").unwrap_or(false)
+                && let Some(parent) = path.parent()
+                && parent.file_name().map(|n| n == ".leindex").unwrap_or(false)
+                && let Ok(canon) = path.canonicalize()
+                && seen.insert(canon.clone())
+            {
+                found.push(canon);
             }
         }
     }

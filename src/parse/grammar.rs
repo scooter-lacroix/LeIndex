@@ -57,10 +57,10 @@ impl GrammarCache {
             })?;
 
             // Ensure the vector is large enough
-            if read_guard.len() > index {
-                if let Some(entry) = &read_guard[index] {
-                    return Ok(entry.language.clone());
-                }
+            if read_guard.len() > index
+                && let Some(entry) = &read_guard[index]
+            {
+                return Ok(entry.language.clone());
             }
         }
 
@@ -70,10 +70,10 @@ impl GrammarCache {
         })?;
 
         // Double-check: another thread might have loaded it while we waited
-        if write_guard.len() > index {
-            if let Some(entry) = &write_guard[index] {
-                return Ok(entry.language.clone());
-            }
+        if write_guard.len() > index
+            && let Some(entry) = &write_guard[index]
+        {
+            return Ok(entry.language.clone());
         }
 
         // Ensure the vector is large enough
@@ -472,10 +472,10 @@ impl LanguageId {
             None, // doc flavor: stand-in below
             None, // doc flavor: stand-in below
         ];
-        LOADERS[*self as usize].map_or_else(
-            || crate::parse::traits::languages::json::language(),
-            |loader| loader(),
-        )
+        LOADERS[*self as usize]
+            .map_or_else(crate::parse::traits::languages::json::language, |loader| {
+                loader()
+            })
     }
 
     /// Get the language from the global cache (lazy-loaded)

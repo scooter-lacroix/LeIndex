@@ -192,14 +192,13 @@ pub fn load_community_memberships(
     let mut loaded = 0;
     for row in rows {
         let (node_id, community) = row?;
-        if let Some(graph_id) = pdg.find_by_id(&node_id) {
-            if pdg
+        if let Some(graph_id) = pdg.find_by_id(&node_id)
+            && pdg
                 .get_node(graph_id)
                 .is_some_and(|node| community_relevant(&node.node_type))
-            {
-                pdg.communities.insert(graph_id, community);
-                loaded += 1;
-            }
+        {
+            pdg.communities.insert(graph_id, community);
+            loaded += 1;
         }
     }
     Ok(loaded)

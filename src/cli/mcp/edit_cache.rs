@@ -209,29 +209,29 @@ impl EditCache {
         }
 
         // Try cold storage fallback
-        if let Ok(json) = tokio::fs::read_to_string(&cache_file).await {
-            if let Ok(entry) = serde_json::from_str::<EditCacheEntry>(&json) {
-                // Backfill hot cache only if within budget
-                let entry_size = entry.estimated_size();
-                if entry_size <= EDIT_CACHE_MAX_ENTRY_BYTES {
-                    let mut guard = self.entries.lock().await;
-                    let (ref mut entries, ref mut total_bytes) = *guard;
-                    if let Some(existing) = entries.pop(&abs_path) {
-                        *total_bytes = total_bytes.saturating_sub(existing.estimated_size());
-                    }
-                    // Evict if needed using O(1) LRU eviction
-                    while *total_bytes + entry_size > EDIT_CACHE_TOTAL_CAP_BYTES {
-                        if let Some((_, removed)) = entries.pop_lru() {
-                            *total_bytes = total_bytes.saturating_sub(removed.estimated_size());
-                        } else {
-                            break;
-                        }
-                    }
-                    *total_bytes = total_bytes.saturating_add(entry_size);
-                    entries.put(abs_path, entry.clone());
+        if let Ok(json) = tokio::fs::read_to_string(&cache_file).await
+            && let Ok(entry) = serde_json::from_str::<EditCacheEntry>(&json)
+        {
+            // Backfill hot cache only if within budget
+            let entry_size = entry.estimated_size();
+            if entry_size <= EDIT_CACHE_MAX_ENTRY_BYTES {
+                let mut guard = self.entries.lock().await;
+                let (ref mut entries, ref mut total_bytes) = *guard;
+                if let Some(existing) = entries.pop(&abs_path) {
+                    *total_bytes = total_bytes.saturating_sub(existing.estimated_size());
                 }
-                return Some(entry);
+                // Evict if needed using O(1) LRU eviction
+                while *total_bytes + entry_size > EDIT_CACHE_TOTAL_CAP_BYTES {
+                    if let Some((_, removed)) = entries.pop_lru() {
+                        *total_bytes = total_bytes.saturating_sub(removed.estimated_size());
+                    } else {
+                        break;
+                    }
+                }
+                *total_bytes = total_bytes.saturating_add(entry_size);
+                entries.put(abs_path, entry.clone());
             }
+            return Some(entry);
         }
 
         None

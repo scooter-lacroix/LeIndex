@@ -298,10 +298,9 @@ impl FeatureFlag {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
+            && let Some(v) = map.get(self)
         {
-            if let Some(v) = map.get(self) {
-                return *v;
-            }
+            return *v;
         }
         // Phase-9 legacy fallback: when LEINDEX_LEGACY=1 is active, all
         // v2.0.0 rollout flags revert to OFF (legacy behavior). This allows
@@ -315,7 +314,7 @@ impl FeatureFlag {
 
     /// Returns a human-readable description of the flag.
     pub fn description(&self) -> &'static str {
-        const DESCRIPTIONS: [(FeatureFlag, &'static str); 23] = [
+        const DESCRIPTIONS: [(FeatureFlag, &str); 23] = [
             (
                 FeatureFlag::NeuralSearch,
                 "Enable neural (ONNX) embedding search at runtime",

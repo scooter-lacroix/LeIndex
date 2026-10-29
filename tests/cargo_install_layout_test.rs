@@ -67,10 +67,11 @@ fn bin_blocks(cargo_toml: &str) -> Vec<String> {
             if let Some(b) = current.take() {
                 blocks.push(b.join("\n"));
             }
-        } else if let Some(ref mut b) = current {
-            if !t.is_empty() && !t.starts_with('#') {
-                b.push(line);
-            }
+        } else if let Some(ref mut b) = current
+            && !t.is_empty()
+            && !t.starts_with('#')
+        {
+            b.push(line);
         }
     }
     if let Some(b) = current {

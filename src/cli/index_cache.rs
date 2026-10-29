@@ -62,11 +62,10 @@ impl IndexCache {
             if let Some(CacheEntry::Binary {
                 serialized_data, ..
             }) = self.cache_spiller.store_mut().get_or_load(&cache_key)?
+                && let Ok(scan) = bincode::deserialize::<ProjectFileScan>(&serialized_data)
             {
-                if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(&serialized_data) {
-                    self.project_scan = Some(scan.clone());
-                    return Ok(scan);
-                }
+                self.project_scan = Some(scan.clone());
+                return Ok(scan);
             }
         }
 

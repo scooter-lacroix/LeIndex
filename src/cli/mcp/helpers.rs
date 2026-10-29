@@ -184,14 +184,12 @@ pub(crate) fn is_index_genuinely_stale(
     // If the index is Fresh and the tree OID matches the current git HEAD tree,
     // the index is current even if there are uncommitted changes to unrelated
     // files.
-    if health.status == ComponentStatus::Fresh {
-        if let Some(indexed_tree_oid) = &health.tree_oid {
-            if let Ok(Some(current_tree_oid)) = crate::cli::git::tree_oid(project_root) {
-                if indexed_tree_oid == &current_tree_oid {
-                    return false;
-                }
-            }
-        }
+    if health.status == ComponentStatus::Fresh
+        && let Some(indexed_tree_oid) = &health.tree_oid
+        && let Ok(Some(current_tree_oid)) = crate::cli::git::tree_oid(project_root)
+        && indexed_tree_oid == &current_tree_oid
+    {
+        return false;
     }
 
     let Some(git_status) = status else {
@@ -309,20 +307,18 @@ pub(crate) fn wrap_live_with_meta_status(
         let stale = is_index_genuinely_stale(&health, project_root, live_status, status_known);
         {
             let mut freshness = freshness;
-            if stale {
-                if let Some(freshness_obj) = freshness.as_object_mut() {
-                    freshness_obj.insert(
-                        "warning".to_string(),
-                        Value::String(
-                            if health.is_none() {
-                                "No indexed generation is loaded; exact live results remain usable."
-                            } else {
-                                "Index may be stale; run leindex_manage action=index with force_reindex=true to refresh."
-                            }
-                            .to_string(),
-                        ),
-                    );
-                }
+            if stale && let Some(freshness_obj) = freshness.as_object_mut() {
+                freshness_obj.insert(
+                    "warning".to_string(),
+                    Value::String(
+                        if health.is_none() {
+                            "No indexed generation is loaded; exact live results remain usable."
+                        } else {
+                            "Index may be stale; run leindex_manage action=index with force_reindex=true to refresh."
+                        }
+                        .to_string(),
+                    ),
+                );
             }
             let meta = obj
                 .entry("_meta".to_string())

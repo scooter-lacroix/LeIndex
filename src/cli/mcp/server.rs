@@ -1350,19 +1350,18 @@ pub fn list_tools_json(handlers: &[ToolHandler]) -> Value {
 /// the endpoint still functions without one.
 async fn list_tools_handler(headers: HeaderMap) -> Json<Value> {
     // Validate session ID if present, but don't require one
-    if let Some(sid) = headers.get("Mcp-Session-Id").and_then(|v| v.to_str().ok()) {
-        if let Some(server) = SERVER_INSTANCE.get() {
-            if let Some(mut entry) = server.session_handshakes.get_mut(sid) {
-                // Update last access time
-                entry.1 = Instant::now();
-                if !entry.0 {
-                    return Json(serde_json::json!({
-                        "error": "Invalid session. Call 'initialize' first."
-                    }));
-                }
-            }
-            // Unknown session ID on a discovery endpoint — allow it (client may be probing)
+    if let Some(sid) = headers.get("Mcp-Session-Id").and_then(|v| v.to_str().ok())
+        && let Some(server) = SERVER_INSTANCE.get()
+        && let Some(mut entry) = server.session_handshakes.get_mut(sid)
+    {
+        // Update last access time
+        entry.1 = Instant::now();
+        if !entry.0 {
+            return Json(serde_json::json!({
+                "error": "Invalid session. Call 'initialize' first."
+            }));
         }
+        // Unknown session ID on a discovery endpoint — allow it (client may be probing)
     }
 
     // Only verify that the server instance exists.

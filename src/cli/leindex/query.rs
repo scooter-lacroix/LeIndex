@@ -96,12 +96,12 @@ impl LeIndex {
                                     .count()
                                     + 1;
                                 result.line_number = Some(line_num);
-                            } else if !node.name.is_empty() {
-                                if let Some(pos) = find_subsequence(content, node.name.as_bytes()) {
-                                    let line_num =
-                                        content[..pos].iter().filter(|&&b| b == b'\n').count() + 1;
-                                    result.line_number = Some(line_num);
-                                }
+                            } else if !node.name.is_empty()
+                                && let Some(pos) = find_subsequence(content, node.name.as_bytes())
+                            {
+                                let line_num =
+                                    content[..pos].iter().filter(|&&b| b == b'\n').count() + 1;
+                                result.line_number = Some(line_num);
                             }
                         }
                     }
@@ -266,12 +266,11 @@ impl LeIndex {
             return Ok(Vec::new());
         }
 
-        if cache_results {
-            if let Some(cached_results) =
+        if cache_results
+            && let Some(cached_results) =
                 self.cached_search_results(query, top_k, query_type.as_ref())?
-            {
-                return Ok(cached_results);
-            }
+        {
+            return Ok(cached_results);
         }
 
         // Derive the effective query type: an explicit caller-provided type
@@ -393,17 +392,15 @@ impl LeIndex {
                 .cache_spiller
                 .store_mut()
                 .get_or_load(&search_cache_key)?
-            {
-                if let Ok(cached_results) =
+                && let Ok(cached_results) =
                     bincode::deserialize::<Vec<SearchResult>>(&serialized_data)
-                {
-                    debug!(
-                        "Search cache hit for '{}' ({} results)",
-                        query,
-                        cached_results.len()
-                    );
-                    return Ok(Some(cached_results));
-                }
+            {
+                debug!(
+                    "Search cache hit for '{}' ({} results)",
+                    query,
+                    cached_results.len()
+                );
+                return Ok(Some(cached_results));
             }
         }
 
@@ -528,12 +525,11 @@ impl LeIndex {
         let start_time = std::time::Instant::now();
 
         let analysis_cache_key = self.analysis_cache_key_for(query, token_budget);
-        if cache_results {
-            if let Some(cached) =
+        if cache_results
+            && let Some(cached) =
                 self.lookup_cached_analysis(query, &analysis_cache_key, start_time)?
-            {
-                return Ok(cached);
-            }
+        {
+            return Ok(cached);
         }
 
         // Step 1: Semantic search for entry points
@@ -839,17 +835,17 @@ impl LeIndex {
             let identity = emb.engram_identity()?;
             Some((engram, identity, dim))
         });
-        if let Some((engram, identity, dim)) = &engram {
-            if let Some(hit) = engram.get(identity, query, *dim) {
-                return Some(hit);
-            }
+        if let Some((engram, identity, dim)) = &engram
+            && let Some(hit) = engram.get(identity, query, *dim)
+        {
+            return Some(hit);
         }
         match emb.embed_neural_blocking(query) {
             Some(Ok(embedding)) => {
-                if let Some((engram, identity, dim)) = &engram {
-                    if embedding.len() == *dim {
-                        engram.put(identity, query, &embedding);
-                    }
+                if let Some((engram, identity, dim)) = &engram
+                    && embedding.len() == *dim
+                {
+                    engram.put(identity, query, &embedding);
                 }
                 Some(embedding)
             }
@@ -1300,6 +1296,30 @@ fn extract_stemmed_keywords(query: &str) -> String {
     stemmed.join(" ")
 }
 
+/// If `base` ends in a doubled consonant (e.g. "runn"), return it with one
+/// consonant dropped ("run"); otherwise `None`. Shared by the -ing and -ed
+/// suffix handlers of [`simple_stem`].
+fn strip_doubled_consonant(base: &str) -> Option<String> {
+    let chars: Vec<char> = base.chars().collect();
+    if chars.len() >= 2
+        && chars[chars.len() - 1] == chars[chars.len() - 2]
+        && !is_vowel(chars[chars.len() - 1])
+    {
+        return Some(drop_last_char(base));
+    }
+    None
+}
+
+/// Restore a trailing 'e' to an -ing stem ending in consonant-vowel-consonant
+/// (e.g. "scor" → "score"); otherwise `None`.
+fn restore_ing_e(base: &str) -> Option<String> {
+    let chars: Vec<char> = base.chars().collect();
+    if chars.len() >= 2 && !is_vowel(chars[chars.len() - 1]) && is_vowel(chars[chars.len() - 2]) {
+        return Some(format!("{}e", base));
+    }
+    None
+}
+
 /// Apply simple suffix-stripping stemming to a word.
 ///
 /// This is a very basic stemmer that handles common English suffixes
@@ -1316,72 +1336,59 @@ fn simple_stem(word: &str) -> String {
     // -ing → base (e.g., "scoring" → "scor" → "score")
     // But handle "ning" → "n" (e.g., "running" → "runn" → "run")
     if let Some(base) = word.strip_suffix("ing") {
-        // If base ends in double consonant, remove one (e.g., "runn" → "run")
-        let chars: Vec<char> = base.chars().collect();
-        if chars.len() >= 2
-            && chars[chars.len() - 1] == chars[chars.len() - 2]
-            && !is_vowel(chars[chars.len() - 1])
-        {
-            return drop_last_char(base);
+        if let Some(stripped) = strip_doubled_consonant(base) {
+            return stripped;
         }
         // Try adding 'e' back (e.g., "scor" → "score", "rat" → "rate")
-        if chars.len() >= 2 {
-            let base_with_e = format!("{}e", base);
-            // Heuristic: if base ends in consonant-vowel-consonant, add 'e'
-            if !is_vowel(chars[chars.len() - 1]) && is_vowel(chars[chars.len() - 2]) {
-                return base_with_e;
-            }
+        if let Some(restored) = restore_ing_e(base) {
+            return restored;
         }
         return base.to_string();
     }
 
     // -ied → -y (e.g., "applied" → "apply")
-    if let Some(base) = word.strip_suffix("ied") {
-        if word_chars > 4 {
-            return format!("{}y", base);
-        }
+    if let Some(base) = word.strip_suffix("ied")
+        && word_chars > 4
+    {
+        return format!("{}y", base);
     }
 
     // -ed → base (e.g., "indexed" → "index", "scored" → "score")
     if let Some(base) = word.strip_suffix("ed") {
-        // If base ends in double consonant, remove one
-        let chars: Vec<char> = base.chars().collect();
-        if chars.len() >= 2
-            && chars[chars.len() - 1] == chars[chars.len() - 2]
-            && !is_vowel(chars[chars.len() - 1])
-        {
-            return drop_last_char(base);
+        if let Some(stripped) = strip_doubled_consonant(base) {
+            return stripped;
         }
         return base.to_string();
     }
 
     // -ies → -y (e.g., "queries" → "query")
-    if let Some(base) = word.strip_suffix("ies") {
-        if word_chars > 4 {
-            return format!("{}y", base);
-        }
+    if let Some(base) = word.strip_suffix("ies")
+        && word_chars > 4
+    {
+        return format!("{}y", base);
     }
 
     // -es → base (e.g., "boxes" → "box", but not "score" → "scor")
-    if let Some(base) = word.strip_suffix("es") {
-        if word_chars > 4 {
-            // Only strip 'es' if base ends in 's', 'x', 'z', 'ch', 'sh'
-            if base.ends_with('s')
-                || base.ends_with('x')
-                || base.ends_with('z')
-                || base.ends_with("ch")
-                || base.ends_with("sh")
-            {
-                return base.to_string();
-            }
+    if let Some(base) = word.strip_suffix("es")
+        && word_chars > 4
+    {
+        // Only strip 'es' if base ends in 's', 'x', 'z', 'ch', 'sh'
+        if base.ends_with('s')
+            || base.ends_with('x')
+            || base.ends_with('z')
+            || base.ends_with("ch")
+            || base.ends_with("sh")
+        {
+            return base.to_string();
         }
     }
 
     // -s → base (e.g., "handlers" → "handler", but not "is" → "i")
-    if let Some(base) = word.strip_suffix('s') {
-        if !base.ends_with('s') && word_chars > 3 {
-            return base.to_string();
-        }
+    if let Some(base) = word.strip_suffix('s')
+        && !base.ends_with('s')
+        && word_chars > 3
+    {
+        return base.to_string();
     }
 
     word.to_string()

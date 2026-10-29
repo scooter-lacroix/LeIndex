@@ -698,9 +698,7 @@ fn neural_tier_filename(dim: usize, generation: u64) -> String {
 /// manifest's, or 1 for a fresh (or legacy schema-1) store.
 #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
 fn next_neural_generation(storage_path: &Path) -> u64 {
-    try_load_neural_generation_manifest(storage_path).map_or(1, |manifest| {
-        manifest.generation + 1
-    })
+    try_load_neural_generation_manifest(storage_path).map_or(1, |manifest| manifest.generation + 1)
 }
 
 #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
@@ -879,7 +877,10 @@ fn sweep_superseded_neural_files(storage_path: &Path, committed: &[NeuralTierEnt
 fn remove_neural_generation_tier_files(storage_path: &Path) -> Result<()> {
     for path in neural_tier_artifacts(storage_path) {
         std::fs::remove_file(&path).map_err(|e| {
-            anyhow::anyhow!("Failed to remove stale neural tier mmap {}: {e}", path.display())
+            anyhow::anyhow!(
+                "Failed to remove stale neural tier mmap {}: {e}",
+                path.display()
+            )
         })?;
         info!(
             path = %path.display(),
@@ -1020,10 +1021,10 @@ fn committed_tier_rejection(
     if index.dimension() as usize != entry.dim {
         return Some("dimension disagrees with the commit");
     }
-    if let (Some(expected), Some(found)) = (manifest.identity.as_deref(), index.identity()) {
-        if found != expected {
-            return Some("identity disagrees with the commit");
-        }
+    if let (Some(expected), Some(found)) = (manifest.identity.as_deref(), index.identity())
+        && found != expected
+    {
+        return Some("identity disagrees with the commit");
     }
     None
 }
@@ -1073,18 +1074,18 @@ fn load_legacy_neural_tiers(
             }
             match crate::search::vector::MmapEmbeddingIndex::open(&path) {
                 Ok(index) => {
-                    if let (Some(expected), Some(found)) = (expected_identity, index.identity()) {
-                        if found != expected {
-                            tracing::warn!(
-                                path = %path.display(),
-                                dim = *dim,
-                                found = %found,
-                                expected = %expected,
-                                "Neural tier mmap is from a different generation \
-                                 (provider/model/dimension/template); tier disabled"
-                            );
-                            return None;
-                        }
+                    if let (Some(expected), Some(found)) = (expected_identity, index.identity())
+                        && found != expected
+                    {
+                        tracing::warn!(
+                            path = %path.display(),
+                            dim = *dim,
+                            found = %found,
+                            expected = %expected,
+                            "Neural tier mmap is from a different generation \
+                             (provider/model/dimension/template); tier disabled"
+                        );
+                        return None;
                     }
                     Some(index)
                 }
@@ -1370,12 +1371,8 @@ mod tests {
             let file = neural_tier_filename(dim, generation);
             let path = dir.path().join(&file);
             let physical = vec![("node-1".to_string(), vec![0.25_f32; dim])];
-            crate::search::vector::write_mmap_embeddings_with_identity(
-                &path,
-                &physical,
-                identity,
-            )
-            .unwrap();
+            crate::search::vector::write_mmap_embeddings_with_identity(&path, &physical, identity)
+                .unwrap();
             tiers.push(NeuralTierEntry { dim, rows, file });
         }
         persist_neural_generation_manifest(
@@ -1755,37 +1752,24 @@ mod tests {
             neural_tier_filename(256, 1),
             "same generation, different dimension: never the same file"
         );
-        assert_eq!(
-            is_neural_tier_artifact_name("neural_embeddings_256.1.bin"),
-            true
-        );
-        assert_eq!(is_neural_tier_artifact_name("neural_embeddings_256.bin"), true);
-        assert_eq!(
-            is_neural_tier_artifact_name("neural_embeddings.bin"),
-            false,
+        assert!(is_neural_tier_artifact_name("neural_embeddings_256.1.bin"));
+        assert!(is_neural_tier_artifact_name("neural_embeddings_256.bin"));
+        assert!(
+            !is_neural_tier_artifact_name("neural_embeddings.bin"),
             "the canonical file is not a tier artifact"
         );
-        assert_eq!(
-            is_neural_tier_artifact_name(".neural_embeddings_256.bin.staged"),
-            false,
+        assert!(
+            !is_neural_tier_artifact_name(".neural_embeddings_256.bin.staged"),
             "staging files are not tier artifacts"
         );
-        assert_eq!(
-            is_neural_tier_artifact_name("neural_embeddings_256.1.2.bin"),
-            false,
+        assert!(
+            !is_neural_tier_artifact_name("neural_embeddings_256.1.2.bin"),
             "two dots is not a filename this build writes"
         );
-        assert_eq!(
-            is_neural_tier_artifact_name("neural_embeddings_x.bin"),
-            false
-        );
-        assert_eq!(
-            is_neural_tier_artifact_name("neural_embeddings_.bin"),
-            false
-        );
-        assert_eq!(
-            is_neural_tier_artifact_name("neural_embeddings_256.txt"),
-            false,
+        assert!(!is_neural_tier_artifact_name("neural_embeddings_x.bin"));
+        assert!(!is_neural_tier_artifact_name("neural_embeddings_.bin"));
+        assert!(
+            !is_neural_tier_artifact_name("neural_embeddings_256.txt"),
             "wrong extension is not ours"
         );
     }
@@ -1843,7 +1827,9 @@ mod tests {
             let path = storage.join(&entry.file);
             assert!(path.is_file(), "committed tier {} exists", entry.file);
             assert!(
-                entry.file.ends_with(&format!(".{}.bin", manifest2.generation))
+                entry
+                    .file
+                    .ends_with(&format!(".{}.bin", manifest2.generation))
                     || entry.file == "neural_embeddings.bin",
                 "every sidecar name carries the committed generation"
             );

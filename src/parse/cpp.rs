@@ -305,12 +305,12 @@ fn extract_cpp_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Import
 
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if node.kind() == "preproc_include" {
-            if let Ok(text) = node.utf8_text(source) {
-                let parts: Vec<_> = text.split_whitespace().collect();
-                if let Some(last) = parts.last() {
-                    add_import(&mut imports, last, None);
-                }
+        if node.kind() == "preproc_include"
+            && let Ok(text) = node.utf8_text(source)
+        {
+            let parts: Vec<_> = text.split_whitespace().collect();
+            if let Some(last) = parts.last() {
+                add_import(&mut imports, last, None);
             }
         }
 
@@ -333,22 +333,22 @@ fn extract_cpp_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String>
     while let Some(current) = stack.pop() {
         match current.kind() {
             "call_expression" => {
-                if let Some(func) = current.child_by_field_name("function") {
-                    if let Ok(text) = func.utf8_text(source) {
-                        let name = clean_call_text(text);
-                        if !name.is_empty() {
-                            calls.push(name);
-                        }
+                if let Some(func) = current.child_by_field_name("function")
+                    && let Ok(text) = func.utf8_text(source)
+                {
+                    let name = clean_call_text(text);
+                    if !name.is_empty() {
+                        calls.push(name);
                     }
                 }
             }
             "new_expression" => {
-                if let Some(typ) = current.child_by_field_name("type") {
-                    if let Ok(text) = typ.utf8_text(source) {
-                        let name = clean_call_text(text);
-                        if !name.is_empty() {
-                            calls.push(name);
-                        }
+                if let Some(typ) = current.child_by_field_name("type")
+                    && let Ok(text) = typ.utf8_text(source)
+                {
+                    let name = clean_call_text(text);
+                    if !name.is_empty() {
+                        calls.push(name);
                     }
                 }
             }
@@ -396,10 +396,10 @@ fn extract_cpp_parameters(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<Pa
                                     break None;
                                 }
                                 let node = ccursor.node();
-                                if node.kind() == "identifier" {
-                                    if let Ok(text) = node.utf8_text(source) {
-                                        break Some(text.to_string());
-                                    }
+                                if node.kind() == "identifier"
+                                    && let Ok(text) = node.utf8_text(source)
+                                {
+                                    break Some(text.to_string());
                                 }
                             }
                         });
@@ -427,20 +427,19 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
     }
     let prev_sibling = node.prev_sibling();
 
-    if let Some(sibling) = prev_sibling {
-        if sibling.kind() == "comment" {
-            if let Ok(text) = sibling.utf8_text(source) {
-                return Some(
-                    text.trim()
-                        .trim_start_matches("/*")
-                        .trim_start_matches("//")
-                        .trim_start_matches("///")
-                        .trim_end_matches("*/")
-                        .trim()
-                        .to_string(),
-                );
-            }
-        }
+    if let Some(sibling) = prev_sibling
+        && sibling.kind() == "comment"
+        && let Ok(text) = sibling.utf8_text(source)
+    {
+        return Some(
+            text.trim()
+                .trim_start_matches("/*")
+                .trim_start_matches("//")
+                .trim_start_matches("///")
+                .trim_end_matches("*/")
+                .trim()
+                .to_string(),
+        );
     }
 
     None

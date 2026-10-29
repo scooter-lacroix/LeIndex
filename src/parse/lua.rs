@@ -150,21 +150,17 @@ fn extract_lua_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Import
     }
 
     fn visit(node: &tree_sitter::Node<'_>, source: &[u8], imports: &mut Vec<ImportInfo>) {
-        if node.kind() == "function_call" || node.kind() == "method_call" {
-            if let Some(name) = node
+        if matches!(node.kind(), "function_call" | "method_call")
+            && let Some(name) = node
                 .child_by_field_name("name")
                 .or_else(|| node.child_by_field_name("function"))
                 .and_then(|n| n.utf8_text(source).ok())
-            {
-                if name == "require" {
-                    if let Some(args) = node.child_by_field_name("arguments") {
-                        if let Ok(text) = args.utf8_text(source) {
-                            let cleaned = text.trim().trim_matches('(').trim_matches(')');
-                            add_import(imports, cleaned);
-                        }
-                    }
-                }
-            }
+            && name == "require"
+            && let Some(args) = node.child_by_field_name("arguments")
+            && let Ok(text) = args.utf8_text(source)
+        {
+            let cleaned = text.trim().trim_matches('(').trim_matches(')');
+            add_import(imports, cleaned);
         }
 
         let mut cursor = node.walk();
@@ -189,12 +185,11 @@ fn extract_lua_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String>
                 if let Some(func) = node
                     .child_by_field_name("name")
                     .or_else(|| node.child_by_field_name("function"))
+                    && let Ok(text) = func.utf8_text(source)
                 {
-                    if let Ok(text) = func.utf8_text(source) {
-                        let name = clean_call_text(text);
-                        if !name.is_empty() {
-                            calls.push(name);
-                        }
+                    let name = clean_call_text(text);
+                    if !name.is_empty() {
+                        calls.push(name);
                     }
                 }
             }
@@ -216,14 +211,14 @@ fn extract_parameters(params_node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec
     let mut cursor = params_node.walk();
 
     for child in params_node.children(&mut cursor) {
-        if child.kind() == "identifier" {
-            if let Ok(name) = child.utf8_text(source) {
-                parameters.push(Parameter {
-                    name: name.to_string(),
-                    type_annotation: None,
-                    default_value: None,
-                });
-            }
+        if child.kind() == "identifier"
+            && let Ok(name) = child.utf8_text(source)
+        {
+            parameters.push(Parameter {
+                name: name.to_string(),
+                type_annotation: None,
+                default_value: None,
+            });
         }
     }
 
@@ -238,20 +233,20 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
     // Look for comment before the function
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "comment" {
-            if let Ok(comment) = child.utf8_text(source) {
-                // Remove comment syntax
-                let cleaned = comment
-                    .trim_start_matches("--[[")
-                    .trim_start_matches("--[=[")
-                    .trim_start_matches("--")
-                    .trim_end_matches("]]")
-                    .trim_end_matches("]=]")
-                    .trim()
-                    .to_string();
-                if !cleaned.is_empty() {
-                    return Some(cleaned);
-                }
+        if child.kind() == "comment"
+            && let Ok(comment) = child.utf8_text(source)
+        {
+            // Remove comment syntax
+            let cleaned = comment
+                .trim_start_matches("--[[")
+                .trim_start_matches("--[=[")
+                .trim_start_matches("--")
+                .trim_end_matches("]]")
+                .trim_end_matches("]=]")
+                .trim()
+                .to_string();
+            if !cleaned.is_empty() {
+                return Some(cleaned);
             }
         }
     }

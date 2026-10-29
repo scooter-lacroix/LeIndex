@@ -345,14 +345,13 @@ fn extract_python_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<Stri
     }
 
     fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {
-        if node.kind() == "call" {
-            if let Some(func) = node.child_by_field_name("function") {
-                if let Ok(text) = func.utf8_text(source) {
-                    let name = clean_call_text(text);
-                    if !name.is_empty() {
-                        calls.push(name);
-                    }
-                }
+        if node.kind() == "call"
+            && let Some(func) = node.child_by_field_name("function")
+            && let Ok(text) = func.utf8_text(source)
+        {
+            let name = clean_call_text(text);
+            if !name.is_empty() {
+                calls.push(name);
             }
         }
 
@@ -385,36 +384,36 @@ fn extract_parameters(params_node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec
             // Extract parameter with type annotation
             let mut param_cursor = child.walk();
             for param_child in child.children(&mut param_cursor) {
-                if param_child.kind() == "identifier" {
-                    if let Ok(name) = param_child.utf8_text(source) {
-                        // Try to find type annotation
-                        let type_annotation = child
-                            .child_by_field_name("type")
-                            .and_then(|t| t.utf8_text(source).ok())
-                            .map(|s| s.trim().to_string());
+                if param_child.kind() == "identifier"
+                    && let Ok(name) = param_child.utf8_text(source)
+                {
+                    // Try to find type annotation
+                    let type_annotation = child
+                        .child_by_field_name("type")
+                        .and_then(|t| t.utf8_text(source).ok())
+                        .map(|s| s.trim().to_string());
 
-                        parameters.push(Parameter {
-                            name: name.to_string(),
-                            type_annotation,
-                            default_value: None,
-                        });
-                        break;
-                    }
+                    parameters.push(Parameter {
+                        name: name.to_string(),
+                        type_annotation,
+                        default_value: None,
+                    });
+                    break;
                 }
             }
         } else if child.kind() == "default_parameter" {
             // Extract parameter with default value
             let mut param_cursor = child.walk();
             for param_child in child.children(&mut param_cursor) {
-                if param_child.kind() == "identifier" {
-                    if let Ok(name) = param_child.utf8_text(source) {
-                        parameters.push(Parameter {
-                            name: name.to_string(),
-                            type_annotation: None,
-                            default_value: Some("...".to_string()), // Could extract actual default
-                        });
-                        break;
-                    }
+                if param_child.kind() == "identifier"
+                    && let Ok(name) = param_child.utf8_text(source)
+                {
+                    parameters.push(Parameter {
+                        name: name.to_string(),
+                        type_annotation: None,
+                        default_value: Some("...".to_string()), // Could extract actual default
+                    });
+                    break;
                 }
             }
         }

@@ -21,10 +21,10 @@ pub(crate) fn detect_amd_gpu() -> bool {
         }
     }
     // Honor the ROCM_PATH env var the same way the worker does.
-    if let Ok(rocm_path) = std::env::var("ROCM_PATH") {
-        if std::path::Path::new(&rocm_path).exists() {
-            return true;
-        }
+    if let Ok(rocm_path) = std::env::var("ROCM_PATH")
+        && std::path::Path::new(&rocm_path).exists()
+    {
+        return true;
     }
     false
 }

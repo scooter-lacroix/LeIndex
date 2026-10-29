@@ -215,10 +215,10 @@ fn extract_scala_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Impo
     }
 
     fn visit(node: &tree_sitter::Node<'_>, source: &[u8], imports: &mut Vec<ImportInfo>) {
-        if node.kind() == "import_declaration" {
-            if let Ok(text) = node.utf8_text(source) {
-                parse_import_text(imports, text);
-            }
+        if node.kind() == "import_declaration"
+            && let Ok(text) = node.utf8_text(source)
+        {
+            parse_import_text(imports, text);
         }
 
         let mut cursor = node.walk();
@@ -275,21 +275,20 @@ fn extract_parameters(params_node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec
     let mut cursor = params_node.walk();
 
     for child in params_node.children(&mut cursor) {
-        if child.kind() == "parameter" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                if let Ok(name) = name_node.utf8_text(source) {
-                    let type_annotation = child
-                        .child_by_field_name("type")
-                        .and_then(|t| t.utf8_text(source).ok())
-                        .map(|s| s.trim().to_string());
+        if child.kind() == "parameter"
+            && let Some(name_node) = child.child_by_field_name("name")
+            && let Ok(name) = name_node.utf8_text(source)
+        {
+            let type_annotation = child
+                .child_by_field_name("type")
+                .and_then(|t| t.utf8_text(source).ok())
+                .map(|s| s.trim().to_string());
 
-                    parameters.push(Parameter {
-                        name: name.to_string(),
-                        type_annotation,
-                        default_value: None,
-                    });
-                }
-            }
+            parameters.push(Parameter {
+                name: name.to_string(),
+                type_annotation,
+                default_value: None,
+            });
         }
     }
 
@@ -303,17 +302,17 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "comment" {
-            if let Ok(comment) = child.utf8_text(source) {
-                let cleaned = comment
-                    .trim_start_matches("/**")
-                    .trim_start_matches("/*")
-                    .trim_end_matches("*/")
-                    .trim()
-                    .to_string();
-                if !cleaned.is_empty() {
-                    return Some(cleaned);
-                }
+        if child.kind() == "comment"
+            && let Ok(comment) = child.utf8_text(source)
+        {
+            let cleaned = comment
+                .trim_start_matches("/**")
+                .trim_start_matches("/*")
+                .trim_end_matches("*/")
+                .trim()
+                .to_string();
+            if !cleaned.is_empty() {
+                return Some(cleaned);
             }
         }
     }

@@ -338,13 +338,12 @@ pub fn fragment_from_pdg(pdg: &ProgramDependenceGraph) -> PdgFragment {
     let mut intra_edges = Vec::with_capacity(pdg.edge_count());
     for eidx in pdg.edge_indices() {
         if let (Some(edge), Some((source, target))) = (pdg.get_edge(eidx), pdg.edge_endpoints(eidx))
+            && let (Some(sn), Some(tn)) = (pdg.get_node(source), pdg.get_node(target))
         {
-            if let (Some(sn), Some(tn)) = (pdg.get_node(source), pdg.get_node(target)) {
-                let mut rec = edge_record(edge);
-                rec.source = sn.id.clone();
-                rec.target = tn.id.clone();
-                intra_edges.push(rec);
-            }
+            let mut rec = edge_record(edge);
+            rec.source = sn.id.clone();
+            rec.target = tn.id.clone();
+            intra_edges.push(rec);
         }
     }
 
@@ -413,10 +412,9 @@ pub fn pdg_from_segment(segment: &PdgSegment) -> ProgramDependenceGraph {
     for record in &segment.edges {
         if let (Some(&from), Some(&to)) =
             (node_ids.get(&record.source), node_ids.get(&record.target))
+            && let Ok(edge) = edge_from_record(record)
         {
-            if let Ok(edge) = edge_from_record(record) {
-                pdg.add_edge(from, to, edge);
-            }
+            pdg.add_edge(from, to, edge);
         }
     }
 

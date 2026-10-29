@@ -267,15 +267,15 @@ fn extract_java_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Impor
     }
 
     fn visit(node: &tree_sitter::Node<'_>, source: &[u8], imports: &mut Vec<ImportInfo>) {
-        if node.kind() == "import_declaration" {
-            if let Ok(text) = node.utf8_text(source) {
-                let text = text.trim().trim_end_matches(';').trim();
-                let text = text
-                    .trim_start_matches("import ")
-                    .trim_start_matches("static ");
-                let alias = text.split('.').next_back().map(|s| s.to_string());
-                add_import(imports, text, alias);
-            }
+        if node.kind() == "import_declaration"
+            && let Ok(text) = node.utf8_text(source)
+        {
+            let text = text.trim().trim_end_matches(';').trim();
+            let text = text
+                .trim_start_matches("import ")
+                .trim_start_matches("static ");
+            let alias = text.split('.').next_back().map(|s| s.to_string());
+            add_import(imports, text, alias);
         }
 
         let mut cursor = node.walk();
@@ -410,12 +410,12 @@ fn extract_java_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
                 }
             }
             "object_creation_expression" => {
-                if let Some(typ) = node.child_by_field_name("type") {
-                    if let Ok(text) = typ.utf8_text(source) {
-                        let name = clean_call_text(text);
-                        if !name.is_empty() {
-                            calls.push(name);
-                        }
+                if let Some(typ) = node.child_by_field_name("type")
+                    && let Ok(text) = typ.utf8_text(source)
+                {
+                    let name = clean_call_text(text);
+                    if !name.is_empty() {
+                        calls.push(name);
                     }
                 }
             }
@@ -502,23 +502,22 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
     let prev_sibling = node.prev_sibling();
 
     // Check for javadoc comment
-    if let Some(sibling) = prev_sibling {
-        if sibling.kind() == "comment" {
-            if let Ok(text) = sibling.utf8_text(source) {
-                let is_javadoc = text.starts_with("/**");
-                if is_javadoc {
-                    return Some(
-                        text.trim()
-                            .trim_start_matches("/**")
-                            .trim_end_matches("*/")
-                            .trim()
-                            .lines()
-                            .map(|l| l.trim().trim_start_matches('*').trim())
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    );
-                }
-            }
+    if let Some(sibling) = prev_sibling
+        && sibling.kind() == "comment"
+        && let Ok(text) = sibling.utf8_text(source)
+    {
+        let is_javadoc = text.starts_with("/**");
+        if is_javadoc {
+            return Some(
+                text.trim()
+                    .trim_start_matches("/**")
+                    .trim_end_matches("*/")
+                    .trim()
+                    .lines()
+                    .map(|l| l.trim().trim_start_matches('*').trim())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
         }
     }
 

@@ -187,22 +187,17 @@ fn extract_ruby_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Impor
     }
 
     fn visit(node: &tree_sitter::Node<'_>, source: &[u8], imports: &mut Vec<ImportInfo>) {
-        if node.kind() == "call" || node.kind() == "method_call" {
-            if let Some(name_node) = node
+        if (node.kind() == "call" || node.kind() == "method_call")
+            && let Some(name_node) = node
                 .child_by_field_name("method")
                 .or_else(|| node.child_by_field_name("name"))
-            {
-                if let Ok(name) = name_node.utf8_text(source) {
-                    if name == "require" || name == "require_relative" {
-                        if let Some(arg) = node.child_by_field_name("arguments") {
-                            if let Ok(text) = arg.utf8_text(source) {
-                                let cleaned = text.trim().trim_matches('(').trim_matches(')');
-                                add_import(imports, cleaned);
-                            }
-                        }
-                    }
-                }
-            }
+            && let Ok(name) = name_node.utf8_text(source)
+            && (name == "require" || name == "require_relative")
+            && let Some(arg) = node.child_by_field_name("arguments")
+            && let Ok(text) = arg.utf8_text(source)
+        {
+            let cleaned = text.trim().trim_matches('(').trim_matches(')');
+            add_import(imports, cleaned);
         }
 
         let mut cursor = node.walk();
@@ -306,14 +301,14 @@ fn extract_ruby_parameters(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<P
     if let Some(params) = node.child_by_field_name("parameters") {
         let mut cursor = params.walk();
         for child in params.children(&mut cursor) {
-            if child.kind() == "identifier" {
-                if let Ok(name) = child.utf8_text(source) {
-                    parameters.push(Parameter {
-                        name: name.to_string(),
-                        type_annotation: None,
-                        default_value: None,
-                    });
-                }
+            if child.kind() == "identifier"
+                && let Ok(name) = child.utf8_text(source)
+            {
+                parameters.push(Parameter {
+                    name: name.to_string(),
+                    type_annotation: None,
+                    default_value: None,
+                });
             }
         }
     }

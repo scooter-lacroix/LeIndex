@@ -467,11 +467,11 @@ impl CacheStore {
             let entry = entry
                 .map_err(|e| Error::SpillFailed(format!("Failed to read dir entry: {}", e)))?;
 
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".bin") {
-                    let key = name.strip_suffix(".bin").unwrap_or(name);
-                    entries.push(key.to_string());
-                }
+            if let Some(name) = entry.file_name().to_str()
+                && name.ends_with(".bin")
+            {
+                let key = name.strip_suffix(".bin").unwrap_or(name);
+                entries.push(key.to_string());
             }
         }
 
@@ -518,17 +518,18 @@ impl CacheStore {
         match std::fs::read_dir(&self.cache_dir) {
             Ok(entries) => {
                 for entry in entries.flatten() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if name.ends_with(".bin") && name.starts_with(sanitized_prefix) {
-                            let path = entry.path();
-                            match std::fs::remove_file(&path) {
-                                Ok(()) => count += 1,
-                                Err(err) => warn!(
-                                    "failed to remove spilled cache entry {}: {}",
-                                    path.display(),
-                                    err
-                                ),
-                            }
+                    if let Some(name) = entry.file_name().to_str()
+                        && name.ends_with(".bin")
+                        && name.starts_with(sanitized_prefix)
+                    {
+                        let path = entry.path();
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => count += 1,
+                            Err(err) => warn!(
+                                "failed to remove spilled cache entry {}: {}",
+                                path.display(),
+                                err
+                            ),
                         }
                     }
                 }
@@ -901,10 +902,10 @@ impl CacheSpiller {
                         .store
                         .cache_dir()
                         .join(format!("{}.bin", sanitize_key(key)));
-                    if let Ok(metadata) = std::fs::metadata(&cache_file) {
-                        if let Ok(modified) = metadata.modified() {
-                            keyed.push((key.clone(), modified));
-                        }
+                    if let Ok(metadata) = std::fs::metadata(&cache_file)
+                        && let Ok(modified) = metadata.modified()
+                    {
+                        keyed.push((key.clone(), modified));
                     }
                 }
 
@@ -948,20 +949,21 @@ impl CacheSpiller {
 
         for key in prioritized {
             // Check if we have space
-            if let Ok(validation) = self.store.validate_entry(&key) {
-                if validation.is_valid && used_bytes + validation.size_bytes <= available_bytes {
-                    match self.store.load_from_disk(&key) {
-                        Ok(entry) => {
-                            if self.store.insert(key.clone(), entry).is_ok() {
-                                restored += 1;
-                                used_bytes += validation.size_bytes;
-                            } else {
-                                failed.push((key, "Insert failed".to_string()));
-                            }
+            if let Ok(validation) = self.store.validate_entry(&key)
+                && validation.is_valid
+                && used_bytes + validation.size_bytes <= available_bytes
+            {
+                match self.store.load_from_disk(&key) {
+                    Ok(entry) => {
+                        if self.store.insert(key.clone(), entry).is_ok() {
+                            restored += 1;
+                            used_bytes += validation.size_bytes;
+                        } else {
+                            failed.push((key, "Insert failed".to_string()));
                         }
-                        Err(e) => {
-                            failed.push((key, e.to_string()));
-                        }
+                    }
+                    Err(e) => {
+                        failed.push((key, e.to_string()));
                     }
                 }
             }

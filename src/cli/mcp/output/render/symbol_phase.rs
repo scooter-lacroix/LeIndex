@@ -137,13 +137,13 @@ pub(super) fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
     if let Some(lang) = data.get("language").and_then(|v| v.as_str()) {
         out.push_str(&field("Language", lang, color));
     }
-    if let Some(br) = data.get("byte_range").and_then(|v| v.as_array()) {
-        if br.len() == 2 {
-            let start = br[0].as_u64().unwrap_or(0);
-            let end = br[1].as_u64().unwrap_or(0);
-            if end > start {
-                out.push_str(&field("Range", &format!("bytes {}-{}", start, end), color));
-            }
+    if let Some(br) = data.get("byte_range").and_then(|v| v.as_array())
+        && br.len() == 2
+    {
+        let start = br[0].as_u64().unwrap_or(0);
+        let end = br[1].as_u64().unwrap_or(0);
+        if end > start {
+            out.push_str(&field("Range", &format!("bytes {}-{}", start, end), color));
         }
     }
     if let Some(cx) = data.get("complexity").and_then(|v| v.as_u64()) {
@@ -169,10 +169,10 @@ pub(super) fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
     if let Some(note) = data.get("impact_note").and_then(|v| v.as_str()) {
         out.push_str(&field("Note", &format!("⚠ {note}"), color));
     }
-    if let Some(freshness) = data.get("index_freshness").and_then(|v| v.as_str()) {
-        if freshness != "fresh" {
-            out.push_str(&field("Index freshness", freshness, color));
-        }
+    if let Some(freshness) = data.get("index_freshness").and_then(|v| v.as_str())
+        && freshness != "fresh"
+    {
+        out.push_str(&field("Index freshness", freshness, color));
     }
     out.push_str(&render_symbol_source(data, color));
 

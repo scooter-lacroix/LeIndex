@@ -94,20 +94,19 @@ impl Refactor {
         .map_err(|e| EditError::WorktreeError(format!("Rename task panicked: {}", e)))??;
 
         // Record in edit history for undo support.
-        if result.success {
-            if let (Some(originals), Some(modifieds)) =
+        if result.success
+            && let (Some(originals), Some(modifieds)) =
                 (&result.original_contents, &result.modified_contents)
-            {
-                let mut history = engine.history.lock().await;
-                history.record_command(EditCommand::Rename {
-                    project_id: UniqueProjectId::new("_rename".to_string(), "".to_string(), 0),
-                    old_name: old_name.to_owned(),
-                    new_name: new_name.to_owned(),
-                    timestamp: chrono::Utc::now(),
-                    original_contents: originals.clone(),
-                    modified_contents: modifieds.clone(),
-                });
-            }
+        {
+            let mut history = engine.history.lock().await;
+            history.record_command(EditCommand::Rename {
+                project_id: UniqueProjectId::new("_rename".to_string(), "".to_string(), 0),
+                old_name: old_name.to_owned(),
+                new_name: new_name.to_owned(),
+                timestamp: chrono::Utc::now(),
+                original_contents: originals.clone(),
+                modified_contents: modifieds.clone(),
+            });
         }
 
         Ok(result)
@@ -117,10 +116,10 @@ impl Refactor {
     fn rename_symbol_blocking(pdg: &PDG, old_name: &str, new_name: &str) -> Result<EditResult> {
         // 1. Resolve the PDG symbol candidates and prefer exact symbol hits.
         let mut seed_ids = pdg.find_all_by_name(old_name);
-        if let Some(exact) = pdg.find_by_symbol(old_name) {
-            if !seed_ids.contains(&exact) {
-                seed_ids.push(exact);
-            }
+        if let Some(exact) = pdg.find_by_symbol(old_name)
+            && !seed_ids.contains(&exact)
+        {
+            seed_ids.push(exact);
         }
 
         // 2. Collect definition + impact files/ranges via exhaustive PDG traversal.
@@ -264,15 +263,15 @@ fn merge_impact_nodes(
     impact_ranges: &mut std::collections::HashMap<String, Vec<(usize, usize)>>,
 ) {
     for &id in ids {
-        if let Some(node) = pdg.get_node(id) {
-            if node.node_type != crate::graph::pdg::NodeType::External {
-                files.insert(PathBuf::from(&*node.file_path));
-                if node.byte_range != (0, 0) {
-                    impact_ranges
-                        .entry(node.file_path.to_string())
-                        .or_default()
-                        .push(node.byte_range);
-                }
+        if let Some(node) = pdg.get_node(id)
+            && node.node_type != crate::graph::pdg::NodeType::External
+        {
+            files.insert(PathBuf::from(&*node.file_path));
+            if node.byte_range != (0, 0) {
+                impact_ranges
+                    .entry(node.file_path.to_string())
+                    .or_default()
+                    .push(node.byte_range);
             }
         }
     }
@@ -309,18 +308,18 @@ fn collect_rename_targets(
     let mut hit_node_limit = false;
 
     for &node_id in seed_ids {
-        if let Some(node) = pdg.get_node(node_id) {
-            if node.node_type != crate::graph::pdg::NodeType::External {
-                files.insert(PathBuf::from(&*node.file_path));
+        if let Some(node) = pdg.get_node(node_id)
+            && node.node_type != crate::graph::pdg::NodeType::External
+        {
+            files.insert(PathBuf::from(&*node.file_path));
 
-                let impacted = pdg.forward_impact(node_id, &traversal_config);
-                hit_node_limit |= impacted.len() >= RENAME_MAX_NODES;
-                merge_impact_nodes(pdg, &impacted, &mut files, &mut impact_ranges);
+            let impacted = pdg.forward_impact(node_id, &traversal_config);
+            hit_node_limit |= impacted.len() >= RENAME_MAX_NODES;
+            merge_impact_nodes(pdg, &impacted, &mut files, &mut impact_ranges);
 
-                let backward = pdg.backward_impact(node_id, &traversal_config);
-                hit_node_limit |= backward.len() >= RENAME_MAX_NODES;
-                merge_impact_nodes(pdg, &backward, &mut files, &mut impact_ranges);
-            }
+            let backward = pdg.backward_impact(node_id, &traversal_config);
+            hit_node_limit |= backward.len() >= RENAME_MAX_NODES;
+            merge_impact_nodes(pdg, &backward, &mut files, &mut impact_ranges);
         }
     }
 
@@ -337,24 +336,24 @@ fn build_matches_by_file(
     let mut matches_by_file: std::collections::HashMap<String, Vec<(usize, usize)>> =
         std::collections::HashMap::new();
     for nid in pdg.find_all_by_name(old_name) {
-        if let Some(node) = pdg.get_node(nid) {
-            if node.byte_range != (0, 0) {
-                matches_by_file
-                    .entry(node.file_path.to_string())
-                    .or_default()
-                    .push(node.byte_range);
-            }
+        if let Some(node) = pdg.get_node(nid)
+            && node.byte_range != (0, 0)
+        {
+            matches_by_file
+                .entry(node.file_path.to_string())
+                .or_default()
+                .push(node.byte_range);
         }
     }
     for &node_id in seed_ids {
-        if let Some(node) = pdg.get_node(node_id) {
-            if node.byte_range != (0, 0) {
-                let entry = matches_by_file
-                    .entry(node.file_path.to_string())
-                    .or_default();
-                if !entry.contains(&node.byte_range) {
-                    entry.push(node.byte_range);
-                }
+        if let Some(node) = pdg.get_node(node_id)
+            && node.byte_range != (0, 0)
+        {
+            let entry = matches_by_file
+                .entry(node.file_path.to_string())
+                .or_default();
+            if !entry.contains(&node.byte_range) {
+                entry.push(node.byte_range);
             }
         }
     }

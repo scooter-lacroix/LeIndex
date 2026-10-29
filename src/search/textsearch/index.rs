@@ -141,7 +141,7 @@ fn read_varint(bytes: &[u8], pos: &mut usize) -> Option<u32> {
 }
 
 fn align8(buf: &mut Vec<u8>) {
-    while buf.len() % 8 != 0 {
+    while !buf.len().is_multiple_of(8) {
         buf.push(0);
     }
 }

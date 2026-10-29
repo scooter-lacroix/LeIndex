@@ -151,10 +151,10 @@ impl ServiceConfig {
     /// The payload model name consumers fall back to: explicit alias, else
     /// the model file stem, else nothing.
     pub fn served_name(&self) -> Option<String> {
-        if let Some(alias) = self.alias.as_deref() {
-            if !alias.trim().is_empty() {
-                return Some(alias.to_string());
-            }
+        if let Some(alias) = self.alias.as_deref()
+            && !alias.trim().is_empty()
+        {
+            return Some(alias.to_string());
         }
         self.model.as_deref().map(|path| {
             std::path::Path::new(path)
@@ -1413,10 +1413,10 @@ impl LeIndexConfig {
     /// `Arc` pins the exact config seen here; the previous snapshot is freed when
     /// its last holder drops it, so no reload leaks.
     pub fn load_cached_arc() -> Arc<LeIndexConfig> {
-        if probe_due() {
-            if let Some(refreshed) = refresh_cached_config() {
-                return refreshed;
-            }
+        if probe_due()
+            && let Some(refreshed) = refresh_cached_config()
+        {
+            return refreshed;
         }
         // `probe_due()` returns true while the slot is empty, so a successful
         // `refresh_cached_config` above installs the first snapshot. The only way

@@ -248,14 +248,13 @@ impl ImpactAnalyzer {
     /// Check if an API is public (exported)
     fn is_public_api(&self, api_name: &str) -> bool {
         // Check if the API is in a public location
-        if let Some(node_id) = self.pdg.find_by_symbol(api_name) {
-            if let Some(node) = self.pdg.get_node(node_id) {
-                // Not in a test file
-                if !node.file_path.contains("test") && !node.file_path.contains("spec") {
-                    // Not in a private/internal module
-                    return !node.file_path.contains("internal")
-                        && !node.file_path.contains("private");
-                }
+        if let Some(node_id) = self.pdg.find_by_symbol(api_name)
+            && let Some(node) = self.pdg.get_node(node_id)
+        {
+            // Not in a test file
+            if !node.file_path.contains("test") && !node.file_path.contains("spec") {
+                // Not in a private/internal module
+                return !node.file_path.contains("internal") && !node.file_path.contains("private");
             }
         }
         false

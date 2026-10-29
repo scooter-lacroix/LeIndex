@@ -184,15 +184,15 @@ impl SyncEngine {
                 // New project
                 report.new_projects += 1;
 
-                if register_new {
-                    if let Err(e) = self.registry.register_project(
+                if register_new
+                    && let Err(e) = self.registry.register_project(
                         &project.path,
                         project.language.clone(),
                         project.file_count,
                         &project.content_fingerprint,
-                    ) {
-                        report.add_error(format!("Failed to register {}: {}", id, e));
-                    }
+                    )
+                {
+                    report.add_error(format!("Failed to register {}: {}", id, e));
                 }
             }
         }

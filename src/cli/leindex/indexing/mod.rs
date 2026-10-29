@@ -381,18 +381,17 @@ impl LeIndex {
         // is the WAL-bricking sequence. If the identity check proves the lock
         // file changed, refuse to publish; the run fails as transient lock
         // contention and can be retried cleanly.
-        if let Ok(slot) = self.write_lock_identity.lock() {
-            if let Some(identity) = slot.as_ref() {
-                if !identity.still_guards() {
-                    anyhow::bail!(
-                        "[transient:lock-contention] The project write lock file {} was \
-                         deleted or replaced while this index run held it; a second writer \
-                         may be active, so generation {generation} will not be published. \
-                         Retry the index operation.",
-                        identity.lock_file_path().display()
-                    );
-                }
-            }
+        if let Ok(slot) = self.write_lock_identity.lock()
+            && let Some(identity) = slot.as_ref()
+            && !identity.still_guards()
+        {
+            anyhow::bail!(
+                "[transient:lock-contention] The project write lock file {} was \
+                 deleted or replaced while this index run held it; a second writer \
+                 may be active, so generation {generation} will not be published. \
+                 Retry the index operation.",
+                identity.lock_file_path().display()
+            );
         }
         // Rename the complete directory once. Readers either see no new
         // generation or the fully materialized immutable snapshot.
@@ -1127,18 +1126,18 @@ impl LeIndex {
         }
         for file_path in &changed_file_paths {
             index_builder::remove_file_from_pdg(pdg, file_path)?;
-            if let Some(hash) = state.source_file_hashes.get(file_path) {
-                if let Err(error) = crate::storage::pdg_store::update_indexed_file(
+            if let Some(hash) = state.source_file_hashes.get(file_path)
+                && let Err(error) = crate::storage::pdg_store::update_indexed_file(
                     &mut self.storage,
                     &self.project_id,
                     file_path,
                     hash,
-                ) {
-                    warn!(
-                        "Failed to update indexed file record for '{}' during indexing: {}",
-                        file_path, error
-                    );
-                }
+                )
+            {
+                warn!(
+                    "Failed to update indexed file record for '{}' during indexing: {}",
+                    file_path, error
+                );
             }
         }
         if let Some((new_pdg, route)) = rebuilt {
@@ -1675,10 +1674,8 @@ impl LeIndex {
         // absent, hydration takes the rebuild path. `persist_artifacts` stays
         // false — the generation read path never writes legacy artifacts back
         // into the store.
-        if !pdg_only {
-            if let Err(error) = layer_artifacts::materialize_search_artifacts(&snapshot) {
-                warn!(%error, "Search layer materialization failed; rebuilding search from the graph");
-            }
+        if !pdg_only && let Err(error) = layer_artifacts::materialize_search_artifacts(&snapshot) {
+            warn!(%error, "Search layer materialization failed; rebuilding search from the graph");
         }
         let artifact_path = snapshot
             .db_path()

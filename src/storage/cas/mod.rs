@@ -141,10 +141,10 @@ impl CasStore {
             }
         }
         // Best-effort: fsync the prefix directory so the rename is durable.
-        if let Some(parent) = final_path.parent() {
-            if let Ok(dir) = fs::File::open(parent) {
-                let _ = fsync_file(&dir);
-            }
+        if let Some(parent) = final_path.parent()
+            && let Ok(dir) = fs::File::open(parent)
+        {
+            let _ = fsync_file(&dir);
         }
 
         Ok(hash)
@@ -290,10 +290,10 @@ impl CasStore {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
                 Err(e) => return Err(e),
             };
-            if let Err(e) = fs::remove_file(&path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(e);
-                }
+            if let Err(e) = fs::remove_file(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(e);
             }
             reclaimed_bytes += size;
             blobs_removed += 1;
@@ -348,12 +348,11 @@ impl CasStore {
             if entry.file_type()?.is_dir() {
                 for sub_entry in fs::read_dir(entry.path())? {
                     let sub_entry = sub_entry?;
-                    if sub_entry.file_type()?.is_file() {
-                        if let Some(hash) =
+                    if sub_entry.file_type()?.is_file()
+                        && let Some(hash) =
                             blob::hex_to_hash(&sub_entry.file_name().to_string_lossy())
-                        {
-                            out.push(hash);
-                        }
+                    {
+                        out.push(hash);
                     }
                 }
             }

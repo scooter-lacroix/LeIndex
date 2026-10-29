@@ -173,13 +173,13 @@ impl ParsedQuery {
             });
         }
 
-        if let Some(budget) = self.token_budget {
-            if budget > MAX_TOKEN_BUDGET {
-                return Err(Error::TokenBudgetTooLarge {
-                    provided: budget,
-                    max: MAX_TOKEN_BUDGET,
-                });
-            }
+        if let Some(budget) = self.token_budget
+            && budget > MAX_TOKEN_BUDGET
+        {
+            return Err(Error::TokenBudgetTooLarge {
+                provided: budget,
+                max: MAX_TOKEN_BUDGET,
+            });
         }
 
         Ok(())

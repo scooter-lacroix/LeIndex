@@ -83,13 +83,12 @@ impl ProgramDependenceGraph {
     /// Find by name with optional file hint.
     /// All lookups are index-backed — no O(n) scans.
     pub fn find_by_name_in_file(&self, name: &str, file_hint: Option<&str>) -> Option<NodeId> {
-        if let Some(file_path) = file_hint {
-            if let Some(&node_id) = self
+        if let Some(file_path) = file_hint
+            && let Some(&node_id) = self
                 .name_file_index
                 .get(&(name.to_string(), file_path.to_string()))
-            {
-                return Some(node_id);
-            }
+        {
+            return Some(node_id);
         }
 
         if let Some(node_id) = self
@@ -112,13 +111,13 @@ impl ProgramDependenceGraph {
         candidates: &[NodeId],
         file_hint: Option<&str>,
     ) -> Option<NodeId> {
-        if let Some(file_path) = file_hint {
-            if let Some(node_id) = candidates.iter().copied().find(|node_id| {
+        if let Some(file_path) = file_hint
+            && let Some(node_id) = candidates.iter().copied().find(|node_id| {
                 self.get_node(*node_id)
                     .is_some_and(|node| node.file_path.as_ref() == file_path)
-            }) {
-                return Some(node_id);
-            }
+            })
+        {
+            return Some(node_id);
         }
         candidates.first().copied()
     }

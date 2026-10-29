@@ -579,15 +579,16 @@ pub fn resolve_call(name: &str, args: Value) -> Result<(String, Value), JsonRpcE
 /// `mode` before this runs, so a bare format value has already been handed down
 /// as `format` together with the `phase` branch.
 fn apply_alias_defaults(spec: &BranchSpec, wanted: &str, args: &mut Value) {
-    if spec.tool == "leindex_find" && matches!(wanted, "grep" | "grep_symbols" | "symbols") {
-        if let Some(object) = args.as_object_mut() {
-            object.entry("target").or_insert_with(|| json!("auto"));
-        }
+    if spec.tool == "leindex_find"
+        && matches!(wanted, "grep" | "grep_symbols" | "symbols")
+        && let Some(object) = args.as_object_mut()
+    {
+        object.entry("target").or_insert_with(|| json!("auto"));
     }
-    if matches!(spec.tool, "leindex_git" | "leindex_manage") {
-        if let Some(object) = args.as_object_mut() {
-            object.insert("action".to_string(), json!(spec.branch));
-        }
+    if matches!(spec.tool, "leindex_git" | "leindex_manage")
+        && let Some(object) = args.as_object_mut()
+    {
+        object.insert("action".to_string(), json!(spec.branch));
     }
 }
 
@@ -624,11 +625,11 @@ fn take_discriminator(group: &GroupSpec, args: &mut Value) -> Option<String> {
         // `{"mode": "ultra"}` names no branch, so it is a phase request —
         // resolve to that branch and hand the value down as `format`, the name
         // the phase schema documents for router calls.
-        if find_branch(group, &value).is_none() {
-            if let Some(spec) = phase_format_branch(group, &value) {
-                object.insert("format".to_string(), json!(value));
-                return Some(spec.branch.to_string());
-            }
+        if find_branch(group, &value).is_none()
+            && let Some(spec) = phase_format_branch(group, &value)
+        {
+            object.insert("format".to_string(), json!(value));
+            return Some(spec.branch.to_string());
         }
         return Some(value);
     }
@@ -723,19 +724,20 @@ fn compact_property(definition: &Value) -> Value {
         .and_then(Value::as_str)
         .map(brief)
         .unwrap_or_default();
-    if let Some(default) = source.get("default") {
-        if !description.to_ascii_lowercase().contains("default") && !default.is_null() {
-            let text = match default {
-                Value::String(text) => text.clone(),
-                other => other.to_string(),
+    if let Some(default) = source.get("default")
+        && !description.to_ascii_lowercase().contains("default")
+        && !default.is_null()
+    {
+        let text = match default {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        if text.len() <= 24 {
+            description = if description.is_empty() {
+                format!("default {text}")
+            } else {
+                format!("{description} (default {text})")
             };
-            if text.len() <= 24 {
-                description = if description.is_empty() {
-                    format!("default {text}")
-                } else {
-                    format!("{description} (default {text})")
-                };
-            }
         }
     }
     if !description.is_empty() {
@@ -787,10 +789,10 @@ fn merge_properties(
                     if let Some(kind) = existing.get("type") {
                         loosened.insert("type".to_string(), kind.clone());
                     }
-                    if existing.get("items") == definition.get("items") {
-                        if let Some(items) = existing.get("items") {
-                            loosened.insert("items".to_string(), items.clone());
-                        }
+                    if existing.get("items") == definition.get("items")
+                        && let Some(items) = existing.get("items")
+                    {
+                        loosened.insert("items".to_string(), items.clone());
                     }
                 }
                 if let Some(description) = existing.get("description") {

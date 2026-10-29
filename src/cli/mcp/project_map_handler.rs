@@ -299,12 +299,11 @@ scoping to subdirectories, sorting, and pagination."
     ) -> Result<(String, PathBuf, PathBuf), JsonRpcError> {
         // Allow legacy "path" param; map it into "scope" for resolution.
         let mut args_with_scope = args.clone();
-        if let Some(obj) = args_with_scope.as_object_mut() {
-            if !obj.contains_key("scope") {
-                if let Some(path) = obj.get("path").cloned() {
-                    obj.insert("scope".to_string(), path);
-                }
-            }
+        if let Some(obj) = args_with_scope.as_object_mut()
+            && !obj.contains_key("scope")
+            && let Some(path) = obj.get("path").cloned()
+        {
+            obj.insert("scope".to_string(), path);
         }
         let scope = resolve_scope(&args_with_scope, project_path)?;
         let scope_str = scope.unwrap_or_else(|| {

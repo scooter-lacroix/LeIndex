@@ -216,10 +216,10 @@ impl LeIndex {
 
     /// Resolve the storage directory (in-project → LEINDEX_HOME → XDG → tmp).
     fn resolve_storage_path(project_path: &Path) -> Result<PathBuf> {
-        if let Some(existing) = Self::resolve_existing_storage_path(project_path) {
-            if Self::try_create_dir(&existing) {
-                return Ok(existing);
-            }
+        if let Some(existing) = Self::resolve_existing_storage_path(project_path)
+            && Self::try_create_dir(&existing)
+        {
+            return Ok(existing);
         }
         let path_hash = &blake3::hash(project_path.to_string_lossy().as_bytes()).to_hex()[..12];
         let dir_name = project_path
@@ -633,19 +633,16 @@ impl LeIndex {
     }
 
     fn get_project_scan(&mut self, refresh: bool) -> Result<ProjectFileScan> {
-        if !refresh {
-            if let Some(scan) = &self.cache.project_scan {
-                return Ok(scan.clone());
-            }
+        if !refresh && let Some(scan) = &self.cache.project_scan {
+            return Ok(scan.clone());
         }
         let project_id = self.project_id.clone();
-        if !refresh {
-            if let result @ Ok(_) = self
+        if !refresh
+            && let result @ Ok(_) = self
                 .cache
                 .get_project_scan(&project_id, false, || Err(anyhow::anyhow!("cache miss")))
-            {
-                return result;
-            }
+        {
+            return result;
         }
         let scan = self.scan_project_files()?;
         self.cache.cache_project_scan(&project_id, &scan);
