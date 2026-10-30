@@ -427,7 +427,7 @@ mod docs_packaging {
     /// glob cannot forget a module; this test pins the glob so the manifest
     /// style cannot silently regress.
     #[test]
-    fn crate_package_include_uses_src_glob() {
+    fn test_crate_package_include_uses_src_glob() {
         let cargo = root_cargo_toml();
         assert!(
             cargo.contains("\"/src/**\""),
@@ -447,7 +447,7 @@ mod docs_packaging {
     /// registry is warm by the time any test binary executes (the compile
     /// phase of this very `cargo test` run downloaded it).
     #[test]
-    fn crate_tarball_actually_contains_worker_source_and_config_modules() {
+    fn test_crate_tarball_actually_contains_worker_source_and_config_modules() {
         let output = std::process::Command::new("cargo")
             .args(["package", "--list", "--allow-dirty", "--offline"])
             .current_dir(repo_root())
