@@ -420,15 +420,63 @@ mod docs_packaging {
         );
     }
 
-    /// Package includes must ship the merged worker source + shared config/skip_dirs.
+    /// The include list must ship the whole src tree via one glob. The
+    /// explicit per-file manifest rotted once already: it named
+    /// `/src/config.rs` but never `/src/config/**`, so `mod remote_presets;`
+    /// and `mod cache;` shipped without their files (E0583 at publish). A
+    /// glob cannot forget a module; this test pins the glob so the manifest
+    /// style cannot silently regress.
     #[test]
-    fn crate_package_includes_embed_source() {
+    fn test_crate_package_include_uses_src_glob() {
         let cargo = root_cargo_toml();
-        for inc in ["/src/embed/**", "/src/config.rs", "/src/skip_dirs.rs"] {
+        assert!(
+            cargo.contains("\"/src/**\""),
+            "crate package include list must contain \"/src/**\" (whole-tree glob, not per-file entries)"
+        );
+        assert!(
+            cargo.contains("/docs/NEURAL_SETUP.md"),
+            "crate package include list must contain docs/NEURAL_SETUP.md because README points to it"
+        );
+    }
+
+    /// Reality check against the actual tarball contents, not the manifest
+    /// text: `cargo package --list` prints exactly the files `cargo publish`
+    /// would ship. The text-based assertions above kept passing while the
+    /// tarball was broken (v2.1.5 died at publish with E0583), so the guard
+    /// must also inspect the package itself. `--offline` is safe here: the
+    /// registry is warm by the time any test binary executes (the compile
+    /// phase of this very `cargo test` run downloaded it).
+    #[test]
+    fn test_crate_tarball_actually_contains_worker_source_and_config_modules() {
+        let output = std::process::Command::new("cargo")
+            .args(["package", "--list", "--allow-dirty", "--offline"])
+            .current_dir(repo_root())
+            .output()
+            .expect("cargo package --list must run");
+        assert!(
+            output.status.success(),
+            "cargo package --list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let listed: Vec<&str> = stdout.lines().map(str::trim).collect();
+        for required in [
+            // Merged worker source (the embed tree, including its nested
+            // cache/ directory module).
+            "src/embed/worker_main.rs",
+            "src/embed/cache/store.rs",
+            "src/embed/cache/key.rs",
+            // Config module tree — the two files whose absence killed v2.1.5.
+            "src/config/remote_presets.rs",
+            "src/config/cache.rs",
+            // Shared module + lib test modules a fresh `cargo test` needs.
+            "src/skip_dirs.rs",
+            "src/config_test.rs",
+            "src/test_env.rs",
+        ] {
             assert!(
-                cargo.contains(inc),
-                "crate package include list must contain '{}' (merged worker source)",
-                inc
+                listed.contains(&required),
+                "packaged tarball must contain '{required}' — the include list dropped it again"
             );
         }
     }
