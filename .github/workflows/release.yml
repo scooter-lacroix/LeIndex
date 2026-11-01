@@ -289,7 +289,7 @@ jobs:
       # tooling, and the model file's expected ABI. Pinned == reproducible
       # bundles regardless of upstream point releases.
       - name: Set up Python (for ORT wheel extraction)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -976,7 +976,7 @@ jobs:
 
       - name: Setup Python
         if: steps.check_token.outputs.available == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
