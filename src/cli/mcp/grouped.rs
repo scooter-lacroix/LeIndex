@@ -754,10 +754,14 @@ fn tier_property() -> Value {
     })
 }
 
+/// Minimal description for the per-turn `tools/list` context: the value
+/// itself is obvious from the name, and every other router repeats it. The
+/// non-obvious part (indexing is NOT automatic) lives in the guide resource,
+/// which is read once instead of paid per turn.
 fn project_path_property() -> Value {
     json!({
         "type": "string",
-        "description": "Project directory (omit for current). Indexing is NOT automatic: an unindexed project answers with a 'project not indexed' error until you run the index action."
+        "description": "Project directory; defaults to the server's project."
     })
 }
 
@@ -1038,8 +1042,10 @@ pub fn tools_guide_markdown(handlers: &[ToolHandler]) -> String {
         "# LeIndex tool guide\n\nLeIndex exposes {} tools. Pick the tool, then the branch with \
          {selectors}; every other argument is forwarded \
          unchanged to that branch. `project_path` is accepted everywhere (omit it to use the \
-         server's project). `tier` (`l0` identity card, `l1` bounded overview — default, `l2` full \
-         detail) is accepted everywhere.\n\nThe individual tool names (`leindex_search`, \
+         server's project). Indexing is NOT automatic: an unindexed project answers with a \
+         'project not indexed' error until you run the index action. `tier` (`l0` identity card, \
+         `l1` bounded overview — default, `l2` full detail) is accepted everywhere.\n\nThe \
+         individual tool names (`leindex_search`, \
          `leindex_edit_apply`, ...) still work as direct calls.\n",
         GROUPS.len()
     );
@@ -1590,5 +1596,36 @@ mod tests {
         // branch that lands here must not push past this without the same
         // accounting.
         assert!(grouped <= 17_500, "tools/list grew to {grouped} bytes");
+    }
+
+    /// Absolute regression cap on the advertised `tools/list` payload (§6.10):
+    /// descriptions are per-turn context paid on every session. 15,960 bytes
+    /// is the measured size after lane A shrank the shared per-router
+    /// `project_path` boilerplate (16,510 before) and moved its non-obvious
+    /// detail into `leindex://tools/guide`. The ceiling adds ~5% headroom;
+    /// the 17,500 backstop above predates this and stays. If a legitimate
+    /// change moves the payload past this line, name what moved it and raise
+    /// the ceiling consciously.
+    #[test]
+    fn test_tools_list_payload_cannot_grow_past_measured_ceiling() {
+        let handlers = all_tool_handlers();
+        let grouped = serde_json::to_string(&public_tools_json(&handlers))
+            .unwrap()
+            .len();
+        assert!(
+            grouped <= 16_800,
+            "tools/list grew to {grouped} bytes (ceiling 16,800 = measured 15,960 + ~5%)"
+        );
+    }
+
+    /// The detail dropped from the advertised schema must be recoverable:
+    /// `leindex://tools/guide` is the doc-of-record for argument semantics.
+    #[test]
+    fn test_guide_carries_the_project_path_detail() {
+        let guide = tools_guide_markdown(&all_tool_handlers());
+        assert!(
+            guide.contains("Indexing is NOT automatic"),
+            "detail removed from tools/list must live in the guide:\n{guide}"
+        );
     }
 }

@@ -276,7 +276,7 @@ async fn state(registry: &Arc<ProjectRegistry>, args: &Value) -> Result<Value, J
         "last_failure_phase": health.last_failure_phase.map(|phase| phase.as_str()),
         "last_failure": health.last_failure,
         "next": if complete {
-            "leindex_manage action=index with force_reindex=true to rebuild"
+            "the generation is current; leindex_manage action=index refreshes incrementally when the worktree changes"
         } else {
             "the last index run did not complete; run leindex_manage action=index to resume"
         },
