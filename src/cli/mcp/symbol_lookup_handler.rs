@@ -21,11 +21,29 @@ struct LookupEnv<'a> {
     include_callers: bool,
     include_callees: bool,
     depth: usize,
+    /// Caller page to serve (brief §6.2: `+N more callers — next: <offset>`).
+    caller_offset: usize,
+    /// Alternate lookup body: relations (default), construct/match usage
+    /// sites (§6.3) or exercising tests (§6.4).
+    kind: LookupKind,
     started: Instant,
     budget: WorkBudget,
     index_freshness: &'static str,
     index_stale: bool,
     graph_has_call_edges: bool,
+}
+
+/// The `kind` discriminator: what the lookup should return *about* the symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LookupKind {
+    /// Callers, callees, impact — the default body.
+    Relations,
+    /// Struct-literal construction sites (`Foo { .. }`, §6.3).
+    Construct,
+    /// Enum-variant pattern sites (`match` arms, `if let`, `matches!`, §6.3).
+    Match,
+    /// Tests exercising the symbol via the call graph, with run commands (§6.4).
+    Tests,
 }
 
 #[allow(missing_docs)]
@@ -95,6 +113,18 @@ For the exact source implementation use LeIndex [Read Symbol]."
                     "minimum": 1,
                     "maximum": 5
                 },
+                "kind": {
+                    "type": "string",
+                    "enum": ["relations", "construct", "match", "tests"],
+                    "description": "What to return: relations (default: callers/callees/impact), construct (struct-literal sites), match (enum-pattern sites), tests (exercising tests + run commands)",
+                    "default": "relations"
+                },
+                "caller_offset": {
+                    "type": "integer",
+                    "description": "Callers to skip before collecting; take it from callers_next_offset of the previous response",
+                    "default": 0,
+                    "minimum": 0
+                },
                 "max_latency_ms": {
                     "type": "integer",
                     "description": "Optional caller/callee enrichment budget (default: 250)",
@@ -125,6 +155,8 @@ For the exact source implementation use LeIndex [Read Symbol]."
         let include_callees = extract_bool(&args, "include_callees", true);
         let depth = extract_usize(&args, "depth", 2)?.min(5);
         let token_budget = extract_usize(&args, "token_budget", 1500)?;
+        let caller_offset = extract_usize(&args, "caller_offset", 0)?;
+        let kind = extract_lookup_kind(&args)?;
         let budget = WorkBudget {
             max_latency_ms: extract_usize(&args, "max_latency_ms", 250)?.min(60000) as u64,
             allow_partial: extract_bool(&args, "allow_partial", true),
@@ -192,6 +224,8 @@ For the exact source implementation use LeIndex [Read Symbol]."
             include_callers,
             include_callees,
             depth,
+            caller_offset,
+            kind,
             started,
             budget,
             index_freshness,
@@ -564,6 +598,30 @@ fn summarize_nodes(
         .collect();
     let truncated = capped_nodes.len() > 50;
     (capped_nodes.into_iter().take(50).collect(), truncated)
+}
+
+/// Parse the `kind` discriminator; unknown values are a named error, not a
+/// silent fallback to relations.
+fn extract_lookup_kind(args: &Value) -> Result<LookupKind, JsonRpcError> {
+    let Some(raw) = args.get("kind") else {
+        return Ok(LookupKind::Relations);
+    };
+    let Value::String(text) = raw else {
+        return Err(JsonRpcError::invalid_params(
+            "'kind' must be a string (relations | construct | match | tests)".to_string(),
+        ));
+    };
+    match text.trim().to_ascii_lowercase().as_str() {
+        "" | "relations" | "callers" | "calls" => Ok(LookupKind::Relations),
+        "construct" | "constructs" | "construction" => Ok(LookupKind::Construct),
+        "match" | "matches" | "pattern" | "patterns" => Ok(LookupKind::Match),
+        "tests" | "test" => Ok(LookupKind::Tests),
+        other => Err(JsonRpcError::invalid_params_with_suggestion(
+            format!("Unknown kind: '{other}'"),
+            "Use kind: relations (default) | construct (struct-literal sites) | \
+             match (enum-pattern sites) | tests (exercising tests + run commands)",
+        )),
+    }
 }
 
 fn parse_symbols(args: &Value) -> Result<Vec<String>, JsonRpcError> {
