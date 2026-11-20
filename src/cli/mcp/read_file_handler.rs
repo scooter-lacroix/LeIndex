@@ -1,7 +1,7 @@
 use super::helpers::{
     extract_bool, extract_string, extract_usize, get_direct_callers, node_type_str,
-    validate_file_within_project, wrap_live_with_meta, wrap_with_meta,
 };
+use super::read_paths::{self, ConsultVerdict};
 use super::protocol::JsonRpcError;
 use crate::cli::live_project::LiveProject;
 use crate::cli::registry::{ProjectHandle, ProjectRegistry};
@@ -83,25 +83,47 @@ fn detect_language(extension: &str) -> &str {
         .map_or(extension, |(_, language)| *language)
 }
 
+/// Project root for handle parsing and PDG enrichment labels.
+///
+/// An unindexed or unresolved project is NOT an error for a read: an
+/// absolute path outside any project is a valid live read (brief §6.1), and
+/// a relative path only needs the root when it is actually relative.
 async fn resolve_project_root(
     registry: &Arc<ProjectRegistry>,
     args: &Value,
-) -> Result<PathBuf, JsonRpcError> {
+) -> Option<PathBuf> {
     if let Some(project_path) = args.get("project_path").and_then(|value| value.as_str()) {
         return LiveProject::resolve(project_path)
-            .map(|project| project.root().to_path_buf())
-            .map_err(|error| JsonRpcError::invalid_params(error.to_string()));
+            .ok()
+            .map(|project| project.root().to_path_buf());
     }
 
-    registry.default_project_path().await
+    registry.default_project_path().await.ok()
 }
 
-async fn read_visible_content(
-    resolved_file_path: &Path,
-    args: &Value,
-    start_line: usize,
-    max_lines: usize,
-) -> Result<(String, usize, usize, String), JsonRpcError> {
+/// Resolve the file argument to a path on disk. Absolute paths read from
+/// disk as-is — the project boundary is irrelevant to a live read (§6.1),
+/// which is what makes logs, /tmp files and other repos readable. Relative
+/// paths join against the project root.
+fn resolve_read_target(
+    file_path: &str,
+    project_root: Option<&Path>,
+) -> Result<PathBuf, JsonRpcError> {
+    let candidate = Path::new(file_path);
+    if candidate.is_absolute() {
+        return Ok(candidate.to_path_buf());
+    }
+    let Some(root) = project_root else {
+        return Err(JsonRpcError::invalid_params(format!(
+            "Relative path '{file_path}' needs a project: pass project_path, or use an absolute file_path"
+        )));
+    };
+    Ok(root.join(file_path))
+}
+
+/// Live bytes of `path`: full content plus the line count. A read never
+/// touches the index — the bytes on disk are the answer (brief §3.10).
+async fn read_file_content(resolved_file_path: &Path) -> Result<(String, usize), JsonRpcError> {
     let content = tokio::fs::read_to_string(resolved_file_path)
         .await
         .map_err(|error| {
@@ -112,36 +134,33 @@ async fn read_visible_content(
             ))
         })?;
     let total_lines = content.lines().count();
-    let end_line_raw = extract_usize(args, "end_line", total_lines)?;
-    let end_line = end_line_raw
-        .min(total_lines)
-        .min(start_line.saturating_add(max_lines).saturating_sub(1));
+    Ok((content, total_lines))
+}
 
+/// Validate the requested window against the file and slice it (1-based,
+/// inclusive bounds).
+fn visible_slice(
+    content: &str,
+    start_line: usize,
+    end_line: usize,
+    total_lines: usize,
+) -> Result<String, JsonRpcError> {
     if total_lines > 0 && start_line > total_lines {
         return Err(JsonRpcError::invalid_params(format!(
-            "start_line {} exceeds total lines {}",
-            start_line, total_lines
+            "start_line {start_line} exceeds total lines {total_lines}"
         )));
     }
     if total_lines > 0 && end_line < start_line {
         return Err(JsonRpcError::invalid_params(format!(
-            "end_line {} precedes start_line {}",
-            end_line_raw, start_line
+            "end_line {end_line} precedes start_line {start_line}"
         )));
     }
-
-    let visible_lines: Vec<String> = if total_lines == 0 {
-        Vec::new()
-    } else {
-        content
-            .lines()
-            .skip(start_line - 1)
-            .take(end_line.min(total_lines) - (start_line - 1))
-            .enumerate()
-            .map(|(index, line)| format!("{}: {}", start_line + index, line))
-            .collect()
-    };
-    Ok((content, total_lines, end_line, visible_lines.join("\n")))
+    Ok(content
+        .lines()
+        .skip(start_line - 1)
+        .take(end_line.saturating_sub(start_line - 1))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 fn visible_byte_range(
@@ -335,20 +354,23 @@ fn language_for(file_path: &str) -> String {
 /// An explicit symbol-map request must not silently degrade: a handle can lack
 /// a resident PDG (fresh one-shot process, or an auto-index swapped in a new
 /// LeIndex whose graph was dropped at completion). Load it on demand in that
-/// case (audit #7: the flag was a no-op).
-async fn ensure_symbol_map_pdg(
-    handle: Option<ProjectHandle>,
-    wanted: bool,
-) -> Option<ProjectHandle> {
+/// case (audit #7: the flag was a no-op) — but WITHOUT holding the project
+/// write lock while doing it. §3.10: a read must never queue behind a
+/// background reindex that holds the write lock; the hydration itself is
+/// still serialized behind that lock, but this call neither waits for it nor
+/// takes the lock at all.
+async fn ensure_symbol_map_pdg(handle: Option<ProjectHandle>, wanted: bool) -> Option<ProjectHandle> {
     match handle {
         Some(handle) if wanted => {
-            let mut guard = handle.write().await;
-            if guard.pdg().is_none() {
-                // The symbol map lists graph nodes only; the full engine
-                // load here added ~1s to every cold read with a map.
-                let _ = guard.ensure_pdg_loaded_graph_only();
+            if let Ok(mut guard) = handle.try_write() {
+                if guard.pdg().is_none() {
+                    // The symbol map lists graph nodes only; the full engine
+                    // load here added ~1s to every cold read with a map.
+                    let _ = guard.ensure_pdg_loaded_graph_only();
+                }
             }
-            drop(guard);
+            // Lock busy (a reindex is running): serve without the map rather
+            // than block — the read itself is exact either way.
             Some(handle)
         }
         other => other,
@@ -356,12 +378,17 @@ async fn ensure_symbol_map_pdg(
 }
 
 /// The resident PDG, cloned for the blocking enrichment task.
+///
+/// §3.10: use `try_read` so a read never queues behind a background reindex
+/// holding the project write lock. A busy lock just means no PDG annotation
+/// for this response; the exact bytes are unaffected.
 async fn pdg_snapshot(handle: Option<&ProjectHandle>) -> Option<ProgramDependenceGraph> {
-    if let Some(handle) = handle {
-        let guard = handle.read().await;
-        guard.pdg().cloned()
-    } else {
-        None
+    match handle {
+        Some(handle) => {
+            let guard = handle.try_read().ok()?;
+            guard.pdg().cloned()
+        }
+        None => None,
     }
 }
 
@@ -407,20 +434,11 @@ async fn pdg_enrichment(
     Ok((symbol_map, context, "fresh"))
 }
 
-/// Attach the freshness badge from the resident handle when there is one, else
-/// the live-only badge for a project with no loaded index.
-async fn wrap_read_result(
-    result: Value,
-    handle: Option<&ProjectHandle>,
-    project_root: &Path,
-) -> Value {
-    match handle {
-        Some(handle) => {
-            let guard = handle.read().await;
-            wrap_with_meta(result, &guard)
-        }
-        None => wrap_live_with_meta(result, project_root),
-    }
+/// Attach the read-path freshness badge WITHOUT touching the project lock
+/// (§3.10). Reads the health snapshot file directly, so a background
+/// reindex holding the write lock cannot stall or gate a live read.
+fn wrap_read_result(result: Value, project_root: &Path) -> Value {
+    super::helpers::wrap_read_live_meta(result, project_root)
 }
 
 #[allow(missing_docs)]
@@ -434,9 +452,10 @@ impl ReadFileHandler {
     }
 
     pub fn description(&self) -> &str {
-        "PRIMARY file reader — returns exact file contents with line numbers PLUS context \
-showing symbols, imports, and dependents. One call replaces Read + Grep for imports. \
-Works for any text file including configs and docs."
+        "PRIMARY file reader — live exact bytes with single line numbers, stable handles \
+(path#symbol, path#L600-800), optional elided views (focus_symbol) and session dedup \
+(re-reads of unchanged content answer `unchanged since read #N`; fresh:true bypasses). \
+Works for any absolute path, including outside the project — no index required."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -445,7 +464,7 @@ Works for any text file including configs and docs."
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute path to file to read"
+                    "description": "File to read: absolute path (anywhere on disk), project-relative path, or handle (path#symbol, path#L600-800)"
                 },
                 "start_line": {
                     "type": "integer",
@@ -465,6 +484,15 @@ Works for any text file including configs and docs."
                     "minimum": 1,
                     "maximum": 2000
                 },
+                "focus_symbol": {
+                    "type": "string",
+                    "description": "Elided read: this symbol in full, sibling top-level items collapsed to one-line signatures with [expand: path#item] handles"
+                },
+                "fresh": {
+                    "type": "boolean",
+                    "description": "Bypass session dedup and serve the bytes even if unchanged since a previous read",
+                    "default": false
+                },
                 "include_symbol_map": {
                     "type": "boolean",
                     "description": "Include PDG symbol annotations (default: false). \
@@ -473,7 +501,7 @@ Works for any text file including configs and docs."
                 },
                 "project_path": {
                     "type": "string",
-                    "description": "Project directory (omit to use current project). Indexing is NOT automatic: an unindexed project answers with a 'project not indexed' error until you run the index action."
+                    "description": "Project directory for relative paths and PDG annotations. Reads never require an index."
                 }
             },
             "required": ["file_path"]
@@ -485,27 +513,224 @@ Works for any text file including configs and docs."
         registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
-        let file_path = extract_string(&args, "file_path")?;
-        let start_line = extract_usize(&args, "start_line", 1)?.max(1);
+        let file_arg = extract_string(&args, "file_path")?;
         let max_lines = extract_usize(&args, "max_lines", 500)?.min(2000);
         let include_symbol_map = extract_bool(&args, "include_symbol_map", false);
+        let fresh = extract_bool(&args, "fresh", false);
+        let focus_symbol = args
+            .get("focus_symbol")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
-        // Resolve and validate against the live project without creating or
-        // hydrating a registry entry. Resident PDG data is enrichment only;
-        // an exact file read must remain useful before any index exists.
-        let project_root = resolve_project_root(registry, &args).await?;
-        let resolved_file_path = validate_file_within_project(&file_path, &project_root)?;
-        let maybe_handle = registry.try_get_loaded(&project_root).await;
+        // An unindexed or unresolved project is fine: absolute paths read
+        // live regardless (§6.1); only relative paths need the root.
+        let project_root = resolve_project_root(registry, &args).await;
 
-        let (content, total_lines, end_line, content_str) =
-            read_visible_content(&resolved_file_path, &args, start_line, max_lines).await?;
+        // Handle form: `path`, `path#symbol`, `path#L600-800` (§4.1).
+        let handle = read_paths::parse_read_handle(&file_arg, project_root.as_deref());
+        let resolved_file_path = resolve_read_target(&handle.file_path, project_root.as_deref())?;
 
-        let language = language_for(&file_path);
+        // THE read: live bytes, no index, no project lock (§3.10).
+        let (content, total_lines) = read_file_content(&resolved_file_path).await?;
+        let language = language_for(&handle.file_path);
 
-        let maybe_handle = ensure_symbol_map_pdg(maybe_handle, include_symbol_map).await;
+        // Window resolution. Precedence: explicit start/end args, then the
+        // #L600-800 fragment, then a symbol anchor, then the whole file.
+        let explicit_start = extract_usize(&args, "start_line", 0)?.max(0);
+        let explicit_end = extract_usize(&args, "end_line", 0)?.max(0);
+        let symbol_target = handle.symbol.clone().or_else(|| focus_symbol.clone());
+
+        let mut anchor: Option<(usize, usize)> = None;
+        if let Some(target) = &symbol_target {
+            let live = super::read_symbol_handler::parse_live_file(resolved_file_path.clone())
+                .await?;
+            let spans = read_paths::spans_with_lines(&content, &live.symbols);
+            let span = read_paths::find_span(&spans, target).ok_or_else(|| {
+                JsonRpcError::invalid_params(format!(
+                    "Symbol '{target}' not found in {}",
+                    resolved_file_path.display()
+                ))
+            })?;
+            anchor = Some((span.start_line, span.end_line));
+        }
+        let (anchor_start, anchor_end) = anchor.unwrap_or((1, 1));
+        let start_line = if explicit_start > 0 {
+            explicit_start.max(1)
+        } else {
+            handle
+                .line_range
+                .map(|(start, _)| start)
+                .unwrap_or(anchor_start)
+        };
+        let end_line = if explicit_end > 0 {
+            explicit_end
+        } else {
+            handle
+                .line_range
+                .map(|(_, end)| end)
+                .unwrap_or(anchor_end)
+        }
+        .min(total_lines.max(1))
+        .min(start_line.saturating_add(max_lines).saturating_sub(1));
+
+        let session = args
+            .get("_session")
+            .and_then(Value::as_str)
+            .unwrap_or("__process__");
+        let ledger = read_paths::session_ledger();
+        let content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+        let range_handle = read_paths::handle_for_range(
+            &resolved_file_path,
+            project_root.as_deref(),
+            start_line,
+            end_line,
+        );
+
+        // Elided view (§4.1): focus symbol in full, siblings collapsed.
+        // Always served — a view is not the same answer as the bytes.
+        if let Some(focus) = &focus_symbol {
+            let live = super::read_symbol_handler::parse_live_file(resolved_file_path.clone())
+                .await?;
+            let file_label = project_root
+                .as_deref()
+                .and_then(|root| resolved_file_path.strip_prefix(root).ok())
+                .map(|rel| rel.to_string_lossy().into_owned())
+                .unwrap_or_else(|| resolved_file_path.to_string_lossy().into_owned());
+            let elided = read_paths::elide_around(
+                &content,
+                &live.symbols,
+                focus,
+                &file_label,
+                max_lines,
+            )
+            .map_err(JsonRpcError::invalid_params)?;
+
+            let mut result = serde_json::json!({
+                "file_path": handle.file_path,
+                "language": language,
+                "total_lines": total_lines,
+                "elided": true,
+                "focus_symbol": focus,
+                "focus_line_start": elided.focus_start_line,
+                "focus_line_end": elided.focus_end_line,
+                "expand": elided.expand,
+                "handle": range_handle,
+                "content": elided.body,
+                "collapsed": elided.collapsed.iter().map(|item| serde_json::json!({
+                    "name": item.name,
+                    "signature": item.signature,
+                    "line": item.start_line,
+                    "lines": item.line_count,
+                    "expand": format!("{file_label}#{}", item.name),
+                })).collect::<Vec<_>>(),
+                "retrieval": serde_json::json!({
+                    "tfidf_status": "not_used_exact",
+                    "pdg_status": "not_needed_live",
+                    "neural_status": "not_used_exact"
+                }),
+            });
+            result = wrap_read_result(result, project_root.as_deref().unwrap_or(&resolved_file_path));
+            // The focus bytes were served in full — record that range.
+            ledger.record(
+                session,
+                &resolved_file_path,
+                &content_hash,
+                elided.focus_start_line,
+                elided.focus_end_line,
+            );
+            return Ok(result);
+        }
+
+        // Session dedup (§4.1): an unchanged re-read costs bytes, not tokens.
+        if !fresh {
+            match ledger.consult(
+                session,
+                &resolved_file_path,
+                &content_hash,
+                start_line,
+                end_line,
+            ) {
+                ConsultVerdict::Unchanged {
+                    since_ordinal,
+                    start_line,
+                    end_line,
+                } => {
+                    let mut payload = read_paths::unchanged_payload(
+                        &handle.file_path,
+                        since_ordinal,
+                        start_line,
+                        end_line,
+                    );
+                    payload["language"] = serde_json::json!(language);
+                    payload["total_lines"] = serde_json::json!(total_lines);
+                    payload["handle"] = serde_json::json!(range_handle);
+                    payload["retrieval"] = serde_json::json!({
+                        "tfidf_status": "not_used_exact",
+                        "pdg_status": "not_needed_live",
+                        "neural_status": "not_used_exact"
+                    });
+                    return Ok(wrap_read_result(
+                        payload,
+                        project_root.as_deref().unwrap_or(&resolved_file_path),
+                    ));
+                }
+                ConsultVerdict::PartialOverlap {
+                    unseen,
+                    since_ordinal,
+                } => {
+                    // Serve only the unseen lines; reference the rest.
+                    let mut body = String::new();
+                    let mut served_ranges: Vec<(usize, usize)> = Vec::new();
+                    for (s, e) in &unseen {
+                        let end = (*e).min(total_lines.max(1));
+                        if let Ok(slice) = visible_slice(&content, *s, end, total_lines) {
+                            let numbered =
+                                read_paths::number_lines(&slice, *s);
+                            if !body.is_empty() {
+                                body.push('\n');
+                            }
+                            body.push_str(&numbered);
+                            served_ranges.push((*s, end));
+                        }
+                    }
+                    let mut result = serde_json::json!({
+                        "file_path": handle.file_path,
+                        "language": language,
+                        "total_lines": total_lines,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                        "unchanged_since_read": since_ordinal,
+                        "unchanged_ranges": format!("{start_line}-{end_line} minus served ranges below"),
+                        "handle": range_handle,
+                        "content": body,
+                    });
+                    for (s, e) in &served_ranges {
+                        ledger.record(session, &resolved_file_path, &content_hash, *s, *e);
+                    }
+                    result["retrieval"] = serde_json::json!({
+                        "tfidf_status": "not_used_exact",
+                        "pdg_status": "not_needed_live",
+                        "neural_status": "not_used_exact"
+                    });
+                    return Ok(wrap_read_result(
+                        result,
+                        project_root.as_deref().unwrap_or(&resolved_file_path),
+                    ));
+                }
+                ConsultVerdict::New => {}
+            }
+        }
+
+        let content_str = visible_slice(&content, start_line, end_line, total_lines)?;
+
+        let maybe_handle = ensure_symbol_map_pdg(
+            registry.try_get_loaded(&project_root.as_deref().unwrap_or(Path::new(""))).await,
+            include_symbol_map,
+        )
+        .await;
         let (symbol_map, context, pdg_status) = pdg_enrichment(
             maybe_handle.as_ref(),
-            &file_path,
+            &handle.file_path,
             &resolved_file_path,
             &content,
             start_line,
@@ -516,13 +741,21 @@ Works for any text file including configs and docs."
         .await?;
 
         let mut result = serde_json::json!({
-            "file_path": file_path,
+            "file_path": handle.file_path,
             "language": language,
             "total_lines": total_lines,
             "start_line": start_line,
-            "end_line": end_line.min(total_lines),
-            "content": content_str,
+            "end_line": end_line,
+            "handle": range_handle,
+            "content": read_paths::number_lines(&content_str, start_line),
         });
+
+        // Symbol-anchored reads report what they resolved to.
+        if let Some((s, e)) = anchor {
+            result["anchor_symbol"] = serde_json::json!(symbol_target.clone().unwrap_or_default());
+            result["anchor_line_start"] = serde_json::json!(s);
+            result["anchor_line_end"] = serde_json::json!(e);
+        }
 
         // Always attach compact context when available
         if let Some(ctx) = context {
@@ -540,8 +773,9 @@ Works for any text file including configs and docs."
             result["symbol_map"] = serde_json::json!(symbol_map);
         }
 
-        // Add staleness warning only if we have an indexed project
-        result = wrap_read_result(result, maybe_handle.as_ref(), &project_root).await;
+        result = wrap_read_result(result, project_root.as_deref().unwrap_or(&resolved_file_path));
+
+        ledger.record(session, &resolved_file_path, &content_hash, start_line, end_line);
 
         Ok(result)
     }

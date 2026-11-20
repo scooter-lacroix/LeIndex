@@ -141,6 +141,56 @@ pub(crate) fn wrap_live_with_meta(result: Value, project_root: &std::path::Path)
     wrap_live_with_meta_status(result, project_root, live_status.as_ref(), live_dirty)
 }
 
+/// Read-path freshness badge (brief §3.10, lane E).
+///
+/// `read_file` is a LIVE filesystem read: the exact bytes were served from
+/// disk, so the response must never claim `initializing` or any other
+/// reindex state — that describes OTHER files' indexing, not this read.
+/// This helper reads the persisted health snapshot directly (no project
+/// handle, no lock, no `git status` fork), so a background reindex holding
+/// the project write lock can neither block the read nor attach its state.
+/// Lane A's `wrap_*` functions are untouched; this is the read-path variant
+/// the SPEC assigns to E.
+pub(crate) fn wrap_read_live_meta(result: Value, project_root: &std::path::Path) -> Value {
+    let storage_path = crate::cli::leindex::resolve_existing_storage_path(project_root)
+        .unwrap_or_else(|| project_root.join(".leindex"));
+    let health = crate::cli::index_freshness::load_health(&storage_path);
+    let (status, generation) = match &health {
+        Some(health) => (health.status, Some(health.generation)),
+        None => (ComponentStatus::NotLoaded, None),
+    };
+    let status_text = match status {
+        ComponentStatus::Initializing => "fresh",
+        // Fresh/Pending: healthy states never read as reindex noise.
+        ComponentStatus::Failed | ComponentStatus::Stale | ComponentStatus::Partial => "stale",
+        _ => "fresh",
+    };
+    if let Some(obj) = result.as_object_mut() {
+        let meta = obj
+            .entry("_meta".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(meta_obj) = meta.as_object_mut() {
+            meta_obj.insert(
+                "read_source".to_string(),
+                Value::String("live_bytes".to_string()),
+            );
+            let freshness = meta_obj
+                .entry("freshness".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(freshness_obj) = freshness.as_object_mut() {
+                freshness_obj.insert(
+                    "status".to_string(),
+                    Value::String(status_text.to_string()),
+                );
+                if let Some(generation) = generation {
+                    freshness_obj.insert("generation".to_string(), serde_json::json!(generation));
+                }
+            }
+        }
+    }
+    result
+}
+
 /// Number of files a worktree delta touches, in every dirty category.
 fn dirty_count(status: &crate::cli::git::GitStatus) -> usize {
     status.modified.len() + status.staged.len() + status.untracked.len() + status.deleted.len()
