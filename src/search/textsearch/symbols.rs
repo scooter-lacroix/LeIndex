@@ -151,6 +151,7 @@ mod tests {
             root: root.to_path_buf(),
             index,
             filter: crate::search::textsearch::FileFilter::new(&[], &[], None),
+            bypass_ignore: false,
         }
     }
 

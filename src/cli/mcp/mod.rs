@@ -61,6 +61,8 @@ pub mod edit_cache;
 pub mod edit_preview_handler;
 /// Handler for LeIndex [File Summary] — structured file analysis.
 pub mod file_summary_handler;
+/// Stable `next` continuation tokens shared by the list-returning tools (§6.8).
+pub mod find_paging;
 /// Handler for LeIndex \[Find\] — index-accelerated text/symbol search.
 pub mod find_handler;
 /// Handler for LeIndex [Git Diff] — PDG-enriched diff.

@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 const DEFAULT_LIMIT: usize = 50;
 const DEFAULT_PER_FILE: usize = 20;
 const DEFAULT_TIMEOUT_MS: usize = 20_000;
+/// Characters a token_budget entry may cost before the page is full.
+const CHARS_PER_TOKEN: usize = 4;
 /// Hard ceiling on a page. `limit` has no schema maximum today, and the
 /// engine buffers `offset + limit` hits per file to keep pagination
 /// complete — an unbounded `limit: 100_000_000` let one request park
@@ -116,12 +118,15 @@ impl FindHandler {
                 "scope": { "type": "string", "description": "Restrict to a project-relative directory or file" },
                 "include_globs": { "type": "array", "items": { "type": "string" }, "description": "Only these, e.g. [\"*.rs\"]" },
                 "exclude_globs": { "type": "array", "items": { "type": "string" }, "description": "Skip these, e.g. [\"vendor/\"]" },
-                "output": { "type": "string", "enum": ["matches", "files", "count", "symbols"], "default": "matches", "description": "matches (default), files, count, or symbols (enclosing symbols by hits)" },
+                "output": { "type": "string", "enum": ["matches", "files", "count", "symbols", "definitions", "callsites", "exists"], "default": "matches", "description": "matches (default), files, count, symbols (enclosing symbols by hits), definitions (where it is defined), callsites (call lines, definition excluded), exists (boolean + first location)" },
                 "kind": { "type": "string", "description": "target=symbols: function, class, struct, ..." },
-                "context_lines": { "type": "integer", "default": 0, "minimum": 0, "maximum": 10, "description": "Context lines per match" },
+                "token_budget": { "type": "integer", "minimum": 0, "description": "Cap the page at roughly this many tokens (1 token = 4 chars); files fill greedily in rank order and the page ends with +N more — next: <token>" },
+                "include_tests": { "type": "boolean", "default": false, "description": "Show test-file hits in full instead of collapsing them to one line after the source hits" },
+                "next": { "type": "string", "description": "Continuation token from a previous page's `next`; pass it (plus project_path) alone to continue without re-sending the query" },
+                "context_lines": { "type": "integer", "default": 0, "minimum": 0, "maximum": 10, "description": "Context lines per match (adjacent windows are merged, no line repeats)" },
                 "limit": { "type": "integer", "default": DEFAULT_LIMIT, "minimum": 0, "maximum": MAX_LIMIT, "description": "Hits per page; 0 = ceiling (10000)" },
                 "offset": { "type": "integer", "default": 0, "minimum": 0, "maximum": MAX_LIMIT, "description": "Hits to skip; clamped to 10000; stream ends there" },
-                "per_file_cap": { "type": "integer", "default": DEFAULT_PER_FILE, "minimum": 0, "description": "Shown per file; past-cap matches appear on no page; 0 = no cap" },
+                "per_file_cap": { "type": "integer", "default": DEFAULT_PER_FILE, "minimum": 0, "description": "Shown per file; matches past the cap stay reachable on the next page (offset/next) and the file announces +K more; 0 = no cap" },
                 "max_line_chars": { "type": "integer", "default": 200, "minimum": 20, "maximum": 2000, "description": "Longest line shown" },
                 "timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": 0, "description": "Time budget; partial results + has_more. 0 = none" },
                 "project_path": { "type": "string", "description": "Project directory; omit to use the current project" }
@@ -135,6 +140,17 @@ impl FindHandler {
         registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
+        // §6.8: `next` alone (with project_path) continues a previous call
+        // without re-sending the query. The stored arguments win; the
+        // caller's overrides (project_path) merge over them; the position
+        // comes from the token.
+        if let Some(token) = args.get("next").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+            let resumed = crate::cli::mcp::find_paging::resume("leindex_find", token).map_err(
+                |reason| JsonRpcError::invalid_params_with_suggestion(reason, "Re-send the full query"),
+            )?;
+            let merged = crate::cli::mcp::find_paging::merge(&resumed.args, &args, resumed.offset);
+            return Box::pin(self.run(registry, merged)).await;
+        }
         // `auto`: definitions named like the pattern first; when there are
         // none (or no index to ask), fall back to the text itself.
         if args.get("target").and_then(Value::as_str) == Some("auto") {
@@ -179,13 +195,25 @@ impl FindHandler {
         let (specs, primary) = find_roots(registry, &args).await?;
 
         // ── Symbol definitions ───────────────────────────────────────────
-        if target_symbols {
-            return symbols_result(&args, found, specs, &primary, window.offset, window.limit)
-                .await;
+        // `target=symbols` and `output=definitions` share the same
+        // machinery; §4.2f names the question differently ("where is X
+        // defined") but the answer is identical.
+        if target_symbols || output_mode == "definitions" {
+            let mut value =
+                symbols_result(&args, found, specs, &primary, window.offset, window.limit).await?;
+            if output_mode == "definitions" {
+                value["output"] = json!("definitions");
+            }
+            return Ok(value);
+        }
+
+        // ── Answer-shaped modes: exists stops at the first hit ──────────
+        if output_mode == "exists" {
+            return exists_result(found, specs, &primary, window).await;
         }
 
         // ── Text ─────────────────────────────────────────────────────────
-        let windowed = output_mode == "matches";
+        let windowed = output_mode == "matches" || output_mode == "callsites";
         let (engine_offset, engine_limit) =
             paging_for_window(windowed, window.offset, window.limit);
         let options = SearchOptions {
@@ -198,20 +226,66 @@ impl FindHandler {
             collect_hits: windowed,
             want_symbols: extract_bool(&args, "symbols", true),
         };
+        // §3.8: a literal search with regex metacharacters that returns
+        // nothing gets ONE retry as a regex, inside the same blocking task —
+        // the double read is paid only on the zero path, and the note says
+        // what happened either way. §6.7: a case-sensitive zero also gets a
+        // case-insensitive recount so the reason can say "0 sensitive,
+        // N insensitive".
+        let case_sensitive = !found.compiled.case_insensitive;
         let compiled = found.compiled;
-        let result: SearchOutput =
-            tokio::task::spawn_blocking(move || search(&specs, &compiled, &options))
-                .await
-                .map_err(|e| JsonRpcError::internal_error(format!("find failed: {e}")))?;
+        let literal = found.text.clone();
+        let want_retry = !extract_bool(&args, "regex", false) && looks_like_regex(&literal);
+        let retry_args = args.clone();
+        let (result, regex_note_owned, case_insensitive_hits) = tokio::task::spawn_blocking(
+            move || -> Result<(SearchOutput, Option<String>, usize), JsonRpcError> {
+                let mut result = search(&specs, &compiled, &options);
+                let mut note = None;
+                if want_retry && result.stats.match_lines == 0 {
+                    let mut query = find_query(&retry_args)?;
+                    query.regex = true;
+                    query.pattern = literal;
+                    if let Ok(regex_compiled) = query.compile() {
+                        let retried = search(&specs, &regex_compiled, &options);
+                        note = Some(
+                            if retried.stats.match_lines > 0 {
+                                "(interpreted as regex)"
+                            } else {
+                                "literal and regex readings both matched nothing"
+                            }
+                            .to_string(),
+                        );
+                        result = retried;
+                    }
+                }
+                let mut insensitive = 0usize;
+                if result.stats.match_lines == 0 && case_sensitive {
+                    let mut query = find_query(&retry_args)?;
+                    query.case = CaseMode::Insensitive;
+                    if let Ok(ci_compiled) = query.compile() {
+                        insensitive = search(&specs, &ci_compiled, &options).stats.match_lines;
+                    }
+                }
+                Ok((result, note, insensitive))
+            },
+        )
+        .await
+        .map_err(|e| JsonRpcError::internal_error(format!("find failed: {e}")))??;
+        let regex_note = regex_note_owned.as_deref();
 
-        Ok(shape_text_result(
+        let mut value = shape_text_result(
             &found.text,
             &output_mode,
             &primary,
             result,
-            window.offset,
-            window.limit,
-        ))
+            &window,
+            regex_note,
+            &args,
+        );
+        if output_mode == "callsites" {
+            filter_callsites(&mut value, &found.text);
+        }
+        Ok(value)
     }
 }
 
@@ -237,6 +311,13 @@ struct FindWindow {
     max_line_chars: usize,
     /// Scan budget; 0 disables the deadline.
     timeout_ms: usize,
+    /// Output budget: fill the page greedily by rank and stop before
+    /// blowing it. `None` = unbounded page (the `limit` ceiling still
+    /// applies).
+    token_budget: Option<usize>,
+    /// Test-file hits listed in full after source hits instead of being
+    /// collapsed to a summary line.
+    include_tests: bool,
 }
 
 /// The primary argument name when the caller supplied it, else the legacy
@@ -284,12 +365,22 @@ fn output_mode_arg(args: &Value) -> Result<String, JsonRpcError> {
         .and_then(Value::as_str)
         .unwrap_or("matches")
         .to_ascii_lowercase();
-    if ["matches", "files", "count", "symbols"].contains(&mode.as_str()) {
+    if [
+        "matches",
+        "files",
+        "count",
+        "symbols",
+        "definitions",
+        "callsites",
+        "exists",
+    ]
+    .contains(&mode.as_str())
+    {
         return Ok(mode);
     }
     Err(JsonRpcError::invalid_params_with_suggestion(
         format!("Unknown output '{mode}'"),
-        "Use output: matches | files | count | symbols",
+        "Use output: matches | files | count | symbols | definitions | callsites | exists",
     ))
 }
 
@@ -314,6 +405,7 @@ fn find_window(args: &Value) -> Result<FindWindow, JsonRpcError> {
         DEFAULT_PER_FILE,
     )?;
     let max_line_chars = extract_usize(args, "max_line_chars", 200)?.clamp(20, 2000);
+    let token_budget = extract_usize(args, "token_budget", 0)?;
     Ok(FindWindow {
         // `limit: 0` means "as much as the ceiling allows", NOT unbounded:
         // a None limit reaches the engine as `collect_bound = 0`, which
@@ -332,6 +424,8 @@ fn find_window(args: &Value) -> Result<FindWindow, JsonRpcError> {
         per_file,
         max_line_chars,
         timeout_ms,
+        token_budget: (token_budget > 0).then_some(token_budget),
+        include_tests: extract_bool(args, "include_tests", false),
     })
 }
 
@@ -485,13 +579,19 @@ struct PrimaryRoot {
     indexed: bool,
     /// Outside the project (explicit `paths` entry): report absolute paths.
     external: bool,
+    /// The root IS the file (an explicit `paths` entry naming one file):
+    /// display the root's own path — the engine reports that file's name
+    /// as `rel`, so joining again produced the doubled `g6.log/g6.log`.
+    file_root: bool,
 }
 
 fn display_path(roots: &[PrimaryRoot], root: usize, rel: &str) -> String {
-    // The project alone: short project-relative paths. Anything else — an
-    // outside path, or several roots — absolute, so a hit is unambiguous and
+    // The project alone: short project-relative paths. A named file: its
+    // own path, exactly as the caller asked. Anything else — an outside
+    // path, or several roots — absolute, so a hit is unambiguous and
     // matches the path the caller asked about.
     match roots.get(root) {
+        Some(r) if r.file_root => r.root.to_string_lossy().into_owned(),
         Some(r) if r.external || roots.len() > 1 => r.root.join(rel).to_string_lossy().into_owned(),
         _ => rel.to_string(),
     }
@@ -507,32 +607,43 @@ fn build_roots(
     let mut specs: Vec<RootSpec> = Vec::new();
     let mut primary: Vec<PrimaryRoot> = Vec::new();
     let project_root = project.map(|p| p.root.clone());
-    let mut push = |root: PathBuf,
-                    index: Option<Arc<crate::search::textsearch::TextIndex>>,
-                    filter: FileFilter| {
-        let external = project_root.as_ref() != Some(&root);
-        primary.push(PrimaryRoot {
-            root: root.clone(),
-            indexed: index.is_some(),
-            external,
-        });
-        specs.push(RootSpec {
-            root,
-            index,
-            filter,
-        });
-    };
+    let mut push =
+        |root: PathBuf,
+         index: Option<Arc<crate::search::textsearch::TextIndex>>,
+         filter: FileFilter,
+         bypass_ignore: bool,
+         file_root: bool| {
+            let external = project_root.as_ref() != Some(&root);
+            primary.push(PrimaryRoot {
+                root: root.clone(),
+                indexed: index.is_some(),
+                external,
+                file_root,
+            });
+            specs.push(RootSpec {
+                root,
+                index,
+                filter,
+                bypass_ignore,
+            });
+        };
 
     if paths.is_empty() {
         let project =
             project.ok_or_else(|| JsonRpcError::invalid_params("No project to search"))?;
         let scope = scope.map(|s| relative_to(&project.root, s));
         let filter = FileFilter::new(include, exclude, scope.as_deref());
-        push(project.root.clone(), project_index(project), filter);
+        push(project.root.clone(), project_index(project), filter, false, false);
         return Ok((specs, primary));
     }
 
-    let mut project_scopes: Vec<String> = Vec::new();
+    // §3.7/§6.1: explicit `paths=[...]` bypass ignore rules entirely —
+    // including files inside git-ignored directories and explicitly named
+    // files — because the raw walk never consults .gitignore, and such
+    // roots carry no trigram index (an index built from `git ls-files`
+    // would silently re-apply the rules being bypassed). Named paths keep
+    // the caller's include/exclude globs; NO project `scope` — the caller
+    // named exactly where to search.
     for raw in paths {
         let candidate = expand_home(raw);
         let candidate = match (&project, candidate.is_relative()) {
@@ -542,31 +653,14 @@ fn build_roots(
         let canonical = candidate
             .canonicalize()
             .map_err(|e| JsonRpcError::invalid_params(format!("Cannot search '{raw}': {e}")))?;
-        // Inside the workspace: same index, narrowed to that subpath.
-        if let Some(project) = project.filter(|p| canonical.starts_with(&p.root)) {
-            let rel = canonical
-                .strip_prefix(&project.root)
-                .map(|r| r.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_default();
-            project_scopes.push(rel);
-            continue;
-        }
-        // Another project that already has an index: use it.
-        let other_index = project_ref(&canonical)
-            .filter(|_| canonical.is_dir())
-            .and_then(|other| crate::cli::textindex::load(&other.storage));
+        let filter = FileFilter::new(include, exclude, None);
         push(
-            canonical,
-            other_index,
-            FileFilter::new(include, exclude, None),
+            canonical.clone(),
+            None,
+            filter,
+            true,
+            canonical.is_file(),
         );
-    }
-    if let Some(project) = project.filter(|_| !project_scopes.is_empty()) {
-        // One RootSpec per in-workspace path so each keeps its own scope.
-        for scope in project_scopes {
-            let filter = FileFilter::new(include, exclude, Some(&scope));
-            push(project.root.clone(), project_index(project), filter);
-        }
     }
     Ok((specs, primary))
 }
@@ -584,11 +678,14 @@ fn shape_text_result(
     output_mode: &str,
     primary: &[PrimaryRoot],
     result: SearchOutput,
-    offset: usize,
-    limit: Option<usize>,
+    window: &FindWindow,
+    regex_note: Option<&str>,
+    query_args: &Value,
 ) -> Value {
     let stats = &result.stats;
-    let (files_json, symbol_totals, file_rows) = collect_file_rows(&result, primary, output_mode);
+    let (mut files_json, symbol_totals, file_rows) =
+        collect_file_rows(&result, primary, output_mode, window.include_tests);
+    let zero_hit = stats.match_lines == 0;
 
     let mut value = json!({
         "pattern": pattern,
@@ -606,6 +703,7 @@ fn shape_text_result(
             "candidates": stats.candidates,
             "scanned": stats.scanned,
             "changed_since_index": stats.dirty,
+            "globs_excluded": stats.glob_excluded,
             "millis": stats.millis as u64,
         },
     });
@@ -616,33 +714,42 @@ fn shape_text_result(
     // case is a truncation; the note explains the rest.
     let ceiling_ended = output_mode == "matches"
         && result.has_more
-        && continuation_past_ceiling(offset + result.returned);
+        && continuation_past_ceiling(window.offset + result.returned);
     let zero_hit_ended =
         output_mode == "matches" && result.has_more && result.returned == 0 && !ceiling_ended;
     match output_mode {
-        "matches" => shape_matches_page(
-            &mut value,
-            &result,
-            offset,
-            ceiling_ended,
-            zero_hit_ended,
-            files_json,
-        ),
+        "matches" => {
+            // §4.2c: test files rank after source files on every page.
+            if window.include_tests {
+                files_json.sort_by_key(|file| is_test_path(file_path_of(file)));
+            }
+            shape_matches_page(
+                &mut value,
+                &result,
+                window.offset,
+                ceiling_ended,
+                zero_hit_ended,
+                files_json,
+                window.token_budget.unwrap_or(0),
+                query_args,
+            );
+        }
         "files" => shape_rows_page(
             &mut value,
             file_rows,
-            offset,
-            limit,
+            window.offset,
+            window.limit,
             "files",
             |(file, matches)| json!({ "file": file, "matches": matches }),
+            query_args,
         ),
         "symbols" => {
             let mut rows: Vec<_> = symbol_totals.into_iter().collect();
             rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            shape_rows_page(&mut value, rows, offset, limit, "symbols", |entry| {
+            shape_rows_page(&mut value, rows, window.offset, window.limit, "symbols", |entry| {
                 let ((name, kind, file), matches) = entry;
                 json!({ "name": name, "kind": kind, "file": file, "matches": matches })
-            });
+            }, query_args);
         }
         _ => {}
     }
@@ -653,18 +760,111 @@ fn shape_text_result(
         .get("has_more")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if let Some(note) = result_note(&result, value_notes_ceiling, response_has_more) {
-        value["note"] = json!(note);
-    }
+    let notes = match text_result_notes(
+        &result,
+        value_notes_ceiling,
+        response_has_more,
+        regex_note,
+    ) {
+        Some(note) => vec![note],
+        None => Vec::new(),
+    };
+    attach_notes(
+        &mut value,
+        notes,
+        zero_hit,
+        regex_note.is_some(),
+        primary,
+        &result,
+    );
     value
 }
 
+/// The file path a shaped file entry carries (its `file` key).
+fn file_path_of(file: &Value) -> &str {
+    file.get("file").and_then(Value::as_str).unwrap_or("")
+}
+
+/// §4.2b: merge overlapping and ADJACENT context windows so no line prints
+/// twice. Hits arrive in line order; a hit whose before-runs into the
+/// previous hit's after-range contributes only its unseen tail.
+fn merge_hit_context(hits: &[Value]) -> Vec<Value> {
+    let mut merged: Vec<Value> = Vec::with_capacity(hits.len());
+    // (start_line, end_line) of the printed region so far (context
+    // inclusive); context lengths come from the first hit's array sizes.
+    let mut printed: Option<(u64, u64)> = None;
+    for hit in hits {
+        let line = hit.get("line").and_then(Value::as_u64).unwrap_or(0);
+        let before_len = hit["before"].as_array().map_or(0, Vec::len) as u64;
+        let after_len = hit["after"].as_array().map_or(0, Vec::len) as u64;
+        let start = line.saturating_sub(before_len);
+        let end = line + after_len;
+        let mut entry = hit.clone();
+        match printed {
+            // Overlapping or adjacent (prev_end + 1 == start): trim the
+            // before-list to the lines the previous window did not print.
+            Some((_, prev_end)) if start <= prev_end + 1 => {
+                let keep = line.saturating_sub(prev_end + 1).min(before_len) as usize;
+                let skip = before_len as usize - keep;
+                if skip > 0 && let Some(arr) = hit["before"].as_array() {
+                    entry["before"] = Value::Array(arr[skip..].to_vec());
+                }
+            }
+            _ => {}
+        }
+        printed = Some(match printed {
+            Some((prev_start, prev_end)) => (prev_start, prev_end.max(end)),
+            None => (start, end),
+        });
+        merged.push(entry);
+    }
+    merged
+}
+
+/// §4.2c: the path conventions test files follow, across the common
+/// languages. `*_test.rs` / `*_tests.rs`, a `tests/` or `test/` directory,
+/// `test_*` / `*_test` / `*_spec` / `*.spec.*` / `*.test.*` names, and
+/// Python's `test_*.py` / `*_test.py`.
+fn is_test_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let segments: Vec<&str> = normalized.split('/').collect();
+    // A tests/ or test/ DIRECTORY anywhere in the path.
+    if segments[..segments.len().saturating_sub(1)]
+        .iter()
+        .any(|segment| *segment == "tests" || *segment == "test")
+    {
+        return true;
+    }
+    let name = segments.last().copied().unwrap_or("");
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("test_")
+        || lower.ends_with("_test")
+        || lower.ends_with("_test.rs")
+        || lower.ends_with("_tests.rs")
+        || lower.ends_with("_test.py")
+        || lower.ends_with("_test.go")
+        || lower.ends_with("_test.ts")
+        || lower.ends_with("_test.tsx")
+        || lower.ends_with("_test.js")
+        || lower.ends_with("_test.mjs")
+        || lower.ends_with(".test.js")
+        || lower.ends_with(".test.ts")
+        || lower.ends_with(".test.tsx")
+        || lower.ends_with(".test.mjs")
+        || lower.ends_with(".spec.js")
+        || lower.ends_with(".spec.ts")
+        || lower.ends_with(".spec.tsx")
+        || lower.ends_with(".spec.mjs")
+}
+
 /// Gather the per-root file results into the shape each output mode needs:
-/// rendered match pages, per-file symbol totals, or plain (file, count) rows.
+/// rendered match pages (context merged, cap tails announced), per-file
+/// symbol totals, or plain (file, count) rows.
 fn collect_file_rows(
     result: &SearchOutput,
     primary: &[PrimaryRoot],
     output_mode: &str,
+    include_tests: bool,
 ) -> (
     Vec<Value>,
     BTreeMap<(String, &'static str, String), usize>,
@@ -673,27 +873,60 @@ fn collect_file_rows(
     let mut files_json = Vec::new();
     let mut symbol_totals: BTreeMap<(String, &'static str, String), usize> = BTreeMap::new();
     let mut file_rows: Vec<(String, usize)> = Vec::new();
+    let mut collapsed_tests: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     for (root_id, root) in result.roots.iter().enumerate() {
         for file in &root.files {
             let shown = display_path(primary, root_id, &file.rel);
             match output_mode {
                 "matches" => {
-                    files_json.push(json!({
+                    // §4.2c: test files collapse to one summary line unless
+                    // the caller asked for them in full.
+                    if !include_tests && is_test_path(&shown) {
+                        let entry = collapsed_tests.entry(shown).or_default();
+                        entry.0 += file.match_lines;
+                        entry.1 += file.total_hits;
+                        continue;
+                    }
+                    let mut value = json!({
                         "file": shown,
                         "matches": file.match_lines,
                         "symbols_stale": file.symbols_stale,
-                        "hits": file.hits.iter().map(|hit| {
-                            let mut value = json!({ "line": hit.line, "text": hit.text });
-                            if hit.col > 1 { value["col"] = json!(hit.col); }
-                            if let Some((name, kind)) = &hit.symbol {
-                                value["symbol"] = json!(name);
-                                value["kind"] = json!(kind);
-                            }
-                            if !hit.before.is_empty() { value["before"] = json!(hit.before); }
-                            if !hit.after.is_empty() { value["after"] = json!(hit.after); }
-                            value
-                        }).collect::<Vec<_>>(),
-                    }));
+                        "hits": merge_hit_context(
+                            &file.hits.iter().map(|hit| {
+                                let mut value = json!({ "line": hit.line, "text": hit.text });
+                                if hit.col > 1 { value["col"] = json!(hit.col); }
+                                if let Some((name, kind)) = &hit.symbol {
+                                    value["symbol"] = json!(name);
+                                    value["kind"] = json!(kind);
+                                }
+                                if !hit.before.is_empty() { value["before"] = json!(hit.before); }
+                                if !hit.after.is_empty() { value["after"] = json!(hit.after); }
+                                value
+                            }).collect::<Vec<_>>(),
+                        ),
+                    });
+                    // §4.2e: the tail is REACHABLE on the next page; say how
+                    // much of this file is still unpaged.
+                    if file.cap_withheld > 0 {
+                        value["cap_line"] = json!(format!(
+                            "+{} more in this file (next page)",
+                            file.cap_withheld
+                        ));
+                    }
+                    // §4.2a: enclosing-symbol ranges for the grouped header.
+                    if !file.symbol_ranges.is_empty() {
+                        let mut ranges = file.symbol_ranges.clone();
+                        ranges.sort_by(|a, b| a.1.cmp(&b.1));
+                        value["symbol_ranges"] = json!(ranges
+                            .iter()
+                            .map(|(name, start, end)| json!({
+                                "name": name,
+                                "start": start,
+                                "end": end,
+                            }))
+                            .collect::<Vec<_>>());
+                    }
+                    files_json.push(value);
                 }
                 "symbols" => {
                     for (name, kind, count) in &file.symbols {
@@ -706,7 +939,44 @@ fn collect_file_rows(
             }
         }
     }
+    // §4.2c: the collapsed test files ride at the END of the page as one
+    // line each — present, counted, and not in the way.
+    for (path, (match_lines, hits)) in collapsed_tests {
+        files_json.push(json!({
+            "file": path,
+            "matches": match_lines,
+            "collapsed": format!("tests: {match_lines} more hits in this file"),
+            "total_shown": hits,
+        }));
+    }
     (files_json, symbol_totals, file_rows)
+}
+
+/// §4.2d: trim the page to the token budget greedily by rank (files arrive
+/// in rank order; test summaries count as one line). Returns the row count
+/// kept and the total rows offered.
+fn trim_to_budget(files: &mut Vec<Value>, token_budget: usize) {
+    if token_budget == 0 {
+        return;
+    }
+    let budget = token_budget.saturating_mul(CHARS_PER_TOKEN);
+    let mut used = 0usize;
+    let mut kept = 0usize;
+    for file in files.iter() {
+        let cost = file.to_string().len();
+        if used + cost > budget && kept > 0 {
+            break;
+        }
+        if used + cost > budget {
+            // The very first entry alone exceeds the budget: keep it anyway
+            // (an empty page helps nobody) and stop here.
+            kept = 1;
+            break;
+        }
+        used += cost;
+        kept += 1;
+    }
+    files.truncate(kept);
 }
 
 /// The `matches` response page: hit lists plus the paging/truncation signals.
@@ -716,14 +986,41 @@ fn shape_matches_page(
     offset: usize,
     ceiling_ended: bool,
     zero_hit_ended: bool,
-    files: Vec<Value>,
+    mut files: Vec<Value>,
+    token_budget: usize,
+    query_args: &Value,
 ) {
+    let offered = files.len();
+    trim_to_budget(&mut files, token_budget);
+    let shown = files.len();
+    let budget_ended = shown < offered;
     let stream_ended = ceiling_ended || zero_hit_ended;
     value["returned"] = json!(result.returned);
     value["offset"] = json!(offset);
-    value["has_more"] = json!(result.has_more && !stream_ended);
-    if result.has_more && !stream_ended {
-        value["next_offset"] = json!(offset + result.returned);
+    value["files"] = Value::Array(files);
+    let more = result.has_more && !stream_ended;
+    value["has_more"] = json!(more || budget_ended);
+    if more || budget_ended {
+        // token_budget ends the page early: the stream position moves by the
+        // rows SHOWN, not by the engine's returned count, so the next page
+        // starts exactly where the budget cut off (§6.8 non-overlap).
+        let next_offset = if budget_ended {
+            offset + shown
+        }
+        else {
+            offset + result.returned
+        };
+        let token = crate::cli::mcp::find_paging::issue("leindex_find", query_args, next_offset);
+        value["next_offset"] = json!(next_offset);
+        if !token.is_empty() {
+            value["next"] = json!(token);
+            if budget_ended {
+                value["budget_note"] = json!(format!(
+                    "+{} more (token_budget reached; pass next to continue)",
+                    offered - shown
+                ));
+            }
+        }
     }
     if ceiling_ended {
         value["truncated_by_ceiling"] = json!(true);
@@ -731,7 +1028,6 @@ fn shape_matches_page(
     if result.cap_withheld > 0 {
         value["withheld_by_cap"] = json!(result.cap_withheld);
     }
-    value["files"] = Value::Array(files);
 }
 
 /// A summarised (`files`/`symbols`) response page: window the sorted rows and
@@ -743,34 +1039,46 @@ fn shape_rows_page<T>(
     limit: Option<usize>,
     key: &str,
     render: impl Fn(&T) -> Value,
+    query_args: &Value,
 ) {
     let cap = limit.unwrap_or(usize::MAX);
     let total = rows.len();
     let page: Vec<_> = rows.into_iter().skip(offset).take(cap).collect();
     let proposed_next = offset + page.len();
     let ceiling_ended = proposed_next < total && continuation_past_ceiling(proposed_next);
+    value[key] = json!(page.iter().map(render).collect::<Vec<_>>());
     value["has_more"] = json!(proposed_next < total && !ceiling_ended);
+    if proposed_next < total && !ceiling_ended {
+        let token = crate::cli::mcp::find_paging::issue("leindex_find", query_args, proposed_next);
+        value["next_offset"] = json!(proposed_next);
+        if !token.is_empty() {
+            value["next"] = json!(token);
+        }
+    }
     if ceiling_ended {
         value["truncated_by_ceiling"] = json!(true);
     }
-    value[key] = json!(page.iter().map(render).collect::<Vec<_>>());
 }
 
-/// Trailing hint for any text payload: why a complete-looking response may
-/// still be incomplete. `None` when no signal applies. `ceiling_ended` is
-/// the caller-computed truncation flag (it needs the request offset); the
-/// ceiling sentence takes precedence because it is the binding cause — the
-/// page's continuation is unservable regardless of the time budget. Whether
-/// the scan ALSO stopped at the deadline is answered by the engine's
-/// `stopped_by_deadline`, not by `complete`: a window stop pairs `has_more`
-/// with `complete = false` itself, so keying the budget sentence on
-/// `complete` mislabeled ceiling-ended pages "time budget".
-fn result_note(
+/// Trailing hints for any text payload: why a complete-looking response may
+/// still be incomplete, and (§6.7) why a zero result is zero.
+/// `ceiling_ended` is the caller-computed truncation flag (it needs the
+/// request offset); the ceiling sentence takes precedence because it is the
+/// binding cause — the page's continuation is unservable regardless of the
+/// time budget. Whether the scan ALSO stopped at the deadline is answered by
+/// the engine's `stopped_by_deadline`, not by `complete`: a window stop
+/// pairs `has_more` with `complete = false` itself, so keying the budget
+/// sentence on `complete` mislabeled ceiling-ended pages "time budget".
+fn text_result_notes(
     result: &SearchOutput,
     ceiling_ended: bool,
     response_has_more: bool,
+    regex_note: Option<&str>,
 ) -> Option<String> {
     let mut note = String::new();
+    if let Some(interpreted) = regex_note {
+        note.push_str(interpreted);
+    }
     if ceiling_ended {
         if !note.is_empty() {
             note.push(' ');
@@ -791,12 +1099,184 @@ fn result_note(
             note.push(' ');
         }
         note.push_str(&format!(
-            "{} buffered matches sit past per_file_cap and appear on no page; \
-             raise per_file_cap (0 = no cap) to page through every match",
+            "{} shown matches sit past per_file_cap on THIS page; the next offset \
+             (or next token) displays them — the cap bounds display, not reach",
             result.cap_withheld
         ));
     }
     (!note.is_empty()).then_some(note)
+}
+
+/// §6.7: every zero result names its reason. Checked in the order a caller
+/// can act on them: literal-vs-regex (already retried by §3.8), globs,
+/// ignore rules, index state, case sensitivity.
+fn zero_reasons(
+    primary: &[PrimaryRoot],
+    result: &SearchOutput,
+    pattern_had_metachars: bool,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if pattern_had_metachars {
+        reasons.push(
+            "the pattern looks like a regex and was also tried as one; neither reading matched"
+                .to_string(),
+        );
+    }
+    if result.stats.glob_excluded > 0 {
+        reasons.push(format!(
+            "{} file(s) were excluded by include_globs/exclude_globs/scope",
+            result.stats.glob_excluded
+        ));
+    }
+    if result.stats.candidates == 0 {
+        if primary.iter().all(|r| r.indexed) {
+            reasons.push(
+                "no candidate files came from the index; the paths you want may be \
+                 git-ignored — pass paths=[\"...\"] to search them anyway"
+                    .to_string(),
+            );
+        } else if primary.iter().all(|r| !r.indexed) {
+            reasons.push(
+                "no index was consulted (raw path search); the directory may be empty \
+                 or hold only binary/oversized files".to_string(),
+            );
+        }
+    }
+    reasons
+}
+
+/// Attach the note(s): the reason list on a zero result, the truncation
+/// notes otherwise. `note` stays a single line; the zero-reasons ride in
+/// `zero_reasons` so a compact renderer prints both without nesting.
+fn attach_notes(
+    value: &mut Value,
+    notes: Vec<String>,
+    zero_hit: bool,
+    pattern_had_metachars: bool,
+    primary: &[PrimaryRoot],
+    result: &SearchOutput,
+) {
+    if zero_hit {
+        value["zero_reasons"] = json!(zero_reasons(primary, result, pattern_had_metachars));
+    }
+    if let Some(first) = notes.first() {
+        value["note"] = json!(first);
+    }
+}
+
+/// §3.8: does this literal pattern plausibly read as a regex? Only
+/// metacharacters that CHANGE meaning trigger the retry — a lone `.` or a
+/// plain word never does, so ordinary literal searches never pay a second
+/// read. A dot next to another metachar (`.*`, `a.b`) still counts: the
+/// caller who typed it in a literal almost certainly meant the regex.
+fn looks_like_regex(pattern: &str) -> bool {
+    let mut chars = pattern.chars().peekable();
+    let mut escaped = false;
+    while let Some(c) = chars.next() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            // Alternation, repetition-with-a-partner, anchors, classes and
+            // groups are the shapes that make a literal reading useless.
+            '|' | '^' | '$' | '[' | '(' => return true,
+            '.' => {
+                if chars.peek().is_some() {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// §4.2f `output=exists`: a yes/no answer that stops at the first hit.
+async fn exists_result(
+    found: FindPattern,
+    specs: Vec<RootSpec>,
+    primary: &[PrimaryRoot],
+    window: FindWindow,
+) -> Result<Value, JsonRpcError> {
+    let compiled = found.compiled;
+    let options = SearchOptions {
+        offset: 0,
+        limit: Some(1),
+        per_file_cap: 1,
+        context: 0,
+        max_line_chars: 200,
+        deadline: search_deadline(window.timeout_ms),
+        collect_hits: true,
+        want_symbols: false,
+    };
+    let result =
+        tokio::task::spawn_blocking(move || search(&specs, &compiled, &options)).await;
+    let result: SearchOutput = result
+        .map_err(|e| JsonRpcError::internal_error(format!("find failed: {e}")))?;
+    let exists = result.stats.match_lines > 0;
+    let mut first = json!(null);
+    for root in &result.roots {
+        for file in &root.files {
+            if let Some(hit) = file.hits.first() {
+                first = json!({
+                    "file": file.rel,
+                    "line": hit.line,
+                    "text": hit.text,
+                });
+                break;
+            }
+        }
+        if !first.is_null() {
+            break;
+        }
+    }
+    Ok(json!({
+        "pattern": found.text,
+        "output": "exists",
+        "exists": exists,
+        "first": first,
+        "roots": primary.iter().map(|r| json!({
+            "path": r.root.to_string_lossy(),
+            "indexed": r.indexed,
+        })).collect::<Vec<_>>(),
+        "complete": result.complete,
+    }))
+}
+
+/// §4.2f `output=callsites`: the engine searched `name(` as a literal
+/// pattern; drop the rows that are the definition itself (the
+/// `fn`/`function`/`def` line naming the pattern) so what remains is the
+/// call surface. Find is registry-free by design, so this stays syntactic —
+/// the PDG-backed variant belongs to symbol_lookup.
+fn filter_callsites(value: &mut Value, pattern: &str) {
+    let definition_marker = format!("{pattern}(");
+    let keywords = ["fn ", "function ", "def ", "func ", "class ", "struct ", "impl "];
+    let mut callsites = 0usize;
+    if let Some(files) = value.get_mut("files").and_then(Value::as_array_mut) {
+        for file in files {
+            let kept = file
+                .get_mut("hits")
+                .and_then(Value::as_array_mut)
+                .map_or(0, |hits| {
+                    hits.retain(|hit| {
+                        let Some(text) = hit.get("text").and_then(Value::as_str) else {
+                            return true;
+                        };
+                        let trimmed = text.trim_start();
+                        let is_definition = trimmed.contains(&definition_marker)
+                            && keywords.iter().any(|kw| trimmed.starts_with(kw));
+                        !is_definition
+                    });
+                    hits.len()
+                });
+            file["matches"] = json!(kept);
+            callsites += kept;
+        }
+    }
+    value["callsites"] = json!(callsites);
+    value["total_matches"] = json!(callsites);
 }
 
 /// The ceiling sentence shared by the text paths (`result_note`) and the

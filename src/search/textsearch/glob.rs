@@ -110,6 +110,12 @@ impl FileFilter {
         }
     }
 
+    /// No include, exclude, or scope was set: the filter admits everything
+    /// and can never be the reason a search came back empty (§6.7).
+    pub fn is_empty(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty() && self.scope.is_none()
+    }
+
     /// Is `rel` (forward slashes) admitted?
     pub fn allows(&self, rel: &str) -> bool {
         if let Some(scope) = &self.scope {

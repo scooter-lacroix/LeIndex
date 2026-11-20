@@ -345,6 +345,14 @@ pub struct RootSpec {
     pub index: Option<Arc<TextIndex>>,
     /// Include/exclude/scope filter over root-relative paths.
     pub filter: FileFilter,
+    /// Ignore NOTHING on this root: walk the raw filesystem instead of
+    /// `git ls-files`, so git-ignored files and directories are searched.
+    /// Set for every explicit `paths=[...]` root (brief §3.7/§6.1): a
+    /// caller who names a path wants that path, not the project's ignore
+    /// policy. The trigram index is also left unset for such roots — an
+    /// index built from `git ls-files` would silently re-apply the ignore
+    /// rules the caller asked to bypass.
+    pub bypass_ignore: bool,
 }
 
 /// Result-shaping options.
@@ -354,13 +362,14 @@ pub struct SearchOptions {
     pub offset: usize,
     /// Hits to return (`None` = all).
     pub limit: Option<usize>,
-    /// Hits shown per file (`0` = unlimited); further matches are counted.
+    /// Hits shown per file on one page (`0` = unlimited); further matches
+    /// are counted and stay reachable.
     ///
-    /// The cap defines each file's contribution to the pagination stream:
-    /// `offset`/`has_more` account only for a file's first `per_file_cap`
-    /// hits, so pages tile the capped stream exactly once. Matches beyond
-    /// the cap never appear on any page (they stay counted in
-    /// `match_lines`); set `0` to page through every match.
+    /// The cap bounds what a page DISPLAYS, never what the pagination
+    /// stream holds: every match keeps its stream position, so pages tile
+    /// all matches exactly once and the next offset still reaches matches
+    /// an earlier page capped away (`FileResult::cap_withheld` reports the
+    /// per-file tail so renderers can say `+K more in this file`).
     pub per_file_cap: usize,
     /// Context lines around each hit.
     pub context: usize,
@@ -415,17 +424,29 @@ pub struct FileResult {
     pub match_lines: usize,
     /// Reported hits.
     pub hits: Vec<Hit>,
+    /// Matches this file buffered for the stream across the whole scan,
+    /// before any windowing (an upper bound on `hits.len() + cap_withheld`).
+    pub total_hits: usize,
+    /// Hits this page displays. The per-file cap applies to `shown`, never
+    /// to the stream: hits past the cap keep their stream positions, so a
+    /// later offset still reaches them (the cap shapes display, not reach).
+    pub shown: usize,
     /// More matching lines exist than were buffered for the window: a page
     /// limit cut collection short while the file's capped stream still has
     /// hits beyond it, so `has_more` must be reported even when the global
     /// window was not exceeded by the buffered hits alone.
     pub collected_truncated: bool,
-    /// Buffered hits this page dropped because they sat past the file's
-    /// `per_file_cap`. They appear on no page; `match_lines` still counts
-    /// them.
+    /// Matches this file holds beyond what this page shows (`total_hits -
+    /// shown` when a `per_file_cap` was in force). They keep their
+    /// pagination-stream positions, so the next page — not no page —
+    /// displays them.
     pub cap_withheld: usize,
     /// Enclosing-symbol tallies `(name, kind, matching lines)`.
     pub symbols: Vec<(String, &'static str, usize)>,
+    /// Enclosing-symbol line ranges `(name, start_line, end_line)` for the
+    /// symbols above, resolved from the index at scan time — the data the
+    /// grouped renderer needs for `path › name (L2336-2428): N hits`.
+    pub symbol_ranges: Vec<(String, u32, u32)>,
     /// Symbols were unavailable because the file changed after indexing.
     pub symbols_stale: bool,
 }
@@ -454,6 +475,9 @@ pub struct SearchStats {
     pub files_matched: usize,
     /// Matching lines found.
     pub match_lines: usize,
+    /// Candidate files dropped by include/exclude globs — the §6.7
+    /// zero-result explanation when a glob was the reason nothing matched.
+    pub glob_excluded: usize,
     /// Wall time.
     pub millis: u128,
 }
@@ -475,10 +499,12 @@ pub struct SearchOutput {
     pub stopped_by_deadline: bool,
     /// Hits returned.
     pub returned: usize,
-    /// Matches buffered for this page that the per-file cap dropped. A
-    /// non-zero value means the result set is cap-limited, not exhaustive:
-    /// the withheld matches appear on no page (`match_lines` still counts
-    /// them). The client signal for `per_file_cap` semantics.
+    /// Matches a page's files hold beyond what it shows (summed
+    /// `FileResult::cap_withheld`). A non-zero value means the page is
+    /// cap-limited, not exhaustive: the withheld matches keep their
+    /// pagination-stream positions and the next offset displays them
+    /// (`match_lines` still counts them). The client signal for
+    /// `per_file_cap` semantics.
     pub cap_withheld: usize,
     /// Totals.
     pub stats: SearchStats,
@@ -499,6 +525,7 @@ fn root_candidates(
 ) -> (Vec<Candidate>, InventoryTruncation) {
     let mut set: BTreeMap<String, Candidate> = BTreeMap::new();
     let mut truncation = InventoryTruncation::default();
+    let mut excluded = 0usize;
     let is_file_root = spec.root.is_file();
 
     if is_file_root {
@@ -517,6 +544,25 @@ fn root_candidates(
                 dirty: true,
             },
         );
+    } else if spec.bypass_ignore {
+        // §3.7/§6.1: an explicitly named path is searched RAW — no git
+        // ignore rules, no trigram index (an index built from `git
+        // ls-files` would silently re-apply the very rules being bypassed),
+        // no side effects. The plain walk only ever skips VCS metadata and
+        // package caches (NEVER_WALK), never .gitignore content.
+        let (rels, trunc) = list_files_reporting(&spec.root, 1_000_000, deadline);
+        truncation = trunc;
+        for rel in rels {
+            set.insert(
+                rel.clone(),
+                Candidate {
+                    abs: spec.root.join(&rel),
+                    rel,
+                    id: None,
+                    dirty: true,
+                },
+            );
+        }
     } else if let Some(index) = &spec.index {
         let narrowed = plan::candidates(index, &compiled.expr);
         let add = |id: u32, set: &mut BTreeMap<String, Candidate>| {
@@ -576,8 +622,15 @@ fn root_candidates(
     }
     let candidates = set
         .into_values()
-        .filter(|c| is_file_root || spec.filter.allows(&c.rel))
+        .filter(|c| {
+            let admitted = is_file_root || spec.filter.allows(&c.rel);
+            if !admitted {
+                excluded += 1;
+            }
+            admitted
+        })
         .collect();
+    stats.glob_excluded += excluded;
     (candidates, truncation)
 }
 
@@ -829,6 +882,7 @@ fn scan_file(
         ..Default::default()
     };
     let mut tallies: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
+    let mut symbol_spans: BTreeMap<String, (u32, u32)> = BTreeMap::new();
     let (mut line_no, mut counted_to, mut last_line_start) = (1u32, 0usize, usize::MAX);
     let collect_bound = page_collect_bound(options);
     for found in compiled.regex.find_iter(&data) {
@@ -844,10 +898,13 @@ fn scan_file(
 
         let symbol = symbol_index
             .and_then(|(index, id)| index.enclosing_symbol(id, start))
-            .map(|(name, kind, _, _)| (name, kind));
-        if let Some(symbol) = &symbol {
-            *tallies.entry(symbol.clone()).or_default() += 1;
-        }
+            .map(|(name, kind, span_start, span_end)| {
+                *tallies.entry((name.clone(), kind)).or_default() += 1;
+                symbol_spans
+                    .entry(name.clone())
+                    .or_insert((span_start, span_end));
+                (name, kind)
+            });
         let reportable =
             options.collect_hits && (collect_bound == 0 || result.hits.len() < collect_bound);
         if !reportable {
@@ -871,6 +928,21 @@ fn scan_file(
     result.collected_truncated = collect_bound > 0
         && result.match_lines > result.hits.len()
         && (options.per_file_cap == 0 || options.per_file_cap > result.hits.len());
+    // Byte spans → 1-based line numbers for the enclosing-symbol ranges the
+    // grouped renderer prints (`path › name (L2336-2428): N hits`); the same
+    // conversion shape `symbols.rs` uses for its hits.
+    let line_of =
+        |at: usize| 1 + memchr::memchr_iter(b'\n', &data[..at.min(data.len())]).count() as u32;
+    result.symbol_ranges = symbol_spans
+        .into_iter()
+        .map(|(name, (start, end))| {
+            (
+                name,
+                line_of(start as usize),
+                line_of(end.saturating_sub(1).max(start) as usize),
+            )
+        })
+        .collect();
     result.symbols = tallies
         .into_iter()
         .map(|((name, kind), count)| (name, kind, count))
@@ -885,30 +957,33 @@ fn window_file_hits(
     window_end: Option<usize>,
     per_file_cap: usize,
 ) {
-    // The per-file cap DEFINES this file's contribution to the pagination
-    // stream: only its first `per_file_cap` hits exist for offset/has_more
-    // accounting, so `offset` indexes the same capped stream on every page
-    // and nothing shown on one page reappears on another. Truncating AFTER
-    // the window walk instead (the previous behavior) dropped hits that
-    // `seen_hits` had already counted: the offset space then described hits
-    // no page would ever show, and a page whose buffer filled the window
-    // exactly (two 25-match files, limit 50, cap 20) reported has_more=false
-    // with ten matches reachable on no offset at all. Cap-dropped matches
-    // remain intentional (documented "shown per file, all counted":
-    // `match_lines` and the symbol tallies still report them). 0 = uncapped.
-    if per_file_cap > 0 && file.hits.len() > per_file_cap {
-        file.cap_withheld = file.hits.len() - per_file_cap;
-        file.hits.truncate(per_file_cap);
-    }
+    // The per-file cap shapes what a page SHOWS without shrinking the
+    // pagination stream: every buffered hit occupies a position in the
+    // stream (`seen_hits` walks the uncapped sequence on every request), so
+    // pages tile it exactly once and a later offset still reaches what an
+    // earlier page capped away. Dropping past-cap hits from the stream
+    // instead (the previous behavior) made them appear on no page while
+    // `match_lines` kept counting them — a silent drop the caller could
+    // never page into. `shown` counts what this page displays; the tail is
+    // reported as `cap_withheld = total_hits - shown` so the renderer can
+    // promise `+K more in this file`. 0 = uncapped.
+    file.total_hits = file.hits.len();
+    file.shown = 0;
     let mut windowed = Vec::with_capacity(file.hits.len());
     for hit in file.hits.drain(..) {
         let position = *seen_hits;
         *seen_hits += 1;
-        if position >= offset && window_end.is_none_or(|end| position < end) {
+        let in_window = position >= offset && window_end.is_none_or(|end| position < end);
+        let shown = in_window && (per_file_cap == 0 || file.shown < per_file_cap);
+        if shown {
+            file.shown += 1;
             windowed.push(hit);
         }
     }
     file.hits = windowed;
+    if per_file_cap > 0 {
+        file.cap_withheld = file.total_hits.saturating_sub(file.shown);
+    }
 }
 
 fn ingest_scanned_files(
@@ -1091,6 +1166,7 @@ mod tests {
             root: dir.to_path_buf(),
             index,
             filter: FileFilter::default(),
+            bypass_ignore: false,
         }
     }
 
@@ -1164,27 +1240,50 @@ mod tests {
     }
 
     #[test]
-    fn test_cap_withheld_reports_dropped_buffered_hits() {
-        // The client-visible signal that a page is cap-limited rather than
-        // exhaustive: hits buffered for the window but dropped by
-        // per_file_cap are counted in `cap_withheld`.
+    fn test_cap_overflow_stays_reachable_on_the_next_page() {
+        // §4.2e: the per-file cap bounds what a page shows, not what the
+        // stream holds. A file with more matches than the cap allows must
+        // keep has_more=true so the tail is REACHABLE via the next offset —
+        // the old code truncated past-cap hits out of the stream, so the
+        // same query ended the stream with the tail on no page at all.
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "big.txt", &"needle\n".repeat(200));
-        let out = search(
+        let compiled = q("needle").compile().unwrap();
+        let page_one = search(
             &[spec(dir.path(), None)],
-            &q("needle").compile().unwrap(),
+            &compiled,
             &SearchOptions {
                 per_file_cap: 20,
                 limit: Some(50),
                 ..Default::default()
             },
         );
-        assert_eq!(out.returned, 20);
-        assert_eq!(
-            out.cap_withheld, 30,
-            "50 buffered minus the 20 the cap keeps"
+        assert_eq!(page_one.returned, 20);
+        assert_eq!(page_one.cap_withheld, 30, "shown + withheld = buffered");
+        assert!(
+            page_one.has_more,
+            "the capped-off tail must be reachable, not dropped"
         );
-        assert!(!out.has_more, "capped stream exhausted within the page");
+
+        // The tail really arrives: page two at offset 20 shows the next 20.
+        let page_two = search(
+            &[spec(dir.path(), None)],
+            &compiled,
+            &SearchOptions {
+                per_file_cap: 20,
+                limit: Some(50),
+                offset: 20,
+                ..Default::default()
+            },
+        );
+        assert_eq!(page_two.returned, 20);
+        let shown_first = page_one.roots[0].files[0].hits[0].line;
+        let shown_second = page_two.roots[0].files[0].hits[0].line;
+        assert_ne!(
+            shown_first, shown_second,
+            "pages must never overlap: page two starts past page one"
+        );
+        assert_eq!(shown_second, 21, "the tail starts right after the cap");
     }
 
     #[test]
@@ -1711,6 +1810,7 @@ mod tests {
             root: dir.path().join("src/main.rs"),
             index: None,
             filter: FileFilter::default(),
+            bypass_ignore: false,
         };
         let out = search(
             &[file],
