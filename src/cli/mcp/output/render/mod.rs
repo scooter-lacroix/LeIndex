@@ -769,6 +769,17 @@ fn render_read_file(data: &Value, color: bool) -> String {
         out.push_str(&header(&format!("Read: {}", path), color));
         out.push('\n');
     }
+    // Session dedup verdict (§4.1): a re-read of unchanged content is a
+    // one-line marker, not the bytes again.
+    if data.get("status").and_then(Value::as_str) == Some("unchanged") {
+        let note = data
+            .get("note")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unchanged");
+        out.push_str(note);
+        out.push('\n');
+        return out;
+    }
     let content = data
         .get("content")
         .and_then(|v| v.as_str())

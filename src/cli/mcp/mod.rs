@@ -89,6 +89,8 @@ pub mod phase_handler;
 pub mod project_map_handler;
 /// Handler for LeIndex [Read File] — PDG-annotated file read.
 pub mod read_file_handler;
+/// Read-path engine: handles, elided reads, session read ledger (lane E).
+pub mod read_paths;
 /// Handler for LeIndex [Read Symbol] — targeted symbol source read.
 pub mod read_symbol_handler;
 /// Handler for LeIndex [Rename Symbol] — cross-file symbol rename.
