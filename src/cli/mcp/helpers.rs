@@ -511,6 +511,12 @@ fn parse_replace_change(
             JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_text'", index))
         })?;
     let has_explicit_range = item.get("start_byte").is_some() || item.get("end_byte").is_some();
+    // A change entry may carry its own file path (multi-file batch, §4.3);
+    // `None` keeps the single-file form where `file_path` is the argument.
+    let owning_file = item
+        .get("file_path")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     if has_explicit_range {
         let start = item.get("start_byte").and_then(Value::as_u64).unwrap_or(0) as usize;
         let end = item
@@ -519,6 +525,7 @@ fn parse_replace_change(
             .map(|value| value as usize)
             .unwrap_or(start + old_text.len());
         return Ok(EditChange::ReplaceText {
+            file_path: owning_file,
             start,
             end,
             new_text: new_text.to_owned(),
@@ -532,6 +539,7 @@ fn parse_replace_change(
     }
     let Some(content) = content else {
         return Ok(EditChange::ReplaceText {
+            file_path: owning_file,
             start: 0,
             end: old_text.len(),
             new_text: new_text.to_owned(),
@@ -545,6 +553,7 @@ fn parse_replace_change(
         return Err(missing_old_text(index, old_text));
     };
     Ok(EditChange::ReplaceText {
+        file_path: owning_file,
         start,
         end: start + length,
         new_text: new_text.to_owned(),
@@ -627,6 +636,7 @@ pub(crate) fn apply_changes_in_memory(
             start,
             end,
             new_text,
+            ..
         } = change
         {
             let bytes = modified.as_bytes();
@@ -1101,6 +1111,7 @@ mod tests {
             start,
             end,
             new_text,
+            ..
         } = &changes[0]
         {
             assert_eq!(*start, content.find("println!(\"Hello\")").unwrap());

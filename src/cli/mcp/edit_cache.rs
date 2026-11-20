@@ -3,6 +3,7 @@ use crate::edit::EditChange;
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
@@ -34,9 +35,47 @@ pub struct EditCacheEntry {
     pub changes: Vec<EditChange>,
     /// When this entry was created.
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Per-file blake3 hash of the content the preview was computed against
+    /// (single-file entries key on `file_path`). Apply re-validates these so
+    /// a file changed between preview and apply is rejected with a clear
+    /// error instead of silently mis-merging.
+    #[serde(default)]
+    pub original_hashes: HashMap<String, String>,
 }
 
 impl EditCacheEntry {
+    /// Build a cache entry for one file, hashing its pre-edit content.
+    pub fn single_file(
+        file_path: PathBuf,
+        preview_token: String,
+        original_text: String,
+        modified_text: String,
+        changes: Vec<EditChange>,
+    ) -> Self {
+        let hash = blake3::hash(original_text.as_bytes()).to_hex().to_string();
+        Self {
+            original_hashes: HashMap::from([(file_path.to_string_lossy().to_string(), hash)]),
+            file_path,
+            preview_token,
+            original_text,
+            modified_text,
+            changes,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// True when every file this entry touched is still byte-identical to
+    /// what the preview was computed against. An empty map (entries written
+    /// before hash tracking existed) is treated as valid — the expected-
+    /// content atomic write remains the hard safety net.
+    pub fn files_unchanged_since_preview(&self) -> bool {
+        self.original_hashes.iter().all(|(path, hash)| {
+            std::fs::read(path)
+                .map(|bytes| blake3::hash(&bytes).to_hex().to_string() == *hash)
+                .unwrap_or(false)
+        })
+    }
+
     /// Estimated byte size of this entry in the hot cache.
     pub fn estimated_size(&self) -> usize {
         let path_bytes = self.file_path.as_os_str().len();
@@ -257,6 +296,43 @@ impl EditCache {
     pub async fn hot_cache_bytes(&self) -> usize {
         self.entries.lock().await.1
     }
+
+    /// Store a preview under its file path AND a token alias so
+    /// `apply` can resolve `preview_token` alone (§3.4 advertised
+    /// path). The alias write is best-effort: the path-keyed entry is
+    /// the primary record.
+    pub async fn set_with_token_alias(
+        &self,
+        project_storage: &Path,
+        entry: EditCacheEntry,
+    ) -> Result<Result<(), EntryTooLargeError>, JsonRpcError> {
+        let primary = self.set(project_storage, entry.clone()).await?;
+        let alias = EditCacheEntry {
+            file_path: token_alias_path(&entry.preview_token),
+            ..entry
+        };
+        let _ = self.set(project_storage, alias).await;
+        Ok(primary)
+    }
+
+    /// Resolve a preview by its token alone (no file_path needed).
+    pub async fn get_by_token(&self, project_storage: &Path, token: &str) -> Option<EditCacheEntry> {
+        self.get(project_storage, &token_alias_path(token)).await
+    }
+
+    /// Clear both the file-path entry and the token alias after an apply.
+    pub async fn clear_with_token_alias(&self, project_storage: &Path, file_path: &Path, token: &str) {
+        self.clear(project_storage, file_path).await;
+        self.clear(project_storage, &token_alias_path(token))
+            .await;
+    }
+}
+
+/// Synthetic cache key for a token alias. Never collides with a real
+/// file path (real paths cannot contain the NUL-free `__token__:`
+/// prefix in normal use, and the value is hashed for cold storage).
+fn token_alias_path(token: &str) -> PathBuf {
+    PathBuf::from(format!("__token__:{token}"))
 }
 
 /// Global singleton for edit caching.
@@ -275,11 +351,13 @@ mod tests {
             original_text: "x".repeat(original_len),
             modified_text: "y".repeat(modified_len),
             changes: vec![EditChange::ReplaceText {
+                file_path: None,
                 start: 0,
                 end: original_len.min(1),
                 new_text: "y".to_string(),
             }],
             timestamp: chrono::Utc::now(),
+            original_hashes: HashMap::new(),
         }
     }
 

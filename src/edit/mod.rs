@@ -73,6 +73,7 @@ mod tests {
         let project_id = make_test_id();
         let file_path = std::path::PathBuf::from("test.py");
         let changes = vec![EditChange::ReplaceText {
+            file_path: None,
             start: 0,
             end: 10,
             new_text: "new content".to_string(),
@@ -92,6 +93,7 @@ mod tests {
     #[test]
     fn test_edit_change_replace_text() {
         let change = EditChange::ReplaceText {
+            file_path: None,
             start: 0,
             end: 10,
             new_text: "replacement".to_string(),
@@ -402,6 +404,7 @@ mod tests {
             project_id,
             file_path: file_path.clone(),
             changes: vec![EditChange::ReplaceText {
+                file_path: None,
                 start: 0,
                 end: 5, // "hello"
                 new_text: "goodbye".to_string(),
@@ -537,6 +540,7 @@ mod tests {
     #[test]
     fn test_edit_change_clone() {
         let change = EditChange::ReplaceText {
+            file_path: None,
             start: 0,
             end: 10,
             new_text: "test".to_string(),
@@ -548,11 +552,13 @@ mod tests {
     #[test]
     fn test_edit_change_equality() {
         let change1 = EditChange::ReplaceText {
+            file_path: None,
             start: 0,
             end: 10,
             new_text: "test".to_string(),
         };
         let change2 = EditChange::ReplaceText {
+            file_path: None,
             start: 0,
             end: 10,
             new_text: "test".to_string(),
