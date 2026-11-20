@@ -6,6 +6,8 @@
 //! VAL-MEASURE-012: `cargo xtask memcheck` is the supported local entrypoint.
 //! VAL-MEASURE-013: `cargo xtask memcheck --update-baseline` regenerates baselines.
 
+mod tokbench;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -31,6 +33,13 @@ enum Commands {
         #[arg(long)]
         update_baseline: bool,
     },
+    /// Run the token-efficiency benchmark harness (native vs LeIndex).
+    ///
+    /// Builds a deterministic 4-crate Rust workspace fixture and replays
+    /// six scripted tasks against the native tool emulations and the
+    /// LeIndex binary, printing a markdown report with per-task output
+    /// tokens, round trips and success assertions (TOK-BENCH-001).
+    Tokbench,
 }
 
 /// Workspace root — xtask lives at `<root>/tools/xtask`.
@@ -50,6 +59,7 @@ fn main() -> Result<()> {
 
     match args.command {
         Some(Commands::Memcheck { update_baseline }) => run_memcheck(update_baseline),
+        Some(Commands::Tokbench) => tokbench::run_tokbench(),
         None => {
             Args::parse_from(["xtask", "--help"]);
             Ok(())
