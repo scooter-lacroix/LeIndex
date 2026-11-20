@@ -880,3 +880,98 @@ fn test_render_search_surfaces_system_one_footer() {
     let s2 = render_tool_output("leindex.search", &clean_payload, &args);
     assert!(!s2.contains("System-One:"), "footer leaked: {}", s2);
 }
+
+/// Brief §3.3 regression: a FRESH index must cost zero footer bytes. The old
+/// renderer emitted `\nFreshness: status=fresh, generation=N\n` on every
+/// response — per-call boilerplate the caller never asked for; the structured
+/// `_meta.freshness` badge already carries the same facts for machine readers.
+#[test]
+fn test_fresh_payload_renders_zero_footer_bytes() {
+    let args = v(r#"{"query": "foo"}"#);
+    let payload = v(r#"{
+        "count": 1,
+        "results": [{"file_path": "/p.rs", "symbol_name": "f", "score": 0.5}],
+        "_meta": {"freshness": {"generation": 695, "status": "fresh"}}
+    }"#);
+    let s = render_tool_output("leindex.search", &payload, &args);
+    assert!(!s.contains("[index:"), "fresh must render no footer: {s}");
+    assert!(
+        !s.contains("Freshness:"),
+        "the old Freshness line must stay gone: {s}"
+    );
+    assert!(
+        !s.contains("Advisory:"),
+        "fresh must never carry an advisory: {s}"
+    );
+}
+
+/// Brief §3.2 regression: a genuinely stale payload renders exactly ONE
+/// compact header-style line (plus the advisory when present), and the line
+/// never recommends `force_reindex` — the incremental `leindex_manage
+/// action=index` advisory text is the documented refresh path.
+#[test]
+fn test_stale_payload_renders_one_line_without_force() {
+    let args = v(r#"{"query": "foo"}"#);
+    let payload = v(r#"{
+        "count": 1,
+        "results": [{"file_path": "/p.rs", "symbol_name": "f", "score": 0.5}],
+        "_meta": {"freshness": {
+            "generation": 695,
+            "status": "stale",
+            "changed_unindexed_count": 3
+        }}
+    }"#);
+    let s = render_tool_output("leindex.search", &payload, &args);
+    assert!(
+        s.contains("\n[index: stale gen=695 changed=3]\n"),
+        "stale must render the one compact line: {s}"
+    );
+    assert_eq!(
+        s.matches("[index:").count(),
+        1,
+        "exactly one footer line, not a block: {s}"
+    );
+    assert!(
+        !s.contains("Freshness:"),
+        "the old Freshness line must stay gone: {s}"
+    );
+    // No advisory in the payload -> no advisory line, and no stale advisory
+    // text anywhere.
+    assert!(!s.contains("Advisory:"), "no advisory, no line: {s}");
+    assert!(
+        !s.contains("force"),
+        "the text surface must never say force: {s}"
+    );
+    assert!(
+        !s.contains(crate::cli::mcp::helpers::STALE_ADVISORY),
+        "a payload without an advisory must not grow one: {s}"
+    );
+}
+
+/// N-11: the `status_note` clarifier lives on the structured badge only; the
+/// fresh status means the renderer emits no footer at all, so the note can
+/// never reach the text surface as per-call boilerplate.
+#[test]
+fn test_n11_status_note_never_reaches_the_text_surface() {
+    let args = v(r#"{"query": "foo"}"#);
+    let payload = v(r#"{
+        "count": 1,
+        "results": [{"file_path": "/p.rs", "symbol_name": "f", "score": 0.5}],
+        "_meta": {"freshness": {
+            "generation": 2,
+            "status": "fresh",
+            "changed_unindexed_count": 1,
+            "status_note": "fresh = the last index run completed; 1 file(s) changed in the worktree since then"
+        }}
+    }"#);
+    let s = render_tool_output("leindex.search", &payload, &args);
+    assert!(
+        !s.contains("status_note"),
+        "the N-11 note must stay in _meta: {s}"
+    );
+    assert!(
+        !s.contains("changed in the worktree"),
+        "no per-call clarifier prose: {s}"
+    );
+    assert!(!s.contains("[index:"), "fresh: no footer at all: {s}");
+}

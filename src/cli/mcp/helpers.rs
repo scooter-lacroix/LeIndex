@@ -146,6 +146,26 @@ fn dirty_count(status: &crate::cli::git::GitStatus) -> usize {
     status.modified.len() + status.staged.len() + status.untracked.len() + status.deleted.len()
 }
 
+/// Text of the once-per-session stale advisory (`_meta.freshness.warning`,
+/// moved to `advisory` by the transport's `apply_freshness_advisory`).
+///
+/// Incremental by contract: `leindex_manage action=index` is the documented
+/// refresh path, and `force_reindex` is never recommended by default — a full
+/// rebuild is a caller decision, not boilerplate advice. `pub(crate)` so the
+/// render tests can assert the exact string the text surface must NOT echo.
+pub(crate) const STALE_ADVISORY: &str =
+    "Index may be stale; run leindex_manage action=index to refresh.";
+pub(crate) const NO_GENERATION_ADVISORY: &str =
+    "No indexed generation is loaded; exact live results remain usable.";
+
+fn stale_warning_message(no_generation_loaded: bool) -> &'static str {
+    if no_generation_loaded {
+        NO_GENERATION_ADVISORY
+    } else {
+        STALE_ADVISORY
+    }
+}
+
 /// Determine whether the index is genuinely stale by checking if dirty files
 /// affect actual indexed source files.
 ///
@@ -263,7 +283,7 @@ pub(crate) fn wrap_live_with_meta_status(
     let storage_path = crate::cli::leindex::resolve_existing_storage_path(project_root)
         .unwrap_or_else(|| project_root.join(".leindex"));
     let health = crate::cli::index_freshness::load_health(&storage_path);
-    let freshness = health
+    let mut freshness = health
         .as_ref()
         .map(|health| {
             let age_ms = health.indexed_at_unix_ms.and_then(|indexed_at| {
@@ -306,18 +326,13 @@ pub(crate) fn wrap_live_with_meta_status(
     if let Some(obj) = result.as_object_mut() {
         let stale = is_index_genuinely_stale(&health, project_root, live_status, status_known);
         {
-            let mut freshness = freshness;
+            // Warn only when the index is GENUINELY stale. The transport
+            // moves `warning` to `advisory` at most once per session and
+            // generation; the text surface must not echo it per call.
             if stale && let Some(freshness_obj) = freshness.as_object_mut() {
                 freshness_obj.insert(
                     "warning".to_string(),
-                    Value::String(
-                        if health.is_none() {
-                            "No indexed generation is loaded; exact live results remain usable."
-                        } else {
-                            "Index may be stale; run leindex_manage action=index with force_reindex=true to refresh."
-                        }
-                        .to_string(),
-                    ),
+                    Value::String(stale_warning_message(health.is_none()).to_string()),
                 );
             }
             let meta = obj
@@ -1248,5 +1263,106 @@ mod tests {
         assert_eq!(diff.additions, 1);
         assert_eq!(diff.deletions, 1);
         assert!(diff.has_changes());
+    }
+
+    /// Regression (brief §3.2): a genuinely-stale worktree must carry the
+    /// incremental advisory and NEVER the old force_reindex recommendation.
+    /// The fixture seeds `index-state.json` through the real persistence
+    /// helper, so the loader path is production-identical.
+    #[test]
+    fn test_stale_warning_recommends_incremental_index_never_force() {
+        let directory = tempdir().unwrap();
+        let storage = directory.path().join(".leindex");
+        crate::cli::index_freshness::save_health(
+            &storage,
+            &IndexHealth {
+                generation: 695,
+                status: ComponentStatus::Fresh,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // A tracked source file changed since the indexed tree: genuinely stale.
+        let status = crate::cli::git::GitStatus {
+            modified: vec![PathBuf::from("src/lib.rs")],
+            ..Default::default()
+        };
+        let result =
+            wrap_live_with_meta_status(serde_json::json!({}), directory.path(), Some(&status), 1);
+        let warning = result["_meta"]["freshness"]["warning"]
+            .as_str()
+            .expect("genuinely stale must warn");
+        assert_eq!(warning, STALE_ADVISORY);
+        assert!(
+            !warning.contains("force_reindex"),
+            "the default advisory must never recommend a force rebuild: {warning}"
+        );
+    }
+
+    /// A fresh index with a clean worktree must NOT warn: the advisory (and
+    /// therefore the text footer) fires only when the index is genuinely
+    /// stale.
+    #[test]
+    fn test_fresh_index_with_clean_worktree_emits_no_warning() {
+        let directory = tempdir().unwrap();
+        let storage = directory.path().join(".leindex");
+        crate::cli::index_freshness::save_health(
+            &storage,
+            &IndexHealth {
+                generation: 1,
+                status: ComponentStatus::Fresh,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let clean = crate::cli::git::GitStatus::default();
+        let result =
+            wrap_live_with_meta_status(serde_json::json!({}), directory.path(), Some(&clean), 0);
+        let freshness = &result["_meta"]["freshness"];
+        assert!(
+            freshness.get("warning").is_none(),
+            "fresh + clean must not warn: {freshness}"
+        );
+        assert!(
+            freshness.get("status_note").is_none(),
+            "the N-11 note must not fire on a clean worktree: {freshness}"
+        );
+    }
+
+    /// N-11: `fresh` plus a nonzero changed count needs the semantics note —
+    /// attached to the structured badge ONLY. The renderer must never echo it
+    /// (asserted on the render side in `output/render/tests.rs`).
+    #[test]
+    fn test_status_note_attaches_only_to_fresh_with_changed_files() {
+        let directory = tempdir().unwrap();
+        let storage = directory.path().join(".leindex");
+        crate::cli::index_freshness::save_health(
+            &storage,
+            &IndexHealth {
+                generation: 2,
+                status: ComponentStatus::Fresh,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // A NON-source untracked file: bumps the changed count without making
+        // the index genuinely stale, so the note fires while the warning
+        // must not.
+        let changed = crate::cli::git::GitStatus {
+            untracked: vec![PathBuf::from("notes.txt")],
+            ..Default::default()
+        };
+        let result =
+            wrap_live_with_meta_status(serde_json::json!({}), directory.path(), Some(&changed), 1);
+        let freshness = &result["_meta"]["freshness"];
+        assert_eq!(freshness["status"], "fresh");
+        let note = freshness["status_note"]
+            .as_str()
+            .expect("fresh + changed must carry the N-11 note");
+        assert!(note.contains("1 file(s)"), "note states the count: {note}");
+        assert!(
+            freshness.get("warning").is_none(),
+            "fresh never warns, even when dirty: {freshness}"
+        );
     }
 }

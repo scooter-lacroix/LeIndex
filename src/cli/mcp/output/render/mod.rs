@@ -480,9 +480,6 @@ fn render_diagnostics_health(data: &Value, color: bool) -> String {
     if let Some(value) = health.get("index_health").and_then(|v| v.as_str()) {
         out.push_str(&field("  Index health", value, color));
     }
-    if let Some(value) = health.get("pdg_loaded").and_then(|v| v.as_bool()) {
-        out.push_str(&field("  PDG loaded", &value.to_string(), color));
-    }
     for (key, label) in [
         ("pdg_nodes", "  PDG nodes"),
         ("pdg_edges", "  PDG edges"),
@@ -573,8 +570,11 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
     if let Some(v) = data.get("db_size_bytes").and_then(|v| v.as_u64()) {
         out.push_str(&field("DB size", &format!("{} bytes", v), color));
     }
-    if let Some(v) = data.get("stale").and_then(|v| v.as_bool()) {
-        out.push_str(&field("Stale", &v.to_string(), color));
+    // `stale: false` is the common case and says nothing; staleness only
+    // deserves a line when it is TRUE — the freshness block already carries
+    // the reason then.
+    if data.get("stale").and_then(|v| v.as_bool()) == Some(true) {
+        out.push_str(&field("Stale", "true", color));
     }
     if let Some(v) = data.get("last_indexed_secs_ago").and_then(|v| v.as_u64()) {
         out.push_str(&field("Last indexed", &format!("{}s ago", v), color));
@@ -1264,20 +1264,37 @@ fn render_footer(data: &Value) -> Option<String> {
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        let generation = freshness
-            .get("generation")
-            .and_then(Value::as_u64)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_string());
         let advisory = freshness
             .get("advisory")
             .and_then(Value::as_str)
             .or_else(|| freshness.get("warning").and_then(Value::as_str));
-        footer.push_str(&format!(
-            "\nFreshness: status={status}, generation={generation}\n"
-        ));
-        if let Some(advisory) = advisory {
-            footer.push_str(&format!("Advisory: {advisory}\n"));
+        // A fresh index with nothing to say costs zero bytes: the old
+        // per-response `Freshness:` line was boilerplate the caller never
+        // asked for, and the structured `_meta.freshness` badge still carries
+        // the same facts for machine readers. When the index is NOT fresh
+        // (or an advisory survived the once-per-session gate), emit exactly
+        // one compact header-style line.
+        if status != "fresh" || advisory.is_some() {
+            let generation = freshness
+                .get("generation")
+                .and_then(Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let changed = freshness
+                .get("changed_unindexed_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let changed_part = if changed > 0 {
+                format!(" changed={changed}")
+            } else {
+                String::new()
+            };
+            footer.push_str(&format!(
+                "\n[index: {status} gen={generation}{changed_part}]\n"
+            ));
+            if let Some(advisory) = advisory {
+                footer.push_str(&format!("Advisory: {advisory}\n"));
+            }
         }
     }
     if let Some(gate) = system_one_footer(data) {

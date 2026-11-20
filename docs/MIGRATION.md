@@ -864,7 +864,7 @@ Behavior:
 
 ## 5. Structured `_meta.freshness` Badge
 
-In v2.0 and earlier, staleness was surfaced as a free-text `_warning` string (e.g. `"Index may be stale; run leindex.index with force_reindex=true to refresh."`) attached to tool responses. Clients had to substring-match prose to detect staleness.
+In v2.0 and earlier, staleness was surfaced as a free-text `_warning` string attached to tool responses. Clients had to substring-match prose to detect staleness.
 
 In v1.9.0, every tool response carries a structured `_meta.freshness` object with machine-readable fields. The free-text `_warning` is replaced by this badge, and a separate per-session `advisory` string (shown once per session and generation) carries the human-readable hint.
 
@@ -876,7 +876,7 @@ In v1.9.0, every tool response carries a structured `_meta.freshness` object wit
   "_meta": {
     "freshness": {
       "generation": 5,
-      "status": "Fresh",            // ComponentStatus: Fresh | Stale | Partial | Failed
+      "status": "fresh",             // ComponentStatus, snake_case: fresh | stale | partial | failed | ...
       "phase": "Complete",          // IndexPhase
       "head_oid": "abc1234",
       "tree_oid": "def5678",
@@ -886,7 +886,7 @@ In v1.9.0, every tool response carries a structured `_meta.freshness` object wit
       "age_ms": 1864000,            // ms since the generation was indexed
       "last_failure_phase": null,   // set when the last index failed at a phase
       "last_failure": null,
-      "warning": "Index may be stale; run leindex.index with force_reindex=true to refresh.",
+      "warning": "Index may be stale; run leindex_manage action=index to refresh.",
       "advisory": null              // human-readable hint, shown once per session+generation
     }
   }
@@ -900,7 +900,7 @@ Field semantics:
 - **`phase`** - the `IndexPhase` of the loaded generation (typically `Complete` for queryable results).
 - **`dirty_file_count`** / **`changed_unindexed_count`** - live `git status --porcelain=v2` counts, floored at the persisted health value. Non-zero with `status != Fresh` indicates the worktree has drifted from the indexed generation.
 - **`age_ms`** - milliseconds since the generation was indexed. Useful for "how stale?" heuristics.
-- **`warning`** - present (non-null) **only when** the index is genuinely stale (a tracked source file differs from what was indexed). This is the compact, always-present freshness warning. When you see it, call `leindex.index` (optionally with `force_reindex=true`) to refresh.
+- **`warning`** - present (non-null) **only when** the index is genuinely stale (a tracked source file differs from what was indexed). This is the compact freshness warning, gated at most once per session and generation on the MCP transport (subsequent responses carry `advisory: null`). When you see it, call `leindex_manage action=index` (incremental); `force_reindex=true` is reserved for explicit full-rebuild requests, never a default recommendation.
 - **`advisory`** - a per-session, per-generation hint string. The MCP transport emits the advisory at most once per session for each generation; subsequent responses for the same generation set `advisory: null` to avoid repeating the hint in long conversations. A new `generation` resets the advisory for that session. Direct CLI calls are unaffected.
 
 **Migration steps for clients:**
