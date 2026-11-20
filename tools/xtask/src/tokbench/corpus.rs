@@ -5,7 +5,7 @@
 //! derived from these same byte-exact sources, so the assertions stay in
 //! lockstep with what the arms operate on.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -46,8 +46,7 @@ impl Fixture {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(&path, content)
-                .with_context(|| format!("write fixture file {rel}"))?;
+            fs::write(&path, content).with_context(|| format!("write fixture file {rel}"))?;
         }
         let fx = Self { _temp: temp, root };
         fx.git_init_baseline()?;
@@ -295,31 +294,55 @@ fn files() -> Vec<(String, String)> {
         ("Cargo.toml".to_string(), WORKSPACE_MANIFEST.to_string()),
         ("README.md".to_string(), README.to_string()),
         (".gitignore".to_string(), GITIGNORE.to_string()),
-        ("crates/core/Cargo.toml".to_string(), CORE_MANIFEST.to_string()),
+        (
+            "crates/core/Cargo.toml".to_string(),
+            CORE_MANIFEST.to_string(),
+        ),
         ("crates/core/src/lib.rs".to_string(), CORE_LIB.to_string()),
-        ("crates/core/src/commands.rs".to_string(), CORE_COMMANDS.to_string()),
-        ("crates/api/Cargo.toml".to_string(), API_MANIFEST.to_string()),
+        (
+            "crates/core/src/commands.rs".to_string(),
+            CORE_COMMANDS.to_string(),
+        ),
+        (
+            "crates/api/Cargo.toml".to_string(),
+            API_MANIFEST.to_string(),
+        ),
         ("crates/api/src/lib.rs".to_string(), API_LIB.to_string()),
-        ("crates/api/src/client.rs".to_string(), API_CLIENT.to_string()),
+        (
+            "crates/api/src/client.rs".to_string(),
+            API_CLIENT.to_string(),
+        ),
         ("crates/api/src/http.rs".to_string(), API_HTTP.to_string()),
-        ("crates/api/tests/api_test.rs".to_string(), API_TEST.to_string()),
-        ("crates/cli/Cargo.toml".to_string(), CLI_MANIFEST.to_string()),
+        (
+            "crates/api/tests/api_test.rs".to_string(),
+            API_TEST.to_string(),
+        ),
+        (
+            "crates/cli/Cargo.toml".to_string(),
+            CLI_MANIFEST.to_string(),
+        ),
         ("crates/cli/src/main.rs".to_string(), CLI_MAIN.to_string()),
-        ("crates/perf/Cargo.toml".to_string(), PERF_MANIFEST.to_string()),
+        (
+            "crates/perf/Cargo.toml".to_string(),
+            PERF_MANIFEST.to_string(),
+        ),
         ("crates/perf/src/lib.rs".to_string(), perf_lib()),
     ]
 }
 
 /// 1-based line number of the first line containing `needle`.
 pub fn line_of(content: &str, needle: &str) -> Option<usize> {
-    content.lines().position(|l| l.contains(needle)).map(|i| i + 1)
+    content
+        .lines()
+        .position(|l| l.contains(needle))
+        .map(|i| i + 1)
 }
 
 /// T1 expectation: `(rel, line)` of the request-body builder fn.
 pub fn expected_builder_location(fx: &Fixture) -> Result<(String, usize)> {
     let content = fx.read_rel(HTTP_REL)?;
-    let line = line_of(&content, "fn build_request_body")
-        .context("builder fn missing from http.rs")?;
+    let line =
+        line_of(&content, "fn build_request_body").context("builder fn missing from http.rs")?;
     Ok((HTTP_REL.to_string(), line))
 }
 

@@ -87,7 +87,11 @@ enum GrepMode {
 /// Returns `Err("unsupported: rg missing")` when `rg` cannot be spawned;
 /// rg's "no matches" exit code (1) is treated as an empty result.
 fn rg(pattern: &str, target: &Path, mode: GrepMode) -> Result<String, String> {
-    let mut cmd = Command::new("rg");
+    rg_with("rg", pattern, target, mode)
+}
+
+fn rg_with(rg_bin: &str, pattern: &str, target: &Path, mode: GrepMode) -> Result<String, String> {
+    let mut cmd = Command::new(rg_bin);
     cmd.arg("--no-messages")
         .arg("-g")
         .arg("!target/**")
@@ -152,11 +156,7 @@ fn git(fx: &corpus::Fixture, args: &[&str]) -> Result<String, String> {
 }
 
 /// Run cargo inside the fixture and report a one-line summary.
-fn cargo_run(
-    fx: &corpus::Fixture,
-    args: &[&str],
-    log_rel: &str,
-) -> Result<String, String> {
+fn cargo_run(fx: &corpus::Fixture, args: &[&str], log_rel: &str) -> Result<String, String> {
     let log = fx.path(log_rel);
     let out = Command::new("cargo")
         .args(args)
@@ -188,10 +188,14 @@ fn task1_read_builder(fx: &corpus::Fixture) -> TaskOutcome {
     let (rel, expected_line) = match corpus::expected_builder_location(fx) {
         Ok(v) => v,
         Err(e) => {
-            return TaskOutcome::failed(corpus::T1_READ_BUILDER, Mode::Read, calls, e.to_string())
+            return TaskOutcome::failed(corpus::T1_READ_BUILDER, Mode::Read, calls, e.to_string());
         }
     };
-    let grep_out = match rg("fn build_request_body", &fx.root, GrepMode::Content { context: 0 }) {
+    let grep_out = match rg(
+        "fn build_request_body",
+        &fx.root,
+        GrepMode::Content { context: 0 },
+    ) {
         Ok(o) => o,
         Err(e) => return unsupported_or_failed(corpus::T1_READ_BUILDER, Mode::Read, e),
     };
@@ -208,7 +212,9 @@ fn task1_read_builder(fx: &corpus::Fixture) -> TaskOutcome {
 
     let numbered = format!("{:>6}\t", found_line.unwrap_or(0));
     let pass = found_line == Some(expected_line)
-        && read_out.lines().any(|l| l.starts_with(&numbered) && l.contains("fn build_request_body"));
+        && read_out
+            .lines()
+            .any(|l| l.starts_with(&numbered) && l.contains("fn build_request_body"));
     let detail = format!(
         "builder line {} (expected {}); read window covers it: {}",
         found_line.unwrap_or(0),
@@ -224,10 +230,14 @@ fn task2_find_callers(fx: &corpus::Fixture) -> TaskOutcome {
     let (expected_count, expected_lines) = match corpus::expected_caller_matches(fx) {
         Ok(v) => v,
         Err(e) => {
-            return TaskOutcome::failed(corpus::T2_FIND_CALLERS, Mode::Find, calls, e.to_string())
+            return TaskOutcome::failed(corpus::T2_FIND_CALLERS, Mode::Find, calls, e.to_string());
         }
     };
-    let grep_out = match rg("perform_request\\(", &fx.root, GrepMode::Content { context: 0 }) {
+    let grep_out = match rg(
+        "perform_request\\(",
+        &fx.root,
+        GrepMode::Content { context: 0 },
+    ) {
         Ok(o) => o,
         Err(e) => return unsupported_or_failed(corpus::T2_FIND_CALLERS, Mode::Find, e),
     };
@@ -235,9 +245,9 @@ fn task2_find_callers(fx: &corpus::Fixture) -> TaskOutcome {
 
     let lines: Vec<&str> = grep_out.lines().collect();
     let count = lines.len();
-    let all_present = expected_lines.iter().all(|(rel, line)| {
-        lines.iter().any(|l| line_from_match(l, rel) == Some(*line))
-    });
+    let all_present = expected_lines
+        .iter()
+        .all(|(rel, line)| lines.iter().any(|l| line_from_match(l, rel) == Some(*line)));
     let pass = count == expected_count && all_present;
     let detail = format!("caller matches {count} (expected {expected_count})");
     outcome(corpus::T2_FIND_CALLERS, Mode::Find, calls, pass, detail)
@@ -296,7 +306,11 @@ fn task3_add_field(fx: &corpus::Fixture) -> TaskOutcome {
     let check_out = match cargo_run(fx, &["check", "-q"], "check-output.txt") {
         Ok(o) => o,
         Err(e) => {
-            calls.push(CallRecord { tool: "cargo check", output_chars: e.chars().count(), ok: false });
+            calls.push(CallRecord {
+                tool: "cargo check",
+                output_chars: e.chars().count(),
+                ok: false,
+            });
             return TaskOutcome::failed(corpus::T3_ADD_FIELD, Mode::Edit, calls, e);
         }
     };
@@ -304,9 +318,8 @@ fn task3_add_field(fx: &corpus::Fixture) -> TaskOutcome {
     let check_ok = check_out.starts_with("exit 0");
 
     let pass = !saw_error && site_edits_ok == 3 && check_ok;
-    let detail = format!(
-        "construction sites edited {site_edits_ok}/3; cargo check -q exit 0: {check_ok}"
-    );
+    let detail =
+        format!("construction sites edited {site_edits_ok}/3; cargo check -q exit 0: {check_ok}");
     outcome(corpus::T3_ADD_FIELD, Mode::Edit, calls, pass, detail)
 }
 
@@ -316,7 +329,7 @@ fn task4_read_failure(fx: &corpus::Fixture) -> TaskOutcome {
     let (rel, expected_line) = match corpus::expected_failure_location(fx) {
         Ok(v) => v,
         Err(e) => {
-            return TaskOutcome::failed(corpus::T4_READ_FAILURE, Mode::Run, calls, e.to_string())
+            return TaskOutcome::failed(corpus::T4_READ_FAILURE, Mode::Run, calls, e.to_string());
         }
     };
     let run_out = match cargo_run(fx, &["test", "-p", "api"], "test-output.txt") {
@@ -325,7 +338,11 @@ fn task4_read_failure(fx: &corpus::Fixture) -> TaskOutcome {
     };
     calls.push(record("cargo test", run_out));
 
-    let grep_out = match rg("-->", &fx.path("test-output.txt"), GrepMode::Content { context: 0 }) {
+    let grep_out = match rg(
+        "-->",
+        &fx.path("test-output.txt"),
+        GrepMode::Content { context: 0 },
+    ) {
         Ok(o) => o,
         Err(e) => return unsupported_or_failed(corpus::T4_READ_FAILURE, Mode::Run, e),
     };
@@ -370,7 +387,11 @@ fn task5_git_commit(fx: &corpus::Fixture) -> TaskOutcome {
     };
     calls.push(record("git show", show_out.clone()));
 
-    let touched: Vec<&str> = show_out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let touched: Vec<&str> = show_out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
     let pass = touched.len() == 2
         && touched.contains(&corpus::README_REL)
         && touched.contains(&corpus::COMMANDS_REL);
@@ -458,7 +479,10 @@ mod tests {
     fn test_edit_message_one_line_and_applies() {
         let (_t, path) = write_temp("let x = 1;\n");
         let msg = native_edit(&path, "x = 1", "y = 2").expect("edit");
-        assert_eq!(msg, format!("Edited {} (1 change applied).", path.display()));
+        assert_eq!(
+            msg,
+            format!("Edited {} (1 change applied).", path.display())
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), "let y = 2;\n");
     }
 
@@ -471,24 +495,27 @@ mod tests {
 
     #[test]
     fn test_rg_missing_reports_unsupported() {
-        // Empty PATH => rg cannot be spawned; the exact unsupported line
-        // must come back, never a fake result.
-        let path = std::path::Path::new("/tmp");
-        let out = Command::new("rg")
-            .env("PATH", "")
-            .arg("-n")
-            .arg("foo")
-            .arg(path)
-            .output();
-        assert!(out.is_err(), "rg should be unreachable with empty PATH");
-        let err = rg("foo", path, GrepMode::Content { context: 0 })
-            .unwrap_err();
+        // A binary name that can never resolve => the exact unsupported
+        // line must come back, never a fake result.
+        let err = rg_with(
+            "__no_such_rg_bin__",
+            "foo",
+            std::path::Path::new("/tmp"),
+            GrepMode::Content { context: 0 },
+        )
+        .unwrap_err();
         assert!(err.starts_with("unsupported: rg missing"), "got {err}");
     }
 
     #[test]
     fn test_line_from_match() {
-        assert_eq!(line_from_match("crates/api/src/http.rs:12:pub fn x", "crates/api/src/http.rs"), Some(12));
+        assert_eq!(
+            line_from_match(
+                "crates/api/src/http.rs:12:pub fn x",
+                "crates/api/src/http.rs"
+            ),
+            Some(12)
+        );
         assert_eq!(line_from_match("other:1:x", "crates/api/src/http.rs"), None);
     }
 
@@ -497,7 +524,8 @@ mod tests {
         let temp = TempDir::new("grep-test").expect("tempdir");
         fs::write(temp.path().join("a.rs"), "foo\nbar\n").expect("write a");
         fs::write(temp.path().join("b.rs"), "bar\n").expect("write b");
-        (temp, temp.path().to_path_buf())
+        let dir = temp.path().to_path_buf();
+        (temp, dir)
     }
 
     #[test]

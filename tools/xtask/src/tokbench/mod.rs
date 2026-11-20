@@ -35,14 +35,19 @@ impl TempDir {
     pub fn new(label: &str) -> Result<Self> {
         let pid = std::process::id();
         let base = std::env::temp_dir().join(format!("tokbench-{label}-{pid}"));
-        let mut path = base.clone();
-        let mut n = 0u32;
-        while path.exists() {
-            n += 1;
-            path = base.with_file_name(format!("tokbench-{label}-{pid}-{n}"));
+        for n in 0..100u32 {
+            let path = if n == 0 {
+                base.clone()
+            } else {
+                base.with_file_name(format!("tokbench-{label}-{pid}-{n}"))
+            };
+            // create_dir (not create_dir_all) fails if the path exists, so
+            // concurrent callers can never collide on the same directory.
+            if fs::create_dir(&path).is_ok() {
+                return Ok(Self { path });
+            }
         }
-        fs::create_dir_all(&path)?;
-        Ok(Self { path })
+        anyhow::bail!("could not create tempdir under {}", base.display());
     }
 
     pub fn path(&self) -> &Path {
@@ -159,9 +164,7 @@ pub fn run_tokbench() -> Result<()> {
     let leindex_bin = leindex::resolve_binary()?;
 
     let native_arm = native::NativeArm;
-    let leindex_arm = leindex::LeIndexArm {
-        bin: leindex_bin,
-    };
+    let leindex_arm = leindex::LeIndexArm { bin: leindex_bin };
 
     let task_ids = [
         corpus::T1_READ_BUILDER,
@@ -218,11 +221,7 @@ fn evaluate(native: &[TaskOutcome], leindex: &[TaskOutcome]) -> Verdict {
         comparable += 1;
         let mut why = Vec::new();
         if l.tokens() * 10 > n.tokens() * 6 {
-            why.push(format!(
-                "tokens {}/{} (need <=60%)",
-                l.tokens(),
-                n.tokens()
-            ));
+            why.push(format!("tokens {}/{} (need <=60%)", l.tokens(), n.tokens()));
         }
         if l.round_trips() > n.round_trips() {
             why.push(format!(
@@ -255,17 +254,27 @@ fn print_report(
     println!("\n# TokBench report");
     println!("Token estimate: {TOKEN_ESTIMATE_LABEL}");
     println!();
-    println!("| Task | Mode | Arm | Status | Output chars | Tokens (est) | Round trips | Assertion |");
+    println!(
+        "| Task | Mode | Arm | Status | Output chars | Tokens (est) | Round trips | Assertion |"
+    );
     println!("|---|---|---|---|---|---|---|---|");
     for (n, l) in native.iter().zip(leindex) {
         for (arm, outcome) in [("native", n), ("leindex", l)] {
             let (status, chars, tokens, rt, assertion) = if outcome.supported {
                 (
-                    if outcome.assertion_passed { "ok" } else { "fail" },
+                    if outcome.assertion_passed {
+                        "ok"
+                    } else {
+                        "fail"
+                    },
                     outcome.output_chars().to_string(),
                     outcome.tokens().to_string(),
                     outcome.round_trips().to_string(),
-                    if outcome.assertion_passed { "PASS" } else { "FAIL" },
+                    if outcome.assertion_passed {
+                        "PASS"
+                    } else {
+                        "FAIL"
+                    },
                 )
             } else {
                 (
@@ -293,7 +302,10 @@ fn print_report(
     print_mode_share(native, leindex);
     println!();
     println!("## Verdict");
-    println!("Comparable tasks (both arms supported): {}", verdict.comparable_tasks);
+    println!(
+        "Comparable tasks (both arms supported): {}",
+        verdict.comparable_tasks
+    );
     for v in &verdict.violations {
         println!("- violation: {v}");
     }
@@ -312,11 +324,15 @@ fn print_mode_share(native: &[TaskOutcome], leindex: &[TaskOutcome]) {
         let nat: (usize, usize) = native
             .iter()
             .filter(|o| o.supported && o.mode == mode)
-            .fold((0, 0), |acc, o| (acc.0 + o.output_chars(), acc.1 + o.tokens()));
+            .fold((0, 0), |acc, o| {
+                (acc.0 + o.output_chars(), acc.1 + o.tokens())
+            });
         let lei: (usize, usize) = leindex
             .iter()
             .filter(|o| o.supported && o.mode == mode)
-            .fold((0, 0), |acc, o| (acc.0 + o.output_chars(), acc.1 + o.tokens()));
+            .fold((0, 0), |acc, o| {
+                (acc.0 + o.output_chars(), acc.1 + o.tokens())
+            });
         println!(
             "| {} | {} | {} | {} | {} |",
             mode.label(),
@@ -364,9 +380,24 @@ fn write_report_json(
                 s.push_str(&format!("\"round_trips\": {}, ", o.round_trips()));
                 s.push_str(&format!("\"assertion_passed\": {}, ", o.assertion_passed));
                 s.push_str(&format!(
-                    "\"assertion_detail\": \"{}\"",
+                    "\"assertion_detail\": \"{}\", ",
                     json_escape(&o.assertion_detail)
                 ));
+                s.push_str("\"calls\": [");
+                let call_rows: Vec<String> = o
+                    .calls
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{{\"tool\": \"{}\", \"output_chars\": {}, \"ok\": {}}}",
+                            json_escape(c.tool),
+                            c.output_chars,
+                            c.ok
+                        )
+                    })
+                    .collect();
+                s.push_str(&call_rows.join(", "));
+                s.push_str("]");
             } else {
                 s.push_str(&format!(
                     "\"unsupported_reason\": \"{}\"",

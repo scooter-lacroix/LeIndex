@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::tokbench::corpus;
 use crate::tokbench::{BenchArm, CallRecord, Mode, TaskOutcome};
@@ -31,13 +31,19 @@ pub fn resolve_binary() -> Result<PathBuf> {
         if path.exists() {
             return Ok(path);
         }
-        bail!("LEINDEX_BIN is set but the binary is missing: {}", path.display());
+        bail!(
+            "LEINDEX_BIN is set but the binary is missing: {}",
+            path.display()
+        );
     }
     if let Some(path) = which_in_path("leindex") {
         return Ok(path);
     }
     let ws = crate::tokbench::workspace_root()?;
-    for cand in [ws.join("target/debug/leindex"), ws.join("target/release/leindex")] {
+    for cand in [
+        ws.join("target/debug/leindex"),
+        ws.join("target/release/leindex"),
+    ] {
         if cand.exists() {
             return Ok(cand);
         }
@@ -162,11 +168,22 @@ impl LeIndexArm {
         let (rel, line) = match corpus::expected_builder_location(fx) {
             Ok(v) => v,
             Err(e) => {
-                return TaskOutcome::failed(corpus::T1_READ_BUILDER, Mode::Read, calls, e.to_string())
+                return TaskOutcome::failed(
+                    corpus::T1_READ_BUILDER,
+                    Mode::Read,
+                    calls,
+                    e.to_string(),
+                );
             }
         };
         let find_args = json_args(&[("action", "find"), ("pattern", "fn build_request_body")]);
-        let find = match self.tool(fx, "leindex_explore", &find_args, corpus::T1_READ_BUILDER, Mode::Read) {
+        let find = match self.tool(
+            fx,
+            "leindex_explore",
+            &find_args,
+            corpus::T1_READ_BUILDER,
+            Mode::Read,
+        ) {
             Ok(r) => r,
             Err(outcome) => return outcome,
         };
@@ -178,7 +195,13 @@ impl LeIndexArm {
             ("start_line", &line.to_string()),
             ("end_line", &(line + 25).to_string()),
         ]);
-        let read = match self.tool(fx, "leindex_explore", &read_args, corpus::T1_READ_BUILDER, Mode::Read) {
+        let read = match self.tool(
+            fx,
+            "leindex_explore",
+            &read_args,
+            corpus::T1_READ_BUILDER,
+            Mode::Read,
+        ) {
             Ok(r) => r,
             Err(outcome) => return outcome,
         };
@@ -206,11 +229,22 @@ impl LeIndexArm {
         let (_expected_count, _expected_lines) = match corpus::expected_caller_matches(fx) {
             Ok(v) => v,
             Err(e) => {
-                return TaskOutcome::failed(corpus::T2_FIND_CALLERS, Mode::Find, calls, e.to_string())
+                return TaskOutcome::failed(
+                    corpus::T2_FIND_CALLERS,
+                    Mode::Find,
+                    calls,
+                    e.to_string(),
+                );
             }
         };
         let find_args = json_args(&[("action", "find"), ("pattern", "perform_request\\(")]);
-        let find = match self.tool(fx, "leindex_explore", &find_args, corpus::T2_FIND_CALLERS, Mode::Find) {
+        let find = match self.tool(
+            fx,
+            "leindex_explore",
+            &find_args,
+            corpus::T2_FIND_CALLERS,
+            Mode::Find,
+        ) {
             Ok(r) => r,
             Err(outcome) => return outcome,
         };
@@ -286,7 +320,11 @@ impl LeIndexArm {
         let check_out = match cargo_check_in_fixture(fx) {
             Ok(o) => o,
             Err(e) => {
-                calls.push(CallRecord { tool: "cargo check", output_chars: e.chars().count(), ok: false });
+                calls.push(CallRecord {
+                    tool: "cargo check",
+                    output_chars: e.chars().count(),
+                    ok: false,
+                });
                 return TaskOutcome::failed(corpus::T3_ADD_FIELD, Mode::Edit, calls, e);
             }
         };
@@ -313,7 +351,12 @@ impl LeIndexArm {
         let (rel, line) = match corpus::expected_failure_location(fx) {
             Ok(v) => v,
             Err(e) => {
-                return TaskOutcome::failed(corpus::T4_READ_FAILURE, Mode::Run, calls, e.to_string())
+                return TaskOutcome::failed(
+                    corpus::T4_READ_FAILURE,
+                    Mode::Run,
+                    calls,
+                    e.to_string(),
+                );
             }
         };
         let run_out = match cargo_test_fixture(fx) {
@@ -327,7 +370,13 @@ impl LeIndexArm {
             ("pattern", "-->"),
             ("path", "test-output.txt"),
         ]);
-        let find = match self.tool(fx, "leindex_explore", &find_args, corpus::T4_READ_FAILURE, Mode::Run) {
+        let find = match self.tool(
+            fx,
+            "leindex_explore",
+            &find_args,
+            corpus::T4_READ_FAILURE,
+            Mode::Run,
+        ) {
             Ok(r) => r,
             Err(outcome) => return outcome,
         };
@@ -363,9 +412,18 @@ impl LeIndexArm {
 
         let add_args = json_args(&[
             ("action", "add"),
-            ("paths", &format!("[\"{}\", \"{}\"]", corpus::README_REL, corpus::COMMANDS_REL)),
+            (
+                "paths",
+                &format!("[\"{}\", \"{}\"]", corpus::README_REL, corpus::COMMANDS_REL),
+            ),
         ]);
-        let add = match self.tool(fx, "leindex_git", &add_args, corpus::T5_GIT_COMMIT, Mode::Git) {
+        let add = match self.tool(
+            fx,
+            "leindex_git",
+            &add_args,
+            corpus::T5_GIT_COMMIT,
+            Mode::Git,
+        ) {
             Ok(r) => r,
             Err(outcome) => return outcome,
         };
@@ -375,7 +433,13 @@ impl LeIndexArm {
             ("action", "commit"),
             ("message", "tokbench: stage two named files"),
         ]);
-        let commit = match self.tool(fx, "leindex_git", &commit_args, corpus::T5_GIT_COMMIT, Mode::Git) {
+        let commit = match self.tool(
+            fx,
+            "leindex_git",
+            &commit_args,
+            corpus::T5_GIT_COMMIT,
+            Mode::Git,
+        ) {
             Ok(r) => r,
             Err(outcome) => return outcome,
         };
@@ -386,14 +450,20 @@ impl LeIndexArm {
             ("what", "HEAD"),
             ("format", "name-only"),
         ]);
-        let show = match self.tool(fx, "leindex_git", &show_args, corpus::T5_GIT_COMMIT, Mode::Git) {
+        let show = match self.tool(
+            fx,
+            "leindex_git",
+            &show_args,
+            corpus::T5_GIT_COMMIT,
+            Mode::Git,
+        ) {
             Ok(r) => r,
             Err(outcome) => return outcome,
         };
         calls.push(record("leindex_git show", &show.stdout));
 
-        let saw_both = show.stdout.contains(corpus::README_REL)
-            && show.stdout.contains(corpus::COMMANDS_REL);
+        let saw_both =
+            show.stdout.contains(corpus::README_REL) && show.stdout.contains(corpus::COMMANDS_REL);
         let pass = saw_both;
         let detail = format!(
             "show names both staged files: {saw_both} ({} chars)",
@@ -420,7 +490,13 @@ impl LeIndexArm {
             ("start_line", "1"),
             ("end_line", "120"),
         ]);
-        let first = match self.tool(fx, "leindex_explore", &read_args, corpus::T6_READ_AFTER_EDIT, Mode::Read) {
+        let first = match self.tool(
+            fx,
+            "leindex_explore",
+            &read_args,
+            corpus::T6_READ_AFTER_EDIT,
+            Mode::Read,
+        ) {
             Ok(r) => r,
             Err(outcome) => return outcome,
         };
@@ -432,13 +508,25 @@ impl LeIndexArm {
             ("old_text", &corpus::perf_region_block()),
             ("new_text", ""),
         ]);
-        let edit = match self.tool(fx, "leindex_edit", &edit_args, corpus::T6_READ_AFTER_EDIT, Mode::Read) {
+        let edit = match self.tool(
+            fx,
+            "leindex_edit",
+            &edit_args,
+            corpus::T6_READ_AFTER_EDIT,
+            Mode::Read,
+        ) {
             Ok(r) => r,
             Err(outcome) => return outcome,
         };
         calls.push(record("leindex_edit apply", &edit.stdout));
 
-        let second = match self.tool(fx, "leindex_explore", &read_args, corpus::T6_READ_AFTER_EDIT, Mode::Read) {
+        let second = match self.tool(
+            fx,
+            "leindex_explore",
+            &read_args,
+            corpus::T6_READ_AFTER_EDIT,
+            Mode::Read,
+        ) {
             Ok(r) => r,
             Err(outcome) => return outcome,
         };
