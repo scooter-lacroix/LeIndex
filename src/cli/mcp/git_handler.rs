@@ -542,7 +542,7 @@ fn git_log(root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
         argv.push(path);
     }
     let (text, truncated) = run_text(root, &argv)?;
-    let mut commits = Vec::new();
+    let mut commits: Vec<Value> = Vec::new();
     let mut files = 0usize;
     for line in text.lines() {
         let mut fields = line.splitn(4, '\t');
@@ -951,7 +951,7 @@ fn tag_argv(args: &Value, name: String) -> Vec<String> {
 ///
 /// This is the only place a mutation's command line is decided; the plan, the
 /// token and the executor all consume this one definition.
-fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> {
+pub(crate) fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> {
     let target = plan_target(op, args)?;
     let required = |field: &str| require_target(&target, op.name, field);
 
@@ -1042,6 +1042,19 @@ fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcE
             "git operation '{other}' has no plan"
         ))),
     }
+}
+
+/// Resolve an action NAME to its plan argv — the executor's entry point, so
+/// the private [`Op`] table stays encapsulated in this module.
+pub(crate) fn plan_argv_for(
+    op_name: &str,
+    root: &Path,
+    args: &Value,
+) -> Result<Vec<String>, JsonRpcError> {
+    let op = Op::parse(op_name).ok_or_else(|| {
+        JsonRpcError::internal_error(format!("git operation '{op_name}' has no plan"))
+    })?;
+    plan_argv(op, root, args)
 }
 
 /// Read-only probe run alongside a plan, so the plan describes the real state.
@@ -1304,36 +1317,51 @@ mod tests {
         }
     }
 
-    /// The whole mutation policy in one assertion: with no `confirm`, a
-    /// mutating op returns a plan and does not run.
+    /// The whole mutation policy in one assertion: a bare mutating call is a
+    /// plan, and the token binds to the argv (a different message must not
+    /// share it).
     #[test]
     fn test_mutation_default_is_a_plan_not_an_execution() {
         let root = Path::new("/tmp/project");
         let op = Op::parse("commit").unwrap();
         let argv = plan_argv(op, root, &json!({ "message": "hi" })).unwrap();
         assert_eq!(argv, ["commit", "--no-gpg-sign", "-m", "hi"]);
-        let token = preview_token(root, op.name, &argv);
+        let token = preview_token(root, op.name, &argv, "");
         assert!(!token.is_empty());
         // A different message must not share the token.
         let other = plan_argv(op, root, &json!({ "message": "bye" })).unwrap();
-        assert_ne!(token, preview_token(root, op.name, &other));
+        assert_ne!(token, preview_token(root, op.name, &other, ""));
+        // State participates in the binding: the same argv under a different
+        // repository state hashes differently (the executor's reject-on-move).
+        assert_ne!(
+            token,
+            preview_token(root, op.name, &argv, "head-moved-or-index-changed")
+        );
     }
 
+    /// The plan's `next` field is the instruction a caller actually follows.
+    /// The apply side exists now, so the hint must SAY how to apply — via the
+    /// token, with confirm reserved to the safe subset — and must still state
+    /// that a bare plan changed nothing. The old text ("this build cannot
+    /// apply git mutations") is stale: the brief (§5) explicitly requires
+    /// real apply, and the old tests pinned preview-only behaviour.
     #[test]
-    fn test_plan_next_never_advertises_confirm() {
-        // The plan's `next` field is the instruction a caller actually follows.
-        // It used to say "re-send this call with `confirm`" — which is exactly
-        // the path that always refuses, because the apply side is not wired.
-        // That sent models into a guaranteed error and made a permanent
-        // limitation look like a transient hiccup. While confirming cannot
-        // succeed, the hint must not mention it, and must say nothing changed.
+    fn test_plan_hint_says_how_to_apply() {
         assert!(
-            !PLAN_NEXT_HINT.contains("confirm"),
-            "the plan hint must not advertise a path that always refuses: {PLAN_NEXT_HINT}"
+            PLAN_NEXT_HINT.contains("preview_token"),
+            "the hint must point at the token path: {PLAN_NEXT_HINT}"
+        );
+        assert!(
+            PLAN_NEXT_HINT.contains("confirm:true"),
+            "the hint must name the safe-subset shortcut: {PLAN_NEXT_HINT}"
         );
         assert!(
             PLAN_NEXT_HINT.contains("Nothing was changed"),
             "the hint must state that no state changed: {PLAN_NEXT_HINT}"
+        );
+        assert!(
+            PLAN_NEXT_HINT.contains("token-only"),
+            "destructive shapes must be marked token-only: {PLAN_NEXT_HINT}"
         );
     }
 
@@ -1398,19 +1426,147 @@ mod tests {
         );
     }
 
-    /// The schema must not name an argument the server cannot honour.
-    ///
-    /// `confirm` was advertised while its only possible outcome was a refusal,
-    /// so a model that followed the schema hit a guaranteed error.
+    /// The schema must advertise exactly the apply path the executor
+    /// implements. `confirm` and `preview_token` were removed when the apply
+    /// side was unwired; the brief (§5) requires real apply, so they are back
+    /// — and the destructive rails must be advertised too, because a model
+    /// that cannot see `confirm_text` cannot pass the force-push gate.
     #[test]
-    fn test_schema_does_not_advertise_confirm() {
+    fn test_schema_advertises_the_apply_path() {
         let schema = GitHandler.argument_schema();
         let properties = schema["properties"].as_object().expect("properties");
-        assert!(
-            !properties.contains_key("confirm"),
-            "confirm is not implemented and must not be advertised: {properties:?}"
-        );
+        for key in [
+            "confirm",
+            "preview_token",
+            "force",
+            "confirm_text",
+            "hard",
+            "clean",
+            "delete",
+            "allow_sensitive",
+            "trailers",
+        ] {
+            assert!(properties.contains_key(key), "{key} must be advertised");
+        }
         assert_eq!(schema["required"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// Rails at the argv layer: destructive shapes are only buildable with
+    /// their explicit flag, and every one of them must be token-only at the
+    /// executor (SAFE_TO_CONFIRM must not contain the ops that carry them).
+    #[test]
+    fn test_destructive_shapes_need_their_explicit_flags() {
+        let root = Path::new("/tmp/project");
+
+        // reset --hard without hard:true stays --mixed.
+        let soft = plan_argv(
+            Op::parse("reset").unwrap(),
+            root,
+            &json!({ "target": "HEAD~1", "hard": false }),
+        )
+        .unwrap();
+        assert_eq!(soft, ["reset", "--mixed", "HEAD~1"]);
+        let hard = plan_argv(
+            Op::parse("reset").unwrap(),
+            root,
+            &json!({ "target": "HEAD~1", "hard": true }),
+        )
+        .unwrap();
+        assert_eq!(hard, ["reset", "--hard", "HEAD~1"]);
+
+        // Branch deletion: only via the flag shape, and only with delete:true.
+        let no_flag = plan_argv(
+            Op::parse("reset").unwrap(),
+            root,
+            &json!({ "target": "-d feature" }),
+        )
+        .unwrap_err();
+        assert!(no_flag.message_with_hint().contains("delete:true"), "{no_flag}");
+        let delete = plan_argv(
+            Op::parse("reset").unwrap(),
+            root,
+            &json!({ "target": "-d feature", "delete": true }),
+        )
+        .unwrap();
+        assert_eq!(delete, ["branch", "-d", "feature"]);
+
+        // clean without clean:true is refused; with it, only -d/-fd pass.
+        let no_clean = plan_argv(
+            Op::parse("reset").unwrap(),
+            root,
+            &json!({ "target": "HEAD", "clean": true }),
+        )
+        .unwrap_err();
+        assert!(no_clean.message_with_hint().contains("-fd"), "{no_clean}");
+        let clean = plan_argv(
+            Op::parse("reset").unwrap(),
+            root,
+            &json!({ "target": "-fd", "clean": true }),
+        )
+        .unwrap();
+        assert_eq!(clean, ["clean", "-fd", "-f"]);
+
+        // Force-push without force:true never builds.
+        let no_force = plan_argv(
+            Op::parse("force").unwrap(),
+            root,
+            &json!({ "target": "origin/main" }),
+        )
+        .unwrap_err();
+        assert!(no_force.message_with_hint().contains("force:true"), "{no_force}");
+
+        // The executor's confirm subset must exclude every op that can carry
+        // one of the destructive shapes.
+        let safe: &[&str] = &super::super::git_apply::SAFE_TO_CONFIRM;
+        for op in ["reset", "force"] {
+            assert!(
+                !safe.contains(&op),
+                "{op} can be destructive and must not be confirmable without a token"
+            );
+        }
+    }
+
+    /// commit paths rides git's native pathspec commit (no temp index): the
+    /// argv is `commit … -- <paths>`, trailers ride `--trailer` one per line,
+    /// and a pathspec commit must not sweep other staged changes in — that is
+    /// git's documented `git commit -- <paths>` behaviour, so the exact-args
+    /// test plus the integration test (commit paths doesn't include other
+    /// staged files) pin both halves.
+    #[test]
+    fn test_commit_paths_use_pathspec_semantics_and_trailers_validate() {
+        let repo = scratch_repo();
+        let root = repo.path();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        std::fs::write(root.join("b.txt"), "b\n").unwrap();
+        let args = json!({
+            "message": "subject",
+            "paths": ["a.txt"],
+            "trailers": ["Co-Authored-By: T <t@t>"],
+        });
+        let argv = commit_argv(root, &args).unwrap();
+        assert!(
+            argv.windows(2).eq([["--".to_string(), "a.txt".to_string()]]),
+            "paths must arrive after -- as a pathspec: {argv:?}"
+        );
+        assert_eq!(
+            argv.iter().filter(|a| a.as_str() == "--trailer").count(),
+            1,
+            "one --trailer flag per line: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&"b.txt".to_string()),
+            "commit paths must not include unrequested files: {argv:?}"
+        );
+        // Trailers are single-line only; a newline would smuggle a paragraph.
+        let bad = commit_argv(
+            root,
+            &json!({ "message": "m", "trailers": ["two\nlines"] }),
+        )
+        .unwrap_err();
+        assert!(bad.message_with_hint().contains("single line"), "{bad}");
+        // Empty paths array is a caller error, not a whole-tree commit.
+        let empty = commit_argv(root, &json!({ "message": "m", "paths": [] })).unwrap_err();
+        assert!(empty.message_with_hint().contains("at least one"), "{empty}");
     }
 
     /// Unknown keys are refused; known-but-ignored ones are reported.

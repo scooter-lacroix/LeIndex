@@ -22,11 +22,11 @@
 //! `allow_sensitive: true`.
 
 use super::git_diff_handler::MAX_DIFF_BYTES;
-use super::git_handler::{plan_argv, preview_token};
+use super::git_handler::{plan_argv_for, preview_token};
 use super::helpers::validate_file_within_project;
 use super::protocol::JsonRpcError;
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 /// Hard timeout for one mutating git command. A hung credential prompt or a
@@ -36,7 +36,7 @@ const MUTATION_TIMEOUT: Duration = Duration::from_secs(300);
 /// Ceiling on captured stdout/stderr of a mutation, per stream.
 const MAX_MUTATION_OUTPUT_BYTES: usize = 256 * 1024;
 
-/// Operations the `confirm: true` shortcut may apply without a token.
+/// Operations the `confirm: true` shortcut may apply without a prior plan.
 const SAFE_TO_CONFIRM: [&str; 3] = ["add", "commit", "push"];
 
 /// Operations that only a prior plan's token may apply.
@@ -122,7 +122,6 @@ fn expand_paths(
     requested: &[String],
 ) -> Result<(Vec<String>, usize, Vec<String>), JsonRpcError> {
     const MAX_DISCOVERED: usize = 2_000;
-    const MAX_DEPTH: usize = 16;
 
     let mut files = Vec::new();
     let mut skipped = 0usize;
@@ -135,13 +134,14 @@ fn expand_paths(
             files.push(raw.clone());
         }
     }
+    let dir_rels = dirs.iter().map(|(rel, _)| rel.clone()).collect::<Vec<_>>();
     for (rel, absolute) in dirs {
         let mut budget = MAX_DISCOVERED;
         walk_dir(root, &rel, &absolute, 0, &mut files, &mut skipped, &mut budget)?;
     }
     files.sort();
     files.dedup();
-    Ok((files, skipped, dirs.into_iter().map(|(rel, _)| rel).collect()))
+    Ok((files, skipped, dir_rels))
 }
 
 /// Recursive worker for [`expand_paths`]. `budget` is shared per directory
@@ -428,7 +428,6 @@ async fn validate_before_apply(
 
 struct MutationOutput {
     stdout: String,
-    stderr: String,
     /// Characters dropped from the combined output by the byte cap.
     truncated_chars: usize,
 }
@@ -526,7 +525,6 @@ async fn run_mutation(root: &Path, argv: &[String]) -> Result<MutationOutput, Js
     }
     Ok(MutationOutput {
         stdout,
-        stderr,
         truncated_chars,
     })
 }
@@ -697,7 +695,7 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
         argv.extend(outcome.staged.iter().cloned());
         argv
     } else {
-        plan_argv(op, root, args)?
+        plan_argv_for(op, root, args)?
     };
 
     validate_before_apply(op, root, args, &argv).await?;
@@ -757,6 +755,7 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::path::PathBuf;
 
     fn git(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
