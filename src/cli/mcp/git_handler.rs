@@ -353,7 +353,10 @@ impl GitHandler {
 
         if op.mutating {
             return if args.get("preview_token").and_then(Value::as_str).is_some()
-                || args.get("confirm").and_then(Value::as_bool).unwrap_or(false)
+                || args
+                    .get("confirm")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
             {
                 crate::cli::mcp::git_apply::handle(op.name, &root, &args).await
             } else {
@@ -811,11 +814,13 @@ async fn mutation_plan(op: &Op, root: &Path, args: &Value) -> Result<Value, Json
     if op.name == "add" {
         let outcome = super::git_apply::staging_outcome(root, args)?;
         payload["will_stage"] = json!(outcome.staged);
-        payload["excluded"] = json!(outcome
-            .excluded
-            .iter()
-            .map(|(path, reason)| json!({ "path": path, "reason": reason }))
-            .collect::<Vec<_>>());
+        payload["excluded"] = json!(
+            outcome
+                .excluded
+                .iter()
+                .map(|(path, reason)| json!({ "path": path, "reason": reason }))
+                .collect::<Vec<_>>()
+        );
         payload["warnings"] = json!(outcome.warnings);
     }
     Ok(with_warnings(payload, &warnings))
@@ -828,9 +833,9 @@ async fn mutation_plan(op: &Op, root: &Path, args: &Value) -> Result<Value, Json
 /// accepted or refused there, so the destructive shapes stay in one place.
 fn plan_target(op: &Op, args: &Value) -> Result<Option<String>, JsonRpcError> {
     match args.get("target").and_then(Value::as_str) {
-        Some(target) if op.name == "reset" && target.starts_with('-') => Ok(Some(
-            target.trim().to_string(),
-        )),
+        Some(target) if op.name == "reset" && target.starts_with('-') => {
+            Ok(Some(target.trim().to_string()))
+        }
         Some(target) => Ok(Some(super::git_ref::validate_ref_or_error(target)?)),
         None => Ok(None),
     }
@@ -978,7 +983,11 @@ pub(crate) fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String
         "tag" => Ok(tag_argv(args, required("target")?)),
         "merge" => Ok(target_argv("merge", Some("--no-edit"), required("target")?)),
         // Non-interactive only (brief §5): no editor, no interactive rebase.
-        "rebase" => Ok(target_argv("rebase", Some("--no-edit"), required("target")?)),
+        "rebase" => Ok(target_argv(
+            "rebase",
+            Some("--no-edit"),
+            required("target")?,
+        )),
         "push" => Ok(vec!["push".to_string(), "--porcelain".to_string()]),
         "reset" => {
             let target = required("target")?;
@@ -1012,11 +1021,8 @@ pub(crate) fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
             if !force {
                 return Err(JsonRpcError::invalid_params_with_suggestion(
-                    "force-push refused: set force:true to allow rewriting the remote"
-                        .to_string(),
-                    format!(
-                        "Set force:true and confirm_text:\"force-push {branch_target}\""
-                    ),
+                    "force-push refused: set force:true to allow rewriting the remote".to_string(),
+                    format!("Set force:true and confirm_text:\"force-push {branch_target}\""),
                 ));
             }
             let printed = format!("force-push {branch_target}");
@@ -1481,7 +1487,10 @@ mod tests {
             &json!({ "target": "-d feature" }),
         )
         .unwrap_err();
-        assert!(no_flag.message_with_hint().contains("delete:true"), "{no_flag}");
+        assert!(
+            no_flag.message_with_hint().contains("delete:true"),
+            "{no_flag}"
+        );
         let delete = plan_argv(
             Op::parse("reset").unwrap(),
             root,
@@ -1513,7 +1522,10 @@ mod tests {
             &json!({ "target": "origin/main" }),
         )
         .unwrap_err();
-        assert!(no_force.message_with_hint().contains("force:true"), "{no_force}");
+        assert!(
+            no_force.message_with_hint().contains("force:true"),
+            "{no_force}"
+        );
 
         // The executor's confirm subset must exclude every op that can carry
         // one of the destructive shapes.
@@ -1545,7 +1557,8 @@ mod tests {
         });
         let argv = commit_argv(root, &args).unwrap();
         assert!(
-            argv.windows(2).eq([["--".to_string(), "a.txt".to_string()]]),
+            argv.windows(2)
+                .eq([["--".to_string(), "a.txt".to_string()]]),
             "paths must arrive after -- as a pathspec: {argv:?}"
         );
         assert_eq!(
@@ -1558,15 +1571,15 @@ mod tests {
             "commit paths must not include unrequested files: {argv:?}"
         );
         // Trailers are single-line only; a newline would smuggle a paragraph.
-        let bad = commit_argv(
-            root,
-            &json!({ "message": "m", "trailers": ["two\nlines"] }),
-        )
-        .unwrap_err();
+        let bad =
+            commit_argv(root, &json!({ "message": "m", "trailers": ["two\nlines"] })).unwrap_err();
         assert!(bad.message_with_hint().contains("single line"), "{bad}");
         // Empty paths array is a caller error, not a whole-tree commit.
         let empty = commit_argv(root, &json!({ "message": "m", "paths": [] })).unwrap_err();
-        assert!(empty.message_with_hint().contains("at least one"), "{empty}");
+        assert!(
+            empty.message_with_hint().contains("at least one"),
+            "{empty}"
+        );
     }
 
     /// Unknown keys are refused; known-but-ignored ones are reported.

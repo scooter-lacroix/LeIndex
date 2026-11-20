@@ -295,7 +295,12 @@ pub(crate) fn line_starts(content: &[u8]) -> Vec<usize> {
 }
 
 /// Byte range covered by 1-based inclusive lines `start..=end`.
-pub(crate) fn lines_to_bytes(starts: &[usize], total: usize, start: usize, end: usize) -> (usize, usize) {
+pub(crate) fn lines_to_bytes(
+    starts: &[usize],
+    total: usize,
+    start: usize,
+    end: usize,
+) -> (usize, usize) {
     let from = starts.get(start - 1).copied().unwrap_or(total);
     let to = starts.get(end).copied().unwrap_or(total);
     (from, to.max(from))
@@ -833,10 +838,12 @@ fn hunk_summaries(patch: &str) -> Value {
         let inside = context
             .trim()
             .split_whitespace()
-            .find(|token| token.starts_with("fn ")
-                && token
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_' || c == ':' || c == '<' || c == '>'))
+            .find(|token| {
+                token.starts_with("fn ")
+                    && token.chars().all(|c| {
+                        c.is_alphanumeric() || c == '_' || c == ':' || c == '<' || c == '>'
+                    })
+            })
             .map(str::to_string);
         entries.push(json!({
             "path": file,

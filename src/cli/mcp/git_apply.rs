@@ -85,10 +85,12 @@ fn is_secret_path(relative: &str) -> bool {
 /// Runtime/generated artefacts the brief names for this workspace.
 fn is_runtime_artifact(relative: &str) -> bool {
     let path = Path::new(relative);
-    if path
-        .components()
-        .any(|component| matches!(component.as_os_str().to_str(), Some("target") | Some("node_modules")))
-    {
+    if path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some("target") | Some("node_modules")
+        )
+    }) {
         return true;
     }
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -137,7 +139,15 @@ fn expand_paths(
     let dir_rels = dirs.iter().map(|(rel, _)| rel.clone()).collect::<Vec<_>>();
     for (rel, absolute) in dirs {
         let mut budget = MAX_DISCOVERED;
-        walk_dir(root, &rel, &absolute, 0, &mut files, &mut skipped, &mut budget)?;
+        walk_dir(
+            root,
+            &rel,
+            &absolute,
+            0,
+            &mut files,
+            &mut skipped,
+            &mut budget,
+        )?;
     }
     files.sort();
     files.dedup();
@@ -175,7 +185,15 @@ fn walk_dir(
             if SKIP_DIR_NAMES.contains(&name.as_str()) || name == "target" {
                 continue;
             }
-            walk_dir(root, &child_rel, &child_abs, depth + 1, files, skipped, budget)?;
+            walk_dir(
+                root,
+                &child_rel,
+                &child_abs,
+                depth + 1,
+                files,
+                skipped,
+                budget,
+            )?;
         } else if *budget > 0 {
             *budget -= 1;
             files.push(child_rel);
@@ -223,7 +241,10 @@ pub(crate) fn staging_outcome(root: &Path, args: &Value) -> Result<StagingOutcom
         .get("allow_sensitive")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let explicit = requested.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+    let explicit = requested
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
     let (discovered, skipped, dirs) = expand_paths(root, &requested)?;
 
     let mut staged = Vec::new();
@@ -258,7 +279,9 @@ pub(crate) fn staging_outcome(root: &Path, args: &Value) -> Result<StagingOutcom
             ));
         }
         if !is_explicit && looks_binary(&absolute) {
-            warnings.push(format!("'{relative}' looks binary; check before committing"));
+            warnings.push(format!(
+                "'{relative}' looks binary; check before committing"
+            ));
         }
         staged.push(relative);
     }
@@ -305,9 +328,7 @@ fn index_digest(root: &Path) -> Result<String, JsonRpcError> {
         &["ls-files".to_string(), "-s".to_string()],
         MAX_DIFF_BYTES,
     )
-    .map_err(|error| {
-        JsonRpcError::internal_error(format!("index probe failed: {error}"))
-    })?;
+    .map_err(|error| JsonRpcError::internal_error(format!("index probe failed: {error}")))?;
     let mut digest = blake3::Hasher::new();
     for line in text.lines() {
         digest.update(line.as_bytes());
@@ -362,7 +383,10 @@ async fn validate_before_apply(
     args: &Value,
     argv: &[String],
 ) -> Result<(), JsonRpcError> {
-    let confirm = args.get("confirm").and_then(Value::as_bool).unwrap_or(false);
+    let confirm = args
+        .get("confirm")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let token = args.get("preview_token").and_then(Value::as_str);
 
     if op == "force" {
@@ -372,9 +396,14 @@ async fn validate_before_apply(
         let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
         let printed = format!(
             "force-push {}",
-            args.get("target").and_then(Value::as_str).unwrap_or_default()
+            args.get("target")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
         );
-        let supplied = args.get("confirm_text").and_then(Value::as_str).unwrap_or_default();
+        let supplied = args
+            .get("confirm_text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if !force {
             return Err(JsonRpcError::invalid_params_with_suggestion(
                 "force-push refused: set force:true to allow rewriting the remote".to_string(),
@@ -383,7 +412,9 @@ async fn validate_before_apply(
         }
         if supplied != printed {
             return Err(JsonRpcError::invalid_params_with_suggestion(
-                format!("confirm_text does not match the plan's confirmation string ('{supplied}')"),
+                format!(
+                    "confirm_text does not match the plan's confirmation string ('{supplied}')"
+                ),
                 format!("Copy it verbatim from the plan: confirm_text:\"{printed}\""),
             ));
         }
@@ -407,9 +438,13 @@ async fn validate_before_apply(
         }
         let safe = SAFE_TO_CONFIRM.join(", ");
         let hint = if TOKEN_ONLY.contains(&op) {
-            format!("Request the plan first, then resend with its preview_token (confirm works only for: {safe})")
+            format!(
+                "Request the plan first, then resend with its preview_token (confirm works only for: {safe})"
+            )
         } else {
-            format!("A destructive operation cannot be confirmed directly: request the plan and apply it with its preview_token (confirm works only for: {safe})")
+            format!(
+                "A destructive operation cannot be confirmed directly: request the plan and apply it with its preview_token (confirm works only for: {safe})"
+            )
         };
         return Err(JsonRpcError::invalid_params_with_suggestion(
             format!("git {op} cannot be applied with confirm:true alone"),
@@ -418,7 +453,8 @@ async fn validate_before_apply(
     }
     Err(JsonRpcError::invalid_params_with_suggestion(
         format!("git {op} needs a preview_token from a plan, or confirm:true"),
-        "Request the plan (omit confirm and preview_token), review what it will do, then apply".to_string(),
+        "Request the plan (omit confirm and preview_token), review what it will do, then apply"
+            .to_string(),
     ))
 }
 
@@ -454,9 +490,9 @@ async fn run_mutation(root: &Path, argv: &[String]) -> Result<MutationOutput, Js
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let mut child = command.spawn().map_err(|error| {
-        JsonRpcError::internal_error(format!("failed to spawn git: {error}"))
-    })?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| JsonRpcError::internal_error(format!("failed to spawn git: {error}")))?;
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
 
@@ -472,11 +508,7 @@ async fn run_mutation(root: &Path, argv: &[String]) -> Result<MutationOutput, Js
             buffer.truncate(MAX_MUTATION_OUTPUT_BYTES);
         }
         let text = String::from_utf8_lossy(&buffer).into_owned();
-        let dropped: usize = if over {
-            text.chars().count()
-        } else {
-            0
-        };
+        let dropped: usize = if over { text.chars().count() } else { 0 };
         (text, dropped)
     };
 
@@ -659,8 +691,12 @@ async fn push_payload(stdout: &str, root: &Path) -> Value {
             let mut fields = counts.trim().split_whitespace();
             let (b, a) = (fields.next(), fields.next());
             upstream = Value::String(format!("{branch}@{{upstream}}"));
-            behind = b.and_then(|v| v.parse::<u64>().ok()).map_or(Value::Null, Value::from);
-            ahead = a.and_then(|v| v.parse::<u64>().ok()).map_or(Value::Null, Value::from);
+            behind = b
+                .and_then(|v| v.parse::<u64>().ok())
+                .map_or(Value::Null, Value::from);
+            ahead = a
+                .and_then(|v| v.parse::<u64>().ok())
+                .map_or(Value::Null, Value::from);
         }
     }
     let mut payload = json!({
@@ -678,7 +714,9 @@ async fn push_payload(stdout: &str, root: &Path) -> Value {
 
 /// Current branch name from the porcelain status probe (`None` when detached).
 fn head_branch(root: &Path) -> Option<String> {
-    crate::cli::git::status(root).ok().and_then(|status| status.branch)
+    crate::cli::git::status(root)
+        .ok()
+        .and_then(|status| status.branch)
 }
 
 // ---------------------------------------------------------------------------
@@ -704,7 +742,10 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
     // caller could have raced the window. Cheap; correctness first.
     if args.get("preview_token").and_then(Value::as_str).is_some() {
         let expected = token_now(root, op, &argv)?;
-        let supplied = args.get("preview_token").and_then(Value::as_str).unwrap_or_default();
+        let supplied = args
+            .get("preview_token")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if supplied != expected {
             return Err(JsonRpcError::invalid_params_with_suggestion(
                 "preview_token no longer matches: the repository state changed while \
@@ -728,11 +769,13 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
         "add" => {
             let outcome = staging_outcome(root, args)?;
             payload["staged"] = json!(outcome.staged);
-            payload["excluded"] = json!(outcome
-                .excluded
-                .iter()
-                .map(|(path, reason)| json!({ "path": path, "reason": reason }))
-                .collect::<Vec<_>>());
+            payload["excluded"] = json!(
+                outcome
+                    .excluded
+                    .iter()
+                    .map(|(path, reason)| json!({ "path": path, "reason": reason }))
+                    .collect::<Vec<_>>()
+            );
             payload["warnings"] = json!(outcome.warnings);
         }
         "commit" => {
@@ -816,7 +859,11 @@ mod test {
 
         let outcome = staging_outcome(root, &serde_json::json!({ "paths": ["."] })).unwrap();
         assert!(outcome.staged.contains(&"keep.rs".to_string()));
-        assert!(!outcome.staged.iter().any(|p| p == ".env"), "{:?}", outcome.staged);
+        assert!(
+            !outcome.staged.iter().any(|p| p == ".env"),
+            "{:?}",
+            outcome.staged
+        );
         assert!(
             !outcome
                 .staged
@@ -825,11 +872,18 @@ mod test {
             "{:?}",
             outcome.staged
         );
-        assert!(outcome.excluded.iter().any(|(p, r)| p == ".env" && *r == "likely secret"));
-        assert!(outcome
-            .excluded
-            .iter()
-            .any(|(p, r)| p.ends_with("/lock") && *r == "runtime artefact"));
+        assert!(
+            outcome
+                .excluded
+                .iter()
+                .any(|(p, r)| p == ".env" && *r == "likely secret")
+        );
+        assert!(
+            outcome
+                .excluded
+                .iter()
+                .any(|(p, r)| p.ends_with("/lock") && *r == "runtime artefact")
+        );
         assert!(outcome.warnings.iter().any(|w| w.contains(".env")));
     }
 
@@ -863,10 +917,12 @@ mod test {
         let root = repo.path();
         std::fs::write(root.join("big.bin"), [0u8; 1024 * 1024 + 42]).unwrap();
         let outcome = staging_outcome(root, &serde_json::json!({ "paths": ["big.bin"] })).unwrap();
-        assert!(outcome
-            .warnings
-            .iter()
-            .any(|w| w.contains("MiB") && w.contains("big.bin")));
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.contains("MiB") && w.contains("big.bin"))
+        );
         assert!(outcome.warnings.iter().any(|w| w.contains("binary")));
     }
 }

@@ -1,9 +1,9 @@
+use super::git_diff_handler::{
+    MAX_DIFF_BYTES, line_starts, lines_to_bytes, parse_hunks, run_git_capped,
+};
 use super::helpers::{
     extract_bool, extract_usize, get_direct_callers, node_type_str, wrap_live_with_meta,
     wrap_live_with_meta_status,
-};
-use super::git_diff_handler::{
-    MAX_DIFF_BYTES, line_starts, lines_to_bytes, parse_hunks, run_git_capped,
 };
 use super::protocol::JsonRpcError;
 use super::request_meta::{WorkBudget, record_git_ms, record_pdg_ms};
@@ -402,11 +402,7 @@ fn enrich_pdg(
 /// Reuses the diff handler's `-U0` hunk parser so both surfaces agree on what
 /// a hunk is; the enclosing-symbol test (hunk byte range overlaps the node's
 /// byte span) mirrors `git_diff_handler::enrich_files`.
-fn symbol_hunk_ranges(
-    root: &Path,
-    absolute: &Path,
-    relative: &str,
-) -> Option<Vec<(usize, usize)>> {
+fn symbol_hunk_ranges(root: &Path, absolute: &Path, relative: &str) -> Option<Vec<(usize, usize)>> {
     let (bytes, _) = run_git_capped(
         root,
         &[

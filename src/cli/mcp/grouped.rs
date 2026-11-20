@@ -13,7 +13,7 @@
 //   leindex_manage   (action)  index | state | projects | evict | lease | cleanup
 //   leindex_git      (action)  status | diff | log | show | blame | branch | remote
 //                              | add | commit | checkout | stash | tag | merge
-//                              | rebase | push | reset | force   (mutations preview-only)
+//                              | rebase | push | reset | force   (mutations: plan -> apply)
 //
 // `leindex_edit` has no default on purpose: an ambiguous call must fail rather
 // than guess at a mutation. The other routers default to their most common
@@ -273,7 +273,7 @@ pub static GROUPS: [GroupSpec; 5] = [
     GroupSpec {
         name: "leindex_git",
         title: "LeIndex [Git]",
-        description: "Live Git. action: status (default), diff, log, show, blame, branch, remote (read); add, commit, checkout, stash, tag, merge, rebase, push, reset, force (PREVIEW ONLY — each returns a dry-run plan and a preview_token).",
+        description: "Live Git. action: status (default), diff, log, show, blame, branch, remote (read); add, commit, checkout, stash, tag, merge, rebase, push, reset, force (mutations: a bare call returns a plan + preview_token; re-send with the token to apply, or confirm:true for add/commit/push; force-push/reset --hard/clean -fd/branch delete need their rails flags).",
         discriminator: "action",
         default_branch: Some("status"),
         branches: &[
@@ -314,63 +314,69 @@ pub static GROUPS: [GroupSpec; 5] = [
                 &[],
                 "Configured remotes and their URLs",
             ),
-            // Mutations: never fire from a default argument set. Each returns
-            // a dry-run plan plus a preview_token that identifies the plan.
-            // There is no `confirm` argument and no apply side.
+            // Mutations: never fire from a default argument set. A bare call
+            // returns a dry-run plan plus a preview_token bound to argv/HEAD/
+            // index; the executor (git_apply) applies it on the token path,
+            // and confirm:true covers the safe subset (add, commit, push).
             branch(
                 "add",
                 "leindex_git",
                 &["stage"],
-                "PREVIEW ONLY: stage the given paths",
+                "Stage paths (plan + preview_token, or confirm:true); bulk adds exclude secrets/runtime artefacts by default",
             ),
             branch(
                 "commit",
                 "leindex_git",
                 &[],
-                "PREVIEW ONLY: commit the staged changes",
+                "Commit staged changes or exactly `paths` (confirm:true allowed); returns <shorthash> <oneline> + files-changed",
             ),
             branch(
                 "checkout",
                 "leindex_git",
                 &["switch"],
-                "PREVIEW ONLY: switch to a branch or commit",
+                "Switch to a branch or commit (apply via preview_token)",
             ),
             branch(
                 "stash",
                 "leindex_git",
                 &[],
-                "PREVIEW ONLY: stash working-tree changes",
+                "Stash working-tree changes (apply via preview_token)",
             ),
-            branch("tag", "leindex_git", &[], "PREVIEW ONLY: create a tag"),
+            branch(
+                "tag",
+                "leindex_git",
+                &[],
+                "Create a tag (apply via preview_token)",
+            ),
             branch(
                 "merge",
                 "leindex_git",
                 &[],
-                "PREVIEW ONLY: merge a branch into the current one",
+                "Merge a branch into the current one (apply via preview_token)",
             ),
             branch(
                 "rebase",
                 "leindex_git",
                 &[],
-                "PREVIEW ONLY: rebase onto a target",
+                "Rebase onto a target, non-interactive (apply via preview_token)",
             ),
             branch(
                 "push",
                 "leindex_git",
                 &[],
-                "PREVIEW ONLY: push the current branch to its remote",
+                "Push the current branch (confirm:true allowed); returns the remote ref range + ahead/behind",
             ),
             branch(
                 "reset",
                 "leindex_git",
                 &[],
-                "PREVIEW ONLY: move the current branch to a commit",
+                "Move the current branch to a commit (--hard needs hard:true + preview_token)",
             ),
             branch(
                 "force",
                 "leindex_git",
                 &["force_push"],
-                "PREVIEW ONLY: force-push (requires a target ref)",
+                "Force-push (needs force:true + confirm_text from the plan, plus its preview_token)",
             ),
         ],
     },
