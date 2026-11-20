@@ -44,7 +44,12 @@ pub(crate) fn validate_syntax(
         .map(|(display, path, content)| {
             let ParseOutcome { total, shown } = parse_one(path, content, max_errors_per_file);
             let summary = if total == 0 {
-                "ok".to_string()
+                match shown.first() {
+                    // A skip marker (no grammar, doc flavor, unknown
+                    // extension) is the outcome — not "ok".
+                    Some(note) if note.starts_with("skipped") => note.clone(),
+                    _ => "ok".to_string(),
+                }
             } else if shown.len() < total {
                 format!(
                     "{} error(s): {}; +{} more",
@@ -131,12 +136,8 @@ impl ErrorCollector {
                 } else {
                     "syntax error"
                 };
-                self.shown.push(format!(
-                    "{}:{} {}",
-                    start.row + 1,
-                    start.column + 1,
-                    kind
-                ));
+                self.shown
+                    .push(format!("{}:{} {}", start.row + 1, start.column + 1, kind));
             }
         }
         let mut cursor = node.walk();
@@ -168,7 +169,9 @@ pub(crate) enum ValidateRequest {
     Syntax,
 }
 
-pub(crate) fn resolve_validate_arg(args: &serde_json::Value) -> Result<ValidateRequest, JsonRpcError> {
+pub(crate) fn resolve_validate_arg(
+    args: &serde_json::Value,
+) -> Result<ValidateRequest, JsonRpcError> {
     let Some(raw) = args.get("validate").and_then(|v| v.as_str()) else {
         return Ok(ValidateRequest::None);
     };
@@ -213,10 +216,7 @@ mod test {
         let path = dir.path().join("broken.rs");
         std::fs::write(&path, "fn broken( {\n    let x = ;\n}\n").unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
-        let outcomes = validate_syntax(
-            &vec![("broken.rs".to_string(), path.clone(), content)],
-            5,
-        );
+        let outcomes = validate_syntax(&[("broken.rs".to_string(), path.clone(), content)], 5);
         assert_eq!(outcomes.len(), 1);
         assert!(
             !outcomes[0].errors.is_empty(),
@@ -236,7 +236,7 @@ mod test {
         let path = dir.path().join("fine.rs");
         std::fs::write(&path, "fn fine() -> u32 { 42 }\n").unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
-        let outcomes = validate_syntax(&vec![("fine.rs".to_string(), path, content)], 5);
+        let outcomes = validate_syntax(&[("fine.rs".to_string(), path, content)], 5);
         assert_eq!(outcomes[0].summary, "ok");
         assert!(outcomes[0].errors.is_empty());
     }
@@ -247,7 +247,7 @@ mod test {
         let path = dir.path().join("notes.md");
         std::fs::write(&path, "# not rust at all ((( \n").unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
-        let outcomes = validate_syntax(&vec![("notes.md".to_string(), path, content)], 5);
+        let outcomes = validate_syntax(&[("notes.md".to_string(), path, content)], 5);
         assert!(
             outcomes[0].summary.contains("skipped"),
             "doc flavors must be skipped: {}",

@@ -828,11 +828,13 @@ fn trim_edit(data: &Value) -> Value {
         "affected_symbols",
         "affected_files",
         "breaking_changes",
-        "risk_level",
-        "change_count",
+        // §3.6 real-signal risk object (absent entirely for low risk)
+        "risk",
         // apply-shaped
         "success",
         "changes_applied",
+        // §4.3 one-line apply echo
+        "applied_lines",
         "dry_run",
         "file_path",
         "edit_region",

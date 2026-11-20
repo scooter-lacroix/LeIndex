@@ -44,12 +44,10 @@ impl BatchEditPlan {
 /// True when the parsed `changes[]` is a multi-file batch: at least one
 /// entry names its own `file_path`.
 pub(crate) fn is_batch(changes_val: &Value) -> bool {
-    changes_val
-        .as_array()
-        .is_some_and(|arr| {
-            arr.iter()
-                .any(|item| item.get("file_path").and_then(Value::as_str).is_some())
-        })
+    changes_val.as_array().is_some_and(|arr| {
+        arr.iter()
+            .any(|item| item.get("file_path").and_then(Value::as_str).is_some())
+    })
 }
 
 /// Resolve a batch `changes[]` into per-file plans. Entries without their
@@ -208,4 +206,127 @@ pub(crate) async fn apply_batch_atomic(plan: &BatchEditPlan) -> Result<(), JsonR
         written.push(file);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// §4.3: every change of every file is validated BEFORE the first
+    /// write — a bad `old_text` in file 2 fails the batch and file 1 is
+    /// never touched on disk.
+    #[tokio::test]
+    async fn test_batch_rejects_before_any_write_when_later_file_old_text_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("one.rs");
+        let f2 = dir.path().join("two.rs");
+        std::fs::write(&f1, "fn one() {}\n").unwrap();
+        std::fs::write(&f2, "fn two() {}\n").unwrap();
+        let changes = serde_json::json!([
+            {
+                "file_path": f1.to_str().unwrap(),
+                "type": "replace_text",
+                "old_text": "fn one() {}",
+                "new_text": "fn one_renamed() {}"
+            },
+            {
+                "file_path": f2.to_str().unwrap(),
+                "type": "replace_text",
+                "old_text": "THIS TEXT IS NOT IN THE FILE",
+                "new_text": "x"
+            }
+        ]);
+        let result = resolve_batch(&changes, None, dir.path()).await;
+        assert!(
+            result.is_err(),
+            "missing old_text in file 2 must fail the whole batch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f1).unwrap(),
+            "fn one() {}\n",
+            "all-or-nothing: file 1 must be untouched when file 2 fails validation"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f2).unwrap(),
+            "fn two() {}\n",
+            "file 2 must be untouched"
+        );
+    }
+
+    /// §4.3: a write failure mid-batch rolls back the already-written
+    /// files, leaving every file at its pre-batch content.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_batch_write_failure_rolls_back_earlier_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let readonly_dir = tempfile::tempdir().unwrap();
+        let writable_dir = tempfile::tempdir().unwrap();
+        let f1 = writable_dir.path().join("one.rs");
+        let f2 = readonly_dir.path().join("two.rs");
+        std::fs::write(&f1, "fn one() {}\n").unwrap();
+        std::fs::write(&f2, "fn two() {}\n").unwrap();
+
+        // File 2's DIRECTORY goes read-only so its temp+rename write
+        // fails after file 1 was already written.
+        let mut perms = std::fs::metadata(readonly_dir.path())
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(readonly_dir.path(), perms).unwrap();
+
+        let plan = BatchEditPlan {
+            files: vec![
+                BatchFileEdit {
+                    canonical_path: f1.clone(),
+                    display_path: f1.to_string_lossy().to_string(),
+                    original: "fn one() {}\n".to_string(),
+                    modified: "fn one_edited() {}\n".to_string(),
+                    changes: parse_edit_changes(
+                        &serde_json::json!([
+                            {"type": "replace_text", "old_text": "fn one() {}", "new_text": "fn one_edited() {}"}
+                        ]),
+                        Some("fn one() {}\n"),
+                    )
+                    .unwrap(),
+                },
+                BatchFileEdit {
+                    canonical_path: f2.clone(),
+                    display_path: f2.to_string_lossy().to_string(),
+                    original: "fn two() {}\n".to_string(),
+                    modified: "fn two_edited() {}\n".to_string(),
+                    changes: parse_edit_changes(
+                        &serde_json::json!([
+                            {"type": "replace_text", "old_text": "fn two() {}", "new_text": "fn two_edited() {}"}
+                        ]),
+                        Some("fn two() {}\n"),
+                    )
+                    .unwrap(),
+                },
+            ],
+        };
+
+        let result = apply_batch_atomic(&plan).await;
+
+        // Restore permissions so tempdir cleanup can succeed.
+        let mut perms = std::fs::metadata(readonly_dir.path())
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(readonly_dir.path(), perms).unwrap();
+
+        assert!(
+            result.is_err(),
+            "the read-only directory must fail the write"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f1).unwrap(),
+            "fn one() {}\n",
+            "file 1 must be ROLLED BACK to its original content after file 2's write failed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f2).unwrap(),
+            "fn two() {}\n",
+            "file 2 must be untouched"
+        );
+    }
 }

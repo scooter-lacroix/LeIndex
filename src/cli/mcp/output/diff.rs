@@ -286,8 +286,11 @@ fn render_hunk_split(hunk: &DiffHunk, layout: &RowLayout) -> String {
             while i + run < hunk.lines.len() && hunk.lines[i + run].op == DiffOp::Context {
                 run += 1;
             }
-            if run > layout.max_context * 2 {
+            if run > layout.max_context * 2 + 2 {
                 // Keep `max_context` on each side, collapse the middle.
+                // The +2 headroom: collapsing must always HIDE lines — a
+                // run that would render as 1 kept + 1 counted + 1 kept is
+                // longer than just printing the three lines.
                 for line in &hunk.lines[i..i + layout.max_context] {
                     out.push_str(&unified_line(line, layout.color));
                 }
@@ -631,29 +634,55 @@ mod tests {
 
     #[test]
     fn test_render_unified_diff_compact_context_collapses_runs() {
-        // ±1 context: a run of many unchanged lines inside one hunk
-        // collapses to a counted line.
+        // ±1 context: two changes 5 unchanged lines apart land in ONE
+        // diffy hunk (diffy merges gaps <= 2*3); the middle run collapses
+        // to a counted line while each change keeps one context line.
+        // (Gaps >= 7 become separate hunks — collapsing by construction.)
         let original = format!(
-            "a\n{}\nz\n",
-            (1..=10).map(|i| format!("ctx{i}")).collect::<Vec<_>>().join("\n")
+            "fn one() {{}}\n{}\nfn two() {{}}\n{}\nfn three() {{}}\n",
+            (1..=5)
+                .map(|i| format!("ctx_a{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            (1..=5)
+                .map(|i| format!("ctx_b{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
-        let modified = original.replacen("ctx5", "CTX5", 1);
+        let modified = original
+            .replacen("ctx_a1", "CTX_A1", 1)
+            .replacen("ctx_b1", "CTX_B1", 1);
         let d = compute_diff(&original, &modified, "ctx.rs");
+        assert_eq!(d.hunks.len(), 1, "fixture must yield one merged hunk");
         let s = render_unified_diff(&d, false);
         assert!(
-            s.contains("unchanged line"),
-            "long context run must collapse with a count: {s}"
+            s.contains("⋯ 3 unchanged lines ⋯"),
+            "5-line middle run must collapse keeping 2, counting 3: {s}"
         );
-        // ±1 context: exactly one context line before/after the change.
+        // ±1 context: exactly one context line before each change.
         let body_lines: Vec<&str> = s.lines().collect();
         let change_idx = body_lines
             .iter()
-            .position(|l| l.starts_with("-ctx5"))
+            .position(|l| l.starts_with("-ctx_a1"))
             .expect("removed line present");
         assert!(
             body_lines[change_idx - 1].starts_with(' '),
             "context before change: {}",
             body_lines[change_idx - 1]
+        );
+        assert_eq!(
+            body_lines[change_idx - 1],
+            " fn one() {}",
+            "exactly ONE context line before the first change: {s}"
+        );
+        let change2_idx = body_lines
+            .iter()
+            .position(|l| l.starts_with("-ctx_b1"))
+            .expect("second change present");
+        assert_eq!(
+            body_lines[change2_idx - 1],
+            " fn two() {}",
+            "exactly ONE context line before the second change: {s}"
         );
     }
 
@@ -663,7 +692,10 @@ mod tests {
         let modified = "a\nB\nc\n";
         let d = compute_diff(original, modified, "small.rs");
         let s = render_unified_diff(&d, false);
-        assert!(!s.contains("unchanged line"), "short run must not collapse: {s}");
+        assert!(
+            !s.contains("unchanged line"),
+            "short run must not collapse: {s}"
+        );
         assert!(s.contains(" a\n"), "context line a must be shown: {s}");
         assert!(s.contains(" c\n"), "context line c must be shown: {s}");
         assert!(s.contains("-b\n"), "removed line must be shown: {s}");

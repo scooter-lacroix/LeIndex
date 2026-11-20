@@ -289,7 +289,7 @@ Full arguments: `leindex://tools/guide`.
 | check a commit, file or branch | `leindex_git` action=log / show / blame / branch |
 | stage, commit or push | `leindex_git` action=add / commit / push (preview-only: returns the plan) |
 | check index health | `leindex_analyze` mode=diagnostics |
-| change code safely | `leindex_edit` action=preview, then action=apply |
+| change code safely | `leindex_edit` action=preview (token is the first line), then action=apply with preview_token + project_path ONLY — never resend old_text/new_text |
 | rename across files | `leindex_edit` action=rename old_name=... new_name=... (preview by default) |
 | (re)build the index | `leindex_manage` action=index |
 | inspect or evict resident projects | `leindex_manage` action=state / projects / evict |
