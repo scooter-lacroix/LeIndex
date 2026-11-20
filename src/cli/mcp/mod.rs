@@ -101,6 +101,12 @@ pub mod search_handler;
 pub mod structural_handler;
 /// Handler for LeIndex [Symbol Lookup] — full call graph lookup.
 pub mod symbol_lookup_handler;
+/// Call-site geometry for symbol_lookup callers (brief §6.2).
+pub mod call_sites;
+/// Construct and match usage sites (brief §6.3).
+pub mod usages;
+/// Test locator with exact run commands (brief §6.4).
+pub mod tests_mode;
 /// Handler for LeIndex \[Write\] — atomic file creation with PDG surfacing.
 pub mod write_handler;
 

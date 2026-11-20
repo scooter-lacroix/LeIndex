@@ -874,6 +874,25 @@ fn chained_method_name(callee: &str) -> Option<&str> {
 
 /// Extract function calls from a Rust node
 fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    extract_rust_calls_depth(node, source, MACRO_REPARSE_DEPTH)
+}
+
+/// How many levels of nested macro token trees are re-parsed for calls.
+///
+/// The Rust grammar parses macro bodies as flat token trees, so `callee(1)`
+/// inside `assert_eq!(callee(1), 2)` is an identifier sequence, not a
+/// `call_expression` — every call made inside a macro (assert!, println!,
+/// vec!, tokio::spawn!, …) previously vanished from the call graph, leaving
+/// test functions (which are assert-heavy) with no outgoing call edges at
+/// all. The token-tree text is re-parsed as Rust and descended into,
+/// bounded by nesting depth to keep pathological inputs cheap.
+const MACRO_REPARSE_DEPTH: usize = 3;
+
+fn extract_rust_calls_depth(
+    node: &tree_sitter::Node<'_>,
+    source: &[u8],
+    depth: usize,
+) -> Vec<String> {
     if crate::parse::traits::lite() {
         return Default::default();
     }
@@ -914,8 +933,78 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
         }
     }
 
-    let mut stack = vec![*node];
-    while let Some(current) = stack.pop() {
+    /// Calls hidden inside a macro invocation's token tree.
+    ///
+    /// The grammar has no rules for macro bodies, so their contents parse as
+    /// flat tokens and `extract_call_expression` can never fire on them. The
+    /// `token_tree` text is re-parsed as Rust under three wrappers, tried in
+    /// order and only accepted on an error-free parse:
+    ///   1. a function block — statement-shaped bodies (`foo(x); let y = …`);
+    ///   2. a parenthesised expression — comma-separated argument lists
+    ///      (`assert_eq!(a, b)`, `println!("{} {}", f(), g())`);
+    ///   3. bare content — a single expression (`vec![…]`).
+    /// A body that fits no wrapper (a custom DSL macro) is skipped silently:
+    /// recording nothing is the previous behaviour, and inventing calls from
+    /// DSL tokens would be worse. The wrapper ladder matters because a
+    /// multi-argument macro body (`callee(1), 2`) is not valid Rust at file
+    /// level, and a statement body is not valid inside parentheses.
+    fn reparse_macro_calls(
+        token_tree: &tree_sitter::Node<'_>,
+        source: &[u8],
+        calls: &mut Vec<String>,
+        depth: usize,
+    ) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(text) = token_tree.utf8_text(source) else {
+            return;
+        };
+        let candidates = [
+            format!("fn __leindex_macro_body() {{ {text} }}"),
+            format!("({text})"),
+            text.to_string(),
+        ];
+        for (idx, candidate) in candidates.iter().enumerate() {
+            let mut parser = Parser::new();
+            if parser
+                .set_language(&crate::parse::traits::languages::rust::language())
+                .is_err()
+            {
+                return;
+            }
+            let Some(tree) = parser.parse(candidate.as_bytes(), None) else {
+                continue;
+            };
+            let root = tree.root_node();
+            if root.has_error() {
+                continue;
+            }
+            // Wrapper 1 hides the content inside a function_item, which the
+            // descent deliberately skips (its calls belong to themselves), so
+            // continue from the body block instead of the root.
+            let descend_from = if idx == 0 {
+                let Some(body) = root
+                    .child(0)
+                    .and_then(|fn_item| fn_item.child_by_field_name("body"))
+                else {
+                    continue;
+                };
+                body
+            } else {
+                root
+            };
+            calls.extend(extract_rust_calls_depth(
+                &descend_from,
+                candidate.as_bytes(),
+                depth - 1,
+            ));
+            return;
+        }
+    }
+
+    let mut stack = vec![(*node, depth)];
+    while let Some((current, depth)) = stack.pop() {
         match current.kind() {
             "call_expression" => {
                 extract_call_expression(&current, source, &mut calls, clean_call_text);
@@ -951,6 +1040,12 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
                         calls.push(name);
                     }
                 }
+                if let Some(token_tree) = current
+                    .children(&mut current.walk())
+                    .find(|child| child.kind() == "token_tree")
+                {
+                    reparse_macro_calls(&token_tree, source, &mut calls, depth);
+                }
             }
             "struct_expression" => {
                 if let Some(name_node) = current.child_by_field_name("name")
@@ -970,7 +1065,7 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
             if child.kind() == "function_item" {
                 continue;
             }
-            stack.push(child);
+            stack.push((child, depth));
         }
     }
     calls
@@ -1305,6 +1400,72 @@ mod tests {
         assert_eq!(sig.parameters[0].name, "name");
         assert_eq!(sig.return_type, Some("String".to_string()));
         assert!(!sig.is_method);
+    }
+
+    /// Calls made inside macro token trees must reach the call graph.
+    ///
+    /// `assert_eq!(callee(1), 2)` parses its body as flat tokens, so before
+    /// the macro re-parse the only recorded call here was `assert_eq` and
+    /// `callee`/`plain_call` had no callers at all — which silently emptied
+    /// every caller list for code exercised through assert!/println!-style
+    /// macros (that is, virtually every test function).
+    #[test]
+    fn test_calls_inside_macros_reach_the_call_list() {
+        let source = b"fn callee(x: u32) -> u32 { x }\n\
+fn outer() {\n\
+    assert_eq!(callee(1), 2);\n\
+    println!(\"{} {}\", callee(3), plain_call());\n\
+}\n\
+fn plain_call() -> u32 { 7 }\n";
+
+        let parser = RustParser::new();
+        let signatures = parser.get_signatures(source).unwrap();
+
+        let outer = signatures
+            .iter()
+            .find(|sig| sig.name == "outer")
+            .expect("outer fn extracted");
+        assert!(
+            outer.calls.iter().any(|call| call == "callee"),
+            "call inside assert_eq! must be recorded, calls: {:?}",
+            outer.calls
+        );
+        assert!(
+            outer.calls.iter().any(|call| call == "plain_call"),
+            "call inside println! must be recorded, calls: {:?}",
+            outer.calls
+        );
+    }
+
+    /// A token tree that is not valid Rust expression syntax (a custom DSL
+    /// macro body) must not invent calls from garbage, and must not wedge the
+    /// extractor: the DSL tokens are simply not recorded.
+    #[test]
+    fn test_dsl_macro_body_does_not_invent_calls() {
+        let source = b"fn dsl_user() {\n\
+    sql_query!(SELECT name FROM users WHERE id = 3);\n\
+    real_call();\n\
+}\n\
+fn real_call() {}\n";
+
+        let parser = RustParser::new();
+        let signatures = parser.get_signatures(source).unwrap();
+
+        let dsl_user = signatures
+            .iter()
+            .find(|sig| sig.name == "dsl_user")
+            .expect("dsl_user fn extracted");
+        // `SELECT name FROM users WHERE id` must not decay into call entries;
+        // the ordinary call right next to it must still be recorded.
+        assert!(
+            !dsl_user
+                .calls
+                .iter()
+                .any(|call| call != "sql_query" && call != "real_call"),
+            "DSL macro body leaked pseudo-calls: {:?}",
+            dsl_user.calls
+        );
+        assert!(dsl_user.calls.iter().any(|call| call == "real_call"));
     }
 
     #[test]
