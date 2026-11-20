@@ -928,11 +928,22 @@ fn append_meta_lines(mut out: String, meta_lines: &[String]) -> String {
     out
 }
 
-/// Render edit-preview output: diff followed by metadata fields
-/// (affected_symbols, affected_files, risk_level, change_count).
+/// Render edit-preview output: `preview_token` on the FIRST line (§3.4 —
+/// the apply-by-token path starts from the text surface), then the unified
+/// diff, then metadata. §3.6: the no-information `Risk level: low` /
+/// `Change count: N` lines are gone; a `risk` line appears only when the
+/// handler computed a real finding, carrying its reason.
 fn render_edit_preview(data: &Value, color: bool) -> String {
-    let mut meta_lines = Vec::new();
+    let mut out = String::new();
+    if let Some(token) = data.get("preview_token").and_then(|v| v.as_str()) {
+        out.push_str(&format!(
+            "{}preview_token: {token}{} — apply with preview_token + project_path\n",
+            if color { LIGHT_GREEN } else { "" },
+            if color { RESET } else { "" },
+        ));
+    }
 
+    let mut meta_lines = Vec::new();
     if let Some(symbols) = data.get("affected_symbols").and_then(|v| v.as_array())
         && !symbols.is_empty()
     {
@@ -949,19 +960,25 @@ fn render_edit_preview(data: &Value, color: bool) -> String {
         let names: Vec<&str> = files.iter().filter_map(|v| v.as_str()).collect();
         meta_lines.push(render_meta_line("Affected files", &names.join(", "), color));
     }
-    if let Some(risk) = data.get("risk_level").and_then(|v| v.as_str()) {
-        meta_lines.push(render_meta_line("Risk level", risk, color));
-    }
-    if let Some(count) = data.get("change_count").and_then(|v| v.as_u64()) {
-        meta_lines.push(render_meta_line("Change count", &count.to_string(), color));
+    // §3.6: real-signal risk only — the handler emits `risk` solely when a
+    // finding exists, and its reason already names the file.
+    if let Some(risk) = data.get("risk") {
+        let level = risk.get("level").and_then(|v| v.as_str()).unwrap_or("?");
+        let reason = risk.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        meta_lines.push(render_meta_line("risk", &format!("{level} — {reason}"), color));
     }
     if let Some(breaks) = data.get("breaking_changes").and_then(|v| v.as_array()) {
         for description in breaks.iter().filter_map(|value| value.as_str()) {
+            // The literal "none" entry is a no-information line (§3.6).
+            if description == "none" {
+                continue;
+            }
             meta_lines.push(render_meta_line("Breaking", description, color));
         }
     }
 
-    append_meta_lines(render_diff_value(data, color), &meta_lines)
+    out.push_str(&append_meta_lines(render_diff_value(data, color), &meta_lines));
+    out
 }
 
 /// Render rename-symbol output: multi-file diffs followed by metadata
@@ -1083,6 +1100,23 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
         status_label,
         if color { RESET } else { "" },
     ));
+    // §4.3: the apply result is ONE line per file —
+    // `Applied: path:L802-828 (+27/-0) in fn name`. The handler computes
+    // it (`applied_lines`); the field block below remains only for shapes
+    // without it (legacy payloads, no-op confirmations).
+    if let Some(lines) = data.get("applied_lines").and_then(|v| v.as_array()) {
+        for line in lines.iter().filter_map(|v| v.as_str()) {
+            out.push_str(&format!(
+                "  {}{}\n",
+                if color { LIGHT_GREEN } else { "" },
+                line,
+            ));
+        }
+        if color {
+            out.push_str(RESET);
+        }
+        return out;
+    }
     if let Some(path) = data.get("file_path").and_then(|v| v.as_str()) {
         out.push_str(&field("File", path, color));
     }

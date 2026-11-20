@@ -57,6 +57,12 @@ pub mod diagnostics_handler;
 pub mod edit_apply_handler;
 /// Disk-persistent cache for edit previews.
 pub mod edit_cache;
+/// Multi-file atomic batch edits.
+pub mod edit_batch;
+/// Edit risk from real PDG/visibility/test signals.
+pub mod edit_risk;
+/// Post-edit syntax validation (`validate: "syntax"`).
+pub mod edit_validate;
 /// Handler for LeIndex [Edit Preview] — dry-run code changes.
 pub mod edit_preview_handler;
 /// Handler for LeIndex [File Summary] — structured file analysis.

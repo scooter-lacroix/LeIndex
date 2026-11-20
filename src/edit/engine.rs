@@ -524,6 +524,7 @@ impl EditEngine {
                 start,
                 end,
                 new_text,
+                ..
             } => {
                 let start_idx = clamp_to_char_boundary(content, *start);
                 let end_idx = clamp_to_char_boundary(content, *end);
