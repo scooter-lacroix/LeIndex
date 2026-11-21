@@ -8,6 +8,7 @@
 //! so they cannot delay publication).
 
 use super::*;
+use crate::config::{CacheSandbox, LeIndexConfig};
 use crate::feature_flags::{
     FeatureFlag, clear_flag_overrides_for_test, lock_flag_tests, set_flag_override_for_test,
 };
@@ -342,6 +343,28 @@ fn test_layer_hydration_matches_published_graph() {
 fn test_layer_search_hydration_matches_graph_rebuild() {
     let _guard = lock_flag_tests();
     let _reset = crate::feature_flags::FlagOverrideReset;
+    // The graph-rebuild leg picks its query-time embedder from the AMBIENT
+    // config when the generation carries no persisted neural state
+    // (`query_remote_embedder`: "config alone decides"), while the
+    // layer-restored leg uses exactly the persisted embedder. A host config
+    // that resolves any embedder route therefore made the rebuilt engine
+    // score neurally while the restored engine stayed TF-IDF. An empty
+    // LEINDEX_HOME gives both legs the same defaults-installed config; the
+    // flag pins below handle the default preset itself.
+    // LEINDEX_HOME is process-global: hold the shared env lock for the whole
+    // sandboxed window, and point the home at an empty dir so the config
+    // load installs defaults instead of reading this host's ~/.leindex.
+    let _env_lock = crate::test_env::EnvLock
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _sandbox = CacheSandbox::new();
+    let home = tempfile::tempdir().expect("sandbox home");
+    // SAFETY: LEINDEX_HOME mutation is serialized by _env_lock above, and
+    // _sandbox restores the previous value on drop (including on panic).
+    unsafe { std::env::set_var(crate::config::LEINDEX_HOME_ENV, home.path()) };
+    // Install the sandboxed defaults now so every later reader — hydration,
+    // rebuild, per-query scoring — sees this snapshot, not the host's.
+    LeIndexConfig::load_cached();
     let dir = tempfile::tempdir().expect("tempdir");
     write_fixture_project(dir.path());
     // Keep this equivalence fixture TF-IDF-only while fresh installs enable
