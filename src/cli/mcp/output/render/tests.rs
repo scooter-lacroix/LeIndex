@@ -359,9 +359,13 @@ fn test_render_diagnostics_plain_output() {
                 },
                 "issues": [{"severity": "warning", "message": "slow"}]
             }"#);
+    // Updated alongside the boilerplate audit (brief §7 / SPEC universal
+    // rules): `PDG loaded: true` is the always-true common case and carried
+    // no information, so `render_diagnostics_health` no longer renders it.
+    // The still-informative counters (pdg_nodes/edges) stay.
     assert_eq!(
         render_diagnostics(&payload, false),
-        "── Diagnostics ──\n  Project: /repo\n  Indexed files: 2\n\n  System Health:\n    Index health: healthy\n    PDG loaded: true\n    PDG nodes: 3\n    Embedding model: model\n\n  Issues:\n    warning slow\n"
+        "── Diagnostics ──\n  Project: /repo\n  Indexed files: 2\n\n  System Health:\n    Index health: healthy\n    PDG nodes: 3\n    Embedding model: model\n\n  Issues:\n    warning slow\n"
     );
 }
 

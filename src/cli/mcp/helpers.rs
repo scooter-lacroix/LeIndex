@@ -1406,11 +1406,11 @@ mod tests {
             },
         )
         .unwrap();
-        // A NON-source untracked file: bumps the changed count without making
-        // the index genuinely stale, so the note fires while the warning
-        // must not.
+        // A NON-source untracked file (`.log` is not in
+        // SOURCE_FILE_EXTENSIONS): bumps the changed count without making the
+        // index genuinely stale, so the note fires while the warning must not.
         let changed = crate::cli::git::GitStatus {
-            untracked: vec![PathBuf::from("notes.txt")],
+            untracked: vec![PathBuf::from("build.log")],
             ..Default::default()
         };
         let result =
