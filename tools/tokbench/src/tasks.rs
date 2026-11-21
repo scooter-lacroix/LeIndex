@@ -23,7 +23,7 @@
 //! 7. Zero-result search with a regex-looking literal (plus a control hit).
 
 use crate::corpus::{self, SOURCE_FILES};
-use crate::leindex_arm::{LeIndexArm, UNSUPPORTED_IN_THIS_BUILD};
+use crate::leindex_arm::LeIndexArm;
 use crate::metrics::{Call, Mode, TaskMetrics};
 use crate::native;
 use crate::tokens::Counter;
@@ -252,28 +252,6 @@ pub fn task2_leindex(
         .join("crates/provider-openai/src/lib.rs")
         .display()
         .to_string();
-    let apply = |m: &mut TaskMetrics,
-                 rt: &Runtime,
-                 arm: &LeIndexArm,
-                 counter: &Counter,
-                 path: &str,
-                 old: &str,
-                 new: &str| {
-        match arm.call(
-            rt,
-            "leindex_edit_apply",
-            json!({ "file_path": path, "old_text": old, "new_text": new, "project_path": pp }),
-        ) {
-            Ok(text) => {
-                measure(m, counter, Mode::Edit, "leindex_edit_apply", &text);
-                true
-            }
-            Err(e) => {
-                m.note = format!("edit_apply failed: {e}");
-                false
-            }
-        }
-    };
 
     let lookup = arm.call(
         rt,
@@ -287,66 +265,43 @@ pub fn task2_leindex(
             return m;
         }
     }
-    match arm.call(
-        rt,
-        "leindex_read_file",
-        json!({ "file_path": lib, "project_path": pp }),
-    ) {
-        Ok(text) => measure(&mut m, counter, Mode::Read, "leindex_read_file", &text),
+    // Lane B's merged multi-file atomic batch: all five construction-site
+    // edits in ONE call (all-or-nothing), the advertised path for touching
+    // several files in one task.
+    let batch = serde_json::json!({
+        "changes": [
+            { "file_path": lib, "old_text": TOP_P_FIELD_OLD, "new_text": TOP_P_FIELD_NEW },
+            { "file_path": lib, "old_text": TOP_P_INIT_OLD, "new_text": TOP_P_INIT_NEW },
+            { "file_path": server, "old_text": SERVER_THREAD_OLD, "new_text": SERVER_THREAD_NEW },
+            { "file_path": server, "old_text": SERVER_THREAD_OLD2, "new_text": SERVER_THREAD_NEW2 },
+            { "file_path": openai, "old_text": OPENAI_THREAD_OLD, "new_text": OPENAI_THREAD_NEW },
+        ],
+        "project_path": pp,
+    });
+    match arm.call(rt, "leindex_edit_apply", batch) {
+        Ok(text) => {
+            measure(
+                &mut m,
+                counter,
+                Mode::Edit,
+                "leindex_edit_apply (batch)",
+                &text,
+            );
+            if text.contains("isError") || text.contains("failed") {
+                m.note = format!("batch apply reported failure: {text}");
+                return m;
+            }
+        }
         Err(e) => {
-            m.note = format!("read_file failed: {e}");
+            m.note = format!("batch edit_apply failed: {e}");
             return m;
         }
-    }
-    let pp2 = pp.clone();
-    if !apply(
-        &mut m,
-        rt,
-        arm,
-        counter,
-        &lib,
-        TOP_P_FIELD_OLD,
-        TOP_P_FIELD_NEW,
-    ) || !apply(
-        &mut m,
-        rt,
-        arm,
-        counter,
-        &lib,
-        TOP_P_INIT_OLD,
-        TOP_P_INIT_NEW,
-    ) || !apply(
-        &mut m,
-        rt,
-        arm,
-        counter,
-        &server,
-        SERVER_THREAD_OLD,
-        SERVER_THREAD_NEW,
-    ) || !apply(
-        &mut m,
-        rt,
-        arm,
-        counter,
-        &server,
-        SERVER_THREAD_OLD2,
-        SERVER_THREAD_NEW2,
-    ) || !apply(
-        &mut m,
-        rt,
-        arm,
-        counter,
-        &openai,
-        OPENAI_THREAD_OLD,
-        OPENAI_THREAD_NEW,
-    ) {
-        return m;
     }
     // Verify with the count output mode.
     match arm.call(
         rt,
         "leindex_find",
-        json!({ "pattern": "top_p", "output": "count", "project_path": pp2 }),
+        json!({ "pattern": "top_p", "output": "count", "project_path": pp }),
     ) {
         Ok(text) => {
             measure(&mut m, counter, Mode::Find, "leindex_find", &text);
@@ -413,11 +368,48 @@ pub fn task3_native(fixture: &Path, counter: &Counter) -> TaskMetrics {
     m
 }
 
-pub fn task3_leindex() -> TaskMetrics {
-    // Master has no `leindex run` tool (brief §4.4). Lane F builds it; the
-    // harness degrades loudly instead of shelling out (that would defeat the
-    // measurement: the whole point is LeIndex owning test-output reading).
-    TaskMetrics::unsupported(3, "leindex run (brief §4.4, lane F)")
+pub fn task3_leindex(
+    fixture: &Path,
+    rt: &Runtime,
+    arm: &LeIndexArm,
+    counter: &Counter,
+) -> TaskMetrics {
+    let mut m = TaskMetrics::new(3);
+    let pp = fixture.display().to_string();
+    // Lane F's real run tool: sandboxed cargo test, structured summary, and
+    // the log stored under a handle. One call replaces Bash + copy-log +
+    // find-in-log.
+    match arm.call(
+        rt,
+        "leindex_manage",
+        json!({ "action": "run", "argv": ["cargo", "test"], "project_path": pp }),
+    ) {
+        Ok(text) => {
+            measure(
+                &mut m,
+                counter,
+                Mode::Run,
+                "leindex_manage run cargo test",
+                &text,
+            );
+            let needle = "panicked at crates/provider-openai/src/lib.rs:";
+            let located = text
+                .lines()
+                .find(|line| line.contains(needle))
+                .and_then(|line| line.split(needle).nth(1))
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|line| line.parse::<usize>().ok());
+            m.success = located == failing_test_line();
+            if !m.success {
+                m.note = format!(
+                    "failing line parsed as {located:?}, want {:?}",
+                    failing_test_line()
+                );
+            }
+        }
+        Err(e) => m.note = format!("leindex run failed: {e}"),
+    }
+    m
 }
 
 // ── Task 4: stage and commit specific files ─────────────────────────────────
@@ -558,40 +550,55 @@ pub fn task4_leindex(
             return m;
         }
     }
-    // Master: `add` is preview-only (git_handler PLAN_NEXT_HINT). Detect the
-    // no-op plan from the REAL response and degrade loudly.
-    match arm.call(
+    // Lane D's merged flow on the documented safe subset: add/commit/push
+    // may apply directly with `confirm: true` — no plan round-trip, and the
+    // review surface is the plan's `will_stage`/exclusions in the response.
+    let applied = match arm.call(
         rt,
         "leindex_git",
-        json!({ "action": "add", "paths": ["crates/server/src/routes.rs"], "project_path": pp }),
+        json!({
+            "action": "add",
+            "paths": ["crates/server/src/routes.rs"],
+            "confirm": true,
+            "project_path": pp,
+        }),
     ) {
         Ok(text) => {
             measure(&mut m, counter, Mode::Git, "leindex_git add", &text);
-            if text.contains("Nothing was changed") || text.contains("cannot apply") {
-                m.note = format!(
-                    "{UNSUPPORTED_IN_THIS_BUILD} (missing: git mutation apply, brief §5, lane D)"
-                );
-                return m;
-            }
+            text
         }
         Err(e) => {
-            m.note = format!(
-                "{UNSUPPORTED_IN_THIS_BUILD} (missing: git mutation apply, brief §5, lane D); add failed: {e}"
-            );
+            m.note = format!("git add failed: {e}");
             return m;
         }
+    };
+    if applied.contains("cannot apply") || applied.contains("\"applied\": false") {
+        m.note = format!("git add reported no-op: {applied}");
+        return m;
     }
-    // Only reachable on a build where git mutations apply (integration).
-    match arm.call(
+
+    let committed = match arm.call(
         rt,
         "leindex_git",
-        json!({ "action": "commit", "message": "tokbench: stage routes only", "project_path": pp }),
+        json!({
+            "action": "commit",
+            "message": "tokbench: stage routes only",
+            "confirm": true,
+            "project_path": pp,
+        }),
     ) {
-        Ok(text) => measure(&mut m, counter, Mode::Git, "leindex_git commit", &text),
+        Ok(text) => {
+            measure(&mut m, counter, Mode::Git, "leindex_git commit", &text);
+            text
+        }
         Err(e) => {
-            m.note = format!("commit failed: {e}");
+            m.note = format!("git commit failed: {e}");
             return m;
         }
+    };
+    if committed.contains("cannot apply") || committed.contains("\"applied\": false") {
+        m.note = format!("git commit reported no-op: {committed}");
+        return m;
     }
     let log = match arm.call(
         rt,
@@ -1002,10 +1009,7 @@ fn run_all_in(scratch: &Path, rt: &Runtime, counter: &Counter) -> Result<CorpusR
             _ => task7_native(&native_fixture, counter),
         };
 
-        // Task 3 LEINDEX needs no fixture (unsupported before any call).
-        let leindex_metrics = if task == 3 {
-            task3_leindex()
-        } else {
+        let leindex_metrics = {
             // Sweep the scratch root between arms: indexing the previous
             // arm's fixture persists per-project state (generation counter,
             // freshness) under `<fixture>/.leindex`, which would otherwise
@@ -1020,6 +1024,7 @@ fn run_all_in(scratch: &Path, rt: &Runtime, counter: &Counter) -> Result<CorpusR
             match task {
                 1 => task1_leindex(&fixture, rt, &arm, counter),
                 2 => task2_leindex(&fixture, rt, &arm, counter),
+                3 => task3_leindex(&fixture, rt, &arm, counter),
                 4 => task4_leindex(&fixture, rt, &arm, counter),
                 5 => task5_leindex(&fixture, rt, &arm, counter),
                 6 => task6_leindex(&fixture, rt, &arm, counter),

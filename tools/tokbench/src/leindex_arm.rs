@@ -74,6 +74,13 @@ impl LeIndexArm {
     /// name (`leindex_git`) with `mode`/`action` in `args` — routing and
     /// normalization happen inside `handle_tool_call`, identical to the wire.
     pub fn call(&self, rt: &tokio::runtime::Runtime, tool: &str, args: Value) -> Result<String> {
+        Ok(response_text(&self.call_raw(rt, tool, args)?))
+    }
+
+    /// Execute one tool call and return the full MCP response value (for
+    /// flows that need structured fields — e.g. a git mutation plan's
+    /// `preview_token` — before the text render).
+    pub fn call_raw(&self, rt: &tokio::runtime::Runtime, tool: &str, args: Value) -> Result<Value> {
         let request: JsonRpcRequest = serde_json::from_value(json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -88,13 +95,13 @@ impl LeIndexArm {
                 &request,
             ))
             .context("handle_tool_call failed")?;
-        Ok(text_of_response(&response))
+        Ok(response)
     }
 }
 
 /// The `content[0].text` the MCP transport would put on the wire, including
 /// the `Error: …` form transport errors take.
-fn text_of_response(response: &Value) -> String {
+pub(crate) fn response_text(response: &Value) -> String {
     response
         .get("content")
         .and_then(Value::as_array)

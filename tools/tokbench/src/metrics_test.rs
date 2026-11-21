@@ -23,8 +23,8 @@ fn test_reduction_pct_known_values() {
 
 #[test]
 fn test_gate_requires_all_three_conditions() {
-    let native = TaskMetrics::new(1);
-    let leindex = TaskMetrics::new(1);
+    let mut native = TaskMetrics::new(1);
+    let mut leindex = TaskMetrics::new(1);
     // Baseline: 100 tok / 2 rt success on both sides.
     native.record(&call(Mode::Read, 60));
     native.record(&call(Mode::Find, 40));

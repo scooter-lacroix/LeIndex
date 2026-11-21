@@ -90,6 +90,8 @@ impl TaskMetrics {
 
     /// Mark the task unsupported in this build (loud, never faked). The
     /// marker names the missing cross-lane feature so the report says WHY.
+    /// Only tests construct it now that the integrated tree wires every task.
+    #[cfg(test)]
     pub fn unsupported(task: usize, missing_feature: &str) -> Self {
         let mut metrics = Self::new(task);
         metrics.note = format!("{UNSUPPORTED_IN_THIS_BUILD} (missing: {missing_feature})");
@@ -123,3 +125,7 @@ pub fn task_passes_gate(native: &TaskMetrics, leindex: &TaskMetrics) -> bool {
     // At least 40% fewer tool-output tokens.
     token_reduction_pct(native.tokens, leindex.tokens) >= 40.0
 }
+
+#[cfg(test)]
+#[path = "metrics_test.rs"]
+mod tests;

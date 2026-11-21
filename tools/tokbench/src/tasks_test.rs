@@ -77,19 +77,22 @@ fn test_has_no_matches_covers_both_arm_shapes() {
 }
 
 #[test]
-fn test_task3_leindex_degrades_loudly_not_faked() {
-    // Master has no `leindex run` (lane F). The harness must FAIL the task
-    // with the UNSUPPORTED marker rather than fabricate a result.
-    let m = task3_leindex();
-    assert!(!m.success);
-    assert!(
-        m.note.contains(UNSUPPORTED_IN_THIS_BUILD),
-        "note: {}",
-        m.note
+fn test_task3_leindex_end_to_end_on_fixture() {
+    // Lane F's run tool is real on the integrated tree: one `action=run`
+    // call runs `cargo test` through the sandbox, and the structured summary
+    // must locate the pinned failing line.
+    let counter = Counter::load();
+    let rt = Runtime::new().expect("tokio runtime");
+    let arm = LeIndexArm::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fixture = fixture_in(dir.path(), "t3-leindex").expect("fixture");
+    arm.index(&rt, fixture.display().to_string().as_str())
+        .expect("index the fixture");
+    let m = task3_leindex(&fixture, &rt, arm.as_ref(), &counter);
+    assert!(m.success, "note: {}", m.note);
+    assert!(m.tokens > 0, "the run summary must be measured");
+    assert_eq!(
+        m.round_trips, 1,
+        "one run call replaces Bash + copy-log + find"
     );
-    assert!(
-        m.note.contains("lane F"),
-        "note must name the missing feature"
-    );
-    assert_eq!(m.round_trips, 0, "no calls were made, none invented");
 }

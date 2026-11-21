@@ -8,7 +8,7 @@ fn test_text_of_response_extracts_content_text() {
         "content": [{ "type": "text", "text": "symbol found at line 12" }],
         "isError": false
     });
-    assert_eq!(text_of_response(&response), "symbol found at line 12");
+    assert_eq!(response_text(&response), "symbol found at line 12");
 }
 
 #[test]
@@ -19,7 +19,7 @@ fn test_text_of_response_error_form_matches_transport() {
         "content": [{ "type": "text", "text": "Error: no such tool: leindex_run" }],
         "isError": true
     });
-    let text = text_of_response(&response);
+    let text = response_text(&response);
     assert!(text.starts_with("Error:"), "got: {text}");
 }
 
