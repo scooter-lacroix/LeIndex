@@ -8,9 +8,9 @@
 //!
 //! | language | construct | match |
 //! |---|---|---|
-//! | Rust | `struct_expression` | `match_pattern` (match arms), `if_let_expression`, `let_declaration` patterns, `matches!` bodies |
+//! | Rust | `struct_expression` | `match_pattern` (match arms), `let_condition` (`if let`), `let_declaration` patterns, `matches!` bodies |
 //! | TypeScript/JavaScript | `new_expression` | `switch_case` |
-//! | Python | — (no typed struct literals) | `match_case` patterns |
+//! | Python | — (no typed struct literals) | pattern nodes inside `match_statement` |
 //!
 //! `Foo::new(..)` is deliberately NOT a construct site: it is a call, and the
 //! call graph already reports it (it reaches this tool as a caller). A site
@@ -89,7 +89,10 @@ impl UsageQuery {
 
 /// Split a candidate into `|` alternatives and normalize `::` to `.`.
 fn alternatives(candidate: &str) -> impl Iterator<Item = &str> {
-    candidate.split('|').map(str::trim).filter(|alt| !alt.is_empty())
+    candidate
+        .split('|')
+        .map(str::trim)
+        .filter(|alt| !alt.is_empty())
 }
 
 /// Names the target: exact, full-path, or last-segment match on a pattern
@@ -97,8 +100,19 @@ fn alternatives(candidate: &str) -> impl Iterator<Item = &str> {
 fn names_target(candidate: &str, query: &UsageQuery) -> bool {
     let normalize = |s: &str| s.replace("::", ".");
     let last = normalize(&query.last);
-    let full = query.full.as_ref().map(|full| normalize(full.trim()));
+    let full = query.full.as_ref().map(|full| {
+        normalize(full.trim())
+            .split('.')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    });
     alternatives(candidate).any(|alt| {
+        // A leading `::` is a crate-root absolute path, never a relative
+        // enum path; filtering empty segments below would erase the anomaly.
+        if alt.starts_with("::") {
+            return false;
+        }
         let cand = normalize(alt);
         let segments: Vec<&str> = cand.split('.').filter(|s| !s.is_empty()).collect();
         let Some(terminal) = segments.last() else {
@@ -111,8 +125,23 @@ fn names_target(candidate: &str, query: &UsageQuery) -> bool {
         if !base {
             return false;
         }
+        // Pattern evidence has two honesty tiers. A struct-literal name
+        // (`Foo { .. }`) or a full pattern node (`Shade::Dark`) carries its
+        // own path, so a bare last segment is fine. But a bare identifier
+        // token from inside a `matches!` token tree proves nothing about the
+        // enum, so whole-type and bare-token combinations are rejected —
+        // except when the query itself is qualified, where the token is all
+        // the evidence the grammar can give and the suffix rule below is the
+        // disclosed approximation.
+        if query.kind == UsageKind::Match && query.is_whole_type() && segments.len() == 1 {
+            return false;
+        }
         match &full {
-            Some(full) => cand == *full || full.ends_with(&cand) || cand.ends_with(full),
+            Some(full) => {
+                let full_seg: Vec<&str> = full.iter().map(String::as_str).collect();
+                (segments == full_seg[..] || full_seg.ends_with(&segments[..]))
+                    && segments.len() <= full.len()
+            }
             None => true,
         }
     })
@@ -155,8 +184,8 @@ fn enclosing_fns(
 fn enclosing_fn_at(table: &[(usize, usize, String)], byte: usize) -> Option<String> {
     table
         .iter()
-        .filter(|(start, end, _)| *start <= byte && byte < *end)
-        .next_back()
+        .rev()
+        .find(|&&(start, end, _)| start <= byte && byte < end)
         .map(|(_, _, name)| name.clone())
 }
 
@@ -189,9 +218,15 @@ fn collect_construct(
                     sites.push((node.start_byte(), "struct literal"));
                 }
             }
-            "typescript" | "ts" | "javascript" | "js" => {
-                if node.kind() == "new_expression"
-                    && let Some(ctor) = node.child_by_field_name("constructor")
+            "typescript" | "ts" | "javascript" | "js" if node.kind() == "new_expression" => {
+                // The constructor is the constructor's first named child;
+                // TS grammars disagree on the field name, so take the
+                // type node directly.
+                let ctor = node.child_by_field_name("constructor").or_else(|| {
+                    node.children(&mut node.walk())
+                        .find(|child| child.is_named())
+                });
+                if let Some(ctor) = ctor
                     && let Ok(name) = ctor.utf8_text(text.as_bytes())
                     && names_target(name, query)
                 {
@@ -244,7 +279,10 @@ fn collect_match_candidates(
                         hits.push(hit);
                     }
                 }
-                "if_let_expression" => {
+                // `if let PAT = expr` parses as a `let_condition` inside the
+                // if_expression's condition field; its `pattern` field is the
+                // pattern alone.
+                "let_condition" => {
                     if let Some(pattern) = node.child_by_field_name("pattern")
                         && let Some(hit) = node_hit(pattern, text, "if let")
                     {
@@ -268,32 +306,94 @@ fn collect_match_candidates(
                             .children(&mut node.walk())
                             .find(|child| child.kind() == "token_tree")
                     {
-                        let mut tokens = vec![token_tree];
-                        while let Some(token) = tokens.pop() {
-                            if token.kind() == "identifier"
-                                && let Ok(ident) = token.utf8_text(text.as_bytes())
-                            {
-                                hits.push(PatternHit {
-                                    byte: token.start_byte(),
-                                    pattern_text: ident.to_string(),
-                                    form: "matches!",
-                                });
+                        // Token-tree contents are flat tokens: `Shade::Light`
+                        // arrives as ident, `::`, ident. Reassemble maximal
+                        // `ident (:: ident)*` sequences so whole-enum queries
+                        // can qualify them and a bare variant token cannot.
+                        let mut flat: Vec<tree_sitter::Node<'_>> = Vec::new();
+                        let mut walk = vec![token_tree];
+                        while let Some(token) = walk.pop() {
+                            if token_tree_noise(token.kind()) {
+                                continue;
                             }
                             let mut cursor = token.walk();
-                            for child in token.children(&mut cursor) {
-                                if !token_tree_noise(child.kind()) {
-                                    tokens.push(child);
-                                }
+                            let children: Vec<_> = token.children(&mut cursor).collect();
+                            if children.is_empty() {
+                                flat.push(token);
+                            }
+                            for child in children.into_iter().rev() {
+                                walk.push(child);
                             }
                         }
+                        flat.sort_by_key(|token| token.start_byte());
+                        let mut path: Vec<String> = Vec::new();
+                        let mut path_start: Option<usize> = None;
+                        let mut after_sep = false;
+                        let flush =
+                            |path: &mut Vec<String>,
+                             start: &mut Option<usize>,
+                             hits: &mut Vec<PatternHit>| {
+                                if path.len() >= 2
+                                    && let Some(start) = *start
+                                {
+                                    hits.push(PatternHit {
+                                        byte: start,
+                                        pattern_text: path.join("::"),
+                                        form: "matches!",
+                                    });
+                                }
+                                path.clear();
+                                *start = None;
+                            };
+                        for token in flat {
+                            let kind = token.kind();
+                            let is_ident = kind == "identifier" || kind == "type_identifier";
+                            let is_sep = token.utf8_text(text.as_bytes()) == Ok("::");
+                            if is_ident {
+                                if !after_sep && !path.is_empty() {
+                                    // Two identifiers without a separator: the
+                                    // previous path ended (`x y` starts a fresh
+                                    // path at `y`; `s,` already flushed at the
+                                    // comma).
+                                    flush(&mut path, &mut path_start, &mut hits);
+                                }
+                                if path.is_empty() {
+                                    path_start = Some(token.start_byte());
+                                }
+                                if let Ok(text) = token.utf8_text(text.as_bytes()) {
+                                    path.push(text.to_string());
+                                }
+                                after_sep = false;
+                            } else if is_sep && !path.is_empty() {
+                                // Keep the path open across the separator.
+                                after_sep = true;
+                            } else {
+                                flush(&mut path, &mut path_start, &mut hits);
+                                after_sep = false;
+                            }
+                        }
+                        flush(&mut path, &mut path_start, &mut hits);
                     }
                 }
                 _ => {}
             },
             "python" | "py" => {
-                if node.kind() == "match_case"
-                    && let Some(pattern) = node.child_by_field_name("pattern")
-                    && let Some(hit) = node_hit(pattern, text, "match case")
+                // The pattern kinds are unnamed and carry no field pointing
+                // at themselves; their kind names only exist inside a
+                // match_statement, so keying on the kind is exact.
+                const PY_PATTERN_KINDS: [&str; 9] = [
+                    "pattern",
+                    "pattern_list",
+                    "as_pattern",
+                    "union_pattern",
+                    "case_pattern",
+                    "class_pattern",
+                    "dict_pattern",
+                    "list_pattern",
+                    "tuple_pattern",
+                ];
+                if PY_PATTERN_KINDS.contains(&node.kind())
+                    && let Some(hit) = node_hit(node, text, "match case")
                 {
                     hits.push(hit);
                 }
@@ -354,6 +454,133 @@ pub(crate) fn collect_sites(
     sites.sort_by_key(|site| site.line);
     sites.dedup_by(|a, b| a.line == b.line && a.form == b.form);
     sites
+}
+
+/// Directories whose sources are vendored or generated, never first-party
+/// usage sites worth reporting. Hidden directories (`.git`, `.leindex`, …)
+/// are skipped by name prefix in [`source_files`].
+const SKIP_DIRS: [&str; 6] = [
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    "vendor",
+    "__pycache__",
+];
+
+/// Hard cap on files walked for one usage query (fail-safe against
+/// pathological trees); overflow is disclosed via `more`, not silent.
+const MAX_USAGE_FILES: usize = 4000;
+
+/// Hard cap on reported sites per query.
+const MAX_USAGE_SITES: usize = 500;
+
+/// One usage site with its project-relative file and language, ready for the
+/// §6.3 response body.
+pub(crate) struct ProjectSite {
+    /// Path relative to the project root (absolute when the file sits above it).
+    pub file: String,
+    /// Language name (`rust`, `python`, `typescript`, `javascript`).
+    pub language: &'static str,
+    /// The site itself.
+    pub site: UsageSite,
+}
+
+/// Language name for a source file extension. `tsx`/`jsx` are deliberately
+/// absent: no grammar is wired for them, and guessing would misreport sites.
+fn language_for_path(path: &std::path::Path) -> Option<&'static str> {
+    match path.extension()?.to_str()? {
+        "rs" => Some("rust"),
+        "py" => Some("python"),
+        "ts" => Some("typescript"),
+        "js" => Some("javascript"),
+        _ => None,
+    }
+}
+
+/// Parseable first-party source files under `root`, sorted for deterministic
+/// order, capped at `limit`. Hidden and vendored/build directories are
+/// skipped.
+fn source_files(root: &std::path::Path, limit: usize) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if files.len() >= limit {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if files.len() >= limit {
+                break;
+            }
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
+                    continue;
+                }
+                stack.push(path);
+            } else if language_for_path(&path).is_some() {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Scan every parseable first-party source under the project for `query`'s
+/// usage sites. Files are parsed once through the shared cache; results are
+/// in deterministic (path, line) order. The third element is `true` when the
+/// site cap hid further hits, so callers can disclose truncation honestly.
+pub(crate) fn sites_in_project(
+    project_root: &std::path::Path,
+    query: &UsageQuery,
+) -> (Vec<ProjectSite>, usize, bool) {
+    let mut cache = crate::cli::mcp::call_sites::SourceCache::new(project_root);
+    let mut sites: Vec<ProjectSite> = Vec::new();
+    let mut scanned = 0usize;
+    let mut more = false;
+    for path in source_files(project_root, MAX_USAGE_FILES) {
+        let Some(language) = language_for_path(&path) else {
+            continue;
+        };
+        let Some(path_text) = path.to_str() else {
+            continue;
+        };
+        // A file-summary node is only a cache key here: `file_source` uses its
+        // path and language to read + parse, nothing else.
+        let summary = crate::graph::pdg::Node::new_file_summary(path_text, language);
+        let Some(source) = cache.file_source(&summary) else {
+            continue;
+        };
+        let Some(tree) = source.tree.as_ref() else {
+            continue;
+        };
+        scanned += 1;
+        let rel = path
+            .strip_prefix(project_root)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| path.display().to_string());
+        for site in collect_sites(tree.root_node(), &source.text, language, query) {
+            if sites.len() >= MAX_USAGE_SITES {
+                more = true;
+                break;
+            }
+            sites.push(ProjectSite {
+                file: rel.clone(),
+                language,
+                site,
+            });
+        }
+        if more {
+            break;
+        }
+    }
+    (sites, scanned, more)
 }
 
 #[cfg(test)]
@@ -442,11 +669,9 @@ pub fn dark_check(s: &Shade) -> bool {
             "rust",
             &query(UsageKind::Construct, "Foo"),
         );
-        assert!(
-            sites
-                .iter()
-                .all(|site| !site.site_line.contains("-> Foo") && !site.site_line.contains("pub struct"))
-        );
+        assert!(sites.iter().all(
+            |site| !site.site_line.contains("-> Foo") && !site.site_line.contains("pub struct")
+        ));
     }
 
     #[test]
@@ -483,8 +708,14 @@ pub fn dark_check(s: &Shade) -> bool {
             .find(|site| site.form == "matches!")
             .expect("matches! site");
         assert_eq!(matches_site.enclosing.as_deref(), Some("dark_check"));
-        // The string literal "bright" must not leak a pseudo-site.
-        assert!(sites.iter().all(|site| !site.site_line.contains('"')));
+        // No reported site may START with a string literal (the "bright"
+        // literal must not become a pseudo-site); the Dark sites' lines are
+        // expression lines that legitimately contain quotes.
+        assert!(
+            sites
+                .iter()
+                .all(|site| !site.site_line.trim_start().starts_with('"'))
+        );
     }
 
     #[test]
@@ -496,17 +727,18 @@ pub fn dark_check(s: &Shade) -> bool {
             "rust",
             &query(UsageKind::Match, "Shade"),
         );
-        // Whole-enum form: every `Shade::Variant` pattern qualifies.
+        // Whole-enum form: every `Shade::Variant` pattern qualifies. Fixture
+        // lines (1-based): match arms 25/26, if let 31, matches! 34. The
+        // `Foo::new()` lines never appear: a call is not a pattern site.
         let lines: Vec<usize> = sites.iter().map(|site| site.line).collect();
-        assert!(lines.contains(&20), "match arm lines: {sites:?}");
-        assert!(lines.contains(&21), "match arm lines: {sites:?}");
-        assert!(lines.contains(&25), "if let lines: {sites:?}");
-        assert!(lines.contains(&28), "matches! lines: {sites:?}");
+        assert!(lines.contains(&25), "match arm lines: {sites:?}");
+        assert!(lines.contains(&26), "match arm lines: {sites:?}");
+        assert!(lines.contains(&31), "if let lines: {sites:?}");
+        assert!(lines.contains(&34), "matches! lines: {sites:?}");
     }
 
     #[test]
     fn test_or_patterns_match_any_alternative() {
-        let tree = parse(RUST_SRC, "rs");
         // No or-pattern in the fixture; assert the matcher directly.
         let q = query(UsageKind::Match, "Shade::Dark");
         assert!(names_target("Shade::Dark | Shade::Light", &q));

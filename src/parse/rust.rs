@@ -943,6 +943,7 @@ fn extract_rust_calls_depth(
     ///   2. a parenthesised expression — comma-separated argument lists
     ///      (`assert_eq!(a, b)`, `println!("{} {}", f(), g())`);
     ///   3. bare content — a single expression (`vec![…]`).
+    ///
     /// A body that fits no wrapper (a custom DSL macro) is skipped silently:
     /// recording nothing is the previous behaviour, and inventing calls from
     /// DSL tokens would be worse. The wrapper ladder matters because a

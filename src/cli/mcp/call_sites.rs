@@ -67,21 +67,11 @@ impl CallerEntry {
 
     /// Approximate response cost of this entry, used for budget filling.
     pub(crate) fn render_cost(&self) -> usize {
-        self.name.len() + self.file.len() + self.kind.len() + 24
+        self.name.len()
+            + self.file.len()
+            + self.kind.len()
+            + 24
             + self.site_line.as_ref().map_or(0, |s| s.len() + 8)
-    }
-
-    /// The exact one-line form the brief specifies.
-    pub(crate) fn render_line(&self, root: &std::path::Path) -> String {
-        let rel = std::path::Path::new(&self.file)
-            .strip_prefix(root)
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| self.file.clone());
-        let body = match (self.line, &self.site_line) {
-            (Some(line), Some(site)) => format!("{rel}:{line}  {site}"),
-            _ => format!("{rel}  (call site not resolved: language not parsed)"),
-        };
-        format!("{body}  (in fn {})", self.name)
     }
 }
 
@@ -149,6 +139,8 @@ pub(crate) fn looks_like_test_name(name: &str) -> bool {
     trimmed.starts_with("test_")
         || trimmed.ends_with("_test")
         || trimmed.starts_with("pytest_")
+        || trimmed.starts_with("it_")
+        || trimmed.starts_with("should_")
         || trimmed == "test"
         || trimmed == "it"
         || trimmed == "should"
@@ -243,8 +235,7 @@ fn node_at_range<'a>(
             if node.start_byte() == range.0 && node.end_byte() == range.1 {
                 return Some(node);
             }
-            let smaller =
-                best.map_or(true, |b| node.byte_range().len() < b.byte_range().len());
+            let smaller = best.is_none_or(|b| node.byte_range().len() < b.byte_range().len());
             if smaller {
                 best = Some(node);
             }
@@ -343,6 +334,73 @@ pub(crate) fn find_call_in_fn(
                 first_hit = Some((node.start_byte(), node.end_byte()));
             }
         }
+        // A call made inside a macro body exists only as a token sequence:
+        // `assert_eq!(callee(1), 2)` has no call_expression node. Paths are
+        // reassembled from ident/`::`/ident token runs, and a path whose last
+        // segment names the callee followed by `(` is the site.
+        if language.starts_with("rust")
+            && node.kind() == "macro_invocation"
+            && let Some(token_tree) = node
+                .children(&mut node.walk())
+                .find(|child| child.kind() == "token_tree")
+        {
+            let mut flat: Vec<tree_sitter::Node<'_>> = Vec::new();
+            let mut walk = vec![token_tree];
+            while let Some(token) = walk.pop() {
+                let mut cursor = token.walk();
+                let children: Vec<_> = token.children(&mut cursor).collect();
+                if children.is_empty() {
+                    flat.push(token);
+                }
+                for child in children.into_iter().rev() {
+                    walk.push(child);
+                }
+            }
+            flat.sort_by_key(|token| token.start_byte());
+            let mut path: Vec<String> = Vec::new();
+            let mut path_start: Option<usize> = None;
+            let mut after_sep = false;
+            for (idx, token) in flat.iter().enumerate() {
+                let kind = token.kind();
+                let token_text = token.utf8_text(text.as_bytes()).unwrap_or("");
+                let is_ident = kind == "identifier" || kind == "type_identifier";
+                let is_sep = token_text == "::";
+                let next_is_open_paren = flat
+                    .get(idx + 1)
+                    .is_some_and(|next| next.utf8_text(text.as_bytes()) == Ok("("));
+                if is_ident {
+                    if !after_sep && !path.is_empty() {
+                        // Two identifiers without a separator: the previous
+                        // path ended (`x y` starts a fresh path at `y`).
+                        path.clear();
+                        path_start = None;
+                    }
+                    if path.is_empty() {
+                        path_start = Some(token.start_byte());
+                    }
+                    path.push(token_text.to_string());
+                    after_sep = false;
+                } else if is_sep && !path.is_empty() {
+                    // Keep the path open across the separator.
+                    after_sep = true;
+                } else {
+                    path.clear();
+                    path_start = None;
+                    after_sep = false;
+                }
+                // The call itself: path + `(`. Comparing on the last segment
+                // so `Vec::push` matches a `push` callee from the PDG.
+                let last_seg = path.last().map(String::as_str);
+                if next_is_open_paren
+                    && let Some(last_seg) = last_seg
+                    && last_seg.eq_ignore_ascii_case(&callee_last)
+                    && let Some(start) = path_start
+                    && first_hit.is_none_or(|(hit_start, _)| start < hit_start)
+                {
+                    first_hit = Some((start, token.end_byte()));
+                }
+            }
+        }
         let mut cursor = node.walk();
         let children: Vec<_> = node.children(&mut cursor).collect();
         for child in children.into_iter().rev() {
@@ -359,7 +417,9 @@ pub(crate) fn find_call_in_fn(
 /// Last `::`/`.`-separated segment of a callee path, macro `!` stripped.
 fn callee_last_segment(callee: &str) -> String {
     let path = callee.rsplit("::").next().unwrap_or(callee);
-    path.rsplit('.').next().unwrap_or(path)
+    path.rsplit('.')
+        .next()
+        .unwrap_or(path)
         .trim_end_matches('!')
         .to_string()
 }
@@ -381,7 +441,10 @@ fn names_match(callee_text: &str, callee: &str, callee_last: &str) -> bool {
 /// 1-based line number of a byte offset.
 pub(crate) fn byte_to_line(text: &str, byte: usize) -> usize {
     let bound = byte.min(text.len());
-    1 + text.as_bytes()[..bound].iter().filter(|b| **b == b'\n').count()
+    1 + text.as_bytes()[..bound]
+        .iter()
+        .filter(|b| **b == b'\n')
+        .count()
 }
 
 /// The trimmed line containing `byte`, capped to [`MAX_SITE_LINE_CHARS`].
@@ -402,17 +465,16 @@ pub(crate) fn line_at(text: &str, byte: usize) -> String {
 /// Resolve and rank every direct caller of `node_id`: call-site line plus
 /// test classification per caller, non-test callers first (stable within
 /// each class). Files are read and parsed through `cache`, so twenty callers
-/// in one file cost one read and one parse.
+/// in one file cost one read and one parse. `callee_name` is the looked-up
+/// symbol's name; it anchors the site search (the PDG's Call edges carry no
+/// position, so the subtree search is what recovers the line).
 pub(crate) fn caller_entries(
     pdg: &ProgramDependenceGraph,
     node_id: crate::graph::pdg::NodeId,
     resolve_sites: bool,
+    callee_name: &str,
     cache: &mut SourceCache,
 ) -> Vec<CallerEntry> {
-    let callee_name = pdg
-        .get_node(node_id)
-        .map(|node| node.name.clone())
-        .unwrap_or_default();
     let mut entries: Vec<CallerEntry> = Vec::new();
     for caller_id in crate::cli::mcp::helpers::get_direct_callers(pdg, node_id) {
         let Some(node) = pdg.get_node(caller_id) else {
@@ -428,15 +490,15 @@ pub(crate) fn caller_entries(
         };
         if resolve_sites {
             let source = cache.file_source(node);
-            entry.is_test =
-                caller_is_test(node, source.as_ref().map(|src| src.text.as_str()));
+            entry.is_test = caller_is_test(node, source.as_ref().map(|src| src.text.as_str()));
             if let Some(source) = source
                 && let Some(tree) = &source.tree
             {
                 let fn_node = node_at_range(tree.root_node(), node.byte_range);
                 if let Some(fn_node) = fn_node {
                     let language = node.language.as_str();
-                    if let Some(site) = find_call_in_fn(fn_node, &source.text, language, &callee_name)
+                    if let Some(site) =
+                        find_call_in_fn(fn_node, &source.text, language, callee_name)
                     {
                         entry.line = Some(site.line);
                         entry.site_line = Some(site.text);
@@ -500,14 +562,15 @@ mod tests {
         let tree = parse_rust(SRC);
         let fn_node = fn_node_in(tree.root_node(), SRC, "caller_fn");
         let site = find_call_in_fn(fn_node, SRC, "rust", "leaf_fn").expect("call site found");
-        // leaf_fn(1) on line 5 comes first in source order.
-        assert_eq!(site.line, 5, "first call in source order: {:?}", site.text);
+        // leaf_fn(1) on line 6 comes first in source order (1-based).
+        assert_eq!(site.line, 6, "first call in source order: {:?}", site.text);
         assert_eq!(site.text, "let a = leaf_fn(1);");
     }
 
     #[test]
     fn test_macro_internal_call_site_is_found() {
-        let src = "fn callee(x: u32) -> u32 { x }\n\nfn tester() {\n    assert_eq!(callee(1), 2);\n}\n";
+        let src =
+            "fn callee(x: u32) -> u32 { x }\n\nfn tester() {\n    assert_eq!(callee(1), 2);\n}\n";
         let tree = parse_rust(src);
         let fn_node = fn_node_in(tree.root_node(), src, "tester");
         let site = find_call_in_fn(fn_node, src, "rust", "callee").expect("macro call site");
@@ -617,7 +680,10 @@ mod tests {
     fn test_attributes_mark_test_fns() {
         let src = "#[test]\nfn test_a() {}\n\n#[tokio::test]\nasync fn test_b() {}\n\n#[cfg(feature = \"x\")]\nfn prod() {}\n";
         assert!(attributes_mention_test(src, src.find("fn test_a").unwrap()));
-        assert!(attributes_mention_test(src, src.find("async fn test_b").unwrap()));
+        assert!(attributes_mention_test(
+            src,
+            src.find("async fn test_b").unwrap()
+        ));
         assert!(!attributes_mention_test(src, src.find("fn prod").unwrap()));
     }
 
@@ -628,22 +694,5 @@ mod tests {
         assert_eq!(byte_to_line(text, 6), 2);
         assert_eq!(line_at(text, 6), "beta");
         assert_eq!(line_at(text, 0), "alpha");
-    }
-
-    #[test]
-    fn test_render_line_reports_relative_path_and_enclosing_fn() {
-        let entry = CallerEntry {
-            name: "helper".into(),
-            file: "/proj/src/lib.rs".into(),
-            kind: "function".into(),
-            is_test: false,
-            line: Some(31),
-            site_line: Some("let foo = make_foo(\"a\");".into()),
-        };
-        let line = entry.render_line(std::path::Path::new("/proj"));
-        assert_eq!(
-            line,
-            "src/lib.rs:31  let foo = make_foo(\"a\");  (in fn helper)"
-        );
     }
 }

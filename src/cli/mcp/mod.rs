@@ -47,6 +47,8 @@ pub mod system_one;
 /// Response detail tiers (`l0` identity card, `l1` overview, `l2` full detail).
 pub mod tier;
 
+/// Call-site geometry for symbol_lookup callers (brief §6.2).
+pub mod call_sites;
 /// Handler for LeIndex \[Context\] — PDG-based context expansion.
 pub mod context_handler;
 /// Handler for LeIndex [Deep Analyze] — deep code analysis.
@@ -103,12 +105,10 @@ pub mod search_handler;
 pub mod structural_handler;
 /// Handler for LeIndex [Symbol Lookup] — full call graph lookup.
 pub mod symbol_lookup_handler;
-/// Call-site geometry for symbol_lookup callers (brief §6.2).
-pub mod call_sites;
-/// Construct and match usage sites (brief §6.3).
-pub mod usages;
 /// Test locator with exact run commands (brief §6.4).
 pub mod tests_mode;
+/// Construct and match usage sites (brief §6.3).
+pub mod usages;
 /// Handler for LeIndex \[Write\] — atomic file creation with PDG surfacing.
 pub mod write_handler;
 
